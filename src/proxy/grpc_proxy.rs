@@ -224,9 +224,9 @@ impl Drop for GrpcBody {
             | GrpcBody::Channel {
                 upload_observer, ..
             } => upload_observer.as_ref(),
-            GrpcBody::Buffered(_)
-            | GrpcBody::BufferedWithTrailers { .. }
-            | GrpcBody::Pumped(_) => None,
+            GrpcBody::Buffered(_) | GrpcBody::BufferedWithTrailers { .. } | GrpcBody::Pumped(_) => {
+                None
+            }
         };
         if let Some(observer) = upload_observer {
             observer.on_upload_terminated();

@@ -2146,11 +2146,7 @@ impl UploadSource {
                         write_timeout_ms,
                     )
                 } else {
-                    crate::proxy::upload_pump::spawn_upload_pump(
-                        incoming,
-                        plan,
-                        write_timeout_ms,
-                    )
+                    crate::proxy::upload_pump::spawn_upload_pump(incoming, plan, write_timeout_ms)
                 };
                 *self = UploadSource::Pumped(source);
                 Some(join)

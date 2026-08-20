@@ -4486,7 +4486,10 @@ fn every_buffered_h3_entry_point_writes_through_the_shared_chunked_sender() {
     let client = include_str!("../../../src/http3/client.rs");
     for (label, anchor) in [
         ("pooled buffered request", "async fn do_request("),
-        ("pooled streaming-response request", "async fn do_request_streaming("),
+        (
+            "pooled streaming-response request",
+            "async fn do_request_streaming(",
+        ),
         (
             "integration/diagnostic client",
             "/// Send an HTTP/3 request to the specified backend.\n    pub async fn request(",
@@ -4569,7 +4572,9 @@ fn the_buffered_h3_sender_slices_are_bounded_complete_and_in_order() {
 
 #[tokio::test(start_paused = true)]
 async fn a_slow_but_progressing_buffered_h3_upload_is_not_falsely_timed_out() {
-    use ferrum_edge::_test_support::{h3_buffered_body_send_for_test, h3_buffered_send_chunk_bytes};
+    use ferrum_edge::_test_support::{
+        h3_buffered_body_send_for_test, h3_buffered_send_chunk_bytes,
+    };
 
     let chunk = h3_buffered_send_chunk_bytes();
     let total = chunk * 4 + 5;

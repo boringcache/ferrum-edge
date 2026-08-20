@@ -16,21 +16,22 @@ use ferrum_edge::_test_support::{
     ResponseCollectBoundForTest, StreamIoSide, UploadPumpProbe,
     attribute_dispatch_phase_bound_for_test, authorization_bounded_header_deadline_for_test,
     authorization_expired_dispatch_placeholder_for_test,
-    authorization_expired_pre_commitment_response_for_test, await_authorized_headers_write_for_test,
-    await_deadline_first_for_test, await_h3_backend_or_peer_for_test,
-    await_precommit_response_phase_for_test, bidirectional_copy_with_authorization_for_test,
+    authorization_expired_pre_commitment_response_for_test,
+    await_authorized_headers_write_for_test, await_deadline_first_for_test,
+    await_h3_backend_or_peer_for_test, await_precommit_response_phase_for_test,
+    bidirectional_copy_with_authorization_for_test,
     collect_buffered_upload_under_authorization_for_test,
     collect_buffered_upload_under_composed_bound_for_test,
     collect_h3_upload_under_authorization_for_test, compose_aggregate_sse_bound_for_test,
     compose_buffered_upload_bound_for_test, compose_dispatch_phase_bound_for_test,
     compose_h3_upload_bound_for_test, compose_precommit_response_phase_bound_for_test,
     direct_h2_upload_join_bound_for_test, dispatch_phase_authorization_expiry_for_test,
-    dtls_authorization_expired_before_relay_for_test, dtls_setup_stage_under_authorization_for_test,
-    precommit_authorization_gate_for_test, relay_failure_is_client_facing,
-    request_received_at_for_test, request_upload_auth_deadline_for_test,
-    set_grpc_deadline_budget_for_test, set_request_credential_deadline_for_test,
-    settle_dtls_relay_authorization_expiry_for_test, tcp_plain_splice_eligible_for_test,
-    within_stream_auth_deadline_for_test,
+    dtls_authorization_expired_before_relay_for_test,
+    dtls_setup_stage_under_authorization_for_test, precommit_authorization_gate_for_test,
+    relay_failure_is_client_facing, request_received_at_for_test,
+    request_upload_auth_deadline_for_test, set_grpc_deadline_budget_for_test,
+    set_request_credential_deadline_for_test, settle_dtls_relay_authorization_expiry_for_test,
+    tcp_plain_splice_eligible_for_test, within_stream_auth_deadline_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::{Direction, DisconnectCause, RequestContext};
@@ -3121,7 +3122,10 @@ async fn the_buffered_grpc_write_watermark_starts_after_sender_acquisition() {
             .await,
         "the same watermark must start once the dispatcher has a sender"
     );
-    assert_eq!(probe.cancel_and_join().await, ProbePumpOutcome::WriteTimeout);
+    assert_eq!(
+        probe.cancel_and_join().await,
+        ProbePumpOutcome::WriteTimeout
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -3140,7 +3144,10 @@ async fn the_backend_write_watermark_ends_a_buffered_grpc_upload_hyper_stopped_t
             .await,
         "backend_write_timeout_ms must end the gRPC header wait before the later read bound"
     );
-    assert_eq!(probe.cancel_and_join().await, ProbePumpOutcome::WriteTimeout);
+    assert_eq!(
+        probe.cancel_and_join().await,
+        ProbePumpOutcome::WriteTimeout
+    );
 
     match probe.poll_transport_once() {
         ProbeReplayFrame::Errored(message) => assert!(
@@ -3258,7 +3265,10 @@ async fn a_partly_drained_buffered_grpc_upload_still_ends_on_the_write_watermark
             .await,
         "the watermark must still fire once hyper stops taking frames"
     );
-    assert_eq!(probe.cancel_and_join().await, ProbePumpOutcome::WriteTimeout);
+    assert_eq!(
+        probe.cancel_and_join().await,
+        ProbePumpOutcome::WriteTimeout
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -3340,7 +3350,9 @@ fn the_buffered_grpc_dispatch_races_every_header_wait_shape_against_the_watermar
         .find("sender.send_request(backend_req)")
         .expect("buffered gRPC dispatch");
     assert!(
-        sender_acquired < pump_installed && pump_installed < pump_armed && pump_armed < request_sent,
+        sender_acquired < pump_installed
+            && pump_installed < pump_armed
+            && pump_armed < request_sent,
         "connection acquisition must finish before the write pump is installed and armed"
     );
     // One race, wrapping the whole header wait, is what covers all three
@@ -3507,8 +3519,7 @@ fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
     // Native gRPC keeps its own body type, so it installs the pump directly on
     // the shared upload source rather than through the H1/H2 adapters.
     assert!(
-        GRPC_PROXY_SOURCE
-            .contains("UploadSource::for_streaming_upload_with_deferred_write(")
+        GRPC_PROXY_SOURCE.contains("UploadSource::for_streaming_upload_with_deferred_write(")
             && GRPC_PROXY_SOURCE.contains("proxy.backend_write_timeout_ms")
             && GRPC_PROXY_SOURCE.contains("pump.arm_write_watermark();"),
         "the fully-streamed native-gRPC upload lost its gateway-owned lifecycle"
