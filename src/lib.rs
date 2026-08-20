@@ -6697,6 +6697,21 @@ pub mod _test_support {
         )
     }
 
+    pub fn new_direct_h2_bytes_latch_for_test()
+        -> std::sync::Arc<crate::proxy::body::DirectH2BytesLatch>
+    {
+        std::sync::Arc::new(crate::proxy::body::DirectH2BytesLatch::new())
+    }
+
+    pub fn finish_direct_h2_passthrough_bytes_for_test(
+        observed: &std::sync::atomic::AtomicU64,
+        seen: u64,
+        published: &mut bool,
+        latch: &crate::proxy::body::DirectH2BytesLatch,
+    ) {
+        crate::proxy::body::publish_passthrough_request_bytes(observed, seen, published, latch);
+    }
+
     pub fn request_may_have_body(method: &str, headers: &HashMap<String, String>) -> bool {
         crate::proxy::request_may_have_body(method, headers)
     }

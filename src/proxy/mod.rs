@@ -35441,6 +35441,10 @@ async fn handle_proxy_request_inner(
     // `StreamingH2` relay so native gRPC without a client deadline does not
     // fall back to the outer proxy default.
     let mut streaming_h2_read_timeout_ms;
+    // Unlimited direct-H2 passthrough publishes request bytes only at upload
+    // terminal states. Capture the latch so transaction summaries can wait
+    // without re-introducing a per-DATA-frame atomic on the hot path.
+    let mut passthrough_request_bytes_latch: Option<Arc<body::DirectH2BytesLatch>> = None;
     // Set when the retry loop breaks on a gateway-synthesized dispatch refusal
     // for a ROTATED candidate that was never dialed (mesh-transport / secured
     // transport screens). `final_upstream_target` deliberately points at that
@@ -35523,10 +35527,12 @@ async fn handle_proxy_request_inner(
                 backend_admission_permits: permits,
                 request_body_exceeded,
                 streaming_h2_read_timeout_ms: mesh_read_timeout_ms,
+                passthrough_request_bytes,
             } => {
                 backend_admission_permits = permits;
                 mesh_request_body_exceeded = request_body_exceeded;
                 streaming_h2_read_timeout_ms = mesh_read_timeout_ms;
+                passthrough_request_bytes_latch = passthrough_request_bytes;
                 (*response, retained_body)
             }
             BackendDispatchResult::AdmissionRejected(rejection) => {
@@ -36224,11 +36230,13 @@ async fn handle_proxy_request_inner(
                 backend_admission_permits: permits,
                 request_body_exceeded,
                 streaming_h2_read_timeout_ms: effective_streaming_h2_read_timeout_ms,
+                passthrough_request_bytes,
                 ..
             } => {
                 backend_admission_permits = permits;
                 mesh_request_body_exceeded = request_body_exceeded;
                 streaming_h2_read_timeout_ms = effective_streaming_h2_read_timeout_ms;
+                passthrough_request_bytes_latch = passthrough_request_bytes;
                 *response
             }
             BackendDispatchResult::AdmissionRejected(rejection) => {
@@ -37244,11 +37252,15 @@ async fn handle_proxy_request_inner(
         !plugins.is_empty() || body_will_stream || backend_error_class.is_some();
     let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =
         if needs_transaction_summary {
-            // Request bytes: read the shared counter populated by the body
-            // handlers in `proxy_to_backend` / `proxy_to_backend_http2` /
-            // `proxy_to_backend_http3`. By this point the request has
-            // completed so the counter reflects the total (Acquire pairs with
-            // the Release stores in the body adapters).
+            // Request bytes: SizeLimitedIncoming / CountingIncoming publish
+            // per DATA frame, so this load is the total once those adapters
+            // have finished. Unlimited direct-H2 passthrough publishes only
+            // at EOS / error / cancel / Drop, and hyper can resolve response
+            // headers while that upload is still in the detached pipe
+            // (`body_completion_rx` is None). Do not treat this header-flush
+            // snapshot as final on that arm — streaming reloads after the
+            // latch in DeferredTransactionLogger, and buffered logs wait
+            // (without blocking TTFB when the latch is still open).
             let bytes_sent = ctx
                 .bytes_sent_observed
                 .load(std::sync::atomic::Ordering::Acquire);
@@ -37271,7 +37283,7 @@ async fn handle_proxy_request_inner(
             let grpc_response_messages = ctx
                 .grpc_response_messages_observed
                 .load(std::sync::atomic::Ordering::Acquire);
-            let summary = TransactionSummary {
+            let mut summary = TransactionSummary {
                 namespace: proxy.namespace.clone(),
                 timestamp_received: ctx.timestamp_received.to_rfc3339(),
                 client_ip: ctx.client_ip.clone(),
@@ -37314,7 +37326,8 @@ async fn handle_proxy_request_inner(
                         Arc::clone(&plugins),
                         ctx.clone(),
                         start_time,
-                    ),
+                    )
+                    .with_passthrough_request_bytes_latch(passthrough_request_bytes_latch.clone()),
                 )
             } else {
                 // ── Buffered commitment / audit boundary (#3815) ─────────────
@@ -37343,14 +37356,40 @@ async fn handle_proxy_request_inner(
                 //
                 // A request with NO authorization plan cannot expire here, so it
                 // keeps the historical sequential awaited contract byte for
-                // byte.
-                if has_authorization_plan {
-                    crate::plugins::spawn_bounded_terminal_summary_log(&plugins, summary, &ctx);
+                // byte — unless unlimited direct-H2 passthrough bytes are still
+                // unpublished. Waiting here would pin TTFB on a still-running
+                // upload after an early backend response; spawn the wait+log
+                // instead so chargeback sees forwarded bytes without restoring
+                // the header completion gate.
+                let pending_passthrough_latch = passthrough_request_bytes_latch
+                    .as_ref()
+                    .filter(|latch| !latch.is_done())
+                    .cloned();
+                if let Some(latch) = pending_passthrough_latch {
+                    spawn_buffered_summary_after_passthrough_bytes(
+                        &plugins,
+                        summary,
+                        &ctx,
+                        latch,
+                    );
                 } else {
-                    crate::plugins::log_with_mirror_before_buffered_response(
-                        &plugins, summary, &ctx,
-                    )
-                    .await;
+                    if passthrough_request_bytes_latch
+                        .as_ref()
+                        .is_some_and(|latch| latch.is_done())
+                    {
+                        summary.bytes_sent = ctx
+                            .bytes_sent_observed
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            .max(summary.bytes_sent);
+                    }
+                    if has_authorization_plan {
+                        crate::plugins::spawn_bounded_terminal_summary_log(&plugins, summary, &ctx);
+                    } else {
+                        crate::plugins::log_with_mirror_before_buffered_response(
+                            &plugins, summary, &ctx,
+                        )
+                        .await;
+                    }
                 }
                 None
             }
@@ -40336,6 +40375,9 @@ enum BackendDispatchResult {
         backend_admission_permits: Option<BackendAdmissionPermitSet>,
         request_body_exceeded: Option<Arc<std::sync::atomic::AtomicBool>>,
         streaming_h2_read_timeout_ms: Option<u64>,
+        /// Join for unlimited direct-H2 passthrough byte publication. `None`
+        /// on every other dispatch (reqwest, limited H2, mesh, H3).
+        passthrough_request_bytes: Option<Arc<body::DirectH2BytesLatch>>,
     },
     AdmissionRejected(backend_dispatch::BackendAdmissionRejection),
 }
@@ -40392,6 +40434,34 @@ impl PreacquiredBackendAdmission {
     }
 }
 
+fn spawn_buffered_summary_after_passthrough_bytes(
+    plugins: &[Arc<dyn crate::plugins::Plugin>],
+    mut summary: crate::plugins::TransactionSummary,
+    ctx: &crate::plugins::RequestContext,
+    latch: Arc<body::DirectH2BytesLatch>,
+) {
+    let plugins = plugins.to_vec();
+    let observed = Arc::clone(&ctx.bytes_sent_observed);
+    let ctx = ctx.clone();
+    let _ = crate::observability_delivery::spawn_deadline_cleanup(async move {
+        latch.wait().await;
+        summary.bytes_sent = observed
+            .load(std::sync::atomic::Ordering::Acquire)
+            .max(summary.bytes_sent);
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::plugins::log_with_mirror(&plugins, &summary, &ctx),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                "Detached transaction logging exceeded the post-response cleanup timeout"
+            );
+        }
+    });
+}
+
 fn backend_dispatch_response(
     response: retry::BackendResponse,
     retained_body: Option<Bytes>,
@@ -40403,6 +40473,7 @@ fn backend_dispatch_response(
         backend_admission_permits,
         request_body_exceeded: None,
         streaming_h2_read_timeout_ms: None,
+        passthrough_request_bytes: None,
     }
 }
 
@@ -41527,6 +41598,7 @@ async fn proxy_to_backend(
             backend_admission_permits,
             request_body_exceeded,
             streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
+            passthrough_request_bytes: None,
         };
     }
 
@@ -41600,6 +41672,7 @@ async fn proxy_to_backend(
             backend_admission_permits,
             request_body_exceeded,
             streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
+            passthrough_request_bytes: None,
         };
     }
 
@@ -41732,6 +41805,7 @@ async fn proxy_to_backend(
             backend_admission_permits,
             request_body_exceeded,
             streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
+            passthrough_request_bytes: None,
         };
     }
 
@@ -42091,6 +42165,7 @@ async fn proxy_to_backend(
                         );
                     }
                 };
+                let mut passthrough_request_bytes = None;
                 let (backend_resp, request_body_exceeded) = proxy_to_backend_http2(
                     state,
                     direct_h2_proxy,
@@ -42110,6 +42185,7 @@ async fn proxy_to_backend(
                     ctx_bytes_sent_observed,
                     route_request_body_limit,
                     route_response_body_limit,
+                    &mut passthrough_request_bytes,
                 )
                 .await;
                 return BackendDispatchResult::Response {
@@ -42118,6 +42194,7 @@ async fn proxy_to_backend(
                     backend_admission_permits: h2_admission_permits.take(),
                     request_body_exceeded,
                     streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
+                    passthrough_request_bytes,
                 };
             }
             // Fall through to the reqwest path: `h2_admission_permits` drops here,
@@ -49356,6 +49433,10 @@ async fn proxy_to_backend_http2(
     // rather than at the generally larger global allowance
     // (`GHSA-xrfj-852f-645j`).
     route_response_body_limit: Option<usize>,
+    // Out-parameter: the passthrough publication latch. Set only on the
+    // unlimited arm so transaction summaries can wait for forwarded bytes
+    // after an early backend response without gating those headers here.
+    passthrough_request_bytes: &mut Option<Arc<body::DirectH2BytesLatch>>,
 ) -> (
     retry::BackendResponse,
     Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -49500,6 +49581,12 @@ async fn proxy_to_backend_http2(
             // `api_chargeback` read. This arm is also the panic-free fallback
             // if `direct_h2_uses_limit_adapter` ever drifts true without a
             // gate or gRPC observer.
+            //
+            // Do NOT wait on that publication before exposing response
+            // headers: HTTP/2 is full duplex, and `body_completion_rx` is
+            // deliberately None here. Summaries wait on `latch` instead.
+            let latch = Arc::new(body::DirectH2BytesLatch::new());
+            *passthrough_request_bytes = Some(Arc::clone(&latch));
             (
                 body::DirectH2RequestBody::Passthrough {
                     inner: body,
@@ -49507,6 +49594,7 @@ async fn proxy_to_backend_http2(
                     seen: 0,
                     observed: Arc::clone(ctx_bytes_sent_observed),
                     published: false,
+                    latch,
                 },
                 None,
                 None,

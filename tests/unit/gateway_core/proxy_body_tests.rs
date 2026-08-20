@@ -785,12 +785,22 @@ fn test_direct_h2_request_body_passthrough_skips_size_limited_incoming() {
 /// plugin both bill on `ctx.bytes_sent_observed`, and an HTTP/2 upload may
 /// legally omit `Content-Length`, so the passthrough arm has to tally what it
 /// actually forwarded and publish it — once — rather than trusting a header.
+///
+/// Publication is terminal (EOS / error / cancel / Drop), not per DATA frame.
+/// Hyper can resolve backend response headers while the detached upload is
+/// still running whenever `body_completion_rx` is None, so summaries must
+/// wait on `DirectH2BytesLatch` rather than freezing the atomic at header
+/// flush.
 #[test]
 fn test_direct_h2_passthrough_still_accounts_forwarded_bytes() {
     let body_source = include_str!("../../../src/proxy/body.rs");
     assert!(
-        body_source.contains("fn publish_bytes"),
+        body_source.contains("fn publish_passthrough_request_bytes"),
         "passthrough arm must publish its byte tally through a named helper"
+    );
+    assert!(
+        body_source.contains("struct DirectH2BytesLatch"),
+        "early backend responses need a publication join, not a header-flush snapshot"
     );
     assert!(
         body_source.contains("impl Drop for DirectH2RequestBody"),
@@ -799,6 +809,17 @@ fn test_direct_h2_passthrough_still_accounts_forwarded_bytes() {
     assert!(
         body_source.contains("*seen = seen.saturating_add(data.len() as u64);"),
         "passthrough must tally data frames in a plain counter, not an atomic"
+    );
+    assert!(
+        !body_source
+            .split("impl http_body::Body for DirectH2RequestBody")
+            .nth(1)
+            .expect("DirectH2RequestBody Body impl")
+            .split("impl Drop for SizeLimitedIncoming")
+            .next()
+            .expect("bounded DirectH2RequestBody Body impl")
+            .contains("fetch_add("),
+        "passthrough poll_frame must not reintroduce a per-DATA-frame atomic"
     );
 
     let proxy_source = include_str!("../../../src/proxy/mod.rs");
@@ -814,6 +835,14 @@ fn test_direct_h2_passthrough_still_accounts_forwarded_bytes() {
         "passthrough must be handed the request's bytes_sent counter"
     );
     assert!(
+        dispatch.contains("*passthrough_request_bytes = Some(Arc::clone(&latch));"),
+        "passthrough must export the publication latch for summary finalize"
+    );
+    assert!(
+        dispatch.contains("deliberately None here"),
+        "unlimited passthrough must keep full-duplex headers (no upload completion gate)"
+    );
+    assert!(
         !dispatch.contains(
             "ctx_bytes_sent_observed.fetch_max(cl, std::sync::atomic::Ordering::Release)"
         ),
@@ -821,6 +850,71 @@ fn test_direct_h2_passthrough_still_accounts_forwarded_bytes() {
          an H2 upload may omit the header, and an aborted one sends fewer bytes \
          than it announced"
     );
+
+    assert!(
+        proxy_source.contains("fn spawn_buffered_summary_after_passthrough_bytes"),
+        "buffered logs must wait for passthrough publication without blocking TTFB"
+    );
+    assert!(
+        proxy_source.contains("with_passthrough_request_bytes_latch"),
+        "streaming logs must finalize request bytes after the passthrough latch"
+    );
+
+    let deferred_source = include_str!("../../../src/proxy/deferred_log.rs");
+    assert!(
+        deferred_source.contains("latch.wait().await"),
+        "deferred fire must wait for passthrough publication before emitting bytes_sent"
+    );
+    assert!(
+        deferred_source.contains("summary.bytes_sent = ctx")
+            && deferred_source.contains(".max(summary.bytes_sent)"),
+        "deferred fire must reload bytes_sent from the atomic after the latch"
+    );
+}
+
+/// Early backend response vs still-running passthrough upload: a header-flush
+/// load sees 0, then terminal publish + latch wait observes the forwarded tally.
+#[tokio::test]
+async fn test_direct_h2_passthrough_latch_repairs_early_response_snapshot() {
+    use ferrum_edge::_test_support::{
+        finish_direct_h2_passthrough_bytes_for_test, new_direct_h2_bytes_latch_for_test,
+    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let observed = Arc::new(AtomicU64::new(0));
+    let latch = new_direct_h2_bytes_latch_for_test();
+    let mut published = false;
+
+    assert_eq!(
+        observed.load(Ordering::Acquire),
+        0,
+        "header-flush snapshot before publication must not invent Content-Length"
+    );
+
+    let waiter_observed = Arc::clone(&observed);
+    let waiter_latch = Arc::clone(&latch);
+    let waiter = tokio::spawn(async move {
+        waiter_latch.wait().await;
+        waiter_observed.load(Ordering::Acquire)
+    });
+
+    tokio::task::yield_now().await;
+    finish_direct_h2_passthrough_bytes_for_test(&observed, 4096, &mut published, &latch);
+    finish_direct_h2_passthrough_bytes_for_test(&observed, 1, &mut published, &latch);
+
+    let finalized = waiter.await.expect("latch waiter");
+    assert_eq!(finalized, 4096);
+    assert_eq!(observed.load(Ordering::Acquire), 4096);
+    assert!(published);
+    assert!(latch.is_done());
+
+    let empty = Arc::new(AtomicU64::new(0));
+    let empty_latch = new_direct_h2_bytes_latch_for_test();
+    let mut empty_published = false;
+    finish_direct_h2_passthrough_bytes_for_test(&empty, 0, &mut empty_published, &empty_latch);
+    assert!(empty_latch.is_done());
+    assert_eq!(empty.load(Ordering::Acquire), 0);
 }
 
 /// hyper's `SendRequest<B>` requires `B: Body + Send + 'static`; the pipe

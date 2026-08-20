@@ -2430,6 +2430,68 @@ pub(crate) fn direct_h2_uses_limit_adapter(
     max_request_body_bytes > 0 || needs_upload_completion_gate || observes_grpc_messages
 }
 
+/// One-shot join for unlimited direct-H2 passthrough byte publication.
+///
+/// Hyper can resolve backend response headers while the detached HTTP/2
+/// upload pipe is still running (`body_completion_rx` is `None` on this
+/// arm). Transaction summaries and `api_chargeback` must wait for this
+/// latch instead of snapshotting `bytes_sent_observed` at header flush.
+/// The hot path still tallies frames into a plain `u64`; this notify is
+/// signaled once at EOS / error / cancel / Drop, not per DATA frame.
+pub struct DirectH2BytesLatch {
+    done: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl DirectH2BytesLatch {
+    pub fn new() -> Self {
+        Self {
+            done: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+
+    pub fn finish(&self) {
+        if !self.done.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    pub async fn wait(&self) {
+        let notified = self.notify.notified();
+        if self.is_done() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// Publish passthrough forwarded bytes once and release waiters.
+///
+/// `fetch_max` matches [`SizeLimitedIncoming`]'s contract: a retry whose
+/// plugin transforms shrink the body must not lower an earlier observation.
+/// `seen == 0` still finishes the latch so GET / empty-body waiters cannot
+/// hang.
+pub(crate) fn publish_passthrough_request_bytes(
+    observed: &AtomicU64,
+    seen: u64,
+    published: &mut bool,
+    latch: &DirectH2BytesLatch,
+) {
+    if *published {
+        return;
+    }
+    *published = true;
+    if seen > 0 {
+        observed.fetch_max(seen, Ordering::Release);
+    }
+    latch.finish();
+}
+
 /// Request body for the ordinary direct-H2 pool ([`super::http2_pool::Http2Sender`]).
 ///
 /// [`Self::Passthrough`] is the Jun 19 hot path: hyper polls `Incoming`
@@ -2442,7 +2504,8 @@ pub enum DirectH2RequestBody {
         cancel: Option<tokio::sync::oneshot::Receiver<()>>,
         /// Bytes polled out of the client body so far. A PLAIN counter, not an
         /// atomic: skipping the per-frame atomic is the whole point of this
-        /// arm (issue #3942). It is published once, in [`Self::publish_bytes`].
+        /// arm (issue #3942). It is published once, in
+        /// [`publish_passthrough_request_bytes`].
         seen: u64,
         /// `ctx.bytes_sent_observed`. `TransactionSummary.bytes_sent` and the
         /// `api_chargeback` plugin bill on this, so the passthrough arm must
@@ -2453,24 +2516,11 @@ pub enum DirectH2RequestBody {
         /// Guards against double publication when end-of-stream is followed by
         /// `Drop`.
         published: bool,
+        /// Signaled from the same publication as `observed` so a summary
+        /// built after an early backend response can wait for the real tally.
+        latch: Arc<DirectH2BytesLatch>,
     },
     Limited(SizeLimitedIncoming),
-}
-
-impl DirectH2RequestBody {
-    /// Publish the passthrough byte count exactly once.
-    ///
-    /// `fetch_max` matches [`SizeLimitedIncoming`]'s contract: a retry whose
-    /// plugin transforms shrink the body must not lower an earlier observation.
-    fn publish_bytes(observed: &Arc<AtomicU64>, seen: u64, published: &mut bool) {
-        if *published {
-            return;
-        }
-        *published = true;
-        if seen > 0 {
-            observed.fetch_max(seen, Ordering::Release);
-        }
-    }
 }
 
 impl Drop for DirectH2RequestBody {
@@ -2482,10 +2532,11 @@ impl Drop for DirectH2RequestBody {
             seen,
             observed,
             published,
+            latch,
             ..
         } = self
         {
-            Self::publish_bytes(observed, *seen, published);
+            publish_passthrough_request_bytes(observed, *seen, published, latch);
         }
     }
 }
@@ -2505,9 +2556,10 @@ impl http_body::Body for DirectH2RequestBody {
                 seen,
                 observed,
                 published,
+                latch,
             } => {
                 if poll_upload_cancel(cancel, cx) == UploadCancelSignal::Cancelled {
-                    Self::publish_bytes(observed, *seen, published);
+                    publish_passthrough_request_bytes(observed, *seen, published, latch);
                     return Poll::Ready(Some(Err(
                         "request body forwarding cancelled after upload timeout".into(),
                     )));
@@ -2524,11 +2576,11 @@ impl http_body::Body for DirectH2RequestBody {
                         Poll::Ready(Some(Ok(frame)))
                     }
                     Poll::Ready(Some(Err(e))) => {
-                        Self::publish_bytes(observed, *seen, published);
+                        publish_passthrough_request_bytes(observed, *seen, published, latch);
                         Poll::Ready(Some(Err(e.into())))
                     }
                     Poll::Ready(None) => {
-                        Self::publish_bytes(observed, *seen, published);
+                        publish_passthrough_request_bytes(observed, *seen, published, latch);
                         Poll::Ready(None)
                     }
                     Poll::Pending => Poll::Pending,
