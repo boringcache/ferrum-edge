@@ -300,6 +300,7 @@ fn classify_stream_setup_kind(kind: crate::proxy::stream_error::StreamSetupKind)
         StreamSetupKind::FrontendTlsHandshake
         | StreamSetupKind::BackendTlsHandshake
         | StreamSetupKind::BackendDtlsHandshake => ErrorClass::TlsError,
+        StreamSetupKind::DnsLookup => ErrorClass::DnsLookupError,
         // Plugin reject (umbrella for ACL/policy/throttle) is a
         // gateway-side decision, not a transport error. NoHealthyTargets
         // and CircuitBreakerOpen are both backend-side gateway-policy
@@ -470,7 +471,10 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
 ///    That collapse is skipped when a `rustls::Error` sits under the
 ///    `io::Error`: TCP connected and the handshake then failed, so the
 ///    class is `TlsError` (connect) / `ConnectionReset` (post-connect),
-///    not "refused". Post-connect `UnexpectedEof` maps to
+///    not "refused". `UnexpectedEof` with rustls's missing-`close_notify`
+///    wording is `ConnectionClosed` (teardown, not handshake) and is
+///    matched *before* the typed rustls walk so a rustls payload cannot
+///    steal it as `TlsError`. Other post-connect `UnexpectedEof` maps to
 ///    `ConnectionClosed` (backend FIN before a complete body).
 /// 5. `hyper::Error` — `is_timeout` → `ReadWriteTimeout`;
 ///    `is_incomplete_message` → `ConnectionClosed`.
@@ -628,6 +632,19 @@ fn classify_typed_chain(
             if matches!(io_err.raw_os_error(), Some(99) | Some(49) | Some(10049)) {
                 return Some(ErrorClass::PortExhaustion);
             }
+            // Peer TCP FIN without TLS `close_notify` is ordinary teardown
+            // (Python `ssl`, many clients), not a handshake failure. Check
+            // it *before* `rustls_error_in_chain`: a rustls payload in
+            // `get_ref()` would otherwise steal this as `TlsError` /
+            // `ConnectionReset` and override the close-notify substring
+            // (the same class of bug as typing DNS over an egress-policy
+            // denial). Post-wire `ConnectionClosed` so alerts keyed on
+            // `tls_error` stay handshake-only.
+            if matches!(io_err.kind(), std::io::ErrorKind::UnexpectedEof)
+                && error_is_tls_close_without_notify(io_err)
+            {
+                return Some(ErrorClass::ConnectionClosed);
+            }
             // rustls often surfaces as `io::Error` wrapping `rustls::Error`
             // in `get_ref()`. `source()` skips that payload and returns
             // the inner error's source instead. Walk `get_ref()` *before*
@@ -782,6 +799,27 @@ pub const WS_UNIX_BACKEND_AUTHORITY_INVALID: &str =
 pub const WS_MESH_BACKEND_REQUEST_TARGET_INVALID: &str =
     "WebSocket backend dial refused: mesh backend request target is invalid";
 
+/// Distinctive rustls wording when a peer TCP-FINs without TLS `close_notify`.
+///
+/// This is ordinary client teardown, not a handshake or record-layer failure.
+/// Classifiers must match this phrase *before* the generic `" TLS "` token so
+/// a clean session cannot be reported as [`ErrorClass::TlsError`].
+pub const TLS_CLOSE_WITHOUT_NOTIFY: &str = "without sending TLS close_notify";
+
+/// Walk an error chain and return true when rustls reported a missing
+/// `close_notify` (typically `io::ErrorKind::UnexpectedEof` whose Display
+/// contains [`TLS_CLOSE_WITHOUT_NOTIFY`]). Error-path only.
+pub fn error_is_tls_close_without_notify(error: &(dyn StdError + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(err) = current {
+        if err.to_string().contains(TLS_CLOSE_WITHOUT_NOTIFY) {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
 /// Tightened substring fallback for boxed/reqwest errors when the typed
 /// walk is exhausted.
 ///
@@ -830,14 +868,27 @@ fn classify_substring_fallback(error_str: &str, debug_str: &str) -> Option<Error
     if error_str.contains("connect timeout") || error_str.contains("timed out") {
         return Some(ErrorClass::ConnectionTimeout);
     }
+    // Peer omitted TLS `close_notify` on close. Must run BEFORE the TLS
+    // token block: the rustls wording contains `" TLS "` inside
+    // `"sending TLS close_notify"` and would otherwise become `TlsError`.
+    if error_str.contains(TLS_CLOSE_WITHOUT_NOTIFY) || debug_str.contains(TLS_CLOSE_WITHOUT_NOTIFY)
+    {
+        return Some(ErrorClass::ConnectionClosed);
+    }
     // DNS — no typed error type bridges from reqwest/hyper-util's GAI
     // resolver, so substrings are the only signal here. Tokens are
-    // distinctive multi-word phrases.
+    // distinctive multi-word phrases. Include the live Ferrum DNS-cache
+    // wording (`DNS resolution returned no addresses`) so untyped
+    // leftovers still classify with HTTP/gRPC.
     if debug_str.contains("dns error")
         || debug_str.contains("Name or service not known")
         || debug_str.contains("No such host")
         || debug_str.contains("no record found")
         || debug_str.contains("failed to lookup address")
+        || debug_str.contains("DNS resolution returned no addresses")
+        || debug_str.contains("DNS resolution failed")
+        || error_str.contains("DNS resolution returned no addresses")
+        || error_str.contains("DNS resolution failed")
     {
         return Some(ErrorClass::DnsLookupError);
     }

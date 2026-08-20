@@ -12,8 +12,9 @@
 
 use chrono::Utc;
 use ferrum_edge::_test_support::{
-    attach_stream_trigger_decisions_for_test, final_request_body_requirements_for_test,
-    set_request_http_flavor_for_test, set_request_wire_protocol_for_test,
+    UdpSetupProgressForTest, attach_stream_trigger_decisions_for_test,
+    final_request_body_requirements_for_test, set_request_http_flavor_for_test,
+    set_request_wire_protocol_for_test,
     validate_plugin_composition_candidate_with_real_ip_header_for_test,
 };
 use ferrum_edge::config::types::{
@@ -1156,6 +1157,22 @@ fn stream_ctx(ip: &str) -> StreamConnectionContext {
     ctx
 }
 
+/// The UDP flavour of [`stream_ctx`]: a plain-UDP listener's admission context.
+fn udp_stream_ctx(ip: &str) -> StreamConnectionContext {
+    let mut ctx = StreamConnectionContext::new(
+        ip.to_string(),
+        ip.to_string(),
+        "udp".to_string(),
+        Some("udp".to_string()),
+        19_314,
+        BackendScheme::Udp,
+        Arc::new(ConsumerIndex::new(&[])),
+    );
+    ctx.proxy_namespace = NS.to_string();
+    ctx.frontend_transport = StreamFrontendTransport::Udp;
+    ctx
+}
+
 #[tokio::test]
 async fn stream_triggers_gate_on_network_facts() {
     let gated = with_trigger(
@@ -1389,6 +1406,94 @@ async fn a_false_stream_trigger_suppresses_connect_and_disconnect_together() {
     assert!(
         !payload.contains("203.0.113.5"),
         "a skipped instance must emit no disconnect record: {payload}"
+    );
+}
+
+/// A UDP session that fails setup BEFORE it is published emits its summary
+/// through the same trigger carrier a published session would (issue #4049).
+/// The setup-failure path must not become a hole through which a connect-time
+/// skip still produces a disconnect record.
+#[tokio::test]
+async fn a_udp_setup_failure_summary_carries_the_connect_trigger_decisions() {
+    let sink = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind record sink");
+    let sink_port = sink.local_addr().expect("sink addr").port();
+
+    let gated = with_trigger(
+        make_plugin_config_with_json(
+            "auditlog",
+            "udp_logging",
+            json!({
+                "host": "127.0.0.1",
+                "port": sink_port,
+                "batch_size": 1,
+                "flush_interval_ms": 100,
+                "max_retries": 0
+            }),
+            PluginScope::Proxy,
+            Some("udp"),
+        ),
+        json!({"when": {"match": {"source_cidr": ["10.0.0.0/8"]}}}),
+    );
+    let proxy = stream_proxy("udp", BackendScheme::Udp, 19_314, vec!["auditlog"]);
+    let plugins = published(&config(vec![proxy.clone()], vec![gated]), "udp");
+    let dns_error = ferrum_edge::_test_support::stream_dns_setup_error_for_test(
+        "backend.local",
+        anyhow::anyhow!("DNS resolution returned no addresses for backend.local"),
+    );
+
+    // Outside the CIDR the instance is skipped at connect. Its setup failure is
+    // emitted FIRST, so a leaked record would be the first datagram to arrive
+    // and the assertion below fails deterministically rather than on a timeout.
+    let mut skipped_ctx = udp_stream_ctx("203.0.113.5");
+    for plugin in &plugins {
+        assert!(matches!(
+            plugin.on_stream_connect(&mut skipped_ctx).await,
+            PluginResult::Continue
+        ));
+    }
+    let mut skipped = UdpSetupProgressForTest::new();
+    skipped.record_stream_admission(plugins.clone(), &proxy, &skipped_ctx);
+    assert!(
+        skipped
+            .emit_setup_failure_if_owner(NS, "udp", "203.0.113.5", 19_314, &dns_error)
+            .await
+    );
+
+    // Inside the CIDR the instance runs, so its setup failure IS recorded.
+    let mut admitted_ctx = udp_stream_ctx("10.9.9.9");
+    for plugin in &plugins {
+        assert!(matches!(
+            plugin.on_stream_connect(&mut admitted_ctx).await,
+            PluginResult::Continue
+        ));
+    }
+    let mut admitted = UdpSetupProgressForTest::new();
+    admitted.record_stream_admission(plugins.clone(), &proxy, &admitted_ctx);
+    assert!(
+        admitted
+            .emit_setup_failure_if_owner(NS, "udp", "10.9.9.9", 19_314, &dns_error)
+            .await
+    );
+
+    let mut buffer = vec![0u8; 64 * 1024];
+    let len = tokio::time::timeout(Duration::from_secs(10), sink.recv(&mut buffer))
+        .await
+        .expect("an admitted setup-failure record reaches the sink")
+        .expect("receive record");
+    let payload = String::from_utf8_lossy(&buffer[..len]).to_string();
+    assert!(
+        payload.contains("10.9.9.9"),
+        "the admitted instance must still log the setup failure: {payload}"
+    );
+    assert!(
+        payload.contains("dns_lookup_error"),
+        "the setup failure carries its classified error_class: {payload}"
+    );
+    assert!(
+        !payload.contains("203.0.113.5"),
+        "a skipped instance must emit no setup-failure record: {payload}"
     );
 }
 

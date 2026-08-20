@@ -2065,8 +2065,51 @@ async fn test_auth_acl_comprehensive() {
     );
     println!("✓ Re-added credential works correctly");
 
-    // Test 40: Delete consumer and verify all auth fails
+    // Test 40: Delete consumer and verify all auth fails. An
+    // `access_control` plugin still listing the username in
+    // `allowed_consumers` must 409; drop the username first, then delete.
     println!("\n--- Test 40: Delete Consumer — All Auth Should Fail ---");
+    let resp = client
+        .delete(format!("{}/consumers/consumer-bob", admin_url))
+        .header("Authorization", &auth_header)
+        .send()
+        .await
+        .expect("Request failed");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "DELETE must 409 while access_control.allowed_consumers still names bob: {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.expect("409 body");
+    assert_eq!(
+        body["error"].as_str().unwrap_or(""),
+        "Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"
+    );
+
+    let resp = client
+        .put(format!("{}/plugins/config/plugin-acl-allow", admin_url))
+        .header("Authorization", &auth_header)
+        .json(&json!({
+            "id": "plugin-acl-allow",
+            "plugin_name": "access_control",
+            "scope": "proxy",
+            "proxy_id": "proxy-keyauth-acl-allow",
+            "enabled": true,
+            "config": {
+                "allowed_consumers": ["alice"]
+            }
+        }))
+        .send()
+        .await
+        .expect("Request failed");
+    assert!(
+        resp.status().is_success(),
+        "Failed to drop bob from allowed_consumers: {} - {}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+
     let resp = client
         .delete(format!("{}/consumers/consumer-bob", admin_url))
         .header("Authorization", &auth_header)

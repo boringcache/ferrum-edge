@@ -1,3 +1,10 @@
+use std::collections::VecDeque;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
 use ferrum_edge::_test_support::{
     StreamIoSide, bidirectional_copy_for_test, bidirectional_copy_for_test_with_timeouts,
     classify_stream_error, disconnect_cause_for_failure, relay_failure_is_client_facing,
@@ -6,12 +13,6 @@ use ferrum_edge::_test_support::{
 };
 use ferrum_edge::plugins::{Direction, DisconnectCause};
 use ferrum_edge::retry::ErrorClass;
-use std::collections::VecDeque;
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 #[test]
 fn test_tcp_fault_admission_requires_actual_socket_error() {
@@ -111,6 +112,21 @@ fn test_classify_stream_error_preserves_tls_failures() {
 fn test_classify_stream_error_preserves_dns_failures() {
     let error = anyhow::anyhow!("DNS resolution failed for backend.local: no record found");
     assert_eq!(classify_stream_error(&error), ErrorClass::DnsLookupError);
+
+    let live_wording = anyhow::anyhow!(
+        "DNS resolution failed for backend.local: {}",
+        "DNS resolution returned no addresses for backend.local"
+    );
+    assert_eq!(
+        classify_stream_error(&live_wording),
+        ErrorClass::DnsLookupError
+    );
+
+    let typed = ferrum_edge::_test_support::stream_dns_setup_error_for_test(
+        "backend.local",
+        anyhow::anyhow!("DNS resolution returned no addresses for backend.local"),
+    );
+    assert_eq!(classify_stream_error(&typed), ErrorClass::DnsLookupError);
 }
 
 // ── Test helpers for bidirectional_copy direction tracking ───────────────────
@@ -2070,6 +2086,34 @@ async fn test_bidirectional_copy_reclassifies_connection_reset_after_eof_as_grac
         result.first_failure.is_none(),
         "write-side ConnectionReset after opposite EOF must reclassify as graceful, got {:?}",
         result.first_failure
+    );
+}
+
+/// rustls reports a peer TCP FIN that omitted `close_notify` as
+/// `UnexpectedEof` whose Display contains "without sending TLS close_notify".
+/// On the userspace copy path that is ordinary teardown, not `tls_error`.
+#[tokio::test]
+async fn test_bidirectional_copy_tls_close_without_notify_is_graceful() {
+    const RUSTLS_EOF: &str = "peer closed connection without sending TLS close_notify: \
+         https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof";
+    let client = ReadChunksThenErrorStream::new(
+        vec![b"REQUEST".to_vec()],
+        io::ErrorKind::UnexpectedEof,
+        RUSTLS_EOF,
+    );
+    let backend = ScriptedStream::new(vec![b"RESPONSE".to_vec()], vec![], WriteOutcome::Accept);
+
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
+
+    assert!(
+        result.first_failure.is_none(),
+        "missing close_notify on a userspace TLS read must be clean EOF, got {:?}",
+        result.first_failure
+    );
+    assert!(
+        result.bytes_client_to_backend > 0 && result.bytes_backend_to_client > 0,
+        "happy-path session must have transferred bytes before teardown"
     );
 }
 

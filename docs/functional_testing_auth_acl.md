@@ -173,7 +173,7 @@ Multi-auth mode executes auth plugins sequentially; first success stops iteratio
 | 37 | List consumers | GET /consumers | Array with >= 3 consumers |
 | 38 | Delete credential | DELETE credential, then auth | 401 (key no longer valid) |
 | 39 | Re-add credential | PUT new credential, then auth | 200 OK (new key works) |
-| 40 | Delete consumer | DELETE consumer, then auth | 401 + admin returns 404 |
+| 40 | Delete consumer | DELETE while ACL still names `bob` is 409; drop the username, then DELETE; auth | 409 then 204; 401 + admin 404 |
 
 ## Environment Variables
 

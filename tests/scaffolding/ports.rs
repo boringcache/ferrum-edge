@@ -30,6 +30,7 @@
 //! so the reasoning is captured in the test source.
 
 use std::io;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
 
@@ -240,11 +241,72 @@ pub async fn reserve_colocated_tcp_udp() -> io::Result<(PortReservation, UdpPort
 ///
 /// **Race caveat**: There is a brief window after the listener is dropped
 /// and before the caller connects in which another process/test could
-/// grab the port. Callers should expect sporadic test flakes if the host
-/// is saturated with parallel tests; for `#[ignore]`d functional tests
-/// the window is tiny and the risk is acceptable.
+/// grab the port. Callers that need a deterministic refused connect should
+/// use [`reserve_refused_tcp_port`] instead, which keeps the port bound
+/// without listening.
 pub async fn unbound_port() -> io::Result<u16> {
     Ok(reserve_port().await?.drop_and_take_port())
+}
+
+/// A TCP port bound on `127.0.0.1` without `listen()`.
+///
+/// Connects receive a kernel `ECONNREFUSED` while the socket remains held,
+/// so a parallel test cannot steal the port. Drop the reservation to
+/// release the port.
+pub struct RefusedTcpPort {
+    /// The reserved local port.
+    pub port: u16,
+    _socket: socket2::Socket,
+}
+
+impl RefusedTcpPort {
+    /// Return the bound `SocketAddr` without releasing the socket.
+    pub fn local_addr(&self) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, self.port))
+    }
+}
+
+fn bind_unlistened_tcp_port() -> io::Result<RefusedTcpPort> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    // Keep SO_REUSEADDR off so a parallel listener cannot steal the port
+    // while this reservation is held.
+    socket.set_reuse_address(false)?;
+    socket.bind(&SocketAddr::from((Ipv4Addr::LOCALHOST, 0)).into())?;
+    let port = socket
+        .local_addr()?
+        .as_socket()
+        .ok_or_else(|| io::Error::other("reserved address was not a socket address"))?
+        .port();
+    Ok(RefusedTcpPort {
+        port,
+        _socket: socket,
+    })
+}
+
+/// Bind `127.0.0.1:0` without listening. Retries transient bind failures
+/// with the same budget as [`reserve_port`]; this is reservation retry, not
+/// a whole-scenario retry-until-green loop.
+pub fn reserve_refused_tcp_port() -> io::Result<RefusedTcpPort> {
+    let mut last_err: Option<io::Error> = None;
+    for attempt in 0..MAX_RESERVE_ATTEMPTS {
+        match bind_unlistened_tcp_port() {
+            Ok(reservation) => return Ok(reservation),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(10 * (attempt + 1) as u64));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "exhausted refused-port reservation retries",
+        )
+    }))
 }
 
 #[cfg(test)]
@@ -300,5 +362,21 @@ mod tests {
         // confirm `local_addr()` works on each.
         assert_eq!(tcp.local_addr().unwrap().port(), tcp.port);
         assert_eq!(udp.local_addr().unwrap().port(), udp.port);
+    }
+
+    #[tokio::test]
+    async fn reserve_refused_tcp_port_refuses_connect_and_cannot_be_stolen() {
+        let reservation = reserve_refused_tcp_port().expect("reserve refused port");
+        let port = reservation.port;
+        let err = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect_err("bound-but-not-listening port must refuse connect");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        let steal = TcpListener::bind(("127.0.0.1", port)).await;
+        assert!(
+            steal.is_err(),
+            "held refused reservation must keep the port from being stolen"
+        );
+        drop(reservation);
     }
 }
