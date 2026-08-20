@@ -3105,6 +3105,26 @@ fn an_empty_replayable_upload_with_no_trailers_installs_no_pump() {
 // watermark. As above, the transport side is DELIBERATELY NOT DRAINED.
 
 #[tokio::test(start_paused = true)]
+async fn the_buffered_grpc_write_watermark_starts_after_sender_acquisition() {
+    let mut probe = GrpcBufferedUploadPumpProbe::start(4 * 1024 * 1024, &[], 800);
+    assert!(probe.pumped());
+
+    assert!(
+        probe
+            .write_watermark_stays_dormant(Duration::from_secs(30))
+            .await,
+        "pool acquisition is connect work and must not consume the backend-write watermark"
+    );
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "the same watermark must start once the dispatcher has a sender"
+    );
+    assert_eq!(probe.cancel_and_join().await, ProbePumpOutcome::WriteTimeout);
+}
+
+#[tokio::test(start_paused = true)]
 async fn the_backend_write_watermark_ends_a_buffered_grpc_upload_hyper_stopped_taking() {
     let mut probe = GrpcBufferedUploadPumpProbe::start(4 * 1024 * 1024, &[], 800);
     assert!(
@@ -3307,6 +3327,22 @@ fn the_buffered_grpc_dispatch_races_every_header_wait_shape_against_the_watermar
         core.contains("buffered_grpc_request_body_with_write_watermark("),
         "the buffered gRPC body must be built through the shared write-watermark selection"
     );
+    let sender_acquired = core
+        .find("transport.get_sender(proxy).await?")
+        .expect("buffered gRPC sender acquisition");
+    let pump_installed = core
+        .find("buffered_grpc_request_body_with_write_watermark(")
+        .expect("buffered gRPC pump installation");
+    let pump_armed = core
+        .find("pump.arm_write_watermark();")
+        .expect("buffered gRPC write-watermark arm");
+    let request_sent = core
+        .find("sender.send_request(backend_req)")
+        .expect("buffered gRPC dispatch");
+    assert!(
+        sender_acquired < pump_installed && pump_installed < pump_armed && pump_armed < request_sent,
+        "connection acquisition must finish before the write pump is installed and armed"
+    );
     // One race, wrapping the whole header wait, is what covers all three
     // shapes: the absolute client deadline, the operator per-phase read
     // timeout, and the unbounded wait.
@@ -3471,8 +3507,10 @@ fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
     // Native gRPC keeps its own body type, so it installs the pump directly on
     // the shared upload source rather than through the H1/H2 adapters.
     assert!(
-        GRPC_PROXY_SOURCE.contains("UploadSource::for_streaming_upload(")
-            && GRPC_PROXY_SOURCE.contains("proxy.backend_write_timeout_ms"),
+        GRPC_PROXY_SOURCE
+            .contains("UploadSource::for_streaming_upload_with_deferred_write(")
+            && GRPC_PROXY_SOURCE.contains("proxy.backend_write_timeout_ms")
+            && GRPC_PROXY_SOURCE.contains("pump.arm_write_watermark();"),
         "the fully-streamed native-gRPC upload lost its gateway-owned lifecycle"
     );
     let native_grpc_poll = GRPC_PROXY_SOURCE

@@ -2084,6 +2084,19 @@ impl UploadSource {
         (source, join)
     }
 
+    /// Native-gRPC variant whose authorization lifetime starts immediately,
+    /// while the backend-write watermark is deferred until `get_sender()` has
+    /// completed and the dispatcher explicitly arms the returned join.
+    pub(crate) fn for_streaming_upload_with_deferred_write(
+        incoming: Incoming,
+        auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+        write_timeout_ms: u64,
+    ) -> (Self, Option<crate::proxy::upload_pump::UploadPumpJoin>) {
+        let mut source = UploadSource::Direct(incoming);
+        let join = source.install_pump_with_write_start(auth, write_timeout_ms, true);
+        (source, join)
+    }
+
     pub(crate) fn poll_frame(
         &mut self,
         cx: &mut Context<'_>,
@@ -2128,13 +2141,33 @@ impl UploadSource {
         plan: Option<&crate::proxy::RequestAuthLifetimePlan>,
         write_timeout_ms: u64,
     ) -> Option<crate::proxy::upload_pump::UploadPumpJoin> {
+        self.install_pump_with_write_start(plan, write_timeout_ms, false)
+    }
+
+    fn install_pump_with_write_start(
+        &mut self,
+        plan: Option<&crate::proxy::RequestAuthLifetimePlan>,
+        write_timeout_ms: u64,
+        defer_write_start: bool,
+    ) -> Option<crate::proxy::upload_pump::UploadPumpJoin> {
         if plan.is_none() && write_timeout_ms == 0 {
             return None;
         }
         match std::mem::replace(self, UploadSource::Exhausted) {
             UploadSource::Direct(incoming) if !http_body::Body::is_end_stream(&incoming) => {
-                let (source, join) =
-                    crate::proxy::upload_pump::spawn_upload_pump(incoming, plan, write_timeout_ms);
+                let (source, join) = if defer_write_start {
+                    crate::proxy::upload_pump::spawn_upload_pump_with_deferred_write(
+                        incoming,
+                        plan,
+                        write_timeout_ms,
+                    )
+                } else {
+                    crate::proxy::upload_pump::spawn_upload_pump(
+                        incoming,
+                        plan,
+                        write_timeout_ms,
+                    )
+                };
                 *self = UploadSource::Pumped(source);
                 Some(join)
             }

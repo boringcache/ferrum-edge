@@ -301,6 +301,10 @@ impl UploadPumpSource {
 /// Dispatcher-side half of the pump: the join point.
 pub(crate) struct UploadPumpJoin {
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Arms a write watermark that was deliberately deferred until the
+    /// dispatcher acquired a backend sender. `None` for the ordinary pump,
+    /// whose write watermark starts immediately.
+    write_start: Option<tokio::sync::oneshot::Sender<()>>,
     finished: Option<tokio::sync::oneshot::Receiver<UploadPumpOutcome>>,
     /// Fires ONLY for [`UploadPumpOutcome::WriteTimeout`], and only after the
     /// task has published its terminal and dropped the client body. Every
@@ -317,6 +321,19 @@ pub(crate) struct UploadPumpJoin {
 }
 
 impl UploadPumpJoin {
+    /// Start a deliberately deferred backend-write watermark.
+    ///
+    /// Native gRPC must install its pump before pool acquisition when an
+    /// authorization lifetime owns the client upload, but connection
+    /// acquisition is not backend-body writing. Its dispatcher calls this
+    /// after `get_sender()` and immediately before `send_request()`, so a slow
+    /// dial cannot be misreported as `ReadWriteTimeout`.
+    pub(crate) fn arm_write_watermark(&mut self) {
+        if let Some(write_start) = self.write_start.take() {
+            let _ = write_start.send(());
+        }
+    }
+
     /// Ask the pump to stop if this handle is dropped without an explicit
     /// join.
     ///
@@ -445,11 +462,50 @@ where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Send,
 {
+    spawn_upload_pump_with_write_start(body, plan, write_timeout_ms, false)
+}
+
+/// Move a client request body into a pump whose authorization lifetime starts
+/// immediately but whose backend-write watermark starts only when the
+/// dispatcher explicitly arms it.
+///
+/// This split is required by native gRPC: authorization must continue to own
+/// and bound the frontend upload during pool acquisition, while
+/// `backend_write_timeout_ms` must not count that connect phase as backend
+/// write inactivity.
+pub(crate) fn spawn_upload_pump_with_deferred_write<B>(
+    body: B,
+    plan: Option<&RequestAuthLifetimePlan>,
+    write_timeout_ms: u64,
+) -> (UploadPumpSource, UploadPumpJoin)
+where
+    B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: Send,
+{
+    spawn_upload_pump_with_write_start(body, plan, write_timeout_ms, true)
+}
+
+fn spawn_upload_pump_with_write_start<B>(
+    body: B,
+    plan: Option<&RequestAuthLifetimePlan>,
+    write_timeout_ms: u64,
+    defer_write_start: bool,
+) -> (UploadPumpSource, UploadPumpJoin)
+where
+    B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: Send,
+{
     let initial_hint = http_body::Body::size_hint(&body);
     let (sender, receiver) = tokio::sync::mpsc::channel(UPLOAD_PUMP_CHANNEL_CAPACITY);
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
     let (write_timeout_tx, write_timeout_rx) = tokio::sync::oneshot::channel();
+    let (write_start_tx, write_start_rx) = if defer_write_start && write_timeout_ms > 0 {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let terminal = Arc::new(AtomicU8::new(PUMP_RUNNING));
     let task_terminal = Arc::clone(&terminal);
     let plan = plan.cloned();
@@ -460,6 +516,7 @@ where
             cancel_rx,
             plan,
             write_timeout_ms,
+            write_start_rx,
             task_terminal,
             write_timeout_tx,
         )
@@ -481,6 +538,7 @@ where
         },
         UploadPumpJoin {
             cancel: Some(cancel_tx),
+            write_start: write_start_tx,
             finished: Some(finished_rx),
             write_timeout: Some(write_timeout_rx),
             terminal,
@@ -539,6 +597,7 @@ async fn run_upload_pump<B>(
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
     plan: Option<RequestAuthLifetimePlan>,
     write_timeout_ms: u64,
+    mut write_start: Option<tokio::sync::oneshot::Receiver<()>>,
     terminal: Arc<AtomicU8>,
     write_timeout_tx: tokio::sync::oneshot::Sender<()>,
 ) -> UploadPumpOutcome
@@ -558,10 +617,11 @@ where
     // Per-reserve idle bound. Reset at the start of each capacity wait so a
     // slow-but-progressing upload keeps the watermark fresh. Not polled while
     // waiting on the client body: that stall is not a backend write stall.
-    let write_armed = write_timeout_ms > 0;
+    let write_configured = write_timeout_ms > 0;
+    let mut write_armed = write_configured && write_start.is_none();
     let write_idle_dur = Duration::from_millis(write_timeout_ms.max(1));
     let mut write_idle = Box::pin(tokio::time::sleep(write_idle_dur));
-    let outcome = loop {
+    let outcome = 'pump: loop {
         // Reserve capacity BEFORE reading the client, so a transport that
         // stops draining stops the read rather than filling a buffer.
         if write_armed && let Some(at) = tokio::time::Instant::now().checked_add(write_idle_dur) {
@@ -569,31 +629,41 @@ where
         }
         let permit = tokio::select! {
             biased;
-            () = cancel_requested(&mut cancel) => break UploadPumpOutcome::Cancelled,
+            () = cancel_requested(&mut cancel) => break 'pump UploadPumpOutcome::Cancelled,
             () = &mut expiry, if auth_armed => {
                 if let Some((deadline, family, latch)) = plan.as_ref() {
                     latch.record_once(deadline.termination, *family);
                 }
-                break UploadPumpOutcome::AuthorizationExpired;
+                break 'pump UploadPumpOutcome::AuthorizationExpired;
+            }
+            () = signal_requested(&mut write_start), if write_configured && !write_armed => {
+                write_armed = true;
+                continue 'pump;
             }
             () = &mut write_idle, if write_armed => {
-                break UploadPumpOutcome::WriteTimeout;
+                break 'pump UploadPumpOutcome::WriteTimeout;
             }
             reserved = sender.reserve() => match reserved {
                 Ok(permit) => permit,
-                Err(_) => break UploadPumpOutcome::ConsumerGone,
+                Err(_) => break 'pump UploadPumpOutcome::ConsumerGone,
             },
         };
-        let frame = tokio::select! {
-            biased;
-            () = cancel_requested(&mut cancel) => break UploadPumpOutcome::Cancelled,
-            () = &mut expiry, if auth_armed => {
-                if let Some((deadline, family, latch)) = plan.as_ref() {
-                    latch.record_once(deadline.termination, *family);
+        let frame = 'frame: loop {
+            break tokio::select! {
+                biased;
+                () = cancel_requested(&mut cancel) => break 'pump UploadPumpOutcome::Cancelled,
+                () = &mut expiry, if auth_armed => {
+                    if let Some((deadline, family, latch)) = plan.as_ref() {
+                        latch.record_once(deadline.termination, *family);
+                    }
+                    break 'pump UploadPumpOutcome::AuthorizationExpired;
                 }
-                break UploadPumpOutcome::AuthorizationExpired;
-            }
-            frame = http_body_util::BodyExt::frame(&mut body) => frame,
+                () = signal_requested(&mut write_start), if write_configured && !write_armed => {
+                    write_armed = true;
+                    continue 'frame;
+                }
+                frame = http_body_util::BodyExt::frame(&mut body) => frame,
+            };
         };
         match frame {
             None => break UploadPumpOutcome::Completed,
@@ -616,6 +686,21 @@ where
         let _ = write_timeout_tx.send(());
     }
     outcome
+}
+
+/// Wait for a one-shot control signal, treating a dropped sender as a
+/// permanently disarmed control rather than as a spurious event.
+async fn signal_requested(signal: &mut Option<tokio::sync::oneshot::Receiver<()>>) {
+    loop {
+        let signalled = match signal.as_mut() {
+            Some(receiver) => await_oneshot_signal(receiver).await,
+            None => match std::future::pending::<std::convert::Infallible>().await {},
+        };
+        if signalled.is_ok() {
+            return;
+        }
+        *signal = None;
+    }
 }
 
 /// The bridge's in-flight frame budget, exposed so a test can prove it is
@@ -803,6 +888,27 @@ pub(crate) fn spawn_replayable_upload_pump(
         return Err((data, trailers));
     }
     Ok(spawn_upload_pump(
+        BufferedUploadFrames {
+            remaining: data,
+            trailers,
+        },
+        None,
+        write_timeout_ms,
+    ))
+}
+
+/// [`spawn_replayable_upload_pump`] with a write watermark that the native
+/// gRPC dispatcher arms only after it has acquired a backend sender.
+#[allow(clippy::type_complexity)]
+pub(crate) fn spawn_replayable_upload_pump_with_deferred_write(
+    data: Bytes,
+    trailers: Option<http::HeaderMap>,
+    write_timeout_ms: u64,
+) -> Result<(UploadPumpSource, UploadPumpJoin), (Bytes, Option<http::HeaderMap>)> {
+    if write_timeout_ms == 0 || (data.is_empty() && trailers.is_none()) {
+        return Err((data, trailers));
+    }
+    Ok(spawn_upload_pump_with_deferred_write(
         BufferedUploadFrames {
             remaining: data,
             trailers,

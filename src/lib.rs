@@ -9497,10 +9497,28 @@ pub mod _test_support {
             let Some(join) = self.join.as_mut() else {
                 return false;
             };
+            join.arm_write_watermark();
             tokio::select! {
                 biased;
                 () = tokio::time::sleep(header_wait) => false,
                 () = join.backend_write_watermark_expired() => true,
+            }
+        }
+
+        /// Observe a deferred native-gRPC write watermark without arming it.
+        ///
+        /// `true` means the observation window elapsed while the watermark
+        /// correctly stayed dormant during the simulated pool-acquisition
+        /// phase. A fired watermark returns `false` and proves connection time
+        /// was incorrectly counted as backend-body write inactivity.
+        pub async fn write_watermark_stays_dormant(&mut self, observation: Duration) -> bool {
+            let Some(join) = self.join.as_mut() else {
+                return true;
+            };
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(observation) => true,
+                () = join.backend_write_watermark_expired() => false,
             }
         }
 

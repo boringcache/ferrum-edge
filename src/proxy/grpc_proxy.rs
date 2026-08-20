@@ -4050,11 +4050,12 @@ pub async fn proxy_grpc_request_streaming(
     // write watermark remains observable while hyper is parked outside a body
     // poll. After headers, the RPC's response side can keep streaming and the
     // transport body plus `UploadPumpSource` abort guard own upload teardown.
-    let (body, upload_pump) = crate::proxy::body::UploadSource::for_streaming_upload(
-        body,
-        auth,
-        proxy.backend_write_timeout_ms,
-    );
+    let (body, upload_pump) =
+        crate::proxy::body::UploadSource::for_streaming_upload_with_deferred_write(
+            body,
+            auth,
+            proxy.backend_write_timeout_ms,
+        );
     let auth_deadline = auth.map(|(deadline, family, latch)| {
         crate::proxy::body::UploadAuthDeadline::new(*deadline, *family, latch.clone())
     });
@@ -4292,6 +4293,12 @@ async fn proxy_grpc_streaming_dispatch(
     *backend_req.uri_mut() = uri;
     *backend_req.headers_mut() = headers;
 
+    // Authorization ownership was armed before pool acquisition, but a slow
+    // connect is not backend-body write inactivity. Start the write watermark
+    // only now that a sender exists and immediately before dispatch.
+    if let Some(pump) = upload_pump.as_mut() {
+        pump.arm_write_watermark();
+    }
     let send_fut = sender.send_request(backend_req);
     let send_wait = async {
         let send_result = if let Some(deadline) = grpc_deadline_at {
@@ -4514,7 +4521,11 @@ pub(crate) async fn collect_grpc_request_body(
 ///
 /// The returned join is the dispatcher's race point: it must be retained
 /// through the response-header wait (`await_upload_write_watermark_first`), or
-/// the watermark stays invisible while hyper is parked on flow control.
+/// the watermark stays invisible while hyper is parked on flow control. Its
+/// timer is deliberately dormant at construction: call
+/// `UploadPumpJoin::arm_write_watermark` only after backend sender acquisition
+/// and immediately before `send_request`, so connect latency is not charged to
+/// a per-direction write policy.
 ///
 /// `backend_write_timeout_ms == 0` — and an upload with neither DATA nor
 /// trailers — returns the previous direct variants with no task, channel, or
@@ -4525,7 +4536,7 @@ pub(crate) fn buffered_grpc_request_body_with_write_watermark(
     write_timeout_ms: u64,
 ) -> (GrpcBody, Option<crate::proxy::upload_pump::UploadPumpJoin>) {
     let request_trailers = request_trailers.filter(|trailers| !trailers.is_empty());
-    match crate::proxy::upload_pump::spawn_replayable_upload_pump(
+    match crate::proxy::upload_pump::spawn_replayable_upload_pump_with_deferred_write(
         body_bytes,
         request_trailers,
         write_timeout_ms,
@@ -4651,29 +4662,6 @@ pub(crate) async fn proxy_grpc_request_core(
         streaming_effective_timeout_ms(&headers, proxy).unwrap_or(0)
     };
 
-    // A validated end-of-stream metadata block (today: a gRPC-Web request
-    // trailer frame the `grpc_web` plugin split off the body) is re-emitted as
-    // a native HTTP/2 TRAILERS frame after the DATA. An empty map is treated as
-    // "no trailers" so a stray empty block cannot cost the backend a frame.
-    //
-    // With a live `backend_write_timeout_ms` the DATA rides a gateway-owned
-    // pump instead (issue #4055); see
-    // [`buffered_grpc_request_body_with_write_watermark`].
-    let (grpc_request_body, mut upload_pump) = buffered_grpc_request_body_with_write_watermark(
-        body_bytes,
-        request_trailers,
-        proxy.backend_write_timeout_ms,
-    );
-    // A pumped upload is no longer a buffer hyper holds in full, so hyper's
-    // `is_canceled` stops proving the request never reached the wire. Keep the
-    // streaming arm's conservative post-wire classification for it rather than
-    // handing the retry layer a pre-wire "nothing happened" verdict for an
-    // ambiguous carrier.
-    let request_upload_pumped = upload_pump.is_some();
-    let mut backend_req = Request::new(grpc_request_body);
-    *backend_req.method_mut() = method;
-    *backend_req.uri_mut() = uri;
-    *backend_req.headers_mut() = headers;
     // Pool acquisition is bounded by the end-to-end client deadline plus the
     // pool's own backend_connect_timeout_ms. backend_read_timeout_ms starts only
     // after a sender exists; applying it here would turn a read-stall policy
@@ -4697,8 +4685,32 @@ pub(crate) async fn proxy_grpc_request_core(
     // on a redial), which is the same re-arming class of error #2933 fixes,
     // just at a smaller scale. Every attempt still gets exactly one rewrite.
     if let Some(deadline) = client_grpc_deadline_at {
-        apply_remaining_grpc_timeout_header(backend_req.headers_mut(), deadline);
+        apply_remaining_grpc_timeout_header(&mut headers, deadline);
     }
+
+    // A validated end-of-stream metadata block (today: a gRPC-Web request
+    // trailer frame the `grpc_web` plugin split off the body) is re-emitted as
+    // a native HTTP/2 TRAILERS frame after the DATA. An empty map is treated as
+    // "no trailers" so a stray empty block cannot cost the backend a frame.
+    //
+    // Install the write pump only AFTER sender acquisition. Its timer is also
+    // explicitly armed immediately before dispatch below, so connection work
+    // can never be misreported as backend-body write inactivity.
+    let (grpc_request_body, mut upload_pump) = buffered_grpc_request_body_with_write_watermark(
+        body_bytes,
+        request_trailers,
+        proxy.backend_write_timeout_ms,
+    );
+    // A pumped upload is no longer a buffer hyper holds in full, so hyper's
+    // `is_canceled` stops proving the request never reached the wire. Keep the
+    // streaming arm's conservative post-wire classification for it rather than
+    // handing the retry layer a pre-wire "nothing happened" verdict for an
+    // ambiguous carrier.
+    let request_upload_pumped = upload_pump.is_some();
+    let mut backend_req = Request::new(grpc_request_body);
+    *backend_req.method_mut() = method;
+    *backend_req.uri_mut() = uri;
+    *backend_req.headers_mut() = headers;
 
     // A client deadline remains one absolute end-to-end ceiling. Layer the
     // operator read timeout over response processing only, after connection
@@ -4720,6 +4732,9 @@ pub(crate) async fn proxy_grpc_request_core(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         crate::plugins::grpc_deadline::duration_millis_ceil_saturating(remaining).unwrap_or(1)
     });
+    if let Some(pump) = upload_pump.as_mut() {
+        pump.arm_write_watermark();
+    }
     let send_fut = sender.send_request(backend_req);
     let map_send_err = |e: GrpcDispatchSendError| {
         map_grpc_dispatch_send_error(e, |e| {
