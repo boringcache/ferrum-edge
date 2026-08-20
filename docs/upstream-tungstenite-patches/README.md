@@ -55,6 +55,13 @@ upstream proposals:
   upstream or explicitly re-affirmed before the first stable release under the
   dependency-policy SLA. It preserves frame-vs-reassembly attribution without
   weakening either parser ceiling.
+- Ordered the stray-continuation opcode/state check ahead of the frame-size
+  policy: a Continue frame received with no fragmented message in progress is
+  reported as `ProtocolError::UnexpectedContinueFrame` before the declared
+  63-bit length is compared to the ceiling. A genuinely oversized frame whose
+  63-bit length is above `u32::MAX` but has its high bit clear therefore stays
+  a `FrameTooLong` size-policy failure (Close 1009) rather than being misread
+  as protocol junk.
 - Added `WebSocketConfig::auto_pong` (default `true`) so the shared H1/H2/H3
   WebSocket relay can disable local auto-Pong while forwarding Ping frames
   (issue #2963). Documented under

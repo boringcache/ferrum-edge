@@ -17349,26 +17349,19 @@ impl EffectiveWsSizeLimits {
     }
 }
 
-/// Capacity overflow whose advertised length cannot fit in 32 bits is
-/// protocol junk (RFC 6455 §5.2 64-bit length field), not a legitimate
-/// application frame that exceeded a configured ceiling.
-pub(crate) fn ws_capacity_overflow_is_protocol_junk(size: usize) -> bool {
-    size > u32::MAX as usize
-}
-
-/// Class for a WebSocket `Capacity` / FrameTooLong / MessageTooLong error.
+/// Directional class for a WebSocket `Capacity` / FrameTooLong /
+/// MessageTooLong overflow.
 ///
-/// A 64-bit length field that cannot fit in `u32` is `ProtocolError`. A
-/// real oversized frame or message stays `RequestBodyTooLarge` (client →
-/// backend) or `ResponseBodyTooLarge` (backend → client).
-///
-/// The relay inlines this mapping at each size-policy arm so
-/// `test_size_policy_rejections_use_explicit_error_classes` can pin the
-/// class names in source. Keep those arms in lockstep with this helper.
-pub(crate) fn ws_capacity_error_class(size: usize, client_to_backend: bool) -> retry::ErrorClass {
-    if ws_capacity_overflow_is_protocol_junk(size) {
-        retry::ErrorClass::ProtocolError
-    } else if client_to_backend {
+/// Any `Capacity` failure is a valid RFC 6455 size-policy violation: the
+/// 64-bit extended length carries a 63-bit value (only its most-significant
+/// bit must be zero), so an advertised length above `u32::MAX` is not itself
+/// malformed. Genuine protocol junk — e.g. issue #4058's stray continuation
+/// frame — is parsed as `tungstenite::Error::Protocol` before the size ceiling
+/// is consulted, so `classify_boxed_error` maps it to `ProtocolError`. The
+/// advertised `size` therefore never changes this class and is retained only
+/// so tests can pin a valid >`u32::MAX` length to the size-limit outcome.
+pub(crate) fn ws_capacity_error_class(_size: usize, client_to_backend: bool) -> retry::ErrorClass {
+    if client_to_backend {
         retry::ErrorClass::RequestBodyTooLarge
     } else {
         retry::ErrorClass::ResponseBodyTooLarge
@@ -18506,11 +18499,7 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut backend_sink, close).await;
-                                if ws_capacity_overflow_is_protocol_junk(size) {
-                                    retry::ErrorClass::ProtocolError
-                                } else {
-                                    retry::ErrorClass::RequestBodyTooLarge
-                                }
+                                retry::ErrorClass::RequestBodyTooLarge
                             } else if let Some((close, limit_kind, size, max_size)) =
                                 EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
                             {
@@ -18529,11 +18518,7 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut backend_sink, close).await;
-                                if ws_capacity_overflow_is_protocol_junk(size) {
-                                    retry::ErrorClass::ProtocolError
-                                } else {
-                                    retry::ErrorClass::RequestBodyTooLarge
-                                }
+                                retry::ErrorClass::RequestBodyTooLarge
                             } else if let Some((close, limit_kind)) =
                                 ws_fragment_policy_close_for_error(&e)
                             {
@@ -18821,11 +18806,7 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut ws_sink, close).await;
-                                if ws_capacity_overflow_is_protocol_junk(size) {
-                                    retry::ErrorClass::ProtocolError
-                                } else {
-                                    retry::ErrorClass::ResponseBodyTooLarge
-                                }
+                                retry::ErrorClass::ResponseBodyTooLarge
                             } else if let Some((close, limit_kind, size, max_size)) =
                                 EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
                             {
@@ -18844,11 +18825,7 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut ws_sink, close).await;
-                                if ws_capacity_overflow_is_protocol_junk(size) {
-                                    retry::ErrorClass::ProtocolError
-                                } else {
-                                    retry::ErrorClass::ResponseBodyTooLarge
-                                }
+                                retry::ErrorClass::ResponseBodyTooLarge
                             } else if let Some((close, limit_kind)) =
                                 ws_fragment_policy_close_for_error(&e)
                             {

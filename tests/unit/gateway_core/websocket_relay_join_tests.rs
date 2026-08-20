@@ -31,11 +31,33 @@ use std::time::Duration;
 
 use futures_util::Sink;
 use tokio_tungstenite::tungstenite::Error as WsError;
-use tokio_tungstenite::tungstenite::error::ProtocolError;
-use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::tungstenite::error::{CapacityError, ProtocolError};
+use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocket, WebSocketConfig};
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_util::sync::CancellationToken;
+
+/// Scripted byte source with a sink that silently accepts writes, so a sync
+/// `tungstenite::WebSocket` can be driven over an in-memory byte stream.
+struct WsScriptedIo {
+    read: std::io::Cursor<Vec<u8>>,
+}
+
+impl std::io::Read for WsScriptedIo {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.read.read(buf)
+    }
+}
+
+impl std::io::Write for WsScriptedIo {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Sanity check: with `tokio::join!` + cancel-on-exit, the fast direction
 /// completes quickly and signals the slow direction, which exits via the
@@ -493,27 +515,77 @@ fn test_global_capacity_close_for_error_selects_1009() {
 }
 
 #[test]
-fn test_ws_capacity_error_class_junk_length_is_protocol_error() {
-    let junk = (u32::MAX as usize).saturating_add(1);
+fn test_ws_63_bit_oversize_frame_is_size_limit_not_protocol_error() {
+    // A valid RFC 6455 63-bit payload length (2^32, above u32::MAX, with the
+    // 64-bit length field's most-significant bit clear) that exceeds the
+    // configured ceiling is a size-policy failure, never a protocol error.
+    let over_u32_max = (u32::MAX as usize).saturating_add(1);
     assert_eq!(
-        ferrum_edge::_test_support::ws_capacity_error_class_for_test(junk, true,),
-        ferrum_edge::retry::ErrorClass::ProtocolError
-    );
-    assert_eq!(
-        ferrum_edge::_test_support::ws_capacity_error_class_for_test(junk, false,),
-        ferrum_edge::retry::ErrorClass::ProtocolError
-    );
-}
-
-#[test]
-fn test_ws_capacity_error_class_real_oversize_stays_size_limit() {
-    assert_eq!(
-        ferrum_edge::_test_support::ws_capacity_error_class_for_test(64, true,),
+        ferrum_edge::_test_support::ws_capacity_error_class_for_test(over_u32_max, true),
         ferrum_edge::retry::ErrorClass::RequestBodyTooLarge
     );
     assert_eq!(
-        ferrum_edge::_test_support::ws_capacity_error_class_for_test(64, false,),
+        ferrum_edge::_test_support::ws_capacity_error_class_for_test(over_u32_max, false),
         ferrum_edge::retry::ErrorClass::ResponseBodyTooLarge
+    );
+
+    let err = WsError::Capacity(CapacityError::FrameTooLong {
+        size: over_u32_max,
+        max_size: 16,
+    });
+    let (close, kind, size, max_size) =
+        ferrum_edge::_test_support::global_ws_capacity_close_for_error_for_test(&err)
+            .expect("63-bit size-policy overflow must still select global Close 1009");
+    assert_eq!(close.code, CloseCode::Size);
+    assert_eq!(kind, "frame");
+    assert_eq!(size, over_u32_max);
+    assert_eq!(max_size, 16);
+
+    // A valid FIN=1 Binary frame advertising a 63-bit length of 2^32 must be
+    // parsed as a Capacity overflow (size policy), not a protocol error.
+    let oversize: Vec<u8> = vec![
+        0x82, 0x7f, // FIN=1 opcode=0x2 (Binary); mask=0 length=127
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // 63-bit length = 2^32
+    ];
+    let mut socket = WebSocket::from_raw_socket(
+        WsScriptedIo { read: std::io::Cursor::new(oversize) },
+        Role::Client,
+        Some(WebSocketConfig::default()),
+    );
+    let read_err = socket.read().unwrap_err();
+    assert!(
+        matches!(
+            &read_err,
+            WsError::Capacity(CapacityError::FrameTooLong { size, .. }) if *size == over_u32_max
+        ),
+        "a valid 63-bit oversized frame must surface as a size-policy failure, got {read_err:?}"
+    );
+}
+
+/// issue #4058 post-upgrade junk (`00 ff 4a 55 4e 4b 4a 55 4e 4b ...`) is a
+/// masked stray continuation frame. Its 63-bit length (0x4A554E4B4A554E4B) has
+/// the high bit clear, so the length itself is well-formed — the RFC 6455
+/// violation is a Continue opcode with no fragmented message in progress.
+#[test]
+fn test_malformed_continuation_frame_is_protocol_error() {
+    let junk: Vec<u8> = vec![
+        0x00, 0xff, // FIN=0 opcode=0x0 (Continue); MASK=1 length=127
+        0x4a, 0x55, 0x4e, 0x4b, 0x4a, 0x55, 0x4e, 0x4b, // 63-bit length, high bit clear
+        0x00, 0x00, 0x00, 0x00, // 4-byte mask key
+    ];
+    let mut socket = WebSocket::from_raw_socket(
+        WsScriptedIo { read: std::io::Cursor::new(junk) },
+        Role::Server,
+        Some(WebSocketConfig::default()),
+    );
+    let err = socket.read().unwrap_err();
+    assert!(
+        matches!(&err, WsError::Protocol(ProtocolError::UnexpectedContinueFrame)),
+        "stray continuation frame must fail closed as a protocol error, got {err:?}"
+    );
+    assert_eq!(
+        ferrum_edge::retry::classify_boxed_error(&err),
+        ferrum_edge::retry::ErrorClass::ProtocolError
     );
 }
 
