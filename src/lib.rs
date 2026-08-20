@@ -6698,8 +6698,7 @@ pub mod _test_support {
     }
 
     pub fn new_direct_h2_bytes_latch_for_test()
-        -> std::sync::Arc<crate::proxy::body::DirectH2BytesLatch>
-    {
+    -> std::sync::Arc<crate::proxy::body::DirectH2BytesLatch> {
         std::sync::Arc::new(crate::proxy::body::DirectH2BytesLatch::new())
     }
 

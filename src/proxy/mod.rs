@@ -37366,12 +37366,7 @@ async fn handle_proxy_request_inner(
                     .filter(|latch| !latch.is_done())
                     .cloned();
                 if let Some(latch) = pending_passthrough_latch {
-                    spawn_buffered_summary_after_passthrough_bytes(
-                        &plugins,
-                        summary,
-                        &ctx,
-                        latch,
-                    );
+                    spawn_buffered_summary_after_passthrough_bytes(&plugins, summary, &ctx, latch);
                 } else {
                     if passthrough_request_bytes_latch
                         .as_ref()
