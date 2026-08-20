@@ -3663,7 +3663,7 @@ impl AdminResource for Proxy {
         self.api_spec_id = None;
         if let Some(methods) = self.allowed_methods.as_mut() {
             for method in methods {
-                *method = method.to_uppercase();
+                *method = crate::config::types::normalize_http_method_token(method);
             }
         }
         self.normalize_fields();

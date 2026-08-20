@@ -49,10 +49,10 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
 };
 use crate::proxy::headers::{
-    ClientResponseFraming, GatewayOwnedResponseHeaders, PrePolicyResponseHeaders,
-    RejectBodyDisposition, ResponseTrailerGovernance, ResponseTrailerPolicyWitness,
-    TrailerSectionKind, apply_response_headers, is_backend_request_strip_header,
-    is_proxy_owned_forwarding_header, is_untrusted_real_ip_header,
+    ClientResponseFraming, GatewayOwnedResponseHeader, GatewayOwnedResponseHeaders,
+    PrePolicyResponseHeaders, RejectBodyDisposition, ResponseTrailerGovernance,
+    ResponseTrailerPolicyWitness, TrailerSectionKind, apply_response_headers,
+    is_backend_request_strip_header, is_proxy_owned_forwarding_header, is_untrusted_real_ip_header,
     parse_connection_listed_from_str_map, preserved_response_content_length,
     reconcile_backend_trailers_with_response_policy, reconcile_streaming_backend_trailers,
     remove_content_length_header, sanitize_backend_request_trailers,
@@ -2684,7 +2684,7 @@ async fn handle_h3_request(
     // still runs from the protocol-filtered plugin-cache view so sinks can
     // attribute the matched-proxy 405.
     if let Some(ref allowed) = proxy.allowed_methods
-        && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
+        && !crate::proxy::request_method_is_allowed(allowed, &method)
     {
         record_h3_flavor_aware_reject(&state, http_flavor, 405);
         let allow_header = crate::proxy::allow_header_from_allowed_methods(allowed);
@@ -8619,14 +8619,6 @@ async fn handle_h3_request(
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
 
-        if !after_proxy_rejected {
-            crate::proxy::insert_x_gateway_error_for_backend_failure(
-                &mut response_headers,
-                !h3_request_on_wire,
-                response_status,
-            );
-        }
-
         // Sticky session cookie injection. The buffered variant also records the
         // cookie as gateway-owned so a committed-hook deadline cannot strip it.
         //
@@ -8934,6 +8926,19 @@ async fn handle_h3_request(
         );
         sanitize_client_response_headers_for_wire(&mut response_headers, framing);
 
+        // Restore the gateway-owned token at the same post-hook / pre-wire
+        // boundary as H1/H2's response builder. Classification is the original
+        // typed `h3_request_on_wire` signal; status is the client-visible one
+        // after after_proxy, body, final-client-visible, and committed hooks.
+        let mut gateway_owned_headers = GatewayOwnedResponseHeaders::default();
+        if crate::proxy::apply_authoritative_backend_gateway_error_header(
+            &mut response_headers,
+            !h3_request_on_wire,
+            response_status,
+        ) {
+            gateway_owned_headers.insert(GatewayOwnedResponseHeader::GatewayError);
+        }
+
         // Reconcile surviving backend trailers with the response-header policy
         // this path already applied. Every response-header phase — `after_proxy`,
         // sticky-cookie injection, committed hooks — sees only the INITIAL header
@@ -8959,7 +8964,7 @@ async fn handle_h3_request(
                 &trailer_policy_witness,
                 plugin_cache_view.response_trailer_policy_names(),
                 plugin_cache_view.response_trailer_policy_prefixes(),
-                GatewayOwnedResponseHeaders::default(),
+                gateway_owned_headers,
                 // Buffered native-H3 send path: plain flavor only (a native gRPC
                 // dispatch goes to `dispatch_grpc_native_h3`), so no exemption.
                 TrailerSectionKind::PlainResponse,

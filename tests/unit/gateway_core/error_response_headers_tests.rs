@@ -1,10 +1,23 @@
 //! Client-visible error-response headers: RFC 9110 `Allow` on 405 and
 //! `X-Gateway-Error` on gateway-synthesized 5xx.
 
+use std::collections::HashMap;
+
 use ferrum_edge::_test_support::{
     PROTOCOL_LEVEL_405_ALLOW_FOR_TEST, allow_header_from_allowed_methods_for_test,
+    apply_authoritative_backend_gateway_error_header_for_test, request_method_is_allowed_for_test,
     x_gateway_error_for_backend_failure_for_test,
 };
+
+fn gateway_error_values(headers: &HashMap<String, String>) -> Vec<&str> {
+    let mut values: Vec<&str> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("x-gateway-error"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    values.sort_unstable();
+    values
+}
 
 #[test]
 fn x_gateway_error_maps_connect_timeout_and_backend_5xx() {
@@ -37,6 +50,47 @@ fn allow_header_uppercases_in_config_order() {
         allow_header_from_allowed_methods_for_test(&methods),
         "GET, HEAD, POST"
     );
+}
+
+#[test]
+fn padded_allowed_methods_admit_and_advertise_the_trimmed_token() {
+    let methods = vec![" GET ".to_string(), "post".to_string()];
+    assert!(request_method_is_allowed_for_test(&methods, "GET"));
+    assert!(request_method_is_allowed_for_test(&methods, "POST"));
+    assert!(!request_method_is_allowed_for_test(&methods, "DELETE"));
+    assert_eq!(
+        allow_header_from_allowed_methods_for_test(&methods),
+        "GET, POST"
+    );
+}
+
+#[test]
+fn late_hook_cannot_erase_or_spoof_authoritative_gateway_error() {
+    let mut headers = HashMap::new();
+    headers.insert("X-Gateway-Error".to_string(), "spoofed".to_string());
+    headers.insert("x-gateway-error".to_string(), "also-spoofed".to_string());
+    assert!(apply_authoritative_backend_gateway_error_header_for_test(
+        &mut headers, true, 403
+    ));
+    assert_eq!(gateway_error_values(&headers), ["connection_failure"]);
+
+    headers.clear();
+    assert!(apply_authoritative_backend_gateway_error_header_for_test(
+        &mut headers, true, 502
+    ));
+    assert_eq!(gateway_error_values(&headers), ["connection_failure"]);
+
+    headers.insert("x-gateway-error".to_string(), "backend_error".to_string());
+    assert!(apply_authoritative_backend_gateway_error_header_for_test(
+        &mut headers, false, 504
+    ));
+    assert_eq!(gateway_error_values(&headers), ["backend_timeout"]);
+
+    headers.insert("X-Gateway-Error".to_string(), "spoofed".to_string());
+    assert!(!apply_authoritative_backend_gateway_error_header_for_test(
+        &mut headers, false, 200
+    ));
+    assert!(gateway_error_values(&headers).is_empty());
 }
 
 #[test]
@@ -129,8 +183,31 @@ fn native_h3_dispatch_failures_send_typed_gateway_error() {
         h3.contains("fn send_h3_backend_failure_response("),
         "native H3 dispatch failures must share one X-Gateway-Error writer"
     );
+    let buffered = h3
+        .split("// ===== BUFFERED RESPONSE PATH =====")
+        .nth(1)
+        .expect("native H3 buffered response path");
+    let after_proxy = buffered
+        .find("run_after_proxy_hooks(")
+        .expect("buffered native H3 after_proxy");
+    let committed = buffered[after_proxy..]
+        .find("run_deadline_bounded_response_committed_hooks(")
+        .map(|idx| after_proxy + idx)
+        .expect("buffered native H3 committed hooks");
+    let sanitize = buffered[committed..]
+        .find("sanitize_client_response_headers_for_wire(")
+        .map(|idx| committed + idx)
+        .expect("buffered native H3 pre-wire sanitize");
+    let restore = buffered[sanitize..]
+        .find("apply_authoritative_backend_gateway_error_header(")
+        .map(|idx| sanitize + idx)
+        .expect("buffered native H3 must restore X-Gateway-Error after committed hooks");
     assert!(
-        h3.contains("fn h3_backend_failure_headers("),
-        "buffered native-H3 dispatch failures must populate X-Gateway-Error before after_proxy"
+        !buffered[..sanitize].contains("apply_authoritative_backend_gateway_error_header("),
+        "buffered native H3 must not restore X-Gateway-Error before the final pre-wire boundary"
+    );
+    assert!(
+        restore > sanitize,
+        "buffered native H3 must restore X-Gateway-Error after sanitizing for the wire"
     );
 }

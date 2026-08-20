@@ -23428,20 +23428,55 @@ pub(crate) fn restore_authoritative_gateway_error_header(
     response_headers.insert(X_GATEWAY_ERROR_HEADER.to_string(), value.to_string());
 }
 
+/// Apply the gateway-owned backend-failure token at the final post-hook /
+/// pre-wire boundary. Classification is the original typed dispatch signal
+/// (`connection_error`); `status` is the client-visible status after every
+/// later hook. Every case variant is stripped first so a hook cannot erase,
+/// replace, or duplicate the token. When the pair does not warrant a token
+/// (plugin-replaced non-5xx with no connection failure), a leftover spoofed
+/// value is removed rather than forwarded.
+///
+/// Returns whether the authoritative token was written.
+pub(crate) fn apply_authoritative_backend_gateway_error_header(
+    response_headers: &mut HashMap<String, String>,
+    connection_error: bool,
+    status: u16,
+) -> bool {
+    response_headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER));
+    if let Some(value) = x_gateway_error_for_backend_failure(connection_error, status) {
+        response_headers.insert(X_GATEWAY_ERROR_HEADER.to_string(), value.to_string());
+        true
+    } else {
+        false
+    }
+}
+
 pub(crate) fn insert_x_gateway_error_for_backend_failure(
     response_headers: &mut HashMap<String, String>,
     connection_error: bool,
     status: u16,
 ) {
-    if let Some(value) = x_gateway_error_for_backend_failure(connection_error, status) {
-        restore_authoritative_gateway_error_header(response_headers, value);
-    }
+    let _ = apply_authoritative_backend_gateway_error_header(
+        response_headers,
+        connection_error,
+        status,
+    );
 }
 
 /// Snapshot of the open-breaker 503 header map. Callers clone it into the
 /// reject builder so the token is not assembled per request.
 pub(crate) fn circuit_breaker_open_reject_headers() -> HashMap<String, String> {
     CIRCUIT_BREAKER_OPEN_HEADERS.clone()
+}
+
+/// Whether `method` is in the route's configured `allowed_methods`.
+/// Surrounding whitespace is ignored so a validated `" GET "` admits GET,
+/// matching [`allow_header_from_allowed_methods`] and config normalization.
+#[inline]
+pub(crate) fn request_method_is_allowed(allowed: &[String], method: &str) -> bool {
+    allowed
+        .iter()
+        .any(|configured| configured.trim().eq_ignore_ascii_case(method))
 }
 
 /// Comma-separated RFC 9110 `Allow` value for a route's configured methods.
@@ -29334,7 +29369,7 @@ async fn handle_proxy_request_inner(
     // still runs from the protocol-filtered plugin-cache view so sinks can
     // attribute the matched-proxy 405.
     if let Some(ref allowed) = proxy.allowed_methods
-        && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
+        && !request_method_is_allowed(allowed, &method)
     {
         state.request_count.fetch_add(1, Ordering::Relaxed);
         let allow_header = allow_header_from_allowed_methods(allowed);
@@ -37552,6 +37587,12 @@ async fn handle_proxy_request_inner(
             | ResponseBody::StreamingH3(_) => headers_mod::ClientResponseFraming::Streaming,
         }
     };
+    // Gateway-owned: strip every hook/backend case variant before sanitizing
+    // so a late phase cannot spoof or duplicate the token beside the builder
+    // write. Classification is the original dispatch signal; status is final.
+    let gateway_error_token =
+        x_gateway_error_for_backend_failure(backend_resp.connection_error, response_status);
+    response_headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER));
     resp_builder =
         headers_mod::apply_sanitized_response_headers(resp_builder, &mut response_headers, framing);
 
@@ -37560,9 +37601,7 @@ async fn handle_proxy_request_inner(
     //   X-Gateway-Error: connection_failure | backend_timeout | backend_error
     //     | circuit_breaker_open (open-breaker 503s use the reject path)
     //   X-Gateway-Upstream-Status: degraded (when routing via all-unhealthy fallback)
-    if let Some(value) =
-        x_gateway_error_for_backend_failure(backend_resp.connection_error, response_status)
-    {
+    if let Some(value) = gateway_error_token {
         resp_builder = resp_builder.header("X-Gateway-Error", value);
     }
 

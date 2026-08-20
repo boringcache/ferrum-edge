@@ -266,7 +266,7 @@ All route table operations (sorting, regex compilation, host partitioning) happe
 
 ## HTTP method admission
 
-After a proxy is matched, `allowed_methods` (when configured) rejects any other method with **405 Method Not Allowed**. RFC 9110 §15.5.6 requires an `Allow` header listing the methods the resource currently supports. The gateway sets `Allow` to the proxy's configured methods, uppercased, in config order (stable, not sorted). HTTP/1.1, HTTP/2, and HTTP/3 share that formatting. Response-header plugins may decorate the 405, but they cannot remove or replace that gateway-owned `Allow` value.
+After a proxy is matched, `allowed_methods` (when configured) rejects any other method with **405 Method Not Allowed**. RFC 9110 §15.5.6 requires an `Allow` header listing the methods the resource currently supports. The gateway sets `Allow` to the proxy's configured methods, uppercased, in config order (stable, not sorted). Surrounding whitespace is trimmed at file/runtime and Admin normalize so a validated `" GET "` both admits GET and advertises `Allow: GET`. HTTP/1.1, HTTP/2, and HTTP/3 share that formatting and admission comparison. Response-header plugins may decorate the 405, but they cannot remove or replace that gateway-owned `Allow` value.
 
 Two protocol-level filters run **before** route match and also return 405:
 

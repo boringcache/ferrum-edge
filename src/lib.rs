@@ -1475,6 +1475,22 @@ pub mod _test_support {
         crate::proxy::x_gateway_error_for_backend_failure(connection_error, status)
     }
 
+    pub fn apply_authoritative_backend_gateway_error_header_for_test(
+        response_headers: &mut HashMap<String, String>,
+        connection_error: bool,
+        status: u16,
+    ) -> bool {
+        crate::proxy::apply_authoritative_backend_gateway_error_header(
+            response_headers,
+            connection_error,
+            status,
+        )
+    }
+
+    pub fn request_method_is_allowed_for_test(allowed: &[String], method: &str) -> bool {
+        crate::proxy::request_method_is_allowed(allowed, method)
+    }
+
     pub fn allow_header_from_allowed_methods_for_test(methods: &[String]) -> String {
         crate::proxy::allow_header_from_allowed_methods(methods)
     }
