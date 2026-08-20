@@ -684,6 +684,10 @@ async fn test_log_and_stream_hooks_enqueue_without_panic() {
     plugin.on_stream_disconnect(&stream).await;
 }
 
+fn rfc3339_millis(dt: chrono::DateTime<chrono::Utc>) -> String {
+    dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_persists_http_and_stream_rows_against_sqlite() {
     if !example_audit_plugin_registered() {
@@ -747,10 +751,17 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
         plugin.commit_background_tasks();
     }
 
+    // Live rows must stay inside `retention_days` as civil time moves. A
+    // hardcoded 2026-07-20 timestamp becomes `timestamp < now-30d` on
+    // 2026-08-19 and is deleted by the same TEXT comparison the worker uses.
+    let now = chrono::Utc::now();
+    let cutoff = rfc3339_millis(now - chrono::Duration::days(30));
+    let live_ts = |offset_ms: i64| rfc3339_millis(now + chrono::Duration::milliseconds(offset_ms));
+
     let metadata_prefix = "k".repeat(128);
     plugin
         .log(&TransactionSummary {
-            timestamp_received: "2026-07-20T12:00:00.000Z".to_string(),
+            timestamp_received: live_ts(0),
             client_ip: "192.0.2.10".to_string(),
             http_method: "POST".to_string(),
             request_path: "/v1/widgets".to_string(),
@@ -775,7 +786,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
 
     plugin
         .log(&TransactionSummary {
-            timestamp_received: "2026-07-20T12:00:00.500Z".to_string(),
+            timestamp_received: live_ts(500),
             client_ip: "192.0.2.14".to_string(),
             http_method: "POST".to_string(),
             request_path: "/example.Audit/Write".to_string(),
@@ -791,7 +802,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
 
     plugin
         .log(&TransactionSummary {
-            timestamp_received: "2026-07-20T12:00:00.600Z".to_string(),
+            timestamp_received: live_ts(600),
             client_ip: "192.0.2.16".to_string(),
             http_method: "POST".to_string(),
             request_path: "/example.Audit/Web".to_string(),
@@ -808,7 +819,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
 
     plugin
         .log(&TransactionSummary {
-            timestamp_received: "2026-07-20T12:00:00.700Z".to_string(),
+            timestamp_received: live_ts(700),
             client_ip: "192.0.2.17".to_string(),
             http_method: "GET".to_string(),
             request_path: "/ws".to_string(),
@@ -820,7 +831,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
 
     plugin
         .log(&TransactionSummary {
-            timestamp_received: "2026-07-20T12:00:00.725Z".to_string(),
+            timestamp_received: live_ts(725),
             client_ip: "192.0.2.18".to_string(),
             http_method: "CONNECT".to_string(),
             request_path: "/ws-h2".to_string(),
@@ -832,7 +843,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
 
     plugin
         .log(&TransactionSummary {
-            timestamp_received: "2026-07-20T12:00:00.740Z".to_string(),
+            timestamp_received: live_ts(740),
             client_ip: "192.0.2.19".to_string(),
             http_method: "GET".to_string(),
             request_path: "/unknown-protocol-metadata".to_string(),
@@ -848,7 +859,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
 
     plugin
         .log(&TransactionSummary {
-            timestamp_received: "2026-07-20T12:00:00.750Z".to_string(),
+            timestamp_received: live_ts(750),
             client_ip: "192.0.2.15".to_string(),
             http_method: "M".repeat(300),
             request_path: "/bounded-method".to_string(),
@@ -898,8 +909,8 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
                 error_class: None,
                 disconnect_direction: None,
                 disconnect_cause: None,
-                timestamp_connected: "2026-07-20T12:00:00.000Z".to_string(),
-                timestamp_disconnected: "2026-07-20T12:00:01.000Z".to_string(),
+                timestamp_connected: live_ts(0),
+                timestamp_disconnected: live_ts(1_000),
                 sni_hostname: None,
                 metadata: HashMap::new(),
             })
@@ -1020,11 +1031,30 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
         "expected tcp/tcps/udp/dtls stream audit rows"
     );
 
-    // Retention skips the immediate first tick (hourly cadence). Prove the
-    // chunked DELETE contract against the seeded expired row with the same
-    // SQLite SQL the worker emits, without waiting an hour for the ticker.
-    let cutoff = (chrono::Utc::now() - chrono::Duration::days(30))
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    // `run_retention` waits on `interval_at(now + RETENTION_INTERVAL)` with a
+    // 1h period and `MissedTickBehavior::Skip`, so the worker cannot fire
+    // during this test. Prove the chunked DELETE contract against the seeded
+    // expired row with the same SQLite SQL the worker emits.
+    let tcp_before = sqlx::query(
+        "SELECT timestamp FROM example_audit_log \
+         WHERE protocol = 'tcp' LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("bounded TCP audit row before retention DELETE");
+    let tcp_timestamp: String = tcp_before.get("timestamp");
+    assert!(
+        !tcp_timestamp.is_empty(),
+        "bounded TCP write must persist a non-empty timestamp"
+    );
+    chrono::DateTime::parse_from_rfc3339(&tcp_timestamp)
+        .expect("bounded TCP write must persist a parseable RFC3339 timestamp");
+    assert!(
+        tcp_timestamp.as_str() >= cutoff.as_str(),
+        "bounded TCP timestamp {tcp_timestamp} must be at or after retention \
+         cutoff {cutoff}"
+    );
+
     let purged = sqlx::query(
         "DELETE FROM example_audit_log WHERE rowid IN (             SELECT rowid FROM example_audit_log WHERE timestamp < ? LIMIT 1000)",
     )
@@ -1118,7 +1148,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
         .expect("make audit table unavailable");
     plugin
         .log(&TransactionSummary {
-            timestamp_received: "2026-07-20T12:00:02.000Z".to_string(),
+            timestamp_received: live_ts(2_000),
             client_ip: "192.0.2.12".to_string(),
             http_method: "GET".to_string(),
             request_path: "/dropped-during-outage".to_string(),
@@ -1136,7 +1166,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
         .expect("restore audit table");
     plugin
         .log(&TransactionSummary {
-            timestamp_received: "2026-07-20T12:00:03.000Z".to_string(),
+            timestamp_received: live_ts(3_000),
             client_ip: "192.0.2.13".to_string(),
             http_method: "GET".to_string(),
             request_path: "/after-recovery".to_string(),
