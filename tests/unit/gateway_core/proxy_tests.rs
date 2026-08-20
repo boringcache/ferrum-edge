@@ -3074,6 +3074,8 @@ async fn test_trusted_forwarded_http_overrides_tls_cookie_and_authority_scope() 
     apply_effective_backend_scheme_headers_for_test(
         &mut backend_headers,
         "203.0.113.10",
+        "10.0.0.8",
+        &trusted,
         ctx.request_is_secure,
         true,
     );
@@ -3156,7 +3158,14 @@ fn test_effective_scheme_headers_remove_case_variants_for_websocket_and_grpc_col
         ("Forwarded".to_string(), "for=plugin".to_string()),
         ("fOrWaRdEd".to_string(), "for=stale".to_string()),
     ]);
-    apply_effective_backend_scheme_headers_for_test(&mut proxy_headers, "203.0.113.8", true, true);
+    apply_effective_backend_scheme_headers_for_test(
+        &mut proxy_headers,
+        "203.0.113.8",
+        "203.0.113.8",
+        &TrustedProxies::none(),
+        true,
+        true,
+    );
 
     assert_eq!(
         proxy_headers

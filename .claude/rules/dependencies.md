@@ -86,11 +86,13 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   three-family shape, and once the base is three-family a revert is refused. See
   `docs/ci_cd.md` → "Admitted release image-family adoption".
 - The temporary `fips-build.yml` whole-file generation admission (first used
-  for #3889, retired by #3943) is **re-armed for exactly one transition**: PR
-  #3950's artifact-based same-run FIPS handoff, pair
-  `0be31357…d6a08` → `17bfb40f…e5e9e1` (including the runner-local AWS-LC
-  CMake quarantine; recompute if #3950's workflow bytes change). One-way,
-  retire again once #3950 lands. Every other
+  for #3889, retired by #3943; re-armed for #3950 and spent when #3950 landed)
+  is **re-armed for exactly one transition**: the issue #4018 FIPS
+  test-binary memory mitigation, pair
+  `17bfb40f…e5e9e1` → `6bb669ab…7dfa84` (`CARGO_BUILD_JOBS=3`,
+  `line-tables-only` on the `dev` AND `test` profiles, and a best-effort swap
+  enlargement on `fips-test-build`; recompute if the workflow bytes change).
+  One-way, retire again once the mitigation lands. Every other
   `fips-build.yml` edit is compared by the normal fail-closed Cross surface
   scan. See `docs/ci_cd.md` → "Admitted `fips-build.yml` generation
   transition".

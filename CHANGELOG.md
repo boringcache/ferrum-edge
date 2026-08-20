@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — untrusted `X-Forwarded-For` is no longer forwarded to backends**
+  (issue #4034). With the default empty `FERRUM_TRUSTED_PROXIES`, Ferrum already
+  ignored a client-supplied XFF chain for its own `client_ip` resolution, but
+  the outbound request still carried that spoofable chain with the socket peer
+  appended (`spoofed, peer`). Backends that trust the leftmost hop therefore
+  saw an attacker-injected address. Outbound XFF now matches
+  [docs/client_ip_resolution.md](docs/client_ip_resolution.md): an untrusted
+  peer (including every peer when the trust list is empty) produces `peer`
+  only; a trusted peer still has its inbound chain honored and appended to.
+  The same drop applies to `X-Real-IP` on untrusted peers (Ferrum never
+  regenerates that header). RFC 7239 `Forwarded` is unchanged: when
+  `FERRUM_ADD_FORWARDED_HEADER=true` it is still regenerated from the resolved
+  client IP; when false, pass-through remains the operator contract from
+  issue #2952. **Operator action**: if a backend depended on seeing
+  client-supplied XFF hops in front of an untrusted Ferrum, add the
+  connecting peer to `FERRUM_TRUSTED_PROXIES` so Ferrum will honor and append
+  that chain; otherwise configure the backend to trust only the rightmost hop
+  (Ferrum's socket peer).
+
 - **BREAKING — WAF custom `match_kind: literal` is now case-sensitive**
   (issue #3937). `literal` was compiled with `(?i)` exactly like `contains`, so
   a rule spelled `pattern: EVIL-LITERAL` also blocked `evil-literal` and there

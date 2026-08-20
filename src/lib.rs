@@ -5741,15 +5741,28 @@ pub mod _test_support {
     pub fn apply_effective_backend_scheme_headers_for_test(
         headers: &mut HashMap<String, String>,
         client_ip: &str,
+        peer_ip: &str,
+        trusted_proxies: &crate::proxy::client_ip::TrustedProxies,
         request_is_secure: bool,
         add_forwarded_header: bool,
     ) {
         crate::proxy::apply_effective_backend_scheme_headers(
             headers,
             client_ip,
+            peer_ip,
+            trusted_proxies,
             request_is_secure,
             add_forwarded_header,
         );
+    }
+
+    pub fn build_xff_value_for_test(
+        existing_xff: Option<&str>,
+        client_ip: &str,
+        peer_ip: &str,
+        trusted_proxies: &crate::proxy::client_ip::TrustedProxies,
+    ) -> String {
+        crate::proxy::build_xff_value(existing_xff, client_ip, peer_ip, trusted_proxies)
     }
 
     /// Canonical backend-visible query (transformer outbound + auth strips).
