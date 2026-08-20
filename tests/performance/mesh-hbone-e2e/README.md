@@ -62,7 +62,7 @@ cargo build --release --example hbone_perf_fixture
 ## Caveats
 
 - **Steady-state only.** The mTLS handshake and HBONE CONNECT setup are amortised across many requests; the per-request cost dominates after the first.
-- **Operator-specific numbers.** Baseline RPS depends entirely on hardware. The shipped `baseline.md` has `_TBD_` rows that operators populate by running `./run.sh` on production-equivalent hardware.
+- **Operator-specific numbers.** Baseline RPS depends entirely on hardware. The shipped `baseline.md` records provenance-tagged GitHub-hosted reference numbers; operators should run `./run.sh` on production-equivalent hardware before setting local expectations.
 - **Cross-platform.** macOS works end-to-end via the userspace HBONE relay. Linux uses the same userspace relay (the gateway's `splice(2)` fast path is bypassed for HBONE because the tunnel terminates in userspace TLS state).
 - **Standalone crate.** Not a workspace member; has its own `Cargo.lock`. Mirrors the layout of `tests/performance/multi_protocol/`.
 
