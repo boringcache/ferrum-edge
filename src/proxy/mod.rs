@@ -3496,14 +3496,18 @@ pub(crate) fn classify_direct_h2_upload_outcome(
         Some(body::RequestBodyOutcome::Exceeded) => DirectH2UploadGate::RequestBodyTooLarge,
         _ if authorization_expired => DirectH2UploadGate::AuthorizationExpired,
         Some(body::RequestBodyOutcome::Completed) => DirectH2UploadGate::Forward,
-        Some(body::RequestBodyOutcome::Errored | body::RequestBodyOutcome::Abandoned) => {
-            if pump_outcome == Some(upload_pump::UploadPumpOutcome::WriteTimeout) {
-                DirectH2UploadGate::BackendWriteTimeout
-            } else {
-                DirectH2UploadGate::FailClosed
-            }
+        // A write-watermark terminal is authoritative for BOTH shapes of an
+        // unfinished upload: the adapter reporting a transport error, and the
+        // adapter never reporting at all. The second is what the dispatcher
+        // sees when its own wait ended on the pump's watermark rather than on
+        // the completion channel, so collapsing it into `FailClosed` would turn
+        // a diagnosed backend write stall back into an anonymous 502 (#4055).
+        _ if pump_outcome == Some(upload_pump::UploadPumpOutcome::WriteTimeout) => {
+            DirectH2UploadGate::BackendWriteTimeout
         }
-        None => DirectH2UploadGate::FailClosed,
+        Some(body::RequestBodyOutcome::Errored | body::RequestBodyOutcome::Abandoned) | None => {
+            DirectH2UploadGate::FailClosed
+        }
     }
 }
 
@@ -39364,23 +39368,18 @@ pub(crate) async fn proxy_to_backend_retry(
         send_auth_deadline.as_ref(),
     );
     let send_future = crate::plugins::await_deadline_first(send_bound.at, req_builder.send());
-    let header_wait = if proxy.backend_read_timeout_ms > 0 {
-        match tokio::time::timeout(
-            Duration::from_millis(proxy.backend_read_timeout_ms),
-            send_future,
-        )
-        .await
-        {
-            Ok(inner) => inner,
-            Err(_) => {
-                return http_backend_dispatch_error_response(
-                    retry::ErrorClass::ReadWriteTimeout,
-                    resolved_ip,
-                );
-            }
+    // The retry dispatcher always carries a RETAINED (buffered) request body,
+    // so there is no streaming upload and no pump to observe here; the operator
+    // response-header bound is the only watermark this wait can end on.
+    let bounded = bounded_response_header_wait(send_future, proxy.backend_read_timeout_ms).await;
+    let header_wait = match bounded {
+        Ok(inner) => inner,
+        Err(()) => {
+            return http_backend_dispatch_error_response(
+                retry::ErrorClass::ReadWriteTimeout,
+                resolved_ip,
+            );
         }
-    } else {
-        send_future.await
     };
     let send_result = match header_wait {
         Ok(result) => result,
@@ -42495,6 +42494,13 @@ async fn proxy_to_backend(
     // Shared flag for detecting size-limit exceeded during streaming.
     // Only allocated when we actually stream a request body.
     let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Join point for the gateway-owned upload pump, when a streaming arm below
+    // installs one. Kept in the dispatcher's scope for exactly one reason: the
+    // response-header wait must be able to end on the backend write watermark
+    // (#4055). It is never joined to completion here — this dispatcher returns
+    // while the response streams, and the transport body owns the upload from
+    // that point — so `cancel_on_drop` stays disarmed.
+    let mut upload_pump: Option<upload_pump::UploadPumpJoin> = None;
 
     if has_body {
         // Enforce request body size limit via Content-Length fast path.
@@ -42627,17 +42633,19 @@ async fn proxy_to_backend(
                     // negotiate HTTP/2, in which case its connection task parks
                     // on stream send capacity exactly like the direct-H2 pipe
                     // and stops polling the body; the pump's deadline is not
-                    // subject to that. The join point is deliberately released
-                    // here rather than awaited: this dispatcher returns while
-                    // the response still streams, so the upload's lifetime is
-                    // the transport body's, and `UploadPumpSource`'s abort
-                    // guard ends the task when reqwest drops that body. The
-                    // pump self-terminates at the deadline regardless.
-                    let (limited, _upload_pump) = install_streaming_upload_authorization(
+                    // subject to that. The join point is KEPT — but only to
+                    // observe the backend write watermark alongside the
+                    // response-header wait (#4055). It is never awaited to
+                    // completion here: this dispatcher returns while the
+                    // response still streams, so the upload's lifetime stays
+                    // the transport body's and `UploadPumpSource`'s abort guard
+                    // ends the task when reqwest drops that body.
+                    let (limited, pump) = install_streaming_upload_authorization(
                         limited,
                         upload_auth_deadline.as_ref(),
                         proxy.backend_write_timeout_ms,
                     );
+                    upload_pump = pump;
                     let limited =
                         if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
                             &request_ctx.metadata,
@@ -42660,12 +42668,14 @@ async fn proxy_to_backend(
                         Arc::clone(ctx_bytes_sent_observed),
                     );
                     // Same pairing as the size-limited arm above; see there for
-                    // why the join point is released rather than awaited.
-                    let (counting, _upload_pump) = install_counting_upload_authorization(
+                    // why the join point is observed rather than awaited to
+                    // completion.
+                    let (counting, pump) = install_counting_upload_authorization(
                         counting,
                         upload_auth_deadline.as_ref(),
                         proxy.backend_write_timeout_ms,
                     );
+                    upload_pump = pump;
                     let counting =
                         if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
                             &request_ctx.metadata,
@@ -43038,27 +43048,50 @@ async fn proxy_to_backend(
         send_auth_deadline.as_ref(),
     );
     let send_future = crate::plugins::await_deadline_first(send_bound.at, req_builder.send());
-    let header_wait = if proxy.backend_read_timeout_ms > 0 {
-        match tokio::time::timeout(
-            Duration::from_millis(proxy.backend_read_timeout_ms),
-            send_future,
-        )
-        .await
-        {
-            Ok(inner) => inner,
-            Err(_) => {
-                return backend_dispatch_response(
-                    http_backend_dispatch_error_response(
-                        retry::ErrorClass::ReadWriteTimeout,
-                        resolved_ip,
-                    ),
-                    retained_body,
-                    backend_admission_permits,
-                );
-            }
+    // Two per-direction watermarks bound this wait, and both end the request as
+    // 504 / `ReadWriteTimeout`: the operator's response-header read bound, and
+    // the upload pump's backend write bound. The write arm is what makes a
+    // backend that accepts and never reads fail at `backend_write_timeout_ms`
+    // instead of running on to `backend_read_timeout_ms` (#4055).
+    let mut write_watermark_expired = false;
+    let bounded = await_upload_write_watermark_first(
+        bounded_response_header_wait(send_future, proxy.backend_read_timeout_ms),
+        upload_pump.as_mut(),
+    )
+    .await;
+    let header_wait = match bounded {
+        Ok(Ok(inner)) => Some(inner),
+        Ok(Err(())) => None,
+        Err(()) => {
+            write_watermark_expired = true;
+            None
         }
-    } else {
-        send_future.await
+    };
+    let Some(header_wait) = header_wait else {
+        if let Some(pump) = upload_pump.as_mut() {
+            // Stop reading the client body now rather than leaving the task to
+            // notice when the transport eventually drops its source.
+            pump.cancel();
+        }
+        // One macro, two attributions: `proxy_to_backend` is one of the two
+        // deepest coroutines on the request path and every `warn!` site it
+        // inlines is a permanent frame slot at `opt-level = 0`.
+        let (watermark, watermark_ms) = if write_watermark_expired {
+            ("backend_write_timeout_ms", proxy.backend_write_timeout_ms)
+        } else {
+            ("backend_read_timeout_ms", proxy.backend_read_timeout_ms)
+        };
+        warn!(
+            proxy_id = %proxy.id,
+            watermark,
+            watermark_ms,
+            "reqwest dispatch: per-direction watermark expired before response headers"
+        );
+        return backend_dispatch_response(
+            http_backend_dispatch_error_response(retry::ErrorClass::ReadWriteTimeout, resolved_ip),
+            retained_body,
+            backend_admission_permits,
+        );
     };
     let send_result = match header_wait {
         Ok(result) => result,
@@ -45459,6 +45492,64 @@ pub(crate) fn request_upload_auth_deadline(
         request_upload_auth_family(ctx),
         ctx.authorization_termination_latch(),
     ))
+}
+
+/// The response-header wait, bounded by the operator's `backend_read_timeout_ms`.
+///
+/// `0` leaves it unbounded, preserving the documented "0 = no timeout"
+/// contract. `Err(())` is the operator read timeout, which every caller maps to
+/// 504 / `ReadWriteTimeout`.
+///
+/// This is deliberately NOT reqwest's `RequestBuilder::timeout()`: that clock
+/// runs from `send()` through response-body completion and is transferred onto
+/// the response body, so it kills a slow-but-progressing SSE stream (#4057).
+/// The per-direction watermark on the body is installed separately.
+pub(crate) async fn bounded_response_header_wait<F>(
+    fut: F,
+    read_timeout_ms: u64,
+) -> Result<F::Output, ()>
+where
+    F: std::future::Future,
+{
+    if read_timeout_ms == 0 {
+        return Ok(fut.await);
+    }
+    tokio::time::timeout(Duration::from_millis(read_timeout_ms), fut)
+        .await
+        .map_err(|_| ())
+}
+
+/// Race a dispatch-phase wait against the gateway-owned upload pump's backend
+/// write watermark (`backend_write_timeout_ms`, issue #4055).
+///
+/// The pump terminates the transport body on expiry, but that error is only
+/// observable when the transport POLLS the body — and a transport whose backend
+/// stopped reading is parked somewhere else entirely: hyper's HTTP/2 pipe in
+/// `poll_capacity`, an HTTP/1.1 connection task on socket writability, reqwest's
+/// connection task in either. Without this arm the dispatcher keeps waiting and
+/// the request ends on whatever LATER bound is configured
+/// (`backend_read_timeout_ms`), which is why a configured 800 ms write watermark
+/// used to surface as an 8 s read timeout.
+///
+/// `Err(())` means the watermark fired first. The wrapped future is polled
+/// FIRST, so a backend that answered in the same poll still wins the race and a
+/// completed exchange is never reclassified as a write stall.
+async fn await_upload_write_watermark_first<F>(
+    fut: F,
+    pump: Option<&mut upload_pump::UploadPumpJoin>,
+) -> Result<F::Output, ()>
+where
+    F: std::future::Future,
+{
+    let Some(pump) = pump else {
+        return Ok(fut.await);
+    };
+    tokio::pin!(fut);
+    tokio::select! {
+        biased;
+        output = &mut fut => Ok(output),
+        () = pump.backend_write_watermark_expired() => Err(()),
+    }
 }
 
 /// Install the FULL upload lifecycle on a size-limited streaming client body
@@ -49859,11 +49950,28 @@ async fn proxy_to_backend_http2(
         ),
         upload_auth_deadline.as_ref(),
     );
+    // The gateway-owned pump's backend write watermark is raced against BOTH
+    // header-wait shapes below. Direct-H2 is the sharpest case for it: hyper's
+    // `PipeToSendStream` parks in `poll_capacity` when the backend stops
+    // granting flow-control credit, so it never polls the transport body and
+    // never observes the pump's terminal error. Without this arm a configured
+    // `backend_write_timeout_ms` was invisible until `backend_read_timeout_ms`
+    // expired (#4055).
+    let mut header_write_watermark_expired = false;
     let response = if let Some((deadline, deadline_source)) = header_deadline {
-        match crate::plugins::await_deadline_first(Some(deadline), h2_send_fut).await {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => return map_h2_err(e),
-            Err(_) => {
+        let bounded = await_upload_write_watermark_first(
+            crate::plugins::await_deadline_first(Some(deadline), h2_send_fut),
+            upload_pump.as_mut(),
+        )
+        .await;
+        match bounded {
+            Ok(Ok(Ok(resp))) => Some(resp),
+            Ok(Ok(Err(e))) => return map_h2_err(e),
+            Err(()) => {
+                header_write_watermark_expired = true;
+                None
+            }
+            Ok(Err(_)) => {
                 // The request body already moved into hyper's detached HTTP/2
                 // pipe task when `send_request` was called, so returning here
                 // does not by itself stop the upload. Two things do.
@@ -49933,9 +50041,47 @@ async fn proxy_to_backend_http2(
             }
         }
     } else {
-        match h2_send_fut.await {
-            Ok(resp) => resp,
-            Err(e) => return map_h2_err(e),
+        let bounded = await_upload_write_watermark_first(h2_send_fut, upload_pump.as_mut()).await;
+        match bounded {
+            Ok(Ok(resp)) => Some(resp),
+            Ok(Err(e)) => return map_h2_err(e),
+            Err(()) => {
+                header_write_watermark_expired = true;
+                None
+            }
+        }
+    };
+    // One terminal for both header-wait shapes. The upload is stopped first —
+    // `cancel_and_join` resolves only after the pump published its outcome,
+    // which it does after dropping the inbound client body — so the gateway
+    // owns no part of the upload once this returns. Nothing was committed
+    // downstream, and the authoritative 413 still wins over a transport
+    // classification.
+    let response = match response {
+        Some(response) => response,
+        None => {
+            debug_assert!(header_write_watermark_expired);
+            if let Some(cancel_tx) = body_cancel_tx.take() {
+                let _ = cancel_tx.send(());
+            }
+            if let Some(pump) = upload_pump.take() {
+                pump.cancel_and_join().await;
+            }
+            if body_size_exceeded.load(std::sync::atomic::Ordering::Acquire) {
+                return request_body_too_large();
+            }
+            warn!(
+                proxy_id = %proxy.id,
+                "HTTP/2: backend stopped reading the request body ({}ms write watermark) before response headers",
+                proxy.backend_write_timeout_ms
+            );
+            return (
+                http_backend_dispatch_error_response(
+                    retry::ErrorClass::ReadWriteTimeout,
+                    resolved_ip,
+                ),
+                None,
+            );
         }
     };
 
@@ -49966,14 +50112,23 @@ async fn proxy_to_backend_http2(
         );
         let outcome = match upload_bound {
             Some((upload_deadline, bound_kind)) => {
-                match crate::plugins::await_deadline_first(
-                    Some(upload_deadline),
-                    body_completion_rx,
+                let joined = await_upload_write_watermark_first(
+                    crate::plugins::await_deadline_first(
+                        Some(upload_deadline),
+                        body_completion_rx,
+                    ),
+                    upload_pump.as_mut(),
                 )
-                .await
-                {
-                    Ok(received) => received.ok(),
-                    Err(_) => {
+                .await;
+                match joined {
+                    Ok(Ok(received)) => received.ok(),
+                    // The backend answered early and then stopped reading. The
+                    // pump has already published its terminal and released the
+                    // client body, so fall through to the join + gate below,
+                    // which reads that typed terminal and returns a
+                    // deterministic 504 / `ReadWriteTimeout` (#4055).
+                    Err(()) => None,
+                    Ok(Err(_)) => {
                         // `send_request` has already yielded response headers, so
                         // hyper moved the request body into a detached H2 pipe
                         // task. Dropping this handler or the response does not
@@ -50062,7 +50217,15 @@ async fn proxy_to_backend_http2(
             // the upload holds this request until the client body terminates or
             // the connection drops. Do not add a hidden floor here — that would
             // silently break the documented contract.
-            None => body_completion_rx.await.ok(),
+            None => {
+                let joined =
+                    await_upload_write_watermark_first(body_completion_rx, upload_pump.as_mut())
+                        .await;
+                match joined {
+                    Ok(received) => received.ok(),
+                    Err(()) => None,
+                }
+            }
         };
         // Normal completion: dropping the sender makes the adapter stop
         // polling the cancellation channel without changing its outcome.

@@ -28,9 +28,9 @@
 #![allow(clippy::bool_assert_comparison)]
 
 use crate::scaffolding::backends::{
-    H2Step, H3Step, H3TlsConfig, HttpStep, MatchHeaders, QuicRefuser, ScriptedH2Backend,
-    ScriptedH3Backend, ScriptedHttp1Backend, ScriptedTcpBackend, ScriptedTlsBackend, TcpStep,
-    TlsConfig,
+    H2Step, H3Step, H3TlsConfig, HttpStep, MatchHeaders, QuicRefuser, RequestMatcher,
+    ScriptedH2Backend, ScriptedH3Backend, ScriptedHttp1Backend, ScriptedTcpBackend,
+    ScriptedTlsBackend, TcpStep, TlsConfig,
 };
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{GetOptions, Http2Client, Http3Client};
@@ -5108,6 +5108,15 @@ async fn h3_sse_stall_after_first_event_classifies_read_write_timeout() {
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
     let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        // Drain the request before answering. Unlike the H1/H2 arms of this
+        // matrix — where the gateway forwards a bodiless GET as a bodiless
+        // request — the H3 bridge always hands reqwest a STREAMING request
+        // body, so a backend that answers without ever reading is a
+        // simultaneous early-response/unread-upload case rather than the plain
+        // response stall #4057 is about. `TrickleBody`, used by the
+        // progressing-SSE sibling below, consumes the request implicitly for
+        // the same reason.
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
         .step(HttpStep::RespondStatus {
             status: 200,
             reason: "OK".into(),

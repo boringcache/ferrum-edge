@@ -454,6 +454,16 @@ fn test_upload_gate_maps_pump_write_timeout_to_backend_write_timeout() {
         ),
         DirectH2UploadGateForTest::BackendWriteTimeout
     );
+    // No adapter report at all. This is the shape the dispatcher sees when its
+    // OWN wait ended on the pump's write watermark rather than on the
+    // completion channel — the seam that makes `backend_write_timeout_ms`
+    // client-visible at the watermark instead of at `backend_read_timeout_ms`
+    // (#4055). Collapsing it into `FailClosed` would republish a diagnosed
+    // backend write stall as an anonymous 502.
+    assert_eq!(
+        direct_h2_upload_gate_for_test(None, Some(UploadPumpOutcomeForTest::WriteTimeout), false),
+        DirectH2UploadGateForTest::BackendWriteTimeout
+    );
 }
 
 #[test]
@@ -480,6 +490,21 @@ fn test_upload_gate_keeps_other_pump_terminals_fail_closed() {
         direct_h2_upload_gate_for_test(Some(RequestBodyOutcome::Errored), None, false),
         DirectH2UploadGateForTest::FailClosed
     );
+    // Same, with no adapter report either: only a WRITE-watermark terminal may
+    // promote a missing size decision to a 504.
+    for pump in [
+        UploadPumpOutcomeForTest::Completed,
+        UploadPumpOutcomeForTest::SourceError,
+        UploadPumpOutcomeForTest::Cancelled,
+        UploadPumpOutcomeForTest::AuthorizationExpired,
+        UploadPumpOutcomeForTest::ConsumerGone,
+    ] {
+        assert_eq!(
+            direct_h2_upload_gate_for_test(None, Some(pump), false),
+            DirectH2UploadGateForTest::FailClosed,
+            "pump {pump:?} must not turn a missing size decision into a 504"
+        );
+    }
 }
 
 #[test]

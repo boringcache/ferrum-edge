@@ -434,6 +434,82 @@ struct PlainPeerGoneBeforeResponseHeadersCtx<'a> {
     response_streamed: bool,
 }
 
+/// Arguments for the ONE pre-header backend-timeout terminal on the plain
+/// H3→HTTP bridge.
+struct PlainBackendTimeoutTerminalCtx<'a> {
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    epoch: &'a RequestEpoch,
+    upstream_balancer: Option<&'a Arc<LoadBalancer>>,
+    current_target: Option<&'a UpstreamTarget>,
+    cb_target_key: Option<&'a str>,
+    cb_is_half_open_probe: bool,
+    backend_start: Instant,
+    backend_admission_elapsed: Duration,
+    bytes_sent: u64,
+    current_url: &'a str,
+}
+
+/// Write the 504 / `backend_timeout` terminal for a per-direction watermark
+/// that expired BEFORE any response header was committed.
+///
+/// Shared by the prebuffered and streaming-upload arms, and by both
+/// watermarks (`backend_read_timeout_ms` waiting for the response head, and
+/// `backend_write_timeout_ms` when the backend stopped reading the upload), so
+/// the two can never drift apart in status, body, header, or recorded
+/// classification.
+///
+/// `#[inline(never)]`: `dispatch_plain` is the largest coroutine on the H3 path
+/// and, at `opt-level = 0`, every temporary in a cold block inlined there is a
+/// permanent frame slot charged to every request that reaches it. Three
+/// separate copies of this terminal overflowed a tokio worker stack.
+#[inline(never)]
+async fn write_plain_backend_timeout_terminal<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    request_ctx: &mut RequestContext,
+    backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
+    args: PlainBackendTimeoutTerminalCtx<'_>,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    record_cross_protocol_backend_admission_outcome(
+        backend_admission_permits,
+        504,
+        false,
+        Some(ErrorClass::ReadWriteTimeout),
+        args.backend_admission_elapsed,
+    );
+    record_backend_outcome(
+        args.state,
+        args.proxy,
+        &args.epoch.load_balancer,
+        args.upstream_balancer,
+        args.current_target,
+        args.cb_target_key,
+        504,
+        false,
+        Some(ErrorClass::ReadWriteTimeout),
+        args.cb_is_half_open_probe,
+        false,
+        args.backend_start.elapsed(),
+    );
+    let mut outcome = write_plain_gateway_error(
+        stream,
+        request_ctx,
+        StatusCode::GATEWAY_TIMEOUT,
+        r#"{"error":"Backend timeout"}"#,
+        Some(("x-gateway-error", "backend_timeout")),
+        args.backend_start,
+        args.bytes_sent,
+    )
+    .await?;
+    outcome.backend_target = Some(strip_query_from_backend_url(args.current_url));
+    outcome.connection_error = false;
+    outcome.error_class = Some(ErrorClass::ReadWriteTimeout);
+    Ok(outcome)
+}
+
 fn plain_peer_gone_before_response_headers(
     ctx: PlainPeerGoneBeforeResponseHeadersCtx<'_>,
 ) -> CrossProtocolOutcome {
@@ -2631,30 +2707,71 @@ where
                         Err(outcome) => return Ok(outcome),
                     };
 
-                    let send_result = match await_h3_backend_or_peer(
-                        plain_write_bound.deadline(),
-                        ctx.peer_connection.as_ref(),
-                        crate::http3::stream_util::peer_response_cancelled(stream),
-                        build_plain_request_builder(
-                            &client,
-                            state,
-                            dispatch_proxy,
-                            req_method.clone(),
-                            proxy_headers,
-                            dial_url,
-                            effective_host,
-                            client_ip,
-                            xff_append_ip,
-                            ctx.request_is_secure,
-                            ctx.is_early_data,
-                        )
-                        .body(buffered_body.clone())
-                        .send(),
+                    // `build_plain_request_builder` no longer installs reqwest's
+                    // `RequestBuilder::timeout()` — that clock runs through
+                    // response-body completion and kills a legitimate SSE stream
+                    // (#4057) — so the operator's response-header bound is armed
+                    // HERE instead. Without it this prebuffered arm (every
+                    // bodiless request, including a plain GET) would wait on a
+                    // backend that never sends a response head until the client
+                    // gave up, silently dropping the header-only-stall 504 that
+                    // #3922 established. `0` still disables it.
+                    let header_bound = crate::proxy::bounded_response_header_wait(
+                        await_h3_backend_or_peer(
+                            plain_write_bound.deadline(),
+                            ctx.peer_connection.as_ref(),
+                            crate::http3::stream_util::peer_response_cancelled(stream),
+                            build_plain_request_builder(
+                                &client,
+                                state,
+                                dispatch_proxy,
+                                req_method.clone(),
+                                proxy_headers,
+                                dial_url,
+                                effective_host,
+                                client_ip,
+                                xff_append_ip,
+                                ctx.request_is_secure,
+                                ctx.is_early_data,
+                            )
+                            .body(buffered_body.clone())
+                            .send(),
+                        ),
+                        dispatch_proxy.backend_read_timeout_ms,
                     )
-                    .await
-                    {
-                        H3BackendOrPeer::Ready(result) => result,
-                        H3BackendOrPeer::Deadline => {
+                    .await;
+                    let send_result = match header_bound {
+                        Err(()) => {
+                            drop(pending_slot);
+                            crate::http3::stream_util::halt_request_body(stream);
+                            warn!(
+                                proxy_id = %proxy.id,
+                                watermark = "backend_read_timeout_ms",
+                                watermark_ms = dispatch_proxy.backend_read_timeout_ms,
+                                "cross-protocol H3 to HTTP: read timeout waiting for backend response headers"
+                            );
+                            return write_plain_backend_timeout_terminal(
+                                stream,
+                                ctx,
+                                &mut backend_admission_permits,
+                                PlainBackendTimeoutTerminalCtx {
+                                    state,
+                                    proxy,
+                                    epoch,
+                                    upstream_balancer,
+                                    current_target: current_target.as_deref(),
+                                    cb_target_key: current_cb_target_key.as_deref(),
+                                    cb_is_half_open_probe: cb_retry_probe_slot_available,
+                                    backend_start,
+                                    backend_admission_elapsed: backend_admission_start.elapsed(),
+                                    bytes_sent,
+                                    current_url: &current_url,
+                                },
+                            )
+                            .await;
+                        }
+                        Ok(H3BackendOrPeer::Ready(result)) => result,
+                        Ok(H3BackendOrPeer::Deadline) => {
                             drop(pending_slot);
                             if let Some(termination) = plain_write_bound.expired_authorization() {
                                 ctx.record_authorization_termination_once(
@@ -2714,7 +2831,7 @@ where
                             )
                             .await;
                         }
-                        H3BackendOrPeer::PeerGone => {
+                        Ok(H3BackendOrPeer::PeerGone) => {
                             drop(pending_slot);
                             crate::http3::stream_util::halt_request_body(stream);
                             return Ok(plain_peer_gone_before_response_headers(
@@ -3478,6 +3595,15 @@ where
                     crate::proxy::auth_lifetime::StreamAuthTermination,
                 > = None;
                 let mut header_wait_expired = false;
+                let mut backend_write_watermark_expired = false;
+                // Set by every pre-header terminal that leaves the request-body
+                // reader running. The halt sequence itself is hoisted BELOW the
+                // loop so it exists once rather than once per arm: this
+                // dispatcher's state machine is already the largest on the H3
+                // path, and a debug/coverage build overflows a tokio worker
+                // stack if each terminal carries its own copy of the
+                // `timeout(.., &mut reader_future)` await.
+                let mut halt_reader_after_loop = false;
                 let peer_signal = ctx.peer_connection.clone();
                 let mut peer_gone = peer_signal
                     .as_ref()
@@ -3516,7 +3642,7 @@ where
                     };
                     tokio::pin!(peer_closed);
                     let mut reader_done = false;
-                    loop {
+                    let resolved = loop {
                         tokio::select! {
                             biased;
                             // The captured earliest bound is FIRST so an already-
@@ -3531,26 +3657,13 @@ where
                             _ = &mut header_wait, if header_wait_active => {
                                 header_wait_expired = true;
                                 drop(pending_slot.take());
-                                if !reader_done {
-                                    halt_notify.notify_one();
-                                    let halt_deadline = Duration::from_millis(100);
-                                    let _ = tokio::time::timeout(
-                                        halt_deadline,
-                                        &mut reader_future,
-                                    )
-                                    .await;
-                                }
+                                halt_reader_after_loop = true;
                                 break None;
                             }
                             _ = &mut stream_cancelled => {
                                 drop(pending_slot.take());
                                 peer_gone = true;
-                                if !reader_done {
-                                    halt_notify.notify_one();
-                                    let halt_deadline = Duration::from_millis(100);
-                                    let _ = tokio::time::timeout(halt_deadline, &mut reader_future)
-                                        .await;
-                                }
+                                halt_reader_after_loop = true;
                                 break None;
                             }
                             _ = &mut peer_closed => {
@@ -3588,6 +3701,18 @@ where
                                     peer_gone = true;
                                     break None;
                                 }
+                                // Same ordering hazard for the write watermark:
+                                // the reader's `TimedOut` bridge item can make
+                                // send() ready with a transport error in the
+                                // same poll. The gateway ended that upload, so
+                                // the terminal is the watermark's 504, not
+                                // whatever class the resulting reqwest error
+                                // happens to map to (#4055). A SUCCESSFUL
+                                // response still wins — the backend answered.
+                                if result.is_err() && write_timed_out.load(Ordering::Acquire) {
+                                    backend_write_watermark_expired = true;
+                                    break None;
+                                }
                                 break Some(result);
                             }
                             _ = &mut reader_future, if !reader_done => {
@@ -3597,9 +3722,35 @@ where
                                     peer_gone = true;
                                     break None;
                                 }
+                                // The reader gave up handing the client upload
+                                // to reqwest for `backend_write_timeout_ms`
+                                // (#4055). It queued a `TimedOut` item on the
+                                // bridge, but reqwest's connection task is
+                                // parked on socket writability — the exact
+                                // state a backend that never reads puts it in —
+                                // so it will not poll the body stream to see
+                                // it. End the exchange on the write watermark
+                                // here instead of running on to whatever
+                                // `backend_read_timeout_ms` happens to be.
+                                if write_timed_out.load(Ordering::Acquire) {
+                                    drop(pending_slot.take());
+                                    backend_write_watermark_expired = true;
+                                    break None;
+                                }
                             }
                         }
+                    };
+                    // The one halt sequence shared by every pre-header terminal
+                    // that left the reader running. `halt_notify` makes the
+                    // reader stop the recv half itself (STOP_SENDING +
+                    // H3_NO_ERROR) rather than having its future dropped, which
+                    // the peer would see as RESET_STREAM(0x0).
+                    if halt_reader_after_loop && !reader_done {
+                        halt_notify.notify_one();
+                        let halt_deadline = Duration::from_millis(100);
+                        let _ = tokio::time::timeout(halt_deadline, &mut reader_future).await;
                     }
+                    resolved
                 };
                 // Final safety net: regardless of how the reader exited
                 // (notified, naturally, oversized, recv error, or dropped
@@ -3657,42 +3808,47 @@ where
                         )
                         .await;
                     }
-                    if header_wait_expired {
-                        record_cross_protocol_backend_admission_outcome(
-                            &mut backend_admission_permits,
-                            504,
-                            false,
-                            Some(ErrorClass::ReadWriteTimeout),
-                            backend_admission_start.elapsed(),
+                    if header_wait_expired || backend_write_watermark_expired {
+                        // One macro, two attributions. At `opt-level = 0` each
+                        // `warn!` invocation is its own set of allocas in this
+                        // already-oversized coroutine, so the branch picks
+                        // fields rather than duplicating the site.
+                        let (watermark, watermark_ms) = if backend_write_watermark_expired {
+                            (
+                                "backend_write_timeout_ms",
+                                dispatch_proxy.backend_write_timeout_ms,
+                            )
+                        } else {
+                            (
+                                "backend_read_timeout_ms",
+                                dispatch_proxy.backend_read_timeout_ms,
+                            )
+                        };
+                        warn!(
+                            proxy_id = %proxy.id,
+                            watermark,
+                            watermark_ms,
+                            "cross-protocol H3 to HTTP: per-direction watermark expired before response headers"
                         );
-                        record_backend_outcome(
-                            state,
-                            proxy,
-                            &epoch.load_balancer,
-                            upstream_balancer,
-                            current_target.as_deref(),
-                            current_cb_target_key.as_deref(),
-                            504,
-                            false,
-                            Some(ErrorClass::ReadWriteTimeout),
-                            cb_retry_probe_slot_available,
-                            false,
-                            backend_start.elapsed(),
-                        );
-                        let mut outcome = write_plain_gateway_error(
+                        return write_plain_backend_timeout_terminal(
                             stream,
                             ctx,
-                            StatusCode::GATEWAY_TIMEOUT,
-                            r#"{"error":"Backend timeout"}"#,
-                            Some(("x-gateway-error", "backend_timeout")),
-                            backend_start,
-                            bytes_sent,
+                            &mut backend_admission_permits,
+                            PlainBackendTimeoutTerminalCtx {
+                                state,
+                                proxy,
+                                epoch,
+                                upstream_balancer,
+                                current_target: current_target.as_deref(),
+                                cb_target_key: current_cb_target_key.as_deref(),
+                                cb_is_half_open_probe: cb_retry_probe_slot_available,
+                                backend_start,
+                                backend_admission_elapsed: backend_admission_start.elapsed(),
+                                bytes_sent,
+                                current_url: &current_url,
+                            },
                         )
-                        .await?;
-                        outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
-                        outcome.connection_error = false;
-                        outcome.error_class = Some(ErrorClass::ReadWriteTimeout);
-                        return Ok(outcome);
+                        .await;
                     }
                     if peer_gone {
                         return Ok(plain_peer_gone_before_response_headers(
@@ -3817,30 +3973,29 @@ where
                             false,
                             backend_start.elapsed(),
                         );
-                        if attempt_result.status_code == 504 {
-                            let mut outcome = write_plain_gateway_error(
-                                stream,
-                                ctx,
-                                StatusCode::GATEWAY_TIMEOUT,
-                                r#"{"error":"Backend timeout"}"#,
-                                Some(("x-gateway-error", "backend_timeout")),
-                                backend_start,
-                                bytes_sent,
-                            )
-                            .await?;
-                            outcome.backend_target =
-                                Some(strip_query_from_backend_url(&current_url));
-                            outcome.connection_error = attempt_result.connection_error;
-                            outcome.error_class = attempt_result.error_class;
-                            outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
-                            return Ok(outcome);
-                        }
+                        // A classified backend TIMEOUT keeps the 504 /
+                        // `backend_timeout` shape the read- and write-watermark
+                        // terminals use; everything else stays the 502 this
+                        // site has always written. One writer, so the two
+                        // shapes cannot drift and this dispatcher's already
+                        // very large state machine does not carry a second
+                        // copy of the response-write await.
+                        let (timeout_status, timeout_body, timeout_header) =
+                            if attempt_result.status_code == 504 {
+                                (
+                                    StatusCode::GATEWAY_TIMEOUT,
+                                    r#"{"error":"Backend timeout"}"#,
+                                    Some(("x-gateway-error", "backend_timeout")),
+                                )
+                            } else {
+                                (StatusCode::BAD_GATEWAY, r#"{"error":"Bad Gateway"}"#, None)
+                            };
                         let mut outcome = write_plain_gateway_error(
                             stream,
                             ctx,
-                            StatusCode::BAD_GATEWAY,
-                            r#"{"error":"Bad Gateway"}"#,
-                            None,
+                            timeout_status,
+                            timeout_body,
+                            timeout_header,
                             backend_start,
                             bytes_sent,
                         )

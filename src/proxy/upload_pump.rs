@@ -297,6 +297,12 @@ impl UploadPumpSource {
 pub(crate) struct UploadPumpJoin {
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
     finished: Option<tokio::sync::oneshot::Receiver<UploadPumpOutcome>>,
+    /// Fires ONLY for [`UploadPumpOutcome::WriteTimeout`], and only after the
+    /// task has published its terminal and dropped the client body. Every
+    /// other terminal drops the sender instead, which
+    /// [`backend_write_watermark_expired`](UploadPumpJoin::backend_write_watermark_expired)
+    /// turns into "never" rather than a spurious wake.
+    write_timeout: Option<tokio::sync::oneshot::Receiver<()>>,
     /// Shared with the pump task and with [`UploadPumpSource`]'s abort guard.
     /// Read only as a FALLBACK, when the task published no outcome of its own
     /// because it was aborted — which is exactly what releasing the transport
@@ -355,6 +361,42 @@ impl UploadPumpJoin {
         self.await_outcome().await
     }
 
+    /// Resolve when — and only when — the pump ends on the backend write
+    /// watermark (`backend_write_timeout_ms`, issue #4055).
+    ///
+    /// This exists because the pump's terminal reaches the backend transport
+    /// only through the transport BODY, and every transport that matters is
+    /// parked outside a body poll exactly when a backend stops reading: hyper's
+    /// HTTP/2 pipe sits in `poll_capacity`, an HTTP/1.1 connection task sits on
+    /// socket writability, and reqwest's connection task does either. A
+    /// dispatcher that waits only on the response head would therefore run past
+    /// the write watermark and end on whatever later bound happens to be
+    /// configured. Racing this future against that wait is what makes the
+    /// watermark client-visible at the watermark.
+    ///
+    /// Cancel-safe, and non-consuming: the `finished` channel is untouched, so
+    /// a caller that loses this race can still [`cancel_and_join`] and read the
+    /// typed terminal. Any other terminal — and a pump with no write bound at
+    /// all — drops the sender, which this turns into a future that stays
+    /// pending forever, so a `select!` arm built on it cannot fire spuriously.
+    ///
+    /// [`cancel_and_join`]: Self::cancel_and_join
+    pub(crate) async fn backend_write_watermark_expired(&mut self) {
+        loop {
+            match self.write_timeout.as_mut() {
+                Some(receiver) => {
+                    if await_oneshot_signal(receiver).await.is_ok() {
+                        return;
+                    }
+                    // Sender dropped without firing: this pump settled on some
+                    // other terminal and can never report a write timeout.
+                    self.write_timeout = None;
+                }
+                None => never().await,
+            }
+        }
+    }
+
     /// The pump's terminal state: its own published outcome when it ran to a
     /// terminal, otherwise the shared one.
     ///
@@ -402,6 +444,7 @@ where
     let (sender, receiver) = tokio::sync::mpsc::channel(UPLOAD_PUMP_CHANNEL_CAPACITY);
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+    let (write_timeout_tx, write_timeout_rx) = tokio::sync::oneshot::channel();
     let terminal = Arc::new(AtomicU8::new(PUMP_RUNNING));
     let task_terminal = Arc::clone(&terminal);
     let plan = plan.cloned();
@@ -413,6 +456,7 @@ where
             plan,
             write_timeout_ms,
             task_terminal,
+            write_timeout_tx,
         )
         .await;
         let _ = finished_tx.send(outcome);
@@ -433,6 +477,7 @@ where
         UploadPumpJoin {
             cancel: Some(cancel_tx),
             finished: Some(finished_rx),
+            write_timeout: Some(write_timeout_rx),
             terminal,
             cancel_on_drop: false,
         },
@@ -448,12 +493,13 @@ where
 async fn cancel_requested(cancel: &mut Option<tokio::sync::oneshot::Receiver<()>>) {
     loop {
         let signalled = match cancel.as_mut() {
-            Some(receiver) => await_cancel_signal(receiver).await,
+            Some(receiver) => await_oneshot_signal(receiver).await,
             None => {
                 // Disarmed: no cancellation can ever arrive, so this arm must
                 // stay pending for the rest of the relay. `pending::<Infallible>()`
                 // has an uninhabited output, so the empty match expresses "this
-                // await never resolves" as a type, not as a proxy-path panic.
+                // await never resolves" as a type — and, unlike `never()`, it
+                // types as this arm's `Result` — not as a proxy-path panic.
                 match std::future::pending::<std::convert::Infallible>().await {}
             }
         };
@@ -464,8 +510,19 @@ async fn cancel_requested(cancel: &mut Option<tokio::sync::oneshot::Receiver<()>
     }
 }
 
-/// Await a borrowed `oneshot::Receiver` without consuming it.
-async fn await_cancel_signal(
+/// A future that never resolves, expressed as a type rather than as a
+/// proxy-path panic: `pending::<Infallible>()` has an uninhabited output, so
+/// the empty match is the "this await never returns" proof.
+async fn never() {
+    match std::future::pending::<std::convert::Infallible>().await {}
+}
+
+/// Await a borrowed `oneshot::Receiver<()>` without consuming it.
+///
+/// Shared by the cancellation arm and the write-watermark arm: both need to
+/// poll their channel repeatedly across `select!` iterations while keeping the
+/// receiver so a later `Err` can disarm it.
+async fn await_oneshot_signal(
     receiver: &mut tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), tokio::sync::oneshot::error::RecvError> {
     std::future::poll_fn(|cx| std::future::Future::poll(Pin::new(&mut *receiver), cx)).await
@@ -478,6 +535,7 @@ async fn run_upload_pump<B>(
     plan: Option<RequestAuthLifetimePlan>,
     write_timeout_ms: u64,
     terminal: Arc<AtomicU8>,
+    write_timeout_tx: tokio::sync::oneshot::Sender<()>,
 ) -> UploadPumpOutcome
 where
     B: http_body::Body<Data = Bytes> + Unpin,
@@ -501,10 +559,8 @@ where
     let outcome = loop {
         // Reserve capacity BEFORE reading the client, so a transport that
         // stops draining stops the read rather than filling a buffer.
-        if write_armed {
-            if let Some(at) = tokio::time::Instant::now().checked_add(write_idle_dur) {
-                write_idle.as_mut().reset(at);
-            }
+        if write_armed && let Some(at) = tokio::time::Instant::now().checked_add(write_idle_dur) {
+            write_idle.as_mut().reset(at);
         }
         let permit = tokio::select! {
             biased;
@@ -548,6 +604,12 @@ where
     // Explicit, and the whole point of this module: the gateway stops owning
     // the inbound client body here, whatever the backend transport is doing.
     drop(body);
+    // Published LAST, so a dispatcher woken by this signal already observes
+    // the terminal state, the closed bridge, and a released client body. Only
+    // the write watermark publishes it; every other terminal drops the sender.
+    if outcome == UploadPumpOutcome::WriteTimeout {
+        let _ = write_timeout_tx.send(());
+    }
     outcome
 }
 

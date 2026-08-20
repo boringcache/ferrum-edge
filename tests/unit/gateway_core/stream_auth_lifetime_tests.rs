@@ -2179,9 +2179,29 @@ fn the_direct_h2_upload_join_reports_authorization_rather_than_an_indeterminate_
         .next()
         .expect("bounded authorization-expired arm");
     assert!(authorization.contains("authorization_expired_dispatch_placeholder("));
-    assert!(PROXY_SOURCE.contains("let authorization_expired = upload_auth_deadline"));
-    assert!(PROXY_SOURCE.contains("latch.observed().is_some()"));
-    assert!(PROXY_SOURCE.contains("auth_lifetime::expired_authorization(Some(*plan))"));
+    // The recheck itself, bounded by its own binding rather than pinned to one
+    // line. rustfmt is free to move `upload_auth_deadline` onto the next line
+    // (and has), so a single-line `contains` would be a formatting contract,
+    // not a semantic one.
+    let recheck = PROXY_SOURCE
+        .split("let authorization_expired =")
+        .nth(1)
+        .expect("direct-H2 pre-commit authorization recheck")
+        .split("match classify_direct_h2_upload_outcome(")
+        .next()
+        .expect("bounded authorization recheck");
+    assert!(
+        recheck.contains("upload_auth_deadline"),
+        "the recheck must read the request's own absolute plan: {recheck}"
+    );
+    assert!(
+        recheck.contains("latch.observed().is_some()"),
+        "an expiry already latched elsewhere must short-circuit: {recheck}"
+    );
+    assert!(
+        recheck.contains("auth_lifetime::expired_authorization(Some(*plan))"),
+        "the recheck must consult the absolute deadline, not a cached flag: {recheck}"
+    );
 }
 
 #[test]
@@ -2967,12 +2987,14 @@ fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
 #[test]
 fn the_direct_h2_handler_joins_its_upload_before_returning() {
     // Every bounded direct-H2 exit, plus the normal completion path, joins the
-    // pump; the residual error exits are covered by `cancel_on_drop`.
+    // pump; the residual error exits are covered by `cancel_on_drop`. The three
+    // bounded exits are the response-header deadline, the early-response upload
+    // join, and the backend write watermark (#4055).
     assert_eq!(
         PROXY_SOURCE
             .matches("pump.cancel_and_join().await;")
             .count(),
-        2,
+        3,
         "a direct-H2 bounded exit stopped joining the gateway-owned upload"
     );
     assert!(

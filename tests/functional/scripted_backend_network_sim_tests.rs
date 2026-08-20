@@ -146,50 +146,46 @@ async fn slow_backend_within_read_timeout_completes() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Test 2 — throttled backend + tight backend_read_timeout fires 502.
+// Test 2 — a bandwidth-throttled but continuously PROGRESSING backend
+// response is not killed by `backend_read_timeout_ms`.
 // ────────────────────────────────────────────────────────────────────────────
 //
+// `backend_read_timeout_ms` is a per-direction IDLE watermark, not a
+// whole-exchange clock (issues #4055 / #4057, `docs/error_classification.md`).
+// It used to be installed as reqwest's `RequestBuilder::timeout()`, which runs
+// from `send()` through response-body completion — so this test previously
+// asserted that a 16 KiB body at 1 KiB/s must be killed at ~400 ms. That
+// contract was retired deliberately: the same clock also killed a legitimate
+// slow-but-progressing SSE stream, which is the whole of #4057.
+//
+// The bandwidth wrapper is a token bucket that hands back at least one byte
+// every `1/rate` seconds, so a throttled transfer never goes idle — its
+// inter-chunk gap is ~1 ms, three orders of magnitude below the watermark.
+// The correct behaviour is therefore that the transfer COMPLETES, slowly.
+//
 // Fixture:
-//   - `ScriptedHttp1Backend` that responds **immediately** with a large
-//     body. No backend `Sleep` — if the bandwidth limiter is a no-op,
-//     the full body transfers in a few ms and the gateway returns 200
-//     under the tight 400 ms budget. That makes the bandwidth wrapper
-//     the sole forcing function for this test.
-//   - `NetworkSimProxy` with a 1 KiB/s bandwidth cap. With a 16 KiB
-//     body, after the 1-second burst there is still ~15 KiB left to
-//     drain at 1024 B/s ≈ 15 s — well past the gateway's 400 ms budget.
+//   - `ScriptedHttp1Backend` that responds immediately with a `Content-Length`
+//     body and no `Sleep`, so the limiter is the only thing that can slow it.
+//   - `NetworkSimProxy` with a 1 KiB/s cap and 50 ms of latency.
 //   - Gateway with `backend_read_timeout_ms = 400`.
 //
-// Expected: one of the two valid "bandwidth wrapper did its job"
-// outcomes, because ferrum-edge can legitimately reach either:
-//   - the gateway fully times out before forwarding any body to the
-//     client → `502 Bad Gateway` (or `504 Gateway Timeout`);
-//   - the gateway streams the headers it already got from the
-//     first-burst window, then times out mid-body → client sees
-//     `200 OK` with a body shorter than the advertised
-//     `Content-Length` (i.e., truncated). Which path fires depends on
-//     whether the gateway eagerly buffered the response or streamed
-//     it; both prove the bandwidth wrapper forced a timeout. We also
-//     check elapsed ≥ a floor below the timeout, so a no-op limiter
-//     (instant 200 + full body) still fails the test.
+// Expected: `200 OK` with the COMPLETE body, taking materially longer than an
+// unthrottled transfer. The elapsed floor is what still catches a no-op
+// limiter (which would finish in a few ms); the full body is what catches the
+// idle watermark being re-armed on anything other than real backend progress.
 //
-// Note: the plan calls this a "write timeout" because the gateway
-// writes the client's body to the backend and the backend consumes
-// slowly. That behaviour is only observable via
-// `backend_write_timeout_ms` on *raw TCP* proxies (see
-// `src/proxy/tcp_proxy.rs`); for HTTP/1 via reqwest the gateway's
-// per-request budget is `backend_read_timeout_ms`. This test
-// exercises the HTTP path — the only surface that matters for
-// scripted HTTP backends. The TCP write-timeout path has its own
-// Phase-1 coverage via `backend_read_timeout_fires_after_backend_read_timeout_ms`.
+// The "backend consumes the gateway's write slowly" direction is
+// `backend_write_timeout_ms`, covered for raw TCP in `src/proxy/tcp_proxy.rs`
+// and for the HTTP family by the gateway-owned upload pump
+// (`scripted_backend_tests::h1_backend_write_timeout_maps_to_504_backend_timeout`
+// and its H2/H3 siblings). A bandwidth cap cannot exercise it: the backend here
+// keeps reading.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn backend_bandwidth_below_budget_triggers_write_timeout() {
-    // 16 KiB response body. At 1024 B/s with a 1-second burst, the
-    // first ~1 KiB arrives instantly and the remaining 15 KiB takes
-    // ~15 seconds to drain — which is what makes the bandwidth
-    // wrapper the causal agent for the 400 ms gateway timeout.
-    const BODY_SIZE: usize = 16 * 1024;
+async fn backend_bandwidth_below_budget_does_not_trip_idle_read_timeout() {
+    // 4 KiB at 1024 B/s with a 1-second burst: ~3 s of drain. Enough to be
+    // unambiguously throttled, small enough to keep the test cheap.
+    const BODY_SIZE: usize = 4 * 1024;
     let body = vec![b'x'; BODY_SIZE];
 
     let backend_res = reserve_port().await.expect("backend port");
@@ -247,64 +243,58 @@ async fn backend_bandwidth_below_budget_triggers_write_timeout() {
         .expect("response");
     let elapsed = started.elapsed();
 
-    // Floor below the 400 ms budget — a no-op bandwidth limiter would
-    // finish in a few ms, so `elapsed >= 200 ms` catches that
-    // regression without being flaky on a loaded host.
+    // A no-op bandwidth limiter would finish in a few ms. This floor is well
+    // above the configured 400 ms watermark, so it also proves the transfer
+    // ran PAST the watermark without being killed.
     assert!(
-        elapsed >= Duration::from_millis(200),
-        "bandwidth wrapper should have slowed the transfer past 200 ms; \
+        elapsed >= Duration::from_millis(600),
+        "bandwidth wrapper should have slowed the transfer past 600 ms; \
          got {elapsed:?} — is the limiter a no-op?"
     );
-    // Upper bound: gateway must give up promptly, not hang the whole
-    // test. ~1.5× the configured budget plus a generous margin.
+    // A generous hang guard only. There is deliberately no tight ceiling: the
+    // gateway is not supposed to give up on a progressing stream, so the
+    // wall-clock here is the limiter's, not a gateway budget's.
     assert!(
-        elapsed <= Duration::from_millis(3000),
-        "took too long ({elapsed:?}); gateway should have given up at ~400ms"
+        elapsed <= Duration::from_secs(20),
+        "throttled transfer hung ({elapsed:?}); expected ~3 s at 1 KiB/s"
     );
 
-    let is_upstream_timeout = matches!(
+    assert_eq!(
         resp.status,
-        StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT
+        StatusCode::OK,
+        "a throttled but continuously progressing response must not be \
+         classified as a backend timeout; got status={} body_bytes={} after {:?}",
+        resp.status,
+        resp.body_bytes.len(),
+        elapsed
     );
-    let is_truncated_body = resp.status == StatusCode::OK && resp.body_bytes.len() < BODY_SIZE;
-    assert!(
-        is_upstream_timeout || is_truncated_body,
-        "expected either 502/504 (eager-buffered path timed out) or \
-         200 with truncated body (streamed path timed out mid-body); \
-         got status={} body_bytes={} after {:?}. Full body would indicate \
-         a no-op bandwidth limiter.",
+    assert_eq!(
+        resp.body_bytes.len(),
+        BODY_SIZE,
+        "the idle watermark must re-arm on every received chunk, so the \
+         complete body must survive; got status={} body_bytes={} after {:?}",
         resp.status,
         resp.body_bytes.len(),
         elapsed,
     );
 
-    // Verify the gateway's logs carry a bandwidth-induced failure
-    // signal. Depending on whether ferrum-edge eager-buffered or
-    // streamed the response, this surfaces as either a plain timeout
-    // string (eager-buffered path) or a body-read failure like
-    // "Failed to read backend response body" (streamed path — reqwest
-    // drops the connection once its per-request `.timeout(400ms)`
-    // fires, which shows up as a decode error in the streaming body
-    // reader). Both indicate the gateway gave up on the backend.
-    let saw_timeout_signal = |logs: &str| {
-        logs.contains("read_timeout")
-            || logs.contains("Timeout")
-            || logs.contains("timeout")
-            || logs.contains("GatewayTimeout")
-            || logs.contains("502")
-            || logs.contains("Backend request failed")
-            || logs.contains("Failed to read backend response body")
-            || logs.contains("error decoding response body")
-    };
-    // Poll: the failure signal flushes through the non-blocking writer after
-    // the client's per-request timeout fires, so a single snapshot races it.
-    let logs = harness
-        .wait_for_log_contains(&saw_timeout_signal, Duration::from_secs(5))
-        .await;
-    assert!(
-        saw_timeout_signal(&logs),
-        "expected timeout/502 or body-read-failure signal in gateway logs:\n{logs}"
-    );
+    // The complementary half of the contract: the gateway must not have
+    // *diagnosed* a per-direction watermark either. A 200 with a complete body
+    // could in principle coexist with a spurious warning, and that warning is
+    // what an operator dashboard and the circuit breaker would act on.
+    let (stdout, stderr) = harness.captured_output().expect("captured output");
+    let logs = format!("{stdout}{stderr}");
+    for marker in [
+        "read_write_timeout",
+        "Backend read timeout",
+        "Backend response body read timed out",
+    ] {
+        assert!(
+            !logs.contains(marker),
+            "a throttled but progressing response must not be classified as a \
+             backend watermark expiry; found {marker:?} in gateway logs:\n{logs}"
+        );
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
