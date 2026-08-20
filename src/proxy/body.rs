@@ -2443,6 +2443,12 @@ pub struct DirectH2BytesLatch {
     notify: tokio::sync::Notify,
 }
 
+impl Default for DirectH2BytesLatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DirectH2BytesLatch {
     pub fn new() -> Self {
         Self {
