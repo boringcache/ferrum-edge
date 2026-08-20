@@ -212,10 +212,14 @@ fn scheduled_scaling_workflow_keeps_the_180_minute_matrix_and_signal_job() {
 }
 
 #[test]
-fn scaling_gate_publisher_jobs_share_serialized_concurrency() {
+fn scaling_gate_publisher_jobs_preserve_queued_work() {
     assert!(
         VERIFIER.contains("PUBLISHER_CONCURRENCY_GROUP = \"scaling-gate-publisher\""),
         "verifier must pin the shared scaling-gate publisher concurrency group"
+    );
+    assert!(
+        VERIFIER.contains("queue: max"),
+        "verifier must pin queue: max so pending publishers are preserved"
     );
     for (workflow, job_name) in [
         (WORKFLOW, "scaling-gate-signal"),
@@ -233,10 +237,61 @@ fn scaling_gate_publisher_jobs_share_serialized_concurrency() {
         assert!(
             job.contains("concurrency:")
                 && job.contains(&format!("group: {PUBLISHER_CONCURRENCY_GROUP}"))
-                && job.contains("cancel-in-progress: false"),
-            "{job_name} publisher job must share the serialized scaling-gate publisher concurrency group"
+                && job.contains("cancel-in-progress: false")
+                && job.contains("queue: max"),
+            "{job_name} publisher job must queue pending scaling-gate publishers without canceling in-progress work"
+        );
+        assert!(
+            !job.contains("cancel-in-progress: true"),
+            "{job_name} must not combine queue: max with cancel-in-progress: true"
         );
     }
+}
+
+#[test]
+fn scaling_gate_signal_is_generation_aware() {
+    assert!(
+        SIGNAL.contains("current_run_id == latest.run_id"),
+        "weekly SCALING_JOB_RESULT may be authoritative only for the exact latest scaling-regression run"
+    );
+    assert!(
+        SIGNAL.contains("latest_run_on_main(repo, token, now)"),
+        "every live invocation must query the latest scaling-regression run on main"
+    );
+    assert!(
+        SIGNAL.contains("parse_github_run_id"),
+        "signal must bind GITHUB_RUN_ID before mutating issues"
+    );
+    assert!(
+        !SIGNAL
+            .split("def self_test")
+            .next()
+            .expect("production signal")
+            .contains("GREEN_RESULTS | RED_RESULTS"),
+        "weekly success/failure must not skip the latest-run query"
+    );
+    for label in [
+        "stale older success over newer failure",
+        "stale older failure over newer fresh success",
+        "latest nonterminal",
+        "missing current run identity",
+        "malformed current run identity",
+        "history API failure",
+        "exact current run success",
+        "exact current run failure",
+        "numeric run-id is not generation order",
+    ] {
+        assert!(
+            SIGNAL.contains(label),
+            "signal self-test must cover {label}"
+        );
+    }
+    assert!(
+        VERIFIER.contains("stale older success over newer failure")
+            && VERIFIER.contains("exact current run success")
+            && VERIFIER.contains("queue: max"),
+        "verifier must pin generation-aware and queue-preservation contracts"
+    );
 }
 
 #[test]

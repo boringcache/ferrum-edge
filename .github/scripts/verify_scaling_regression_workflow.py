@@ -40,7 +40,16 @@ REQUIRED_LATEST_RUN_SELF_TESTS = (
     "stale latest success",
     "malformed latest item",
     "future timestamp",
+    "stale older success over newer failure",
+    "stale older failure over newer fresh success",
+    "latest nonterminal",
+    "missing current run identity",
+    "malformed current run identity",
+    "history API failure",
+    "exact current run success",
+    "exact current run failure",
 )
+PUBLISHER_QUEUE_MODE = "queue: max"
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,6 +103,11 @@ def require_publisher_job_concurrency(job_name: str, block: str, failures: list[
     require(
         "cancel-in-progress: false" in block,
         f"{job_name} publisher job must keep cancel-in-progress: false",
+        failures,
+    )
+    require(
+        PUBLISHER_QUEUE_MODE in block,
+        f"{job_name} publisher job must keep {PUBLISHER_QUEUE_MODE} so pending publishers are not replaced",
         failures,
     )
 
@@ -245,6 +259,31 @@ def validate_signal_text(text: str, failures: list[str]) -> None:
     require(
         "def latest_run_on_main" in production,
         "signal must inspect the latest scaling-regression run on main",
+        failures,
+    )
+    require(
+        "latest_run_on_main(repo, token, now)" in production,
+        "every live invocation must query the latest scaling-regression run on main",
+        failures,
+    )
+    require(
+        "parse_github_run_id" in production and "GITHUB_RUN_ID" in production,
+        "signal must bind the current weekly result to GITHUB_RUN_ID",
+        failures,
+    )
+    require(
+        "current_run_id == latest.run_id" in production,
+        "weekly job results may be authoritative only for the exact latest scaling-regression run",
+        failures,
+    )
+    require(
+        "not numeric run-id comparison" in production or "not numeric run-id" in production,
+        "signal must not treat numeric run-id ordering as generation order",
+        failures,
+    )
+    require(
+        "GREEN_RESULTS | RED_RESULTS" not in production,
+        "weekly success/failure must not skip the latest-run query",
         failures,
     )
     require(
@@ -401,6 +440,7 @@ jobs:
     concurrency:
       group: scaling-gate-publisher
       cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       actions: read
@@ -423,13 +463,21 @@ jobs:
     missing_publisher_concurrency: list[str] = []
     validate_workflow_text(
         good_workflow.replace(
-            "    concurrency:\n      group: scaling-gate-publisher\n      cancel-in-progress: false\n",
+            "    concurrency:\n      group: scaling-gate-publisher\n      cancel-in-progress: false\n      queue: max\n",
             "",
         ),
         missing_publisher_concurrency,
     )
     if not any("scaling-gate-signal" in item for item in missing_publisher_concurrency):
         failures.append("self-test expected missing publisher concurrency to fail")
+
+    missing_queue_failures: list[str] = []
+    validate_workflow_text(
+        good_workflow.replace("      queue: max\n", ""),
+        missing_queue_failures,
+    )
+    if not any("queue: max" in item for item in missing_queue_failures):
+        failures.append("self-test expected missing publisher queue: max to fail")
 
     good_freshness = """
 name: Scheduled Scaling Gate Freshness
@@ -443,6 +491,7 @@ jobs:
     concurrency:
       group: scaling-gate-publisher
       cancel-in-progress: false
+      queue: max
     permissions:
       issues: write
       actions: read
@@ -472,6 +521,11 @@ fail-closed
 SIGNAL_AUTHOR = "github-actions[bot]"
 "state": "all"
 def latest_run_on_main
+latest_run_on_main(repo, token, now)
+parse_github_run_id
+GITHUB_RUN_ID
+current_run_id == latest.run_id
+not numeric run-id comparison
 in_progress
 out of order
 def self_test
@@ -481,6 +535,14 @@ latest fresh success
 stale latest success
 malformed latest item
 future timestamp
+stale older success over newer failure
+stale older failure over newer fresh success
+latest nonterminal
+missing current run identity
+malformed current run identity
+history API failure
+exact current run success
+exact current run failure
 """
     signal_failures: list[str] = []
     validate_signal_text(good_signal, signal_failures)
@@ -505,6 +567,16 @@ future timestamp
     )
     if not any("newer failure plus older fresh success" in item for item in missing_label_failures):
         failures.append("self-test expected missing latest-run self-test label to fail")
+
+    missing_generation_failures: list[str] = []
+    validate_signal_text(
+        good_signal.replace("stale older success over newer failure\n", ""),
+        missing_generation_failures,
+    )
+    if not any(
+        "stale older success over newer failure" in item for item in missing_generation_failures
+    ):
+        failures.append("self-test expected missing generation self-test label to fail")
 
     if failures:
         for failure in failures:

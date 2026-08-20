@@ -4,13 +4,18 @@ name: Scheduled Scaling Gate Freshness
 # main. Only a completed success within eight days may close the blocker; a
 # newer red, skipped, or still-running run, or stale/missing history, keeps
 # it open. Reuses the same issue publisher as scaling-regression.yml. Does
-# not run the 10k/30k suites.
+# not run the 10k/30k suites. The publisher job shares
+# scaling-gate-publisher with queue: max and cancel-in-progress: false so
+# overlapping weekly/daily publishers stay queued. GitHub does not
+# guarantee FIFO among queued jobs; issue mutation follows the latest
+# scaling-regression.yml run on main, not this workflow's own run id.
 
 on:
   schedule:
     # 12:00 UTC sits after the Saturday 04:00 scaling matrix (180-minute
     # timeout ends by 07:00). Workflow concurrency stays distinct from the
-    # weekly matrix; the publisher job shares scaling-gate-publisher with it.
+    # weekly matrix; the publisher job shares scaling-gate-publisher with
+    # queue: max so pending weekly/daily publishers are not replaced.
     - cron: "0 12 * * *"
   workflow_dispatch:
 
@@ -29,6 +34,7 @@ jobs:
     concurrency:
       group: scaling-gate-publisher
       cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       actions: read

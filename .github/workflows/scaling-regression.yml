@@ -20,7 +20,12 @@ permissions:
 # The scaling-gate-signal job below is the durable alert for a red weekly
 # run. A separate daily freshness workflow reuses the same publisher so a
 # stale (unrun) gate cannot stay silent. Both upsert a `severity:high` issue
-# and must not mention required check names in live YAML.
+# and must not mention required check names in live YAML. Publisher jobs
+# share scaling-gate-publisher with queue: max and cancel-in-progress:
+# false so overlapping weekly/daily work stays queued instead of replacing
+# the default single pending job. GitHub does not guarantee FIFO among
+# queued jobs; the publisher is generation-aware and follows the latest
+# scaling-regression.yml run on main.
 
 env:
   CARGO_TERM_COLOR: always
@@ -216,6 +221,7 @@ jobs:
     concurrency:
       group: scaling-gate-publisher
       cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       actions: read

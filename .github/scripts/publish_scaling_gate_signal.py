@@ -3,18 +3,24 @@
 
 When the weekly scale/load matrix is red, or the latest scaling-regression run
 on `main` is not a completed success within the freshness ceiling, this program
-upserts a GitHub issue labeled `severity:high`. The current
-matrix result is authoritative for the scaling workflow itself: success closes,
-failure/cancel/timeout opens. Freshness inspects the latest run on `main` and
-must not treat an older success as green over a newer non-success. Only a
-latest completed success within the ceiling closes the issue, so a red or
-stale scaling gate always has an open, dated issue naming it.
+upserts a GitHub issue labeled `severity:high`. Every live invocation queries
+the latest `scaling-regression.yml` run on `main`. The current weekly
+`SCALING_JOB_RESULT` is bound to `GITHUB_RUN_ID` and is authoritative only
+when that exact run is the API's newest-first latest run. An older publisher
+derives the issue from that latest run, never from the stale job result: a
+newer completed fresh success may close, and a newer failure, cancel, timeout,
+skip, nonterminal, malformed, stale, missing, or API-unknown state keeps the
+issue open. A stale older success never closes over a newer red or in-progress
+run, and a stale older failure never reopens over a newer fresh success.
+Missing or malformed current-run identity fails closed and must not close.
 
 The program never grants itself extra credentials: it uses the job-scoped
 GITHUB_TOKEN with `issues: write` and `actions: read` only. It refuses
 pull_request events and refuses to mutate issues off `refs/heads/main`.
 Missing, malformed, out-of-order, future-dated, or API-failed history is
-treated as stale (fail-closed).
+treated as stale (fail-closed). Run links are constructed for the generation
+that drove the decision; an API html_url is used only after a strict
+same-repo Actions-run match.
 """
 
 from __future__ import annotations
@@ -50,6 +56,7 @@ ISO_Z_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
 )
 REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
+RUN_ID_RE = re.compile(r"^[1-9][0-9]*$")
 RED_RESULTS = frozenset({"failure", "cancelled", "timed_out"})
 GREEN_RESULTS = frozenset({"success"})
 SKIPPED_RESULTS = frozenset({"skipped", ""})
@@ -70,13 +77,16 @@ class Decision:
     action: str  # "open" | "close"
     reason: str
     fail_job: bool
+    source_run_id: int | None = None
 
 
 @dataclass(frozen=True)
 class LatestRun:
+    run_id: int
     status: str
     conclusion: str | None
     age_seconds: int
+    html_url: str | None = None
 
 
 def utc_now() -> datetime:
@@ -95,47 +105,121 @@ def parse_iso8601(value: Any, label: str = "timestamp") -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def decide(
-    job_result: str,
-    latest: LatestRun | None,
-    history_error: str | None,
-) -> Decision:
-    """Pure policy. Current matrix success/failure/cancel/timeout is authoritative.
+def parse_github_run_id(value: str) -> tuple[int | None, str | None]:
+    raw = (value or "").strip()
+    if not raw:
+        return None, "schema: missing GITHUB_RUN_ID"
+    if not RUN_ID_RE.fullmatch(raw):
+        return None, "schema: malformed GITHUB_RUN_ID"
+    try:
+        parsed = int(raw, 10)
+    except ValueError:
+        return None, "schema: malformed GITHUB_RUN_ID"
+    if parsed <= 0:
+        return None, "schema: malformed GITHUB_RUN_ID"
+    return parsed, None
 
-    Freshness (`skipped`) inspects the latest scaling-regression run on `main`.
-    Only a latest completed success within the ceiling may close. A newer
-    non-success, in-progress, malformed, or missing history cannot be greened
-    by an older success.
+
+def canonical_actions_run_url(server: str, repo: str, run_id: int) -> str:
+    return f"{server.rstrip('/')}/{repo}/actions/runs/{run_id}"
+
+
+def issue_run_url(
+    server: str,
+    repo: str,
+    run_id: int | None,
+    api_html_url: Any = None,
+) -> str:
+    """Construct the issue run link from known repo identity.
+
+    An API-supplied html_url is accepted only when it is exactly the same-repo
+    Actions run URL for `run_id`. Arbitrary hosts, paths, or query strings are
+    ignored.
     """
 
-    result = (job_result or "").strip().lower()
-    if result in GREEN_RESULTS:
-        return Decision("close", "scaling matrix succeeded", False)
-    if result in RED_RESULTS:
-        return Decision("open", f"scaling matrix result is {result}", False)
-    if result not in SKIPPED_RESULTS:
-        return Decision("open", f"unknown scaling job result {result!r}", True)
-    if history_error:
-        return Decision("open", f"scaling history unknown: {history_error}", True)
-    if latest is None:
-        return Decision("open", "no scaling-regression run on main", True)
+    if run_id is None:
+        return server.rstrip("/")
+    expected = canonical_actions_run_url(server, repo, run_id)
+    if isinstance(api_html_url, str) and api_html_url.rstrip("/") == expected:
+        return expected
+    return expected
+
+
+def _workflow_run_id(entry: dict[str, Any]) -> int:
+    run_id = entry.get("id")
+    if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0:
+        raise SignalError("schema", "workflow run id is malformed")
+    return run_id
+
+
+def decide_from_latest(latest: LatestRun) -> Decision:
     status = (latest.status or "").strip().lower()
     conclusion = (latest.conclusion or "").strip().lower()
+    source = latest.run_id
     if status in NON_TERMINAL_STATUSES:
-        return Decision("open", f"latest scaling run is {status}", True)
+        return Decision("open", f"latest scaling run is {status}", True, source)
     if status != "completed":
-        return Decision("open", f"unknown latest scaling run status {status!r}", True)
+        return Decision("open", f"unknown latest scaling run status {status!r}", True, source)
     if conclusion in GREEN_RESULTS:
         if latest.age_seconds > MAX_AGE_SECONDS:
             return Decision(
                 "open",
                 f"latest successful scaling run is {latest.age_seconds}s old",
                 True,
+                source,
             )
-        return Decision("close", "latest successful scaling run is within freshness", False)
+        return Decision(
+            "close",
+            "latest successful scaling run is within freshness",
+            False,
+            source,
+        )
     if not conclusion:
-        return Decision("open", "latest scaling run conclusion is missing", True)
-    return Decision("open", f"latest scaling run conclusion is {conclusion}", True)
+        return Decision("open", "latest scaling run conclusion is missing", True, source)
+    return Decision("open", f"latest scaling run conclusion is {conclusion}", True, source)
+
+
+def decide(
+    job_result: str,
+    current_run_id: int | None,
+    current_run_id_error: str | None,
+    latest: LatestRun | None,
+    history_error: str | None,
+) -> Decision:
+    """Pure generation-aware policy.
+
+    Current weekly success/failure/cancel/timeout is authoritative only when
+    `current_run_id` is the exact latest scaling-regression run. Ordering uses
+    the API's validated newest-first identity, not numeric run-id comparison.
+    Freshness and stale publishers inspect that latest run. Only a latest
+    completed success within the ceiling may close. A newer non-success,
+    in-progress, malformed, or missing history cannot be greened by an older
+    success, and an older failure cannot reopen over a newer fresh success.
+    """
+
+    if current_run_id_error or current_run_id is None:
+        reason = current_run_id_error or "schema: missing GITHUB_RUN_ID"
+        return Decision("open", reason, True)
+    if history_error:
+        return Decision("open", f"scaling history unknown: {history_error}", True, current_run_id)
+    if latest is None:
+        return Decision("open", "no scaling-regression run on main", True, current_run_id)
+
+    result = (job_result or "").strip().lower()
+    if current_run_id == latest.run_id:
+        if result in GREEN_RESULTS:
+            return Decision("close", "scaling matrix succeeded", False, current_run_id)
+        if result in RED_RESULTS:
+            return Decision("open", f"scaling matrix result is {result}", False, current_run_id)
+        if result not in SKIPPED_RESULTS:
+            return Decision(
+                "open",
+                f"unknown scaling job result {result!r}",
+                True,
+                current_run_id,
+            )
+        return decide_from_latest(latest)
+    return decide_from_latest(latest)
 
 
 def issue_body(reason: str, run_url: str) -> str:
@@ -204,7 +288,9 @@ def latest_run_on_main(
     GitHub lists workflow runs by created_at descending. Freshness must honor
     that order: a newer failure, cancel, timeout, skip, or in-progress run
     cannot be greened by an older success still inside the eight-day window.
-    Out-of-order, malformed, or future-dated history fails closed.
+    Out-of-order, malformed, or future-dated history fails closed. Generation
+    identity is the exact `id` of the first validated run, not numeric ordering
+    across ids.
     """
 
     query = urllib.parse.urlencode(
@@ -275,11 +361,23 @@ def latest_run_on_main(
     normalized_conclusion = conclusion.strip().lower() if isinstance(conclusion, str) else None
     if normalized_conclusion == "":
         normalized_conclusion = None
+    try:
+        run_id = _workflow_run_id(latest_entry)
+    except SignalError as exc:
+        return None, f"{exc.code}: {exc.message}"
+    html_url = latest_entry.get("html_url")
+    accepted_html = None
+    if isinstance(html_url, str):
+        # Stash the raw candidate; issue_run_url applies same-repo validation
+        # against the caller's GITHUB_SERVER_URL once the generation is known.
+        accepted_html = html_url
     return (
         LatestRun(
+            run_id=run_id,
             status=status.strip().lower(),
             conclusion=normalized_conclusion,
             age_seconds=age,
+            html_url=accepted_html,
         ),
         None,
     )
@@ -433,15 +531,19 @@ def run_live(now: datetime) -> int:
     mutate = ref == "refs/heads/main"
     job_result = os.environ.get("SCALING_JOB_RESULT", "skipped")
     server = os.environ.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/")
-    run_id = os.environ.get("GITHUB_RUN_ID", "")
-    run_url = f"{server}/{repo}/actions/runs/{run_id}" if run_id else server
-
-    latest: LatestRun | None = None
-    history_error: str | None = None
-    if (job_result or "").strip().lower() not in GREEN_RESULTS | RED_RESULTS:
-        latest, history_error = latest_run_on_main(repo, token, now)
-
-    decision = decide(job_result, latest, history_error)
+    current_run_id, current_run_id_error = parse_github_run_id(
+        os.environ.get("GITHUB_RUN_ID", "")
+    )
+    latest, history_error = latest_run_on_main(repo, token, now)
+    decision = decide(
+        job_result, current_run_id, current_run_id_error, latest, history_error
+    )
+    api_html_url = (
+        latest.html_url
+        if latest is not None and decision.source_run_id == latest.run_id
+        else None
+    )
+    run_url = issue_run_url(server, repo, decision.source_run_id, api_html_url)
     print(f"scaling-gate-signal: {decision.action} because {decision.reason}")
     apply_decision(repo, token, decision, run_url, mutate)
     return 1 if decision.fail_job else 0
@@ -457,29 +559,129 @@ def self_test() -> int:
                 f"got action={decision.action} fail_job={decision.fail_job}"
             )
 
-    expect(decide("success", None, None), "close", False, "matrix success")
-    expect(decide("failure", None, None), "open", False, "matrix failure")
+    current = 100
+    newer = 200
+    older = 50
+    in_progress_current = LatestRun(current, "in_progress", None, 5)
     expect(
-        decide("cancelled", LatestRun("completed", "success", 10), None),
+        decide("success", current, None, in_progress_current, None),
+        "close",
+        False,
+        "exact current run success",
+    )
+    expect(
+        decide("failure", current, None, in_progress_current, None),
+        "open",
+        False,
+        "exact current run failure",
+    )
+    expect(
+        decide(
+            "cancelled",
+            current,
+            None,
+            LatestRun(current, "in_progress", None, 10),
+            None,
+        ),
         "open",
         False,
         "matrix cancelled",
     )
     expect(
-        decide("success", LatestRun("completed", "failure", 60), None),
-        "close",
-        False,
-        "current success remains authoritative",
+        decide(
+            "success",
+            older,
+            None,
+            LatestRun(newer, "completed", "failure", 10),
+            None,
+        ),
+        "open",
+        True,
+        "stale older success over newer failure",
     )
     expect(
-        decide("failure", LatestRun("completed", "success", 60), None),
-        "open",
+        decide(
+            "failure",
+            older,
+            None,
+            LatestRun(newer, "completed", "success", 60),
+            None,
+        ),
+        "close",
         False,
-        "current failure remains authoritative",
+        "stale older failure over newer fresh success",
     )
-    expect(decide("skipped", None, None), "open", True, "never green")
-    expect(decide("skipped", None, "api: boom"), "open", True, "history unknown")
-    expect(decide("weird", None, None), "open", True, "unknown result")
+    expect(
+        decide(
+            "success",
+            older,
+            None,
+            LatestRun(newer, "in_progress", None, 20),
+            None,
+        ),
+        "open",
+        True,
+        "latest nonterminal",
+    )
+    expect(
+        decide(
+            "success",
+            newer,
+            None,
+            LatestRun(current, "completed", "failure", 10),
+            None,
+        ),
+        "open",
+        True,
+        "numeric run-id is not generation order",
+    )
+    expect(
+        decide("success", None, "schema: missing GITHUB_RUN_ID", None, None),
+        "open",
+        True,
+        "missing current run identity",
+    )
+    expect(
+        decide("success", None, "schema: malformed GITHUB_RUN_ID", in_progress_current, None),
+        "open",
+        True,
+        "malformed current run identity",
+    )
+    expect(
+        decide("success", current, None, None, "api: boom"),
+        "open",
+        True,
+        "history API failure",
+    )
+    expect(decide("skipped", current, None, None, None), "open", True, "never green")
+    expect(
+        decide("skipped", current, None, None, "api: boom"),
+        "open",
+        True,
+        "history unknown",
+    )
+    expect(
+        decide("weird", current, None, in_progress_current, None),
+        "open",
+        True,
+        "unknown result",
+    )
+    parsed_ok, parsed_err = parse_github_run_id("12345")
+    if parsed_ok != 12345 or parsed_err is not None:
+        failures.append("parse_github_run_id must accept a positive integer run id")
+    if parse_github_run_id("")[0] is not None or parse_github_run_id("01")[0] is not None:
+        failures.append("missing current run identity and leading-zero ids must fail closed")
+    if parse_github_run_id("0")[0] is not None or parse_github_run_id("12.0")[0] is not None:
+        failures.append("malformed current run identity must fail closed")
+    repo = "ferrum-edge/ferrum-edge"
+    server = "https://github.com"
+    expected_url = f"{server}/{repo}/actions/runs/{current}"
+    if issue_run_url(server, repo, current, "https://evil.example/phish") != expected_url:
+        failures.append("API-supplied arbitrary run URL must be ignored")
+    if issue_run_url(server, repo, current, expected_url) != expected_url:
+        failures.append("same-repo Actions run html_url must be accepted as the constructed URL")
+    if issue_run_url(server, repo, None, expected_url) != server:
+        failures.append("missing generation must not use an API-supplied run URL")
 
     now = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -492,10 +694,12 @@ def self_test() -> int:
         status: str = "completed",
         conclusion: str | None = "success",
         head_branch: str | None = "main",
+        run_id: int = 1,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         stamp = iso(created)
         run: dict[str, Any] = {
+            "id": run_id,
             "created_at": stamp,
             "updated_at": stamp,
             "status": status,
@@ -522,16 +726,23 @@ def self_test() -> int:
 
         return request
 
+    freshness_run_id = 999
+
     def expect_history(runs: list[Any], action: str, fail_job: bool, label: str) -> None:
         latest, err = latest_run_on_main(
             "ferrum-edge/ferrum-edge", "token", now, history_request(runs)
         )
-        expect(decide("skipped", latest, err), action, fail_job, label)
+        expect(
+            decide("skipped", freshness_run_id, None, latest, err),
+            action,
+            fail_job,
+            label,
+        )
 
-    older_fresh_success = workflow_run(created=timedelta(days=7))
+    older_fresh_success = workflow_run(created=timedelta(days=7), run_id=10)
     expect_history(
         [
-            workflow_run(created=timedelta(hours=8), conclusion="failure"),
+            workflow_run(created=timedelta(hours=8), conclusion="failure", run_id=20),
             older_fresh_success,
         ],
         "open",
@@ -544,6 +755,7 @@ def self_test() -> int:
                 created=timedelta(minutes=20),
                 status="in_progress",
                 conclusion=None,
+                run_id=21,
             ),
             older_fresh_success,
         ],
@@ -552,13 +764,13 @@ def self_test() -> int:
         "latest in-progress plus older success",
     )
     expect_history(
-        [workflow_run(created=timedelta(days=1))],
+        [workflow_run(created=timedelta(days=1), run_id=22)],
         "close",
         False,
         "latest fresh success",
     )
     expect_history(
-        [workflow_run(created=timedelta(days=9))],
+        [workflow_run(created=timedelta(days=9), run_id=23)],
         "open",
         True,
         "stale latest success",
@@ -583,6 +795,85 @@ def self_test() -> int:
         "open",
         True,
         "out-of-order history",
+    )
+    missing_id = workflow_run(created=timedelta(hours=2), run_id=24)
+    del missing_id["id"]
+    expect_history([missing_id], "open", True, "malformed latest item")
+    expect_history(
+        [workflow_run(created=timedelta(hours=3), extra={"id": True})],
+        "open",
+        True,
+        "malformed latest item",
+    )
+
+    def boom_request(method: str, url: str, token: str, body: dict[str, Any] | None) -> Any:
+        raise SignalError("api", "boom")
+
+    boom_latest, boom_err = latest_run_on_main(
+        "ferrum-edge/ferrum-edge", "token", now, boom_request
+    )
+    expect(
+        decide("success", current, None, boom_latest, boom_err),
+        "open",
+        True,
+        "history API failure",
+    )
+
+    def expect_live_history(
+        job_result: str,
+        current_id: int,
+        runs: list[Any],
+        action: str,
+        fail_job: bool,
+        label: str,
+    ) -> None:
+        latest, err = latest_run_on_main(
+            "ferrum-edge/ferrum-edge", "token", now, history_request(runs)
+        )
+        expect(
+            decide(job_result, current_id, None, latest, err),
+            action,
+            fail_job,
+            label,
+        )
+
+    expect_live_history(
+        "success",
+        30,
+        [workflow_run(created=timedelta(hours=1), run_id=30, status="in_progress", conclusion=None)],
+        "close",
+        False,
+        "exact current run success",
+    )
+    expect_live_history(
+        "failure",
+        31,
+        [workflow_run(created=timedelta(hours=1), run_id=31, status="in_progress", conclusion=None)],
+        "open",
+        False,
+        "exact current run failure",
+    )
+    expect_live_history(
+        "success",
+        32,
+        [
+            workflow_run(created=timedelta(hours=1), conclusion="failure", run_id=40),
+            workflow_run(created=timedelta(days=1), run_id=32),
+        ],
+        "open",
+        True,
+        "stale older success over newer failure",
+    )
+    expect_live_history(
+        "failure",
+        33,
+        [
+            workflow_run(created=timedelta(hours=1), conclusion="success", run_id=41),
+            workflow_run(created=timedelta(days=1), conclusion="failure", run_id=33),
+        ],
+        "close",
+        False,
+        "stale older failure over newer fresh success",
     )
 
     def signal_issue(
