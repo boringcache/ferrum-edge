@@ -355,17 +355,12 @@ artifact handoff:
   look newer and invalidate its dependents.
 
   Cargo also includes the resolved `RUSTC_WRAPPER` executable identity in its
-  artifact hashes, and Swatinem/rust-cache hashes the wrapper environment into
-  its cache keys. The checksum-pinned sccache installer therefore publishes
-  `RUSTC_WRAPPER`/`CARGO_BUILD_RUSTC_WRAPPER` as a fixed action-owned path
-  under `${RUNNER_TEMP}/ferrum-sccache-bin/bin/` (still runner-local and never
-  on `PATH`), repopulating it only after the pinned archive passes its SHA-256
-  so stale binaries cannot be trusted. That wrapper-path determinism is
-  load-bearing for rust-cache key reuse across equivalent hosted jobs on the
-  same platform, but it still cannot identify an exact `target/` tree across
-  jobs. Each FIPS Cargo job therefore stops that wrapper and clears both wrapper
-  variables before any cache or Cargo operation; the immutable exact-target
-  channel is the FIPS compiler cache. These two controls keep Cargo from rebuilding
+  artifact hashes. The checksum-pinned sccache installer intentionally uses a
+  fresh runner-private path, which is safe for ordinary compiler caching but
+  cannot identify an exact `target/` tree across jobs. Each FIPS Cargo job
+  therefore stops that private wrapper and clears both wrapper variables before
+  any cache or Cargo operation; the immutable exact-target channel is the FIPS
+  compiler cache. These two controls keep Cargo from rebuilding
   content-identical outputs without allowing a partial, fork, cold,
   mismatched-tree, or runner-unique-compiler restore to masquerade as current.
   `force_cold_cache` skips both handoff download and upload. Run artifacts
@@ -425,11 +420,8 @@ aarch64 archives actually used by callers) and does **not** invoke
 `ACTIONS_RESULTS_URL` into `GITHUB_ENV`. A fail-closed assertion before cargo
 refuses to continue if those variables are present in a `run:` environment
 (values are never printed). The installer publishes an empty
-`FERRUM_SCCACHE_BIN` sentinel first, discards any stale contents under
-`${RUNNER_TEMP}/ferrum-sccache-bin/`, then sets `RUSTC_WRAPPER` to the
-checksum-verified path only; it never puts sccache on `PATH`. Keeping that
-wrapper path deterministic across equivalent hosted jobs on the same platform
-is load-bearing for rust-cache key reuse. It persists
+`FERRUM_SCCACHE_BIN` sentinel first, then sets `RUSTC_WRAPPER` to that
+checksum-verified path only; it never puts sccache on `PATH`. It persists
 `SCCACHE_GHA_ENABLED` as empty so a later step cannot re-enable the
 credential-bearing GHA backend. Install failure clears the rustc wrapper and
 continues uncached. Compiler outputs use a 2 GiB local directory persisted by
@@ -1227,6 +1219,24 @@ pass-through to Swatinem/rust-cache; omitting it leaves rust-cache's default
 `. -> target`, so other jobs keep root-only caching. Do not list only the mesh
 workspace, and do not add unrelated workspaces, `cache-all-crates`, or extra
 `cache-directories` here.
+
+The checksum-pinned installer deliberately gives every hosted job a fresh
+runner-private wrapper path. Swatinem/rust-cache hashes every non-empty
+`RUST*` and `CARGO*` variable into its environment key, so hashing that path
+would prevent an otherwise equivalent `ci-perf` job from restoring the cache
+seeded by `main`. The `performance-regression` invocation therefore sets
+`RUSTC_WRAPPER` and `CARGO_BUILD_RUSTC_WRAPPER` to empty values only on the
+`setup-rust-ci` composite step. That step scope makes the nested rust-cache
+action omit the runner-unique values while `setup-sccache` still publishes its
+checksum-verified path through `FERRUM_SCCACHE_BIN`. Immediately after the
+composite returns, the workflow copies that verified executable to the fixed
+`${RUNNER_TEMP}/ferrum-performance-sccache/bin/sccache` path and republishes
+both wrapper variables, so Cargo's own compiler identity is stable as well as
+the rust-cache key. If the installer failed or its verified executable is no
+longer available, the step clears both variables and the benchmarks continue
+uncached. Do not move the initial empty values to job scope, which would
+override the later activation and disable sccache for the builds whose reuse
+this cache is intended to accelerate.
 
 Hosted follow-ups that still need measured evidence before changing
 measurement fidelity or trigger breadth:
@@ -2357,22 +2367,6 @@ former direct #3889→#3911 destination
 superseded by this chain; #3911 must rebase to the combined step-2 text.
 #3910's comment-only `setup-rust-ci` tweak is not admitted here; drop or
 re-pin it after merging latest `main`.
-
-##### Admitted `setup-sccache` generation transition (temporary)
-
-`.github/actions/setup-sccache/action.yml` carries one admitted move decided by
-this trusted policy (`LOCAL_ACTION_GENERATION_TRANSITIONS`) for PR #4090 (issue
-#3906): the trusted-base file (SHA-256
-`0a76993b4ad68a96430ca12a2ab082116a302d84dc89cc486e564c61ad8d6dd4`) moves to
-the deterministic wrapper-path generation
-(`d14af1484f2c7656e71f29c1c1e9386d5b1f5286193ec3d811bba6f224ffa00e`) so
-Swatinem/rust-cache keys stay stable across jobs. The pair is exact,
-path-bound, one-way, and fail-closed. The candidate supplies no digest,
-allowlist, or fallback. Any other revision pair or path is scanned as an
-ordinary Cross surface change. RETIREMENT IS MANDATORY: delete this tuple once
-#4090 is on `main`. Issue #3906 remains open for post-merge warm-cache
-acceptance evidence; this PR references it with `Refs #3906`, not a closing
-keyword.
 
 ##### Remaining CI-tranche predecessor sequence
 

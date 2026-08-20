@@ -17,7 +17,8 @@ with exact occurrence counts and checkout provenance (current repository,
 default ref, default root, persist-credentials: false) plus shell-only
 local actions so JavaScript toolkit carriers cannot reach
 the cache-credential environment, same-run producer and immutable inter-run
-artifact handoff warming, exact verified executable activation, empty
+artifact handoff warming, exact verified executable activation, performance
+rust-cache key isolation from runner-unique wrapper paths, empty
 SCCACHE_GHA_ENABLED persistence, fail-closed uncached fallback, hosted
 cache-token absence assertions, and Ambient production-image GHA cache-to
 gated to trusted `refs/heads/main` so pull requests restore without publishing.
@@ -51,6 +52,7 @@ SETUP_FAST_LINKER = REPO_ROOT / ".github" / "actions" / "setup-fast-linker" / "a
 CI_CD_DOC = REPO_ROOT / "docs" / "ci_cd.md"
 FIPS_DOC = REPO_ROOT / "docs" / "fips.md"
 COVERAGE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "coverage.yml"
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 RUST_TOOLCHAIN = "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8"
@@ -1985,31 +1987,6 @@ def check_shell_only_local_action(
     check_no_sccache_credential_exporter(text, source, failures)
 
 
-def check_setup_sccache_deterministic_install_path(
-    text: str,
-    source: str,
-    failures: list[str],
-) -> None:
-    require(
-        'install_root="${RUNNER_TEMP}/ferrum-sccache-bin"' in text,
-        f"{source} must install sccache under a deterministic RUNNER_TEMP path "
-        "so rust-cache sees stable wrapper environment values",
-        failures,
-    )
-    require(
-        'mktemp -d "${RUNNER_TEMP}/ferrum-sccache-bin.XXXXXX"' not in text,
-        f"{source} must not install the verified wrapper under a random "
-        "mktemp directory",
-        failures,
-    )
-    require(
-        'rm -rf "$install_root"' in text,
-        f"{source} must discard stale install contents before the pinned archive "
-        "passes checksum verification",
-        failures,
-    )
-
-
 def check_setup_sccache_verified_activation(
     text: str,
     source: str,
@@ -2048,6 +2025,107 @@ def check_setup_sccache_verified_activation(
     require(
         '"$sccache_bin" --start-server' in text and "command -v sccache" not in text,
         f"{source} must invoke only the verified executable, never PATH lookup",
+        failures,
+    )
+
+
+def check_performance_cache_wrapper_key(
+    workflow: str,
+    source: str,
+    failures: list[str],
+) -> None:
+    """Keep runner-unique sccache paths out of the performance cache key."""
+
+    job = extract_job(workflow, "performance-regression")
+    require(
+        bool(job),
+        f"{source} must define performance-regression",
+        failures,
+    )
+    if not job:
+        return
+    require(
+        re.search(r"(?m)^    env:\s*$", job) is None,
+        f"{source} performance-regression must not clear the rustc wrapper at "
+        "job scope; benchmark builds need the verified sccache wrapper",
+        failures,
+    )
+    steps = job_steps(job)
+    setup_steps = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if step_uses(step) == "./.github/actions/setup-rust-ci"
+    ]
+    require(
+        len(setup_steps) == 1,
+        f"{source} performance-regression must invoke setup-rust-ci exactly once",
+        failures,
+    )
+    if len(setup_steps) != 1:
+        return
+    setup_index, setup = setup_steps[0]
+    require(
+        re.search(
+            r'(?m)^        env:\s*\n'
+            r'          RUSTC_WRAPPER: ["\']{2}\s*\n'
+            r'          CARGO_BUILD_RUSTC_WRAPPER: ["\']{2}\s*$',
+            setup,
+        )
+        is not None,
+        f"{source} performance setup-rust-ci step must clear RUSTC_WRAPPER and "
+        "CARGO_BUILD_RUSTC_WRAPPER only for the nested rust-cache key calculation",
+        failures,
+    )
+    with_block = step_with(setup)
+    require(
+        re.search(r'(?m)^          shared-key: ["\']ci-perf["\']\s*$', with_block)
+        is not None
+        and "tests/performance/mesh -> target" in with_block,
+        f"{source} performance setup-rust-ci step must retain the ci-perf shared "
+        "key and expanded mesh workspace",
+        failures,
+    )
+    stabilization_steps = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if "name: Stabilize performance compiler wrapper identity" in step
+    ]
+    require(
+        len(stabilization_steps) == 1,
+        f"{source} performance-regression must stabilize the verified wrapper "
+        "exactly once",
+        failures,
+    )
+    if len(stabilization_steps) != 1:
+        return
+    stabilization_index, stabilization = stabilization_steps[0]
+    require(
+        stabilization_index == setup_index + 1,
+        f"{source} performance wrapper stabilization must run immediately after "
+        "setup-rust-ci and before any benchmark build",
+        failures,
+    )
+    stabilization_contract = (
+        "set -euo pipefail",
+        'source="${FERRUM_SCCACHE_BIN:-}"',
+        '[ -z "$source" ] || [ ! -x "$source" ]',
+        "'RUSTC_WRAPPER=' 'CARGO_BUILD_RUSTC_WRAPPER='",
+        'stable_root="${RUNNER_TEMP}/ferrum-performance-sccache"',
+        'stable_wrapper="${stable_root}/bin/sccache"',
+        'rm -rf "$stable_root"',
+        'mkdir -p "${stable_root}/bin"',
+        'cp -- "$source" "$stable_wrapper"',
+        'chmod 0755 "$stable_wrapper"',
+        '"RUSTC_WRAPPER=${stable_wrapper}"',
+        '"CARGO_BUILD_RUSTC_WRAPPER=${stable_wrapper}"',
+        '>> "$GITHUB_ENV"',
+    )
+    missing = [item for item in stabilization_contract if item not in stabilization]
+    require(
+        not missing and "GITHUB_PATH" not in stabilization,
+        f"{source} performance wrapper stabilization must copy only the verified "
+        f"binary to the fixed runner-local path and fail closed to no wrapper; "
+        f"missing={missing}",
         failures,
     )
 
@@ -4083,7 +4161,6 @@ def check_shared_actions(failures: list[str]) -> None:
     )
     check_credential_absence_assertion(sccache, "setup-sccache", failures)
     check_setup_sccache_verified_activation(sccache, "setup-sccache", failures)
-    check_setup_sccache_deterministic_install_path(sccache, "setup-sccache", failures)
     require(
         SCCACHE_RELEASE_DOWNLOAD in sccache,
         "setup-sccache must download a pinned mozilla/sccache GitHub release",
@@ -5806,37 +5883,77 @@ def self_test() -> int:
         failures,
     )
 
-    random_install_failures: list[str] = []
-    check_setup_sccache_deterministic_install_path(
-        'install_root="$(mktemp -d "${RUNNER_TEMP}/ferrum-sccache-bin.XXXXXX")"\n',
-        "self-test-random-sccache-install",
-        random_install_failures,
+    performance_cache_fixture = (
+        "jobs:\n"
+        "  performance-regression:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: ./.github/actions/setup-rust-ci\n"
+        "        env:\n"
+        '          RUSTC_WRAPPER: ""\n'
+        '          CARGO_BUILD_RUSTC_WRAPPER: ""\n'
+        "        with:\n"
+        '          shared-key: "ci-perf"\n'
+        "          workspaces: |\n"
+        "            . -> target\n"
+        "            tests/performance/mesh -> target\n"
+        "      - name: Stabilize performance compiler wrapper identity\n"
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        '          source="${FERRUM_SCCACHE_BIN:-}"\n'
+        '          if [ -z "$source" ] || [ ! -x "$source" ]; then\n'
+        "            printf '%s\\n' 'RUSTC_WRAPPER=' "
+        "'CARGO_BUILD_RUSTC_WRAPPER=' >> \"$GITHUB_ENV\"\n"
+        "            exit 0\n"
+        "          fi\n"
+        '          stable_root="${RUNNER_TEMP}/ferrum-performance-sccache"\n'
+        '          stable_wrapper="${stable_root}/bin/sccache"\n'
+        '          rm -rf "$stable_root"\n'
+        '          mkdir -p "${stable_root}/bin"\n'
+        '          cp -- "$source" "$stable_wrapper"\n'
+        '          chmod 0755 "$stable_wrapper"\n'
+        "          printf '%s\\n' \"RUSTC_WRAPPER=${stable_wrapper}\" "
+        '"CARGO_BUILD_RUSTC_WRAPPER=${stable_wrapper}" >> "$GITHUB_ENV"\n'
+        "      - name: Build release binaries\n"
+        "        run: cargo build --profile ci-release\n"
+    )
+    performance_cache_failures: list[str] = []
+    check_performance_cache_wrapper_key(
+        performance_cache_fixture,
+        "self-test-performance-cache",
+        performance_cache_failures,
     )
     require(
-        any("deterministic RUNNER_TEMP path" in item for item in random_install_failures)
-        and any("random mktemp directory" in item for item in random_install_failures),
-        "self-test: random ferrum-sccache-bin mktemp install path must fail",
+        not performance_cache_failures,
+        "self-test: exact step-scoped performance cache wrapper isolation should "
+        "pass: " + "; ".join(performance_cache_failures),
         failures,
     )
-
-    deterministic_install = (
-        'install_root="${RUNNER_TEMP}/ferrum-sccache-bin"\n'
-        'install_dir="${install_root}/bin"\n'
-        'rm -rf "$install_root"\n'
-        'mkdir -p "$install_dir"\n'
-    )
-    deterministic_failures: list[str] = []
-    check_setup_sccache_deterministic_install_path(
-        deterministic_install,
-        "self-test-deterministic-sccache-install",
-        deterministic_failures,
-    )
-    require(
-        not deterministic_failures,
-        "self-test: deterministic sccache install path should pass: "
-        + "; ".join(deterministic_failures),
-        failures,
-    )
+    for label, mutated in {
+        "missing cargo wrapper": performance_cache_fixture.replace(
+            '          CARGO_BUILD_RUSTC_WRAPPER: ""\n', "", 1
+        ),
+        "job-scoped wrapper clearing": performance_cache_fixture.replace(
+            "        env:\n", "    env:\n", 1
+        ),
+        "missing mesh workspace": performance_cache_fixture.replace(
+            "            tests/performance/mesh -> target\n", "", 1
+        ),
+        "missing stable wrapper copy": performance_cache_fixture.replace(
+            '          cp -- "$source" "$stable_wrapper"\n', "", 1
+        ),
+    }.items():
+        mutated_failures: list[str] = []
+        check_performance_cache_wrapper_key(
+            mutated,
+            f"self-test-performance-cache-{label}",
+            mutated_failures,
+        )
+        require(
+            bool(mutated_failures),
+            f"self-test: {label} must fail the performance cache key contract",
+            failures,
+        )
 
     missing_assert_failures: list[str] = []
     check_credential_absence_assertion(
@@ -7341,6 +7458,7 @@ def main(argv: list[str] | None = None) -> int:
     fips = FIPS_WORKFLOW.read_text(encoding="utf-8")
     node = NODE_WORKFLOW.read_text(encoding="utf-8")
     ambient = AMBIENT_WORKFLOW.read_text(encoding="utf-8")
+    ci = CI_WORKFLOW.read_text(encoding="utf-8")
     check_common_trust(fips, "fips-build.yml", failures)
     check_common_trust(node, "node-waypoint-ebpf-live.yml", failures)
     check_common_trust(ambient, "ambient-host-udp-live.yml", failures)
@@ -7352,6 +7470,7 @@ def main(argv: list[str] | None = None) -> int:
         failures,
     )
     check_shared_actions(failures)
+    check_performance_cache_wrapper_key(ci, "ci.yml", failures)
     check_docs_and_coverage(failures)
     check_dockerfile(failures)
     for failure in failures:
