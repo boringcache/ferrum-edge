@@ -2267,7 +2267,7 @@ where
                 ctx,
                 StatusCode::METHOD_NOT_ALLOWED,
                 r#"{"error":"Method Not Allowed"}"#,
-                None,
+                Some(("allow", crate::proxy::PROTOCOL_LEVEL_405_ALLOW)),
                 backend_start,
                 0,
             )
@@ -3342,21 +3342,17 @@ where
                                 false,
                                 backend_start.elapsed(),
                             );
-                            let mut outcome = write_plain_gateway_error(
+                            let mut outcome = write_classified_backend_dispatch_error(
                                 stream,
                                 ctx,
-                                StatusCode::BAD_GATEWAY,
-                                r#"{"error":"Bad Gateway"}"#,
-                                None,
+                                &attempt_result,
                                 backend_start,
                                 bytes_sent,
                             )
                             .await?;
                             outcome.backend_target =
                                 Some(strip_query_from_backend_url(&current_url));
-                            outcome.connection_error = attempt_result.connection_error;
-                            outcome.error_class = attempt_result.error_class;
-                            outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+                            outcome.backend_resolved_ip = final_backend_resolved_ip;
                             return Ok(outcome);
                         }
                     }
@@ -4234,37 +4230,15 @@ where
                             false,
                             backend_start.elapsed(),
                         );
-                        // A classified backend TIMEOUT keeps the 504 /
-                        // `backend_timeout` shape the read- and write-watermark
-                        // terminals use; everything else stays the 502 this
-                        // site has always written. One writer, so the two
-                        // shapes cannot drift and this dispatcher's already
-                        // very large state machine does not carry a second
-                        // copy of the response-write await.
-                        let (timeout_status, timeout_body, timeout_header) =
-                            if attempt_result.status_code == 504 {
-                                (
-                                    StatusCode::GATEWAY_TIMEOUT,
-                                    r#"{"error":"Backend timeout"}"#,
-                                    Some(("x-gateway-error", "backend_timeout")),
-                                )
-                            } else {
-                                (StatusCode::BAD_GATEWAY, r#"{"error":"Bad Gateway"}"#, None)
-                            };
-                        let mut outcome = write_plain_gateway_error(
+                        let mut outcome = write_classified_backend_dispatch_error(
                             stream,
                             ctx,
-                            timeout_status,
-                            timeout_body,
-                            timeout_header,
+                            &attempt_result,
                             backend_start,
                             bytes_sent,
                         )
                         .await?;
                         outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
-                        outcome.connection_error = attempt_result.connection_error;
-                        outcome.error_class = attempt_result.error_class;
-                        outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
                         return Ok(outcome);
                     }
                 }
@@ -9967,6 +9941,51 @@ where
         bytes_sent,
     )
     .await
+}
+
+/// Write a classified HTTP-family backend dispatch failure to the H3 client.
+/// Preserves the status/body/`X-Gateway-Error` mapping H1/H2 already emit
+/// instead of collapsing every classified failure to generic 502 Bad Gateway.
+async fn write_classified_backend_dispatch_error<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &mut RequestContext,
+    attempt_result: &crate::retry::BackendResponse,
+    backend_start: Instant,
+    bytes_sent: u64,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    let status =
+        StatusCode::from_u16(attempt_result.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = match &attempt_result.body {
+        crate::retry::ResponseBody::Buffered(bytes) => bytes.clone(),
+        crate::retry::ResponseBody::Streaming { .. }
+        | crate::retry::ResponseBody::StreamingH2(_)
+        | crate::retry::ResponseBody::StreamingH3(_) => {
+            Bytes::from_static(br#"{"error":"Backend unavailable"}"#)
+        }
+    };
+    let mut headers = HashMap::new();
+    crate::proxy::insert_x_gateway_error_for_backend_failure(
+        &mut headers,
+        attempt_result.connection_error,
+        status.as_u16(),
+    );
+    let mut outcome = write_plain_gateway_reject(
+        stream,
+        ctx,
+        status,
+        body,
+        &headers,
+        backend_start,
+        bytes_sent,
+    )
+    .await?;
+    outcome.connection_error = attempt_result.connection_error;
+    outcome.error_class = attempt_result.error_class;
+    outcome.backend_resolved_ip = attempt_result.backend_resolved_ip.clone();
+    Ok(outcome)
 }
 
 async fn write_plain_gateway_reject<S>(

@@ -17,7 +17,7 @@ Every classifier funnels its result into [`crate::retry::ErrorClass`](../src/ret
 | `ConnectionReset` | Mid-stream RST received after the connection was established. | `true` (post-wire) |
 | `ConnectionClosed` | Peer sent FIN before a response was completed; broken pipe; aborted connection. | `true` (post-wire) |
 | `DnsLookupError` | Hostname could not be resolved. | `false` (pre-wire) |
-| `TlsError` | TLS or DTLS handshake failed (certificate, ALPN, alert). | `false` (pre-wire) |
+| `TlsError` | TLS or DTLS handshake failed (certificate, ALPN, alert). Missing `close_notify` is teardown, not this class. | `false` (pre-wire) |
 | `ReadWriteTimeout` | Backend read or write exceeded the per-direction watermark. | `true` (post-wire) |
 | `ProtocolError` | HTTP/2 or HTTP/3 protocol-level error after a stream is opened (stream reset, GOAWAY, RST_STREAM), or RFC 6455 WebSocket protocol violation. NOTE: gRPC h2c handshake failure classifies as `ConnectionRefused` (pre-wire), NOT `ProtocolError` — see the gRPC kind table below. | `true` (post-wire) |
 | `ResponseBodyTooLarge` | Backend response exceeded the configured maximum size. | `true` (post-wire) |
@@ -68,13 +68,63 @@ pub enum StreamSetupKind {
     BackendTlsHandshake,    // gateway → backend TCP-TLS failed (backend-side)
     BackendDtlsHandshake,   // gateway → backend DTLS failed (backend-side)
     RejectedByPlugin,       // umbrella for ACL/policy/throttle rejections (client-side)
-    NoHealthyTargets,       // LB pool empty or all targets failing active health checks (backend-side)
+    DnsLookup,              // backend hostname did not resolve (backend-side, pre-wire)
+    NoHealthyTargets,       // LB pool empty, empty subset, or no family-matching backends (backend-side)
     CircuitBreakerOpen,     // per-proxy passive-health circuit breaker is open (backend-side)
     BackendMaxConnectionsExceeded, // DestinationRule connectionPool.tcp.maxConnections cap hit at backend dial (backend-side)
 }
 ```
 
-`NoHealthyTargets` and `CircuitBreakerOpen` are intentionally split: the former fires from LB target selection (active health checks / empty pool), the latter from the per-proxy circuit-breaker check (passive health, failure-rate threshold). Operators can distinguish "no candidate exists" from "candidates exist but the gateway is shedding traffic away from them" without joining across log streams.
+`DnsLookup` maps to `ErrorClass::DnsLookupError` so TCP/UDP/DTLS setup DNS
+failures grep the same class as HTTP and gRPC. Construction sites go through
+`stream_error::stream_dns_setup_error(host, source)`, whose Display keeps the
+legacy `"DNS resolution failed for {host}: {source}"` wording.
+
+One resolve failure is deliberately **not** typed as `DnsLookup`: a target
+refused by the backend egress policy. No query was answered and no backend was
+consulted, so it stays `DispatchPolicyRejected` — non-retryable and neutral to
+backend health, matching the `record_neutral` circuit-breaker accounting the
+same call sites already perform. Typing it would let the typed walk override
+that classification.
+
+### UDP setup failures that never publish a session
+
+A UDP setup attempt emits exactly one `StreamTransactionSummary`, and which
+side emits it is decided by the operation itself (`UdpSetupProgress`), never by
+probing the session map afterwards:
+
+- **Setup owns** every failure observed before `sessions.insert` — DNS, empty
+  pool, plugin reject, circuit breaker, backend bind/connect, backend DTLS
+  handshake. The summary carries the epoch the attempt was *admitted* under:
+  that generation's stream plugin slice, the proxy lifecycle generation, the
+  connect-time execution-trigger decisions, and the `StreamConnectionContext`
+  identity/auth/SNI/metadata. The backend target is the one selection actually
+  chose (load balancer or mesh preselection), not the proxy's configured
+  default.
+- **The published session owns** everything after that insert, including an
+  error the spawned setup task observes later — even if the session has already
+  been removed by idle expiry, shutdown, or reload. A removed session does not
+  hand ownership back to setup; doing so would produce a duplicate summary
+  alongside the session's own disconnect summary.
+- A failure *before* any epoch view resolved (for example the proxy was
+  withdrawn between listener dispatch and setup) has no admitted plugin slice
+  and no admitted generation. It records the transaction with no proxy name, no
+  backend target, and `proxy_lifecycle_generation` unset, and notifies **no**
+  plugins — invoking the current generation's plugins would attribute the
+  failure to a configuration that never admitted it.
+
+`NoHealthyTargets` and `CircuitBreakerOpen` are intentionally split: the former
+fires from LB target selection when **no candidate exists** (empty pool, empty
+subset, or no backend shares the session destination's address family). The
+latter fires from the per-proxy circuit-breaker check (passive health,
+failure-rate threshold). An upstream whose targets are all failing **active**
+health checks still selects a target via the shared all-unhealthy fallback
+documented in [load_balancing.md](load_balancing.md) ("Fallback When All
+Unhealthy"); that degraded dial is a later connect failure
+(`connection_refused` / `connection_timeout`), not `NoHealthyTargets`.
+`max_ejection_percent` only re-admits **passive** ejections. Operators can
+distinguish "no candidate exists" from "candidates exist but the gateway is
+shedding traffic away from them" without joining across log streams.
 
 `StreamSetupKind::tls_side()`, `is_client_side()`, and `direction()` derive cause/direction attribution **directly from the typed kind**. The `Display` impl reproduces the legacy `STREAM_ERR_*` prefix verbatim (a regression test enforces this) so log consumers and dashboards keying on the wording continue to work.
 
@@ -207,7 +257,19 @@ Refer to the canonical-taxonomy table above for what each class means. A few cla
 
 - **`ConnectionPoolError`** — pool exhaustion. Increase `FERRUM_POOL_MAX_IDLE_PER_HOST` or per-proxy `pool_idle_timeout`.
 - **`PortExhaustion`** — EADDRNOTAVAIL. Widen the port range with `sysctl net.ipv4.ip_local_port_range="1024 65535"`, enable `net.ipv4.tcp_tw_reuse=1`, and reduce idle pool timeouts (`FERRUM_POOL_IDLE_TIMEOUT_SECONDS`). Monitor via the `port_exhaustion_events` counter on authenticated `GET /overload` detail (unauthenticated callers receive only `{"level": ...}`).
-- **`TlsError`** — for self-signed certs in development, set `FERRUM_TLS_NO_VERIFY=true`. For mTLS backends, verify the client certificate and CA chain. The typed `StreamSetupKind::FrontendTlsHandshake` vs `BackendTlsHandshake`/`BackendDtlsHandshake` tells you which side failed without inspecting the message.
+- **`TlsError`** — for self-signed certs in development, set
+  `FERRUM_TLS_NO_VERIFY=true`. For mTLS backends, verify the client certificate
+  and CA chain. The typed `StreamSetupKind::FrontendTlsHandshake` vs
+  `BackendTlsHandshake`/`BackendDtlsHandshake` tells you which side failed
+  without inspecting the message. Do **not** key alerts on `tls_error` for
+  omitted `close_notify`: userspace rustls reports that as `UnexpectedEof`
+  ("without sending TLS close_notify"). Two shapes are operator-visible and both
+  are intentional: the TCP direction-tracking relay and the DTLS session outcome
+  treat it as clean teardown and omit `error_class` entirely, while the
+  all-bounds-disabled `copy_bidirectional` fast path (which stringifies its
+  error and loses the typed chain) reports `connection_closed`. Neither is
+  `tls_error`. kTLS still treats a bare FIN without an authenticated
+  `close_notify` as truncation.
 - **`GracefulRemoteClose`** — informational, not an error. The peer closed the session cleanly. Do not alert on this.
 - **`ClientDisconnect`** — the client (not the backend) dropped the connection. Often benign (user navigated away). High rates may indicate aggressive client-side timeouts.
 

@@ -220,6 +220,17 @@ use self::http2_pool::Http2ConnectionPool;
 static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
+/// Precomputed circuit-breaker-open reject headers. Open-breaker 503s are
+/// still a reject path, but the map is rebuilt from this snapshot so the
+/// observability token is not `format!()`ed or assembled per request.
+static CIRCUIT_BREAKER_OPEN_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
+    std::sync::LazyLock::new(|| {
+        HashMap::from([(
+            X_GATEWAY_ERROR_HEADER.to_string(),
+            X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN.to_string(),
+        )])
+    });
+
 /// Hyper's HTTP/1 parser panics when `max_buf_size` is below 8 KiB. Ferrum's
 /// configured logical header limit may be lower; keep the parser floor safe
 /// and enforce the operator's lower limit in `check_protocol_headers`.
@@ -23397,6 +23408,120 @@ pub(crate) fn restore_authoritative_allow_header(
     response_headers.insert("allow".to_string(), allow_value.to_string());
 }
 
+/// Wire name for the HTTP-family failure-class header. HashMap reject paths
+/// use this lowercase spelling; the H1/H2 response builder keeps the
+/// historical `X-Gateway-Error` casing. HTTP header names are
+/// case-insensitive either way.
+pub(crate) const X_GATEWAY_ERROR_HEADER: &str = "x-gateway-error";
+pub(crate) const X_GATEWAY_ERROR_CONNECTION_FAILURE: &str = "connection_failure";
+pub(crate) const X_GATEWAY_ERROR_BACKEND_TIMEOUT: &str = "backend_timeout";
+pub(crate) const X_GATEWAY_ERROR_BACKEND_ERROR: &str = "backend_error";
+/// Distinct from `backend_error`: the gateway never contacted a backend on
+/// this request, so reusing that bucket would make open-breaker 503s
+/// indistinguishable from a backend that actually returned 5xx.
+pub(crate) const X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN: &str = "circuit_breaker_open";
+
+/// RFC 9110 `Allow` for protocol-level 405s (TRACE and non-WebSocket CONNECT)
+/// that run before a proxy is matched, so no per-route `allowed_methods`
+/// exists. TRACE and CONNECT are omitted because this same filter rejected
+/// them. Static so the reject path does not allocate the value.
+pub(crate) const PROTOCOL_LEVEL_405_ALLOW: &str = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
+
+/// Client-visible `X-Gateway-Error` value for an HTTP-family backend
+/// dispatch or status failure. `None` for non-5xx. Circuit-breaker-open
+/// 503s must not use this helper — they are not a backend response.
+#[inline]
+pub(crate) fn x_gateway_error_for_backend_failure(
+    connection_error: bool,
+    status: u16,
+) -> Option<&'static str> {
+    if connection_error {
+        Some(X_GATEWAY_ERROR_CONNECTION_FAILURE)
+    } else if status == 504 {
+        Some(X_GATEWAY_ERROR_BACKEND_TIMEOUT)
+    } else if status >= 500 {
+        Some(X_GATEWAY_ERROR_BACKEND_ERROR)
+    } else {
+        None
+    }
+}
+
+/// Insert or replace the gateway-owned `X-Gateway-Error` value after generic
+/// response policy has run. Policy may decorate a 5xx, but it must not
+/// remove, replace, or duplicate this observability token.
+pub(crate) fn restore_authoritative_gateway_error_header(
+    response_headers: &mut HashMap<String, String>,
+    value: &'static str,
+) {
+    response_headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER));
+    response_headers.insert(X_GATEWAY_ERROR_HEADER.to_string(), value.to_string());
+}
+
+/// Apply the gateway-owned backend-failure token at the final post-hook /
+/// pre-wire boundary. Classification is the original typed dispatch signal
+/// (`connection_error`); `status` is the client-visible status after every
+/// later hook. Every case variant is stripped first so a hook cannot erase,
+/// replace, or duplicate the token. When the pair does not warrant a token
+/// (plugin-replaced non-5xx with no connection failure), a leftover spoofed
+/// value is removed rather than forwarded.
+///
+/// Returns whether the authoritative token was written.
+pub(crate) fn apply_authoritative_backend_gateway_error_header(
+    response_headers: &mut HashMap<String, String>,
+    connection_error: bool,
+    status: u16,
+) -> bool {
+    response_headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER));
+    if let Some(value) = x_gateway_error_for_backend_failure(connection_error, status) {
+        response_headers.insert(X_GATEWAY_ERROR_HEADER.to_string(), value.to_string());
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn insert_x_gateway_error_for_backend_failure(
+    response_headers: &mut HashMap<String, String>,
+    connection_error: bool,
+    status: u16,
+) {
+    let _ = apply_authoritative_backend_gateway_error_header(
+        response_headers,
+        connection_error,
+        status,
+    );
+}
+
+/// Snapshot of the open-breaker 503 header map. Callers clone it into the
+/// reject builder so the token is not assembled per request.
+pub(crate) fn circuit_breaker_open_reject_headers() -> HashMap<String, String> {
+    CIRCUIT_BREAKER_OPEN_HEADERS.clone()
+}
+
+/// Whether `method` is in the route's configured `allowed_methods`.
+/// Surrounding whitespace is ignored so a validated `" GET "` admits GET,
+/// matching [`allow_header_from_allowed_methods`] and config normalization.
+#[inline]
+pub(crate) fn request_method_is_allowed(allowed: &[String], method: &str) -> bool {
+    allowed
+        .iter()
+        .any(|configured| configured.trim().eq_ignore_ascii_case(method))
+}
+
+/// Comma-separated RFC 9110 `Allow` value for a route's configured methods.
+/// Uppercased in config order so the 405 is stable without sorting on the
+/// request path.
+pub(crate) fn allow_header_from_allowed_methods(methods: &[String]) -> String {
+    let mut out = String::new();
+    for (i, method) in methods.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&method.trim().to_ascii_uppercase());
+    }
+    out
+}
+
 fn finalize_synthesized_reject_headers(
     reject: &mut NormalizedRejectResponse,
     request_protocol: ProxyProtocol,
@@ -28590,8 +28715,7 @@ async fn handle_proxy_request_inner(
     if method == "TRACE" {
         warn!("Rejected TRACE request");
         record_request(&state, 405);
-        return Ok(build_response(
-            StatusCode::METHOD_NOT_ALLOWED,
+        return Ok(build_method_not_allowed_response(
             r#"{"error":"TRACE method is not allowed"}"#,
         ));
     }
@@ -28608,8 +28732,7 @@ async fn handle_proxy_request_inner(
     if method == "CONNECT" && !is_h2_websocket_connect(&req) && !is_hbone_connect_any {
         warn!("Rejected non-WebSocket CONNECT request");
         record_request(&state, 405);
-        return Ok(build_response(
-            StatusCode::METHOD_NOT_ALLOWED,
+        return Ok(build_method_not_allowed_response(
             r#"{"error":"CONNECT method is not allowed"}"#,
         ));
     }
@@ -29275,10 +29398,10 @@ async fn handle_proxy_request_inner(
     // still runs from the protocol-filtered plugin-cache view so sinks can
     // attribute the matched-proxy 405.
     if let Some(ref allowed) = proxy.allowed_methods
-        && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
+        && !request_method_is_allowed(allowed, &method)
     {
         state.request_count.fetch_add(1, Ordering::Relaxed);
-        let allow_header = allowed.join(", ");
+        let allow_header = allow_header_from_allowed_methods(allowed);
         let mut reject_headers = HashMap::new();
         reject_headers.insert("allow".to_string(), allow_header.clone());
         let mut reject = normalize_reject_response(
@@ -31180,17 +31303,21 @@ async fn handle_proxy_request_inner(
         match backend_dispatch::check_circuit_breaker(&proxy, &state, upstream_target.as_deref()) {
             Ok(result) => result,
             Err(()) => {
-                let reject = finalize_reject_response_with_after_proxy_hooks(
+                let mut reject = finalize_reject_response_with_after_proxy_hooks(
                     &plugins,
                     &mut ctx,
                     StatusCode::SERVICE_UNAVAILABLE,
                     Bytes::from_static(
                         br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
                     ),
-                    HashMap::new(),
+                    circuit_breaker_open_reject_headers(),
                     is_grpc_request,
                 )
                 .await;
+                restore_authoritative_gateway_error_header(
+                    &mut reject.headers,
+                    X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN,
+                );
                 apply_grpc_reject_metadata(&mut ctx, &reject);
                 // Use `original_request_path` so the log records the path the
                 // client actually requested, not the VirtualService-rewritten
@@ -37489,19 +37616,22 @@ async fn handle_proxy_request_inner(
             | ResponseBody::StreamingH3(_) => headers_mod::ClientResponseFraming::Streaming,
         }
     };
+    // Gateway-owned: strip every hook/backend case variant before sanitizing
+    // so a late phase cannot spoof or duplicate the token beside the builder
+    // write. Classification is the original dispatch signal; status is final.
+    let gateway_error_token =
+        x_gateway_error_for_backend_failure(backend_resp.connection_error, response_status);
+    response_headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER));
     resp_builder =
         headers_mod::apply_sanitized_response_headers(resp_builder, &mut response_headers, framing);
 
     // Add gateway error categorization headers so clients and ops teams
     // can distinguish different failure modes:
     //   X-Gateway-Error: connection_failure | backend_timeout | backend_error
+    //     | circuit_breaker_open (open-breaker 503s use the reject path)
     //   X-Gateway-Upstream-Status: degraded (when routing via all-unhealthy fallback)
-    if backend_resp.connection_error {
-        resp_builder = resp_builder.header("X-Gateway-Error", "connection_failure");
-    } else if response_status == 504 {
-        resp_builder = resp_builder.header("X-Gateway-Error", "backend_timeout");
-    } else if response_status >= 500 {
-        resp_builder = resp_builder.header("X-Gateway-Error", "backend_error");
+    if let Some(value) = gateway_error_token {
+        resp_builder = resp_builder.header("X-Gateway-Error", value);
     }
 
     if upstream_is_fallback {
@@ -44755,6 +44885,19 @@ fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
+        .body(ProxyBody::from_string(body))
+        .unwrap_or_else(|_| {
+            Response::new(ProxyBody::from_string(
+                r#"{"error":"Internal server error"}"#,
+            ))
+        })
+}
+
+fn build_method_not_allowed_response(body: &str) -> Response<ProxyBody> {
+    Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .header("Content-Type", "application/json")
+        .header("Allow", PROTOCOL_LEVEL_405_ALLOW)
         .body(ProxyBody::from_string(body))
         .unwrap_or_else(|_| {
             Response::new(ProxyBody::from_string(

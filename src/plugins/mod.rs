@@ -8114,6 +8114,18 @@ impl StreamConnectionContext {
         )
     }
 
+    /// Non-consuming snapshot of this connection's summary metadata, with
+    /// authoritative correlation ownership reprojected exactly as
+    /// `finalize_stream_summary_metadata` does for a session-owned summary.
+    ///
+    /// Used by setup-failure paths that must describe an admitted-but-never-
+    /// published stream while the context is still owned by the setup chain.
+    pub(crate) fn snapshot_summary_metadata(&self) -> HashMap<String, String> {
+        let mut metadata = self.metadata.clone().unwrap_or_default();
+        self.correlation_ids.project_correlation_ids(&mut metadata);
+        metadata
+    }
+
     pub(crate) fn add_admission_permit(&mut self, permit: StreamAdmissionPermit) {
         self.admission_permits.push(permit);
     }
