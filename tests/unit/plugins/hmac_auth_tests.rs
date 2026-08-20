@@ -2874,8 +2874,7 @@ async fn non_utf8_duplicate_digest_field_line_fails_closed() {
     let digest = sha256_content_digest_header(body);
     let date = current_date();
     let nonce = test_nonce(3949);
-    let signature =
-        sign_v2_with_digest(TEST_SECRET, "POST", "/api/orders", &date, &digest, &nonce);
+    let signature = sign_v2_with_digest(TEST_SECRET, "POST", "/api/orders", &date, &digest, &nonce);
     let authorization = v2_auth_header(TEST_USERNAME, &nonce, &signature);
 
     let mut raw_headers = http::HeaderMap::new();
