@@ -1231,7 +1231,9 @@ fn test_execute_reload_rejects_self_pid() {
 #[cfg(unix)]
 #[test]
 fn test_execute_reload_rejects_pid_outside_pid_t() {
-    let result = ferrum_edge::cli::execute_reload(&ReloadArgs { pid: Some(u32::MAX) });
+    let result = ferrum_edge::cli::execute_reload(&ReloadArgs {
+        pid: Some(u32::MAX),
+    });
     assert!(result.is_err());
     let msg = result.unwrap_err();
     assert!(

@@ -851,8 +851,7 @@ pub fn execute_reload(args: &ReloadArgs) -> Result<(), String> {
 fn unix_reload_pid_t(pid: u32) -> Result<libc::pid_t, String> {
     if pid == 0 {
         return Err(
-            "invalid --pid 0: POSIX kill treats 0 as this process group, not a gateway PID"
-                .into(),
+            "invalid --pid 0: POSIX kill treats 0 as this process group, not a gateway PID".into(),
         );
     }
     let self_pid = std::process::id();
@@ -861,9 +860,8 @@ fn unix_reload_pid_t(pid: u32) -> Result<libc::pid_t, String> {
             "invalid --pid {pid}: that is this CLI process, not a running ferrum-edge gateway"
         ));
     }
-    libc::pid_t::try_from(pid).map_err(|_| {
-        format!("invalid --pid {pid}: value is outside the range of a process ID")
-    })
+    libc::pid_t::try_from(pid)
+        .map_err(|_| format!("invalid --pid {pid}: value is outside the range of a process ID"))
 }
 
 /// Render a `validate` report field whose value is derived from `env_key`.
