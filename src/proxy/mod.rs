@@ -3456,6 +3456,11 @@ pub(crate) enum DirectH2UploadGate {
     /// The configured request body limit was exceeded — deterministic 413,
     /// never the backend's early response.
     RequestBodyTooLarge,
+    /// The admitted request's authorization lifetime elapsed before the
+    /// backend response was committed. This gateway security decision wins
+    /// over transport classification once the authoritative 413 check has
+    /// passed.
+    AuthorizationExpired,
     /// The upload pump terminated on the backend write watermark
     /// (`backend_write_timeout_ms`) before the upload completed. The backend
     /// response was never committed, so this is a deterministic 504
@@ -3478,26 +3483,27 @@ pub(crate) enum DirectH2UploadGate {
 /// outcome — kept by the join point — distinguishes a backend write stall
 /// (504 `ReadWriteTimeout`) from an indeterminate size outcome. The pump's
 /// biased `select!` ranks its authorization-expiry arm above the write-idle
-/// arm, so a `WriteTimeout` terminal already implies the credential never
-/// expired; every other terminal (client/source error, cancellation, consumer
-/// drop) keeps failing closed.
+/// arm, so a `WriteTimeout` terminal proves the credential had not expired at
+/// that poll. The caller rechecks the absolute deadline before committing its
+/// replacement response; every other terminal (client/source error,
+/// cancellation, consumer drop) keeps failing closed.
 pub(crate) fn classify_direct_h2_upload_outcome(
     outcome: Option<body::RequestBodyOutcome>,
     pump_outcome: Option<upload_pump::UploadPumpOutcome>,
+    authorization_expired: bool,
 ) -> DirectH2UploadGate {
-    let Some(outcome) = outcome else {
-        return DirectH2UploadGate::FailClosed;
-    };
     match outcome {
-        body::RequestBodyOutcome::Exceeded => DirectH2UploadGate::RequestBodyTooLarge,
-        body::RequestBodyOutcome::Completed => DirectH2UploadGate::Forward,
-        body::RequestBodyOutcome::Errored | body::RequestBodyOutcome::Abandoned => {
+        Some(body::RequestBodyOutcome::Exceeded) => DirectH2UploadGate::RequestBodyTooLarge,
+        _ if authorization_expired => DirectH2UploadGate::AuthorizationExpired,
+        Some(body::RequestBodyOutcome::Completed) => DirectH2UploadGate::Forward,
+        Some(body::RequestBodyOutcome::Errored | body::RequestBodyOutcome::Abandoned) => {
             if pump_outcome == Some(upload_pump::UploadPumpOutcome::WriteTimeout) {
                 DirectH2UploadGate::BackendWriteTimeout
             } else {
                 DirectH2UploadGate::FailClosed
             }
         }
+        None => DirectH2UploadGate::FailClosed,
     }
 }
 
@@ -50019,9 +50025,39 @@ async fn proxy_to_backend_http2(
         } else {
             None
         };
-        match classify_direct_h2_upload_outcome(outcome, pump_outcome) {
+        // A `WriteTimeout` pump terminal only proves that the write watermark
+        // won at the pump's last poll. The absolute authorization deadline can
+        // elapse before this dispatcher commits its replacement response, so
+        // recheck it here and publish the same once-only latch every other
+        // upload seam uses. The gate keeps authoritative 413 precedence, then
+        // makes this security decision win over transport classification.
+        let authorization_expired = upload_auth_deadline.as_ref().is_some_and(
+            |(plan, family, latch)| {
+                if latch.observed().is_some() {
+                    return true;
+                }
+                let Some(termination) =
+                    crate::proxy::auth_lifetime::expired_authorization(Some(*plan))
+                else {
+                    return false;
+                };
+                latch.record_once(termination, *family);
+                true
+            },
+        );
+        match classify_direct_h2_upload_outcome(
+            outcome,
+            pump_outcome,
+            authorization_expired,
+        ) {
             DirectH2UploadGate::Forward => {}
             DirectH2UploadGate::RequestBodyTooLarge => return request_body_too_large(),
+            DirectH2UploadGate::AuthorizationExpired => {
+                return (
+                    authorization_expired_dispatch_placeholder(resolved_ip),
+                    None,
+                );
+            }
             DirectH2UploadGate::BackendWriteTimeout => {
                 warn!(
                     proxy_id = %proxy.id,
@@ -50037,20 +50073,6 @@ async fn proxy_to_backend_http2(
                 );
             }
             DirectH2UploadGate::FailClosed => {
-                // An upload the AUTHORIZATION deadline ended reports `Abandoned`
-                // too, but it is the gateway's own security decision rather than
-                // an indeterminate size outcome. Report it as such — health-neutral
-                // and already latched/counted by the adapter — instead of a 502.
-                if upload_auth_deadline
-                    .as_ref()
-                    .and_then(|(_, _, latch)| latch.observed())
-                    .is_some()
-                {
-                    return (
-                        authorization_expired_dispatch_placeholder(resolved_ip),
-                        None,
-                    );
-                }
                 error!(
                     proxy_id = %proxy.id,
                     outcome = ?outcome,

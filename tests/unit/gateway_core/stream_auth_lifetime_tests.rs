@@ -2168,19 +2168,20 @@ fn the_direct_h2_upload_completion_gate_is_installed_for_authenticated_requests(
 
 #[test]
 fn the_direct_h2_upload_join_reports_authorization_rather_than_an_indeterminate_size() {
-    // An authorization-terminated upload also reports `Abandoned`, which the
-    // size gate classifies as FailClosed. That must not surface as a 502
-    // backend fault.
-    let fail_closed = PROXY_SOURCE
-        .split("DirectH2UploadGate::FailClosed => {")
+    // A write timeout can win at the pump's last poll immediately before the
+    // credential expires. The dispatcher must recheck the absolute deadline
+    // and route the typed authorization gate before its timeout/502 arms.
+    let authorization = PROXY_SOURCE
+        .split("DirectH2UploadGate::AuthorizationExpired => {")
         .nth(1)
-        .expect("direct-H2 fail-closed arm")
-        .split("\"HTTP/2 request upload did not establish an authoritative size decision")
+        .expect("direct-H2 authorization-expired arm")
+        .split("DirectH2UploadGate::BackendWriteTimeout => {")
         .next()
-        .expect("bounded fail-closed arm");
-    assert!(fail_closed.contains("upload_auth_deadline"));
-    assert!(fail_closed.contains("latch.observed()"));
-    assert!(fail_closed.contains("authorization_expired_dispatch_placeholder("));
+        .expect("bounded authorization-expired arm");
+    assert!(authorization.contains("authorization_expired_dispatch_placeholder("));
+    assert!(PROXY_SOURCE.contains("let authorization_expired = upload_auth_deadline"));
+    assert!(PROXY_SOURCE.contains("latch.observed().is_some()"));
+    assert!(PROXY_SOURCE.contains("auth_lifetime::expired_authorization(Some(*plan))"));
 }
 
 #[test]

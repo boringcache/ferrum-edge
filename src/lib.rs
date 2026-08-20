@@ -9837,6 +9837,7 @@ pub mod _test_support {
     pub enum DirectH2UploadGateForTest {
         Forward,
         RequestBodyTooLarge,
+        AuthorizationExpired,
         BackendWriteTimeout,
         FailClosed,
     }
@@ -9868,6 +9869,7 @@ pub mod _test_support {
     pub fn direct_h2_upload_gate_for_test(
         outcome: Option<crate::proxy::body::RequestBodyOutcome>,
         pump_outcome: Option<UploadPumpOutcomeForTest>,
+        authorization_expired: bool,
     ) -> DirectH2UploadGateForTest {
         let pump = pump_outcome.map(|outcome| {
             use crate::proxy::upload_pump::UploadPumpOutcome;
@@ -9882,10 +9884,17 @@ pub mod _test_support {
                 UploadPumpOutcomeForTest::WriteTimeout => UploadPumpOutcome::WriteTimeout,
             }
         });
-        match crate::proxy::classify_direct_h2_upload_outcome(outcome, pump) {
+        match crate::proxy::classify_direct_h2_upload_outcome(
+            outcome,
+            pump,
+            authorization_expired,
+        ) {
             crate::proxy::DirectH2UploadGate::Forward => DirectH2UploadGateForTest::Forward,
             crate::proxy::DirectH2UploadGate::RequestBodyTooLarge => {
                 DirectH2UploadGateForTest::RequestBodyTooLarge
+            }
+            crate::proxy::DirectH2UploadGate::AuthorizationExpired => {
+                DirectH2UploadGateForTest::AuthorizationExpired
             }
             crate::proxy::DirectH2UploadGate::BackendWriteTimeout => {
                 DirectH2UploadGateForTest::BackendWriteTimeout

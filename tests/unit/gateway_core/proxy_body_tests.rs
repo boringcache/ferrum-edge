@@ -425,7 +425,7 @@ fn test_drop_with_outstanding_frames_reports_abandoned() {
 #[test]
 fn test_upload_gate_forwards_on_clean_completion() {
     assert_eq!(
-        direct_h2_upload_gate_for_test(Some(RequestBodyOutcome::Completed), None),
+        direct_h2_upload_gate_for_test(Some(RequestBodyOutcome::Completed), None, false),
         DirectH2UploadGateForTest::Forward
     );
 }
@@ -440,6 +440,7 @@ fn test_upload_gate_maps_pump_write_timeout_to_backend_write_timeout() {
         direct_h2_upload_gate_for_test(
             Some(RequestBodyOutcome::Errored),
             Some(UploadPumpOutcomeForTest::WriteTimeout),
+            false,
         ),
         DirectH2UploadGateForTest::BackendWriteTimeout
     );
@@ -449,6 +450,7 @@ fn test_upload_gate_maps_pump_write_timeout_to_backend_write_timeout() {
         direct_h2_upload_gate_for_test(
             Some(RequestBodyOutcome::Abandoned),
             Some(UploadPumpOutcomeForTest::WriteTimeout),
+            false,
         ),
         DirectH2UploadGateForTest::BackendWriteTimeout
     );
@@ -459,8 +461,8 @@ fn test_upload_gate_keeps_other_pump_terminals_fail_closed() {
     // A client/source error, cancellation, authorization expiry, consumer drop,
     // clean completion, or a missing pump terminal all leave the size decision
     // indeterminate: none of them is a backend write stall, so none may surface
-    // as a 504. Authorization expiry is still privileged by the handler's latch
-    // check in the FailClosed arm.
+    // as a 504. Authorization expiry is passed separately and has its own
+    // higher-precedence gate.
     for pump in [
         UploadPumpOutcomeForTest::Completed,
         UploadPumpOutcomeForTest::SourceError,
@@ -469,13 +471,17 @@ fn test_upload_gate_keeps_other_pump_terminals_fail_closed() {
         UploadPumpOutcomeForTest::ConsumerGone,
     ] {
         assert_eq!(
-            direct_h2_upload_gate_for_test(Some(RequestBodyOutcome::Errored), Some(pump)),
+            direct_h2_upload_gate_for_test(
+                Some(RequestBodyOutcome::Errored),
+                Some(pump),
+                false,
+            ),
             DirectH2UploadGateForTest::FailClosed,
             "pump {pump:?} must not turn an indeterminate size outcome into a 504"
         );
     }
     assert_eq!(
-        direct_h2_upload_gate_for_test(Some(RequestBodyOutcome::Errored), None),
+        direct_h2_upload_gate_for_test(Some(RequestBodyOutcome::Errored), None, false),
         DirectH2UploadGateForTest::FailClosed
     );
 }
@@ -487,7 +493,7 @@ fn test_upload_gate_fails_closed_on_error_and_abandon() {
     // interrupt polling before an over-limit frame is observed.
     for outcome in [RequestBodyOutcome::Errored, RequestBodyOutcome::Abandoned] {
         assert_eq!(
-            direct_h2_upload_gate_for_test(Some(outcome), None),
+            direct_h2_upload_gate_for_test(Some(outcome), None, false),
             DirectH2UploadGateForTest::FailClosed,
             "outcome {outcome:?} must fail closed"
         );
@@ -498,7 +504,7 @@ fn test_upload_gate_fails_closed_on_error_and_abandon() {
 fn test_upload_gate_maps_overflow_to_deterministic_413() {
     // Overflow must never expose the backend's early response.
     assert_eq!(
-        direct_h2_upload_gate_for_test(Some(RequestBodyOutcome::Exceeded), None),
+        direct_h2_upload_gate_for_test(Some(RequestBodyOutcome::Exceeded), None, false),
         DirectH2UploadGateForTest::RequestBodyTooLarge
     );
 }
@@ -508,8 +514,36 @@ fn test_upload_gate_fails_closed_on_missing_signal() {
     // Sender dropped without reporting: unreachable through the adapter's Drop
     // impl, but with no terminal size decision the gate must refuse to forward.
     assert_eq!(
-        direct_h2_upload_gate_for_test(None, None),
+        direct_h2_upload_gate_for_test(None, None, false),
         DirectH2UploadGateForTest::FailClosed
+    );
+}
+
+#[test]
+fn test_upload_gate_precedence_is_413_then_authorization_then_write_timeout() {
+    assert_eq!(
+        direct_h2_upload_gate_for_test(
+            Some(RequestBodyOutcome::Exceeded),
+            Some(UploadPumpOutcomeForTest::WriteTimeout),
+            true,
+        ),
+        DirectH2UploadGateForTest::RequestBodyTooLarge
+    );
+    assert_eq!(
+        direct_h2_upload_gate_for_test(
+            Some(RequestBodyOutcome::Errored),
+            Some(UploadPumpOutcomeForTest::WriteTimeout),
+            true,
+        ),
+        DirectH2UploadGateForTest::AuthorizationExpired
+    );
+    assert_eq!(
+        direct_h2_upload_gate_for_test(Some(RequestBodyOutcome::Completed), None, true),
+        DirectH2UploadGateForTest::AuthorizationExpired
+    );
+    assert_eq!(
+        direct_h2_upload_gate_for_test(None, None, true),
+        DirectH2UploadGateForTest::AuthorizationExpired
     );
 }
 
