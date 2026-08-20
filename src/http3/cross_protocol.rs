@@ -134,7 +134,7 @@ use crate::proxy::grpc_proxy::{
 use crate::proxy::headers::{
     ClientResponseFraming, GatewayOwnedResponseHeaders, PrePolicyResponseHeaders,
     RejectBodyDisposition, ResponseTrailerGovernance, TrailerSectionKind, apply_response_headers,
-    is_backend_response_strip_header, parse_connection_listed_headers,
+    is_backend_response_strip_header, is_untrusted_real_ip_header, parse_connection_listed_headers,
     reconcile_streaming_backend_trailers, sanitize_backend_request_trailers,
     sanitize_client_response_headers_for_wire, strip_response_hop_by_hop_trailers,
 };
@@ -1020,6 +1020,8 @@ fn build_plain_request_builder(
 
     let original_host_header = proxy_headers.get("host").map(|s| s.as_str());
     let original_xff = proxy_headers.get("x-forwarded-for").map(|s| s.as_str());
+    let peer_trusted =
+        crate::proxy::forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
     for (k, v) in proxy_headers {
         match k.as_str() {
             "host" => {
@@ -1036,6 +1038,7 @@ fn build_plain_request_builder(
             // `build_h3_backend_headers` (native H3 backend path).
             _ if k.as_str() == "early-data" => {}
             _ if should_skip_cross_protocol_backend_header(k.as_str()) => {}
+            _ if is_untrusted_real_ip_header(k.as_str(), peer_trusted) => {}
             _ => {
                 req_builder = req_builder.header(k, v);
             }
@@ -4950,12 +4953,16 @@ fn build_h3_grpc_backend_headers(
 ) -> HeaderMap {
     let original_host_header = proxy_headers.get("host").map(|s| s.as_str());
     let original_xff = proxy_headers.get("x-forwarded-for").map(|s| s.as_str());
+    let peer_trusted =
+        crate::proxy::forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
     // Pre-size the HeaderMap — each source entry produces at most one output
     // and we add up to 5 forwarding headers; `HeaderMap::with_capacity`
     // clamps to the power-of-two bucket count so extra slack is cheap.
     let mut hmap = HeaderMap::with_capacity(proxy_headers.len() + 5);
     for (k, v) in proxy_headers {
-        if should_skip_cross_protocol_backend_header(k.as_str()) {
+        if should_skip_cross_protocol_backend_header(k.as_str())
+            || is_untrusted_real_ip_header(k.as_str(), peer_trusted)
+        {
             continue;
         }
         // RFC 8470 §5.2: `Early-Data` is set by the intermediary that
@@ -11850,22 +11857,83 @@ mod tests {
         );
     }
 
-    /// H1/H2/H3 XFF parity on the cross-protocol bridge: append the
-    /// immediate QUIC peer to an existing inbound chain, and seed a
-    /// generated chain with the resolved client when it differs from the
-    /// peer (real-IP-header deployments). See `proxy::build_xff_value`.
+    /// H1/H2/H3 XFF parity on the cross-protocol bridge: drop a spoofed
+    /// inbound chain from an untrusted peer, append the QUIC peer to a
+    /// trusted inbound chain, and seed a generated chain with the resolved
+    /// client when it differs from the peer (real-IP-header deployments).
+    /// See `proxy::build_xff_value`.
     #[tokio::test]
     async fn build_plain_request_builder_xff_appends_peer_and_seeds_resolved_client() {
-        let state = minimal_proxy_state();
+        let untrusted_state = minimal_proxy_state();
+        let mut trusted_state = minimal_proxy_state();
+        trusted_state.trusted_proxies = Arc::new(
+            crate::proxy::client_ip::TrustedProxies::parse_strict("10.0.0.7", "test")
+                .expect("valid trusted proxy list"),
+        );
         let proxy = minimal_proxy();
         let client = reqwest::Client::new();
 
-        // Trusted LB sent XFF: append the peer, never the resolved client.
+        // Untrusted peer (default empty trust list): spoofed inbound XFF
+        // and X-Real-IP must not reach the backend.
         let mut headers: HashMap<String, String> = HashMap::new();
         headers.insert("x-forwarded-for".to_string(), "198.51.100.7".to_string());
+        headers.insert("x-real-ip".to_string(), "8.8.8.8".to_string());
         let req = build_plain_request_builder(
             &client,
-            &state,
+            &untrusted_state,
+            &proxy,
+            reqwest::Method::GET,
+            &headers,
+            "https://backend.example/path",
+            "backend.example",
+            "203.0.113.1",
+            "203.0.113.1",
+            true,
+            false,
+        )
+        .build()
+        .expect("request should build");
+        assert_eq!(
+            header_value(&req, "x-forwarded-for"),
+            Some(&b"203.0.113.1"[..]),
+            "untrusted inbound XFF must be dropped; outbound is the QUIC peer"
+        );
+        assert_eq!(
+            count_header(&req, "x-real-ip"),
+            0,
+            "untrusted X-Real-IP must not reach the H3→H1/H2 backend"
+        );
+
+        let grpc_headers = build_h3_grpc_backend_headers(
+            &untrusted_state,
+            &headers,
+            "203.0.113.1",
+            "203.0.113.1",
+            true,
+            false,
+        );
+        assert_eq!(
+            grpc_headers
+                .get("x-forwarded-for")
+                .map(|value| value.as_bytes()),
+            Some(&b"203.0.113.1"[..]),
+            "untrusted inbound XFF must be dropped on the H3→gRPC path"
+        );
+        assert!(
+            grpc_headers.get("x-real-ip").is_none(),
+            "untrusted X-Real-IP must not reach the H3→gRPC backend"
+        );
+
+        // Trusted LB sent a multi-hop XFF chain that seeding cannot fake.
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert(
+            "x-forwarded-for".to_string(),
+            "1.1.1.1, 198.51.100.7".to_string(),
+        );
+        headers.insert("x-real-ip".to_string(), "1.1.1.1".to_string());
+        let req = build_plain_request_builder(
+            &client,
+            &trusted_state,
             &proxy,
             reqwest::Method::GET,
             &headers,
@@ -11880,8 +11948,34 @@ mod tests {
         .expect("request should build");
         assert_eq!(
             header_value(&req, "x-forwarded-for"),
-            Some(&b"198.51.100.7, 10.0.0.7"[..]),
-            "inbound chain + appended QUIC peer; resolved client must not duplicate"
+            Some(&b"1.1.1.1, 198.51.100.7, 10.0.0.7"[..]),
+            "trusted inbound chain + appended QUIC peer; resolved client must not duplicate"
+        );
+        assert_eq!(
+            header_value(&req, "x-real-ip"),
+            Some(&b"1.1.1.1"[..]),
+            "trusted X-Real-IP must still reach the backend"
+        );
+
+        let grpc_headers = build_h3_grpc_backend_headers(
+            &trusted_state,
+            &headers,
+            "198.51.100.7",
+            "10.0.0.7",
+            true,
+            false,
+        );
+        assert_eq!(
+            grpc_headers
+                .get("x-forwarded-for")
+                .map(|value| value.as_bytes()),
+            Some(&b"1.1.1.1, 198.51.100.7, 10.0.0.7"[..]),
+            "trusted inbound chain must reach the H3→gRPC backend"
+        );
+        assert_eq!(
+            grpc_headers.get("x-real-ip").map(|value| value.as_bytes()),
+            Some(&b"1.1.1.1"[..]),
+            "trusted X-Real-IP must still reach the H3→gRPC backend"
         );
 
         // Trusted LB sent only a real-IP header (no XFF): seed with the
@@ -11889,7 +11983,7 @@ mod tests {
         let headers: HashMap<String, String> = HashMap::new();
         let req = build_plain_request_builder(
             &client,
-            &state,
+            &trusted_state,
             &proxy,
             reqwest::Method::GET,
             &headers,
@@ -11911,7 +12005,7 @@ mod tests {
         // Direct client (no proxy in front): client == peer, single entry.
         let req = build_plain_request_builder(
             &client,
-            &state,
+            &untrusted_state,
             &proxy,
             reqwest::Method::GET,
             &headers,
