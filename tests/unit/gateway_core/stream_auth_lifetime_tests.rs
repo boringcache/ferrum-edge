@@ -3629,7 +3629,9 @@ fn specialized_streaming_dispatchers_race_the_backend_write_watermark() {
             "{label} must make backend_write_timeout_ms observable while response headers are pending"
         );
         assert!(
-            !dispatch.contains("_upload_pump"),
+            !dispatch
+                .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .any(|token| token == "_upload_pump"),
             "{label} must not discard the write-watermark receiver"
         );
     }
