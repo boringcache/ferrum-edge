@@ -45587,7 +45587,7 @@ where
 /// `Err(())` means the watermark fired first. The wrapped future is polled
 /// FIRST, so a backend that answered in the same poll still wins the race and a
 /// completed exchange is never reclassified as a write stall.
-async fn await_upload_write_watermark_first<F>(
+pub(crate) async fn await_upload_write_watermark_first<F>(
     fut: F,
     pump: Option<&mut upload_pump::UploadPumpJoin>,
 ) -> Result<F::Output, ()>
@@ -46754,7 +46754,7 @@ async fn proxy_to_backend_hbone_after_ready(
         &client_request_body,
         MeshClientRequestBody::Replayable { .. }
     );
-    let (mut parts, body) = match client_request_body {
+    let (mut parts, body, mut upload_pump) = match client_request_body {
         MeshClientRequestBody::Streaming(request) => {
             let (parts, body) = request.into_parts();
             let body = body::SizeLimitedIncoming::new_with_counter(
@@ -46766,11 +46766,11 @@ async fn proxy_to_backend_hbone_after_ready(
             // Full upload lifecycle for the UPLOAD direction (#3815): the
             // adapter deadline plus a gateway-owned pump, so the bound still
             // fires while this pooled connection task is parked and not
-            // polling the body. The join point is released here — the response
-            // streams past this dispatcher, so the upload's lifetime is the
-            // transport body's, bounded by `UploadPumpSource`'s abort guard —
-            // and the pump self-terminates at the deadline regardless.
-            let (body, _upload_pump) = install_streaming_upload_authorization(
+            // polling the body. Retain the join through the response-header
+            // wait so `backend_write_timeout_ms` is client-visible even when
+            // the transport is parked outside a body poll; after headers, the
+            // transport body and `UploadPumpSource` abort guard own teardown.
+            let (body, upload_pump) = install_streaming_upload_authorization(
                 body,
                 request_upload_auth_deadline(
                     ctx,
@@ -46791,7 +46791,7 @@ async fn proxy_to_backend_hbone_after_ready(
                 }
                 _ => body,
             };
-            (parts, http_body_util::Either::Left(body))
+            (parts, http_body_util::Either::Left(body), upload_pump)
         }
         MeshClientRequestBody::Replayable {
             body,
@@ -46803,6 +46803,7 @@ async fn proxy_to_backend_hbone_after_ready(
             (
                 parts,
                 http_body_util::Either::Right(body::ReplayableRequestBody::new(body, trailers)),
+                None,
             )
         }
     };
@@ -46930,9 +46931,14 @@ async fn proxy_to_backend_hbone_after_ready(
     let send_bound = compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
     let send_fut = sender.send_request(backend_req);
     let response = if let Some(send_deadline) = send_bound.at {
-        match crate::plugins::await_deadline_first(Some(send_deadline), send_fut).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(err)) => {
+        let bounded = await_upload_write_watermark_first(
+            crate::plugins::await_deadline_first(Some(send_deadline), send_fut),
+            upload_pump.as_mut(),
+        )
+        .await;
+        match bounded {
+            Ok(Ok(Ok(response))) => Some(response),
+            Ok(Ok(Err(err))) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
                     return (
                         hbone_request_body_too_large_response(
@@ -46951,7 +46957,7 @@ async fn proxy_to_backend_hbone_after_ready(
                     None,
                 );
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
                     return (
                         hbone_request_body_too_large_response(
@@ -46989,11 +46995,12 @@ async fn proxy_to_backend_hbone_after_ready(
                     None,
                 );
             }
+            Err(()) => None,
         }
     } else {
-        match send_fut.await {
-            Ok(response) => response,
-            Err(err) => {
+        match await_upload_write_watermark_first(send_fut, upload_pump.as_mut()).await {
+            Ok(Ok(response)) => Some(response),
+            Ok(Err(err)) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
                     return (
                         hbone_request_body_too_large_response(
@@ -47012,6 +47019,40 @@ async fn proxy_to_backend_hbone_after_ready(
                     None,
                 );
             }
+            Err(()) => None,
+        }
+    };
+    let response = match response {
+        Some(response) => response,
+        None => {
+            if let Some(pump) = upload_pump.take() {
+                pump.cancel_and_join().await;
+            }
+            if body_size_exceeded.load(Ordering::Acquire) {
+                return (
+                    hbone_request_body_too_large_response(
+                        proxy,
+                        resolved_ip,
+                        None,
+                        effective_request_body_size_limit,
+                    ),
+                    None,
+                    None,
+                );
+            }
+            warn!(
+                proxy_id = %proxy.id,
+                watermark_ms = proxy.backend_write_timeout_ms,
+                "HBONE tunneled HTTP backend write watermark expired before response headers"
+            );
+            return (
+                http_backend_dispatch_error_response(
+                    retry::ErrorClass::ReadWriteTimeout,
+                    resolved_ip,
+                ),
+                None,
+                None,
+            );
         }
     };
 
@@ -47460,7 +47501,7 @@ async fn proxy_to_backend_unix(
         &client_request_body,
         MeshClientRequestBody::Replayable { .. }
     );
-    let (mut parts, body) = match client_request_body {
+    let (mut parts, body, mut upload_pump) = match client_request_body {
         MeshClientRequestBody::Streaming(request) => {
             let (parts, body) = request.into_parts();
             let body = body::SizeLimitedIncoming::new_with_counter(
@@ -47472,11 +47513,11 @@ async fn proxy_to_backend_unix(
             // Full upload lifecycle for the UPLOAD direction (#3815): the
             // adapter deadline plus a gateway-owned pump, so the bound still
             // fires while this pooled connection task is parked and not
-            // polling the body. The join point is released here — the response
-            // streams past this dispatcher, so the upload's lifetime is the
-            // transport body's, bounded by `UploadPumpSource`'s abort guard —
-            // and the pump self-terminates at the deadline regardless.
-            let (body, _upload_pump) = install_streaming_upload_authorization(
+            // polling the body. Retain the join through the response-header
+            // wait so `backend_write_timeout_ms` is client-visible even when
+            // the transport is parked outside a body poll; after headers, the
+            // transport body and `UploadPumpSource` abort guard own teardown.
+            let (body, upload_pump) = install_streaming_upload_authorization(
                 body,
                 request_upload_auth_deadline(
                     ctx,
@@ -47497,7 +47538,7 @@ async fn proxy_to_backend_unix(
                 }
                 _ => body,
             };
-            (parts, http_body_util::Either::Left(body))
+            (parts, http_body_util::Either::Left(body), upload_pump)
         }
         MeshClientRequestBody::Replayable {
             body,
@@ -47509,6 +47550,7 @@ async fn proxy_to_backend_unix(
             (
                 parts,
                 http_body_util::Either::Right(body::ReplayableRequestBody::new(body, trailers)),
+                None,
             )
         }
     };
@@ -47646,9 +47688,14 @@ async fn proxy_to_backend_unix(
             let send_bound =
                 compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
             if let Some(send_deadline) = send_bound.at {
-                match crate::plugins::await_deadline_first(Some(send_deadline), send_fut).await {
-                    Ok(result) => result,
-                    Err(_) => {
+                let bounded = await_upload_write_watermark_first(
+                    crate::plugins::await_deadline_first(Some(send_deadline), send_fut),
+                    upload_pump.as_mut(),
+                )
+                .await;
+                match bounded {
+                    Ok(Ok(result)) => Some(result),
+                    Ok(Err(_)) => {
                         if body_size_exceeded.load(Ordering::Acquire) {
                             return (
                                 unix_request_body_too_large_response(
@@ -47692,10 +47739,43 @@ async fn proxy_to_backend_unix(
                             None,
                         );
                     }
+                    Err(()) => None,
                 }
             } else {
-                send_fut.await
+                match await_upload_write_watermark_first(send_fut, upload_pump.as_mut()).await {
+                    Ok(result) => Some(result),
+                    Err(()) => None,
+                }
             }
+        };
+        let Some(send_result) = send_result else {
+            if let Some(pump) = upload_pump.take() {
+                pump.cancel_and_join().await;
+            }
+            if body_size_exceeded.load(Ordering::Acquire) {
+                return (
+                    unix_request_body_too_large_response(
+                        proxy,
+                        resolved_ip,
+                        effective_request_body_size_limit,
+                    ),
+                    None,
+                    None,
+                );
+            }
+            warn!(
+                proxy_id = %proxy.id,
+                watermark_ms = proxy.backend_write_timeout_ms,
+                "Unix backend write watermark expired before response headers"
+            );
+            return (
+                http_backend_dispatch_error_response(
+                    retry::ErrorClass::ReadWriteTimeout,
+                    resolved_ip,
+                ),
+                None,
+                None,
+            );
         };
         match send_result {
             Ok(response) => break response,
@@ -48947,7 +49027,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
         &client_request_body,
         MeshClientRequestBody::Replayable { .. }
     );
-    let (mut parts, body) = match client_request_body {
+    let (mut parts, body, mut upload_pump) = match client_request_body {
         MeshClientRequestBody::Streaming(request) => {
             let (parts, body) = request.into_parts();
             let body = body::SizeLimitedIncoming::new_with_counter(
@@ -48959,11 +49039,11 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
             // Full upload lifecycle for the UPLOAD direction (#3815): the
             // adapter deadline plus a gateway-owned pump, so the bound still
             // fires while this pooled connection task is parked and not
-            // polling the body. The join point is released here — the response
-            // streams past this dispatcher, so the upload's lifetime is the
-            // transport body's, bounded by `UploadPumpSource`'s abort guard —
-            // and the pump self-terminates at the deadline regardless.
-            let (body, _upload_pump) = install_streaming_upload_authorization(
+            // polling the body. Retain the join through the response-header
+            // wait so `backend_write_timeout_ms` is client-visible even when
+            // the transport is parked outside a body poll; after headers, the
+            // transport body and `UploadPumpSource` abort guard own teardown.
+            let (body, upload_pump) = install_streaming_upload_authorization(
                 body,
                 request_upload_auth_deadline(
                     Some(request_ctx),
@@ -48981,7 +49061,11 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
             } else {
                 body
             };
-            (parts, mesh_mtls_pool::MeshMtlsRequestBody::Streaming(body))
+            (
+                parts,
+                mesh_mtls_pool::MeshMtlsRequestBody::Streaming(body),
+                upload_pump,
+            )
         }
         MeshClientRequestBody::Replayable {
             body,
@@ -48995,6 +49079,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                 mesh_mtls_pool::MeshMtlsRequestBody::Replayable(body::ReplayableRequestBody::new(
                     body, trailers,
                 )),
+                None,
             )
         }
     };
@@ -49151,9 +49236,14 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
         send_auth_deadline.as_ref(),
     );
     let send_result = if let Some(deadline) = send_bound.at {
-        match crate::plugins::await_deadline_first(Some(deadline), send_fut).await {
-            Ok(result) => result,
-            Err(_) => {
+        let bounded = await_upload_write_watermark_first(
+            crate::plugins::await_deadline_first(Some(deadline), send_fut),
+            upload_pump.as_mut(),
+        )
+        .await;
+        match bounded {
+            Ok(Ok(result)) => Some(result),
+            Ok(Err(_)) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
                     return (
                         mesh_mtls_request_body_too_large_response(
@@ -49219,9 +49309,48 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                     None,
                 );
             }
+            Err(()) => None,
         }
     } else {
-        send_fut.await
+        match await_upload_write_watermark_first(send_fut, upload_pump.as_mut()).await {
+            Ok(result) => Some(result),
+            Err(()) => None,
+        }
+    };
+    let Some(send_result) = send_result else {
+        if let Some(pump) = upload_pump.take() {
+            pump.cancel_and_join().await;
+        }
+        if body_size_exceeded.load(Ordering::Acquire) {
+            return (
+                mesh_mtls_request_body_too_large_response(
+                    proxy,
+                    resolved_ip,
+                    is_grpc_flavored,
+                    request_body_limit,
+                ),
+                None,
+                None,
+            );
+        }
+        warn!(
+            proxy_id = %proxy.id,
+            watermark_ms = proxy.backend_write_timeout_ms,
+            is_grpc_flavored,
+            "sidecar mTLS backend write watermark expired before response headers"
+        );
+        return (
+            if is_grpc_flavored {
+                mesh_grpc_deadline_exceeded_response(resolved_ip)
+            } else {
+                http_backend_dispatch_error_response(
+                    retry::ErrorClass::ReadWriteTimeout,
+                    resolved_ip,
+                )
+            },
+            None,
+            None,
+        );
     };
     let response = match send_result {
         Ok(response) => response,

@@ -3092,21 +3092,95 @@ fn the_direct_h2_handler_joins_its_upload_before_returning() {
     // pump; the residual error exits are covered by `cancel_on_drop`. The three
     // bounded exits are the response-header deadline, the early-response upload
     // join, and the backend write watermark (#4055).
+    let direct_h2 = PROXY_SOURCE
+        .split("async fn proxy_to_backend_http2(")
+        .nth(1)
+        .expect("direct-H2 dispatcher")
+        .split("fn build_http3_backend_headers(")
+        .next()
+        .expect("bounded direct-H2 dispatcher");
     assert_eq!(
-        PROXY_SOURCE
-            .matches("pump.cancel_and_join().await;")
-            .count(),
+        direct_h2.matches("pump.cancel_and_join().await;").count(),
         3,
         "a direct-H2 bounded exit stopped joining the gateway-owned upload"
     );
     assert!(
-        PROXY_SOURCE.contains("pump.cancel_and_join().await\n"),
+        direct_h2.contains("pump.cancel_and_join().await\n"),
         "the normal-completion path must capture the join outcome instead of \
          discarding it"
     );
     assert!(
         PROXY_SOURCE.contains("UploadPumpJoin::cancel_on_drop"),
         "direct-H2 must arm cancel-on-drop so residual early returns still release the upload"
+    );
+}
+
+#[test]
+fn specialized_streaming_dispatchers_race_the_backend_write_watermark() {
+    for (start, end, label) in [
+        (
+            "async fn proxy_to_backend_hbone_after_ready(",
+            "fn unix_backend_dispatch_unavailable_response(",
+            "HBONE",
+        ),
+        (
+            "async fn proxy_to_backend_unix(",
+            "async fn proxy_to_backend_unix(\n    _state:",
+            "Unix HTTP/1.1",
+        ),
+        (
+            "async fn proxy_to_backend_mesh_mtls_after_ready(",
+            "async fn proxy_to_backend_http2(",
+            "sidecar mesh mTLS",
+        ),
+    ] {
+        let dispatch = PROXY_SOURCE
+            .split(start)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{label} streaming dispatcher"))
+            .split(end)
+            .next()
+            .unwrap_or_else(|| panic!("bounded {label} streaming dispatcher"));
+        assert!(
+            dispatch.contains("let (mut parts, body, mut upload_pump)")
+                && dispatch.contains("await_upload_write_watermark_first(")
+                && dispatch.contains("upload_pump.as_mut()")
+                && dispatch.contains("pump.cancel_and_join().await;")
+                && dispatch.contains("backend write watermark expired before response headers"),
+            "{label} must make backend_write_timeout_ms observable while response headers are pending"
+        );
+        assert!(
+            !dispatch.contains("_upload_pump"),
+            "{label} must not discard the write-watermark receiver"
+        );
+    }
+
+    let native_grpc = GRPC_PROXY_SOURCE
+        .split("pub async fn proxy_grpc_request_streaming(")
+        .nth(1)
+        .expect("native gRPC streaming entry")
+        .split("pub async fn proxy_grpc_request_streaming_channel(")
+        .next()
+        .expect("bounded native gRPC streaming entry");
+    assert!(
+        native_grpc.contains("let (body, upload_pump)")
+            && native_grpc.contains("held_frontend_upload,\n        upload_pump,"),
+        "native gRPC must retain the upload-pump join through dispatch"
+    );
+    let native_grpc_dispatch = GRPC_PROXY_SOURCE
+        .split("async fn proxy_grpc_streaming_dispatch(")
+        .nth(1)
+        .expect("native gRPC streaming dispatcher")
+        .split("/// Collect the incoming gRPC request body")
+        .next()
+        .expect("bounded native gRPC streaming dispatcher");
+    assert!(
+        native_grpc_dispatch.contains("await_upload_write_watermark_first(")
+            && native_grpc_dispatch.contains("upload_pump.as_mut()")
+            && native_grpc_dispatch.contains("pump.cancel_and_join().await;")
+            && native_grpc_dispatch
+                .contains("gRPC backend write watermark expired before response headers"),
+        "native gRPC must surface backend_write_timeout_ms before the later read/client deadline"
     );
 }
 

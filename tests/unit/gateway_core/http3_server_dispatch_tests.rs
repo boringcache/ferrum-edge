@@ -90,6 +90,37 @@ fn h3_plain_bridge_dispatches_mesh_through_shared_pools() {
 }
 
 #[test]
+fn h3_plain_dispatcher_is_boxed_off_the_cross_protocol_run_stack() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let run = source
+        .split("pub(crate) async fn run<S>(")
+        .nth(1)
+        .expect("cross-protocol run dispatcher")
+        .split("type BoxedPlainDispatchFuture<'a>")
+        .next()
+        .expect("bounded run dispatcher");
+    assert!(
+        run.contains("boxed_dispatch_plain(") && !run.contains("\n            dispatch_plain("),
+        "run must not materialize the oversized plain bridge future in its poll frame"
+    );
+
+    let boxed = source
+        .split("fn boxed_dispatch_plain<'a, S>(")
+        .nth(1)
+        .expect("boxed plain-dispatch factory")
+        .split("async fn dispatch_plain<S>(")
+        .next()
+        .expect("bounded boxed plain-dispatch factory");
+    assert!(
+        source.contains("#[inline(never)]\nfn boxed_dispatch_plain<'a, S>(")
+            && boxed.contains("Box::pin(async move {")
+            && boxed.contains("dispatch_plain(")
+            && !boxed.contains("Box::pin(dispatch_plain("),
+        "plain-dispatch boxing must use an out-of-line trampoline, not a stack temporary"
+    );
+}
+
+#[test]
 fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_write() {
     let source = include_str!("../../../src/http3/cross_protocol.rs");
     let plain = source

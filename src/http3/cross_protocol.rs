@@ -963,7 +963,7 @@ where
 
     match flavor {
         HttpFlavor::Plain => {
-            dispatch_plain(
+            boxed_dispatch_plain(
                 state,
                 epoch,
                 proxy,
@@ -2038,6 +2038,102 @@ where
             (0, false)
         }
     }
+}
+
+type PlainDispatchResult = Result<CrossProtocolOutcome, anyhow::Error>;
+type BoxedPlainDispatchFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = PlainDispatchResult> + Send + 'a>>;
+
+/// Construct the plain H3 bridge dispatcher out of line and keep its concrete
+/// coroutine on the heap.
+///
+/// `dispatch_plain` is the largest cross-protocol state machine: its streaming
+/// reqwest arm owns the request-reader bridge, upload/read watermark timers,
+/// peer-cancellation futures, and every pre-header terminal. Awaiting that
+/// concrete future inline in [`run`] charges the whole state machine to the H3
+/// request poll stack even when the selected attempt is the much smaller
+/// buffered mesh arm. In an unoptimized hosted functional-test build that stack
+/// also contains the HBONE checkout and inner HTTP/1.1 dispatch chain, which is
+/// enough to overflow a Tokio worker before the healthy response completes.
+///
+/// The thin `async move` trampoline is intentional. A bare
+/// `Box::pin(dispatch_plain(..))` would first materialize the concrete future as
+/// a stack temporary in this factory; the trampoline constructs it only when
+/// its already-heap-resident frame is polled.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_dispatch_plain<'a, S>(
+    state: &'a ProxyState,
+    epoch: &'a RequestEpoch,
+    proxy: &'a Proxy,
+    stream: &'a mut RequestStream<S, Bytes>,
+    method: &'a str,
+    proxy_headers: &'a HashMap<String, String>,
+    path: &'a str,
+    query_string: &'a str,
+    backend_url: &'a str,
+    strip_len: usize,
+    backend_path_is_policy_bound: bool,
+    lb_hash_key: Option<&'a str>,
+    upstream_target: Option<&'a UpstreamTarget>,
+    upstream_balancer: Option<&'a Arc<LoadBalancer>>,
+    cb_target_key: Option<&'a str>,
+    cb_is_half_open_probe: bool,
+    prebuffered_body: Option<Vec<u8>>,
+    raw_prebuffered_body_bytes: u64,
+    client_ip: &'a str,
+    xff_append_ip: &'a str,
+    backend_start: Instant,
+    ctx: &'a mut RequestContext,
+    plugins: &'a [Arc<dyn Plugin>],
+    initial_response_header_policy_plugins: &'a [Arc<dyn Plugin>],
+    backend_admission_plugins: &'a [Arc<dyn Plugin>],
+    preacquired_backend_admission: crate::proxy::PreacquiredBackendAdmission,
+    requires_response_body_buffering: bool,
+    response_committed_plugins: &'a [Arc<dyn Plugin>],
+    requires_response_stream_hooks: bool,
+    sticky_cookie_needed: bool,
+    request_authority: Option<&'a str>,
+) -> BoxedPlainDispatchFuture<'a>
+where
+    S: RecvStream + SendStream<Bytes> + SendStreamStopped + 'a,
+{
+    Box::pin(async move {
+        dispatch_plain(
+            state,
+            epoch,
+            proxy,
+            stream,
+            method,
+            proxy_headers,
+            path,
+            query_string,
+            backend_url,
+            strip_len,
+            backend_path_is_policy_bound,
+            lb_hash_key,
+            upstream_target,
+            upstream_balancer,
+            cb_target_key,
+            cb_is_half_open_probe,
+            prebuffered_body,
+            raw_prebuffered_body_bytes,
+            client_ip,
+            xff_append_ip,
+            backend_start,
+            ctx,
+            plugins,
+            initial_response_header_policy_plugins,
+            backend_admission_plugins,
+            preacquired_backend_admission,
+            requires_response_body_buffering,
+            response_committed_plugins,
+            requires_response_stream_hooks,
+            sticky_cookie_needed,
+            request_authority,
+        )
+        .await
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
