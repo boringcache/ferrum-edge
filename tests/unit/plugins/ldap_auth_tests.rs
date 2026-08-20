@@ -2472,7 +2472,7 @@ fn test_filter_escape_preserves_utf8() {
 async fn test_ldap_auth_non_ascii_authorization_returns_invalid_not_missing() {
     let plugin = LdapAuth::new(
         &json!({"ldap_url": "ldap://127.0.0.1:389", "bind_dn_template": "uid={username},dc=example,dc=com"}),
-        &http_client(),
+        http_client(),
     )
     .unwrap();
     let consumer_index = ConsumerIndex::new(&[]);

@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use super::plugin_utils::{
     assert_continue, assert_reject, assert_reject_body, context_with_materialized_raw_header,
     context_with_materialized_raw_header_bytes, context_with_materialized_raw_header_lines,
+    create_test_consumer,
 };
 
 fn make_ctx() -> RequestContext {

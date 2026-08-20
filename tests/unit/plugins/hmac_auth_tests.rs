@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use super::plugin_utils::{
     assert_continue, assert_reject, assert_reject_body, context_with_materialized_raw_header,
-    context_with_materialized_raw_header_bytes,
+    context_with_materialized_raw_header_bytes, create_test_proxy,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -2609,7 +2609,7 @@ async fn test_hmac_auth_non_ascii_authorization_returns_invalid_not_missing() {
              nonce=\"01234567890123456789012345678901\", signature=\"dGVzdA==\"\u{3000}"
         ),
     );
-    ctx.matched_proxy = Some(create_test_proxy());
+    ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject_body(result, r#"{"error":"Invalid Authorization header"}"#);
@@ -2623,7 +2623,7 @@ async fn test_hmac_auth_non_ascii_digest_returns_invalid_not_missing() {
     let mut ctx = make_ctx("GET", "/test");
     ctx.headers.clear();
     ctx.identified_consumer = None;
-    ctx.matched_proxy = Some(create_test_proxy());
+    ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
     ctx.headers.insert(
         "authorization".to_string(),
         format!(
@@ -2658,7 +2658,7 @@ async fn test_hmac_auth_invalid_utf8_authorization_returns_invalid_not_missing()
         "Authorization",
         b"hmac username=\"x\", nonce=\"01234567890123456789012345678901\", signature=\"dGVzdA==\"\xff",
     );
-    ctx.matched_proxy = Some(create_test_proxy());
+    ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject_body(result, r#"{"error":"Invalid Authorization header"}"#);
