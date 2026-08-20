@@ -9,8 +9,9 @@ use ferrum_edge::_test_support::{
     parse_scheme, statement_timeout_sql, validate_tcp_connection_throttle_attachments,
 };
 use ferrum_edge::config::db_backend::{
-    BatchConfigWriteMode, DatabaseBackend, is_incremental_full_reload_required,
-    is_mtls_dns_admission_unavailable, is_mtls_dns_identity_conflict,
+    BatchConfigWriteMode, DatabaseBackend, checked_next_config_topology_epoch,
+    is_incremental_full_reload_required, is_mtls_dns_admission_unavailable,
+    is_mtls_dns_identity_conflict,
     tcp_connection_throttle_attachment_conflict,
 };
 use ferrum_edge::config::db_loader::DatabaseStore;
@@ -3019,6 +3020,7 @@ async fn write_topology_permit_blocks_failover_until_dropped() {
     assert!(store.failover_topology_status().primary_active);
 
     let permit = store.acquire_write_topology_permit().await;
+    let primary_epoch = permit.topology_epoch();
     assert!(
         permit.is_pinned(),
         "SQL write admit must retain a reconnect-transition read pin"
@@ -3027,6 +3029,7 @@ async fn write_topology_permit_blocks_failover_until_dropped() {
         store.failover_topology_status().primary_active,
         "pin must observe primary topology"
     );
+    assert_eq!(store.config_topology_epoch(), primary_epoch);
     assert_eq!(
         store.list_namespaces().await.unwrap(),
         vec!["primary-ns".to_string()],
@@ -3111,9 +3114,25 @@ async fn write_topology_permit_blocks_failover_until_dropped() {
     database_store_set_reconnect_transition_hooks_for_test(&store, None);
 
     assert!(!store.failover_topology_status().primary_active);
+    let failover_epoch = store.config_topology_epoch();
+    assert!(
+        failover_epoch > primary_epoch,
+        "a published SQL topology must advance its process-local epoch"
+    );
+    let failover_permit = store.acquire_write_topology_permit().await;
+    assert_eq!(failover_permit.topology_epoch(), failover_epoch);
     assert_eq!(
         store.list_namespaces().await.unwrap(),
         vec!["failover-ns".to_string()]
+    );
+}
+
+#[test]
+fn topology_epoch_refuses_wraparound() {
+    assert_eq!(checked_next_config_topology_epoch(1).unwrap(), 2);
+    assert!(
+        checked_next_config_topology_epoch(u64::MAX).is_err(),
+        "epoch exhaustion must refuse reconnect publication instead of allowing ABA"
     );
 }
 

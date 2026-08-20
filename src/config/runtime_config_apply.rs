@@ -11,7 +11,7 @@
 //!   never rebuilds caches itself.
 //! - Admin writers capture a covering watermark from the pinned write
 //!   topology after persist, release that pin, then wait on the durable
-//!   sequence the poll loop publishes after `apply_incremental` /
+//!   topology-bound cursor the poll loop publishes after `apply_incremental` /
 //!   `update_config`.
 //! - Concurrent writers coalesce onto one reload: each waits for the covering
 //!   watermark captured under its pin (see [`PreparedLiveApply`]), and a
@@ -63,9 +63,29 @@ pub enum LiveApplyFailure {
 /// a failover can publish a different pool whose watermark is `<= accepted`
 /// and would yield a false 2xx.
 #[derive(Debug, Clone)]
-#[must_use = "captured covering sequence must be awaited after releasing topology pins"]
+#[must_use = "captured covering cursor must be awaited after releasing topology pins"]
 pub struct PreparedLiveApply {
     covering: PreparedLiveApplyCovering,
+}
+
+/// Process-local database topology plus its durable change-log watermark.
+///
+/// A sequence has meaning only inside the database/pool generation that
+/// produced it. Keeping the pair as one value prevents a stale high watermark
+/// from one topology from covering a lower watermark after failover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveApplyCursor {
+    pub topology_epoch: u64,
+    pub sequence: u64,
+}
+
+impl LiveApplyCursor {
+    pub const fn new(topology_epoch: u64, sequence: u64) -> Self {
+        Self {
+            topology_epoch,
+            sequence,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +93,7 @@ enum PreparedLiveApplyCovering {
     /// No poll-loop coordinator, or the write targeted a namespace this process
     /// does not serve.
     Noop,
-    Sequence(u64),
+    Cursor(LiveApplyCursor),
 }
 
 impl PreparedLiveApply {
@@ -84,8 +104,12 @@ impl PreparedLiveApply {
     }
 
     pub fn from_covering_sequence(sequence: u64) -> Self {
+        Self::from_covering_cursor(LiveApplyCursor::new(0, sequence))
+    }
+
+    pub fn from_covering_cursor(cursor: LiveApplyCursor) -> Self {
         Self {
-            covering: PreparedLiveApplyCovering::Sequence(sequence),
+            covering: PreparedLiveApplyCovering::Cursor(cursor),
         }
     }
 
@@ -97,7 +121,15 @@ impl PreparedLiveApply {
     pub fn covering_sequence(&self) -> Option<u64> {
         match self.covering {
             PreparedLiveApplyCovering::Noop => None,
-            PreparedLiveApplyCovering::Sequence(sequence) => Some(sequence),
+            PreparedLiveApplyCovering::Cursor(cursor) => Some(cursor.sequence),
+        }
+    }
+
+    /// Topology-bound covering watermark to wait for.
+    pub fn covering_cursor(&self) -> Option<LiveApplyCursor> {
+        match self.covering {
+            PreparedLiveApplyCovering::Noop => None,
+            PreparedLiveApplyCovering::Cursor(cursor) => Some(cursor),
         }
     }
 }
@@ -128,6 +160,7 @@ impl LiveApplyFailure {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ApplySnapshot {
+    topology_epoch: u64,
     accepted: u64,
     rejected_through: u64,
 }
@@ -140,12 +173,31 @@ pub struct RuntimeConfigApply {
     wake: Arc<ConfigChangeWakeSignal>,
     snapshot: watch::Sender<ApplySnapshot>,
     waiter_count: AtomicUsize,
+    max_waiting_epoch: AtomicU64,
     max_waiting: AtomicU64,
 }
 
 impl RuntimeConfigApply {
     pub fn new(namespace: impl Into<String>, accepted_sequence: u64) -> Self {
-        Self::with_timeout(namespace, accepted_sequence, ADMIN_WRITE_LIVE_APPLY_TIMEOUT)
+        Self::with_timeout_at_epoch(
+            namespace,
+            0,
+            accepted_sequence,
+            ADMIN_WRITE_LIVE_APPLY_TIMEOUT,
+        )
+    }
+
+    pub fn at_epoch(
+        namespace: impl Into<String>,
+        topology_epoch: u64,
+        accepted_sequence: u64,
+    ) -> Self {
+        Self::with_timeout_at_epoch(
+            namespace,
+            topology_epoch,
+            accepted_sequence,
+            ADMIN_WRITE_LIVE_APPLY_TIMEOUT,
+        )
     }
 
     pub fn with_timeout(
@@ -153,7 +205,17 @@ impl RuntimeConfigApply {
         accepted_sequence: u64,
         timeout: Duration,
     ) -> Self {
+        Self::with_timeout_at_epoch(namespace, 0, accepted_sequence, timeout)
+    }
+
+    pub fn with_timeout_at_epoch(
+        namespace: impl Into<String>,
+        topology_epoch: u64,
+        accepted_sequence: u64,
+        timeout: Duration,
+    ) -> Self {
         let (snapshot, _) = watch::channel(ApplySnapshot {
+            topology_epoch,
             accepted: accepted_sequence,
             rejected_through: 0,
         });
@@ -163,6 +225,7 @@ impl RuntimeConfigApply {
             wake: Arc::new(ConfigChangeWakeSignal::new()),
             snapshot,
             waiter_count: AtomicUsize::new(0),
+            max_waiting_epoch: AtomicU64::new(topology_epoch),
             max_waiting: AtomicU64::new(0),
         }
     }
@@ -179,15 +242,33 @@ impl RuntimeConfigApply {
         self.snapshot.borrow().accepted
     }
 
+    pub fn accepted_cursor(&self) -> LiveApplyCursor {
+        let snapshot = *self.snapshot.borrow();
+        LiveApplyCursor::new(snapshot.topology_epoch, snapshot.accepted)
+    }
+
     pub fn waiter_count(&self) -> usize {
         self.waiter_count.load(Ordering::Acquire)
     }
 
     /// Publish that the poll loop accepted a generation covering `sequence`.
     pub fn record_accepted(&self, sequence: u64) {
+        let topology_epoch = self.snapshot.borrow().topology_epoch;
+        self.record_accepted_cursor(LiveApplyCursor::new(topology_epoch, sequence));
+    }
+
+    /// Publish an accepted cursor without ever comparing it to a different
+    /// topology's sequence. Older in-flight poll results are ignored.
+    pub fn record_accepted_cursor(&self, cursor: LiveApplyCursor) {
         self.snapshot.send_modify(|snap| {
-            if sequence > snap.accepted {
-                snap.accepted = sequence;
+            if cursor.topology_epoch > snap.topology_epoch {
+                snap.topology_epoch = cursor.topology_epoch;
+                snap.accepted = cursor.sequence;
+                snap.rejected_through = 0;
+            } else if cursor.topology_epoch == snap.topology_epoch
+                && cursor.sequence > snap.accepted
+            {
+                snap.accepted = cursor.sequence;
             }
         });
     }
@@ -195,9 +276,34 @@ impl RuntimeConfigApply {
     /// Publish that a completed poll attempted `sequence` and rejected it.
     /// Waiters whose covering sequence is `<= sequence` fail closed.
     pub fn record_rejected(&self, sequence: u64) {
+        let topology_epoch = self.snapshot.borrow().topology_epoch;
+        self.record_rejected_cursor(LiveApplyCursor::new(topology_epoch, sequence));
+    }
+
+    pub fn record_rejected_cursor(&self, cursor: LiveApplyCursor) {
         self.snapshot.send_modify(|snap| {
-            if sequence > snap.rejected_through {
-                snap.rejected_through = sequence;
+            if cursor.topology_epoch > snap.topology_epoch {
+                snap.topology_epoch = cursor.topology_epoch;
+                snap.accepted = 0;
+                snap.rejected_through = cursor.sequence;
+            } else if cursor.topology_epoch == snap.topology_epoch
+                && cursor.sequence > snap.rejected_through
+            {
+                snap.rejected_through = cursor.sequence;
+            }
+        });
+    }
+
+    /// Observe a successfully published database topology before it has an
+    /// accepted config cursor. This immediately makes older waiters fail
+    /// `sequence_unavailable` and makes lower sequences in the new topology
+    /// wait instead of short-circuiting on the old accepted high-water mark.
+    pub fn observe_topology(&self, topology_epoch: u64) {
+        self.snapshot.send_modify(|snap| {
+            if topology_epoch > snap.topology_epoch {
+                snap.topology_epoch = topology_epoch;
+                snap.accepted = 0;
+                snap.rejected_through = 0;
             }
         });
     }
@@ -209,9 +315,12 @@ impl RuntimeConfigApply {
         if self.waiter_count.load(Ordering::Acquire) == 0 {
             return;
         }
+        let waiting_epoch = self.max_waiting_epoch.load(Ordering::Acquire);
         let waiting = self.max_waiting.load(Ordering::Acquire);
-        let accepted = self.snapshot.borrow().accepted;
-        if accepted < waiting {
+        let snapshot = *self.snapshot.borrow();
+        if snapshot.topology_epoch < waiting_epoch
+            || (snapshot.topology_epoch == waiting_epoch && snapshot.accepted < waiting)
+        {
             self.wake.signal_immediate();
         }
     }
@@ -222,11 +331,23 @@ impl RuntimeConfigApply {
     /// database. Signals an immediate coalesced wake so the wait does not sit
     /// on `FERRUM_DB_POLL_INTERVAL`.
     pub async fn await_committed(&self, sequence: u64) -> Result<(), LiveApplyFailure> {
-        if self.accepted_sequence() >= sequence {
-            return Ok(());
+        let topology_epoch = self.snapshot.borrow().topology_epoch;
+        self.await_committed_cursor(LiveApplyCursor::new(topology_epoch, sequence))
+            .await
+    }
+
+    pub async fn await_committed_cursor(
+        &self,
+        cursor: LiveApplyCursor,
+    ) -> Result<(), LiveApplyFailure> {
+        if let Some(result) = classify_snapshot(*self.snapshot.borrow(), cursor) {
+            return result;
         }
 
-        self.max_waiting.fetch_max(sequence, Ordering::AcqRel);
+        self.max_waiting_epoch
+            .fetch_max(cursor.topology_epoch, Ordering::AcqRel);
+        self.max_waiting
+            .fetch_max(cursor.sequence, Ordering::AcqRel);
         self.waiter_count.fetch_add(1, Ordering::AcqRel);
         struct WaiterGuard<'a>(&'a RuntimeConfigApply);
         impl Drop for WaiterGuard<'_> {
@@ -243,11 +364,8 @@ impl RuntimeConfigApply {
         loop {
             {
                 let snap = *rx.borrow();
-                if snap.accepted >= sequence {
-                    return Ok(());
-                }
-                if snap.rejected_through >= sequence {
-                    return Err(LiveApplyFailure::ConfigRejected);
+                if let Some(result) = classify_snapshot(snap, cursor) {
+                    return result;
                 }
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -261,4 +379,23 @@ impl RuntimeConfigApply {
             }
         }
     }
+}
+
+fn classify_snapshot(
+    snapshot: ApplySnapshot,
+    cursor: LiveApplyCursor,
+) -> Option<Result<(), LiveApplyFailure>> {
+    if snapshot.topology_epoch > cursor.topology_epoch {
+        return Some(Err(LiveApplyFailure::SequenceUnavailable));
+    }
+    if snapshot.topology_epoch < cursor.topology_epoch {
+        return None;
+    }
+    if snapshot.accepted >= cursor.sequence {
+        return Some(Ok(()));
+    }
+    if snapshot.rejected_through >= cursor.sequence {
+        return Some(Err(LiveApplyFailure::ConfigRejected));
+    }
+    None
 }

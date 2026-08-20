@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ferrum_edge::config::runtime_config_apply::{
-    LiveApplyFailure, PreparedLiveApply, RuntimeConfigApply,
+    LiveApplyCursor, LiveApplyFailure, PreparedLiveApply, RuntimeConfigApply,
 };
 
 #[tokio::test]
@@ -71,6 +71,52 @@ async fn one_accepted_generation_unblocks_coalesced_waiters() {
         .await
         .expect("second waiter")
         .expect("sequence 2 is live");
+}
+
+#[tokio::test]
+async fn topology_change_fails_waiters_from_the_replaced_epoch() {
+    let apply = Arc::new(RuntimeConfigApply::at_epoch("ferrum", 1, 900));
+    let waiter = apply.clone();
+    let handle = tokio::spawn(async move {
+        waiter
+            .await_committed_cursor(LiveApplyCursor::new(1, 901))
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    apply.observe_topology(2);
+    assert_eq!(
+        handle.await.expect("old-epoch waiter task"),
+        Err(LiveApplyFailure::SequenceUnavailable)
+    );
+    assert_eq!(apply.accepted_cursor(), LiveApplyCursor::new(2, 0));
+}
+
+#[tokio::test]
+async fn lower_sequence_in_new_topology_waits_and_old_poll_result_is_ignored() {
+    let apply = Arc::new(RuntimeConfigApply::at_epoch("ferrum", 1, 900));
+    apply.observe_topology(2);
+    let waiter = apply.clone();
+    let handle = tokio::spawn(async move {
+        waiter
+            .await_committed_cursor(LiveApplyCursor::new(2, 3))
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(!handle.is_finished(), "new epoch sequence 3 is not live yet");
+
+    apply.record_accepted_cursor(LiveApplyCursor::new(1, 10_000));
+    tokio::task::yield_now().await;
+    assert!(
+        !handle.is_finished(),
+        "a stale high cursor from the replaced topology must be ignored"
+    );
+
+    apply.record_accepted_cursor(LiveApplyCursor::new(2, 3));
+    handle
+        .await
+        .expect("new-epoch waiter task")
+        .expect("new topology sequence becomes live");
 }
 
 #[tokio::test(start_paused = true)]
@@ -141,4 +187,36 @@ fn prepared_live_apply_distinguishes_noop_from_covering_watermark() {
     let covering = PreparedLiveApply::from_covering_sequence(12);
     assert!(!covering.is_noop());
     assert_eq!(covering.covering_sequence(), Some(12));
+}
+
+#[test]
+fn database_incremental_publication_is_fenced_after_async_validation() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let start = source
+        .find("async fn apply_incremental_inner(")
+        .expect("incremental apply implementation");
+    let end = source[start..]
+        .find("\n    pub fn current_config(")
+        .map(|offset| start + offset)
+        .expect("incremental apply implementation end");
+    let body = &source[start..end];
+
+    let off_thread_validation = body
+        .find("validate_plugin_file_dependencies_off_thread(")
+        .expect("off-thread file validation");
+    let topology_pin = body
+        .find("db.acquire_write_topology_permit().await")
+        .expect("late database topology pin");
+    let publication = body
+        .find("self.publish_request_epoch_with_gateway_trust(")
+        .expect("request-epoch publication");
+    let release = body
+        .find("drop(topology_permit)")
+        .expect("topology pin release");
+    assert!(
+        off_thread_validation < topology_pin
+            && topology_pin < publication
+            && publication < release,
+        "the database topology pin must cover only final synchronous publication"
+    );
 }

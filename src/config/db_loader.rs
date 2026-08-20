@@ -46,7 +46,7 @@ use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -684,6 +684,11 @@ pub struct DatabaseStore {
     /// so a reconnect cannot redirect an in-flight write. Not taken on ordinary
     /// read/request hot paths.
     reconnect_transition: Arc<tokio::sync::RwLock<()>>,
+    /// Monotonic process-local generation of the pool published under
+    /// `reconnect_transition`. Captured by Admin writes and authoritative poll
+    /// loads so sequence watermarks from different databases are never
+    /// compared as one namespace history.
+    topology_epoch: Arc<AtomicU64>,
     /// External-test hooks around [`Self::reconnect_transition`]. Empty in
     /// production; see [`Self::set_reconnect_transition_hooks_for_test`].
     reconnect_transition_test_hooks: Arc<std::sync::Mutex<Option<SqlReconnectTransitionTestHooks>>>,
@@ -1822,6 +1827,7 @@ impl DatabaseStore {
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
             failover_topology: DbFailoverTopologyState::new(),
             reconnect_transition: Arc::new(tokio::sync::RwLock::new(())),
+            topology_epoch: Arc::new(AtomicU64::new(1)),
             reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
             latest_change_sequence_test_fault: Arc::new(AtomicBool::new(false)),
             db_type: db_type.to_string(),
@@ -1883,6 +1889,7 @@ impl DatabaseStore {
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
             failover_topology: DbFailoverTopologyState::new(),
             reconnect_transition: Arc::new(tokio::sync::RwLock::new(())),
+            topology_epoch: Arc::new(AtomicU64::new(1)),
             reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
             latest_change_sequence_test_fault: Arc::new(AtomicBool::new(false)),
             db_type: db_type.to_string(),
@@ -7299,6 +7306,10 @@ impl DatabaseStore {
         if topology == DatabaseTopology::Primary {
             self.failover_topology.ensure_primary_failback_allowed()?;
         }
+        let next_topology_epoch =
+            crate::config::db_backend::checked_next_config_topology_epoch(
+                self.topology_epoch.load(Ordering::Acquire),
+            )?;
 
         // Disable and close the configured primary-topology replica before
         // exposing a failover pool. Keeping the dormant pool would make it
@@ -7315,6 +7326,8 @@ impl DatabaseStore {
 
         // Atomic swap — readers that already loaded the old pool keep using it.
         let old_pool = self.pool.swap(Arc::new(new_pool));
+        self.topology_epoch
+            .store(next_topology_epoch, Ordering::Release);
         info!(
             "Database pool reconnected (db_type={}). Old pool closing in background.",
             self.db_type
@@ -9907,7 +9920,12 @@ impl DatabaseBackend for DatabaseStore {
         // Shared read pin: blocks reconnect write publication for the
         // mutation's lifetime without serializing concurrent Admin writes.
         let guard = self.reconnect_transition.clone().read_owned().await;
-        crate::config::db_backend::DbWriteTopologyPermit::pinned(guard)
+        let topology_epoch = self.topology_epoch.load(Ordering::Acquire);
+        crate::config::db_backend::DbWriteTopologyPermit::pinned(guard, topology_epoch)
+    }
+
+    fn config_topology_epoch(&self) -> u64 {
+        self.topology_epoch.load(Ordering::Acquire)
     }
 
     fn pool_stats(&self) -> Option<crate::config::db_backend::DbPoolStats> {

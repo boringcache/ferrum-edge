@@ -36,7 +36,7 @@ use crate::config::config_change_watch::{
 use crate::config::db_backend::{self, DatabaseBackend};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::config::gateway_trust::detect_gateway_trust_drift;
-use crate::config::runtime_config_apply::RuntimeConfigApply;
+use crate::config::runtime_config_apply::{LiveApplyCursor, RuntimeConfigApply};
 use crate::config::types::GatewayConfig;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::modes::file::{
@@ -1142,8 +1142,8 @@ pub async fn run(
     // listener binds (issue #3727).
     let mut gateway_trust_authority_unresolved = false;
     let initial_load = load_full_config_with_sequence(&db, &env_config.namespace).await;
-    let (config, initial_change_sequence) = match initial_load {
-        Ok((cfg, sequence)) => {
+    let (config, initial_change_cursor) = match initial_load {
+        Ok((cfg, cursor)) => {
             // The lazy offline store can recover after the deferred-migration
             // probe above fails but before this first authoritative load. A
             // successful load proves that the database is reachable now; run
@@ -1169,7 +1169,7 @@ pub async fn run(
                 cfg.proxies.len(),
                 cfg.consumers.len()
             );
-            (cfg, Some(sequence))
+            (cfg, Some(cursor))
         }
         Err(e) => {
             // Classify the initial full-load failure for backup eligibility.
@@ -1891,9 +1891,12 @@ pub async fn run(
     // no new mutations still has to drain the backlog it inherited.
     crate::admin::audit::start_delivery(env_config.admin_audit_enabled, db.clone());
 
-    let runtime_config_apply = Arc::new(RuntimeConfigApply::new(
+    let initial_runtime_cursor = initial_change_cursor
+        .unwrap_or_else(|| LiveApplyCursor::new(db.config_topology_epoch(), 0));
+    let runtime_config_apply = Arc::new(RuntimeConfigApply::at_epoch(
         env_config.namespace.clone(),
-        initial_change_sequence.unwrap_or(0),
+        initial_runtime_cursor.topology_epoch,
+        initial_runtime_cursor.sequence,
     ));
 
     let admin_state = AdminState {
@@ -2304,8 +2307,8 @@ pub async fn run(
 
                     // Generation 0 keeps the startup cursor; unexpected respawns
                     // start with None so the first tick does a full reload.
-                    let mut last_change_sequence: Option<u64> = if generation == 0 {
-                        initial_change_sequence
+                    let mut last_change_cursor: Option<LiveApplyCursor> = if generation == 0 {
+                        initial_change_cursor
                     } else {
                         None
                     };
@@ -2357,6 +2360,9 @@ pub async fn run(
                                 );
                                 match db_poll.reconnect(&db_url_for_reconnect).await {
                                     Ok(_) => {
+                                        let topology_epoch = db_poll.config_topology_epoch();
+                                        runtime_config_apply_poll.observe_topology(topology_epoch);
+                                        last_change_cursor = None;
                                         // Pool topology changed — re-probe plugin migrations
                                         // on the next successful load (failback/failover safety).
                                         plugin_migration_reconcile_state_poll
@@ -2406,7 +2412,7 @@ pub async fn run(
 
                         if force_full_reload {
                             match load_full_config_with_sequence(&db_poll, &poll_namespace).await {
-                                Ok((new_config, sequence)) => {
+                                Ok((new_config, cursor)) => {
                                     match try_publish_full_reload_after_gate(
                                         &db_poll,
                                         &db_available_poll,
@@ -2416,8 +2422,8 @@ pub async fn run(
                                         "after DB DNS reconnect",
                                         auto_apply_plugin_migrations_poll,
                                         &plugin_migration_reconcile_state_poll,
-                                        &mut last_change_sequence,
-                                        sequence,
+                                        &mut last_change_cursor,
+                                        cursor,
                                         &config_rejected_poll,
                                         &runtime_config_apply_poll,
                                     )
@@ -2460,11 +2466,24 @@ pub async fn run(
                                     continue;
                                 }
                             }
-                        } else if let Some(after_sequence) = last_change_sequence {
-                            match db_poll
-                                .load_incremental_config(&poll_namespace, after_sequence)
-                                .await
-                            {
+                        } else if let Some(after_cursor) = last_change_cursor {
+                            let load_topology_permit =
+                                db_poll.acquire_write_topology_permit().await;
+                            let load_topology_epoch = load_topology_permit.topology_epoch();
+                            if load_topology_epoch != after_cursor.topology_epoch {
+                                runtime_config_apply_poll.observe_topology(load_topology_epoch);
+                                last_change_cursor = None;
+                                database_delta_poll_metrics_for_poll.record_poll_completed();
+                                continue;
+                            }
+                            let incremental_result = db_poll
+                                .load_incremental_config(
+                                    &poll_namespace,
+                                    after_cursor.sequence,
+                                )
+                                .await;
+                            drop(load_topology_permit);
+                            match incremental_result {
                                 Ok(result) => {
                                     if !mark_db_available_after_successful_poll_load(
                                         &db_poll,
@@ -2479,24 +2498,73 @@ pub async fn run(
                                         database_delta_poll_metrics_for_poll.record_poll_completed();
                                         continue;
                                     }
-                                    let next_sequence = result.sequence_cursor;
+                                    let next_cursor = LiveApplyCursor::new(
+                                        after_cursor.topology_epoch,
+                                        result.sequence_cursor,
+                                    );
                                     let rejected_delta_identity =
-                                        RejectedDeltaIdentity::from_incremental(after_sequence, &result);
+                                        RejectedDeltaIdentity::from_incremental(
+                                            after_cursor.sequence,
+                                            &result,
+                                        );
 
-                                    match proxy_state_poll.apply_incremental(result).await {
-                                        proxy::ConfigApplyOutcome::Applied => {
-                                            last_change_sequence = Some(next_sequence);
-                                            runtime_config_apply_poll.record_accepted(next_sequence);
+                                    match proxy_state_poll
+                                        .apply_database_incremental(
+                                            result,
+                                            &db_poll,
+                                            next_cursor.topology_epoch,
+                                        )
+                                        .await
+                                    {
+                                        Err(actual_epoch) => {
+                                            runtime_config_apply_poll
+                                                .observe_topology(actual_epoch);
+                                            last_change_cursor = None;
+                                            database_delta_poll_metrics_for_poll
+                                                .record_poll_completed();
+                                            continue;
+                                        }
+                                        Ok(proxy::ConfigApplyOutcome::Applied) => {
+                                            let final_topology_permit =
+                                                db_poll.acquire_write_topology_permit().await;
+                                            let actual_epoch =
+                                                final_topology_permit.topology_epoch();
+                                            if actual_epoch != next_cursor.topology_epoch {
+                                                runtime_config_apply_poll
+                                                    .observe_topology(actual_epoch);
+                                                last_change_cursor = None;
+                                                database_delta_poll_metrics_for_poll
+                                                    .record_poll_completed();
+                                                continue;
+                                            }
+                                            last_change_cursor = Some(next_cursor);
+                                            runtime_config_apply_poll
+                                                .record_accepted_cursor(next_cursor);
+                                            drop(final_topology_permit);
                                             debug!("Incremental config reload complete");
                                             rejected_delta_tracker.record_accepted();
                                         }
-                                        proxy::ConfigApplyOutcome::Unchanged => {
-                                            last_change_sequence = Some(next_sequence);
-                                            runtime_config_apply_poll.record_accepted(next_sequence);
+                                        Ok(proxy::ConfigApplyOutcome::Unchanged) => {
+                                            let final_topology_permit =
+                                                db_poll.acquire_write_topology_permit().await;
+                                            let actual_epoch =
+                                                final_topology_permit.topology_epoch();
+                                            if actual_epoch != next_cursor.topology_epoch {
+                                                runtime_config_apply_poll
+                                                    .observe_topology(actual_epoch);
+                                                last_change_cursor = None;
+                                                database_delta_poll_metrics_for_poll
+                                                    .record_poll_completed();
+                                                continue;
+                                            }
+                                            last_change_cursor = Some(next_cursor);
+                                            runtime_config_apply_poll
+                                                .record_accepted_cursor(next_cursor);
+                                            drop(final_topology_permit);
                                             debug!("Incremental config poll valid but unchanged");
                                             rejected_delta_tracker.record_accepted();
                                         }
-                                        proxy::ConfigApplyOutcome::Rejected { errors } => {
+                                        Ok(proxy::ConfigApplyOutcome::Rejected { errors }) => {
                                             let decision = rejected_delta_tracker.record_rejection(
                                                 rejected_delta_identity.with_validation(&errors),
                                             );
@@ -2513,7 +2581,7 @@ pub async fn run(
                                                 )
                                                 .await
                                                 {
-                                                    Ok((new_config, sequence)) => {
+                                                    Ok((new_config, cursor)) => {
                                                         match try_publish_full_reload_after_gate(
                                                             &db_poll,
                                                             &db_available_poll,
@@ -2523,8 +2591,8 @@ pub async fn run(
                                                             "rejected delta escalation",
                                                             auto_apply_plugin_migrations_poll,
                                                             &plugin_migration_reconcile_state_poll,
-                                                            &mut last_change_sequence,
-                                                            sequence,
+                                                            &mut last_change_cursor,
+                                                            cursor,
                                                             &config_rejected_poll,
                                                             &runtime_config_apply_poll,
                                                         )
@@ -2576,6 +2644,11 @@ pub async fn run(
                                                                 .await
                                                             {
                                                                 Ok(_url) => {
+                                                                    let topology_epoch =
+                                                                        db_poll.config_topology_epoch();
+                                                                    runtime_config_apply_poll
+                                                                        .observe_topology(topology_epoch);
+                                                                    last_change_cursor = None;
                                                                     plugin_migration_reconcile_state_poll
                                                                         .store(PLUGIN_MIGRATIONS_NEED_RECONCILE, Ordering::Release);
                                                                     match load_full_config_with_sequence(
@@ -2584,7 +2657,7 @@ pub async fn run(
                                                                     )
                                                                     .await
                                                                     {
-                                                                        Ok((new_config, sequence)) => {
+                                                                        Ok((new_config, cursor)) => {
                                                                             match try_publish_full_reload_after_gate(
                                                                                 &db_poll,
                                                                                 &db_available_poll,
@@ -2594,8 +2667,8 @@ pub async fn run(
                                                                                 "rejected delta escalation failover",
                                                                                 auto_apply_plugin_migrations_poll,
                                                                                 &plugin_migration_reconcile_state_poll,
-                                                                                &mut last_change_sequence,
-                                                                                sequence,
+                                                                                &mut last_change_cursor,
+                                                                                cursor,
                                                                                 &config_rejected_poll,
                                                                                 &runtime_config_apply_poll,
                                                                             )
@@ -2658,7 +2731,23 @@ pub async fn run(
                                             }
 
                                             if !recovered_by_full_reload {
-                                                runtime_config_apply_poll.record_rejected(next_sequence);
+                                                let final_topology_permit = db_poll
+                                                    .acquire_write_topology_permit()
+                                                    .await;
+                                                let actual_epoch =
+                                                    final_topology_permit.topology_epoch();
+                                                if actual_epoch != next_cursor.topology_epoch {
+                                                    runtime_config_apply_poll
+                                                        .observe_topology(actual_epoch);
+                                                    last_change_cursor = None;
+                                                    earliest_wake = None;
+                                                    database_delta_poll_metrics_for_poll
+                                                        .record_poll_completed();
+                                                    continue;
+                                                }
+                                                runtime_config_apply_poll
+                                                    .record_rejected_cursor(next_cursor);
+                                                drop(final_topology_permit);
                                                 let backoff = decision.backoff;
                                                 interval.reset_after(backoff);
                                                 // Gate stream wake-ups on the
@@ -2685,7 +2774,7 @@ pub async fn run(
                                     }
                                     match load_full_config_with_sequence(&db_poll, &poll_namespace).await
                                     {
-                                        Ok((new_config, sequence)) => {
+                                        Ok((new_config, cursor)) => {
                                             match try_publish_full_reload_after_gate(
                                                 &db_poll,
                                                 &db_available_poll,
@@ -2695,8 +2784,8 @@ pub async fn run(
                                                 "full fallback",
                                                 auto_apply_plugin_migrations_poll,
                                                 &plugin_migration_reconcile_state_poll,
-                                                &mut last_change_sequence,
-                                                sequence,
+                                                &mut last_change_cursor,
+                                                cursor,
                                                 &config_rejected_poll,
                                                 &runtime_config_apply_poll,
                                             )
@@ -2736,6 +2825,11 @@ pub async fn run(
                                                     .await
                                                 {
                                                     Ok(_url) => {
+                                                        let topology_epoch =
+                                                            db_poll.config_topology_epoch();
+                                                        runtime_config_apply_poll
+                                                            .observe_topology(topology_epoch);
+                                                        last_change_cursor = None;
                                                         plugin_migration_reconcile_state_poll
                                                             .store(PLUGIN_MIGRATIONS_NEED_RECONCILE, Ordering::Release);
                                                         match load_full_config_with_sequence(
@@ -2744,7 +2838,7 @@ pub async fn run(
                                                         )
                                                         .await
                                                         {
-                                                            Ok((new_config, sequence)) => {
+                                                            Ok((new_config, cursor)) => {
                                                                 match try_publish_full_reload_after_gate(
                                                                     &db_poll,
                                                                     &db_available_poll,
@@ -2754,8 +2848,8 @@ pub async fn run(
                                                                     "failover",
                                                                     auto_apply_plugin_migrations_poll,
                                                                     &plugin_migration_reconcile_state_poll,
-                                                                    &mut last_change_sequence,
-                                                                    sequence,
+                                                                    &mut last_change_cursor,
+                                                                    cursor,
                                                                     &config_rejected_poll,
                                                                     &runtime_config_apply_poll,
                                                                 )
@@ -2810,7 +2904,7 @@ pub async fn run(
                             }
                         } else {
                             match load_full_config_with_sequence(&db_poll, &poll_namespace).await {
-                                Ok((new_config, sequence)) => {
+                                Ok((new_config, cursor)) => {
                                     match try_publish_full_reload_after_gate(
                                         &db_poll,
                                         &db_available_poll,
@@ -2820,8 +2914,8 @@ pub async fn run(
                                         "initial full poll",
                                         auto_apply_plugin_migrations_poll,
                                         &plugin_migration_reconcile_state_poll,
-                                        &mut last_change_sequence,
-                                        sequence,
+                                        &mut last_change_cursor,
+                                        cursor,
                                         &config_rejected_poll,
                                         &runtime_config_apply_poll,
                                     )
@@ -2952,11 +3046,14 @@ pub async fn run(
 async fn load_full_config_with_sequence(
     db: &Arc<dyn DatabaseBackend>,
     namespace: &str,
-) -> Result<(GatewayConfig, u64), anyhow::Error> {
+) -> Result<(GatewayConfig, LiveApplyCursor), anyhow::Error> {
+    let topology_permit = db.acquire_write_topology_permit().await;
+    let topology_epoch = topology_permit.topology_epoch();
     db.maybe_apply_deferred_migrations().await?;
     let sequence = db.latest_change_sequence(namespace).await?;
     let config = db.load_full_config(namespace).await?;
-    Ok((config, sequence))
+    drop(topology_permit);
+    Ok((config, LiveApplyCursor::new(topology_epoch, sequence)))
 }
 
 /// Publication chokepoint for full-reload poll sites: run the recovery plugin-
@@ -2973,8 +3070,8 @@ async fn try_publish_full_reload_after_gate(
     commit_context: &str,
     auto_apply_plugin_migrations: bool,
     plugin_migration_reconcile_state: &AtomicU8,
-    last_change_sequence: &mut Option<u64>,
-    sequence: u64,
+    last_change_cursor: &mut Option<LiveApplyCursor>,
+    cursor: LiveApplyCursor,
     config_rejected: &AtomicBool,
     runtime_config_apply: &RuntimeConfigApply,
 ) -> Option<bool> {
@@ -2989,15 +3086,23 @@ async fn try_publish_full_reload_after_gate(
     {
         return None;
     }
+    let topology_permit = db.acquire_write_topology_permit().await;
+    let actual_epoch = topology_permit.topology_epoch();
+    if actual_epoch != cursor.topology_epoch {
+        runtime_config_apply.observe_topology(actual_epoch);
+        *last_change_cursor = None;
+        return None;
+    }
     let outcome = proxy_state.update_config(new_config);
     let committed = commit_full_reload_poll_state(
         commit_context,
         outcome,
-        last_change_sequence,
-        sequence,
+        last_change_cursor,
+        cursor,
         config_rejected,
         runtime_config_apply,
     );
+    drop(topology_permit);
     // This is the ONE chokepoint through which an authoritative database FULL
     // snapshot reaches the live runtime, so it is the only place that may
     // settle a trust authority the backup bootstrap left unknown (issue #3727).
@@ -3021,15 +3126,15 @@ async fn try_publish_full_reload_after_gate(
 fn commit_full_reload_poll_state(
     context: &str,
     outcome: proxy::ConfigApplyOutcome,
-    last_change_sequence: &mut Option<u64>,
-    sequence: u64,
+    last_change_cursor: &mut Option<LiveApplyCursor>,
+    cursor: LiveApplyCursor,
     config_rejected: &AtomicBool,
     runtime_config_apply: &RuntimeConfigApply,
 ) -> bool {
     match outcome {
         proxy::ConfigApplyOutcome::Applied => {
-            *last_change_sequence = Some(sequence);
-            runtime_config_apply.record_accepted(sequence);
+            *last_change_cursor = Some(cursor);
+            runtime_config_apply.record_accepted_cursor(cursor);
             info!("Configuration applied from database ({})", context);
             crate::modes::clear_config_rejected_after_accepted_full_reload(
                 config_rejected,
@@ -3038,8 +3143,8 @@ fn commit_full_reload_poll_state(
             true
         }
         proxy::ConfigApplyOutcome::Unchanged => {
-            *last_change_sequence = Some(sequence);
-            runtime_config_apply.record_accepted(sequence);
+            *last_change_cursor = Some(cursor);
+            runtime_config_apply.record_accepted_cursor(cursor);
             debug!("Database configuration valid but unchanged ({})", context);
             // An Unchanged outcome still means the freshly-loaded FULL snapshot
             // passed loader validation and matches the running config, so the
@@ -3051,7 +3156,7 @@ fn commit_full_reload_poll_state(
             true
         }
         proxy::ConfigApplyOutcome::Rejected { errors } => {
-            runtime_config_apply.record_rejected(sequence);
+            runtime_config_apply.record_rejected_cursor(cursor);
             if !config_rejected.swap(true, Ordering::Relaxed) {
                 error!(
                     "Database configuration candidate rejected during full apply ({}); \
@@ -3212,12 +3317,13 @@ mod tests {
     fn normal_startup_seeds_poll_cursor_from_initial_full_load() {
         let source = include_str!("database.rs");
         assert!(
-            source.contains("let (config, initial_change_sequence) ="),
-            "database startup must retain the initial full-load change sequence"
+            source.contains("let (config, initial_change_cursor) ="),
+            "database startup must retain the initial topology-bound full-load cursor"
         );
         assert!(
-            source.contains("let mut last_change_sequence: Option<u64> = if generation == 0 {")
-                && source.contains("initial_change_sequence"),
+            source.contains(
+                "let mut last_change_cursor: Option<LiveApplyCursor> = if generation == 0 {"
+            ) && source.contains("initial_change_cursor"),
             "poll loop must start from the initial full-load cursor on generation 0"
         );
     }
@@ -3287,7 +3393,7 @@ mod tests {
         // migration probe but before the initial authoritative load.
         let source = include_str!("database.rs");
         let success_arm = source
-            .find("Ok((cfg, sequence)) => {")
+            .find("Ok((cfg, cursor)) => {")
             .expect("initial load success arm must exist");
         let initial_availability = source
             .find("let db_available = Arc::new(AtomicBool::new(initial_db_available(")
@@ -3617,13 +3723,16 @@ mod tests {
         let migration_hook = helper_source
             .find("maybe_apply_deferred_migrations")
             .expect("full reload helper must apply deferred migrations");
+        let topology_pin = helper_source
+            .find("acquire_write_topology_permit")
+            .expect("full reload helper must pin the database topology");
         let sequence_read = helper_source
             .find("latest_change_sequence")
             .expect("full reload helper must read latest change sequence");
 
         assert!(
-            migration_hook < sequence_read,
-            "deferred migrations must run before reading config_changes"
+            topology_pin < migration_hook && migration_hook < sequence_read,
+            "the topology pin must cover migrations and the config_changes read"
         );
     }
 
@@ -3632,22 +3741,23 @@ mod tests {
         // An Unchanged outcome still means the freshly-loaded FULL snapshot
         // passed loader validation, so a standing config_rejected must clear
         // (issue #2158, P2).
-        let mut last_change_sequence = Some(7);
-        let sequence = 42;
+        let previous = LiveApplyCursor::new(1, 7);
+        let cursor = LiveApplyCursor::new(1, 42);
+        let mut last_change_cursor = Some(previous);
         let config_rejected = AtomicBool::new(true);
-        let runtime_config_apply = RuntimeConfigApply::new("ferrum", 0);
+        let runtime_config_apply = RuntimeConfigApply::at_epoch("ferrum", 1, 0);
 
         let accepted = commit_full_reload_poll_state(
             "test unchanged",
             proxy::ConfigApplyOutcome::Unchanged,
-            &mut last_change_sequence,
-            sequence,
+            &mut last_change_cursor,
+            cursor,
             &config_rejected,
             &runtime_config_apply,
         );
 
         assert!(accepted);
-        assert_eq!(last_change_sequence, Some(sequence));
+        assert_eq!(last_change_cursor, Some(cursor));
         assert!(
             !config_rejected.load(Ordering::Relaxed),
             "an accepted full reload (even Unchanged) must clear config_rejected"
@@ -3658,21 +3768,22 @@ mod tests {
     fn full_reload_applied_clears_standing_config_rejection() {
         // The primary clearing site: an accepted FULL reload proves the offending
         // row is gone (issue #2158, P2).
-        let mut last_change_sequence = None;
+        let mut last_change_cursor = None;
+        let cursor = LiveApplyCursor::new(1, 99);
         let config_rejected = AtomicBool::new(true);
-        let runtime_config_apply = RuntimeConfigApply::new("ferrum", 0);
+        let runtime_config_apply = RuntimeConfigApply::at_epoch("ferrum", 1, 0);
 
         let accepted = commit_full_reload_poll_state(
             "test applied",
             proxy::ConfigApplyOutcome::Applied,
-            &mut last_change_sequence,
-            99,
+            &mut last_change_cursor,
+            cursor,
             &config_rejected,
             &runtime_config_apply,
         );
 
         assert!(accepted);
-        assert_eq!(last_change_sequence, Some(99));
+        assert_eq!(last_change_cursor, Some(cursor));
         assert!(
             !config_rejected.load(Ordering::Relaxed),
             "an accepted full reload must clear config_rejected"
@@ -3684,24 +3795,24 @@ mod tests {
         // A rejected full-reload candidate keeps the previous cursor AND raises
         // config_rejected even when the loader accepted the snapshot but the
         // final runtime apply rejected it.
-        let previous_sequence = Some(7);
-        let mut last_change_sequence = previous_sequence;
+        let previous_cursor = Some(LiveApplyCursor::new(1, 7));
+        let mut last_change_cursor = previous_cursor;
         let config_rejected = AtomicBool::new(false);
-        let runtime_config_apply = RuntimeConfigApply::new("ferrum", 0);
+        let runtime_config_apply = RuntimeConfigApply::at_epoch("ferrum", 1, 0);
 
         let accepted = commit_full_reload_poll_state(
             "test rejected",
             proxy::ConfigApplyOutcome::Rejected {
                 errors: vec!["invalid candidate".to_string()],
             },
-            &mut last_change_sequence,
-            42,
+            &mut last_change_cursor,
+            LiveApplyCursor::new(1, 42),
             &config_rejected,
             &runtime_config_apply,
         );
 
         assert!(!accepted);
-        assert_eq!(last_change_sequence, previous_sequence);
+        assert_eq!(last_change_cursor, previous_cursor);
         assert!(
             config_rejected.load(Ordering::Relaxed),
             "a rejected full apply must raise config_rejected"
@@ -3817,13 +3928,13 @@ mod tests {
         );
 
         // 3) An accepted full reload clears the flag.
-        let mut cursor = Some(1);
-        let runtime_config_apply = RuntimeConfigApply::new("ferrum", 0);
+        let mut cursor = Some(LiveApplyCursor::new(1, 1));
+        let runtime_config_apply = RuntimeConfigApply::at_epoch("ferrum", 1, 0);
         let accepted = commit_full_reload_poll_state(
             "full reload",
             proxy::ConfigApplyOutcome::Applied,
             &mut cursor,
-            2,
+            LiveApplyCursor::new(1, 2),
             &config_rejected,
             &runtime_config_apply,
         );
