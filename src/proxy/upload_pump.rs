@@ -510,16 +510,16 @@ where
     let task_terminal = Arc::clone(&terminal);
     let plan = plan.cloned();
     let handle = tokio::spawn(async move {
-        let outcome = run_upload_pump(
+        let outcome = run_upload_pump(UploadPumpTask {
             body,
             sender,
             cancel_rx,
             plan,
             write_timeout_ms,
             write_start_rx,
-            task_terminal,
+            terminal: task_terminal,
             write_timeout_tx,
-        )
+        })
         .await;
         let _ = finished_tx.send(outcome);
     });
@@ -591,19 +591,36 @@ async fn await_oneshot_signal(
     std::future::poll_fn(|cx| std::future::Future::poll(Pin::new(&mut *receiver), cx)).await
 }
 
-async fn run_upload_pump<B>(
-    mut body: B,
+/// State moved into the gateway-owned upload task.
+///
+/// Keeping the task controls together makes their shared lifecycle explicit:
+/// every sender is consumed by exactly one pump invocation and every terminal
+/// path publishes through the corresponding terminal and watermark channels.
+struct UploadPumpTask<B> {
+    body: B,
     sender: tokio::sync::mpsc::Sender<Frame<Bytes>>,
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
     plan: Option<RequestAuthLifetimePlan>,
     write_timeout_ms: u64,
-    mut write_start: Option<tokio::sync::oneshot::Receiver<()>>,
+    write_start_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     terminal: Arc<AtomicU8>,
     write_timeout_tx: tokio::sync::oneshot::Sender<()>,
-) -> UploadPumpOutcome
+}
+
+async fn run_upload_pump<B>(task: UploadPumpTask<B>) -> UploadPumpOutcome
 where
     B: http_body::Body<Data = Bytes> + Unpin,
 {
+    let UploadPumpTask {
+        mut body,
+        sender,
+        cancel_rx,
+        plan,
+        write_timeout_ms,
+        write_start_rx: mut write_start,
+        terminal,
+        write_timeout_tx,
+    } = task;
     let mut cancel = Some(cancel_rx);
     // Absolute and armed once when a credential admitted the stream. Relayed
     // DATA, gRPC messages, and trailers never refresh it, and it is owned by
@@ -878,7 +895,10 @@ pub(crate) const fn buffered_upload_frame_bytes() -> usize {
 /// `collect_request_body_under_authorization`, and the response-header wait
 /// still composes the admitted stream's deadline through
 /// `compose_dispatch_phase_auth_bound`.
-#[allow(clippy::type_complexity)]
+// Keeping the fallback tuple inline is deliberate: this is the allocation-free
+// operator opt-out path, so boxing the HeaderMap merely to shrink Result would
+// add an allocation to the exact path this API promises leaves untouched.
+#[allow(clippy::type_complexity, clippy::result_large_err)]
 pub(crate) fn spawn_replayable_upload_pump(
     data: Bytes,
     trailers: Option<http::HeaderMap>,
@@ -899,7 +919,9 @@ pub(crate) fn spawn_replayable_upload_pump(
 
 /// [`spawn_replayable_upload_pump`] with a write watermark that the native
 /// gRPC dispatcher arms only after it has acquired a backend sender.
-#[allow(clippy::type_complexity)]
+// See `spawn_replayable_upload_pump`: the large fallback stays inline so the
+// disabled-watermark path remains allocation-free.
+#[allow(clippy::type_complexity, clippy::result_large_err)]
 pub(crate) fn spawn_replayable_upload_pump_with_deferred_write(
     data: Bytes,
     trailers: Option<http::HeaderMap>,
