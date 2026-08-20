@@ -512,7 +512,10 @@ impl AdminState {
             return Ok(PreparedLiveApply::noop());
         }
         let Some(db) = self.db.as_ref() else {
-            return Ok(PreparedLiveApply::noop());
+            warn_persistence_failure_redacted("admin_write_live_apply_store");
+            return Err(live_apply_failure_response(
+                LiveApplyFailure::SequenceUnavailable,
+            ));
         };
         match db.latest_change_sequence(namespace).await {
             Ok(sequence) => Ok(PreparedLiveApply::from_covering_sequence(sequence)),
