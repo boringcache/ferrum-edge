@@ -2003,8 +2003,8 @@ fn transition_and_global_publish_are_one_linearized_critical_section() {
 
         // A concurrent outage must serialize behind the held lock rather than
         // publishing its unavailable delta out of epoch order.
-        let started = std::sync::atomic::AtomicBool::new(false);
-        let done = std::sync::atomic::AtomicBool::new(false);
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (started_w, done_w) = (Arc::clone(&started), Arc::clone(&done));
         let outage = scope.spawn({
             let client = Arc::clone(&client);
