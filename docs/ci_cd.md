@@ -2240,17 +2240,18 @@ thread holds a full-debuginfo LLVM module for the whole crate.
 
 The destination adds a job-level `env` capping `CARGO_BUILD_JOBS` at 3 and
 setting `line-tables-only` debuginfo on the `dev` **and** `test` profiles (both,
-rather than relying on `test` inheriting from `dev`), plus a best-effort swap
-enlargement immediately before that step. The swap step is deliberately not
-fail-closed — it is insurance rather than a correctness gate, and this file is
-digest-frozen, so a runner-image change that broke `swapoff` would cost a second
-protected-path push to repair. It cannot pass silently: any failure raises a
+rather than relying on `test` inheriting from `dev`), plus a best-effort
+additive 8 GiB Ferrum-owned swapfile immediately before that step. The swap
+step is deliberately not fail-closed — it is insurance rather than a
+correctness gate, and this file is digest-frozen. It never disables, removes,
+or rewrites the runner image's existing swap; failure cleanup targets only
+`/mnt/ferrum-fips-swapfile`. It cannot pass silently: any failure raises a
 warning annotation and the resulting `SwapTotal` is always printed.
 
 The pair is exact and one-way: trusted-base
 `17bfb40fbd31e80e6ae1a0efca922069c54ec485ec7a611c3420840da3e5e9e1` (the workflow
 after PR #3950's landed artifact handoff — the previous admission's adopted end)
-→ `6bb669ab79edc9bc53452b59acd50462b8db1b5b7fc5528d6b5eea76907dfa84`. Recompute
+→ `7d995d79d9932c9595d3f19eddf16c1dbd1a0d2842230f1d92eb1b24502ca401`. Recompute
 and re-pin if review changes the workflow bytes. The digest is over
 universal-newline-decoded text. RETIREMENT IS MANDATORY once the mitigation
 lands, exactly as #3943 retired the #3889 pair. Any other `fips-build.yml` edit
