@@ -2359,7 +2359,7 @@ fn buffered_terminal_logging_never_awaits_after_the_authorization_gate() {
     // The summary is built AFTER the gate, so it records the terminal status,
     // the buffered classification, and the bounded class the gate latched.
     let summary_at = PROXY_SOURCE[gate_at..builder_at]
-        .find("let summary = TransactionSummary {")
+        .find("let mut summary = TransactionSummary {")
         .map(|offset| gate_at + offset)
         .expect("the terminal transaction summary is built between the gate and the builder");
 

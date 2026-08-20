@@ -35444,7 +35444,9 @@ async fn handle_proxy_request_inner(
     // Unlimited direct-H2 passthrough publishes request bytes only at upload
     // terminal states. Capture the latch so transaction summaries can wait
     // without re-introducing a per-DATA-frame atomic on the hot path.
-    let mut passthrough_request_bytes_latch: Option<Arc<body::DirectH2BytesLatch>> = None;
+    // Assigned on every continuing dispatch path before first read; leave
+    // uninitialized so an unused starter `None` cannot trip `-D warnings`.
+    let mut passthrough_request_bytes_latch: Option<Arc<body::DirectH2BytesLatch>>;
     // Set when the retry loop breaks on a gateway-synthesized dispatch refusal
     // for a ROTATED candidate that was never dialed (mesh-transport / secured
     // transport screens). `final_upstream_target` deliberately points at that
