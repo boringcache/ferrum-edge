@@ -2044,8 +2044,17 @@ def check_performance_cache_wrapper_key(
     )
     if not job:
         return
+    job_env_match = re.search(
+        r"(?ms)^    env:\s*\n(?P<body>(?:^      [^\n]*\n)*)",
+        job,
+    )
+    job_env = job_env_match.group("body") if job_env_match is not None else ""
     require(
-        re.search(r"(?m)^    env:\s*$", job) is None,
+        re.search(
+            r"(?m)^      (?:RUSTC_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER):",
+            job_env,
+        )
+        is None,
         f"{source} performance-regression must not clear the rustc wrapper at "
         "job scope; benchmark builds need the verified sccache wrapper",
         failures,
@@ -2103,6 +2112,12 @@ def check_performance_cache_wrapper_key(
         stabilization_index == setup_index + 1,
         f"{source} performance wrapper stabilization must run immediately after "
         "setup-rust-ci and before any benchmark build",
+        failures,
+    )
+    require(
+        not step_if(stabilization) and "continue-on-error:" not in stabilization,
+        f"{source} performance wrapper stabilization must run unconditionally "
+        "after setup-rust-ci and fail the job on an unexpected copy error",
         failures,
     )
     stabilization_contract = (
@@ -5934,7 +5949,13 @@ def self_test() -> int:
             '          CARGO_BUILD_RUSTC_WRAPPER: ""\n', "", 1
         ),
         "job-scoped wrapper clearing": performance_cache_fixture.replace(
-            "        env:\n", "    env:\n", 1
+            "        env:\n"
+            '          RUSTC_WRAPPER: ""\n'
+            '          CARGO_BUILD_RUSTC_WRAPPER: ""\n',
+            "    env:\n"
+            '      RUSTC_WRAPPER: ""\n'
+            '      CARGO_BUILD_RUSTC_WRAPPER: ""\n',
+            1,
         ),
         "missing mesh workspace": performance_cache_fixture.replace(
             "            tests/performance/mesh -> target\n", "", 1
