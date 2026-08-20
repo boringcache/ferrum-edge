@@ -157,14 +157,26 @@ impl KeyAuth {
     }
 }
 
-/// Read a configured header credential from the materialized map, falling back
-/// to raw field-line bytes when `materialize_headers()` omitted a legal UTF-8
-/// value because `HeaderValue::to_str()` rejects non-ASCII bytes.
+/// Read a configured header credential from retained raw field lines when they
+/// are available, falling back to the materialized map for synthetic contexts.
+/// Raw bytes are authoritative because `materialize_headers()` can keep one
+/// ASCII field line while omitting a repeated non-ASCII or malformed line.
 fn extract_configured_header_key(
     ctx: &RequestContext,
     lower: &str,
     original: Option<&str>,
 ) -> HeaderCredentialExtract {
+    if ctx.has_raw_headers() {
+        for name in [Some(lower), original] {
+            let Some(name) = name else {
+                continue;
+            };
+            if let Some(extracted) = extract_raw_header_field_lines(ctx, name) {
+                return extracted;
+            }
+        }
+    }
+
     if let Some(value) = ctx
         .headers
         .get(lower)
@@ -172,37 +184,27 @@ fn extract_configured_header_key(
     {
         return HeaderCredentialExtract::Present(value.clone());
     }
-
-    if !ctx.has_raw_headers() {
-        return HeaderCredentialExtract::Missing;
-    }
-
-    for name in [Some(lower), original] {
-        let Some(name) = name else {
-            continue;
-        };
-        let values: Vec<&[u8]> = ctx.raw_header_value_bytes(name).collect();
-        if values.is_empty() {
-            continue;
-        }
-        return match raw_header_field_lines_to_utf8_string(name, &values) {
-            Some(value) => HeaderCredentialExtract::Present(value),
-            None => HeaderCredentialExtract::InvalidFormat,
-        };
-    }
     HeaderCredentialExtract::Missing
 }
 
-fn raw_header_field_lines_to_utf8_string(name: &str, values: &[&[u8]]) -> Option<String> {
+fn extract_raw_header_field_lines(
+    ctx: &RequestContext,
+    name: &str,
+) -> Option<HeaderCredentialExtract> {
     let separator = super::repeated_request_header_separator(name);
     let mut out = String::new();
-    for (idx, bytes) in values.iter().enumerate() {
+    let mut found = false;
+    for (idx, bytes) in ctx.raw_header_value_bytes(name).enumerate() {
+        found = true;
         if idx > 0 {
             out.push_str(separator);
         }
-        out.push_str(std::str::from_utf8(bytes).ok()?);
+        let Ok(value) = std::str::from_utf8(bytes) else {
+            return Some(HeaderCredentialExtract::InvalidFormat);
+        };
+        out.push_str(value);
     }
-    Some(out)
+    found.then_some(HeaderCredentialExtract::Present(out))
 }
 
 #[async_trait]
