@@ -206,6 +206,26 @@ async fn sequence_unavailable_returns_applied_false() {
 }
 
 #[tokio::test]
+async fn active_coordinator_without_database_store_fails_closed() {
+    let (store, _primary, _failover, _tmp) = sqlite_pair().await;
+    let apply = Arc::new(RuntimeConfigApply::new("ferrum", 0));
+    let db: Arc<dyn DatabaseBackend> = Arc::new(store);
+    let state = AdminState {
+        db: None,
+        ..live_apply_state(db, Some(apply))
+    };
+
+    let failure = state
+        .prepare_live_apply_after_commit(&default_namespace())
+        .await
+        .expect_err("an active live-apply coordinator requires its database store");
+    let (status, body) = response_json(failure).await;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["applied"], false);
+    assert_eq!(body["reason"], "sequence_unavailable");
+}
+
+#[tokio::test]
 async fn sequence_is_captured_under_pin_and_not_re_queried_after_release() {
     let (store, _primary, failover_url, _tmp) = sqlite_pair().await;
     store
