@@ -51,6 +51,7 @@ jobs:
           python3 -I .github/scripts/publish_scaling_gate_signal.py --self-test
 
       - name: Publish scaling gate freshness
+        if: always()
         env:
           GITHUB_TOKEN: ${{ github.token }}
           SCALING_JOB_RESULT: skipped

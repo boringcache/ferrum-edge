@@ -5,15 +5,19 @@
 //! to accept that same maximum TTL. Consumer JWTs stay on their own 1-hour
 //! minting path and must not reuse this constant.
 //!
-//! `POST /batch` is all-or-nothing. The only retried failure is the documented
-//! namespace-fence response: HTTP 503 plus
-//! `{"error":"Namespace mutation is temporarily unavailable; retry later"}`.
+//! `POST /batch` is all-or-nothing. The only retried failures are the documented
+//! HTTP 503 bodies: the namespace-fence object
+//! `{"error":"Namespace mutation is temporarily unavailable; retry later"}` and
+//! the persistence/lease object `{"error": <string>, "rollback": "not_needed"}`.
 
 #![allow(dead_code)]
 
 use std::time::Duration;
 
 use serde_json::json;
+
+/// Documented `rollback` value for all-or-nothing persistence/lease 503s.
+pub const BATCH_ROLLBACK_NOT_NEEDED: &str = "not_needed";
 
 /// Documented admin-facing namespace-fence retry message.
 pub const NAMESPACE_FENCE_RETRY_MESSAGE: &str =
@@ -93,15 +97,20 @@ pub fn namespace_fence_backoff(attempt: u32) -> Duration {
     Duration::from_secs((1u64 << shift).min(NAMESPACE_FENCE_MAX_BACKOFF_SECS))
 }
 
-fn is_documented_namespace_fence_body(body: &str) -> bool {
+fn is_documented_retryable_batch_503_body(body: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
         return false;
     };
     match value {
         serde_json::Value::Object(map) => {
-            map.len() == 1
-                && map.get("error").and_then(serde_json::Value::as_str)
-                    == Some(NAMESPACE_FENCE_RETRY_MESSAGE)
+            let error = map.get("error").and_then(serde_json::Value::as_str);
+            if map.len() == 1 {
+                return error == Some(NAMESPACE_FENCE_RETRY_MESSAGE);
+            }
+            map.len() == 2
+                && error.is_some()
+                && map.get("rollback").and_then(serde_json::Value::as_str)
+                    == Some(BATCH_ROLLBACK_NOT_NEEDED)
         }
         _ => false,
     }
@@ -122,7 +131,7 @@ pub fn classify_admin_batch_response(
     if status == 201 {
         return BatchProvisionDecision::Success;
     }
-    if status == 503 && is_documented_namespace_fence_body(body) {
+    if status == 503 && is_documented_retryable_batch_503_body(body) {
         return BatchProvisionDecision::Retry {
             delay: namespace_fence_retry_after_delay(retry_after),
         };
@@ -133,7 +142,7 @@ pub fn classify_admin_batch_response(
     }
 }
 
-/// POST one atomic batch body, retrying only the documented namespace-fence 503.
+/// POST one atomic batch body, retrying only the documented all-or-nothing 503s.
 pub async fn post_admin_batch(
     client: &reqwest::Client,
     admin_url: &str,
@@ -203,4 +212,9 @@ pub async fn post_admin_batch(
 /// Canonical JSON body used by the documented namespace-fence contract.
 pub fn documented_namespace_fence_body() -> serde_json::Value {
     json!({ "error": NAMESPACE_FENCE_RETRY_MESSAGE })
+}
+
+/// Canonical JSON body used by documented persistence/lease 503s.
+pub fn documented_batch_rollback_not_needed_body(error: &str) -> serde_json::Value {
+    json!({ "error": error, "rollback": BATCH_ROLLBACK_NOT_NEEDED })
 }

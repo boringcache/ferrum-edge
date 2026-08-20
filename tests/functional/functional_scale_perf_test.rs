@@ -419,8 +419,8 @@ async fn create_batch(
     // proxies exist before plugin_configs reference proxy_id.
 
     // `POST /batch` is all-or-nothing and succeeds only with 201. Only the
-    // documented pre-mutation namespace-fence 503 is retried, so repeating the
-    // same atomic body cannot accept or compound a partial graph.
+    // documented all-or-nothing 503s are retried, so repeating the same atomic
+    // body cannot accept or compound a partial graph.
     for chunk in all_consumers.chunks(API_BATCH_CHUNK) {
         let batch_body = json!({ "consumers": chunk });
         post_admin_batch(

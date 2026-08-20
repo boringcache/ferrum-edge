@@ -44,6 +44,8 @@ ISSUE_LABELS = ("severity:high",)
 SIGNAL_AUTHOR = "github-actions[bot]"
 ISSUE_LIST_PER_PAGE = 30
 ISSUE_LIST_MAX_PAGES = 5
+ISSUE_REASON_MAX_CHARS = 200
+ISSUE_RUN_LINE_RE = re.compile(r"(?m)^Run: \S+/actions/runs/([1-9][0-9]*)\s*$")
 WORKFLOW_FILE = "scaling-regression.yml"
 WORKFLOW_RUN_LIST_PER_PAGE = 5
 # Weekly cadence (7d) plus one day so Sunday–Friday freshness checks do not
@@ -86,7 +88,6 @@ class LatestRun:
     status: str
     conclusion: str | None
     age_seconds: int
-    html_url: str | None = None
 
 
 def utc_now() -> datetime:
@@ -124,24 +125,62 @@ def canonical_actions_run_url(server: str, repo: str, run_id: int) -> str:
     return f"{server.rstrip('/')}/{repo}/actions/runs/{run_id}"
 
 
-def issue_run_url(
-    server: str,
-    repo: str,
-    run_id: int | None,
-    api_html_url: Any = None,
-) -> str:
+def issue_run_url(server: str, repo: str, run_id: int | None) -> str:
     """Construct the issue run link from known repo identity.
 
-    The link is always built from `server`/`repo`/`run_id`, never taken from
-    the API payload: an API-supplied html_url can only ever equal the value
-    already constructed here, so arbitrary hosts, paths, or query strings have
-    no way to reach the issue body. `api_html_url` is accepted (and ignored)
-    so callers can pass the payload field through without special-casing it.
+    The link is always built from `server`/`repo`/`run_id`. API payloads are
+    never consulted for this URL.
     """
 
     if run_id is None:
         return server.rstrip("/")
     return canonical_actions_run_url(server, repo, run_id)
+
+
+def public_issue_reason(reason: str) -> str:
+    """Keep issue-body Reason lines markdown-safe and bounded."""
+
+    cleaned: list[str] = []
+    for char in reason:
+        if char in "`\r\n":
+            cleaned.append(" ")
+        else:
+            cleaned.append(char)
+    text = " ".join("".join(cleaned).split())
+    if len(text) > ISSUE_REASON_MAX_CHARS:
+        text = text[:ISSUE_REASON_MAX_CHARS].rstrip()
+    return text
+
+
+def recorded_run_id_from_issue_body(body: Any) -> int | None:
+    if not isinstance(body, str):
+        return None
+    match = ISSUE_RUN_LINE_RE.search(body)
+    if match is None:
+        return None
+    parsed, err = parse_github_run_id(match.group(1))
+    if err is not None or parsed is None:
+        return None
+    return parsed
+
+
+def close_blocked_by_recorded_generation(
+    existing: dict[str, Any], decision: Decision
+) -> str | None:
+    """Refuse close when the issue already records a newer generation.
+
+    Returns a reason to leave the blocker open, or None when close may proceed.
+    An unreadable recorded run id fails closed.
+    """
+
+    if decision.source_run_id is None:
+        return "close source run id is missing"
+    recorded = recorded_run_id_from_issue_body(existing.get("body"))
+    if recorded is None:
+        return "recorded run id is unreadable"
+    if recorded > decision.source_run_id:
+        return f"recorded run {recorded} is newer than {decision.source_run_id}"
+    return None
 
 
 def _workflow_run_id(entry: dict[str, Any]) -> int:
@@ -227,7 +266,7 @@ def issue_body(reason: str, run_url: str) -> str:
         "The Scheduled Scaling Regression gate is red or stale. This issue is the\n"
         "durable signal so a broken 10k/30k scale lane cannot stay red unnoticed.\n"
         "\n"
-        f"Reason: {reason}\n"
+        f"Reason: {public_issue_reason(reason)}\n"
         f"Run: {run_url}\n"
         "\n"
         "The next successful scheduled or dispatched scaling run on `main` closes this\n"
@@ -321,7 +360,7 @@ def latest_run_on_main(
         if not isinstance(entry, dict):
             return None, "schema: workflow run item is not an object"
         head_branch = entry.get("head_branch")
-        if head_branch not in (None, "main"):
+        if head_branch != "main":
             return None, "schema: workflow run is not on main"
         try:
             created = parse_iso8601(entry.get("created_at"), "workflow run created_at")
@@ -364,19 +403,12 @@ def latest_run_on_main(
         run_id = _workflow_run_id(latest_entry)
     except SignalError as exc:
         return None, f"{exc.code}: {exc.message}"
-    html_url = latest_entry.get("html_url")
-    accepted_html = None
-    if isinstance(html_url, str):
-        # Stash the raw candidate; issue_run_url applies same-repo validation
-        # against the caller's GITHUB_SERVER_URL once the generation is known.
-        accepted_html = html_url
     return (
         LatestRun(
             run_id=run_id,
             status=status.strip().lower(),
             conclusion=normalized_conclusion,
             age_seconds=age,
-            html_url=accepted_html,
         ),
         None,
     )
@@ -427,6 +459,9 @@ def find_signal_issue(
             {
                 "state": "all",
                 "labels": ",".join(ISSUE_LABELS),
+                "creator": SIGNAL_AUTHOR,
+                "sort": "updated",
+                "direction": "desc",
                 "per_page": str(ISSUE_LIST_PER_PAGE),
                 "page": str(page),
             }
@@ -453,6 +488,13 @@ def find_signal_issue(
         if len(payload) < ISSUE_LIST_PER_PAGE:
             break
         if page == ISSUE_LIST_MAX_PAGES:
+            # sort=updated keeps the live publisher-owned signal in this
+            # window because every mutation rewrites the issue. Unrelated
+            # label history must not make discovery unreachable: a unique
+            # match already collected is returned. Zero matches on a full
+            # window still fail closed; absence cannot be proved past the bound.
+            if len(matches) == 1:
+                break
             raise SignalError("schema", "issue listing exceeded pagination bound")
     if len(matches) > 1:
         raise SignalError("schema", "ambiguous publisher-owned signal issues")
@@ -492,7 +534,7 @@ def apply_decision(
         number = existing.get("number")
         if not isinstance(number, int):
             raise SignalError("schema", "existing signal issue is missing number")
-        patch: dict[str, Any] = {"body": body, "labels": list(ISSUE_LABELS)}
+        patch: dict[str, Any] = {"body": body}
         if existing.get("state") != "open":
             patch["state"] = "open"
         request("PATCH", f"https://api.github.com/repos/{repo}/issues/{number}", token, patch)
@@ -500,6 +542,10 @@ def apply_decision(
         return
     if existing is None or existing.get("state") != "open":
         print("scaling-gate-signal: no open signal issue to close")
+        return
+    blocked = close_blocked_by_recorded_generation(existing, decision)
+    if blocked is not None:
+        print(f"scaling-gate-signal: refusing to close ({blocked})")
         return
     number = existing.get("number")
     if not isinstance(number, int):
@@ -537,12 +583,7 @@ def run_live(now: datetime) -> int:
     decision = decide(
         job_result, current_run_id, current_run_id_error, latest, history_error
     )
-    api_html_url = (
-        latest.html_url
-        if latest is not None and decision.source_run_id == latest.run_id
-        else None
-    )
-    run_url = issue_run_url(server, repo, decision.source_run_id, api_html_url)
+    run_url = issue_run_url(server, repo, decision.source_run_id)
     print(f"scaling-gate-signal: {decision.action} because {decision.reason}")
     apply_decision(repo, token, decision, run_url, mutate)
     return 1 if decision.fail_job else 0
@@ -675,12 +716,10 @@ def self_test() -> int:
     repo = "ferrum-edge/ferrum-edge"
     server = "https://github.com"
     expected_url = f"{server}/{repo}/actions/runs/{current}"
-    if issue_run_url(server, repo, current, "https://evil.example/phish") != expected_url:
-        failures.append("API-supplied arbitrary run URL must be ignored")
-    if issue_run_url(server, repo, current, expected_url) != expected_url:
-        failures.append("same-repo Actions run html_url must be accepted as the constructed URL")
-    if issue_run_url(server, repo, None, expected_url) != server:
-        failures.append("missing generation must not use an API-supplied run URL")
+    if issue_run_url(server, repo, current) != expected_url:
+        failures.append("run URL must be constructed from repo identity")
+    if issue_run_url(server, repo, None) != server:
+        failures.append("missing generation must not invent a run URL")
 
     now = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -804,6 +843,15 @@ def self_test() -> int:
         True,
         "malformed latest item",
     )
+    expect_history(
+        [workflow_run(created=timedelta(hours=4), head_branch=None, run_id=25)],
+        "open",
+        True,
+        "missing head_branch is not on main",
+    )
+    missing_branch = workflow_run(created=timedelta(hours=4), run_id=26)
+    del missing_branch["head_branch"]
+    expect_history([missing_branch], "open", True, "missing head_branch is not on main")
 
     def boom_request(method: str, url: str, token: str, body: dict[str, Any] | None) -> Any:
         raise SignalError("api", "boom")
@@ -895,13 +943,57 @@ def self_test() -> int:
             issue.update(extra)
         return issue
 
+    def listing_query_ok(url: str) -> None:
+        if "state=all" not in url or "labels=" not in url:
+            raise AssertionError(f"listing must be bounded labeled state=all: {url}")
+        if "sort=updated" not in url or "direction=desc" not in url:
+            raise AssertionError(f"listing must sort by updated desc: {url}")
+        encoded_creator = urllib.parse.urlencode({"creator": SIGNAL_AUTHOR})
+        if encoded_creator not in url:
+            raise AssertionError(f"listing must filter by publisher creator: {url}")
+
     def listing_request(items: list[Any]) -> Callable[[str, str, str, dict[str, Any] | None], Any]:
         def request(method: str, url: str, token: str, body: dict[str, Any] | None) -> Any:
             if method != "GET" or "/issues?" not in url:
                 raise AssertionError(f"unexpected {method} {url}")
-            if "state=all" not in url or "labels=" not in url:
-                raise AssertionError(f"listing must be bounded labeled state=all: {url}")
+            listing_query_ok(url)
             return items
+
+        return request
+
+    def dummy_issue(number: int) -> dict[str, Any]:
+        return {
+            "number": number,
+            "title": "unrelated",
+            "body": "no marker",
+            "state": "open",
+            "user": {"login": SIGNAL_AUTHOR},
+        }
+
+    def full_window_pages(match: dict[str, Any] | None) -> dict[int, list[Any]]:
+        pages: dict[int, list[Any]] = {}
+        for page in range(1, ISSUE_LIST_MAX_PAGES + 1):
+            start = (page - 1) * ISSUE_LIST_PER_PAGE
+            pages[page] = [
+                dummy_issue(10_000 + start + index) for index in range(ISSUE_LIST_PER_PAGE)
+            ]
+        if match is not None:
+            pages[1][0] = match
+        return pages
+
+    def paged_listing_request(
+        pages: dict[int, list[Any]],
+    ) -> Callable[[str, str, str, dict[str, Any] | None], Any]:
+        def request(method: str, url: str, token: str, body: dict[str, Any] | None) -> Any:
+            if method != "GET" or "/issues?" not in url:
+                raise AssertionError(f"unexpected {method} {url}")
+            listing_query_ok(url)
+            parsed = urllib.parse.urlparse(url)
+            page_raw = urllib.parse.parse_qs(parsed.query).get("page", ["1"])[0]
+            page = int(page_raw, 10)
+            if page not in pages:
+                raise AssertionError(f"listing requested unbound page {page}")
+            return pages[page]
 
         return request
 
@@ -941,11 +1033,33 @@ def self_test() -> int:
     if found_closed != closed:
         failures.append("closed publisher-owned signal must be selectable for reopen")
 
+    unique_in_window = signal_issue(1)
+    found_in_full_window = find_signal_issue(
+        "ferrum-edge/ferrum-edge",
+        "token",
+        paged_listing_request(full_window_pages(unique_in_window)),
+    )
+    if found_in_full_window != unique_in_window:
+        failures.append("unique match in a full listing window must still be discovered")
+    try:
+        find_signal_issue(
+            "ferrum-edge/ferrum-edge",
+            "token",
+            paged_listing_request(full_window_pages(None)),
+        )
+        failures.append("full listing window with no match must fail closed")
+    except SignalError as exc:
+        if "pagination bound" not in exc.message:
+            failures.append(
+                f"full listing window with no match must name the pagination bound, got {exc.message}"
+            )
+
     captured: list[tuple[str, str, dict[str, Any] | None]] = []
 
     def fake_request(method: str, url: str, token: str, body: dict[str, Any] | None) -> Any:
         captured.append((method, url, body))
         if method == "GET" and "/issues?" in url:
+            listing_query_ok(url)
             return []
         if method == "POST" and url.endswith("/issues"):
             assert body is not None
@@ -971,10 +1085,12 @@ def self_test() -> int:
     def reopen_request(method: str, url: str, token: str, body: dict[str, Any] | None) -> Any:
         captured.append((method, url, body))
         if method == "GET" and "/issues?" in url:
+            listing_query_ok(url)
             return [closed]
         if method == "PATCH" and url.endswith("/issues/13"):
             assert body is not None
             assert body.get("state") == "open"
+            assert "labels" not in body
             return closed
         raise AssertionError(f"unexpected {method} {url}")
 
@@ -989,8 +1105,97 @@ def self_test() -> int:
     if not any(method == "PATCH" and url.endswith("/issues/13") for method, url, _ in captured):
         failures.append("self-test expected closed publisher-owned issue to be reopened")
 
+    captured.clear()
+    already_open = signal_issue(14, state="open")
+
+    def update_open_request(method: str, url: str, token: str, body: dict[str, Any] | None) -> Any:
+        captured.append((method, url, body))
+        if method == "GET" and "/issues?" in url:
+            listing_query_ok(url)
+            return [already_open]
+        if method == "PATCH" and url.endswith("/issues/14"):
+            assert body is not None
+            assert "labels" not in body
+            assert "state" not in body
+            return already_open
+        raise AssertionError(f"unexpected {method} {url}")
+
+    apply_decision(
+        "ferrum-edge/ferrum-edge",
+        "token",
+        Decision("open", "scaling matrix result is failure", False, 100),
+        canonical_actions_run_url(server, repo, 100),
+        True,
+        update_open_request,
+    )
+    if not any(method == "PATCH" and url.endswith("/issues/14") for method, url, _ in captured):
+        failures.append("self-test expected open publisher-owned issue to be updated without replacing labels")
+
+    def close_request(
+        existing: dict[str, Any], *, allow_patch: bool
+    ) -> Callable[[str, str, str, dict[str, Any] | None], Any]:
+        def request(method: str, url: str, token: str, body: dict[str, Any] | None) -> Any:
+            captured.append((method, url, body))
+            if method == "GET" and "/issues?" in url:
+                listing_query_ok(url)
+                return [existing]
+            if allow_patch and method == "PATCH" and url.endswith(f"/issues/{existing['number']}"):
+                assert body is not None
+                assert body.get("state") == "closed"
+                assert "labels" not in body
+                return existing
+            raise AssertionError(f"unexpected {method} {url}")
+
+        return request
+
+    newer_recorded = signal_issue(
+        15,
+        body=issue_body("already open", canonical_actions_run_url(server, repo, newer)),
+    )
+    captured.clear()
+    apply_decision(
+        "ferrum-edge/ferrum-edge",
+        "token",
+        Decision("close", "latest successful scaling run is within freshness", False, current),
+        canonical_actions_run_url(server, repo, current),
+        True,
+        close_request(newer_recorded, allow_patch=False),
+    )
+    if any(method == "PATCH" for method, _, _ in captured):
+        failures.append("must not close when recorded run id is newer than the decision")
+
+    unreadable_recorded = signal_issue(16, body=MARKER + "\nno run line")
+    captured.clear()
+    apply_decision(
+        "ferrum-edge/ferrum-edge",
+        "token",
+        Decision("close", "latest successful scaling run is within freshness", False, current),
+        canonical_actions_run_url(server, repo, current),
+        True,
+        close_request(unreadable_recorded, allow_patch=False),
+    )
+    if any(method == "PATCH" for method, _, _ in captured):
+        failures.append("must not close when recorded run id is unreadable")
+
+    older_recorded = signal_issue(
+        17,
+        body=issue_body("stale open", canonical_actions_run_url(server, repo, older)),
+    )
+    captured.clear()
+    apply_decision(
+        "ferrum-edge/ferrum-edge",
+        "token",
+        Decision("close", "latest successful scaling run is within freshness", False, current),
+        canonical_actions_run_url(server, repo, current),
+        True,
+        close_request(older_recorded, allow_patch=True),
+    )
+    if not any(method == "PATCH" and url.endswith("/issues/17") for method, url, _ in captured):
+        failures.append("newer close must proceed when recorded run id is older")
+
     def empty_create(method: str, url: str, token: str, body: dict[str, Any] | None) -> Any:
         if method == "GET" and "/issues?" in url:
+            listing_query_ok(url)
             return []
         if method == "POST" and url.endswith("/issues"):
             return {}
@@ -1025,6 +1230,20 @@ def self_test() -> int:
     body = issue_body("reason", "https://example.invalid/run")
     if MARKER not in body:
         failures.append("issue body must carry the durable signal marker")
+    nasty = "boom\n`inject` " + ("A" * 400)
+    sanitized = issue_body(nasty, expected_url)
+    reason_lines = [line for line in sanitized.splitlines() if line.startswith("Reason: ")]
+    if len(reason_lines) != 1:
+        failures.append("issue body must carry exactly one Reason line")
+    else:
+        reason_line = reason_lines[0]
+        payload = reason_line[len("Reason: ") :]
+        if "`" in payload or "\n" in payload:
+            failures.append("issue Reason line must strip backticks and newlines")
+        if len(payload) > ISSUE_REASON_MAX_CHARS:
+            failures.append("issue Reason line must stay within the public-reason bound")
+        if "inject" not in payload:
+            failures.append("issue Reason line must keep the sanitized message")
 
     if MAX_AGE_SECONDS != 8 * 24 * 60 * 60:
         failures.append("freshness ceiling drifted from the weekly-plus-one-day contract")

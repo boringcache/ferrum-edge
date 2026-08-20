@@ -1,8 +1,8 @@
 //! Static contracts for the scheduled scaling harness and gate signal (#3892).
 //!
-//! These pin the workflow-sized admin JWT policy, documented-only namespace-fence
-//! batch retries, and the fail-closed scaling-gate notification without executing
-//! the 10k/30k suites.
+//! These pin the workflow-sized admin JWT policy, documented all-or-nothing
+//! batch 503 retries, and the fail-closed scaling-gate notification without
+//! executing the 10k/30k suites.
 
 use std::time::Duration;
 
@@ -12,12 +12,13 @@ use serde_json::json;
 mod scheduled_scaling;
 
 use scheduled_scaling::{
-    ADMIN_BATCH_REQUEST_TIMEOUT_SECS, BatchProvisionDecision,
+    ADMIN_BATCH_REQUEST_TIMEOUT_SECS, BATCH_ROLLBACK_NOT_NEEDED, BatchProvisionDecision,
     NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS, NAMESPACE_FENCE_MAX_ATTEMPTS,
     NAMESPACE_FENCE_MAX_BACKOFF_SECS, NAMESPACE_FENCE_MAX_RETRY_AFTER_SECS,
     NAMESPACE_FENCE_RETRY_MESSAGE, SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS,
-    classify_admin_batch_response, documented_namespace_fence_body, namespace_fence_backoff,
-    namespace_fence_retry_after_delay, scheduled_scaling_admin_jwt_max_ttl_value,
+    classify_admin_batch_response, documented_batch_rollback_not_needed_body,
+    documented_namespace_fence_body, namespace_fence_backoff, namespace_fence_retry_after_delay,
+    scheduled_scaling_admin_jwt_max_ttl_value,
 };
 
 const WORKFLOW: &str = include_str!("../../../.github/workflows/scaling-regression.yml");
@@ -74,20 +75,43 @@ fn consumer_jwt_minting_stays_separate_from_the_admin_workflow_ttl() {
 }
 
 #[test]
-fn documented_namespace_fence_503_is_the_only_retried_batch_response() {
-    let body = serde_json::to_string(&documented_namespace_fence_body()).expect("json");
+fn documented_retryable_503s_are_retried_and_other_outcomes_stay_fatal() {
+    let fence = serde_json::to_string(&documented_namespace_fence_body()).expect("json");
     assert_eq!(
-        classify_admin_batch_response(503, Some("1"), &body),
+        classify_admin_batch_response(503, Some("1"), &fence),
         BatchProvisionDecision::Retry {
             delay: Duration::from_secs(1)
         }
     );
     assert_eq!(
-        classify_admin_batch_response(503, Some("99"), &body),
+        classify_admin_batch_response(503, Some("99"), &fence),
         BatchProvisionDecision::Retry {
             delay: Duration::from_secs(NAMESPACE_FENCE_MAX_RETRY_AFTER_SECS)
         }
     );
+
+    let lease_lost = serde_json::to_string(&documented_batch_rollback_not_needed_body(
+        "Namespace config admission was lost before the batch could commit; nothing was applied",
+    ))
+    .expect("json");
+    assert_eq!(
+        classify_admin_batch_response(503, Some("1"), &lease_lost),
+        BatchProvisionDecision::Retry {
+            delay: Duration::from_secs(1)
+        }
+    );
+
+    let persistence = serde_json::to_string(&documented_batch_rollback_not_needed_body(
+        "database is temporarily unavailable",
+    ))
+    .expect("json");
+    assert_eq!(
+        classify_admin_batch_response(503, None, &persistence),
+        BatchProvisionDecision::Retry {
+            delay: Duration::from_secs(NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS)
+        }
+    );
+
     assert_eq!(
         classify_admin_batch_response(201, None, "{}"),
         BatchProvisionDecision::Success
@@ -112,8 +136,7 @@ fn documented_namespace_fence_503_is_the_only_retried_batch_response() {
         other => panic!("malformed 503 bodies must be fatal, got {other:?}"),
     }
 
-    let fence_on_500 = serde_json::to_string(&documented_namespace_fence_body()).expect("json");
-    match classify_admin_batch_response(500, Some("1"), &fence_on_500) {
+    match classify_admin_batch_response(500, Some("1"), &fence) {
         BatchProvisionDecision::Fatal { status, .. } => assert_eq!(status, 500),
         other => panic!("non-503 statuses must be fatal, got {other:?}"),
     }
@@ -123,10 +146,16 @@ fn documented_namespace_fence_503_is_the_only_retried_batch_response() {
         other => panic!("partial-success statuses must be fatal, got {other:?}"),
     }
 
+    match classify_admin_batch_response(409, None, &persistence) {
+        BatchProvisionDecision::Fatal { status, .. } => assert_eq!(status, 409),
+        other => panic!("conflict rollback bodies must stay fatal, got {other:?}"),
+    }
+
     assert_eq!(
         NAMESPACE_FENCE_RETRY_MESSAGE,
         "Namespace mutation is temporarily unavailable; retry later"
     );
+    assert_eq!(BATCH_ROLLBACK_NOT_NEEDED, "not_needed");
     assert_eq!(NAMESPACE_FENCE_MAX_ATTEMPTS, 10);
 }
 
@@ -194,6 +223,27 @@ fn documented_namespace_fence_error_plus_extra_field_is_fatal() {
             assert!(body.contains("retry"));
         }
         other => panic!("documented error plus an extra field must be fatal, got {other:?}"),
+    }
+
+    let extra_rollback = json!({
+        "error": "database is temporarily unavailable",
+        "rollback": BATCH_ROLLBACK_NOT_NEEDED,
+        "detail": "nope"
+    })
+    .to_string();
+    match classify_admin_batch_response(503, Some("1"), &extra_rollback) {
+        BatchProvisionDecision::Fatal { status, .. } => assert_eq!(status, 503),
+        other => panic!("rollback body plus an extra field must be fatal, got {other:?}"),
+    }
+
+    let wrong_rollback = json!({
+        "error": "database is temporarily unavailable",
+        "rollback": "needed"
+    })
+    .to_string();
+    match classify_admin_batch_response(503, Some("1"), &wrong_rollback) {
+        BatchProvisionDecision::Fatal { status, .. } => assert_eq!(status, 503),
+        other => panic!("non-not_needed rollback must be fatal, got {other:?}"),
     }
 }
 
@@ -317,6 +367,9 @@ fn scaling_gate_signal_is_generation_aware() {
         "exact current run success",
         "exact current run failure",
         "numeric run-id is not generation order",
+        "missing head_branch is not on main",
+        "must not close when recorded run id is newer than the decision",
+        "must not close when recorded run id is unreadable",
     ] {
         assert!(
             SIGNAL.contains(label),
@@ -337,6 +390,18 @@ fn freshness_workflow_is_fail_closed_and_does_not_run_the_suites() {
     assert!(FRESHNESS.contains("publish_scaling_gate_signal.py"));
     assert!(FRESHNESS.contains("issues: write"));
     assert!(FRESHNESS.contains("actions: read"));
+    let publish = FRESHNESS
+        .split("- name: Publish scaling gate freshness")
+        .nth(1)
+        .expect("freshness publish step");
+    let publish_step = publish
+        .split("\n      - ")
+        .next()
+        .expect("freshness publish step body");
+    assert!(
+        publish_step.contains("if: always()"),
+        "freshness publish must still run when static verification fails"
+    );
     assert!(!FRESHNESS.contains("cargo test"));
     assert!(!FRESHNESS.contains("cargo build"));
     assert!(!FRESHNESS.contains("pull_request:"));
@@ -350,4 +415,96 @@ fn freshness_workflow_is_fail_closed_and_does_not_run_the_suites() {
     assert!(SIGNAL.contains("refs/heads/main"));
     assert!(VERIFIER.contains("verify_scaling_regression_workflow.py"));
     assert!(CI_CD.contains("scaling-gate-freshness.yml"));
+}
+
+#[test]
+fn scaling_gate_publisher_spoof_and_discovery_contracts_are_pr_gated() {
+    let production = SIGNAL
+        .split("def self_test")
+        .next()
+        .expect("production publisher");
+    let author_line = production
+        .lines()
+        .find(|line| line.starts_with("SIGNAL_AUTHOR = "))
+        .expect("SIGNAL_AUTHOR assignment");
+    assert_eq!(author_line, "SIGNAL_AUTHOR = \"github-actions[bot]\"");
+    let login_checks = production
+        .lines()
+        .filter(|line| line.trim() == "if login != SIGNAL_AUTHOR:")
+        .count();
+    assert_eq!(
+        login_checks, 2,
+        "listing skip and require_publisher_owned_signal must both reject non-bot authors"
+    );
+
+    let listing = production
+        .split("def find_signal_issue")
+        .nth(1)
+        .expect("find_signal_issue")
+        .split("def apply_decision")
+        .next()
+        .expect("find_signal_issue body");
+    assert!(
+        listing.contains("\"state\": \"all\""),
+        "discovery must list state=all so a closed signal can be reopened"
+    );
+    assert!(
+        listing.contains("\"sort\": \"updated\"") && listing.contains("\"direction\": \"desc\""),
+        "discovery must sort by updated desc so the live signal stays in the window"
+    );
+    assert!(
+        listing.contains("\"creator\": SIGNAL_AUTHOR"),
+        "discovery must filter by publisher creator so PRs and unrelated issues cannot consume the bound"
+    );
+    assert!(
+        listing.contains("ISSUE_LIST_PER_PAGE") && listing.contains("ISSUE_LIST_MAX_PAGES"),
+        "discovery must keep a finite listing bound"
+    );
+    assert!(
+        listing.contains("if len(matches) == 1:")
+            && listing.contains("issue listing exceeded pagination bound"),
+        "a unique match in a full window must be returned; absence on a full window stays fail-closed"
+    );
+
+    let latest = production
+        .split("def latest_run_on_main")
+        .nth(1)
+        .expect("latest_run_on_main")
+        .split("def _issue_number")
+        .next()
+        .expect("latest_run_on_main body");
+    assert!(
+        latest.contains("if head_branch != \"main\":"),
+        "missing or null head_branch must fail closed rather than counting as main"
+    );
+    assert!(
+        !latest.contains("html_url"),
+        "latest-run parsing must not stash an API-supplied html_url"
+    );
+
+    let apply = production
+        .split("def apply_decision")
+        .nth(1)
+        .expect("apply_decision")
+        .split("def run_live")
+        .next()
+        .expect("apply_decision body");
+    assert!(
+        apply.contains("close_blocked_by_recorded_generation"),
+        "close must compare the recorded Run id against the decision generation"
+    );
+    assert!(
+        apply.contains("\"labels\": list(ISSUE_LABELS)"),
+        "creation must still set the severity label"
+    );
+    assert!(
+        apply.contains("patch: dict[str, Any] = {\"body\": body}"),
+        "open-path updates must patch body only and not replace maintainer labels"
+    );
+
+    assert!(
+        production.contains("def public_issue_reason")
+            && production.contains("ISSUE_REASON_MAX_CHARS = 200"),
+        "public issue reasons must be sanitized and truncated before they reach the issue body"
+    );
 }

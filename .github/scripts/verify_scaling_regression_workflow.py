@@ -2,7 +2,7 @@
 """Static contracts for Scheduled Scaling Regression (issue #3892).
 
 Pins the weekly 180-minute matrix, workflow-sized admin JWT policy in both
-affected harnesses, documented-only namespace-fence batch retries, and the
+affected harnesses, documented all-or-nothing batch 503 retries, and the
 fail-closed scaling-gate signal / freshness notification. Does not execute
 tests or mint tokens.
 """
@@ -48,6 +48,7 @@ REQUIRED_LATEST_RUN_SELF_TESTS = (
     "history API failure",
     "exact current run success",
     "exact current run failure",
+    "missing head_branch is not on main",
 )
 PUBLISHER_QUEUE_MODE = "queue: max"
 
@@ -202,6 +203,11 @@ def validate_freshness_text(text: str, failures: list[str]) -> None:
     require("actions: read" in text, "freshness workflow must request actions: read", failures)
     require("contents: write" not in text, "freshness workflow must not request contents: write", failures)
     require(
+        "if: always()" in text,
+        "freshness publish must run even when static verification fails",
+        failures,
+    )
+    require(
         "cargo test" not in text and "cargo build" not in text,
         "freshness workflow must not run the 10k/30k suites",
         failures,
@@ -256,6 +262,21 @@ def validate_signal_text(text: str, failures: list[str]) -> None:
     require('"state": "all"' in text, "signal must list issues with state=all", failures)
     production, sep, self_test_src = text.partition("def self_test")
     require(sep == "def self_test", "signal must define self_test", failures)
+    require("if login != SIGNAL_AUTHOR" in production, "signal must reject non-bot issue authors", failures)
+    require('"sort": "updated"' in production, "signal must sort issue discovery by updated", failures)
+    require('"direction": "desc"' in production, "signal must list newest-updated issues first", failures)
+    require(
+        '"creator": SIGNAL_AUTHOR' in production,
+        "signal must filter issue discovery by publisher creator",
+        failures,
+    )
+    require('if head_branch != "main"' in production, "missing head_branch must fail closed", failures)
+    require("def public_issue_reason" in production, "signal must sanitize public issue reasons", failures)
+    require(
+        "close_blocked_by_recorded_generation" in production,
+        "signal must refuse stale closes against a newer recorded run",
+        failures,
+    )
     require(
         "def latest_run_on_main" in production,
         "signal must inspect the latest scaling-regression run on main",
@@ -330,6 +351,7 @@ def validate_helper_text(text: str, failures: list[str]) -> None:
     )
     require("classify_admin_batch_response" in text, "helper must classify batch responses", failures)
     require("status == 503" in text, "helper must require HTTP 503", failures)
+    require('"not_needed"' in text, "helper must retry documented rollback:not_needed 503s", failures)
     require("NAMESPACE_FENCE_MAX_ATTEMPTS" in text, "helper must bound retries", failures)
     require(
         "delay.max(namespace_fence_backoff(attempt))" in text,
@@ -501,7 +523,9 @@ jobs:
       issues: write
       actions: read
     steps:
-      - run: python3 -I .github/scripts/publish_scaling_gate_signal.py
+      - name: Publish scaling gate freshness
+        if: always()
+        run: python3 -I .github/scripts/publish_scaling_gate_signal.py
 """
     freshness_failures: list[str] = []
     validate_freshness_text(good_freshness, freshness_failures)
@@ -525,6 +549,13 @@ ref == "refs/heads/main"
 fail-closed
 SIGNAL_AUTHOR = "github-actions[bot]"
 "state": "all"
+"sort": "updated"
+"direction": "desc"
+"creator": SIGNAL_AUTHOR
+if login != SIGNAL_AUTHOR
+if head_branch != "main"
+def public_issue_reason
+close_blocked_by_recorded_generation
 def latest_run_on_main
 latest_run_on_main(repo, token, now)
 parse_github_run_id
@@ -548,6 +579,7 @@ malformed current run identity
 history API failure
 exact current run success
 exact current run failure
+missing head_branch is not on main
 """
     signal_failures: list[str] = []
     validate_signal_text(good_signal, signal_failures)

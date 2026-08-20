@@ -624,8 +624,8 @@ async fn provision_resources(
         }));
     }
     // `POST /batch` is all-or-nothing and succeeds only with 201. Only the
-    // documented pre-mutation namespace-fence 503 is retried, so repeating the
-    // same atomic body cannot accept or compound a partial graph.
+    // documented all-or-nothing 503s are retried, so repeating the same atomic
+    // body cannot accept or compound a partial graph.
     for chunk in all_consumers.chunks(API_BATCH_CHUNK) {
         post_admin_batch(
             client,
