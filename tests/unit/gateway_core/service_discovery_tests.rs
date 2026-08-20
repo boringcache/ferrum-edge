@@ -3081,6 +3081,59 @@ async fn mesh_sd_sidecar_topology_bridges_remote_workloads_via_east_west_gateway
 }
 
 #[tokio::test]
+async fn mesh_sd_sidecar_topology_skips_remote_workloads_on_tcp_selected_port() {
+    // Sidecar east-west bridging is HTTP-family only. A TCP selected port
+    // keeps the local target and skips remotes fail-closed — never a
+    // `remote-pod:15006` dial and never an east-west gateway target.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let remote_id = "spiffe://west.local/ns/ferrum/sa/api";
+    let tcp_port = ServicePort {
+        port: 9090,
+        protocol: AppProtocol::Tcp,
+        name: Some("tcp".to_string()),
+        target_port: None,
+    };
+    let mut svc = mesh_service_with_ports(api_id, vec![tcp_port]);
+    svc.workloads.push(WorkloadRef {
+        spiffe_id: mesh_spiffe(remote_id),
+    });
+    let mut local = mesh_workload(api_id, "api", "10.0.0.1", 9090);
+    local.ports = vec![WorkloadPort {
+        port: 9090,
+        protocol: AppProtocol::Tcp,
+        name: Some("tcp".to_string()),
+    }];
+    let mut remote = mesh_remote_west_workload(remote_id, 9090);
+    remote.ports = vec![WorkloadPort {
+        port: 9090,
+        protocol: AppProtocol::Tcp,
+        name: Some("tcp".to_string()),
+    }];
+    let mesh = MeshConfig {
+        services: vec![svc],
+        workloads: vec![local, remote],
+        multi_cluster: Some(mesh_west_multi_cluster()),
+        ..MeshConfig::default()
+    };
+
+    let targets = mesh_sd_discoverer(mesh, Some(9090), MeshSdTopology::Sidecar)
+        .discover()
+        .await
+        .expect("discover succeeds");
+
+    assert_eq!(
+        targets.len(),
+        1,
+        "TCP selected port must keep the local target and skip remotes"
+    );
+    assert_eq!(targets[0].host, "10.0.0.1");
+    assert_eq!(targets[0].port, 9090);
+    assert!(!targets[0].tags.contains_key("mesh.cross_cluster"));
+    assert!(!targets[0].tags.contains_key("mesh.eastwest_sni"));
+    assert!(!targets[0].tags.contains_key("mesh.remote"));
+}
+
+#[tokio::test]
 async fn mesh_sd_sidecar_bridges_service_name_matched_remote_workloads_without_refs() {
     // A MeshService with NO `workloads` refs matches workloads by
     // `workload.service_name` (the supported mesh-SD shape pinned by the
