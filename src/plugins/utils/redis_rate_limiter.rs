@@ -3120,6 +3120,8 @@ impl RedisRateLimitClient {
     ///
     /// Uses a Redis pipeline to send `INCR` + `EXPIRE` in a single round-trip.
     /// This is the core primitive for fixed-window rate limiting.
+    // Redis command failures are intentionally collapsed to () at this boundary.
+    #[allow(clippy::result_unit_err)]
     pub async fn incr_with_expire(&self, key: &str, ttl_seconds: u64) -> Result<i64, ()> {
         let mut conn = self.get_connection().await.ok_or(())?;
 
@@ -3158,6 +3160,7 @@ impl RedisRateLimitClient {
     /// The caller makes its allow/deny decision from the returned post-INCR
     /// current count, tying admission to the mutation even when many gateway
     /// instances race on the same key.
+    #[allow(clippy::result_unit_err)]
     pub async fn sliding_window_increment(
         &self,
         previous_key: &str,
@@ -3175,6 +3178,7 @@ impl RedisRateLimitClient {
     /// message in a single round trip rather than one round trip per fragment.
     /// `amount` must be positive; the caller owns the bound on how large it can
     /// grow.
+    #[allow(clippy::result_unit_err)]
     pub async fn sliding_window_increment_by(
         &self,
         previous_key: &str,
@@ -3222,6 +3226,7 @@ impl RedisRateLimitClient {
     /// Uses a Redis pipeline to send `INCRBY` + `EXPIRE` in a single round-trip.
     /// Used by the AI token rate limiter where each request may consume a variable
     /// number of tokens.
+    #[allow(clippy::result_unit_err)]
     pub async fn incrby_with_expire(
         &self,
         key: &str,
@@ -3289,6 +3294,7 @@ impl RedisRateLimitClient {
     /// in the conservative direction (a concurrent add during the race can
     /// leave a transient over-count, which is safe for a rate limiter — it
     /// never under-counts usage).
+    #[allow(clippy::result_unit_err)]
     pub async fn incrby_with_expire_floor_zero(
         &self,
         key: &str,
@@ -3328,6 +3334,7 @@ impl RedisRateLimitClient {
 
     /// Increment one counter by 1 and another by a specific amount in a single
     /// pipelined round-trip. Returns `(new_count, new_total)`.
+    #[allow(clippy::result_unit_err)]
     pub async fn incr_and_incrby_with_expire(
         &self,
         count_key: &str,
@@ -3377,6 +3384,7 @@ impl RedisRateLimitClient {
     ///
     /// Used by the AI token rate limiter to fetch both the previous and current
     /// window counters without two separate round-trips.
+    #[allow(clippy::result_unit_err)]
     pub async fn get_two_counters(&self, key1: &str, key2: &str) -> Result<(i64, i64), ()> {
         let mut conn = self.get_connection().await.ok_or(())?;
 
@@ -3410,6 +3418,7 @@ impl RedisRateLimitClient {
     ///
     /// Used by plugins that need arbitrary key-value storage (e.g., request
     /// deduplication, AI semantic cache) rather than rate limiting counters.
+    #[allow(clippy::result_unit_err)]
     pub async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>, ()> {
         let mut conn = self.get_connection().await.ok_or(())?;
 
@@ -3447,6 +3456,7 @@ impl RedisRateLimitClient {
     /// independently verified against the bound before admission. Callers treat
     /// [`BoundedRedisValue::Oversized`] and [`BoundedRedisValue::Empty`] as
     /// invalid entries and quarantine them.
+    #[allow(clippy::result_unit_err)]
     pub async fn get_bytes_bounded(
         &self,
         key: &str,
@@ -3530,6 +3540,7 @@ impl RedisRateLimitClient {
 
     /// Best-effort unconditional key deletion, used to quarantine a poisoned or
     /// invalid cache entry so it is not re-served on the next request.
+    #[allow(clippy::result_unit_err)]
     pub async fn delete(&self, key: &str) -> Result<(), ()> {
         let mut conn = self.get_connection().await.ok_or(())?;
 
@@ -3558,6 +3569,7 @@ impl RedisRateLimitClient {
     ///
     /// Uses a pipelined `SET` + `EXPIRE` in a single round-trip.
     /// Used by plugins that need arbitrary key-value storage.
+    #[allow(clippy::result_unit_err)]
     pub async fn set_bytes_with_expire(
         &self,
         key: &str,
@@ -3601,6 +3613,7 @@ impl RedisRateLimitClient {
     ///
     /// Returns `Ok(true)` when the caller acquired the key, `Ok(false)` when an
     /// existing key prevented the write, and `Err(())` when Redis is unavailable.
+    #[allow(clippy::result_unit_err)]
     pub async fn set_bytes_nx_with_expire(
         &self,
         key: &str,
@@ -3662,6 +3675,7 @@ impl RedisRateLimitClient {
     /// fail-closed result. A timeout marks the client unavailable exactly like
     /// any other command failure, so the background recovery checker owns
     /// restoring it.
+    #[allow(clippy::result_unit_err)]
     pub async fn set_bytes_nx_with_expire_bounded(
         &self,
         key: &str,
@@ -3752,6 +3766,7 @@ impl RedisRateLimitClient {
     /// connection-local `WATCH` state can neither be interleaved by another
     /// command nor silently dropped by a transparent reconnect. Any I/O failure
     /// at `WATCH`, `GET`, `UNWATCH`, or `EXEC` fails closed as `Err(())`.
+    #[allow(clippy::result_unit_err)]
     pub async fn delete_if_value_matches(&self, key: &str, expected: &[u8]) -> Result<bool, ()> {
         // Owned for the duration of the transaction; never cloned or shared.
         let mut conn = self.get_dedicated_connection().await.ok_or(())?;
@@ -3866,6 +3881,7 @@ impl RedisRateLimitClient {
     ///
     /// Any I/O failure at `WATCH`, `GET`, `UNWATCH`, or `EXEC` fails closed;
     /// a partial transaction is never retried on a fresh connection.
+    #[allow(clippy::result_unit_err)]
     pub async fn set_bytes_with_expire_if_value_matches(
         &self,
         key: &str,
