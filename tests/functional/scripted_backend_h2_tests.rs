@@ -2995,6 +2995,8 @@ async fn direct_h2_strips_spoofed_client_forwarded_when_regenerating() {
         .get(harness.proxy_url("/api/ownership"))
         .header(reqwest::header::HOST, "example.com")
         .header("forwarded", "for=10.0.0.1;proto=https")
+        .header("x-forwarded-for", "198.51.100.9")
+        .header("x-real-ip", "8.8.8.8")
         .send()
         .await
         .expect("gateway response");
@@ -3038,6 +3040,29 @@ async fn direct_h2_strips_spoofed_client_forwarded_when_regenerating() {
     assert!(
         forwarded.iter().all(|v| !v.contains("10.0.0.1")),
         "spoofed client Forwarded must not reach the direct-H2 backend: {forwarded:?}"
+    );
+    let xff: Vec<&str> = stream
+        .headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("x-forwarded-for"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(
+        xff,
+        vec!["127.0.0.1"],
+        "untrusted inbound XFF must not reach the direct-H2 backend; got {xff:?} \
+         (headers={:?})",
+        stream.headers
+    );
+    let real_ip: Vec<&str> = stream
+        .headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("x-real-ip"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert!(
+        real_ip.is_empty(),
+        "untrusted X-Real-IP must not reach the direct-H2 backend: {real_ip:?}"
     );
 }
 
