@@ -2995,6 +2995,7 @@ async fn hmac_auth_preserves_downstream_request_body_bytes() {
         !ctx.metadata.contains_key("request_body"),
         "hmac_auth must not retain a UTF-8 body copy"
     );
+    ctx.set_raw_query_string("access_token=debug-secret".to_string());
     let credential_debug = format!("{:?}", plugin.extract(&ctx));
     assert!(
         credential_debug.contains("[REDACTED]"),
@@ -3007,6 +3008,10 @@ async fn hmac_auth_preserves_downstream_request_body_bytes() {
     assert!(
         !credential_debug.contains(&signature),
         "extracted HMAC credential debug must not include the signature bytes"
+    );
+    assert!(
+        !credential_debug.contains("debug-secret"),
+        "extracted HMAC credential debug must not include raw query credentials"
     );
 }
 

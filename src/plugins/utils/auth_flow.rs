@@ -90,7 +90,9 @@ impl fmt::Debug for HmacAuthCredential {
             .field("date", &self.date)
             .field("method", &self.method)
             .field("path", &self.path)
-            .field("query", &self.query)
+            // Raw queries can carry tokens and other credentials. Keep the
+            // signing input available to verification, never to Debug output.
+            .field("query", &"[REDACTED]")
             .field("digest_header", &"[REDACTED]")
             .field("digest_is_rfc9530", &self.digest_is_rfc9530)
             .field("nonce", &self.nonce.as_ref().map(|_| "[REDACTED]"))
