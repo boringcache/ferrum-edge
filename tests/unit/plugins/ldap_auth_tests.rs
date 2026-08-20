@@ -2478,7 +2478,7 @@ async fn test_ldap_auth_non_ascii_authorization_returns_invalid_not_missing() {
     let consumer_index = ConsumerIndex::new(&[]);
     let mut ctx = context_with_materialized_raw_header(
         "Authorization",
-        &format!("Basic dXNlcjpwYXNz\u{3000}"),
+        "Basic dXNlcjpwYXNz\u{3000}",
     );
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
