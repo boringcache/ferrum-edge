@@ -121,7 +121,11 @@ pub struct ReloadArgs {
     ///
     /// Must be a positive process ID. `0` is rejected because POSIX `kill`
     /// treats it as this process group. This CLI process is also rejected.
-    #[arg(short = 'p', long = "pid")]
+    #[arg(
+        short = 'p',
+        long = "pid",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
     pub pid: Option<u32>,
 }
 

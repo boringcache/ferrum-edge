@@ -1242,12 +1242,9 @@ fn test_execute_reload_rejects_pid_outside_pid_t() {
 
 #[cfg(unix)]
 #[test]
-fn test_parse_reload_accepts_pid_zero_at_clap() {
-    let cli = Cli::try_parse_from(["ferrum-edge", "reload", "--pid", "0"]).unwrap();
-    match cli.command {
-        Some(Command::Reload(args)) => assert_eq!(args.pid, Some(0)),
-        _ => panic!("Expected Reload command"),
-    }
+fn test_parse_reload_rejects_pid_zero_at_clap() {
+    let result = Cli::try_parse_from(["ferrum-edge", "reload", "--pid", "0"]);
+    assert!(result.is_err(), "clap must reject the POSIX special PID 0");
 }
 
 #[cfg(unix)]
