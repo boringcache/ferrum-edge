@@ -34,7 +34,9 @@ use crate::scaffolding::backends::{
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{GetOptions, Http2Client, Http3Client};
 use crate::scaffolding::harness::GatewayHarness;
-use crate::scaffolding::ports::{reserve_colocated_tcp_udp, reserve_port, reserve_refused_tcp_port};
+use crate::scaffolding::ports::{
+    reserve_colocated_tcp_udp, reserve_port, reserve_refused_tcp_port,
+};
 use serde_json::{Value, json};
 use std::time::Duration;
 

@@ -70,25 +70,33 @@ fn late_hook_cannot_erase_or_spoof_authoritative_gateway_error() {
     headers.insert("X-Gateway-Error".to_string(), "spoofed".to_string());
     headers.insert("x-gateway-error".to_string(), "also-spoofed".to_string());
     assert!(apply_authoritative_backend_gateway_error_header_for_test(
-        &mut headers, true, 403
+        &mut headers,
+        true,
+        403
     ));
     assert_eq!(gateway_error_values(&headers), ["connection_failure"]);
 
     headers.clear();
     assert!(apply_authoritative_backend_gateway_error_header_for_test(
-        &mut headers, true, 502
+        &mut headers,
+        true,
+        502
     ));
     assert_eq!(gateway_error_values(&headers), ["connection_failure"]);
 
     headers.insert("x-gateway-error".to_string(), "backend_error".to_string());
     assert!(apply_authoritative_backend_gateway_error_header_for_test(
-        &mut headers, false, 504
+        &mut headers,
+        false,
+        504
     ));
     assert_eq!(gateway_error_values(&headers), ["backend_timeout"]);
 
     headers.insert("X-Gateway-Error".to_string(), "spoofed".to_string());
     assert!(!apply_authoritative_backend_gateway_error_header_for_test(
-        &mut headers, false, 200
+        &mut headers,
+        false,
+        200
     ));
     assert!(gateway_error_values(&headers).is_empty());
 }
