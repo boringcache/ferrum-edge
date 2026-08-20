@@ -155,6 +155,132 @@ async fn in_process_backend_write_timeout_zero_does_not_504() {
     }
 }
 
+// #4055, buffered dispatch. `retry` forces `stream_request_body = false`, so
+// the upload is collected into memory and handed to reqwest as one buffer —
+// the arm that had no body adapter and therefore no watermark at all. The
+// contract is the same: a backend that accepts and never reads must 504 near
+// `backend_write_timeout_ms`, not run on to a much longer
+// `backend_read_timeout_ms`.
+//
+// `ReadWriteTimeout` reached the wire, so `connection_error` is false and the
+// retry loop does not replay it; the elapsed time is one watermark.
+fn buffered_timeout_overrides(read_ms: u64, write_ms: u64) -> serde_json::Value {
+    json!({
+        "backend_read_timeout_ms": read_ms,
+        "backend_write_timeout_ms": write_ms,
+        "retry": {
+            "max_retries": 1,
+            "retryable_status_codes": [],
+            "retry_on_connect_failure": true,
+            "backoff": {
+                "fixed": {"delay_ms": 1}
+            },
+        },
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_buffered_backend_write_timeout_maps_to_504_backend_timeout() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .step(TcpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let yaml = file_mode_yaml_for_backend_with(
+        backend_port,
+        buffered_timeout_overrides(8_000, WRITE_TIMEOUT_MS),
+    );
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = harness.http_client().expect("client");
+    let started = Instant::now();
+    let resp = client
+        .as_reqwest()
+        .post(harness.proxy_url("/api/twrite"))
+        .header("content-type", "application/octet-stream")
+        .body(vec![b'x'; UPLOAD_STALL_BYTES])
+        .send()
+        .await
+        .expect("gateway returns a response");
+    let elapsed = started.elapsed();
+    let status = resp.status();
+    let header = gateway_error_header(resp.headers()).map(str::to_owned);
+    let body = resp.text().await.expect("body");
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::GATEWAY_TIMEOUT,
+        "buffered upload write timeout must be 504, got {status} body={body}"
+    );
+    assert_eq!(
+        header.as_deref(),
+        Some("backend_timeout"),
+        "timeout must carry X-Gateway-Error=backend_timeout, body={body}"
+    );
+    assert_timeout_envelope(elapsed, WRITE_TIMEOUT_MS);
+}
+
+// Companion opt-out on the buffered arm: `backend_write_timeout_ms: 0` keeps
+// the reusable-`Bytes` path, so a never-read backend must not 504 at 800ms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_buffered_backend_write_timeout_zero_does_not_504() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .step(TcpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let yaml = file_mode_yaml_for_backend_with(backend_port, buffered_timeout_overrides(8_000, 0));
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = harness.http_client().expect("client");
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_millis(1_500),
+        client
+            .as_reqwest()
+            .post(harness.proxy_url("/api/twrite"))
+            .header("content-type", "application/octet-stream")
+            .body(vec![b'x'; UPLOAD_STALL_BYTES])
+            .send(),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    match result {
+        Err(_) => {
+            assert!(
+                elapsed >= Duration::from_millis(1_300),
+                "zero write timeout must not 504 at the 800ms watermark; \
+                 client gave up at {elapsed:?}"
+            );
+        }
+        Ok(Ok(resp)) => {
+            assert_ne!(
+                resp.status(),
+                reqwest::StatusCode::GATEWAY_TIMEOUT,
+                "buffered backend_write_timeout_ms=0 must not produce a 504"
+            );
+        }
+        Ok(Err(err)) => {
+            panic!("unexpected client error under buffered write-timeout=0: {err}");
+        }
+    }
+}
+
 // #4057: headers + one SSE event + stall. Client sees 200 and the first
 // event; the body then aborts near `backend_read_timeout_ms`. A 504 is
 // impossible once headers are committed.

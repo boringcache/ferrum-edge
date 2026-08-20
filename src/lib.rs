@@ -9088,6 +9088,94 @@ pub mod _test_support {
         }
     }
 
+    /// One gateway-owned BUFFERED upload pump under test (issue #4055).
+    ///
+    /// The buffered reqwest dispatch has no body adapter to hang a deadline
+    /// on, so `backend_write_timeout_ms` is enforceable only if the collected
+    /// buffer is handed to a pump. As with [`UploadPumpProbe`], the transport
+    /// side is held and DELIBERATELY NOT DRAINED — the shape of a reqwest
+    /// connection task parked on socket writability against a backend that
+    /// accepts and never reads.
+    pub struct BufferedUploadPumpProbe {
+        body: Option<crate::proxy::upload_pump::PumpedUploadBody>,
+        join: Option<crate::proxy::upload_pump::UploadPumpJoin>,
+    }
+
+    impl BufferedUploadPumpProbe {
+        /// Start a buffered pump over `len` bytes under `write_timeout_ms`.
+        ///
+        /// `None` means the dispatcher keeps the reusable `Bytes` path — the
+        /// `0` opt-out, or an empty upload — and installs no task, channel, or
+        /// timer at all.
+        pub fn start(len: usize, write_timeout_ms: u64) -> Option<Self> {
+            let body = bytes::Bytes::from(vec![b'x'; len]);
+            crate::proxy::upload_pump::spawn_buffered_upload_pump(body, write_timeout_ms)
+                .ok()
+                .map(|(body, join)| Self {
+                    body: Some(body),
+                    join: Some(join),
+                })
+        }
+
+        /// The bounded frame size the buffered source is sliced into.
+        pub fn frame_size() -> usize {
+            crate::proxy::upload_pump::buffered_upload_frame_bytes()
+        }
+
+        /// What hyper would derive `Content-Length` from.
+        pub fn declared_content_length(&self) -> Option<u64> {
+            self.body
+                .as_ref()
+                .and_then(|body| http_body::Body::size_hint(body).exact())
+        }
+
+        /// Poll the transport side exactly once with a no-op waker.
+        pub fn poll_transport_once(&mut self) -> ProbeTransportPoll {
+            let Some(body) = self.body.as_mut() else {
+                return ProbeTransportPoll::Ended;
+            };
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            match http_body::Body::poll_frame(std::pin::Pin::new(body), &mut cx) {
+                std::task::Poll::Pending => ProbeTransportPoll::Pending,
+                std::task::Poll::Ready(None) => ProbeTransportPoll::Ended,
+                std::task::Poll::Ready(Some(Ok(frame))) => {
+                    ProbeTransportPoll::Data(frame.data_ref().map_or(0, bytes::Bytes::len))
+                }
+                std::task::Poll::Ready(Some(Err(e))) => ProbeTransportPoll::Errored(e.to_string()),
+            }
+        }
+
+        /// Race the dispatcher's response-header wait against the pump's
+        /// backend write watermark, exactly as `proxy_to_backend` does.
+        ///
+        /// `true` means the watermark won, which is what makes the request end
+        /// as 504 / `ReadWriteTimeout` at `backend_write_timeout_ms` instead of
+        /// running on to `backend_read_timeout_ms`.
+        pub async fn write_watermark_wins_header_wait(&mut self, header_wait: Duration) -> bool {
+            let Some(join) = self.join.as_mut() else {
+                return false;
+            };
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(header_wait) => false,
+                () = join.backend_write_watermark_expired() => true,
+            }
+        }
+
+        /// Wait for the pump to finish on its own — no cancellation.
+        pub async fn join(&mut self) -> ProbePumpOutcome {
+            map_probe_outcome(match self.join.take() {
+                Some(join) => join.join().await,
+                None => None,
+            })
+        }
+
+        /// Drop the transport side, modelling reqwest releasing the body.
+        pub fn drop_transport(&mut self) {
+            self.body = None;
+        }
+    }
+
     fn map_probe_outcome(
         outcome: Option<crate::proxy::upload_pump::UploadPumpOutcome>,
     ) -> ProbePumpOutcome {

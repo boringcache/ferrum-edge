@@ -39265,10 +39265,22 @@ pub(crate) async fn proxy_to_backend_retry(
 
     // Replay the original request body on retry if available.
     // On connection failures the body was never sent, so replaying is safe.
+    //
+    // A replay is still an upload the gateway has to write, so it carries the
+    // same gateway-owned backend write watermark as the initial attempt
+    // (#4055): without it a retry against a backend that accepts and never
+    // reads would run on to `backend_read_timeout_ms`. `0` keeps the reusable
+    // `Bytes` path.
+    let mut upload_pump: Option<upload_pump::UploadPumpJoin> = None;
     if let Some(body) = request_body
         && !body.is_empty()
     {
-        req_builder = req_builder.body(body.to_vec());
+        let (upload_body, pump) = install_buffered_upload_write_watermark(
+            Bytes::copy_from_slice(body),
+            proxy.backend_write_timeout_ms,
+        );
+        upload_pump = pump;
+        req_builder = req_builder.body(upload_body);
     }
 
     // DestinationRule `connectionPool.http.http1MaxPendingRequests`: re-enter the
@@ -39368,13 +39380,35 @@ pub(crate) async fn proxy_to_backend_retry(
         send_auth_deadline.as_ref(),
     );
     let send_future = crate::plugins::await_deadline_first(send_bound.at, req_builder.send());
-    // The retry dispatcher always carries a RETAINED (buffered) request body,
-    // so there is no streaming upload and no pump to observe here; the operator
-    // response-header bound is the only watermark this wait can end on.
-    let bounded = bounded_response_header_wait(send_future, proxy.backend_read_timeout_ms).await;
+    // Both per-direction watermarks bound this wait, exactly as they do on the
+    // initial attempt: the operator's response-header read bound, and the
+    // buffered upload's backend write bound. Both end the attempt as 504 /
+    // `ReadWriteTimeout`.
+    let bounded = await_upload_write_watermark_first(
+        bounded_response_header_wait(send_future, proxy.backend_read_timeout_ms),
+        upload_pump.as_mut(),
+    )
+    .await;
     let header_wait = match bounded {
-        Ok(inner) => inner,
+        Ok(Ok(inner)) => inner,
+        Ok(Err(())) => {
+            return http_backend_dispatch_error_response(
+                retry::ErrorClass::ReadWriteTimeout,
+                resolved_ip,
+            );
+        }
         Err(()) => {
+            // Stop writing the replayed body now rather than leaving the task
+            // to notice when reqwest eventually drops its source.
+            if let Some(pump) = upload_pump.as_mut() {
+                pump.cancel();
+            }
+            warn!(
+                proxy_id = %proxy.id,
+                watermark = "backend_write_timeout_ms",
+                watermark_ms = proxy.backend_write_timeout_ms,
+                "reqwest retry dispatch: backend write watermark expired before response headers"
+            );
             return http_backend_dispatch_error_response(
                 retry::ErrorClass::ReadWriteTimeout,
                 resolved_ip,
@@ -42494,12 +42528,14 @@ async fn proxy_to_backend(
     // Shared flag for detecting size-limit exceeded during streaming.
     // Only allocated when we actually stream a request body.
     let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // Join point for the gateway-owned upload pump, when a streaming arm below
-    // installs one. Kept in the dispatcher's scope for exactly one reason: the
-    // response-header wait must be able to end on the backend write watermark
-    // (#4055). It is never joined to completion here — this dispatcher returns
-    // while the response streams, and the transport body owns the upload from
-    // that point — so `cancel_on_drop` stays disarmed.
+    // Join point for the gateway-owned upload pump, when a body arm below
+    // installs one — streaming OR buffered, since both directions are written
+    // through reqwest and both must honour `backend_write_timeout_ms`. Kept in
+    // the dispatcher's scope for exactly one reason: the response-header wait
+    // must be able to end on the backend write watermark (#4055). It is never
+    // joined to completion here — this dispatcher returns while the response
+    // streams, and the transport body owns the upload from that point — so
+    // `cancel_on_drop` stays disarmed.
     let mut upload_pump: Option<upload_pump::UploadPumpJoin> = None;
 
     if has_body {
@@ -42601,7 +42637,16 @@ async fn proxy_to_backend(
                     if retain_request_body {
                         retained_body = Some(body_bytes.clone());
                     }
-                    req_builder = req_builder.body(body_bytes);
+                    // A buffered upload still has to be WRITTEN, so it needs the
+                    // same gateway-owned write watermark the streaming arms get
+                    // (#4055). With `backend_write_timeout_ms == 0` this hands
+                    // reqwest the reusable `Bytes` back unchanged.
+                    let (upload_body, pump) = install_buffered_upload_write_watermark(
+                        body_bytes,
+                        proxy.backend_write_timeout_ms,
+                    );
+                    upload_pump = pump;
+                    req_builder = req_builder.body(upload_body);
                 }
             }
             ClientRequestBody::Streaming(original_req) if stream_request_body => {
@@ -42871,7 +42916,15 @@ async fn proxy_to_backend(
                     if retain_request_body {
                         retained_body = Some(body_bytes.clone());
                     }
-                    req_builder = req_builder.body(body_bytes);
+                    // Collected-then-buffered is still an upload the gateway has
+                    // to write; same watermark, same `0` opt-out, as the
+                    // pre-buffered arm above (#4055).
+                    let (upload_body, pump) = install_buffered_upload_write_watermark(
+                        body_bytes,
+                        proxy.backend_write_timeout_ms,
+                    );
+                    upload_pump = pump;
+                    req_builder = req_builder.body(upload_body);
                 }
             }
         }
@@ -45615,6 +45668,39 @@ pub(crate) fn install_counting_upload_authorization(
         return (body, None);
     }
     body.with_gateway_upload_pump(auth, write_timeout_ms)
+}
+
+/// Install the gateway-owned backend write watermark on a fully BUFFERED
+/// reqwest upload (issue #4055).
+///
+/// The streaming arms reach the pump through their body adapters; a buffered
+/// upload has no adapter, and handing reqwest a reusable `Bytes` leaves the
+/// dispatcher with no pump to observe. A backend that accepts the connection
+/// and never reads would then run past `backend_write_timeout_ms` and end on
+/// `backend_read_timeout_ms` instead, which is not the unqualified HTTP-family
+/// contract `docs/configuration.md` states.
+///
+/// The pump slices the buffer into bounded refcounted frames, so the bridge's
+/// backpressure stays coupled to what the transport has actually taken rather
+/// than completing the moment hyper pulls one giant frame. The size hint stays
+/// exact, so `Content-Length` is unchanged.
+///
+/// `backend_write_timeout_ms == 0` (and an empty body) keeps the previous
+/// reusable-`Bytes` path exactly: no task, no channel, no timer, and reqwest
+/// retains the body it can replay internally.
+///
+/// No authorization plan is armed here. A buffered upload was already collected
+/// under `collect_request_body_under_authorization`, and the response-header
+/// wait still composes the admitted stream's deadline through
+/// `compose_dispatch_phase_auth_bound`, so expiry precedence is unchanged.
+pub(crate) fn install_buffered_upload_write_watermark(
+    body_bytes: Bytes,
+    write_timeout_ms: u64,
+) -> (reqwest::Body, Option<upload_pump::UploadPumpJoin>) {
+    match upload_pump::spawn_buffered_upload_pump(body_bytes, write_timeout_ms) {
+        Ok((body, join)) => (body.into_reqwest_body(), Some(join)),
+        Err(body_bytes) => (reqwest::Body::from(body_bytes), None),
+    }
 }
 
 /// Compose the admitted request's absolute authorization deadline over the

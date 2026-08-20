@@ -68,6 +68,11 @@
 //! authorization plan **or** a live `backend_write_timeout_ms`. Uploads with
 //! neither keep `UploadSource::Direct` (no task, no channel, no timer). Frames
 //! move by `Bytes` handle, so no per-chunk copy or allocation is introduced.
+//!
+//! A fully BUFFERED upload pays the same one task + one channel when
+//! `backend_write_timeout_ms` is live, and nothing at all when it is `0`; see
+//! [`spawn_buffered_upload_pump`]. Its frames are refcounted `Bytes::split_to`
+//! slices of the collected buffer, so it copies nothing either.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -618,4 +623,133 @@ where
 #[allow(dead_code)]
 pub(crate) const fn upload_pump_channel_capacity() -> usize {
     UPLOAD_PUMP_CHANNEL_CAPACITY
+}
+
+// -- Buffered uploads ---------------------------------------------------------
+
+/// Frame size the bridge slices a fully buffered upload into.
+///
+/// The pump's write-idle arm sits on `sender.reserve()`, so the watermark stays
+/// coupled to transport consumption only while frames remain to hand over. A
+/// single giant frame would let hyper "consume" the whole upload in one pull —
+/// completing the pump — while not one byte had reached the wire, which is the
+/// opposite of what `backend_write_timeout_ms` promises. Slicing keeps the
+/// bridge's backpressure tied to the transport until the last byte has actually
+/// been taken.
+///
+/// 64 KiB matches hyper's own write granularity, bounds the in-flight budget at
+/// two frames (this one plus the queued one), and costs no copy: `split_to`
+/// hands out a refcounted view of the same allocation.
+const BUFFERED_UPLOAD_FRAME_BYTES: usize = 64 * 1024;
+
+/// Zero-copy chunked view over a fully collected request body.
+///
+/// Exists only as the pump's *source*: it turns one `Bytes` into a bounded
+/// sequence of refcounted slices so the pump has something to be backpressured
+/// on. The size hint stays exact, so `Content-Length` framing is identical to
+/// handing reqwest the reusable `Bytes` directly.
+struct BufferedUploadFrames {
+    remaining: Bytes,
+}
+
+impl http_body::Body for BufferedUploadFrames {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.remaining.is_empty() {
+            return Poll::Ready(None);
+        }
+        let take = this.remaining.len().min(BUFFERED_UPLOAD_FRAME_BYTES);
+        Poll::Ready(Some(Ok(Frame::data(this.remaining.split_to(take)))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.remaining.is_empty()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.remaining.len() as u64)
+    }
+}
+
+/// Transport-side body for a pumped BUFFERED upload.
+///
+/// The streaming dispatch paths reach [`UploadPumpSource`] through
+/// `SizeLimitedIncoming` / `CountingIncoming`, which also own byte counting,
+/// the request-size ceiling, and gRPC message counting. A buffered upload has
+/// already been counted, limited, and message-counted before it got here, so
+/// this wrapper adds nothing but the `http_body::Body` shape the transport
+/// needs.
+pub struct PumpedUploadBody {
+    source: UploadPumpSource,
+}
+
+impl PumpedUploadBody {
+    /// Hand this body to reqwest.
+    ///
+    /// `reqwest::Body::wrap` preserves `size_hint()`, so hyper still derives an
+    /// exact `Content-Length` from the buffered length.
+    pub(crate) fn into_reqwest_body(self) -> reqwest::Body {
+        reqwest::Body::wrap(self)
+    }
+}
+
+impl http_body::Body for PumpedUploadBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.get_mut().source.poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.source.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.source.size_hint()
+    }
+}
+
+/// Install the gateway-owned backend write watermark on a fully buffered
+/// upload (issue #4055).
+///
+/// `Err(bytes)` hands the caller its `Bytes` back untouched, which is the
+/// allocation-, task-, and timer-free path the buffered dispatch used before:
+/// taken when `backend_write_timeout_ms == 0` (the operator opt-out) or when
+/// the upload is empty (nothing to write, and the request must stay
+/// end-of-stream at headers).
+pub(crate) fn spawn_buffered_upload_pump(
+    body: Bytes,
+    write_timeout_ms: u64,
+) -> Result<(PumpedUploadBody, UploadPumpJoin), Bytes> {
+    if write_timeout_ms == 0 || body.is_empty() {
+        return Err(body);
+    }
+    let (source, join) = spawn_upload_pump(
+        BufferedUploadFrames { remaining: body },
+        // No authorization plan: a buffered upload was already collected under
+        // `collect_request_body_under_authorization`, and the response-header
+        // wait still composes the admitted stream's deadline through
+        // `compose_dispatch_phase_auth_bound`. Arming a second, pump-owned
+        // expiry here would reorder that precedence.
+        None,
+        write_timeout_ms,
+    );
+    Ok((PumpedUploadBody { source }, join))
+}
+
+/// The buffered bridge's frame size, exposed so a test can prove the source is
+/// sliced rather than handed over whole. Reached through `crate::_test_support`.
+#[allow(dead_code)]
+pub(crate) const fn buffered_upload_frame_bytes() -> usize {
+    BUFFERED_UPLOAD_FRAME_BYTES
 }

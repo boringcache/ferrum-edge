@@ -157,7 +157,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - HTTP-family `backend_write_timeout_ms` now bounds request-body upload
   inactivity on H1, H2 (reqwest and the direct H2 pool), and native H3, not
-  only TCP streams. A backend that accepts and never reads surfaces as
+  only TCP streams. It covers streamed and buffered uploads alike, including
+  retry replays. A backend that accepts and never reads surfaces as
   `504` / `X-Gateway-Error: backend_timeout` /
   `error_class=read_write_timeout`. `0` still disables the bound.
 

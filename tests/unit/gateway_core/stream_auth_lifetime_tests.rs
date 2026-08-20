@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ferrum_edge::_test_support::{
-    BufferedUploadWaitOutcomeForTest, DtlsAuthorizationExpiryForTest, EarlyUploadBoundKind,
-    H3AuthorizedHeadersWrite, H3BackendOrPeerForTest, H3UploadWaitOutcomeForTest,
-    PrecommitPhaseOutcomeForTest, ProbePumpOutcome, ProbeTransportPoll,
+    BufferedUploadPumpProbe, BufferedUploadWaitOutcomeForTest, DtlsAuthorizationExpiryForTest,
+    EarlyUploadBoundKind, H3AuthorizedHeadersWrite, H3BackendOrPeerForTest,
+    H3UploadWaitOutcomeForTest, PrecommitPhaseOutcomeForTest, ProbePumpOutcome, ProbeTransportPoll,
     ResponseCollectBoundForTest, StreamIoSide, UploadPumpProbe,
     attribute_dispatch_phase_bound_for_test, authorization_bounded_header_deadline_for_test,
     authorization_expired_dispatch_placeholder_for_test,
@@ -2806,6 +2806,108 @@ fn the_upload_bridge_is_bounded_rather_than_a_buffer() {
         UploadPumpProbe::channel_capacity(),
         1,
         "the pump must reserve capacity before reading, so it can never buffer the upload"
+    );
+}
+
+// --- Backend write watermark on a BUFFERED upload (#4055) -------------------
+//
+// A buffered reqwest upload has no body adapter, so before #4055's repair the
+// dispatcher held no pump at all and a backend that accepted and never read ran
+// on to `backend_read_timeout_ms`. These hold the transport side and
+// DELIBERATELY DO NOT DRAIN IT, which is what a reqwest connection task parked
+// on socket writability looks like.
+
+#[tokio::test(start_paused = true)]
+async fn the_backend_write_watermark_ends_a_buffered_upload_the_transport_stopped_taking() {
+    let mut probe = BufferedUploadPumpProbe::start(1024 * 1024, 800).expect("buffered pump");
+
+    // A much longer response-header wait, i.e. the operator's read watermark.
+    // The write watermark has to win it, or the request ends on the wrong bound.
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "backend_write_timeout_ms must end the header wait before backend_read_timeout_ms"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
+
+    match probe.poll_transport_once() {
+        ProbeTransportPoll::Errored(message) => assert!(
+            message.contains("backend request body write timeout"),
+            "unexpected termination message: {message}"
+        ),
+        other => panic!("expected a transport error, got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_buffered_upload_crosses_the_bridge_in_bounded_slices_not_one_giant_frame() {
+    let frame = BufferedUploadPumpProbe::frame_size();
+    let total = frame * 3 + 7;
+    // Long enough that the watermark cannot fire while the transport drains.
+    let mut probe = BufferedUploadPumpProbe::start(total, 600_000).expect("buffered pump");
+    assert_eq!(
+        probe.declared_content_length(),
+        Some(total as u64),
+        "the bridge must not degrade a known Content-Length"
+    );
+
+    let mut sizes = Vec::new();
+    for _ in 0..64 {
+        match probe.poll_transport_once() {
+            ProbeTransportPoll::Data(len) => sizes.push(len),
+            ProbeTransportPoll::Pending => tokio::task::yield_now().await,
+            ProbeTransportPoll::Ended => break,
+            other => panic!("unexpected transport poll: {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        sizes.iter().sum::<usize>(),
+        total,
+        "every buffered byte must cross the bridge: {sizes:?}"
+    );
+    assert_eq!(
+        sizes,
+        vec![frame, frame, frame, 7],
+        "the source must be sliced so backpressure stays coupled to the transport"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_partly_drained_buffered_upload_still_ends_on_the_write_watermark() {
+    let frame = BufferedUploadPumpProbe::frame_size();
+    let mut probe = BufferedUploadPumpProbe::start(frame * 4, 800).expect("buffered pump");
+    // The transport takes one frame and then stops, exactly as a socket whose
+    // peer stopped reading does once the kernel buffers fill.
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Data(_) | ProbeTransportPoll::Pending
+    ));
+
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "the watermark must still fire once the transport stops taking frames"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
+}
+
+#[test]
+fn a_zero_backend_write_timeout_keeps_the_reusable_buffered_body() {
+    assert!(
+        BufferedUploadPumpProbe::start(1024 * 1024, 0).is_none(),
+        "the operator opt-out must install no task, channel, or timer"
+    );
+}
+
+#[test]
+fn an_empty_buffered_upload_installs_no_pump() {
+    assert!(
+        BufferedUploadPumpProbe::start(0, 800).is_none(),
+        "an empty upload must stay end-of-stream at headers"
     );
 }
 
