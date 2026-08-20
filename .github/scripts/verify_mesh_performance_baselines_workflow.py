@@ -61,6 +61,9 @@ APPROVED_SETUP = (
 )
 PINNED_SHA = re.compile(r"^[0-9a-f]{40}$")
 PUBLISHED_BASELINE_DATE = re.compile(r"\bPublished \d{4}-\d{2}-\d{2}\b")
+PUBLISHED_BASELINE_STATUS = re.compile(
+    r"Publication status[^\n]*?:\*{0,2}\s*Published\b", re.IGNORECASE
+)
 PUBLISHED_BASELINE_SHA = re.compile(
     r"Ferrum (?:commit )?SHA[^0-9a-f]+`?([0-9a-f]{40})"
 )
@@ -916,10 +919,14 @@ def check_baseline_publication_state(
     prefix = f"{path}"
     has_tbd = "_TBD_" in text
     # Stage-1 documents use a ``Publication status`` heading to explain why
-    # their cells remain placeholders.  Only the dated ``Published YYYY-MM-DD``
-    # form is a publication claim; treating the heading itself as one makes the
-    # documented placeholder state impossible.
-    claims_publication = PUBLISHED_BASELINE_DATE.search(text) is not None
+    # their cells remain placeholders.  Treat the status as a claim only when
+    # its value says Published (with or without the required date); treating the
+    # heading itself as a claim makes the documented placeholder state
+    # impossible.
+    claims_publication = (
+        PUBLISHED_BASELINE_STATUS.search(text) is not None
+        or PUBLISHED_BASELINE_DATE.search(text) is not None
+    )
     if has_tbd:
         require(
             not claims_publication,
@@ -929,7 +936,8 @@ def check_baseline_publication_state(
         return
 
     require(
-        "Publication status" in text and PUBLISHED_BASELINE_DATE.search(text) is not None,
+        PUBLISHED_BASELINE_STATUS.search(text) is not None
+        and PUBLISHED_BASELINE_DATE.search(text) is not None,
         f"{prefix} removed stage-1 TBD cells without a dated publication status",
         failures,
     )
@@ -1360,6 +1368,19 @@ artifact `mesh-performance-baselines-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`
         partial_failures,
     )
     require(partial_failures, "published baseline retaining TBD cells must fail", failures)
+
+    undated_claim_failures: list[str] = []
+    check_baseline_publication_state(
+        Path("undated-claim.md"),
+        "**Publication status:** Published from hosted evidence | _TBD_ |",
+        "mesh",
+        undated_claim_failures,
+    )
+    require(
+        undated_claim_failures,
+        "undated publication claim retaining TBD cells must fail",
+        failures,
+    )
 
 
 def self_test() -> int:
