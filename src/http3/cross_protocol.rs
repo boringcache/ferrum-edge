@@ -139,9 +139,8 @@ use crate::proxy::headers::{
     sanitize_client_response_headers_for_wire, strip_response_hop_by_hop_trailers,
 };
 use crate::proxy::{
-    BufferedUploadReplay, absolute_response_header_read_bound,
-    await_upload_write_watermark_first, install_buffered_upload_write_watermark,
-    optional_sleep_elapsed,
+    BufferedUploadReplay, absolute_response_header_read_bound, await_upload_write_watermark_first,
+    install_buffered_upload_write_watermark, optional_sleep_elapsed,
 };
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
@@ -2908,11 +2907,9 @@ where
                                 plain_attempt_builder.send(),
                             ),
                         );
-                        let outcome = await_upload_write_watermark_first(
-                            attempt,
-                            plain_upload_pump.as_mut(),
-                        )
-                        .await;
+                        let outcome =
+                            await_upload_write_watermark_first(attempt, plain_upload_pump.as_mut())
+                                .await;
                         let should_replay = outcome
                             .as_ref()
                             .is_ok_and(|attempt| plain_send_is_protocol_nack(attempt));
