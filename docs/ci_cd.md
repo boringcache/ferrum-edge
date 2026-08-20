@@ -2310,7 +2310,8 @@ Jobs omitted because a single predecessor cannot name a unique merged text:
 
   `("test", "afac282642da4e7fea7b38a4e4f5534fcc6df41281601daabc08206fddaaecb3", "617404b7716b0697fe95db855d6dedb00dbbf1bc2045ce0938aa74acc8d8ad12")`
 
-  After that predecessor is the trusted base, this PR rebases onto it. Hosted
+  After that predecessor is the trusted base, this PR merges latest `main`
+  into its head. Hosted
   wall-time and cache-size evidence from #3910 is still outstanding, so #3904
   stays open.
 
