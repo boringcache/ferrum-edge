@@ -3660,6 +3660,20 @@ fn authoritative_sidecar_l4_source<'a>(
     })
 }
 
+/// Block startup until a received slice converts into a serving config.
+///
+/// The native, xDS, and stock-xDS consumers install first and convert here, so
+/// this loop — not the apply task — is the runtime gate for the FIRST slice.
+/// It therefore owns the same #2473 watermark finalization the apply task does:
+/// a candidate refused here never served a request and must not keep the
+/// accepted revision, or a conversion-invalid first slice at a far-future
+/// sequence quarantines every corrected slice beneath it and startup never
+/// completes (issue #4041). The verdict rides
+/// [`MeshRuntimeState::evaluate_received_slice`] so a future stage added to
+/// this loop cannot reopen that hole by forgetting to finalize.
+///
+/// The localized `file` source converts BEFORE `install_slice` and refuses
+/// startup outright, so it never reaches this loop.
 async fn wait_for_initial_mesh_config(
     mesh_state: &MeshRuntimeState,
     runtime: &MeshRuntimeConfig,
@@ -3670,6 +3684,7 @@ async fn wait_for_initial_mesh_config(
     loop {
         let snapshot = mesh_state.snapshot();
         if let Some(slice) = snapshot.as_ref().as_ref() {
+            let evaluation = mesh_state.evaluate_received_slice(&snapshot);
             let federation_snapshot = mesh_state.federation_store().snapshot();
             let remote_snapshot = mesh_state.remote_endpoint_store().snapshot();
             match gateway_config_from_mesh_slice_with_federation(
@@ -3679,10 +3694,24 @@ async fn wait_for_initial_mesh_config(
                 Some(&remote_snapshot),
                 activation,
             ) {
-                Ok(config) => return Ok((config, Arc::new(slice.clone()))),
+                Ok(config) => {
+                    // Not "applied" yet — `serve_mesh_runtime` commits the
+                    // watermark once this generation is actually live. Passing
+                    // only hands the candidate to that stage with its
+                    // provisional admission intact.
+                    evaluation.pass();
+                    return Ok((config, Arc::new(slice.clone())));
+                }
                 Err(e) => {
+                    // Roll the provisional admission back to the last applied
+                    // generation (none at startup) so the control plane's
+                    // corrected slice — including a resend at the SAME sequence
+                    // and a lower-sequence recovery — is eligible instead of
+                    // quarantined behind a slice that never served a request.
+                    let revision_rolled_back = evaluation.reject();
                     warn!(
                         mesh_slice_version = %slice.version,
+                        revision_rolled_back,
                         error = %e,
                         "Ignoring invalid initial mesh slice"
                     );
@@ -18588,6 +18617,12 @@ fn start_mesh_slice_apply_task(
                 current_federation_revision != last_applied_federation_revision;
             let remote_changed = current_remote_revision != last_applied_remote_revision;
             if let Some(slice) = snapshot.as_ref().as_ref() {
+                // Issue #4041: the runtime verdict on this received candidate
+                // finalizes the #2473 watermark exactly once, whichever branch
+                // (or future stage) reaches the verdict. Dropping the guard
+                // unresolved rolls the provisional admission back rather than
+                // leaving a candidate that never served holding the watermark.
+                let evaluation = mesh_state.evaluate_received_slice(&snapshot);
                 let slice_unchanged =
                     mesh_slice_matches_last_applied(last_applied_slice.as_deref(), slice);
                 if slice_unchanged && !federation_changed && !remote_changed {
@@ -18599,6 +18634,7 @@ fn start_mesh_slice_apply_task(
                         true,
                         revision_apply_token,
                     );
+                    evaluation.pass();
                     if let Some(recovery) = local_source_recovery.as_ref() {
                         recovery.note_proxy_apply_success(slice);
                     }
@@ -18641,11 +18677,12 @@ fn start_mesh_slice_apply_task(
                     // last APPLIED revision, keyed to this exact received
                     // candidate so a newer one received mid-apply is untouched.
                     if received_accepted {
+                        evaluation.pass();
                         if let Some(recovery) = local_source_recovery.as_ref() {
                             recovery.note_proxy_apply_success(slice);
                         }
                     } else {
-                        mesh_state.record_rejected_slice(&snapshot);
+                        evaluation.reject();
                         if let Some(recovery) = local_source_recovery.as_ref() {
                             recovery.note_proxy_apply_rejection(slice);
                         }
@@ -19171,7 +19208,7 @@ pub mod startup_rollback_test_seams {
         let _ = crate::fips::base_crypto_provider().install_default();
     }
 
-    fn probe_runtime_config() -> MeshRuntimeConfig {
+    pub(super) fn probe_runtime_config() -> MeshRuntimeConfig {
         MeshRuntimeConfig {
             node_id: "node-a".to_string(),
             namespace: "ferrum".to_string(),
@@ -19354,6 +19391,57 @@ pub mod startup_rollback_test_seams {
             returned_promptly,
             stuck_aborted,
         }
+    }
+}
+
+/// External coverage seam for the startup initial-config wait (issue #4041).
+///
+/// `wait_for_initial_mesh_config` is the runtime gate for the FIRST slice on
+/// every control-plane-driven source (native `MeshSubscribe`, xDS ADS, and the
+/// stock-xDS discovery half): those consumers `install_slice` first and convert
+/// here. Driving it needs a `MeshRuntimeConfig`, and both it and the wait are
+/// private, so external coverage of the config-revision watermark lifecycle
+/// ACROSS that stage reaches it through this seam rather than through an
+/// in-source test.
+///
+/// `src/main.rs` re-declares modules without the `_test_support` bridge, so
+/// this module is unused in the binary target — hence the module-scoped
+/// `allow(dead_code)`. Production code is not suppressed.
+#[allow(dead_code)]
+#[doc(hidden)]
+pub mod initial_config_wait_test_seams {
+    use super::*;
+
+    /// Node identity the probe's `MeshRuntimeConfig` runs as. Exported so an
+    /// external test can build slices this node would actually materialize
+    /// instead of guessing the probe's fixture.
+    pub const PROBE_NODE_ID: &str = "mesh-wait-probe-node";
+    /// Namespace the probe's `MeshRuntimeConfig` runs in. See
+    /// [`PROBE_NODE_ID`].
+    pub const PROBE_NAMESPACE: &str = "ferrum";
+
+    /// Run the production startup wait against `mesh_state`.
+    ///
+    /// Returns the `version` of the slice the wait accepted, or the rendered
+    /// wait error. Callers install candidates through
+    /// `MeshRuntimeState::install_slice` exactly as a config consumer does and
+    /// read the watermark through the ordinary `accepted_revision()` /
+    /// `applied_revision()` accessors.
+    pub async fn wait_for_initial_mesh_config_for_test(
+        mesh_state: MeshRuntimeState,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<String, String> {
+        let mut runtime = startup_rollback_test_seams::probe_runtime_config();
+        runtime.node_id = PROBE_NODE_ID.to_string();
+        runtime.namespace = PROBE_NAMESPACE.to_string();
+        let activation = FederationActivation {
+            fail_open: false,
+            poll_enabled: false,
+        };
+        wait_for_initial_mesh_config(&mesh_state, &runtime, activation, shutdown_rx)
+            .await
+            .map(|(_, slice)| slice.version.clone())
+            .map_err(|error| error.to_string())
     }
 }
 
