@@ -50199,10 +50199,7 @@ async fn proxy_to_backend_http2(
         let outcome = match upload_bound {
             Some((upload_deadline, bound_kind)) => {
                 let joined = await_upload_write_watermark_first(
-                    crate::plugins::await_deadline_first(
-                        Some(upload_deadline),
-                        body_completion_rx,
-                    ),
+                    crate::plugins::await_deadline_first(Some(upload_deadline), body_completion_rx),
                     upload_pump.as_mut(),
                 )
                 .await;
