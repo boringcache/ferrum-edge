@@ -3473,13 +3473,12 @@ fn http_timeout_access_log_yaml(
     }))
 }
 
-const H2_UPLOAD_STALL_BYTES: usize = 2 * 1024 * 1024;
+const H2_UPLOAD_STALL_BYTES: usize = 8 * 1024 * 1024;
 const H2_SSE_FIRST_EVENT: &[u8] = b"data: hello\r\n\n";
-// Pin the listener receive buffer before accept so the 2 MiB upload cannot fit
-// in the kernel's autotuned receive window. A backend that never reads must
-// backpressure the gateway's write pump, otherwise the 8-second read timeout
-// wins and the test observes the wrong envelope.
-const BACKEND_RECEIVE_BUFFER_BYTES: usize = 8 * 1024;
+// Pin the listener before accept so the backend cannot autotune a large receive
+// window. The upload remains larger than ordinary sender buffers, guaranteeing
+// that a backend which never reads eventually backpressures the upload pump.
+const BACKEND_RECEIVE_BUFFER_BYTES: usize = 1024;
 
 // #4055 H2 frontend → reqwest (H1 backend that never reads).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
