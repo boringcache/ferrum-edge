@@ -279,3 +279,101 @@ async fn test_stdout_logging_stream_disconnect() {
 
     plugin.on_stream_disconnect(&summary).await;
 }
+
+fn ws_disconnect_ctx(
+    http_method: &str,
+    request_path: &str,
+    handshake_status_code: u16,
+    backend_target: &str,
+) -> ferrum_edge::plugins::WsDisconnectContext {
+    ferrum_edge::plugins::WsDisconnectContext {
+        namespace: "ferrum".to_string(),
+        proxy_id: "proxy-ws".to_string(),
+        proxy_lifecycle_generation: None,
+        proxy_name: Some("websocket-proxy".to_string()),
+        client_ip: "10.0.0.1".to_string(),
+        backend_target: backend_target.to_string(),
+        http_method: http_method.to_string(),
+        request_path: request_path.to_string(),
+        handshake_status_code,
+        listen_port: 8080,
+        duration_ms: 42.0,
+        frames_client_to_backend: 1,
+        frames_backend_to_client: 0,
+        bytes_client_to_backend: 16,
+        bytes_backend_to_client: 0,
+        timestamp_connected: "2026-01-01T00:00:00Z".to_string(),
+        timestamp_disconnected: "2026-01-01T00:00:01Z".to_string(),
+        direction: Some(ferrum_edge::plugins::Direction::ClientToBackend),
+        io_side: None,
+        error_class: Some(ferrum_edge::retry::ErrorClass::ProtocolError),
+        consumer_username: None,
+        auth_method: None,
+        connection_id: 7,
+        metadata: HashMap::new(),
+    }
+}
+
+#[test]
+fn ws_disconnect_projection_keeps_h1_handshake_when_backend_path_differs() {
+    let ctx = ws_disconnect_ctx(
+        "GET",
+        "/client/ws",
+        101,
+        "ws://backend.local:9000/v1/rewritten",
+    );
+    let summary = StdoutLogging::project_ws_disconnect(&ctx);
+    assert_eq!(summary.http_method, "GET");
+    assert_eq!(summary.response_status_code, 101);
+    assert_eq!(summary.request_path, "/client/ws");
+    assert_eq!(
+        summary.backend_target.as_deref(),
+        Some("ws://backend.local:9000/v1/rewritten")
+    );
+    assert_eq!(
+        summary.error_class,
+        Some(ferrum_edge::retry::ErrorClass::ProtocolError)
+    );
+    assert_eq!(summary.bytes_sent, 16);
+    assert!(summary.is_terminal_failure());
+}
+
+#[test]
+fn ws_disconnect_projection_keeps_extended_connect_handshake_when_backend_path_differs() {
+    let ctx = ws_disconnect_ctx(
+        "CONNECT",
+        "/h2/original",
+        200,
+        "https://backend.local:9443/internal/socket",
+    );
+    let summary = StdoutLogging::project_ws_disconnect(&ctx);
+    assert_eq!(summary.http_method, "CONNECT");
+    assert_eq!(summary.response_status_code, 200);
+    assert_eq!(summary.request_path, "/h2/original");
+    assert_eq!(
+        summary.backend_target.as_deref(),
+        Some("https://backend.local:9443/internal/socket")
+    );
+    assert_ne!(summary.request_path, "/internal/socket");
+}
+
+#[test]
+fn ws_disconnect_projection_does_not_infer_path_from_backend_query() {
+    let ctx = ws_disconnect_ctx(
+        "GET",
+        "/client/ws",
+        101,
+        "ws://backend.local:9000/v1/rewritten",
+    );
+    let summary = StdoutLogging::project_ws_disconnect(&ctx);
+    assert_eq!(summary.request_path, "/client/ws");
+    assert!(
+        !summary.request_path.contains("secret="),
+        "request_path must not inherit backend query material"
+    );
+    assert_eq!(
+        summary.backend_target.as_deref(),
+        Some("ws://backend.local:9000/v1/rewritten"),
+        "backend_target remains the already-stripped upgrade target"
+    );
+}

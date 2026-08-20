@@ -134,6 +134,15 @@ impl StdoutLogging {
         Ok(Self { filter, schema })
     }
 
+    /// Project a WebSocket disconnect into the HTTP access-log schema.
+    ///
+    /// Hidden test helper so external unit tests can assert handshake
+    /// method/status/original-path without going through stdout.
+    #[doc(hidden)]
+    pub fn project_ws_disconnect(ctx: &WsDisconnectContext) -> TransactionSummary {
+        transaction_summary_from_ws_disconnect(ctx)
+    }
+
     /// Apply the configured HTTP-family predicates to a finalized summary.
     pub fn should_log_transaction(&self, summary: &TransactionSummary) -> bool {
         let Some(filter) = &self.filter else {
@@ -210,12 +219,13 @@ impl StdoutLogging {
 
 /// Project a WebSocket session-end into the HTTP-family access-log schema.
 ///
-/// Handshake `log()` already emitted the 101 row (usually without
+/// Handshake `log()` already emitted the upgrade row (usually without
 /// `error_class`). In-session faults live on `WsDisconnectContext`; this
-/// conversion lets operators grep the same `error_class` key. Status stays
-/// 101 so the row is recognisable as the upgraded session, not a new HTTP
-/// request. BASE schema only — this is not the `websocket_disconnect`
-/// capability family.
+/// conversion lets operators grep the same `error_class` key. Method, path,
+/// and status are the values captured at upgrade admission (`GET`/`101` for
+/// HTTP/1.1, `CONNECT`/`200` for RFC 8441/9220 Extended CONNECT) so a
+/// rewritten backend target cannot corrupt those fields. BASE schema only —
+/// this is not the `websocket_disconnect` capability family.
 fn transaction_summary_from_ws_disconnect(ctx: &WsDisconnectContext) -> TransactionSummary {
     TransactionSummary {
         namespace: ctx.namespace.clone(),
@@ -223,12 +233,12 @@ fn transaction_summary_from_ws_disconnect(ctx: &WsDisconnectContext) -> Transact
         client_ip: ctx.client_ip.clone(),
         consumer_username: ctx.consumer_username.clone(),
         auth_method: ctx.auth_method,
-        http_method: "GET".to_string(),
-        request_path: ws_disconnect_request_path(&ctx.backend_target),
+        http_method: ctx.http_method.clone(),
+        request_path: ctx.request_path.clone(),
         proxy_id: Some(ctx.proxy_id.clone()),
         proxy_name: ctx.proxy_name.clone(),
         backend_target: Some(ctx.backend_target.clone()),
-        response_status_code: 101,
+        response_status_code: ctx.handshake_status_code,
         latency_total_ms: ctx.duration_ms,
         latency_gateway_processing_ms: ctx.duration_ms,
         bytes_sent: ctx.bytes_client_to_backend,
@@ -238,16 +248,6 @@ fn transaction_summary_from_ws_disconnect(ctx: &WsDisconnectContext) -> Transact
         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
         ..TransactionSummary::default()
     }
-}
-
-fn ws_disconnect_request_path(backend_target: &str) -> String {
-    if let Some(scheme_end) = backend_target.find("://") {
-        let rest = &backend_target[scheme_end + 3..];
-        if let Some(slash) = rest.find('/') {
-            return rest[slash..].to_string();
-        }
-    }
-    "/".to_string()
 }
 
 fn reject_unknown_keys(
@@ -630,6 +630,9 @@ mod tests {
             proxy_name: Some("websocket-proxy".to_string()),
             client_ip: "10.0.0.1".to_string(),
             backend_target: backend_target.to_string(),
+            http_method: "GET".to_string(),
+            request_path: "/chat".to_string(),
+            handshake_status_code: 101,
             listen_port: 8080,
             duration_ms: 42.0,
             frames_client_to_backend: 1,

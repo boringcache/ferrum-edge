@@ -14715,6 +14715,9 @@ async fn handle_websocket_request_authenticated(
         // unchanged `current_backend_url` (Finding C) — so the disconnect log
         // records a valid backend URL, not the synthetic `mesh-xc-hbone|...` key.
         backend_target: strip_query_params(&ws_display_backend_url).to_string(),
+        http_method: ws_method.to_string(),
+        request_path: original_request_path.clone(),
+        handshake_status_code: ws_status_code,
         listen_port,
         // Same admission ID passed into the relay / on_ws_frame so disconnect
         // hooks (including upgrade-handoff failure below) correlate without a
@@ -16703,6 +16706,12 @@ pub struct WsSessionMeta {
     pub proxy_name: Option<String>,
     pub client_ip: String,
     pub backend_target: String,
+    /// Frontend HTTP method that admitted the upgrade (`GET` or `CONNECT`).
+    pub http_method: String,
+    /// Original client request path captured at upgrade admission.
+    pub request_path: String,
+    /// Successful handshake status (`101` for HTTP/1.1, `200` for Extended CONNECT).
+    pub handshake_status_code: u16,
     pub listen_port: u16,
     /// Process-local accepted session ID allocated at upgrade admission and
     /// preserved through every teardown path that builds `WsDisconnectContext`.
@@ -16930,6 +16939,9 @@ async fn fire_ws_tunnel_disconnect_hooks_with_reason(
         proxy_name: session_meta.proxy_name.clone(),
         client_ip: session_meta.client_ip.clone(),
         backend_target: session_meta.backend_target.clone(),
+        http_method: session_meta.http_method.clone(),
+        request_path: session_meta.request_path.clone(),
+        handshake_status_code: session_meta.handshake_status_code,
         listen_port: session_meta.listen_port,
         connection_id: session_meta.connection_id,
         duration_ms: disconnect_duration_ms,
@@ -16990,6 +17002,9 @@ pub(crate) async fn fire_ws_framed_disconnect_hooks_with_reason(
         proxy_name: session_meta.proxy_name,
         client_ip: session_meta.client_ip,
         backend_target: session_meta.backend_target,
+        http_method: session_meta.http_method,
+        request_path: session_meta.request_path,
+        handshake_status_code: session_meta.handshake_status_code,
         listen_port: session_meta.listen_port,
         connection_id: session_meta.connection_id,
         duration_ms: disconnect_duration_ms,

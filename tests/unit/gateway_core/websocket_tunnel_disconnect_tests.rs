@@ -54,6 +54,10 @@ struct CapturedDisconnect {
     io_side: Option<StreamIoSide>,
     error_class: Option<ErrorClass>,
     termination_reason: Option<String>,
+    http_method: String,
+    request_path: String,
+    handshake_status_code: u16,
+    backend_target: String,
 }
 
 impl CapturingDisconnectPlugin {
@@ -98,6 +102,10 @@ impl Plugin for CapturingDisconnectPlugin {
             io_side: ctx.io_side,
             error_class: ctx.error_class,
             termination_reason: ctx.metadata.get("websocket.termination_reason").cloned(),
+            http_method: ctx.http_method.clone(),
+            request_path: ctx.request_path.clone(),
+            handshake_status_code: ctx.handshake_status_code,
+            backend_target: ctx.backend_target.clone(),
         });
     }
 }
@@ -477,4 +485,47 @@ async fn test_session_meta_connection_id_survives_reload_style_plugin_resnapshot
         reloaded.is_empty(),
         "reload-generation plugins must not observe a session accepted earlier"
     );
+}
+
+#[tokio::test]
+async fn test_tunnel_and_framed_disconnect_preserve_admission_handshake_fields() {
+    // Access-log projection must use the frontend handshake captured at
+    // upgrade admission, not a path inferred from the rewritten backend URL.
+    let (plugin, captured) = CapturingDisconnectPlugin::new();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(plugin)];
+
+    let mut h1 = session_meta_with_id(2001);
+    h1.http_method = "GET".to_string();
+    h1.request_path = "/client/ws".to_string();
+    h1.handshake_status_code = 101;
+    h1.backend_target = "ws://backend.local:9000/v1/rewritten".to_string();
+
+    let mut h2 = session_meta_with_id(2002);
+    h2.http_method = "CONNECT".to_string();
+    h2.request_path = "/h2/original".to_string();
+    h2.handshake_status_code = 200;
+    h2.backend_target = "https://backend.local:9443/internal/socket".to_string();
+
+    fire_ws_tunnel_disconnect_hooks(&plugins, "proxy-h1", &h1, 8, 16, None).await;
+    fire_ws_framed_disconnect_hooks(&plugins, "proxy-h2", h2, 1, 1, 4, 4, None).await;
+
+    let rows = captured.lock().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].http_method, "GET");
+    assert_eq!(rows[0].handshake_status_code, 101);
+    assert_eq!(rows[0].request_path, "/client/ws");
+    assert_eq!(
+        rows[0].backend_target,
+        "ws://backend.local:9000/v1/rewritten"
+    );
+    assert_ne!(rows[0].request_path.as_str(), "/v1/rewritten");
+
+    assert_eq!(rows[1].http_method, "CONNECT");
+    assert_eq!(rows[1].handshake_status_code, 200);
+    assert_eq!(rows[1].request_path, "/h2/original");
+    assert_eq!(
+        rows[1].backend_target,
+        "https://backend.local:9443/internal/socket"
+    );
+    assert_ne!(rows[1].request_path.as_str(), "/internal/socket");
 }
