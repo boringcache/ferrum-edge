@@ -1561,7 +1561,7 @@ fn observe_send_half_join(
 /// therefore present a clean capsule FIN for an authorization expiry unless
 /// drop RESETS. `reset_on_drop` stays armed until this task applies
 /// [`SessionEnd::close_kind`].
-struct ConnectUdpSendHalf<S> {
+struct ConnectUdpSendHalf<S: h3::quic::SendStream<Bytes>> {
     stream: RequestStream<S, Bytes>,
     reset_on_drop: bool,
 }
@@ -2532,7 +2532,7 @@ async fn relay(
     let max_payload = state.env_config.http3_connect_udp_max_datagram_bytes;
     let idle_seconds = state.env_config.http3_connect_udp_idle_timeout_seconds;
     let idle_timeout = Duration::from_secs(idle_seconds);
-    let (mut h3_send, mut h3_recv) = stream.split();
+    let (h3_send, mut h3_recv) = stream.split();
 
     // Millisecond-resolution activity clock shared by both relays, seeded at
     // tunnel establishment so the idle window is measured from the 200 rather
@@ -2743,11 +2743,15 @@ async fn relay(
             // indistinguishability RFC 9114 §4.1.2 exists to prevent.
             StreamCloseKind::MessageError => {
                 h3_send.disarm_reset();
-                h3_send.stream.stop_stream(h3::error::Code::H3_MESSAGE_ERROR);
+                h3_send
+                    .stream
+                    .stop_stream(h3::error::Code::H3_MESSAGE_ERROR);
             }
             StreamCloseKind::InternalError => {
                 h3_send.disarm_reset();
-                h3_send.stream.stop_stream(h3::error::Code::H3_INTERNAL_ERROR);
+                h3_send
+                    .stream
+                    .stop_stream(h3::error::Code::H3_INTERNAL_ERROR);
             }
         }
         end
