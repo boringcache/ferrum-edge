@@ -14,6 +14,7 @@ use std::collections::HashMap;
 
 use super::plugin_utils::{
     assert_continue, assert_reject, assert_reject_body, context_with_materialized_raw_header,
+    context_with_materialized_raw_header_bytes, context_with_materialized_raw_header_lines,
 };
 
 fn make_ctx() -> RequestContext {
@@ -842,6 +843,31 @@ async fn test_jwt_auth_non_ascii_bearer_token_returns_invalid_not_missing() {
     let mut ctx = context_with_materialized_raw_header(
         "Authorization",
         "Bearer \u{3000}not-a-valid-jwt-token",
+    );
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject_body(result, r#"{"error":"Invalid JWT token"}"#);
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn test_jwt_auth_invalid_utf8_custom_header_returns_invalid_not_missing() {
+    let plugin = JwtAuth::new(&json!({"token_lookup": "header:X-Token"})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let mut ctx = context_with_materialized_raw_header_bytes("X-Token", b"token\xffvalue");
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject_body(result, r#"{"error":"Invalid JWT token"}"#);
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn test_jwt_auth_malformed_repeated_line_cannot_hide_behind_materialized_value() {
+    let plugin = JwtAuth::new(&json!({"token_lookup": "header:X-Token"})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let mut ctx = context_with_materialized_raw_header_lines(
+        "X-Token",
+        &[b"visible-token", b"malformed\xff-token"],
     );
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;

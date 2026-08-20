@@ -10,7 +10,7 @@ use crate::plugins::{RequestContext, repeated_request_header_separator};
 pub(crate) enum ConfiguredHeaderLookup {
     Absent,
     Value(String),
-    /// Raw field line(s) exist but were omitted from the materialized map.
+    /// Raw field line(s) exist but cannot be represented as one valid UTF-8 value.
     PresentNonMaterialized,
 }
 
@@ -19,6 +19,21 @@ pub(crate) fn lookup_configured_header(
     lower: &str,
     original: Option<&str>,
 ) -> ConfiguredHeaderLookup {
+    // Retained raw field lines are authoritative. `materialize_headers()` can
+    // preserve one visible-ASCII repeated line while omitting a malformed
+    // sibling, so consulting the folded map first would let the valid line mask
+    // hostile input.
+    if ctx.has_raw_headers() {
+        for name in [Some(lower), original] {
+            let Some(name) = name else {
+                continue;
+            };
+            if let Some(value) = raw_header_field_lines_to_utf8_string(ctx, name) {
+                return value;
+            }
+        }
+    }
+
     if let Some(value) = ctx
         .headers
         .get(lower)
@@ -27,56 +42,25 @@ pub(crate) fn lookup_configured_header(
         return ConfiguredHeaderLookup::Value(value.clone());
     }
 
-    if !ctx.has_raw_headers() {
-        return ConfiguredHeaderLookup::Absent;
-    }
-
-    for name in [Some(lower), original] {
-        let Some(name) = name else {
-            continue;
-        };
-        if ctx.raw_header_value_bytes(name).next().is_some() {
-            return ConfiguredHeaderLookup::PresentNonMaterialized;
-        }
-    }
-
     ConfiguredHeaderLookup::Absent
 }
 
-/// Read a configured header credential, falling back to raw field-line bytes
-/// when `materialize_headers()` omitted a legal UTF-8 value.
-pub(crate) fn extract_configured_header_value(
+fn raw_header_field_lines_to_utf8_string(
     ctx: &RequestContext,
-    lower: &str,
-    original: Option<&str>,
-) -> Option<String> {
-    match lookup_configured_header(ctx, lower, original) {
-        ConfiguredHeaderLookup::Value(value) => Some(value),
-        ConfiguredHeaderLookup::Absent => None,
-        ConfiguredHeaderLookup::PresentNonMaterialized => {
-            for name in [Some(lower), original] {
-                let Some(name) = name else {
-                    continue;
-                };
-                let values: Vec<&[u8]> = ctx.raw_header_value_bytes(name).collect();
-                if values.is_empty() {
-                    continue;
-                }
-                return raw_header_field_lines_to_utf8_string(name, &values);
-            }
-            None
-        }
-    }
-}
-
-fn raw_header_field_lines_to_utf8_string(name: &str, values: &[&[u8]]) -> Option<String> {
+    name: &str,
+) -> Option<ConfiguredHeaderLookup> {
     let separator = repeated_request_header_separator(name);
     let mut out = String::new();
-    for (idx, bytes) in values.iter().enumerate() {
+    let mut found = false;
+    for (idx, bytes) in ctx.raw_header_value_bytes(name).enumerate() {
+        found = true;
         if idx > 0 {
             out.push_str(separator);
         }
-        out.push_str(std::str::from_utf8(bytes).ok()?);
+        let Ok(value) = std::str::from_utf8(bytes) else {
+            return Some(ConfiguredHeaderLookup::PresentNonMaterialized);
+        };
+        out.push_str(value);
     }
-    Some(out)
+    found.then_some(ConfiguredHeaderLookup::Value(out))
 }

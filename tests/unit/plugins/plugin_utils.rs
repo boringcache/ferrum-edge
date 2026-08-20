@@ -169,6 +169,21 @@ pub fn context_with_materialized_raw_header(name: &str, value: &str) -> RequestC
 /// Build a request context from raw header bytes that `materialize_headers()`
 /// omits, then materialize the rest of the map.
 pub fn context_with_materialized_raw_header_bytes(name: &str, value: &[u8]) -> RequestContext {
+    let ctx = context_with_materialized_raw_header_lines(name, &[value]);
+    assert!(
+        !ctx.headers.contains_key(name.to_ascii_lowercase().as_str())
+            && !ctx.headers.contains_key(name),
+        "non-materializable header values must stay out of the materialized map in this repro"
+    );
+    ctx
+}
+
+/// Build a request context from repeated raw header field lines, including
+/// field lines that the materialized map cannot represent.
+pub fn context_with_materialized_raw_header_lines(
+    name: &str,
+    values: &[&[u8]],
+) -> RequestContext {
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "GET".to_string(),
@@ -179,17 +194,14 @@ pub fn context_with_materialized_raw_header_bytes(name: &str, value: &[u8]) -> R
 
     let mut raw = HeaderMap::new();
     let header_name = http::HeaderName::from_bytes(name.as_bytes()).expect("valid header name");
-    raw.insert(
-        header_name,
-        http::HeaderValue::from_bytes(value).expect("valid header bytes"),
-    );
+    for value in values {
+        raw.append(
+            header_name.clone(),
+            http::HeaderValue::from_bytes(value).expect("valid header bytes"),
+        );
+    }
     ctx.set_raw_headers(raw);
     ctx.materialize_headers();
-    assert!(
-        !ctx.headers.contains_key(name.to_ascii_lowercase().as_str())
-            && !ctx.headers.contains_key(name),
-        "non-materializable header values must stay out of the materialized map in this repro"
-    );
     ctx
 }
 

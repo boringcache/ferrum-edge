@@ -23,7 +23,7 @@ use tracing::debug;
 use crate::consumer_index::ConsumerIndex;
 
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
-use super::utils::header_extract::extract_configured_header_value;
+use super::utils::header_extract::{ConfiguredHeaderLookup, lookup_configured_header};
 use super::utils::token_extract::bearer_credential_from_authorization_value;
 use super::{RequestContext, strip_auth_scheme};
 
@@ -129,12 +129,18 @@ impl JwtAuth {
                 lower_name,
                 original_name,
             } => {
-                let Some(value) = extract_configured_header_value(
+                let value = match lookup_configured_header(
                     ctx,
                     lower_name.as_str(),
                     Some(original_name.as_str()),
-                ) else {
-                    return ExtractedCredential::Missing;
+                ) {
+                    ConfiguredHeaderLookup::Absent => return ExtractedCredential::Missing,
+                    ConfiguredHeaderLookup::PresentNonMaterialized => {
+                        return ExtractedCredential::InvalidFormat(
+                            r#"{"error":"Invalid JWT token"}"#.into(),
+                        );
+                    }
+                    ConfiguredHeaderLookup::Value(value) => value,
                 };
                 if lower_name.eq_ignore_ascii_case("authorization") {
                     // Shared with JWKS/OAuth: a foreign scheme is not
