@@ -47742,10 +47742,7 @@ async fn proxy_to_backend_unix(
                     Err(()) => None,
                 }
             } else {
-                match await_upload_write_watermark_first(send_fut, upload_pump.as_mut()).await {
-                    Ok(result) => Some(result),
-                    Err(()) => None,
-                }
+                await_upload_write_watermark_first(send_fut, upload_pump.as_mut()).await.ok()
             }
         };
         let Some(send_result) = send_result else {
@@ -49312,10 +49309,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
             Err(()) => None,
         }
     } else {
-        match await_upload_write_watermark_first(send_fut, upload_pump.as_mut()).await {
-            Ok(result) => Some(result),
-            Err(()) => None,
-        }
+        await_upload_write_watermark_first(send_fut, upload_pump.as_mut()).await.ok()
     };
     let Some(send_result) = send_result else {
         if let Some(pump) = upload_pump.take() {
