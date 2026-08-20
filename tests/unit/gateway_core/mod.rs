@@ -142,6 +142,7 @@ mod udp_reply_stop_tests;
 mod unix_backend_pool_tests;
 mod unix_backend_tests;
 mod unix_pool_publication_tests;
+mod untrusted_xff_outbound_tests;
 mod upstream_tag_reload_tests;
 mod waf_websocket_message_tests;
 mod websocket_auth_lifetime_tests;

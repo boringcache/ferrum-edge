@@ -18,6 +18,15 @@ struct HeaderHarness {
 
 impl HeaderHarness {
     async fn new(add_via: bool, via_pseudonym: &str, add_forwarded: bool) -> Self {
+        Self::spawn(add_via, via_pseudonym, add_forwarded, None).await
+    }
+
+    async fn spawn(
+        add_via: bool,
+        via_pseudonym: &str,
+        add_forwarded: bool,
+        trusted_proxies: Option<&str>,
+    ) -> Self {
         let reservation = reserve_port().await.expect("reserve backend port");
         let backend_port = reservation.port;
         let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
@@ -39,15 +48,16 @@ impl HeaderHarness {
             .spawn()
             .expect("spawn backend");
 
-        let gateway = TestGateway::builder()
+        let mut gateway = TestGateway::builder()
             .mode_file(build_config(backend_port))
             .log_level("warn")
             .env("FERRUM_ADD_VIA_HEADER", add_via.to_string())
             .env("FERRUM_VIA_PSEUDONYM", via_pseudonym)
-            .env("FERRUM_ADD_FORWARDED_HEADER", add_forwarded.to_string())
-            .spawn()
-            .await
-            .expect("start gateway");
+            .env("FERRUM_ADD_FORWARDED_HEADER", add_forwarded.to_string());
+        if let Some(trusted) = trusted_proxies {
+            gateway = gateway.env("FERRUM_TRUSTED_PROXIES", trusted);
+        }
+        let gateway = gateway.spawn().await.expect("start gateway");
         gateway
             .wait_for_proxy_port(Duration::from_secs(10))
             .await
@@ -160,6 +170,7 @@ async fn functional_forwarded_via_default_adds_x_forwarded_and_via() {
         .get(harness.proxy_url())
         .header("host", "example.com")
         .header("x-forwarded-for", "198.51.100.9")
+        .header("x-real-ip", "8.8.8.8")
         .header("x-forwarded-proto", "https")
         .header("x-forwarded-host", "attacker.example")
         .send()
@@ -174,14 +185,41 @@ async fn functional_forwarded_via_default_adds_x_forwarded_and_via() {
     assert_eq!(response.text().await.expect("body"), "ok");
 
     let request = harness.assert_backend_ok().await;
-    assert_eq!(
-        only_header(&request, "x-forwarded-for"),
-        "198.51.100.9, 127.0.0.1"
-    );
+    assert_eq!(only_header(&request, "x-forwarded-for"), "127.0.0.1");
+    no_header(&request, "x-real-ip");
     assert_eq!(only_header(&request, "x-forwarded-proto"), "http");
     assert_eq!(only_header(&request, "x-forwarded-host"), "example.com");
     assert_eq!(only_header(&request, "via"), "1.1 ferrum-edge");
     no_header(&request, "forwarded");
+}
+
+/// Issue #4034: when the connecting peer is in `FERRUM_TRUSTED_PROXIES`, the
+/// inbound XFF chain is still honored and the peer appended. `X-Real-IP`
+/// from a trusted peer is passed through (Ferrum does not regenerate it).
+#[ignore]
+#[tokio::test]
+async fn functional_forwarded_via_trusted_peer_appends_inbound_xff() {
+    let harness = HeaderHarness::spawn(true, "ferrum-edge", false, Some("127.0.0.1")).await;
+    let client = http1_client();
+
+    let response = client
+        .get(harness.proxy_url())
+        .header("host", "example.com")
+        .header("x-forwarded-for", "1.1.1.1, 198.51.100.9")
+        .header("x-real-ip", "1.1.1.1")
+        .send()
+        .await
+        .expect("gateway response");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().await.expect("body"), "ok");
+
+    let request = harness.assert_backend_ok().await;
+    assert_eq!(
+        only_header(&request, "x-forwarded-for"),
+        "1.1.1.1, 198.51.100.9, 127.0.0.1"
+    );
+    assert_eq!(only_header(&request, "x-real-ip"), "1.1.1.1");
 }
 
 #[ignore]
