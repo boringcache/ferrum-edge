@@ -50,9 +50,7 @@ use crate::config::db_backend::{
     tcp_connection_throttle_attachment_conflict,
 };
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
-use crate::config::runtime_config_apply::{
-    LiveApplyCursor, LiveApplyFailure, PreparedLiveApply,
-};
+use crate::config::runtime_config_apply::{LiveApplyCursor, LiveApplyFailure, PreparedLiveApply};
 use crate::config::types::{
     ApiSpec, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
     max_credentials_per_type,
@@ -527,12 +525,11 @@ impl AdminState {
             ));
         }
         match db.latest_change_sequence(namespace).await {
-            Ok(sequence) if db.config_topology_epoch() == topology_epoch => Ok(
-                PreparedLiveApply::from_covering_cursor(LiveApplyCursor::new(
-                    topology_epoch,
-                    sequence,
-                )),
-            ),
+            Ok(sequence) if db.config_topology_epoch() == topology_epoch => {
+                Ok(PreparedLiveApply::from_covering_cursor(
+                    LiveApplyCursor::new(topology_epoch, sequence),
+                ))
+            }
             Ok(_) => {
                 warn_persistence_failure_redacted("admin_write_live_apply_topology");
                 Err(live_apply_failure_response(

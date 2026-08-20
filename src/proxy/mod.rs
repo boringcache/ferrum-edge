@@ -12457,10 +12457,7 @@ impl ProxyState {
         &self,
         result: crate::config::db_loader::IncrementalResult,
     ) -> ConfigApplyOutcome {
-        match self
-            .apply_incremental_inner(result, None, None)
-            .await
-        {
+        match self.apply_incremental_inner(result, None, None).await {
             IncrementalApplyResult::Outcome(outcome) => outcome,
             IncrementalApplyResult::TopologyChanged(_) => {
                 ConfigApplyOutcome::rejected_one("unexpected database topology fence")
@@ -12482,11 +12479,7 @@ impl ProxyState {
         expected_topology_epoch: u64,
     ) -> Result<ConfigApplyOutcome, u64> {
         match self
-            .apply_incremental_inner(
-                result,
-                None,
-                Some((db, expected_topology_epoch)),
-            )
+            .apply_incremental_inner(result, None, Some((db, expected_topology_epoch)))
             .await
         {
             IncrementalApplyResult::Outcome(outcome) => Ok(outcome),

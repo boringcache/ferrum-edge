@@ -103,7 +103,10 @@ async fn lower_sequence_in_new_topology_waits_and_old_poll_result_is_ignored() {
             .await
     });
     tokio::task::yield_now().await;
-    assert!(!handle.is_finished(), "new epoch sequence 3 is not live yet");
+    assert!(
+        !handle.is_finished(),
+        "new epoch sequence 3 is not live yet"
+    );
 
     apply.record_accepted_cursor(LiveApplyCursor::new(1, 10_000));
     tokio::task::yield_now().await;
@@ -214,9 +217,7 @@ fn database_incremental_publication_is_fenced_after_async_validation() {
         .find("drop(topology_permit)")
         .expect("topology pin release");
     assert!(
-        off_thread_validation < topology_pin
-            && topology_pin < publication
-            && publication < release,
+        off_thread_validation < topology_pin && topology_pin < publication && publication < release,
         "the database topology pin must cover only final synchronous publication"
     );
 }

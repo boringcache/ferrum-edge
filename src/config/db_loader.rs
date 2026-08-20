@@ -7306,10 +7306,9 @@ impl DatabaseStore {
         if topology == DatabaseTopology::Primary {
             self.failover_topology.ensure_primary_failback_allowed()?;
         }
-        let next_topology_epoch =
-            crate::config::db_backend::checked_next_config_topology_epoch(
-                self.topology_epoch.load(Ordering::Acquire),
-            )?;
+        let next_topology_epoch = crate::config::db_backend::checked_next_config_topology_epoch(
+            self.topology_epoch.load(Ordering::Acquire),
+        )?;
 
         // Disable and close the configured primary-topology replica before
         // exposing a failover pool. Keeping the dormant pool would make it
