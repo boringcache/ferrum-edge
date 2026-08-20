@@ -5821,6 +5821,10 @@ paths:
         derived resource namespace — decided inside the committing
         transaction, not by an earlier query. Admin role required. File mode
         and other read-only topologies return `403`.
+
+        A create writes no `config_changes` record, so in database mode the
+        `201` deliberately does **not** wait for a poll-loop reload: the
+        runtime snapshot does not contain the registry table.
       tags: [Namespaces]
       requestBody:
         required: true
@@ -5955,6 +5959,13 @@ paths:
         `403`. When
         `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`, the token must be
         allowed to address both the current name and the new name.
+
+        In database mode a rename whose source or target is the namespace this
+        process serves (`FERRUM_NAMESPACE`) returns `200` only after the
+        poll-loop reload has published a covering `config_changes` generation;
+        if that reload cannot apply, the response is `503` with
+        `applied: false` even though the rename is durable. A description-only
+        update writes no change record and never waits.
       tags: [Namespaces]
       requestBody:
         required: true
@@ -6027,6 +6038,13 @@ paths:
         registry rows and concurrently delete a different one. Ordinary
         resource CRUD is not serialized by the global registry lease and does
         not insert registry rows. Admin role required. File mode returns `403`.
+
+        In database mode a confirmed cascade delete of the namespace this
+        process serves returns `204` only after the poll-loop reload has
+        published a covering `config_changes` generation; if that reload cannot
+        apply, the response is `503` with `applied: false` even though the
+        delete is durable. An unconfirmed delete removes only an empty tenant's
+        registry row, writes no change record, and never waits.
       tags: [Namespaces]
       parameters:
         - name: confirm

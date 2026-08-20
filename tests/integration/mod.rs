@@ -17,6 +17,7 @@ mod admin_mesh_slice_drift_tests;
 mod admin_metrics_tls_inventory_snapshot_tests;
 mod admin_namespace_claim_tests;
 mod admin_namespace_crud_tests;
+mod admin_namespace_live_apply_tests;
 mod admin_node_waypoint_identities_tests;
 mod admin_observability_auth_tests;
 mod admin_runtime_metrics_tests;

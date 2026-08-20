@@ -442,6 +442,37 @@ Every precondition that can race is evaluated inside that transaction, not by an
   - The `409` reason is a fixed string naming the two configuration keys (`FERRUM_NAMESPACE` / `FERRUM_CP_NAMESPACES`). It never echoes the rest of the configured set, so the response cannot be used to enumerate which other tenants this gateway serves.
 - The last remaining **registry row** cannot be deleted, re-checked at the commit boundary so two gateway instances cannot each observe two registry rows and concurrently delete a different one. `GET /namespaces` remains the union of registry names and derived resource names; ordinary resource CRUD is not serialized by the global registry lease and does not insert registry rows, so a derived-only name cannot be the durable authority for that invariant.
 
+### Database-mode live apply for registry mutations
+
+Registry mutations follow the same read-your-write contract as ordinary
+config-database writes (see *Database-mode live apply*), but only when they
+actually change what this process serves:
+
+- `POST /namespaces` inserts one `namespaces` row and writes **no**
+  `config_changes` record. The runtime snapshot does not contain the registry
+  table, so `201` never waits for a poll-loop reload.
+- A description-only `PUT` likewise writes no change record and does not wait.
+- A **rename** rewrites resource `namespace` columns and writes `delete` /
+  `upsert` tombstones under both the source and the target name. If either name
+  is the namespace this process serves (`FERRUM_NAMESPACE`), the `200` is
+  withheld until the poll loop accepts a covering generation.
+- A **confirmed cascade delete** (`?confirm=true`) writes `delete` tombstones
+  under the deleted name. If that is the served namespace, the `204` is withheld
+  the same way. An unconfirmed delete can only remove an empty tenant's registry
+  row and does not wait.
+
+The covering `config_changes` watermark is captured from the pinned write
+topology *after* the registry transaction commits and *before* the write-topology
+permit and the registry admission leases are released; the wait itself happens
+after those pins drop, so the poll (or a reconnect) that has to publish the
+generation is never blocked by the waiting request. A reload that rejects, times
+out, or whose watermark cannot be read returns the shared `503` with
+`{"applied": false, "reason": "config_rejected" | "reload_timeout" |
+"sequence_unavailable"}` and no `Retry-After` — the mutation is durable but not
+yet live, which is a different outcome from the `Retry-After: 1` contention and
+lost-lease `503`s below, where nothing was applied. CP, DP, and file modes, and
+mutations targeting a namespace this process does not serve, never wait.
+
 ### Retryable database conflicts
 
 A registry mutation can be aborted by the database itself rather than by the

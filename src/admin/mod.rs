@@ -9651,6 +9651,61 @@ fn protected_namespace_response(name: &str) -> Response<Full<Bytes>> {
     ))
 }
 
+/// The namespace a completed registry mutation moved rows into or out of that
+/// this process actually serves (issues #3926 x #3955).
+///
+/// A registry-only `POST` and a description-only `PUT` write no `config_changes`
+/// row at all, so their callers pass an empty slice and never wait. Waiting
+/// there would be a lie in both directions: there is no generation of their own
+/// to become live, and `latest_change_sequence` is a namespace-wide `MAX`, so
+/// they would block on an unrelated concurrent writer and could report a
+/// truthful, already-visible mutation as a `503`.
+///
+/// A rename rewrites every resource `namespace` column and writes `delete` /
+/// `upsert` tombstones under BOTH names; a confirmed cascade delete writes
+/// `delete` tombstones under the deleted name. When one of those names is the
+/// namespace this process serves, the served runtime snapshot changes, so the
+/// mutation must not report success before the poll loop accepts it.
+fn served_live_apply_namespace<'a>(state: &AdminState, candidates: &[&'a str]) -> Option<&'a str> {
+    let apply = state.runtime_config_apply.as_ref()?;
+    let served = candidates.iter().find(|name| apply.serves_namespace(name));
+    served.copied()
+}
+
+/// Finish a committed namespace-registry mutation under the #3926 two-phase
+/// completion path.
+///
+/// `pins` is the write-topology permit plus the registry admission guards. They
+/// stay live while the covering `config_changes` watermark is captured from the
+/// same pinned topology that persisted the rows, and are dropped **before** the
+/// wait so the poll (or a reconnect) that has to publish that generation is not
+/// blocked by this request.
+///
+/// Returns a boxed future behind an `#[inline(never)]` boundary for the same
+/// reason [`AdminState::complete_live_config_mutation_after_commit_boxed`] does:
+/// at the coverage profile's `opt-level = 0` the whole future would otherwise be
+/// an alloca in the admin dispatch frame.
+#[inline(never)]
+fn complete_namespace_registry_mutation<'a, P>(
+    state: &'a AdminState,
+    candidates: &[&'a str],
+    pins: P,
+    response: Response<Full<Bytes>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response<Full<Bytes>>> + Send + 'a>>
+where
+    P: Send + 'a,
+{
+    match served_live_apply_namespace(state, candidates) {
+        Some(namespace) => {
+            state.complete_live_config_mutation_after_commit_boxed(namespace, pins, response)
+        }
+        None => {
+            drop(pins);
+            Box::pin(std::future::ready(response))
+        }
+    }
+}
+
 async fn handle_list_namespaces(
     state: &AdminState,
     auth: &AuditActor,
@@ -9847,6 +9902,11 @@ async fn handle_create_namespace(
     if let Err(error) = audit::record(state.admin_audit_enabled, db, event).await {
         log_audit_enqueue_failure(&error);
     }
+    // Registry-only: a create inserts one `namespaces` row and no
+    // `config_changes` row, and the runtime snapshot never contains that table.
+    // There is nothing for the poll loop to make live, so this must NOT take the
+    // #3926 live-apply wait — doing so would block on an unrelated concurrent
+    // writer's watermark. The admission guards and the write permit drop here.
     Ok(json_response(
         StatusCode::CREATED,
         &serde_json::to_value(&record).unwrap_or_else(|_| json!({})),
@@ -9949,16 +10009,21 @@ async fn handle_update_namespace(
         Err(error) => return Ok(map_namespace_registry_error(&error)),
     };
 
-    let holds = admission.holds();
-    let record = match run_namespace_registry_mutation(
-        &admission,
-        db.update_namespace(current_name, &new_name, update.description, &holds),
-    )
-    .await
-    {
-        Ok(record) => record,
-        Err(resp) => return Ok(resp),
+    // Scoped so the lease-hold borrows end before `admission` is moved into the
+    // completion pins below.
+    let record = {
+        let holds = admission.holds();
+        match run_namespace_registry_mutation(
+            &admission,
+            db.update_namespace(current_name, &new_name, update.description, &holds),
+        )
+        .await
+        {
+            Ok(record) => record,
+            Err(resp) => return Ok(resp),
+        }
     };
+    let renaming = new_name != current_name;
     let event = audit::AuditEvent::new(
         actor,
         "update",
@@ -9970,10 +10035,25 @@ async fn handle_update_namespace(
     if let Err(error) = audit::record(state.admin_audit_enabled, db, event).await {
         log_audit_enqueue_failure(&error);
     }
-    Ok(json_response(
+    let response = json_response(
         StatusCode::OK,
         &serde_json::to_value(&record).unwrap_or_else(|_| json!({})),
-    ))
+    );
+    // Only a rename moves resource rows. A description-only update touches one
+    // registry row that the runtime snapshot does not contain, so it returns
+    // without waiting for the poll loop.
+    let live_apply_candidates: Vec<&str> = if renaming {
+        vec![current_name, new_name.as_str()]
+    } else {
+        Vec::new()
+    };
+    Ok(complete_namespace_registry_mutation(
+        state,
+        &live_apply_candidates,
+        (admission, _write_permit),
+        response,
+    )
+    .await)
 }
 
 async fn handle_delete_namespace(
@@ -10035,18 +10115,25 @@ async fn handle_delete_namespace(
         }
         Err(error) => return Ok(map_namespace_registry_error(&error)),
     };
-    let holds = admission.holds();
-    match run_namespace_registry_mutation(&admission, db.delete_namespace(name, cascade, &holds))
-        .await
+    // Scoped so the lease-hold borrows end before `admission` is moved into the
+    // completion pins below.
     {
-        Ok(true) => {}
-        Ok(false) => {
-            return Ok(json_response(
-                StatusCode::NOT_FOUND,
-                &json!({"error": format!("namespace '{name}' not found")}),
-            ));
+        let holds = admission.holds();
+        match run_namespace_registry_mutation(
+            &admission,
+            db.delete_namespace(name, cascade, &holds),
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": format!("namespace '{name}' not found")}),
+                ));
+            }
+            Err(resp) => return Ok(resp),
         }
-        Err(resp) => return Ok(resp),
     }
     let event = audit::AuditEvent::new(
         actor,
@@ -10059,7 +10146,17 @@ async fn handle_delete_namespace(
     if let Err(error) = audit::record(state.admin_audit_enabled, db, event).await {
         log_audit_enqueue_failure(&error);
     }
-    Ok(empty_response(StatusCode::NO_CONTENT))
+    // Only a confirmed cascade removes resource rows and writes polling
+    // tombstones. An unconfirmed delete can only remove an empty tenant's
+    // registry row, which the runtime snapshot does not contain.
+    let live_apply_candidates: Vec<&str> = if cascade { vec![name] } else { Vec::new() };
+    Ok(complete_namespace_registry_mutation(
+        state,
+        &live_apply_candidates,
+        (admission, _write_permit),
+        empty_response(StatusCode::NO_CONTENT),
+    )
+    .await)
 }
 
 // ---- Helpers ----
