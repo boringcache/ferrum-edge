@@ -1025,6 +1025,34 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
     );
 }
 
+#[test]
+fn proxy_create_schema_requires_upstream_or_direct_backend() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let choices = spec
+        .pointer("/components/schemas/ProxyCreate/allOf/1/anyOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("ProxyCreate must require an upstream or direct backend");
+
+    assert_eq!(choices[0]["required"], json!(["upstream_id"]));
+    assert_eq!(
+        choices[0]["properties"]["upstream_id"]["minLength"],
+        json!(1)
+    );
+    assert_eq!(
+        choices[1]["required"],
+        json!(["backend_host", "backend_port"])
+    );
+    assert_eq!(
+        choices[1]["properties"]["backend_host"]["minLength"],
+        json!(1)
+    );
+    assert_eq!(
+        choices[1]["properties"]["backend_port"]["minimum"],
+        json!(1)
+    );
+}
+
 /// The documented read-modify-write flow tells a client it may PUT back a
 /// `Consumer` response it never held the secrets for, so the PUT request schema
 /// must accept the exact `[REDACTED]` projection the server emits while create,

@@ -8237,6 +8237,21 @@ components:
           is set. They remain required for a direct-backend proxy.
       allOf:
         - $ref: "#/components/schemas/Proxy"
+        - anyOf:
+            - required: [upstream_id]
+              properties:
+                upstream_id:
+                  type: string
+                  minLength: 1
+            - required: [backend_host, backend_port]
+              properties:
+                backend_host:
+                  type: string
+                  minLength: 1
+                backend_port:
+                  type: integer
+                  format: uint16
+                  minimum: 1
 
     StreamMatchCriteria:
       type: object
