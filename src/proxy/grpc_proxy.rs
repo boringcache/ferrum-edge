@@ -4320,36 +4320,34 @@ async fn proxy_grpc_streaming_dispatch(
             })
         })
     };
-    let response = match crate::proxy::await_upload_write_watermark_first(
-        send_wait,
-        upload_pump.as_mut(),
-    )
-    .await
-    {
-        Ok(result) => result?,
-        Err(()) => {
-            if let Some(pump) = upload_pump.take() {
-                pump.cancel_and_join().await;
+    let response =
+        match crate::proxy::await_upload_write_watermark_first(send_wait, upload_pump.as_mut())
+            .await
+        {
+            Ok(result) => result?,
+            Err(()) => {
+                if let Some(pump) = upload_pump.take() {
+                    pump.cancel_and_join().await;
+                }
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return Err(GrpcProxyError::ResourceExhausted(format!(
+                        "gRPC request payload size exceeds maximum of {} bytes",
+                        max_grpc_recv_size_bytes
+                    )));
+                }
+                warn!(
+                    watermark_ms = proxy.backend_write_timeout_ms,
+                    "gRPC backend write watermark expired before response headers"
+                );
+                return Err(GrpcProxyError::BackendTimeout {
+                    kind: GrpcTimeoutKind::Read,
+                    message: format!(
+                        "gRPC backend request body write timeout after {}ms",
+                        proxy.backend_write_timeout_ms
+                    ),
+                });
             }
-            if body_size_exceeded.load(Ordering::Acquire) {
-                return Err(GrpcProxyError::ResourceExhausted(format!(
-                    "gRPC request payload size exceeds maximum of {} bytes",
-                    max_grpc_recv_size_bytes
-                )));
-            }
-            warn!(
-                watermark_ms = proxy.backend_write_timeout_ms,
-                "gRPC backend write watermark expired before response headers"
-            );
-            return Err(GrpcProxyError::BackendTimeout {
-                kind: GrpcTimeoutKind::Read,
-                message: format!(
-                    "gRPC backend request body write timeout after {}ms",
-                    proxy.backend_write_timeout_ms
-                ),
-            });
-        }
-    };
+        };
 
     // Check if the request body already exceeded the limit before response
     // headers arrived. If so, fail immediately with a clear error.

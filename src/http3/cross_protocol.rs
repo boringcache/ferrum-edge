@@ -847,7 +847,7 @@ pub(crate) async fn run<S>(
     request: CrossProtocolRequest<'_, S>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
-    S: RecvStream + SendStream<Bytes> + SendStreamStopped,
+    S: RecvStream + SendStream<Bytes> + SendStreamStopped + Send,
 {
     let CrossProtocolRequest {
         state,
@@ -2096,7 +2096,7 @@ fn boxed_dispatch_plain<'a, S>(
     request_authority: Option<&'a str>,
 ) -> BoxedPlainDispatchFuture<'a>
 where
-    S: RecvStream + SendStream<Bytes> + SendStreamStopped + 'a,
+    S: RecvStream + SendStream<Bytes> + SendStreamStopped + Send + 'a,
 {
     Box::pin(async move {
         dispatch_plain(
