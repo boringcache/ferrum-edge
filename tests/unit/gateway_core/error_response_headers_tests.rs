@@ -158,14 +158,18 @@ fn circuit_breaker_open_sites_use_distinct_token() {
 #[test]
 fn h3_cross_protocol_classified_failures_keep_typed_gateway_error() {
     let cross = include_str!("../../../src/http3/cross_protocol.rs");
+    let helper_definition = "fn reqwest_error_response_for_cross_protocol(";
+    let helper_end = cross
+        .find(helper_definition)
+        .expect("cross-protocol reqwest classifier definition")
+        + helper_definition.len();
     let mut classified_writes = 0usize;
-    let mut search = cross;
+    // Search only after the helper definition. Slicing at the function-name
+    // match itself loses the preceding `fn `, so trying to reject the
+    // definition from the suffix misclassifies it as a call site.
+    let mut search = &cross[helper_end..];
     while let Some(idx) = search.find("reqwest_error_response_for_cross_protocol(") {
         let suffix = &search[idx..];
-        if suffix.contains("fn reqwest_error_response_for_cross_protocol") {
-            search = &search[idx + 1..];
-            continue;
-        }
         let end = suffix
             .find("return Ok(outcome);")
             .expect("classified dispatch branch must return its written outcome")
