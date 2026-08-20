@@ -5683,6 +5683,17 @@ fn test_proxy_allowed_methods_roundtrip_serialization() {
     );
 }
 
+#[test]
+fn test_proxy_normalize_fields_trims_and_uppercases_allowed_methods() {
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.allowed_methods = Some(vec![" GET ".into(), "post".into()]);
+    proxy.normalize_fields();
+    assert_eq!(
+        proxy.allowed_methods,
+        Some(vec!["GET".to_string(), "POST".to_string()])
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Namespace validation & cross-namespace uniqueness
 // ---------------------------------------------------------------------------
