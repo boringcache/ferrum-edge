@@ -151,7 +151,7 @@ impl JwtAuth {
                 } else {
                     ExtractedCredential::BearerToken(
                         strip_auth_scheme(&value, "Bearer")
-                            .unwrap_or(value.as_str())
+                            .unwrap_or(value.as_ref())
                             .to_string(),
                     )
                 }

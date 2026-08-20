@@ -1880,7 +1880,7 @@ async fn dpop_present_but_non_materialized_rejects_invalid_not_missing() {
     .unwrap();
     plugin.warmup_jwks().await;
 
-    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
     let token = create_rs256_token(
         &json!({"sub": "idp-user", "iss": "https://idp.example.com", "cnf": {"jkt": "missing"}}),
         private_key_pem,

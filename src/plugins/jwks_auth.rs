@@ -31,6 +31,7 @@ use super::utils::dpop::{
     self, DPOP_MARKER_RETENTION_SECONDS, DPOP_REPLAY_PROFILE, DpopVerifyInput,
     MAX_DPOP_CLOCK_SKEW_SECS,
 };
+use super::utils::header_extract::{ConfiguredHeaderLookup, lookup_configured_header};
 use super::utils::jwks_cache::{
     DiscoveryStoreCandidate, JwksRefreshRequirement, LateActiveRequirement,
     clear_late_active_requirement, get_or_create_jwks_store, last_discovered_jwks_uri,
@@ -47,7 +48,6 @@ use super::utils::replay_authority::{
     ReplayAdmission, ReplayAuthority, ReplayDomain, ReplayMarker, ReplayScope,
     validate_scope_backend,
 };
-use super::utils::header_extract::{ConfiguredHeaderLookup, lookup_configured_header};
 use super::utils::replay_partition::PartitionHasher;
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};

@@ -1142,7 +1142,7 @@ impl HmacAuth {
 
     /// Look up the digest header on the request. Prefers RFC 9530
     /// `Content-Digest` and falls back to RFC 3230 `Digest`.
-    fn lookup_digest_header(ctx: &RequestContext) -> ConfiguredHeaderLookup {
+    fn lookup_digest_header(ctx: &RequestContext) -> ConfiguredHeaderLookup<'_> {
         match lookup_configured_header(ctx, "content-digest", None) {
             ConfiguredHeaderLookup::Absent => lookup_configured_header(ctx, "digest", None),
             other => other,
@@ -1416,7 +1416,7 @@ impl AuthMechanism for HmacAuth {
             );
         }
         let digest_header = match Self::lookup_digest_header(ctx) {
-            ConfiguredHeaderLookup::Value(header) => header,
+            ConfiguredHeaderLookup::Value(header) => header.into_owned(),
             ConfiguredHeaderLookup::PresentNonMaterialized => {
                 return ExtractedCredential::InvalidFormat(
                     r#"{"error":"Invalid Digest header"}"#.to_string(),

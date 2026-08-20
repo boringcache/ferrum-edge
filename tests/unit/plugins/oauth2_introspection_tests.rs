@@ -1883,7 +1883,8 @@ async fn oauth2_non_materialized_authorization_rejects_invalid_not_missing() {
     )
     .unwrap();
 
-    let mut ctx = context_with_materialized_raw_header("Authorization", "Bearer \u{3000}not-a-token");
+    let mut ctx =
+        context_with_materialized_raw_header("Authorization", "Bearer \u{3000}not-a-token");
     let result = plugin
         .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
         .await;
