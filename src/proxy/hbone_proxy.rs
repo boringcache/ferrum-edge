@@ -653,17 +653,21 @@ pub(super) async fn handle_hbone_request(
         match backend_dispatch::check_circuit_breaker(proxy, state, upstream_target.as_deref()) {
             Ok(result) => result,
             Err(()) => {
-                let reject = finalize_reject_response_with_after_proxy_hooks(
+                let mut reject = finalize_reject_response_with_after_proxy_hooks(
                     plugins,
                     ctx,
                     StatusCode::SERVICE_UNAVAILABLE,
                     Bytes::from_static(
                         br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
                     ),
-                    HashMap::new(),
+                    crate::proxy::circuit_breaker_open_reject_headers(),
                     false,
                 )
                 .await;
+                crate::proxy::restore_authoritative_gateway_error_header(
+                    &mut reject.headers,
+                    crate::proxy::X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN,
+                );
                 log_rejected_request(
                     plugins,
                     ctx,
