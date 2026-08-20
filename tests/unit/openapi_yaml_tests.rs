@@ -8113,6 +8113,51 @@ fn mtls_dns_admission_mutations_document_conflict_responses() {
 }
 
 #[test]
+fn admin_referential_delete_conflicts_have_openapi_parity() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let consumer_409 = spec
+        .pointer("/paths/~1consumers~1{id}/delete/responses/409")
+        .expect("DELETE /consumers/{id} must document 409");
+    let consumer_desc = consumer_409["description"]
+        .as_str()
+        .expect("DELETE /consumers/{id} 409 description");
+    assert!(
+        consumer_desc.contains(
+            "Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"
+        ),
+        "DELETE /consumers/{{id}} 409 must name the access_control error string: {consumer_desc}"
+    );
+
+    let upstream_409 = spec
+        .pointer("/paths/~1upstreams~1{id}/delete/responses/409")
+        .expect("DELETE /upstreams/{id} must document 409");
+    let upstream_desc = upstream_409["description"]
+        .as_str()
+        .expect("DELETE /upstreams/{id} 409 description");
+    assert!(
+        upstream_desc
+            .contains("Upstream is referenced by one or more proxies and cannot be deleted"),
+        "DELETE /upstreams/{{id}} 409 must name the proxy-reference error string: {upstream_desc}"
+    );
+    assert!(
+        upstream_desc.contains(
+            "Upstream is referenced by a mesh_route_dispatch plugin_config and cannot be deleted"
+        ),
+        "DELETE /upstreams/{{id}} 409 must name the mesh_route_dispatch error string: {upstream_desc}"
+    );
+
+    let proxy_desc = spec["paths"]["/proxies/{id}"]["delete"]["description"]
+        .as_str()
+        .expect("DELETE /proxies/{id} description");
+    assert!(
+        proxy_desc.contains("hand-owned") && proxy_desc.contains("orphan-cleaned"),
+        "DELETE /proxies/{{id}} must document hand-owned upstream orphan cleanup: {proxy_desc}"
+    );
+}
+
+#[test]
 fn plugin_graph_delete_rejections_have_openapi_parity() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

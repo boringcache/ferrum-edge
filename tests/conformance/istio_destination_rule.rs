@@ -515,6 +515,32 @@ fn dr_subset_connection_pool_http_idle_timeout_and_h2_max_requests_supported() {
     assert_eq!(http.http2_max_requests, Some(10));
 }
 
+/// `trafficPolicy.loadBalancer.simple = PASSTHROUGH` → `Passthrough`.
+#[test]
+fn dr_load_balancer_simple_passthrough() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "trafficPolicy.loadBalancer.simple = PASSTHROUGH",
+        status = Status::Supported,
+        notes = "Maps to LoadBalancerAlgorithm::Passthrough. Captured orig-dst \
+                 matching a healthy pool target is dialed; unmatched, absent, or \
+                 ejected orig-dst falls back to ROUND_ROBIN with a warning.",
+    );
+    let dr = translated(json!({
+        "host": "echo.default.svc.cluster.local",
+        "trafficPolicy": {"loadBalancer": {"simple": "PASSTHROUGH"}}
+    }));
+    let lb = dr
+        .traffic_policy
+        .expect("traffic policy")
+        .load_balancer
+        .expect("lb");
+    match lb {
+        MeshLoadBalancer::Simple(MeshSimpleLb::Passthrough) => {}
+        other => panic!("expected Passthrough, got {other:?}"),
+    }
+}
+
 /// `trafficPolicy.loadBalancer.simple = ROUND_ROBIN` → `RoundRobin`.
 #[test]
 fn dr_load_balancer_simple_round_robin() {

@@ -12035,7 +12035,15 @@ extensionProviders:
         )
         .expect_err("unsupported LB must fail");
 
-        assert!(err.to_string().contains("unsupported"));
+        let err = err.to_string();
+        assert!(
+            err.contains("MAGLEV"),
+            "reject diagnostic must name MAGLEV, got {err}"
+        );
+        assert!(
+            err.contains("unsupported"),
+            "reject diagnostic must say unsupported, got {err}"
+        );
     }
 
     #[test]
@@ -12261,6 +12269,18 @@ extensionProviders:
                 && w.contains("round-robin")),
             "expected PASSTHROUGH true-passthrough-with-RR-fallback warning, got {:?}",
             result.warnings
+        );
+        let mesh = result.config.mesh.expect("mesh config");
+        let lb = mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .expect("traffic policy")
+            .load_balancer
+            .as_ref()
+            .expect("load balancer");
+        assert!(
+            matches!(lb, MeshLoadBalancer::Simple(MeshSimpleLb::Passthrough)),
+            "PASSTHROUGH must store MeshSimpleLb::Passthrough, not silently become ROUND_ROBIN"
         );
     }
 

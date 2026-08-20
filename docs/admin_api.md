@@ -415,6 +415,15 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" \
 curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:9000/proxies/{proxy_id}
 ```
 
+`DELETE /proxies/{id}` of a **hand-managed** proxy (no owning API-spec row) also
+orphan-cleans that proxy's current `upstream_id` when the upstream is itself
+hand-owned (`api_spec_id` is null) and no remaining proxy or
+`mesh_route_dispatch` plugin still references it. A shared hand-owned upstream
+survives. Spec-owned upstreams are removed by the spec cascade, not this
+generic orphan path; a spec-owned proxy that drifted onto a hand-owned
+upstream leaves that upstream in place. See
+[Cascade and ownership summary](#cascade-and-ownership-summary).
+
 ### Stream Proxy (TCP/UDP)
 
 Stream proxies use `listen_port` instead of `listen_path`:
@@ -478,6 +487,15 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
 curl -X DELETE -H "Authorization: Bearer $TOKEN" \
   http://localhost:9000/consumers/{consumer_id}/credentials/keyauth
 ```
+
+`DELETE /consumers/{id}` returns **409 Conflict** with
+`{"error":"Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"}`
+when any `access_control` plugin config in the same namespace still lists that
+consumer's **username** in `allowed_consumers`. The consumer and plugin configs
+are left unchanged; Ferrum does not rewrite the operator's authorization
+policy. Remove or edit the username in those plugin configs, then retry. A
+consumer named only in `disallowed_consumers`, or not named in any
+`access_control` allow-list, can still be deleted.
 
 Credential rotation workflow:
 1. `POST .../credentials/keyauth` with the new key — both old and new are now active
@@ -603,6 +621,13 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" \
 # Delete an upstream
 curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams/{upstream_id}
 ```
+
+`DELETE /upstreams/{id}` returns **409 Conflict** with
+`{"error":"Upstream is referenced by one or more proxies and cannot be deleted"}`
+when any proxy still has that `upstream_id`. The upstream and referencing
+proxies are left unchanged. A `mesh_route_dispatch` plugin config that still
+names the upstream likewise returns 409 with
+`{"error":"Upstream is referenced by a mesh_route_dispatch plugin_config and cannot be deleted"}`.
 
 Supported algorithms: `round_robin`, `weighted_round_robin`, `least_connections`, `least_latency`, `consistent_hashing`, `random`, `passthrough`.
 
@@ -1272,7 +1297,7 @@ Deletes the spec and cascades:
 | `POST /api-specs` | Created; tagged with `api_spec_id` | — |
 | `PUT /api-specs/{id}` | Replaced (deleted + re-inserted) | Survive unchanged |
 | `DELETE /api-specs/{id}` | Proxy + plugins deleted; spec-owned upstream deleted | Non-spec upstreams survive |
-| `DELETE /proxies/{id}` | Proxy, spec row, scoped plugins, and generated upstreams deleted atomically on SQL/replica-set MongoDB; standalone MongoDB refuses before mutation | — |
+| `DELETE /proxies/{id}` | Proxy, spec row, scoped plugins, and generated (spec-owned) upstreams deleted atomically on SQL/replica-set MongoDB; standalone MongoDB refuses before mutation | Last-referenced **hand-owned** upstream (`api_spec_id` null) is orphan-cleaned when the deleted proxy is itself hand-managed and no remaining proxy or `mesh_route_dispatch` plugin still references it. A shared hand-owned upstream survives. A spec-owned proxy that drifted onto a hand-owned upstream leaves that upstream in place. |
 
 ### Mode behavior
 
