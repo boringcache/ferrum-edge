@@ -3970,8 +3970,7 @@ async fn direct_h2_early_response_survives_an_unlimited_unauthenticated_upload()
 
     assert_eq!(status, StatusCode::OK, "unexpected status; body={body}");
     assert_eq!(
-        body,
-        "earlytail",
+        body, "earlytail",
         "the early response must complete: a truncated body means the \
          dispatcher cancelled the still-live upload on return"
     );

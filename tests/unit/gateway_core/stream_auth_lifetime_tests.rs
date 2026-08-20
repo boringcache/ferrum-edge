@@ -3113,7 +3113,11 @@ async fn a_replayable_upload_write_watermark_stays_dormant_until_the_transport_c
         probe.poll_transport_once(),
         ProbeReplayFrame::Data(_) | ProbeReplayFrame::Pending
     ));
-    assert!(probe.write_watermark_wins_header_wait(Duration::from_secs(30)).await);
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await
+    );
     assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
 }
 
@@ -3126,7 +3130,11 @@ async fn a_terminated_pump_body_reports_its_error_once_and_never_a_clean_eof() {
         probe.poll_transport_once(),
         ProbeTransportPoll::Data(_) | ProbeTransportPoll::Pending
     ));
-    assert!(probe.write_watermark_wins_header_wait(Duration::from_secs(30)).await);
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await
+    );
     assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
 
     // Exactly one error...
