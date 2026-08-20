@@ -156,10 +156,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - HTTP-family `backend_write_timeout_ms` now bounds request-body upload
-  inactivity on H1, H2 (reqwest and the direct H2 pool), and native H3, not
-  only TCP streams. It covers streamed and buffered uploads alike, including
-  retry replays. A backend that accepts and never reads surfaces as
-  `504` / `X-Gateway-Error: backend_timeout` /
+  inactivity on H1, H2 (reqwest, the direct H2 pool, and native gRPC), and
+  native H3, not only TCP streams. It covers streamed and buffered uploads
+  alike, including retry replays, and it stays an *idle* watermark: a buffered
+  body is written in bounded slices, so an upload that is slow but continuously
+  progressing is not timed out. A backend that accepts and never reads surfaces
+  as `504` / `X-Gateway-Error: backend_timeout` /
   `error_class=read_write_timeout`. `0` still disables the bound.
 
 - HTTP-family `backend_read_timeout_ms` is an idle-between-frames watermark

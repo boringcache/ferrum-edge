@@ -1205,13 +1205,16 @@ proxies it has three roles:
 
 `backend_write_timeout_ms` defaults to `30000` (30 seconds) and is the
 per-direction *idle* bound on writing the request body to the backend. HTTP-family
-uploads arm it in the gateway-owned upload pump (H1/H2/reqwest) or on
-each native-H3 `send_data`/`finish` — streaming uploads through their body
+uploads arm it in the gateway-owned upload pump (H1/H2/reqwest and native gRPC)
+or on each native-H3 `send_data`/`finish` — streaming uploads through their body
 adapter, and buffered uploads (retries, body-processing policy, retry replays)
 by handing the collected buffer to the same pump in bounded slices; a backend
 that accepts and never reads
 surfaces as `504` / `X-Gateway-Error: backend_timeout` /
-`error_class=read_write_timeout`. `0` disables the write bound. Streaming
+`error_class=read_write_timeout`. `0` disables the write bound. Because the
+bound is idle rather than total, a buffered body is written in bounded slices
+and every slice that the backend takes re-arms it, so a large upload that is
+slow but continuously progressing is not timed out. Streaming
 pass-through uploads are otherwise unaffected by the buffered-upload collection
 deadline above.
 
