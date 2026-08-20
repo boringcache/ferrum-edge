@@ -53,6 +53,10 @@ fn timeout_overrides(read_ms: u64, write_ms: u64) -> serde_json::Value {
     })
 }
 
+fn gateway_error_header(headers: &reqwest::header::HeaderMap) -> Option<&str> {
+    headers.get("x-gateway-error").and_then(|v| v.to_str().ok())
+}
+
 async fn raw_h1_upload_response(harness: &GatewayHarness) -> (String, Duration) {
     let url = reqwest::Url::parse(harness.proxy_base_url()).expect("proxy URL");
     let port = url.port().expect("proxy URL has explicit port");
@@ -243,21 +247,41 @@ async fn in_process_buffered_backend_write_timeout_maps_to_504_backend_timeout()
         .await
         .expect("spawn gateway");
 
-    let (response, elapsed) = raw_h1_upload_response(&harness).await;
-    let (headers, body) = response
-        .split_once("\r\n\r\n")
-        .expect("HTTP/1 response has a header terminator");
-    assert!(
-        headers.starts_with("HTTP/1.1 504 "),
-        "buffered upload write timeout must be 504, got {response:?}"
+    // Retry forces gateway-side body collection before dispatch. The streaming
+    // arm uses `raw_h1_upload_response` so the upload stays live while the
+    // backend write watermark fires; reading concurrently during collection
+    // here closes the frontend with no HTTP block (hosted CI: empty EOF at
+    // split_once). Reqwest finishes the client upload before awaiting headers,
+    // which matches how a buffered dispatch actually reaches the backend.
+    let client = harness.http_client().expect("client");
+    let started = Instant::now();
+    let resp = client
+        .as_reqwest()
+        .post(harness.proxy_url("/api/twrite"))
+        .header("content-type", "application/octet-stream")
+        .body(vec![b'x'; UPLOAD_STALL_BYTES])
+        .send()
+        .await
+        .expect("gateway returns a response");
+    let elapsed = started.elapsed();
+    let status = resp.status();
+    let header = gateway_error_header(resp.headers()).map(str::to_owned);
+    let body = resp.text().await.expect("body");
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::GATEWAY_TIMEOUT,
+        "buffered upload write timeout must be 504, got {status} body={body}"
     );
-    assert!(
-        headers
-            .to_ascii_lowercase()
-            .contains("\r\nx-gateway-error: backend_timeout"),
-        "timeout must carry X-Gateway-Error=backend_timeout, got {response:?}"
+    assert_eq!(
+        header.as_deref(),
+        Some("backend_timeout"),
+        "timeout must carry X-Gateway-Error=backend_timeout, body={body}"
     );
-    assert_eq!(body, r#"{"error":"Backend timeout"}"#);
+    assert_eq!(
+        body, r#"{"error":"Backend timeout"}"#,
+        "timeout body must be timeout-specific"
+    );
     assert_timeout_envelope(elapsed, WRITE_TIMEOUT_MS);
 }
 
