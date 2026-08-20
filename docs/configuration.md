@@ -192,7 +192,7 @@ value.
 |---|---|---|---|
 | `FERRUM_DB_TYPE` | DB/CP modes | — | Database type: `postgres`, `mysql`, `sqlite`, `mongodb` |
 | `FERRUM_DB_URL` | DB/CP modes | — | Database connection string. For MongoDB: `mongodb://` or `mongodb+srv://` |
-| `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls. Incremental polling reads durable `config_changes` records after the last accepted sequence cursor, then point-loads changed IDs only. If polling fails or the cursor is older than retained change history, Ferrum falls back to a full runtime reload. SQL full reloads use transaction-scoped keyset pagination, MongoDB replica-set full reloads use snapshot transactions, and standalone MongoDB pollers use full reloads because change records are not crash-atomic without transactions; failed candidates keep the last known-good runtime config active. |
+| `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls. Incremental polling reads durable `config_changes` records after the last accepted sequence cursor, then point-loads changed IDs only. In-process Admin API mutations in database mode wake this loop immediately after commit and wait for that generation to become live, so they do not sit on this interval. The interval remains the correctness backstop for external writers, missed wakes, and change-stream gaps. If polling fails or the cursor is older than retained change history, Ferrum falls back to a full runtime reload. SQL full reloads use transaction-scoped keyset pagination, MongoDB replica-set full reloads use snapshot transactions, and standalone MongoDB pollers use full reloads because change records are not crash-atomic without transactions; failed candidates keep the last known-good runtime config active. |
 | `FERRUM_DB_REJECTED_DELTA_BACKOFF_INITIAL_SECONDS` | No | `1` | Database-mode initial retry backoff after a DB incremental delta is rejected by validation. The poller retries after this delay and does not advance the accepted cursor. CP mode uses `FERRUM_DB_POLL_INTERVAL`. |
 | `FERRUM_DB_REJECTED_DELTA_BACKOFF_MAX_SECONDS` | No | `30` | Database-mode maximum retry backoff for the same rejected DB incremental delta. Values below the initial backoff are clamped up to the initial value. |
 | `FERRUM_DB_REJECTED_DELTA_FULL_RELOAD_THRESHOLD` | No | `3` | Database-mode number of identical rejected DB incremental deltas before attempting an authoritative primary-backed full reload while preserving the last known-good config if that snapshot fails or is rejected. |
@@ -229,6 +229,11 @@ candidates before storing and broadcasting them, but it does not use those
 Database-mode polling commits the accepted `config_changes.sequence` cursor only
 after an `Applied` or `Unchanged` candidate. Full reload candidates follow the
 same rule: a rejected full snapshot cannot poison the later incremental cursor.
+In-process Admin API mutations share that same apply path: after the database
+transaction commits they capture a covering `config_changes` watermark from the
+pinned write topology, release that pin, then wait until the poll loop publishes
+a generation covering it (or a truthful `503` with `applied: false` if reload
+cannot apply).
 SQL runtime polling always uses the primary pool; `FERRUM_DB_READ_REPLICA_URL`
 is only for eligible admin reads. MongoDB config reads force primary read
 preference, and standalone MongoDB polling intentionally uses full reloads

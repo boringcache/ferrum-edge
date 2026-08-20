@@ -338,6 +338,7 @@ async fn undecodable_consumer_row_keeps_admin_writable_for_in_band_repair() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_admin(state).await;
     let token = admin_token();
@@ -505,6 +506,7 @@ async fn undecodable_proxy_row_allows_delete_repair() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_admin(state).await;
     let token = admin_token();
@@ -608,6 +610,7 @@ async fn undecodable_consumer_row_allows_put_overwrite_repair() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_admin(state).await;
     let token = admin_token();

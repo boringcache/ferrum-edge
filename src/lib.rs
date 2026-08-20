@@ -4815,6 +4815,15 @@ pub mod _test_support {
         store.reconnect_as_failover(db_url).await
     }
 
+    /// Fail `DatabaseStore::latest_change_sequence` so live-apply tests can
+    /// prove `sequence_unavailable` after a durable commit (issue #3926).
+    pub fn database_store_set_latest_change_sequence_fault_for_test(
+        store: &crate::config::db_loader::DatabaseStore,
+        fail: bool,
+    ) {
+        store.set_latest_change_sequence_fault_for_test(fail);
+    }
+
     // ── config/mongo_store: Admin write-topology / publication test seams ────
     pub use crate::config::mongo_store::{
         MongoReconnectTopology, MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,

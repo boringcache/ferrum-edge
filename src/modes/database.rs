@@ -30,12 +30,13 @@ use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::config_backup::load_config_backup;
 use crate::config::config_change_watch::{
-    ConfigChangeWakeSignal, ConfigChangeWakeWatcherParams, ConfigChangeWatchSettings,
-    ConfigChangeWatcherHealth, ConfigChangeWatcherStatus, wait_for_config_poll_wake,
+    ConfigChangeWakeWatcherParams, ConfigChangeWatchSettings, ConfigChangeWatcherHealth,
+    ConfigChangeWatcherStatus, wait_for_config_poll_wake,
 };
 use crate::config::db_backend::{self, DatabaseBackend};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::config::gateway_trust::detect_gateway_trust_drift;
+use crate::config::runtime_config_apply::RuntimeConfigApply;
 use crate::config::types::GatewayConfig;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::modes::file::{
@@ -1902,6 +1903,11 @@ pub async fn run(
     // no new mutations still has to drain the backlog it inherited.
     crate::admin::audit::start_delivery(env_config.admin_audit_enabled, db.clone());
 
+    let runtime_config_apply = Arc::new(RuntimeConfigApply::new(
+        env_config.namespace.clone(),
+        initial_change_sequence.unwrap_or(0),
+    ));
+
     let admin_state = AdminState {
         db: Some(db.clone()),
         jwt_manager,
@@ -1948,6 +1954,7 @@ pub async fn run(
                 fixtures: std::collections::HashMap::new(),
             },
         ),
+        runtime_config_apply: Some(runtime_config_apply.clone()),
     };
     // Clone admin_state before the HTTP listener moves it, so we can reuse
     // the same JwtManager instance for the HTTPS listener (instead of calling
@@ -2180,6 +2187,7 @@ pub async fn run(
         Duration::from_secs(env_config.db_rejected_delta_backoff_max_seconds);
     let rejected_delta_full_reload_threshold = env_config.db_rejected_delta_full_reload_threshold;
     let poll_shutdown_tx = shutdown_tx.clone();
+    let runtime_config_apply_poll = runtime_config_apply.clone();
 
     // DNS re-resolution for the database FQDN: if the URL contains a hostname
     // (not an IP literal), resolve it via DnsCache on each poll cycle and
@@ -2203,8 +2211,14 @@ pub async fn run(
     // and never publishes a generation. `poll_interval` above stays armed as
     // the correctness backstop, so a watcher that is absent, degraded, or
     // silently dropping events degrades to plain periodic polling.
+    //
+    // The same wake channel is shared with in-process admin writers (issue
+    // #3926): they signal an immediate permit after commit and wait for this
+    // loop's authoritative apply. SQL backends have no change stream, so the
+    // admin signal is what makes POST /proxies live without waiting for the
+    // periodic tick.
     let change_stream_settings = ConfigChangeWatchSettings::from_env(&env_config);
-    let config_change_wake = Arc::new(ConfigChangeWakeSignal::new());
+    let config_change_wake = runtime_config_apply.wake_signal();
     let mut change_stream_redact_urls = vec![effective_url.clone()];
     change_stream_redact_urls.extend(failover_urls.iter().cloned());
     let config_change_watcher =
@@ -2216,11 +2230,9 @@ pub async fn run(
             shutdown: shutdown_tx.subscribe(),
             redact_urls: change_stream_redact_urls,
         });
-    // `Some` only when the backend accepted the watch. The poll loop keeps its
-    // periodic tick either way and simply gains a wake-up source.
-    let poll_wake_signal = config_change_watcher
-        .as_ref()
-        .map(|_| config_change_wake.clone());
+    // Always arm the wake source so admin writers can short-circuit the
+    // interval. The periodic tick remains the correctness backstop.
+    let poll_wake_signal = Some(config_change_wake.clone());
     match config_change_watcher {
         Some(handle) => {
             info!(
@@ -2259,6 +2271,7 @@ pub async fn run(
             let poll_generation = poll_generation.clone();
             let poll_shutdown_tx = poll_shutdown_tx.clone();
             let poll_wake_signal = poll_wake_signal.clone();
+            let runtime_config_apply_poll = runtime_config_apply_poll.clone();
             move || {
                 let db_poll = db_poll.clone();
                 let proxy_state_poll = proxy_state_poll.clone();
@@ -2275,6 +2288,7 @@ pub async fn run(
                 let db_hostname = db_hostname.clone();
                 let replica_hostname = replica_hostname.clone();
                 let poll_wake_signal = poll_wake_signal.clone();
+                let runtime_config_apply_poll = runtime_config_apply_poll.clone();
                 let generation = poll_generation.fetch_add(1, Ordering::AcqRel);
                 let mut poll_shutdown = poll_shutdown_tx.subscribe();
                 tokio::spawn(async move {
@@ -2417,10 +2431,12 @@ pub async fn run(
                                         &mut last_change_sequence,
                                         sequence,
                                         &config_rejected_poll,
+                                        &runtime_config_apply_poll,
                                     )
                                     .await
                                     {
                                         None => {
+                                            runtime_config_apply_poll.nudge_if_waiters_pending();
                                             database_delta_poll_metrics_for_poll.record_poll_completed();
                                             continue;
                                         }
@@ -2451,6 +2467,7 @@ pub async fn run(
                                         );
                                         db_available_poll.store(false, Ordering::Relaxed);
                                     }
+                                    runtime_config_apply_poll.nudge_if_waiters_pending();
                                     database_delta_poll_metrics_for_poll.record_poll_completed();
                                     continue;
                                 }
@@ -2470,6 +2487,7 @@ pub async fn run(
                                     )
                                     .await
                                     {
+                                        runtime_config_apply_poll.nudge_if_waiters_pending();
                                         database_delta_poll_metrics_for_poll.record_poll_completed();
                                         continue;
                                     }
@@ -2480,11 +2498,13 @@ pub async fn run(
                                     match proxy_state_poll.apply_incremental(result).await {
                                         proxy::ConfigApplyOutcome::Applied => {
                                             last_change_sequence = Some(next_sequence);
+                                            runtime_config_apply_poll.record_accepted(next_sequence);
                                             debug!("Incremental config reload complete");
                                             rejected_delta_tracker.record_accepted();
                                         }
                                         proxy::ConfigApplyOutcome::Unchanged => {
                                             last_change_sequence = Some(next_sequence);
+                                            runtime_config_apply_poll.record_accepted(next_sequence);
                                             debug!("Incremental config poll valid but unchanged");
                                             rejected_delta_tracker.record_accepted();
                                         }
@@ -2518,10 +2538,12 @@ pub async fn run(
                                                             &mut last_change_sequence,
                                                             sequence,
                                                             &config_rejected_poll,
+                                                            &runtime_config_apply_poll,
                                                         )
                                                         .await
                                                         {
                                                             None => {
+                                                                runtime_config_apply_poll.nudge_if_waiters_pending();
                                                                 database_delta_poll_metrics_for_poll.record_poll_completed();
                                                                 continue;
                                                             }
@@ -2587,10 +2609,12 @@ pub async fn run(
                                                                                 &mut last_change_sequence,
                                                                                 sequence,
                                                                                 &config_rejected_poll,
+                                                                                &runtime_config_apply_poll,
                                                                             )
                                                                             .await
                                                                             {
                                                                                 None => {
+                                                                                    runtime_config_apply_poll.nudge_if_waiters_pending();
                                                                                     database_delta_poll_metrics_for_poll.record_poll_completed();
                                                                                     continue;
                                                                                 }
@@ -2646,6 +2670,7 @@ pub async fn run(
                                             }
 
                                             if !recovered_by_full_reload {
+                                                runtime_config_apply_poll.record_rejected(next_sequence);
                                                 let backoff = decision.backoff;
                                                 interval.reset_after(backoff);
                                                 // Gate stream wake-ups on the
@@ -2685,10 +2710,12 @@ pub async fn run(
                                                 &mut last_change_sequence,
                                                 sequence,
                                                 &config_rejected_poll,
+                                                &runtime_config_apply_poll,
                                             )
                                             .await
                                             {
                                                 None => {
+                                                    runtime_config_apply_poll.nudge_if_waiters_pending();
                                                     database_delta_poll_metrics_for_poll.record_poll_completed();
                                                     continue;
                                                 }
@@ -2742,10 +2769,12 @@ pub async fn run(
                                                                     &mut last_change_sequence,
                                                                     sequence,
                                                                     &config_rejected_poll,
+                                                                    &runtime_config_apply_poll,
                                                                 )
                                                                 .await
                                                                 {
                                                                     None => {
+                                                                        runtime_config_apply_poll.nudge_if_waiters_pending();
                                                                         database_delta_poll_metrics_for_poll.record_poll_completed();
                                                                         continue;
                                                                     }
@@ -2806,10 +2835,12 @@ pub async fn run(
                                         &mut last_change_sequence,
                                         sequence,
                                         &config_rejected_poll,
+                                        &runtime_config_apply_poll,
                                     )
                                     .await
                                     {
                                         None => {
+                                            runtime_config_apply_poll.nudge_if_waiters_pending();
                                             database_delta_poll_metrics_for_poll.record_poll_completed();
                                             continue;
                                         }
@@ -2842,6 +2873,7 @@ pub async fn run(
                             }
                         }
                                     // Normal fallthrough: success, empty, rejection, or handled error.
+                                    runtime_config_apply_poll.nudge_if_waiters_pending();
                                     database_delta_poll_metrics_for_poll.record_poll_completed();
                                 }
                                 _ = poll_shutdown.changed() => {
@@ -2956,6 +2988,7 @@ async fn try_publish_full_reload_after_gate(
     last_change_sequence: &mut Option<u64>,
     sequence: u64,
     config_rejected: &AtomicBool,
+    runtime_config_apply: &RuntimeConfigApply,
 ) -> Option<bool> {
     if !mark_db_available_after_successful_poll_load(
         db,
@@ -2975,6 +3008,7 @@ async fn try_publish_full_reload_after_gate(
         last_change_sequence,
         sequence,
         config_rejected,
+        runtime_config_apply,
     );
     // This is the ONE chokepoint through which an authoritative database FULL
     // snapshot reaches the live runtime, so it is the only place that may
@@ -3002,10 +3036,12 @@ fn commit_full_reload_poll_state(
     last_change_sequence: &mut Option<u64>,
     sequence: u64,
     config_rejected: &AtomicBool,
+    runtime_config_apply: &RuntimeConfigApply,
 ) -> bool {
     match outcome {
         proxy::ConfigApplyOutcome::Applied => {
             *last_change_sequence = Some(sequence);
+            runtime_config_apply.record_accepted(sequence);
             info!("Configuration applied from database ({})", context);
             crate::modes::clear_config_rejected_after_accepted_full_reload(
                 config_rejected,
@@ -3015,6 +3051,7 @@ fn commit_full_reload_poll_state(
         }
         proxy::ConfigApplyOutcome::Unchanged => {
             *last_change_sequence = Some(sequence);
+            runtime_config_apply.record_accepted(sequence);
             debug!("Database configuration valid but unchanged ({})", context);
             // An Unchanged outcome still means the freshly-loaded FULL snapshot
             // passed loader validation and matches the running config, so the
@@ -3026,6 +3063,7 @@ fn commit_full_reload_poll_state(
             true
         }
         proxy::ConfigApplyOutcome::Rejected { errors } => {
+            runtime_config_apply.record_rejected(sequence);
             if !config_rejected.swap(true, Ordering::Relaxed) {
                 error!(
                     "Database configuration candidate rejected during full apply ({}); \
@@ -3609,6 +3647,7 @@ mod tests {
         let mut last_change_sequence = Some(7);
         let sequence = 42;
         let config_rejected = AtomicBool::new(true);
+        let runtime_config_apply = RuntimeConfigApply::new("ferrum", 0);
 
         let accepted = commit_full_reload_poll_state(
             "test unchanged",
@@ -3616,6 +3655,7 @@ mod tests {
             &mut last_change_sequence,
             sequence,
             &config_rejected,
+            &runtime_config_apply,
         );
 
         assert!(accepted);
@@ -3632,6 +3672,7 @@ mod tests {
         // row is gone (issue #2158, P2).
         let mut last_change_sequence = None;
         let config_rejected = AtomicBool::new(true);
+        let runtime_config_apply = RuntimeConfigApply::new("ferrum", 0);
 
         let accepted = commit_full_reload_poll_state(
             "test applied",
@@ -3639,6 +3680,7 @@ mod tests {
             &mut last_change_sequence,
             99,
             &config_rejected,
+            &runtime_config_apply,
         );
 
         assert!(accepted);
@@ -3657,6 +3699,7 @@ mod tests {
         let previous_sequence = Some(7);
         let mut last_change_sequence = previous_sequence;
         let config_rejected = AtomicBool::new(false);
+        let runtime_config_apply = RuntimeConfigApply::new("ferrum", 0);
 
         let accepted = commit_full_reload_poll_state(
             "test rejected",
@@ -3666,6 +3709,7 @@ mod tests {
             &mut last_change_sequence,
             42,
             &config_rejected,
+            &runtime_config_apply,
         );
 
         assert!(!accepted);
@@ -3786,12 +3830,14 @@ mod tests {
 
         // 3) An accepted full reload clears the flag.
         let mut cursor = Some(1);
+        let runtime_config_apply = RuntimeConfigApply::new("ferrum", 0);
         let accepted = commit_full_reload_poll_state(
             "full reload",
             proxy::ConfigApplyOutcome::Applied,
             &mut cursor,
             2,
             &config_rejected,
+            &runtime_config_apply,
         );
         assert!(accepted);
         assert!(

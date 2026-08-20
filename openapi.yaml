@@ -4129,7 +4129,9 @@ paths:
               $ref: "#/components/schemas/BatchCreateRequest"
       responses:
         "201":
-          description: All resources created successfully
+          description: |
+            All resources created successfully. In database mode the committed
+            generation is already live on this process.
           content:
             application/json:
               schema:
@@ -4566,6 +4568,12 @@ paths:
       description: |
         Creates a new proxy route. A UUID is generated when `id` is omitted or
         empty. `created_at` and `updated_at` are set automatically.
+
+        In database mode a `201` means a covering `config_changes` generation is
+        live on this process: the handler captures that watermark under the
+        write-topology pin, then waits for the same poll-loop reload that
+        periodic ticks use. If that reload cannot apply, the API returns `503`
+        with `applied: false` even though the row is durable.
       tags: [Proxies]
       requestBody:
         required: true
@@ -4575,7 +4583,9 @@ paths:
               $ref: "#/components/schemas/ProxyCreate"
       responses:
         "201":
-          description: Proxy created
+          description: |
+            Proxy created. In database mode a covering `config_changes`
+            generation is already live on this process.
           content:
             application/json:
               schema:
@@ -4632,6 +4642,10 @@ paths:
         Replaces the proxy with the given body. The `id` field in the body is
         ignored — the path parameter is authoritative. `updated_at` is set
         automatically.
+
+        In database mode a `200` means a covering `config_changes` generation
+        is live on this process. If reload cannot apply, the API returns `503`
+        with `applied: false` even though the row is durable.
       tags: [Proxies]
       requestBody:
         required: true
@@ -4641,7 +4655,9 @@ paths:
               $ref: "#/components/schemas/ProxyCreate"
       responses:
         "200":
-          description: Proxy updated
+          description: |
+            Proxy updated. In database mode a covering `config_changes`
+            generation is already live on this process.
           content:
             application/json:
               schema:
@@ -4669,7 +4685,10 @@ paths:
       operationId: deleteProxy
       summary: Delete a proxy
       description: |
-        Deletes the proxy and its proxy-owned cascade resources. If the proxy is
+        Deletes the proxy and its proxy-owned cascade resources. In database
+        mode a `204` means a covering `config_changes` generation is live on
+        this process; if reload cannot apply, the API returns `503` with
+        `applied: false` even though the delete is durable. If the proxy is
         owned by an API spec, the spec row and spec-owned resources are also
         deleted. When namespace admission is lost after that deletion commits,
         SQL backends and replica-set MongoDB use the API-spec compensation
@@ -6998,11 +7017,13 @@ components:
             $ref: "#/components/schemas/Error"
     NamespaceAdmissionUnavailable:
       description: >-
-        The mutation is temporarily unavailable and **nothing was applied**;
-        retry after the indicated delay. Three fail-closed outcomes share this
-        response. (1) Namespace contention: the namespace is fenced by another
-        mutation or an intentionally retained uncertain operation — operators
-        must recover a retained uncertain fence before retries can succeed.
+        Two distinct fail-closed families share this response, and the body
+        distinguishes them.
+
+        **Nothing was applied** (no `applied` field; `Retry-After` present).
+        (1) Namespace contention: the namespace is fenced by another mutation
+        or an intentionally retained uncertain operation — operators must
+        recover a retained uncertain fence before retries can succeed.
         (2) A namespace-registry admission lease was not held (or not the exact
         canonical key sequence) at the commit boundary, so the transaction
         aborted. (3) The database itself aborted the committing transaction as
@@ -7014,6 +7035,16 @@ components:
         (2) and (3) carry `rollback: not_needed` and a fixed redacted message;
         the driver's own text is never returned or logged, and a uniqueness or
         name conflict is a `409` rather than this response.
+
+        **Committed but not live** (`applied: false`; no `Retry-After`). In
+        database mode this status is also returned after a config-database
+        write has committed when the in-process poll-loop reload cannot make
+        that generation live. That body includes `applied: false` and a closed
+        `reason` (`config_rejected`, `reload_timeout`, or
+        `sequence_unavailable`). The row is durable. Namespace registry
+        mutations that change the served runtime snapshot (rename of or into
+        the served namespace, and a confirmed cascade delete of the served
+        namespace) use this same contract.
       headers:
         Retry-After:
           required: false
@@ -7156,6 +7187,23 @@ components:
             - no_durable_spool
             - destination_mismatch
             - prepare_failed
+        applied:
+          type: boolean
+          description: |
+            Present on database-mode `503` responses after a config-database
+            mutation committed but the in-process poll-loop reload did not make
+            that generation live (issue #3926). Always `false` when present.
+            Omitted when the mutation was not performed (admission, audit gate,
+            validation).
+        reason:
+          type: string
+          description: |
+            Closed static label for why a committed database-mode mutation is
+            not live. Never a resource id, namespace, or driver error string.
+          enum:
+            - config_rejected
+            - reload_timeout
+            - sequence_unavailable
 
     AcmeCertificateRecordListResponse:
       type: object

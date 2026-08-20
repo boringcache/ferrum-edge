@@ -85,6 +85,7 @@ fn create_test_admin_state(config: &TestConfig, read_only: bool) -> AdminState {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     }
 }
 
@@ -234,6 +235,7 @@ async fn test_admin_state_mode_field() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     assert_eq!(admin_state_prod.mode, "production");
 }
@@ -294,6 +296,7 @@ async fn test_check_write_allowed_permits_when_db_available() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     assert!(
         state.check_write_allowed().is_none(),
@@ -346,6 +349,7 @@ async fn test_check_write_allowed_blocks_when_db_unavailable() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let resp = state.check_write_allowed();
     assert!(
@@ -404,6 +408,7 @@ async fn test_check_write_allowed_blocks_when_read_only() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let resp = state.check_write_allowed();
     assert!(
@@ -461,6 +466,7 @@ async fn test_check_write_allowed_permits_when_no_db_flag() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     assert!(
         state.check_write_allowed().is_none(),
@@ -513,6 +519,7 @@ async fn test_db_available_flag_transitions() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
 
     // Initially available
@@ -593,6 +600,7 @@ async fn test_check_write_allowed_blocks_on_failover_without_opt_in() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
 
     assert!(
@@ -675,6 +683,7 @@ async fn test_check_write_allowed_opt_in_is_policy_pure() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
 
     assert!(
@@ -771,6 +780,7 @@ async fn test_admit_write_pins_and_blocks_on_failover_without_opt_in() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
 
     let Err(err) = state.admit_write().await else {
@@ -834,6 +844,7 @@ async fn test_admit_non_config_db_write_keeps_read_only_and_db_unavailable_gates
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let Err(read_only_err) = read_only_state.admit_non_config_db_write().await else {
         panic!("admit_non_config_db_write must honor read-only mode");
@@ -843,6 +854,7 @@ async fn test_admit_non_config_db_write_keeps_read_only_and_db_unavailable_gates
     let unavailable_state = AdminState {
         read_only: false,
         db_available: Some(db_flag),
+        runtime_config_apply: None,
         ..read_only_state
     };
     let Err(unavailable_err) = unavailable_state.admit_non_config_db_write().await else {
@@ -922,6 +934,7 @@ async fn test_admit_write_retains_pin_for_mutation_lifetime_on_primary() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
 
     let permit = state
@@ -1102,6 +1115,109 @@ fn admin_mutation_handlers_use_admit_write_not_sync_gate_alone() {
             idx + 1
         );
     }
+}
+
+/// Config-database mutation handlers must capture the covering sequence under
+/// the write-topology pin, then release pins before the coordinator wait.
+#[test]
+fn live_apply_handlers_capture_sequence_before_releasing_pins() {
+    let config_db_sources = [
+        include_str!("../../../src/admin/mod.rs"),
+        include_str!("../../../src/admin/crud.rs"),
+        include_str!("../../../src/admin/api_specs/handlers.rs"),
+    ];
+    let joined = config_db_sources.join("\n");
+
+    assert!(
+        !joined.contains("finish_live_config_mutation(")
+            && !joined.contains("await_live_apply_after_commit("),
+        "the post-drop sequence re-query helpers must not exist"
+    );
+    // Count the boxed factory's CALL SITES rather than the bare substring: the
+    // factory's own name contains the inner helper's name, so a substring
+    // count conflates definitions, doc links, and calls. `..._boxed<` is the
+    // definition and `..._boxed(` is a call, so this counts calls only.
+    assert_eq!(
+        joined
+            .matches("complete_live_config_mutation_after_commit_boxed(")
+            .count(),
+        12,
+        "twelve wired mutation completions, every one through the boxed factory"
+    );
+    // The inner async helper must have exactly one caller — the factory. Any
+    // handler awaiting it directly would put the whole future back into that
+    // handler's coroutine frame, which is what overflowed the stack in the
+    // admin-api coverage shard at opt-level 0.
+    assert_eq!(
+        joined
+            .matches("Box::pin(self.complete_live_config_mutation_after_commit(")
+            .count(),
+        1,
+        "only the inline(never) factory may construct the completion future"
+    );
+    assert!(
+        !joined.contains("drop(_write_permit)"),
+        "write-topology permits must be released by the two-phase helper, not dropped before capture"
+    );
+
+    let admin_source = include_str!("../../../src/admin/mod.rs");
+    let prepare = admin_source
+        .split("pub async fn prepare_live_apply_after_commit")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn await_prepared_live_apply").next())
+        .expect("prepare_live_apply_after_commit remains inspectable");
+    assert!(
+        prepare.contains("latest_change_sequence"),
+        "covering watermark must be read in prepare, while pins are still held"
+    );
+
+    let await_phase = admin_source
+        .split("pub async fn await_prepared_live_apply")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("pub async fn complete_live_config_mutation_after_commit")
+                .next()
+        })
+        .expect("await/finish phase remains inspectable");
+    assert!(
+        !await_phase.contains("latest_change_sequence"),
+        "await/finish must not re-query latest_change_sequence after pin release"
+    );
+
+    let complete = admin_source
+        .split("pub async fn complete_live_config_mutation_after_commit")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn admit_write").next())
+        .expect("complete_live_config_mutation_after_commit remains inspectable");
+    let drop_pins = complete
+        .find("drop(pins)")
+        .expect("pins dropped after capture");
+    let finish = complete
+        .find("finish_prepared_live_apply")
+        .expect("wait runs after pin release");
+    assert!(
+        drop_pins < finish,
+        "topology/namespace pins must drop before the coordinator wait"
+    );
+
+    let batch = admin_source
+        .split("async fn handle_batch_create")
+        .nth(1)
+        .and_then(|tail| tail.split("// ---- Backup & Restore ----").next())
+        .expect("batch create remains inspectable");
+    assert!(
+        batch.contains("(namespace_config_admission_guard, _write_permit)"),
+        "batch must capture the covering sequence before releasing the namespace guard"
+    );
+
+    let restore = admin_source
+        .split("async fn handle_restore")
+        .nth(1)
+        .expect("restore remains inspectable");
+    assert!(
+        restore.contains("(namespace_config_admission_guard, _write_permit)"),
+        "restore must capture the covering sequence before releasing the namespace guard"
+    );
 }
 
 // These tests reset/mutate the process-global read-only rejection observability

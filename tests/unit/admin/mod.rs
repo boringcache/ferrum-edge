@@ -3,6 +3,7 @@ mod admin_backup_audit_tests;
 mod admin_conn_limit_tests;
 mod admin_db_health_cache_tests;
 mod admin_jwt_auth_tests;
+mod admin_live_apply_topology_tests;
 mod admin_metrics_contract_tests;
 mod admin_read_only_tests;
 mod admin_slowloris_tests;

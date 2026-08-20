@@ -51,7 +51,7 @@ use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -818,6 +818,9 @@ pub struct DatabaseStore {
     /// External-test hooks around [`Self::reconnect_transition`]. Empty in
     /// production; see [`Self::set_reconnect_transition_hooks_for_test`].
     reconnect_transition_test_hooks: Arc<std::sync::Mutex<Option<SqlReconnectTransitionTestHooks>>>,
+    /// When true, [`Self::latest_change_sequence`] fails closed so tests can
+    /// prove `sequence_unavailable` after a durable commit (issue #3926).
+    latest_change_sequence_test_fault: Arc<AtomicBool>,
     db_type: String,
     failover_urls: Vec<String>,
     pool_config: DbPoolConfig,
@@ -1914,6 +1917,7 @@ impl DatabaseStore {
             failover_topology: DbFailoverTopologyState::new(),
             reconnect_transition: Arc::new(tokio::sync::RwLock::new(())),
             reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
+            latest_change_sequence_test_fault: Arc::new(AtomicBool::new(false)),
             db_type: db_type.to_string(),
             failover_urls: Vec::new(),
             pool_config,
@@ -1975,6 +1979,7 @@ impl DatabaseStore {
             failover_topology: DbFailoverTopologyState::new(),
             reconnect_transition: Arc::new(tokio::sync::RwLock::new(())),
             reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
+            latest_change_sequence_test_fault: Arc::new(AtomicBool::new(false)),
             db_type: db_type.to_string(),
             failover_urls: failover_urls.to_vec(),
             pool_config,
@@ -5609,6 +5614,12 @@ impl DatabaseStore {
     // ---- Incremental Polling ----
 
     pub async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error> {
+        if self
+            .latest_change_sequence_test_fault
+            .load(Ordering::Acquire)
+        {
+            anyhow::bail!("latest_change_sequence test fault");
+        }
         let row = sqlx::query(
             &self.q("SELECT COALESCE(MAX(sequence), 0) AS max_sequence FROM config_changes WHERE namespace = ?"),
         )
@@ -7343,6 +7354,13 @@ impl DatabaseStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *guard = hooks;
+    }
+
+    /// Fail the next [`Self::latest_change_sequence`] reads (issue #3926 tests).
+    #[allow(dead_code)] // exercised via external unit tests through the lib target
+    pub fn set_latest_change_sequence_fault_for_test(&self, fail: bool) {
+        self.latest_change_sequence_test_fault
+            .store(fail, Ordering::Release);
     }
 
     async fn invoke_reconnect_transition_hook(

@@ -50,6 +50,7 @@ use crate::config::db_backend::{
     tcp_connection_throttle_attachment_conflict,
 };
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
+use crate::config::runtime_config_apply::{LiveApplyFailure, PreparedLiveApply};
 use crate::config::types::{
     ApiSpec, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
     max_credentials_per_type,
@@ -456,6 +457,11 @@ pub struct AdminState {
     pub external_ref_policy: std::sync::Arc<crate::admin::api_specs::ExternalRefProcessPolicy>,
     /// Loader used when external `$ref` resolution is effectively enabled.
     pub external_ref_loader: std::sync::Arc<crate::admin::api_specs::DefaultExternalDocumentLoader>,
+    /// Database-mode coordinator that waits for the poll-loop reload to publish
+    /// a covering `config_changes` watermark before admin mutations return 2xx
+    /// (issue #3926). `None` in every other mode and in tests that do not run
+    /// a poll loop, so existing write handlers stay non-blocking.
+    pub runtime_config_apply: Option<Arc<crate::config::runtime_config_apply::RuntimeConfigApply>>,
 }
 
 impl AdminState {
@@ -483,11 +489,143 @@ impl AdminState {
         self.check_write_allowed().is_some()
     }
 
+    /// After a config-database mutation commits, capture the covering
+    /// `config_changes` watermark from the **same pinned write topology**
+    /// that just persisted the row (issue #3926).
+    ///
+    /// Call this after persist succeeds and **before** dropping the
+    /// write-topology permit (and before dropping a still-held namespace
+    /// admission guard). A sequence-read failure is a truthful `503`
+    /// `sequence_unavailable` after a durable commit.
+    ///
+    /// No-ops when this process has no poll-loop coordinator (CP/DP/file/tests)
+    /// or when the write targeted a namespace this process does not serve.
+    #[allow(clippy::result_large_err)]
+    pub async fn prepare_live_apply_after_commit(
+        &self,
+        namespace: &str,
+    ) -> Result<PreparedLiveApply, Response<Full<Bytes>>> {
+        let Some(apply) = self.runtime_config_apply.as_ref() else {
+            return Ok(PreparedLiveApply::noop());
+        };
+        if !apply.serves_namespace(namespace) {
+            return Ok(PreparedLiveApply::noop());
+        }
+        let Some(db) = self.db.as_ref() else {
+            return Ok(PreparedLiveApply::noop());
+        };
+        match db.latest_change_sequence(namespace).await {
+            Ok(sequence) => Ok(PreparedLiveApply::from_covering_sequence(sequence)),
+            Err(_error) => {
+                warn_persistence_failure_redacted("admin_write_live_apply_sequence");
+                Err(live_apply_failure_response(
+                    LiveApplyFailure::SequenceUnavailable,
+                ))
+            }
+        }
+    }
+
+    /// Phase 2: wait on a covering watermark captured by
+    /// [`Self::prepare_live_apply_after_commit`]. Call **after** releasing
+    /// topology / namespace pins. Never re-queries `latest_change_sequence`.
+    #[allow(clippy::result_large_err)]
+    pub async fn await_prepared_live_apply(
+        &self,
+        prepared: &PreparedLiveApply,
+    ) -> Result<(), Response<Full<Bytes>>> {
+        let Some(sequence) = prepared.covering_sequence() else {
+            return Ok(());
+        };
+        let Some(apply) = self.runtime_config_apply.as_ref() else {
+            return Err(live_apply_failure_response(
+                LiveApplyFailure::SequenceUnavailable,
+            ));
+        };
+        apply
+            .await_committed(sequence)
+            .await
+            .map_err(live_apply_failure_response)
+    }
+
+    /// Overlay live-apply waiting onto a successful mutation response using a
+    /// previously captured covering watermark.
+    pub async fn finish_prepared_live_apply(
+        &self,
+        prepared: PreparedLiveApply,
+        response: Response<Full<Bytes>>,
+    ) -> Response<Full<Bytes>> {
+        if !response.status().is_success() {
+            return response;
+        }
+        match self.await_prepared_live_apply(&prepared).await {
+            Ok(()) => response,
+            Err(failure) => failure,
+        }
+    }
+
+    /// Capture the covering watermark while `pins` (write-topology permit and
+    /// a still-held namespace admission guard, when the handler still has one)
+    /// remain live, then drop those pins **before** waiting so a poll or
+    /// reconnect needed to publish the generation is not blocked.
+    ///
+    /// This is the only supported success-path completion for config-database
+    /// mutations. Non-success responses skip capture and wait.
+    /// Heap-boxed [`Self::complete_live_config_mutation_after_commit`].
+    ///
+    /// At the coverage profile's `opt-level = 0`, every temporary in a
+    /// coroutine's `poll` body is a fixed alloca emitted on entry, so awaiting
+    /// the generic async fn directly charges its whole future — a
+    /// `Response<Full<Bytes>>`, the pins, and the live-apply wait state — to
+    /// EVERY admin write handler's frame. Adding that to the API-spec handlers
+    /// overflowed the stack in the `admin-api` coverage shard (22 tests
+    /// aborting with `fatal runtime error: stack overflow`).
+    ///
+    /// A call-site `Box::pin` does not fix this: the future is still
+    /// materialized in the caller's frame before it is moved to the heap. The
+    /// box has to happen behind an `#[inline(never)]` boundary so the
+    /// construction lands in THIS function's frame and the caller keeps only a
+    /// pointer. Same remedy as the #3764 / #3820 coverage overflows.
+    #[inline(never)]
+    pub fn complete_live_config_mutation_after_commit_boxed<'a, P>(
+        &'a self,
+        namespace: &'a str,
+        pins: P,
+        response: Response<Full<Bytes>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response<Full<Bytes>>> + Send + 'a>>
+    where
+        P: Send + 'a,
+    {
+        Box::pin(self.complete_live_config_mutation_after_commit(namespace, pins, response))
+    }
+
+    pub async fn complete_live_config_mutation_after_commit<P>(
+        &self,
+        namespace: &str,
+        pins: P,
+        response: Response<Full<Bytes>>,
+    ) -> Response<Full<Bytes>> {
+        if !response.status().is_success() {
+            drop(pins);
+            return response;
+        }
+        let prepared = match self.prepare_live_apply_after_commit(namespace).await {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                drop(pins);
+                return failure;
+            }
+        };
+        drop(pins);
+        self.finish_prepared_live_apply(prepared, response).await
+    }
+
     /// Admit an Admin API mutation under a write-topology pin (issue #3001).
     ///
     /// Acquires a backend topology pin **before** evaluating sticky-failover
     /// policy, and returns that pin so the caller retains it through
-    /// persistence and response construction. Ordering:
+    /// persistence and covering-sequence capture. Drop the pin before the
+    /// live-apply wait so a poll or reconnect needed to publish that
+    /// generation is not blocked. Ordering:
     /// - If a failover reconnect publishes first, this returns the existing
     ///   `503` fail-closed response (or admits under opt-in and pins failover).
     /// - If this pin wins first, reconnect publication waits (SQL) or
@@ -6375,7 +6513,9 @@ async fn handle_update_credentials(
         response
     })
     .await;
-    Ok(response)
+    Ok(state
+        .complete_live_config_mutation_after_commit_boxed(namespace, _write_permit, response)
+        .await)
 }
 
 async fn handle_delete_credentials(
@@ -6459,7 +6599,9 @@ async fn handle_delete_credentials(
         response
     })
     .await;
-    Ok(response)
+    Ok(state
+        .complete_live_config_mutation_after_commit_boxed(namespace, _write_permit, response)
+        .await)
 }
 
 /// POST /consumers/:id/credentials/:type — Append a credential entry for zero-downtime rotation.
@@ -6597,7 +6739,9 @@ async fn handle_append_credential(
         response
     })
     .await;
-    Ok(response)
+    Ok(state
+        .complete_live_config_mutation_after_commit_boxed(namespace, _write_permit, response)
+        .await)
 }
 
 /// DELETE /consumers/:id/credentials/:type/:index — Remove a specific credential entry by index.
@@ -6722,7 +6866,9 @@ async fn handle_delete_credential_by_index(
         response
     })
     .await;
-    Ok(response)
+    Ok(state
+        .complete_live_config_mutation_after_commit_boxed(namespace, _write_permit, response)
+        .await)
 }
 
 // ---- Gateway trust bundles (issue #3727) ----
@@ -7514,7 +7660,13 @@ async fn handle_batch_create(
         }
     }
 
-    Ok(json_response(StatusCode::CREATED, &response))
+    Ok(state
+        .complete_live_config_mutation_after_commit_boxed(
+            namespace,
+            (namespace_config_admission_guard, _write_permit),
+            json_response(StatusCode::CREATED, &response),
+        )
+        .await)
 }
 
 // ---- Backup & Restore ----
@@ -9184,7 +9336,13 @@ async fn handle_restore(
         log_audit_enqueue_failure(&error);
     }
 
-    Ok(json_response(StatusCode::OK, &response))
+    Ok(state
+        .complete_live_config_mutation_after_commit_boxed(
+            namespace,
+            (namespace_config_admission_guard, _write_permit),
+            json_response(StatusCode::OK, &response),
+        )
+        .await)
 }
 
 fn parse_audit_filter(
@@ -9905,6 +10063,17 @@ async fn handle_delete_namespace(
 }
 
 // ---- Helpers ----
+
+fn live_apply_failure_response(failure: LiveApplyFailure) -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &json!({
+            "error": failure.error_message(),
+            "applied": false,
+            "reason": failure.as_str(),
+        }),
+    )
+}
 
 pub(in crate::admin) fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
     let body_str = serde_json::to_string(body).unwrap_or_else(|_| "{}".into());

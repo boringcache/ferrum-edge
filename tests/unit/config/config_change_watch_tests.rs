@@ -169,6 +169,87 @@ async fn a_wake_up_cannot_outrun_an_active_rejection_backoff() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn extra_change_stream_signals_during_backoff_do_not_skip_it() {
+    let signal = Arc::new(ConfigChangeWakeSignal::new());
+    let mut interval = armed_interval(Duration::from_secs(3600));
+    interval.tick().await;
+
+    let backoff = Duration::from_secs(10);
+    let earliest_wake = tokio::time::Instant::now() + backoff;
+    signal.signal();
+    let burst = signal.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        burst.signal();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        burst.signal();
+    });
+
+    let started = tokio::time::Instant::now();
+    let wake = wait_for_config_poll_wake(
+        &mut interval,
+        Some(&signal),
+        Duration::from_millis(250),
+        Some(earliest_wake),
+    )
+    .await;
+
+    assert_eq!(wake, ConfigPollWake::ChangeStream);
+    assert!(
+        started.elapsed() >= backoff,
+        "non-immediate signals must not defeat rejected-delta backoff"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn admin_immediate_signal_skips_debounce() {
+    let signal = Arc::new(ConfigChangeWakeSignal::new());
+    let mut interval = armed_interval(Duration::from_secs(3600));
+    interval.tick().await;
+
+    signal.signal_immediate();
+    let started = tokio::time::Instant::now();
+    let wake = wait_for_config_poll_wake(
+        &mut interval,
+        Some(&signal),
+        Duration::from_millis(250),
+        None,
+    )
+    .await;
+
+    assert_eq!(wake, ConfigPollWake::AdminWrite);
+    assert!(
+        started.elapsed() < Duration::from_millis(50),
+        "admin writers must not sit on the change-stream debounce window"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn admin_immediate_signal_skips_rejected_delta_backoff() {
+    let signal = Arc::new(ConfigChangeWakeSignal::new());
+    let mut interval = armed_interval(Duration::from_secs(3600));
+    interval.tick().await;
+
+    let backoff = Duration::from_secs(10);
+    let earliest_wake = tokio::time::Instant::now() + backoff;
+    signal.signal_immediate();
+    let started = tokio::time::Instant::now();
+    let wake = wait_for_config_poll_wake(
+        &mut interval,
+        Some(&signal),
+        Duration::from_millis(250),
+        Some(earliest_wake),
+    )
+    .await;
+
+    assert_eq!(wake, ConfigPollWake::AdminWrite);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "in-process admin writers must skip rejected-delta backoff"
+    );
+}
+
 // ── Bounded reconnect backoff ────────────────────────────────────────────────
 
 #[test]

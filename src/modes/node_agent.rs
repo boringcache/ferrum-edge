@@ -1298,6 +1298,7 @@ async fn start_node_agent_admin_listeners(
                 fixtures: std::collections::HashMap::new(),
             },
         ),
+        runtime_config_apply: None,
     };
     let admin_state_for_https = admin_state.clone();
 
