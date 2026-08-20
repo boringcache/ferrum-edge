@@ -756,8 +756,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
     // 2026-08-19 and is deleted by the same TEXT comparison the worker uses.
     let now = chrono::Utc::now();
     let cutoff = rfc3339_millis(now - chrono::Duration::days(30));
-    let live_ts =
-        |offset_ms: i64| rfc3339_millis(now + chrono::Duration::milliseconds(offset_ms));
+    let live_ts = |offset_ms: i64| rfc3339_millis(now + chrono::Duration::milliseconds(offset_ms));
 
     let metadata_prefix = "k".repeat(128);
     plugin
@@ -1049,9 +1048,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
         "bounded TCP write must persist a non-empty timestamp"
     );
     chrono::DateTime::parse_from_rfc3339(&tcp_timestamp)
-        .expect(
-            "bounded TCP write must persist a parseable RFC3339 timestamp",
-        );
+        .expect("bounded TCP write must persist a parseable RFC3339 timestamp");
     assert!(
         tcp_timestamp.as_str() >= cutoff.as_str(),
         "bounded TCP timestamp {tcp_timestamp} must be at or after retention \
