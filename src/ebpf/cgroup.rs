@@ -196,7 +196,12 @@ pub fn cgroup_path_for_qos(cgroup_root: &str, pod_uid: &str, qos_class: &str) ->
 /// reported via [`CgroupTreeWalkStatus`] rather than silently truncated.
 pub const CGROUP_TREE_MAX_DEPTH: usize = 8;
 pub const CGROUP_TREE_MAX_INODES: usize = 256;
+/// Per-directory and whole-walk visit bounds. Only the Unix walk reads them —
+/// the non-Unix [`collect_cgroup_tree`] has no hierarchy to enumerate — so they
+/// are gated with the code that uses them rather than left dead on Windows.
+#[cfg(unix)]
 const CGROUP_TREE_MAX_DIR_ENTRIES: usize = 512;
+#[cfg(unix)]
 const CGROUP_TREE_MAX_VISITS: usize = 512;
 
 /// Why a bounded cgroup-tree walk could not prove the inode set complete.
