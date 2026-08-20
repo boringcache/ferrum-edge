@@ -6621,8 +6621,7 @@ fn is_supported_mmdb_country_code(code: &str) -> bool {
     SUPPORTED_GEO_COUNTRY_CODES
         .as_chunks::<2>()
         .0
-        .iter()
-        .any(|supported| *supported == normalized)
+        .contains(&normalized)
 }
 
 #[cfg(unix)]

@@ -64,8 +64,7 @@ impl CountryCode {
         SUPPORTED_GEO_COUNTRY_CODES
             .as_chunks::<2>()
             .0
-            .iter()
-            .any(|assigned| *assigned == code)
+            .contains(&code)
     }
 
     fn bit_index(self) -> usize {
