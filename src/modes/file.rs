@@ -107,6 +107,8 @@ pub struct ServeOptions {
     /// Both the initial probe (when enabled) and the periodic loop start
     /// only after required listeners have bound — a lost exclusive listen
     /// must not dial caller-owned backends (issue #4080).
+    /// Synchronous pool warmup obeys the same bind barrier and still
+    /// completes before readiness is published.
     ///
     /// In-process tests set this `true` to keep the harness "cold". The
     /// h2c probe that runs against HTTP backends opens a real connection
@@ -880,9 +882,6 @@ pub async fn serve(
 
     dns_cache.warmup(hostnames).await;
 
-    if env_config.pool_warmup_enabled {
-        proxy_state.warmup_connection_pools().await;
-    }
     // Without warmup, the registry is otherwise empty until the first
     // periodic tick (24 h default) — pass `true` so `start_backend_*`
     // kicks off an immediate probe pass. In-process tests that want a
@@ -1620,6 +1619,13 @@ pub async fn serve(
             .stream_listener_manager
             .wait_until_started(Duration::from_secs(10))
             .await?;
+        // Pool warmup includes real capability probes and HTTP dials. Keep it
+        // startup-gating, but do not let it touch caller-owned backends until
+        // every required listener has proved its bind. A failed bind must be
+        // side-effect free in both warmup modes (issue #4080).
+        if env_config.pool_warmup_enabled {
+            proxy_state.warmup_connection_pools().await;
+        }
         proxy_state.set_h3_websocket_listener_started(h3_listener_started);
         startup_ready.store(true, Ordering::Release);
         info!("Gateway startup complete; /health now reports ready");

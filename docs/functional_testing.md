@@ -394,6 +394,9 @@ the test must verify:
   cannot consume a caller-owned scripted backend (issue #4080). In-process
   `serve()` uses the same bind barrier; the in-process harness additionally
   sets `skip_initial_capability_refresh` when warmup is off.
+  Warmup-enabled starts likewise defer synchronous pool warmup until required
+  listeners bind, while still completing warmup before `/health` becomes
+  ready.
 - The file-mode YAML loader's strict-loading rules apply identically —
   every top-level collection (`consumers`, `upstreams`,
   `plugin_configs`) must be present in the YAML even if empty.

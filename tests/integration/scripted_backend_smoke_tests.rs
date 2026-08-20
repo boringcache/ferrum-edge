@@ -726,9 +726,9 @@ async fn serve_drains_spawned_tasks_when_late_startup_fails() {
 //
 // Recipe: occupy the env proxy port (no pre-bound proxy FD — that path skips
 // the bind signal). Point a plaintext HTTP proxy at a scripted gRPC backend
-// with `skip_initial_capability_refresh = false` and warmup off. `serve()`
-// must fail the bind, leave `accepted_connections == 0`, then a retry on
-// fresh ports must run the initial probe exactly once.
+// with `skip_initial_capability_refresh = false`. With warmup both off and on,
+// `serve()` must fail the bind and leave `accepted_connections == 0`; then a
+// warmup-off retry on fresh ports must run the initial probe exactly once.
 // ────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abandoned_bind_failure_does_not_probe_backend_before_successful_retry() {
@@ -779,6 +779,23 @@ async fn abandoned_bind_failure_does_not_probe_backend_before_successful_retry()
         max_ttl_seconds: 3600,
         algorithm: jsonwebtoken::Algorithm::HS256,
     };
+    let make_env =
+        |proxy_http_port: u16, admin_http_port: u16, pool_warmup_enabled: bool| EnvConfig {
+            mode: OperatingMode::File,
+            proxy_http_port,
+            proxy_https_port: 0,
+            admin_http_port,
+            admin_https_port: 0,
+            admin_jwt_secret: Some("regression-test-secret-32-chars-min-len".to_string()),
+            admin_jwt_issuer: "regression-test".to_string(),
+            shutdown_drain_seconds: 0,
+            pool_warmup_enabled,
+            max_connections: 0,
+            proxy_bind_address: "127.0.0.1".to_string(),
+            stream_proxy_bind_address: "127.0.0.1".to_string(),
+            backend_capability_refresh_interval_secs: 86_400,
+            ..EnvConfig::default()
+        };
 
     // Hold the exclusive proxy port so the first serve() bind fails the same
     // way TestGateway's stolen ephemeral listen does.
@@ -787,61 +804,56 @@ async fn abandoned_bind_failure_does_not_probe_backend_before_successful_retry()
         .expect("bind proxy blocker");
     let occupied_proxy_port = proxy_blocker.local_addr().unwrap().port();
 
-    let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind admin");
-    let admin_port = admin_listener.local_addr().unwrap().port();
+    // Exercise both ways capability work can begin: the asynchronous initial
+    // refresh when warmup is off and synchronous pool warmup when it is on.
+    for pool_warmup_enabled in [false, true] {
+        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind admin");
+        let admin_port = admin_listener.local_addr().unwrap().port();
+        let opts = ServeOptions {
+            admin_http: Some(admin_listener),
+            admin_jwt_manager: Some(JwtManager::new(jwt_config.clone())),
+            skip_initial_capability_refresh: false,
+            background_drain_timeout: Some(Duration::from_millis(200)),
+            ..ServeOptions::default()
+        };
 
-    let env_config = EnvConfig {
-        mode: OperatingMode::File,
-        proxy_http_port: occupied_proxy_port,
-        proxy_https_port: 0,
-        admin_http_port: admin_port,
-        admin_https_port: 0,
-        admin_jwt_secret: Some("regression-test-secret-32-chars-min-len".to_string()),
-        admin_jwt_issuer: "regression-test".to_string(),
-        shutdown_drain_seconds: 0,
-        pool_warmup_enabled: false,
-        max_connections: 0,
-        proxy_bind_address: "127.0.0.1".to_string(),
-        stream_proxy_bind_address: "127.0.0.1".to_string(),
-        backend_capability_refresh_interval_secs: 86_400,
-        ..EnvConfig::default()
-    };
-
-    let opts = ServeOptions {
-        admin_http: Some(admin_listener),
-        admin_jwt_manager: Some(JwtManager::new(jwt_config.clone())),
-        skip_initial_capability_refresh: false,
-        background_drain_timeout: Some(Duration::from_millis(200)),
-        ..ServeOptions::default()
-    };
-
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-    let result = file::serve(env_config, config.clone(), opts, shutdown_tx).await;
-    match result {
-        Ok(_) => panic!("serve() must fail when proxy port {occupied_proxy_port} is already taken"),
-        Err(err) => {
-            let msg = err.to_string().to_lowercase();
-            assert!(
-                msg.contains("listener")
-                    || msg.contains("bind")
-                    || msg.contains("startup")
-                    || msg.contains("address already in use"),
-                "error must surface the required-listener bind failure; got {err}"
-            );
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let result = file::serve(
+            make_env(occupied_proxy_port, admin_port, pool_warmup_enabled),
+            config.clone(),
+            opts,
+            shutdown_tx,
+        )
+        .await;
+        match result {
+            Ok(_) => {
+                panic!("serve() must fail when proxy port {occupied_proxy_port} is already taken")
+            }
+            Err(err) => {
+                let msg = err.to_string().to_lowercase();
+                assert!(
+                    msg.contains("listener")
+                        || msg.contains("bind")
+                        || msg.contains("startup")
+                        || msg.contains("address already in use"),
+                    "error must surface the required-listener bind failure; got {err}"
+                );
+            }
         }
-    }
 
-    assert_eq!(
-        backend.accepted_connections(),
-        0,
-        "abandoned bind failure must not start backend capability refresh; \
-         accepted={}, handshakes={}, acceptors_waiting={}",
-        backend.accepted_connections(),
-        backend.handshakes_completed(),
-        backend.acceptors_waiting()
-    );
+        assert_eq!(
+            backend.accepted_connections(),
+            0,
+            "abandoned bind failure must not start backend capability work \
+             with pool_warmup_enabled={pool_warmup_enabled}; accepted={}, \
+             handshakes={}, acceptors_waiting={}",
+            backend.accepted_connections(),
+            backend.handshakes_completed(),
+            backend.acceptors_waiting()
+        );
+    }
 
     // Successful retry on a free exclusive listen, same caller-owned backend.
     let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -853,22 +865,7 @@ async fn abandoned_bind_failure_does_not_probe_backend_before_successful_retry()
     let proxy_port = proxy_listener.local_addr().unwrap().port();
     let admin_port = admin_listener.local_addr().unwrap().port();
 
-    let env_config = EnvConfig {
-        mode: OperatingMode::File,
-        proxy_http_port: proxy_port,
-        proxy_https_port: 0,
-        admin_http_port: admin_port,
-        admin_https_port: 0,
-        admin_jwt_secret: Some("regression-test-secret-32-chars-min-len".to_string()),
-        admin_jwt_issuer: "regression-test".to_string(),
-        shutdown_drain_seconds: 0,
-        pool_warmup_enabled: false,
-        max_connections: 0,
-        proxy_bind_address: "127.0.0.1".to_string(),
-        stream_proxy_bind_address: "127.0.0.1".to_string(),
-        backend_capability_refresh_interval_secs: 86_400,
-        ..EnvConfig::default()
-    };
+    let env_config = make_env(proxy_port, admin_port, false);
 
     let opts = ServeOptions {
         proxy_http: Some(proxy_listener),
