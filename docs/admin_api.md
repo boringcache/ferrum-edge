@@ -446,11 +446,15 @@ In `FERRUM_MODE=database`, a successful create, update, or delete (proxies,
 consumers, plugins, upstreams, credentials, API specs, batch, and restore)
 returns 2xx only after the same authoritative poll-loop reload that periodic
 ticks use has published a covering `config_changes` generation. The covering
-watermark is captured from the pinned write topology after persist and before
-the topology/namespace pins are released; a later concurrent same-namespace
-writer may raise that watermark above this mutation's own row. `GET /proxies`
-already reads the database, so a 201 with an empty live snapshot is no longer
-possible on this process. If reload cannot apply, the API returns `503` with
+cursor pairs the sequence with the process-local database topology epoch and is
+captured from the pinned write topology after persist and before the
+topology/namespace pins are released; a later concurrent same-namespace writer
+may raise that watermark above this mutation's own row. A reconnect/failover
+invalidates waiters from the replaced topology rather than comparing their old
+high watermark with the new database's potentially lower sequence. The existing
+`GET /proxies` route already reads the database, so a 201 with an empty live
+snapshot is no longer possible on this process. If reload cannot apply or the
+covering cursor becomes unverifiable, the API returns `503` with
 `{"error":"...","applied":false,"reason":"config_rejected"|"reload_timeout"|"sequence_unavailable"}`.
 The row is durable; retry or repair the rejected candidate. Writes to a
 namespace this process does not serve, and writes in CP/file/DP modes, do not

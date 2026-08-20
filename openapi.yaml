@@ -6675,6 +6675,9 @@ components:
         write has committed when the in-process poll-loop reload cannot make
         that generation live. That body includes `applied: false` and a closed
         `reason` (`config_rejected`, `reload_timeout`, or `sequence_unavailable`).
+        The covering sequence is bound to the pinned database topology epoch;
+        reconnect/failover invalidates the old cursor instead of comparing it
+        with the replacement database's potentially lower watermark.
         The row is durable; `Retry-After` is not used for this case.
       headers:
         Retry-After:
@@ -6741,7 +6744,9 @@ components:
           type: string
           description: |
             Closed static label for why a committed database-mode mutation is
-            not live. Never a resource id, namespace, or driver error string.
+            not live. `sequence_unavailable` also covers a reconnect/failover
+            that replaced the topology which produced the captured sequence.
+            Never a resource id, namespace, or driver error string.
           enum:
             - config_rejected
             - reload_timeout
