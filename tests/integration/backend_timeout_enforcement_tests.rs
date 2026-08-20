@@ -20,6 +20,8 @@ use crate::scaffolding::ports::reserve_port;
 use futures_util::StreamExt;
 use serde_json::json;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 const WRITE_TIMEOUT_MS: u64 = 800;
 const READ_TIMEOUT_MS: u64 = 800;
@@ -27,7 +29,7 @@ const READ_TIMEOUT_MS: u64 = 800;
 // window. The upload remains larger than ordinary sender buffers, guaranteeing
 // that a backend which never reads eventually backpressures the upload pump.
 const BACKEND_RECEIVE_BUFFER_BYTES: usize = 1024;
-const UPLOAD_STALL_BYTES: usize = 16 * 1024 * 1024;
+const UPLOAD_STALL_BYTES: usize = 8 * 1024 * 1024;
 const SSE_FIRST_EVENT: &[u8] = b"data: hello\r\n\n";
 
 fn assert_timeout_envelope(elapsed: Duration, timeout_ms: u64) {
@@ -44,15 +46,59 @@ fn assert_timeout_envelope(elapsed: Duration, timeout_ms: u64) {
     );
 }
 
-fn gateway_error_header(headers: &reqwest::header::HeaderMap) -> Option<&str> {
-    headers.get("x-gateway-error").and_then(|v| v.to_str().ok())
-}
-
 fn timeout_overrides(read_ms: u64, write_ms: u64) -> serde_json::Value {
     json!({
         "backend_read_timeout_ms": read_ms,
         "backend_write_timeout_ms": write_ms,
     })
+}
+
+async fn raw_h1_upload_response(harness: &GatewayHarness) -> (String, Duration) {
+    let url = reqwest::Url::parse(harness.proxy_base_url()).expect("proxy URL");
+    let port = url.port().expect("proxy URL has explicit port");
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect to proxy");
+    let request_head = format!(
+        "POST /api/twrite HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Content-Type: application/octet-stream\r\n\
+         Content-Length: {UPLOAD_STALL_BYTES}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let started = Instant::now();
+    stream
+        .write_all(request_head.as_bytes())
+        .await
+        .expect("write request head");
+    let (mut reader, mut writer) = stream.into_split();
+    let upload = tokio::spawn(async move {
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut remaining = UPLOAD_STALL_BYTES;
+        while remaining > 0 {
+            let len = remaining.min(chunk.len());
+            writer.write_all(&chunk[..len]).await?;
+            remaining -= len;
+        }
+        std::io::Result::Ok(())
+    });
+
+    let mut response = Vec::new();
+    let read_result =
+        tokio::time::timeout(Duration::from_secs(5), reader.read_to_end(&mut response))
+            .await
+            .expect("gateway response completed within five seconds");
+    upload.abort();
+    if let Err(err) = read_result {
+        assert!(
+            !response.is_empty(),
+            "gateway closed without a response: {err}"
+        );
+    }
+    (
+        String::from_utf8(response).expect("HTTP/1 response is UTF-8"),
+        started.elapsed(),
+    )
 }
 
 // #4055: backend accepts and never reads. `HttpStep::ExpectRequest` would
@@ -76,30 +122,19 @@ async fn in_process_backend_write_timeout_maps_to_504_backend_timeout() {
         .await
         .expect("spawn gateway");
 
-    let client = harness.http_client().expect("client");
-    let started = Instant::now();
-    let resp = client
-        .as_reqwest()
-        .post(harness.proxy_url("/api/twrite"))
-        .header("content-type", "application/octet-stream")
-        .body(vec![b'x'; UPLOAD_STALL_BYTES])
-        .send()
-        .await
-        .expect("gateway returns a response");
-    let elapsed = started.elapsed();
-    let status = resp.status();
-    let header = gateway_error_header(resp.headers()).map(str::to_owned);
-    let body = resp.text().await.expect("body");
-
-    assert_eq!(
-        status,
-        reqwest::StatusCode::GATEWAY_TIMEOUT,
-        "live backend write timeout must be 504, got {status} body={body}"
+    let (response, elapsed) = raw_h1_upload_response(&harness).await;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .expect("HTTP/1 response has a header terminator");
+    assert!(
+        headers.starts_with("HTTP/1.1 504 "),
+        "live backend write timeout must be 504, got {response:?}"
     );
-    assert_eq!(
-        header.as_deref(),
-        Some("backend_timeout"),
-        "timeout must carry X-Gateway-Error=backend_timeout, body={body}"
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("\r\nx-gateway-error: backend_timeout"),
+        "timeout must carry X-Gateway-Error=backend_timeout, got {response:?}"
     );
     assert_eq!(
         body, r#"{"error":"Backend timeout"}"#,
@@ -208,31 +243,21 @@ async fn in_process_buffered_backend_write_timeout_maps_to_504_backend_timeout()
         .await
         .expect("spawn gateway");
 
-    let client = harness.http_client().expect("client");
-    let started = Instant::now();
-    let resp = client
-        .as_reqwest()
-        .post(harness.proxy_url("/api/twrite"))
-        .header("content-type", "application/octet-stream")
-        .body(vec![b'x'; UPLOAD_STALL_BYTES])
-        .send()
-        .await
-        .expect("gateway returns a response");
-    let elapsed = started.elapsed();
-    let status = resp.status();
-    let header = gateway_error_header(resp.headers()).map(str::to_owned);
-    let body = resp.text().await.expect("body");
-
-    assert_eq!(
-        status,
-        reqwest::StatusCode::GATEWAY_TIMEOUT,
-        "buffered upload write timeout must be 504, got {status} body={body}"
+    let (response, elapsed) = raw_h1_upload_response(&harness).await;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .expect("HTTP/1 response has a header terminator");
+    assert!(
+        headers.starts_with("HTTP/1.1 504 "),
+        "buffered upload write timeout must be 504, got {response:?}"
     );
-    assert_eq!(
-        header.as_deref(),
-        Some("backend_timeout"),
-        "timeout must carry X-Gateway-Error=backend_timeout, body={body}"
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("\r\nx-gateway-error: backend_timeout"),
+        "timeout must carry X-Gateway-Error=backend_timeout, got {response:?}"
     );
+    assert_eq!(body, r#"{"error":"Backend timeout"}"#);
     assert_timeout_envelope(elapsed, WRITE_TIMEOUT_MS);
 }
 

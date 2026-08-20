@@ -30,8 +30,8 @@
 #![allow(clippy::bool_assert_comparison)]
 
 use crate::scaffolding::backends::{
-    ConnectionSettings, GrpcStep, H2Step, HttpStep, MatchHeaders, MatchRpc, ScriptedGrpcBackend,
-    RequestMatcher, ScriptedH2Backend, ScriptedHttp1Backend, ScriptedTcpBackend, TcpStep,
+    ConnectionSettings, GrpcStep, H2Step, HttpStep, MatchHeaders, MatchRpc, RequestMatcher,
+    ScriptedGrpcBackend, ScriptedH2Backend, ScriptedHttp1Backend, ScriptedTcpBackend, TcpStep,
 };
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{GrpcClient, Http2Client};
