@@ -60,6 +60,19 @@ APPROVED_SETUP = (
     "./.github/actions/setup-fast-linker",
 )
 PINNED_SHA = re.compile(r"^[0-9a-f]{40}$")
+PUBLISHED_BASELINE_DATE = re.compile(r"\bPublished \d{4}-\d{2}-\d{2}\b")
+PUBLISHED_BASELINE_SHA = re.compile(
+    r"Ferrum (?:commit )?SHA[^0-9a-f]+`?([0-9a-f]{40})"
+)
+PUBLISHED_BASELINE_RUN = re.compile(
+    r"https://github\.com/ferrum-edge/ferrum-edge/actions/runs/\d+"
+)
+PUBLISHED_BASELINE_ARTIFACT = re.compile(
+    r"mesh-performance-baselines-([0-9a-f]{40})"
+)
+PUBLISHED_BASELINE_COLLECTED_AT = re.compile(
+    r"Collected at \(UTC\).*\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"
+)
 HBONE_BACKEND_ALLOW_IPS_VAR = "FERRUM_BACKEND_ALLOW_IPS"
 HBONE_BACKEND_ALLOW_IPS_VALUE = "private"
 HBONE_GATEWAY_EXECUTABLE = "$PROJECT_ROOT/target/release/examples/hbone_perf_fixture"
@@ -886,6 +899,107 @@ def check_pr_ci_wiring(failures: list[str]) -> None:
         failures,
     )
 
+
+def check_baseline_publication_state(
+    path: Path,
+    text: str,
+    suite: str,
+    failures: list[str],
+) -> None:
+    """Accept stage-1 placeholders or require provenance-complete publication.
+
+    Stage 1 deliberately keeps ``_TBD_`` cells until accepted hosted evidence
+    exists. Once a document removes every placeholder, it must carry enough
+    immutable provenance and suite-specific acceptance evidence to make that
+    transition fail closed rather than silently accepting fabricated numbers.
+    """
+    prefix = f"{path}"
+    has_tbd = "_TBD_" in text
+    claims_publication = "Publication status" in text or bool(
+        PUBLISHED_BASELINE_DATE.search(text)
+    )
+    if has_tbd:
+        require(
+            not claims_publication,
+            f"{prefix} must not claim publication while stage-1 TBD cells remain",
+            failures,
+        )
+        return
+
+    require(
+        "Publication status" in text and PUBLISHED_BASELINE_DATE.search(text) is not None,
+        f"{prefix} removed stage-1 TBD cells without a dated publication status",
+        failures,
+    )
+    require(
+        "issue #3332" in text,
+        f"{prefix} published baseline must retain the issue #3332 evidence pointer",
+        failures,
+    )
+    ferrum_shas = set(PUBLISHED_BASELINE_SHA.findall(text))
+    artifact_shas = set(PUBLISHED_BASELINE_ARTIFACT.findall(text))
+    require(
+        bool(ferrum_shas),
+        f"{prefix} published baseline must identify the exact 40-character Ferrum SHA",
+        failures,
+    )
+    require(
+        PUBLISHED_BASELINE_RUN.search(text) is not None,
+        f"{prefix} published baseline must link its GitHub Actions run",
+        failures,
+    )
+    require(
+        bool(artifact_shas),
+        f"{prefix} published baseline must name its SHA-bound artifact",
+        failures,
+    )
+    require(
+        bool(ferrum_shas & artifact_shas),
+        f"{prefix} published baseline artifact must be bound to a documented Ferrum SHA",
+        failures,
+    )
+    require(
+        PUBLISHED_BASELINE_COLLECTED_AT.search(text) is not None,
+        f"{prefix} published baseline must record an RFC3339 UTC collection time",
+        failures,
+    )
+    for token, label in (
+        ("runner_health_ok=true", "accepted runner-health gate"),
+        ("Raw artifacts", "raw-artifact pointer"),
+        ("summary.json", "machine-readable summary"),
+        ("provenance.json", "machine-readable provenance"),
+        ("max CPU steal", "measured CPU-steal result"),
+    ):
+        require(
+            token in text,
+            f"{prefix} published baseline missing {label} ({token})",
+            failures,
+        )
+
+    suite_tokens = {
+        "mesh": ("mesh_complete=true",),
+        "hbone": (
+            "hbone_complete=true",
+            "hbone_errors_ok=true",
+            "3 clean repetitions",
+            "total_errors=0",
+        ),
+        "dns": (
+            "dns_complete=true",
+            "dns_errors_ok=true",
+            "3 clean repetitions",
+            "total_errors=0",
+            "total_nxdomain=0",
+        ),
+    }
+    for token in suite_tokens[suite]:
+        require(
+            token in text,
+            f"{prefix} published {suite} baseline missing accepted evidence ({token})",
+            failures,
+        )
+
+
 def check_docs_and_baselines(failures: list[str]) -> None:
     protocol = PROTOCOL_DOC.read_text(encoding="utf-8")
     require("mesh-performance-baselines.yml" in protocol, "protocol_perf_regression.md missing workflow pointer", failures)
@@ -946,7 +1060,11 @@ def check_docs_and_baselines(failures: list[str]) -> None:
         failures,
     )
 
-    for path in (MESH_BASELINE, HBONE_BASELINE, DNS_BASELINE):
+    for path, suite in (
+        (MESH_BASELINE, "mesh"),
+        (HBONE_BASELINE, "hbone"),
+        (DNS_BASELINE, "dns"),
+    ):
         text = path.read_text(encoding="utf-8")
         require("Overhead formula" in text or "overhead formula" in text.lower(), f"{path} missing overhead formula", failures)
         require("Rerun procedure" in text or "rerun procedure" in text.lower(), f"{path} missing rerun procedure", failures)
@@ -954,7 +1072,7 @@ def check_docs_and_baselines(failures: list[str]) -> None:
         require("directional" in text.lower(), f"{path} missing directional hardware caveat", failures)
         require("bottleneck" in text.lower(), f"{path} missing bottleneck review note", failures)
         require("ubuntu-24.04" in text, f"{path} must pin runner class ubuntu-24.04", failures)
-        require("_TBD_" in text, f"{path} must keep stage-1 TBD cells (no fabricated numbers)", failures)
+        check_baseline_publication_state(path, text, suite, failures)
         require("5.0%" in text or "5%" in text, f"{path} must document CPU steal publication threshold", failures)
         require(
             "workload-interval" in text.lower() or "workload interval" in text.lower(),
@@ -1175,6 +1293,70 @@ eprintln!("[dns_upstream_stub] UDP listening on {addr}");
         require(not real, f"real DNS harness must pass tcp/fail-closed contract: {real}", failures)
 
 
+def _self_test_baseline_publication_state(failures: list[str]) -> None:
+    """Prove the stage-1-to-published transition requires accepted evidence."""
+    stage1_failures: list[str] = []
+    check_baseline_publication_state(
+        Path("stage1.md"),
+        "Directional baseline | _TBD_ |",
+        "mesh",
+        stage1_failures,
+    )
+    require(not stage1_failures, "plain stage-1 TBD baseline must pass", failures)
+
+    common = """
+**Publication status (issue #3332):** Published 2026-08-20 from hosted collection
+at Ferrum SHA `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`.
+https://github.com/ferrum-edge/ferrum-edge/actions/runs/123456
+artifact `mesh-performance-baselines-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`
+`runner_health_ok=true`, max CPU steal 0.0%
+| Collected at (UTC) | 2026-08-14T16:44:57Z |
+| Raw artifacts | summary.json, provenance.json |
+"""
+    suite_evidence = {
+        "mesh": "`mesh_complete=true`",
+        "hbone": (
+            "`hbone_complete=true`, `hbone_errors_ok=true`, 3 clean repetitions, "
+            "`total_errors=0`"
+        ),
+        "dns": (
+            "`dns_complete=true`, `dns_errors_ok=true`, 3 clean repetitions, "
+            "`total_errors=0`, `total_nxdomain=0`"
+        ),
+    }
+    for suite, evidence in suite_evidence.items():
+        published_failures: list[str] = []
+        check_baseline_publication_state(
+            Path(f"published-{suite}.md"),
+            common + evidence,
+            suite,
+            published_failures,
+        )
+        require(
+            not published_failures,
+            f"provenance-complete published {suite} baseline must pass: {published_failures}",
+            failures,
+        )
+
+    forged_failures: list[str] = []
+    check_baseline_publication_state(
+        Path("forged.md"),
+        "Published benchmark numbers without hosted evidence",
+        "mesh",
+        forged_failures,
+    )
+    require(forged_failures, "published numbers without provenance must fail", failures)
+
+    partial_failures: list[str] = []
+    check_baseline_publication_state(
+        Path("partial.md"),
+        common + "`mesh_complete=true` | _TBD_ |",
+        "mesh",
+        partial_failures,
+    )
+    require(partial_failures, "published baseline retaining TBD cells must fail", failures)
+
+
 def self_test() -> int:
     sample = """
 name: Mesh Performance Baselines
@@ -1266,7 +1448,9 @@ jobs:
     _self_test_hbone_backend_allow_ips(failures)
     _self_test_hbone_trusted_fixture_contract(failures)
     _self_test_dns_tcp_stub_and_fail_closed(failures)
-    # Intentionally skip docs checks in self-test.
+    _self_test_baseline_publication_state(failures)
+    # Intentionally skip repository docs checks in self-test; the publication
+    # state machine above is exercised with isolated fixtures.
     if failures:
         print("self-test failures:", *failures, sep="\n- ")
         return 1
