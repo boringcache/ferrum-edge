@@ -358,6 +358,22 @@ pub(crate) enum H3BackendOrPeer<T> {
     PeerGone,
 }
 
+/// Did this H3-to-plain buffered dispatch outcome carry an HTTP/2 protocol
+/// NACK (issue #4074)?
+///
+/// Only a reqwest transport error can be one: a peer-gone, an
+/// authorization/client deadline, and a committed response all mean the
+/// exchange is over, and the operator's header bound firing says nothing about
+/// whether the backend processed the request.
+fn plain_send_is_protocol_nack(
+    outcome: &Result<H3BackendOrPeer<reqwest::Result<reqwest::Response>>, ()>,
+) -> bool {
+    match outcome {
+        Ok(H3BackendOrPeer::Ready(Err(e))) => crate::retry::reqwest_error_is_protocol_nack(e),
+        _ => false,
+    }
+}
+
 /// Race a backend wait against per-stream H3 cancellation, whole-connection
 /// close, and an optional composed absolute deadline.
 ///
@@ -376,22 +392,6 @@ pub(crate) enum H3BackendOrPeer<T> {
 /// deadline arm wins an exact-deadline tie. No deadline keeps the no-timer
 /// hot path. Callers attribute ownership from the composition they already
 /// captured.
-/// Did this H3-to-plain buffered dispatch outcome carry an HTTP/2 protocol
-/// NACK (issue #4074)?
-///
-/// Only a reqwest transport error can be one: a peer-gone, an
-/// authorization/client deadline, and a committed response all mean the
-/// exchange is over, and the operator's header bound firing says nothing about
-/// whether the backend processed the request.
-fn plain_send_is_protocol_nack(
-    outcome: &Result<H3BackendOrPeer<reqwest::Result<reqwest::Response>>, ()>,
-) -> bool {
-    match outcome {
-        Ok(H3BackendOrPeer::Ready(Err(e))) => crate::retry::reqwest_error_is_protocol_nack(e),
-        _ => false,
-    }
-}
-
 pub(crate) async fn await_h3_backend_or_peer<F, T>(
     deadline: Option<tokio::time::Instant>,
     peer: Option<&crate::plugins::PeerConnectionSignal>,
