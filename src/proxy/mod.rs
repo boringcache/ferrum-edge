@@ -18514,7 +18514,7 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut backend_sink, close).await;
-                                retry::ErrorClass::RequestBodyTooLarge
+                                ws_capacity_error_class(size, true)
                             } else if let Some((close, limit_kind, size, max_size)) =
                                 EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
                             {
@@ -18533,7 +18533,7 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut backend_sink, close).await;
-                                retry::ErrorClass::RequestBodyTooLarge
+                                ws_capacity_error_class(size, true)
                             } else if let Some((close, limit_kind)) =
                                 ws_fragment_policy_close_for_error(&e)
                             {
@@ -18821,7 +18821,7 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut ws_sink, close).await;
-                                retry::ErrorClass::ResponseBodyTooLarge
+                                ws_capacity_error_class(size, false)
                             } else if let Some((close, limit_kind, size, max_size)) =
                                 EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
                             {
@@ -18840,7 +18840,7 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut ws_sink, close).await;
-                                retry::ErrorClass::ResponseBodyTooLarge
+                                ws_capacity_error_class(size, false)
                             } else if let Some((close, limit_kind)) =
                                 ws_fragment_policy_close_for_error(&e)
                             {
