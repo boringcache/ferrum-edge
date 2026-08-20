@@ -16,7 +16,9 @@ use std::time::Duration;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::plugin_utils::{assert_continue, create_test_consumer};
+use super::plugin_utils::{
+    assert_continue, assert_reject_body, context_with_materialized_raw_header, create_test_consumer,
+};
 
 struct InvalidSecondaryAuth;
 
@@ -1866,4 +1868,25 @@ async fn retired_discovery_generation_is_cancelled_and_live_start_is_idempotent(
 
     assert_eq!(retired_server.received_requests().await.unwrap().len(), 1);
     assert_eq!(live_server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn oauth2_non_materialized_authorization_rejects_invalid_not_missing() {
+    let plugin = Oauth2Introspection::new(
+        &json!({
+            "providers": [{
+                "introspection_endpoint": "http://127.0.0.1:8181/introspect",
+                "client_auth": {"method": "none"}
+            }]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = context_with_materialized_raw_header("Authorization", "Bearer \u{3000}not-a-token");
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_reject_body(result, r#"{"error":"Invalid Authorization header"}"#);
+    assert!(ctx.authenticated_identity.is_none());
 }

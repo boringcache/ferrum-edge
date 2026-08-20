@@ -3,6 +3,7 @@ use crate::plugins::RequestContext;
 
 use super::auth_attempt::AuthenticationAttempt;
 use super::auth_flow::ExtractedCredential;
+use super::header_extract::{ConfiguredHeaderLookup, lookup_configured_header};
 
 /// Metadata-key prefix marking a query parameter that carried the auth token and
 /// must be stripped from the URL forwarded upstream. It is shared by every auth
@@ -64,9 +65,15 @@ pub enum TokenLocationExtract {
 }
 
 pub fn extract_authorization_bearer(ctx: &RequestContext) -> ExtractedCredential {
-    match ctx.headers.get("authorization") {
-        None => ExtractedCredential::Missing,
-        Some(value) => bearer_credential_from_authorization_value(value),
+    // `Authorization: Bearer` conveys a base64url token (RFC 6750 §2.1), i.e.
+    // visible ASCII. A present field line that `materialize_headers()` omitted
+    // is malformed credential material, not an absent header.
+    match lookup_configured_header(ctx, "authorization", None) {
+        ConfiguredHeaderLookup::Absent => ExtractedCredential::Missing,
+        ConfiguredHeaderLookup::PresentNonMaterialized => ExtractedCredential::InvalidFormat(
+            r#"{"error":"Invalid Authorization header"}"#.to_string(),
+        ),
+        ConfiguredHeaderLookup::Value(value) => bearer_credential_from_authorization_value(&value),
     }
 }
 
@@ -93,17 +100,26 @@ pub fn extract_from_location(
     ctx: &RequestContext,
 ) -> TokenLocationExtract {
     match location {
-        TokenLocation::Header(header) => match ctx.headers.get(&header.name) {
-            Some(value) => {
+        TokenLocation::Header(header) => match lookup_configured_header(ctx, &header.name, None) {
+            ConfiguredHeaderLookup::Absent => TokenLocationExtract::Missing,
+            // Bearer/JWT/opaque tokens are ASCII by grammar (RFC 6750 §2.1
+            // base64url, JWS compact serialisation, RFC 6749 opaque tokens). A
+            // present field line that `materialize_headers()` omitted is
+            // malformed credential material, not an absent header.
+            ConfiguredHeaderLookup::PresentNonMaterialized => {
+                TokenLocationExtract::Credential(ExtractedCredential::InvalidFormat(
+                    r#"{"error":"Invalid token"}"#.to_string(),
+                ))
+            }
+            ConfiguredHeaderLookup::Value(value) => {
                 if header.name.eq_ignore_ascii_case("authorization") && header.prefix.is_none() {
-                    return match bearer_credential_from_authorization_value(value) {
+                    return match bearer_credential_from_authorization_value(&value) {
                         ExtractedCredential::Missing => TokenLocationExtract::Missing,
                         credential => TokenLocationExtract::Credential(credential),
                     };
                 }
-                extract_location_value(value, header.prefix.as_deref())
+                extract_location_value(&value, header.prefix.as_deref())
             }
-            None => TokenLocationExtract::Missing,
         },
         TokenLocation::QueryParam(name) => match ctx.query_params.get(name) {
             Some(value) => extract_location_value(value, None),
