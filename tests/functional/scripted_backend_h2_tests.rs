@@ -3475,6 +3475,11 @@ fn http_timeout_access_log_yaml(
 
 const H2_UPLOAD_STALL_BYTES: usize = 2 * 1024 * 1024;
 const H2_SSE_FIRST_EVENT: &[u8] = b"data: hello\r\n\n";
+// Pin the listener receive buffer before accept so the 2 MiB upload cannot fit
+// in the kernel's autotuned receive window. A backend that never reads must
+// backpressure the gateway's write pump, otherwise the 8-second read timeout
+// wins and the test observes the wrong envelope.
+const BACKEND_RECEIVE_BUFFER_BYTES: usize = 8 * 1024;
 
 // #4055 H2 frontend → reqwest (H1 backend that never reads).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3483,6 +3488,7 @@ async fn h2_reqwest_backend_write_timeout_maps_to_504() {
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
     let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .receive_buffer_size(BACKEND_RECEIVE_BUFFER_BYTES)
         .step(TcpStep::Sleep(Duration::from_secs(30)))
         .spawn()
         .expect("spawn");
