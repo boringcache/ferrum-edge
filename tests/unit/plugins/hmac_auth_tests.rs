@@ -12,7 +12,6 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_proxy};
