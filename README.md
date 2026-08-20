@@ -25,7 +25,7 @@ Ferrum Edge is a lightweight, extensible edge proxy designed for modern microser
 - **Eight operating modes**: Database, File, Control Plane, Data Plane, Mesh, Injector, Node Agent, and Migrate
 - **Lock-free hot path**: All request-path reads use `ArcSwap` or `DashMap` — no mutexes on the proxy path
 - **Zero-downtime config reloads**: Atomic config swap via DB polling, SIGHUP, or CP push
-- **Service mesh**: Six topologies (sidecar, ambient, node waypoint, service waypoint, east-west gateway, egress), native MeshSubscribe, xDS ADS, or localized file config consumption, SPIFFE identity, HBONE, transparent DNS proxy, mesh authorization, REGISTRY_ONLY outbound policy, and Istio/GAMMA RED metrics. See [docs/mesh.md](docs/mesh.md)
+- **Service mesh**: Six topologies (sidecar, ambient, **Experimental** node waypoint, service waypoint, east-west gateway, egress), native MeshSubscribe, xDS ADS, or localized file config consumption, SPIFFE identity, HBONE, transparent DNS proxy, mesh authorization, REGISTRY_ONLY outbound policy, and Istio/GAMMA RED metrics. See [docs/mesh.md](docs/mesh.md)
 - **Runtime observability**: JWT-gated `/metrics/runtime` JSON snapshot with system/process state, HTTP status windows, error classes, DNS outcomes, backend pool churn, TCP resets, log counters, and overload state
 - **Kubernetes mesh translation**: Gateway API and Istio VirtualService route splits, Istio AuthorizationPolicy/RequestAuthentication/PeerAuthentication, and sidecar injection webhook
 
