@@ -1917,7 +1917,7 @@ jobs:
     needs: fips-compile
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    # Issue #4018: `Precompile FIPS test binaries for consumers` is killed with
+    # Issue #4018: the precompile step below is killed with
     # `exit code 143` and "The runner has received a shutdown signal" on a large
     # minority of runs. The log always ends the same way: the dependency graph
     # finishes, the run goes silent for several minutes while Cargo builds the
