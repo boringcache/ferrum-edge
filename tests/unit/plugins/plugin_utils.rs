@@ -180,10 +180,7 @@ pub fn context_with_materialized_raw_header_bytes(name: &str, value: &[u8]) -> R
 
 /// Build a request context from repeated raw header field lines, including
 /// field lines that the materialized map cannot represent.
-pub fn context_with_materialized_raw_header_lines(
-    name: &str,
-    values: &[&[u8]],
-) -> RequestContext {
+pub fn context_with_materialized_raw_header_lines(name: &str, values: &[&[u8]]) -> RequestContext {
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "GET".to_string(),
