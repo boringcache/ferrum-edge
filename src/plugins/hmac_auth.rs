@@ -1149,15 +1149,6 @@ impl HmacAuth {
         }
     }
 
-    /// Look up the digest header on the request. Prefers RFC 9530
-    /// `Content-Digest` and falls back to RFC 3230 `Digest`.
-    fn extract_digest_header(ctx: &RequestContext) -> Option<String> {
-        match Self::lookup_digest_header(ctx) {
-            ConfiguredHeaderLookup::Value(value) => Some(value),
-            ConfiguredHeaderLookup::Absent | ConfiguredHeaderLookup::PresentNonMaterialized => None,
-        }
-    }
-
     fn has_hmac_authorization(&self, ctx: &RequestContext) -> bool {
         match lookup_configured_header(ctx, "authorization", None) {
             ConfiguredHeaderLookup::Absent => false,
@@ -1384,7 +1375,7 @@ impl AuthMechanism for HmacAuth {
             ConfiguredHeaderLookup::Value(header) => header,
         };
 
-        let Some(params_str) = strip_auth_scheme(auth_header, "hmac") else {
+        let Some(params_str) = strip_auth_scheme(&auth_header, "hmac") else {
             return ExtractedCredential::InvalidFormat(
                 r#"{"error":"Invalid HMAC authorization format"}"#.to_string(),
             );

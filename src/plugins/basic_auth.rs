@@ -223,7 +223,7 @@ impl AuthMechanism for BasicAuth {
             return ExtractedCredential::Missing;
         }
 
-        let Some(encoded) = strip_auth_scheme(auth_header, "Basic") else {
+        let Some(encoded) = strip_auth_scheme(&auth_header, "Basic") else {
             return ExtractedCredential::InvalidFormat(
                 r#"{"error":"Invalid Basic auth format"}"#.into(),
             );

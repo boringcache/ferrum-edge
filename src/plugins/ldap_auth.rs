@@ -1523,7 +1523,7 @@ impl AuthMechanism for LdapAuth {
             ConfiguredHeaderLookup::Value(header) => header,
         };
 
-        let encoded = match strip_auth_scheme(auth_header, "Basic") {
+        let encoded = match strip_auth_scheme(&auth_header, "Basic") {
             Some(encoded) => encoded,
             None => {
                 return ExtractedCredential::InvalidFormat(

@@ -825,19 +825,14 @@ async fn test_jwt_auth_rejects_completely_empty_signature() {
 }
 
 #[tokio::test]
-async fn test_jwt_auth_non_ascii_bearer_separator_authenticates() {
-    let plugin = JwtAuth::new(&json!({})).unwrap();
+async fn test_jwt_auth_non_ascii_custom_header_token_returns_invalid_not_missing() {
+    let plugin = JwtAuth::new(&json!({"token_lookup": "header:X-Token"})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
-    let token = create_jwt_token(&json!({"sub": "testuser"}), "test-jwt-secret");
-    let mut ctx =
-        context_with_materialized_raw_header("Authorization", &format!("Bearer \u{3000}{token}"));
+    let mut ctx = context_with_materialized_raw_header("X-Token", "token\u{3000}value");
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_continue(result);
-    assert_eq!(
-        ctx.identified_consumer.as_ref().unwrap().username,
-        "testuser"
-    );
+    assert_reject_body(result, r#"{"error":"Invalid JWT token"}"#);
+    assert!(ctx.identified_consumer.is_none());
 }
 
 #[tokio::test]
