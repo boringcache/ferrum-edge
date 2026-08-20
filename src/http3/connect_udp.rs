@@ -154,8 +154,13 @@
 //!   the bounded [`crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamUdp`]
 //!   family — no route, target, or credential label is created;
 //! * teardown stays bounded even when the client-bound relay is parked in QUIC
-//!   send flow control: the existing `CLOSE_GRACE` abort-and-join is what
-//!   releases the socket, permit, and connection guard on time.
+//!   send flow control: that write is raced with the supervisor close command
+//!   so `stop_stream` can land, and a `ConnectUdpSendHalf` that is dropped
+//!   without `finish()`/`stop_stream` RESETS rather than letting Quinn
+//!   implicitly `finish()` (a clean FIN — see
+//!   [`crate::http3::stream_util::committed_response_requires_reset`]).
+//!   `CLOSE_GRACE` abort-and-join still releases the socket, permit, and
+//!   connection guard on time if the write never returns to `select!`.
 //!   [`reconcile_authorization_teardown`] keeps that designed abort classified
 //!   as the expiry it was only when the send half was cancelled after the
 //!   grace timeout; a panic or any unrelated cancellation stays
@@ -1466,11 +1471,12 @@ pub fn classify_send_half_teardown(joined: SendHalfTeardownJoin) -> SessionEnd {
 /// the gateway asked for an orderly close and did not get one. An
 /// authorization-lifetime expiry is different: the whole point of that arm is
 /// that it must fire on time even when the client has parked the client-bound
-/// relay in QUIC send flow control, and a relay parked in `send_data` cannot
-/// observe the supervisor's close command at all. Aborting it after
-/// `CLOSE_GRACE` is therefore the DESIGNED path, not a gateway fault — and the
-/// abort drops the QUIC send half, which resets the stream, which is exactly
-/// the non-clean terminal this outcome requires.
+/// relay in QUIC send flow control. The live `send_data` is raced with the
+/// supervisor command so `stop_stream` can apply. If that write still never
+/// returns, aborting after `CLOSE_GRACE` is the DESIGNED bound, not a gateway
+/// fault. Quinn implicitly `finish()`es a send stream that was neither
+/// finished nor reset on drop, so that abort is only a RESET because
+/// `ConnectUdpSendHalf` stops the stream unless a close was already applied.
 ///
 /// That preservation is deliberately narrow. It requires all three:
 /// the supervisor's own verdict is [`SessionEnd::AuthorizationExpired`], the
@@ -1511,11 +1517,12 @@ fn observe_send_half_join(
             SendHalfTeardownJoin::Panicked
         }
         // Designed abort after CLOSE_GRACE on an authorization expiry: the
-        // relay was parked in QUIC send flow control and could not consume the
-        // close command, and THIS session is the one that timed out the grace
-        // and aborted it. The abort itself resets the stream. It is ordinary,
-        // client-triggerable lifecycle rather than a gateway fault, so it is
-        // `debug!` (see the `Log level` section of `src/proxy/auth_lifetime.rs`).
+        // relay was still parked after the send_data/close_rx race, and THIS
+        // session is the one that timed out the grace and aborted it.
+        // `ConnectUdpSendHalf` RESETS on drop (Quinn would otherwise
+        // `finish()`). It is ordinary, client-triggerable lifecycle rather
+        // than a gateway fault, so it is `debug!` (see the `Log level`
+        // section of `src/proxy/auth_lifetime.rs`).
         // A panic is already classified above; a cancellation that was not
         // this session's grace abort falls through to the warning arm.
         Err(_)
@@ -1528,8 +1535,7 @@ fn observe_send_half_join(
                 grace_timed_out,
                 reason = supervisor_verdict.as_str(),
                 "H3 CONNECT-UDP client-bound relay was aborted at the authorization \
-                 lifetime; a relay parked in QUIC send flow control cannot apply the \
-                 close itself, and the abort resets the capsule stream"
+                 lifetime; ConnectUdpSendHalf resets the capsule stream on drop"
             );
             SendHalfTeardownJoin::Cancelled
         }
@@ -1545,6 +1551,79 @@ fn observe_send_half_join(
             );
             SendHalfTeardownJoin::Cancelled
         }
+    }
+}
+
+/// Client-bound CONNECT-UDP send half.
+///
+/// Quinn implicitly `finish()`es a send stream that is dropped without
+/// `finish()` or `reset()`. Aborting a task parked in `send_data` would
+/// therefore present a clean capsule FIN for an authorization expiry unless
+/// drop RESETS. `reset_on_drop` stays armed until this task applies
+/// [`SessionEnd::close_kind`].
+struct ConnectUdpSendHalf<S> {
+    stream: RequestStream<S, Bytes>,
+    reset_on_drop: bool,
+}
+
+impl<S> ConnectUdpSendHalf<S>
+where
+    S: h3::quic::SendStream<Bytes>,
+{
+    fn new(stream: RequestStream<S, Bytes>) -> Self {
+        Self {
+            stream,
+            reset_on_drop: true,
+        }
+    }
+
+    fn disarm_reset(&mut self) {
+        self.reset_on_drop = false;
+    }
+}
+
+impl<S> Drop for ConnectUdpSendHalf<S>
+where
+    S: h3::quic::SendStream<Bytes>,
+{
+    fn drop(&mut self) {
+        if self.reset_on_drop {
+            self.stream.stop_stream(h3::error::Code::H3_INTERNAL_ERROR);
+        }
+    }
+}
+
+/// Send one DATAGRAM capsule, or take a supervisor close that arrived while
+/// the write was parked in QUIC flow control.
+///
+/// `send_data` does not share the relay's outer `select!`. Without this race
+/// the task cannot consume the supervisor oneshot until the client starts
+/// reading, and abort-then-drop would Quinn-`finish()` the stream.
+async fn send_capsule_or_supervisor_close<S>(
+    send: &mut RequestStream<S, Bytes>,
+    capsule: Bytes,
+    close_rx: &mut tokio::sync::oneshot::Receiver<SessionEnd>,
+    proxy_id: &str,
+) -> Result<(), SessionEnd>
+where
+    S: h3::quic::SendStream<Bytes>,
+{
+    tokio::select! {
+        biased;
+        supervisor = &mut *close_rx => Err(resolve_send_half_close_command(
+            supervisor.ok(),
+            SessionEnd::ClientClosed,
+        )),
+        sent = send.send_data(capsule) => match sent {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                debug!(
+                    proxy_id = %proxy_id,
+                    "H3 CONNECT-UDP target relay: send_data failed: {error}"
+                );
+                Err(SessionEnd::ClientClosed)
+            }
+        },
     }
 }
 
@@ -2531,6 +2610,7 @@ async fn relay(
     let from_target_proxy_id = proxy.id.clone();
     // target → client: frame each datagram as a Context ID 0 DATAGRAM capsule.
     let mut from_target = tokio::spawn(async move {
+        let mut h3_send = ConnectUdpSendHalf::new(h3_send);
         // One extra byte so an oversized datagram is detectable rather than
         // silently truncated into a corrupted tunnel payload.
         let mut buf = vec![0u8; max_payload + 1];
@@ -2570,12 +2650,15 @@ async fn relay(
                         Ordering::Relaxed,
                     );
                     let capsule = encode_udp_datagram_capsule(&mut out, &buf[..len]);
-                    if let Err(error) = h3_send.send_data(capsule).await {
-                        debug!(
-                            proxy_id = %from_target_proxy_id,
-                            "H3 CONNECT-UDP target relay: send_data failed: {error}"
-                        );
-                        break SessionEnd::ClientClosed;
+                    if let Err(end) = send_capsule_or_supervisor_close(
+                        &mut h3_send.stream,
+                        capsule,
+                        &mut close_rx,
+                        &from_target_proxy_id,
+                    )
+                    .await
+                    {
+                        break end;
                     }
                 }
                 Err(error) => match classify_udp_recv_error(&error) {
@@ -2641,7 +2724,8 @@ async fn relay(
             // Ordinary end of tunnel: FIN so the client sees an orderly end of
             // the capsule stream.
             StreamCloseKind::Clean => {
-                if let Err(error) = h3_send.finish().await {
+                h3_send.disarm_reset();
+                if let Err(error) = h3_send.stream.finish().await {
                     debug!(
                         proxy_id = %from_target_proxy_id,
                         "H3 CONNECT-UDP target relay: finish failed: {error}"
@@ -2658,10 +2742,12 @@ async fn relay(
             // client the session ended normally, which is exactly the
             // indistinguishability RFC 9114 §4.1.2 exists to prevent.
             StreamCloseKind::MessageError => {
-                h3_send.stop_stream(h3::error::Code::H3_MESSAGE_ERROR);
+                h3_send.disarm_reset();
+                h3_send.stream.stop_stream(h3::error::Code::H3_MESSAGE_ERROR);
             }
             StreamCloseKind::InternalError => {
-                h3_send.stop_stream(h3::error::Code::H3_INTERNAL_ERROR);
+                h3_send.disarm_reset();
+                h3_send.stream.stop_stream(h3::error::Code::H3_INTERNAL_ERROR);
             }
         }
         end
@@ -2826,13 +2912,12 @@ async fn relay(
     // client-bound relay flush and close within its grace before it is aborted.
     //
     // This bound is what makes the authorization arm above enforceable against
-    // a client that stops reading: a client-bound relay parked in QUIC send
-    // flow control never returns to its own `select!`, so it can neither
-    // observe the supervisor's close command nor act on it. The `CLOSE_GRACE`
-    // timeout, the abort, and the awaited cancellation acknowledgement are the
-    // only reason such a tunnel releases its socket clone, session permit, and
-    // connection guard on time rather than lasting as long as the QUIC
-    // connection.
+    // a client that stops reading: `send_capsule_or_supervisor_close` races the
+    // parked write with the close command so `stop_stream` can land. If that
+    // write still never returns, `CLOSE_GRACE` abort-and-join releases the
+    // socket clone, session permit, and connection guard on time.
+    // `ConnectUdpSendHalf` RESETS on drop so that abort cannot Quinn-`finish()`
+    // the capsule stream.
     let supervisor_verdict = end;
     if !to_target_finished {
         to_target.abort();
