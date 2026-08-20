@@ -327,6 +327,25 @@ mod inner {
             .map(ToOwned::to_owned)
     }
 
+    /// `access_control.allowed_consumers` names gateway Consumer usernames
+    /// (byte-for-byte). A delete must refuse while any plugin config in the
+    /// namespace still authorizes that username; the operator's policy is not
+    /// rewritten.
+    fn access_control_plugin_allows_consumer(plugin: &PluginConfig, username: &str) -> bool {
+        if plugin.plugin_name != "access_control" {
+            return false;
+        }
+        plugin
+            .config
+            .get("allowed_consumers")
+            .and_then(|value| value.as_array())
+            .is_some_and(|consumers| {
+                consumers
+                    .iter()
+                    .any(|entry| entry.as_str() == Some(username))
+            })
+    }
+
     /// Connection settings captured at startup so `reconnect()` and
     /// `try_failover_reconnect()` can rebuild the underlying `Client` against
     /// a different URL without changing any other client behavior.
@@ -3755,6 +3774,45 @@ mod inner {
                 while cursor.advance().await? {
                     let plugin = doc_to_plugin_config(cursor.deserialize_current()?)?;
                     if mesh_route_dispatch_references_upstream_id(&plugin, upstream_id) {
+                        return Ok(Some(plugin));
+                    }
+                }
+            }
+            Ok(None)
+        }
+
+        async fn find_access_control_consumer_ref_opt_session(
+            &self,
+            session: Option<&mut ClientSession>,
+            namespace: &str,
+            username: &str,
+        ) -> Result<Option<PluginConfig>, anyhow::Error> {
+            if let Some(s) = session {
+                let plugin_configs = self.plugin_configs();
+                let mut cursor = plugin_configs
+                    .find(doc! {
+                        "plugin_name": "access_control",
+                        "namespace": namespace,
+                    })
+                    .session(&mut *s)
+                    .await?;
+                while cursor.advance(&mut *s).await? {
+                    let plugin = doc_to_plugin_config(cursor.deserialize_current()?)?;
+                    if access_control_plugin_allows_consumer(&plugin, username) {
+                        return Ok(Some(plugin));
+                    }
+                }
+            } else {
+                let plugin_configs = self.plugin_configs();
+                let mut cursor = plugin_configs
+                    .find(doc! {
+                        "plugin_name": "access_control",
+                        "namespace": namespace,
+                    })
+                    .await?;
+                while cursor.advance().await? {
+                    let plugin = doc_to_plugin_config(cursor.deserialize_current()?)?;
+                    if access_control_plugin_allows_consumer(&plugin, username) {
                         return Ok(Some(plugin));
                     }
                 }
@@ -8134,6 +8192,40 @@ mod inner {
                                 (self, id.to_string(), namespace.to_string(), composite_id),
                                 |s, (this, id, namespace, composite_id)| {
                                     Box::pin(async move {
+                                        let consumer_doc = this
+                                            .consumers()
+                                            .find_one(doc! { "_id": composite_id.as_str() })
+                                            .session(&mut *s)
+                                            .await?;
+                                        let Some(consumer_doc) = consumer_doc else {
+                                            return Ok(false);
+                                        };
+                                        let username = consumer_doc
+                                            .get_str("username")
+                                            .map_err(|error| {
+                                                mongodb::error::Error::custom(format!(
+                                                    "consumer '{}' is missing username: {}",
+                                                    id, error
+                                                ))
+                                            })?
+                                            .to_string();
+                                        if let Some(plugin) = this
+                                            .find_access_control_consumer_ref_opt_session(
+                                                Some(&mut *s),
+                                                namespace.as_str(),
+                                                &username,
+                                            )
+                                            .await
+                                            .map_err(|error| {
+                                                mongodb::error::Error::custom(error.to_string())
+                                            })?
+                                        {
+                                            return Err(mongodb::error::Error::custom(format!(
+                                                "Consumer {} is referenced by access_control plugin_config '{}' and cannot be deleted",
+                                                id,
+                                                plugin.id
+                                            )));
+                                        }
                                         let result = this
                                             .consumers()
                                             .delete_one(doc! { "_id": composite_id.as_str() })
@@ -8170,6 +8262,31 @@ mod inner {
                         }
                         deleted
                     } else {
+                        // Standalone pre-checks (best-effort, no transaction).
+                        let existing = self
+                            .consumers()
+                            .find_one(doc! { "_id": &composite_id })
+                            .await?;
+                        let Some(existing) = existing else {
+                            return Ok(false);
+                        };
+                        let username = existing.get_str("username").map_err(|error| {
+                            anyhow::anyhow!("consumer '{}' is missing username: {}", id, error)
+                        })?;
+                        if let Some(plugin) = self
+                            .find_access_control_consumer_ref_opt_session(
+                                None,
+                                namespace,
+                                username,
+                            )
+                            .await?
+                        {
+                            anyhow::bail!(
+                                "Consumer {} is referenced by access_control plugin_config '{}' and cannot be deleted",
+                                id,
+                                plugin.id
+                            );
+                        }
                         let result = self
                             .consumers()
                             .delete_one(doc! { "_id": &composite_id })
@@ -8182,7 +8299,10 @@ mod inner {
                             // itself already succeeded.
                             if let Err(err) = self
                                 .consumer_identity_index()
-                                .delete_many(doc! { "namespace": namespace, "consumer_id": id })
+                                .delete_many(doc! {
+                                    "namespace": namespace,
+                                    "consumer_id": id
+                                })
                                 .await
                             {
                                 warn!(
@@ -15792,6 +15912,34 @@ mod inner {
                 target_lookup < proxy_refs && target_lookup < plugin_refs,
                 "standalone delete_upstream must establish target existence in the requested \
                  namespace before scanning references"
+            );
+        }
+
+        #[test]
+        fn delete_consumer_standalone_checks_access_control_refs_before_delete() {
+            let source = include_str!("mongo_store.rs");
+            let delete_start = source
+                .find("async fn delete_consumer(&self, namespace: &str, id: &str)")
+                .expect("delete_consumer function");
+            let delete_body = &source[delete_start..];
+            let standalone_start = delete_body
+                .find("// Standalone pre-checks (best-effort, no transaction).")
+                .expect("delete_consumer standalone marker");
+            let standalone_path = &delete_body[standalone_start..];
+            let target_lookup = standalone_path
+                .find(".find_one(doc! { \"_id\": &composite_id })")
+                .expect("standalone consumer existence lookup");
+            let plugin_refs = standalone_path
+                .find(".find_access_control_consumer_ref_opt_session(")
+                .expect("access_control allowed_consumers reference check");
+            let consumer_delete = standalone_path
+                .find(".delete_one(doc! { \"_id\": &composite_id })")
+                .expect("standalone consumer delete");
+
+            assert!(
+                target_lookup < plugin_refs && plugin_refs < consumer_delete,
+                "standalone delete_consumer must refuse access_control \
+                 allowed_consumers references before deleting the consumer"
             );
         }
 

@@ -34,7 +34,9 @@ use crate::scaffolding::backends::{
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{GetOptions, Http2Client, Http3Client};
 use crate::scaffolding::harness::GatewayHarness;
-use crate::scaffolding::ports::{reserve_colocated_tcp_udp, reserve_port};
+use crate::scaffolding::ports::{
+    reserve_colocated_tcp_udp, reserve_port, reserve_refused_tcp_port,
+};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -414,6 +416,42 @@ async fn h3_probe_classifies_backend_without_quic_as_h3_unsupported() {
     );
 
     let _ = https_port;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_cross_protocol_refused_connect_sets_x_gateway_error() {
+    let refused = reserve_refused_tcp_port().expect("reserve refused tcp port");
+    let yaml = crate::scaffolding::file_mode_yaml_for_backend(refused.port);
+    let (harness, _ca_pem, _https_port) =
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, false, None).await;
+    let resp = h3_get(&harness, "/api/anything")
+        .await
+        .expect("h3 get against refused backend");
+    assert_eq!(
+        resp.status.as_u16(),
+        502,
+        "expected 502, got {} body={}",
+        resp.status,
+        resp.body_text()
+    );
+    let gateway_error = resp
+        .headers
+        .get("x-gateway-error")
+        .and_then(|v| v.to_str().ok());
+    assert_eq!(
+        gateway_error,
+        Some("connection_failure"),
+        "expected X-Gateway-Error=connection_failure, got {gateway_error:?} body={}",
+        resp.body_text()
+    );
+    assert_eq!(
+        resp.body_text(),
+        r#"{"error":"Backend unavailable"}"#,
+        "expected Backend unavailable, got {}",
+        resp.body_text()
+    );
+    let _keep_port_bound = refused;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

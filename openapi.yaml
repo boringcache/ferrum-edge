@@ -4802,6 +4802,14 @@ paths:
     delete:
       operationId: deleteConsumer
       summary: Delete a consumer
+      description: |
+        Deletes the consumer. Returns `409 Conflict` with
+        `{"error":"Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"}`
+        when any `access_control` plugin config in the same namespace still lists
+        this consumer's username in `allowed_consumers`. The consumer and plugin
+        configs are left unchanged; the delete does not rewrite authorization
+        policy. A consumer named only in `disallowed_consumers` can still be
+        deleted.
       tags: [Consumers]
       responses:
         "204":
@@ -4813,7 +4821,15 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/Conflict"
+          description: |
+            Conflict — mTLS DNS identity repair cannot proceed, or an
+            `access_control` plugin_config still lists this consumer's username
+            in `allowed_consumers`. Body for the allow-list case:
+            `{"error":"Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"}`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 

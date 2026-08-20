@@ -6544,6 +6544,186 @@ async fn test_upstream_delete_referenced_by_mesh_route_dispatch_returns_409() {
 }
 
 #[tokio::test]
+async fn test_consumer_delete_referenced_by_access_control_returns_409() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let consumer = json!({
+        "id": "acl-cs",
+        "username": "acluser",
+        "credentials": {"keyauth": [{"key": "acl-key-1"}]}
+    });
+    let (status, body) = admin_post(&base_url, "/consumers", &token, &consumer).await;
+    assert_eq!(status, 201, "Create consumer failed: {:?}", body);
+
+    let proxy = json!({
+        "id": "acl-px",
+        "listen_path": "/acl-cascade",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "Create proxy failed: {:?}", body);
+
+    let plugin = json!({
+        "id": "acl-pc",
+        "plugin_name": "access_control",
+        "scope": "proxy",
+        "proxy_id": "acl-px",
+        "enabled": true,
+        "config": {"allowed_consumers": ["acluser"]}
+    });
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+    assert_eq!(status, 201, "Create plugin failed: {:?}", body);
+
+    let (status, body) = admin_delete(&base_url, "/consumers/acl-cs", &token).await;
+    assert_eq!(
+        status, 409,
+        "Should return 409 when access_control still names the username: {:?}",
+        body
+    );
+    assert_eq!(
+        body["error"].as_str().unwrap_or(""),
+        "Consumer is referenced by one or more access_control plugin_configs and cannot be deleted",
+        "409 body must use the documented error string: {:?}",
+        body
+    );
+
+    let (status, _, _) = admin_get(&base_url, "/consumers/acl-cs", &token).await;
+    assert_eq!(status, 200, "consumer must survive a refused delete");
+
+    let (status, plugin_body, _) = admin_get(&base_url, "/plugins/config/acl-pc", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        plugin_body["config"]["allowed_consumers"],
+        json!(["acluser"]),
+        "refused delete must not rewrite the operator's plugin config: {:?}",
+        plugin_body
+    );
+
+    let deny_only = json!({
+        "id": "acl-pc",
+        "plugin_name": "access_control",
+        "scope": "proxy",
+        "proxy_id": "acl-px",
+        "enabled": true,
+        "config": {"disallowed_consumers": ["acluser"]}
+    });
+    let (status, body) = admin_put(&base_url, "/plugins/config/acl-pc", &token, &deny_only).await;
+    assert_eq!(
+        status, 200,
+        "Updating access_control to a deny-list must succeed: {:?}",
+        body
+    );
+
+    let (status, _) = admin_delete(&base_url, "/consumers/acl-cs", &token).await;
+    assert_eq!(
+        status, 204,
+        "disallowed_consumers must not block consumer delete"
+    );
+    let (status, _, _) = admin_get(&base_url, "/consumers/acl-cs", &token).await;
+    assert_eq!(status, 404);
+
+    let (status, plugin_body, _) = admin_get(&base_url, "/plugins/config/acl-pc", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        plugin_body["config"]["disallowed_consumers"],
+        json!(["acluser"]),
+        "successful delete must not rewrite the operator's plugin config: {:?}",
+        plugin_body
+    );
+}
+
+#[tokio::test]
+async fn test_delete_hand_managed_proxy_orphan_cleans_last_referenced_hand_owned_upstream() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let upstream = json!({
+        "id": "cas-up-hand",
+        "name": "cas-up-hand",
+        "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+    });
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 201, "Create upstream failed: {:?}", body);
+
+    let shared = json!({
+        "id": "cas-up-shared",
+        "name": "cas-up-shared",
+        "targets": [{"host": "10.0.0.2", "port": 8080, "weight": 100}]
+    });
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &shared).await;
+    assert_eq!(status, 201, "Create shared upstream failed: {:?}", body);
+
+    let sole = json!({
+        "id": "cas-px-sole",
+        "listen_path": "/cas-sole",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true,
+        "upstream_id": "cas-up-hand"
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &sole).await;
+    assert_eq!(status, 201, "Create sole proxy failed: {:?}", body);
+
+    let shared_a = json!({
+        "id": "cas-px-shared-a",
+        "listen_path": "/cas-shared-a",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true,
+        "upstream_id": "cas-up-shared"
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &shared_a).await;
+    assert_eq!(status, 201, "Create shared proxy A failed: {:?}", body);
+
+    let shared_b = json!({
+        "id": "cas-px-shared-b",
+        "listen_path": "/cas-shared-b",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true,
+        "upstream_id": "cas-up-shared"
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &shared_b).await;
+    assert_eq!(status, 201, "Create shared proxy B failed: {:?}", body);
+
+    let (status, _) = admin_delete(&base_url, "/proxies/cas-px-sole", &token).await;
+    assert_eq!(status, 204);
+    let (status, body, _) = admin_get(&base_url, "/upstreams/cas-up-hand", &token).await;
+    assert_eq!(
+        status, 404,
+        "last-referenced hand-owned upstream must be orphan-cleaned: {:?}",
+        body
+    );
+
+    let (status, _) = admin_delete(&base_url, "/proxies/cas-px-shared-a", &token).await;
+    assert_eq!(status, 204);
+    let (status, _, _) = admin_get(&base_url, "/upstreams/cas-up-shared", &token).await;
+    assert_eq!(
+        status, 200,
+        "shared hand-owned upstream must survive while another proxy still references it"
+    );
+
+    let (status, _) = admin_delete(&base_url, "/proxies/cas-px-shared-b", &token).await;
+    assert_eq!(status, 204);
+    let (status, _, _) = admin_get(&base_url, "/upstreams/cas-up-shared", &token).await;
+    assert_eq!(
+        status, 404,
+        "shared hand-owned upstream must be orphan-cleaned after the last proxy is deleted"
+    );
+}
+
+#[tokio::test]
 async fn test_delete_proxy_orphan_cleans_last_referenced_hand_owned_upstream_by_default() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

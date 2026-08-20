@@ -26,17 +26,25 @@
 //! incrementally (bidi), that a client `grpc-timeout` is honored, and that a
 //! target whose pinned peer identity does not match FAILS CLOSED rather than
 //! falling back to an unauthenticated direct dial.
+//!
+//! A separate HTTP-family request-path test drives `handle_proxy_request` into
+//! `proxy_to_backend_mesh_mtls` so a public client `Host` is rewritten to
+//! `mesh.mtls_authority_host` as `:authority` while the original Host rides
+//! `x-forwarded-host`. gRPC dispatch rewrites `:authority` but does not stamp
+//! `x-forwarded-host`, so that Host-survival contract has to ride the HTTP path.
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::Utc;
+use ferrum_edge::config::EnvConfig;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, DispatchKind, Proxy, ResponseBodyMode, UpstreamTarget,
+    AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy, ResponseBodyMode, UpstreamTarget,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain, spiffe_id_to_san};
 use ferrum_edge::identity::{SharedSvidBundle, SvidBundle, TrustBundle, TrustBundleSet};
+use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::proxy::grpc_proxy::{
     GrpcConnectionPool, GrpcDispatchTransport, GrpcProxyError, GrpcResponseKind, GrpcTimeoutKind,
     proxy_grpc_request_from_bytes, proxy_grpc_request_streaming_channel,
@@ -51,12 +59,18 @@ use ferrum_edge::proxy::mesh_mtls_pool::{
 };
 use ferrum_edge::tls::spiffe::build_spiffe_inbound_config;
 use http::{HeaderMap, Response, StatusCode};
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper::{Method, Request};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
+use serde_json::json;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -87,7 +101,11 @@ fn synthetic_root(td: &TrustDomain) -> (Vec<u8>, String, String) {
     (cert.der().to_vec(), cert.pem(), key.serialize_pem())
 }
 
-fn issue_svid(spiffe_id: &SpiffeId, root_pem: &str, root_key_pem: &str) -> (Vec<u8>, Vec<u8>) {
+fn issue_svid_pems(
+    spiffe_id: &SpiffeId,
+    root_pem: &str,
+    root_key_pem: &str,
+) -> (Vec<u8>, Vec<u8>, String, String) {
     let issuer_key = KeyPair::from_pem(root_key_pem).expect("issuer key");
     let issuer = Issuer::from_ca_cert_pem(root_pem, issuer_key).expect("issuer");
     let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf key");
@@ -111,7 +129,17 @@ fn issue_svid(spiffe_id: &SpiffeId, root_pem: &str, root_key_pem: &str) -> (Vec<
     params.not_after = now + time::Duration::hours(1);
 
     let cert = params.signed_by(&leaf_key, &issuer).expect("leaf cert");
-    (cert.der().to_vec(), leaf_key.serialize_der())
+    (
+        cert.der().to_vec(),
+        leaf_key.serialize_der(),
+        cert.pem(),
+        leaf_key.serialize_pem(),
+    )
+}
+
+fn issue_svid(spiffe_id: &SpiffeId, root_pem: &str, root_key_pem: &str) -> (Vec<u8>, Vec<u8>) {
+    let (der, key, _, _) = issue_svid_pems(spiffe_id, root_pem, root_key_pem);
+    (der, key)
 }
 
 fn bundle_for(id: SpiffeId, leaf_der: Vec<u8>, key_der: Vec<u8>, root_der: Vec<u8>) -> SvidBundle {
@@ -445,6 +473,126 @@ async fn start_mesh_mtls_grpc_server(
     (addr, observed_rx)
 }
 
+/// What the HTTP-family Sidecar peer observed on the dispatched request.
+struct ObservedHttpRequest {
+    authority: String,
+    host: Option<String>,
+    x_forwarded_host: Option<String>,
+}
+
+/// A real SVID-mTLS HTTP/2 listener that serves ONE HTTP request — the Sidecar
+/// peer for gateway-to-mesh authority-rewrite coverage.
+async fn start_mesh_mtls_http_server(
+    server_slot: SharedSvidBundle,
+) -> (SocketAddr, oneshot::Receiver<ObservedHttpRequest>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mesh mtls http server");
+    let addr = listener.local_addr().expect("listener addr");
+    let (observed_tx, observed_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let inbound = build_spiffe_inbound_config(server_slot, true, Arc::new(Vec::new()))
+            .expect("server config");
+        let acceptor = TlsAcceptor::from(inbound);
+        let (tcp, _) = listener.accept().await.expect("accept mesh mtls tcp");
+        let tls = acceptor.accept(tcp).await.expect("accept spiffe tls");
+        serve_one_http_request(tls, observed_tx).await;
+    });
+
+    (addr, observed_rx)
+}
+
+async fn serve_one_http_request<T>(io: T, observed_tx: oneshot::Sender<ObservedHttpRequest>)
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut h2 = h2::server::handshake(io).await.expect("h2 server");
+    let (request, mut respond) = h2.accept().await.expect("http stream").expect("stream ok");
+
+    let header = |name: &str| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let _ = observed_tx.send(ObservedHttpRequest {
+        authority: request
+            .uri()
+            .authority()
+            .map(|a| a.to_string())
+            .unwrap_or_default(),
+        host: header("host"),
+        x_forwarded_host: header("x-forwarded-host"),
+    });
+
+    let handler = tokio::spawn(async move {
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/plain")
+            .body(())
+            .expect("http response");
+        let mut send = respond
+            .send_response(response, false)
+            .expect("send response headers");
+        send.send_data(Bytes::from_static(b"ok"), true)
+            .expect("send response body");
+    });
+
+    while let Some(next) = h2.accept().await {
+        if next.is_err() {
+            break;
+        }
+    }
+
+    match tokio::time::timeout(std::time::Duration::from_secs(5), handler).await {
+        Ok(Ok(())) | Err(_) => {}
+        Ok(Err(join_error)) => std::panic::resume_unwind(join_error.into_panic()),
+    }
+}
+
+async fn start_http_test_gateway(state: ProxyState) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gateway-to-mesh test gateway");
+    let gateway_addr = listener.local_addr().expect("gateway addr");
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, remote_addr) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = stream.set_nodelay(true);
+                let io = TokioIo::new(stream);
+                let mut builder =
+                    hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+                builder.http1().max_buf_size(state.max_header_size_bytes);
+                builder
+                    .http2()
+                    .max_header_list_size(state.max_header_size_bytes as u32);
+
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let state = state.clone();
+                    let addr = remote_addr;
+                    async move {
+                        ferrum_edge::proxy::handle_proxy_request(
+                            req, state, addr, false, None, None,
+                        )
+                        .await
+                    }
+                });
+                let _ = builder.serve_connection_with_upgrades(io, svc).await;
+            });
+        }
+    });
+
+    (gateway_addr, handle)
+}
+
 /// A plaintext h2c gRPC server — the destination APP behind an Ambient HBONE
 /// relay. The relay byte-copies the tunnel into this socket, so the nested
 /// HTTP/2 client really has to negotiate and frame end to end.
@@ -625,6 +773,51 @@ fn mesh_identities() -> MeshIdentities {
         gateway_slot: svid_slot(gateway),
         server_slot: svid_slot(server),
         peer_id,
+    }
+}
+
+/// Same identities as [`mesh_identities`], plus PEM files `ProxyState::new`
+/// loads for gateway-to-mesh admission (`FERRUM_GATEWAY_SVID_*`).
+struct MeshIdentitiesOnDisk {
+    identities: MeshIdentities,
+    _dir: tempfile::TempDir,
+    cert_path: String,
+    key_path: String,
+    trust_bundle_path: String,
+}
+
+fn mesh_identities_on_disk() -> MeshIdentitiesOnDisk {
+    init_crypto_provider();
+    let td = TrustDomain::new("cluster.local").expect("trust domain");
+    let (root, root_pem, root_key_pem) = synthetic_root(&td);
+
+    let gateway_id =
+        SpiffeId::new("spiffe://cluster.local/ns/default/sa/gateway").expect("gateway id");
+    let peer_id = SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews").expect("peer id");
+    let (gw_leaf, gw_key, gw_cert_pem, gw_key_pem) =
+        issue_svid_pems(&gateway_id, &root_pem, &root_key_pem);
+    let (peer_leaf, peer_key) = issue_svid(&peer_id, &root_pem, &root_key_pem);
+    let gateway = bundle_for(gateway_id, gw_leaf, gw_key, root.clone());
+    let server = bundle_for(peer_id.clone(), peer_leaf, peer_key, root);
+
+    let dir = tempfile::tempdir().expect("svid dir");
+    let cert_path = dir.path().join("gateway-svid.pem");
+    let key_path = dir.path().join("gateway-svid.key");
+    let trust_bundle_path = dir.path().join("gateway-trust.pem");
+    std::fs::write(&cert_path, gw_cert_pem).expect("write cert");
+    std::fs::write(&key_path, gw_key_pem).expect("write key");
+    std::fs::write(&trust_bundle_path, root_pem).expect("write trust");
+
+    MeshIdentitiesOnDisk {
+        identities: MeshIdentities {
+            gateway_slot: svid_slot(gateway),
+            server_slot: svid_slot(server),
+            peer_id,
+        },
+        _dir: dir,
+        cert_path: cert_path.to_string_lossy().to_string(),
+        key_path: key_path.to_string_lossy().to_string(),
+        trust_bundle_path: trust_bundle_path.to_string_lossy().to_string(),
     }
 }
 
@@ -1427,4 +1620,126 @@ async fn grpc_over_ambient_hbone_relays_a_non_zero_status_and_custom_trailers() 
         Some(PEER_CUSTOM_TRAILER),
         "custom (non-hop-by-hop) trailers must survive the HBONE tunnel"
     );
+}
+
+/// Gateway-to-mesh Sidecar dispatch must force `mesh.mtls_authority_host` as
+/// `:authority` while the public client `Host` survives on `x-forwarded-host`.
+/// This rides `handle_proxy_request` → `proxy_to_backend_mesh_mtls`, not the
+/// gRPC transport: native gRPC rewrites `:authority` but does not stamp
+/// `x-forwarded-host`.
+#[tokio::test]
+async fn http_mesh_mtls_rewrites_authority_and_forwards_client_host() {
+    let files = mesh_identities_on_disk();
+    let peer_id = files.identities.peer_id.as_str().to_string();
+    let (peer_addr, observed_rx) =
+        start_mesh_mtls_http_server(Arc::clone(&files.identities.server_slot)).await;
+
+    let mut config: GatewayConfig = serde_json::from_value(json!({
+        "version": "1",
+        "consumers": [],
+        "plugin_configs": [],
+        "proxies": [{
+            "id": "gw-to-mesh",
+            "hosts": ["api.example.com"],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": APP_PORT,
+            "upstream_id": "orders-mesh",
+            "preserve_host_header": false
+        }],
+        "upstreams": [{
+            "id": "orders-mesh",
+            "targets": [{
+                "host": "127.0.0.1",
+                "port": APP_PORT,
+                "tags": {
+                    "mesh.mtls": "true",
+                    "mesh.mtls_port": peer_addr.port().to_string(),
+                    "mesh.mtls_authority_host": "orders.production.svc",
+                    "mesh.spiffe_id": peer_id
+                }
+            }]
+        }]
+    }))
+    .expect("test config should deserialize");
+    config.normalize_fields();
+
+    let env_config = EnvConfig {
+        gateway_svid_cert_path: Some(files.cert_path.clone()),
+        gateway_svid_key_path: Some(files.key_path.clone()),
+        gateway_svid_trust_bundle_path: Some(files.trust_bundle_path.clone()),
+        ..Default::default()
+    };
+    let (state, handles) = ProxyState::new(
+        config,
+        DnsCache::new(DnsConfig::default()),
+        env_config,
+        None,
+        None,
+    )
+    .expect("proxy state");
+    assert!(
+        state.admits_gateway_mesh_identity(),
+        "file-loaded gateway SVID must admit mesh-mTLS dispatch"
+    );
+
+    let (gateway_addr, gateway_handle) = start_http_test_gateway(state).await;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr)
+        .await
+        .expect("connect to test gateway");
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/")
+        .header("host", "api.example.com")
+        .body(Full::new(Bytes::new()))
+        .expect("client request");
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .expect("h1 handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("gateway response");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "gateway-to-mesh HTTP dispatch must succeed"
+    );
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("response body")
+        .to_bytes();
+    assert_eq!(body.as_ref(), b"ok");
+
+    let observed = await_observation(observed_rx, "the sidecar peer's HTTP request").await;
+    assert_eq!(
+        observed.authority, "orders.production.svc",
+        "dispatch must force mesh.mtls_authority_host as :authority, not the \
+         public client Host or the dial address"
+    );
+    assert_eq!(
+        observed.x_forwarded_host.as_deref(),
+        Some("api.example.com"),
+        "the original client Host must survive on x-forwarded-host"
+    );
+    assert!(
+        observed.host.is_none(),
+        "mesh-mTLS dispatch removes Host so it cannot duplicate :authority; \
+         got {:?}",
+        observed.host
+    );
+
+    for handle in handles {
+        handle.abort();
+    }
+    gateway_handle.abort();
 }

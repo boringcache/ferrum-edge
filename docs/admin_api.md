@@ -501,6 +501,15 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
   http://localhost:9000/consumers/{consumer_id}/credentials/keyauth
 ```
 
+`DELETE /consumers/{id}` returns **409 Conflict** with
+`{"error":"Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"}`
+when any `access_control` plugin config in the same namespace still lists that
+consumer's **username** in `allowed_consumers`. The consumer and plugin configs
+are left unchanged; Ferrum does not rewrite the operator's authorization
+policy. Remove or edit the username in those plugin configs, then retry. A
+consumer named only in `disallowed_consumers`, or not named in any
+`access_control` allow-list, can still be deleted.
+
 Credential rotation workflow:
 1. `POST .../credentials/keyauth` with the new key — both old and new are now active
 2. Roll out the new key to all clients
