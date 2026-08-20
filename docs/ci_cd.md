@@ -2298,22 +2298,6 @@ Jobs omitted because a single predecessor cannot name a unique merged text:
   Cross-sensitive digest.
 - `ci-plan` / `test` for #3915 (issue #3900) — different destination hashes from
   #3913. After #3913 is the trusted base, #3915 needs a follow-up predecessor.
-- `ci-plan` / `test` for issue #3904's deploy-only mesh retirement — removing
-  `run_mesh_federation` / `run_mesh_sidecar_smoke` and the two `ci.yml` jobs
-  rewrites those Cross-sensitive opaque-inline-shell jobs. This implementation
-  PR must not self-admit the pair. A separately root-reviewed predecessor has
-  to add these exact `CI_JOB_GENERATION_TRANSITIONS` tuples (SHA-256 of
-  `extract_job_block` text at `95bd4e64390f65ae2f0406d4990dcd57aeed721d` →
-  this destination; recompute if either job's bytes change):
-
-  `("ci-plan", "7e97e05eeff7e9abbada96bcf4c7c5e91e994983ccb4321a70be2b14fb11a29f", "1ed47ffda870f565dd98e4d19ef2c340404d7cb012e99fd99a2b785bc916cca6")`
-
-  `("test", "afac282642da4e7fea7b38a4e4f5534fcc6df41281601daabc08206fddaaecb3", "617404b7716b0697fe95db855d6dedb00dbbf1bc2045ce0938aa74acc8d8ad12")`
-
-  After that predecessor is the trusted base, this PR merges latest `main`
-  into its head. Hosted
-  wall-time and cache-size evidence from #3910 is still outstanding, so #3904
-  stays open.
 
 Lint (`#3909`), `build-binaries` (`#3916`), and optional live-suite `changes`
 jobs (`#3919`) are not admitted here. They are not folded into this
