@@ -28,6 +28,7 @@ const VERIFIER: &str =
 const SCALE: &str = include_str!("../../../tests/functional/functional_scale_perf_test.rs");
 const LOAD: &str = include_str!("../../../tests/functional/functional_load_stress_test.rs");
 const CI_CD: &str = include_str!("../../../docs/ci_cd.md");
+const PUBLISHER_CONCURRENCY_GROUP: &str = "scaling-gate-publisher";
 
 #[test]
 fn admin_jwt_ttl_covers_the_180_minute_job_and_is_accepted_by_configured_max_ttl() {
@@ -208,6 +209,32 @@ fn scheduled_scaling_workflow_keeps_the_180_minute_matrix_and_signal_job() {
     assert!(!WORKFLOW.contains("LAUNCH_ADVISORY_READ_TOKEN"));
     assert!(!WORKFLOW.contains("Launch Readiness Gate"));
     assert!(!WORKFLOW.contains("contents: write"));
+}
+
+#[test]
+fn scaling_gate_publisher_jobs_share_serialized_concurrency() {
+    assert!(
+        VERIFIER.contains("PUBLISHER_CONCURRENCY_GROUP = \"scaling-gate-publisher\""),
+        "verifier must pin the shared scaling-gate publisher concurrency group"
+    );
+    for (workflow, job_name) in [
+        (WORKFLOW, "scaling-gate-signal"),
+        (FRESHNESS, "scaling-gate-freshness"),
+    ] {
+        let job = workflow
+            .split(&format!("  {job_name}:"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing {job_name} job"))
+            .split("\n  ")
+            .next()
+            .unwrap_or_else(|| panic!("missing {job_name} job body"));
+        assert!(
+            job.contains("concurrency:")
+                && job.contains(&format!("group: {PUBLISHER_CONCURRENCY_GROUP}"))
+                && job.contains("cancel-in-progress: false"),
+            "{job_name} publisher job must share the serialized scaling-gate publisher concurrency group"
+        );
+    }
 }
 
 #[test]

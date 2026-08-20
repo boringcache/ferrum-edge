@@ -32,6 +32,7 @@ REQUIRED_CHECK_NAMES = (
     "Launch Readiness Gate",
     "Launch Readiness Integrity",
 )
+PUBLISHER_CONCURRENCY_GROUP = "scaling-gate-publisher"
 REQUIRED_LATEST_RUN_SELF_TESTS = (
     "newer failure plus older fresh success",
     "latest in-progress plus older success",
@@ -77,6 +78,24 @@ def job_blocks(workflow: str) -> dict[str, str]:
     if current is not None:
         blocks[current] = "".join(body)
     return blocks
+
+
+def require_publisher_job_concurrency(job_name: str, block: str, failures: list[str]) -> None:
+    require(
+        "concurrency:" in block,
+        f"{job_name} publisher job must declare job-level concurrency",
+        failures,
+    )
+    require(
+        f"group: {PUBLISHER_CONCURRENCY_GROUP}" in block,
+        f"{job_name} publisher job must use the shared {PUBLISHER_CONCURRENCY_GROUP} concurrency group",
+        failures,
+    )
+    require(
+        "cancel-in-progress: false" in block,
+        f"{job_name} publisher job must keep cancel-in-progress: false",
+        failures,
+    )
 
 
 def validate_workflow_text(text: str, failures: list[str]) -> None:
@@ -141,6 +160,7 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         "signal job must bind to the matrix job result",
         failures,
     )
+    require_publisher_job_concurrency("scaling-gate-signal", signal, failures)
     require(
         "verify_scaling_regression_workflow.py --self-test" in text,
         "workflow must self-test this verifier",
@@ -175,6 +195,17 @@ def validate_freshness_text(text: str, failures: list[str]) -> None:
     require(
         "publish_scaling_gate_signal.py" in text,
         "freshness workflow must run the scaling-gate publisher",
+        failures,
+    )
+    blocks = job_blocks(text)
+    require(
+        "scaling-gate-freshness" in blocks,
+        "freshness workflow must keep the scaling-gate-freshness publisher job",
+        failures,
+    )
+    require_publisher_job_concurrency(
+        "scaling-gate-freshness",
+        blocks.get("scaling-gate-freshness", ""),
         failures,
     )
     require(
@@ -367,6 +398,9 @@ jobs:
         run: python3 -I .github/scripts/verify_scaling_regression_workflow.py --self-test
   scaling-gate-signal:
     if: always()
+    concurrency:
+      group: scaling-gate-publisher
+      cancel-in-progress: false
     permissions:
       contents: read
       actions: read
@@ -385,6 +419,48 @@ jobs:
     validate_workflow_text("on:\n  pull_request:\n", bad_workflow_failures)
     if not bad_workflow_failures:
         failures.append("self-test expected pull_request workflow to fail")
+
+    missing_publisher_concurrency: list[str] = []
+    validate_workflow_text(
+        good_workflow.replace(
+            "    concurrency:\n      group: scaling-gate-publisher\n      cancel-in-progress: false\n",
+            "",
+        ),
+        missing_publisher_concurrency,
+    )
+    if not any("scaling-gate-signal" in item for item in missing_publisher_concurrency):
+        failures.append("self-test expected missing publisher concurrency to fail")
+
+    good_freshness = """
+name: Scheduled Scaling Gate Freshness
+on:
+  schedule:
+    - cron: "0 12 * * *"
+permissions:
+  contents: read
+jobs:
+  scaling-gate-freshness:
+    concurrency:
+      group: scaling-gate-publisher
+      cancel-in-progress: false
+    permissions:
+      issues: write
+      actions: read
+    steps:
+      - run: python3 -I .github/scripts/publish_scaling_gate_signal.py
+"""
+    freshness_failures: list[str] = []
+    validate_freshness_text(good_freshness, freshness_failures)
+    if freshness_failures:
+        failures.append(f"self-test unexpectedly rejected good freshness workflow: {freshness_failures}")
+
+    bad_freshness_failures: list[str] = []
+    validate_freshness_text(
+        good_freshness.replace("group: scaling-gate-publisher", "group: scaling-gate-freshness"),
+        bad_freshness_failures,
+    )
+    if not any("scaling-gate-publisher" in item for item in bad_freshness_failures):
+        failures.append("self-test expected mismatched publisher concurrency group to fail")
 
     good_signal = """
 MAX_AGE_SECONDS = 8 * 24 * 60 * 60

@@ -213,6 +213,9 @@ jobs:
     timeout-minutes: 10
     needs: [scaling-regression]
     if: always()
+    concurrency:
+      group: scaling-gate-publisher
+      cancel-in-progress: false
     permissions:
       contents: read
       actions: read
