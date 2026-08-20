@@ -11,10 +11,11 @@ shape, not a laptop SLA.
 > ([Actions run 31820671032](https://github.com/ferrum-edge/ferrum-edge/actions/runs/31820671032),
 > artifact
 > `mesh-performance-baselines-5c3a58cd5fc1083911796621d5f2cd0237946c09`).
-> Selected suite: **mesh Criterion microbenchmarks only** (`mesh_complete=true`,
+> Published evidence used here: **mesh Criterion microbenchmarks** (`mesh_complete=true`,
 > `runner_health_ok=true`, max CPU steal 0.0%). HBONE and DNS baselines in
-> sibling directories come from separate accepted hosted collections (see
-> combined provenance note below). The same all-suite run also attempted DNS
+> sibling directories are suite-gated separately: HBONE shares this accepted
+> hosted collection, while DNS uses the later collection in the combined
+> provenance note below. The same all-suite run also attempted DNS
 > with `--protocol both`; that portion failed acceptance (`dns_complete=false`,
 > `ready_to_publish_baselines=false` on that run) because the upstream stub
 > lacked TCP DNS — do not treat that run's aggregate flag or failed DNS blobs as

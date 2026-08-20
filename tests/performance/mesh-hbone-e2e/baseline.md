@@ -10,7 +10,7 @@ RPS when interpreting regressions.
 > ([Actions run 31820671032](https://github.com/ferrum-edge/ferrum-edge/actions/runs/31820671032),
 > artifact
 > `mesh-performance-baselines-5c3a58cd5fc1083911796621d5f2cd0237946c09`).
-> Selected suite: **HBONE E2E only** (`hbone_complete=true`, `hbone_errors_ok=true`,
+> Published evidence used here: **HBONE E2E** (`hbone_complete=true`, `hbone_errors_ok=true`,
 > 3 clean repetitions per scenario, all `total_errors=0`, `runner_health_ok=true`,
 > max CPU steal 0.0%). The same run's DNS portion failed acceptance and was
 > not published; its aggregate `ready_to_publish_baselines=false` reflects that

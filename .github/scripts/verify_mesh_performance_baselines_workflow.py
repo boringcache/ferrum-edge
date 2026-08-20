@@ -915,9 +915,11 @@ def check_baseline_publication_state(
     """
     prefix = f"{path}"
     has_tbd = "_TBD_" in text
-    claims_publication = "Publication status" in text or bool(
-        PUBLISHED_BASELINE_DATE.search(text)
-    )
+    # Stage-1 documents use a ``Publication status`` heading to explain why
+    # their cells remain placeholders.  Only the dated ``Published YYYY-MM-DD``
+    # form is a publication claim; treating the heading itself as one makes the
+    # documented placeholder state impossible.
+    claims_publication = PUBLISHED_BASELINE_DATE.search(text) is not None
     if has_tbd:
         require(
             not claims_publication,
@@ -1298,7 +1300,10 @@ def _self_test_baseline_publication_state(failures: list[str]) -> None:
     stage1_failures: list[str] = []
     check_baseline_publication_state(
         Path("stage1.md"),
-        "Directional baseline | _TBD_ |",
+        (
+            "**Publication status (issue #3332):** result cells remain _TBD_ "
+            "until accepted hosted evidence exists. Directional baseline."
+        ),
         "mesh",
         stage1_failures,
     )
