@@ -2246,7 +2246,7 @@ warning annotation and the resulting `SwapTotal` is always printed.
 The pair is exact and one-way: trusted-base
 `17bfb40fbd31e80e6ae1a0efca922069c54ec485ec7a611c3420840da3e5e9e1` (the workflow
 after PR #3950's landed artifact handoff — the previous admission's adopted end)
-→ `9e8765d257d51b401a2d9b481860a4ff3fcf4001c47eaf167653a73c5390c469`. Recompute
+→ `6bb669ab79edc9bc53452b59acd50462b8db1b5b7fc5528d6b5eea76907dfa84`. Recompute
 and re-pin if review changes the workflow bytes. The digest is over
 universal-newline-decoded text. RETIREMENT IS MANDATORY once the mitigation
 lands, exactly as #3943 retired the #3889 pair. Any other `fips-build.yml` edit
