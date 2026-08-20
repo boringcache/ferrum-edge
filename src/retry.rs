@@ -671,15 +671,12 @@ fn classify_typed_chain(
                         ErrorClass::ConnectionClosed
                     });
                 }
-                std::io::ErrorKind::UnexpectedEof => {
-                    // Post-connect FIN / truncated body. Do *not* map
-                    // connect-phase UnexpectedEof: without rustls (already
-                    // checked above) that is an incomplete handshake, and
-                    // treating it as `ConnectionClosed` would make it
-                    // post-wire and skip `retry_on_connect_failure`.
-                    if !phase_is_connect {
-                        return Some(ErrorClass::ConnectionClosed);
-                    }
+                // Post-connect FIN / truncated body. Do *not* map connect-phase
+                // UnexpectedEof: without rustls (already checked above) that is
+                // an incomplete handshake, and treating it as `ConnectionClosed`
+                // would make it post-wire and skip `retry_on_connect_failure`.
+                std::io::ErrorKind::UnexpectedEof if !phase_is_connect => {
+                    return Some(ErrorClass::ConnectionClosed);
                 }
                 _ => {}
             }
