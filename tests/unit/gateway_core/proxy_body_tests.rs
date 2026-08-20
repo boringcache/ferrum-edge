@@ -4,8 +4,9 @@
 
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
-    DirectH2UploadGateForTest, UploadCancelSignalForTest, direct_h2_upload_gate_for_test,
-    poll_upload_cancel_for_test, proxy_body_streaming_for_test, request_body_drop_outcome_for_test,
+    DirectH2UploadGateForTest, UploadCancelSignalForTest, UploadPumpOutcomeForTest,
+    direct_h2_upload_gate_for_test, poll_upload_cancel_for_test, proxy_body_streaming_for_test,
+    request_body_drop_outcome_for_test,
 };
 use ferrum_edge::proxy::body::{
     PooledBackendLease, ProxyBody, ProxyBodyError, RequestBodyOutcome, StreamingMetrics,
@@ -424,8 +425,58 @@ fn test_drop_with_outstanding_frames_reports_abandoned() {
 #[test]
 fn test_upload_gate_forwards_on_clean_completion() {
     assert_eq!(
-        direct_h2_upload_gate_for_test(Some(RequestBodyOutcome::Completed)),
+        direct_h2_upload_gate_for_test(Some(RequestBodyOutcome::Completed), None),
         DirectH2UploadGateForTest::Forward
+    );
+}
+
+#[test]
+fn test_upload_gate_maps_pump_write_timeout_to_backend_write_timeout() {
+    // The adapter collapses the pump's write-watermark expiry into a transport
+    // error (`Errored`), but the join point keeps the typed terminal. An early
+    // backend response that was never committed must therefore classify as a
+    // deterministic 504 write timeout, not an indeterminate size failure.
+    assert_eq!(
+        direct_h2_upload_gate_for_test(
+            Some(RequestBodyOutcome::Errored),
+            Some(UploadPumpOutcomeForTest::WriteTimeout),
+        ),
+        DirectH2UploadGateForTest::BackendWriteTimeout
+    );
+    // `Abandoned` is the same shape the adapter reports for other non-clean
+    // terminals; only the typed pump outcome distinguishes the write stall.
+    assert_eq!(
+        direct_h2_upload_gate_for_test(
+            Some(RequestBodyOutcome::Abandoned),
+            Some(UploadPumpOutcomeForTest::WriteTimeout),
+        ),
+        DirectH2UploadGateForTest::BackendWriteTimeout
+    );
+}
+
+#[test]
+fn test_upload_gate_keeps_other_pump_terminals_fail_closed() {
+    // A client/source error, cancellation, authorization expiry, consumer drop,
+    // clean completion, or a missing pump terminal all leave the size decision
+    // indeterminate: none of them is a backend write stall, so none may surface
+    // as a 504. Authorization expiry is still privileged by the handler's latch
+    // check in the FailClosed arm.
+    for pump in [
+        UploadPumpOutcomeForTest::Completed,
+        UploadPumpOutcomeForTest::SourceError,
+        UploadPumpOutcomeForTest::Cancelled,
+        UploadPumpOutcomeForTest::AuthorizationExpired,
+        UploadPumpOutcomeForTest::ConsumerGone,
+    ] {
+        assert_eq!(
+            direct_h2_upload_gate_for_test(Some(RequestBodyOutcome::Errored), Some(pump)),
+            DirectH2UploadGateForTest::FailClosed,
+            "pump {pump:?} must not turn an indeterminate size outcome into a 504"
+        );
+    }
+    assert_eq!(
+        direct_h2_upload_gate_for_test(Some(RequestBodyOutcome::Errored), None),
+        DirectH2UploadGateForTest::FailClosed
     );
 }
 
@@ -436,7 +487,7 @@ fn test_upload_gate_fails_closed_on_error_and_abandon() {
     // interrupt polling before an over-limit frame is observed.
     for outcome in [RequestBodyOutcome::Errored, RequestBodyOutcome::Abandoned] {
         assert_eq!(
-            direct_h2_upload_gate_for_test(Some(outcome)),
+            direct_h2_upload_gate_for_test(Some(outcome), None),
             DirectH2UploadGateForTest::FailClosed,
             "outcome {outcome:?} must fail closed"
         );
@@ -447,7 +498,7 @@ fn test_upload_gate_fails_closed_on_error_and_abandon() {
 fn test_upload_gate_maps_overflow_to_deterministic_413() {
     // Overflow must never expose the backend's early response.
     assert_eq!(
-        direct_h2_upload_gate_for_test(Some(RequestBodyOutcome::Exceeded)),
+        direct_h2_upload_gate_for_test(Some(RequestBodyOutcome::Exceeded), None),
         DirectH2UploadGateForTest::RequestBodyTooLarge
     );
 }
@@ -457,7 +508,7 @@ fn test_upload_gate_fails_closed_on_missing_signal() {
     // Sender dropped without reporting: unreachable through the adapter's Drop
     // impl, but with no terminal size decision the gate must refuse to forward.
     assert_eq!(
-        direct_h2_upload_gate_for_test(None),
+        direct_h2_upload_gate_for_test(None, None),
         DirectH2UploadGateForTest::FailClosed
     );
 }

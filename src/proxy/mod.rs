@@ -3456,6 +3456,11 @@ pub(crate) enum DirectH2UploadGate {
     /// The configured request body limit was exceeded — deterministic 413,
     /// never the backend's early response.
     RequestBodyTooLarge,
+    /// The upload pump terminated on the backend write watermark
+    /// (`backend_write_timeout_ms`) before the upload completed. The backend
+    /// response was never committed, so this is a deterministic 504
+    /// `ReadWriteTimeout`, never the backend's early response.
+    BackendWriteTimeout,
     /// The complete upload was not observed, so the size decision is unknown.
     /// Fail closed: an unvetted early backend response must not reach the client.
     FailClosed,
@@ -3467,8 +3472,18 @@ pub(crate) enum DirectH2UploadGate {
 /// configured limit. `Errored` and `Abandoned` leave the size decision unknown:
 /// unread frames may still take the upload over the limit, so they fail closed
 /// along with a missing completion signal.
+///
+/// One typed terminal is safe to report through it: the adapter collapses the
+/// pump's write-watermark expiry into a transport error, so the pump's own
+/// outcome — kept by the join point — distinguishes a backend write stall
+/// (504 `ReadWriteTimeout`) from an indeterminate size outcome. The pump's
+/// biased `select!` ranks its authorization-expiry arm above the write-idle
+/// arm, so a `WriteTimeout` terminal already implies the credential never
+/// expired; every other terminal (client/source error, cancellation, consumer
+/// drop) keeps failing closed.
 pub(crate) fn classify_direct_h2_upload_outcome(
     outcome: Option<body::RequestBodyOutcome>,
+    pump_outcome: Option<upload_pump::UploadPumpOutcome>,
 ) -> DirectH2UploadGate {
     let Some(outcome) = outcome else {
         return DirectH2UploadGate::FailClosed;
@@ -3477,7 +3492,11 @@ pub(crate) fn classify_direct_h2_upload_outcome(
         body::RequestBodyOutcome::Exceeded => DirectH2UploadGate::RequestBodyTooLarge,
         body::RequestBodyOutcome::Completed => DirectH2UploadGate::Forward,
         body::RequestBodyOutcome::Errored | body::RequestBodyOutcome::Abandoned => {
-            DirectH2UploadGate::FailClosed
+            if pump_outcome == Some(upload_pump::UploadPumpOutcome::WriteTimeout) {
+                DirectH2UploadGate::BackendWriteTimeout
+            } else {
+                DirectH2UploadGate::FailClosed
+            }
         }
     }
 }
@@ -40470,7 +40489,6 @@ async fn eager_collect_charged_backend_body(
     preallocation_hint: usize,
     read_timeout_ms: u64,
 ) -> Result<Bytes, EagerRetainFailure> {
-    use futures_util::StreamExt as _;
     let mut collector = response_buffer_budget::ChargedBodyCollector::with_preallocation(
         response_buffer_budget::BudgetRef::global(),
         ceiling,
@@ -43600,7 +43618,6 @@ async fn collect_response_with_limit(
     max_size: usize,
     read_timeout_ms: u64,
 ) -> Result<(Bytes, usize), BufferedCollectFailure> {
-    use futures_util::StreamExt as _;
     let mut body = response_buffer_budget::ChargedBodyCollector::new(
         response_buffer_budget::BudgetRef::global(),
         max_size,
@@ -49993,13 +50010,32 @@ async fn proxy_to_backend_http2(
         // belongs to. A pump that already finished resolves immediately; one
         // whose adapter reported a terminal state without the pump having
         // observed it yet (an authorization expiry seen first on the adapter
-        // side) is stopped here.
-        if let Some(pump) = upload_pump.take() {
-            pump.cancel_and_join().await;
-        }
-        match classify_direct_h2_upload_outcome(outcome) {
+        // side) is stopped here. The join's own outcome is KEPT: the adapter
+        // collapses the pump's write-watermark expiry into a transport error, so
+        // the typed terminal is what distinguishes a backend write stall (504
+        // `ReadWriteTimeout`) from an indeterminate size decision (502).
+        let pump_outcome = if let Some(pump) = upload_pump.take() {
+            pump.cancel_and_join().await
+        } else {
+            None
+        };
+        match classify_direct_h2_upload_outcome(outcome, pump_outcome) {
             DirectH2UploadGate::Forward => {}
             DirectH2UploadGate::RequestBodyTooLarge => return request_body_too_large(),
+            DirectH2UploadGate::BackendWriteTimeout => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    "HTTP/2: backend response arrived before the upload finished, then the backend stopped reading the request body ({}ms)",
+                    proxy.backend_write_timeout_ms
+                );
+                return (
+                    http_backend_dispatch_error_response(
+                        retry::ErrorClass::ReadWriteTimeout,
+                        resolved_ip,
+                    ),
+                    None,
+                );
+            }
             DirectH2UploadGate::FailClosed => {
                 // An upload the AUTHORIZATION deadline ended reports `Abandoned`
                 // too, but it is the gateway's own security decision rather than

@@ -2971,8 +2971,13 @@ fn the_direct_h2_handler_joins_its_upload_before_returning() {
         PROXY_SOURCE
             .matches("pump.cancel_and_join().await;")
             .count(),
-        3,
-        "a direct-H2 exit stopped joining the gateway-owned upload"
+        2,
+        "a direct-H2 bounded exit stopped joining the gateway-owned upload"
+    );
+    assert!(
+        PROXY_SOURCE.contains("pump.cancel_and_join().await\n"),
+        "the normal-completion path must capture the join outcome instead of \
+         discarding it"
     );
     assert!(
         PROXY_SOURCE.contains("UploadPumpJoin::cancel_on_drop"),

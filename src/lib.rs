@@ -9837,7 +9837,20 @@ pub mod _test_support {
     pub enum DirectH2UploadGateForTest {
         Forward,
         RequestBodyTooLarge,
+        BackendWriteTimeout,
         FailClosed,
+    }
+
+    /// Public mirror of the crate-private upload-pump terminal state, limited to
+    /// the variants the direct-H2 gate can observe through a join point.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum UploadPumpOutcomeForTest {
+        Completed,
+        SourceError,
+        Cancelled,
+        AuthorizationExpired,
+        ConsumerGone,
+        WriteTimeout,
     }
 
     /// Terminal outcome the size-limit adapter reports when it is dropped
@@ -9849,15 +9862,33 @@ pub mod _test_support {
         crate::proxy::body::request_body_drop_outcome(inner_is_end_stream)
     }
 
-    /// Gate a direct-H2 backend response on the terminal upload outcome.
-    /// `None` models a completion sender dropped without reporting.
+    /// Gate a direct-H2 backend response on the terminal upload outcome plus the
+    /// typed pump terminal. `None` models a completion sender dropped without
+    /// reporting (or a pump that never ran).
     pub fn direct_h2_upload_gate_for_test(
         outcome: Option<crate::proxy::body::RequestBodyOutcome>,
+        pump_outcome: Option<UploadPumpOutcomeForTest>,
     ) -> DirectH2UploadGateForTest {
-        match crate::proxy::classify_direct_h2_upload_outcome(outcome) {
+        let pump = pump_outcome.map(|outcome| {
+            use crate::proxy::upload_pump::UploadPumpOutcome;
+            match outcome {
+                UploadPumpOutcomeForTest::Completed => UploadPumpOutcome::Completed,
+                UploadPumpOutcomeForTest::SourceError => UploadPumpOutcome::SourceError,
+                UploadPumpOutcomeForTest::Cancelled => UploadPumpOutcome::Cancelled,
+                UploadPumpOutcomeForTest::AuthorizationExpired => {
+                    UploadPumpOutcome::AuthorizationExpired
+                }
+                UploadPumpOutcomeForTest::ConsumerGone => UploadPumpOutcome::ConsumerGone,
+                UploadPumpOutcomeForTest::WriteTimeout => UploadPumpOutcome::WriteTimeout,
+            }
+        });
+        match crate::proxy::classify_direct_h2_upload_outcome(outcome, pump) {
             crate::proxy::DirectH2UploadGate::Forward => DirectH2UploadGateForTest::Forward,
             crate::proxy::DirectH2UploadGate::RequestBodyTooLarge => {
                 DirectH2UploadGateForTest::RequestBodyTooLarge
+            }
+            crate::proxy::DirectH2UploadGate::BackendWriteTimeout => {
+                DirectH2UploadGateForTest::BackendWriteTimeout
             }
             crate::proxy::DirectH2UploadGate::FailClosed => DirectH2UploadGateForTest::FailClosed,
         }

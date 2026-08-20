@@ -2052,14 +2052,6 @@ impl UploadSource {
     /// Returns `None` — leaving the direct path untouched — when the body is
     /// already at end of stream (an empty upload has nothing to bound, and
     /// hyper relies on `is_end_stream()` being true up front to send
-    /// `END_STREAM` with the request headers) or when a pump is already
-    /// installed.
-    /// Move the client body into a gateway-owned pump, returning the join
-    /// point.
-    ///
-    /// Returns `None` — leaving the direct path untouched — when the body is
-    /// already at end of stream (an empty upload has nothing to bound, and
-    /// hyper relies on `is_end_stream()` being true up front to send
     /// `END_STREAM` with the request headers), when a pump is already
     /// installed, or when neither an authorization plan nor a live write
     /// timeout needs a gateway-owned task.

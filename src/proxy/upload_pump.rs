@@ -502,9 +502,8 @@ where
         // Reserve capacity BEFORE reading the client, so a transport that
         // stops draining stops the read rather than filling a buffer.
         if write_armed {
-            match tokio::time::Instant::now().checked_add(write_idle_dur) {
-                Some(at) => write_idle.as_mut().reset(at),
-                None => {}
+            if let Some(at) = tokio::time::Instant::now().checked_add(write_idle_dur) {
+                write_idle.as_mut().reset(at);
             }
         }
         let permit = tokio::select! {
