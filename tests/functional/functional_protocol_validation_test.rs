@@ -386,15 +386,6 @@ async fn send_h2_with_headers(proxy_port: u16, headers: &[(&str, &str)]) -> (u16
     (status, body)
 }
 
-async fn send_h2_prior_knowledge(
-    proxy_port: u16,
-    req: Request<Full<Bytes>>,
-    label: &str,
-) -> (u16, String) {
-    let (status, body_str, _) = send_h2_prior_knowledge_with_headers(proxy_port, req, label).await;
-    (status, body_str)
-}
-
 async fn send_h2_prior_knowledge_with_headers(
     proxy_port: u16,
     req: Request<Full<Bytes>>,
