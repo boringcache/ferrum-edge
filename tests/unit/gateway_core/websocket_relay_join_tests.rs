@@ -32,9 +32,9 @@ use std::time::Duration;
 use futures_util::Sink;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::error::{CapacityError, ProtocolError};
-use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocket, WebSocketConfig};
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocket, WebSocketConfig};
 use tokio_util::sync::CancellationToken;
 
 /// Scripted byte source with a sink that silently accepts writes, so a sync
@@ -548,7 +548,9 @@ fn test_ws_63_bit_oversize_frame_is_size_limit_not_protocol_error() {
         0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // 63-bit length = 2^32
     ];
     let mut socket = WebSocket::from_raw_socket(
-        WsScriptedIo { read: std::io::Cursor::new(oversize) },
+        WsScriptedIo {
+            read: std::io::Cursor::new(oversize),
+        },
         Role::Client,
         Some(WebSocketConfig::default()),
     );
@@ -574,13 +576,18 @@ fn test_malformed_continuation_frame_is_protocol_error() {
         0x00, 0x00, 0x00, 0x00, // 4-byte mask key
     ];
     let mut socket = WebSocket::from_raw_socket(
-        WsScriptedIo { read: std::io::Cursor::new(junk) },
+        WsScriptedIo {
+            read: std::io::Cursor::new(junk),
+        },
         Role::Server,
         Some(WebSocketConfig::default()),
     );
     let err = socket.read().unwrap_err();
     assert!(
-        matches!(&err, WsError::Protocol(ProtocolError::UnexpectedContinueFrame)),
+        matches!(
+            &err,
+            WsError::Protocol(ProtocolError::UnexpectedContinueFrame)
+        ),
         "stray continuation frame must fail closed as a protocol error, got {err:?}"
     );
     assert_eq!(
