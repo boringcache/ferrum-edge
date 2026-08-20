@@ -2068,7 +2068,10 @@ triggers and onto the same posture:
   `production-dockerfile-plan` job reading `ci_runtime_plan.py` — so it did not
   get a second one. Two relevance jobs gating one live job is precisely the
   "either gate bypasses the other" hazard; the existing planner stayed the sole
-  authority and only the trigger and the aggregate changed.
+  authority and only the trigger and the aggregate changed. The classifier is
+  trusted, but the workflow's live-job `needs`/`if` binding and aggregate are
+  still supplied by the pull request until the direct-to-`main` policy
+  follow-up protects their exact contract.
 - `istio-status-cas-live.yml` and `cni-lifecycle-live.yml` gained a `changes`
   job that currently matches the `LIVE_SUITE_RELEVANCE_JOB_TEMPLATE` text
   above, apart from the display name, slug, `--suite` selector, and one
@@ -2083,15 +2086,19 @@ input-less `pull_request`, `merge_group` with exactly `checks_requested`,
 and `push: branches: [main]` trigger shape.
 
 Because they are not in `LIVE_SUITE_RELEVANCE_CONTRACTS`, the trusted policy
-does not yet freeze the two new relevance jobs. Adding them requires editing
+does not yet freeze the two new relevance jobs. It also does not yet freeze the
+NodeWaypoint live-job binding or aggregate; the candidate-side verifier is a
+drift diagnostic, not a trusted-base tamper barrier. Adding the CNI/Istio
+contracts and a dedicated NodeWaypoint binding/aggregate contract requires editing
 `.github/scripts/verify_cross_build_policy.py`, which no pull request may
 change (`Trusted Cross Build Policy` rejects it outright), so that step is a
 separate trusted-base change that lands directly on `main` after this one.
 Until that follow-up lands, issue #3908 is **not durably complete** against
-future PR tampering: a later pull request can still rewrite the two `changes`
-jobs because the trusted policy does not freeze their text. The current
-workflows do compute the verdict from the base branch's classifier, but that
-posture is not protected until `LIVE_SUITE_RELEVANCE_CONTRACTS` adoption.
+future PR tampering: a later pull request can still rewrite either new
+`changes` job or the NodeWaypoint binding/aggregate because trusted policy does
+not freeze those surfaces. The current workflows do compute their verdicts
+from base-branch classifiers, but the complete planner-to-live-to-aggregate
+posture is not protected until that policy adoption.
 
 ###### Bootstrap handshake for a newly named suite
 

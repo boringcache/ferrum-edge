@@ -57,11 +57,13 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   (`NodeWaypoint eBPF Live`, `Istio Status CAS Live`, `CNI Lifecycle Live`) are
   NOT branch-protection-required and must not be added to
   `REQUIRED_MERGE_GROUP_WORKFLOWS` or `DEDICATED_REQUIRED_CHECKS`. The two new
-  `changes` jobs are not yet in `LIVE_SUITE_RELEVANCE_CONTRACTS`; they are not
-  byte-frozen, and issue #3908 is not durably complete against future PR
-  tampering until the follow-up direct-to-`main` policy change adds them
-  (and deletes their temporary `--list-suites` bootstrap block). The
-  classifier refuses to classify
+  `changes` jobs are not yet in `LIVE_SUITE_RELEVANCE_CONTRACTS`, and the
+  NodeWaypoint workflow's live-job binding and aggregate are not yet frozen by
+  trusted policy even though its classifier is trusted-base. Issue #3908 is
+  therefore not durably complete against future PR tampering until the
+  follow-up direct-to-`main` policy change adds the CNI/Istio contracts,
+  protects the NodeWaypoint `needs`/`if` plus aggregate contract, and deletes
+  the temporary `--list-suites` bootstrap blocks. The classifier refuses to classify
   any change-set record that is not a normal repository-relative pathname and
   forces the suite to run instead. See `docs/ci_cd.md` → "Trusted-base
   relevance for required live gates".
