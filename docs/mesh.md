@@ -220,20 +220,23 @@ Where to look, and what to expect, when the mesh data plane misbehaves. All slic
 
 ## Observability and Troubleshooting Quick Reference
 
-### Admin introspection endpoints (all JWT-authenticated; 404 outside mesh mode / wrong topology)
+### Admin introspection endpoints (JWT-authenticated; status codes are per-endpoint)
 
-| Endpoint | Purpose | Diagnose |
-|---|---|---|
-| `GET /mesh/config-drift` (`?include_overlay=false`) | Per-DP "where is this DP vs the CP's last push" — `slice.last_received_at`, `version`, per-kind `resources` counts, `fingerprint`, `source_protocol`/`source_cp_url`, RTDS `runtime_overlay`, and (xDS mode) the `convergence` block (per-type versions, missing required types). | Stuck DP (stale `last_received_at`), split-brain (fingerprint divergence), cross-cluster endpoint discovery (workload/service resource counts), RTDS drift, wedged xDS warming (non-empty `convergence.missing_required_types`). |
-| `GET /mesh/slice-drift` (CP mode) | CP-side desired / sent / acknowledged / rejected slice versions per authenticated local MeshSubscribe identity (issue #3265). | Stuck/partitioned/rejecting DPs after a successful CP reconciliation; pair with each DP's `/mesh/config-drift`. |
-| `GET /mesh/federation` | Trust-bundle federation snapshot: per-trust-domain `bundle_age_seconds` + authority counts. | Stale / missing federated bundles for cross-cluster mTLS. |
-| `GET /mesh/remote-clusters` | Multicluster east-west discovery: `discovered` remote clusters (per-cluster workload/service counts + fetch age) and the `configured` remote clusters from the accepted slice (each with a `discovered` flag). | Which remote cluster is contributing endpoints; configured-but-unreachable clusters (`configured` present, `discovered: false`). |
-| `GET /mesh/runtime-overlay` | Live RTDS overlay (fault percentages, transformer gates, log level). | RTDS knob propagation. |
-| `GET /mesh/service-graph` | Node-local source/destination edge graph from `workload_metrics`. | Who is talking to whom (per DP; aggregate in the backend). |
-| `GET /mesh/policy-denies/recent` (`?window=`, `?limit=`) | Aggregated recent `mesh_authz` denies grouped by `(rule, source, destination, reason)`. | Misconfigured `AuthorizationPolicy` / unexpected denies. |
-| `GET /mesh/egress-scope` + `POST /mesh/egress-scope/test` | Resolved Sidecar egress scope: admitted/denied services + outbound-registry destinations; dry-run host/port check. | Sidecar egress narrowing before/after enabling enforcement. |
-| `GET /node-waypoint/identities` (NodeWaypoint only) | Currently enrolled pod identities. | Node-waypoint enrollment / cookie resolution. |
-| `GET /service-waypoint/services` (ServiceWaypoint only) | Services bound to this waypoint in the active slice. | GAMMA waypoint binding resolution. |
+Every row below requires a valid admin JWT. Wrong-mode and boot-time responses are **not** a blanket `404` outside mesh mode — several surfaces return `200` with an empty body before convergence, `503` when `proxy_state` is unwired (typical `cp` mode), or `404` only on CP-only routes. Operators rely on the split between **`404` = wrong mode or endpoint not applicable** and **`200` with null/empty fields = mesh mode, not converged yet** (for example `GET /mesh/config-drift` with `last_received_at: null` vs `GET /mesh/federation` returning `404` until the first federation poll succeeds).
+
+| Endpoint | Access | Status contract | Purpose | Diagnose |
+|---|---|---|---|---|
+| `GET /mesh/config-drift` (`?include_overlay=false`) | mesh DP | **404** outside mesh. **200** zeroed `resources` and omitted/null `last_received_at` before the first accepted slice. | Per-DP "where is this DP vs the CP's last push" — `slice.last_received_at`, `version`, per-kind `resources` counts, `fingerprint`, `source_protocol`/`source_cp_url`, RTDS `runtime_overlay`, and (xDS mode) the `convergence` block (per-type versions, missing required types). | Stuck DP (stale `last_received_at`), split-brain (fingerprint divergence), cross-cluster endpoint discovery (workload/service resource counts), RTDS drift, wedged xDS warming (non-empty `convergence.missing_required_types`). |
+| `POST /mesh/config-revision/reset` | mesh DP; JWT **`operator`** role | **404** outside mesh. **200** `{status:"reset", cleared_revision}` (or `cleared_revision: null` when the gate held none). | Clears the accepted config revision so the next slice from any authority is eligible — recovery for a sequence rewind inside one authority (config store restored from backup without bumping `FERRUM_MESH_CONFIG_AUTHORITY_ID`). Prefer fleet-wide `FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID` / `FERRUM_MESH_CONFIG_AUTHORITY_ID` bumps when possible; foreign-authority adoption uses `FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS` instead. | Same-authority etcd/DB restore stuck behind the revision gate; pair with `GET /mesh/config-drift` after reset. |
+| `GET /mesh/slice-drift` | **CP only** | **404** outside CP mode (including mesh DPs: `"Mesh slice-drift is only available in control-plane mode"`). **200** empty `data_planes` before the first local `MeshSubscribe` DP connects. | CP-side desired / sent / acknowledged / rejected slice versions per authenticated local MeshSubscribe identity (issue #3265). | Stuck/partitioned/rejecting DPs after a successful CP reconciliation; pair with each DP's `/mesh/config-drift`. |
+| `GET /mesh/federation` | mesh DP | **404** outside mesh or before the first successful federation poll (`"No mesh federation bundles cached yet"`). | Trust-bundle federation snapshot: per-trust-domain `bundle_age_seconds` + authority counts. | Stale / missing federated bundles for cross-cluster mTLS. |
+| `GET /mesh/remote-clusters` | mesh DP | **404** outside mesh. **200** empty `discovered`/`configured` before remote discovery runs. | Multicluster east-west discovery: `discovered` remote clusters (per-cluster workload/service counts + fetch age) and the `configured` remote clusters from the accepted slice (each with a `discovered` flag). | Which remote cluster is contributing endpoints; configured-but-unreachable clusters (`configured` present, `discovered: false`). |
+| `GET /mesh/runtime-overlay` | mesh DP | **404** outside mesh or before the first proxy-accepted slice. **200** empty overlay after the first slice when no RTDS layers have arrived. | Live RTDS overlay (fault percentages, transformer gates, log level). | RTDS knob propagation. |
+| `GET /mesh/service-graph` | mesh DP | **404** outside mesh or before the first accepted slice. | Node-local source/destination edge graph from `workload_metrics`. | Who is talking to whom (per DP; aggregate in the backend). |
+| `GET /mesh/policy-denies/recent` (`?window=`, `?limit=`) | mesh DP | **404** outside mesh. **200** empty `grouped` before denies occur (also when `FERRUM_MESH_POLICY_DENY_LOG_CAPACITY=0`). | Aggregated recent `mesh_authz` denies grouped by `(rule, source, destination, reason)`. | Misconfigured `AuthorizationPolicy` / unexpected denies. |
+| `GET /mesh/egress-scope` + `POST /mesh/egress-scope/test` | mesh DP | **503** `"No proxy state available"` when `proxy_state` is unwired (typical CP). **404** outside mesh or before an egress-scope snapshot exists. | Resolved Sidecar egress scope: admitted/denied services + outbound-registry destinations; dry-run host/port check. | Sidecar egress narrowing before/after enabling enforcement. |
+| `GET /node-waypoint/identities` | NodeWaypoint mesh DP | **503** `"proxy_state unavailable in this mode"` when `proxy_state` is unwired. **404** when node-waypoint topology is not enabled. | Currently enrolled pod identities. | Node-waypoint enrollment / cookie resolution. |
+| `GET /service-waypoint/services` | ServiceWaypoint mesh DP | **404** outside mesh, before the first slice, or when the slice has no `waypoint_name`. | Services bound to this waypoint in the active slice. | GAMMA waypoint binding resolution. |
 
 For remote-cluster discovery specifically, `GET /mesh/remote-clusters` names each remote cluster the DP has fetched endpoints from (and the remote clusters the accepted slice declares); `GET /mesh/config-drift` resource counts and the locality-aware LB behavior remain useful for the aggregate workload/service totals.
 
@@ -426,7 +429,7 @@ Sidecars route external traffic to the egress gateway over mTLS. The gateway ter
 
 ## Configuration Consumption
 
-Mesh mode consumes configuration via one of three sources, selected by `FERRUM_MESH_CONFIG_PROTOCOL`: two Control-Plane protocols (`native`, `xds`) and a localized file source (`file`).
+Mesh mode consumes configuration via one of four sources, selected by `FERRUM_MESH_CONFIG_PROTOCOL`: two Ferrum control-plane protocols (`native`, `xds`), a localized file source (`file`), or stock Envoy / third-party Istio xDS interop (`stock_xds` — discovery only; policy from `FERRUM_MESH_FILE_CONFIG_PATH`; see [Stock Envoy / third-party Istio xDS interoperability](#stock-envoy--third-party-istio-xds-interoperability)).
 
 ### Native MeshSubscribe (default)
 
@@ -4086,7 +4089,7 @@ Reserved mesh-managed plugin IDs are updated in place on each slice apply. If a 
 
 ## Gateway-to-Mesh Bridge
 
-Non-mesh gateway modes (`database`, `file`, `cp`, `dp`) can route traffic into the mesh via the gateway-to-mesh bridge. This enables a Ferrum gateway operating as an ingress or API gateway to forward requests to mesh workloads over the destination topology's secured transport with full SPIFFE mTLS: **HBONE** (`:15008`) for Ambient/waypoint destinations, **plain SVID-mTLS HTTP/2** (`:15006`) for Sidecar destinations. The transport is selected per upstream by `service_discovery.mesh.topology` (or by which `mesh.*` transport tag statically configured targets carry); it must match the destination mesh's topology — the transports are not interchangeable, and a mismatch fails closed at dispatch.
+Gateway traffic modes (`database`, `file`, `dp`) can route traffic into the mesh via the gateway-to-mesh bridge. This enables a Ferrum gateway operating as an ingress or API gateway to forward requests to mesh workloads over the destination topology's secured transport with full SPIFFE mTLS: **HBONE** (`:15008`) for Ambient/waypoint destinations, **plain SVID-mTLS HTTP/2** (`:15006`) for Sidecar destinations. The transport is selected per upstream by `service_discovery.mesh.topology` (or by which `mesh.*` transport tag statically configured targets carry); it must match the destination mesh's topology — the transports are not interchangeable, and a mismatch fails closed at dispatch. `cp` mode does not proxy client traffic; it distributes mesh snapshots and trust bundles to DPs that do (see Trust Bundle Distribution below).
 
 ### Trust Bundle Distribution
 
@@ -6038,7 +6041,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 
 | Variable | Default | Description |
 |---|---|---|
-| `FERRUM_MESH_CONFIG_PROTOCOL` | `native` | Config consumption protocol: `native`, `xds`, `file` (localized file source — requires `FERRUM_MESH_FILE_CONFIG_PATH` at `run`; `validate -m mesh -c` may supply that path and infer `file` from a `{version?, mesh}` document), or `stock_xds` |
+| `FERRUM_MESH_CONFIG_PROTOCOL` | `native` | Config consumption protocol: `native` (Ferrum `MeshSubscribe`), `xds` (Ferrum-private mesh ADS), `file` (localized slice from `FERRUM_MESH_FILE_CONFIG_PATH` — required at `run`; `validate -m mesh -c` may infer `file` from a `{version?, mesh}` document), or `stock_xds` (standard v3 CDS/EDS/LDS/RDS from a stock Envoy / third-party Istio control plane for **discovery only**; enforcement policy always comes from `FERRUM_MESH_FILE_CONFIG_PATH` — see [Stock Envoy / third-party Istio xDS interoperability](#stock-envoy--third-party-istio-xds-interoperability)) |
 | `FERRUM_MESH_NODE_ID` | `$HOSTNAME` or `ferrum-mesh-node` | Node identifier sent to the CP. On the xDS path it becomes `DiscoveryRequest.node.id` and must satisfy the CP's [`Node.id` contract](#xds-ads-admission-budgets): non-empty, at most `FERRUM_XDS_MAX_NODE_ID_BYTES` UTF-8 bytes, printable ASCII (`0x21`–`0x7E`) only |
 | `FERRUM_MESH_TOPOLOGY` | `sidecar` | Topology: `sidecar`, `ambient`, `node_waypoint`, `service_waypoint`, `east_west_gateway`, `egress_gateway` |
 | `FERRUM_MESH_WAYPOINT_NAME` | (none) | Required when `FERRUM_MESH_TOPOLOGY=service_waypoint`; names the GAMMA waypoint binding requested from the CP |
