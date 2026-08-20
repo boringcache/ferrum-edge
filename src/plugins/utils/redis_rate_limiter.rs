@@ -1199,6 +1199,7 @@ fn pause_shared_replay_apply_for_test() {
 /// unit tests use this to deterministically reproduce the previously dangerous
 /// transition/global-publish reordering.
 #[doc(hidden)]
+#[allow(dead_code)]
 pub fn arm_shared_replay_apply_pause_for_test() {
     REPLAY_HEALTH_APPLY_PAUSE_ENTERED.store(0, Ordering::Release);
     REPLAY_HEALTH_APPLY_PAUSE_ARMED.store(true, Ordering::Release);
@@ -1206,12 +1207,14 @@ pub fn arm_shared_replay_apply_pause_for_test() {
 
 /// Disarm the apply-pause gate so a paused transition can proceed.
 #[doc(hidden)]
+#[allow(dead_code)]
 pub fn disarm_shared_replay_apply_pause_for_test() {
     REPLAY_HEALTH_APPLY_PAUSE_ARMED.store(false, Ordering::Release);
 }
 
 /// Number of transitions currently (or previously) paused at the tear point.
 #[doc(hidden)]
+#[allow(dead_code)]
 pub fn shared_replay_apply_pause_entered_for_test() -> usize {
     REPLAY_HEALTH_APPLY_PAUSE_ENTERED.load(Ordering::Acquire)
 }
@@ -1219,6 +1222,7 @@ pub fn shared_replay_apply_pause_entered_for_test() -> usize {
 /// Whether the shared-replay transition lock is currently held. External tests
 /// use this to prove a transition spans the tear point under the lock.
 #[doc(hidden)]
+#[allow(dead_code)]
 pub fn shared_replay_transition_lock_held_for_test() -> bool {
     SHARED_REPLAY_TRANSITION_LOCK.try_lock().is_err()
 }
