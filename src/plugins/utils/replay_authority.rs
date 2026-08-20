@@ -901,9 +901,10 @@ impl SharedReplayAuthorityHealth {
 /// One acquire-load of a packed atomic published on lifecycle transitions
 /// (first registration of a distinct replay Redis client, reachable to
 /// unavailable, unavailable to reachable, terminal topology, and retirement).
-/// No mutex, no registry scan, no allocation, no I/O, and no work proportional
-/// to configured or historical authorities. `/health`, `/status`, and
-/// `/metrics/runtime` all read this same word.
+/// No mutex on the read path, no registry scan, no allocation, no I/O, and no
+/// work proportional to configured or historical authorities (writers serialize
+/// their packed deltas behind a cold transition lock). `/health`, `/status`,
+/// and `/metrics/runtime` all read this same word.
 pub fn shared_health_snapshot() -> SharedReplayAuthorityHealth {
     let (shared_authorities, shared_authorities_unavailable) =
         super::redis_rate_limiter::shared_replay_health_counts();
