@@ -2605,7 +2605,7 @@ def normalize_authority_for_signing(netloc: str, scheme: str) -> str:
     return normalized_host
 
 secret = os.environ.get("HMAC_SECRET", "")
-if len(secret.strip()) < 32:
+if sum(not char.isspace() for char in secret) < 32:
     sys.exit("set HMAC_SECRET to the Consumer hmac_auth secret (>= 32 non-whitespace chars)")
 
 url = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080/p/hmac"
