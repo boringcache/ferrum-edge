@@ -221,13 +221,15 @@ fn scaling_gate_publisher_jobs_share_serialized_concurrency() {
         (WORKFLOW, "scaling-gate-signal"),
         (FRESHNESS, "scaling-gate-freshness"),
     ] {
+        let job_header = format!("  {job_name}:");
         let job = workflow
-            .split(&format!("  {job_name}:"))
-            .nth(1)
-            .unwrap_or_else(|| panic!("missing {job_name} job"))
-            .split("\n  ")
-            .next()
-            .unwrap_or_else(|| panic!("missing {job_name} job body"));
+            .lines()
+            .skip_while(|line| *line != job_header)
+            .skip(1)
+            .take_while(|line| line.trim().is_empty() || line.starts_with("    "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!job.is_empty(), "missing {job_name} job body");
         assert!(
             job.contains("concurrency:")
                 && job.contains(&format!("group: {PUBLISHER_CONCURRENCY_GROUP}"))
