@@ -5915,9 +5915,7 @@ mod tests {
             "the request-scoped typed deadline must be the sole absolute source"
         );
         assert!(
-            body.contains(
-                "apply_remaining_grpc_timeout_header(backend_req.headers_mut(), deadline)"
-            ),
+            body.contains("apply_remaining_grpc_timeout_header(&mut headers, deadline)"),
             "each attempt must forward a decremented remaining grpc-timeout, \
              measured after pool acquisition"
         );
@@ -5932,12 +5930,16 @@ mod tests {
         let sender_acquisition = body
             .find("let mut sender =")
             .expect("sender acquisition not found");
+        let timeout_rewrite = body
+            .find("apply_remaining_grpc_timeout_header(&mut headers, deadline)")
+            .expect("remaining grpc-timeout rewrite not found");
         let backend_read_deadline = body
             .find("let backend_read_deadline_at =")
             .expect("backend read deadline not found");
         assert!(
-            sender_acquisition < backend_read_deadline,
-            "backend_read_timeout_ms must start after connection acquisition"
+            sender_acquisition < timeout_rewrite && timeout_rewrite < backend_read_deadline,
+            "grpc-timeout must be rewritten after connection acquisition, and the \
+             backend_read_timeout_ms budget must start afterward"
         );
         assert!(
             body.contains("let shared_response_deadline =")
