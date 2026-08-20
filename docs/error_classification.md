@@ -76,9 +76,42 @@ pub enum StreamSetupKind {
 ```
 
 `DnsLookup` maps to `ErrorClass::DnsLookupError` so TCP/UDP/DTLS setup DNS
-failures grep the same class as HTTP and gRPC. Construction sites emit
-`StreamSetupError::dns_lookup(host, source)`, whose Display keeps the legacy
-`"DNS resolution failed for {host}: {source}"` wording.
+failures grep the same class as HTTP and gRPC. Construction sites go through
+`stream_error::stream_dns_setup_error(host, source)`, whose Display keeps the
+legacy `"DNS resolution failed for {host}: {source}"` wording.
+
+One resolve failure is deliberately **not** typed as `DnsLookup`: a target
+refused by the backend egress policy. No query was answered and no backend was
+consulted, so it stays `DispatchPolicyRejected` — non-retryable and neutral to
+backend health, matching the `record_neutral` circuit-breaker accounting the
+same call sites already perform. Typing it would let the typed walk override
+that classification.
+
+### UDP setup failures that never publish a session
+
+A UDP setup attempt emits exactly one `StreamTransactionSummary`, and which
+side emits it is decided by the operation itself (`UdpSetupProgress`), never by
+probing the session map afterwards:
+
+- **Setup owns** every failure observed before `sessions.insert` — DNS, empty
+  pool, plugin reject, circuit breaker, backend bind/connect, backend DTLS
+  handshake. The summary carries the epoch the attempt was *admitted* under:
+  that generation's stream plugin slice, the proxy lifecycle generation, the
+  connect-time execution-trigger decisions, and the `StreamConnectionContext`
+  identity/auth/SNI/metadata. The backend target is the one selection actually
+  chose (load balancer or mesh preselection), not the proxy's configured
+  default.
+- **The published session owns** everything after that insert, including an
+  error the spawned setup task observes later — even if the session has already
+  been removed by idle expiry, shutdown, or reload. A removed session does not
+  hand ownership back to setup; doing so would produce a duplicate summary
+  alongside the session's own disconnect summary.
+- A failure *before* any epoch view resolved (for example the proxy was
+  withdrawn between listener dispatch and setup) has no admitted plugin slice
+  and no admitted generation. It records the transaction with no proxy name, no
+  backend target, and `proxy_lifecycle_generation` unset, and notifies **no**
+  plugins — invoking the current generation's plugins would attribute the
+  failure to a configuration that never admitted it.
 
 `NoHealthyTargets` and `CircuitBreakerOpen` are intentionally split: the former
 fires from LB target selection when **no candidate exists** (empty pool, empty
@@ -230,9 +263,13 @@ Refer to the canonical-taxonomy table above for what each class means. A few cla
   `BackendTlsHandshake`/`BackendDtlsHandshake` tells you which side failed
   without inspecting the message. Do **not** key alerts on `tls_error` for
   omitted `close_notify`: userspace rustls reports that as `UnexpectedEof`
-  ("without sending TLS close_notify"), which classifies as `connection_closed`
-  (or a clean TCP/DTLS session omits `error_class` entirely). kTLS still treats
-  a bare FIN without an authenticated `close_notify` as truncation.
+  ("without sending TLS close_notify"). Two shapes are operator-visible and both
+  are intentional: the TCP direction-tracking relay and the DTLS session outcome
+  treat it as clean teardown and omit `error_class` entirely, while the
+  all-bounds-disabled `copy_bidirectional` fast path (which stringifies its
+  error and loses the typed chain) reports `connection_closed`. Neither is
+  `tls_error`. kTLS still treats a bare FIN without an authenticated
+  `close_notify` as truncation.
 - **`GracefulRemoteClose`** — informational, not an error. The peer closed the session cleanly. Do not alert on this.
 - **`ClientDisconnect`** — the client (not the backend) dropped the connection. Often benign (user navigated away). High rates may indicate aggressive client-side timeouts.
 

@@ -49,7 +49,9 @@ use crate::plugins::{
 use crate::proxy::datagram_client_address::{
     DatagramClientAddressGate, DatagramClientIdentity, DatagramMetadataError,
 };
-use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
+use crate::proxy::stream_error::{
+    StreamSetupError, StreamSetupKind, find_stream_setup_error, stream_dns_setup_error,
+};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 
 /// Maximum datagram size for UDP forwarding.
@@ -1749,59 +1751,229 @@ async fn emit_udp_stream_disconnect(
     }
 }
 
+/// Race-free ownership + attribution state for one UDP session setup attempt.
+///
+/// Exactly one side may emit a stream summary for a setup attempt:
+///
+/// * **setup** owns failures observed *before* `sessions.insert`;
+/// * **the published session** owns everything after that insert, including
+///   the error the spawned setup task later observes.
+///
+/// Reading the session map back after the fact cannot answer that question.
+/// A published session can already have been removed — idle expiry, listener
+/// shutdown, reload, or an explicit close — by the time the spawned task
+/// inspects the map, so a `contains_key` probe reports "never published" for a
+/// session that already emitted its own disconnect summary and produces a
+/// duplicate. Publication is therefore recorded by the operation that performs
+/// it, and never re-derived.
+///
+/// The same value carries the exact epoch the attempt was admitted under, so a
+/// setup-failure summary can never be attributed to a *later* configuration
+/// generation than the one that admitted it.
+#[derive(Default)]
+pub(crate) struct UdpSetupProgress {
+    /// Set by [`Self::mark_published`] at the `sessions.insert` that publishes
+    /// the session. Once set, setup owns nothing.
+    published: bool,
+    /// Present once stream admission ran against a resolved epoch view.
+    attribution: Option<UdpSetupAttribution>,
+    /// The backend target actually selected for this session (load balancer,
+    /// mesh preselection, or the proxy's configured host/port), recorded the
+    /// moment selection settles rather than reconstructed after the failure.
+    backend_target: Option<String>,
+    /// The resolved backend IP, once DNS/connect settled on one.
+    backend_resolved_ip: Option<String>,
+}
+
+/// The admitted epoch's attribution for a setup attempt, captured at the
+/// `on_stream_connect` chain's exit and never re-read from the current epoch.
+struct UdpSetupAttribution {
+    /// The exact stream plugin slice this attempt was admitted against.
+    plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    proxy_name: Option<String>,
+    protocol: String,
+    proxy_lifecycle_generation: Option<u64>,
+    /// Connect-time per-instance execution-trigger decisions, so a skipped
+    /// instance stays skipped on the setup-failure summary exactly as it does
+    /// on a session-owned disconnect summary.
+    plugin_trigger_decisions: crate::plugins::StreamTriggerDecisions,
+    consumer_username: Option<String>,
+    auth_method: Option<&'static str>,
+    sni_hostname: Option<String>,
+    metadata: std::collections::HashMap<String, String>,
+    /// The proxy's configured host/port, used only when the attempt failed
+    /// before any target selection settled.
+    configured_backend_target: String,
+}
+
+impl UdpSetupProgress {
+    /// Record the epoch/plugin/identity facts of the admission chain that just
+    /// ran. Called on the admission chain's single exit point so a rejected,
+    /// revalidation-failed, and admitted attempt all carry the same generation.
+    pub(crate) fn record_stream_admission(
+        &mut self,
+        plugins: Arc<Vec<Arc<dyn Plugin>>>,
+        proxy_name: Option<&str>,
+        backend_scheme: BackendScheme,
+        configured_backend_target: String,
+        stream_ctx: &StreamConnectionContext,
+    ) {
+        self.attribution = Some(UdpSetupAttribution {
+            plugins,
+            proxy_name: proxy_name.map(str::to_string),
+            protocol: backend_scheme.to_string(),
+            proxy_lifecycle_generation: stream_ctx.proxy_lifecycle_generation,
+            plugin_trigger_decisions: stream_ctx.plugin_trigger_decisions(),
+            consumer_username: stream_ctx.effective_identity().map(str::to_owned),
+            auth_method: stream_ctx.auth_method,
+            sni_hostname: stream_ctx.sni_hostname.clone(),
+            metadata: stream_ctx.snapshot_summary_metadata(),
+            configured_backend_target,
+        });
+    }
+
+    /// The backend this attempt actually selected. Write-once: mesh
+    /// preselection settles the target before admission, and `create_session`
+    /// reuses that same pair, so the first recorded selection is the real one.
+    pub(crate) fn record_backend_selection(&mut self, host: &str, port: u16) {
+        if self.backend_target.is_none() {
+            self.backend_target = Some(format!("{host}:{port}"));
+        }
+    }
+
+    /// The address the selected target resolved to, once connect settled.
+    pub(crate) fn record_backend_resolved_ip(&mut self, ip: std::net::IpAddr) {
+        self.backend_resolved_ip = Some(ip.to_string());
+    }
+
+    /// The session is now in the session map and owns its own disconnect
+    /// summary.
+    pub(crate) fn mark_published(&mut self) {
+        self.published = true;
+    }
+
+    /// Whether setup — rather than a published session — owns this failure.
+    pub(crate) fn owns_setup_failure(&self) -> bool {
+        !self.published
+    }
+
+    /// Whether stream admission ran, i.e. whether there is an admitted epoch to
+    /// attribute a failure to.
+    pub(crate) fn has_admitted_attribution(&self) -> bool {
+        self.attribution.is_some()
+    }
+
+    /// Emit the setup-failure summary when, and only when, setup owns it.
+    ///
+    /// Returns whether a summary was emitted, so callers and tests can assert
+    /// exactly-once emission without inspecting the session map.
+    pub(crate) async fn emit_setup_failure_if_owner(
+        &self,
+        context: UdpSetupFailureContext<'_>,
+    ) -> bool {
+        if !self.owns_setup_failure() {
+            return false;
+        }
+        self.emit_setup_failure(context).await;
+        true
+    }
+
+    async fn emit_setup_failure(&self, context: UdpSetupFailureContext<'_>) {
+        let class = dtls_error_class(context.error);
+        let disconnect_cause = Some(dtls_disconnect_cause(context.error, &class));
+        let disconnect_direction = Some(dtls_disconnect_direction(context.error, &class));
+        // Bounded, redacted exactly like every other stream summary: the
+        // `connection_error` string is the same `Display` a session-owned
+        // summary carries, and `metadata` is serialized through the shared
+        // redacting serializer on `StreamTransactionSummary`.
+        let connection_error = Some(context.error.to_string());
+        let selected_backend_target = self.backend_target.clone();
+        let summary = match self.attribution.as_ref() {
+            Some(attribution) => StreamTransactionSummary {
+                namespace: context.namespace.to_string(),
+                proxy_id: context.proxy_id.to_string(),
+                proxy_lifecycle_generation: attribution.proxy_lifecycle_generation,
+                plugin_trigger_decisions: attribution.plugin_trigger_decisions.clone(),
+                proxy_name: attribution.proxy_name.clone(),
+                client_ip: context.client_ip.to_string(),
+                consumer_username: attribution.consumer_username.clone(),
+                auth_method: attribution.auth_method,
+                backend_target: selected_backend_target
+                    .unwrap_or_else(|| attribution.configured_backend_target.clone()),
+                backend_resolved_ip: self.backend_resolved_ip.clone(),
+                protocol: attribution.protocol.clone(),
+                listen_port: context.listen_port,
+                duration_ms: context.duration_ms,
+                bytes_sent: 0,
+                bytes_received: 0,
+                connection_error,
+                error_class: Some(class),
+                disconnect_direction,
+                disconnect_cause,
+                timestamp_connected: context.connected_wall_at.to_rfc3339(),
+                timestamp_disconnected: chrono::Utc::now().to_rfc3339(),
+                sni_hostname: attribution.sni_hostname.clone(),
+                metadata: attribution.metadata.clone(),
+            },
+            // Explicit bounded fallback: the attempt failed before any epoch
+            // view resolved, so there is no admitted plugin slice and no
+            // admitted proxy generation. Record the transaction so operators
+            // still see the failure, but attribute nothing: no generation, no
+            // trigger decisions, no proxy name, no backend target, and — below
+            // — no plugin notification. Invoking the *current* generation's
+            // plugins here would attribute a failure to a configuration that
+            // never admitted it.
+            None => StreamTransactionSummary {
+                namespace: context.namespace.to_string(),
+                proxy_id: context.proxy_id.to_string(),
+                proxy_lifecycle_generation: None,
+                plugin_trigger_decisions: Default::default(),
+                proxy_name: None,
+                client_ip: context.client_ip.to_string(),
+                consumer_username: None,
+                auth_method: None,
+                backend_target: String::new(),
+                backend_resolved_ip: None,
+                // The listener's own frontend transport, which is a static
+                // listener fact rather than a config lookup.
+                protocol: BackendScheme::Udp.to_string(),
+                listen_port: context.listen_port,
+                duration_ms: context.duration_ms,
+                bytes_sent: 0,
+                bytes_received: 0,
+                connection_error,
+                error_class: Some(class),
+                disconnect_direction,
+                disconnect_cause,
+                timestamp_connected: context.connected_wall_at.to_rfc3339(),
+                timestamp_disconnected: chrono::Utc::now().to_rfc3339(),
+                sni_hostname: None,
+                metadata: Default::default(),
+            },
+        };
+        crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
+        let Some(attribution) = self.attribution.as_ref() else {
+            return;
+        };
+        // Same carrier contract as a session-owned disconnect: notify every
+        // instance of the admitted slice and let each one consult the
+        // connect-time decision carried on the summary.
+        for plugin in attribution.plugins.iter() {
+            plugin.on_stream_disconnect(&summary).await;
+        }
+    }
+}
+
 /// Setup-phase UDP/DTLS failure that never published a session: DNS, plugin
-/// reject, empty pool, connect, and similar. A published session owns its
-/// own disconnect summary, so callers skip this when `sessions` already
-/// contains the key.
+/// reject, empty pool, connect, and similar.
 pub(crate) struct UdpSetupFailureContext<'a> {
     pub(crate) namespace: &'a str,
     pub(crate) proxy_id: &'a str,
-    pub(crate) proxy_name: Option<&'a str>,
     pub(crate) client_ip: &'a str,
-    pub(crate) backend_target: &'a str,
-    pub(crate) protocol: &'a str,
     pub(crate) listen_port: u16,
     pub(crate) connected_wall_at: chrono::DateTime<chrono::Utc>,
     pub(crate) duration_ms: f64,
     pub(crate) error: &'a anyhow::Error,
-}
-
-pub(crate) async fn emit_udp_setup_failure(
-    plugins: &[Arc<dyn Plugin>],
-    context: UdpSetupFailureContext<'_>,
-) {
-    let class = dtls_error_class(context.error);
-    let disconnect_cause = Some(dtls_disconnect_cause(context.error, &class));
-    let disconnect_direction = Some(dtls_disconnect_direction(context.error, &class));
-    let summary = StreamTransactionSummary {
-        namespace: context.namespace.to_string(),
-        proxy_id: context.proxy_id.to_string(),
-        proxy_lifecycle_generation: None,
-        plugin_trigger_decisions: Default::default(),
-        proxy_name: context.proxy_name.map(str::to_string),
-        client_ip: context.client_ip.to_string(),
-        consumer_username: None,
-        auth_method: None,
-        backend_target: context.backend_target.to_string(),
-        backend_resolved_ip: None,
-        protocol: context.protocol.to_string(),
-        listen_port: context.listen_port,
-        duration_ms: context.duration_ms,
-        bytes_sent: 0,
-        bytes_received: 0,
-        connection_error: Some(context.error.to_string()),
-        error_class: Some(class),
-        disconnect_direction,
-        disconnect_cause,
-        timestamp_connected: context.connected_wall_at.to_rfc3339(),
-        timestamp_disconnected: chrono::Utc::now().to_rfc3339(),
-        sni_hostname: None,
-        metadata: Default::default(),
-    };
-    crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
-    for plugin in plugins {
-        plugin.on_stream_disconnect(&summary).await;
-    }
 }
 
 struct DtlsDisconnectContext<'a> {
@@ -3746,7 +3918,6 @@ fn spawn_new_session_datagram(
 ) {
     let client_addr = identity.socket_peer;
     let client_ip = udp_session_client_ip(identity.resolved());
-    let session_key_for_emit = session_key.clone();
     let setup_started = Instant::now();
     let connected_wall_at = chrono::Utc::now();
     tokio::spawn(async move {
@@ -3759,6 +3930,10 @@ fn spawn_new_session_datagram(
             session_key: session_key.clone(),
             armed: true,
         };
+        // Publication/attribution state is carried by the setup operation
+        // itself. See `UdpSetupProgress`: probing the session map after the
+        // fact races a concurrently removed session and double-emits.
+        let mut progress = UdpSetupProgress::default();
         let result = process_new_session_datagram(
             data,
             identity,
@@ -3790,10 +3965,12 @@ fn spawn_new_session_datagram(
             max_sessions,
             session_key,
             gate,
+            &mut progress,
         )
         .await;
         if let Err(e) = result {
-            if is_client_or_policy_udp_setup_drop(&e) {
+            let client_or_policy_drop = is_client_or_policy_udp_setup_drop(&e);
+            if client_or_policy_drop {
                 debug!(
                     proxy_id = %proxy_id,
                     client = %udp_client_log_addr(client_addr),
@@ -3810,40 +3987,29 @@ fn spawn_new_session_datagram(
                     "UDP session setup or initial forward failed"
                 );
             }
-            // A published session owns its own disconnect summary. Setup
-            // failures that never reached `sessions.insert` must still emit
-            // so DNS / empty-pool / plugin-reject reach logging plugins.
-            if !sessions.contains_key(&session_key_for_emit) {
-                let epoch = request_epoch.load();
-                let plugins = epoch.plugin_cache.plugins_for_protocol(
-                    &proxy_namespace,
-                    &proxy_id,
-                    ProxyProtocol::Udp,
-                );
-                let proxy = epoch.proxy_by_namespaced_id(&proxy_namespace, &proxy_id);
-                let protocol = proxy
-                    .map(|p| p.effective_scheme().to_scheme_str())
-                    .unwrap_or("udp");
-                let backend_target = proxy
-                    .map(|p| format!("{}:{}", p.backend_host, p.backend_port))
-                    .unwrap_or_default();
-                let proxy_name = proxy.and_then(|p| p.name.as_deref());
-                emit_udp_setup_failure(
-                    plugins.as_slice(),
-                    UdpSetupFailureContext {
-                        namespace: &proxy_namespace,
-                        proxy_id: &proxy_id,
-                        proxy_name,
-                        client_ip: client_ip.as_ref(),
-                        backend_target: &backend_target,
-                        protocol,
-                        listen_port,
-                        connected_wall_at,
-                        duration_ms: setup_started.elapsed().as_millis() as f64,
-                        error: &e,
-                    },
-                )
-                .await;
+            // A published session owns its own disconnect summary; setup owns
+            // only failures observed before `sessions.insert`. The decision
+            // comes from the operation's own recorded state, so a session that
+            // was published and then concurrently removed cannot produce a
+            // second, duplicate summary here.
+            //
+            // Per-datagram client/policy noise that never reached stream
+            // admission — an unmatched passthrough SNI, a stray DTLS
+            // continuation fragment — is the one thing that stays debug-only:
+            // no proxy, plugin slice, or generation was admitted, so there is
+            // nothing to attribute, and the volume is attacker-controlled. A
+            // plugin reject DID reach admission and still emits.
+            if progress.has_admitted_attribution() || !client_or_policy_drop {
+                let failure = UdpSetupFailureContext {
+                    namespace: &proxy_namespace,
+                    proxy_id: &proxy_id,
+                    client_ip: client_ip.as_ref(),
+                    listen_port,
+                    connected_wall_at,
+                    duration_ms: setup_started.elapsed().as_secs_f64() * 1000.0,
+                    error: &e,
+                };
+                progress.emit_setup_failure_if_owner(failure).await;
             }
         }
     });
@@ -3899,6 +4065,9 @@ async fn process_new_session_datagram(
     max_sessions: usize,
     session_key: UdpSessionKey,
     mut gate: PendingSessionGate,
+    // Publication + admitted-epoch attribution for this attempt, written as
+    // setup progresses so the caller never has to re-derive either.
+    progress: &mut UdpSetupProgress,
 ) -> Result<(), anyhow::Error> {
     let client_addr = identity.socket_peer;
     if sessions.contains_key(&session_key) {
@@ -3961,6 +4130,7 @@ async fn process_new_session_datagram(
             session_key.destination,
         )?;
         preselected_backend_target = Some((backend_host.clone(), backend_port));
+        progress.record_backend_selection(&backend_host, backend_port);
         let protocol_label = if matches!(view.proxy.effective_scheme(), BackendScheme::Dtls) {
             PROTOCOL_UDP_DTLS
         } else {
@@ -4003,6 +4173,7 @@ async fn process_new_session_datagram(
         listen_port,
         node_waypoint_udp_source,
         local_addr.map(|local| local.ifindex),
+        progress,
     )
     .await?;
 
@@ -4145,6 +4316,7 @@ async fn process_new_session_datagram(
         auth_deadline,
         &auth_latch,
         &first_datagram_metadata,
+        progress,
     )
     .await?;
     reservation.disarm();
@@ -6500,7 +6672,7 @@ async fn handle_dtls_client_inner(
                     cb.record_failure(502, true, cb_is_half_open_probe);
                 }
             }
-            return Err(StreamSetupError::dns_lookup(&backend_host, e).into());
+            return Err(stream_dns_setup_error(&backend_host, e));
         }
     };
     let dtls_params = (proxy.effective_scheme() == BackendScheme::Dtls)
@@ -7111,6 +7283,7 @@ async fn admit_plain_udp_stream(
         &crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceScoping,
     >,
     ingress_ifindex: Option<u32>,
+    progress: &mut UdpSetupProgress,
 ) -> Result<
     (
         StreamConnectionContext,
@@ -7193,12 +7366,29 @@ async fn admit_plain_udp_stream(
             }
         }
     }
+    let mut rejected_by_plugin = false;
     for plugin in view.plugins.iter() {
         if let PluginResult::Reject { .. } = plugin.on_stream_connect(&mut stream_ctx).await {
-            return Err(
-                StreamSetupError::new(StreamSetupKind::RejectedByPlugin, "(UDP session)").into(),
-            );
+            rejected_by_plugin = true;
+            break;
         }
+    }
+    // Single snapshot point for the whole admission chain, taken before any of
+    // its verdicts branch. A rejected, revalidation-failed, and admitted
+    // attempt therefore all carry the SAME epoch: this generation's plugin
+    // slice, this proxy's lifecycle generation, and the trigger decisions the
+    // chain just memoized. Nothing downstream re-reads `request_epoch`.
+    progress.record_stream_admission(
+        Arc::clone(&view.plugins),
+        view.proxy.name.as_deref(),
+        view.proxy.effective_scheme(),
+        format!("{}:{}", view.proxy.backend_host, view.proxy.backend_port),
+        &stream_ctx,
+    );
+    if rejected_by_plugin {
+        return Err(
+            StreamSetupError::new(StreamSetupKind::RejectedByPlugin, "(UDP session)").into(),
+        );
     }
     if let Some(source) = node_waypoint_session_source.as_ref()
         && let Err(refusal) = source.revalidate(ingress_ifindex, client_addr.ip())
@@ -7252,6 +7442,7 @@ async fn create_session(
     auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     auth_latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
     setup_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    progress: &mut UdpSetupProgress,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     let UdpSessionEpochView {
         proxy,
@@ -7282,6 +7473,10 @@ async fn create_session(
         &lb_hash_key,
         session_key.destination,
     )?;
+    // The target this session actually dials, recorded before any failure can
+    // occur against it, so a setup-failure summary names the selected backend
+    // rather than the proxy's configured default.
+    progress.record_backend_selection(&backend_host, backend_port);
 
     // Circuit breaker check — reject before creating backend socket if open.
     // When admitted, capture whether this is a half-open probe so downstream
@@ -7371,7 +7566,7 @@ async fn create_session(
                     cb.record_failure(502, true, cb_is_half_open_probe);
                 }
             }
-            return Err(StreamSetupError::dns_lookup(&backend_host, e).into());
+            return Err(stream_dns_setup_error(&backend_host, e));
         }
     };
     let candidates = match session_key.destination {
@@ -7450,6 +7645,7 @@ async fn create_session(
         }
     };
     let resolved_ip = backend_addr.ip();
+    progress.record_backend_resolved_ip(resolved_ip);
     let (backend_socket, dtls_conn) = match connected {
         ConnectedUdpBackend::Plain(socket) => (Some(Arc::new(socket)), None),
         ConnectedUdpBackend::Dtls(connection) => (None, Some(Arc::new(connection))),
@@ -7614,6 +7810,10 @@ async fn create_session(
     }
 
     sessions.insert(session_key.clone(), session.clone());
+    // Publication boundary. From here the session owns every summary for this
+    // flow, including the error the spawned setup task may still observe, so
+    // setup must never emit again even if the session is removed first.
+    progress.mark_published();
     // Note: active_sessions is reserved by the receive loop before the
     // background setup task calls create_session, avoiding TOCTOU races.
     metrics.total_sessions.fetch_add(1, Ordering::Relaxed);

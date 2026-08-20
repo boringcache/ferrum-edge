@@ -306,13 +306,44 @@ impl StreamSetupError {
     /// Setup-phase DNS failure. Display is the legacy
     /// `"DNS resolution failed for {host}: {source}"` wording so log
     /// pipelines keyed on that prefix keep matching.
-    pub fn dns_lookup<E>(host: impl fmt::Display, source: E) -> Self
-    where
-        E: std::error::Error + Send + Sync + 'static,
-    {
-        let detail = format!("for {host}: {source}");
-        Self::with_source(StreamSetupKind::DnsLookup, detail, source)
+    ///
+    /// Takes `anyhow::Error` because every stream DNS resolve site
+    /// (`DnsCache::resolve_candidates`, `DnsCache::resolve`) returns one.
+    /// The source is retained as a boxed chain link so
+    /// the classifier's typed source walk can still reach the underlying typed
+    /// cause.
+    ///
+    /// Prefer `stream_dns_setup_error`, which additionally refuses to type
+    /// a gateway-side egress-policy denial as a name-resolution failure.
+    pub fn dns_lookup(host: impl fmt::Display, source: anyhow::Error) -> Self {
+        let kind = StreamSetupKind::DnsLookup;
+        Self {
+            kind,
+            message: format!("{} for {host}: {source}", kind.prefix()),
+            source: Some(source.into()),
+        }
     }
+}
+
+/// Wrap a stream-setup DNS resolve failure in the correct taxonomy.
+///
+/// A resolve refused by the backend egress policy is a **gateway-side dispatch
+/// decision**, not a name-resolution outcome: no query was answered and no
+/// backend was consulted. It already classifies as
+/// [`crate::retry::ErrorClass::DispatchPolicyRejected`] — non-retryable and
+/// neutral to backend health — via the `"egress policy"` anchor in the
+/// substring fallback. Typing it as [`StreamSetupKind::DnsLookup`] would take
+/// precedence over that anchor in the typed walk and silently reclassify it as
+/// `dns_lookup_error`, changing both its retryability and its backend-health
+/// attribution.
+///
+/// So the denial keeps its untyped wording (byte-identical to the pre-typed
+/// emit) and only genuine resolver failures become typed DNS setup errors.
+pub(crate) fn stream_dns_setup_error(host: &str, source: anyhow::Error) -> anyhow::Error {
+    if crate::dns::is_egress_policy_denial(&source) {
+        return anyhow::anyhow!("DNS resolution failed for {host}: {source}");
+    }
+    StreamSetupError::dns_lookup(host, source).into()
 }
 
 impl fmt::Display for StreamSetupError {
@@ -514,7 +545,9 @@ mod tests {
             "DTLS legacy wording must use ': ' (no preceding space)"
         );
 
-        let inner = std::io::Error::other("DNS resolution returned no addresses for backend.local");
+        let inner = anyhow::Error::from(std::io::Error::other(
+            "DNS resolution returned no addresses for backend.local",
+        ));
         let dns = StreamSetupError::dns_lookup("backend.local", inner);
         let displayed = format!("{dns}");
         assert!(

@@ -42,7 +42,9 @@ use crate::plugins::{
     Direction, Plugin, PluginResult, ProxyProtocol, StreamBytesKind, StreamConnectionContext,
     StreamTransactionSummary,
 };
-use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
+use crate::proxy::stream_error::{
+    StreamSetupError, StreamSetupKind, find_stream_setup_error, stream_dns_setup_error,
+};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 use crate::retry::ErrorClass;
 
@@ -3935,7 +3937,7 @@ async fn handle_tcp_connection_inner(
                         cb.record_failure(502, true, cb_info.is_half_open_probe);
                     }
                 }
-                return Err(StreamSetupError::dns_lookup(&params.backend_host, e).into());
+                return Err(stream_dns_setup_error(&params.backend_host, e));
             }
         };
         // DestinationRule `connectionPool.tcp.maxConnections` enforcement on
@@ -4790,8 +4792,7 @@ async fn handle_tcp_connection_inner(
                 } else {
                     record_cb_failure(circuit_breaker_cache, proxy_id, &current_cb_info);
                 }
-                let setup_err: anyhow::Error =
-                    StreamSetupError::dns_lookup(&current_host, e).into();
+                let setup_err: anyhow::Error = stream_dns_setup_error(&current_host, e);
                 if can_retry
                     && attempt < max_retries
                     && let Some(next) = try_next_enforced_target(

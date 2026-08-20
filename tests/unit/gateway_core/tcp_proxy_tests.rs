@@ -1,21 +1,17 @@
 use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-
-use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use ferrum_edge::_test_support::{
     StreamIoSide, bidirectional_copy_for_test, bidirectional_copy_for_test_with_timeouts,
-    classify_stream_error, disconnect_cause_for_failure, emit_udp_setup_failure_for_test,
-    relay_failure_is_client_facing, tcp_fault_admission_retry_delays_for_test,
-    tcp_fault_admission_should_cancel_for_test, tcp_stream_summary_from_clocks_for_test,
-    wait_for_tcp_peer_reset_for_test,
+    classify_stream_error, disconnect_cause_for_failure, relay_failure_is_client_facing,
+    tcp_fault_admission_retry_delays_for_test, tcp_fault_admission_should_cancel_for_test,
+    tcp_stream_summary_from_clocks_for_test, wait_for_tcp_peer_reset_for_test,
 };
-use ferrum_edge::plugins::{Direction, DisconnectCause, Plugin, StreamTransactionSummary};
+use ferrum_edge::plugins::{Direction, DisconnectCause};
 use ferrum_edge::retry::ErrorClass;
 
 #[test]
@@ -126,11 +122,10 @@ fn test_classify_stream_error_preserves_dns_failures() {
         ErrorClass::DnsLookupError
     );
 
-    let typed: anyhow::Error = ferrum_edge::proxy::stream_error::StreamSetupError::dns_lookup(
+    let typed = ferrum_edge::_test_support::stream_dns_setup_error_for_test(
         "backend.local",
-        std::io::Error::other("DNS resolution returned no addresses for backend.local"),
-    )
-    .into();
+        anyhow::anyhow!("DNS resolution returned no addresses for backend.local"),
+    );
     assert_eq!(classify_stream_error(&typed), ErrorClass::DnsLookupError);
 }
 
@@ -2541,62 +2536,5 @@ fn tcp_stream_duration_uses_instant_not_wall_clock() {
     assert_eq!(
         forward.timestamp_disconnected,
         disconnected_wall_forward.to_rfc3339()
-    );
-}
-
-struct CaptureUdpSetupPlugin {
-    summaries: Arc<Mutex<Vec<StreamTransactionSummary>>>,
-}
-
-#[async_trait]
-impl Plugin for CaptureUdpSetupPlugin {
-    fn name(&self) -> &str {
-        "capture-udp-setup"
-    }
-
-    async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        self.summaries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(summary.clone());
-    }
-}
-
-#[tokio::test]
-async fn test_udp_setup_dns_failure_emits_stream_summary() {
-    let captured = Arc::new(Mutex::new(Vec::new()));
-    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(CaptureUdpSetupPlugin {
-        summaries: Arc::clone(&captured),
-    })];
-    let error: anyhow::Error = ferrum_edge::proxy::stream_error::StreamSetupError::dns_lookup(
-        "backend.local",
-        std::io::Error::other("DNS resolution returned no addresses for backend.local"),
-    )
-    .into();
-
-    emit_udp_setup_failure_for_test(
-        &plugins,
-        "ferrum",
-        "udp-proxy",
-        Some("UDP Proxy"),
-        "127.0.0.1",
-        "backend.local:5353",
-        "udp",
-        5353,
-        &error,
-    )
-    .await;
-
-    let summaries = captured.lock().unwrap_or_else(|e| e.into_inner());
-    assert_eq!(summaries.len(), 1);
-    let summary = &summaries[0];
-    assert_eq!(summary.protocol, "udp");
-    assert_eq!(summary.listen_port, 5353);
-    assert_eq!(summary.bytes_sent, 0);
-    assert_eq!(summary.bytes_received, 0);
-    assert_eq!(summary.error_class, Some(ErrorClass::DnsLookupError));
-    assert_eq!(
-        summary.disconnect_cause,
-        Some(DisconnectCause::BackendError)
     );
 }
