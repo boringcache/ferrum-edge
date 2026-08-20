@@ -12,6 +12,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_proxy};
@@ -2819,6 +2820,88 @@ async fn both_digest_headers_fail_closed_as_ambiguous() {
         plugin.authenticate(&mut ctx, &consumer_index).await,
         401,
         "Ambiguous Digest and Content-Digest headers",
+    );
+}
+
+#[tokio::test]
+async fn repeated_valid_content_digest_field_lines_are_folded_and_verified() {
+    let plugin = v2_plugin_named("v2-repeated-valid-content-digest");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let body = br#"{"ping":1}"#;
+    let sha256 = sha256_content_digest_header(body);
+    let sha512 = sha512_content_digest_header(body);
+    let folded_digest = format!("{sha256}, {sha512}");
+    let date = current_date();
+    let nonce = test_nonce(3948);
+    let signature = sign_v2_with_digest(
+        TEST_SECRET,
+        "POST",
+        "/api/orders",
+        &date,
+        &folded_digest,
+        &nonce,
+    );
+    let authorization = v2_auth_header(TEST_USERNAME, &nonce, &signature);
+
+    let mut raw_headers = http::HeaderMap::new();
+    raw_headers.append(
+        "content-digest",
+        http::HeaderValue::from_str(&sha256).unwrap(),
+    );
+    raw_headers.append(
+        "content-digest",
+        http::HeaderValue::from_str(&sha512).unwrap(),
+    );
+    raw_headers.insert(
+        "authorization",
+        http::HeaderValue::from_str(&authorization).unwrap(),
+    );
+    raw_headers.insert("date", http::HeaderValue::from_str(&date).unwrap());
+
+    let mut ctx = make_ctx("POST", "/api/orders");
+    ctx.headers.clear();
+    ctx.set_raw_headers(raw_headers);
+    ctx.materialize_headers();
+    set_request_body(&mut ctx, body);
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+}
+
+#[tokio::test]
+async fn non_utf8_duplicate_digest_field_line_fails_closed() {
+    let plugin = v2_plugin_named("v2-non-utf8-content-digest");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let body = br#"{"ping":1}"#;
+    let digest = sha256_content_digest_header(body);
+    let date = current_date();
+    let nonce = test_nonce(3949);
+    let signature =
+        sign_v2_with_digest(TEST_SECRET, "POST", "/api/orders", &date, &digest, &nonce);
+    let authorization = v2_auth_header(TEST_USERNAME, &nonce, &signature);
+
+    let mut raw_headers = http::HeaderMap::new();
+    raw_headers.append(
+        "content-digest",
+        http::HeaderValue::from_str(&digest).unwrap(),
+    );
+    raw_headers.append(
+        "content-digest",
+        http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+    );
+    raw_headers.insert(
+        "authorization",
+        http::HeaderValue::from_str(&authorization).unwrap(),
+    );
+    raw_headers.insert("date", http::HeaderValue::from_str(&date).unwrap());
+
+    let mut ctx = make_ctx("POST", "/api/orders");
+    ctx.headers.clear();
+    ctx.set_raw_headers(raw_headers);
+    ctx.materialize_headers();
+    set_request_body(&mut ctx, body);
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "Malformed digest header",
     );
 }
 

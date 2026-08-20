@@ -367,24 +367,52 @@ fn parse_body_digest_header(
     Ok(parsed)
 }
 
+fn digest_field_line_state(ctx: &RequestContext, name: &str) -> (bool, bool) {
+    let mut present = false;
+    let mut all_utf8 = true;
+    for value in ctx.header_field_lines(name) {
+        present = true;
+        all_utf8 &= std::str::from_utf8(value).is_ok();
+    }
+    (present, all_utf8)
+}
+
 fn select_digest_header(ctx: &RequestContext) -> Result<(&str, DigestSyntax), &'static str> {
-    match (ctx.headers.get("content-digest"), ctx.headers.get("digest")) {
-        (Some(_), Some(_)) => Err(AMBIGUOUS_DIGEST_BODY),
-        (Some(value), None) => {
+    // The materialized map comma-folds repeated valid field lines, which is
+    // exactly the list representation both supported digest syntaxes parse.
+    // It intentionally omits non-UTF-8 lines, however. Inspect the pristine
+    // HeaderMap as well so a valid signed line plus an unparseable duplicate
+    // cannot authenticate as though the competing wire line never existed.
+    let (content_present, content_all_utf8) = digest_field_line_state(ctx, "content-digest");
+    let (legacy_present, legacy_all_utf8) = digest_field_line_state(ctx, "digest");
+    match (content_present, legacy_present) {
+        (true, true) => Err(AMBIGUOUS_DIGEST_BODY),
+        (true, false) => {
+            if !content_all_utf8 {
+                return Err(MALFORMED_DIGEST_BODY);
+            }
+            let value = ctx
+                .headers
+                .get("content-digest")
+                .ok_or(MALFORMED_DIGEST_BODY)?;
             if value.trim().is_empty() {
                 Err(MALFORMED_DIGEST_BODY)
             } else {
                 Ok((value.as_str(), DigestSyntax::Rfc9530))
             }
         }
-        (None, Some(value)) => {
+        (false, true) => {
+            if !legacy_all_utf8 {
+                return Err(MALFORMED_DIGEST_BODY);
+            }
+            let value = ctx.headers.get("digest").ok_or(MALFORMED_DIGEST_BODY)?;
             if value.trim().is_empty() {
                 Err(MALFORMED_DIGEST_BODY)
             } else {
                 Ok((value.as_str(), DigestSyntax::Rfc3230))
             }
         }
-        (None, None) => Err(MISSING_DIGEST_BODY),
+        (false, false) => Err(MISSING_DIGEST_BODY),
     }
 }
 
