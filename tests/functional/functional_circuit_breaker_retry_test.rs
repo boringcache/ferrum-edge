@@ -216,6 +216,13 @@ async fn test_circuit_breaker_opens_and_recovers() {
         "Circuit breaker should return 503 when open"
     );
     assert_eq!(
+        resp.headers()
+            .get("x-gateway-error")
+            .and_then(|v| v.to_str().ok()),
+        Some("circuit_breaker_open"),
+        "open-breaker 503 must be distinguishable from a backend 5xx"
+    );
+    assert_eq!(
         count_before, count_after,
         "No request should reach backend when circuit is open"
     );

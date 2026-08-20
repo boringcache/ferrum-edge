@@ -76,8 +76,8 @@ pub use network::{
     TruncatedStream,
 };
 pub use ports::{
-    PortReservation, UdpPortReservation, reserve_colocated_tcp_udp, reserve_port,
-    reserve_port_pair, reserve_udp_port, unbound_port, unbound_udp_port,
+    PortReservation, RefusedTcpPort, UdpPortReservation, reserve_colocated_tcp_udp, reserve_port,
+    reserve_port_pair, reserve_refused_tcp_port, reserve_udp_port, unbound_port, unbound_udp_port,
 };
 
 // Small helpers that several acceptance tests reuse.
