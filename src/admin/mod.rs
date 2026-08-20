@@ -2262,7 +2262,7 @@ pub async fn handle_admin_request(
     );
     let result = audit::scope_request(
         Arc::clone(&slot),
-        handle_admin_request_inner(req, state, client_ip),
+        boxed_handle_admin_request_inner(req, state, client_ip),
     )
     .await;
     // The mutation returned, so the outcome is knowable. A prepared intent that
@@ -2275,6 +2275,27 @@ pub async fn handle_admin_request(
         .unwrap_or(500);
     audit::finalize_unconsumed_intent(&slot, status).await;
     result
+}
+
+type BoxedAdminResponseFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Response<Full<Bytes>>, hyper::Error>> + Send>,
+>;
+
+/// Construct the large route-dispatch future behind a non-inlined heap
+/// boundary.
+///
+/// The coverage profile instruments the unoptimized dispatcher, whose match
+/// includes every admin handler future. Keeping that aggregate future inline
+/// in [`handle_admin_request`] can exhaust the same two-MiB worker stack used
+/// by production Tokio runtimes as the route surface grows. The factory must
+/// return before the future is polled so the caller retains only a pointer.
+#[inline(never)]
+fn boxed_handle_admin_request_inner(
+    req: Request<Incoming>,
+    state: AdminState,
+    client_ip: std::net::IpAddr,
+) -> BoxedAdminResponseFuture {
+    Box::pin(handle_admin_request_inner(req, state, client_ip))
 }
 
 async fn handle_admin_request_inner(
