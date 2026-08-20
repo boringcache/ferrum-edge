@@ -3882,3 +3882,102 @@ async fn h2_direct_sse_stall_after_first_event_classifies_read_write_timeout() {
         "direct-H2 SSE stall must classify as read_write_timeout; logs:\n{logs}"
     );
 }
+
+// #4074 (finding H1): direct-H2 with request-size limits DISABLED and no
+// authenticated principal takes the arm that installs NO upload-completion
+// gate, so `proxy_to_backend_http2` returns the instant response headers
+// arrive. Arming cancel-on-drop on that arm cancelled the still-live upload
+// when the dispatcher's join handle dropped, which errored the transport body
+// and reset a healthy full-duplex exchange. The backend here answers early,
+// keeps the response open, THEN drains the rest of the upload — so the
+// response can only complete if the upload survived the dispatcher's return.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn direct_h2_early_response_survives_an_unlimited_unauthenticated_upload() {
+    let ca = TestCa::new("h2-early-response-upload").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls backend")
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        // One DATA frame proves the upload started; the rest is still in
+        // flight when the response head goes out.
+        .step(H2Step::ReadRequestData)
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "text/plain".into()),
+        ]))
+        .step(H2Step::RespondData {
+            data: Bytes::from_static(b"early"),
+            end_stream: false,
+        })
+        // Only reachable if the gateway is still writing the client upload
+        // after `proxy_to_backend_http2` returned.
+        .step(H2Step::DrainRequestBody)
+        .step(H2Step::RespondData {
+            data: Bytes::from_static(b"tail"),
+            end_stream: true,
+        })
+        .spawn()
+        .expect("spawn backend");
+
+    // 30s: the shipped `backend_write_timeout_ms` default, so this proves the
+    // default configuration, not a special one.
+    let yaml = http_timeout_access_log_yaml(
+        backend_port,
+        30_000,
+        30_000,
+        json!({
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_tls_verify_server_cert": false,
+            "pool_enable_http2": true,
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .env("RUST_LOG", "info")
+        // Unlimited request bodies: this is what disables the upload-completion
+        // gate and selects the arm under test. No consumer/auth is configured,
+        // so no authorization lifetime is armed either.
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "0")
+        .pool_warmup_enabled(true)
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let _ = wait_for_h2_tls_supported(&harness, Duration::from_secs(15))
+        .await
+        .expect("backend must be classified h2_tls=supported for the direct-H2 arm");
+
+    let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
+    // Larger than the backend's default 65,535-byte stream window, so the
+    // upload is provably unfinished when the response head arrives.
+    let upload = vec![b'x'; 2 * 1024 * 1024];
+    let resp = client
+        .as_reqwest()
+        .post(format!("{}/api/early", harness.proxy_base_url()))
+        .header("content-type", "application/octet-stream")
+        .body(upload)
+        .send()
+        .await
+        .expect("gateway returns a response");
+    let status = resp.status();
+    let body = resp.text().await.expect("response body");
+
+    assert_eq!(status, StatusCode::OK, "unexpected status; body={body}");
+    assert_eq!(
+        body,
+        "earlytail",
+        "the early response must complete: a truncated body means the \
+         dispatcher cancelled the still-live upload on return"
+    );
+    assert_eq!(
+        backend.received_stream_count(),
+        1,
+        "the exchange must complete on a single backend stream, not a retry"
+    );
+}

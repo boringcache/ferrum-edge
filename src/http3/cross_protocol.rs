@@ -138,6 +138,11 @@ use crate::proxy::headers::{
     reconcile_streaming_backend_trailers, sanitize_backend_request_trailers,
     sanitize_client_response_headers_for_wire, strip_response_hop_by_hop_trailers,
 };
+use crate::proxy::{
+    BufferedUploadReplay, absolute_response_header_read_bound,
+    install_buffered_upload_write_watermark, optional_sleep_elapsed,
+    send_buffered_upload_with_protocol_nack_replay,
+};
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
 
@@ -371,6 +376,22 @@ pub(crate) enum H3BackendOrPeer<T> {
 /// deadline arm wins an exact-deadline tie. No deadline keeps the no-timer
 /// hot path. Callers attribute ownership from the composition they already
 /// captured.
+/// Did this H3-to-plain buffered dispatch outcome carry an HTTP/2 protocol
+/// NACK (issue #4074)?
+///
+/// Only a reqwest transport error can be one: a peer-gone, an
+/// authorization/client deadline, and a committed response all mean the
+/// exchange is over, and the operator's header bound firing says nothing about
+/// whether the backend processed the request.
+fn plain_send_is_protocol_nack(
+    outcome: &Result<H3BackendOrPeer<reqwest::Result<reqwest::Response>>, ()>,
+) -> bool {
+    match outcome {
+        Ok(H3BackendOrPeer::Ready(Err(e))) => crate::retry::reqwest_error_is_protocol_nack(e),
+        _ => false,
+    }
+}
+
 pub(crate) async fn await_h3_backend_or_peer<F, T>(
     deadline: Option<tokio::time::Instant>,
     peer: Option<&crate::plugins::PeerConnectionSignal>,
@@ -2812,32 +2833,112 @@ where
                     // backend that never sends a response head until the client
                     // gave up, silently dropping the header-only-stall 504 that
                     // #3922 established. `0` still disables it.
-                    let header_bound = crate::proxy::bounded_response_header_wait(
-                        await_h3_backend_or_peer(
-                            plain_write_bound.deadline(),
-                            ctx.peer_connection.as_ref(),
-                            crate::http3::stream_util::peer_response_cancelled(stream),
-                            build_plain_request_builder(
-                                &client,
-                                state,
-                                dispatch_proxy,
-                                req_method.clone(),
-                                proxy_headers,
-                                dial_url,
-                                effective_host,
-                                client_ip,
-                                xff_append_ip,
-                                ctx.request_is_secure,
-                                ctx.is_early_data,
+                    //
+                    // This arm is ALSO where `backend_write_timeout_ms` reaches
+                    // a prebuffered H3 upload (issue #4074). It used to hand
+                    // reqwest a reusable `Vec<u8>` and bound only the response
+                    // header wait, so a buffering-forcing route (retry policy or
+                    // a request-body plugin) pointed at a backend that accepts
+                    // and never reads reproduced #4055 on the H3 path alone.
+                    // The buffer now rides the same gateway-owned pump the
+                    // H1/H2 buffered dispatches use, and its typed terminal is
+                    // raced against this wait — reqwest's connection task is
+                    // parked on socket writability exactly then and would never
+                    // poll the body to observe it.
+                    //
+                    // Pumping makes the carrier streaming, which disables
+                    // reqwest's own HTTP/2 protocol-NACK replay, so the same
+                    // replay Ferrum reproduces for the H1/H2 buffered arms is
+                    // applied here too. Precedence is unchanged: the raced
+                    // future is polled FIRST, so an authorization/client
+                    // deadline, a peer-gone, and a completed exchange all still
+                    // win over the watermark.
+                    let plain_request_builder = build_plain_request_builder(
+                        &client,
+                        state,
+                        dispatch_proxy,
+                        req_method.clone(),
+                        proxy_headers,
+                        dial_url,
+                        effective_host,
+                        client_ip,
+                        xff_append_ip,
+                        ctx.request_is_secure,
+                        ctx.is_early_data,
+                    );
+                    let plain_upload_bytes = Bytes::from(buffered_body.clone());
+                    let (plain_upload_body, mut plain_upload_pump) =
+                        install_buffered_upload_write_watermark(
+                            plain_upload_bytes.clone(),
+                            dispatch_proxy.backend_write_timeout_ms,
+                        );
+                    let plain_buffered_replay = if plain_upload_pump.is_some() {
+                        BufferedUploadReplay::capture(
+                            &plain_request_builder,
+                            &plain_upload_bytes,
+                            dispatch_proxy.backend_write_timeout_ms,
+                        )
+                    } else {
+                        None
+                    };
+                    // ONE absolute header instant, so a protocol-NACK replay
+                    // cannot re-arm the operator's response-header bound.
+                    let plain_header_deadline_at =
+                        absolute_response_header_read_bound(dispatch_proxy.backend_read_timeout_ms);
+                    let plain_upload_deadline = plain_write_bound.deadline();
+                    let plain_peer_signal = ctx.peer_connection.as_ref();
+                    let header_bound = send_buffered_upload_with_protocol_nack_replay(
+                        plain_request_builder.body(plain_upload_body),
+                        plain_buffered_replay,
+                        &mut plain_upload_pump,
+                        |builder| {
+                            crate::plugins::await_deadline_first(
+                                plain_header_deadline_at,
+                                await_h3_backend_or_peer(
+                                    plain_upload_deadline,
+                                    plain_peer_signal,
+                                    crate::http3::stream_util::peer_response_cancelled(stream),
+                                    builder.send(),
+                                ),
                             )
-                            .body(buffered_body.clone())
-                            .send(),
-                        ),
-                        dispatch_proxy.backend_read_timeout_ms,
+                        },
+                        plain_send_is_protocol_nack,
                     )
                     .await;
                     let send_result = match header_bound {
                         Err(()) => {
+                            drop(pending_slot);
+                            if let Some(pump) = plain_upload_pump.as_mut() {
+                                pump.cancel();
+                            }
+                            crate::http3::stream_util::halt_request_body(stream);
+                            warn!(
+                                proxy_id = %proxy.id,
+                                watermark = "backend_write_timeout_ms",
+                                watermark_ms = dispatch_proxy.backend_write_timeout_ms,
+                                "cross-protocol H3 to HTTP: backend stopped reading the prebuffered request body before response headers"
+                            );
+                            return write_plain_backend_timeout_terminal(
+                                stream,
+                                ctx,
+                                &mut backend_admission_permits,
+                                PlainBackendTimeoutTerminalCtx {
+                                    state,
+                                    proxy,
+                                    epoch,
+                                    upstream_balancer,
+                                    current_target: current_target.as_deref(),
+                                    cb_target_key: current_cb_target_key.as_deref(),
+                                    cb_is_half_open_probe: cb_retry_probe_slot_available,
+                                    backend_start,
+                                    backend_admission_elapsed: backend_admission_start.elapsed(),
+                                    bytes_sent,
+                                    current_url: &current_url,
+                                },
+                            )
+                            .await;
+                        }
+                        Ok(Err(())) => {
                             drop(pending_slot);
                             crate::http3::stream_util::halt_request_body(stream);
                             warn!(
@@ -2866,8 +2967,8 @@ where
                             )
                             .await;
                         }
-                        Ok(H3BackendOrPeer::Ready(result)) => result,
-                        Ok(H3BackendOrPeer::Deadline) => {
+                        Ok(Ok(H3BackendOrPeer::Ready(result))) => result,
+                        Ok(Ok(H3BackendOrPeer::Deadline)) => {
                             drop(pending_slot);
                             if let Some(termination) = plain_write_bound.expired_authorization() {
                                 ctx.record_authorization_termination_once(
@@ -2927,7 +3028,7 @@ where
                             )
                             .await;
                         }
-                        Ok(H3BackendOrPeer::PeerGone) => {
+                        Ok(Ok(H3BackendOrPeer::PeerGone)) => {
                             drop(pending_slot);
                             crate::http3::stream_util::halt_request_body(stream);
                             return Ok(plain_peer_gone_before_response_headers(
@@ -3488,17 +3589,35 @@ where
                 let reader_finished = Arc::new(AtomicBool::new(false));
                 let reader_done_notify = Arc::new(tokio::sync::Notify::new());
                 let write_timed_out = Arc::new(AtomicBool::new(false));
+                // `backend_write_timeout_ms` must not charge reqwest's DNS /
+                // TCP / TLS connection acquisition (issue #4074). reqwest polls
+                // this stream only once it owns a connection and has written
+                // the request head, so the first poll is the first proof that
+                // the transport is consuming the upload — before it, a full
+                // bridge channel means "not connected yet", not "backend
+                // stopped reading". `backend_connect_timeout_ms` bounds that
+                // window.
+                let transport_consuming = Arc::new(AtomicBool::new(false));
                 let body_stream_reader_finished = Arc::clone(&reader_finished);
                 let body_stream_reader_done_notify = Arc::clone(&reader_done_notify);
                 let body_stream_write_timed_out = Arc::clone(&write_timed_out);
+                let body_stream_transport_consuming = Arc::clone(&transport_consuming);
                 let body_stream = futures_util::stream::unfold(
                     (
                         rx,
                         body_stream_reader_finished,
                         body_stream_reader_done_notify,
                         body_stream_write_timed_out,
+                        body_stream_transport_consuming,
                     ),
-                    |(mut rx, reader_finished, reader_done_notify, write_timed_out)| async move {
+                    |(
+                        mut rx,
+                        reader_finished,
+                        reader_done_notify,
+                        write_timed_out,
+                        transport_consuming,
+                    )| async move {
+                        transport_consuming.store(true, Ordering::Release);
                         loop {
                             if write_timed_out.load(Ordering::Acquire) {
                                 return Some((
@@ -3506,7 +3625,13 @@ where
                                         std::io::ErrorKind::TimedOut,
                                         "backend request body write timeout",
                                     )),
-                                    (rx, reader_finished, reader_done_notify, write_timed_out),
+                                    (
+                                        rx,
+                                        reader_finished,
+                                        reader_done_notify,
+                                        write_timed_out,
+                                        transport_consuming,
+                                    ),
                                 ));
                             }
                             if reader_finished.load(Ordering::Acquire) && rx.is_empty() {
@@ -3522,6 +3647,7 @@ where
                                                 reader_finished,
                                                 reader_done_notify,
                                                 write_timed_out,
+                                                transport_consuming,
                                             ),
                                         )
                                     });
@@ -3563,6 +3689,7 @@ where
                 let reader_finished_for_reader = Arc::clone(&reader_finished);
                 let reader_done_notify_for_reader = Arc::clone(&reader_done_notify);
                 let reader_write_timed_out = Arc::clone(&write_timed_out);
+                let reader_transport_consuming = Arc::clone(&transport_consuming);
                 let reader_write_timeout_ms = dispatch_proxy.backend_write_timeout_ms;
                 // Capture STOP_SENDING before the reader borrows the stream.
                 // The future is `'static` and does not hold `&mut` on either
@@ -3575,9 +3702,15 @@ where
                         reader_finished_for_reader.store(true, Ordering::Release);
                         reader_done_notify_for_reader.notify_waiters();
                     };
-                    let write_timeout_active = reader_write_timeout_ms > 0;
-                    let write_deadline =
-                        tokio::time::sleep(Duration::from_millis(reader_write_timeout_ms.max(1)));
+                    // Configured vs ARMED: the bound exists as soon as the
+                    // operator sets it, but it only starts once reqwest has
+                    // begun consuming this body (issue #4074). Constructed only
+                    // when configured, so the disabled path allocates no timer
+                    // state and reads no clock.
+                    let write_timeout_configured = reader_write_timeout_ms > 0;
+                    let write_deadline = write_timeout_configured.then(|| {
+                        tokio::time::sleep(Duration::from_millis(reader_write_timeout_ms))
+                    });
                     tokio::pin!(write_deadline);
                     let mut total: usize = 0;
                     loop {
@@ -3614,8 +3747,13 @@ where
                                         // pattern used by the native H3 backend pool
                                         // in `src/http3/client.rs`.
                                         let body_bytes = chunk.copy_to_bytes(len);
-                                        if write_timeout_active {
-                                            write_deadline.as_mut().reset(
+                                        let write_timeout_active = write_timeout_configured
+                                            && reader_transport_consuming.load(Ordering::Acquire);
+                                        if write_timeout_active
+                                            && let Some(deadline) =
+                                                write_deadline.as_mut().as_pin_mut()
+                                        {
+                                            deadline.reset(
                                                 tokio::time::Instant::now()
                                                     + Duration::from_millis(
                                                         reader_write_timeout_ms,
@@ -3629,7 +3767,9 @@ where
                                                 finish_reader();
                                                 return;
                                             }
-                                            _ = &mut write_deadline, if write_timeout_active => {
+                                            _ = optional_sleep_elapsed(
+                                                write_deadline.as_mut(),
+                                            ), if write_timeout_active => {
                                                 reader_write_timed_out
                                                     .store(true, Ordering::Release);
                                                 crate::http3::stream_util::halt_request_body(
@@ -3726,8 +3866,11 @@ where
                     tokio::pin!(stream_cancelled);
                     let header_wait_ms = dispatch_proxy.backend_read_timeout_ms;
                     let header_wait_active = header_wait_ms > 0;
-                    let header_wait =
-                        tokio::time::sleep(Duration::from_millis(header_wait_ms.max(1)));
+                    // Built only when the bound is live; `header_wait_active`
+                    // already proves it is nonzero, so no `.max(1)` floor and
+                    // no timer at all on the `0` opt-out (issue #4074).
+                    let header_wait = header_wait_active
+                        .then(|| tokio::time::sleep(Duration::from_millis(header_wait_ms)));
                     tokio::pin!(header_wait);
                     let peer_closed = async {
                         if let Some(signal) = peer_signal.as_ref() {
@@ -3750,7 +3893,7 @@ where
                                 drop(pending_slot.take());
                                 break None;
                             }
-                            _ = &mut header_wait, if header_wait_active => {
+                            _ = optional_sleep_elapsed(header_wait.as_mut()), if header_wait_active => {
                                 header_wait_expired = true;
                                 drop(pending_slot.take());
                                 halt_reader_after_loop = true;
@@ -8466,9 +8609,14 @@ where
     let mut bytes_streamed: u64 = 0;
     let mut client_disconnected = false;
     let mut body_error_class: Option<ErrorClass> = None;
+    // Built ONLY when the bound is live (issue #4074): `0` is the documented
+    // opt-out long-lived SSE routes rely on, so an unconditional `Sleep` cost
+    // every such relay timer state and a clock read for a timer it can never
+    // poll. The enabled path is unchanged. `.max(1)` is gone — the active flag
+    // already proves the value is nonzero.
     let read_timeout_active = read_timeout_ms > 0;
-    let read_deadline =
-        tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms.max(1)));
+    let read_deadline = read_timeout_active
+        .then(|| tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms)));
     tokio::pin!(read_deadline);
     let mut just_received_backend_frame = false;
 
@@ -8513,8 +8661,11 @@ where
     }
 
     'outer: loop {
-        if read_timeout_active && just_received_backend_frame && coalesce_buf.is_empty() {
-            read_deadline.as_mut().reset(
+        if just_received_backend_frame
+            && coalesce_buf.is_empty()
+            && let Some(deadline) = read_deadline.as_mut().as_pin_mut()
+        {
+            deadline.reset(
                 tokio::time::Instant::now() + std::time::Duration::from_millis(read_timeout_ms),
             );
             just_received_backend_frame = false;
@@ -8615,7 +8766,7 @@ where
                 auth_termination = Some(termination);
                 break 'outer;
             }
-            _ = &mut read_deadline, if read_timeout_active && !stream_done && coalesce_buf.is_empty() => {
+            _ = optional_sleep_elapsed(read_deadline.as_mut()), if read_timeout_active && !stream_done && coalesce_buf.is_empty() => {
                 warn!(
                     "Backend read timeout ({read_timeout_ms}ms) during cross-protocol \
                      H3 streaming response body; aborting"
@@ -8728,9 +8879,14 @@ where
         }));
     tokio::pin!(auth_deadline_sleep);
     let mut auth_termination: Option<crate::proxy::auth_lifetime::StreamAuthTermination> = None;
+    // Built ONLY when the bound is live (issue #4074): `0` is the documented
+    // opt-out long-lived SSE routes rely on, so an unconditional `Sleep` cost
+    // every such relay timer state and a clock read for a timer it can never
+    // poll. The enabled path is unchanged. `.max(1)` is gone — the active flag
+    // already proves the value is nonzero.
     let read_timeout_active = read_timeout_ms > 0;
-    let read_deadline =
-        tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms.max(1)));
+    let read_deadline = read_timeout_active
+        .then(|| tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms)));
     tokio::pin!(read_deadline);
 
     // The ONE downstream-write seam for this relay (issue #3815) — the same
@@ -8775,8 +8931,8 @@ where
     'relay: loop {
         // Re-arm the idle watermark at the start of each wait so inspector
         // time is not charged against `backend_read_timeout_ms`.
-        if read_timeout_active {
-            read_deadline.as_mut().reset(
+        if let Some(deadline) = read_deadline.as_mut().as_pin_mut() {
+            deadline.reset(
                 tokio::time::Instant::now() + std::time::Duration::from_millis(read_timeout_ms),
             );
         }
@@ -8807,7 +8963,7 @@ where
                 auth_termination = Some(termination);
                 break 'relay;
             }
-            _ = &mut read_deadline, if read_timeout_active => {
+            _ = optional_sleep_elapsed(read_deadline.as_mut()), if read_timeout_active => {
                 warn!(
                     "Backend read timeout ({read_timeout_ms}ms) during inspected \
                      cross-protocol H3 streaming response body; aborting"
@@ -9049,10 +9205,14 @@ where
     let mut client_deadline_expired = false;
     let mut grpc_response_scanner =
         crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner::default();
+    // Built ONLY when the bound is live (issue #4074): `0` is the documented
+    // opt-out long-lived SSE routes rely on, so an unconditional `Sleep` cost
+    // every such relay timer state and a clock read for a timer it can never
+    // poll. The enabled path is unchanged. `.max(1)` is gone — the active flag
+    // already proves the value is nonzero.
     let read_timeout_active = response_read_timeout_ms > 0 && grpc_deadline_at.is_none();
-    let read_deadline = tokio::time::sleep(std::time::Duration::from_millis(
-        response_read_timeout_ms.max(1),
-    ));
+    let read_deadline = read_timeout_active
+        .then(|| tokio::time::sleep(std::time::Duration::from_millis(response_read_timeout_ms)));
     tokio::pin!(read_deadline);
     let mut just_received_backend_frame = false;
     let grpc_deadline_active = grpc_deadline_at.is_some();
@@ -9169,8 +9329,11 @@ where
     }
 
     'outer: loop {
-        if read_timeout_active && just_received_backend_frame && coalesce_buf.is_empty() {
-            read_deadline.as_mut().reset(
+        if just_received_backend_frame
+            && coalesce_buf.is_empty()
+            && let Some(deadline) = read_deadline.as_mut().as_pin_mut()
+        {
+            deadline.reset(
                 tokio::time::Instant::now()
                     + std::time::Duration::from_millis(response_read_timeout_ms),
             );
@@ -9356,7 +9519,7 @@ where
                     .as_mut()
                     .reset(tokio::time::Instant::now() + coalesce.flush_interval);
             }
-            _ = &mut read_deadline, if read_timeout_active && !stream_done && coalesce_buf.is_empty() => {
+            _ = optional_sleep_elapsed(read_deadline.as_mut()), if read_timeout_active && !stream_done && coalesce_buf.is_empty() => {
                 warn!(
                     "Backend read timeout ({}ms) during cross-protocol H3 gRPC response body; aborting",
                     response_read_timeout_ms

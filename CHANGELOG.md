@@ -171,6 +171,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   classify `read_write_timeout` in the access log. Slow-but-progressing
   streams keep the watermark fresh. `0` still disables the bound.
 
+  The write watermark arms when the backend transport begins consuming the
+  request body rather than when the upload is prepared, so DNS/TCP/TLS
+  connection acquisition stays bounded by `backend_connect_timeout_ms` and a
+  slow dial keeps its retryable pre-wire classification. Because a live write
+  bound hands the HTTP client a streaming carrier for buffered uploads — which
+  disables that client's built-in replay of HTTP/2 protocol NACKs (remote
+  `GOAWAY NO_ERROR` / `RST_STREAM REFUSED_STREAM`) — Ferrum now reproduces that
+  replay itself, with the same budget, for buffered H1/H2 and H3-to-HTTP
+  uploads. The H3-to-plain prebuffered arm, which previously bounded only the
+  response-header wait, is covered by the same watermark.
+
 - WAF `mode: enforce` admission now counts `on_body_too_large: block` as a
   reachable enforcement path (issue #4006). That setting already rejected
   oversize governed HTTP bodies and WebSocket application messages whenever

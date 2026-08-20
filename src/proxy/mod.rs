@@ -39272,13 +39272,27 @@ pub(crate) async fn proxy_to_backend_retry(
     // reads would run on to `backend_read_timeout_ms`. `0` keeps the reusable
     // `Bytes` path.
     let mut upload_pump: Option<upload_pump::UploadPumpJoin> = None;
+    // Pumping the replayed buffer makes reqwest's carrier streaming, which
+    // disables its own HTTP/2 protocol-NACK replay. Capture the bodiless
+    // builder plus the buffer so Ferrum can reproduce that replay itself
+    // (issue #4074); nothing is captured when no pump is installed, because
+    // reqwest still owns a reusable `Bytes` on that path.
+    let mut buffered_replay: Option<BufferedUploadReplay> = None;
     if let Some(body) = request_body
         && !body.is_empty()
     {
+        let body_bytes = Bytes::copy_from_slice(body);
         let (upload_body, pump) = install_buffered_upload_write_watermark(
-            Bytes::copy_from_slice(body),
+            body_bytes.clone(),
             proxy.backend_write_timeout_ms,
         );
+        if pump.is_some() {
+            buffered_replay = BufferedUploadReplay::capture(
+                &req_builder,
+                &body_bytes,
+                proxy.backend_write_timeout_ms,
+            );
+        }
         upload_pump = pump;
         req_builder = req_builder.body(upload_body);
     }
@@ -39379,14 +39393,26 @@ pub(crate) async fn proxy_to_backend_retry(
         request_ctx.grpc_deadline_at(),
         send_auth_deadline.as_ref(),
     );
-    let send_future = crate::plugins::await_deadline_first(send_bound.at, req_builder.send());
     // Both per-direction watermarks bound this wait, exactly as they do on the
     // initial attempt: the operator's response-header read bound, and the
     // buffered upload's backend write bound. Both end the attempt as 504 /
-    // `ReadWriteTimeout`.
-    let bounded = await_upload_write_watermark_first(
-        bounded_response_header_wait(send_future, proxy.backend_read_timeout_ms),
-        upload_pump.as_mut(),
+    // `ReadWriteTimeout`. The response-header bound is turned into ONE absolute
+    // instant up front so an HTTP/2 protocol-NACK replay cannot re-arm it
+    // (issue #4074) — reqwest's own internal replay ran inside a single timer,
+    // and Ferrum's stand-in must not be more generous.
+    let header_deadline_at = absolute_response_header_read_bound(proxy.backend_read_timeout_ms);
+    let send_bound_at = send_bound.at;
+    let bounded = send_buffered_upload_with_protocol_nack_replay(
+        req_builder,
+        buffered_replay.take(),
+        &mut upload_pump,
+        |builder| {
+            crate::plugins::await_deadline_first(
+                header_deadline_at,
+                crate::plugins::await_deadline_first(send_bound_at, builder.send()),
+            )
+        },
+        reqwest_send_is_protocol_nack,
     )
     .await;
     let header_wait = match bounded {
@@ -42537,6 +42563,11 @@ async fn proxy_to_backend(
     // streams, and the transport body owns the upload from that point — so
     // `cancel_on_drop` stays disarmed.
     let mut upload_pump: Option<upload_pump::UploadPumpJoin> = None;
+    // Replay source for a PUMPED buffered upload (issue #4074). Pumping makes
+    // reqwest's carrier streaming, which disables its own HTTP/2 protocol-NACK
+    // replay; this is what lets Ferrum reproduce it. Streaming uploads leave it
+    // `None` — an unreplayable body must never be retried.
+    let mut buffered_replay: Option<BufferedUploadReplay> = None;
 
     if has_body {
         // Enforce request body size limit via Content-Length fast path.
@@ -42642,9 +42673,16 @@ async fn proxy_to_backend(
                     // (#4055). With `backend_write_timeout_ms == 0` this hands
                     // reqwest the reusable `Bytes` back unchanged.
                     let (upload_body, pump) = install_buffered_upload_write_watermark(
-                        body_bytes,
+                        body_bytes.clone(),
                         proxy.backend_write_timeout_ms,
                     );
+                    if pump.is_some() {
+                        buffered_replay = BufferedUploadReplay::capture(
+                            &req_builder,
+                            &body_bytes,
+                            proxy.backend_write_timeout_ms,
+                        );
+                    }
                     upload_pump = pump;
                     req_builder = req_builder.body(upload_body);
                 }
@@ -42918,11 +42956,19 @@ async fn proxy_to_backend(
                     }
                     // Collected-then-buffered is still an upload the gateway has
                     // to write; same watermark, same `0` opt-out, as the
-                    // pre-buffered arm above (#4055).
+                    // pre-buffered arm above (#4055). Same protocol-NACK replay
+                    // capture as that arm (#4074).
                     let (upload_body, pump) = install_buffered_upload_write_watermark(
-                        body_bytes,
+                        body_bytes.clone(),
                         proxy.backend_write_timeout_ms,
                     );
+                    if pump.is_some() {
+                        buffered_replay = BufferedUploadReplay::capture(
+                            &req_builder,
+                            &body_bytes,
+                            proxy.backend_write_timeout_ms,
+                        );
+                    }
                     upload_pump = pump;
                     req_builder = req_builder.body(upload_body);
                 }
@@ -43100,16 +43146,27 @@ async fn proxy_to_backend(
         request_ctx.grpc_deadline_at(),
         send_auth_deadline.as_ref(),
     );
-    let send_future = crate::plugins::await_deadline_first(send_bound.at, req_builder.send());
     // Two per-direction watermarks bound this wait, and both end the request as
     // 504 / `ReadWriteTimeout`: the operator's response-header read bound, and
     // the upload pump's backend write bound. The write arm is what makes a
     // backend that accepts and never reads fail at `backend_write_timeout_ms`
-    // instead of running on to `backend_read_timeout_ms` (#4055).
+    // instead of running on to `backend_read_timeout_ms` (#4055). The header
+    // bound is one ABSOLUTE instant so an HTTP/2 protocol-NACK replay of a
+    // buffered upload cannot re-arm it (#4074).
     let mut write_watermark_expired = false;
-    let bounded = await_upload_write_watermark_first(
-        bounded_response_header_wait(send_future, proxy.backend_read_timeout_ms),
-        upload_pump.as_mut(),
+    let header_deadline_at = absolute_response_header_read_bound(proxy.backend_read_timeout_ms);
+    let send_bound_at = send_bound.at;
+    let bounded = send_buffered_upload_with_protocol_nack_replay(
+        req_builder,
+        buffered_replay.take(),
+        &mut upload_pump,
+        |builder| {
+            crate::plugins::await_deadline_first(
+                header_deadline_at,
+                crate::plugins::await_deadline_first(send_bound_at, builder.send()),
+            )
+        },
+        reqwest_send_is_protocol_nack,
     )
     .await;
     let header_wait = match bounded {
@@ -45547,29 +45604,51 @@ pub(crate) fn request_upload_auth_deadline(
     ))
 }
 
-/// The response-header wait, bounded by the operator's `backend_read_timeout_ms`.
+/// The operator's `backend_read_timeout_ms` response-header bound as ONE
+/// absolute instant.
 ///
-/// `0` leaves it unbounded, preserving the documented "0 = no timeout"
-/// contract. `Err(())` is the operator read timeout, which every caller maps to
-/// 504 / `ReadWriteTimeout`.
+/// `None` when the operator disabled it (`0`), preserving the documented
+/// "0 = no timeout" contract. Every caller feeds this to
+/// [`crate::plugins::await_deadline_first`], whose `Err(())` is the operator
+/// read timeout and maps to 504 / `ReadWriteTimeout`.
+///
+/// Absolute rather than a fresh `timeout()` per attempt (issue #4074): a
+/// buffered upload may be replayed after an HTTP/2 protocol NACK, and reqwest's
+/// own internal replay ran inside ONE header clock. Re-arming the bound per
+/// attempt would let a replaying request outlive the operator's configured
+/// header wait by a multiple of it.
 ///
 /// This is deliberately NOT reqwest's `RequestBuilder::timeout()`: that clock
 /// runs from `send()` through response-body completion and is transferred onto
 /// the response body, so it kills a slow-but-progressing SSE stream (#4057).
 /// The per-direction watermark on the body is installed separately.
-pub(crate) async fn bounded_response_header_wait<F>(
-    fut: F,
+pub(crate) fn absolute_response_header_read_bound(
     read_timeout_ms: u64,
-) -> Result<F::Output, ()>
-where
-    F: std::future::Future,
-{
-    if read_timeout_ms == 0 {
-        return Ok(fut.await);
+) -> Option<tokio::time::Instant> {
+    (read_timeout_ms > 0)
+        .then(|| tokio::time::Instant::now().checked_add(Duration::from_millis(read_timeout_ms)))
+        .flatten()
+}
+
+/// Await a per-direction idle deadline that may not exist (issue #4074).
+///
+/// Relay loops on the proxy hot path arm `backend_read_timeout_ms` /
+/// `backend_write_timeout_ms` as a stack-pinned `Sleep` they `reset()` on every
+/// progress step. Constructing that `Sleep` unconditionally means a relay whose
+/// bound is DISABLED (`0`, the documented opt-out — long-lived SSE routes use
+/// it) still builds timer state and reads the clock for a timer it will never
+/// poll. Holding the sleep as `Pin<&mut Option<Sleep>>` keeps the enabled path
+/// byte-for-byte what it was — same stack slot, same `reset()` — while the
+/// disabled path allocates and registers nothing.
+///
+/// `None` is a future that never resolves, expressed as a type rather than as a
+/// proxy-path panic. Cancel-safe: `Sleep` is, and re-creating this wrapper each
+/// `select!` iteration re-borrows the same pinned sleep.
+pub(crate) async fn optional_sleep_elapsed(sleep: std::pin::Pin<&mut Option<tokio::time::Sleep>>) {
+    match sleep.as_pin_mut() {
+        Some(sleep) => sleep.await,
+        None => match std::future::pending::<std::convert::Infallible>().await {},
     }
-    tokio::time::timeout(Duration::from_millis(read_timeout_ms), fut)
-        .await
-        .map_err(|_| ())
 }
 
 /// Race a dispatch-phase wait against the gateway-owned upload pump's backend
@@ -45689,6 +45768,13 @@ pub(crate) fn install_counting_upload_authorization(
 /// reusable-`Bytes` path exactly: no task, no channel, no timer, and reqwest
 /// retains the body it can replay internally.
 ///
+/// When a pump IS installed reqwest sees a streaming carrier, so its own
+/// `ProtocolNacks` replay (`try_clone()`) is unavailable. Ferrum re-establishes
+/// that exact behaviour at its own layer — see
+/// [`send_buffered_upload_with_protocol_nack_replay`] — so a dispatch site must
+/// pair this installer with a [`BufferedUploadReplay`] capture rather than
+/// calling `send()` directly (issue #4074).
+///
 /// No authorization plan is armed here. A buffered upload was already collected
 /// under `collect_request_body_under_authorization`, and the response-header
 /// wait still composes the admitted stream's deadline through
@@ -45700,6 +45786,130 @@ pub(crate) fn install_buffered_upload_write_watermark(
     match upload_pump::spawn_buffered_upload_pump(body_bytes, write_timeout_ms) {
         Ok((body, join)) => (body.into_reqwest_body(), Some(join)),
         Err(body_bytes) => (reqwest::Body::from(body_bytes), None),
+    }
+}
+
+/// Did this reqwest dispatch outcome carry an HTTP/2 protocol NACK (issue
+/// #4074)?
+///
+/// The shape is the reqwest dispatch sites' composed outcome: the operator's
+/// absolute response-header bound outside, the composed authorization/client
+/// deadline inside, and reqwest's own result innermost. Anything that is not a
+/// transport error — a response, either bound firing — is not a NACK.
+fn reqwest_send_is_protocol_nack(
+    outcome: &Result<Result<reqwest::Result<reqwest::Response>, ()>, ()>,
+) -> bool {
+    match outcome {
+        Ok(Ok(Err(e))) => retry::reqwest_error_is_protocol_nack(e),
+        _ => false,
+    }
+}
+
+/// How many times a buffered upload may be replayed after an HTTP/2 protocol
+/// NACK (issue #4074).
+///
+/// Matches reqwest's own default policy (`max_retries_per_request: 2`, on top of
+/// the original attempt) so installing the write watermark neither weakens nor
+/// amplifies the retry behaviour a buffered upload had before.
+pub(crate) const BUFFERED_UPLOAD_PROTOCOL_NACK_REPLAYS: u8 = 2;
+
+/// Everything needed to rebuild one buffered reqwest attempt (issue #4074).
+///
+/// Captured BEFORE the body is attached, so `builder` is bodiless and
+/// `RequestBuilder::try_clone()` succeeds; `body` is the same refcounted
+/// `Bytes` the first attempt was built from, so a replay costs a refcount bump
+/// rather than a copy.
+pub(crate) struct BufferedUploadReplay {
+    builder: reqwest::RequestBuilder,
+    body: Bytes,
+    write_timeout_ms: u64,
+}
+
+impl BufferedUploadReplay {
+    /// Capture a replay source for a buffered upload that IS pumped.
+    ///
+    /// `None` when the builder cannot be cloned (it carries an unclonable
+    /// body or is already in an error state) — the caller then simply gets the
+    /// single-attempt behaviour.
+    ///
+    /// Deliberately NOT captured when no pump was installed: on that path
+    /// reqwest still holds a reusable `Bytes` and applies its OWN protocol-NACK
+    /// retry, so capturing here would double the replay budget.
+    pub(crate) fn capture(
+        builder: &reqwest::RequestBuilder,
+        body: &Bytes,
+        write_timeout_ms: u64,
+    ) -> Option<Self> {
+        Some(Self {
+            builder: builder.try_clone()?,
+            body: body.clone(),
+            write_timeout_ms,
+        })
+    }
+}
+
+/// Send a buffered reqwest upload, replaying it on an HTTP/2 protocol NACK
+/// (issue #4074), with every attempt raced against its own upload pump's
+/// backend write watermark.
+///
+/// `attempt` builds ONE dispatch future from a request builder — the caller's
+/// composed authorization/client deadline and response-header read bound live
+/// inside it, so this helper does not reinterpret either. `should_replay`
+/// inspects whatever shape that future resolved to and answers the ONE question
+/// this loop asks: did the backend prove it did not process the request? Call
+/// sites reach [`retry::reqwest_error_is_protocol_nack`] through it; anything
+/// else — a success, a deadline, a peer-gone, any other transport failure —
+/// ends the loop immediately.
+///
+/// `Err(())` means the backend write watermark fired, exactly as
+/// [`await_upload_write_watermark_first`] reports it, so call sites keep their
+/// existing match shape.
+///
+/// Why this exists: `install_buffered_upload_write_watermark` hands reqwest a
+/// STREAMING carrier, which makes `reqwest::Body::try_clone()` return `None` and
+/// silently disables reqwest's default `ProtocolNacks` replay for every buffered
+/// HTTP-family upload whenever `backend_write_timeout_ms` is live (the shipped
+/// default is `30000`). Ferrum still owns the collected buffer, so the replay is
+/// re-established here instead of being documented away. Each replay installs a
+/// FRESH pump (the previous one is cancelled and joined first), so the watermark
+/// stays per attempt rather than accumulating across them.
+pub(crate) async fn send_buffered_upload_with_protocol_nack_replay<F, Fut, A>(
+    mut builder: reqwest::RequestBuilder,
+    replay: Option<BufferedUploadReplay>,
+    pump: &mut Option<upload_pump::UploadPumpJoin>,
+    mut attempt: F,
+    should_replay: impl Fn(&A) -> bool,
+) -> Result<A, ()>
+where
+    F: FnMut(reqwest::RequestBuilder) -> Fut,
+    Fut: std::future::Future<Output = A>,
+{
+    let mut replays_left = BUFFERED_UPLOAD_PROTOCOL_NACK_REPLAYS;
+    loop {
+        let outcome = await_upload_write_watermark_first(attempt(builder), pump.as_mut()).await?;
+        let Some(source) = replay.as_ref() else {
+            return Ok(outcome);
+        };
+        if replays_left == 0 {
+            return Ok(outcome);
+        }
+        if !should_replay(&outcome) {
+            return Ok(outcome);
+        }
+        let Some(next) = source.builder.try_clone() else {
+            return Ok(outcome);
+        };
+        replays_left -= 1;
+        // Stop the attempt that just NACKed before starting another: its pump
+        // may still own the bridge task, and two live pumps for one request
+        // would race two watermarks onto the same join point.
+        if let Some(previous) = pump.take() {
+            previous.cancel_and_join().await;
+        }
+        let (body, next_pump) =
+            install_buffered_upload_write_watermark(source.body.clone(), source.write_timeout_ms);
+        *pump = next_pump;
+        builder = next.body(body);
     }
 }
 
@@ -49970,13 +50180,21 @@ async fn proxy_to_backend_http2(
         // `upload_auth_deadline.is_some()`). A live write timeout still
         // installs the pump so an unauthenticated upload cannot hang when
         // the backend never reads.
+        //
+        // `cancel_on_drop` is deliberately NOT armed on this arm (issue
+        // #4074). Without the completion gate there is no later join point:
+        // this dispatcher returns as soon as response headers arrive, and on a
+        // full-duplex HTTP/2 exchange the upload is still in flight. Arming
+        // cancel-on-drop would cancel that live upload the moment this handler
+        // returned, error the transport body, and truncate — or `RST_STREAM` —
+        // an otherwise healthy response. The upload legitimately outlives the
+        // dispatcher here: hyper's detached pipe owns the transport body, and
+        // `UploadPumpSource`'s abort guard is what ends the task when that body
+        // is released. The gated arm above keeps cancel-on-drop precisely
+        // because it DOES join the pump before returning.
         let (body, upload_pump) =
             install_streaming_upload_authorization(body, None, proxy.backend_write_timeout_ms);
-        (
-            body,
-            None,
-            upload_pump.map(crate::proxy::upload_pump::UploadPumpJoin::cancel_on_drop),
-        )
+        (body, None, upload_pump)
     };
 
     // Set the URI

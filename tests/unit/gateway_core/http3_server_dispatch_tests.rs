@@ -4604,3 +4604,73 @@ async fn a_slow_but_progressing_buffered_h3_upload_is_not_falsely_timed_out() {
         "backend_write_timeout_ms == 0 must remain the unbounded operator opt-out"
     );
 }
+
+/// #4074 (finding M3): the H3 -> plain-HTTP PREBUFFERED arm used to hand
+/// reqwest a reusable `Vec<u8>` and bound only the response-header wait, so a
+/// buffering-forcing route (a request-body plugin, a mesh-tagged target, or an
+/// early authenticate-body phase) pointed at a backend that accepts and never
+/// reads reproduced #4055 on the H3 path alone.
+///
+/// It must now install the SAME gateway-owned buffered upload pump the H1/H2
+/// buffered dispatches use, race that pump's typed terminal against the header
+/// wait, and — because pumping makes reqwest's carrier streaming and so
+/// disables reqwest's own `ProtocolNacks` replay — carry the buffered
+/// protocol-NACK replay too.
+#[test]
+fn the_h3_prebuffered_plain_arm_writes_under_the_backend_write_watermark() {
+    let cross = include_str!("../../../src/http3/cross_protocol.rs");
+    let dispatch = cross
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("cross-protocol plain dispatcher")
+        .split("async fn dispatch_grpc<S>(")
+        .next()
+        .expect("bounded cross-protocol plain dispatcher");
+
+    let install = dispatch
+        .find("install_buffered_upload_write_watermark(")
+        .expect("the prebuffered arm must install the shared buffered upload pump");
+    let replay = dispatch
+        .find("send_buffered_upload_with_protocol_nack_replay(")
+        .expect("the prebuffered arm must dispatch through the shared replay loop");
+    assert!(
+        install < replay,
+        "the pump must exist before the attempt that races it"
+    );
+    assert!(
+        !dispatch.contains(".body(buffered_body.clone())"),
+        "the prebuffered arm must not hand reqwest an unwatermarked buffer"
+    );
+    assert!(
+        dispatch.contains("BufferedUploadReplay::capture("),
+        "pumping disables reqwest's own protocol-NACK replay, so Ferrum must \
+         retain the buffer and reproduce it"
+    );
+
+    // Precedence: the raced future is polled FIRST, so an authorization /
+    // client deadline, a peer-gone, and a completed exchange all still win over
+    // the write watermark. The watermark terminal is the LAST arm added, and it
+    // is the typed 504 backend-timeout terminal, never a generic 502.
+    let arm = dispatch
+        .split("watermark = \"backend_write_timeout_ms\",")
+        .nth(1)
+        .expect("the prebuffered arm must attribute its own watermark")
+        .split("Ok(Err(())) => {")
+        .next()
+        .expect("bounded prebuffered write-watermark terminal");
+    assert!(
+        arm.contains("write_plain_backend_timeout_terminal("),
+        "a prebuffered write stall must use the shared 504 backend-timeout terminal"
+    );
+    assert!(
+        arm.contains("halt_request_body(stream)"),
+        "the H3 request half must be halted rather than left dangling"
+    );
+
+    // ONE absolute response-header instant, so a replay cannot re-arm the
+    // operator's bound once per attempt.
+    assert!(
+        dispatch.contains("absolute_response_header_read_bound("),
+        "the prebuffered header bound must be captured as one absolute instant"
+    );
+}

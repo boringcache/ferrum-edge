@@ -1218,6 +1218,22 @@ slow but continuously progressing is not timed out. Streaming
 pass-through uploads are otherwise unaffected by the buffered-upload collection
 deadline above.
 
+The bound starts when the backend transport begins consuming the request body —
+the first moment a connection provably exists and the request head is written —
+not when the gateway prepares the upload. DNS resolution, TCP connect, and the
+TLS handshake are therefore bounded by `backend_connect_timeout_ms` alone, so a
+slow dial stays a pre-wire connect failure (retryable under
+`retry_on_connect_failure`) instead of being reported as a post-wire
+`read_write_timeout`. Native gRPC arms the same bound explicitly after it
+acquires a backend sender. A stall while no transport is consuming the body is
+consequently NOT a write timeout: there is nothing to write to yet.
+
+A live write bound also changes how a *buffered* upload is handed to the HTTP
+client, which would otherwise disable that client's built-in replay of HTTP/2
+protocol NACKs (a remote `GOAWAY NO_ERROR` or `RST_STREAM REFUSED_STREAM` — the
+backend proving it did not process the request). Ferrum reproduces that replay
+itself with the same budget; see [Retry](retry.md#reqwest-protocol-nacks-http2-buffered-uploads).
+
 ### Stream Proxy (TCP/UDP/DTLS)
 
 Stream proxies use `listen_port` instead of `listen_path` and bind to dedicated ports:

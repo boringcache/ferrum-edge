@@ -4387,9 +4387,15 @@ pub(crate) async fn run_response_inspection(
 
     let mut stream = response.bytes_stream();
     let mut total_received: usize = 0;
+    // Built ONLY when the bound is live (issue #4074): `0` is the documented
+    // opt-out that long-lived SSE routes rely on, and an unconditional `Sleep`
+    // made every such relay construct timer state and read the clock for a
+    // timer it can never poll. The enabled path is unchanged — same stack slot,
+    // same `reset()`. `.max(1)` is gone: `read_timeout_active` already proves
+    // the value is nonzero.
     let read_timeout_active = read_timeout_ms > 0;
-    let read_deadline =
-        tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms.max(1)));
+    let read_deadline = read_timeout_active
+        .then(|| tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms)));
     tokio::pin!(read_deadline);
     loop {
         // Watch for client disconnect WHILE awaiting the next backend chunk: an
@@ -4401,15 +4407,15 @@ pub(crate) async fn run_response_inspection(
         //
         // Re-arm the idle watermark at the start of each wait so inspection
         // time is not charged against `backend_read_timeout_ms`.
-        if read_timeout_active {
-            read_deadline.as_mut().reset(
+        if let Some(deadline) = read_deadline.as_mut().as_pin_mut() {
+            deadline.reset(
                 tokio::time::Instant::now() + std::time::Duration::from_millis(read_timeout_ms),
             );
         }
         let chunk = tokio::select! {
             biased;
             _ = tx.closed() => return,
-            _ = &mut read_deadline, if read_timeout_active => {
+            _ = super::optional_sleep_elapsed(read_deadline.as_mut()), if read_timeout_active => {
                 let _ = tx
                     .send(Err(Box::new(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,

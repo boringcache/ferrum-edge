@@ -4113,17 +4113,23 @@ impl Http3Client {
         // Send request
         let mut stream = send_request.send_request(req).await?;
 
-        // Send the body in bounded slices, each under its own write watermark
+        // Send the body in bounded slices, each under its own write watermark.
+        //
+        // The typed `H3PoolError` is preserved verbatim rather than flattened
+        // into a formatted string (issue #4074): it implements `Error` with a
+        // `source()` that walks straight through to the underlying cause, so a
+        // caller can still downcast and read `is_read_timeout()` /
+        // `request_on_wire()` instead of substring-matching a message.
         send_h3_buffered_request_body(&mut stream, body, proxy.backend_write_timeout_ms)
             .await
-            .map_err(|e| anyhow::anyhow!("{}", e.as_error()))?;
+            .map_err(anyhow::Error::new)?;
         await_h3_client_write_with_timeout(
             proxy.backend_write_timeout_ms,
             stream.finish(),
             "finish",
         )
         .await
-        .map_err(|e| anyhow::anyhow!("{}", e.as_error()))?;
+        .map_err(anyhow::Error::new)?;
 
         // Receive response
         let response = stream.recv_response().await?;

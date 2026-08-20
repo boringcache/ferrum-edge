@@ -4701,12 +4701,6 @@ pub(crate) async fn proxy_grpc_request_core(
         request_trailers,
         proxy.backend_write_timeout_ms,
     );
-    // A pumped upload is no longer a buffer hyper holds in full, so hyper's
-    // `is_canceled` stops proving the request never reached the wire. Keep the
-    // streaming arm's conservative post-wire classification for it rather than
-    // handing the retry layer a pre-wire "nothing happened" verdict for an
-    // ambiguous carrier.
-    let request_upload_pumped = upload_pump.is_some();
     let mut backend_req = Request::new(grpc_request_body);
     *backend_req.method_mut() = method;
     *backend_req.uri_mut() = uri;
@@ -4738,12 +4732,18 @@ pub(crate) async fn proxy_grpc_request_core(
     let send_fut = sender.send_request(backend_req);
     let map_send_err = |e: GrpcDispatchSendError| {
         map_grpc_dispatch_send_error(e, |e| {
-            // A DIRECT buffered unary/client body is fully held — hyper
-            // `is_canceled` proves the request never hit the wire, so classify
-            // pre-wire and drop the stale pooled sender for the next attempt /
-            // RPC. A PUMPED body is a capacity-1 bridge instead, so the same
-            // signal is ambiguous: still drop the stale sender, but do not
-            // report the attempt as pre-wire.
+            // `hyper::Error::is_canceled()` is a wire-boundary proof, not a
+            // statement about the body carrier: every `Kind::Canceled`
+            // producer in hyper 1.x fires before the request is handed to the
+            // h2 layer, and a request that reached h2 surfaces as
+            // `Kind::Http2` instead. Slicing the SAME fully collected buffer
+            // across a capacity-1 bridge (issue #4055) does not move that
+            // boundary, and the caller still owns the buffered `Bytes` it
+            // cloned into this attempt, so a redial replays the identical
+            // request. Classify pre-wire and drop the stale pooled sender for
+            // the next attempt / RPC. Only genuinely unreplayable
+            // streaming/channel uploads keep `BackendRequest` — see
+            // `proxy_grpc_request_streaming`.
             if e.is_canceled() {
                 transport.invalidate_on_pre_wire_cancel(proxy);
             }
@@ -4758,7 +4758,7 @@ pub(crate) async fn proxy_grpc_request_core(
                     message: format!("Backend timeout: {}", e),
                 }
             } else {
-                let kind = if e.is_canceled() && !request_upload_pumped {
+                let kind = if e.is_canceled() {
                     GrpcBackendUnavailableKind::DispatchCanceled
                 } else {
                     GrpcBackendUnavailableKind::BackendRequest

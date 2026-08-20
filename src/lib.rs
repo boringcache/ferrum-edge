@@ -9162,6 +9162,24 @@ pub mod _test_support {
             }
         }
 
+        /// Observe the watermark WITHOUT the transport ever polling the body.
+        ///
+        /// This is the connect phase: reqwest has not resolved DNS, opened a
+        /// socket, or written the request head, so it has not polled this body
+        /// once. `true` means the watermark correctly stayed dormant for the
+        /// whole window; `false` proves connection acquisition was charged to a
+        /// per-direction write policy (issue #4074).
+        pub async fn write_watermark_stays_dormant(&mut self, observation: Duration) -> bool {
+            let Some(join) = self.join.as_mut() else {
+                return true;
+            };
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(observation) => true,
+                () = join.backend_write_watermark_expired() => false,
+            }
+        }
+
         /// Wait for the pump to finish on its own — no cancellation.
         pub async fn join(&mut self) -> ProbePumpOutcome {
             map_probe_outcome(match self.join.take() {
@@ -9174,6 +9192,57 @@ pub mod _test_support {
         pub fn drop_transport(&mut self) {
             self.body = None;
         }
+    }
+
+    /// Drive [`crate::proxy::send_buffered_upload_with_protocol_nack_replay`]
+    /// against a scripted attempt sequence (issue #4074).
+    ///
+    /// Uses the PRODUCTION replay loop, the production buffered-pump installer,
+    /// and the production `BufferedUploadReplay` capture, so a pass proves the
+    /// shipped contract rather than a re-implementation of it. No socket is
+    /// opened: the attempt closure discards the builder it is handed and
+    /// returns a canned verdict, and `nacking_attempts` is how many leading
+    /// attempts report an HTTP/2 protocol NACK.
+    ///
+    /// Returns the TOTAL number of attempts the loop made.
+    pub async fn buffered_upload_protocol_nack_replay_attempts_for_test(
+        nacking_attempts: usize,
+        write_timeout_ms: u64,
+    ) -> usize {
+        let client = reqwest::Client::new();
+        // Never dialled — the attempt closure below drops the builder.
+        let builder = client.post("http://127.0.0.1:9/upload-replay-probe");
+        let body = bytes::Bytes::from(vec![b'x'; 256 * 1024]);
+        let (upload_body, mut pump) =
+            crate::proxy::install_buffered_upload_write_watermark(body.clone(), write_timeout_ms);
+        let replay = if pump.is_some() {
+            crate::proxy::BufferedUploadReplay::capture(&builder, &body, write_timeout_ms)
+        } else {
+            None
+        };
+        let attempts = std::cell::Cell::new(0usize);
+        let _ = crate::proxy::send_buffered_upload_with_protocol_nack_replay(
+            builder.body(upload_body),
+            replay,
+            &mut pump,
+            |builder| {
+                drop(builder);
+                attempts.set(attempts.get() + 1);
+                std::future::ready(attempts.get())
+            },
+            |attempt: &usize| *attempt <= nacking_attempts,
+        )
+        .await;
+        if let Some(pump) = pump.take() {
+            pump.cancel_and_join().await;
+        }
+        attempts.get()
+    }
+
+    /// The replay budget the buffered-upload dispatch reproduces from reqwest's
+    /// own default policy (issue #4074).
+    pub fn buffered_upload_protocol_nack_replays() -> usize {
+        crate::proxy::BUFFERED_UPLOAD_PROTOCOL_NACK_REPLAYS as usize
     }
 
     /// One transport-side frame observed from a probed REPLAYABLE upload.
@@ -9317,6 +9386,23 @@ pub mod _test_support {
                 }
             }
             frames
+        }
+
+        /// Observe the watermark WITHOUT the transport ever polling the body.
+        ///
+        /// The pooled HBONE / mesh-mTLS / Unix dispatchers build this body
+        /// BEFORE they check out a sender, so this window is connection
+        /// acquisition. `true` means the watermark correctly stayed dormant
+        /// (issue #4074).
+        pub async fn write_watermark_stays_dormant(&mut self, observation: Duration) -> bool {
+            let Some(join) = self.join.as_mut() else {
+                return true;
+            };
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(observation) => true,
+                () = join.backend_write_watermark_expired() => false,
+            }
         }
 
         /// Race the dispatcher's response-header wait against the pump's

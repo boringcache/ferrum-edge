@@ -20,6 +20,7 @@ use ferrum_edge::_test_support::{
     await_authorized_headers_write_for_test, await_deadline_first_for_test,
     await_h3_backend_or_peer_for_test, await_precommit_response_phase_for_test,
     bidirectional_copy_with_authorization_for_test,
+    buffered_upload_protocol_nack_replay_attempts_for_test, buffered_upload_protocol_nack_replays,
     collect_buffered_upload_under_authorization_for_test,
     collect_buffered_upload_under_composed_bound_for_test,
     collect_h3_upload_under_authorization_for_test, compose_aggregate_sse_bound_for_test,
@@ -2822,6 +2823,15 @@ fn the_upload_bridge_is_bounded_rather_than_a_buffer() {
 async fn the_backend_write_watermark_ends_a_buffered_upload_the_transport_stopped_taking() {
     let mut probe = BufferedUploadPumpProbe::start(1024 * 1024, 800).expect("buffered pump");
 
+    // The watermark arms on the transport's FIRST body poll (#4074), which is
+    // the first moment reqwest provably owns a connection and is writing this
+    // request. One poll, then nothing — a socket whose peer stopped reading
+    // once the kernel buffers filled.
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Data(_) | ProbeTransportPoll::Pending
+    ));
+
     // A much longer response-header wait, i.e. the operator's read watermark.
     // The write watermark has to win it, or the request ends on the wrong bound.
     assert!(
@@ -2926,6 +2936,13 @@ async fn the_backend_write_watermark_ends_a_replayable_upload_the_transport_stop
     let mut probe = ReplayableUploadPumpProbe::start(1024 * 1024, &[], 800);
     assert!(probe.pumped(), "a live write watermark must install a pump");
 
+    // One transport poll arms the watermark (#4074) — the pooled sender exists
+    // and the request head is written. Then the transport stops taking frames.
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeReplayFrame::Data(_) | ProbeReplayFrame::Pending
+    ));
+
     // A much longer response-header wait, i.e. the operator's read watermark.
     assert!(
         probe
@@ -3010,7 +3027,7 @@ async fn a_pumped_replayable_upload_preserves_its_terminal_trailers_after_the_da
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_replayable_upload_with_only_trailers_still_arms_the_write_watermark() {
+async fn a_replayable_upload_with_only_trailers_is_still_pumped_and_still_watermarked() {
     let mut probe = ReplayableUploadPumpProbe::start(0, &[("grpc-status", "0")], 800);
     assert!(
         probe.pumped(),
@@ -3025,13 +3042,158 @@ async fn a_replayable_upload_with_only_trailers_still_arms_the_write_watermark()
         Some(0),
         "a trailers-only upload still declares an exact zero-length body"
     );
+    // Connect phase: the dispatcher built this body before checking out a
+    // sender, so nothing has polled it. The watermark must stay dormant rather
+    // than charge connection acquisition to a write policy (#4074).
+    assert!(
+        probe
+            .write_watermark_stays_dormant(Duration::from_secs(5))
+            .await,
+        "an unpolled upload must not fire the backend write watermark"
+    );
+    // Once the transport takes the terminal trailers frame there is nothing
+    // left for the gateway to hand over, so the pump completes rather than
+    // stalling: the watermark bounds work that REMAINS, never a finished one.
+    assert_eq!(
+        probe.poll_transport_once(),
+        ProbeReplayFrame::Trailers(vec![("grpc-status".to_string(), "0".to_string())])
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+// --- The write watermark starts at transport consumption (#4074) -----------
+//
+// The pump is installed before reqwest has resolved DNS, opened a socket, or
+// finished a TLS handshake. Arming `backend_write_timeout_ms` at spawn charged
+// that connect phase to a per-direction WRITE policy: with a write timeout
+// shorter than `backend_connect_timeout_ms`, a slow dial surfaced as a
+// post-wire `ReadWriteTimeout` and suppressed the pre-wire connect retry the
+// failure warranted. `backend_connect_timeout_ms` bounds that window instead.
+
+#[tokio::test(start_paused = true)]
+async fn a_buffered_upload_write_watermark_stays_dormant_until_the_transport_consumes() {
+    let mut probe = BufferedUploadPumpProbe::start(1024 * 1024, 800).expect("buffered pump");
+
+    // Far longer than the 800ms watermark: with spawn-time arming this window
+    // fired a write timeout while no transport existed at all.
+    assert!(
+        probe
+            .write_watermark_stays_dormant(Duration::from_secs(30))
+            .await,
+        "connection acquisition must not be charged to backend_write_timeout_ms"
+    );
+
+    // The transport connects and takes its first frame — from here the
+    // watermark is live and a backend that stops reading still ends the
+    // request at the configured bound.
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Data(_) | ProbeTransportPoll::Pending
+    ));
     assert!(
         probe
             .write_watermark_wins_header_wait(Duration::from_secs(30))
             .await,
-        "the watermark must be enforceable for a trailers-only upload too"
+        "once the transport is consuming, the watermark must still fire"
     );
     assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_replayable_upload_write_watermark_stays_dormant_until_the_transport_consumes() {
+    let mut probe = ReplayableUploadPumpProbe::start(1024 * 1024, &[], 800);
+    assert!(probe.pumped());
+    assert!(
+        probe
+            .write_watermark_stays_dormant(Duration::from_secs(30))
+            .await,
+        "pooled sender acquisition must not be charged to backend_write_timeout_ms"
+    );
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeReplayFrame::Data(_) | ProbeReplayFrame::Pending
+    ));
+    assert!(probe.write_watermark_wins_header_wait(Duration::from_secs(30)).await);
+    assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
+}
+
+// --- Terminal fuse of the transport-side pump body (#4074, finding L1) ------
+
+#[tokio::test(start_paused = true)]
+async fn a_terminated_pump_body_reports_its_error_once_and_never_a_clean_eof() {
+    let mut probe = BufferedUploadPumpProbe::start(1024 * 1024, 800).expect("buffered pump");
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Data(_) | ProbeTransportPoll::Pending
+    ));
+    assert!(probe.write_watermark_wins_header_wait(Duration::from_secs(30)).await);
+    assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
+
+    // Exactly one error...
+    match probe.poll_transport_once() {
+        ProbeTransportPoll::Errored(message) => assert!(
+            message.contains("backend request body write timeout"),
+            "unexpected termination message: {message}"
+        ),
+        other => panic!("expected a transport error, got {other:?}"),
+    }
+    // ...then the body is fused. Repeating the error would spin a consumer
+    // that polls past one; every transport that matters stops at the first.
+    for _ in 0..4 {
+        assert_eq!(
+            probe.poll_transport_once(),
+            ProbeTransportPoll::Ended,
+            "the pump body must fuse after its single terminal error"
+        );
+    }
+    // The fuse is NOT a completed upload: the declared length still accounts
+    // for the bytes that never crossed the bridge, so a truncated request can
+    // never present itself as a whole one.
+    assert!(
+        probe.declared_content_length().is_some_and(|len| len > 0),
+        "a fused, non-clean terminal must keep advertising its residual bytes"
+    );
+}
+
+// --- Buffered-upload protocol-NACK replay (#4074, finding M2) ---------------
+//
+// Handing reqwest the pumped (streaming) carrier makes `Body::try_clone()`
+// return `None`, which silently disables reqwest's default `ProtocolNacks`
+// replay for EVERY buffered HTTP-family upload whenever
+// `backend_write_timeout_ms` is live — and the shipped default is 30000. Ferrum
+// still owns the collected buffer, so the replay is reproduced at its own
+// dispatch layer with the same budget.
+
+#[tokio::test(start_paused = true)]
+async fn a_pumped_buffered_upload_replays_a_protocol_nack_with_reqwests_own_budget() {
+    let budget = buffered_upload_protocol_nack_replays();
+    assert_eq!(budget, 2, "the budget must mirror reqwest's default policy");
+
+    // Every attempt NACKs: original + the whole replay budget, then stop.
+    assert_eq!(
+        buffered_upload_protocol_nack_replay_attempts_for_test(usize::MAX, 800).await,
+        1 + budget,
+        "a pumped buffered upload must replay a protocol NACK, and must stop at the budget"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_buffered_upload_that_is_not_nacked_is_never_replayed() {
+    assert_eq!(
+        buffered_upload_protocol_nack_replay_attempts_for_test(0, 800).await,
+        1,
+        "only a proven not-processed verdict may replay a request"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_disabled_write_timeout_leaves_the_replay_to_reqwest() {
+    assert_eq!(
+        buffered_upload_protocol_nack_replay_attempts_for_test(usize::MAX, 0).await,
+        1,
+        "with no pump reqwest still holds a reusable body and applies its OWN \
+         replay; replaying here too would double the budget"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -3383,9 +3545,19 @@ fn the_buffered_grpc_dispatch_races_every_header_wait_shape_against_the_watermar
         "the watermark must surface the typed backend-timeout family that classifies as \
          ReadWriteTimeout"
     );
+    // The wire boundary is hyper's, not the carrier's: every `Kind::Canceled`
+    // producer in hyper 1.x fires before the request reaches the h2 layer, and
+    // the caller still owns the buffered `Bytes` it cloned into this attempt.
+    // Slicing that same buffer across the pump's capacity-1 bridge must
+    // therefore not fork the classification (issue #4074). Behavioural proof
+    // lives in `tests/functional/scripted_backend_h2_tests.rs`
+    // (`pooled_h2_goaway_canceled_send_retries_buffered_unary`), which runs
+    // with `backend_write_timeout_ms: 5000` — i.e. WITH the pump installed —
+    // and requires the GOAWAY'd attempt to redial and complete.
     assert!(
-        core.contains("e.is_canceled() && !request_upload_pumped"),
-        "a pumped request carrier is ambiguous and must not be reported as a pre-wire cancel"
+        !core.contains("request_upload_pumped"),
+        "the buffered gRPC dispatch must not classify hyper's wire boundary by \
+         request-body carrier shape"
     );
 }
 
@@ -3588,9 +3760,29 @@ fn the_direct_h2_handler_joins_its_upload_before_returning() {
         "the normal-completion path must capture the join outcome instead of \
          discarding it"
     );
+    // Cancel-on-drop is armed on EXACTLY the arm that also joins the pump
+    // before returning — the one with the upload-completion gate (issue #4074).
+    // The ungated arm (request limits disabled AND unauthenticated) has no
+    // later join point: it returns the moment response headers arrive, so on a
+    // full-duplex HTTP/2 exchange the upload is still in flight and arming
+    // cancel-on-drop there errored the transport body and truncated (or
+    // `RST_STREAM`ed) a healthy response. There the upload legitimately
+    // outlives the dispatcher, bounded by `UploadPumpSource`'s abort guard.
+    assert_eq!(
+        direct_h2.matches("UploadPumpJoin::cancel_on_drop").count(),
+        1,
+        "cancel-on-drop belongs only to the direct-H2 arm that joins its pump"
+    );
+    let gate_arm = direct_h2
+        .split("if needs_upload_completion_gate {")
+        .nth(1)
+        .expect("direct-H2 upload-gate arm")
+        .split("\n    } else {")
+        .next()
+        .expect("bounded direct-H2 upload-gate arm");
     assert!(
-        PROXY_SOURCE.contains("UploadPumpJoin::cancel_on_drop"),
-        "direct-H2 must arm cancel-on-drop so residual early returns still release the upload"
+        gate_arm.contains("UploadPumpJoin::cancel_on_drop"),
+        "the gated arm — the one that joins the pump before returning — keeps it"
     );
 }
 
@@ -6220,12 +6412,22 @@ fn composed_authorization_waits_use_the_shared_expiry_first_primitive() {
     assert!(collect.contains("await_deadline_first(bound.at, collect)"));
     assert!(!collect.contains("timeout_at("));
 
-    assert!(
+    // Both reqwest dispatch sites (initial attempt and retry attempt) now build
+    // their attempt inside the buffered protocol-NACK replay loop (issue
+    // #4074), so `send_bound.at` is captured once per dispatch and reused for
+    // every attempt. The primitive is unchanged and still expiry-first.
+    assert_eq!(
         proxy
-            .matches("await_deadline_first(send_bound.at, req_builder.send())")
-            .count()
-            >= 2,
+            .matches("crate::plugins::await_deadline_first(send_bound_at, builder.send()),")
+            .count(),
+        2,
         "reqwest response-header waits must use the expiry-first primitive"
+    );
+    assert_eq!(
+        proxy.matches("let send_bound_at = send_bound.at;").count(),
+        2,
+        "the composed authorization/client bound must be captured ONCE per \
+         dispatch, so a protocol-NACK replay cannot re-arm it"
     );
 
     let cross = include_str!("../../../src/http3/cross_protocol.rs");

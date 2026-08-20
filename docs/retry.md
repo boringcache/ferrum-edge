@@ -96,6 +96,14 @@ Connection failures are TCP/transport-level problems where the request **never r
 
 These are retried when `retry_on_connect_failure: true` (the default). Because the request never reached the backend, **all HTTP methods are retried** — idempotency is not a concern since nothing was processed.
 
+Note that `is_canceled` is a statement about hyper's own wire boundary, not about the request-body carrier: a fully collected upload that Ferrum writes through the `backend_write_timeout_ms` upload pump is still the same caller-retained `Bytes`, so it keeps the pre-wire classification. Only genuinely unreplayable streaming / channel uploads are downgraded to post-wire on `is_canceled`.
+
+### Reqwest Protocol NACKs (HTTP/2, buffered uploads)
+
+Independently of the Ferrum retry policy above, reqwest replays a request **once per protocol NACK** (up to two replays) when the backend proves it did not process it: a remote `GOAWAY` with `NO_ERROR` (RFC 9113 §6.8) or a remote `RST_STREAM` with `REFUSED_STREAM` (RFC 9113 §8.7). Reqwest can only do this for a body it holds in full.
+
+A live `backend_write_timeout_ms` (default `30000`) makes Ferrum hand reqwest a *streaming* carrier for buffered uploads, which would silently disable that replay. Ferrum therefore reproduces it at its own dispatch layer — same two shapes, same budget of two replays, a fresh upload pump per attempt, and one absolute response-header bound across all attempts. This is typed (`h2::Reason`), never substring-matched: a mis-detected NACK would replay a non-idempotent request the backend may already have processed. It requires no `retry` configuration and is independent of `retryable_methods`, exactly as reqwest's own behavior was.
+
 ### HTTP Status Code Failures
 
 HTTP status-code failures are real HTTP responses from the backend (e.g., 502 Bad Gateway from an upstream load balancer, 503 during deployment). These are retried only when:
