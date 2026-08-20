@@ -40,6 +40,10 @@ fn create_unicode_key_consumer() -> Consumer {
 }
 
 fn context_with_materialized_raw_header(name: &str, value: &str) -> RequestContext {
+    context_with_materialized_raw_header_bytes(name, value.as_bytes())
+}
+
+fn context_with_materialized_raw_header_bytes(name: &str, value: &[u8]) -> RequestContext {
     let mut ctx = create_test_context();
     ctx.headers.clear();
     ctx.identified_consumer = None;
@@ -48,15 +52,38 @@ fn context_with_materialized_raw_header(name: &str, value: &str) -> RequestConte
     let header_name = http::HeaderName::from_bytes(name.as_bytes()).expect("valid header name");
     raw.insert(
         header_name,
-        http::HeaderValue::from_bytes(value.as_bytes()).expect("valid header bytes"),
+        http::HeaderValue::from_bytes(value).expect("valid header bytes"),
     );
     ctx.set_raw_headers(raw);
     ctx.materialize_headers();
-    assert!(
-        !ctx.headers.contains_key(name.to_ascii_lowercase().as_str())
-            && !ctx.headers.contains_key(name),
-        "non-ASCII header values must stay out of the materialized map in this repro"
-    );
+    if value.iter().any(|byte| *byte > 0x7F) {
+        assert!(
+            !ctx.headers.contains_key(name.to_ascii_lowercase().as_str())
+                && !ctx.headers.contains_key(name),
+            "non-ASCII header values must stay out of the materialized map in this repro"
+        );
+    }
+    ctx
+}
+
+fn context_with_materialized_repeated_raw_header_bytes(
+    name: &str,
+    values: &[&[u8]],
+) -> RequestContext {
+    let mut ctx = create_test_context();
+    ctx.headers.clear();
+    ctx.identified_consumer = None;
+
+    let mut raw = HeaderMap::new();
+    let header_name = http::HeaderName::from_bytes(name.as_bytes()).expect("valid header name");
+    for value in values {
+        raw.append(
+            header_name.clone(),
+            http::HeaderValue::from_bytes(value).expect("valid header bytes"),
+        );
+    }
+    ctx.set_raw_headers(raw);
+    ctx.materialize_headers();
     ctx
 }
 
@@ -598,5 +625,43 @@ async fn test_key_auth_wrong_unicode_api_key_returns_invalid_not_missing() {
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject_body(result, r#"{"error":"Invalid API key"}"#);
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn test_key_auth_missing_header_remains_continue_not_invalid_format() {
+    let plugin = KeyAuth::new(&json!({"key_location": "header:X-API-Key"})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_unicode_key_consumer()]);
+    let mut ctx = create_test_context();
+    ctx.headers.clear();
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn test_key_auth_invalid_utf8_header_returns_invalid_format() {
+    let plugin = KeyAuth::new(&json!({"key_location": "header:X-API-Key"})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_unicode_key_consumer()]);
+    let mut ctx = context_with_materialized_raw_header_bytes("X-API-Key", b"\xFF\xFE");
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject_body(result, r#"{"error":"Invalid API key format"}"#);
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn test_key_auth_repeated_header_with_invalid_line_returns_invalid_format() {
+    let plugin = KeyAuth::new(&json!({"key_location": "header:X-API-Key"})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_unicode_key_consumer()]);
+    let mut ctx = context_with_materialized_repeated_raw_header_bytes(
+        "X-API-Key",
+        &[b"valid-ascii-key", b"\xFF\xFE"],
+    );
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject_body(result, r#"{"error":"Invalid API key format"}"#);
     assert!(ctx.identified_consumer.is_none());
 }

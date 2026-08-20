@@ -22,6 +22,14 @@ use super::RequestContext;
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
 use super::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX;
 
+const INVALID_API_KEY_FORMAT_BODY: &str = r#"{"error":"Invalid API key format"}"#;
+
+enum HeaderCredentialExtract {
+    Missing,
+    Present(String),
+    InvalidFormat,
+}
+
 pub struct KeyAuth {
     /// Pre-lowercased header name for header-based key extraction.
     /// Avoids a per-request `to_lowercase()` allocation.
@@ -135,11 +143,14 @@ impl KeyAuth {
         })
     }
 
-    fn extract_key(&self, ctx: &RequestContext) -> Option<String> {
+    fn extract_key_credential(&self, ctx: &RequestContext) -> HeaderCredentialExtract {
         if let Some(ref lower) = self.header_name_lower {
             extract_configured_header_key(ctx, lower.as_str(), self.header_name_original.as_deref())
         } else if let Some(ref param) = self.query_param_name {
-            ctx.query_params.get(param.as_str()).cloned()
+            match ctx.query_params.get(param.as_str()) {
+                Some(key) => HeaderCredentialExtract::Present(key.clone()),
+                None => HeaderCredentialExtract::Missing,
+            }
         } else {
             extract_configured_header_key(ctx, "x-api-key", Some("X-API-Key"))
         }
@@ -153,17 +164,17 @@ fn extract_configured_header_key(
     ctx: &RequestContext,
     lower: &str,
     original: Option<&str>,
-) -> Option<String> {
+) -> HeaderCredentialExtract {
     if let Some(value) = ctx
         .headers
         .get(lower)
         .or_else(|| original.and_then(|orig| ctx.headers.get(orig)))
     {
-        return Some(value.clone());
+        return HeaderCredentialExtract::Present(value.clone());
     }
 
     if !ctx.has_raw_headers() {
-        return None;
+        return HeaderCredentialExtract::Missing;
     }
 
     for name in [Some(lower), original] {
@@ -174,9 +185,12 @@ fn extract_configured_header_key(
         if values.is_empty() {
             continue;
         }
-        return raw_header_field_lines_to_utf8_string(name, &values);
+        return match raw_header_field_lines_to_utf8_string(name, &values) {
+            Some(value) => HeaderCredentialExtract::Present(value),
+            None => HeaderCredentialExtract::InvalidFormat,
+        };
     }
-    None
+    HeaderCredentialExtract::Missing
 }
 
 fn raw_header_field_lines_to_utf8_string(name: &str, values: &[&[u8]]) -> Option<String> {
@@ -198,9 +212,12 @@ impl AuthMechanism for KeyAuth {
     }
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
-        match self.extract_key(ctx) {
-            Some(key) => ExtractedCredential::ApiKey(key),
-            None => ExtractedCredential::Missing,
+        match self.extract_key_credential(ctx) {
+            HeaderCredentialExtract::Present(key) => ExtractedCredential::ApiKey(key),
+            HeaderCredentialExtract::Missing => ExtractedCredential::Missing,
+            HeaderCredentialExtract::InvalidFormat => {
+                ExtractedCredential::InvalidFormat(INVALID_API_KEY_FORMAT_BODY.into())
+            }
         }
     }
 
