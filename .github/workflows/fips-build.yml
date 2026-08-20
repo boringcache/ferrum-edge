@@ -2449,27 +2449,28 @@ jobs:
       # not remove (issue #4018). The hosted image ships a 4 GiB
       # `/mnt/swapfile` on a partition with tens of GiB free.
       #
-      # Deliberately best-effort rather than fail-closed. This step is
-      # insurance, not a correctness gate, and this workflow's text is frozen
-      # by `verify_cross_build_policy.py` under a single admitted generation
-      # digest — so a runner-image change that broke `swapoff` here would cost
-      # a second protected-path push to repair. It still cannot pass silently:
-      # any failure raises a warning annotation, and the resulting `SwapTotal`
-      # is always printed, so "the swap was never enlarged" is readable from
-      # the log rather than inferred.
+      # Add an 8 GiB Ferrum-owned swapfile alongside the image swap (~12 GiB
+      # total) rather than disabling or replacing `/mnt/swapfile`. Deliberately
+      # best-effort rather than fail-closed: this step is insurance, not a
+      # correctness gate, and this workflow's text is frozen by
+      # `verify_cross_build_policy.py` under a single admitted generation
+      # digest. Any failure raises a warning annotation, leaves the image swap
+      # untouched, best-effort cleans up only `/mnt/ferrum-fips-swapfile`, and
+      # the resulting `SwapTotal` is always printed so "the swap was never
+      # enlarged" is readable from the log rather than inferred.
       - name: Enlarge runner swap for the test-binary codegen tail
         run: |
           set -uo pipefail
-          if sudo swapoff -a \
-            && sudo rm -f /mnt/swapfile \
-            && sudo fallocate -l 12G /mnt/swapfile \
-            && sudo chmod 600 /mnt/swapfile \
-            && sudo mkswap /mnt/swapfile \
-            && sudo swapon /mnt/swapfile; then
-            echo "Runner swap enlarged for the FIPS test-binary build."
+          ferrum_swap="/mnt/ferrum-fips-swapfile"
+          if sudo fallocate -l 8G "$ferrum_swap" \
+            && sudo chmod 600 "$ferrum_swap" \
+            && sudo mkswap "$ferrum_swap" \
+            && sudo swapon "$ferrum_swap"; then
+            echo "Runner swap enlarged for the FIPS test-binary build (additive 8 GiB Ferrum swapfile)."
           else
             echo "::warning::could not enlarge runner swap; continuing on whatever the image provides" >&2
-            sudo swapon -a || true
+            sudo swapoff "$ferrum_swap" 2>/dev/null || true
+            sudo rm -f "$ferrum_swap" || true
           fi
           awk '/^SwapTotal:/ {print "SwapTotal: " $2 " kB"}' /proc/meminfo
           free -h
