@@ -25,10 +25,13 @@ const NS: &str = "ferrum";
 const PROXY_ID: &str = "u-dns";
 const LISTEN_PORT: u16 = 20_273;
 
+type CapturedSummaries = Arc<Mutex<Vec<StreamTransactionSummary>>>;
+type CaptureFixture = (Vec<Arc<dyn Plugin>>, CapturedSummaries);
+
 /// Records every `on_stream_disconnect` it receives so "exactly once" is a
 /// count, not an absence-of-panic.
 struct CaptureDisconnects {
-    summaries: Arc<Mutex<Vec<StreamTransactionSummary>>>,
+    summaries: CapturedSummaries,
 }
 
 #[async_trait]
@@ -45,10 +48,7 @@ impl Plugin for CaptureDisconnects {
     }
 }
 
-fn capture() -> (
-    Vec<Arc<dyn Plugin>>,
-    Arc<Mutex<Vec<StreamTransactionSummary>>>,
-) {
+fn capture() -> CaptureFixture {
     let summaries = Arc::new(Mutex::new(Vec::new()));
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(CaptureDisconnects {
         summaries: Arc::clone(&summaries),
