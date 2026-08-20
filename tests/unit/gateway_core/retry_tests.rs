@@ -1157,7 +1157,9 @@ fn test_classify_boxed_error_typed_dns_lookup() {
     use ferrum_edge::proxy::stream_error::StreamSetupError;
     let err: Box<dyn std::error::Error + Send + Sync> = Box::new(StreamSetupError::dns_lookup(
         "backend.example.com",
-        anyhow::Error::from(std::io::Error::other("DNS resolution returned no addresses")),
+        anyhow::Error::from(std::io::Error::other(
+            "DNS resolution returned no addresses",
+        )),
     ));
     assert_eq!(classify_boxed_error(&*err), ErrorClass::DnsLookupError);
 }

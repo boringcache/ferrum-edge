@@ -45,7 +45,10 @@ impl Plugin for CaptureDisconnects {
     }
 }
 
-fn capture() -> (Vec<Arc<dyn Plugin>>, Arc<Mutex<Vec<StreamTransactionSummary>>>) {
+fn capture() -> (
+    Vec<Arc<dyn Plugin>>,
+    Arc<Mutex<Vec<StreamTransactionSummary>>>,
+) {
     let summaries = Arc::new(Mutex::new(Vec::new()));
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(CaptureDisconnects {
         summaries: Arc::clone(&summaries),
@@ -123,7 +126,10 @@ async fn a_pre_publication_dns_failure_emits_exactly_one_attributed_summary() {
     assert_eq!(summaries.len(), 1, "exactly one setup-failure summary");
     let summary = &summaries[0];
     assert_eq!(summary.error_class, Some(ErrorClass::DnsLookupError));
-    assert_eq!(summary.disconnect_cause, Some(DisconnectCause::BackendError));
+    assert_eq!(
+        summary.disconnect_cause,
+        Some(DisconnectCause::BackendError)
+    );
     assert_eq!(summary.protocol, "udp");
     assert_eq!(summary.listen_port, LISTEN_PORT);
     assert_eq!(summary.bytes_sent, 0);

@@ -13,8 +13,8 @@
 use chrono::Utc;
 use ferrum_edge::_test_support::{
     UdpSetupProgressForTest, attach_stream_trigger_decisions_for_test,
-    final_request_body_requirements_for_test,
-    set_request_http_flavor_for_test, set_request_wire_protocol_for_test,
+    final_request_body_requirements_for_test, set_request_http_flavor_for_test,
+    set_request_wire_protocol_for_test,
     validate_plugin_composition_candidate_with_real_ip_header_for_test,
 };
 use ferrum_edge::config::types::{
