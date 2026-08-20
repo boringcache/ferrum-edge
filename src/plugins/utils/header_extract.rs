@@ -10,7 +10,7 @@ use crate::plugins::{RequestContext, repeated_request_header_separator};
 pub(crate) enum ConfiguredHeaderLookup {
     Absent,
     Value(String),
-    /// Raw field line(s) exist but cannot be represented as one valid UTF-8 value.
+    /// Raw field line(s) exist but cannot be represented as one visible-ASCII value.
     PresentNonMaterialized,
 }
 
@@ -56,6 +56,18 @@ fn raw_header_field_lines_to_utf8_string(
         found = true;
         if idx > 0 {
             out.push_str(separator);
+        }
+        // Keep this boundary identical to `HeaderValue::to_str()`, which is
+        // also what `RequestContext::materialize_headers()` uses: SP through
+        // `~`, plus HTAB. Merely checking UTF-8 would admit non-ASCII Unicode
+        // here even though the materialized map deliberately omitted it,
+        // letting malformed credential bytes reach a later parser as if the
+        // raw/materialized views agreed.
+        if !bytes
+            .iter()
+            .all(|byte| (*byte >= 0x20 && *byte < 0x7f) || *byte == b'\t')
+        {
+            return Some(ConfiguredHeaderLookup::PresentNonMaterialized);
         }
         let Ok(value) = std::str::from_utf8(bytes) else {
             return Some(ConfiguredHeaderLookup::PresentNonMaterialized);
