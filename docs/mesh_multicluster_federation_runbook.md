@@ -15,7 +15,7 @@ Docker/kind install report.
 |---|---|---|
 | Live datapath (SPIRE-federated two kind clusters, bidirectional traffic + negatives + Stage-3 failure injection; fail-closed required-assertion gate) | `tests/k8s/multicluster-federation/run.sh` | `.github/workflows/multicluster-federation-live.yml` — path-filtered on PRs, force-run on every `main` push / `workflow_dispatch` (requires `FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE=true`) |
 | Poller partition / last-good retention (issue #3331; two Ferrum CP/DP deployments, verified TLS/mTLS, bound per-remote JWTs, four independent Toxiproxy links) | `tests/k8s/multicluster-poller-partition/run.sh` | `.github/workflows/multicluster-poller-partition-live.yml` — dedicated required `Multicluster Poller Partition Live` gate |
-| Deploy-only smoke (rollouts, no traffic) | same script with `FERRUM_MULTICLUSTER_DEPLOY_ONLY=1` | Legacy path-filtered `Mesh Multicluster Federation` CI job; a packaging/rollout check, not the authoritative datapath/release gate |
+| Deploy-only smoke (rollouts, no traffic) | same script with `FERRUM_MULTICLUSTER_DEPLOY_ONLY=1` | Local/dev shortcut only; not a CI job. Authoritative packaging, rollout, and datapath coverage is the dedicated `Multicluster Federation Live` workflow |
 
 In-process federation/discovery unit and integration coverage remains necessary
 but is not a substitute for the two-cluster harness. Preflight requires
@@ -214,10 +214,10 @@ It runs in two modes:
   The cargo-based `live_contract_artifact_gate` is only invoked by
   `.github/workflows/mesh-e2e-sidecar-live.yml`; it self-skips everywhere else.
 - **Deploy-only smoke (`FERRUM_MULTICLUSTER_DEPLOY_ONLY=1`):** stops after the
-  SPIRE/workload deploy and rollouts, before driving traffic. The legacy
-  path-filtered `Mesh Multicluster Federation` CI job keeps this narrower
-  packaging/rollout check; it is distinct from, and never substitutes for, the
-  dedicated full-datapath PR/main/release gate. The Helm chart is NOT a trigger
+  SPIRE/workload deploy and rollouts, before driving traffic. This is a local
+  packaging/rollout shortcut only; it is not a CI job and never substitutes for
+  the dedicated full-datapath PR/main/release gate
+  (`.github/workflows/multicluster-federation-live.yml`). The Helm chart is NOT a trigger
   and is NOT deployed — this fixture uses hand-crafted NodePort manifests
   because the chart's east-west Service is ClusterIP-only and not cross-cluster
   reachable; the chart is covered by the dedicated `Helm Chart` CI job.

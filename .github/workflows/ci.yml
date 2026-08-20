@@ -36,8 +36,6 @@ jobs:
     outputs:
       mode: ${{ steps.plan.outputs.mode }}
       run_helm: ${{ steps.plan.outputs.run_helm }}
-      run_mesh_federation: ${{ steps.plan.outputs.run_mesh_federation }}
-      run_mesh_sidecar_smoke: ${{ steps.plan.outputs.run_mesh_sidecar_smoke }}
       run_ebpf_kernel_live: ${{ steps.plan.outputs.run_ebpf_kernel_live }}
       run_netns_capture_live: ${{ steps.plan.outputs.run_netns_capture_live }}
       run_two_cluster_live: ${{ steps.plan.outputs.run_two_cluster_live }}
@@ -250,7 +248,7 @@ jobs:
           # after the new planner proves the NUL stream classifiable.
           # Missing/invalid individual outputs still fail closed to true.
           gate_fallbacks=()
-          for gate in run_helm run_mesh_federation run_mesh_sidecar_smoke run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11; do
+          for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11; do
             value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"
             if [ "$paths_classifiable" != "true" ]; then
               value=true
@@ -284,7 +282,7 @@ jobs:
             echo ""
             echo "| Gate | Scheduled |"
             echo "| --- | --- |"
-            for gate in run_helm run_mesh_federation run_mesh_sidecar_smoke run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11; do
+            for gate in run_helm run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11; do
               value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"
               if [ "$paths_classifiable" != "true" ]; then
                 value=true
@@ -2062,103 +2060,6 @@ jobs:
           echo "- test_hmac_v2_shared_redis_admits_one_backend_mutation_across_replicas" >> $GITHUB_STEP_SUMMARY
           echo "- test_dpop_shared_redis_admits_one_proof_across_replicas" >> $GITHUB_STEP_SUMMARY
           echo "- test_shared_replay_authority_live_redis_admits_exactly_one_winner" >> $GITHUB_STEP_SUMMARY
-
-  mesh-multicluster-federation:
-    name: Mesh Multicluster Federation
-    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_mesh_federation == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    needs: [ci-plan, build-test-artifacts]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    env:
-      FERRUM_IMAGE: ferrum-edge:multicluster-federation
-      FERRUM_MULTICLUSTER_DEPLOY_ONLY: "1"
-      FERRUM_SKIP_IMAGE_BUILD: "1"
-      FERRUM_IMAGE_REPOSITORY: ferrum-edge
-      FERRUM_IMAGE_TAG: multicluster-federation
-      # This deploy-only smoke creates and destroys disposable kind clusters in
-      # CI; acknowledge run.sh's preflight guard (the live workflow sets the same).
-      FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE: "true"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-
-      - name: Install Kubernetes tools
-        uses: ./.github/actions/setup-kubernetes-tools
-
-      - name: Download prebuilt gateway binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}
-          path: target/debug
-
-      - name: Package Ferrum image
-        uses: ./.github/actions/package-ferrum-runtime-image
-        with:
-          binary-path: target/debug/ferrum-edge
-          image: ${{ env.FERRUM_IMAGE }}
-
-      - name: Run two-cluster deployment smoke
-        env:
-          ARTIFACT_DIR: ${{ runner.temp }}/ferrum-multicluster-federation
-        run: tests/k8s/multicluster-federation/run.sh
-
-      - name: Upload mesh federation diagnostics
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: ferrum-multicluster-federation
-          path: ${{ runner.temp }}/ferrum-multicluster-federation
-          if-no-files-found: ignore
-          retention-days: 14
-
-  mesh-e2e-sidecar:
-    name: Mesh E2E Sidecar
-    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_mesh_sidecar_smoke == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    needs: [ci-plan, build-test-artifacts]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    env:
-      # Deploy-only smoke: SPIRE + sidecar workloads roll out, no traffic
-      # probes. The full datapath run rides the path-filtered
-      # mesh-e2e-sidecar-live workflow.
-      FERRUM_MESH_E2E_DEPLOY_ONLY: "1"
-      FERRUM_SKIP_IMAGE_BUILD: "1"
-      FERRUM_IMAGE_REPOSITORY: ferrum-edge
-      FERRUM_IMAGE_TAG: mesh-e2e-sidecar
-      # This smoke creates and destroys a disposable kind cluster in CI;
-      # acknowledge run.sh's preflight guard (the live workflow sets the same).
-      FERRUM_MESH_E2E_LIVE_ACK_DISPOSABLE: "true"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-
-      - name: Install Kubernetes tools
-        uses: ./.github/actions/setup-kubernetes-tools
-
-      - name: Download prebuilt gateway binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}
-          path: target/debug
-
-      - name: Package Ferrum image
-        uses: ./.github/actions/package-ferrum-runtime-image
-        with:
-          binary-path: target/debug/ferrum-edge
-          image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}
-
-      - name: Run sidecar deployment smoke
-        env:
-          ARTIFACT_DIR: ${{ runner.temp }}/ferrum-mesh-e2e-sidecar
-        run: tests/k8s/mesh_e2e_sidecar/run.sh
-
-      - name: Upload mesh e2e sidecar diagnostics
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: ferrum-mesh-e2e-sidecar
-          path: ${{ runner.temp }}/ferrum-mesh-e2e-sidecar
-          if-no-files-found: ignore
-          retention-days: 14
-
 
   helm-chart:
     name: Helm Chart
@@ -4430,8 +4331,6 @@ jobs:
       - test-vendor-patches
       - test-functional
       - plugin-hardening-redis-regression
-      - mesh-multicluster-federation
-      - mesh-e2e-sidecar
       - helm-chart
       - lint
       - fuzz-smoke
@@ -4504,8 +4403,6 @@ jobs:
           add_row "Vendored patch regressions" "${{ needs.test-vendor-patches.result }}"
           add_row "Functional shards" "${{ needs.test-functional.result }}"
           add_row "Plugin hardening Redis regression" "${{ needs.plugin-hardening-redis-regression.result }}"
-          add_row "Mesh multicluster federation" "${{ needs.mesh-multicluster-federation.result }}"
-          add_row "Mesh e2e sidecar" "${{ needs.mesh-e2e-sidecar.result }}"
           add_row "Helm chart" "${{ needs.helm-chart.result }}"
           add_row "Lint" "${{ needs.lint.result }}"
           add_row "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"
@@ -4530,8 +4427,6 @@ jobs:
           require_success "Vendored patch regressions" "${{ needs.test-vendor-patches.result }}"
           require_success "Functional shards" "${{ needs.test-functional.result }}"
           require_success "Plugin hardening Redis regression" "${{ needs.plugin-hardening-redis-regression.result }}"
-          require_planned_gate "Mesh multicluster federation" "${{ needs.mesh-multicluster-federation.result }}" "${{ needs.ci-plan.outputs.run_mesh_federation }}"
-          require_planned_gate "Mesh e2e sidecar" "${{ needs.mesh-e2e-sidecar.result }}" "${{ needs.ci-plan.outputs.run_mesh_sidecar_smoke }}"
           require_planned_gate "Helm chart" "${{ needs.helm-chart.result }}" "${{ needs.ci-plan.outputs.run_helm }}"
           require_success "Lint" "${{ needs.lint.result }}"
           require_success "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"

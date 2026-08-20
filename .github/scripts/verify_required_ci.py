@@ -64,8 +64,6 @@ REQUIRED_JOBS = {
     "test-vendor-patches",
     "test-functional",
     "plugin-hardening-redis-regression",
-    "mesh-multicluster-federation",
-    "mesh-e2e-sidecar",
     "helm-chart",
     "lint",
     "fuzz-smoke",
@@ -97,8 +95,6 @@ DIRECT_FULL_CI_JOBS = {
 }
 
 PATH_GATED_JOBS = {
-    "mesh-multicluster-federation": "run_mesh_federation",
-    "mesh-e2e-sidecar": "run_mesh_sidecar_smoke",
     "helm-chart": "run_helm",
     "build-ebpf": "run_ebpf_build",
     "ebpf-live": "run_ebpf_kernel_live",
@@ -127,6 +123,8 @@ REMOVED_JOBS = {
     "build-gateway-binary",
     "build-functional-tests-archive",
     "detect-ebpf-live-changes",
+    "mesh-multicluster-federation",
+    "mesh-e2e-sidecar",
 }
 
 REMOVED_MIRROR_JOBS = {
@@ -718,7 +716,7 @@ def merge_group_self_test() -> list[str]:
 # ci-plan treats paths_classifiable as a trust/transport version handshake.
 # Unless the flag is exactly true, every published job gate is forced on
 # before $GITHUB_OUTPUT emission so an older newline-only trusted-base
-# planner cannot honor syntactically valid false Helm/mesh/eBPF values from
+# planner cannot honor syntactically valid false Helm/eBPF/secrets/PKCS values from
 # a NUL changed-file stream.
 CLASSIFIABLE_HANDSHAKE_SUMMARY = (
     "The planner did not prove a classifiable NUL stream; every job gate was "

@@ -152,9 +152,12 @@ FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE=true \
 ```
 
 Set `FERRUM_MULTICLUSTER_DEPLOY_ONLY=1` to run only the SPIRE/workload deploy
-(no traffic, no gate). Set `FERRUM_SKIP_IMAGE_BUILD=1` when the
+(no traffic, no gate) locally. Set `FERRUM_SKIP_IMAGE_BUILD=1` when the
 `ferrum-edge:multicluster-federation` image is already loaded into both clusters
 (CI builds + packages it via `.github/actions/package-ferrum-runtime-image`).
+Hosted coverage is the full datapath run in
+`.github/workflows/multicluster-federation-live.yml`; the required check is
+`Multicluster Federation Live`.
 
 ## Stage 3 (failure injection)
 

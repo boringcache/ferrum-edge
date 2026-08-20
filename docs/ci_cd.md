@@ -81,7 +81,7 @@ Pull Request / Merge Queue group
                     ├─► Fuzz smoke (property budgets on PRs; the six-target
                     │   libFuzzer budget on merge_group / push to main / manual)
                     ├─► Per-suite eBPF kernel / netns-capture / two-cluster live checks when planner marks relevant
-                    ├─► Planner-gated mesh / Helm / performance gates
+                    ├─► Planner-gated Helm / eBPF / Secret Backends / PKCS#11 / performance gates
                     └─► Five target release builds
     └─► Dedicated required checks (internally skip unrelated changes)
             ├─► Merge Coverage
@@ -564,8 +564,7 @@ planner proves the NUL stream classifiable. Missing or invalid individual
 outputs still fail closed to `true`. Unclassifiable and pre-handshake summaries
 use the canned reason and never interpolate hostile paths.
 
-The same trusted planner emits fail-closed job outputs for Helm, the legacy
-multicluster deployment smoke, the sidecar deployment smoke, eBPF program
+The same trusted planner emits fail-closed job outputs for Helm, eBPF program
 builds, three separate live suites (`run_ebpf_kernel_live`,
 `run_netns_capture_live`, `run_two_cluster_live`), Secret Backends
 (`run_secrets_backends`), and PKCS#11 SoftHSM (`run_pkcs11`). Each live job
@@ -601,14 +600,14 @@ Non-PR events, empty or unavailable diffs, and
 edits to `GATE_CONTROLLER_PATHS` (`pr_ci_plan.py`, `live_suite_path_filter.py`)
 force every gated suite on. Missing/invalid planner outputs fail closed to
 `true` in `CI Plan`. Non-mesh-plugin-only, admin-only, Dockerfile, and dedicated
-ambient-host-UDP/k8s-live paths do not schedule these three jobs. The
-deploy-only multicluster job remains a
-distinct packaging-and-rollout check; authoritative datapath coverage rides the
-dedicated `multicluster-federation-live.yml` workflow (path-filtered on PRs,
-force-run on every `main` push). PRs outside those curated path sets skip the
+ambient-host-UDP/k8s-live paths do not schedule these three jobs.
+Authoritative sidecar and multicluster datapath coverage rides the dedicated
+`mesh-e2e-sidecar-live.yml` and `multicluster-federation-live.yml` workflows
+(path-filtered on PRs, fail-closed on `merge_group` / every `main` push);
+`ci.yml` no longer runs a subset deploy-only smoke of either suite. PRs outside those curated path sets skip the
 downstream job before GitHub allocates a runner. Pushes to `main`, manual
 `workflow_dispatch` runs (the Secret Backends and PKCS#11 SoftHSM jobs use the
-same event guard as the other path-gated mesh/Helm/eBPF jobs), empty or
+same event guard as the other path-gated Helm/eBPF/secrets/PKCS jobs), empty or
 unavailable diffs, unclassifiable/unsafe changed paths, a missing or non-`true`
 `paths_classifiable` handshake from an old trusted-base planner, and edits to
 the gate-controller scripts force all of these gates on. Shared compile-graph
@@ -669,7 +668,15 @@ lib/functional test binaries (`ci-ambient-host-udp-live`). Kind, kubectl, and
 Helm downloads used by those labs are restored inside
 `.github/actions/setup-kubernetes-tools` under an exact key of pinned
 versions/checksums, install subset, and runner OS/arch; checksums are verified
-after both restore and download.
+after both restore and download. That compile-cache and tool-download sharing
+landed in PR #3910. A later #3904 slice retires the redundant `ci.yml`
+deploy-only mesh jobs (`mesh-multicluster-federation` /
+`mesh-e2e-sidecar` with `FERRUM_*_DEPLOY_ONLY=1`): each dedicated full live
+suite already performs the same SPIRE/workload rollout and then continues into
+traffic probes and fail-closed live assertions, so the extra kind clusters did
+not add unique coverage. Cross-workflow executable-artifact polling is still
+out of scope; independent workflows start concurrently, and the shared
+`ci-live-pr-build` cache remains the accepted compile reuse.
 
 On pull requests and merge groups the checker is extracted from the base revision when
 one exists, then self-tested and executed against the proposed chart tree. That
@@ -750,7 +757,7 @@ prove each rejection dimension) in the `Tests` aggregate.
 
 In full mode, the `Tests` aggregate waits for the planner/format checks, test
 shards, lint, dependency audit, vendored patch regressions,
-planner-gated Secret Backends / PKCS#11 / mesh / Helm gates, per-suite eBPF
+planner-gated Secret Backends / PKCS#11 / Helm gates, per-suite eBPF
 kernel / netns-capture / two-cluster live gates, performance, and the
 cross-platform build matrix. When the planner marks `run_secrets_backends` or
 `run_pkcs11` false, the aggregate accepts a skipped Secret Backends or PKCS#11
@@ -2291,6 +2298,21 @@ Jobs omitted because a single predecessor cannot name a unique merged text:
   Cross-sensitive digest.
 - `ci-plan` / `test` for #3915 (issue #3900) — different destination hashes from
   #3913. After #3913 is the trusted base, #3915 needs a follow-up predecessor.
+- `ci-plan` / `test` for issue #3904's deploy-only mesh retirement — removing
+  `run_mesh_federation` / `run_mesh_sidecar_smoke` and the two `ci.yml` jobs
+  rewrites those Cross-sensitive opaque-inline-shell jobs. This implementation
+  PR must not self-admit the pair. A separately root-reviewed predecessor has
+  to add these exact `CI_JOB_GENERATION_TRANSITIONS` tuples (SHA-256 of
+  `extract_job_block` text at `95bd4e64390f65ae2f0406d4990dcd57aeed721d` →
+  this destination; recompute if either job's bytes change):
+
+  `("ci-plan", "7e97e05eeff7e9abbada96bcf4c7c5e91e994983ccb4321a70be2b14fb11a29f", "1ed47ffda870f565dd98e4d19ef2c340404d7cb012e99fd99a2b785bc916cca6")`
+
+  `("test", "afac282642da4e7fea7b38a4e4f5534fcc6df41281601daabc08206fddaaecb3", "617404b7716b0697fe95db855d6dedb00dbbf1bc2045ce0938aa74acc8d8ad12")`
+
+  After that predecessor is the trusted base, this PR rebases onto it. Hosted
+  wall-time and cache-size evidence from #3910 is still outstanding, so #3904
+  stays open.
 
 Lint (`#3909`), `build-binaries` (`#3916`), and optional live-suite `changes`
 jobs (`#3919`) are not admitted here. They are not folded into this
