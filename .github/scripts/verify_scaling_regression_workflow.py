@@ -331,6 +331,11 @@ def validate_helper_text(text: str, failures: list[str]) -> None:
     require("classify_admin_batch_response" in text, "helper must classify batch responses", failures)
     require("status == 503" in text, "helper must require HTTP 503", failures)
     require("NAMESPACE_FENCE_MAX_ATTEMPTS" in text, "helper must bound retries", failures)
+    require(
+        "delay.max(namespace_fence_backoff(attempt))" in text,
+        "helper must back off past the gateway's constant Retry-After: 1 minimum",
+        failures,
+    )
     require("transport error" in text, "helper must not retry transport errors", failures)
     require("unreadable body" in text, "helper must not retry malformed bodies", failures)
 

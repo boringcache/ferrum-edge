@@ -33,7 +33,15 @@ pub const NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS: u64 = 1;
 pub const NAMESPACE_FENCE_MAX_RETRY_AFTER_SECS: u64 = 5;
 
 /// Bounded attempts for one atomic `POST /batch` body (1 try + retries).
-pub const NAMESPACE_FENCE_MAX_ATTEMPTS: u32 = 6;
+///
+/// The gateway answers the namespace fence with a constant `Retry-After: 1`
+/// (`docs/admin_api.md`, `openapi.yaml`), so the header alone never widens the
+/// wait. Paired with [`namespace_fence_backoff`] this budget is ~151 seconds
+/// per body rather than the ~5 seconds a header-only schedule would give.
+pub const NAMESPACE_FENCE_MAX_ATTEMPTS: u32 = 10;
+
+/// Ceiling for one backed-off namespace-fence wait, in seconds.
+pub const NAMESPACE_FENCE_MAX_BACKOFF_SECS: u64 = 30;
 
 /// Per-request timeout for one atomic admin batch mutation.
 ///
@@ -67,6 +75,22 @@ pub fn namespace_fence_retry_after_delay(header: Option<&str>) -> Duration {
         _ => NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS,
     };
     Duration::from_secs(secs)
+}
+
+/// Exponential floor for the wait before retry `attempt` (1-based).
+///
+/// `Retry-After` is documented as the *minimum* delay, and the gateway always
+/// sends `1`, so honoring only the header spends the whole attempt budget in
+/// about five seconds. The scheduled-scaling failures this harness exists for
+/// (issue #3892) fenced the namespace while the admin plane was saturated and
+/// were still fenced minutes later, so each retry also waits at least this
+/// long. Doubling stops at [`NAMESPACE_FENCE_MAX_BACKOFF_SECS`], giving a
+/// worst-case 1+2+4+8+16+30+30+30+30 = 151s for one atomic body. The first
+/// exhausted body aborts provisioning, so that is the total added cost of a
+/// fence that never clears — bounded well inside the 180-minute job budget.
+pub fn namespace_fence_backoff(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(6);
+    Duration::from_secs((1u64 << shift).min(NAMESPACE_FENCE_MAX_BACKOFF_SECS))
 }
 
 fn is_documented_namespace_fence_body(body: &str) -> bool {
@@ -162,7 +186,10 @@ pub async fn post_admin_batch(
                 if attempt == NAMESPACE_FENCE_MAX_ATTEMPTS {
                     break;
                 }
-                tokio::time::sleep(delay).await;
+                // The classified `delay` is the server's documented minimum;
+                // the exponential floor is what lets a bounded attempt count
+                // outlast a fence that survives longer than one second.
+                tokio::time::sleep(delay.max(namespace_fence_backoff(attempt))).await;
             }
         }
     }

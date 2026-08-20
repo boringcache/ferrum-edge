@@ -14,10 +14,10 @@ mod scheduled_scaling;
 use scheduled_scaling::{
     ADMIN_BATCH_REQUEST_TIMEOUT_SECS, BatchProvisionDecision,
     NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS, NAMESPACE_FENCE_MAX_ATTEMPTS,
-    NAMESPACE_FENCE_MAX_RETRY_AFTER_SECS, NAMESPACE_FENCE_RETRY_MESSAGE,
-    SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, classify_admin_batch_response,
-    documented_namespace_fence_body, namespace_fence_retry_after_delay,
-    scheduled_scaling_admin_jwt_max_ttl_value,
+    NAMESPACE_FENCE_MAX_BACKOFF_SECS, NAMESPACE_FENCE_MAX_RETRY_AFTER_SECS,
+    NAMESPACE_FENCE_RETRY_MESSAGE, SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS,
+    classify_admin_batch_response, documented_namespace_fence_body, namespace_fence_backoff,
+    namespace_fence_retry_after_delay, scheduled_scaling_admin_jwt_max_ttl_value,
 };
 
 const WORKFLOW: &str = include_str!("../../../.github/workflows/scaling-regression.yml");
@@ -127,7 +127,44 @@ fn documented_namespace_fence_503_is_the_only_retried_batch_response() {
         NAMESPACE_FENCE_RETRY_MESSAGE,
         "Namespace mutation is temporarily unavailable; retry later"
     );
-    assert_eq!(NAMESPACE_FENCE_MAX_ATTEMPTS, 6);
+    assert_eq!(NAMESPACE_FENCE_MAX_ATTEMPTS, 10);
+}
+
+#[test]
+fn namespace_fence_retries_back_off_past_the_servers_one_second_minimum() {
+    // The gateway always answers the fence with `Retry-After: 1`, so a
+    // header-only schedule would exhaust the whole attempt budget in about
+    // five seconds — far shorter than the fenced windows observed in the red
+    // scheduled-scaling runs this harness exists to survive (issue #3892).
+    assert_eq!(
+        namespace_fence_retry_after_delay(Some("1")),
+        Duration::from_secs(1)
+    );
+    let mut schedule = Vec::new();
+    for attempt in 1..NAMESPACE_FENCE_MAX_ATTEMPTS {
+        let header = namespace_fence_retry_after_delay(Some("1"));
+        let wait = header.max(namespace_fence_backoff(attempt));
+        schedule.push(wait.as_secs());
+    }
+    assert_eq!(schedule, [1, 2, 4, 8, 16, 30, 30, 30, 30]);
+    assert_eq!(
+        namespace_fence_backoff(NAMESPACE_FENCE_MAX_ATTEMPTS).as_secs(),
+        NAMESPACE_FENCE_MAX_BACKOFF_SECS,
+        "backoff must saturate rather than grow without bound"
+    );
+
+    // The first exhausted body aborts provisioning, so this is the entire
+    // added cost of a fence that never clears.
+    let total: u64 = schedule.iter().sum();
+    assert_eq!(total, 151);
+    assert!(
+        total < 180 * 60,
+        "one atomic body's fence-retry budget must stay inside the job timeout"
+    );
+    assert!(
+        total > 10 * NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS,
+        "the retry budget must not collapse back onto the server's minimum"
+    );
 }
 
 #[test]

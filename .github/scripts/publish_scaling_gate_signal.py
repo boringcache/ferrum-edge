@@ -18,9 +18,9 @@ The program never grants itself extra credentials: it uses the job-scoped
 GITHUB_TOKEN with `issues: write` and `actions: read` only. It refuses
 pull_request events and refuses to mutate issues off `refs/heads/main`.
 Missing, malformed, out-of-order, future-dated, or API-failed history is
-treated as stale (fail-closed). Run links are constructed for the generation
-that drove the decision; an API html_url is used only after a strict
-same-repo Actions-run match.
+treated as stale (fail-closed). Run links are always constructed from the
+repository identity for the generation that drove the decision; an API-supplied
+html_url is never used verbatim.
 """
 
 from __future__ import annotations
@@ -132,17 +132,16 @@ def issue_run_url(
 ) -> str:
     """Construct the issue run link from known repo identity.
 
-    An API-supplied html_url is accepted only when it is exactly the same-repo
-    Actions run URL for `run_id`. Arbitrary hosts, paths, or query strings are
-    ignored.
+    The link is always built from `server`/`repo`/`run_id`, never taken from
+    the API payload: an API-supplied html_url can only ever equal the value
+    already constructed here, so arbitrary hosts, paths, or query strings have
+    no way to reach the issue body. `api_html_url` is accepted (and ignored)
+    so callers can pass the payload field through without special-casing it.
     """
 
     if run_id is None:
         return server.rstrip("/")
-    expected = canonical_actions_run_url(server, repo, run_id)
-    if isinstance(api_html_url, str) and api_html_url.rstrip("/") == expected:
-        return expected
-    return expected
+    return canonical_actions_run_url(server, repo, run_id)
 
 
 def _workflow_run_id(entry: dict[str, Any]) -> int:
