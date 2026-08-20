@@ -11932,7 +11932,7 @@ FIPS_BUILD_RETIRED_GENERATION_SHA256 = (
 # sets `line-tables-only` debuginfo on the `dev` AND `test` profiles, and adds a
 # best-effort swap enlargement immediately before that step.
 FIPS_BUILD_ADOPTED_GENERATION_SHA256 = (
-    "9e8765d257d51b401a2d9b481860a4ff3fcf4001c47eaf167653a73c5390c469"
+    "6bb669ab79edc9bc53452b59acd50462b8db1b5b7fc5528d6b5eea76907dfa84"
 )
 FIPS_BUILD_ADMITTED_GENERATION_TRANSITION = (
     FIPS_BUILD_WORKFLOW_FILENAME,
