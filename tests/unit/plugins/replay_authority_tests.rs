@@ -22,7 +22,11 @@ use std::time::Duration;
 
 use ferrum_edge::_test_support::{ReplaySetNxReplyError, classify_replay_set_nx_reply};
 use ferrum_edge::plugins::Plugin;
-use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
+use ferrum_edge::plugins::utils::redis_rate_limiter::{
+    RedisConfig, RedisRateLimitClient, arm_shared_replay_apply_pause_for_test,
+    disarm_shared_replay_apply_pause_for_test, shared_replay_apply_pause_entered_for_test,
+    shared_replay_transition_lock_held_for_test,
+};
 use ferrum_edge::plugins::utils::replay_authority::{
     MAX_PROCESS_REPLAY_LANES, ReplayAdmission, ReplayAuthority, ReplayDomain, ReplayScope,
     SharedReplayAuthorityHealth, admit_process_at, counters, monotonic_millis, process_lane,
@@ -1178,6 +1182,19 @@ async fn wait_until_available(client: &RedisRateLimitClient) {
     .await;
 }
 
+/// Bounded, yield-friendly spin for the synchronous shared-replay concurrency
+/// tests. Unlike [`wait_until`] this does not need a Tokio runtime, so it can
+/// gate `std::thread` workers deterministically.
+fn wait_for_sync(mut pred: impl FnMut() -> bool, what: &str) {
+    for _ in 0..10_000_000 {
+        if pred() {
+            return;
+        }
+        std::thread::yield_now();
+    }
+    panic!("timed out waiting until {what}");
+}
+
 fn unreachable_shared_client(prefix: &str) -> Arc<RedisRateLimitClient> {
     let config = RedisConfig::from_plugin_config(
         &serde_json::json!({
@@ -1923,6 +1940,135 @@ fn concurrent_registration_and_outage_publish_exact_counts() {
     drop(authorities);
     drop(client);
     assert_eq!(shared_health_snapshot(), baseline);
+}
+
+/// Deterministic regression for the tear the lock-free shared replay health
+/// accounting used to allow (#4077): the per-registration `(epoch, state)`
+/// word update and its global packed-count delta must publish as one
+/// linearized critical section. The gate below holds the first transition
+/// exactly between its word store and its delta, proving the packed pair
+/// cannot go through an impossible state and a concurrent outage cannot
+/// publish out of epoch order.
+#[test]
+fn transition_and_global_publish_are_one_linearized_critical_section() {
+    let _serialized = shared_health_guard();
+    let baseline = shared_health_snapshot();
+
+    let client = unreachable_shared_client("ferrum:replay_authority_tests:linearized");
+    assert!(
+        client.publish_reachable_for_test(),
+        "prove reachable before attaching so the first count is a reachable sample"
+    );
+    let reachable = client.capture_shared_replay_registration_sample_for_test();
+    assert!(reachable.available());
+    assert_eq!(
+        shared_health_snapshot(),
+        baseline,
+        "attaching the handle must not publish before apply"
+    );
+
+    struct DisarmOnDrop;
+    impl Drop for DisarmOnDrop {
+        fn drop(&mut self) {
+            disarm_shared_replay_apply_pause_for_test();
+        }
+    }
+
+    let after = std::thread::scope(|scope| {
+        arm_shared_replay_apply_pause_for_test();
+        let _disarm = DisarmOnDrop;
+
+        let publisher = scope.spawn({
+            let client = Arc::clone(&client);
+            move || client.publish_shared_replay_registration_sample_for_test(reachable)
+        });
+
+        wait_for_sync(
+            || shared_replay_apply_pause_entered_for_test() >= 1,
+            "the first transition to reach the tear point",
+        );
+
+        // Reaching the tear point means the per-registration word is published
+        // (the gate sits between the word store and the delta), …
+        // … but the global delta is not, and the transition lock spans both.
+        assert_eq!(
+            shared_health_snapshot(),
+            baseline,
+            "the global delta must not apply before the tear point releases"
+        );
+        assert!(
+            shared_replay_transition_lock_held_for_test(),
+            "the transition lock must be held across the word + delta publish"
+        );
+
+        // A concurrent outage must serialize behind the held lock rather than
+        // publishing its unavailable delta out of epoch order.
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (started_w, done_w) = (Arc::clone(&started), Arc::clone(&done));
+        let outage = scope.spawn({
+            let client = Arc::clone(&client);
+            move || {
+                started_w.store(true, std::sync::atomic::Ordering::Release);
+                client.mark_unavailable_for_test();
+                done_w.store(true, std::sync::atomic::Ordering::Release);
+            }
+        });
+
+        wait_for_sync(
+            || started.load(std::sync::atomic::Ordering::Acquire),
+            "the outage thread to start",
+        );
+        for _ in 0..10_000_000 {
+            if done.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        assert!(
+            !done.load(std::sync::atomic::Ordering::Acquire),
+            "a concurrent outage must not complete while the transition lock is held"
+        );
+        assert!(
+            shared_replay_transition_lock_held_for_test(),
+            "the lock must still be held while the concurrent outage is pending"
+        );
+        assert_eq!(
+            shared_health_snapshot(),
+            baseline,
+            "the packed pair must stay untouched until the pause releases"
+        );
+
+        disarm_shared_replay_apply_pause_for_test();
+        publisher.join().expect("publisher must not panic");
+        outage.join().expect("outage thread must not panic");
+
+        let settled = shared_health_snapshot();
+        assert_eq!(
+            settled.shared_authorities,
+            baseline.shared_authorities + 1,
+            "the paused registration publishes exactly one authority"
+        );
+        assert_eq!(
+            settled.shared_authorities_unavailable,
+            baseline.shared_authorities_unavailable + 1,
+            "the concurrent outage moves exactly that one authority to unavailable"
+        );
+        settled
+    });
+
+    assert_eq!(
+        shared_health_snapshot(),
+        after,
+        "the published pair stays exactly correct once the race settles"
+    );
+
+    drop(client);
+    assert_eq!(
+        shared_health_snapshot(),
+        baseline,
+        "retirement clears the single authority exactly once"
+    );
 }
 
 /// A stale reachable registration sample must not overwrite a later unavailable
