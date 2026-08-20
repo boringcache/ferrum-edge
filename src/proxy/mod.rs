@@ -50031,25 +50031,22 @@ async fn proxy_to_backend_http2(
         // recheck it here and publish the same once-only latch every other
         // upload seam uses. The gate keeps authoritative 413 precedence, then
         // makes this security decision win over transport classification.
-        let authorization_expired = upload_auth_deadline.as_ref().is_some_and(
-            |(plan, family, latch)| {
-                if latch.observed().is_some() {
-                    return true;
-                }
-                let Some(termination) =
-                    crate::proxy::auth_lifetime::expired_authorization(Some(*plan))
-                else {
-                    return false;
-                };
-                latch.record_once(termination, *family);
-                true
-            },
-        );
-        match classify_direct_h2_upload_outcome(
-            outcome,
-            pump_outcome,
-            authorization_expired,
-        ) {
+        let authorization_expired =
+            upload_auth_deadline
+                .as_ref()
+                .is_some_and(|(plan, family, latch)| {
+                    if latch.observed().is_some() {
+                        return true;
+                    }
+                    let Some(termination) =
+                        crate::proxy::auth_lifetime::expired_authorization(Some(*plan))
+                    else {
+                        return false;
+                    };
+                    latch.record_once(termination, *family);
+                    true
+                });
+        match classify_direct_h2_upload_outcome(outcome, pump_outcome, authorization_expired) {
             DirectH2UploadGate::Forward => {}
             DirectH2UploadGate::RequestBodyTooLarge => return request_body_too_large(),
             DirectH2UploadGate::AuthorizationExpired => {

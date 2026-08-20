@@ -9884,11 +9884,8 @@ pub mod _test_support {
                 UploadPumpOutcomeForTest::WriteTimeout => UploadPumpOutcome::WriteTimeout,
             }
         });
-        match crate::proxy::classify_direct_h2_upload_outcome(
-            outcome,
-            pump,
-            authorization_expired,
-        ) {
+        match crate::proxy::classify_direct_h2_upload_outcome(outcome, pump, authorization_expired)
+        {
             crate::proxy::DirectH2UploadGate::Forward => DirectH2UploadGateForTest::Forward,
             crate::proxy::DirectH2UploadGate::RequestBodyTooLarge => {
                 DirectH2UploadGateForTest::RequestBodyTooLarge

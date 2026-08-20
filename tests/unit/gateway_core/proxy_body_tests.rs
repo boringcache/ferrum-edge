@@ -471,11 +471,7 @@ fn test_upload_gate_keeps_other_pump_terminals_fail_closed() {
         UploadPumpOutcomeForTest::ConsumerGone,
     ] {
         assert_eq!(
-            direct_h2_upload_gate_for_test(
-                Some(RequestBodyOutcome::Errored),
-                Some(pump),
-                false,
-            ),
+            direct_h2_upload_gate_for_test(Some(RequestBodyOutcome::Errored), Some(pump), false,),
             DirectH2UploadGateForTest::FailClosed,
             "pump {pump:?} must not turn an indeterminate size outcome into a 504"
         );
