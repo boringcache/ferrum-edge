@@ -45823,6 +45823,7 @@ pub(crate) struct BufferedUploadReplay {
     builder: reqwest::RequestBuilder,
     body: Bytes,
     write_timeout_ms: u64,
+    replays_left: u8,
 }
 
 impl BufferedUploadReplay {
@@ -45844,7 +45845,33 @@ impl BufferedUploadReplay {
             builder: builder.try_clone()?,
             body: body.clone(),
             write_timeout_ms,
+            replays_left: BUFFERED_UPLOAD_PROTOCOL_NACK_REPLAYS,
         })
+    }
+
+    /// Rebuild the next pumped attempt after the backend proved that the
+    /// previous HTTP/2 attempt was not processed.
+    ///
+    /// The replay budget and pump replacement live here so callers that need
+    /// to construct transport-specific cancellation futures per attempt still
+    /// share exactly the same reqwest-compatible replay contract. The old pump
+    /// is cancelled and joined before the fresh body carrier is installed.
+    pub(crate) async fn replay_after_protocol_nack(
+        &mut self,
+        pump: &mut Option<upload_pump::UploadPumpJoin>,
+    ) -> Option<reqwest::RequestBuilder> {
+        if self.replays_left == 0 {
+            return None;
+        }
+        let next = self.builder.try_clone()?;
+        self.replays_left -= 1;
+        if let Some(previous) = pump.take() {
+            previous.cancel_and_join().await;
+        }
+        let (body, next_pump) =
+            install_buffered_upload_write_watermark(self.body.clone(), self.write_timeout_ms);
+        *pump = next_pump;
+        Some(next.body(body))
     }
 }
 
@@ -45875,7 +45902,7 @@ impl BufferedUploadReplay {
 /// stays per attempt rather than accumulating across them.
 pub(crate) async fn send_buffered_upload_with_protocol_nack_replay<F, Fut, A>(
     mut builder: reqwest::RequestBuilder,
-    replay: Option<BufferedUploadReplay>,
+    mut replay: Option<BufferedUploadReplay>,
     pump: &mut Option<upload_pump::UploadPumpJoin>,
     mut attempt: F,
     should_replay: impl Fn(&A) -> bool,
@@ -45884,32 +45911,18 @@ where
     F: FnMut(reqwest::RequestBuilder) -> Fut,
     Fut: std::future::Future<Output = A>,
 {
-    let mut replays_left = BUFFERED_UPLOAD_PROTOCOL_NACK_REPLAYS;
     loop {
         let outcome = await_upload_write_watermark_first(attempt(builder), pump.as_mut()).await?;
-        let Some(source) = replay.as_ref() else {
-            return Ok(outcome);
-        };
-        if replays_left == 0 {
-            return Ok(outcome);
-        }
         if !should_replay(&outcome) {
             return Ok(outcome);
         }
-        let Some(next) = source.builder.try_clone() else {
+        let Some(source) = replay.as_mut() else {
             return Ok(outcome);
         };
-        replays_left -= 1;
-        // Stop the attempt that just NACKed before starting another: its pump
-        // may still own the bridge task, and two live pumps for one request
-        // would race two watermarks onto the same join point.
-        if let Some(previous) = pump.take() {
-            previous.cancel_and_join().await;
-        }
-        let (body, next_pump) =
-            install_buffered_upload_write_watermark(source.body.clone(), source.write_timeout_ms);
-        *pump = next_pump;
-        builder = next.body(body);
+        let Some(next) = source.replay_after_protocol_nack(pump).await else {
+            return Ok(outcome);
+        };
+        builder = next;
     }
 }
 

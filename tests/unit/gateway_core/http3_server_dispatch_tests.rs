@@ -4631,8 +4631,8 @@ fn the_h3_prebuffered_plain_arm_writes_under_the_backend_write_watermark() {
         .find("install_buffered_upload_write_watermark(")
         .expect("the prebuffered arm must install the shared buffered upload pump");
     let replay = dispatch
-        .find("send_buffered_upload_with_protocol_nack_replay(")
-        .expect("the prebuffered arm must dispatch through the shared replay loop");
+        .find("replay_after_protocol_nack(")
+        .expect("the prebuffered arm must advance through the shared replay state");
     assert!(
         install < replay,
         "the pump must exist before the attempt that races it"

@@ -140,8 +140,8 @@ use crate::proxy::headers::{
 };
 use crate::proxy::{
     BufferedUploadReplay, absolute_response_header_read_bound,
-    install_buffered_upload_write_watermark, optional_sleep_elapsed,
-    send_buffered_upload_with_protocol_nack_replay,
+    await_upload_write_watermark_first, install_buffered_upload_write_watermark,
+    optional_sleep_elapsed,
 };
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
@@ -2872,7 +2872,7 @@ where
                             plain_upload_bytes.clone(),
                             dispatch_proxy.backend_write_timeout_ms,
                         );
-                    let plain_buffered_replay = if plain_upload_pump.is_some() {
+                    let mut plain_buffered_replay = if plain_upload_pump.is_some() {
                         BufferedUploadReplay::capture(
                             &plain_request_builder,
                             &plain_upload_bytes,
@@ -2887,24 +2887,49 @@ where
                         absolute_response_header_read_bound(dispatch_proxy.backend_read_timeout_ms);
                     let plain_upload_deadline = plain_write_bound.deadline();
                     let plain_peer_signal = ctx.peer_connection.as_ref();
-                    let header_bound = send_buffered_upload_with_protocol_nack_replay(
-                        plain_request_builder.body(plain_upload_body),
-                        plain_buffered_replay,
-                        &mut plain_upload_pump,
-                        |builder| {
-                            crate::plugins::await_deadline_first(
-                                plain_header_deadline_at,
-                                await_h3_backend_or_peer(
-                                    plain_upload_deadline,
-                                    plain_peer_signal,
-                                    crate::http3::stream_util::peer_response_cancelled(stream),
-                                    builder.send(),
-                                ),
-                            )
-                        },
-                        plain_send_is_protocol_nack,
-                    )
-                    .await;
+                    let mut plain_attempt_builder = plain_request_builder.body(plain_upload_body);
+                    // The H3 STOP_SENDING future must be constructed directly
+                    // for each attempt. Retaining `stream` inside the generic
+                    // replay closure would either require the transport to be
+                    // `Sync` or let an `FnMut` future borrow its capture. The
+                    // returned cancellation future is `'static`, so this local
+                    // construction releases the stream reborrow before the
+                    // attempt is awaited and the stream remains available for
+                    // the eventual response.
+                    let header_bound = loop {
+                        let stream_cancelled =
+                            crate::http3::stream_util::peer_response_cancelled(stream);
+                        let attempt = crate::plugins::await_deadline_first(
+                            plain_header_deadline_at,
+                            await_h3_backend_or_peer(
+                                plain_upload_deadline,
+                                plain_peer_signal,
+                                stream_cancelled,
+                                plain_attempt_builder.send(),
+                            ),
+                        );
+                        let outcome = await_upload_write_watermark_first(
+                            attempt,
+                            plain_upload_pump.as_mut(),
+                        )
+                        .await;
+                        let should_replay = outcome
+                            .as_ref()
+                            .is_ok_and(|attempt| plain_send_is_protocol_nack(attempt));
+                        if !should_replay {
+                            break outcome;
+                        }
+                        let Some(replay) = plain_buffered_replay.as_mut() else {
+                            break outcome;
+                        };
+                        let Some(next) = replay
+                            .replay_after_protocol_nack(&mut plain_upload_pump)
+                            .await
+                        else {
+                            break outcome;
+                        };
+                        plain_attempt_builder = next;
+                    };
                     let send_result = match header_bound {
                         Err(()) => {
                             drop(pending_slot);

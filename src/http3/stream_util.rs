@@ -368,14 +368,10 @@ where
 /// Quinn's `SendStream::stopped` is `&self` and `'static`, so this future does
 /// not borrow `stream` and can race a backend header wait while the receive
 /// half is still polled or the send half is later used to write a response.
-/// The helper deliberately accepts an exclusive reborrow: a caller may retain
-/// a cancellation-future factory across an `.await`, and capturing `&mut
-/// RequestStream` keeps that factory `Send` under the stream's existing `Send`
-/// bound without imposing an unnecessary `Sync` bound on the transport.
 /// Completes on peer `STOP_SENDING` or a connection-level failure. A clean
 /// local finish acknowledgement (`Ok(None)`) is not cancellation.
 pub(crate) fn peer_response_cancelled<S>(
-    stream: &mut RequestStream<S, Bytes>,
+    stream: &RequestStream<S, Bytes>,
 ) -> impl Future<Output = ()> + Send + 'static
 where
     S: SendStreamStopped,
