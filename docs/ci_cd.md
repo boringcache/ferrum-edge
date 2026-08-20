@@ -2358,6 +2358,22 @@ superseded by this chain; #3911 must rebase to the combined step-2 text.
 #3910's comment-only `setup-rust-ci` tweak is not admitted here; drop or
 re-pin it after merging latest `main`.
 
+##### Admitted `setup-sccache` generation transition (temporary)
+
+`.github/actions/setup-sccache/action.yml` carries one admitted move decided by
+this trusted policy (`LOCAL_ACTION_GENERATION_TRANSITIONS`) for PR #4090 (issue
+#3906): the trusted-base file (SHA-256
+`0a76993b4ad68a96430ca12a2ab082116a302d84dc89cc486e564c61ad8d6dd4`) moves to
+the deterministic wrapper-path generation
+(`d14af1484f2c7656e71f29c1c1e9386d5b1f5286193ec3d811bba6f224ffa00e`) so
+Swatinem/rust-cache keys stay stable across jobs. The pair is exact,
+path-bound, one-way, and fail-closed. The candidate supplies no digest,
+allowlist, or fallback. Any other revision pair or path is scanned as an
+ordinary Cross surface change. RETIREMENT IS MANDATORY: delete this tuple once
+#4090 is on `main`. Issue #3906 remains open for post-merge warm-cache
+acceptance evidence; this PR references it with `Refs #3906`, not a closing
+keyword.
+
 ##### Remaining CI-tranche predecessor sequence
 
 This predecessor is the maximum safe consolidation. Preserve every original

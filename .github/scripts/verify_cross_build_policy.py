@@ -12125,7 +12125,10 @@ WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS: tuple[
 # change plus #3911's optional `workspaces` input/pass-through. Each step is
 # exact, path-bound, one-way, fail-closed. The candidate cannot supply a
 # digest. The former direct #3889→#3911 pair is superseded by this chain and
-# #3911 must rebase to the combined destination text. The Helm Chart
+# #3911 must rebase to the combined destination text. `setup-sccache/action.yml`
+# carries one admitted move for PR #4090 (issue #3906): the trusted-base file
+# moves to a deterministic wrapper path under `${RUNNER_TEMP}/ferrum-sccache-bin/`
+# so Swatinem/rust-cache keys stay stable across jobs. The Helm Chart
 # setup-kubernetes-tools generation lives in `verify_trusted_local_action.py`,
 # not here: that gate is byte-identity of the extracted checker, not a Cross
 # surface comparison.
@@ -12139,6 +12142,11 @@ LOCAL_ACTION_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
         "setup-rust-ci/action.yml",
         "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
         "219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925",
+    ),
+    (
+        "setup-sccache/action.yml",
+        "0a76993b4ad68a96430ca12a2ab082116a302d84dc89cc486e564c61ad8d6dd4",
+        "d14af1484f2c7656e71f29c1c1e9386d5b1f5286193ec3d811bba6f224ffa00e",
     ),
 )
 
@@ -19080,10 +19088,16 @@ pre_build = []
             "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
             "219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925",
         ),
+        (
+            "setup-sccache/action.yml",
+            "0a76993b4ad68a96430ca12a2ab082116a302d84dc89cc486e564c61ad8d6dd4",
+            "d14af1484f2c7656e71f29c1c1e9386d5b1f5286193ec3d811bba6f224ffa00e",
+        ),
     ):
         failures.append(
-            "the setup-rust-ci generation table does not pin the cache-budget "
-            "generation chain and the rebased combined #3911 destination"
+            "the local-action generation table does not pin the setup-rust-ci "
+            "cache-budget chain, the rebased combined #3911 destination, and "
+            "the setup-sccache #4090 deterministic-wrapper move"
         )
 
     remote_action_composite = (
