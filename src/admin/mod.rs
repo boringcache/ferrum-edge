@@ -498,7 +498,8 @@ impl AdminState {
     /// batch, restore). Managed TLS / ACME handlers mutate independent stores
     /// and must call [`Self::admit_non_config_db_write`] instead.
     // Returning the constructed response by value matches the established admin
-    // admission contract; boxing would add an allocation on every gated write.
+    // admission contract; boxing would add allocation and API churn to a cold
+    // rejection path without reducing the successful-path footprint.
     #[allow(clippy::result_large_err)]
     pub async fn admit_write(
         &self,
