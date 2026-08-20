@@ -25,7 +25,7 @@ Ferrum Edge is a lightweight, extensible edge proxy designed for modern microser
 - **Eight operating modes**: Database, File, Control Plane, Data Plane, Mesh, Injector, Node Agent, and Migrate
 - **Lock-free hot path**: All request-path reads use `ArcSwap` or `DashMap` — no mutexes on the proxy path
 - **Zero-downtime config reloads**: Atomic config swap via DB polling, SIGHUP, or CP push
-- **Service mesh**: Six topologies (sidecar, ambient, node waypoint, service waypoint, east-west gateway, egress), native MeshSubscribe, xDS ADS, or localized file config consumption, SPIFFE identity, HBONE, transparent DNS proxy, mesh authorization, REGISTRY_ONLY outbound policy, and Istio/GAMMA RED metrics. See [docs/mesh.md](docs/mesh.md)
+- **Service mesh**: Six topologies (sidecar, ambient, **Experimental** node waypoint, service waypoint, east-west gateway, egress), native MeshSubscribe, xDS ADS, or localized file config consumption, SPIFFE identity, HBONE, transparent DNS proxy, mesh authorization, REGISTRY_ONLY outbound policy, and Istio/GAMMA RED metrics. See [docs/mesh.md](docs/mesh.md)
 - **Runtime observability**: JWT-gated `/metrics/runtime` JSON snapshot with system/process state, HTTP status windows, error classes, DNS outcomes, backend pool churn, TCP resets, log counters, and overload state
 - **Kubernetes mesh translation**: Gateway API and Istio VirtualService route splits, Istio AuthorizationPolicy/RequestAuthentication/PeerAuthentication, and sidecar injection webhook
 
@@ -237,7 +237,7 @@ Ferrum Edge is configured through environment variables, with an optional `ferru
 | `FERRUM_LOG_BUFFER_CAPACITY` | No | `4096` | Per-sink hard record limit; aggregate bytes are separately bounded by `FERRUM_LOG_BUFFER_BYTES` |
 | `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy port (`0` = disabled) |
 | `FERRUM_PROXY_HTTPS_PORT` | No | `8443` | HTTPS proxy port |
-| `FERRUM_ACCEPT_THREADS` | No | `0` (auto-detect) | Parallel accept loops via SO_REUSEPORT (0 = CPU cores; Unix only, non-Unix falls back to one loop) |
+| `FERRUM_ACCEPT_THREADS` | No | `0` (auto-detect) | Parallel accept loops on duplicated fds of one exclusive listen socket (0 = CPU cores; Unix only, non-Unix falls back to one loop) |
 | `FERRUM_ADMIN_HTTP_PORT` | No | `9000` | Admin API HTTP port (`0` = disabled) |
 | `FERRUM_ADMIN_JWT_SECRET` | DB/CP | — | HS256 secret for Admin API (min 32 chars) |
 | `FERRUM_DB_TYPE` | DB/CP | — | `postgres`, `mysql`, `sqlite`, `mongodb` |

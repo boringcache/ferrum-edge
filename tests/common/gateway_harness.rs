@@ -55,14 +55,12 @@
 //!   The child holds that socket for its whole lifetime, so the proof stays
 //!   valid while it runs.
 //! - That ownership claim requires an **exclusive** proxy bind. Production
-//!   defaults `FERRUM_ACCEPT_THREADS` to `available_parallelism()`, which
-//!   enables `SO_REUSEPORT` whenever the value is greater than one. Two
-//!   parallel harness children can then bind the same ephemeral proxy port
-//!   after the classic bind-drop-rebind race, keep distinct admin ports (so
-//!   identity still succeeds), and leave client traffic load-balanced onto a
-//!   foreign gateway that returns 404 for this test's routes. The harness
-//!   therefore pins `FERRUM_ACCEPT_THREADS=1` unless the caller overrides it,
-//!   so a colliding bind fails closed and the spawn retry picks a fresh port.
+//!   binds one exclusive listen socket and duplicates it for
+//!   `FERRUM_ACCEPT_THREADS` accept workers — it never sets `SO_REUSEPORT` —
+//!   so a second process cannot join the same TCP proxy port. The harness
+//!   still pins `FERRUM_ACCEPT_THREADS=1` unless the caller overrides it, so a
+//!   colliding bind is a single-socket `EADDRINUSE` and the spawn retry picks
+//!   a fresh port.
 //!
 //! The spawn wait also polls `Child::try_wait`, so a child that dies after a
 //! partial bind fails fast instead of letting the retry loop burn the full
@@ -1271,11 +1269,9 @@ async fn build_env(
     env.insert("FERRUM_ADMIN_HTTP_PORT".into(), admin_port.to_string());
     env.insert("FERRUM_LOG_LEVEL".into(), b.log_level.clone());
     // A test subprocess gets one accept socket unless the test explicitly
-    // overrides this. Production's auto-sized default enables SO_REUSEPORT;
-    // after the harness's bind/drop port selection, a parallel gateway can
-    // otherwise join the same reuse-port group. Admin identity proves the
-    // child, but requests to its separately selected proxy port may then be
-    // kernel-distributed to the foreign gateway (wrong-route 404/reset).
+    // overrides this. Production accept workers share one exclusive listen
+    // socket (never SO_REUSEPORT); pinning a single accept task keeps the
+    // harness bind/drop retry's EADDRINUSE path simple.
     env.insert("FERRUM_ACCEPT_THREADS".into(), "1".into());
     // Tests don't need the 5s warmup stall; pool warmup failures are
     // non-fatal but noisy in test logs.

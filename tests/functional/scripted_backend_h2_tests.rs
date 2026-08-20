@@ -2585,7 +2585,8 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
         // make the gateway cold: with warmup off, `modes::file::serve` sets
         // `run_initial_refresh = true` and the backend-capability refresh task
         // immediately probes this plaintext backend via
-        // `ProxyState::probe_h2c` -> `grpc_pool.get_sender()`. That probe uses
+        // `ProxyState::probe_h2c` -> `grpc_pool.get_sender_for_capability_probe()`.
+        // That probe uses
         // a clone of this proxy whose only delta is a clamped connect timeout —
         // a field deliberately excluded from the pool key — so it lands on the
         // SAME single-shard gRPC pool entry the request path uses, and it is
@@ -2678,12 +2679,13 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
 }
 
 /// Wait until the binary harness's startup h2c capability probe has finished
-/// `grpc_pool.get_sender()` and connection 0's scripted `AcceptRpc` is armed.
+/// `grpc_pool.get_sender_for_capability_probe()` and connection 0's scripted
+/// `AcceptRpc` is armed.
 ///
 /// With `FERRUM_POOL_WARMUP_ENABLED=false` the binary harness still gets
 /// `run_initial_refresh = true` (see `modes::file::serve`), so a spawned
 /// capability-refresh pass dials plaintext backends through the shared gRPC
-/// pool via `probe_h2c` → `get_sender()`. Under
+/// pool via `probe_h2c` → `get_sender_for_capability_probe()`. Under
 /// `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST=1` that probe occupies the only
 /// shard and inserts a pooled sender the request path will reuse.
 ///
@@ -2993,6 +2995,8 @@ async fn direct_h2_strips_spoofed_client_forwarded_when_regenerating() {
         .get(harness.proxy_url("/api/ownership"))
         .header(reqwest::header::HOST, "example.com")
         .header("forwarded", "for=10.0.0.1;proto=https")
+        .header("x-forwarded-for", "198.51.100.9")
+        .header("x-real-ip", "8.8.8.8")
         .send()
         .await
         .expect("gateway response");
@@ -3036,6 +3040,29 @@ async fn direct_h2_strips_spoofed_client_forwarded_when_regenerating() {
     assert!(
         forwarded.iter().all(|v| !v.contains("10.0.0.1")),
         "spoofed client Forwarded must not reach the direct-H2 backend: {forwarded:?}"
+    );
+    let xff: Vec<&str> = stream
+        .headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("x-forwarded-for"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(
+        xff,
+        vec!["127.0.0.1"],
+        "untrusted inbound XFF must not reach the direct-H2 backend; got {xff:?} \
+         (headers={:?})",
+        stream.headers
+    );
+    let real_ip: Vec<&str> = stream
+        .headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("x-real-ip"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert!(
+        real_ip.is_empty(),
+        "untrusted X-Real-IP must not reach the direct-H2 backend: {real_ip:?}"
     );
 }
 

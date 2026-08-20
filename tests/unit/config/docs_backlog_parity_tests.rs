@@ -39,6 +39,40 @@ fn production_readiness_does_not_track_completed_epic_rows_as_open() {
         PRODUCTION_READINESS.contains("intentional mixed strategy"),
         "k8s status ownership must document the intentional RMW+SSA mixed strategy"
     );
+    assert!(
+        PRODUCTION_READINESS.contains("<!-- launch-readiness:historical -->"),
+        "historical launch-readiness marker must remain after the gate was removed"
+    );
+    assert!(
+        !PRODUCTION_READINESS.contains("live gate is authoritative"),
+        "removed launch gate must not be cited as live authority"
+    );
+    assert!(
+        !PRODUCTION_READINESS.contains("Subsequent launch state is owned by the live gate"),
+        "removed launch gate / policy inventory must not own subsequent launch state"
+    );
+    assert!(
+        PRODUCTION_READINESS
+            .contains("| Provenance-complete mesh/HBONE/DNS perf baselines | #3332 |"),
+        "open #3332 must remain in the residual map"
+    );
+    assert!(
+        PRODUCTION_READINESS.contains("#3892"),
+        "still-open 2026-08-15 scaling-regression tracker #3892 must remain recorded as OPEN"
+    );
+    assert!(
+        !PRODUCTION_READINESS.contains("| Live OIDC / OAuth2 introspection coverage | #3333 |"),
+        "closed #3333 must not remain a residual-map live row"
+    );
+    assert!(
+        !PRODUCTION_READINESS
+            .contains("| EgressGateway UDP `ServiceEntry` materialization | #3263 |"),
+        "closed #3263 must not remain a residual-map live row"
+    );
+    assert!(
+        PRODUCTION_READINESS.contains("#3263") && PRODUCTION_READINESS.contains("#3671"),
+        "closed #3263 must be recorded as implemented with its closing PR"
+    );
 }
 
 #[test]
@@ -186,9 +220,21 @@ fn issue_2110_register_maps_completed_work_and_live_trackers() {
     for issue in ["#3228", "#3299", "#3302", "#3304", "#3331", "#3332"] {
         assert!(
             ISSUE_2110_REGISTER.contains(issue),
-            "register must cite live tracker {issue}"
+            "register must keep completed/open residual {issue} recorded"
         );
     }
+    assert!(
+        !ISSUE_2110_REGISTER.contains("## Live dedicated trackers"),
+        "frozen register must not keep a live dedicated-trackers heading"
+    );
+    assert!(
+        ISSUE_2110_REGISTER.contains("not a live tracker"),
+        "register must say it is not a live tracker"
+    );
+    assert!(
+        ISSUE_2110_REGISTER.contains("CLOSED (COMPLETED, 2026-07-28)"),
+        "register must record that GitHub issue #2110 is closed"
+    );
     // #3263 moved from the live-tracker table to the completed table.
     assert!(
         ISSUE_2110_REGISTER

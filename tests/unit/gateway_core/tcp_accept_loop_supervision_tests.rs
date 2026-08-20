@@ -1,4 +1,4 @@
-//! External regression coverage for TCP SO_REUSEPORT accept-loop supervision
+//! External regression coverage for TCP accept-loop supervision
 //! (issue #3216).
 //!
 //! Extra accept loops previously ran as unchecked `JoinHandle`s while the

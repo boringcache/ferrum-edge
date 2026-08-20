@@ -16,6 +16,9 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 use super::common::containers::{BoxError, fail_in_ci_else_skip};
+use super::common::host_ports::{
+    allocate_host_port, is_host_port_collision, retry_on_host_port_collision,
+};
 
 struct MySqlFixture {
     _container: ContainerAsync<GenericImage>,
@@ -24,13 +27,19 @@ struct MySqlFixture {
 }
 
 /// Bound transient Docker image-transfer/start failures without turning a
-/// deterministic fixture failure into an unbounded CI retry.
-async fn start_mysql_container(password: &str) -> Result<ContainerAsync<GenericImage>, BoxError> {
+/// deterministic fixture failure into an unbounded CI retry. Host-port bind
+/// collisions are not retried here: they must surface so
+/// `retry_on_host_port_collision` can re-allocate a fresh port.
+async fn start_mysql_container(
+    password: &str,
+    host_port: u16,
+) -> Result<ContainerAsync<GenericImage>, BoxError> {
     const START_ATTEMPTS: u32 = 3;
 
     for attempt in 1..=START_ATTEMPTS {
         match GenericImage::new("mysql", "8.4")
             .with_exposed_port(3306.tcp())
+            .with_mapped_port(host_port, 3306.tcp())
             .with_env_var("MYSQL_ROOT_PASSWORD", password)
             .with_env_var("MYSQL_ROOT_HOST", "%")
             .with_env_var("MYSQL_DATABASE", "ferrum")
@@ -39,6 +48,9 @@ async fn start_mysql_container(password: &str) -> Result<ContainerAsync<GenericI
         {
             Ok(container) => return Ok(container),
             Err(error) => {
+                if is_host_port_collision(&error.to_string()) {
+                    return Err(format!("MySQL container start failed: {error}").into());
+                }
                 if attempt == START_ATTEMPTS {
                     return Err(format!(
                         "MySQL container failed to start after {START_ATTEMPTS} attempts: {error}"
@@ -58,8 +70,12 @@ async fn start_mysql_container(password: &str) -> Result<ContainerAsync<GenericI
 
 async fn start_mysql() -> Result<MySqlFixture, BoxError> {
     const PASSWORD: &str = "ferrum-mysql-test-password";
-    let container = start_mysql_container(PASSWORD).await?;
-    let port = container.get_host_port_ipv4(3306.tcp()).await?;
+    let (container, port) = retry_on_host_port_collision(|| async {
+        let host_port = allocate_host_port()?;
+        let container = start_mysql_container(PASSWORD, host_port).await?;
+        Ok((container, host_port))
+    })
+    .await?;
     let url = format!("mysql://root:{PASSWORD}@127.0.0.1:{port}/ferrum");
 
     sqlx::any::install_default_drivers();

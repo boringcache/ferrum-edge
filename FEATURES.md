@@ -64,7 +64,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 
 ## Service Mesh
 
-- **Six topologies** — `sidecar` (inbound mTLS on 15006 + outbound capture on 15001), `ambient` (HBONE termination on 15008), `node_waypoint` (HBONE on 15008, per-pod identity resolved from node-agent/eBPF socket-cookie records), `service_waypoint` (HBONE on 15008, service-scoped Ambient waypoint for Istio GAMMA traffic), `east_west_gateway` (SNI-routed passthrough on 15443), `egress_gateway` (mTLS inbound on 15090 → external ServiceEntry backends)
+- **Six topologies** — `sidecar` (inbound mTLS on 15006 + outbound capture on 15001), `ambient` (HBONE termination on 15008), `node_waypoint` (**Experimental** — HBONE on 15008, per-pod identity resolved from node-agent/eBPF socket-cookie records), `service_waypoint` (HBONE on 15008, service-scoped Ambient waypoint for Istio GAMMA traffic), `east_west_gateway` (SNI-routed passthrough on 15443), `egress_gateway` (mTLS inbound on 15090 → external ServiceEntry backends)
 - **Config consumption** — native `MeshSubscribe` gRPC (Ferrum-native), standard xDS ADS (CDS/EDS/LDS/RDS/SDS) with multi-CP failover and jittered exponential backoff, or a localized mesh config file (`FERRUM_MESH_FILE_CONFIG_PATH`, fail-closed startup + SIGHUP reload, no control plane)
 - **SPIFFE identity** — extracted from mTLS peer certificates and HBONE W3C Baggage headers with trust-domain aliasing for federated multi-cluster. On the `internal` CA backend Ferrum can serve its own Workload API: X.509-SVIDs plus JWT-SVID mint/validate/bundle streaming (ES256, attested-subject-only, bounded lifetimes, operator-configured and externally-rotated signing material for restart/HA continuity). Serving a Workload API on the `spire` backend is refused at startup — that agent issues only the calling process's own identity — while the active SPIRE path continues to consume its X.509 SVID and trust bundles for peer verification ([#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617))
 - **Mesh authorization** — identity-based `MeshPolicy` with `PolicyScope` filtering (MeshWide / Namespace / WorkloadSelector), DENY-first evaluation, Istio-compatible implicit deny semantics, principal/request/condition matching with glob patterns
@@ -225,7 +225,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 ## High-Concurrency & Runtime Tuning
 
 - **jemalloc** memory allocator (Linux/macOS) for reduced fragmentation at scale
-- **Multi-listener SO_REUSEPORT** — N parallel accept loops per proxy port (auto-detects CPU cores via `FERRUM_ACCEPT_THREADS`), giving the kernel separate accept queues to eliminate single-socket lock bottleneck at high connection rates
+- **Exclusive multi-accept** — N parallel accept loops per proxy port on duplicated fds of one exclusive listen socket (auto-detects CPU cores via `FERRUM_ACCEPT_THREADS`). A second process cannot bind the same TCP proxy address/port; `SO_REUSEPORT` is never used for this fan-out
 - Configurable TCP listen backlog (default 2048) for burst absorption
 - Connection limit semaphore (default 100k) with graceful queuing under overload
 - Server-side HTTP/2 `max_concurrent_streams` (default 1000) to bound per-connection resource usage

@@ -38,7 +38,9 @@ jobs:
       run_helm: ${{ steps.plan.outputs.run_helm }}
       run_mesh_federation: ${{ steps.plan.outputs.run_mesh_federation }}
       run_mesh_sidecar_smoke: ${{ steps.plan.outputs.run_mesh_sidecar_smoke }}
-      run_ebpf_live: ${{ steps.plan.outputs.run_ebpf_live }}
+      run_ebpf_kernel_live: ${{ steps.plan.outputs.run_ebpf_kernel_live }}
+      run_netns_capture_live: ${{ steps.plan.outputs.run_netns_capture_live }}
+      run_two_cluster_live: ${{ steps.plan.outputs.run_two_cluster_live }}
       run_ebpf_build: ${{ steps.plan.outputs.run_ebpf_build }}
       run_secrets_backends: ${{ steps.plan.outputs.run_secrets_backends }}
       run_pkcs11: ${{ steps.plan.outputs.run_pkcs11 }}
@@ -248,7 +250,7 @@ jobs:
           # after the new planner proves the NUL stream classifiable.
           # Missing/invalid individual outputs still fail closed to true.
           gate_fallbacks=()
-          for gate in run_helm run_mesh_federation run_mesh_sidecar_smoke run_ebpf_live run_ebpf_build run_secrets_backends run_pkcs11; do
+          for gate in run_helm run_mesh_federation run_mesh_sidecar_smoke run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11; do
             value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"
             if [ "$paths_classifiable" != "true" ]; then
               value=true
@@ -282,7 +284,7 @@ jobs:
             echo ""
             echo "| Gate | Scheduled |"
             echo "| --- | --- |"
-            for gate in run_helm run_mesh_federation run_mesh_sidecar_smoke run_ebpf_live run_ebpf_build run_secrets_backends run_pkcs11; do
+            for gate in run_helm run_mesh_federation run_mesh_sidecar_smoke run_ebpf_kernel_live run_netns_capture_live run_two_cluster_live run_ebpf_build run_secrets_backends run_pkcs11; do
               value="$(printf '%s\n' "$plan" | sed -n "s/^${gate}=//p")"
               if [ "$paths_classifiable" != "true" ]; then
                 value=true
@@ -622,8 +624,11 @@ jobs:
         # Consul, LDAP, Kafka/Redpanda, MySQL, and Hydra (OIDC / introspection)
         # run real third-party software through testcontainers. Nextest reports
         # each test independently and keeps running after one backend fails so
-        # one middleware cannot mask another.
-        run: cargo nextest run --test service_integration --no-fail-fast consul ldap kafka mysql oidc oauth2_introspection
+        # one middleware cannot mask another. `host_port_allocation` needs no
+        # container: it is the pure unit coverage for the host-port allocator
+        # every fixture above maps through, and the filter list is exhaustive,
+        # so a module missing from it never runs (issue #3999).
+        run: cargo nextest run --test service_integration --no-fail-fast consul ldap kafka mysql oidc oauth2_introspection host_port_allocation
         env:
           RUST_BACKTRACE: 1
 
@@ -4469,20 +4474,6 @@ jobs:
             fi
           }
 
-          require_live_gate() {
-            local label="$1"
-            local result="$2"
-            local changed="${{ needs.ci-plan.outputs.run_ebpf_live }}"
-            if [ "$changed" = "true" ]; then
-              require_success "$label" "$result"
-              return
-            fi
-            if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
-              echo "::error title=Live CI gate failed::${label} completed with result '${result}'"
-              failures=1
-            fi
-          }
-
           require_planned_gate() {
             local label="$1"
             local result="$2"
@@ -4547,9 +4538,9 @@ jobs:
           require_success "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"
           require_planned_gate "eBPF programs" "${{ needs.build-ebpf.result }}" "${{ needs.ci-plan.outputs.run_ebpf_build }}"
           require_success "eBPF userspace loader" "${{ needs.build-ebpf-userspace.result }}"
-          require_live_gate "eBPF live-kernel" "${{ needs.ebpf-live.result }}"
-          require_live_gate "Netns capture live" "${{ needs.netns-capture-live.result }}"
-          require_live_gate "Two-cluster mesh live" "${{ needs.two-cluster-mesh-live.result }}"
+          require_planned_gate "eBPF live-kernel" "${{ needs.ebpf-live.result }}" "${{ needs.ci-plan.outputs.run_ebpf_kernel_live }}"
+          require_planned_gate "Netns capture live" "${{ needs.netns-capture-live.result }}" "${{ needs.ci-plan.outputs.run_netns_capture_live }}"
+          require_planned_gate "Two-cluster mesh live" "${{ needs.two-cluster-mesh-live.result }}" "${{ needs.ci-plan.outputs.run_two_cluster_live }}"
           require_success "Performance regression" "${{ needs.performance-regression.result }}"
           require_success "Native platform binaries" "${{ needs.build-binaries.result }}"
           if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
@@ -4798,9 +4789,9 @@ jobs:
   ebpf-live:
     name: eBPF Live-Kernel Test
     needs: ci-plan
-    # Live kernel validation is high-value for BPF/node-waypoint-sensitive
-    # changes, but it adds several minutes to every PR when run unconditionally.
-    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_live == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    # Live kernel validation is high-value for BPF/loader-sensitive changes,
+    # but it adds several minutes to every PR when run unconditionally.
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_kernel_live == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -4899,9 +4890,10 @@ jobs:
   netns-capture-live:
     name: Netns Source Capture Live Tests
     needs: ci-plan
-    # The netns tests require privileged live-kernel operations; the path gate
-    # keeps unrelated PRs fast while preserving coverage for capture/proxy paths.
-    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_live == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    # The netns tests require privileged live-kernel operations; the dedicated
+    # path gate keeps unrelated PRs fast while preserving coverage for
+    # capture/netns/UDP surfaces.
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_netns_capture_live == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -5030,10 +5022,9 @@ jobs:
   two-cluster-mesh-live:
     name: Two-Cluster Mesh Live Datapath
     needs: ci-plan
-    # Shares the mesh/netns-sensitive path detector with the source-capture
-    # lane. The gate is intentionally separate because it downloads two real
-    # SPIRE control planes and runs the full cross-cluster protocol matrix.
-    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_live == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    # Dedicated cross-cluster/HBONE/identity path gate. The job downloads two
+    # real SPIRE control planes and runs the full cross-cluster protocol matrix.
+    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_two_cluster_live == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

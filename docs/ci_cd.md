@@ -80,7 +80,7 @@ Pull Request / Merge Queue group
                     ├─► Lint, dependency audit, vendored regressions
                     ├─► Fuzz smoke (property budgets on PRs; the six-target
                     │   libFuzzer budget on merge_group / push to main / manual)
-                    ├─► eBPF/netns live checks when planner marks relevant
+                    ├─► Per-suite eBPF kernel / netns-capture / two-cluster live checks when planner marks relevant
                     ├─► Planner-gated mesh / Helm / performance gates
                     └─► Five target release builds
     └─► Dedicated required checks (internally skip unrelated changes)
@@ -429,7 +429,51 @@ rust-cache / the FIPS producer archive. Production-image cache restore and save 
 pinned `actions/cache/*` actions; PR-controlled `run:` steps only measure the
 restored directory and move the BuildKit local export. Workflows stay
 `permissions: contents: read`. Static checks live in
-`.github/scripts/verify_ci_runtime_cache.py`.
+`.github/scripts/verify_ci_runtime_cache.py`. The cache-credential gate is
+structural: `fips-build.yml` may invoke only a closed allowlist of pinned
+actions and the two local shell-only composites (`setup-sccache`,
+`setup-fast-linker`). Extracted `uses` must match that allowlist with exact
+occurrence counts, so inserting a duplicate of an already-admitted
+checkout, rust-cache, artifact, toolchain, or local action fails. Each
+`actions/checkout` step must keep the current-repository / default-ref /
+default-root contract: `persist-credentials: false` and no `repository`,
+`ref`, or `path` redirection (including equivalent quoted, escaped, or
+dynamic spellings). Each checkout has exactly one inspectable `with:` mapping,
+so duplicate-key shadowing cannot hide the effective inputs. Those local actions
+must remain `using: composite`
+with `run:` steps only — no nested `uses:`, so no inline or third-party
+JavaScript carrier can reach the Actions toolkit credential environment.
+Alternate YAML spellings of `uses` (flow mappings, unbraced flow pairs,
+quoted/escaped/multiline keys, explicit keys, anchors, aliases, tags,
+merge keys, block scalars, templates, compact-sequence siblings after a
+block scalar, and non-comment `#` data in plain flow scalars) are
+rejected fail-closed rather than treated as an absence of invocations.
+The contiguous
+`exportVariable` token deny remains defense in depth; it does not catch
+computed property forms such as `core["export" + "Variable"]` on its own.
+It is scanned over every slot except the **document-root** `description:`
+metadata **scalar**, which GitHub renders and never evaluates:
+`setup-sccache/action.yml` is whole-file digest-frozen by the Cross build
+policy, so the installer that enforces the credential boundary has to stay free
+to document the toolkit call it refuses. The carve-out is that one key at
+column zero — its plain or quoted scalar plus its correctly delimited block
+body — and nothing else. A root `description:` whose value is a flow mapping,
+flow sequence, explicit complex value, or any other non-scalar shape stays
+scanned: it is not rendered string prose, and a nested `&anchor` inside a flow
+collection is not a leading node property, so blanking it would hide the token
+while an alias could still feed it into executable data. Nested `description:`
+keys are **not** exempt: an action or
+`workflow_dispatch` input description is `core.getInput('description')`, an
+`env:`/`with:` entry is `process.env.description`, and any other nested mapping
+is data some `run:` body can read, so a carrier parked there could rebuild the
+forbidden property (`core[process.env.description]`) with no contiguous token
+left on the line. A root `description:` carrying a leading `&anchor`, `*alias`,
+or `!tag` is scanned too, because an anchored scalar is reachable by alias from
+an executable slot, and only the first root `description:` is exempted because a
+second one is a duplicate key rather than more rendered metadata. A
+`description:`-shaped line inside a `run:` body is stepped
+over as shell, a `- description:` item is a sequence entry rather than the root
+mapping, and quoted or suffixed key spellings keep the full scan.
 
 `node-waypoint-ebpf-live.yml` path-filtered `pull_request.paths` must be a
 **trigger superset** of every `production-dockerfile-smoke` sensitive input in
@@ -444,12 +488,21 @@ and fail closed when planning succeeds but the output is blank or malformed
 
 The same trusted plan job emits a second exact boolean,
 `node_waypoint_relevant`, from the `node-waypoint-ebpf-live` planner suite.
-That suite keeps the pre-#3888 NodeWaypoint path scope (eBPF, node-agent,
-mesh/HBONE, chart, harness, and the original specific `src/` files). Ordinary
-`src/**`, `vendor/**`, `.cargo/**`, `rust-toolchain.toml`, and
-`custom_plugins/**` changes still start the workflow for production-image
-smoke, but skip the 120-minute Kind/eBPF live job unless they also match that
-prior scope. The live job uses `if: always() &&
+That suite is the pre-#3888 NodeWaypoint path scope (eBPF, node-agent,
+mesh/HBONE, chart, harness, and specific `src/` files) plus the NodeWaypoint
+datapath modules that landed after the historical list was written: every
+`src/proxy/node_waypoint_*` module, `src/proxy/stream_listener.rs`,
+`src/proxy/udp_proxy.rs`, and `src/proxy/mesh_tcp_inbound.rs`. The
+`src/proxy/node_waypoint_` entry is a **prefix**, not a file list, because
+that historical set enumerated `src/proxy/` file by file and was already
+stale when it was frozen: `node_waypoint_ingress_capture.rs` and the four
+`node_waypoint_udp_*.rs` modules were the only gate for the
+`node_waypoint.udp.*` and `node_waypoint.dtls.*` live assertions and were
+skipping it. A new NodeWaypoint proxy module is now sensitive by
+construction. Ordinary `src/**`, `vendor/**`, `.cargo/**`,
+`rust-toolchain.toml`, and `custom_plugins/**` changes still start the
+workflow for production-image smoke, but skip the 120-minute Kind/eBPF live
+job unless they also match that scope. The live job uses `if: always() &&
 needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false'`:
 GitHub skip-propagation is defeated with `always()`, and a trustworthy exact
 `false` is the only skip. A missing trusted planner (adoption PR), planner
@@ -513,8 +566,43 @@ use the canned reason and never interpolate hostile paths.
 
 The same trusted planner emits fail-closed job outputs for Helm, the legacy
 multicluster deployment smoke, the sidecar deployment smoke, eBPF program
-builds, eBPF/netns live suites, Secret Backends (`run_secrets_backends`), and
-PKCS#11 SoftHSM (`run_pkcs11`). The deploy-only multicluster job remains a
+builds, three separate live suites (`run_ebpf_kernel_live`,
+`run_netns_capture_live`, `run_two_cluster_live`), Secret Backends
+(`run_secrets_backends`), and PKCS#11 SoftHSM (`run_pkcs11`). Each live job
+reads only its own output. Pattern lists are derived from the files those jobs actually
+compile and execute: kernel live is the BPF crate plus `src/ebpf/`, the
+node-agent ingress-redirect helpers, `src/capture/` (`should_fallback_to_iptables`
+via `kernel_probe`), and the loader-adjacent transparent bind
+(`src/proxy/mod.rs` `create_proxy_socket` + `src/socket_opts.rs`); netns
+capture live is the netns/TPROXY/SO_ORIGINAL_DST/UDP producer surfaces
+(`src/proxy/host_udp_capture_live_tests.rs`, `src/proxy/udp_placement_migration.rs`) plus
+the HBONE/mesh-runtime/MeshSubscribe/identity/TLS boundaries, backend dispatch,
+TCP relay, route selection, and mesh policy the source-capture e2e tests
+traverse; two-cluster live is mesh/HBONE/identity/SPIRE/east-west plus
+`SO_ORIGINAL_DST`, mesh trust withdrawal, backend dispatch, route selection,
+mesh policy, MeshSubscribe JWT helpers, the shared functional harness, and
+`two_cluster_spire.sh`. Shared compile inputs
+(`Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `vendor/`, `setup-rust-ci`)
+still fire every live gate. The functional harness file schedules netns and
+two-cluster only — kernel live tests live in `src/ebpf/loader.rs`, not that
+file. CP-side trust serving (`src/grpc/cp_trust.rs`) stays isolated from all
+three, while `src/grpc/cp_server.rs` schedules netns and two-cluster because it
+owns the default JWT issuer shared by their functional fixture and production
+MeshSubscribe client. The deliberate drops from the old `run_ebpf_live` union —
+`src/k8s_controller/**`, `src/service_discovery/**` (except `mesh.rs`),
+`src/grpc/{mod,cp_trust,cp_trust_health,configsync_lifecycle}.rs`,
+`src/modes/control_plane.rs`, and `src/plugins/prometheus_metrics.rs` — are not
+exercised by any of the three ci.yml live jobs and stay out of their gates;
+they are instead covered by the dedicated live workflows or the always-run
+cargo jobs. The shared `tests/k8s/lib/` Kind/SPIRE harness is likewise not a
+ci.yml live input: `node-waypoint-ebpf-live.yml` owns it through its
+`pull_request.paths` (`tests/k8s/lib/**`) and its scoped planner suite.
+Non-PR events, empty or unavailable diffs, and
+edits to `GATE_CONTROLLER_PATHS` (`pr_ci_plan.py`, `live_suite_path_filter.py`)
+force every gated suite on. Missing/invalid planner outputs fail closed to
+`true` in `CI Plan`. Non-mesh-plugin-only, admin-only, Dockerfile, and dedicated
+ambient-host-UDP/k8s-live paths do not schedule these three jobs. The
+deploy-only multicluster job remains a
 distinct packaging-and-rollout check; authoritative datapath coverage rides the
 dedicated `multicluster-federation-live.yml` workflow (path-filtered on PRs,
 force-run on every `main` push). PRs outside those curated path sets skip the
@@ -662,11 +750,12 @@ prove each rejection dimension) in the `Tests` aggregate.
 
 In full mode, the `Tests` aggregate waits for the planner/format checks, test
 shards, lint, dependency audit, vendored patch regressions,
-planner-gated Secret Backends / PKCS#11 / mesh / Helm gates, eBPF/netns gates,
-performance, and the cross-platform build matrix. When the planner marks
-`run_secrets_backends` or `run_pkcs11` false, the aggregate accepts a skipped
-Secret Backends or PKCS#11 job; when the planner marks either true, that job
-must succeed. In light mode it requires the planner to succeed
+planner-gated Secret Backends / PKCS#11 / mesh / Helm gates, per-suite eBPF
+kernel / netns-capture / two-cluster live gates, performance, and the
+cross-platform build matrix. When the planner marks `run_secrets_backends` or
+`run_pkcs11` false, the aggregate accepts a skipped Secret Backends or PKCS#11
+job; when the planner marks either true, that job must succeed. In light mode
+it requires the planner to succeed
 and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
 `latest` prerelease and Docker images only after the full aggregate and build
 matrix pass.
@@ -877,14 +966,42 @@ nightly to build `ferrum-ebpf`, uses stable to run
 artifact with 14-day retention. If this job is edited, preserve the intent that
 the shared-types test runs on stable Rust.
 
+#### 4b. eBPF / netns / two-cluster live jobs (`ci.yml`)
+
+**Runs**: `ubuntu-latest` (privileged), only when `CI Plan` marks the matching
+gate `true`
+
+These three jobs used to share one `run_ebpf_live` allow-list. They now have
+separate fail-closed planner outputs and the `Tests` aggregate enforces each
+with `require_planned_gate` against that job's own output:
+
+| Job | Planner output | Distinctive surfaces |
+|---|---|---|
+| `ebpf-live` | `run_ebpf_kernel_live` | `ebpf/`, `src/ebpf/`, `src/capture/`, `src/proxy/mod.rs`, `src/socket_opts.rs`, `src/modes/node_agent.rs`, `setup-bpf-linker` |
+| `netns-capture-live` | `run_netns_capture_live` | netns/UDP/TPROXY/SO_ORIGINAL_DST producers, `src/capture/`, HBONE pool/proxy, mesh runtime, MeshSubscribe (`src/grpc/mesh_*`, `auth.rs`, `cp_server.rs`, `dp_client.rs`), backend dispatch/TCP relay, routing/service discovery, mesh policy, identity, TLS, `mesh_trust_registry`, source-capture functional tests |
+| `two-cluster-mesh-live` | `run_two_cluster_live` | `src/modes/mesh/`, `src/identity/`, `src/tls/`, MeshSubscribe JWT/gRPC helpers (including `cp_server.rs`), backend dispatch/TCP relay, routing/service discovery, mesh policy, HBONE, east-west, `SO_ORIGINAL_DST`, `mesh_trust_registry`, `two_cluster_spire.sh` |
+
+All three also schedule on shared compile/CI inputs (`Cargo.toml`/`Cargo.lock`,
+`rust-toolchain.toml`, `.cargo/`, `vendor/`, `build.rs`, `.github/workflows/ci.yml`,
+and the rust-ci/sccache/fast-linker actions). `tests/functional/functional_mesh_mode_test.rs`
+schedules netns-capture live and two-cluster live only; kernel live does not
+run from that file because `ebpf-live` executes `ebpf::loader::live_kernel_tests`.
+Empty diffs, non-PR/`main`/manual events, and planner controller edits force
+every gate on. The dedicated `ambient-host-udp-live.yml` and
+`node-waypoint-ebpf-live.yml` workflows keep their own path filters; they are
+not part of these three `ci.yml` jobs.
+
 #### 5. NodeWaypoint eBPF Live Datapath Workflow
 
 **Runs**: `ubuntu-24.04`
 
-`node-waypoint-ebpf-live` still runs on PRs that match its **prior** path
+`node-waypoint-ebpf-live` still runs on PRs that match its narrowed planner
 scope: eBPF, node-agent, NodeWaypoint identity, netns capture, socket option,
-TCP/HBONE mesh, chart, live harness files, and the original specific `src/`
-paths. The workflow `pull_request.paths` trigger remains a **superset** of
+TCP/HBONE mesh, chart, live harness files, the specific `src/` paths from the
+pre-#3888 trigger, and the NodeWaypoint datapath modules added since (the
+`src/proxy/node_waypoint_` prefix, `src/proxy/stream_listener.rs`,
+`src/proxy/udp_proxy.rs`, `src/proxy/mesh_tcp_inbound.rs`). The workflow
+`pull_request.paths` trigger remains a **superset** of
 every production-Dockerfile smoke input (`src/**`, `vendor/**`,
 `custom_plugins/**`, `.cargo/**`, `rust-toolchain.toml`, and the other planner
 sensitive paths) so those changes always reach the trusted planner. The
@@ -2101,23 +2218,39 @@ modification of the verifier it protects, and the landing is administrative afte
 root review), then an ordinary pull request that adopts the release workflow
 under the now-trusted policy and runs the full hosted matrix.
 
-##### Admitted `fips-build.yml` generation transition (issue #3888 lineage / PR #3950, temporary)
+##### Admitted `fips-build.yml` generation transition (issue #3888 lineage / issue #4018, temporary)
 
-The temporary whole-file SHA-256 admission first used for PR #3889 (and retired
-by #3943 once #3889 landed) is **re-armed for exactly one transition**: PR
-#3950 moves the FIPS same-run producer→consumer handoff off the eviction-prone
-repository cache onto the immutable run artifact, which necessarily edits four
-digest-frozen `fips-build.yml` job bodies. The destination also quarantines only
-restored `aws-lc-fips-sys-*/out/build` CMake intermediates before a cross-runner
-incremental build can reparse them. The pair is exact and one-way:
-trusted-base `0be313579a66265ef1f54e0a611f519e8d109a536ba29b0d6c4244530b9d6a08`
-(the workflow after PR #3952's landed static-path planner hardening) →
-`17bfb40fbd31e80e6ae1a0efca922069c54ec485ec7a611c3420840da3e5e9e1` (PR #3950
-head `df1223520`; recompute and re-pin if review changes the workflow bytes).
-The digest is over universal-newline-decoded text. RETIREMENT IS MANDATORY
-once #3950 lands, exactly as #3943 retired the #3889 pair. Any other
-`fips-build.yml` edit is still compared by the normal fail-closed Cross
-surface scan.
+The temporary whole-file SHA-256 admission first used for PR #3889 (retired by
+#3943), then re-armed for PR #3950 and spent when #3950 landed, is **re-armed
+for exactly one transition**: the issue #4018 mitigation for the
+`fips-test-build` job.
+
+`Precompile FIPS test binaries for consumers` is killed with `exit code 143`
+and `The runner has received a shutdown signal` on a large minority of runs.
+The log always ends the same way — the dependency graph finishes, the run goes
+silent for several minutes while Cargo builds `unit_tests` and
+`integration_tests`, and the runner dies mid-tail with no diagnostic. That is
+the hosted runner's memory ceiling, not a compile error: `[profile.dev]` sets
+`debug = true` and the `test` profile inherits it, so every concurrent codegen
+thread holds a full-debuginfo LLVM module for the whole crate.
+
+The destination adds a job-level `env` capping `CARGO_BUILD_JOBS` at 3 and
+setting `line-tables-only` debuginfo on the `dev` **and** `test` profiles (both,
+rather than relying on `test` inheriting from `dev`), plus a best-effort swap
+enlargement immediately before that step. The swap step is deliberately not
+fail-closed — it is insurance rather than a correctness gate, and this file is
+digest-frozen, so a runner-image change that broke `swapoff` would cost a second
+protected-path push to repair. It cannot pass silently: any failure raises a
+warning annotation and the resulting `SwapTotal` is always printed.
+
+The pair is exact and one-way: trusted-base
+`17bfb40fbd31e80e6ae1a0efca922069c54ec485ec7a611c3420840da3e5e9e1` (the workflow
+after PR #3950's landed artifact handoff — the previous admission's adopted end)
+→ `6bb669ab79edc9bc53452b59acd50462b8db1b5b7fc5528d6b5eea76907dfa84`. Recompute
+and re-pin if review changes the workflow bytes. The digest is over
+universal-newline-decoded text. RETIREMENT IS MANDATORY once the mitigation
+lands, exactly as #3943 retired the #3889 pair. Any other `fips-build.yml` edit
+is still compared by the normal fail-closed Cross surface scan.
 
 ##### Admitted CI job SHA-256 generation transitions (temporary)
 

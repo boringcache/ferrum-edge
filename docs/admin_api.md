@@ -1434,6 +1434,8 @@ For the full extension contract, supported versions, validation rules, and worke
 
 Ferrum Edge classifies each HTTP-family backend target's protocol support (HTTP/1.1, HTTP/2 over TLS, HTTP/3, gRPC-over-TLS, h2c) at startup and on a periodic background refresh (`FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS`, default 24h). The hot path consults this registry to decide whether to route plain HTTPS traffic through the native H3 pool, the direct HTTP/2 pool, or the generic reqwest path without per-request probing. See [CLAUDE.md — Backend Capability Registry](../CLAUDE.md) and [docs/http3.md](http3.md) for the underlying design.
 
+Plaintext HTTP backends are still probed for prior-knowledge h2c because gRPC is a runtime flavor, not a scheme — a single `http` origin may carry native gRPC. That probe uses the same pool handshake as live gRPC, but with explicit capability-probe context: an expected HTTP/1.1 classification miss (`h2c handshake failed`) is a debug-level event, including on SIGHUP refresh, and does not emit `WARN` at the documented default `FERRUM_LOG_LEVEL=warn`. Request-time gRPC establishment failures, probe dial timeouts, port exhaustion, and unexpected candidate connection/handshake failures remain `WARN`/`ERROR`. Secrets and credential metadata are never included in these lines.
+
 Two JWT-authenticated endpoints let operators inspect and force-refresh the registry at runtime.
 
 ### `GET /backend-capabilities`
@@ -1540,7 +1542,7 @@ The registry stores only protocol classifications and probe timestamps — never
 
 The node-waypoint topology accepts traffic on behalf of many pods on the same node. Each pod's identity is enrolled into a per-resolver index keyed by Kubernetes pod UID; the eBPF data path records the socket cookie and original destination per outbound connection. `GET /node-waypoint/identities` exposes the live snapshot of that index so operators can answer "which pods is this waypoint actually serving?" without scraping eBPF maps.
 
-The endpoint returns `404 Not Found` when the node-waypoint resolver is not installed on `ProxyState` — including all non-mesh modes and mesh modes other than `NodeWaypoint` topology. This avoids surfacing an empty stub list that could be mistaken for "no pods enrolled yet" on a sidecar/ambient/east-west/egress-gateway DP.
+The endpoint returns `503 Service Unavailable` with `"proxy_state unavailable in this mode"` when `proxy_state` is not wired (typical `cp` mode). It returns `404 Not Found` when the node-waypoint resolver is not installed on `ProxyState` — including mesh modes other than `NodeWaypoint` topology. This avoids surfacing an empty stub list that could be mistaken for "no pods enrolled yet" on a sidecar/ambient/east-west/egress-gateway DP.
 
 ### `GET /node-waypoint/identities`
 
@@ -1636,6 +1638,38 @@ Field semantics:
 
 `services` are returned in slice order. The payload exposes service names, namespaces, ports, and workload counts, but no request bodies, credentials, or backend TLS material.
 
+## Mesh Config Drift (mesh mode)
+
+`GET /mesh/config-drift` is JWT-authenticated and mesh-only. It returns a structured "where is this DP relative to the CP's last push?" view: accepted-slice fingerprint, per-kind resource counts, `source_protocol`/`source_cp_url`, optional xDS `convergence`, RTDS `runtime_overlay` (when `?include_overlay=true`), and the authoritative `revision` block. It sees only what this DP has accepted into the proxy runtime — cross-DP comparison is done by operator tooling that walks `/mesh/config-drift` on every member of a deployment and diffs the fingerprints.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/mesh/config-drift
+```
+
+Returns `404 Not Found` outside mesh mode (no `mesh_runtime_state`). Returns `200 OK` with zeroed `resources` and omitted/null `last_received_at` when mesh runtime is wired but no slice has been accepted yet — operators rely on the difference between **`404` = wrong mode** and **`200` + null `last_received_at` = mesh mode, not converged yet**. See [docs/mesh.md](mesh.md#authoritative-config-revisions-and-stale-fallback-rejection) for revision semantics and [openapi.yaml](../openapi.yaml) for the full response schema.
+
+## Mesh Config Revision Reset (mesh mode)
+
+`POST /mesh/config-revision/reset` clears this DP's accepted authoritative config revision so the next mesh slice from **any** config authority is eligible again. Requires JWT authentication and the **`operator`** role (`403 Forbidden` without it). Returns `404 Not Found` outside mesh mode. On success returns `200 OK`:
+
+```json
+{
+  "status": "reset",
+  "cleared_revision": {
+    "authority": "db",
+    "sequence": 4821
+  }
+}
+```
+
+`cleared_revision` is `null` when the gate held no accepted revision.
+
+Use this for the one case that is never auto-adopted: a sequence rewind **inside** one authority (for example a config store restored from backup without bumping `FERRUM_MESH_CONFIG_AUTHORITY_ID`). Foreign-authority adoption uses `FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS` instead; fleet-wide ordering-domain resets are preferably done by bumping `FERRUM_MESH_CONFIG_AUTHORITY_ID` or `FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID` so every DP adopts through the normal grace period without a per-DP call. The reset installs nothing itself — the next slice still has to pass subscription binding and update validation. Pair with `GET /mesh/config-drift` to confirm convergence after recovery.
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:9000/mesh/config-revision/reset
+```
+
 ## Mesh Slice Drift (CP mode)
 
 `GET /mesh/slice-drift` is JWT-authenticated and **control-plane only** (issue #3265). It reports per-authenticated mesh data plane desired / sent / acknowledged / rejected slice-version watermarks so operators can spot stuck, partitioned, or repeatedly rejecting DPs after a successful CP reconciliation.
@@ -1694,7 +1728,7 @@ The graph is node-local. In CP/DP or multi-replica mesh deployments, query each 
 
 ## Mesh Egress Scope (mesh mode)
 
-Two JWT-authenticated endpoints expose the live Sidecar egress scope for operability and pre-enforcement validation. They are mesh-only: requests return `404 Not Found` when no mesh slice has been installed (for example, during DP startup before the first CP push or when running on a non-mesh mode).
+Two JWT-authenticated endpoints expose the live Sidecar egress scope for operability and pre-enforcement validation. They are mesh-only. `GET /mesh/egress-scope` returns `503 Service Unavailable` with `"No proxy state available"` when `proxy_state` is unwired (typical `cp` mode). Both endpoints return `404 Not Found` outside mesh mode or before an egress-scope snapshot exists.
 
 ### `GET /mesh/egress-scope`
 

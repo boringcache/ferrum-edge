@@ -90,16 +90,12 @@ async fn spawn_h3_gateway(
     let backend_task = tokio::spawn(backend);
     sleep(Duration::from_millis(150)).await;
 
-    let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let https_port = https_reservation.local_addr().unwrap().port();
-    drop(https_reservation);
-
     let gateway = TestGateway::builder()
         .mode_file(build_config(backend_port))
         .log_level("warn")
         .capture_output()
         .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
         .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
         .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
         .env(env_key, "0")
@@ -107,6 +103,9 @@ async fn spawn_h3_gateway(
         .await
         .expect("start gateway");
 
+    let https_port = gateway
+        .env_port("FERRUM_PROXY_HTTPS_PORT")
+        .expect("harness-allocated HTTPS port");
     (gateway, backend_task, https_port)
 }
 

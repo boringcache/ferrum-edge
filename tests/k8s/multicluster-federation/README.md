@@ -129,9 +129,20 @@ live suite gates its `node_waypoint.*` IDs in its own run.sh REQUIRED array):
 | `multicluster.eastwest.endpoint_blackhole_when_dest_down` | (Stage 3) with B's `svc` scaled to 0, A→B returns a real upstream error (a 5xx from the client sidecar — not a `000` curl-timeout hang, not 200) |
 | `multicluster.eastwest.endpoint_recovers_when_dest_returns` | (Stage 3) scaling `svc` back up + re-rendering the gateway for the new pod IP restores A→B (200, body `svc-b`) |
 
-Cross-cluster east-west is Beta/Experimental in `docs/mesh.md`, so there is
-intentionally no `ga_contract.yaml` row yet — a GA promotion would add a
-`maturity: ga` capability with a backing conformance semantic assertion.
+Cross-cluster east-west SNI passthrough + SPIRE trust-bundle federation is
+**GA-enrolled** in `tests/conformance/ga_contract.yaml` and live-backed by this
+suite:
+
+- `mesh.multicluster.spire_trust_federation`
+- `mesh.multicluster.eastwest_authenticated_datapath`
+- `mesh.multicluster.untrusted_peer_rejected`
+- `mesh.multicluster.trust_revocation_recovery`
+- `mesh.multicluster.endpoint_failure_recovery`
+
+The thirteen required `multicluster.*` assertion IDs in `run.sh` match those
+rows (plus supporting federation/workload/gateway probes). Poller-driven
+cross-cluster endpoint discovery remains **Beta** and is gated separately by
+the `multicluster-poller-partition` suite — not by this federation contract.
 
 ## Run manually
 

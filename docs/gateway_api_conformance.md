@@ -477,9 +477,9 @@ without a restart. These bounds are deliberate and tested:
   refusals and ordinary OS bind failures suppress the intentional
   Service-fronted remap.
 - **An HTTP↔HTTPS class flip retires the old generation first.** The retiring
-  accept-loop task is awaited before the replacement binds, so with
-  `FERRUM_ACCEPT_THREADS > 1` the `SO_REUSEPORT` sockets of the two classes
-  never coexist on one port. Already accepted connections keep draining.
+  accept-loop task is awaited before the replacement binds, so extra
+  accept workers sharing the exclusive listen socket never overlap a
+  plaintext generation with a TLS replacement. Already accepted connections keep draining.
 - **A listener that stops serving is rebound.** A started listener whose accept
   loop later ends — cleanly, with an error, or by panic — is reaped on the next
   reconcile, surfaced as a bind failure, and rebound; finished drains are reaped

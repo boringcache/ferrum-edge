@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — untrusted `X-Forwarded-For` is no longer forwarded to backends**
+  (issue #4034). With the default empty `FERRUM_TRUSTED_PROXIES`, Ferrum already
+  ignored a client-supplied XFF chain for its own `client_ip` resolution, but
+  the outbound request still carried that spoofable chain with the socket peer
+  appended (`spoofed, peer`). Backends that trust the leftmost hop therefore
+  saw an attacker-injected address. Outbound XFF now matches
+  [docs/client_ip_resolution.md](docs/client_ip_resolution.md): an untrusted
+  peer (including every peer when the trust list is empty) produces `peer`
+  only; a trusted peer still has its inbound chain honored and appended to.
+  The same drop applies to `X-Real-IP` on untrusted peers (Ferrum never
+  regenerates that header). RFC 7239 `Forwarded` is unchanged: when
+  `FERRUM_ADD_FORWARDED_HEADER=true` it is still regenerated from the resolved
+  client IP; when false, pass-through remains the operator contract from
+  issue #2952. **Operator action**: if a backend depended on seeing
+  client-supplied XFF hops in front of an untrusted Ferrum, add the
+  connecting peer to `FERRUM_TRUSTED_PROXIES` so Ferrum will honor and append
+  that chain; otherwise configure the backend to trust only the rightmost hop
+  (Ferrum's socket peer).
+
+- **BREAKING — WAF custom `match_kind: literal` is now case-sensitive**
+  (issue #3937). `literal` was compiled with `(?i)` exactly like `contains`, so
+  a rule spelled `pattern: EVIL-LITERAL` also blocked `evil-literal` and there
+  was no way to express a case-sensitive literal match at all. `literal` is now
+  a case-sensitive Unicode substring; `contains` keeps the folded substring
+  semantics and `equals` keeps the folded anchored match. **Operator action**:
+  a pre-existing `literal` rule that relied on the accidental folding no longer
+  matches other spellings — change its `match_kind` to `contains` to keep the
+  old behavior, or to `regex` with an explicit `(?i)` prefix for partial
+  folding. Metacharacters stay escaped under both `literal` and `contains`, so
+  neither becomes a pattern language. See
+  [docs/waf.md](docs/waf.md) for the full `match_kind` table.
+
 - **BREAKING — `hmac_auth` and `jwks_auth` DPoP single-use replay protection**
   (issues #3834 / #3837). Both admission controls now claim each proof exactly
   once through one shared, fail-closed replay authority. Existing configurations
@@ -122,6 +154,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   half-configured identity validate clean.
 
 ### Fixed
+
+- WAF `mode: enforce` admission now counts `on_body_too_large: block` as a
+  reachable enforcement path (issue #4006). That setting already rejected
+  oversize governed HTTP bodies and WebSocket application messages whenever
+  the global mode was `enforce`, even with every rule left monitor-only, but
+  construction refused the config as having no enforcement path. The
+  observation-only-rules, resource-bound-enforced posture is now admitted
+  when a body inspection hook can actually run. `fail_closed` (the default),
+  `scan_truncated`, and `skip` still do not satisfy the gate, and a config
+  that cannot block anything is still refused.
 
 - Authenticated UDP/DTLS client-facing sends no longer emit after the
   authorization deadline (issues #3815, #3816, #3820). A pre-send commitment

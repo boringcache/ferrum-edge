@@ -951,8 +951,18 @@ fn image_surfaces_are_scheduled_by_the_trusted_relevance_classifier() {
 
     let plan = read(".github/scripts/pr_ci_plan.py");
     assert!(
-        plan.contains("r\"^Dockerfile$\""),
-        "the planner's eBPF/capture live patterns must include the Dockerfile"
+        plan.contains(
+            "\
+            [\"Dockerfile\"],
+            {
+                \"run_helm\": True,
+                \"run_ebpf_kernel_live\": False,
+                \"run_netns_capture_live\": False,
+                \"run_two_cluster_live\": False,
+            },"
+        ),
+        "the generic planner must leave Dockerfile coverage to the dedicated \
+         trusted Ambient Host UDP gate rather than scheduling all three live suites"
     );
 }
 
@@ -1163,22 +1173,36 @@ fn ambient_udp_production_entry_points_are_scheduled_by_the_trusted_classifier()
 }
 
 #[test]
-fn pr_ci_plan_schedules_ebpf_live_for_host_udp_surfaces() {
+fn pr_ci_plan_schedules_netns_capture_live_for_host_udp_surfaces() {
     let plan = read(".github/scripts/pr_ci_plan.py");
     assert!(
         plan.contains("host_udp_capture"),
-        "planner eBPF/netns live patterns must include host_udp_capture"
-    );
-    assert!(
-        plan.contains("ambient_host_udp_live"),
-        "planner must include the ambient host-UDP live fixture path"
-    );
-    assert!(
-        plan.contains("ambient-host-udp-live"),
-        "planner must treat the ambient host-UDP workflow as a live trigger"
+        "planner netns-capture live patterns must include host_udp_capture"
     );
     assert!(
         plan.contains("[\"src/proxy/host_udp_capture.rs\"]"),
-        "planner self-test must pin host_udp_capture as run_ebpf_live"
+        "planner self-test must pin host_udp_capture.rs as a netns-capture live input"
+    );
+    assert!(
+        plan.contains(
+            "\
+            [\"src/proxy/host_udp_capture.rs\"],
+            {
+                \"run_ebpf_kernel_live\": False,
+                \"run_netns_capture_live\": True,
+                \"run_two_cluster_live\": False,
+            },"
+        ),
+        "planner self-test must pin host_udp_capture.rs to kernel=false, netns=true, two-cluster=false"
+    );
+    // Match the QUOTED KEY, not any mention: `plan` is the raw file text, so a
+    // bare substring check also matches prose. The constants deliberately
+    // document which paths used to sit in the old single `run_ebpf_live` union
+    // and why each was re-homed, and that documentation must not be what makes
+    // this contract fail. The gate itself can only appear as a quoted output
+    // key, exactly like the positive assertions above.
+    assert!(
+        !plan.contains("\"run_ebpf_live\""),
+        "the shared run_ebpf_live planner gate must not remain"
     );
 }
