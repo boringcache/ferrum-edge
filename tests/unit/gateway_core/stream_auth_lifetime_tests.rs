@@ -11,9 +11,10 @@ use std::time::Duration;
 use ferrum_edge::_test_support::{
     BufferedUploadPumpProbe, BufferedUploadWaitOutcomeForTest, DtlsAuthorizationExpiryForTest,
     EarlyUploadBoundKind, H3AuthorizedHeadersWrite, H3BackendOrPeerForTest,
-    H3UploadWaitOutcomeForTest, PrecommitPhaseOutcomeForTest, ProbePumpOutcome, ProbeTransportPoll,
-    ResponseCollectBoundForTest, StreamIoSide, UploadPumpProbe,
-    attribute_dispatch_phase_bound_for_test, authorization_bounded_header_deadline_for_test,
+    H3UploadWaitOutcomeForTest, PrecommitPhaseOutcomeForTest, ProbePumpOutcome, ProbeReplayFrame,
+    ProbeTransportPoll, ReplayableUploadPumpProbe, ResponseCollectBoundForTest, StreamIoSide,
+    UploadPumpProbe, attribute_dispatch_phase_bound_for_test,
+    authorization_bounded_header_deadline_for_test,
     authorization_expired_dispatch_placeholder_for_test,
     authorization_expired_pre_commitment_response_for_test,
     await_authorized_headers_write_for_test, await_deadline_first_for_test,
@@ -2909,6 +2910,190 @@ fn an_empty_buffered_upload_installs_no_pump() {
         BufferedUploadPumpProbe::start(0, 800).is_none(),
         "an empty upload must stay end-of-stream at headers"
     );
+}
+
+// --- Backend write watermark on a REPLAYABLE upload (#4055) ----------------
+//
+// The buffered/body-policy/retry-replay bodies dispatched by the specialized
+// HBONE HTTP/1, Unix HTTP/1, and sidecar-mTLS HTTP/2 transports had no pump at
+// all before this repair, so a backend that accepted and never read bypassed
+// `backend_write_timeout_ms` entirely on those paths. As above, the transport
+// side is held and DELIBERATELY NOT DRAINED: an HTTP/2 pipe parked in
+// `poll_capacity`, or an HTTP/1 connection task parked on socket writability.
+
+#[tokio::test(start_paused = true)]
+async fn the_backend_write_watermark_ends_a_replayable_upload_the_transport_stopped_taking() {
+    let mut probe = ReplayableUploadPumpProbe::start(1024 * 1024, &[], 800);
+    assert!(probe.pumped(), "a live write watermark must install a pump");
+
+    // A much longer response-header wait, i.e. the operator's read watermark.
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "backend_write_timeout_ms must end the header wait before backend_read_timeout_ms"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
+
+    match probe.poll_transport_once() {
+        ProbeReplayFrame::Errored(message) => assert!(
+            message.contains("backend request body write timeout"),
+            "unexpected termination message: {message}"
+        ),
+        other => panic!("expected a transport error, got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_replayable_upload_crosses_the_bridge_in_bounded_slices_not_one_giant_frame() {
+    let frame = ReplayableUploadPumpProbe::frame_size();
+    let total = frame * 3 + 11;
+    // Long enough that the watermark cannot fire while the transport drains.
+    let mut probe = ReplayableUploadPumpProbe::start(total, &[], 600_000);
+    assert_eq!(
+        probe.declared_content_length(),
+        Some(total as u64),
+        "the bridge must not degrade the replayable body's exact Content-Length"
+    );
+
+    let frames = probe.drain_transport(64).await;
+    let sizes: Vec<usize> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            ProbeReplayFrame::Data(len) => Some(*len),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sizes,
+        vec![frame, frame, frame, 11],
+        "the source must be sliced so backpressure stays coupled to the transport: {frames:?}"
+    );
+    assert_eq!(
+        frames.last(),
+        Some(&ProbeReplayFrame::Ended),
+        "a fully drained upload must end cleanly: {frames:?}"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pumped_replayable_upload_preserves_its_terminal_trailers_after_the_data() {
+    let frame = ReplayableUploadPumpProbe::frame_size();
+    let mut probe = ReplayableUploadPumpProbe::start(
+        frame + 5,
+        &[("grpc-status", "0"), ("grpc-message", "ok")],
+        600_000,
+    );
+    assert!(probe.pumped());
+    assert_eq!(
+        probe.declared_content_length(),
+        Some((frame + 5) as u64),
+        "trailers carry no DATA bytes, so the declared length is unchanged"
+    );
+
+    let frames = probe.drain_transport(64).await;
+    assert_eq!(
+        frames,
+        vec![
+            ProbeReplayFrame::Data(frame),
+            ProbeReplayFrame::Data(5),
+            ProbeReplayFrame::Trailers(vec![
+                ("grpc-status".to_string(), "0".to_string()),
+                ("grpc-message".to_string(), "ok".to_string()),
+            ]),
+            ProbeReplayFrame::Ended,
+        ],
+        "validated gRPC-Web trailers must survive the bridge, strictly after the DATA"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_replayable_upload_with_only_trailers_still_arms_the_write_watermark() {
+    let mut probe = ReplayableUploadPumpProbe::start(0, &[("grpc-status", "0")], 800);
+    assert!(
+        probe.pumped(),
+        "an empty body with trailers is transport work, not a no-work opt-out"
+    );
+    assert!(
+        !probe.is_end_stream(),
+        "a trailers-only replayable upload must not be framed as end-of-stream at headers"
+    );
+    assert_eq!(
+        probe.declared_content_length(),
+        Some(0),
+        "a trailers-only upload still declares an exact zero-length body"
+    );
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "the watermark must be enforceable for a trailers-only upload too"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_partly_drained_replayable_upload_still_ends_on_the_write_watermark() {
+    let frame = ReplayableUploadPumpProbe::frame_size();
+    let mut probe = ReplayableUploadPumpProbe::start(frame * 4, &[], 800);
+    // The transport takes one frame and then stops, exactly as a socket whose
+    // peer stopped reading does once the kernel buffers fill.
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeReplayFrame::Data(_) | ProbeReplayFrame::Pending
+    ));
+
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "the watermark must still fire once the transport stops taking frames"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
+}
+
+#[tokio::test(start_paused = true)]
+async fn releasing_a_replayable_transport_body_never_leaves_the_pump_running() {
+    let mut probe = ReplayableUploadPumpProbe::start(1024 * 1024, &[], 800);
+    probe.drop_transport();
+    assert_eq!(probe.join().await, ProbePumpOutcome::ConsumerGone);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_zero_backend_write_timeout_keeps_the_direct_replayable_body() {
+    let total = ReplayableUploadPumpProbe::frame_size() * 2;
+    let mut probe = ReplayableUploadPumpProbe::start(total, &[("grpc-status", "0")], 0);
+    assert!(
+        !probe.pumped(),
+        "the operator opt-out must install no task, channel, or timer"
+    );
+    assert_eq!(
+        probe.declared_content_length(),
+        Some(total as u64),
+        "the opt-out must keep the exact Content-Length"
+    );
+    assert_eq!(
+        probe.drain_transport(8).await,
+        vec![
+            ProbeReplayFrame::Data(total),
+            ProbeReplayFrame::Trailers(vec![("grpc-status".to_string(), "0".to_string())]),
+            ProbeReplayFrame::Ended,
+        ],
+        "the direct path keeps its single DATA frame plus terminal trailers"
+    );
+}
+
+#[test]
+fn an_empty_replayable_upload_with_no_trailers_installs_no_pump() {
+    let probe = ReplayableUploadPumpProbe::start(0, &[], 800);
+    assert!(
+        !probe.pumped(),
+        "an upload with nothing to write must stay end-of-stream at headers"
+    );
+    assert!(probe.is_end_stream());
+    assert_eq!(probe.declared_content_length(), Some(0));
 }
 
 // --- Composed dispatch-phase attribution under delayed observation (#3815) ---

@@ -642,14 +642,21 @@ pub(crate) const fn upload_pump_channel_capacity() -> usize {
 /// hands out a refcounted view of the same allocation.
 const BUFFERED_UPLOAD_FRAME_BYTES: usize = 64 * 1024;
 
-/// Zero-copy chunked view over a fully collected request body.
+/// Zero-copy chunked view over a fully collected request body, plus the
+/// optional validated terminal trailers frame that follows it.
 ///
 /// Exists only as the pump's *source*: it turns one `Bytes` into a bounded
 /// sequence of refcounted slices so the pump has something to be backpressured
 /// on. The size hint stays exact, so `Content-Length` framing is identical to
-/// handing reqwest the reusable `Bytes` directly.
+/// handing the transport the reusable `Bytes` directly.
+///
+/// `trailers` is only ever populated from the gRPC-Web plugin's validated
+/// staging representation (the same source `ReplayableRequestBody` accepts),
+/// and is emitted strictly AFTER the last DATA slice, so the replayable
+/// mesh/HBONE/Unix paths keep their existing frame ordering across the bridge.
 struct BufferedUploadFrames {
     remaining: Bytes,
+    trailers: Option<http::HeaderMap>,
 }
 
 impl http_body::Body for BufferedUploadFrames {
@@ -661,18 +668,23 @@ impl http_body::Body for BufferedUploadFrames {
         _cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
-        if this.remaining.is_empty() {
-            return Poll::Ready(None);
+        if !this.remaining.is_empty() {
+            let take = this.remaining.len().min(BUFFERED_UPLOAD_FRAME_BYTES);
+            return Poll::Ready(Some(Ok(Frame::data(this.remaining.split_to(take)))));
         }
-        let take = this.remaining.len().min(BUFFERED_UPLOAD_FRAME_BYTES);
-        Poll::Ready(Some(Ok(Frame::data(this.remaining.split_to(take)))))
+        if let Some(trailers) = this.trailers.take() {
+            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+        }
+        Poll::Ready(None)
     }
 
     fn is_end_stream(&self) -> bool {
-        self.remaining.is_empty()
+        self.remaining.is_empty() && self.trailers.is_none()
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
+        // Trailers carry no DATA bytes, so the declared length is exactly the
+        // DATA still to cross the bridge.
         http_body::SizeHint::with_exact(self.remaining.len() as u64)
     }
 }
@@ -735,7 +747,10 @@ pub(crate) fn spawn_buffered_upload_pump(
         return Err(body);
     }
     let (source, join) = spawn_upload_pump(
-        BufferedUploadFrames { remaining: body },
+        BufferedUploadFrames {
+            remaining: body,
+            trailers: None,
+        },
         // No authorization plan: a buffered upload was already collected under
         // `collect_request_body_under_authorization`, and the response-header
         // wait still composes the admitted stream's deadline through
@@ -752,4 +767,47 @@ pub(crate) fn spawn_buffered_upload_pump(
 #[allow(dead_code)]
 pub(crate) const fn buffered_upload_frame_bytes() -> usize {
     BUFFERED_UPLOAD_FRAME_BYTES
+}
+
+/// Install the gateway-owned backend write watermark on a REPLAYABLE upload —
+/// the buffered/body-policy/retry-replay bodies the specialized HBONE, mesh
+/// mTLS, and Unix HTTP transports dispatch (issue #4055).
+///
+/// Same contract as [`spawn_buffered_upload_pump`], with two differences that
+/// the replayable paths need:
+///
+/// * the validated terminal trailers frame rides the bridge after the last
+///   DATA slice, so gRPC-Web terminal metadata is preserved in order, and
+/// * an upload with NO data but non-empty trailers still gets a pump: a
+///   trailers frame is transport work, so treating it as "nothing to write"
+///   would silently reopen the same watermark bypass for it.
+///
+/// `Err((data, trailers))` hands the inputs back untouched, which is the
+/// allocation-, task-, and timer-free path these dispatches used before: taken
+/// when `backend_write_timeout_ms == 0` (the operator opt-out) or when there is
+/// neither DATA nor trailers to write (the request must stay end-of-stream at
+/// headers).
+///
+/// No authorization plan is armed here for the same reason as the buffered
+/// pump: these bodies were already collected under
+/// `collect_request_body_under_authorization`, and the response-header wait
+/// still composes the admitted stream's deadline through
+/// `compose_dispatch_phase_auth_bound`.
+#[allow(clippy::type_complexity)]
+pub(crate) fn spawn_replayable_upload_pump(
+    data: Bytes,
+    trailers: Option<http::HeaderMap>,
+    write_timeout_ms: u64,
+) -> Result<(UploadPumpSource, UploadPumpJoin), (Bytes, Option<http::HeaderMap>)> {
+    if write_timeout_ms == 0 || (data.is_empty() && trailers.is_none()) {
+        return Err((data, trailers));
+    }
+    Ok(spawn_upload_pump(
+        BufferedUploadFrames {
+            remaining: data,
+            trailers,
+        },
+        None,
+        write_timeout_ms,
+    ))
 }

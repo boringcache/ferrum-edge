@@ -9176,6 +9176,188 @@ pub mod _test_support {
         }
     }
 
+    /// One transport-side frame observed from a probed REPLAYABLE upload.
+    ///
+    /// Separate from [`ProbeTransportPoll`] because the replayable bodies are
+    /// the only pumped source that can carry a validated terminal TRAILERS
+    /// frame, and preserving it — after the last DATA slice — is part of the
+    /// contract.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ProbeReplayFrame {
+        Pending,
+        Data(usize),
+        Trailers(Vec<(String, String)>),
+        Ended,
+        Errored(String),
+    }
+
+    /// One gateway-owned REPLAYABLE upload pump under test (issue #4055).
+    ///
+    /// The buffered/body-policy/retry-replay bodies dispatched by the
+    /// specialized HBONE, sidecar-mTLS, and Unix HTTP transports have no body
+    /// adapter to hang a deadline on, and their transports park OUTSIDE a body
+    /// poll (H2 send capacity, H1 socket writability) exactly when a backend
+    /// accepts and stops reading. As with [`BufferedUploadPumpProbe`], the
+    /// transport side is held and DELIBERATELY NOT DRAINED.
+    pub struct ReplayableUploadPumpProbe {
+        body: Option<crate::proxy::body::ReplayableRequestBody>,
+        join: Option<crate::proxy::upload_pump::UploadPumpJoin>,
+    }
+
+    impl ReplayableUploadPumpProbe {
+        /// Build the replayable body exactly as the specialized dispatches do.
+        ///
+        /// `trailers` is the gRPC-Web plugin's validated staging shape.
+        pub fn start(len: usize, trailers: &[(&str, &str)], write_timeout_ms: u64) -> Self {
+            let data = bytes::Bytes::from(vec![b'x'; len]);
+            let trailers = if trailers.is_empty() {
+                None
+            } else {
+                let mut map = http::HeaderMap::new();
+                for (name, value) in trailers {
+                    let name = http::header::HeaderName::from_bytes(name.as_bytes())
+                        .expect("test trailer name is a valid header name");
+                    let value = http::header::HeaderValue::from_str(value)
+                        .expect("test trailer value is a valid header value");
+                    map.append(name, value);
+                }
+                Some(map)
+            };
+            let (body, join) = crate::proxy::body::ReplayableRequestBody::with_gateway_upload_pump(
+                data,
+                trailers,
+                write_timeout_ms,
+            );
+            Self {
+                body: Some(body),
+                join,
+            }
+        }
+
+        /// Whether a pump was installed at all.
+        ///
+        /// `false` is the allocation-, task-, and timer-free direct path: the
+        /// `backend_write_timeout_ms == 0` operator opt-out, or an upload with
+        /// neither DATA nor trailers to write.
+        pub fn pumped(&self) -> bool {
+            self.join.is_some()
+        }
+
+        /// The bounded frame size the buffered source is sliced into.
+        pub fn frame_size() -> usize {
+            crate::proxy::upload_pump::buffered_upload_frame_bytes()
+        }
+
+        /// What hyper would derive `Content-Length` from.
+        pub fn declared_content_length(&self) -> Option<u64> {
+            self.body
+                .as_ref()
+                .and_then(|body| http_body::Body::size_hint(body).exact())
+        }
+
+        /// Whether the transport would frame this request as end-of-stream at
+        /// headers.
+        pub fn is_end_stream(&self) -> bool {
+            match self.body.as_ref() {
+                Some(body) => http_body::Body::is_end_stream(body),
+                None => true,
+            }
+        }
+
+        /// Poll the transport side exactly once with a no-op waker.
+        pub fn poll_transport_once(&mut self) -> ProbeReplayFrame {
+            let Some(body) = self.body.as_mut() else {
+                return ProbeReplayFrame::Ended;
+            };
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            match http_body::Body::poll_frame(std::pin::Pin::new(body), &mut cx) {
+                std::task::Poll::Pending => ProbeReplayFrame::Pending,
+                std::task::Poll::Ready(None) => ProbeReplayFrame::Ended,
+                std::task::Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) => ProbeReplayFrame::Data(data.len()),
+                    Err(frame) => match frame.into_trailers() {
+                        Ok(trailers) => ProbeReplayFrame::Trailers(
+                            trailers
+                                .iter()
+                                .map(|(name, value)| {
+                                    (
+                                        name.as_str().to_string(),
+                                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                                    )
+                                })
+                                .collect(),
+                        ),
+                        Err(_) => ProbeReplayFrame::Ended,
+                    },
+                },
+                std::task::Poll::Ready(Some(Err(e))) => ProbeReplayFrame::Errored(e.to_string()),
+            }
+        }
+
+        /// Drain the transport side until it blocks, ends, or errors, yielding
+        /// to the runtime between polls so the pump task can refill the bridge.
+        ///
+        /// Returns every frame observed, in order.
+        pub async fn drain_transport(&mut self, max_polls: usize) -> Vec<ProbeReplayFrame> {
+            let mut frames = Vec::new();
+            for _ in 0..max_polls {
+                match self.poll_transport_once() {
+                    ProbeReplayFrame::Pending => tokio::task::yield_now().await,
+                    ProbeReplayFrame::Ended => {
+                        frames.push(ProbeReplayFrame::Ended);
+                        break;
+                    }
+                    frame => {
+                        let errored = matches!(frame, ProbeReplayFrame::Errored(_));
+                        frames.push(frame);
+                        if errored {
+                            break;
+                        }
+                    }
+                }
+            }
+            frames
+        }
+
+        /// Race the dispatcher's response-header wait against the pump's
+        /// backend write watermark, exactly as the specialized dispatches do.
+        ///
+        /// `true` means the watermark won, which is what makes the request end
+        /// as 504 / `ReadWriteTimeout` at `backend_write_timeout_ms` instead of
+        /// running on to `backend_read_timeout_ms`.
+        pub async fn write_watermark_wins_header_wait(&mut self, header_wait: Duration) -> bool {
+            let Some(join) = self.join.as_mut() else {
+                return false;
+            };
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(header_wait) => false,
+                () = join.backend_write_watermark_expired() => true,
+            }
+        }
+
+        /// Wait for the pump to finish on its own — no cancellation.
+        pub async fn join(&mut self) -> ProbePumpOutcome {
+            map_probe_outcome(match self.join.take() {
+                Some(join) => join.join().await,
+                None => None,
+            })
+        }
+
+        /// Cancel the pump and wait for it to finish.
+        pub async fn cancel_and_join(&mut self) -> ProbePumpOutcome {
+            map_probe_outcome(match self.join.take() {
+                Some(join) => join.cancel_and_join().await,
+                None => None,
+            })
+        }
+
+        /// Drop the transport side, modelling hyper releasing the request body.
+        pub fn drop_transport(&mut self) {
+            self.body = None;
+        }
+    }
+
     fn map_probe_outcome(
         outcome: Option<crate::proxy::upload_pump::UploadPumpOutcome>,
     ) -> ProbePumpOutcome {

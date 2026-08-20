@@ -46800,11 +46800,21 @@ async fn proxy_to_backend_hbone_after_ready(
         } => {
             let (mut parts, ()) = Request::new(()).into_parts();
             parts.headers = headers;
-            (
-                parts,
-                http_body_util::Either::Right(body::ReplayableRequestBody::new(body, trailers)),
-                None,
-            )
+            // Same backend write watermark the streaming arm installs
+            // (#4055). A replayable body is already collected, so the pump
+            // arms no second authorization lifetime — the response-header wait
+            // below still composes the admitted stream's deadline — but its
+            // DATA is sliced into bounded refcounted views so backpressure
+            // stays coupled to what the transport has actually taken, through
+            // the last byte and the validated terminal trailers frame.
+            // `backend_write_timeout_ms == 0` keeps the allocation-, task-,
+            // and timer-free direct path.
+            let (body, upload_pump) = body::ReplayableRequestBody::with_gateway_upload_pump(
+                body,
+                trailers,
+                proxy.backend_write_timeout_ms,
+            );
+            (parts, http_body_util::Either::Right(body), upload_pump)
         }
     };
     parts.uri = tunneled_uri;
@@ -47547,11 +47557,21 @@ async fn proxy_to_backend_unix(
         } => {
             let (mut parts, ()) = Request::new(()).into_parts();
             parts.headers = headers;
-            (
-                parts,
-                http_body_util::Either::Right(body::ReplayableRequestBody::new(body, trailers)),
-                None,
-            )
+            // Same backend write watermark the streaming arm installs
+            // (#4055). A replayable body is already collected, so the pump
+            // arms no second authorization lifetime — the response-header wait
+            // below still composes the admitted stream's deadline — but its
+            // DATA is sliced into bounded refcounted views so backpressure
+            // stays coupled to what the transport has actually taken, through
+            // the last byte and the validated terminal trailers frame.
+            // `backend_write_timeout_ms == 0` keeps the allocation-, task-,
+            // and timer-free direct path.
+            let (body, upload_pump) = body::ReplayableRequestBody::with_gateway_upload_pump(
+                body,
+                trailers,
+                proxy.backend_write_timeout_ms,
+            );
+            (parts, http_body_util::Either::Right(body), upload_pump)
         }
     };
     parts.uri = origin_form_uri;
@@ -49071,13 +49091,21 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
         } => {
             let (mut parts, ()) = Request::new(()).into_parts();
             parts.headers = headers;
-            (
-                parts,
-                mesh_mtls_pool::MeshMtlsRequestBody::Replayable(body::ReplayableRequestBody::new(
-                    body, trailers,
-                )),
-                None,
-            )
+            // Same backend write watermark the streaming arm installs
+            // (#4055). A replayable body is already collected, so the pump
+            // arms no second authorization lifetime — the response-header wait
+            // below still composes the admitted stream's deadline — but its
+            // DATA is sliced into bounded refcounted views so backpressure
+            // stays coupled to what the transport has actually taken, through
+            // the last byte and the validated terminal trailers frame.
+            // `backend_write_timeout_ms == 0` keeps the allocation-, task-,
+            // and timer-free direct path.
+            let (body, upload_pump) = body::ReplayableRequestBody::with_gateway_upload_pump(
+                body,
+                trailers,
+                proxy.backend_write_timeout_ms,
+            );
+            (parts, mesh_mtls_pool::MeshMtlsRequestBody::Replayable(body), upload_pump)
         }
     };
     parts.uri = tunneled_uri;

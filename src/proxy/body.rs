@@ -1806,6 +1806,25 @@ pin_project! {
 // required for soundness.
 unsafe impl<B: Send + Sync> Sync for SyncBody<B> {}
 
+/// How a [`ReplayableRequestBody`] reaches the backend transport.
+enum ReplayableUploadSource {
+    /// Straight to the transport: one DATA frame, then the optional validated
+    /// terminal trailers frame. The exact pre-#4055 shape, kept as the
+    /// allocation-, task-, and timer-free path taken whenever
+    /// `backend_write_timeout_ms == 0` or there is nothing to write.
+    Direct {
+        data: Option<Bytes>,
+        trailers: Option<http::HeaderMap>,
+    },
+    /// Through a gateway-owned upload pump (`crate::proxy::upload_pump`),
+    /// which slices the DATA into bounded refcounted views and emits the
+    /// trailers after them. Installed only when `backend_write_timeout_ms > 0`,
+    /// because the specialized H1/H2 transports park OUTSIDE a body poll
+    /// exactly when a backend accepts and stops reading, so a bound delivered
+    /// through the body alone can never fire there (issue #4055).
+    Pumped(crate::proxy::upload_pump::UploadPumpSource),
+}
+
 /// Immutable request DATA with an optional validated terminal trailers frame.
 ///
 /// Mesh retries clone the `Bytes` and `HeaderMap` handles for each attempt.
@@ -1813,45 +1832,94 @@ unsafe impl<B: Send + Sync> Sync for SyncBody<B> {}
 /// generic intake path has no trailer-policy validation; callers may populate
 /// `trailers` only from the gRPC-Web plugin's validated staging representation.
 pub struct ReplayableRequestBody {
-    data: Option<Bytes>,
-    trailers: Option<http::HeaderMap>,
+    source: ReplayableUploadSource,
 }
 
 impl ReplayableRequestBody {
-    pub(crate) fn new(data: Bytes, trailers: Option<http::HeaderMap>) -> Self {
-        Self {
-            data: (!data.is_empty()).then_some(data),
-            trailers: trailers.filter(|trailers| !trailers.is_empty()),
+    /// Build the replayable body, arming the backend write watermark when the
+    /// operator configured one (issue #4055).
+    ///
+    /// The returned join is the dispatcher's race point: it must be retained
+    /// through the response-header wait (`await_upload_write_watermark_first`)
+    /// exactly like the adjacent streaming arm, or the watermark stays
+    /// invisible while the transport is parked on flow control / socket
+    /// writability.
+    ///
+    /// `write_timeout_ms == 0` — and an upload with neither DATA nor trailers
+    /// — return `(Direct, None)`: no task, no channel, no timer.
+    pub(crate) fn with_gateway_upload_pump(
+        data: Bytes,
+        trailers: Option<http::HeaderMap>,
+        write_timeout_ms: u64,
+    ) -> (Self, Option<crate::proxy::upload_pump::UploadPumpJoin>) {
+        let trailers = trailers.filter(|trailers| !trailers.is_empty());
+        match crate::proxy::upload_pump::spawn_replayable_upload_pump(
+            data,
+            trailers,
+            write_timeout_ms,
+        ) {
+            Ok((source, join)) => (
+                Self {
+                    source: ReplayableUploadSource::Pumped(source),
+                },
+                Some(join),
+            ),
+            Err((data, trailers)) => (
+                Self {
+                    source: ReplayableUploadSource::Direct {
+                        data: (!data.is_empty()).then_some(data),
+                        trailers,
+                    },
+                },
+                None,
+            ),
         }
     }
 }
 
 impl http_body::Body for ReplayableRequestBody {
     type Data = Bytes;
-    type Error = std::convert::Infallible;
+    type Error = BoxError;
 
     fn poll_frame(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        if let Some(data) = self.data.take() {
-            return Poll::Ready(Some(Ok(Frame::data(data))));
+        match &mut self.get_mut().source {
+            ReplayableUploadSource::Direct { data, trailers } => {
+                if let Some(data) = data.take() {
+                    return Poll::Ready(Some(Ok(Frame::data(data))));
+                }
+                if let Some(trailers) = trailers.take() {
+                    return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+                }
+                Poll::Ready(None)
+            }
+            ReplayableUploadSource::Pumped(source) => source.poll_frame(cx),
         }
-        if let Some(trailers) = self.trailers.take() {
-            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
-        }
-        Poll::Ready(None)
     }
 
     fn is_end_stream(&self) -> bool {
-        self.data.is_none() && self.trailers.is_none()
+        match &self.source {
+            ReplayableUploadSource::Direct { data, trailers } => {
+                data.is_none() && trailers.is_none()
+            }
+            ReplayableUploadSource::Pumped(source) => source.is_end_stream(),
+        }
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
-        let mut hint = http_body::SizeHint::new();
-        let len = self.data.as_ref().map_or(0, Bytes::len) as u64;
-        hint.set_exact(len);
-        hint
+        match &self.source {
+            ReplayableUploadSource::Direct { data, .. } => {
+                let mut hint = http_body::SizeHint::new();
+                let len = data.as_ref().map_or(0, Bytes::len) as u64;
+                hint.set_exact(len);
+                hint
+            }
+            // The pump snapshotted this same exact hint before the body moved
+            // across the bridge, so `Content-Length` framing is unchanged.
+            ReplayableUploadSource::Pumped(source) => source.size_hint(),
+        }
     }
 }
 
