@@ -11,7 +11,9 @@
 //! suite (`scripted_backend_tests.rs`, `scripted_backend_h2_tests.rs`,
 //! `scripted_backend_h3_tests.rs`).
 
-use crate::scaffolding::backends::{HttpStep, ScriptedHttp1Backend, ScriptedTcpBackend, TcpStep};
+use crate::scaffolding::backends::{
+    HttpStep, RequestMatcher, ScriptedHttp1Backend, ScriptedTcpBackend, TcpStep,
+};
 use crate::scaffolding::file_mode_yaml_for_backend_with;
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
@@ -21,7 +23,11 @@ use std::time::{Duration, Instant};
 
 const WRITE_TIMEOUT_MS: u64 = 800;
 const READ_TIMEOUT_MS: u64 = 800;
-const UPLOAD_STALL_BYTES: usize = 2 * 1024 * 1024;
+// Pin the listener before accept so the backend cannot autotune a large receive
+// window. The upload remains larger than ordinary sender buffers, guaranteeing
+// that a backend which never reads eventually backpressures the upload pump.
+const BACKEND_RECEIVE_BUFFER_BYTES: usize = 1024;
+const UPLOAD_STALL_BYTES: usize = 16 * 1024 * 1024;
 const SSE_FIRST_EVENT: &[u8] = b"data: hello\r\n\n";
 
 fn assert_timeout_envelope(elapsed: Duration, timeout_ms: u64) {
@@ -56,6 +62,7 @@ async fn in_process_backend_write_timeout_maps_to_504_backend_timeout() {
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
     let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .receive_buffer_size(BACKEND_RECEIVE_BUFFER_BYTES)
         .step(TcpStep::Sleep(Duration::from_secs(30)))
         .spawn()
         .expect("spawn");
@@ -108,6 +115,7 @@ async fn in_process_backend_write_timeout_zero_does_not_504() {
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
     let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .receive_buffer_size(BACKEND_RECEIVE_BUFFER_BYTES)
         .step(TcpStep::Sleep(Duration::from_secs(30)))
         .spawn()
         .expect("spawn");
@@ -184,6 +192,7 @@ async fn in_process_buffered_backend_write_timeout_maps_to_504_backend_timeout()
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
     let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .receive_buffer_size(BACKEND_RECEIVE_BUFFER_BYTES)
         .step(TcpStep::Sleep(Duration::from_secs(30)))
         .spawn()
         .expect("spawn");
@@ -234,6 +243,7 @@ async fn in_process_buffered_backend_write_timeout_zero_does_not_504() {
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
     let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .receive_buffer_size(BACKEND_RECEIVE_BUFFER_BYTES)
         .step(TcpStep::Sleep(Duration::from_secs(30)))
         .spawn()
         .expect("spawn");
@@ -289,6 +299,7 @@ async fn in_process_sse_stall_after_first_event_idles_until_read_timeout() {
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
     let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
         .step(HttpStep::RespondStatus {
             status: 200,
             reason: "OK".into(),
@@ -415,6 +426,7 @@ async fn in_process_sse_read_timeout_zero_stays_open_past_watermark() {
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
     let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
         .step(HttpStep::RespondStatus {
             status: 200,
             reason: "OK".into(),

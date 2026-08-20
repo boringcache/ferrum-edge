@@ -31,7 +31,7 @@
 
 use crate::scaffolding::backends::{
     ConnectionSettings, GrpcStep, H2Step, HttpStep, MatchHeaders, MatchRpc, ScriptedGrpcBackend,
-    ScriptedH2Backend, ScriptedHttp1Backend, ScriptedTcpBackend, TcpStep,
+    RequestMatcher, ScriptedH2Backend, ScriptedHttp1Backend, ScriptedTcpBackend, TcpStep,
 };
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{GrpcClient, Http2Client};
@@ -3710,6 +3710,7 @@ async fn h2_reqwest_sse_stall_after_first_event_classifies_read_write_timeout() 
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
     let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
         .step(HttpStep::RespondStatus {
             status: 200,
             reason: "OK".into(),
