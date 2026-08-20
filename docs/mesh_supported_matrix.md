@@ -70,10 +70,9 @@ CI today."
 
 - **GA track — Ferrum-native sidecar mesh.** `Sidecar` topology + native
   `MeshSubscribe` + SPIRE/SPIFFE mTLS + `AuthorizationPolicy`/`RequestAuthentication`
-  + `ServiceEntry` HTTP egress + `REGISTRY_ONLY` + `VirtualService` routing +
-  `DestinationRule` LB/timeout/outlier **plus `exportTo` namespace visibility
-  and the client → target-service → root-namespace lookup hierarchy**
-  (issues #2465 / #2469). Lookup resolution is per destination HOST at both
+  + `VirtualService` routing + `DestinationRule` LB/timeout/outlier **plus `exportTo`
+  namespace visibility and the client → target-service → root-namespace lookup
+  hierarchy** (issues #2465 / #2469). Lookup resolution is per destination HOST at both
   layers, the mesh root namespace rides the slice so the data plane can refuse
   a rule outside all three lookup namespaces (missing/blank root provenance
   fails closed rather than restoring permissive Unscoped bucketing), host-owner
@@ -133,7 +132,8 @@ CI today."
   withdrawal retirement.
 - **Beta.** xDS ADS (Ferrum-CP↔Ferrum-DP), stock xDS interoperability
   (`FERRUM_MESH_CONFIG_PROTOCOL=stock_xds`; discovery-only, policy stays local),
-  `Ambient` HBONE, HTTP-family `EgressGateway`, `ServiceWaypoint` (GAMMA).
+  `Ambient` HBONE, HTTP-family `EgressGateway` (`ServiceEntry` HTTP egress),
+  `REGISTRY_ONLY` outbound registry enforcement, `ServiceWaypoint` (GAMMA).
 - **Experimental.** `NodeWaypoint` sidecarless capture (IPv4 and IPv6 capture
   paths gated by a privileged live job; secured node-to-node transport,
   production SPIRE, stale source-IP reuse, and inbound direct-pod enforcement
@@ -147,7 +147,8 @@ CI today."
   (`node_waypoint.observability.hbone_handshake_inbound_tls_failure`,
   `node_waypoint.observability.asserted_identity_rejected`,
   `node_waypoint.observability.hbone_handshake_outbound_success`) are wired
-  into the live harness and remain required Beta gates — see
+  into the live harness and remain required live observability gates for this
+  Experimental topology — see
   `docs/plans/node_waypoint_transport_adr.md`;
   Helm must mount the shared node-agent ↔ ambient pod registry plus host
   cgroup/bpffs views and `SYS_ADMIN`/`SYS_PTRACE` netns capabilities for

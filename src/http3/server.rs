@@ -52,11 +52,12 @@ use crate::proxy::headers::{
     ClientResponseFraming, GatewayOwnedResponseHeaders, PrePolicyResponseHeaders,
     RejectBodyDisposition, ResponseTrailerGovernance, ResponseTrailerPolicyWitness,
     TrailerSectionKind, apply_response_headers, is_backend_request_strip_header,
-    is_proxy_owned_forwarding_header, parse_connection_listed_from_str_map,
-    preserved_response_content_length, reconcile_backend_trailers_with_response_policy,
-    reconcile_streaming_backend_trailers, remove_content_length_header,
-    sanitize_backend_request_trailers, sanitize_client_response_headers_for_wire,
-    strip_client_response_hop_by_hop_headers, strip_response_hop_by_hop_trailers,
+    is_proxy_owned_forwarding_header, is_untrusted_real_ip_header,
+    parse_connection_listed_from_str_map, preserved_response_content_length,
+    reconcile_backend_trailers_with_response_policy, reconcile_streaming_backend_trailers,
+    remove_content_length_header, sanitize_backend_request_trailers,
+    sanitize_client_response_headers_for_wire, strip_client_response_hop_by_hop_headers,
+    strip_response_hop_by_hop_trailers,
 };
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
@@ -5847,6 +5848,8 @@ async fn handle_h3_request(
         crate::proxy::apply_effective_backend_scheme_headers(
             &mut proxy_headers,
             &ctx.client_ip,
+            socket_ip,
+            &state.trusted_proxies,
             ctx.request_is_secure,
             state.add_forwarded_header,
         );
@@ -9556,6 +9559,8 @@ fn build_h3_backend_headers(
         .unwrap_or(proxy.backend_host.as_str());
 
     let connection_listed_strip = parse_connection_listed_from_str_map(headers);
+    let peer_trusted =
+        crate::proxy::forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
     for (k, v) in headers {
         match k.as_str() {
             "host" | ":authority" => {
@@ -9575,6 +9580,7 @@ fn build_h3_backend_headers(
             // would duplicate the header (reqwest appends; this Vec push
             // path would leave the spoofed element first).
             n if is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => continue,
+            n if is_untrusted_real_ip_header(n, peer_trusted) => continue,
             // RFC 9110 §7.6.1 Connection-listed strip — see
             // `parse_connection_listed_from_str_map`.
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
@@ -9613,7 +9619,7 @@ fn build_h3_backend_headers(
         ));
     }
 
-    // X-Forwarded-For — same append-the-immediate-peer (+ resolved-client
+    // X-Forwarded-For — same trust-gated append (+ resolved-client
     // seeding) semantics as the H1/H2 paths; see `proxy::build_xff_value`.
     let xff = crate::proxy::build_xff_value(
         headers.get("x-forwarded-for").map(String::as_str),
@@ -18212,6 +18218,7 @@ mod build_h3_backend_headers_tests {
     //!   output vector contains only host + XFF + XFP + maybe XFH +
     //!   the `Early-Data` header under test.
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use super::build_h3_backend_headers;
     use crate::config::EnvConfig;
@@ -18581,33 +18588,74 @@ mod build_h3_backend_headers_tests {
         );
     }
 
-    /// H1/H2/H3 XFF parity: the native H3 backend path must append the
-    /// immediate QUIC peer to an existing inbound chain (not the resolved
-    /// client, which is already in the chain) and seed a generated chain
-    /// with the resolved client when it differs from the peer
-    /// (real-IP-header deployments). See `proxy::build_xff_value`.
+    /// H1/H2/H3 XFF parity: the native H3 backend path must drop a spoofed
+    /// inbound chain from an untrusted peer, append the QUIC peer to a
+    /// trusted inbound chain (not the resolved client, which is already in
+    /// the chain), and seed a generated chain with the resolved client when
+    /// it differs from the peer (real-IP-header deployments). See
+    /// `proxy::build_xff_value`.
     #[tokio::test]
     async fn xff_appends_quic_peer_and_seeds_resolved_client() {
-        let state = minimal_proxy_state();
+        let untrusted_state = minimal_proxy_state();
+        let mut trusted_state = minimal_proxy_state();
+        trusted_state.trusted_proxies = Arc::new(
+            crate::proxy::client_ip::TrustedProxies::parse_strict("10.0.0.7", "test")
+                .expect("valid trusted proxy list"),
+        );
         let proxy = minimal_proxy();
 
-        // Trusted LB sent XFF: append the peer, never the resolved client.
+        // Untrusted peer (default empty trust list): spoofed inbound XFF
+        // and X-Real-IP must not reach the backend.
         let mut headers = HashMap::new();
         headers.insert("x-forwarded-for".to_string(), "198.51.100.7".to_string());
+        headers.insert("x-real-ip".to_string(), "8.8.8.8".to_string());
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            "203.0.113.1",
+            &untrusted_state,
+            true,
+            false,
+        );
+        assert_eq!(
+            header_value(&out, "x-forwarded-for").map(|v| v.as_bytes()),
+            Some(&b"203.0.113.1"[..]),
+            "untrusted inbound XFF must be dropped; outbound is the QUIC peer"
+        );
+        assert!(
+            !header_present(&out, "x-real-ip"),
+            "untrusted X-Real-IP must not reach the native H3 backend"
+        );
+
+        // Trusted LB sent a multi-hop XFF chain that seeding cannot fake:
+        // append the peer, never the resolved client.
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-forwarded-for".to_string(),
+            "1.1.1.1, 198.51.100.7".to_string(),
+        );
+        headers.insert("x-real-ip".to_string(), "1.1.1.1".to_string());
         let out = build_h3_backend_headers(
             &proxy,
             None,
             &headers,
             "198.51.100.7", // resolved client (already in the chain)
             "10.0.0.7",     // immediate QUIC peer (the LB)
-            &state,
+            &trusted_state,
             true,
             false,
         );
         assert_eq!(
             header_value(&out, "x-forwarded-for").map(|v| v.as_bytes()),
-            Some(&b"198.51.100.7, 10.0.0.7"[..]),
-            "inbound chain + appended QUIC peer; resolved client must not duplicate"
+            Some(&b"1.1.1.1, 198.51.100.7, 10.0.0.7"[..]),
+            "trusted inbound chain + appended QUIC peer; resolved client must not duplicate"
+        );
+        assert_eq!(
+            header_value(&out, "x-real-ip").map(|v| v.as_bytes()),
+            Some(&b"1.1.1.1"[..]),
+            "trusted X-Real-IP must still reach the backend"
         );
 
         // Trusted LB sent only a real-IP header (no XFF): seed with the
@@ -18619,7 +18667,7 @@ mod build_h3_backend_headers_tests {
             &headers,
             "203.0.113.9", // resolved from FERRUM_REAL_IP_HEADER
             "10.0.0.7",    // immediate QUIC peer (the LB)
-            &state,
+            &trusted_state,
             true,
             false,
         );
@@ -18636,7 +18684,7 @@ mod build_h3_backend_headers_tests {
             &headers,
             "203.0.113.1",
             "203.0.113.1",
-            &state,
+            &untrusted_state,
             true,
             false,
         );
