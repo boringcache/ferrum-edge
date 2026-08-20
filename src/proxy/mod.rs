@@ -12453,6 +12453,7 @@ impl ProxyState {
     /// no-op candidates (`Unchanged`) from validation/build rejections
     /// (`Rejected`). The DB poller relies on this to avoid advancing
     /// `last_poll_at` on rejection — see `src/modes/database.rs`.
+    #[allow(dead_code)] // Integration-test seam; DB mode uses the topology-fenced entry point.
     pub async fn apply_incremental(
         &self,
         result: crate::config::db_loader::IncrementalResult,
