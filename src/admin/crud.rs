@@ -1013,6 +1013,7 @@ async fn persist_update_to_settlement<R: AdminResource>(
 async fn persist_undecodable_delete_repair<R: AdminResource>(
     context: OwnedWriteSettlementContext,
     id: String,
+    delete_query: R::DeleteQuery,
 ) -> DbResult<bool> {
     let OwnedWriteSettlementContext {
         db,
@@ -1023,23 +1024,25 @@ async fn persist_undecodable_delete_repair<R: AdminResource>(
         actor,
     } = context;
     let success_db = db.clone();
-    let result =
-        match run_db_write_while_held(guard.as_ref(), R::db_delete(db.as_ref(), &namespace, &id))
-            .await
-        {
-            Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
-            Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
-                Ok(false) => Ok(false),
-                // Without a hydratable previous row or namespace snapshot we cannot
-                // compensate a late write. Fail closed rather than claiming success
-                // after an unverified admission loss.
-                Ok(true) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                    "namespace config admission was lost during undecodable-row delete repair"
-                ))),
-                Err(persistence_error) => Err(persistence_error),
-            },
-            Err(error) => Err(error),
-        };
+    let result = match run_db_write_while_held(
+        guard.as_ref(),
+        R::db_delete_from_request(db.as_ref(), &namespace, &id, delete_query),
+    )
+    .await
+    {
+        Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
+        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
+            Ok(false) => Ok(false),
+            // Without a hydratable previous row or namespace snapshot we cannot
+            // compensate a late write. Fail closed rather than claiming success
+            // after an unverified admission loss.
+            Ok(true) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                "namespace config admission was lost during undecodable-row delete repair"
+            ))),
+            Err(persistence_error) => Err(persistence_error),
+        },
+        Err(error) => Err(error),
+    };
     if matches!(&result, Ok(true)) {
         let event = AuditEvent::new(
             &actor,
@@ -2052,7 +2055,7 @@ pub(crate) trait AdminResource:
     async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool>;
 
     /// Extra query-string state for DELETE. Default is unused.
-    type DeleteQuery: Send + Sync + Clone + Default + 'static = ();
+    type DeleteQuery: Send + Sync + Clone + Default + 'static;
 
     /// Parse resource-specific DELETE query parameters. Default ignores the
     /// query string. Return `Err` for a 400 before any persistence.
@@ -2276,9 +2279,9 @@ pub(crate) async fn handle_update<R: AdminResource>(
 /// Parse `cleanup_orphaned_upstream` from `DELETE /proxies/{id}`.
 ///
 /// The parameter is absent → `true` (today's last-referenced hand-owned
-/// orphan cleanup). Only the exact strings `true` and `false` are accepted;
-/// any other value is an error because this flag decides whether operator
-/// data is deleted.
+/// orphan cleanup). Exactly one occurrence with the exact string `true` or
+/// `false` is accepted; any other value or duplicate occurrence is an error
+/// because this flag decides whether operator data is deleted.
 pub(crate) fn parse_cleanup_orphaned_upstream_query(query: Option<&str>) -> Result<bool, String> {
     let Some(query) = query else {
         return Ok(true);
@@ -2297,12 +2300,9 @@ pub(crate) fn parse_cleanup_orphaned_upstream_query(query: Option<&str>) -> Resu
                 ));
             }
         };
-        if let Some(previous) = parsed
-            && previous != this
-        {
+        if parsed.is_some() {
             return Err(
-                "cleanup_orphaned_upstream was supplied more than once with conflicting values"
-                    .to_string(),
+                "cleanup_orphaned_upstream must not be supplied more than once".to_string(),
             );
         }
         parsed = Some(this);
@@ -2376,6 +2376,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
                         actor: actor.clone(),
                     },
                     id.to_string(),
+                    delete_query.clone(),
                 ))
                 .await
                 {

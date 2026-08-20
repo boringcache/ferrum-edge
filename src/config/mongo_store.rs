@@ -7421,7 +7421,7 @@ mod inner {
                                     // must survive deletion of the spec graph.
                                     // Spec-owned upstreams are skipped here
                                     // (parity with SQL cleanup_orphaned_upstream_tx).
-                                    if cleanup_orphaned_upstream
+                                    if *cleanup_orphaned_upstream
                                         && spec_owner.is_none()
                                         && let Some(ref uid) = upstream_id_to_check
                                     {
@@ -15513,7 +15513,7 @@ mod inner {
             let method = &source[method_start..next_fn];
 
             let replica_flag = method
-                .find("if cleanup_orphaned_upstream")
+                .find("if *cleanup_orphaned_upstream")
                 .expect("replica-set path must consult cleanup_orphaned_upstream");
             let replica_spec = method
                 .find("doc.get_str(\"api_spec_id\").is_ok()")

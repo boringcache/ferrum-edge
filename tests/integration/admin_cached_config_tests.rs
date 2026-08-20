@@ -6709,6 +6709,26 @@ async fn test_delete_proxy_rejects_unrecognized_cleanup_orphaned_upstream_value(
         body
     );
 
+    let (status, body) = admin_delete(
+        &base_url,
+        "/proxies/orphan-px-badflag?cleanup_orphaned_upstream=false&cleanup_orphaned_upstream=false",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "duplicate cleanup_orphaned_upstream must fail closed even when values agree: {:?}",
+        body
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("more than once"),
+        "duplicate-value 400 must explain the ambiguity: {:?}",
+        body
+    );
+
     let (status, _, _) = admin_get(&base_url, "/proxies/orphan-px-badflag", &token).await;
     assert_eq!(status, 200, "invalid flag must not delete the proxy");
     let (status, _, _) = admin_get(&base_url, "/upstreams/orphan-up-badflag", &token).await;

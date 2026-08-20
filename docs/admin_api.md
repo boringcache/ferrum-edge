@@ -425,8 +425,9 @@ hand-owned (`api_spec_id` is null) and no remaining proxy or
 `mesh_route_dispatch` plugin still references it. That cascade is the **default**
 (omitting the query parameter, or passing `cleanup_orphaned_upstream=true`).
 Pass `cleanup_orphaned_upstream=false` to keep the upstream so it can be
-reattached. Only the exact strings `true` and `false` are accepted; any other
-value returns **400** rather than guessing. A shared hand-owned upstream
+reattached. Exactly one occurrence with the exact string `true` or `false` is
+accepted; any other value or duplicate occurrence returns **400** rather than
+guessing. A shared hand-owned upstream
 survives regardless of the flag. Spec-owned upstreams are removed by the spec
 cascade, not this generic orphan path; a spec-owned proxy that drifted onto a
 hand-owned upstream leaves that upstream in place.

@@ -4624,7 +4624,7 @@ paths:
         "204":
           description: Proxy deleted
         "400":
-          description: Deletion would leave an invalid plugin-composition graph, or an API-spec-owned proxy has foreign/missing ownership metadata or another restore-snapshot shape that atomic compensation cannot reproduce safely, or `cleanup_orphaned_upstream` was supplied with a value other than the exact strings `true` or `false`
+          description: Deletion would leave an invalid plugin-composition graph, or an API-spec-owned proxy has foreign/missing ownership metadata or another restore-snapshot shape that atomic compensation cannot reproduce safely, or `cleanup_orphaned_upstream` was duplicated or supplied with a value other than the exact strings `true` or `false`
           content:
             application/json:
               schema:
@@ -6553,10 +6553,11 @@ components:
         reattached. Spec-owned upstreams and still-referenced upstreams are
         never cleaned, regardless of this parameter.
 
-        Only the exact strings `true` and `false` are accepted. Any other value
-        — including `1`, `0`, `yes`, or an empty value — returns `400` rather
-        than guessing, because this flag decides whether operator data is
-        deleted. Omitting the parameter is equivalent to `true`. Direct
+        Exactly one occurrence with the exact string `true` or `false` is
+        accepted. Any other value — including `1`, `0`, `yes`, or an empty
+        value — or any duplicate occurrence returns `400` rather than guessing,
+        because this flag decides whether operator data is deleted. Omitting
+        the parameter is equivalent to `true`. Direct
         `DELETE /upstreams/{id}` is the opposite shape: it returns `409` while
         any proxy or `mesh_route_dispatch` plugin still references the
         upstream and never cascades.
