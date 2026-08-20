@@ -2132,6 +2132,13 @@ fn test_proxy_allowed_methods_valid() {
     assert!(proxy.validate_fields().is_ok());
 }
 
+#[test]
+fn test_proxy_allowed_methods_accepts_surrounding_whitespace() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.allowed_methods = Some(vec![" GET ".into(), "post".into()]);
+    assert!(proxy.validate_fields().is_ok());
+}
+
 // ---- Allowed WebSocket origins validation tests ----
 
 #[test]

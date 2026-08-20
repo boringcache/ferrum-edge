@@ -381,6 +381,13 @@ pub const VALID_HTTP_METHODS: &[&str] = &[
     "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT",
 ];
 
+/// Trim surrounding whitespace and ASCII-uppercase an HTTP method token.
+/// File/runtime `normalize_fields` and Admin `normalize` share this so a
+/// validated `" GET "` is stored as `GET`.
+pub(crate) fn normalize_http_method_token(method: &str) -> String {
+    method.trim().to_ascii_uppercase()
+}
+
 /// Regex pattern for valid resource IDs.
 /// Must start with alphanumeric, followed by alphanumeric, dots, underscores, or hyphens.
 static ID_REGEX: LazyLock<Regex> =
@@ -7311,6 +7318,12 @@ impl Proxy {
         // duplicate entries for mixed-case variants of the same hostname.
         self.backend_host = self.backend_host.to_ascii_lowercase();
 
+        if let Some(methods) = self.allowed_methods.as_mut() {
+            for method in methods {
+                *method = normalize_http_method_token(method);
+            }
+        }
+
         self.resolve_dispatch_kind_fields();
 
         // Compile L4 stream match predicates once so the accept path stays
@@ -8005,7 +8018,7 @@ impl Proxy {
                 );
             }
             for method in methods {
-                let upper = method.trim().to_uppercase();
+                let upper = normalize_http_method_token(method);
                 if !VALID_HTTP_METHODS.contains(&upper.as_str()) {
                     errors.push(format!(
                         "allowed_methods contains invalid HTTP method: {}",

@@ -4605,8 +4605,15 @@ paths:
       description: |
         Deletes the proxy and its proxy-owned cascade resources. If the proxy is
         owned by an API spec, the spec row and spec-owned resources are also
-        deleted. When namespace admission is lost after that deletion commits,
-        SQL backends and replica-set MongoDB use the API-spec compensation
+        deleted. When the deleted proxy is hand-managed (no owning API-spec
+        row), a last-referenced **hand-owned** upstream (`api_spec_id` null) is
+        orphan-cleaned if no remaining proxy or `mesh_route_dispatch` plugin
+        still references it. A shared hand-owned upstream survives. A spec-owned
+        proxy that drifted onto a hand-owned upstream leaves that upstream in
+        place. Spec-owned upstreams are removed by the spec cascade, not that
+        generic orphan path. When namespace admission is lost after that
+        deletion commits, SQL backends and replica-set MongoDB use the
+        API-spec compensation
         transaction to restore the stamped spec resources, an orphaned
         hand-owned upstream, hand-owned cascade plugins, associations, and
         config-change records together. Before persistence, the namespace
@@ -4807,6 +4814,14 @@ paths:
     delete:
       operationId: deleteConsumer
       summary: Delete a consumer
+      description: |
+        Deletes the consumer. Returns `409 Conflict` with
+        `{"error":"Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"}`
+        when any `access_control` plugin config in the same namespace still lists
+        this consumer's username in `allowed_consumers`. The consumer and plugin
+        configs are left unchanged; the delete does not rewrite authorization
+        policy. A consumer named only in `disallowed_consumers` can still be
+        deleted.
       tags: [Consumers]
       responses:
         "204":
@@ -4818,7 +4833,15 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/Conflict"
+          description: |
+            Conflict — mTLS DNS identity repair cannot proceed, or an
+            `access_control` plugin_config still lists this consumer's username
+            in `allowed_consumers`. Body for the allow-list case:
+            `{"error":"Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"}`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -5427,6 +5450,13 @@ paths:
     delete:
       operationId: deleteUpstream
       summary: Delete an upstream
+      description: |
+        Deletes the upstream. Returns `409 Conflict` with
+        `{"error":"Upstream is referenced by one or more proxies and cannot be deleted"}`
+        when any proxy still has this `upstream_id`. A `mesh_route_dispatch`
+        plugin_config that still names the upstream returns `409` with
+        `{"error":"Upstream is referenced by a mesh_route_dispatch plugin_config and cannot be deleted"}`.
+        The upstream and referencing resources are left unchanged.
       tags: [Upstreams]
       responses:
         "204":
@@ -5437,6 +5467,17 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            The upstream is still referenced by a proxy or by a
+            `mesh_route_dispatch` plugin_config and cannot be deleted. Bodies:
+            `{"error":"Upstream is referenced by one or more proxies and cannot be deleted"}`
+            or
+            `{"error":"Upstream is referenced by a mesh_route_dispatch plugin_config and cannot be deleted"}`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
