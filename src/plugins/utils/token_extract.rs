@@ -106,11 +106,9 @@ pub fn extract_from_location(
             // base64url, JWS compact serialisation, RFC 6749 opaque tokens). A
             // present field line that `materialize_headers()` omitted is
             // malformed credential material, not an absent header.
-            ConfiguredHeaderLookup::PresentNonMaterialized => {
-                TokenLocationExtract::Credential(ExtractedCredential::InvalidFormat(
-                    r#"{"error":"Invalid token"}"#.to_string(),
-                ))
-            }
+            ConfiguredHeaderLookup::PresentNonMaterialized => TokenLocationExtract::Credential(
+                ExtractedCredential::InvalidFormat(r#"{"error":"Invalid token"}"#.to_string()),
+            ),
             ConfiguredHeaderLookup::Value(value) => {
                 if header.name.eq_ignore_ascii_case("authorization") && header.prefix.is_none() {
                     return match bearer_credential_from_authorization_value(&value) {
