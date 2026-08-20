@@ -179,6 +179,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Stream-family DNS setup failures now classify as `error_class=dns_lookup_error`
+  (TCP previously fell through to `request_error` because the live DNS-cache
+  wording `"DNS resolution returned no addresses"` missed the substring
+  fallback). UDP/DTLS setup DNS uses the same typed `StreamSetupKind::DnsLookup`.
+  Dashboards keyed on `dns_lookup_error` for TCP streams will start matching.
+
+- UDP session setup failures that never publish a session (DNS, empty pool,
+  plugin reject, connect) now emit a `StreamTransactionSummary` and invoke
+  `on_stream_disconnect`. Previously those failures were WARN-only, so logging
+  plugins never saw an `error_class`. Which side emits is decided by the setup
+  operation itself, not by probing the session map afterwards: a published
+  session owns every summary for its flow even when it is removed before the
+  spawned setup task observes the error, so no duplicate setup summary can
+  appear alongside the session's disconnect summary. The setup-failure summary
+  carries the epoch the attempt was *admitted* under — that generation's plugin
+  slice, proxy lifecycle generation, connect-time execution-trigger decisions,
+  identity/auth/SNI/metadata — and the backend target selection actually chose.
+  A failure before any epoch view resolved records the transaction but notifies
+  no plugins, so it can never be attributed to a later configuration
+  generation.
+
+- Stream-setup DNS resolves refused by the backend egress policy keep
+  classifying as `dispatch_policy_rejected` rather than becoming
+  `dns_lookup_error`. No query was answered and no backend was dialed, which is
+  also why those call sites already settle the circuit breaker neutrally.
+
+- Userspace TLS/DTLS teardown where the peer TCP-FINs without `close_notify`
+  no longer classifies as `tls_error`. The shared classifier maps rustls's
+  `UnexpectedEof` wording to `connection_closed`; the TCP direction-tracking
+  copy and DTLS session outcome treat it as graceful (omit `error_class`), while
+  the all-bounds-disabled `copy_bidirectional` fast path reports
+  `connection_closed`. Alerts keyed on `tls_error` for clean Python/`ssl` closes
+  will stop firing.
+  kTLS is unchanged: a bare FIN without an authenticated `close_notify` remains
+  truncation.
+
 - WAF `mode: enforce` admission now counts `on_body_too_large: block` as a
   reachable enforcement path (issue #4006). That setting already rejected
   oversize governed HTTP bodies and WebSocket application messages whenever

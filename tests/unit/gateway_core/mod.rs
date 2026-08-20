@@ -138,6 +138,7 @@ mod udp_amplification_tests;
 mod udp_auth_lifetime_tests;
 mod udp_dtls_idle_activity_tests;
 mod udp_reply_stop_tests;
+mod udp_setup_failure_tests;
 mod unix_backend_pool_tests;
 mod unix_backend_tests;
 mod unix_pool_publication_tests;
