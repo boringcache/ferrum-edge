@@ -3885,7 +3885,10 @@ fn test_direct_h2_dispatch_uses_passthrough_body_when_unlimited() {
     let dispatch = source
         .split("async fn proxy_to_backend_http2(")
         .nth(1)
-        .expect("direct-H2 dispatch");
+        .expect("direct-H2 dispatch")
+        .split("\nstruct Http3BackendHeaderContext")
+        .next()
+        .expect("bounded direct-H2 dispatch");
     assert!(
         dispatch.contains("direct_h2_uses_limit_adapter("),
         "direct-H2 upload must consult direct_h2_uses_limit_adapter"
@@ -3898,6 +3901,31 @@ fn test_direct_h2_dispatch_uses_passthrough_body_when_unlimited() {
         dispatch.contains("DirectH2RequestBody::Limited"),
         "limited / gated direct-H2 must still wrap SizeLimitedIncoming"
     );
+    assert!(
+        dispatch.contains("if use_limit_adapter && needs_upload_completion_gate {"),
+        "the completion-gate arm must remain the first dispatch choice"
+    );
+    assert!(
+        dispatch.contains("else if let (true, Some(messages)) = (use_limit_adapter, observe_grpc)"),
+        "gRPC observation without a gate must still take SizeLimitedIncoming"
+    );
+    let limited_ctors: Vec<&str> = dispatch.split("SizeLimitedIncoming::").skip(1).collect();
+    assert_eq!(
+        limited_ctors.len(),
+        2,
+        "proxy_to_backend_http2 must construct SizeLimitedIncoming only on the gated and gRPC arms"
+    );
+    for ctor in limited_ctors {
+        let args = ctor.split(')').next().expect("constructor argument list");
+        assert!(
+            args.contains("max_request_body_size"),
+            "limiter must receive the mapped budget, never a raw operator 0: {args}"
+        );
+        assert!(
+            !args.contains("effective_max_request_body_size_bytes"),
+            "passing the operator spelling 0 into SizeLimitedIncoming is deny-all: {args}"
+        );
+    }
 }
 
 #[test]

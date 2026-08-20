@@ -8,7 +8,8 @@ use ferrum_edge::_test_support::{
     poll_upload_cancel_for_test, proxy_body_streaming_for_test, request_body_drop_outcome_for_test,
 };
 use ferrum_edge::proxy::body::{
-    PooledBackendLease, ProxyBody, ProxyBodyError, RequestBodyOutcome, StreamingMetrics,
+    DirectH2RequestBody, PooledBackendLease, ProxyBody, ProxyBodyError, RequestBodyOutcome,
+    StreamingMetrics,
 };
 use http_body::{Body, Frame};
 use std::pin::Pin;
@@ -804,7 +805,10 @@ fn test_direct_h2_passthrough_still_accounts_forwarded_bytes() {
     let dispatch = proxy_source
         .split("async fn proxy_to_backend_http2(")
         .nth(1)
-        .expect("proxy_to_backend_http2 must exist");
+        .expect("proxy_to_backend_http2 must exist")
+        .split("\nstruct Http3BackendHeaderContext")
+        .next()
+        .expect("bounded proxy_to_backend_http2");
     assert!(
         dispatch.contains("observed: Arc::clone(ctx_bytes_sent_observed)"),
         "passthrough must be handed the request's bytes_sent counter"
@@ -817,4 +821,17 @@ fn test_direct_h2_passthrough_still_accounts_forwarded_bytes() {
          an H2 upload may omit the header, and an aborted one sends fewer bytes \
          than it announced"
     );
+}
+
+/// hyper's `SendRequest<B>` requires `B: Body + Send + 'static`; the pipe
+/// task also `Pin`s the body. `Sync` matches `SizeLimitedIncoming` so a
+/// pool/handle bound cannot silently regress.
+#[test]
+fn test_direct_h2_request_body_is_send_sync_unpin() {
+    fn must_be_send<T: Send>() {}
+    fn must_be_sync<T: Sync>() {}
+    fn must_be_unpin<T: Unpin>() {}
+    must_be_send::<DirectH2RequestBody>();
+    must_be_sync::<DirectH2RequestBody>();
+    must_be_unpin::<DirectH2RequestBody>();
 }

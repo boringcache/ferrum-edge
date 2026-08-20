@@ -2249,11 +2249,15 @@ impl SizeLimitedIncoming {
     /// Arm the upload cancellation channel without installing a completion
     /// signal.
     ///
-    /// The direct-H2 dispatch path uses this when request-size limits are
-    /// disabled: there is no response-side gate to satisfy, but an early return
-    /// after `send_request` (a response-header timeout) must still be able to
-    /// tear down hyper's detached HTTP/2 upload pipe instead of leaving it
-    /// draining the client body toward a response nobody will read.
+    /// Ordinary unlimited unauthenticated direct-H2 does **not** use this
+    /// (issue #3942): that path is [`DirectH2RequestBody::Passthrough`], which
+    /// owns the cancel receiver itself. This builder is for
+    /// [`SizeLimitedIncoming`] arms that still need the limiter (gRPC message
+    /// observation with no size cap and no auth deadline) but have no
+    /// response-side completion gate. An early return after `send_request` (a
+    /// response-header timeout) must still tear down hyper's detached HTTP/2
+    /// upload pipe instead of leaving it draining the client body toward a
+    /// response nobody will read.
     #[must_use]
     pub fn with_cancel(mut self, cancel: tokio::sync::oneshot::Receiver<()>) -> Self {
         self.cancel = Some(cancel);

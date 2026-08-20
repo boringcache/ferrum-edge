@@ -49336,9 +49336,10 @@ async fn proxy_to_backend_http2(
     xff_append_ip: &str,
     request_is_secure: bool,
     resolved_ip: Option<String>,
-    // Shared counter for request body bytes. SizeLimitedIncoming increments
-    // this as frames are polled so summary builders observe streamed uploads
-    // (not just Content-Length) once the response completes.
+    // Shared counter for request body bytes. The Limited arm increments it
+    // per DATA frame via SizeLimitedIncoming; the Passthrough arm tallies
+    // into a plain counter and publishes once so summary builders still
+    // observe streamed uploads (not just Content-Length).
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
     // Strictest active route-scoped request-body ceiling, or `None` when no
     // matched plugin enforces one.

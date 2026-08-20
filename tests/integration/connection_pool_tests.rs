@@ -900,3 +900,35 @@ fn test_direct_h2_dispatch_unlimited_and_deny_all_semantics_are_distinct() {
     );
     assert!(direct_h2_uses_limit_adapter(64, false, false));
 }
+
+/// Issue #3942: skipping SizeLimitedIncoming is ordinary-direct-H2 only.
+/// Mesh/HBONE/Unix limiter-typed senders still wrap the adapter and map
+/// operator 0 to usize::MAX.
+#[test]
+fn test_mesh_hbone_unix_senders_stay_limiter_typed() {
+    let mesh = include_str!("../../src/proxy/mesh_mtls_pool.rs");
+    assert!(
+        mesh.contains("Streaming(SizeLimitedIncoming)"),
+        "mesh-mTLS streaming uploads must stay SizeLimitedIncoming"
+    );
+    assert!(
+        !mesh.contains("DirectH2RequestBody"),
+        "mesh-mTLS must not share the ordinary direct-H2 passthrough body"
+    );
+
+    let hbone = include_str!("../../src/proxy/hbone_pool.rs");
+    assert!(
+        !hbone.contains("DirectH2RequestBody"),
+        "HBONE must not share the ordinary direct-H2 passthrough body"
+    );
+
+    let unix = include_str!("../../src/proxy/unix_backend_pool.rs");
+    assert!(
+        unix.contains("SizeLimitedIncoming"),
+        "Unix H1 streaming uploads must stay SizeLimitedIncoming"
+    );
+    assert!(
+        !unix.contains("DirectH2RequestBody"),
+        "Unix backend pool must not share the ordinary direct-H2 passthrough body"
+    );
+}
