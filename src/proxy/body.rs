@@ -2067,24 +2067,8 @@ pub enum UploadSource {
 }
 
 impl UploadSource {
-    /// Build the source for one streaming client upload, installing a
-    /// gateway-owned pump when the request carries an authorization-lifetime
-    /// plan and/or a live `backend_write_timeout_ms`.
-    ///
-    /// This is the entry the native-gRPC request body uses; the H1/H2 adapters
-    /// reach the same machinery through
-    /// `SizeLimitedIncoming::with_gateway_upload_pump`.
-    pub(crate) fn for_streaming_upload(
-        incoming: Incoming,
-        auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
-        write_timeout_ms: u64,
-    ) -> (Self, Option<crate::proxy::upload_pump::UploadPumpJoin>) {
-        let mut source = UploadSource::Direct(incoming);
-        let join = source.install_pump(auth, write_timeout_ms);
-        (source, join)
-    }
-
-    /// Native-gRPC variant whose authorization lifetime starts immediately,
+    /// Build a native-gRPC streaming source whose authorization lifetime
+    /// starts immediately,
     /// while the backend-write watermark is deferred until `get_sender()` has
     /// completed and the dispatcher explicitly arms the returned join.
     pub(crate) fn for_streaming_upload_with_deferred_write(
