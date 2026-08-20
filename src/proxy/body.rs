@@ -3782,6 +3782,11 @@ where
                                 this.done = true;
                                 return Poll::Ready(None);
                             }
+                            // A backend read timeout is terminal. Fuse the body
+                            // before returning the error so an unusual consumer
+                            // re-poll cannot emit the same timeout repeatedly and
+                            // `is_end_stream()` reflects the terminal state.
+                            this.done = true;
                             Poll::Ready(Some(Err(Box::new(std::io::Error::new(
                                 std::io::ErrorKind::TimedOut,
                                 format!(
@@ -6043,6 +6048,14 @@ mod tests {
             .downcast_ref::<std::io::Error>()
             .expect("read timeout must be an io::Error");
         assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            body.is_end_stream(),
+            "a data-phase read timeout must fuse the body",
+        );
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Ready(None)
+        ));
     }
 
     #[tokio::test]
