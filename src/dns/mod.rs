@@ -464,7 +464,10 @@ where
     Fut: Future<Output = Result<T, E>>,
 {
     debug_assert!(!addresses.is_empty());
-    let started = Instant::now();
+    // Use Tokio's monotonic clock because the per-attempt deadlines are Tokio
+    // timers too. This keeps budget accounting on one clock and makes the
+    // invariant deterministic under paused-time tests.
+    let started = tokio::time::Instant::now();
     let mut last_failure = None;
 
     for (index, ip) in addresses.iter().enumerate() {
@@ -2918,7 +2921,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn candidate_attempts_share_one_overall_budget() {
         let addresses = ResolvedAddresses {
             addresses: Arc::from([
@@ -2927,7 +2930,7 @@ mod tests {
             ]),
             start: 0,
         };
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         let result = connect_candidates(&addresses, 443, Duration::from_millis(40), |_| async {
             std::future::pending::<()>().await;
             Ok::<(), std::io::Error>(())
@@ -2937,7 +2940,7 @@ mod tests {
             result,
             Err(CandidateConnectError::TimedOut { .. })
         ));
-        assert!(started.elapsed() < Duration::from_millis(200));
+        assert_eq!(started.elapsed(), Duration::from_millis(40));
     }
 
     #[tokio::test]
