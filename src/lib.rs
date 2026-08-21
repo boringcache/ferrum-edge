@@ -3555,6 +3555,15 @@ pub mod _test_support {
         crate::proxy::ws_idle_timeout_policy_close_frame()
     }
 
+    /// Class for a WebSocket capacity overflow used when the relay maps
+    /// `Capacity` errors onto `ErrorClass`.
+    pub fn ws_capacity_error_class_for_test(
+        size: usize,
+        client_to_backend: bool,
+    ) -> crate::retry::ErrorClass {
+        crate::proxy::ws_capacity_error_class(size, client_to_backend)
+    }
+
     /// Global capacity-overflow Close selection used when no plugin rule binds.
     pub fn global_ws_capacity_close_for_error_for_test(
         error: &WsError,
@@ -7376,6 +7385,9 @@ pub mod _test_support {
             proxy_name,
             client_ip,
             backend_target,
+            http_method: "GET".to_string(),
+            request_path: "/".to_string(),
+            handshake_status_code: 101,
             listen_port,
             connection_id: 0,
             consumer_username,
@@ -7406,6 +7418,9 @@ pub mod _test_support {
             proxy_name,
             client_ip,
             backend_target,
+            http_method: "GET".to_string(),
+            request_path: "/".to_string(),
+            handshake_status_code: 101,
             listen_port,
             connection_id: 0,
             consumer_username,

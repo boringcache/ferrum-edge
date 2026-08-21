@@ -14728,6 +14728,9 @@ async fn handle_websocket_request_authenticated(
         // unchanged `current_backend_url` (Finding C) — so the disconnect log
         // records a valid backend URL, not the synthetic `mesh-xc-hbone|...` key.
         backend_target: strip_query_params(&ws_display_backend_url).to_string(),
+        http_method: ws_method.to_string(),
+        request_path: original_request_path.clone(),
+        handshake_status_code: ws_status_code,
         listen_port,
         // Same admission ID passed into the relay / on_ws_frame so disconnect
         // hooks (including upgrade-handoff failure below) correlate without a
@@ -16716,6 +16719,12 @@ pub struct WsSessionMeta {
     pub proxy_name: Option<String>,
     pub client_ip: String,
     pub backend_target: String,
+    /// Frontend HTTP method that admitted the upgrade (`GET` or `CONNECT`).
+    pub http_method: String,
+    /// Original client request path captured at upgrade admission.
+    pub request_path: String,
+    /// Successful handshake status (`101` for HTTP/1.1, `200` for Extended CONNECT).
+    pub handshake_status_code: u16,
     pub listen_port: u16,
     /// Process-local accepted session ID allocated at upgrade admission and
     /// preserved through every teardown path that builds `WsDisconnectContext`.
@@ -16943,6 +16952,9 @@ async fn fire_ws_tunnel_disconnect_hooks_with_reason(
         proxy_name: session_meta.proxy_name.clone(),
         client_ip: session_meta.client_ip.clone(),
         backend_target: session_meta.backend_target.clone(),
+        http_method: session_meta.http_method.clone(),
+        request_path: session_meta.request_path.clone(),
+        handshake_status_code: session_meta.handshake_status_code,
         listen_port: session_meta.listen_port,
         connection_id: session_meta.connection_id,
         duration_ms: disconnect_duration_ms,
@@ -17003,6 +17015,9 @@ pub(crate) async fn fire_ws_framed_disconnect_hooks_with_reason(
         proxy_name: session_meta.proxy_name,
         client_ip: session_meta.client_ip,
         backend_target: session_meta.backend_target,
+        http_method: session_meta.http_method,
+        request_path: session_meta.request_path,
+        handshake_status_code: session_meta.handshake_status_code,
         listen_port: session_meta.listen_port,
         connection_id: session_meta.connection_id,
         duration_ms: disconnect_duration_ms,
@@ -17359,6 +17374,25 @@ impl EffectiveWsSizeLimits {
             _ => return None,
         };
         Some((ws_global_capacity_close_frame(), kind, size, max_size))
+    }
+}
+
+/// Directional class for a WebSocket `Capacity` / FrameTooLong /
+/// MessageTooLong overflow.
+///
+/// Any `Capacity` failure is a valid RFC 6455 size-policy violation: the
+/// 64-bit extended length carries a 63-bit value (only its most-significant
+/// bit must be zero), so an advertised length above `u32::MAX` is not itself
+/// malformed. Genuine protocol junk — e.g. issue #4058's stray continuation
+/// frame — is parsed as `tungstenite::Error::Protocol` before the size ceiling
+/// is consulted, so `classify_boxed_error` maps it to `ProtocolError`. The
+/// advertised `size` therefore never changes this class and is retained only
+/// so tests can pin a valid >`u32::MAX` length to the size-limit outcome.
+pub(crate) fn ws_capacity_error_class(_size: usize, client_to_backend: bool) -> retry::ErrorClass {
+    if client_to_backend {
+        retry::ErrorClass::RequestBodyTooLarge
+    } else {
+        retry::ErrorClass::ResponseBodyTooLarge
     }
 }
 
@@ -18493,7 +18527,7 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut backend_sink, close).await;
-                                retry::ErrorClass::RequestBodyTooLarge
+                                ws_capacity_error_class(size, true)
                             } else if let Some((close, limit_kind, size, max_size)) =
                                 EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
                             {
@@ -18512,7 +18546,7 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut backend_sink, close).await;
-                                retry::ErrorClass::RequestBodyTooLarge
+                                ws_capacity_error_class(size, true)
                             } else if let Some((close, limit_kind)) =
                                 ws_fragment_policy_close_for_error(&e)
                             {
@@ -18800,7 +18834,7 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut ws_sink, close).await;
-                                retry::ErrorClass::ResponseBodyTooLarge
+                                ws_capacity_error_class(size, false)
                             } else if let Some((close, limit_kind, size, max_size)) =
                                 EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
                             {
@@ -18819,7 +18853,7 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut ws_sink, close).await;
-                                retry::ErrorClass::ResponseBodyTooLarge
+                                ws_capacity_error_class(size, false)
                             } else if let Some((close, limit_kind)) =
                                 ws_fragment_policy_close_for_error(&e)
                             {
