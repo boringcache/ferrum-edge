@@ -3825,7 +3825,9 @@ async fn buffer_request_body_for_before_proxy(
 /// secured-transport attempt. The returned `Bytes` are retained only when the
 /// retry loop needs replay; mesh pool acquisition, identity verification, and
 /// backend admission remain per attempt.
-#[allow(clippy::too_many_arguments)]
+// BackendResponse is the shared, protocol-aware fail-closed result for request
+// preparation; boxing it here would ripple through the mesh dispatch contract.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 async fn prepare_mesh_request_body(
     client_request_body: ClientRequestBody,
     method: &str,

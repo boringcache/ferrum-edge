@@ -1798,7 +1798,7 @@ fn ipv6_from_hex(raw: &str) -> Result<Ipv6Addr, IngressTopologyReason> {
         return Err(IngressTopologyReason::RouteTableInvalid);
     }
     let mut bytes = [0u8; 16];
-    for (byte, pair) in bytes.iter_mut().zip(raw.chunks_exact(2)) {
+    for (byte, pair) in bytes.iter_mut().zip(raw.as_chunks::<2>().0) {
         let high = hex_nibble(pair[0]).ok_or(IngressTopologyReason::RouteTableInvalid)?;
         let low = hex_nibble(pair[1]).ok_or(IngressTopologyReason::RouteTableInvalid)?;
         *byte = (high << 4) | low;
