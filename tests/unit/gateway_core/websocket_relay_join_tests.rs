@@ -413,7 +413,8 @@ async fn test_bounded_close_limits_stuck_peer_echo_flush() {
 /// only after the full disconnect logger lifecycle. Functional tests cover the
 /// wire-level 1009 contract; widening the runtime API solely for this private
 /// bookkeeping check would be less representative than pinning these two
-/// assignments directly.
+/// assignments directly. The directional mapping the call encodes is
+/// asserted separately against `ws_capacity_error_class_for_test`.
 #[test]
 fn test_size_policy_rejections_use_explicit_error_classes() {
     let source = include_str!("../../../src/proxy/mod.rs");
@@ -422,12 +423,12 @@ fn test_size_policy_rejections_use_explicit_error_classes() {
         (
             "direction = \"client->backend\"",
             "Client -> backend forwarding completed",
-            "retry::ErrorClass::RequestBodyTooLarge",
+            "ws_capacity_error_class(size, true)",
         ),
         (
             "direction = \"backend->client\"",
             "Backend -> client forwarding completed",
-            "retry::ErrorClass::ResponseBodyTooLarge",
+            "ws_capacity_error_class(size, false)",
         ),
     ] {
         let branch = source
