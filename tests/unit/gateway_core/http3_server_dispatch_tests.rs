@@ -863,7 +863,10 @@ fn h3_cross_protocol_streaming_grpc_consumes_deadline_and_read_bounds() {
          offered DATA"
     );
     assert!(relay.contains("abort_response_stream(stream)"));
-    assert!(relay.contains("_ = &mut read_deadline"));
+    // `read_deadline` is an `Option<Sleep>`, so its arm goes through the
+    // optional-sleep helper rather than taking `&mut` on a bare `Sleep`
+    // the way `grpc_deadline` above does.
+    assert!(relay.contains("optional_sleep_elapsed(read_deadline.as_mut())"));
     assert!(relay.contains("await_response_write_before_deadline("));
     assert!(relay.contains("await_downstream_write!(stream.send_data"));
 }
@@ -4651,13 +4654,21 @@ fn the_h3_prebuffered_plain_arm_writes_under_the_backend_write_watermark() {
     // client deadline, a peer-gone, and a completed exchange all still win over
     // the write watermark. The watermark terminal is the LAST arm added, and it
     // is the typed 504 backend-timeout terminal, never a generic 502.
+    // Slice the whole `Err(())` arm, not just the tail after the watermark
+    // field: the arm halts the request half BEFORE it emits the attributing
+    // `warn!`, so a window opened at the watermark marker would exclude the
+    // very call this asserts.
     let arm = dispatch
-        .split("watermark = \"backend_write_timeout_ms\",")
+        .split("let send_result = match header_bound {")
         .nth(1)
-        .expect("the prebuffered arm must attribute its own watermark")
+        .expect("the prebuffered arm must bound its response headers")
         .split("Ok(Err(())) => {")
         .next()
         .expect("bounded prebuffered write-watermark terminal");
+    assert!(
+        arm.contains("watermark = \"backend_write_timeout_ms\","),
+        "the prebuffered write stall must attribute its own watermark"
+    );
     assert!(
         arm.contains("write_plain_backend_timeout_terminal("),
         "a prebuffered write stall must use the shared 504 backend-timeout terminal"
