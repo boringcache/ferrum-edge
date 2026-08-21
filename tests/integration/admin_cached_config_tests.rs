@@ -6724,6 +6724,257 @@ async fn test_delete_hand_managed_proxy_orphan_cleans_last_referenced_hand_owned
 }
 
 #[tokio::test]
+async fn test_delete_proxy_orphan_cleans_last_referenced_hand_owned_upstream_by_default() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let upstream = json!({
+        "id": "orphan-up-default",
+        "name": "orphan-up-default",
+        "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+    });
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 201, "Create upstream failed: {:?}", body);
+
+    let proxy = json!({
+        "id": "orphan-px-default",
+        "listen_path": "/orphan-default",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true,
+        "upstream_id": "orphan-up-default"
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "Create proxy failed: {:?}", body);
+
+    let (status, _) = admin_delete(&base_url, "/proxies/orphan-px-default", &token).await;
+    assert_eq!(status, 204);
+    let (status, body, _) = admin_get(&base_url, "/upstreams/orphan-up-default", &token).await;
+    assert_eq!(
+        status, 404,
+        "omitting cleanup_orphaned_upstream must keep today's orphan cleanup: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_delete_proxy_opt_out_preserves_last_referenced_hand_owned_upstream() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let upstream = json!({
+        "id": "orphan-up-keep",
+        "name": "orphan-up-keep",
+        "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+    });
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 201, "Create upstream failed: {:?}", body);
+
+    let proxy = json!({
+        "id": "orphan-px-keep",
+        "listen_path": "/orphan-keep",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true,
+        "upstream_id": "orphan-up-keep"
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "Create proxy failed: {:?}", body);
+
+    let (status, body) = admin_delete(
+        &base_url,
+        "/proxies/orphan-px-keep?cleanup_orphaned_upstream=false",
+        &token,
+    )
+    .await;
+    assert_eq!(status, 204, "opt-out delete must succeed: {:?}", body);
+    let (status, body, _) = admin_get(&base_url, "/upstreams/orphan-up-keep", &token).await;
+    assert_eq!(
+        status, 200,
+        "cleanup_orphaned_upstream=false must leave the upstream queryable: {:?}",
+        body
+    );
+    assert_eq!(body["id"].as_str().unwrap_or(""), "orphan-up-keep");
+}
+
+#[tokio::test]
+async fn test_delete_proxy_explicit_true_orphan_cleans_last_referenced_upstream() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let upstream = json!({
+        "id": "orphan-up-true",
+        "name": "orphan-up-true",
+        "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+    });
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 201, "Create upstream failed: {:?}", body);
+
+    let proxy = json!({
+        "id": "orphan-px-true",
+        "listen_path": "/orphan-true",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true,
+        "upstream_id": "orphan-up-true"
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "Create proxy failed: {:?}", body);
+
+    let (status, _) = admin_delete(
+        &base_url,
+        "/proxies/orphan-px-true?cleanup_orphaned_upstream=true",
+        &token,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _, _) = admin_get(&base_url, "/upstreams/orphan-up-true", &token).await;
+    assert_eq!(
+        status, 404,
+        "cleanup_orphaned_upstream=true must orphan-clean the last-referenced upstream"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_proxy_rejects_unrecognized_cleanup_orphaned_upstream_value() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let upstream = json!({
+        "id": "orphan-up-badflag",
+        "name": "orphan-up-badflag",
+        "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+    });
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 201, "Create upstream failed: {:?}", body);
+
+    let proxy = json!({
+        "id": "orphan-px-badflag",
+        "listen_path": "/orphan-badflag",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true,
+        "upstream_id": "orphan-up-badflag"
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "Create proxy failed: {:?}", body);
+
+    let (status, body) = admin_delete(
+        &base_url,
+        "/proxies/orphan-px-badflag?cleanup_orphaned_upstream=yes",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "unrecognized cleanup_orphaned_upstream must 400, not guess: {:?}",
+        body
+    );
+    let error = body["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("cleanup_orphaned_upstream") && error.contains("true"),
+        "400 body must name the flag and accepted values: {:?}",
+        body
+    );
+
+    let (status, body) = admin_delete(
+        &base_url,
+        "/proxies/orphan-px-badflag?cleanup_orphaned_upstream=false&cleanup_orphaned_upstream=false",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "duplicate cleanup_orphaned_upstream must fail closed even when values agree: {:?}",
+        body
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("more than once"),
+        "duplicate-value 400 must explain the ambiguity: {:?}",
+        body
+    );
+
+    let (status, _, _) = admin_get(&base_url, "/proxies/orphan-px-badflag", &token).await;
+    assert_eq!(status, 200, "invalid flag must not delete the proxy");
+    let (status, _, _) = admin_get(&base_url, "/upstreams/orphan-up-badflag", &token).await;
+    assert_eq!(status, 200, "invalid flag must not delete the upstream");
+}
+
+#[tokio::test]
+async fn test_delete_proxy_still_referenced_upstream_survives_with_or_without_flag() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    for (suffix, query) in [
+        ("default", ""),
+        ("optout", "?cleanup_orphaned_upstream=false"),
+        ("explicit", "?cleanup_orphaned_upstream=true"),
+    ] {
+        let upstream_id = format!("orphan-up-shared-{suffix}");
+        let p1 = format!("orphan-px-shared-a-{suffix}");
+        let p2 = format!("orphan-px-shared-b-{suffix}");
+        let upstream = json!({
+            "id": upstream_id,
+            "name": upstream_id,
+            "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+        });
+        let (status, body) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+        assert_eq!(status, 201, "Create upstream failed: {:?}", body);
+
+        let proxy_a = json!({
+            "id": p1,
+            "listen_path": format!("/orphan-shared-a-{suffix}"),
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "upstream_id": upstream_id
+        });
+        let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy_a).await;
+        assert_eq!(status, 201, "Create proxy A failed: {:?}", body);
+
+        let proxy_b = json!({
+            "id": p2,
+            "listen_path": format!("/orphan-shared-b-{suffix}"),
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "upstream_id": upstream_id
+        });
+        let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy_b).await;
+        assert_eq!(status, 201, "Create proxy B failed: {:?}", body);
+
+        let (status, body) =
+            admin_delete(&base_url, &format!("/proxies/{p1}{query}"), &token).await;
+        assert_eq!(status, 204, "delete proxy A must succeed: {:?}", body);
+        let (status, _, _) =
+            admin_get(&base_url, &format!("/upstreams/{upstream_id}"), &token).await;
+        assert_eq!(
+            status, 200,
+            "shared upstream must survive deleting one referencer (query={query:?})"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_upstream_update_rejects_removing_referenced_subset() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

@@ -3179,7 +3179,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_delete::<Proxy>(&state, &auth, id, &namespace).await
+            crud::handle_delete::<Proxy>(&state, &auth, id, &namespace, uri.query()).await
         }
 
         // Consumers CRUD
@@ -3206,7 +3206,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            crud::handle_delete::<Consumer>(&state, &auth, id, &namespace).await
+            crud::handle_delete::<Consumer>(&state, &auth, id, &namespace, uri.query()).await
         }
 
         // Consumer credentials
@@ -3284,7 +3284,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_delete::<PluginConfig>(&state, &auth, id, &namespace).await
+            crud::handle_delete::<PluginConfig>(&state, &auth, id, &namespace, uri.query()).await
         }
 
         // Upstreams CRUD
@@ -3311,7 +3311,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_delete::<Upstream>(&state, &auth, id, &namespace).await
+            crud::handle_delete::<Upstream>(&state, &auth, id, &namespace, uri.query()).await
         }
 
         // Gateway trust bundles CRUD (issue #3727).
@@ -3373,7 +3373,14 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            crud::handle_delete::<GatewayTrustBundleRecord>(&state, &auth, id, &namespace).await
+            crud::handle_delete::<GatewayTrustBundleRecord>(
+                &state,
+                &auth,
+                id,
+                &namespace,
+                uri.query(),
+            )
+            .await
         }
 
         // Batch create

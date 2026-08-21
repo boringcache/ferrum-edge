@@ -274,6 +274,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`DELETE /proxies/{id}?cleanup_orphaned_upstream=` opt-out** (issue #4064).
+  This is a non-breaking feature addition: omitting the parameter preserves
+  existing behavior, which orphan-cleans a last-referenced hand-owned
+  (`api_spec_id` null) upstream when a hand-managed proxy is deleted.
+  `cleanup_orphaned_upstream=false` keeps that upstream so it can be reattached.
+  Only the exact strings `true` and `false` are accepted; any other value
+  returns `400` rather than guessing. Spec-owned upstreams and still-referenced
+  upstreams are never cleaned, regardless of the flag. Direct
+  `DELETE /upstreams/{id}` still returns `409` while referenced. See
+  [docs/admin_api.md](docs/admin_api.md).
+
 - Authorization lifetime for admitted streams and request uploads (issues
   #3815, #3816). An authenticated stream is bounded by the earliest of the
   accepted credential's own deadline and the finite
