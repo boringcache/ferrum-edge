@@ -14,7 +14,10 @@ use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::plugin_utils::{assert_continue, assert_reject, create_test_proxy};
+use super::plugin_utils::{
+    assert_continue, assert_reject, assert_reject_body, context_with_materialized_raw_header,
+    context_with_materialized_raw_header_bytes, create_test_proxy,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha512 = Hmac<Sha512>;
@@ -3119,4 +3122,71 @@ async fn hmac_prebuffer_then_matching_rfc9530_body_authenticates() {
     set_request_body(&mut ctx, body);
     assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
     assert_eq!(ctx.identified_consumer.unwrap().username, TEST_USERNAME);
+}
+
+#[tokio::test]
+async fn test_hmac_auth_non_ascii_authorization_returns_invalid_not_missing() {
+    let plugin = HmacAuth::new(&v2_config()).unwrap();
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = context_with_materialized_raw_header(
+        "Authorization",
+        &format!(
+            "hmac username=\"{TEST_USERNAME}\", algorithm=\"hmac-sha256\", \
+             nonce=\"01234567890123456789012345678901\", signature=\"dGVzdA==\"\u{3000}"
+        ),
+    );
+    ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject_body(result, r#"{"error":"Invalid Authorization header"}"#);
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn test_hmac_auth_non_ascii_digest_returns_invalid_not_missing() {
+    let plugin = HmacAuth::new(&v2_config()).unwrap();
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = make_ctx("GET", "/test");
+    ctx.headers.clear();
+    ctx.identified_consumer = None;
+    ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    ctx.headers.insert(
+        "authorization".to_string(),
+        format!(
+            "hmac username=\"{TEST_USERNAME}\", algorithm=\"hmac-sha256\", \
+             nonce=\"01234567890123456789012345678901\", signature=\"dGVzdA==\""
+        ),
+    );
+
+    let mut digest_value = sha256_digest_header(&[]).into_bytes();
+    digest_value.push(0xC2);
+    digest_value.push(0x80);
+
+    let mut raw = http::HeaderMap::new();
+    raw.insert(
+        "digest",
+        http::HeaderValue::from_bytes(&digest_value).expect("valid header bytes"),
+    );
+    ctx.set_raw_headers(raw);
+    ctx.materialize_headers();
+    assert!(!ctx.headers.contains_key("digest"));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject_body(result, r#"{"error":"Malformed digest header"}"#);
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn test_hmac_auth_invalid_utf8_authorization_returns_invalid_not_missing() {
+    let plugin = HmacAuth::new(&v2_config()).unwrap();
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = context_with_materialized_raw_header_bytes(
+        "Authorization",
+        b"hmac username=\"x\", nonce=\"01234567890123456789012345678901\", signature=\"dGVzdA==\"\xff",
+    );
+    ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject_body(result, r#"{"error":"Invalid Authorization header"}"#);
+    assert!(ctx.identified_consumer.is_none());
 }

@@ -106,6 +106,7 @@ use super::utils::auth_flow::{
     self, AuthMechanism, ExtractedCredential, VerifyOutcome, commit_authentication_attempt,
     constant_time_eq,
 };
+use super::utils::header_extract::{ConfiguredHeaderLookup, lookup_configured_header};
 use super::utils::redis_rate_limiter::{
     REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient,
 };
@@ -1290,10 +1291,16 @@ impl HmacAuth {
     }
 
     fn has_hmac_authorization(&self, ctx: &RequestContext) -> bool {
-        let Some(auth_header) = ctx.headers.get("authorization") else {
-            return false;
-        };
-        strip_auth_scheme(auth_header, "hmac").is_some()
+        match lookup_configured_header(ctx, "authorization", None) {
+            ConfiguredHeaderLookup::Absent => false,
+            // Present but omitted from the materialized map still means the client
+            // attempted `Authorization`; extraction will reject as invalid rather
+            // than report the credential missing.
+            ConfiguredHeaderLookup::PresentNonMaterialized => true,
+            ConfiguredHeaderLookup::Value(auth_header) => {
+                strip_auth_scheme(&auth_header, "hmac").is_some()
+            }
+        }
     }
 
     fn authorization_fingerprint(ctx: &RequestContext) -> Option<[u8; 32]> {
@@ -1489,11 +1496,20 @@ impl AuthMechanism for HmacAuth {
     }
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
-        let Some(auth_header) = ctx.headers.get("authorization") else {
-            return ExtractedCredential::Missing;
+        // RFC 6750-style `Authorization` parameters and digest headers are
+        // visible-ASCII structured fields. A present but non-materialized line
+        // is malformed, not absent.
+        let auth_header = match lookup_configured_header(ctx, "authorization", None) {
+            ConfiguredHeaderLookup::Absent => return ExtractedCredential::Missing,
+            ConfiguredHeaderLookup::PresentNonMaterialized => {
+                return ExtractedCredential::InvalidFormat(
+                    r#"{"error":"Invalid Authorization header"}"#.into(),
+                );
+            }
+            ConfiguredHeaderLookup::Value(header) => header,
         };
 
-        let Some(params_str) = strip_auth_scheme(auth_header, "hmac") else {
+        let Some(params_str) = strip_auth_scheme(&auth_header, "hmac") else {
             return ExtractedCredential::InvalidFormat(
                 r#"{"error":"Invalid HMAC authorization format"}"#.to_string(),
             );
