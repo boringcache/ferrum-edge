@@ -147,10 +147,10 @@ wait_for_not_found() {
 }
 
 wait_for_ages_increased() {
-  local label="$1" timeout="$2"; shift 2
+  local label="$1" timeout="$2" snapshot_file="$3"; shift 3
   local deadline=$((SECONDS + timeout))
   while (( SECONDS < deadline )); do
-    if ages_increased_below_stale "$@"; then return 0; fi
+    if capture_ages_increased_below_stale "$snapshot_file" "$@"; then return 0; fi
     sleep 1
   done
   echo "timed out waiting for $label (${timeout}s)" >&2
@@ -625,9 +625,12 @@ admin_ages() {
       admin-ages "$3"
 }
 
-ages_increased_below_stale() {
+capture_ages_increased_below_stale() {
+  local snapshot_file="$1" context="$2" token="$3" peer="$4"
   local ages trust_age endpoint_age
-  ages="$( admin_ages "$1" "$2" "$3")" || return 1
+  admin_json "$context" "$token" > "$snapshot_file" || return 1
+  ages="$( python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \
+    admin-ages "$peer" < "$snapshot_file")" || return 1
   read -r trust_age endpoint_age <<<"$ages"
   (( trust_age >= 3 && endpoint_age >= 3 &&
      trust_age > INITIAL_TRUST_AGE && endpoint_age > INITIAL_ENDPOINT_AGE &&
@@ -754,16 +757,16 @@ scenario_initial() {
 scenario_transient() {
   read -r INITIAL_TRUST_AGE INITIAL_ENDPOINT_AGE < <(admin_ages "$CONTEXT_A" "$JWT_A" cluster-b)
   set_all_proxies false
-  # Observe the retained caches before doing any serial counter accounting.
-  # The endpoint window is only eight seconds; waiting for metrics first can
-  # consume that window and turn a short-partition assertion into an expiry.
-  wait_for_ages_increased "last-good cache ages increase below both stale windows" 7 "$CONTEXT_A" "$JWT_A" cluster-b
-  traffic_once "$CONTEXT_A" echo-b echo-b; traffic_once "$CONTEXT_B" echo-a echo-a
   local transient_json="$RESULTS_DIR/poller.transient.last_good_retained.json"
   local transient_metrics="$RESULTS_DIR/poller.transient.last_good_retained.prom"
   local snapshot_ages snapshot_trust_age snapshot_endpoint_age ff df
   local fed_presence disc_presence
-  admin_json "$CONTEXT_A" "$JWT_A" > "$transient_json"
+  # Persist the exact admin response that satisfies the below-stale predicate.
+  # Fetching a second snapshot after the serial traffic probes can cross the
+  # endpoint's exclusive eight-second expiry boundary on a loaded runner.
+  wait_for_ages_increased "last-good cache ages increase below both stale windows" 7 \
+    "$transient_json" "$CONTEXT_A" "$JWT_A" cluster-b
+  traffic_once "$CONTEXT_A" echo-b echo-b; traffic_once "$CONTEXT_B" echo-a echo-a
   metrics "$CONTEXT_A" "$JWT_A" > "$transient_metrics"
   set_all_proxies true
   snapshot_ages="$( python3 ./tests/k8s/multicluster-poller-partition/live_assertions.py \

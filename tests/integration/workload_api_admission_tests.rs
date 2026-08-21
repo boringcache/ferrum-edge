@@ -443,7 +443,7 @@ async fn read_max_concurrent_streams(stream: &mut UnixStream) -> Option<u32> {
 }
 
 fn settings_max_concurrent_streams(payload: &[u8]) -> Option<u32> {
-    for entry in payload.chunks_exact(6) {
+    for entry in payload.as_chunks::<6>().0 {
         if u16::from_be_bytes([entry[0], entry[1]]) == 0x3 {
             return Some(u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]));
         }

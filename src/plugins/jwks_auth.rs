@@ -31,6 +31,7 @@ use super::utils::dpop::{
     self, DPOP_MARKER_RETENTION_SECONDS, DPOP_REPLAY_PROFILE, DpopVerifyInput,
     MAX_DPOP_CLOCK_SKEW_SECS,
 };
+use super::utils::header_extract::{ConfiguredHeaderLookup, lookup_configured_header};
 use super::utils::jwks_cache::{
     DiscoveryStoreCandidate, JwksRefreshRequirement, LateActiveRequirement,
     clear_late_active_requirement, get_or_create_jwks_store, last_discovered_jwks_uri,
@@ -1057,8 +1058,17 @@ impl JwksAuth {
             return Ok(None);
         }
 
-        let Some(proof) = ctx.headers.get("dpop") else {
-            return Err((401, r#"{"error":"DPoP proof required"}"#.to_string()));
+        // RFC 9449 DPoP proofs are compact JWTs (base64url), visible ASCII. A
+        // present `dpop` field line that `materialize_headers()` omitted is
+        // malformed proof material, not a missing proof.
+        let proof = match lookup_configured_header(ctx, "dpop", None) {
+            ConfiguredHeaderLookup::Absent => {
+                return Err((401, r#"{"error":"DPoP proof required"}"#.to_string()));
+            }
+            ConfiguredHeaderLookup::PresentNonMaterialized => {
+                return Err((401, r#"{"error":"Invalid DPoP proof"}"#.to_string()));
+            }
+            ConfiguredHeaderLookup::Value(proof) => proof,
         };
         // A `require_dpop` provider always carries a domain and an authority:
         // construction rejects the configuration otherwise. Fail closed rather
@@ -1082,7 +1092,7 @@ impl JwksAuth {
             return Err((401, r#"{"error":"DPoP URL mismatch"}"#.to_string()));
         };
         match dpop::verify(DpopVerifyInput {
-            proof,
+            proof: &proof,
             access_token: token,
             access_token_claims: claims,
             method: &ctx.method,

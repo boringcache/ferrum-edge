@@ -118,7 +118,14 @@ pub struct ValidateArgs {
 #[derive(clap::Args)]
 pub struct ReloadArgs {
     /// PID of the running gateway (auto-detected if omitted).
-    #[arg(short = 'p', long = "pid")]
+    ///
+    /// Must be a positive process ID. `0` is rejected because POSIX `kill`
+    /// treats it as this process group. This CLI process is also rejected.
+    #[arg(
+        short = 'p',
+        long = "pid",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
     pub pid: Option<u32>,
 }
 
@@ -804,15 +811,20 @@ pub fn execute_reload(args: &ReloadArgs) -> Result<(), String> {
             Some(p) => p,
             None => find_gateway_pid()?,
         };
-        let status = std::process::Command::new("kill")
-            .args(["-HUP", &pid.to_string()])
-            .status()
-            .map_err(|e| format!("Failed to execute kill: {}", e))?;
-        if status.success() {
+        let target = unix_reload_pid_t(pid)?;
+        // SAFETY: `target` is a positive `pid_t` (not 0, not this CLI
+        // process). `SIGHUP` is a valid signal. `kill` does not dereference
+        // memory; a failure returns -1 and sets errno.
+        let rc = unsafe { libc::kill(target, libc::SIGHUP) };
+        if rc == 0 {
             println!("Sent SIGHUP to PID {}", pid);
             Ok(())
         } else {
-            Err(format!("Failed to send SIGHUP to PID {}", pid))
+            Err(format!(
+                "Failed to send SIGHUP to PID {}: {}",
+                pid,
+                std::io::Error::last_os_error()
+            ))
         }
     }
 
@@ -821,6 +833,35 @@ pub fn execute_reload(args: &ReloadArgs) -> Result<(), String> {
         let _ = args;
         Err("reload is only supported on Unix platforms".into())
     }
+}
+
+/// Convert a CLI `--pid` into a `pid_t` that is safe to pass to POSIX `kill`.
+///
+/// `kill(pid, …)` with `pid == 0` signals every process in the caller's
+/// process group, not a process named "0". Negative special values cannot
+/// arrive through `u32`, but values that do not fit in `pid_t` also cannot
+/// name a live process. The reload CLI itself is refused so an explicit
+/// `--pid` cannot SIGHUP this process.
+///
+/// Identity and liveness of the target are not probed first: `/proc` or
+/// `kill(pid, 0)` would be racy with PID reuse, and explicit `--pid` already
+/// bypasses `pgrep` auto-detection by contract. `kill(SIGHUP)` itself reports
+/// ESRCH / EPERM.
+#[cfg(unix)]
+fn unix_reload_pid_t(pid: u32) -> Result<libc::pid_t, String> {
+    if pid == 0 {
+        return Err(
+            "invalid --pid 0: POSIX kill treats 0 as this process group, not a gateway PID".into(),
+        );
+    }
+    let self_pid = std::process::id();
+    if pid == self_pid {
+        return Err(format!(
+            "invalid --pid {pid}: that is this CLI process, not a running ferrum-edge gateway"
+        ));
+    }
+    libc::pid_t::try_from(pid)
+        .map_err(|_| format!("invalid --pid {pid}: value is outside the range of a process ID"))
 }
 
 /// Render a `validate` report field whose value is derived from `env_key`.
