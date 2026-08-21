@@ -2910,9 +2910,8 @@ where
                         let outcome =
                             await_upload_write_watermark_first(attempt, plain_upload_pump.as_mut())
                                 .await;
-                        let should_replay = outcome
-                            .as_ref()
-                            .is_ok_and(plain_send_is_protocol_nack);
+                        let should_replay =
+                            outcome.as_ref().is_ok_and(plain_send_is_protocol_nack);
                         if !should_replay {
                             break outcome;
                         }
