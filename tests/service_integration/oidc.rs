@@ -74,7 +74,7 @@ fn base_oidc_config(hydra: &HydraContainer, client: &HydraClient) -> Value {
             "redirect_uri": client.redirect_uri,
             "callback_path": REDIRECT_PATH,
             "logout_path": LOGOUT_PATH,
-            "post_logout_redirect_uri": format!("http://127.0.0.1/"),
+            "post_logout_redirect_uri": "http://127.0.0.1/".to_string(),
             "consumer_identity_claim": "email",
             "claim_headers": {
                 "email": "X-Authenticated-Email",

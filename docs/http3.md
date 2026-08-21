@@ -1019,13 +1019,15 @@ the request-receipt instant, before the tunnel exists:
   (`H3_INTERNAL_ERROR`), never by a clean FIN: a client must be able to tell an
   authorization termination from a tunnel that ran to completion.
 - **Teardown.** A client that stops reading parks the client-bound relay in QUIC
-  send flow control, where it cannot observe the supervisor's close command at
-  all. The existing bounded close grace then aborts and joins both relay tasks,
-  so the socket, session permit, and connection guard are released on time and
-  the abort itself resets the stream. That designed abort stays classified as
-  the authorization expiry only when the send half was cancelled after the
-  grace timeout; a panic or any unrelated cancellation is reported as an
-  internal relay failure.
+  send flow control. That write is raced with the supervisor close command so
+  `stop_stream` can land. If it still never returns, the existing bounded close
+  grace aborts and joins both relay tasks so the socket, session permit, and
+  connection guard are released on time. Quinn would implicitly `finish()` a
+  send stream dropped without `finish()`/`reset()`, so the send half RESETS on
+  drop unless a close was already applied — the abort must not present a clean
+  FIN. That designed abort stays classified as the authorization expiry only
+  when the send half was cancelled after the grace timeout; a panic or any
+  unrelated cancellation is reported as an internal relay failure.
 - **Accounting.** Exactly one termination is recorded, through the request's
   shared once-only latch, on the fixed-cardinality `authorization_lifetime`
   counters under the existing closed `stream_udp` protocol family. No route,

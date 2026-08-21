@@ -62,8 +62,9 @@ impl CountryCode {
     fn is_supported(self) -> bool {
         let code = self.bytes();
         SUPPORTED_GEO_COUNTRY_CODES
-            .chunks_exact(2)
-            .any(|assigned| assigned == code.as_slice())
+            .as_chunks::<2>()
+            .0
+            .contains(&code)
     }
 
     fn bit_index(self) -> usize {

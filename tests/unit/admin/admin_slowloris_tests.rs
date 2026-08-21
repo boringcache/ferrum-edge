@@ -638,7 +638,7 @@ async fn h2c_server_settings_advertise_configured_bounds() {
             if kind != H2_SETTINGS || flags & 0x1 != 0 {
                 continue;
             }
-            for entry in payload.chunks_exact(6) {
+            for entry in payload.as_chunks::<6>().0 {
                 let id = u16::from_be_bytes([entry[0], entry[1]]);
                 let raw = [entry[2], entry[3], entry[4], entry[5]];
                 let value = u32::from_be_bytes(raw);

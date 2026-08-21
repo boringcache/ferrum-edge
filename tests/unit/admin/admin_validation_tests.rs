@@ -298,6 +298,31 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
 }
 
 #[test]
+fn proxy_admin_normalize_trims_allowed_methods() {
+    let source = include_str!("../../../src/admin/crud.rs");
+    let proxy_impl = source
+        .find("impl AdminResource for Proxy")
+        .expect("Proxy admin implementation must exist");
+    let normalize = source[proxy_impl..]
+        .find("fn normalize(&mut self)")
+        .map(|offset| proxy_impl + offset)
+        .expect("Proxy admin normalize");
+    let region_end = source[normalize..]
+        .find("fn validate(")
+        .map(|offset| normalize + offset)
+        .expect("Proxy admin validate follows normalize");
+    let normalize = &source[normalize..region_end];
+    assert!(
+        normalize.contains("normalize_http_method_token"),
+        "Admin Proxy normalize must trim+uppercase allowed_methods"
+    );
+    assert!(
+        normalize.contains("self.normalize_fields()"),
+        "Admin Proxy normalize must still run Proxy::normalize_fields"
+    );
+}
+
+#[test]
 fn direct_api_spec_proxy_delete_rereads_ownership_and_uses_atomic_restore() {
     let source = include_str!("../../../src/admin/crud.rs");
     let proxy_impl = source

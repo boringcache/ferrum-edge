@@ -630,6 +630,26 @@ impl MeshRuntimeState {
             .rollback_rejected(slice.revision.as_ref(), slice_content_identity(slice))
     }
 
+    /// Begin a downstream stage's evaluation of the RECEIVED candidate.
+    ///
+    /// `received` must be the exact `Arc` the stage pulled from
+    /// [`Self::snapshot`]: the guard finalizes through
+    /// [`Self::record_rejected_slice`], whose two identity checks are what keep
+    /// a late refusal from disturbing a newer candidate received meanwhile.
+    ///
+    /// See [`MeshSliceEvaluation`] for why the verdict is a guard rather than a
+    /// call each stage has to remember (issue #4041).
+    pub fn evaluate_received_slice(
+        &self,
+        received: &Arc<Option<MeshSlice>>,
+    ) -> MeshSliceEvaluation {
+        MeshSliceEvaluation {
+            state: self.clone(),
+            received: Arc::clone(received),
+            resolved: false,
+        }
+    }
+
     /// Resolve once the initial mesh slice is available.
     ///
     /// Race-free against concurrent installs: the waiter is registered before
@@ -644,6 +664,77 @@ impl MeshRuntimeState {
             return;
         }
         notified.await;
+    }
+}
+
+/// A received mesh slice awaiting the verdict of a downstream pipeline stage.
+///
+/// [`MeshRuntimeState::install_slice`] advances the accepted watermark
+/// PROVISIONALLY: passing the freshness gate only makes a candidate the
+/// RECEIVED slice. Whatever stage rules on it next has to finalize that
+/// watermark exactly once — and there is more than one such stage:
+///
+/// * slice→config conversion, materialization, and mesh-field validation in
+///   the native / xDS / stock-xDS startup wait (`wait_for_initial_mesh_config`);
+/// * the same preparation plus `ProxyState::update_config` in the steady-state
+///   apply loop.
+///
+/// A stage that refuses a candidate without finalizing leaves a slice that
+/// never served a request holding the watermark, so every corrected slice at or
+/// below its sequence is quarantined and the data plane cannot recover without
+/// `POST /mesh/config-revision/reset` (issue #4041).
+///
+/// This guard makes the finalization structural instead of a rule each stage
+/// has to remember: it rolls the watermark back on drop unless [`Self::pass`]
+/// was called, so a newly added early return, a `?`, or a whole new stage
+/// cannot silently reintroduce that hole. Rollback returns the accepted
+/// revision to the last PROXY-APPLIED generation — `None` before the first
+/// apply — which is exactly what makes a corrected slice at the SAME sequence
+/// as the refused one, or at a lower sequence, eligible again while leaving the
+/// last-good guarantee intact: content that diverges from the applied
+/// generation at ITS revision is still quarantined.
+///
+/// Passing is not applying. It records only that this stage did not refuse the
+/// candidate; the stage that actually installs the generation still commits
+/// through [`MeshRuntimeState::record_applied_slice`].
+#[must_use = "an unresolved evaluation rolls the config-revision watermark back on drop"]
+pub struct MeshSliceEvaluation {
+    state: MeshRuntimeState,
+    received: Arc<Option<MeshSlice>>,
+    resolved: bool,
+}
+
+impl MeshSliceEvaluation {
+    /// Record that this stage did not refuse the candidate, leaving the
+    /// provisionally advanced watermark in place for the next stage (or for the
+    /// apply commit) to finalize.
+    pub fn pass(mut self) {
+        self.resolved = true;
+    }
+
+    /// Refuse the candidate now, returning the accepted watermark to the last
+    /// proxy-applied generation.
+    ///
+    /// Equivalent to dropping the guard, but returns whether the watermark
+    /// actually moved so the refusing stage can say so in its log line. `false`
+    /// means a newer candidate has already superseded this one (or the slice
+    /// carried no revision to roll back), not that the refusal was ignored.
+    pub fn reject(mut self) -> bool {
+        self.finalize()
+    }
+
+    fn finalize(&mut self) -> bool {
+        if self.resolved {
+            return false;
+        }
+        self.resolved = true;
+        self.state.record_rejected_slice(&self.received)
+    }
+}
+
+impl Drop for MeshSliceEvaluation {
+    fn drop(&mut self) {
+        self.finalize();
     }
 }
 
