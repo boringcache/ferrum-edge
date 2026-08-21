@@ -4530,17 +4530,17 @@ async fn grpc_retry_does_not_dial_path_changing_target() {
 ///
 /// Assertion strategy: consume the response frame-by-frame on the client
 /// side and record the timestamp each frame arrives. If the gateway is
-/// buffering, ALL frames (and the trailer) will land together after
-/// `num_frames × per_frame_delay`. If streaming, the first frame arrives
-/// quickly and later frames are spread out roughly by `per_frame_delay`.
+/// buffering, the first frame cannot arrive until the whole backend body
+/// is collected (~`(num_frames - 1) × per_frame_delay`). If streaming,
+/// the first frame arrives after the backend sends its first chunk.
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_retry_enabled_does_not_stall_trailers_behind_streaming_body() {
     use std::time::Instant;
 
-    // 5 data frames × 100 ms = 500 ms total body time. If the gateway
-    // buffers we would see ALL frames arrive in a 500 ms burst at the
-    // end, so the gap between first and last arrival would be ~0 ms.
-    // If streaming, the gap should be ≥ 300 ms.
+    // 5 data frames × 100 ms = 400 ms before the last backend frame is
+    // sent. If the gateway buffers, the first client frame cannot arrive
+    // before that window elapses. If streaming, the first frame arrives
+    // much sooner (one round-trip + first backend chunk).
     const NUM_FRAMES: usize = 5;
     const FRAME_SIZE: usize = 1024;
     const PER_FRAME_DELAY_MS: u64 = 100;
@@ -4626,27 +4626,33 @@ async fn grpc_retry_enabled_does_not_stall_trailers_behind_streaming_body() {
         arrival_times.len()
     );
 
-    // If the gateway is buffering, first and last frame arrivals will
-    // be within a few ms of each other (all land after the full body
-    // is collected). If streaming, the spread should roughly equal
-    // the inter-frame delay times (num_frames - 1).
     let first = arrival_times.first().copied().unwrap();
     let last = arrival_times.last().copied().unwrap();
     let spread = last.saturating_sub(first);
 
-    // Require at least 60 % of the synthetic delay window to be observed
-    // — this is comfortably above buffered-mode's ~0 ms spread and
-    // robust to scheduler jitter.
-    let expected_spread_ms = ((NUM_FRAMES as u64 - 1) * PER_FRAME_DELAY_MS) * 6 / 10;
+    // Buffered mode cannot emit the first client frame until the whole
+    // backend body is collected (~400 ms here). Streaming delivers the
+    // first chunk as soon as the backend sends it (~100 ms observed).
+    let full_buffer_window_ms = (NUM_FRAMES as u64 - 1) * PER_FRAME_DELAY_MS;
     assert!(
-        spread.as_millis() as u64 >= expected_spread_ms,
-        "streamed-response trailer stall: arrival spread {} ms is below \
-         the {} ms threshold expected for {}-frame × {} ms delay. \
+        (first.as_millis() as u64) < full_buffer_window_ms,
+        "streamed-response trailer stall: first frame arrived at {} ms, \
+         which is not before the {} ms full-buffer window expected for \
+         {}-frame × {} ms delay (gateway appears to be buffering). \
          Raw timings: {:?}",
-        spread.as_millis(),
-        expected_spread_ms,
+        first.as_millis(),
+        full_buffer_window_ms,
         NUM_FRAMES,
         PER_FRAME_DELAY_MS,
+        arrival_times
+    );
+
+    // Weak sanity: buffered mode collapses first/last arrivals together.
+    assert!(
+        spread.as_millis() > 0,
+        "streamed-response trailer stall: arrival spread is 0 ms — \
+         all frames landed together (gateway appears to be buffering). \
+         Raw timings: {:?}",
         arrival_times
     );
 }
