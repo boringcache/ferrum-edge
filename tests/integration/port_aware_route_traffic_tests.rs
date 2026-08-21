@@ -205,10 +205,7 @@ async fn undeclared_port_stolen_externally(
 
 /// True when the gateway lost an ephemeral-port reservation because another
 /// process bound the port first.
-fn port_bind_lost_to_external_steal(
-    failures: &[GatewayListenerBindFailure],
-    port: u16,
-) -> bool {
+fn port_bind_lost_to_external_steal(failures: &[GatewayListenerBindFailure], port: u16) -> bool {
     failures.iter().any(|failure| {
         failure.port == port
             && failure.category == GatewayListenerFailureCategory::BindFailed
