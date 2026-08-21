@@ -631,6 +631,9 @@ Set on 5xx responses to categorize the failure:
 | `connection_failure` | TCP connection refused, DNS resolution failure, TLS handshake error, or connect timeout — the gateway could not reach the backend at all |
 | `backend_timeout` | The backend accepted the connection but did not respond in time (504 Gateway Timeout) |
 | `backend_error` | The backend returned a 5xx error response (500, 502, 503, etc.) |
+| `circuit_breaker_open` | The circuit breaker is open; the gateway returned 503 without contacting a backend |
+
+`circuit_breaker_open` is distinct from `backend_error`. An open-breaker 503 never reached a backend, so reusing `backend_error` would make alert rules unable to tell a tripped breaker from a backend that actually returned 5xx. HTTP/1.1, HTTP/2, HTTP/3 (native and H3→HTTP cross-protocol), and HBONE all emit the same vocabulary.
 
 ### `X-Gateway-Upstream-Status`
 
@@ -651,6 +654,12 @@ X-Gateway-Error: backend_timeout
 X-Gateway-Upstream-Status: degraded
 ```
 
+**Example: circuit breaker open**
+```
+HTTP/1.1 503 Service Unavailable
+X-Gateway-Error: circuit_breaker_open
+```
+
 **Example: successful response (no error headers)**
 ```
 HTTP/1.1 200 OK
@@ -658,10 +667,10 @@ HTTP/1.1 200 OK
 
 ### Use Cases
 
-- **Alerting**: Alert on `X-Gateway-Error: connection_failure` to detect backends that are completely down vs. backends that are slow (`backend_timeout`).
+- **Alerting**: Alert on `X-Gateway-Error: connection_failure` to detect backends that are completely down vs. backends that are slow (`backend_timeout`). Alert on `circuit_breaker_open` to detect a tripped breaker rather than a live backend 5xx (`backend_error`).
 - **Client-side retry**: Clients can decide whether to retry based on the error type — connection failures may resolve quickly, while backend errors suggest the service itself is unhealthy.
 - **Dashboards**: Track `X-Gateway-Upstream-Status: degraded` to monitor when upstreams are operating in fallback mode.
-- **Distinguishing gateway vs. backend issues**: A `backend_error` means the backend returned a 5xx — the issue is with the backend. A `connection_failure` means the gateway couldn't reach the backend — the issue may be network, DNS, or the backend process is down.
+- **Distinguishing gateway vs. backend issues**: A `backend_error` means the backend returned a 5xx — the issue is with the backend. A `connection_failure` means the gateway couldn't reach the backend — the issue may be network, DNS, or the backend process is down. A `circuit_breaker_open` means the gateway short-circuited the request locally.
 
 ## Retry Logic
 
@@ -735,7 +744,7 @@ proxies:
 **States:**
 
 - **Closed** (normal) — Requests pass through. Responses with status codes in `failure_status_codes` increment the failure counter; connection-level errors also increment it when `trip_on_connection_errors` is enabled. All other responses reset the counter to zero. When the failure counter reaches `failure_threshold`, the circuit opens.
-- **Open** — All requests immediately return `503 Service Unavailable` without contacting the backend. After `timeout_seconds`, the circuit transitions to Half-Open.
+- **Open** — All requests immediately return `503 Service Unavailable` with `X-Gateway-Error: circuit_breaker_open` without contacting the backend. After `timeout_seconds`, the circuit transitions to Half-Open.
 - **Half-Open** — The circuit allows up to `half_open_max_requests` concurrent probe requests. Successful responses count toward `success_threshold`; when reached, the circuit closes (recovered). Any failure immediately reopens the circuit.
 
 **Failure detection:**

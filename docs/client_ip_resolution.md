@@ -261,7 +261,7 @@ The resolved client IP (`ctx.client_ip`) is used throughout the gateway. It is a
 | **Rate Limiting** | When `limit_by="ip"` (default), rate limit key is `ip:{client_ip}`. `consumer` and `spiffe_identity` modes fall back to this IP key when their identity is absent |
 | **Load Balancer Hashing** | `client_ip` used as hash key for consistent upstream selection |
 | **Transaction Logging** | `client_ip` included in all log entries and transaction summaries |
-| **X-Forwarded-For (outbound)** | Outbound XFF chain built per standard `proxy_add_x_forwarded_for` semantics (see below) |
+| **X-Forwarded-For (outbound)** | Immediate socket peer, or the inbound chain plus the peer when that peer is in `FERRUM_TRUSTED_PROXIES` (see below) |
 | **Forwarded (outbound, RFC 7239)** | `for=` carries the resolved client IP when `FERRUM_ADD_FORWARDED_HEADER` is enabled; client-supplied `Forwarded` is discarded so only the gateway-owned element reaches backends |
 
 ## Troubleshooting
@@ -286,7 +286,7 @@ The resolved client IP (`ctx.client_ip`) is used throughout the gateway. It is a
 
 ### XFF header is not being set on backend requests
 
-The gateway always sets the `X-Forwarded-For` header when proxying to backends, using standard `proxy_add_x_forwarded_for` semantics: the immediate socket peer is appended to the inbound chain. When there is no inbound XFF but the resolved client IP differs from the peer (a trusted proxy supplied `FERRUM_REAL_IP_HEADER`), the generated chain is seeded with the resolved client first. The same chain shape is produced on the HTTP/1.1, HTTP/2, and HTTP/3 frontends:
+The gateway always sets the `X-Forwarded-For` header when proxying to backends. The inbound chain is honored — and the immediate socket peer appended — only when that peer is in `FERRUM_TRUSTED_PROXIES`. An empty trust list (the default) matches nothing, so every peer is untrusted and outbound XFF is the socket peer alone; a client-supplied chain is dropped rather than forwarded. When there is no inbound XFF but trusted-proxy resolution produced a real client IP that differs from the peer (a trusted proxy supplied `FERRUM_REAL_IP_HEADER`), the generated chain is seeded with the resolved client first. The same chain shape is produced on the HTTP/1.1, HTTP/2, and HTTP/3 frontends, and on gRPC and WebSocket dispatch:
 
 | Deployment shape | Inbound XFF | Outbound XFF |
 |---|---|---|

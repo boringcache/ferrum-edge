@@ -49,14 +49,15 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
 };
 use crate::proxy::headers::{
-    ClientResponseFraming, GatewayOwnedResponseHeaders, PrePolicyResponseHeaders,
-    RejectBodyDisposition, ResponseTrailerGovernance, ResponseTrailerPolicyWitness,
-    TrailerSectionKind, apply_response_headers, is_backend_request_strip_header,
-    is_proxy_owned_forwarding_header, parse_connection_listed_from_str_map,
-    preserved_response_content_length, reconcile_backend_trailers_with_response_policy,
-    reconcile_streaming_backend_trailers, remove_content_length_header,
-    sanitize_backend_request_trailers, sanitize_client_response_headers_for_wire,
-    strip_client_response_hop_by_hop_headers, strip_response_hop_by_hop_trailers,
+    ClientResponseFraming, GatewayOwnedResponseHeader, GatewayOwnedResponseHeaders,
+    PrePolicyResponseHeaders, RejectBodyDisposition, ResponseTrailerGovernance,
+    ResponseTrailerPolicyWitness, TrailerSectionKind, apply_response_headers,
+    is_backend_request_strip_header, is_proxy_owned_forwarding_header, is_untrusted_real_ip_header,
+    parse_connection_listed_from_str_map, preserved_response_content_length,
+    reconcile_backend_trailers_with_response_policy, reconcile_streaming_backend_trailers,
+    remove_content_length_header, sanitize_backend_request_trailers,
+    sanitize_client_response_headers_for_wire, strip_client_response_hop_by_hop_headers,
+    strip_response_hop_by_hop_trailers,
 };
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
@@ -2272,14 +2273,12 @@ async fn handle_h3_request(
     if method == "TRACE" {
         warn!("Rejected HTTP/3 TRACE request");
         record_h3_flavor_aware_reject(&state, http_flavor, 405);
-        send_h3_error_flavor_aware(
+        send_h3_protocol_method_not_allowed(
             &mut stream,
             http_flavor,
             grpc_web_response_content_type,
-            StatusCode::METHOD_NOT_ALLOWED,
+            &mut ctx,
             r#"{"error":"TRACE method is not allowed"}"#,
-            crate::proxy::grpc_proxy::grpc_status::UNIMPLEMENTED,
-            "TRACE method is not allowed",
         )
         .await?;
         return Ok(());
@@ -2297,14 +2296,12 @@ async fn handle_h3_request(
     if method == "CONNECT" && http_flavor != HttpFlavor::WebSocket && !is_connect_udp_request {
         warn!("Rejected unsupported HTTP/3 CONNECT request");
         record_h3_flavor_aware_reject(&state, http_flavor, 405);
-        send_h3_error_flavor_aware(
+        send_h3_protocol_method_not_allowed(
             &mut stream,
             http_flavor,
             grpc_web_response_content_type,
-            StatusCode::METHOD_NOT_ALLOWED,
+            &mut ctx,
             r#"{"error":"CONNECT method is not allowed"}"#,
-            crate::proxy::grpc_proxy::grpc_status::UNIMPLEMENTED,
-            "CONNECT method is not allowed",
         )
         .await?;
         return Ok(());
@@ -2687,10 +2684,10 @@ async fn handle_h3_request(
     // still runs from the protocol-filtered plugin-cache view so sinks can
     // attribute the matched-proxy 405.
     if let Some(ref allowed) = proxy.allowed_methods
-        && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
+        && !crate::proxy::request_method_is_allowed(allowed, &method)
     {
         record_h3_flavor_aware_reject(&state, http_flavor, 405);
-        let allow_header = allowed.join(", ");
+        let allow_header = crate::proxy::allow_header_from_allowed_methods(allowed);
         let mut headers = HashMap::new();
         headers.insert("allow".to_string(), allow_header.clone());
         finalize_h3_gateway_error_headers(
@@ -5066,7 +5063,7 @@ async fn handle_h3_request(
                 let mut reject_body = Bytes::from_static(
                     br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
                 );
-                let mut rej_headers = HashMap::new();
+                let mut rej_headers = crate::proxy::circuit_breaker_open_reject_headers();
                 crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
                     &plugins,
                     &mut ctx,
@@ -5095,6 +5092,11 @@ async fn handle_h3_request(
                         &mut rej_headers,
                         &mut reject_body,
                         initial_response_header_policy_plugins.as_ref(),
+                    );
+                } else {
+                    crate::proxy::restore_authoritative_gateway_error_header(
+                        &mut rej_headers,
+                        crate::proxy::X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN,
                     );
                 }
                 let log_status_code = if deadline_replaced {
@@ -5847,6 +5849,8 @@ async fn handle_h3_request(
         crate::proxy::apply_effective_backend_scheme_headers(
             &mut proxy_headers,
             &ctx.client_ip,
+            socket_ip,
+            &state.trusted_proxies,
             ctx.request_is_secure,
             state.add_forwarded_header,
         );
@@ -6477,28 +6481,23 @@ async fn handle_h3_request(
                         h3_backend_failure_status_body(&e)
                     };
                 let reject_status_code = reject_status.as_u16();
-                // Do NOT propagate a send error: record_backend_outcome below
-                // releases the LB active-connection count, so a `?` here would
-                // skip it and leak the count when the client disconnects during
-                // the reject write.
-                let _ = send_h3_response(&mut stream, reject_status, reject_body).await;
-
-                // Record outcome for CB/health even on failure.
-                // Frontend client aborts while uploading request bodies are
-                // client-caused and must not poison backend CB/passive health:
-                // h3_streaming_body_failure_outcome maps that case to
-                // (connection_error=false, ClientDisconnect), and the
-                // ClientDisconnect class is centrally suppressed in
-                // record_backend_outcome_inner — it routes the breaker to
-                // record_neutral() and skips both the least-latency sample and
-                // the passive-health report (so this 502 no longer records a
-                // passive failure even when 502 sits in unhealthy_status_codes).
                 let (outcome_connection_error, outcome_error_class) =
                     h3_streaming_body_failure_outcome(
                         is_client_request_body_disconnect,
                         e.is_read_timeout(),
                         h3_error_class,
                     );
+                // Do NOT propagate a send error: record_backend_outcome below
+                // releases the LB active-connection count, so a `?` here would
+                // skip it and leak the count when the client disconnects during
+                // the reject write.
+                let _ = send_h3_backend_failure_response(
+                    &mut stream,
+                    reject_status,
+                    reject_body,
+                    outcome_connection_error,
+                )
+                .await;
                 crate::proxy::backend_dispatch::record_backend_outcome(
                     &state,
                     &proxy,
@@ -8927,6 +8926,19 @@ async fn handle_h3_request(
         );
         sanitize_client_response_headers_for_wire(&mut response_headers, framing);
 
+        // Restore the gateway-owned token at the same post-hook / pre-wire
+        // boundary as H1/H2's response builder. Classification is the original
+        // typed `h3_request_on_wire` signal; status is the client-visible one
+        // after after_proxy, body, final-client-visible, and committed hooks.
+        let mut gateway_owned_headers = GatewayOwnedResponseHeaders::default();
+        if crate::proxy::apply_authoritative_backend_gateway_error_header(
+            &mut response_headers,
+            !h3_request_on_wire,
+            response_status,
+        ) {
+            gateway_owned_headers.insert(GatewayOwnedResponseHeader::GatewayError);
+        }
+
         // Reconcile surviving backend trailers with the response-header policy
         // this path already applied. Every response-header phase — `after_proxy`,
         // sticky-cookie injection, committed hooks — sees only the INITIAL header
@@ -8952,7 +8964,7 @@ async fn handle_h3_request(
                 &trailer_policy_witness,
                 plugin_cache_view.response_trailer_policy_names(),
                 plugin_cache_view.response_trailer_policy_prefixes(),
-                GatewayOwnedResponseHeaders::default(),
+                gateway_owned_headers,
                 // Buffered native-H3 send path: plain flavor only (a native gRPC
                 // dispatch goes to `dispatch_grpc_native_h3`), so no exemption.
                 TrailerSectionKind::PlainResponse,
@@ -9556,6 +9568,8 @@ fn build_h3_backend_headers(
         .unwrap_or(proxy.backend_host.as_str());
 
     let connection_listed_strip = parse_connection_listed_from_str_map(headers);
+    let peer_trusted =
+        crate::proxy::forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
     for (k, v) in headers {
         match k.as_str() {
             "host" | ":authority" => {
@@ -9575,6 +9589,7 @@ fn build_h3_backend_headers(
             // would duplicate the header (reqwest appends; this Vec push
             // path would leave the spoofed element first).
             n if is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => continue,
+            n if is_untrusted_real_ip_header(n, peer_trusted) => continue,
             // RFC 9110 §7.6.1 Connection-listed strip — see
             // `parse_connection_listed_from_str_map`.
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
@@ -9613,7 +9628,7 @@ fn build_h3_backend_headers(
         ));
     }
 
-    // X-Forwarded-For — same append-the-immediate-peer (+ resolved-client
+    // X-Forwarded-For — same trust-gated append (+ resolved-client
     // seeding) semantics as the H1/H2 paths; see `proxy::build_xff_value`.
     let xff = crate::proxy::build_xff_value(
         headers.get("x-forwarded-for").map(String::as_str),
@@ -9814,6 +9829,16 @@ fn h3_backend_failure_status_body(
         StatusCode::BAD_GATEWAY
     };
     (status, body)
+}
+
+fn h3_backend_failure_headers(connection_error: bool, status: u16) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    crate::proxy::insert_x_gateway_error_for_backend_failure(
+        &mut headers,
+        connection_error,
+        status,
+    );
+    headers
 }
 
 fn is_h3_client_request_body_disconnect(err_msg: &str) -> bool {
@@ -10093,7 +10118,7 @@ async fn proxy_to_backend_h3_refined_response(
                 return Ok(H3RefinedResponse::Buffered(H3BufferedDispatchResult {
                     status: reject_status.as_u16(),
                     body: Bytes::from_static(reject_body.as_bytes()),
-                    headers: HashMap::new(),
+                    headers: h3_backend_failure_headers(!request_on_wire, reject_status.as_u16()),
                     trailers: None,
                     error_class: Some(h3_error_class),
                     request_on_wire,
@@ -10107,9 +10132,14 @@ async fn proxy_to_backend_h3_refined_response(
             // disconnect in the result so the caller still records the outcome
             // and releases the connection — mirrors the size-limit / after_proxy
             // reject paths in `stream_h3_open_response_to_client`.
-            let reject_sent = send_h3_response(h3_stream, reject_status, reject_body)
-                .await
-                .is_ok();
+            let reject_sent = send_h3_backend_failure_response(
+                h3_stream,
+                reject_status,
+                reject_body,
+                !request_on_wire,
+            )
+            .await
+            .is_ok();
             return Ok(H3RefinedResponse::Streamed(
                 h3_backend_unavailable_stream_result(
                     reject_status.as_u16(),
@@ -10259,7 +10289,7 @@ async fn collect_h3_open_response_body(
                     return H3BufferedDispatchResult {
                         status,
                         body: Bytes::from_static(body.as_bytes()),
-                        headers: HashMap::new(),
+                        headers: h3_backend_failure_headers(false, status),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::ReadWriteTimeout),
                         request_on_wire: true,
@@ -10308,7 +10338,7 @@ async fn collect_h3_open_response_body(
                         body: Bytes::from_static(
                             br#"{"error":"HTTP/3 backend response truncated"}"#,
                         ),
-                        headers: HashMap::new(),
+                        headers: h3_backend_failure_headers(false, 502),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::ConnectionClosed),
                         request_on_wire: true,
@@ -10345,7 +10375,7 @@ async fn collect_h3_open_response_body(
                 return H3BufferedDispatchResult {
                     status,
                     body: Bytes::from_static(body.as_bytes()),
-                    headers: HashMap::new(),
+                    headers: h3_backend_failure_headers(false, status),
                     trailers: None,
                     error_class: Some(h3_error_class),
                     request_on_wire: true,
@@ -10383,7 +10413,7 @@ async fn collect_h3_open_response_body(
             return H3BufferedDispatchResult {
                 status,
                 body: Bytes::from_static(body.as_bytes()),
-                headers: HashMap::new(),
+                headers: h3_backend_failure_headers(false, status),
                 trailers: None,
                 error_class: Some(h3_error_class),
                 request_on_wire: true,
@@ -14444,9 +14474,14 @@ async fn proxy_to_backend_h3_streaming(
             // disconnects during the reject write. Report the disconnect so the
             // caller still records the outcome and releases the connection —
             // same contract as the size-limit / after_proxy reject paths below.
-            let reject_sent = send_h3_response(h3_stream, reject_status, reject_body)
-                .await
-                .is_ok();
+            let reject_sent = send_h3_backend_failure_response(
+                h3_stream,
+                reject_status,
+                reject_body,
+                !request_on_wire,
+            )
+            .await
+            .is_ok();
             // No backend response was received (pre-headers dispatch failure),
             // so backend_status is the gateway-synthesized reject status
             // (502 generic, 504 for a backend read timeout).
@@ -15067,7 +15102,7 @@ fn h3_buffered_result_from_backend_response(
             return H3BufferedDispatchResult {
                 status: 502,
                 body: Bytes::from_static(br#"{"error":"Backend unavailable"}"#),
-                headers: HashMap::new(),
+                headers: h3_backend_failure_headers(!request_on_wire, 502),
                 trailers: None,
                 error_class: Some(crate::retry::ErrorClass::ProtocolError),
                 request_on_wire,
@@ -15221,7 +15256,7 @@ async fn proxy_to_backend_h3(
             H3BufferedDispatchResult {
                 status: reject_status.as_u16(),
                 body: Bytes::from_static(reject_body.as_bytes()),
-                headers: HashMap::new(),
+                headers: h3_backend_failure_headers(!request_on_wire, reject_status.as_u16()),
                 trailers: None,
                 error_class: Some(h3_error_class),
                 request_on_wire,
@@ -15261,6 +15296,72 @@ async fn send_h3_response_with_recv_halt(
         crate::http3::stream_util::halt_request_body(stream);
     }
     Ok(())
+}
+
+/// Protocol-level 405 (TRACE / non-WebSocket CONNECT) with the static RFC 9110
+/// `Allow` list. These filters run before a proxy is matched, so there is no
+/// per-route `allowed_methods` value.
+async fn send_h3_protocol_method_not_allowed(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    flavor: HttpFlavor,
+    grpc_web_response_content_type: Option<&str>,
+    ctx: &mut RequestContext,
+    http_body: &'static str,
+) -> Result<(), anyhow::Error> {
+    let mut headers = HashMap::new();
+    headers.insert(
+        "allow".to_string(),
+        crate::proxy::PROTOCOL_LEVEL_405_ALLOW.to_string(),
+    );
+    if let Some(content_type) = grpc_web_response_content_type {
+        send_h3_grpc_web_reject(
+            stream,
+            &[],
+            ctx,
+            content_type,
+            StatusCode::METHOD_NOT_ALLOWED,
+            Bytes::from_static(http_body.as_bytes()),
+            &headers,
+        )
+        .await
+    } else {
+        send_h3_reject_flavor_aware(
+            stream,
+            flavor,
+            StatusCode::METHOD_NOT_ALLOWED,
+            Bytes::from_static(http_body.as_bytes()),
+            &headers,
+            RejectBodyDisposition::for_request(&ctx.method, 405),
+        )
+        .await
+    }
+}
+
+/// Gateway-synthesized backend-dispatch failure (502/504) with the same
+/// `X-Gateway-Error` token the H1/H2 builder attaches.
+async fn send_h3_backend_failure_response(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    status: StatusCode,
+    body: &str,
+    connection_error: bool,
+) -> Result<(), anyhow::Error> {
+    let mut headers = HashMap::new();
+    crate::proxy::insert_x_gateway_error_for_backend_failure(
+        &mut headers,
+        connection_error,
+        status.as_u16(),
+    );
+    send_h3_finalized_reject_response(
+        stream,
+        status,
+        // `body` is a runtime `&str` — the classifier picks the message per
+        // failure — so it cannot be promoted to `&'static [u8]`. These are
+        // short fixed error bodies; a copy is the correct trade.
+        Bytes::copy_from_slice(body.as_bytes()),
+        &headers,
+        RejectBodyDisposition::WireBody,
+    )
+    .await
 }
 
 /// Send an HTTP/3 rejection response with custom headers. Same recv-half
@@ -18212,6 +18313,7 @@ mod build_h3_backend_headers_tests {
     //!   output vector contains only host + XFF + XFP + maybe XFH +
     //!   the `Early-Data` header under test.
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use super::build_h3_backend_headers;
     use crate::config::EnvConfig;
@@ -18581,33 +18683,74 @@ mod build_h3_backend_headers_tests {
         );
     }
 
-    /// H1/H2/H3 XFF parity: the native H3 backend path must append the
-    /// immediate QUIC peer to an existing inbound chain (not the resolved
-    /// client, which is already in the chain) and seed a generated chain
-    /// with the resolved client when it differs from the peer
-    /// (real-IP-header deployments). See `proxy::build_xff_value`.
+    /// H1/H2/H3 XFF parity: the native H3 backend path must drop a spoofed
+    /// inbound chain from an untrusted peer, append the QUIC peer to a
+    /// trusted inbound chain (not the resolved client, which is already in
+    /// the chain), and seed a generated chain with the resolved client when
+    /// it differs from the peer (real-IP-header deployments). See
+    /// `proxy::build_xff_value`.
     #[tokio::test]
     async fn xff_appends_quic_peer_and_seeds_resolved_client() {
-        let state = minimal_proxy_state();
+        let untrusted_state = minimal_proxy_state();
+        let mut trusted_state = minimal_proxy_state();
+        trusted_state.trusted_proxies = Arc::new(
+            crate::proxy::client_ip::TrustedProxies::parse_strict("10.0.0.7", "test")
+                .expect("valid trusted proxy list"),
+        );
         let proxy = minimal_proxy();
 
-        // Trusted LB sent XFF: append the peer, never the resolved client.
+        // Untrusted peer (default empty trust list): spoofed inbound XFF
+        // and X-Real-IP must not reach the backend.
         let mut headers = HashMap::new();
         headers.insert("x-forwarded-for".to_string(), "198.51.100.7".to_string());
+        headers.insert("x-real-ip".to_string(), "8.8.8.8".to_string());
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            "203.0.113.1",
+            &untrusted_state,
+            true,
+            false,
+        );
+        assert_eq!(
+            header_value(&out, "x-forwarded-for").map(|v| v.as_bytes()),
+            Some(&b"203.0.113.1"[..]),
+            "untrusted inbound XFF must be dropped; outbound is the QUIC peer"
+        );
+        assert!(
+            !header_present(&out, "x-real-ip"),
+            "untrusted X-Real-IP must not reach the native H3 backend"
+        );
+
+        // Trusted LB sent a multi-hop XFF chain that seeding cannot fake:
+        // append the peer, never the resolved client.
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-forwarded-for".to_string(),
+            "1.1.1.1, 198.51.100.7".to_string(),
+        );
+        headers.insert("x-real-ip".to_string(), "1.1.1.1".to_string());
         let out = build_h3_backend_headers(
             &proxy,
             None,
             &headers,
             "198.51.100.7", // resolved client (already in the chain)
             "10.0.0.7",     // immediate QUIC peer (the LB)
-            &state,
+            &trusted_state,
             true,
             false,
         );
         assert_eq!(
             header_value(&out, "x-forwarded-for").map(|v| v.as_bytes()),
-            Some(&b"198.51.100.7, 10.0.0.7"[..]),
-            "inbound chain + appended QUIC peer; resolved client must not duplicate"
+            Some(&b"1.1.1.1, 198.51.100.7, 10.0.0.7"[..]),
+            "trusted inbound chain + appended QUIC peer; resolved client must not duplicate"
+        );
+        assert_eq!(
+            header_value(&out, "x-real-ip").map(|v| v.as_bytes()),
+            Some(&b"1.1.1.1"[..]),
+            "trusted X-Real-IP must still reach the backend"
         );
 
         // Trusted LB sent only a real-IP header (no XFF): seed with the
@@ -18619,7 +18762,7 @@ mod build_h3_backend_headers_tests {
             &headers,
             "203.0.113.9", // resolved from FERRUM_REAL_IP_HEADER
             "10.0.0.7",    // immediate QUIC peer (the LB)
-            &state,
+            &trusted_state,
             true,
             false,
         );
@@ -18636,7 +18779,7 @@ mod build_h3_backend_headers_tests {
             &headers,
             "203.0.113.1",
             "203.0.113.1",
-            &state,
+            &untrusted_state,
             true,
             false,
         );

@@ -11930,9 +11930,10 @@ FIPS_BUILD_RETIRED_GENERATION_SHA256 = (
 # `unit_tests` / `integration_tests` binaries — the hosted runner's memory
 # ceiling, not a compile error. The destination caps `CARGO_BUILD_JOBS` at 3,
 # sets `line-tables-only` debuginfo on the `dev` AND `test` profiles, and adds a
-# best-effort swap enlargement immediately before that step.
+# best-effort 8 GiB Ferrum-owned swapfile alongside the runner image's existing
+# swap immediately before that step. It never disables or rewrites image swap.
 FIPS_BUILD_ADOPTED_GENERATION_SHA256 = (
-    "9e8765d257d51b401a2d9b481860a4ff3fcf4001c47eaf167653a73c5390c469"
+    "7d995d79d9932c9595d3f19eddf16c1dbd1a0d2842230f1d92eb1b24502ca401"
 )
 FIPS_BUILD_ADMITTED_GENERATION_TRANSITION = (
     FIPS_BUILD_WORKFLOW_FILENAME,

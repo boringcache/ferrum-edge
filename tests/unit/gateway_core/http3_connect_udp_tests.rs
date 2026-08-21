@@ -1715,13 +1715,15 @@ fn a_connect_udp_expiry_is_attributed_once_under_the_bounded_stream_udp_family()
 
 #[test]
 fn a_flow_control_stalled_client_cannot_relabel_its_own_expiry_as_a_gateway_fault() {
-    // A client-bound relay parked in QUIC send flow control never returns to
-    // its `select!`, so it cannot consume the supervisor's close command and is
-    // aborted after CLOSE_GRACE — which is how teardown stays bounded. That
+    // A client-bound relay parked in QUIC send flow control is raced with the
+    // supervisor close command so `stop_stream` can land. If that write still
+    // never returns, it is aborted after CLOSE_GRACE — which is how teardown
+    // stays bounded. Quinn would `finish()` that abort on drop, so
+    // `ConnectUdpSendHalf` RESETS unless a close was already applied. That
     // abort is the DESIGNED path for an authorization expiry only when the
-    // join is a cancellation AND the grace timed out. The abort itself resets
-    // the stream, so the outcome keeps its own class instead of being demoted
-    // to an internal relay failure the gateway never suffered.
+    // join is a cancellation AND the grace timed out. The terminal stays
+    // non-clean instead of being demoted to an internal relay failure the
+    // gateway never suffered.
     for termination in [
         StreamAuthTermination::CredentialExpired,
         StreamAuthTermination::AuthenticatedStreamMaxLifetime,
@@ -2293,6 +2295,20 @@ fn send_half_teardown_wires_the_joined_outcome_as_authoritative() {
     assert!(
         squeezed.contains("from_target.abort();(from_target.await,true)"),
         "CLOSE_GRACE expiry must abort then join the send-half task, never detach"
+    );
+    assert!(
+        squeezed.contains("send_capsule_or_supervisor_close("),
+        "a flow-control-stalled send_data must share a select with the supervisor close command"
+    );
+    assert!(
+        squeezed.contains("ConnectUdpSendHalf::new(h3_send)"),
+        "the client-bound send half must RESET on drop unless finish/stop_stream already ran"
+    );
+    assert!(
+        squeezed.contains(
+            "ifself.reset_on_drop{self.stream.stop_stream(h3::error::Code::H3_INTERNAL_ERROR);}"
+        ),
+        "Quinn finish-on-drop must not present a clean FIN for an aborted stalled send half"
     );
 }
 
