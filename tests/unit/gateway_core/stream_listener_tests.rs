@@ -992,7 +992,10 @@ async fn opaque_tcp_sni_group_rebuilds_on_reload_and_delete() {
                 *failed_port == frontend_port && error.contains("already in use")
             });
             runtime.manager.shutdown_all().await;
-            assert!(only_port_collision, "initial reconcile failed: {failures:?}");
+            assert!(
+                only_port_collision,
+                "initial reconcile failed: {failures:?}"
+            );
             bind_races.push(format!(
                 "attempt {attempt}, port {frontend_port}, reconcile: {failures:?}"
             ));
