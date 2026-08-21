@@ -595,6 +595,8 @@ impl<A: RateLimitAlgorithm> RedisLimiter<A> {
         }))
     }
 
+    // Redis command failures are intentionally collapsed to () at this boundary.
+    #[allow(clippy::result_unit_err)]
     pub async fn check(&self, key: &str, op: &A::Op) -> Result<RateLimitOutcome, ()> {
         self.algorithm
             .check_redis(&self.redis_client, key, op)
