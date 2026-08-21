@@ -7954,6 +7954,7 @@ struct CopyDirectionState {
     buf: PooledCopyBuffer,
     pos: usize,
     cap: usize,
+    terminal_read_error: Option<std::io::Error>,
 }
 
 impl CopyDirectionState {
@@ -7963,6 +7964,7 @@ impl CopyDirectionState {
             buf: PooledCopyBuffer::new(buf_size),
             pos: 0,
             cap: 0,
+            terminal_read_error: None,
         }
     }
 }
@@ -8026,7 +8028,10 @@ where
                 return match writer.as_mut().poll_shutdown(cx) {
                     Poll::Ready(_) => {
                         state.phase = CopyPhase::Done;
-                        Poll::Ready(Ok(()))
+                        match state.terminal_read_error.take() {
+                            Some(e) => Poll::Ready(Err((StreamIoSide::Read, e))),
+                            None => Poll::Ready(Ok(())),
+                        }
                     }
                     Poll::Pending => Poll::Pending,
                 };
@@ -8036,7 +8041,22 @@ where
                     let mut read_buf = ReadBuf::new(state.buf.as_mut_slice());
                     match reader.as_mut().poll_read(cx, &mut read_buf) {
                         Poll::Ready(Ok(())) => read_buf.filled().len(),
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err((StreamIoSide::Read, e))),
+                        Poll::Ready(Err(e)) => {
+                            // rustls represents a TCP FIN without close_notify as an
+                            // error, but the relay later classifies it as clean EOF.
+                            // Preserve true-EOF semantics by half-closing the opposite
+                            // writer before returning the error for classification.
+                            if is_userspace_tls_close_without_notify(
+                                StreamIoSide::Read,
+                                e.kind(),
+                                &e,
+                            ) {
+                                state.terminal_read_error = Some(e);
+                                state.phase = CopyPhase::ShuttingDown;
+                                continue;
+                            }
+                            return Poll::Ready(Err((StreamIoSide::Read, e)));
+                        }
                         Poll::Pending => return Poll::Pending,
                     }
                 };
