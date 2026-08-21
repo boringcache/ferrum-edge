@@ -20,7 +20,16 @@ use crate::consumer_index::ConsumerIndex;
 
 use super::RequestContext;
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
+use super::utils::header_extract::{ConfiguredUtf8HeaderLookup, lookup_configured_header_utf8};
 use super::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX;
+
+const INVALID_API_KEY_FORMAT_BODY: &str = r#"{"error":"Invalid API key format"}"#;
+
+enum HeaderCredentialExtract {
+    Missing,
+    Present(String),
+    InvalidFormat,
+}
 
 pub struct KeyAuth {
     /// Pre-lowercased header name for header-based key extraction.
@@ -135,24 +144,32 @@ impl KeyAuth {
         })
     }
 
-    fn extract_key(&self, ctx: &RequestContext) -> Option<String> {
+    fn extract_key_credential(&self, ctx: &RequestContext) -> HeaderCredentialExtract {
         if let Some(ref lower) = self.header_name_lower {
-            ctx.headers
-                .get(lower.as_str())
-                .or_else(|| {
-                    self.header_name_original
-                        .as_ref()
-                        .and_then(|orig| ctx.headers.get(orig.as_str()))
-                })
-                .cloned()
+            let original = self.header_name_original.as_deref();
+            let lookup = lookup_configured_header_utf8(ctx, lower.as_str(), original);
+            utf8_header_lookup_to_extract(lookup)
         } else if let Some(ref param) = self.query_param_name {
-            ctx.query_params.get(param.as_str()).cloned()
+            match ctx.query_params.get(param.as_str()) {
+                Some(key) => HeaderCredentialExtract::Present(key.clone()),
+                None => HeaderCredentialExtract::Missing,
+            }
         } else {
-            ctx.headers
-                .get("x-api-key")
-                .or_else(|| ctx.headers.get("X-API-Key"))
-                .cloned()
+            let lookup = lookup_configured_header_utf8(ctx, "x-api-key", Some("X-API-Key"));
+            utf8_header_lookup_to_extract(lookup)
         }
+    }
+}
+
+fn utf8_header_lookup_to_extract(
+    lookup: ConfiguredUtf8HeaderLookup<'_>,
+) -> HeaderCredentialExtract {
+    match lookup {
+        ConfiguredUtf8HeaderLookup::Value(key) => {
+            HeaderCredentialExtract::Present(key.into_owned())
+        }
+        ConfiguredUtf8HeaderLookup::Absent => HeaderCredentialExtract::Missing,
+        ConfiguredUtf8HeaderLookup::InvalidUtf8 => HeaderCredentialExtract::InvalidFormat,
     }
 }
 
@@ -163,9 +180,12 @@ impl AuthMechanism for KeyAuth {
     }
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
-        match self.extract_key(ctx) {
-            Some(key) => ExtractedCredential::ApiKey(key),
-            None => ExtractedCredential::Missing,
+        match self.extract_key_credential(ctx) {
+            HeaderCredentialExtract::Present(key) => ExtractedCredential::ApiKey(key),
+            HeaderCredentialExtract::Missing => ExtractedCredential::Missing,
+            HeaderCredentialExtract::InvalidFormat => {
+                ExtractedCredential::InvalidFormat(INVALID_API_KEY_FORMAT_BODY.into())
+            }
         }
     }
 
