@@ -2912,7 +2912,7 @@ where
                                 .await;
                         let should_replay = outcome
                             .as_ref()
-                            .is_ok_and(|attempt| plain_send_is_protocol_nack(attempt));
+                            .is_ok_and(plain_send_is_protocol_nack);
                         if !should_replay {
                             break outcome;
                         }
