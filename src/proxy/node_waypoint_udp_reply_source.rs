@@ -370,7 +370,7 @@ fn decode_hex_octets(hex: &str, out: &mut [u8]) -> Option<()> {
     if bytes.len() != out.len() * 2 {
         return None;
     }
-    for (slot, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+    for (slot, pair) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
         let high = (pair[0] as char).to_digit(16)?;
         let low = (pair[1] as char).to_digit(16)?;
         *slot = ((high << 4) | low) as u8;
