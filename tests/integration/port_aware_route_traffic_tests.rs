@@ -190,7 +190,12 @@ async fn undeclared_port_stolen_externally(
     handles: &ferrum_edge::modes::file::ServeHandles,
     port: u16,
 ) -> bool {
-    if handles.gateway_listeners.active_ports().await.contains(&port) {
+    if handles
+        .gateway_listeners
+        .active_ports()
+        .await
+        .contains(&port)
+    {
         return false;
     }
     try_http_get(port, "/api/x").await.is_ok()
