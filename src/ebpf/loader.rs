@@ -579,6 +579,11 @@ impl EbpfBackend for AyaEbpfBackend {
         maps.replace_udp_reply_sources(sources)
     }
 
+    fn replace_udp_relay_cgroups(&mut self, cgroup_ids: &[u64]) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.replace_udp_relay_cgroups(cgroup_ids)
+    }
+
     fn set_udp_reply_sources_enabled(&mut self, enabled: bool) -> Result<(), String> {
         let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.set_udp_reply_sources_enabled(enabled)

@@ -481,10 +481,28 @@ impl UdpReplySourceKey6 {
 /// than letting the kernel silently reject the overflow.
 pub const UDP_REPLY_SOURCE_MAX_ENTRIES: u32 = 1024;
 
-/// Single shared enable gate for the IPv4 and IPv6 NodeWaypoint UDP/DTLS
-/// reply-source authorization maps. Both tc classifier families consult this
-/// key before reading either family map, so entries left behind by a failed
-/// whole-set replacement are inert.
+/// Bound on `FERRUM_UDP_RELAY_CGROUPS`.
+///
+/// The map holds the cgroup-v2 ids of exactly ONE pod — the NodeWaypoint relay's
+/// own — so the realistic occupancy is the pod slice plus one scope per
+/// container. This matches `cgroup::collect_cgroup_tree`'s own
+/// `CGROUP_TREE_MAX_INODES` walk bound. A tree the walk reports complete is
+/// always a tree the node-agent can publish whole; an over-bound or incompletely
+/// enumerated tree is refused rather than truncated, because a truncated set
+/// silently black-holes the container whose leaf fell off the end. Exactly 256
+/// complete directory inodes remain representable; a 257th is detected as
+/// overflow instead of being dropped by the walker.
+pub const UDP_RELAY_CGROUP_MAX_ENTRIES: u32 = 256;
+
+/// Single shared enable gate for every NodeWaypoint UDP/DTLS relay
+/// authorization map: `FERRUM_UDP_REPLY_SOURCES`,
+/// `FERRUM_UDP_REPLY_SOURCES6`, and `FERRUM_UDP_RELAY_CGROUPS`. Both tc
+/// classifier families consult this key before reading any of them, so entries
+/// left behind by a failed whole-set replacement are inert.
+///
+/// One gate for all three is deliberate: the sender proof and the source proof
+/// are halves of ONE conjunction, and a generation in which only one half had
+/// been applied is exactly the incoherent state the gate exists to hide.
 pub const UDP_REPLY_SOURCE_GATE_KEY: u32 = 0;
 pub const UDP_REPLY_SOURCE_GATE_DISABLED: u8 = 0;
 pub const UDP_REPLY_SOURCE_GATE_ENABLED: u8 = 1;
