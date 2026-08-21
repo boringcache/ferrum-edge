@@ -526,8 +526,7 @@ async fn test_retry_succeeds_on_second_attempt() {
 async fn test_retry_on_connect_failure() {
     // Bound-but-not-listening port: kernel ECONNREFUSED and parallel tests
     // cannot steal the port while this reservation is held.
-    let dead_port_reservation =
-        reserve_refused_tcp_port().expect("reserve refused backend port");
+    let dead_port_reservation = reserve_refused_tcp_port().expect("reserve refused backend port");
     let dead_port = dead_port_reservation.port;
 
     let mut gateway = spawn_gateway().await;

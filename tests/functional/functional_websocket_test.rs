@@ -3250,8 +3250,7 @@ async fn test_h3_websocket_origin_allowlist_enforced_before_backend_connect() {
 #[ignore]
 #[tokio::test]
 async fn test_h3_websocket_retry_rotates_to_next_upstream_target() {
-    let dead_port_reservation =
-        reserve_refused_tcp_port().expect("reserve refused dead port");
+    let dead_port_reservation = reserve_refused_tcp_port().expect("reserve refused dead port");
     let dead_port = dead_port_reservation.port;
     let backend_port = free_port().await;
 
@@ -3292,8 +3291,7 @@ async fn test_h3_websocket_retry_rotates_to_next_upstream_target() {
 #[ignore]
 #[tokio::test]
 async fn test_h3_websocket_failed_backend_upgrade_returns_502() {
-    let dead_port_reservation =
-        reserve_refused_tcp_port().expect("reserve refused dead port");
+    let dead_port_reservation = reserve_refused_tcp_port().expect("reserve refused dead port");
     let dead_port = dead_port_reservation.port;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");

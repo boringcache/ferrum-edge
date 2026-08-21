@@ -2027,12 +2027,7 @@ plugin_configs: []
 
         last_err = format!(
             "attempt {}/{} failed (proxy={}, admin={}, health={}, route={})",
-            attempt,
-            MAX_ATTEMPTS,
-            proxy_port,
-            admin_port,
-            health_ok,
-            route_ok
+            attempt, MAX_ATTEMPTS, proxy_port, admin_port, health_ok, route_ok
         );
         eprintln!("{}", last_err);
         if attempt < MAX_ATTEMPTS {
