@@ -6798,6 +6798,36 @@ pub mod _test_support {
         )
     }
 
+    /// Issue #3942: ordinary unlimited direct-H2 must not wrap
+    /// `SizeLimitedIncoming` (the adapter treats `max_bytes = 0` as deny-all
+    /// and a `usize::MAX` wrap still costs a per-frame atomic + limit compare).
+    /// The Passthrough arm keeps the early-return cancel oneshot.
+    pub fn direct_h2_uses_limit_adapter(
+        max_request_body_bytes: usize,
+        needs_upload_completion_gate: bool,
+        observes_grpc_messages: bool,
+    ) -> bool {
+        crate::proxy::body::direct_h2_uses_limit_adapter(
+            max_request_body_bytes,
+            needs_upload_completion_gate,
+            observes_grpc_messages,
+        )
+    }
+
+    pub fn new_direct_h2_bytes_latch_for_test()
+    -> std::sync::Arc<crate::proxy::body::DirectH2BytesLatch> {
+        std::sync::Arc::new(crate::proxy::body::DirectH2BytesLatch::new())
+    }
+
+    pub fn finish_direct_h2_passthrough_bytes_for_test(
+        observed: &std::sync::atomic::AtomicU64,
+        seen: u64,
+        published: &mut bool,
+        latch: &crate::proxy::body::DirectH2BytesLatch,
+    ) {
+        crate::proxy::body::publish_passthrough_request_bytes(observed, seen, published, latch);
+    }
+
     pub fn request_may_have_body(method: &str, headers: &HashMap<String, String>) -> bool {
         crate::proxy::request_may_have_body(method, headers)
     }
