@@ -4487,7 +4487,7 @@ async fn grpc_retry_enabled_does_not_stall_trailers_behind_streaming_body() {
     // first chunk as soon as the backend sends it (~100 ms observed).
     let full_buffer_window_ms = (NUM_FRAMES as u64 - 1) * PER_FRAME_DELAY_MS;
     assert!(
-        first.as_millis() as u64 < full_buffer_window_ms,
+        (first.as_millis() as u64) < full_buffer_window_ms,
         "streamed-response trailer stall: first frame arrived at {} ms, \
          which is not before the {} ms full-buffer window expected for \
          {}-frame × {} ms delay (gateway appears to be buffering). \
