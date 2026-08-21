@@ -6626,8 +6626,9 @@ fn is_supported_mmdb_country_code(code: &str) -> bool {
     }
     let normalized = [bytes[0].to_ascii_uppercase(), bytes[1].to_ascii_uppercase()];
     SUPPORTED_GEO_COUNTRY_CODES
-        .chunks_exact(2)
-        .any(|supported| supported == normalized.as_slice())
+        .as_chunks::<2>()
+        .0
+        .contains(&normalized)
 }
 
 #[cfg(unix)]
