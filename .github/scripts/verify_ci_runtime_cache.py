@@ -1728,14 +1728,22 @@ def _is_root_description_key(parsed: re.Match[str], value: str) -> bool:
     is a duplicate key rather than more rendered metadata.
     """
 
-    if parsed.group("lead") != "" or parsed.group("dash") is not None:
-        return False
-    if parsed.group("key") != "description":
+    if not _is_root_description_mapping_key(parsed):
         return False
     had_properties, remainder = _leading_yaml_node_properties(value)
     if had_properties:
         return False
     return _is_inspectable_yaml_scalar(remainder)
+
+
+def _is_root_description_mapping_key(parsed: re.Match[str]) -> bool:
+    """Return whether this is the unquoted root `description` mapping key."""
+
+    return (
+        parsed.group("lead") == ""
+        and parsed.group("dash") is None
+        and parsed.group("key") == "description"
+    )
 
 
 def _without_yaml_description_prose(text: str) -> str:
@@ -1771,7 +1779,7 @@ def _without_yaml_description_prose(text: str) -> str:
 
     lines = text.splitlines()
     index = 0
-    exempted_root = False
+    saw_root_description = False
     while index < len(lines):
         line = lines[index]
         stripped = line.lstrip(" \t")
@@ -1790,8 +1798,13 @@ def _without_yaml_description_prose(text: str) -> str:
             continue
         key_indent = _yaml_mapping_key_indent(parsed)
         value = _yaml_strip_trailing_comment(parsed.group("value")).strip()
-        prose = not exempted_root and _is_root_description_key(parsed, value)
-        exempted_root = exempted_root or prose
+        is_root_description = _is_root_description_mapping_key(parsed)
+        prose = (
+            not saw_root_description
+            and is_root_description
+            and _is_root_description_key(parsed, value)
+        )
+        saw_root_description = saw_root_description or is_root_description
         if prose:
             lines[index] = line[: parsed.start("value")]
         index += 1
@@ -5658,6 +5671,16 @@ def self_test() -> int:
         # One root mapping means one root `description:`. A second is a
         # duplicate key, not more rendered metadata, so it stays scanned.
         "description: rendered metadata\n"
+        "description: exportVariable\n"
+        "runs:\n"
+        "  using: composite\n",
+        # A non-scalar or empty first root description still consumes the
+        # one root metadata slot; a later scalar is a scanned duplicate.
+        "description: {carrier: harmless}\n"
+        "description: exportVariable\n"
+        "runs:\n"
+        "  using: composite\n",
+        "description:\n"
         "description: exportVariable\n"
         "runs:\n"
         "  using: composite\n",
