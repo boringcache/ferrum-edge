@@ -33,6 +33,8 @@ use ferrum_edge::config::EnvConfig;
 use ferrum_edge::config::env_config::OperatingMode;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::modes::file::{ServeOptions, serve};
+use ferrum_edge::proxy::gateway_listener::GatewayListenerBindFailure;
+use ferrum_edge::proxy::gateway_listener_status::GatewayListenerFailureCategory;
 
 const HOST: &str = "app.example.com";
 
@@ -199,6 +201,30 @@ async fn undeclared_port_stolen_externally(
         return false;
     }
     try_http_get(port, "/api/x").await.is_ok()
+}
+
+/// True when the gateway lost an ephemeral-port reservation because another
+/// process bound the port first.
+fn port_bind_lost_to_external_steal(
+    failures: &[GatewayListenerBindFailure],
+    port: u16,
+) -> bool {
+    failures.iter().any(|failure| {
+        failure.port == port
+            && failure.category == GatewayListenerFailureCategory::BindFailed
+            && failure.error.contains("Address already in use")
+    })
+}
+
+async fn shutdown_serve_handles_before_retry(
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    handles: ferrum_edge::modes::file::ServeHandles,
+) {
+    let _ = shutdown_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(5), handles.join())
+        .await
+        .expect("a failed attempt must drain before retrying")
+        .expect("a failed attempt must join cleanly before retrying");
 }
 
 /// Successful startup for two same-protocol Gateway listener ports via
@@ -601,80 +627,133 @@ async fn refused_gateway_listener_does_not_poison_sibling_and_recovers() {
     let (backend_refused, _br) = start_body_backend(b"listener-refused").await;
     let (backend_ok, _bo) = start_body_backend(b"listener-ok").await;
 
-    let proxy_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let admin_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let admin_port = admin_http.local_addr().unwrap().port();
-    let sibling_port = reserve_free_port().await;
+    for attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+        let proxy_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_port = admin_http.local_addr().unwrap().port();
+        let sibling_port = reserve_free_port().await;
 
-    let mut refused = port_scoped_proxy("gw-refused", backend_refused, Some(admin_port));
-    refused.hosts = vec![HOST.to_string()];
-    let mut sibling = port_scoped_proxy("gw-ok", backend_ok, Some(sibling_port));
-    sibling.hosts = vec!["ok.example.com".to_string()];
+        let mut refused = port_scoped_proxy("gw-refused", backend_refused, Some(admin_port));
+        refused.hosts = vec![HOST.to_string()];
+        let mut sibling = port_scoped_proxy("gw-ok", backend_ok, Some(sibling_port));
+        sibling.hosts = vec!["ok.example.com".to_string()];
 
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-    let handles = serve(
-        test_env_config(0, 0),
-        config_with(vec![refused, sibling]),
-        serve_options(proxy_http, admin_http),
-        shutdown_tx.clone(),
-    )
-    .await
-    .expect("file::serve starts");
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let handles = serve(
+            test_env_config(0, 0),
+            config_with(vec![refused, sibling]),
+            serve_options(proxy_http, admin_http),
+            shutdown_tx.clone(),
+        )
+        .await
+        .expect("file::serve starts");
 
-    wait_for_listener_ports(&handles, &[sibling_port]).await;
-    assert!(
-        handles
-            .gateway_listeners
-            .bind_failures()
-            .iter()
-            .any(|failure| failure.port == admin_port),
-        "the admin collision must remain surfaced"
-    );
-    let (ok_status, ok_body) = http_get_host(sibling_port, "/api/x", "ok.example.com").await;
-    assert_eq!(
-        ok_status, 200,
-        "sibling listener must keep serving: {ok_body}"
-    );
-    assert_eq!(ok_body, "listener-ok");
-    assert_eq!(
-        http_get_host(sibling_port, "/api/x", HOST).await.0,
-        404,
-        "the refused route must not be reachable on the sibling listener port"
-    );
+        let bind_failures = handles.gateway_listeners.bind_failures();
+        if port_bind_lost_to_external_steal(bind_failures.as_ref(), sibling_port) {
+            eprintln!(
+                "refused/sibling recovery attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
+                 lost sibling-port reservation race on port {sibling_port}"
+            );
+            shutdown_serve_handles_before_retry(&shutdown_tx, handles).await;
+            if attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+                panic!(
+                    "port {sibling_port} was stolen by another test in all \
+                     {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
+                );
+            }
+            continue;
+        }
 
-    let recovered_port = reserve_free_port().await;
-    let mut recovered = port_scoped_proxy("gw-refused", backend_refused, Some(recovered_port));
-    recovered.hosts = vec![HOST.to_string()];
-    let mut sibling = port_scoped_proxy("gw-ok", backend_ok, Some(sibling_port));
-    sibling.hosts = vec!["ok.example.com".to_string()];
-    let outcome = handles
-        .proxy_state
-        .update_config(config_with(vec![recovered, sibling]));
-    assert!(
-        matches!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied),
-        "recovery publication must apply: {outcome:?}"
-    );
-    wait_for_listener_ports_and_withdrawn_failures(
-        &handles,
-        &[sibling_port, recovered_port],
-        &[admin_port],
-    )
-    .await;
-    assert_eq!(
-        http_get(recovered_port, "/api/x").await,
-        (200, "listener-refused".to_string()),
-        "withdrawing the collision must restore the route on the new listen_port"
-    );
-    assert_eq!(
-        http_get_host(sibling_port, "/api/x", "ok.example.com")
-            .await
-            .1,
-        "listener-ok",
-        "sibling must remain healthy across recovery"
-    );
+        wait_for_listener_ports(&handles, &[sibling_port]).await;
+        assert!(
+            handles
+                .gateway_listeners
+                .bind_failures()
+                .iter()
+                .any(|failure| failure.port == admin_port),
+            "the admin collision must remain surfaced"
+        );
+        let (ok_status, ok_body) = http_get_host(sibling_port, "/api/x", "ok.example.com").await;
+        assert_eq!(
+            ok_status, 200,
+            "sibling listener must keep serving: {ok_body}"
+        );
+        assert_eq!(ok_body, "listener-ok");
+        assert_eq!(
+            http_get_host(sibling_port, "/api/x", HOST).await.0,
+            404,
+            "the refused route must not be reachable on the sibling listener port"
+        );
 
-    let _ = shutdown_tx.send(true);
-    let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
+        let recovered_port = reserve_free_port().await;
+        if undeclared_port_stolen_externally(&handles, recovered_port).await {
+            eprintln!(
+                "refused/sibling recovery attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
+                 lost recovered-port reservation race on port {recovered_port}"
+            );
+            shutdown_serve_handles_before_retry(&shutdown_tx, handles).await;
+            if attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+                panic!(
+                    "port {recovered_port} was stolen by another test in all \
+                     {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
+                );
+            }
+            continue;
+        }
+        let mut recovered = port_scoped_proxy("gw-refused", backend_refused, Some(recovered_port));
+        recovered.hosts = vec![HOST.to_string()];
+        let mut sibling = port_scoped_proxy("gw-ok", backend_ok, Some(sibling_port));
+        sibling.hosts = vec!["ok.example.com".to_string()];
+        let outcome = handles
+            .proxy_state
+            .update_config(config_with(vec![recovered, sibling]));
+        assert!(
+            matches!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied),
+            "recovery publication must apply: {outcome:?}"
+        );
+        let recovery_failures = handles.gateway_listeners.bind_failures();
+        if port_bind_lost_to_external_steal(recovery_failures.as_ref(), recovered_port) {
+            eprintln!(
+                "refused/sibling recovery attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
+                 lost recovered-port bind race on port {recovered_port}"
+            );
+            shutdown_serve_handles_before_retry(&shutdown_tx, handles).await;
+            if attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+                panic!(
+                    "port {recovered_port} was stolen by another test in all \
+                     {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
+                );
+            }
+            continue;
+        }
+        wait_for_listener_ports_and_withdrawn_failures(
+            &handles,
+            &[sibling_port, recovered_port],
+            &[admin_port],
+        )
+        .await;
+        assert_eq!(
+            http_get(recovered_port, "/api/x").await,
+            (200, "listener-refused".to_string()),
+            "withdrawing the collision must restore the route on the new listen_port"
+        );
+        assert_eq!(
+            http_get_host(sibling_port, "/api/x", "ok.example.com")
+                .await
+                .1,
+            "listener-ok",
+            "sibling must remain healthy across recovery"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
+        return;
+    }
+
+    panic!(
+        "could not reserve Gateway listener ports in \
+         {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
+    );
 }
 
 /// A config publication that lands **between** the readiness reconcile and the
@@ -691,60 +770,91 @@ async fn a_config_publication_before_the_supervisor_starts_is_not_missed() {
     use ferrum_edge::proxy::gateway_listener::{GatewayListenerManager, GatewayListenerTls};
 
     let (backend, _b) = start_body_backend(b"listener-a").await;
-    let listener_port = reserve_free_port().await;
 
-    let state = ProxyState::new(
-        config_with(vec![]),
-        DnsCache::new(DnsConfig::default()),
-        test_env_config(0, 0),
-        None,
-        None,
-    )
-    .expect("proxy state")
-    .0;
+    for attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+        let listener_port = reserve_free_port().await;
 
-    let manager = std::sync::Arc::new(GatewayListenerManager::new(
-        state.clone(),
-        std::net::IpAddr::from([127, 0, 0, 1]),
-        GatewayListenerTls::default(),
-    ));
+        let state = ProxyState::new(
+            config_with(vec![]),
+            DnsCache::new(DnsConfig::default()),
+            test_env_config(0, 0),
+            None,
+            None,
+        )
+        .expect("proxy state")
+        .0;
 
-    // Readiness reconcile: nothing to bind yet.
-    manager.reconcile().await;
-    assert!(manager.active_ports().await.is_empty());
+        let manager = std::sync::Arc::new(GatewayListenerManager::new(
+            state.clone(),
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            GatewayListenerTls::default(),
+        ));
 
-    // The publication happens HERE — after the readiness reconcile and before
-    // the supervisor task exists.
-    let outcome = state.update_config(config_with(vec![port_scoped_proxy(
-        "gw-a",
-        backend,
-        Some(listener_port),
-    )]));
-    assert!(
-        matches!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied),
-        "publication must apply: {outcome:?}"
-    );
+        // Readiness reconcile: nothing to bind yet.
+        manager.reconcile().await;
+        assert!(manager.active_ports().await.is_empty());
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let supervisor = tokio::spawn(manager.clone().run(shutdown_rx));
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if manager.active_ports().await == vec![listener_port] {
-            break;
-        }
+        // The publication happens HERE — after the readiness reconcile and before
+        // the supervisor task exists.
+        let outcome = state.update_config(config_with(vec![port_scoped_proxy(
+            "gw-a",
+            backend,
+            Some(listener_port),
+        )]));
         assert!(
-            std::time::Instant::now() < deadline,
-            "the publication made before the supervisor started was never reconciled; \
-             failures {:?}",
-            manager.bind_failures()
+            matches!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied),
+            "publication must apply: {outcome:?}"
         );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert_eq!(http_get(listener_port, "/api/x").await.1, "listener-a");
 
-    let _ = shutdown_tx.send(true);
-    let _ = tokio::time::timeout(Duration::from_secs(5), supervisor).await;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let supervisor = tokio::spawn(manager.clone().run(shutdown_rx));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut stolen_port = None;
+        loop {
+            if manager.active_ports().await == vec![listener_port] {
+                break;
+            }
+            let failures = manager.bind_failures();
+            if port_bind_lost_to_external_steal(failures.as_ref(), listener_port) {
+                stolen_port = Some(listener_port);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the publication made before the supervisor started was never reconciled; \
+                 failures {:?}",
+                manager.bind_failures()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if let Some(stolen) = stolen_port {
+            eprintln!(
+                "pre-supervisor publication attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
+                 lost listener-port reservation race on port {stolen}"
+            );
+            let _ = shutdown_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_secs(5), supervisor).await;
+            manager.shutdown_all().await;
+            if attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+                panic!(
+                    "port {stolen} was stolen by another test in all \
+                     {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
+                );
+            }
+            continue;
+        }
+        assert_eq!(http_get(listener_port, "/api/x").await.1, "listener-a");
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), supervisor).await;
+        return;
+    }
+
+    panic!(
+        "could not reserve a Gateway listener port in \
+         {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
+    );
 }
 
 /// Listener routing admission is part of the exact request/config generation:
@@ -880,71 +990,116 @@ async fn an_http_to_https_class_flip_retires_the_plaintext_accept_loops_first() 
 
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (backend, _b) = start_body_backend(b"listener-a").await;
-    let listener_port = reserve_free_port().await;
 
-    let mut env = test_env_config(0, 0);
-    // Several duplicated exclusive-listen accept loops per listener.
-    env.accept_threads = 4;
+    for startup_attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+        let listener_port = reserve_free_port().await;
 
-    let plaintext = config_with(vec![port_scoped_proxy(
-        "gw-a",
-        backend,
-        Some(listener_port),
-    )]);
-    let state = ProxyState::new(
-        plaintext.clone(),
-        DnsCache::new(DnsConfig::default()),
-        env,
-        None,
-        None,
-    )
-    .expect("proxy state")
-    .0;
+        let mut env = test_env_config(0, 0);
+        // Several duplicated exclusive-listen accept loops per listener.
+        env.accept_threads = 4;
 
-    let manager = GatewayListenerManager::new(
-        state.clone(),
-        std::net::IpAddr::from([127, 0, 0, 1]),
-        GatewayListenerTls {
-            static_config: Some(self_signed_server_config()),
-            reload_slot: None,
-        },
-    );
-    manager.reconcile().await;
-    assert_eq!(manager.active_ports().await, vec![listener_port]);
-    assert_eq!(
-        http_get(listener_port, "/api/x").await.1,
-        "listener-a",
-        "the plaintext generation serves before the flip"
-    );
+        let plaintext = config_with(vec![port_scoped_proxy(
+            "gw-a",
+            backend,
+            Some(listener_port),
+        )]);
+        let state = ProxyState::new(
+            plaintext.clone(),
+            DnsCache::new(DnsConfig::default()),
+            env,
+            None,
+            None,
+        )
+        .expect("proxy state")
+        .0;
 
-    // Flip the same port to TLS.
-    let mut tls_config = plaintext.clone();
-    tls_config.http_tls_listen_ports.insert((
-        ferrum_edge::config::types::default_namespace(),
-        listener_port,
-    ));
-    let outcome = state.update_config(tls_config);
-    assert!(
-        matches!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied),
-        "class flip must apply: {outcome:?}"
-    );
-    manager.reconcile().await;
-    assert_eq!(manager.active_ports().await, vec![listener_port]);
-
-    // Every plaintext accept socket is closed, so no cleartext request can be
-    // answered on this port any more — the kernel has no old-generation socket
-    // left to distribute to.
-    for attempt in 0..20 {
-        if let Ok((status, body)) = try_http_get(listener_port, "/api/x").await {
-            assert_ne!(
-                status, 200,
-                "attempt {attempt}: a retired plaintext accept loop still served \
-                 cleartext on a TLS listener port: {body}"
-            );
+        let manager = GatewayListenerManager::new(
+            state.clone(),
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            GatewayListenerTls {
+                static_config: Some(self_signed_server_config()),
+                reload_slot: None,
+            },
+        );
+        manager.reconcile().await;
+        let active = manager.active_ports().await;
+        if active != vec![listener_port] {
+            let failures = manager.bind_failures();
+            if port_bind_lost_to_external_steal(failures.as_ref(), listener_port) {
+                eprintln!(
+                    "http-to-https flip attempt {startup_attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
+                     lost plaintext listener-port reservation race on port {listener_port}"
+                );
+                manager.shutdown_all().await;
+                if startup_attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+                    panic!(
+                        "port {listener_port} was stolen by another test in all \
+                         {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
+                    );
+                }
+                continue;
+            }
+            assert_eq!(active, vec![listener_port]);
         }
+        assert_eq!(
+            http_get(listener_port, "/api/x").await.1,
+            "listener-a",
+            "the plaintext generation serves before the flip"
+        );
+
+        // Flip the same port to TLS.
+        let mut tls_config = plaintext.clone();
+        tls_config.http_tls_listen_ports.insert((
+            ferrum_edge::config::types::default_namespace(),
+            listener_port,
+        ));
+        let outcome = state.update_config(tls_config);
+        assert!(
+            matches!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied),
+            "class flip must apply: {outcome:?}"
+        );
+        manager.reconcile().await;
+        let active = manager.active_ports().await;
+        if active != vec![listener_port] {
+            let failures = manager.bind_failures();
+            if port_bind_lost_to_external_steal(failures.as_ref(), listener_port) {
+                eprintln!(
+                    "http-to-https flip attempt {startup_attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
+                     lost TLS listener-port reservation race on port {listener_port}"
+                );
+                manager.shutdown_all().await;
+                if startup_attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+                    panic!(
+                        "port {listener_port} was stolen by another test in all \
+                         {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
+                    );
+                }
+                continue;
+            }
+            assert_eq!(active, vec![listener_port]);
+        }
+
+        // Every plaintext accept socket is closed, so no cleartext request can be
+        // answered on this port any more — the kernel has no old-generation socket
+        // left to distribute to.
+        for attempt in 0..20 {
+            if let Ok((status, body)) = try_http_get(listener_port, "/api/x").await {
+                assert_ne!(
+                    status, 200,
+                    "attempt {attempt}: a retired plaintext accept loop still served \
+                     cleartext on a TLS listener port: {body}"
+                );
+            }
+        }
+
+        manager.shutdown_all().await;
+        return;
     }
 
-    manager.shutdown_all().await;
+    panic!(
+        "could not reserve a Gateway listener port in \
+         {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
+    );
 }
 
 fn self_signed_server_config() -> std::sync::Arc<rustls::ServerConfig> {
