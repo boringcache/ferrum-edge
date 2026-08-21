@@ -17,7 +17,8 @@ with exact occurrence counts and checkout provenance (current repository,
 default ref, default root, persist-credentials: false) plus shell-only
 local actions so JavaScript toolkit carriers cannot reach
 the cache-credential environment, same-run producer and immutable inter-run
-artifact handoff warming, exact verified executable activation, empty
+artifact handoff warming, exact verified executable activation, performance
+rust-cache key isolation from runner-unique wrapper paths, empty
 SCCACHE_GHA_ENABLED persistence, fail-closed uncached fallback, hosted
 cache-token absence assertions, and Ambient production-image GHA cache-to
 gated to trusted `refs/heads/main` so pull requests restore without publishing.
@@ -51,6 +52,7 @@ SETUP_FAST_LINKER = REPO_ROOT / ".github" / "actions" / "setup-fast-linker" / "a
 CI_CD_DOC = REPO_ROOT / "docs" / "ci_cd.md"
 FIPS_DOC = REPO_ROOT / "docs" / "fips.md"
 COVERAGE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "coverage.yml"
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 RUST_TOOLCHAIN = "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8"
@@ -1728,14 +1730,22 @@ def _is_root_description_key(parsed: re.Match[str], value: str) -> bool:
     is a duplicate key rather than more rendered metadata.
     """
 
-    if parsed.group("lead") != "" or parsed.group("dash") is not None:
-        return False
-    if parsed.group("key") != "description":
+    if not _is_root_description_mapping_key(parsed):
         return False
     had_properties, remainder = _leading_yaml_node_properties(value)
     if had_properties:
         return False
     return _is_inspectable_yaml_scalar(remainder)
+
+
+def _is_root_description_mapping_key(parsed: re.Match[str]) -> bool:
+    """Return whether this is the unquoted root `description` mapping key."""
+
+    return (
+        parsed.group("lead") == ""
+        and parsed.group("dash") is None
+        and parsed.group("key") == "description"
+    )
 
 
 def _without_yaml_description_prose(text: str) -> str:
@@ -1771,7 +1781,7 @@ def _without_yaml_description_prose(text: str) -> str:
 
     lines = text.splitlines()
     index = 0
-    exempted_root = False
+    saw_root_description = False
     while index < len(lines):
         line = lines[index]
         stripped = line.lstrip(" \t")
@@ -1790,8 +1800,13 @@ def _without_yaml_description_prose(text: str) -> str:
             continue
         key_indent = _yaml_mapping_key_indent(parsed)
         value = _yaml_strip_trailing_comment(parsed.group("value")).strip()
-        prose = not exempted_root and _is_root_description_key(parsed, value)
-        exempted_root = exempted_root or prose
+        is_root_description = _is_root_description_mapping_key(parsed)
+        prose = (
+            not saw_root_description
+            and is_root_description
+            and _is_root_description_key(parsed, value)
+        )
+        saw_root_description = saw_root_description or is_root_description
         if prose:
             lines[index] = line[: parsed.start("value")]
         index += 1
@@ -2023,6 +2038,122 @@ def check_setup_sccache_verified_activation(
     require(
         '"$sccache_bin" --start-server' in text and "command -v sccache" not in text,
         f"{source} must invoke only the verified executable, never PATH lookup",
+        failures,
+    )
+
+
+def check_performance_cache_wrapper_key(
+    workflow: str,
+    source: str,
+    failures: list[str],
+) -> None:
+    """Keep runner-unique sccache paths out of the performance cache key."""
+
+    job = extract_job(workflow, "performance-regression")
+    require(
+        bool(job),
+        f"{source} must define performance-regression",
+        failures,
+    )
+    if not job:
+        return
+    job_env_match = re.search(
+        r"(?ms)^    env:\s*\n(?P<body>(?:^      [^\n]*\n)*)",
+        job,
+    )
+    job_env = job_env_match.group("body") if job_env_match is not None else ""
+    require(
+        re.search(
+            r"(?m)^      (?:RUSTC_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER):",
+            job_env,
+        )
+        is None,
+        f"{source} performance-regression must not clear the rustc wrapper at "
+        "job scope; benchmark builds need the verified sccache wrapper",
+        failures,
+    )
+    steps = job_steps(job)
+    setup_steps = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if step_uses(step) == "./.github/actions/setup-rust-ci"
+    ]
+    require(
+        len(setup_steps) == 1,
+        f"{source} performance-regression must invoke setup-rust-ci exactly once",
+        failures,
+    )
+    if len(setup_steps) != 1:
+        return
+    setup_index, setup = setup_steps[0]
+    require(
+        re.search(
+            r'(?m)^        env:\s*\n'
+            r'          RUSTC_WRAPPER: ["\']{2}\s*\n'
+            r'          CARGO_BUILD_RUSTC_WRAPPER: ["\']{2}\s*$',
+            setup,
+        )
+        is not None,
+        f"{source} performance setup-rust-ci step must clear RUSTC_WRAPPER and "
+        "CARGO_BUILD_RUSTC_WRAPPER only for the nested rust-cache key calculation",
+        failures,
+    )
+    with_block = step_with(setup)
+    require(
+        re.search(r'(?m)^          shared-key: ["\']ci-perf["\']\s*$', with_block)
+        is not None
+        and "tests/performance/mesh -> target" in with_block,
+        f"{source} performance setup-rust-ci step must retain the ci-perf shared "
+        "key and expanded mesh workspace",
+        failures,
+    )
+    stabilization_steps = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if "name: Stabilize performance compiler wrapper identity" in step
+    ]
+    require(
+        len(stabilization_steps) == 1,
+        f"{source} performance-regression must stabilize the verified wrapper "
+        "exactly once",
+        failures,
+    )
+    if len(stabilization_steps) != 1:
+        return
+    stabilization_index, stabilization = stabilization_steps[0]
+    require(
+        stabilization_index == setup_index + 1,
+        f"{source} performance wrapper stabilization must run immediately after "
+        "setup-rust-ci and before any benchmark build",
+        failures,
+    )
+    require(
+        not step_if(stabilization) and "continue-on-error:" not in stabilization,
+        f"{source} performance wrapper stabilization must run unconditionally "
+        "after setup-rust-ci and fail the job on an unexpected copy error",
+        failures,
+    )
+    stabilization_contract = (
+        "set -euo pipefail",
+        'source="${FERRUM_SCCACHE_BIN:-}"',
+        '[ -z "$source" ] || [ ! -x "$source" ]',
+        "'RUSTC_WRAPPER=' 'CARGO_BUILD_RUSTC_WRAPPER='",
+        'stable_root="${RUNNER_TEMP}/ferrum-performance-sccache"',
+        'stable_wrapper="${stable_root}/bin/sccache"',
+        'rm -rf "$stable_root"',
+        'mkdir -p "${stable_root}/bin"',
+        'cp -- "$source" "$stable_wrapper"',
+        'chmod 0755 "$stable_wrapper"',
+        '"RUSTC_WRAPPER=${stable_wrapper}"',
+        '"CARGO_BUILD_RUSTC_WRAPPER=${stable_wrapper}"',
+        '>> "$GITHUB_ENV"',
+    )
+    missing = [item for item in stabilization_contract if item not in stabilization]
+    require(
+        not missing and "GITHUB_PATH" not in stabilization,
+        f"{source} performance wrapper stabilization must copy only the verified "
+        f"binary to the fixed runner-local path and fail closed to no wrapper; "
+        f"missing={missing}",
         failures,
     )
 
@@ -5661,6 +5792,16 @@ def self_test() -> int:
         "description: exportVariable\n"
         "runs:\n"
         "  using: composite\n",
+        # A non-scalar or empty first root description still consumes the
+        # one root metadata slot; a later scalar is a scanned duplicate.
+        "description: {carrier: harmless}\n"
+        "description: exportVariable\n"
+        "runs:\n"
+        "  using: composite\n",
+        "description:\n"
+        "description: exportVariable\n"
+        "runs:\n"
+        "  using: composite\n",
         # A flow sequence is not rendered scalar prose.
         "description: [exportVariable]\n"
         "runs:\n"
@@ -5779,6 +5920,84 @@ def self_test() -> int:
         + "; ".join(verified_failures),
         failures,
     )
+
+    performance_cache_fixture = (
+        "jobs:\n"
+        "  performance-regression:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: ./.github/actions/setup-rust-ci\n"
+        "        env:\n"
+        '          RUSTC_WRAPPER: ""\n'
+        '          CARGO_BUILD_RUSTC_WRAPPER: ""\n'
+        "        with:\n"
+        '          shared-key: "ci-perf"\n'
+        "          workspaces: |\n"
+        "            . -> target\n"
+        "            tests/performance/mesh -> target\n"
+        "      - name: Stabilize performance compiler wrapper identity\n"
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        '          source="${FERRUM_SCCACHE_BIN:-}"\n'
+        '          if [ -z "$source" ] || [ ! -x "$source" ]; then\n'
+        "            printf '%s\\n' 'RUSTC_WRAPPER=' "
+        "'CARGO_BUILD_RUSTC_WRAPPER=' >> \"$GITHUB_ENV\"\n"
+        "            exit 0\n"
+        "          fi\n"
+        '          stable_root="${RUNNER_TEMP}/ferrum-performance-sccache"\n'
+        '          stable_wrapper="${stable_root}/bin/sccache"\n'
+        '          rm -rf "$stable_root"\n'
+        '          mkdir -p "${stable_root}/bin"\n'
+        '          cp -- "$source" "$stable_wrapper"\n'
+        '          chmod 0755 "$stable_wrapper"\n'
+        "          printf '%s\\n' \"RUSTC_WRAPPER=${stable_wrapper}\" "
+        '"CARGO_BUILD_RUSTC_WRAPPER=${stable_wrapper}" >> "$GITHUB_ENV"\n'
+        "      - name: Build release binaries\n"
+        "        run: cargo build --profile ci-release\n"
+    )
+    performance_cache_failures: list[str] = []
+    check_performance_cache_wrapper_key(
+        performance_cache_fixture,
+        "self-test-performance-cache",
+        performance_cache_failures,
+    )
+    require(
+        not performance_cache_failures,
+        "self-test: exact step-scoped performance cache wrapper isolation should "
+        "pass: " + "; ".join(performance_cache_failures),
+        failures,
+    )
+    for label, mutated in {
+        "missing cargo wrapper": performance_cache_fixture.replace(
+            '          CARGO_BUILD_RUSTC_WRAPPER: ""\n', "", 1
+        ),
+        "job-scoped wrapper clearing": performance_cache_fixture.replace(
+            "        env:\n"
+            '          RUSTC_WRAPPER: ""\n'
+            '          CARGO_BUILD_RUSTC_WRAPPER: ""\n',
+            "    env:\n"
+            '      RUSTC_WRAPPER: ""\n'
+            '      CARGO_BUILD_RUSTC_WRAPPER: ""\n',
+            1,
+        ),
+        "missing mesh workspace": performance_cache_fixture.replace(
+            "            tests/performance/mesh -> target\n", "", 1
+        ),
+        "missing stable wrapper copy": performance_cache_fixture.replace(
+            '          cp -- "$source" "$stable_wrapper"\n', "", 1
+        ),
+    }.items():
+        mutated_failures: list[str] = []
+        check_performance_cache_wrapper_key(
+            mutated,
+            f"self-test-performance-cache-{label}",
+            mutated_failures,
+        )
+        require(
+            bool(mutated_failures),
+            f"self-test: {label} must fail the performance cache key contract",
+            failures,
+        )
 
     missing_assert_failures: list[str] = []
     check_credential_absence_assertion(
@@ -7283,6 +7502,7 @@ def main(argv: list[str] | None = None) -> int:
     fips = FIPS_WORKFLOW.read_text(encoding="utf-8")
     node = NODE_WORKFLOW.read_text(encoding="utf-8")
     ambient = AMBIENT_WORKFLOW.read_text(encoding="utf-8")
+    ci = CI_WORKFLOW.read_text(encoding="utf-8")
     check_common_trust(fips, "fips-build.yml", failures)
     check_common_trust(node, "node-waypoint-ebpf-live.yml", failures)
     check_common_trust(ambient, "ambient-host-udp-live.yml", failures)
@@ -7294,6 +7514,7 @@ def main(argv: list[str] | None = None) -> int:
         failures,
     )
     check_shared_actions(failures)
+    check_performance_cache_wrapper_key(ci, "ci.yml", failures)
     check_docs_and_coverage(failures)
     check_dockerfile(failures)
     for failure in failures:

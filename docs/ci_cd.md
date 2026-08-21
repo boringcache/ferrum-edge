@@ -1220,6 +1220,24 @@ pass-through to Swatinem/rust-cache; omitting it leaves rust-cache's default
 workspace, and do not add unrelated workspaces, `cache-all-crates`, or extra
 `cache-directories` here.
 
+The checksum-pinned installer deliberately gives every hosted job a fresh
+runner-private wrapper path. Swatinem/rust-cache hashes every non-empty
+`RUST*` and `CARGO*` variable into its environment key, so hashing that path
+would prevent an otherwise equivalent `ci-perf` job from restoring the cache
+seeded by `main`. The `performance-regression` invocation therefore sets
+`RUSTC_WRAPPER` and `CARGO_BUILD_RUSTC_WRAPPER` to empty values only on the
+`setup-rust-ci` composite step. That step scope makes the nested rust-cache
+action omit the runner-unique values while `setup-sccache` still publishes its
+checksum-verified path through `FERRUM_SCCACHE_BIN`. Immediately after the
+composite returns, the workflow copies that verified executable to the fixed
+`${RUNNER_TEMP}/ferrum-performance-sccache/bin/sccache` path and republishes
+both wrapper variables, so Cargo's own compiler identity is stable as well as
+the rust-cache key. If the installer failed or its verified executable is no
+longer available, the step clears both variables and the benchmarks continue
+uncached. Do not move the initial empty values to job scope, which would
+override the later activation and disable sccache for the builds whose reuse
+this cache is intended to accelerate.
+
 Hosted follow-ups that still need measured evidence before changing
 measurement fidelity or trigger breadth:
 

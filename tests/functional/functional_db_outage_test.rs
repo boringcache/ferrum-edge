@@ -566,11 +566,18 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     harness.wait_for_poll().await;
     harness.assert_gateway_alive();
 
+    // Setup used `client` for mutations, then two consecutive `wait_for_poll()` sleeps
+    // (5s each) leave its pooled admin connection idle for exactly
+    // `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` (default 10). The admin listener
+    // closes idle connections at that boundary; reqwest may still select the stale
+    // pooled socket for the first post-outage request, racing server close → IncompleteMessage.
+    let admin_client = reqwest::Client::new();
+
     // --- Phase 2a: Verify reads fall back to cached config ---
     println!("  Testing read operations (should use cached config)...");
 
     // GET /proxies — list should return cached data
-    let resp = client
+    let resp = admin_client
         .get(format!("{}/proxies", harness.admin_base_url))
         .header("Authorization", &auth)
         .send()
@@ -598,7 +605,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     );
 
     // GET /proxies/:id — single proxy from cache
-    let resp = client
+    let resp = admin_client
         .get(format!(
             "{}/proxies/admin-test-proxy",
             harness.admin_base_url
@@ -624,7 +631,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     println!("    GET /proxies/:id: OK (cached)");
 
     // GET /consumers — list should return cached data
-    let resp = client
+    let resp = admin_client
         .get(format!("{}/consumers", harness.admin_base_url))
         .header("Authorization", &auth)
         .send()
@@ -645,7 +652,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     println!("    GET /consumers: OK (cached)");
 
     // GET /consumers/:id — single consumer from cache
-    let resp = client
+    let resp = admin_client
         .get(format!(
             "{}/consumers/admin-test-consumer",
             harness.admin_base_url
@@ -671,7 +678,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     println!("    GET /consumers/:id: OK (cached)");
 
     // GET /plugins/config — list should return cached data
-    let resp = client
+    let resp = admin_client
         .get(format!("{}/plugins/config", harness.admin_base_url))
         .header("Authorization", &auth)
         .send()
@@ -692,7 +699,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     println!("    GET /plugins/config: OK (cached)");
 
     // GET /plugins/config/:id — single plugin config from cache
-    let resp = client
+    let resp = admin_client
         .get(format!(
             "{}/plugins/config/admin-test-plugin",
             harness.admin_base_url
@@ -719,7 +726,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     println!("  Testing write operations (should return 503)...");
 
     // POST /proxies — create should fail
-    let resp = client
+    let resp = admin_client
         .post(format!("{}/proxies", harness.admin_base_url))
         .header("Authorization", &auth)
         .json(&json!({
@@ -745,7 +752,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     println!("    POST /proxies: 503 (correct)");
 
     // PUT /proxies/:id — update should fail
-    let resp = client
+    let resp = admin_client
         .put(format!(
             "{}/proxies/admin-test-proxy",
             harness.admin_base_url
@@ -770,7 +777,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     println!("    PUT /proxies/:id: 503 (correct)");
 
     // DELETE /proxies/:id — delete should fail
-    let resp = client
+    let resp = admin_client
         .delete(format!(
             "{}/proxies/admin-test-proxy",
             harness.admin_base_url
@@ -787,7 +794,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     println!("    DELETE /proxies/:id: 503 (correct)");
 
     // POST /consumers — create should fail
-    let resp = client
+    let resp = admin_client
         .post(format!("{}/consumers", harness.admin_base_url))
         .header("Authorization", &auth)
         .json(&json!({
@@ -805,7 +812,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     println!("    POST /consumers: 503 (correct)");
 
     // PUT /consumers/:id — update should fail
-    let resp = client
+    let resp = admin_client
         .put(format!(
             "{}/consumers/admin-test-consumer",
             harness.admin_base_url
@@ -826,7 +833,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     println!("    PUT /consumers/:id: 503 (correct)");
 
     // DELETE /consumers/:id — delete should fail
-    let resp = client
+    let resp = admin_client
         .delete(format!(
             "{}/consumers/admin-test-consumer",
             harness.admin_base_url
@@ -843,7 +850,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     println!("    DELETE /consumers/:id: 503 (correct)");
 
     // POST /plugins/config — create should fail
-    let resp = client
+    let resp = admin_client
         .post(format!("{}/plugins/config", harness.admin_base_url))
         .header("Authorization", &auth)
         .json(&json!({
@@ -865,7 +872,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     println!("    POST /plugins/config: 503 (correct)");
 
     // PUT /plugins/config/:id — update should fail
-    let resp = client
+    let resp = admin_client
         .put(format!(
             "{}/plugins/config/admin-test-plugin",
             harness.admin_base_url
@@ -890,7 +897,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     println!("    PUT /plugins/config/:id: 503 (correct)");
 
     // DELETE /plugins/config/:id — delete should fail
-    let resp = client
+    let resp = admin_client
         .delete(format!(
             "{}/plugins/config/admin-test-plugin",
             harness.admin_base_url
@@ -908,7 +915,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
 
     // --- Phase 2c: Verify health endpoint reports degraded status ---
     println!("  Testing health endpoint...");
-    let resp = client
+    let resp = admin_client
         .get(format!("{}/health", harness.admin_base_url))
         .header("Authorization", &auth)
         .send()
@@ -943,7 +950,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     harness.wait_for_poll().await;
 
     // Verify health is back to normal
-    let resp = client
+    let resp = admin_client
         .get(format!("{}/health", harness.admin_base_url))
         .header("Authorization", &auth)
         .send()
@@ -957,7 +964,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     println!("  Health recovered: admin_writes_enabled=true");
 
     // Verify writes work again after recovery
-    let resp = client
+    let resp = admin_client
         .post(format!("{}/proxies", harness.admin_base_url))
         .header("Authorization", &auth)
         .json(&json!({
@@ -978,7 +985,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     println!("  POST /proxies: success after recovery");
 
     // Verify reads no longer have X-Data-Source: cached header
-    let resp = client
+    let resp = admin_client
         .get(format!("{}/proxies", harness.admin_base_url))
         .header("Authorization", &auth)
         .send()
@@ -992,7 +999,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     println!("  GET /proxies: from DB (no X-Data-Source: cached)");
 
     // Clean up the recovery proxy
-    let _ = client
+    let _ = admin_client
         .delete(format!("{}/proxies/recovery-proxy", harness.admin_base_url))
         .header("Authorization", &auth)
         .send()
