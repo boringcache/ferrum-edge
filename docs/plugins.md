@@ -4546,9 +4546,12 @@ toggles — built-in pack plus `mode: enforce` alone is not blocking.
 inspection surface can run: it rejects oversize governed HTTP bodies and
 WebSocket application messages while globally enforcing, even when every rule
 stays monitor-only. `fail_closed`, `scan_truncated`, and `skip` do not satisfy
-the gate. `mode: monitor` with zero enforcing rules remains valid. Invalid WAF
-configuration is security-fatal at startup/reload, so the gateway does not
-silently serve without the intended inspection.
+the gate. `mode: monitor` with zero enforcing rules remains valid. SSRF
+metadata/private-IP and dangerous-scheme signatures cover both request bodies
+and decoded query values at paranoia 1 (`FE-SSRF-001`/`002` and the `-Q`
+mirrors); see [waf.md](waf.md#built-in-rule-pack). Invalid WAF configuration is
+security-fatal at startup/reload, so the gateway does not silently serve
+without the intended inspection.
 
 **Admission.** Fixed-shape objects reject unknown keys with path-qualified
 diagnostics and spelling suggestions before defaults apply (top-level config,
@@ -4610,7 +4613,9 @@ of them governs that request.
 WAF scans raw query pairs even after the proxy has materialized the parsed
 query map, so duplicate keys remain visible before the parsed `HashMap` can
 collapse them; synthetic contexts without a raw query string fall back to
-scanning the parsed key/value map and a best-effort reconstructed URL.
+scanning the parsed key/value map and a best-effort reconstructed URL. Query
+rules match those percent-decoded parameter values plus the same bounded
+layered decode variants used for bodies, not raw whole-URI text.
 
 **Priority:** 2930
 **Phase:** `authorize`, `on_final_request_body`, `after_proxy`, `on_final_response_body`

@@ -224,6 +224,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when a body inspection hook can actually run. `fail_closed` (the default),
   `scan_truncated`, and `skip` still do not satisfy the gate, and a config
   that cannot block anything is still refused.
+- WAF query SSRF mirrors `FE-SSRF-001-Q` / `FE-SSRF-002-Q` now compile at
+  paranoia 1, matching the documented body/query pack and the recommended
+  `{mode: enforce, default_rule_action: enforce, paranoia_level: 1}` posture
+  (issue #3936). They were present but gated at paranoia 2, so
+  `http://169.254.169.254/latest/meta-data/` and `gopher://127.0.0.1/` in a
+  query string produced `waf.action=clean` while the same payload in the body
+  blocked as `FE-SSRF-001` / `FE-SSRF-002`. Matching stays on decoded query
+  values (percent-decode plus the bounded layered variants used for bodies),
+  not raw whole-URI text, and keeps the existing dotted-IPv4 / metadata-host /
+  dangerous-scheme claims without expanding into IPv6 or alternate textual IP
+  forms.
 
 - Authenticated UDP/DTLS client-facing sends no longer emit after the
   authorization deadline (issues #3815, #3816, #3820). A pre-send commitment
