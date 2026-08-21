@@ -37,6 +37,11 @@ use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
 use uuid::Uuid;
 
+use crate::common::scheduled_scaling::{
+    SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, post_admin_batch,
+    scheduled_scaling_admin_jwt_max_ttl_value,
+};
+
 const BATCH_SIZE: usize = 3_000;
 const TOTAL_PROXIES: usize = 30_000;
 const PERF_TEST_DURATION_SECS: u64 = 30;
@@ -218,6 +223,10 @@ impl ScalePerfHarness {
             .env("FERRUM_MODE", "database")
             .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
             .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
+            .env(
+                "FERRUM_ADMIN_JWT_MAX_TTL",
+                scheduled_scaling_admin_jwt_max_ttl_value(),
+            )
             .env("FERRUM_DB_TYPE", db_type)
             .env("FERRUM_DB_URL", db_url)
             .env("FERRUM_DB_POLL_INTERVAL", "2")
@@ -289,7 +298,8 @@ impl ScalePerfHarness {
             "role": "admin",
             "iat": now.timestamp(),
             "nbf": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+            "exp": (now + chrono::Duration::seconds(SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS))
+                .timestamp(),
             "jti": Uuid::new_v4().to_string()
         });
         let header = Header::new(jsonwebtoken::Algorithm::HS256);
@@ -408,55 +418,43 @@ async fn create_batch(
     // This ensures referential integrity: consumers exist before ACL plugins reference them,
     // proxies exist before plugin_configs reference proxy_id.
 
+    // `POST /batch` is all-or-nothing and succeeds only with 201. Only the
+    // documented all-or-nothing 503s are retried, so repeating the same atomic
+    // body cannot accept or compound a partial graph.
     for chunk in all_consumers.chunks(API_BATCH_CHUNK) {
         let batch_body = json!({ "consumers": chunk });
-        let resp = client
-            .post(format!("{}/batch", admin_url))
-            .header("Authorization", auth_header)
-            .json(&batch_body)
-            .send()
-            .await?;
-        // `POST /batch` is all-or-nothing: any non-2xx means nothing was
-        // applied, so there is no partial-success status to tolerate.
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Batch consumer create failed: {} - {}", status, body).into());
-        }
+        post_admin_batch(
+            client,
+            admin_url,
+            auth_header,
+            &batch_body,
+            "Batch consumer create",
+        )
+        .await?;
     }
 
     for chunk in all_proxies.chunks(API_BATCH_CHUNK) {
         let batch_body = json!({ "proxies": chunk });
-        let resp = client
-            .post(format!("{}/batch", admin_url))
-            .header("Authorization", auth_header)
-            .json(&batch_body)
-            .send()
-            .await?;
-        // `POST /batch` is all-or-nothing: any non-2xx means nothing was
-        // applied, so there is no partial-success status to tolerate.
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Batch proxy create failed: {} - {}", status, body).into());
-        }
+        post_admin_batch(
+            client,
+            admin_url,
+            auth_header,
+            &batch_body,
+            "Batch proxy create",
+        )
+        .await?;
     }
 
     for chunk in all_plugins.chunks(API_BATCH_CHUNK) {
         let batch_body = json!({ "plugin_configs": chunk });
-        let resp = client
-            .post(format!("{}/batch", admin_url))
-            .header("Authorization", auth_header)
-            .json(&batch_body)
-            .send()
-            .await?;
-        // `POST /batch` is all-or-nothing: any non-2xx means nothing was
-        // applied, so there is no partial-success status to tolerate.
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Batch plugin create failed: {} - {}", status, body).into());
-        }
+        post_admin_batch(
+            client,
+            admin_url,
+            auth_header,
+            &batch_body,
+            "Batch plugin create",
+        )
+        .await?;
     }
 
     Ok(entries)
