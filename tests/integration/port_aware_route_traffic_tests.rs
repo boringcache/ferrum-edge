@@ -174,7 +174,7 @@ async fn start_body_backend(body: &'static [u8]) -> (u16, tokio::task::JoinHandl
 }
 
 /// Reserve an ephemeral port number and release the socket so the gateway can
-/// bind it itself. Whole-startup callers retry on a bind race.
+/// bind it itself. Whole-startup and reload callers retry on a bind race.
 async fn reserve_free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -183,6 +183,18 @@ async fn reserve_free_port() -> u16 {
 }
 
 const GATEWAY_LISTENER_STARTUP_ATTEMPTS: u32 = 3;
+
+/// True when another test bound `port` after we released the reservation but
+/// the gateway has not declared it in `active_ports`.
+async fn undeclared_port_stolen_externally(
+    handles: &ferrum_edge::modes::file::ServeHandles,
+    port: u16,
+) -> bool {
+    if handles.gateway_listeners.active_ports().await.contains(&port) {
+        return false;
+    }
+    try_http_get(port, "/api/x").await.is_ok()
+}
 
 /// Successful startup for two same-protocol Gateway listener ports via
 /// `file::serve`. Production still owns every Gateway listener bind.
@@ -391,80 +403,106 @@ async fn gateway_listener_ports_follow_config_reload_add_and_withdraw() {
     let (backend_a, _ba) = start_body_backend(b"listener-a").await;
     let (backend_b, _bb) = start_body_backend(b"listener-b").await;
 
-    let listener_a_port = reserve_free_port().await;
-    let listener_b_port = reserve_free_port().await;
-    assert_ne!(listener_a_port, listener_b_port);
+    for attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+        let listener_a_port = reserve_free_port().await;
+        let listener_b_port = reserve_free_port().await;
+        if listener_a_port == listener_b_port {
+            continue;
+        }
 
-    let proxy_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let admin_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-    let handles = serve(
-        test_env_config(0, 0),
-        config_with(vec![port_scoped_proxy(
-            "gw-a",
-            backend_a,
-            Some(listener_a_port),
-        )]),
-        serve_options(proxy_http, admin_http),
-        shutdown_tx.clone(),
-    )
-    .await
-    .expect("file::serve starts");
+        let proxy_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let handles = serve(
+            test_env_config(0, 0),
+            config_with(vec![port_scoped_proxy(
+                "gw-a",
+                backend_a,
+                Some(listener_a_port),
+            )]),
+            serve_options(proxy_http, admin_http),
+            shutdown_tx.clone(),
+        )
+        .await
+        .expect("file::serve starts");
 
-    assert_eq!(
-        handles.gateway_listeners.active_ports().await,
-        vec![listener_a_port]
+        assert_eq!(
+            handles.gateway_listeners.active_ports().await,
+            vec![listener_a_port]
+        );
+        assert_eq!(http_get(listener_a_port, "/api/x").await.0, 200);
+        if undeclared_port_stolen_externally(&handles, listener_b_port).await {
+            eprintln!(
+                "reload add/withdraw attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
+                 lost undeclared-port reservation race on port {listener_b_port}"
+            );
+            let _ = shutdown_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
+            if attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+                panic!(
+                    "an undeclared listener port must not be bound, but port \
+                     {listener_b_port} was stolen by another test in all \
+                     {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
+                );
+            }
+            continue;
+        }
+        assert!(
+            try_http_get(listener_b_port, "/api/x").await.is_err(),
+            "an undeclared listener port must not be bound"
+        );
+
+        // ── Update: add a second listener ────────────────────────────────────
+        let outcome = handles.proxy_state.update_config(config_with(vec![
+            port_scoped_proxy("gw-a", backend_a, Some(listener_a_port)),
+            port_scoped_proxy("gw-b", backend_b, Some(listener_b_port)),
+        ]));
+        assert!(
+            matches!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied),
+            "reload must apply: {outcome:?}"
+        );
+        wait_for_listener_ports(&handles, &[listener_a_port, listener_b_port]).await;
+
+        let (status_b, body_b) = http_get(listener_b_port, "/api/x").await;
+        assert_eq!(status_b, 200, "the added listener must serve: {body_b}");
+        assert_eq!(body_b, "listener-b");
+        assert_eq!(http_get(listener_a_port, "/api/x").await.1, "listener-a");
+
+        // ── Delete: withdraw the first listener ──────────────────────────────
+        let outcome = handles
+            .proxy_state
+            .update_config(config_with(vec![port_scoped_proxy(
+                "gw-b",
+                backend_b,
+                Some(listener_b_port),
+            )]));
+        assert!(
+            matches!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied),
+            "withdrawal must apply: {outcome:?}"
+        );
+        wait_for_listener_ports(&handles, &[listener_b_port]).await;
+
+        // Routing is withdrawn by the config swap itself. While the accept socket
+        // is still draining it answers HTTP 404 (never stale-route). Once the
+        // accept loop has observed shutdown, the kernel may complete a handshake
+        // and then close without an HTTP response (`try_http_get` status 0) or
+        // refuse the connect entirely. All three are fail-closed; 200 is not.
+        assert_withdrawn_listener_fail_closed(listener_a_port).await;
+        assert_eq!(
+            http_get(listener_b_port, "/api/x").await.1,
+            "listener-b",
+            "the surviving sibling listener keeps serving across the withdrawal"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
+        return;
+    }
+
+    panic!(
+        "could not reserve two distinct Gateway listener ports in \
+         {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
     );
-    assert_eq!(http_get(listener_a_port, "/api/x").await.0, 200);
-    assert!(
-        try_http_get(listener_b_port, "/api/x").await.is_err(),
-        "an undeclared listener port must not be bound"
-    );
-
-    // ── Update: add a second listener ────────────────────────────────────
-    let outcome = handles.proxy_state.update_config(config_with(vec![
-        port_scoped_proxy("gw-a", backend_a, Some(listener_a_port)),
-        port_scoped_proxy("gw-b", backend_b, Some(listener_b_port)),
-    ]));
-    assert!(
-        matches!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied),
-        "reload must apply: {outcome:?}"
-    );
-    wait_for_listener_ports(&handles, &[listener_a_port, listener_b_port]).await;
-
-    let (status_b, body_b) = http_get(listener_b_port, "/api/x").await;
-    assert_eq!(status_b, 200, "the added listener must serve: {body_b}");
-    assert_eq!(body_b, "listener-b");
-    assert_eq!(http_get(listener_a_port, "/api/x").await.1, "listener-a");
-
-    // ── Delete: withdraw the first listener ──────────────────────────────
-    let outcome = handles
-        .proxy_state
-        .update_config(config_with(vec![port_scoped_proxy(
-            "gw-b",
-            backend_b,
-            Some(listener_b_port),
-        )]));
-    assert!(
-        matches!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied),
-        "withdrawal must apply: {outcome:?}"
-    );
-    wait_for_listener_ports(&handles, &[listener_b_port]).await;
-
-    // Routing is withdrawn by the config swap itself. While the accept socket
-    // is still draining it answers HTTP 404 (never stale-route). Once the
-    // accept loop has observed shutdown, the kernel may complete a handshake
-    // and then close without an HTTP response (`try_http_get` status 0) or
-    // refuse the connect entirely. All three are fail-closed; 200 is not.
-    assert_withdrawn_listener_fail_closed(listener_a_port).await;
-    assert_eq!(
-        http_get(listener_b_port, "/api/x").await.1,
-        "listener-b",
-        "the surviving sibling listener keeps serving across the withdrawal"
-    );
-
-    let _ = shutdown_tx.send(true);
-    let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
 }
 
 /// A Gateway listener whose port and frontend class match the process-global
