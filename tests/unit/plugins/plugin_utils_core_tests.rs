@@ -570,6 +570,34 @@ fn token_extract_prefixless_authorization_location_classifies_bearer_scheme() {
     ));
 }
 
+#[test]
+fn token_extract_non_materialized_authorization_is_invalid_not_missing() {
+    let ctx = super::plugin_utils::context_with_materialized_raw_header(
+        "Authorization",
+        "Bearer \u{3000}not-a-token",
+    );
+    assert!(matches!(
+        extract_authorization_bearer(&ctx),
+        ExtractedCredential::InvalidFormat(body)
+            if body == r#"{"error":"Invalid Authorization header"}"#
+    ));
+}
+
+#[test]
+fn token_extract_non_materialized_custom_header_is_invalid_not_missing() {
+    let ctx =
+        super::plugin_utils::context_with_materialized_raw_header("X-Token", "value\u{3000}token");
+    let location = TokenLocation::Header(TokenHeaderLocation {
+        name: "x-token".to_string(),
+        prefix: None,
+    });
+    assert!(matches!(
+        extract_from_location(&location, &ctx),
+        TokenLocationExtract::Credential(ExtractedCredential::InvalidFormat(body))
+            if body == r#"{"error":"Invalid token"}"#
+    ));
+}
+
 // --- H1/H2/H3 parity.
 //
 // H1/H2 call `materialize_query_params` (percent-decoded) while H3 calls

@@ -302,4 +302,4 @@ Persistent changes should be made in the spec's `x-ferrum-validate` block and ap
 
 Emergency changes can be made directly to the generated plugin row with `PUT /plugins/config/{id}`. This is intentionally ephemeral: the next spec `PUT` regenerates the spec-owned plugin and replaces direct edits. Use it for incident response, then backport the change into the spec.
 
-Directly created `openapi_validator` plugins are accepted only when `scope` is `proxy` and the referenced proxy has an attached `api_spec_id`. This prevents the validator from drifting away from the contract it is enforcing.
+Through the Admin API (database and CP modes), directly created `openapi_validator` plugin rows are accepted only when `scope` is `proxy` and the referenced proxy has an attached `api_spec_id`. That ties hand-maintained validators to a published spec so they cannot drift from the importer-owned contract. File-mode YAML has no `api_spec` resource: a proxy-scoped validator with hand-authored `operations` is admitted at config validation and does not require `api_spec_id` on the proxy.

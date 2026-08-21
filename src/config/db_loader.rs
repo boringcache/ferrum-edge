@@ -460,6 +460,25 @@ fn mesh_route_dispatch_referenced_upstream(
         .map(ToOwned::to_owned)
 }
 
+/// `access_control.allowed_consumers` names gateway Consumer usernames
+/// (byte-for-byte). A delete must refuse while any plugin config in the
+/// namespace still authorizes that username; the operator's policy is not
+/// rewritten.
+fn access_control_plugin_allows_consumer(plugin: &PluginConfig, username: &str) -> bool {
+    if plugin.plugin_name != "access_control" {
+        return false;
+    }
+    plugin
+        .config
+        .get("allowed_consumers")
+        .and_then(|value| value.as_array())
+        .is_some_and(|consumers| {
+            consumers
+                .iter()
+                .any(|entry| entry.as_str() == Some(username))
+        })
+}
+
 fn upstream_backend_tls_san_allow_list_json(
     upstream: &Upstream,
 ) -> Result<Option<String>, anyhow::Error> {
@@ -3839,16 +3858,29 @@ impl DatabaseStore {
             .await?;
         // Scope the existence check to the caller's namespace (issue #2122):
         // consumer ids are only unique per namespace.
-        let existing: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT id FROM consumers WHERE id = ? AND namespace = ?"))
-                .bind(id)
-                .bind(namespace)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if existing.is_none() {
+        let existing: Option<AnyRow> = sqlx::query(
+            &self.q("SELECT id, username FROM consumers WHERE id = ? AND namespace = ?"),
+        )
+        .bind(id)
+        .bind(namespace)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(existing) = existing else {
             tx.rollback().await?;
             self.check_slow_query("delete_consumer", start);
             return Ok(false);
+        };
+        let username: String = existing.try_get("username")?;
+        if let Some(plugin) = self
+            .find_access_control_consumer_ref_tx(&mut tx, namespace, &username)
+            .await?
+        {
+            tx.rollback().await?;
+            anyhow::bail!(
+                "Consumer {} is referenced by access_control plugin_config '{}' and cannot be deleted",
+                id,
+                plugin.id
+            );
         }
         // The FK cascade on both index tables covers these deletes; keep them
         // explicit for defense in depth (mirrors delete_all_resources).
@@ -5013,6 +5045,29 @@ impl DatabaseStore {
             plugin.namespace == namespace
                 && mesh_route_dispatch_references_upstream_id(plugin, upstream_id)
         }))
+    }
+
+    async fn find_access_control_consumer_ref_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        username: &str,
+    ) -> Result<Option<PluginConfig>, anyhow::Error> {
+        let rows: Vec<AnyRow> = sqlx::query(
+            &self.q("SELECT * FROM plugin_configs WHERE plugin_name = ? AND namespace = ?"),
+        )
+        .bind("access_control")
+        .bind(namespace)
+        .fetch_all(&mut **tx)
+        .await?;
+
+        for row in &rows {
+            let plugin = row_to_plugin_config(row)?;
+            if access_control_plugin_allows_consumer(&plugin, username) {
+                return Ok(Some(plugin));
+            }
+        }
+        Ok(None)
     }
 
     /// Delete an upstream only if it is not referenced by any proxy.
