@@ -7,10 +7,12 @@
 //!   cargo test --test functional_tests -- --ignored functional_cli
 
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::time::sleep;
+
+use crate::scaffolding::ports::{reserve_port, reserve_port_pair};
 
 fn binary_path() -> &'static str {
     if std::path::Path::new("./target/debug/ferrum-edge").exists() {
@@ -1916,6 +1918,8 @@ async fn functional_cli_reload_sends_sighup() {
 #[tokio::test]
 async fn functional_cli_smart_path_discovery_from_cwd() {
     const MAX_ATTEMPTS: u32 = 3;
+    const ROUTE_POLL_DEADLINE: Duration = Duration::from_secs(5);
+    const ROUTE_POLL_INTERVAL: Duration = Duration::from_millis(100);
     let binary = binary_abs_path();
 
     let mut last_err = String::new();
@@ -1923,12 +1927,15 @@ async fn functional_cli_smart_path_discovery_from_cwd() {
         // Each attempt gets its own temp dir + fresh ports so failures don't
         // contaminate the next try.
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
-        let proxy_port = ephemeral_port().await;
-        let admin_port = ephemeral_port().await;
+        let (proxy_reservation, admin_reservation) =
+            reserve_port_pair().await.expect("reserve gateway ports");
+        let proxy_port_conf = proxy_reservation.port;
+        let admin_port_conf = admin_reservation.port;
 
         // Backend echo server on a held listener (no port race for the echo).
-        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let echo_port = echo_listener.local_addr().unwrap().port();
+        let echo_reservation = reserve_port().await.expect("reserve echo port");
+        let echo_port = echo_reservation.port;
+        let echo_listener = echo_reservation.into_listener();
         let echo_server = tokio::spawn(async move {
             loop {
                 if let Ok((mut stream, _)) = echo_listener.accept().await {
@@ -1948,13 +1955,12 @@ async fn functional_cli_smart_path_discovery_from_cwd() {
                 }
             }
         });
-        sleep(Duration::from_millis(150)).await;
 
         // ferrum.conf drives ports + mode. Put it in the CWD root so the
         // `./ferrum.conf` smart-path entry wins.
         let conf = format!(
             "FERRUM_MODE = file\nFERRUM_PROXY_HTTP_PORT = {}\nFERRUM_ADMIN_HTTP_PORT = {}\n",
-            proxy_port, admin_port
+            proxy_port_conf, admin_port_conf
         );
         std::fs::write(temp_dir.path().join("ferrum.conf"), conf).unwrap();
 
@@ -1974,6 +1980,10 @@ plugin_configs: []
         );
         std::fs::write(temp_dir.path().join("resources.yaml"), spec).unwrap();
 
+        // Release gateway ports immediately before spawn so the subprocess can bind.
+        let proxy_port = proxy_reservation.drop_and_take_port();
+        let admin_port = admin_reservation.drop_and_take_port();
+
         // IMPORTANT: spawn with current_dir() set AND no FERRUM_* env vars
         // for config paths / mode. We also clear inherited vars that would
         // short-circuit the smart-path search.
@@ -1990,35 +2000,41 @@ plugin_configs: []
             .stderr(Stdio::null());
         let mut child = cmd.spawn().expect("Failed to spawn ferrum-edge");
 
-        if wait_for_health(admin_port).await {
-            // Verify proxy routes through.
+        let health_ok = wait_for_health(admin_port).await;
+        let mut route_ok = false;
+        if health_ok {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(3))
                 .build()
                 .unwrap();
             let url = format!("http://127.0.0.1:{}/sp/anything", proxy_port);
-            let resp = client.get(&url).send().await;
-            let route_ok = matches!(resp, Ok(r) if r.status().is_success());
+            let route_deadline = Instant::now() + ROUTE_POLL_DEADLINE;
+            while Instant::now() < route_deadline {
+                if matches!(client.get(&url).send().await, Ok(r) if r.status().is_success()) {
+                    route_ok = true;
+                    break;
+                }
+                sleep(ROUTE_POLL_INTERVAL).await;
+            }
+        }
 
-            // Cleanup regardless.
-            kill_child(child);
-            echo_server.abort();
+        kill_child(child);
+        echo_server.abort();
 
-            assert!(
-                route_ok,
-                "Smart-path gateway started but proxy routing failed"
-            );
+        if health_ok && route_ok {
             return;
         }
 
         last_err = format!(
-            "attempt {}/{} failed (proxy={}, admin={})",
-            attempt, MAX_ATTEMPTS, proxy_port, admin_port
+            "attempt {}/{} failed (proxy={}, admin={}, health={}, route={})",
+            attempt,
+            MAX_ATTEMPTS,
+            proxy_port,
+            admin_port,
+            health_ok,
+            route_ok
         );
         eprintln!("{}", last_err);
-        let _ = child.kill();
-        let _ = child.wait();
-        echo_server.abort();
         if attempt < MAX_ATTEMPTS {
             sleep(Duration::from_secs(1)).await;
         }
