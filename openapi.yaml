@@ -19060,9 +19060,11 @@ components:
         Plugin: hmac_auth — Ferrum-specific versioned HMAC authorization with
         mandatory request-body integrity protection. RFC 9530 defines
         Content-Digest; this is not RFC 9421 HTTP Message Signatures. Requests
-        must include Digest or Content-Digest matching the original body.
-        The signing base's FIRST field is the profile version, so a signature
-        produced under one profile can never verify under another.
+        must include exactly one of Digest or Content-Digest matching the
+        original body. Sending both headers is refused as ambiguous;
+        unsupported algorithms and malformed members fail closed. The signing
+        base's FIRST field is the profile version, so a signature produced
+        under one profile can never verify under another.
         `ferrum-hmac-v2` (the default) signs the profile version, matched proxy
         namespace, credential identity, normalized authority, method, raw path,
         raw query, Date, literal digest value, and a mandatory client nonce, and

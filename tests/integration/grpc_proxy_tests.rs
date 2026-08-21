@@ -2093,6 +2093,154 @@ async fn hmac_auth_reuses_prebuffered_native_grpc_body_for_primary_dispatch() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambiguous_headers() {
+    let (backend_addr, _backend_handle) = start_mock_grpc_backend().await;
+    let mut proxy = create_grpc_proxy("grpc-hmac-cd", "/grpc-hmac-cd", backend_addr.port());
+    attach_test_plugin(&mut proxy, "grpc-hmac-cd-auth");
+
+    let secret = "0123456789abcdef0123456789abcdef";
+    let consumer = Consumer {
+        id: "grpc-hmac-cd-consumer".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        username: "grpc-hmac-cd-user".to_string(),
+        custom_id: None,
+        credentials: HashMap::from([(
+            "hmac_auth".to_string(),
+            serde_json::json!([{ "secret": secret }]),
+        )]),
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let plugin = test_plugin_config(
+        "grpc-hmac-cd-auth",
+        "hmac_auth",
+        "grpc-hmac-cd",
+        serde_json::json!({
+            "signing_profile": "ferrum-hmac-v1",
+            "allow_unsafe_replayable_v1": true
+        }),
+    );
+    let state = create_test_proxy_state_with_plugins_upstreams_and_consumers(
+        vec![proxy],
+        vec![plugin],
+        Vec::new(),
+        vec![consumer],
+    );
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    let path = "/grpc-hmac-cd/my.Service/Echo";
+    let grpc_message = b"\x00\x00\x00\x00\x0bsigned body";
+    let date = Utc::now().to_rfc2822();
+    let digest = crate::common::content_digest_sha256_header(grpc_message);
+    let signature = crate::common::generate_hmac_signature_with_digest(
+        "POST",
+        path,
+        &date,
+        "grpc-hmac-cd-user",
+        &gateway_addr.to_string(),
+        secret,
+        &digest,
+    );
+    let authorization = format!(
+        "hmac username=\"grpc-hmac-cd-user\", algorithm=\"hmac-sha256\", signature=\"{signature}\""
+    );
+
+    let (status, headers, body) = send_grpc_request_with_authority(
+        gateway_addr,
+        path,
+        grpc_message,
+        &[
+            ("date", date.as_str()),
+            ("content-digest", digest.as_str()),
+            ("authorization", authorization.as_str()),
+        ],
+    )
+    .await
+    .expect("RFC 9530 Content-Digest gRPC request should reach the backend");
+
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("0"));
+    assert_eq!(body, grpc_message);
+
+    let empty_body: &[u8] = b"";
+    let empty_date = Utc::now().to_rfc2822();
+    let empty_digest = crate::common::content_digest_sha256_header(empty_body);
+    let empty_signature = crate::common::generate_hmac_signature_with_digest(
+        "POST",
+        path,
+        &empty_date,
+        "grpc-hmac-cd-user",
+        &gateway_addr.to_string(),
+        secret,
+        &empty_digest,
+    );
+    let empty_authorization = format!(
+        "hmac username=\"grpc-hmac-cd-user\", algorithm=\"hmac-sha256\", signature=\"{empty_signature}\""
+    );
+    let (empty_status, empty_headers, empty_response) = send_grpc_request_with_authority(
+        gateway_addr,
+        path,
+        empty_body,
+        &[
+            ("date", empty_date.as_str()),
+            ("content-digest", empty_digest.as_str()),
+            ("authorization", empty_authorization.as_str()),
+        ],
+    )
+    .await
+    .expect("empty-body Content-Digest gRPC request should complete");
+    assert_eq!(empty_status, 200);
+    assert_eq!(
+        empty_headers.get("grpc-status").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(empty_response, empty_body);
+
+    let legacy = crate::common::empty_digest_header();
+    let ambiguous_date = Utc::now().to_rfc2822();
+    let ambiguous_signature = crate::common::generate_hmac_signature_with_digest(
+        "POST",
+        path,
+        &ambiguous_date,
+        "grpc-hmac-cd-user",
+        &gateway_addr.to_string(),
+        secret,
+        digest.as_str(),
+    );
+    let ambiguous_authorization = format!(
+        "hmac username=\"grpc-hmac-cd-user\", algorithm=\"hmac-sha256\", signature=\"{ambiguous_signature}\""
+    );
+    let (ambiguous_status, ambiguous_headers, _) = send_grpc_request_with_authority(
+        gateway_addr,
+        path,
+        grpc_message,
+        &[
+            ("date", ambiguous_date.as_str()),
+            ("content-digest", digest.as_str()),
+            ("digest", legacy.as_str()),
+            ("authorization", ambiguous_authorization.as_str()),
+        ],
+    )
+    .await
+    .expect("ambiguous digest headers should complete as a rejection");
+    // A plugin reject on an `application/grpc` request is normalized to a
+    // trailers-only gRPC error, NOT an HTTP 401: the transport status stays
+    // 200 and the refusal is carried in `grpc-status`. Assert the trailer,
+    // which also proves the reject reached the client as a well-formed gRPC
+    // error rather than merely "not a success".
+    assert_eq!(
+        ambiguous_status, 200,
+        "gRPC rejections are trailers-only; the HTTP status stays 200"
+    );
+    assert_eq!(
+        ambiguous_headers.get("grpc-status").map(String::as_str),
+        Some("16"),
+        "sending both Digest and Content-Digest must fail closed as UNAUTHENTICATED"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn request_mirror_failure_does_not_block_prebuffered_native_grpc_primary() {
     let (backend_addr, _backend_handle) = start_mock_grpc_backend().await;
     let mut proxy = create_grpc_proxy("grpc-mirror", "/grpc-mirror", backend_addr.port());

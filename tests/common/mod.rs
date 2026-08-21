@@ -87,7 +87,7 @@ pub use gateway_harness::{
     scrub_gateway_capture_for_diagnostics, shutdown_gateway_child,
 };
 pub use hmac_helpers::{
-    HmacV2Request, empty_digest_header, generate_hmac_signature,
+    HmacV2Request, content_digest_sha256_header, empty_digest_header, generate_hmac_signature,
     generate_hmac_signature_with_digest, generate_hmac_signature_with_query,
     hmac_authority_from_url, hmac_v2_authorization_header, hmac_v2_nonce,
 };
