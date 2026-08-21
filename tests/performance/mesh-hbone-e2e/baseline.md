@@ -5,28 +5,46 @@ GitHub-hosted runner class and are not universal product targets. Prefer the
 same-run overhead percent (and self-relative CI guardrails elsewhere) over raw
 RPS when interpreting regressions.
 
-> **Publication status (issue #3332):** every result cell remains `_TBD_` until
-> a hosted `Mesh Performance Baselines` run completes with zero errors across
-> ≥3 clean repetitions and those aggregates are copied here. Local laptop runs
-> must not be published as baselines.
+> **Publication status (issue #3332):** Published 2026-08-20 from hosted
+> collection at Ferrum SHA `5c3a58cd5fc1083911796621d5f2cd0237946c09`
+> ([Actions run 31820671032](https://github.com/ferrum-edge/ferrum-edge/actions/runs/31820671032),
+> artifact
+> `mesh-performance-baselines-5c3a58cd5fc1083911796621d5f2cd0237946c09`).
+> Published evidence used here: **HBONE E2E** (`hbone_complete=true`, `hbone_errors_ok=true`,
+> 3 clean repetitions per scenario, all `total_errors=0`, `runner_health_ok=true`,
+> max CPU steal 0.0%). The same run's DNS portion failed acceptance and was
+> not published; its aggregate `ready_to_publish_baselines=false` reflects that
+> DNS gap, not HBONE invalidity. DNS baselines live in
+> `tests/performance/mesh-dns-e2e/baseline.md` from a separate DNS-only
+> collection. See combined provenance in `tests/performance/mesh/baseline.md`.
 
 ## Test environment
 
 | Field | Value |
 |---|---|
-| CPU | _TBD_ |
-| RAM | _TBD_ |
-| OS / kernel | _TBD_ |
-| Architecture | _TBD_ |
-| Ferrum Edge revision | _TBD_ |
+| CPU | AMD EPYC 9V74 80-Core Processor; 4 vCPU (2 cores × 2 threads × 1 socket) |
+| RAM | 15.61 GiB |
+| OS / kernel | Linux 6.17.0-1022-azure (Ubuntu 24.04 runner image) |
+| Architecture | x86_64 |
+| Ferrum Edge revision | `5c3a58cd5fc1083911796621d5f2cd0237946c09` |
+| Collected at (UTC) | 2026-08-14T16:44:57Z |
 | Runner class | `ubuntu-24.04` (GitHub-hosted Linux; pinned) |
-| Rust / harness versions | from artifact `provenance.json` |
+| Rust / harness versions | rustc 1.97.1; cargo 1.97.1; `mesh-hbone-e2e-perf`; hdrhistogram 7.5.4 |
 | Build profile | `--release` |
 | Feature flags | default (no `--features`) |
 | Non-default Ferrum/env settings | harness `run.sh` trusted-projection fixture (`hbone_perf_fixture`) + generated SVID/trust-bundle paths; `FERRUM_BACKEND_ALLOW_IPS=private` |
-| Warmup / repetitions | steady-state loadgen after gateway ready; **≥3 clean repetitions** per row |
+| Warmup / repetitions | steady-state loadgen after gateway ready; **3 clean repetitions** per row |
 | Commands | see below |
-| Raw artifacts | `mesh-performance-baselines-<sha>` → `hbone/**/run_*.txt` + `summary.json` |
+| Runner health | max CPU steal 0.0% (pre-collection + per-run workload-interval deltas) |
+| Raw artifacts | [run 31820671032](https://github.com/ferrum-edge/ferrum-edge/actions/runs/31820671032) → `hbone/**/run_*.txt`, `summary.json`, `provenance.json` |
+
+## Aggregation semantics
+
+Published RPS and latency quantiles are **arithmetic means across the three
+clean repetitions** per scenario. Run-to-run RPS ranges are listed in the Notes
+column. Latency p50/p95/p99 are means of per-run hdrhistogram quantiles and are
+not inputs to the overhead percent. All retained repetitions had
+`total_errors=0`.
 
 ## Overhead formula
 
@@ -55,22 +73,28 @@ cd tests/performance/mesh-hbone-e2e
 
 | Path              | RPS    | p50    | p95    | p99    | Overhead vs direct |
 |-------------------|--------|--------|--------|--------|--------------------|
-| Direct baseline   | _TBD_  | _TBD_  | _TBD_  | _TBD_  | —                  |
-| Gateway + HBONE   | _TBD_  | _TBD_  | _TBD_  | _TBD_  | _TBD_ %            |
+| Direct baseline   | 96,109 | 492 µs | 873 µs | 1.08 ms | —                  |
+| Gateway + HBONE   | 8,477  | 5.79 ms | 8.11 ms | 9.35 ms | 91.2 %             |
+
+Notes: direct RPS range 95,753–96,641; gateway RPS range 8,344–8,573.
 
 ## 16 KiB payload, concurrency 50, 30 s
 
 | Path              | RPS    | p50    | p95    | p99    | Overhead vs direct |
 |-------------------|--------|--------|--------|--------|--------------------|
-| Direct baseline   | _TBD_  | _TBD_  | _TBD_  | _TBD_  | —                  |
-| Gateway + HBONE   | _TBD_  | _TBD_  | _TBD_  | _TBD_  | _TBD_ %            |
+| Direct baseline   | 74,449 | 626 µs | 1.16 ms | 1.49 ms | —                  |
+| Gateway + HBONE   | 4,496  | 10.40 ms | 15.16 ms | 17.55 ms | 94.0 %             |
+
+Notes: direct RPS range 73,562–75,686; gateway RPS range 4,474–4,538.
 
 ## 256 KiB payload, concurrency 100, 60 s
 
 | Path              | RPS    | p50    | p95    | p99    | Overhead vs direct |
 |-------------------|--------|--------|--------|--------|--------------------|
-| Direct baseline   | _TBD_  | _TBD_  | _TBD_  | _TBD_  | —                  |
-| Gateway + HBONE   | _TBD_  | _TBD_  | _TBD_  | _TBD_  | _TBD_ %            |
+| Direct baseline   | 14,019 | 6.81 ms | 11.72 ms | 14.53 ms | —                  |
+| Gateway + HBONE   | 573    | 173.01 ms | 206.38 ms | 222.12 ms | 95.9 %             |
+
+Notes: direct RPS range 13,971–14,107; gateway RPS range 572–574.
 
 ## Rerun procedure
 
@@ -87,6 +111,11 @@ cd tests/performance/mesh-hbone-e2e
 7. Publish mean RPS / latency across remaining clean runs and the overhead percent
    from the formula above.
 8. Attach or link the raw `hbone/**/run_*.txt` JSON blobs from the artifact.
+
+When combining with mesh and DNS baseline refreshes, treat each suite's
+acceptance gate independently; an all-suite run whose aggregate
+`ready_to_publish_baselines` is false because DNS failed does not invalidate
+accepted HBONE rows from the same artifact.
 
 ## Bottleneck review
 

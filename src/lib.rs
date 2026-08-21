@@ -7736,6 +7736,9 @@ pub mod _test_support {
     /// tie expire rather than accepting a ready success. `Err(())` means
     /// the bound fired without polling a ready future; `Ok` is completion.
     /// Ownership is not decided here.
+    // This test-only facade intentionally preserves the unit error contract of
+    // the shared expiry-first primitive so external tests exercise it directly.
+    #[allow(clippy::result_unit_err)]
     pub async fn await_deadline_first_for_test<F, T>(
         deadline: Option<tokio::time::Instant>,
         future: F,

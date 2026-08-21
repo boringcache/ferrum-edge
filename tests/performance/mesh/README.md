@@ -60,7 +60,7 @@ Criterion writes:
 
 `run.sh` does NOT clean `target/` so results accumulate across runs — `cargo criterion baseline` semantics work as documented in the criterion book.
 
-A coarse one-shot baseline taken on the author's machine is checked in at [`baseline.md`](./baseline.md). It is **directional**, not authoritative — operator-specific hardware will see different numbers.
+A provenance-tagged baseline collected on a pinned GitHub-hosted runner is checked in at [`baseline.md`](./baseline.md). It is **directional**, not authoritative — operator-specific hardware will see different numbers.
 
 ## Architecture decisions recorded
 
@@ -75,5 +75,5 @@ Add a new bench:
 1. Create `benches/<name>.rs` exporting `criterion_main!(benches)`.
 2. Add `[[bench]] name = "<name>" harness = false` to `Cargo.toml`.
 3. Document it in this README's table.
-4. Capture a baseline number into `baseline.md` (hosted CI may leave a new row
-   as `_TBD_` until a provenance-complete reference run is selected).
+4. Capture a provenance-complete reference number in `baseline.md`; do not
+   publish placeholder rows as baseline results.
