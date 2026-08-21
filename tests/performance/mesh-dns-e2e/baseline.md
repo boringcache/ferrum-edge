@@ -4,27 +4,42 @@
 are not universal product targets. Use same-run direct-stub comparisons and
 self-relative trends; do not promote opportunistic laptop numbers into CI floors.
 
-> **Publication status (issue #3332):** UDP/TCP gateway and direct-stub cells
-> remain `_TBD_` until a hosted `Mesh Performance Baselines` workflow run yields
-> ≥3 clean zero-error repetitions and those aggregates are copied here. The
-> deterministic upstream stub must serve DNS-over-TCP (RFC 1035 §4.2.2) on the
-> same listen address as UDP; a UDP-only stub is not a publishable `--protocol
-> both` collection. Harness executables fail closed on zero-success or
-> errorful rows, and the workflow acceptance gate remains fail-closed.
+> **Publication status (issue #3332):** Published 2026-08-20 from a **DNS-only**
+> hosted collection at Ferrum SHA `a7921ea2176360c7812da6d2c2dff356ad99f5d8`
+> ([Actions run 31917782760](https://github.com/ferrum-edge/ferrum-edge/actions/runs/31917782760),
+> artifact
+> `mesh-performance-baselines-a7921ea2176360c7812da6d2c2dff356ad99f5d8`).
+> Selected suite: **DNS E2E only** (`dns_complete=true`, `dns_errors_ok=true`,
+> 3 clean repetitions, all `total_errors=0` and `total_nxdomain=0`,
+> `runner_health_ok=true`, max CPU steal 0.0%). This run intentionally selected
+> `suites=dns`, so `mesh_complete` / `hbone_complete` and aggregate
+> `ready_to_publish_baselines=false` are false by selection — they do **not**
+> invalidate the accepted DNS suite. Mesh Criterion and HBONE baselines come
+> from an earlier all-suite collection (see combined provenance in
+> `tests/performance/mesh/baseline.md`); that run's failed DNS portion must not
+> be used as DNS evidence.
 
-## Reference environment (filled from hosted provenance)
+## Reference environment (DNS-only collection)
 
 | Field | Value |
 |---|---|
-| Ferrum commit SHA | _TBD_ |
+| Ferrum commit SHA | `a7921ea2176360c7812da6d2c2dff356ad99f5d8` |
+| Collected at (UTC) | 2026-08-16T00:41:30Z |
 | Runner class | `ubuntu-24.04` (GitHub-hosted Linux; pinned) |
-| CPU / RAM / OS / kernel / arch | _TBD_ (see `provenance.json`) |
-| Rust / harness versions | from artifact provenance |
+| CPU / RAM / OS / kernel / arch | AMD EPYC 9V74 80-Core Processor; 4 vCPU (2×2×1); 15.61 GiB; Linux 6.17.0-1022-azure / x86_64 |
+| Rust / harness versions | rustc 1.97.1; cargo 1.97.1; `mesh-dns-e2e-perf`; hdrhistogram 7.5.4 |
 | Build profile / features | `--release`, default features |
 | Non-default settings | `run.sh` mesh-mode DNS env (`FERRUM_MESH_DNS_*`, stub CP/upstream); benchmark-only `FERRUM_MESH_ALLOW_NO_CA=true` in `start_gateway()` (no gateway SVID/CA — production mesh must provide identity) |
-| Warmup / repetitions | listener ready then loadgen; **≥3 clean repetitions** |
+| Warmup / repetitions | listener ready then loadgen; **3 clean repetitions** |
 | Command | `./run.sh --skip-build --json --duration 60 --concurrency 100 --protocol both` |
-| Raw artifacts | `mesh-performance-baselines-<sha>` → `dns/run_*.txt` + `summary.json` |
+| Runner health | max CPU steal 0.0% (pre-collection + per-run workload-interval deltas) |
+| Raw artifacts | [run 31917782760](https://github.com/ferrum-edge/ferrum-edge/actions/runs/31917782760) → `dns/run_*.txt`, `summary.json`, `provenance.json` |
+
+## Aggregation semantics
+
+Published QPS and latency quantiles are **arithmetic means across the three
+clean repetitions**. Run-to-run QPS ranges appear in table Notes where useful.
+All retained repetitions had `total_errors=0` and `total_nxdomain=0`.
 
 ## Overhead formula
 
@@ -39,6 +54,13 @@ table, so those rows are absolute gateway measurements (no direct baseline).
 
 Latency p50/p90/p99 are means across clean repetitions and are not folded into
 the overhead percent.
+
+### Upstream-forward overhead (published)
+
+| Transport | Gateway QPS (mean) | Direct stub QPS (mean) | Overhead |
+|---|---:|---:|---:|
+| UDP | 35,098 | 101,244 | 65.3 % |
+| TCP | 4,609 | 14,007 | 67.1 % |
 
 ## Commands
 
@@ -59,17 +81,17 @@ UDP transport:
 
 | Name class | qps | p50 | p90 | p99 | Notes |
 |---|---|---|---|---|---|
-| mesh-internal | _TBD_ | _TBD_ | _TBD_ | _TBD_ | exact `DnsResolutionTable.exact` hit |
-| mesh-wildcard | _TBD_ | _TBD_ | _TBD_ | _TBD_ | one-label wildcard suffix match |
-| upstream-forward | _TBD_ | _TBD_ | _TBD_ | _TBD_ | UDP forward to `dns_upstream_stub` |
+| mesh-internal | 35,097 | 584 µs | 1.01 ms | 1.45 ms | exact `DnsResolutionTable.exact` hit; QPS range 34,535–35,945 |
+| mesh-wildcard | 35,098 | 549 µs | 971 µs | 1.40 ms | one-label wildcard suffix match; QPS range 34,535–35,946 |
+| upstream-forward | 35,098 | 1.59 ms | 2.43 ms | 3.38 ms | UDP forward to `dns_upstream_stub`; QPS range 34,536–35,947 |
 
 TCP transport (RFC 1035 §4.2.2 length-framed):
 
 | Name class | qps | p50 | p90 | p99 | Notes |
 |---|---|---|---|---|---|
-| mesh-internal | _TBD_ | _TBD_ | _TBD_ | _TBD_ | |
-| mesh-wildcard | _TBD_ | _TBD_ | _TBD_ | _TBD_ | |
-| upstream-forward | _TBD_ | _TBD_ | _TBD_ | _TBD_ | TCP forward to `dns_upstream_stub` |
+| mesh-internal | 4,609 | 4.64 ms | 9.98 ms | 28.94 ms | QPS range 4,589–4,625 |
+| mesh-wildcard | 4,610 | 4.66 ms | 10.00 ms | 29.34 ms | QPS range 4,589–4,625 |
+| upstream-forward | 4,609 | 8.55 ms | 13.78 ms | 29.43 ms | TCP forward to `dns_upstream_stub`; QPS range 4,589–4,625 |
 
 ## Direct baseline (dns_upstream_stub)
 
@@ -77,8 +99,10 @@ Only the upstream-forward class is meaningful here (mesh-internal / mesh-wildcar
 
 | Class | Transport | qps | p50 | p90 | p99 |
 |---|---|---|---|---|---|
-| upstream-forward | UDP | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
-| upstream-forward | TCP | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| upstream-forward | UDP | 101,244 | 1.02 ms | 1.34 ms | 1.79 ms |
+| upstream-forward | TCP | 14,007 | 4.63 ms | 11.49 ms | 57.76 ms |
+
+Direct stub QPS ranges: UDP 100,933–101,497; TCP 13,947–14,050.
 
 ## Rerun procedure
 
@@ -96,11 +120,16 @@ Only the upstream-forward class is meaningful here (mesh-internal / mesh-wildcar
    `total_errors`; partial NXDOMAIN across a class/repetition and all-NXDOMAIN
    collections both fail `dns_errors_ok`.
 6. Publish mean qps/latency into the tables and record upstream-forward overhead
-   with the formula above.
+   with the formula above (UDP and TCP separately).
 7. Link the artifact paths for raw JSON blobs.
 8. To isolate EDNS(0) OPT-echo / UDP payload-size bottlenecks, rerun the harness
    with `--edns 1232` (or another 512..=4096 size). That option is available on
    `run.sh` but is not the hosted publication default (`--edns 0`).
+
+The upstream stub must serve DNS-over-TCP on the same listen address as UDP.
+A UDP-only stub makes `--protocol both` TCP rows connection-refused and fails
+`dns_errors_ok`. Prefer a DNS-only hosted run after stub repairs rather than
+publishing partial rows from a failed all-suite collection.
 
 ## Bottleneck review
 
