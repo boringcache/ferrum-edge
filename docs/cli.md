@@ -242,7 +242,9 @@ ferrum-edge reload --pid 42195
 
 ### PID Auto-Detection
 
-When `--pid` is omitted, the CLI uses `pgrep -x ferrum-edge` to find running processes, then excludes its own PID before selecting a target. A single other `ferrum-edge` process is reloaded automatically. If none remain after excluding self, it reports that no gateway was found. If multiple other instances remain, it reports their PIDs and asks you to specify one with `--pid`. Explicit `--pid` bypasses auto-detection entirely.
+When `--pid` is omitted, the CLI uses `pgrep -x ferrum-edge` to find running processes, then excludes its own PID before selecting a target. A single other `ferrum-edge` process is reloaded automatically. If none remain after excluding self, it reports that no gateway was found. If multiple other instances remain, it reports their PIDs and asks you to specify one with `--pid`. Explicit `--pid` bypasses auto-detection entirely. There is no PID file.
+
+`--pid 0` is rejected before signalling: POSIX `kill` would treat `0` as this process group, not a gateway. The CLI also refuses to signal its own PID. Other explicit PIDs are passed to `kill(SIGHUP)` without a prior identity probe (PID reuse would make that check racy).
 
 ## health
 
