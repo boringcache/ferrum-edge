@@ -20,6 +20,7 @@ use crate::consumer_index::ConsumerIndex;
 
 use super::RequestContext;
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
+use super::utils::header_extract::{ConfiguredUtf8HeaderLookup, lookup_configured_header_utf8};
 use super::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX;
 
 const INVALID_API_KEY_FORMAT_BODY: &str = r#"{"error":"Invalid API key format"}"#;
@@ -145,66 +146,31 @@ impl KeyAuth {
 
     fn extract_key_credential(&self, ctx: &RequestContext) -> HeaderCredentialExtract {
         if let Some(ref lower) = self.header_name_lower {
-            extract_configured_header_key(ctx, lower.as_str(), self.header_name_original.as_deref())
+            let original = self.header_name_original.as_deref();
+            let lookup = lookup_configured_header_utf8(ctx, lower.as_str(), original);
+            utf8_header_lookup_to_extract(lookup)
         } else if let Some(ref param) = self.query_param_name {
             match ctx.query_params.get(param.as_str()) {
                 Some(key) => HeaderCredentialExtract::Present(key.clone()),
                 None => HeaderCredentialExtract::Missing,
             }
         } else {
-            extract_configured_header_key(ctx, "x-api-key", Some("X-API-Key"))
+            let lookup = lookup_configured_header_utf8(ctx, "x-api-key", Some("X-API-Key"));
+            utf8_header_lookup_to_extract(lookup)
         }
     }
 }
 
-/// Read a configured header credential from retained raw field lines when they
-/// are available, falling back to the materialized map for synthetic contexts.
-/// Raw bytes are authoritative because `materialize_headers()` can keep one
-/// ASCII field line while omitting a repeated non-ASCII or malformed line.
-fn extract_configured_header_key(
-    ctx: &RequestContext,
-    lower: &str,
-    original: Option<&str>,
+fn utf8_header_lookup_to_extract(
+    lookup: ConfiguredUtf8HeaderLookup<'_>,
 ) -> HeaderCredentialExtract {
-    if ctx.has_raw_headers() {
-        for name in [Some(lower), original] {
-            let Some(name) = name else {
-                continue;
-            };
-            if let Some(extracted) = extract_raw_header_field_lines(ctx, name) {
-                return extracted;
-            }
+    match lookup {
+        ConfiguredUtf8HeaderLookup::Value(key) => {
+            HeaderCredentialExtract::Present(key.into_owned())
         }
+        ConfiguredUtf8HeaderLookup::Absent => HeaderCredentialExtract::Missing,
+        ConfiguredUtf8HeaderLookup::InvalidUtf8 => HeaderCredentialExtract::InvalidFormat,
     }
-
-    if let Some(value) = ctx
-        .headers
-        .get(lower)
-        .or_else(|| original.and_then(|orig| ctx.headers.get(orig)))
-    {
-        return HeaderCredentialExtract::Present(value.clone());
-    }
-    HeaderCredentialExtract::Missing
-}
-
-fn extract_raw_header_field_lines(
-    ctx: &RequestContext,
-    name: &str,
-) -> Option<HeaderCredentialExtract> {
-    let separator = super::repeated_request_header_separator(name);
-    let mut out = String::new();
-    let mut found = false;
-    for (idx, bytes) in ctx.raw_header_value_bytes(name).enumerate() {
-        found = true;
-        if idx > 0 {
-            out.push_str(separator);
-        }
-        let Ok(value) = std::str::from_utf8(bytes) else {
-            return Some(HeaderCredentialExtract::InvalidFormat);
-        };
-        out.push_str(value);
-    }
-    found.then_some(HeaderCredentialExtract::Present(out))
 }
 
 #[async_trait]
