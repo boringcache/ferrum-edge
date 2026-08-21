@@ -1998,7 +1998,7 @@ plugin_configs: []
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = cmd.spawn().expect("Failed to spawn ferrum-edge");
+        let child = cmd.spawn().expect("Failed to spawn ferrum-edge");
 
         let health_ok = wait_for_health(admin_port).await;
         let mut route_ok = false;
