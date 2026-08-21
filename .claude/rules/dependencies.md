@@ -113,9 +113,10 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   for #3889, retired by #3943; re-armed for #3950 and spent when #3950 landed)
   is **re-armed for exactly one transition**: the issue #4018 FIPS
   test-binary memory mitigation, pair
-  `17bfb40f…e5e9e1` → `6bb669ab…7dfa84` (`CARGO_BUILD_JOBS=3`,
-  `line-tables-only` on the `dev` AND `test` profiles, and a best-effort swap
-  enlargement on `fips-test-build`; recompute if the workflow bytes change).
+  `17bfb40f…e5e9e1` → `7d995d79…2ca401` (`CARGO_BUILD_JOBS=3`,
+  `line-tables-only` on the `dev` AND `test` profiles, and a best-effort
+  additive Ferrum-owned swapfile on `fips-test-build`; recompute if the
+  workflow bytes change).
   One-way, retire again once the mitigation lands. Every other
   `fips-build.yml` edit is compared by the normal fail-closed Cross surface
   scan. See `docs/ci_cd.md` → "Admitted `fips-build.yml` generation

@@ -1468,6 +1468,35 @@ pub mod _test_support {
         crate::proxy::http_backend_failure_status_and_body(class)
     }
 
+    pub fn x_gateway_error_for_backend_failure_for_test(
+        connection_error: bool,
+        status: u16,
+    ) -> Option<&'static str> {
+        crate::proxy::x_gateway_error_for_backend_failure(connection_error, status)
+    }
+
+    pub fn apply_authoritative_backend_gateway_error_header_for_test(
+        response_headers: &mut HashMap<String, String>,
+        connection_error: bool,
+        status: u16,
+    ) -> bool {
+        crate::proxy::apply_authoritative_backend_gateway_error_header(
+            response_headers,
+            connection_error,
+            status,
+        )
+    }
+
+    pub fn request_method_is_allowed_for_test(allowed: &[String], method: &str) -> bool {
+        crate::proxy::request_method_is_allowed(allowed, method)
+    }
+
+    pub fn allow_header_from_allowed_methods_for_test(methods: &[String]) -> String {
+        crate::proxy::allow_header_from_allowed_methods(methods)
+    }
+
+    pub const PROTOCOL_LEVEL_405_ALLOW_FOR_TEST: &str = crate::proxy::PROTOCOL_LEVEL_405_ALLOW;
+
     pub fn set_grpc_deadline_budget_for_test(
         ctx: &mut crate::plugins::RequestContext,
         budget_ms: Option<u64>,
@@ -3028,6 +3057,94 @@ pub mod _test_support {
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
     pub fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
         crate::proxy::tcp_proxy::classify_stream_error(error)
+    }
+
+    /// Drive the production UDP setup-failure ownership + emit path.
+    ///
+    /// This is the same `UdpSetupProgress` value `spawn_new_session_datagram`
+    /// threads through `process_new_session_datagram` / `create_session`: it
+    /// records publication at the session-map insert and carries the exact
+    /// epoch the attempt was admitted under. Tests drive it rather than
+    /// reproducing the summary construction, so the ownership rule and the
+    /// generation/trigger binding under test are the production ones.
+    pub struct UdpSetupProgressForTest(crate::proxy::udp_proxy::UdpSetupProgress);
+
+    impl Default for UdpSetupProgressForTest {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl UdpSetupProgressForTest {
+        pub fn new() -> Self {
+            Self(crate::proxy::udp_proxy::UdpSetupProgress::default())
+        }
+
+        /// Mirror `admit_plain_udp_stream`'s single snapshot point: the
+        /// admitted plugin slice plus everything the `on_stream_connect` chain
+        /// memoized on the context.
+        pub fn record_stream_admission(
+            &mut self,
+            plugins: Vec<Arc<dyn Plugin>>,
+            proxy: &crate::config::types::Proxy,
+            ctx: &crate::plugins::StreamConnectionContext,
+        ) {
+            self.0.record_stream_admission(
+                Arc::new(plugins),
+                proxy.name.as_deref(),
+                proxy.effective_scheme(),
+                format!("{}:{}", proxy.backend_host, proxy.backend_port),
+                ctx,
+            );
+        }
+
+        /// Mirror the load-balancer / mesh target selection in `create_session`.
+        pub fn record_backend_selection(&mut self, host: &str, port: u16) {
+            self.0.record_backend_selection(host, port);
+        }
+
+        /// Mirror the post-connect resolved-address record in `create_session`.
+        pub fn record_backend_resolved_ip(&mut self, ip: std::net::IpAddr) {
+            self.0.record_backend_resolved_ip(ip);
+        }
+
+        /// Mirror the `sessions.insert` publication boundary.
+        pub fn mark_published(&mut self) {
+            self.0.mark_published();
+        }
+
+        pub fn owns_setup_failure(&self) -> bool {
+            self.0.owns_setup_failure()
+        }
+
+        /// Run the exact tail of `spawn_new_session_datagram`. Returns whether
+        /// a setup-failure summary was emitted.
+        pub async fn emit_setup_failure_if_owner(
+            &self,
+            namespace: &str,
+            proxy_id: &str,
+            client_ip: &str,
+            listen_port: u16,
+            error: &anyhow::Error,
+        ) -> bool {
+            let failure = crate::proxy::udp_proxy::UdpSetupFailureContext {
+                namespace,
+                proxy_id,
+                client_ip,
+                listen_port,
+                connected_wall_at: chrono::Utc::now(),
+                duration_ms: 0.0,
+                error,
+            };
+            self.0.emit_setup_failure_if_owner(failure).await
+        }
+    }
+
+    /// The production wrapper that decides whether a stream-setup DNS resolve
+    /// failure becomes a typed `StreamSetupKind::DnsLookup` or stays an
+    /// untyped gateway-side egress-policy denial.
+    pub fn stream_dns_setup_error_for_test(host: &str, source: anyhow::Error) -> anyhow::Error {
+        crate::proxy::stream_error::stream_dns_setup_error(host, source)
     }
 
     pub fn tcp_listener_proxy_for_test(
@@ -7604,6 +7721,9 @@ pub mod _test_support {
     /// tie expire rather than accepting a ready success. `Err(())` means
     /// the bound fired without polling a ready future; `Ok` is completion.
     /// Ownership is not decided here.
+    // This test-only facade intentionally preserves the unit error contract of
+    // the shared expiry-first primitive so external tests exercise it directly.
+    #[allow(clippy::result_unit_err)]
     pub async fn await_deadline_first_for_test<F, T>(
         deadline: Option<tokio::time::Instant>,
         future: F,

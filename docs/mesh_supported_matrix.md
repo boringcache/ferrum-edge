@@ -451,7 +451,8 @@ need them, or because they are blocked upstream / architecturally:
   honors only top-level `trafficPolicy.portLevelSettings` (Istio's
   highest-precedence subset port-level tier is unsupported). Express per-port
   policy at top-level or via subset `connectionPool` fields; see `docs/mesh.md`.
-- **LB `MAGLEV` / `PASSTHROUGH`** — niche; `PASSTHROUGH` approximates to round-robin.
+- **LB `MAGLEV`** — niche; `loadBalancer.simple = MAGLEV` is a hard reject at
+  translation.
 - **Active-active multi-cluster endpoint discovery at scale** — minority need;
   targets verified-Beta, not GA.
 

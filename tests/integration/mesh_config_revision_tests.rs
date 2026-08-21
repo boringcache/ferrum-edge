@@ -74,6 +74,7 @@ use ferrum_edge::k8s_controller::revision::{
 use ferrum_edge::modes::control_plane::{
     CpFullLoadSource, load_full_config_multi_with_sequence_for_test,
 };
+use ferrum_edge::modes::mesh::config::MeshService;
 use ferrum_edge::modes::mesh::config_consumer::native_client::{
     NativeMeshClientConfig, NativeMeshConfigConsumer, start_native_mesh_client_with_shutdown,
 };
@@ -82,6 +83,9 @@ use ferrum_edge::modes::mesh::config_consumer::update_validation::{
     MeshUpdateConsumer, MeshUpdateExpectation, MeshUpdateRejectReason, validate_mesh_config_update,
 };
 use ferrum_edge::modes::mesh::config_consumer::xds_client::{XdsClientConfig, XdsConfigConsumer};
+use ferrum_edge::modes::mesh::initial_config_wait_test_seams::{
+    PROBE_NAMESPACE, PROBE_NODE_ID, wait_for_initial_mesh_config_for_test,
+};
 use ferrum_edge::modes::mesh::revision::{
     KUBERNETES_AUTHORITY_DOMAIN, MeshConfigRevision, MeshRevisionContentIdentity, MeshRevisionGate,
     MeshRevisionOrder, MeshRevisionPolicy, MeshRevisionRejectReason, is_kubernetes_authority,
@@ -1761,6 +1765,189 @@ fn an_equal_revision_replay_commits_the_applied_watermark() {
     );
     assert!(state.record_rejected_slice(&state.snapshot()));
     assert_eq!(state.accepted_revision(), Some(revision("db", 10)));
+}
+
+// ── Startup: the initial-config wait is a runtime gate too (issue #4041) ────
+//
+// The localized `file` source converts BEFORE `install_slice`, so an invalid
+// document refuses startup outright. Every control-plane-driven source —
+// native `MeshSubscribe`, xDS ADS, and the stock-xDS discovery half — installs
+// FIRST and converts inside `wait_for_initial_mesh_config`. That conversion is
+// the runtime gate for the first slice, so it owes the watermark the same
+// rollback the steady-state apply task performs: a candidate refused there
+// never served a request, and pinning the accepted revision to it quarantines
+// every corrected slice at or below its sequence.
+
+/// A slice the probe node would materialize, carrying an authoritative
+/// change-log revision at `sequence`.
+fn startup_slice(version: &str, sequence: u64) -> MeshSlice {
+    MeshSlice {
+        node_id: PROBE_NODE_ID.to_string(),
+        namespace: PROBE_NAMESPACE.to_string(),
+        version: version.to_string(),
+        revision: Some(revision("db", sequence)),
+        ..MeshSlice::default()
+    }
+}
+
+/// A candidate that passes the freshness gate and then fails CONVERSION.
+///
+/// A blank `MeshService.name` is refused by `MeshConfig::validate` for every
+/// namespace, so the failure is a property of the slice rather than of the
+/// probe node's namespace — and it is reached inside the startup wait, after
+/// `install_slice` has already admitted the revision.
+fn conversion_invalid_startup_slice(version: &str, sequence: u64) -> MeshSlice {
+    MeshSlice {
+        services: vec![MeshService {
+            name: String::new(),
+            namespace: PROBE_NAMESPACE.to_string(),
+            ports: Vec::new(),
+            workloads: Vec::new(),
+            protocol_overrides: HashMap::new(),
+            cluster_ips: Vec::new(),
+            uid: None,
+        }],
+        ..startup_slice(version, sequence)
+    }
+}
+
+/// Wait, bounded, for the startup wait to finalize its refusal of the received
+/// candidate. Bounded rather than open-ended so the pre-fix behaviour fails an
+/// assertion instead of hanging the shard.
+async fn await_accepted_revision_cleared(state: &MeshRuntimeState) -> bool {
+    for _ in 0..200 {
+        if state.accepted_revision().is_none() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
+/// The reporter's central case: a control plane that fixes a bad snapshot IN
+/// PLACE republishes the corrected slice at the SAME sequence. Before the fix
+/// the conversion refusal left `accepted` pinned at that sequence, so the
+/// corrected slice was quarantined as `divergent_content`, the wait never
+/// returned, and the data plane stayed NotReady until a strictly higher
+/// sequence arrived or an operator called `POST /mesh/config-revision/reset`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_conversion_invalid_first_slice_does_not_pin_the_startup_watermark() {
+    let state = MeshRuntimeState::new();
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let wait = tokio::spawn(wait_for_initial_mesh_config_for_test(
+        state.clone(),
+        shutdown_rx,
+    ));
+
+    assert!(
+        state
+            .install_slice(conversion_invalid_startup_slice("v-bad", 100))
+            .installed(),
+        "the freshness gate admits the candidate — conversion is the stage that refuses it"
+    );
+
+    assert!(
+        await_accepted_revision_cleared(&state).await,
+        "a candidate the startup wait refused never served, so it must not keep the watermark"
+    );
+    assert!(
+        state.applied_revision().is_none(),
+        "nothing was ever applied, so the rollback target is no baseline"
+    );
+    assert!(
+        !wait.is_finished(),
+        "the wait must still be waiting for a slice that actually converts"
+    );
+
+    // The corrected slice, republished at the SAME sequence with different
+    // content. That is `divergent_content` against a pinned watermark and
+    // `Bootstrap` against a rolled-back one.
+    let corrected = startup_slice("v-good", 100);
+    assert!(
+        state.install_slice(corrected.clone()).installed(),
+        "the same-sequence correction is eligible once the refusal rolled back"
+    );
+
+    let accepted = tokio::time::timeout(Duration::from_secs(10), wait)
+        .await
+        .expect("the startup wait converges on the corrected slice")
+        .expect("wait task joins")
+        .expect("the corrected slice converts");
+    assert_eq!(accepted, "v-good");
+    assert_eq!(
+        state.accepted_revision(),
+        Some(revision("db", 100)),
+        "a candidate the wait passed keeps its provisional admission"
+    );
+
+    // `serve_mesh_runtime` commits the generation once it is actually live.
+    {
+        let _overlay_guard = overlay_consumer_guard();
+        state.record_applied_slice(&corrected);
+    }
+    assert_eq!(state.applied_revision(), Some(revision("db", 100)));
+
+    // The reopening is bounded by the last-good guarantee, not a general
+    // relaxation: once a generation is applied, both a lower sequence and
+    // divergent content at the applied sequence are quarantined again.
+    assert_eq!(
+        state
+            .install_slice(startup_slice("v-older", 99))
+            .rejection()
+            .expect("a lower sequence is stale against the applied generation")
+            .reason(),
+        MeshRevisionRejectReason::StaleRevision
+    );
+    assert_eq!(
+        state
+            .install_slice(conversion_invalid_startup_slice("v-bad-again", 100))
+            .rejection()
+            .expect("divergent content at the applied sequence stays quarantined")
+            .reason(),
+        MeshRevisionRejectReason::DivergentContent
+    );
+    assert_eq!(state.applied_revision(), Some(revision("db", 100)));
+}
+
+/// The lower-sequence half of the same recovery, at the hostile bound: a
+/// conversion-invalid slice published at `u64::MAX` must not lock the ordering
+/// domain, because no sequence can ever beat it. A control plane that reverts
+/// its bad snapshot republishes BELOW the refused sequence, and that recovery
+/// is eligible only because the refusal returned the gate to no baseline.
+#[tokio::test(flavor = "current_thread")]
+async fn a_lower_sequence_slice_recovers_startup_after_a_conversion_refusal() {
+    let state = MeshRuntimeState::new();
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let wait = tokio::spawn(wait_for_initial_mesh_config_for_test(
+        state.clone(),
+        shutdown_rx,
+    ));
+
+    assert!(
+        state
+            .install_slice(conversion_invalid_startup_slice("v-bad-max", u64::MAX))
+            .installed()
+    );
+    assert!(
+        await_accepted_revision_cleared(&state).await,
+        "a far-future refused candidate must not become an unbeatable watermark"
+    );
+    assert!(!wait.is_finished());
+
+    assert!(
+        state
+            .install_slice(startup_slice("v-recovery", 7))
+            .installed(),
+        "the lower-sequence recovery is eligible again"
+    );
+
+    let accepted = tokio::time::timeout(Duration::from_secs(10), wait)
+        .await
+        .expect("the startup wait converges on the recovery slice")
+        .expect("wait task joins")
+        .expect("the recovery slice converts");
+    assert_eq!(accepted, "v-recovery");
+    assert_eq!(state.accepted_revision(), Some(revision("db", 7)));
 }
 
 // ── Equal-revision content binding (issue #3611) ────────────────────────────
