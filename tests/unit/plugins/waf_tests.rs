@@ -3291,13 +3291,23 @@ fn enforce_mode_allows_on_body_too_large_block_with_monitor_only_rules() {
 
 #[test]
 fn enforce_mode_allows_on_body_too_large_block_with_monitor_body_rule() {
-    Waf::new(&json!({
+    let plugin = Waf::new(&json!({
         "mode": "enforce",
         "include_default_rules": false,
         "on_body_too_large": "block",
         "custom_rules": [monitor_request_body_rule()]
     }))
     .unwrap();
+
+    let mut request = body_ctx();
+    request
+        .headers
+        .insert("content-encoding".into(), "gzip".into());
+    let headers = request.headers.clone();
+
+    // The representation gate must decode governed compressed bodies before
+    // applying the size cap, even when `block` is the only enforcement path.
+    assert!(plugin.enforces_final_request_body_policy(&request, &headers, b"compressed-body"));
 }
 
 #[test]
