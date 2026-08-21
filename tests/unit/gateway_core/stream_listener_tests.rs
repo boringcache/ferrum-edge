@@ -953,8 +953,7 @@ async fn opaque_tcp_sni_group_rebuilds_on_reload_and_delete() {
     let first_port = first_backend.local_addr().unwrap().port();
     let second_port = second_backend.local_addr().unwrap().port();
 
-    let frontend_port = ephemeral_port().await;
-    let build = |backend_port: u16, include_default: bool| {
+    let build = |frontend_port: u16, backend_port: u16, include_default: bool| {
         let mut named = create_stream_proxy("named", BackendScheme::Tcp, frontend_port);
         named.backend_port = backend_port;
         named.hosts = vec!["tenant-a.example.com".to_string()];
@@ -971,20 +970,70 @@ async fn opaque_tcp_sni_group_rebuilds_on_reload_and_delete() {
         }
     };
 
-    let initial = build(first_port, true);
-    assert!(initial.validate_stream_proxies().is_ok());
-    let config_arc = Arc::new(ArcSwap::from_pointee(initial.clone()));
-    let runtime = create_manager_runtime(config_arc.clone(), &initial);
+    // `ephemeral_port()` binds and releases, so a parallel test can claim the
+    // port before the manager performs its own bind. Retry the acquisition the
+    // way `start_manager_on_fresh_tcp_port` does. This fixture cannot call that
+    // helper: it needs `create_manager_runtime` so the request epoch is
+    // mirrored into the shared ArcSwap. Only the EADDRINUSE class for this
+    // exact port is retryable; every other failure stays a hard failure.
+    const MAX_BIND_ATTEMPTS: usize = 8;
+    let mut bind_races: Vec<String> = Vec::new();
+    let mut acquired = None;
+    for attempt in 1..=MAX_BIND_ATTEMPTS {
+        let frontend_port = ephemeral_port().await;
+        let initial = build(frontend_port, first_port, true);
+        assert!(initial.validate_stream_proxies().is_ok());
+        let config_arc = Arc::new(ArcSwap::from_pointee(initial.clone()));
+        let runtime = create_manager_runtime(config_arc.clone(), &initial);
+
+        let failures = runtime.manager.reconcile().await;
+        if !failures.is_empty() {
+            let only_port_collision = failures.iter().all(|(_, failed_port, error)| {
+                *failed_port == frontend_port && error.contains("already in use")
+            });
+            runtime.manager.shutdown_all().await;
+            assert!(only_port_collision, "initial reconcile failed: {failures:?}");
+            bind_races.push(format!(
+                "attempt {attempt}, port {frontend_port}, reconcile: {failures:?}"
+            ));
+            continue;
+        }
+
+        let started = runtime
+            .manager
+            .wait_until_started(Duration::from_secs(5))
+            .await;
+        if started.is_ok() {
+            acquired = Some((runtime, config_arc, frontend_port));
+            break;
+        }
+
+        // Reconcile probes the port, then the listener task performs the owning
+        // bind. A competing test can win that second, narrower interval.
+        let async_failures = runtime.manager.stream_bind_failures();
+        let only_async_port_collision = !async_failures.is_empty()
+            && async_failures.iter().all(|failure| {
+                failure.listen_port == frontend_port
+                    && matches!(failure.kind, StreamListenerDegradation::BindFailed)
+                    && failure.error.contains("already in use")
+            });
+        runtime.manager.shutdown_all().await;
+        assert!(
+            only_async_port_collision,
+            "SNI group listener on fresh port {frontend_port} did not start: \
+             {started:?}; failures={async_failures:?}"
+        );
+        bind_races.push(format!(
+            "attempt {attempt}, port {frontend_port}, async failures: {async_failures:?}"
+        ));
+    }
+    let (runtime, config_arc, frontend_port) = acquired.unwrap_or_else(|| {
+        panic!(
+            "could not bind a fresh SNI-group frontend port in \
+             {MAX_BIND_ATTEMPTS} attempts: {bind_races:?}"
+        )
+    });
     let manager = &runtime.manager;
-    let failures = manager.reconcile().await;
-    assert!(
-        failures.is_empty(),
-        "initial reconcile failed: {failures:?}"
-    );
-    manager
-        .wait_until_started(Duration::from_secs(5))
-        .await
-        .expect("SNI group listener should start");
 
     let mut client = tokio::net::TcpStream::connect(("127.0.0.1", frontend_port))
         .await
@@ -1002,7 +1051,7 @@ async fn opaque_tcp_sni_group_rebuilds_on_reload_and_delete() {
     // request epoch first so accept-path dials see the new backend_port, then
     // swap the ArcSwap and reconcile so `__sni_{port}` restarts without the
     // deleted catch-all in its captured candidate list.
-    let updated = build(second_port, false);
+    let updated = build(frontend_port, second_port, false);
     assert!(updated.validate_stream_proxies().is_ok());
     runtime
         .request_epoch
