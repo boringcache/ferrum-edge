@@ -3291,13 +3291,48 @@ fn enforce_mode_allows_on_body_too_large_block_with_monitor_only_rules() {
 
 #[test]
 fn enforce_mode_allows_on_body_too_large_block_with_monitor_body_rule() {
-    Waf::new(&json!({
+    let plugin = Waf::new(&json!({
         "mode": "enforce",
         "include_default_rules": false,
         "on_body_too_large": "block",
         "custom_rules": [monitor_request_body_rule()]
     }))
     .unwrap();
+
+    let mut request = body_ctx();
+    request
+        .headers
+        .insert("content-encoding".into(), "gzip".into());
+    let headers = request.headers.clone();
+
+    // The representation gate must decode governed compressed bodies before
+    // applying the size cap, even when `block` is the only enforcement path.
+    assert!(plugin.enforces_final_request_body_policy(&request, &headers, b"compressed-body"));
+}
+
+#[test]
+fn monitor_mode_with_on_body_too_large_block_does_not_claim_encoded_bodies() {
+    // Boundary guard for the enforce-mode widening above: ONLY an enforce-mode
+    // `block` disposition may claim the final request representation. A monitor
+    // instance observes and logs, so an unscannable body there is a lost
+    // observation, never a protection-mechanism failure — claiming it would
+    // convert a non-blocking configuration into a fail-closed 400 on an
+    // ordinary compressed upload.
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "include_default_rules": false,
+        "on_body_too_large": "block",
+        "custom_rules": [monitor_request_body_rule()]
+    }))
+    .unwrap();
+
+    let mut request = body_ctx();
+    request
+        .headers
+        .insert("content-encoding".into(), "gzip".into());
+    let headers = request.headers.clone();
+
+    assert!(!plugin.enforces_final_request_body_policy(&request, &headers, b"compressed-body"));
 }
 
 #[test]
