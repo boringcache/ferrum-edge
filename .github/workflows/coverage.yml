@@ -139,11 +139,22 @@ jobs:
     # the combined invocation so runner loss cannot discard the shared compile.
     timeout-minutes: 75
     env:
-      # Cold-cache instrumented compiles have repeatedly killed hosted runners
-      # ("shutdown signal" + exit 143) on this shard matrix. Cap cargo's
-      # parallelism so peak memory/disk fits the runner; llvm-cov's own
-      # instrumentation settings are untouched.
+      # Issue #4099: cold-cache instrumented compiles have killed hosted
+      # runners ("shutdown signal" + exit 143) during the cargo compile
+      # phase, before any test runs — the same memory-ceiling signature as
+      # fips-test-build (#4018). Cap cargo's jobserver so peak memory fits
+      # the runner, and shrink debuginfo per codegen thread. llvm-cov's
+      # instrumentation flags (`--no-report`, `--lib`, `--test`, nextest)
+      # are untouched.
       CARGO_BUILD_JOBS: "3"
+      # `line-tables-only` keeps file:line for backtraces and drops only
+      # variable-level DWARF. Line/region attribution comes from
+      # `-C instrument-coverage` mapping sections, not from DWARF locals, so
+      # cargo-llvm-cov reports stay equivalent. Set on BOTH profiles rather
+      # than relying on `test` inheriting from `dev` (`cargo llvm-cov --lib
+      # --test` builds under the test profile).
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
     # The lib-unit shard compiles the aggregated tests/unit_tests binary,
     # whose single-crate rustc frontend exceeds hosted-runner RAM cold — the
     # swap step below keeps the VM alive through that window (see ci.yml

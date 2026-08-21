@@ -2253,6 +2253,34 @@ universal-newline-decoded text. RETIREMENT IS MANDATORY once the mitigation
 lands, exactly as #3943 retired the #3889 pair. Any other `fips-build.yml` edit
 is still compared by the normal fail-closed Cross surface scan.
 
+##### Coverage-shard compile-memory knobs (issue #4099)
+
+`Coverage Shard (lib-unit)` can be killed with `exit code 143` and "The runner
+has received a shutdown signal" **during the instrumented compile**, before any
+test runs. The log matches `fips-test-build` (issue #4018): the last
+`Compiling` line is followed by tens of minutes of silence, then a shutdown
+signal. Because `Merge Coverage` depends on the shards and is a required check,
+that ejects otherwise-green PRs from the merge queue under concurrent
+merge-group load — exactly when the queue is trying to drain. Coverage adds
+`-C instrument-coverage` on top of `[profile.dev] debug = true` (inherited by
+`test`), so the per-thread LLVM module is even larger than the FIPS
+test-binary tail.
+
+The `coverage-shard` job therefore mirrors the **safe** FIPS knobs that do not
+require a Cross generation transition. Only `coverage-merge` is digest-frozen
+by `WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS`; this subsection does not
+admit any new pair, and `coverage-merge` stays byte-identical.
+
+| Knob | FIPS `fips-test-build` (#4018) | Coverage `coverage-shard` (#4099) |
+|---|---|---|
+| `CARGO_BUILD_JOBS=3` | Job-level env; caps rustc codegen threads inside the large crates | Already present on `coverage-shard`; kept |
+| `line-tables-only` on `dev` **and** `test` | `CARGO_PROFILE_{DEV,TEST}_DEBUG` | Added. Drops variable-level DWARF only. Line/region attribution comes from `-C instrument-coverage` mapping, not DWARF locals, so `cargo llvm-cov` reports stay equivalent |
+| Additive swapfile | Best-effort 8 GiB `/mnt/ferrum-fips-swapfile` (workflow is digest-frozen, so the step must not fail-close) | **Not added.** `coverage-shard` already enlarges swap with a fail-closed 12 GiB `/mnt/ferrum-swapfile` (same pattern as `ci.yml` `test-unit`). A second Ferrum swapfile would be redundant; converting the existing step to best-effort would not lower compile memory |
+
+Instrumentation, shard matrix, test filters, and `cargo llvm-cov` /
+nextest invocation flags are unchanged. No coverage shard is removed or
+narrowed. Action pins and tool installs are unchanged.
+
 ##### Admitted CI job SHA-256 generation transitions (temporary)
 
 `ci.yml` is a protected workflow. The ARM64 job stays digest-frozen; every other
