@@ -204,6 +204,27 @@ const CGROUP_TREE_MAX_DIR_ENTRIES: usize = 512;
 #[cfg(unix)]
 const CGROUP_TREE_MAX_VISITS: usize = 512;
 
+// The walk bound and the `FERRUM_UDP_RELAY_CGROUPS` map bound are ONE number,
+// not two that happen to agree. This walk produces the set the node-agent
+// publishes, and the node-agent refuses any set larger than
+// `ferrum_ebpf_common::UDP_RELAY_CGROUP_MAX_ENTRIES`. Raise only the map and
+// complete-looking sets are silently short of a container leaf; raise only the
+// walk and legitimate generations start being refused. The two constants live
+// in separate crates, so make the coupling a compile error rather than a doc
+// comment two people have to read.
+const _: () =
+    assert!(CGROUP_TREE_MAX_INODES == ferrum_ebpf_common::UDP_RELAY_CGROUP_MAX_ENTRIES as usize);
+
+/// How many times [`collect_cgroup_tree`] restarts the walk after a descendant
+/// vanished (`ENOENT`) partway through it.
+///
+/// A pod cgroup subtree is static except at container start/stop, so one
+/// re-walk almost always settles. The bound is what keeps a tree churning
+/// under the walker from spinning: after this many restarts the walk gives up
+/// and reports [`CgroupTreeWalkStatus::IncompleteEnumeration`], so total work
+/// stays at `(CGROUP_TREE_MAX_REWALKS + 1) * CGROUP_TREE_MAX_VISITS`.
+const CGROUP_TREE_MAX_REWALKS: usize = 3;
+
 /// Why a bounded cgroup-tree walk could not prove the inode set complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CgroupTreeWalkStatus {
@@ -259,6 +280,73 @@ fn record_incomplete(status: &mut CgroupTreeWalkStatus, reason: CgroupTreeWalkSt
     }
 }
 
+/// Why one directory operation inside the walk could not answer.
+///
+/// The distinction is the whole point: `Vanished` is EVIDENCE about the tree
+/// (it is smaller than it was a moment ago), while `Unreadable` is an inability
+/// to observe the tree at all. The module's doctrine — an inability to prove a
+/// claim is not evidence for it — refuses the second. It must not refuse the
+/// first, because a NodeWaypoint UDP refusal costs every relay datagram on the
+/// node plus a steering teardown/reinstall cycle.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirFailure {
+    /// `ENOENT`: the directory is gone. A descendant can disappear between its
+    /// parent's `readdir` and its own `stat` whenever a container exits.
+    Vanished,
+    /// The directory exists but could not be fully enumerated (permissions,
+    /// I/O error, a `readdir` stream longer than the per-directory bound).
+    Unreadable,
+}
+
+#[cfg(unix)]
+fn classify_dir_failure(error: &std::io::Error) -> DirFailure {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        DirFailure::Vanished
+    } else {
+        DirFailure::Unreadable
+    }
+}
+
+/// What one pass of the bounded walk observed.
+#[cfg(unix)]
+struct CgroupTreeWalkPass {
+    walk: CgroupTreeWalk,
+    /// A descendant vanished mid-pass, so `walk` describes a tree that no
+    /// longer has the shape it was observed in. The driver re-walks rather
+    /// than publishing a set stitched together from two different trees.
+    shrank: bool,
+}
+
+#[cfg(unix)]
+struct PassOutcome {
+    status: CgroupTreeWalkStatus,
+    shrank: bool,
+}
+
+#[cfg(unix)]
+impl PassOutcome {
+    fn new() -> Self {
+        Self {
+            status: CgroupTreeWalkStatus::Complete,
+            shrank: false,
+        }
+    }
+
+    fn record(&mut self, reason: CgroupTreeWalkStatus) {
+        record_incomplete(&mut self.status, reason);
+    }
+
+    fn record_dir_failure(&mut self, failure: DirFailure) {
+        match failure {
+            DirFailure::Vanished => self.shrank = true,
+            DirFailure::Unreadable => {
+                self.record(CgroupTreeWalkStatus::IncompleteEnumeration);
+            }
+        }
+    }
+}
+
 /// Collect the inode of `pod_cgroup_path` plus every descendant cgroup
 /// directory inode, breadth-first and bounded by [`CGROUP_TREE_MAX_DEPTH`] /
 /// [`CGROUP_TREE_MAX_INODES`]. The pod inode is returned first.
@@ -291,38 +379,99 @@ pub fn collect_cgroup_tree_inodes(pod_cgroup_path: &Path) -> Vec<u64> {
 /// the hook reads.
 ///
 /// A missing or non-directory root returns an empty complete walk (nothing to
-/// enroll). Stat or `read_dir` failures on descendants, a unique directory
+/// enroll). A `read_dir` or `stat` failure on a descendant, a unique directory
 /// past [`CGROUP_TREE_MAX_INODES`], or a child past [`CGROUP_TREE_MAX_DEPTH`]
 /// return the inodes observed so far with a non-complete status. The walk
 /// itself stays bounded against hostile trees.
+///
+/// A descendant that vanished (`ENOENT`) is the one failure that does NOT make
+/// the walk incomplete. A container exiting removes its cgroup directory, and
+/// it can do so between its parent's `readdir` and its own `stat`. That is
+/// evidence the tree shrank — not an inability to enumerate it — so the walk
+/// restarts (bounded by `CGROUP_TREE_MAX_REWALKS`) and reports the smaller
+/// tree as complete. Without that, one transient `ENOENT` would refuse the
+/// whole NodeWaypoint UDP relay generation: acknowledgement cleared, gate
+/// closed, every relay datagram on the node dropped until the next reconcile.
+/// A tree still shrinking after the last re-walk is reported as
+/// [`CgroupTreeWalkStatus::IncompleteEnumeration`], because at that point no
+/// single coherent set was ever observed.
 #[cfg(unix)]
 pub fn collect_cgroup_tree(pod_cgroup_path: &Path) -> CgroupTreeWalk {
+    collect_cgroup_tree_with_vanished(pod_cgroup_path, &|_: &Path| false)
+}
+
+/// [`collect_cgroup_tree`] with a fault-injection seam.
+///
+/// `vanished` names paths this walk must treat as `ENOENT` regardless of what
+/// the filesystem reports. It exists solely for the regression tests: the race
+/// this function must tolerate — a descendant removed between its parent's
+/// `readdir` and its own `stat` — cannot be staged from a single-threaded test
+/// against a real directory tree, because the test would have to delete the
+/// directory from inside the walk. The predicate is called with each directory
+/// the walk is about to `stat` or `read_dir`, so a test can also perform the
+/// real removal there. Production callers use [`collect_cgroup_tree`], whose
+/// predicate is a constant `false`.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn collect_cgroup_tree_with_vanished(
+    pod_cgroup_path: &Path,
+    vanished: &dyn Fn(&Path) -> bool,
+) -> CgroupTreeWalk {
+    let mut rewalks = 0usize;
+    loop {
+        let pass = collect_cgroup_tree_pass(pod_cgroup_path, vanished);
+        if !pass.shrank {
+            return pass.walk;
+        }
+        rewalks += 1;
+        if rewalks > CGROUP_TREE_MAX_REWALKS {
+            // The tree kept shrinking under every attempt, so no pass ever saw
+            // one coherent set. Refuse rather than publish a stitched one.
+            let mut walk = pass.walk;
+            record_incomplete(
+                &mut walk.status,
+                CgroupTreeWalkStatus::IncompleteEnumeration,
+            );
+            return walk;
+        }
+    }
+}
+
+/// One bounded breadth-first pass over the subtree.
+#[cfg(unix)]
+fn collect_cgroup_tree_pass(
+    pod_cgroup_path: &Path,
+    vanished: &dyn Fn(&Path) -> bool,
+) -> CgroupTreeWalkPass {
     use std::collections::HashSet;
     use std::os::unix::fs::MetadataExt;
 
     let mut inodes: Vec<u64> = Vec::new();
     let mut seen: HashSet<u64> = HashSet::new();
     let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
-    let mut status = CgroupTreeWalkStatus::Complete;
+    let mut outcome = PassOutcome::new();
     queue.push_back((pod_cgroup_path.to_path_buf(), 0));
     let mut visits = 0usize;
 
     while let Some((path, depth)) = queue.pop_front() {
         visits += 1;
         if visits > CGROUP_TREE_MAX_VISITS {
-            record_incomplete(&mut status, CgroupTreeWalkStatus::IncompleteEnumeration);
+            outcome.record(CgroupTreeWalkStatus::IncompleteEnumeration);
             break;
         }
 
-        let meta = match std::fs::metadata(&path) {
+        let meta = match stat_directory(&path, vanished) {
             Ok(meta) => meta,
             Err(_) if inodes.is_empty() => {
                 // Missing or unreadable root: nothing enrolled, not a truncated
-                // descendant set.
-                return CgroupTreeWalk::complete(Vec::new());
+                // descendant set, and nothing a re-walk would recover.
+                return CgroupTreeWalkPass {
+                    walk: CgroupTreeWalk::complete(Vec::new()),
+                    shrank: false,
+                };
             }
-            Err(_) => {
-                record_incomplete(&mut status, CgroupTreeWalkStatus::IncompleteEnumeration);
+            Err(failure) => {
+                outcome.record_dir_failure(failure);
                 continue;
             }
         };
@@ -334,7 +483,7 @@ pub fn collect_cgroup_tree(pod_cgroup_path: &Path) -> CgroupTreeWalk {
         let inode = meta.ino();
         if seen.insert(inode) {
             if inodes.len() >= CGROUP_TREE_MAX_INODES {
-                record_incomplete(&mut status, CgroupTreeWalkStatus::ExceededEntryBound);
+                outcome.record(CgroupTreeWalkStatus::ExceededEntryBound);
                 break;
             }
             inodes.push(inode);
@@ -345,29 +494,56 @@ pub fn collect_cgroup_tree(pod_cgroup_path: &Path) -> CgroupTreeWalk {
         }
 
         if depth >= CGROUP_TREE_MAX_DEPTH {
-            match directory_has_directory_children(&path) {
+            match directory_has_directory_children(&path, vanished) {
                 Ok(true) => {
-                    record_incomplete(&mut status, CgroupTreeWalkStatus::ExceededDepthBound);
+                    outcome.record(CgroupTreeWalkStatus::ExceededDepthBound);
                 }
                 Ok(false) => {}
-                Err(()) => {
-                    record_incomplete(&mut status, CgroupTreeWalkStatus::IncompleteEnumeration);
-                }
+                Err(failure) => outcome.record_dir_failure(failure),
             }
             continue;
         }
 
-        match std::fs::read_dir(&path) {
+        match read_directory(&path, vanished) {
             Ok(entries) => {
-                enqueue_directory_children(&mut queue, entries, depth, &mut status);
+                enqueue_directory_children(&mut queue, entries, depth, &mut outcome);
             }
-            Err(_) => {
-                record_incomplete(&mut status, CgroupTreeWalkStatus::IncompleteEnumeration);
-            }
+            Err(failure) => outcome.record_dir_failure(failure),
         }
     }
 
-    CgroupTreeWalk { inodes, status }
+    CgroupTreeWalkPass {
+        walk: CgroupTreeWalk {
+            inodes,
+            status: outcome.status,
+        },
+        shrank: outcome.shrank,
+    }
+}
+
+/// `stat` one directory, honouring the vanish seam and classifying the failure.
+#[cfg(unix)]
+fn stat_directory(
+    path: &Path,
+    vanished: &dyn Fn(&Path) -> bool,
+) -> Result<std::fs::Metadata, DirFailure> {
+    if vanished(path) {
+        return Err(DirFailure::Vanished);
+    }
+    std::fs::metadata(path).map_err(|error| classify_dir_failure(&error))
+}
+
+/// `read_dir` one directory, honouring the vanish seam and classifying the
+/// failure.
+#[cfg(unix)]
+fn read_directory(
+    path: &Path,
+    vanished: &dyn Fn(&Path) -> bool,
+) -> Result<std::fs::ReadDir, DirFailure> {
+    if vanished(path) {
+        return Err(DirFailure::Vanished);
+    }
+    std::fs::read_dir(path).map_err(|error| classify_dir_failure(&error))
 }
 
 /// Enqueue directory children of one cgroup dir. Stops enqueueing once the
@@ -378,19 +554,19 @@ fn enqueue_directory_children(
     queue: &mut VecDeque<(PathBuf, usize)>,
     entries: std::fs::ReadDir,
     depth: usize,
-    status: &mut CgroupTreeWalkStatus,
+    outcome: &mut PassOutcome,
 ) {
     let mut inspected = 0usize;
     for entry in entries {
         inspected += 1;
         if inspected > CGROUP_TREE_MAX_DIR_ENTRIES {
-            record_incomplete(status, CgroupTreeWalkStatus::IncompleteEnumeration);
+            outcome.record(CgroupTreeWalkStatus::IncompleteEnumeration);
             return;
         }
         let entry = match entry {
             Ok(entry) => entry,
-            Err(_) => {
-                record_incomplete(status, CgroupTreeWalkStatus::IncompleteEnumeration);
+            Err(error) => {
+                outcome.record_dir_failure(classify_dir_failure(&error));
                 continue;
             }
         };
@@ -402,7 +578,7 @@ fn enqueue_directory_children(
             continue;
         }
         if queue.len() >= CGROUP_TREE_MAX_INODES {
-            record_incomplete(status, CgroupTreeWalkStatus::ExceededEntryBound);
+            outcome.record(CgroupTreeWalkStatus::ExceededEntryBound);
             return;
         }
         queue.push_back((entry.path(), depth + 1));
@@ -413,15 +589,18 @@ fn enqueue_directory_children(
 /// that would require walking deeper. Unknown `d_type` is treated as a possible
 /// directory so a child cgroup is never mistaken for a leaf.
 #[cfg(unix)]
-fn directory_has_directory_children(path: &Path) -> Result<bool, ()> {
-    let entries = std::fs::read_dir(path).map_err(|_| ())?;
+fn directory_has_directory_children(
+    path: &Path,
+    vanished: &dyn Fn(&Path) -> bool,
+) -> Result<bool, DirFailure> {
+    let entries = read_directory(path, vanished)?;
     let mut inspected = 0usize;
     for entry in entries {
         inspected += 1;
         if inspected > CGROUP_TREE_MAX_DIR_ENTRIES {
-            return Err(());
+            return Err(DirFailure::Unreadable);
         }
-        let entry = entry.map_err(|_| ())?;
+        let entry = entry.map_err(|error| classify_dir_failure(&error))?;
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(true) {
             return Ok(true);
         }

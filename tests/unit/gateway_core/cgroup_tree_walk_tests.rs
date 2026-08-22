@@ -6,12 +6,19 @@
 //! pin that a complete 256-inode tree stays representable, a 257th unique
 //! directory is detected, a depth overflow is detected, and an unreadable
 //! descendant is not mistaken for a complete set.
+//!
+//! Issue #4021 adds the other half of that contract: a descendant that VANISHED
+//! (`ENOENT`) is evidence the tree shrank, not an inability to enumerate it, so
+//! the walk re-runs (bounded) and reports the smaller tree as complete rather
+//! than blacking out every NodeWaypoint UDP relay datagram on the node. It also
+//! pins the walk bound to the `FERRUM_UDP_RELAY_CGROUPS` map bound.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use ferrum_edge::ebpf::cgroup::{
     CGROUP_TREE_MAX_DEPTH, CGROUP_TREE_MAX_INODES, CgroupTreeWalkStatus, collect_cgroup_tree,
-    collect_cgroup_tree_inodes,
+    collect_cgroup_tree_inodes, collect_cgroup_tree_with_vanished,
 };
 
 fn pod_tree() -> (tempfile::TempDir, PathBuf) {
@@ -136,6 +143,10 @@ fn a_child_past_the_depth_bound_is_detected() {
     );
 }
 
+/// Issue #4021 split `NotFound` (the tree shrank — re-walk) out of every other
+/// failure. This is the doctrine that must NOT have moved: an inability to
+/// PROVE the tree's shape is still not evidence about it, so `EACCES` remains a
+/// refusal.
 #[test]
 fn an_unreadable_descendant_is_not_a_complete_set() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -173,5 +184,130 @@ fn an_unreadable_descendant_is_not_a_complete_set() {
     assert!(
         !walk.is_complete(),
         "authorization must refuse this walk rather than publish a truncated sender set"
+    );
+}
+
+/// A descendant that VANISHED mid-walk must not refuse the generation
+/// (issue #4021, follow-up 1).
+///
+/// A container exiting removes its cgroup directory, and it can do so between
+/// the pod's `readdir` and that child's `stat`. Recording that as
+/// `IncompleteEnumeration` made `resolve_node_waypoint_relay_cgroups` return
+/// `Err`, which clears the acknowledgement, closes the shared BPF gate, and
+/// revokes the relay cgroups AND the reply sources — every NodeWaypoint UDP
+/// relay datagram on the node, plus a steering teardown/reinstall cycle, for
+/// one transient `ENOENT`.
+///
+/// The vanish predicate performs the REAL removal on first sight, so the
+/// re-walk observes a genuinely smaller tree rather than a synthetic one.
+#[test]
+fn a_descendant_that_vanished_mid_walk_is_absent_not_a_refusal() {
+    let (_dir, pod) = pod_tree();
+    let alive = pod.join("cri-containerd-aaaa.scope");
+    let doomed = pod.join("cri-containerd-bbbb.scope");
+    std::fs::create_dir(&alive).expect("surviving container");
+    std::fs::create_dir(&doomed).expect("exiting container");
+    std::fs::create_dir(doomed.join("nested-leaf")).expect("nested leaf");
+    let doomed_inode = inode_of(&doomed);
+
+    let removed = Cell::new(false);
+    let walk = collect_cgroup_tree_with_vanished(&pod, &|path: &Path| {
+        if path != doomed || removed.get() {
+            return false;
+        }
+        removed.set(true);
+        std::fs::remove_dir_all(path).expect("stage the vanished subtree");
+        true
+    });
+
+    assert!(removed.get(), "the vanish seam must have fired");
+    assert!(
+        walk.is_complete(),
+        "a re-walk that observed one coherent smaller tree is complete, not a refusal"
+    );
+    assert_eq!(walk.inodes.first(), Some(&inode_of(&pod)));
+    assert!(walk.inodes.contains(&inode_of(&alive)));
+    assert!(
+        !walk.inodes.contains(&doomed_inode),
+        "the vanished subtree is absent, never stitched in from the first pass"
+    );
+    assert_eq!(walk.inodes.len(), 2);
+}
+
+/// The re-walk is BOUNDED: a tree that keeps shrinking is still refused, and
+/// the walk terminates (issue #4021, follow-up 1).
+///
+/// No pass ever observed one coherent set here, so publishing a stitched set
+/// would be exactly the truncation the completeness contract exists to
+/// prevent. This test also proves the re-walk cannot spin: it only returns if
+/// the bound is enforced.
+#[test]
+fn a_tree_that_keeps_shrinking_is_still_refused() {
+    let (_dir, pod) = pod_tree();
+    let doomed = pod.join("cri-containerd-bbbb.scope");
+    std::fs::create_dir(&doomed).expect("churning container");
+
+    let observations = Cell::new(0usize);
+    let walk = collect_cgroup_tree_with_vanished(&pod, &|path: &Path| {
+        if path != doomed {
+            return false;
+        }
+        observations.set(observations.get() + 1);
+        true
+    });
+
+    assert!(
+        observations.get() > 1,
+        "a shrinking tree must be re-walked, not accepted on the first pass"
+    );
+    assert_eq!(
+        walk.status,
+        CgroupTreeWalkStatus::IncompleteEnumeration,
+        "a tree still shrinking after the last re-walk was never observed coherently"
+    );
+    assert!(!walk.is_complete());
+}
+
+/// An `ENOENT` on the ROOT is still "nothing enrolled", not a re-walk
+/// (issue #4021, follow-up 1).
+#[test]
+fn a_vanished_root_stays_empty_and_complete() {
+    let (_dir, pod) = pod_tree();
+    let observations = Cell::new(0usize);
+    let walk = collect_cgroup_tree_with_vanished(&pod, &|path: &Path| {
+        if path != pod {
+            return false;
+        }
+        observations.set(observations.get() + 1);
+        true
+    });
+
+    assert!(walk.inodes.is_empty());
+    assert_eq!(walk.status, CgroupTreeWalkStatus::Complete);
+    assert_eq!(
+        observations.get(),
+        1,
+        "an absent root is answered on the first pass; it is not a shrinking tree"
+    );
+}
+
+/// The walk bound and the relay-cgroup BPF map bound are ONE number
+/// (issue #4021, follow-up 4).
+///
+/// `src/ebpf/cgroup.rs` carries a `const _: () = assert!(...)` so a drift is a
+/// compile error; this test exists so the FAILURE NAMES the coupling instead
+/// of pointing at an anonymous const. Raise only the map and complete-looking
+/// sets are silently short of a container leaf; raise only the walk and the
+/// node-agent's `cgroups.len() > UDP_RELAY_CGROUP_MAX_ENTRIES` check starts
+/// refusing legitimate generations.
+#[test]
+fn the_walk_bound_and_the_relay_cgroup_map_bound_are_one_number() {
+    assert_eq!(
+        CGROUP_TREE_MAX_INODES,
+        ferrum_ebpf_common::UDP_RELAY_CGROUP_MAX_ENTRIES as usize,
+        "CGROUP_TREE_MAX_INODES (src/ebpf/cgroup.rs) and UDP_RELAY_CGROUP_MAX_ENTRIES \
+         (ebpf/ferrum-ebpf-common/src/lib.rs) are coupled: the walk produces the set the \
+         node-agent publishes into FERRUM_UDP_RELAY_CGROUPS, and the node-agent refuses \
+         any set larger than the map bound. Change both or neither."
     );
 }
