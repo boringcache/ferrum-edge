@@ -76,13 +76,19 @@ impl Default for DbFailoverTopologyStatus {
 /// full mutation persistence lifetime (issue #3001 check-to-use race).
 pub struct DbWriteTopologyPermit {
     _guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    topology_epoch: u64,
 }
 
 impl DbWriteTopologyPermit {
-    /// Construct a pin that holds `guard` until dropped.
-    pub(crate) fn pinned(guard: tokio::sync::OwnedRwLockReadGuard<()>) -> Self {
+    /// Construct a pin that holds `guard` until dropped and binds every read or
+    /// write performed under it to `topology_epoch`.
+    pub(crate) fn pinned(
+        guard: tokio::sync::OwnedRwLockReadGuard<()>,
+        topology_epoch: u64,
+    ) -> Self {
         let permit = Self {
             _guard: Some(guard),
+            topology_epoch,
         };
         debug_assert!(permit.is_pinned());
         permit
@@ -90,7 +96,10 @@ impl DbWriteTopologyPermit {
 
     /// No-op permit for backends / modes without a reconnect topology gate.
     pub fn noop() -> Self {
-        let permit = Self { _guard: None };
+        let permit = Self {
+            _guard: None,
+            topology_epoch: 0,
+        };
         debug_assert!(!permit.is_pinned());
         permit
     }
@@ -99,6 +108,46 @@ impl DbWriteTopologyPermit {
     pub fn is_pinned(&self) -> bool {
         self._guard.is_some()
     }
+
+    /// Process-local generation of the config-store topology held by this pin.
+    ///
+    /// Epoch zero is reserved for no-op backends. SQL and MongoDB start at one
+    /// and advance inside their exclusive reconnect publication section.
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+}
+
+/// Pin container accepted by the Admin live-apply completion helper.
+///
+/// Most mutations retain only the write-topology permit. Namespace-wide batch
+/// and restore operations retain an admission guard beside it, so the tuple
+/// implementation deliberately reads the epoch from the same permit while
+/// leaving the unrelated guard opaque.
+pub trait LiveApplyTopologyPins {
+    fn topology_epoch(&self) -> u64;
+}
+
+impl LiveApplyTopologyPins for DbWriteTopologyPermit {
+    fn topology_epoch(&self) -> u64 {
+        DbWriteTopologyPermit::topology_epoch(self)
+    }
+}
+
+impl<T> LiveApplyTopologyPins for (T, DbWriteTopologyPermit) {
+    fn topology_epoch(&self) -> u64 {
+        self.1.topology_epoch()
+    }
+}
+
+/// Refuse topology-generation wrap instead of letting an ancient generation
+/// become indistinguishable from a future one (ABA).
+pub fn checked_next_config_topology_epoch(current: u64) -> Result<u64, anyhow::Error> {
+    current.checked_add(1).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Configuration database topology epoch exhausted; refusing connection publication"
+        )
+    })
 }
 
 /// Shared sticky-failover window state for SQL and MongoDB config stores.
@@ -1645,6 +1694,15 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     /// Ordinary read/request hot paths must not call this.
     async fn acquire_write_topology_permit(&self) -> DbWriteTopologyPermit {
         DbWriteTopologyPermit::noop()
+    }
+
+    /// Process-local generation of the active config-store topology.
+    ///
+    /// The default epoch zero matches [`DbWriteTopologyPermit::noop`]. SQL and
+    /// MongoDB implementations publish a monotonically increasing, non-wrapping
+    /// value under the same exclusive gate that swaps their pool/connection.
+    fn config_topology_epoch(&self) -> u64 {
+        0
     }
 
     /// Return connection pool statistics for observability.

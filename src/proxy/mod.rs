@@ -5972,6 +5972,11 @@ pub enum ConfigApplyOutcome {
     Rejected { errors: Vec<String> },
 }
 
+enum IncrementalApplyResult {
+    Outcome(ConfigApplyOutcome),
+    TopologyChanged(u64),
+}
+
 impl ConfigApplyOutcome {
     #[inline]
     pub fn accepted(&self) -> bool {
@@ -12461,12 +12466,39 @@ impl ProxyState {
     /// no-op candidates (`Unchanged`) from validation/build rejections
     /// (`Rejected`). The DB poller relies on this to avoid advancing
     /// `last_poll_at` on rejection — see `src/modes/database.rs`.
+    #[allow(dead_code)] // Integration-test seam; DB mode uses the topology-fenced entry point.
     pub async fn apply_incremental(
         &self,
         result: crate::config::db_loader::IncrementalResult,
     ) -> ConfigApplyOutcome {
-        self.apply_incremental_with_gateway_trust(result, None)
+        match self.apply_incremental_inner(result, None, None).await {
+            IncrementalApplyResult::Outcome(outcome) => outcome,
+            IncrementalApplyResult::TopologyChanged(_) => {
+                ConfigApplyOutcome::rejected_one("unexpected database topology fence")
+            }
+        }
+    }
+
+    /// Apply a database delta while fencing its final request-epoch publication
+    /// to the topology that produced it.
+    ///
+    /// File-backed plugin validation deliberately runs before the permit is
+    /// acquired because it may block off-thread. The permit covers only the
+    /// synchronous publication section, preventing a reconnect from swapping
+    /// the authoritative store between validation and the live epoch swap.
+    pub(crate) async fn apply_database_incremental(
+        &self,
+        result: crate::config::db_loader::IncrementalResult,
+        db: &Arc<dyn crate::config::db_backend::DatabaseBackend>,
+        expected_topology_epoch: u64,
+    ) -> Result<ConfigApplyOutcome, u64> {
+        match self
+            .apply_incremental_inner(result, None, Some((db, expected_topology_epoch)))
             .await
+        {
+            IncrementalApplyResult::Outcome(outcome) => Ok(outcome),
+            IncrementalApplyResult::TopologyChanged(actual_epoch) => Err(actual_epoch),
+        }
     }
 
     /// [`Self::apply_incremental`] carrying an out-of-band gateway trust
@@ -12482,6 +12514,26 @@ impl ProxyState {
         result: crate::config::db_loader::IncrementalResult,
         explicit_trust: Option<GatewayTrustCommit>,
     ) -> ConfigApplyOutcome {
+        match self
+            .apply_incremental_inner(result, explicit_trust, None)
+            .await
+        {
+            IncrementalApplyResult::Outcome(outcome) => outcome,
+            IncrementalApplyResult::TopologyChanged(_) => {
+                ConfigApplyOutcome::rejected_one("unexpected database topology fence")
+            }
+        }
+    }
+
+    async fn apply_incremental_inner(
+        &self,
+        result: crate::config::db_loader::IncrementalResult,
+        explicit_trust: Option<GatewayTrustCommit>,
+        database_topology_fence: Option<(
+            &Arc<dyn crate::config::db_backend::DatabaseBackend>,
+            u64,
+        )>,
+    ) -> IncrementalApplyResult {
         if result.is_empty() {
             // An empty resource delta still has to commit an explicit trust
             // decision: a CP trust-only update carries no resources at all.
@@ -12495,7 +12547,7 @@ impl ProxyState {
                     self.commit_gateway_trust_generation_locked(commit);
                 }
             }
-            return ConfigApplyOutcome::Unchanged;
+            return IncrementalApplyResult::Outcome(ConfigApplyOutcome::Unchanged);
         }
 
         // Patch the stored GatewayConfig: clone current, apply mutations, store.
@@ -12660,10 +12712,12 @@ impl ProxyState {
         // known-good configuration exactly like full reloads.
         if let Err(error) = crate::fips::policy::check_gateway_config(&new_config) {
             error!("Incremental config rejected — FIPS policy: {}", error);
-            return ConfigApplyOutcome::rejected_one(format!("FIPS policy: {error}"));
+            return IncrementalApplyResult::Outcome(ConfigApplyOutcome::rejected_one(format!(
+                "FIPS policy: {error}"
+            )));
         }
         if let Err(errors) = self.validate_full_config(&new_config) {
-            return ConfigApplyOutcome::rejected(errors);
+            return IncrementalApplyResult::Outcome(ConfigApplyOutcome::rejected(errors));
         }
 
         // Incremental database and CP/DP deltas stage plugin caches directly
@@ -12716,10 +12770,23 @@ impl ProxyState {
                 Err(error) => {
                     let message = format!("incremental plugin file validation failed: {error}");
                     error!("Incremental config rejected: {}", message);
-                    return ConfigApplyOutcome::rejected_one(message);
+                    return IncrementalApplyResult::Outcome(ConfigApplyOutcome::rejected_one(
+                        message,
+                    ));
                 }
             };
         }
+
+        let topology_permit = if let Some((db, expected_epoch)) = database_topology_fence {
+            let permit = db.acquire_write_topology_permit().await;
+            let actual_epoch = permit.topology_epoch();
+            if actual_epoch != expected_epoch {
+                return IncrementalApplyResult::TopologyChanged(actual_epoch);
+            }
+            Some(permit)
+        } else {
+            None
+        };
 
         let mut applied_delta = None;
         // See `update_config` rustdoc nearby for why this is a `Cell` and not
@@ -12784,12 +12851,18 @@ impl ProxyState {
                 self.mirror_request_epoch_wrappers(published, route_changed.get(), false);
             },
         );
+        // Release the database topology pin before listener, health-check, or
+        // service-discovery reconciliation can await. The live request epoch
+        // is already coherent at this point.
+        drop(topology_permit);
         let published = match publish_result {
             Ok(Some(epoch)) => epoch,
-            Ok(None) => return ConfigApplyOutcome::Unchanged,
+            Ok(None) => {
+                return IncrementalApplyResult::Outcome(ConfigApplyOutcome::Unchanged);
+            }
             Err(e) => {
                 let message = format!("configuration publication refused: {e}");
-                return ConfigApplyOutcome::rejected_one(message);
+                return IncrementalApplyResult::Outcome(ConfigApplyOutcome::rejected_one(message));
             }
         };
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
@@ -12813,7 +12886,7 @@ impl ProxyState {
 
         let Some(delta) = applied_delta else {
             debug!("Incremental config: accepted projected route/MMDB generation republished");
-            return ConfigApplyOutcome::Applied;
+            return IncrementalApplyResult::Outcome(ConfigApplyOutcome::Applied);
         };
 
         // --- CircuitBreakerCache ---
@@ -13013,7 +13086,7 @@ impl ProxyState {
                 .restart_with_shutdown(&new_cfg, self.health_check_shutdown_rx.clone());
         }
 
-        ConfigApplyOutcome::Applied
+        IncrementalApplyResult::Outcome(ConfigApplyOutcome::Applied)
     }
 
     pub fn current_config(&self) -> Arc<GatewayConfig> {

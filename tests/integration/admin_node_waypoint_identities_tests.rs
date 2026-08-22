@@ -163,6 +163,7 @@ fn make_admin_state(jwt: JwtManager, with_resolver: bool) -> AdminState {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     }
 }
 

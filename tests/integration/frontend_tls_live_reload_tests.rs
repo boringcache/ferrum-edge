@@ -690,6 +690,9 @@ fn trust_test_admin_state(header_read_timeout_seconds: u64) -> ferrum_edge::admi
         external_ref_loader: Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        // File mode runs no database poll loop, so there is no live-apply
+        // coordinator to wait on (issue #3926).
+        runtime_config_apply: None,
     }
 }
 

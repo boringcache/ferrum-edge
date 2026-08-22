@@ -15068,6 +15068,7 @@ fn start_mesh_admin_listeners(
                 fixtures: std::collections::HashMap::new(),
             },
         ),
+        runtime_config_apply: None,
     };
 
     let mut handles = Vec::new();

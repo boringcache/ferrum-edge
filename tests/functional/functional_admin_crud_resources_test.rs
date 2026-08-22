@@ -1595,7 +1595,9 @@ async fn run_available_plugin_config_crud(gateway: &TestGateway, backend_port: u
             "openapi_validator" => ("proxy", Some(validator_proxy_id.as_str())),
             // These plugins own process-global registries, so the admin write
             // path and runtime rejecting contract both require global scope.
-            "transaction_log_schema" | "prometheus_metrics" => ("global", None),
+            "transaction_log_schema" | "prometheus_metrics" | "__mesh_bpf_metrics" => {
+                ("global", None)
+            }
             _ => ("proxy_group", None),
         };
 

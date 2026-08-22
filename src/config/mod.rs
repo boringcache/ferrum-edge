@@ -11,6 +11,8 @@
 //! - `config_backup` — On-disk JSON backup for DB-unreachable startup failover
 //! - `config_change_watch` — Coalesced wake-up signal for backend-native
 //!   config-change watchers (MongoDB replica-set change streams)
+//! - `runtime_config_apply` — Database-mode admin read-your-write wait on the
+//!   authoritative poll-loop reload (issue #3926)
 //! - `config_migration` — Config format version migrations (chain-of-responsibility)
 //! - `migrations` — SQL schema migrations for database mode
 //! - `plugin_trigger` — Declarative per-plugin-instance execution triggers
@@ -43,6 +45,9 @@ pub mod plugin_trigger;
 pub mod pool_config;
 #[allow(dead_code)] // Public DOC-03 inventory is consumed by external tests, not the binary crate.
 pub mod public_env_inventory;
+/// In-process database-mode admin write live-apply coordinator (issue #3926).
+#[allow(dead_code)]
+pub mod runtime_config_apply;
 /// TEST-ONLY debug-build database outage control for functional fixtures.
 /// See the module docs — not a production configuration surface.
 #[allow(dead_code)] // arm_path / disarm_for_tests are exercised by external unit tests.

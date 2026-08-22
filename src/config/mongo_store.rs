@@ -95,7 +95,7 @@ mod inner {
     use std::ops::Deref;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
     use tracing::{debug, error, info, warn};
     use uuid::Uuid;
@@ -943,6 +943,9 @@ mod inner {
         // `connection_generation`. Readers never take both locks nested on the
         // same fair RwLock.
         admin_write_topology: Arc<tokio::sync::RwLock<()>>,
+        /// Monotonic process-local generation of `connection`, published under
+        /// the same Admin + admission write guards as the ArcSwap.
+        topology_epoch: Arc<AtomicU64>,
         // Multi-step admission guards outlive an individual trait call. Their owner
         // token indexes the exact connection bundle and generation pin that
         // every clear/replay batch must borrow until explicit release.
@@ -1050,6 +1053,7 @@ mod inner {
                 connection: Arc::new(ArcSwap::from_pointee(connection)),
                 connection_generation: Arc::new(tokio::sync::RwLock::new(())),
                 admin_write_topology: Arc::new(tokio::sync::RwLock::new(())),
+                topology_epoch: Arc::new(AtomicU64::new(1)),
                 persistent_admission_pins: Arc::new(DashMap::new()),
                 retained_admission_pins: Arc::new(DashMap::new()),
                 conn_settings,
@@ -1570,10 +1574,16 @@ mod inner {
             if topology == MongoReconnectTopology::Primary {
                 self.failover_topology.ensure_primary_failback_allowed()?;
             }
+            let next_topology_epoch =
+                crate::config::db_backend::checked_next_config_topology_epoch(
+                    self.topology_epoch.load(Ordering::Acquire),
+                )?;
             if topology == MongoReconnectTopology::Failover {
                 self.failover_topology.mark_failover(url_redacted);
             }
             let _old_connection = self.connection.swap(Arc::new(new_connection));
+            self.topology_epoch
+                .store(next_topology_epoch, Ordering::Release);
             self.replica_set_configured
                 .store(replica_set_configured, Ordering::Release);
             // Test seam: hold publication guards across the primary
@@ -1679,6 +1689,7 @@ mod inner {
                 connection: Arc::new(ArcSwap::from_pointee(connection)),
                 connection_generation: Arc::new(tokio::sync::RwLock::new(())),
                 admin_write_topology: Arc::new(tokio::sync::RwLock::new(())),
+                topology_epoch: Arc::new(AtomicU64::new(1)),
                 persistent_admission_pins: Arc::new(DashMap::new()),
                 retained_admission_pins: Arc::new(DashMap::new()),
                 conn_settings: settings,
@@ -6183,7 +6194,12 @@ mod inner {
             // an in-flight mutation cannot be redirected and reconnect stays
             // fail-fast while either pin is held.
             let guard = self.admin_write_topology.clone().read_owned().await;
-            crate::config::db_backend::DbWriteTopologyPermit::pinned(guard)
+            let topology_epoch = self.topology_epoch.load(Ordering::Acquire);
+            crate::config::db_backend::DbWriteTopologyPermit::pinned(guard, topology_epoch)
+        }
+
+        fn config_topology_epoch(&self) -> u64 {
+            self.topology_epoch.load(Ordering::Acquire)
         }
 
         fn set_slow_query_threshold(&mut self, threshold_ms: Option<u64>) {
@@ -15156,6 +15172,7 @@ mod inner {
                 connection: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(connection)),
                 connection_generation: std::sync::Arc::new(tokio::sync::RwLock::new(())),
                 admin_write_topology: std::sync::Arc::new(tokio::sync::RwLock::new(())),
+                topology_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
                 persistent_admission_pins: std::sync::Arc::new(DashMap::new()),
                 retained_admission_pins: std::sync::Arc::new(DashMap::new()),
                 conn_settings: settings,

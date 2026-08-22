@@ -69,6 +69,7 @@ fn admin_state_for_source_status(mode: &str, db_available: Option<Arc<AtomicBool
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     }
 }
 
