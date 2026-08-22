@@ -18951,7 +18951,8 @@ async fn functional_h3_plain_dispatches_over_same_cluster_sidecar_mesh_mtls() {
 /// yields 502 `{"error":"HBONE backend unavailable"}` after CONNECT succeeds.
 #[test]
 fn h3_plain_ambient_hbone_inner_app_is_http1_not_h2c() {
-    let test = mesh_test_fn_body("functional_h3_plain_dispatches_over_same_cluster_ambient_hbone");
+    let test =
+        mesh_test_fn_body("functional_h3_plain_dispatches_over_same_cluster_ambient_hbone_inner");
     assert!(
         test.contains("start_h3_mesh_http1_http_app("),
         "plain Ambient HBONE must reach an HTTP/1.1 app through the byte tunnel"
@@ -18979,8 +18980,27 @@ fn h3_plain_ambient_hbone_inner_app_is_http1_not_h2c() {
 /// Inner tunnel traffic is HTTP/1.1 (same as H1/H2 `proxy_to_backend_hbone`),
 /// not nested h2c.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_plain_dispatches_over_same_cluster_ambient_hbone() {
+#[test]
+fn functional_h3_plain_dispatches_over_same_cluster_ambient_hbone() {
+    // Production gives every worker 8 MiB (`thread_stack_size` in `src/main.rs`)
+    // because, as that comment records, "the proxy request future is deliberately
+    // broad ... and a real cross-cluster sidecar HTTP/2 request has exceeded"
+    // Rust's 2 MiB spawned-thread default on hosted Linux runners. `#[tokio::test]`
+    // silently takes that 2 MiB default, so this H3-over-HBONE dispatch — the
+    // broadest request future the gateway has — aborted the worker at
+    // `opt-level = 0` purely because the test under-provisions the stack by 4x
+    // relative to the binary under test. Match production rather than reshaping
+    // the request path to fit a budget production does not use.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("build 8 MiB-stack runtime matching src/main.rs")
+        .block_on(functional_h3_plain_dispatches_over_same_cluster_ambient_hbone_inner());
+}
+
+async fn functional_h3_plain_dispatches_over_same_cluster_ambient_hbone_inner() {
     let identities = TempDir::new().expect("h3 plain hbone identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
