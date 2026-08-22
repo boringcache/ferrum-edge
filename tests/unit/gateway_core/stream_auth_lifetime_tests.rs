@@ -3804,11 +3804,14 @@ fn the_direct_h2_handler_joins_its_upload_before_returning() {
         1,
         "cancel-on-drop belongs only to the direct-H2 arm that joins its pump"
     );
+    // #4020 split this into three arms gated by `direct_h2_uses_limit_adapter`,
+    // so the condition now carries that predicate and the arm closes into an
+    // `else if` rather than a bare `else`.
     let gate_arm = direct_h2
-        .split("if needs_upload_completion_gate {")
+        .split("if use_limit_adapter && needs_upload_completion_gate {")
         .nth(1)
         .expect("direct-H2 upload-gate arm")
-        .split("\n    } else {")
+        .split("\n        } else if let")
         .next()
         .expect("bounded direct-H2 upload-gate arm");
     assert!(
