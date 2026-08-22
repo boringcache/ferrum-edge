@@ -33,7 +33,7 @@ set -euo pipefail
 #     tests/k8s/multicluster-federation/run.sh
 #
 # Set FERRUM_MULTICLUSTER_DEPLOY_ONLY=1 to run only the SPIRE/workload deploy
-# without driving traffic or gating (smoke).
+# without driving traffic or gating (local smoke; not a CI job).
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/.context/multicluster-federation}"

@@ -142,8 +142,9 @@ FERRUM_MESH_E2E_LIVE_ACK_DISPOSABLE=true tests/k8s/mesh_e2e_sidecar/run.sh
 ```
 
 Requires `docker`, `kind`, `kubectl`, `curl`, `python3`, `openssl`. Set
-`FERRUM_MESH_E2E_DEPLOY_ONLY=1` for the deploy-only smoke (the `ci.yml`
-`mesh-e2e-sidecar` job), `FERRUM_SKIP_IMAGE_BUILD=1` when the runtime image is
-prebuilt/loaded. The full datapath run rides
+`FERRUM_MESH_E2E_DEPLOY_ONLY=1` for a local deploy-only smoke (SPIRE/workload
+rollout, no traffic probes). `FERRUM_SKIP_IMAGE_BUILD=1` when the runtime image is
+prebuilt/loaded. CI coverage is the full datapath run in
 `.github/workflows/mesh-e2e-sidecar-live.yml` (path-filtered via
-`.github/scripts/live_suite_path_filter.py`, suite `mesh-e2e-sidecar`).
+`.github/scripts/live_suite_path_filter.py`, suite `mesh-e2e-sidecar`); the
+required check is `Mesh E2E Sidecar Live`.
