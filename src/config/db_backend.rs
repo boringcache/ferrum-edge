@@ -10,8 +10,8 @@
 #[allow(unused_imports)]
 pub use crate::config::batch_atomicity::{
     ATOMIC_BATCH_UNSUPPORTED_MESSAGE, AtomicBatchCounts, AtomicBatchGraph, AtomicBatchUnsupported,
-    BATCH_ADMISSION_LEASE_LOST_MESSAGE, BatchAdmissionLeaseLost, NamespaceConfigAdmissionLeaseRef,
-    atomic_batch_unsupported, is_batch_admission_lease_lost,
+    BATCH_ADMISSION_LEASE_LOST_MESSAGE, BatchAdmissionLeaseLost, NamespaceAdmissionLeaseHold,
+    NamespaceConfigAdmissionLeaseRef, atomic_batch_unsupported, is_batch_admission_lease_lost,
 };
 use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
 use crate::config::types::{
@@ -2234,6 +2234,153 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<String>, anyhow::Error>;
+
+    /// Load one registry row. Returns `None` when the name is not in the
+    /// registry. Callers that need derived-only names should also check
+    /// [`Self::namespace_name_in_use`].
+    async fn get_namespace(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::config::namespace_registry::NamespaceRecord>, anyhow::Error> {
+        let _ = name;
+        Ok(None)
+    }
+
+    /// True when `name` exists in the registry or as a derived resource
+    /// namespace (the five resource tables plus API specs).
+    async fn namespace_name_in_use(&self, name: &str) -> Result<bool, anyhow::Error> {
+        Ok(self
+            .list_namespaces_authoritative()
+            .await?
+            .iter()
+            .any(|existing| existing == name))
+    }
+
+    /// True when the tenant still has occupancy resources that block an
+    /// unconfirmed DELETE (proxies, consumers, plugins, upstreams, trust
+    /// bundles, API specs).
+    async fn namespace_has_resources(&self, name: &str) -> Result<bool, anyhow::Error> {
+        let counts = self.count_namespace_resources(name).await?;
+        if !counts.is_empty() {
+            return Ok(true);
+        }
+        Ok(self
+            .get_namespace_gateway_trust_bundle(name)
+            .await?
+            .is_some())
+    }
+
+    /// The namespaces this process is configured to serve, sorted and
+    /// de-duplicated.
+    ///
+    /// Applied once at startup through [`Self::set_protected_namespaces`] from
+    /// the already-resolved `EnvConfig`, so no request-time code has to re-read
+    /// the process environment (which would bypass the
+    /// CLI > env > conf-file > default precedence `EnvConfig` already applied).
+    ///
+    /// Database mode contributes its resolved `FERRUM_NAMESPACE`. A control
+    /// plane additionally contributes every explicitly configured
+    /// `FERRUM_CP_NAMESPACES` entry, because `CpScope::Single`/`Set` keeps
+    /// polling exactly those names forever: removing or renaming one would
+    /// leave the CP polling a namespace that no longer exists, and every DP
+    /// subscribed to it would converge to empty configuration until the process
+    /// was restarted. `FERRUM_CP_NAMESPACES=*` is dynamic and contributes
+    /// nothing beyond `FERRUM_NAMESPACE`.
+    ///
+    /// Every namespace here is protected from DELETE **and** from rename-away:
+    /// a rename is semantically a removal of the old name. A description-only
+    /// update remains allowed.
+    fn protected_namespaces(&self) -> &[String] {
+        crate::config::namespace_registry::default_protected_namespaces()
+    }
+
+    /// Apply the resolved protected namespace set after store construction, the
+    /// same way [`Self::set_failover_allow_writes`] applies its env-derived
+    /// setting. Implementations normalize through
+    /// [`crate::config::namespace_registry::normalize_protected_namespaces`].
+    fn set_protected_namespaces(&mut self, namespaces: &[String]) {
+        let _ = namespaces;
+    }
+
+    /// True when `name` may not be deleted or renamed away.
+    fn is_protected_namespace(&self, name: &str) -> bool {
+        crate::config::namespace_registry::protected_namespaces_contains(
+            self.protected_namespaces(),
+            name,
+        )
+    }
+
+    /// Whether this backend deployment can commit a namespace registry
+    /// mutation all-or-nothing right now.
+    ///
+    /// Admin handlers must consult this before acquiring admission leases so
+    /// an unsupported deployment is refused without touching even the guard
+    /// documents. Backends whose capability depends on live topology must
+    /// re-check inside [`DatabaseBackend::create_namespace`],
+    /// [`DatabaseBackend::update_namespace`], and
+    /// [`DatabaseBackend::delete_namespace`] so a reconnect between preflight
+    /// and persistence cannot open a partial-commit window.
+    fn ensure_namespace_registry_atomicity_supported(
+        &self,
+    ) -> Result<(), crate::config::namespace_registry::NamespaceRegistryAtomicityUnsupported> {
+        Ok(())
+    }
+
+    /// Insert a registry row, all-or-nothing, re-verifying every `leases` entry
+    /// inside the committing transaction.
+    ///
+    /// Returns [`crate::config::namespace_registry::NamespaceRegistryError::NameInUse`]
+    /// when the name already exists in the registry or as a derived namespace —
+    /// checked inside the transaction, not by an earlier handler query.
+    async fn create_namespace(
+        &self,
+        record: &crate::config::namespace_registry::NamespaceRecord,
+        leases: &[NamespaceAdmissionLeaseHold<'_>],
+    ) -> Result<(), anyhow::Error> {
+        let _ = (record, leases);
+        Err(anyhow::anyhow!(
+            "namespace registry writes are not supported by this backend"
+        ))
+    }
+
+    /// Update description and/or rename, all-or-nothing.
+    ///
+    /// A rename rewrites the registry row, every resource `namespace` column,
+    /// every namespace-keyed ancillary row, and the polling change-log
+    /// tombstones in ONE transaction, re-verifying the source, target, and
+    /// global registry leases immediately before commit.
+    async fn update_namespace(
+        &self,
+        current_name: &str,
+        new_name: &str,
+        description: Option<Option<String>>,
+        leases: &[NamespaceAdmissionLeaseHold<'_>],
+    ) -> Result<crate::config::namespace_registry::NamespaceRecord, anyhow::Error> {
+        let _ = (current_name, new_name, description, leases);
+        Err(anyhow::anyhow!(
+            "namespace registry writes are not supported by this backend"
+        ))
+    }
+
+    /// Delete a namespace, all-or-nothing.
+    ///
+    /// Occupancy, process-default protection, and the last remaining
+    /// **registry row** are all evaluated INSIDE the committing transaction — a
+    /// handler precheck can only improve the error message, never be the
+    /// authority. When `cascade` is false and resources remain, returns
+    /// [`crate::config::namespace_registry::NamespaceRegistryError::NotEmpty`]
+    /// with nothing deleted.
+    async fn delete_namespace(
+        &self,
+        name: &str,
+        cascade: bool,
+        leases: &[NamespaceAdmissionLeaseHold<'_>],
+    ) -> Result<bool, anyhow::Error> {
+        let _ = (name, cascade, leases);
+        Err(anyhow::anyhow!(
+            "namespace registry writes are not supported by this backend"
+        ))
+    }
 
     // -----------------------------------------------------------------------
     // ApiSpec CRUD (admin-only — NEVER call from polling loops, gRPC

@@ -1995,6 +1995,8 @@ fn body_consuming_route_role(method: &Method, segments: &[&str]) -> Option<Optio
         // which peer identities the fleet will accept.
         ["gateway-trust-bundles"] if is_post => Some(Some(AdminRole::Admin)),
         ["gateway-trust-bundles", _] if is_put => Some(Some(AdminRole::Admin)),
+        ["namespaces"] if is_post => Some(Some(AdminRole::Admin)),
+        ["namespaces", _] if is_put => Some(Some(AdminRole::Admin)),
         ["batch"] | ["restore"] if is_post => Some(Some(AdminRole::Admin)),
         ["mesh", "egress-scope", "test"] if is_post => Some(Some(AdminRole::Operator)),
         ["admin", "tls", "acme", "certificates"] if is_post => tls_role(),
@@ -2166,9 +2168,10 @@ fn extract_namespace(headers: &hyper::HeaderMap) -> Result<String, Response<Full
 /// Whether an admin route operates on namespace-scoped resources selected via
 /// `X-Ferrum-Namespace`. Used by the opt-in per-namespace `ns`-claim gate
 /// (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`); global admin surfaces (TLS
-/// management, `/cluster`, `/namespaces`, metrics, backend capabilities, mesh
-/// introspection, `/plugins` type listing) are exempt because the namespace
-/// header does not select a tenant there.
+/// management, `/cluster`, `/namespaces` registry CRUD, metrics, backend
+/// capabilities, mesh introspection, `/plugins` type listing) are exempt
+/// because the namespace header does not select a tenant there. Namespace
+/// registry handlers apply the `ns` claim to the path/body name themselves.
 fn is_namespace_scoped_route(segments: &[&str]) -> bool {
     match segments.first().copied() {
         Some(
@@ -3140,7 +3143,9 @@ async fn handle_admin_request_inner(
     // CP↔DP gRPC `ns` claim so a staging-scoped operator token cannot address
     // prod by swapping X-Ferrum-Namespace. Applies only to namespace-scoped
     // resource routes — global admin surfaces (TLS management, /cluster,
-    // /namespaces, metrics, mesh introspection) are not tenant-selected.
+    // /namespaces registry, metrics, mesh introspection) are not selected
+    // by X-Ferrum-Namespace. Registry handlers apply the claim to the
+    // path/body name themselves.
     if state.admin_require_namespace_claim
         && is_namespace_scoped_route(segments_peek.as_slice())
         && let Some(resp) = enforce_namespace_claim(&auth, &namespace, &path)
@@ -3655,10 +3660,29 @@ async fn handle_admin_request_inner(
             handle_audit_list(&state, &pagination, query.as_deref(), &namespace).await
         }
 
-        // Namespaces
+        // Namespaces (registry CRUD; not selected by X-Ferrum-Namespace)
         (Method::GET, ["namespaces"]) => {
             let pagination = route_pagination!();
-            handle_list_namespaces(&state, &pagination).await
+            handle_list_namespaces(&state, &auth, &pagination).await
+        }
+        (Method::GET, ["namespaces", name]) => handle_get_namespace(&state, &auth, name).await,
+        (Method::POST, ["namespaces"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            handle_create_namespace(&state, &auth, &body_bytes).await
+        }
+        (Method::PUT, ["namespaces", name]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            handle_update_namespace(&state, &auth, name, &body_bytes).await
+        }
+        (Method::DELETE, ["namespaces", name]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
+            handle_delete_namespace(&state, &auth, name, query.as_deref()).await
         }
 
         // Metrics
@@ -9509,11 +9533,296 @@ async fn handle_audit_list(
 
 // ---- Namespaces ----
 
+/// When `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` is on, `GET /namespaces` is
+/// filtered to the token's claimed names (missing/empty claim → empty list)
+/// rather than 403, because the list route is a global surface.
+fn filter_listed_namespaces(
+    require_claim: bool,
+    auth: &AuditActor,
+    names: Vec<String>,
+) -> Vec<String> {
+    if !require_claim {
+        return names;
+    }
+    names
+        .into_iter()
+        .filter(|name| auth.allowed_namespaces.allows(name))
+        .collect()
+}
+
+fn maybe_enforce_namespace_claim(
+    state: &AdminState,
+    auth: &AuditActor,
+    name: &str,
+    path: &str,
+) -> Option<Response<Full<Bytes>>> {
+    if !state.admin_require_namespace_claim {
+        return None;
+    }
+    enforce_namespace_claim(auth, name, path)
+}
+
+/// Detail record for a name that exists only as a derived resource namespace
+/// (or, in file mode, only in the loaded config).
+///
+/// There is no durable registry row, so there is no durable history either:
+/// `created_at`/`updated_at` are **observation timestamps** stamped when the
+/// request is served, not stable registry metadata. Two `GET`s of the same
+/// derived-only namespace return two different values, and they must not be
+/// compared, cached as identity, or used for ordering. A `POST /namespaces` or
+/// a `PUT` that materializes the row is what gives the tenant durable
+/// timestamps. Both timestamps stay required in the response schema so clients
+/// never have to special-case a missing field; this repair deliberately does
+/// not fabricate durable history for a row that does not exist.
+fn synthesized_namespace_record(name: &str) -> crate::config::namespace_registry::NamespaceRecord {
+    crate::config::namespace_registry::NamespaceRecord::new(name.to_string(), None, Utc::now())
+}
+
+fn namespace_registry_atomicity_unsupported_response(
+    unsupported: &crate::config::namespace_registry::NamespaceRegistryAtomicityUnsupported,
+) -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::NOT_IMPLEMENTED,
+        &json!({
+            "error": crate::config::namespace_registry::NAMESPACE_REGISTRY_ATOMICITY_UNSUPPORTED_MESSAGE,
+            "detail": unsupported.detail(),
+        }),
+    )
+}
+
+/// Map a failed namespace registry mutation onto a documented status.
+///
+/// Every path here is fail-closed: nothing from the request is durable unless
+/// the backend's committing transaction returned success, so a lost lease and a
+/// deployment that cannot supply the guarantee both report "nothing changed".
+fn map_namespace_registry_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
+    if let Some(reg) = crate::config::namespace_registry::is_namespace_registry_error(error) {
+        let status = match reg {
+            crate::config::namespace_registry::NamespaceRegistryError::NameInUse { .. }
+            | crate::config::namespace_registry::NamespaceRegistryError::NotEmpty { .. }
+            | crate::config::namespace_registry::NamespaceRegistryError::Protected { .. } => {
+                StatusCode::CONFLICT
+            }
+            crate::config::namespace_registry::NamespaceRegistryError::NotFound { .. } => {
+                StatusCode::NOT_FOUND
+            }
+        };
+        return json_response(status, &json!({"error": reg.to_string()}));
+    }
+    if crate::config::namespace_registry::is_namespace_registry_corrupt(error).is_some() {
+        warn_persistence_failure_redacted("namespace_registry_corrupt");
+        return json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({
+                "error": crate::config::namespace_registry::NamespaceRegistryCorrupt::MESSAGE
+            }),
+        );
+    }
+    // `501 Not Implemented` rather than `503`, matching `POST /batch`: the
+    // request is well-formed and the server is healthy, but the endpoint's
+    // atomicity contract is not implementable against the configured database
+    // deployment, so retrying unchanged will never succeed.
+    if let Some(unsupported) =
+        crate::config::namespace_registry::namespace_registry_atomicity_unsupported(error)
+    {
+        return namespace_registry_atomicity_unsupported_response(unsupported);
+    }
+    if is_mtls_dns_admission_unavailable(error) {
+        return mtls_dns_admission_unavailable_response();
+    }
+    // The authorizing lease was not held at the commit boundary, so the
+    // transaction aborted: nothing is durable and a retry is safe.
+    if crate::config::db_backend::is_batch_admission_lease_lost(error) {
+        error_persistence_failure_redacted("namespace_registry_admission_lost");
+        let mut response = json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({
+                "error": crate::config::db_backend::BATCH_ADMISSION_LEASE_LOST_MESSAGE,
+                "rollback": "not_needed",
+            }),
+        );
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        return response;
+    }
+    if chain_has_unique_constraint_violation(error) {
+        return json_response(
+            StatusCode::CONFLICT,
+            &json!({"error": "namespace already exists"}),
+        );
+    }
+    // The database itself aborted the committing transaction as a serialization
+    // failure or deadlock victim — PostgreSQL `40001`/`40P01` under the
+    // REPEATABLE READ capture a rename/delete uses, which the independent
+    // 30-second admission-lease renewer can trigger by updating
+    // `config_admission_locks` between this transaction's snapshot and its
+    // final `SELECT ... FOR UPDATE`. Nothing committed, so this is the same
+    // fail-closed, safe-to-retry answer a lost lease gets rather than a `500`.
+    // Classified after the uniqueness branch so a real name conflict — which a
+    // retry would only repeat — can never land here.
+    if crate::config::namespace_registry::is_namespace_registry_retryable_conflict(error) {
+        use crate::config::namespace_registry::NAMESPACE_REGISTRY_RETRYABLE_CONFLICT_MESSAGE;
+        error_persistence_failure_redacted("namespace_registry_transaction_conflict");
+        let mut response = json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({
+                "error": NAMESPACE_REGISTRY_RETRYABLE_CONFLICT_MESSAGE,
+                "rollback": "not_needed",
+            }),
+        );
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        return response;
+    }
+    json_response(StatusCode::INTERNAL_SERVER_ERROR, &db_error_response(error))
+}
+
+/// Acquire the global registry lease plus one lease per affected namespace, in
+/// the total order that makes concurrent registry mutations serializable across
+/// gateway processes.
+#[allow(clippy::result_large_err)]
+async fn acquire_namespace_registry_admission(
+    db: Arc<dyn DatabaseBackend>,
+    names: &[&str],
+) -> Result<crud::NamespaceRegistryAdmission, Response<Full<Bytes>>> {
+    match crud::lock_namespace_registry_admission(db, names).await {
+        Ok(guards) => Ok(guards),
+        Err(_error) => {
+            warn_persistence_failure_redacted("namespace_registry_admission_acquire");
+            // Same retryable 503 (with `Retry-After`) every other
+            // admission-leased mutation returns, so clients can back off
+            // instead of treating contention as a hard failure.
+            Err(mtls_dns_admission_unavailable_response())
+        }
+    }
+}
+
+/// Run one registry mutation under the admission guards.
+///
+/// A `Lost` completion whose persistence returned `Ok` is still a success: the
+/// backend verified every lease inside the transaction it committed, against the
+/// datastore's own clock, so the write WAS authorized even though this process's
+/// local liveness view has since lapsed. A `Lost` completion whose persistence
+/// failed is mapped from the backend's typed error (including a commit-boundary
+/// lease loss as the retryable fail-closed 503); a lease lost before persistence
+/// started is also 503. No unverified late write is ever reported as success.
+#[allow(clippy::result_large_err)]
+async fn run_namespace_registry_mutation<T, F>(
+    admission: &crud::NamespaceRegistryAdmission,
+    future: F,
+) -> Result<T, Response<Full<Bytes>>>
+where
+    F: std::future::Future<Output = Result<T, anyhow::Error>>,
+{
+    let completion = match admission.run_to_completion_while_held(future).await {
+        Ok(completion) => completion,
+        Err(_error) => {
+            warn_persistence_failure_redacted("namespace_registry_admission_lost_before_write");
+            return Err(mtls_dns_admission_unavailable_response());
+        }
+    };
+    let result = match completion {
+        crud::NamespaceConfigAdmissionCompletion::Held(result) => result,
+        crud::NamespaceConfigAdmissionCompletion::Lost { result, error: _ } => match result {
+            Ok(value) => return Ok(value),
+            Err(persist_error) => Err(persist_error),
+        },
+    };
+    result.map_err(|error| map_namespace_registry_error(&error))
+}
+
+/// Registry names a handler refuses to mutate, as the typed conflict error so
+/// the wire shape matches every other registry 409.
+///
+/// The reason is a fixed constant naming only the configuration keys an
+/// operator can change: it must never enumerate the rest of the configured
+/// namespace set, which would let a caller probe which tenants this gateway
+/// serves.
+fn protected_namespace_response(name: &str) -> Response<Full<Bytes>> {
+    use crate::config::namespace_registry::NamespaceRegistryError as RegistryError;
+    map_namespace_registry_error(&RegistryError::protected(
+        name,
+        RegistryError::PROTECTED_CONFIGURED_NAMESPACE,
+    ))
+}
+
+/// The namespace a completed registry mutation moved rows into or out of that
+/// this process actually serves (issues #3926 x #3955).
+///
+/// A registry-only `POST` and a description-only `PUT` write no `config_changes`
+/// row at all, so their callers pass an empty slice and never wait. Waiting
+/// there would be a lie in both directions: there is no generation of their own
+/// to become live, and `latest_change_sequence` is a namespace-wide `MAX`, so
+/// they would block on an unrelated concurrent writer and could report a
+/// truthful, already-visible mutation as a `503`.
+///
+/// A rename rewrites every resource `namespace` column and writes `delete` /
+/// `upsert` tombstones under BOTH names; a confirmed cascade delete writes
+/// `delete` tombstones under the deleted name. When one of those names is the
+/// namespace this process serves, the served runtime snapshot changes, so the
+/// mutation must not report success before the poll loop accepts it.
+fn served_live_apply_namespace<'a>(state: &AdminState, candidates: &[&'a str]) -> Option<&'a str> {
+    let apply = state.runtime_config_apply.as_ref()?;
+    let served = candidates.iter().find(|name| apply.serves_namespace(name));
+    served.copied()
+}
+
+/// Finish a committed namespace-registry mutation under the #3926 two-phase
+/// completion path.
+///
+/// `pins` is the write-topology permit plus the registry admission guards. They
+/// stay live while the covering `config_changes` watermark is captured from the
+/// same pinned topology that persisted the rows, and are dropped **before** the
+/// wait so the poll (or a reconnect) that has to publish that generation is not
+/// blocked by this request.
+///
+/// Returns a boxed future behind an `#[inline(never)]` boundary for the same
+/// reason [`AdminState::complete_live_config_mutation_after_commit_boxed`] does:
+/// at the coverage profile's `opt-level = 0` the whole future would otherwise be
+/// an alloca in the admin dispatch frame.
+#[inline(never)]
+fn complete_namespace_registry_mutation<'a, P>(
+    state: &'a AdminState,
+    candidates: &[&'a str],
+    pins: P,
+    response: Response<Full<Bytes>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response<Full<Bytes>>> + Send + 'a>>
+where
+    P: LiveApplyTopologyPins + Send + 'a,
+{
+    match served_live_apply_namespace(state, candidates) {
+        Some(namespace) => {
+            state.complete_live_config_mutation_after_commit_boxed(namespace, pins, response)
+        }
+        None => {
+            drop(pins);
+            Box::pin(std::future::ready(response))
+        }
+    }
+}
+
 async fn handle_list_namespaces(
     state: &AdminState,
+    auth: &AuditActor,
     pagination: &PaginationParams,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(ref db) = state.db {
+        if state.admin_require_namespace_claim {
+            match db.list_namespaces().await {
+                Ok(names) => {
+                    let filtered = filter_listed_namespaces(true, auth, names);
+                    return Ok(json_response(
+                        StatusCode::OK,
+                        &paginate_response(&filtered, pagination),
+                    ));
+                }
+                Err(e) => {
+                    return Ok(map_namespace_registry_error(&e));
+                }
+            }
+        }
         match db
             .list_namespaces_paginated(pagination.query_limit_i64(), pagination.query_offset_i64())
             .await
@@ -9522,23 +9831,429 @@ async fn handle_list_namespaces(
                 StatusCode::OK,
                 &paginate_db_response(&result.items, result.total, pagination),
             )),
-            Err(e) => Ok(json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &db_error_response(&e),
-            )),
+            Err(e) => Ok(map_namespace_registry_error(&e)),
         }
     } else if let Some(config) = state.cached_gateway_config() {
         // File mode: return namespaces captured at load time (before namespace filtering)
+        let names = filter_listed_namespaces(
+            state.admin_require_namespace_claim,
+            auth,
+            config.known_namespaces.clone(),
+        );
         Ok(json_response(
             StatusCode::OK,
-            &paginate_response(&config.known_namespaces, pagination),
+            &paginate_response(&names, pagination),
+        ))
+    } else {
+        let names = filter_listed_namespaces(
+            state.admin_require_namespace_claim,
+            auth,
+            vec![crate::config::types::DEFAULT_NAMESPACE.to_string()],
+        );
+        Ok(json_response(
+            StatusCode::OK,
+            &paginate_response(&names, pagination),
+        ))
+    }
+}
+
+async fn resolve_namespace_record(
+    db: &dyn DatabaseBackend,
+    name: &str,
+) -> Result<Option<crate::config::namespace_registry::NamespaceRecord>, anyhow::Error> {
+    if let Some(record) = db.get_namespace(name).await? {
+        return Ok(Some(record));
+    }
+    if db.namespace_name_in_use(name).await? {
+        return Ok(Some(synthesized_namespace_record(name)));
+    }
+    Ok(None)
+}
+
+async fn handle_get_namespace(
+    state: &AdminState,
+    auth: &AuditActor,
+    name: &str,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if let Err(e) = crate::config::namespace_registry::validate_namespace_name(name) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid namespace name: {e}")}),
+        ));
+    }
+    if let Some(resp) =
+        maybe_enforce_namespace_claim(state, auth, name, &format!("/namespaces/{name}"))
+    {
+        return Ok(resp);
+    }
+    if let Some(ref db) = state.db {
+        match resolve_namespace_record(db.as_ref(), name).await {
+            Ok(Some(record)) => Ok(json_response(
+                StatusCode::OK,
+                &serde_json::to_value(&record).unwrap_or_else(|_| json!({})),
+            )),
+            Ok(None) => Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": format!("namespace '{name}' not found")}),
+            )),
+            Err(e) => Ok(map_namespace_registry_error(&e)),
+        }
+    } else if let Some(config) = state.cached_gateway_config() {
+        if config
+            .known_namespaces
+            .iter()
+            .any(|existing| existing == name)
+        {
+            Ok(json_response(
+                StatusCode::OK,
+                &serde_json::to_value(synthesized_namespace_record(name))
+                    .unwrap_or_else(|_| json!({})),
+            ))
+        } else {
+            Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": format!("namespace '{name}' not found")}),
+            ))
+        }
+    } else if name == crate::config::types::DEFAULT_NAMESPACE {
+        Ok(json_response(
+            StatusCode::OK,
+            &serde_json::to_value(synthesized_namespace_record(name)).unwrap_or_else(|_| json!({})),
         ))
     } else {
         Ok(json_response(
-            StatusCode::OK,
-            &paginate_response(&[crate::config::types::DEFAULT_NAMESPACE], pagination),
+            StatusCode::NOT_FOUND,
+            &json!({"error": format!("namespace '{name}' not found")}),
         ))
     }
+}
+
+async fn handle_create_namespace(
+    state: &AdminState,
+    actor: &AuditActor,
+    body: &[u8],
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
+    let request: crate::config::namespace_registry::CreateNamespaceRequest =
+        match serde_json::from_slice(body) {
+            Ok(request) => request,
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("Invalid JSON body: {e}")}),
+                ));
+            }
+        };
+    if let Err(e) = crate::config::namespace_registry::validate_namespace_name(&request.name) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid namespace name: {e}")}),
+        ));
+    }
+    let description =
+        match crate::config::namespace_registry::normalize_description(request.description) {
+            Ok(description) => description,
+            Err(e) => {
+                return Ok(json_response(StatusCode::BAD_REQUEST, &json!({"error": e})));
+            }
+        };
+    if let Some(resp) = maybe_enforce_namespace_claim(state, actor, &request.name, "/namespaces") {
+        return Ok(resp);
+    }
+    let db = match require_db(state) {
+        Ok(db) => db.clone(),
+        Err(resp) => return Ok(*resp),
+    };
+    if let Err(unsupported) = db.ensure_namespace_registry_atomicity_supported() {
+        return Ok(namespace_registry_atomicity_unsupported_response(
+            &unsupported,
+        ));
+    }
+    let admission =
+        match acquire_namespace_registry_admission(db.clone(), &[request.name.as_str()]).await {
+            Ok(admission) => admission,
+            Err(resp) => return Ok(resp),
+        };
+    let record = crate::config::namespace_registry::NamespaceRecord::new(
+        request.name.clone(),
+        description,
+        Utc::now(),
+    );
+    let holds = admission.holds();
+    if let Err(resp) =
+        run_namespace_registry_mutation(&admission, db.create_namespace(&record, &holds)).await
+    {
+        return Ok(resp);
+    }
+    let event = audit::AuditEvent::new(
+        actor,
+        "create",
+        "namespace",
+        &record.name,
+        &record.name,
+        audit::create_diff(record.audit_body()),
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db, event).await {
+        log_audit_enqueue_failure(&error);
+    }
+    // Registry-only: a create inserts one `namespaces` row and no
+    // `config_changes` row, and the runtime snapshot never contains that table.
+    // There is nothing for the poll loop to make live, so this must NOT take the
+    // #3926 live-apply wait — doing so would block on an unrelated concurrent
+    // writer's watermark. The admission guards and the write permit drop here.
+    Ok(json_response(
+        StatusCode::CREATED,
+        &serde_json::to_value(&record).unwrap_or_else(|_| json!({})),
+    ))
+}
+
+async fn handle_update_namespace(
+    state: &AdminState,
+    actor: &AuditActor,
+    current_name: &str,
+    body: &[u8],
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
+    if let Err(e) = crate::config::namespace_registry::validate_namespace_name(current_name) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid namespace name: {e}")}),
+        ));
+    }
+    let request: crate::config::namespace_registry::UpdateNamespaceBody =
+        match serde_json::from_slice(body) {
+            Ok(request) => request,
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("Invalid JSON body: {e}")}),
+                ));
+            }
+        };
+    // Fail-closed field interpretation: an object/array/number/boolean, an
+    // over-long description, or `name: null` is a 400 with nothing mutated —
+    // never a silent clear and never a silent no-op.
+    let update = match request.resolve() {
+        Ok(update) => update,
+        Err(e) => {
+            return Ok(json_response(StatusCode::BAD_REQUEST, &json!({"error": e})));
+        }
+    };
+    let new_name = update
+        .name
+        .clone()
+        .unwrap_or_else(|| current_name.to_string());
+    if let Some(resp) = maybe_enforce_namespace_claim(
+        state,
+        actor,
+        current_name,
+        &format!("/namespaces/{current_name}"),
+    ) {
+        return Ok(resp);
+    }
+    if new_name != current_name
+        && let Some(resp) = maybe_enforce_namespace_claim(
+            state,
+            actor,
+            &new_name,
+            &format!("/namespaces/{current_name}"),
+        )
+    {
+        return Ok(resp);
+    }
+    let db = match require_db(state) {
+        Ok(db) => db.clone(),
+        Err(resp) => return Ok(*resp),
+    };
+    if let Err(unsupported) = db.ensure_namespace_registry_atomicity_supported() {
+        return Ok(namespace_registry_atomicity_unsupported_response(
+            &unsupported,
+        ));
+    }
+
+    // A rename is semantically a removal of the old name, so every namespace
+    // this gateway is configured to serve — the resolved `FERRUM_NAMESPACE`
+    // plus, on a control plane, each explicitly configured
+    // `FERRUM_CP_NAMESPACES` entry — is protected from it. Checked again inside
+    // the backend transaction; this precheck only produces a better message.
+    if new_name != current_name && db.is_protected_namespace(current_name) {
+        return Ok(protected_namespace_response(current_name));
+    }
+
+    // Global registry key first, then source and target in ascending order.
+    let admission =
+        match acquire_namespace_registry_admission(db.clone(), &[current_name, new_name.as_str()])
+            .await
+        {
+            Ok(admission) => admission,
+            Err(resp) => return Ok(resp),
+        };
+
+    let before = match resolve_namespace_record(db.as_ref(), current_name).await {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": format!("namespace '{current_name}' not found")}),
+            ));
+        }
+        Err(error) => return Ok(map_namespace_registry_error(&error)),
+    };
+
+    // Scoped so the lease-hold borrows end before `admission` is moved into the
+    // completion pins below.
+    let record = {
+        let holds = admission.holds();
+        match run_namespace_registry_mutation(
+            &admission,
+            db.update_namespace(current_name, &new_name, update.description, &holds),
+        )
+        .await
+        {
+            Ok(record) => record,
+            Err(resp) => return Ok(resp),
+        }
+    };
+    let renaming = new_name != current_name;
+    let event = audit::AuditEvent::new(
+        actor,
+        "update",
+        "namespace",
+        &record.name,
+        &record.name,
+        audit::update_diff(before.audit_body(), record.audit_body()),
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db, event).await {
+        log_audit_enqueue_failure(&error);
+    }
+    let response = json_response(
+        StatusCode::OK,
+        &serde_json::to_value(&record).unwrap_or_else(|_| json!({})),
+    );
+    // Only a rename moves resource rows. A description-only update touches one
+    // registry row that the runtime snapshot does not contain, so it returns
+    // without waiting for the poll loop.
+    let live_apply_candidates: Vec<&str> = if renaming {
+        vec![current_name, new_name.as_str()]
+    } else {
+        Vec::new()
+    };
+    Ok(complete_namespace_registry_mutation(
+        state,
+        &live_apply_candidates,
+        (admission, _write_permit),
+        response,
+    )
+    .await)
+}
+
+async fn handle_delete_namespace(
+    state: &AdminState,
+    actor: &AuditActor,
+    name: &str,
+    query: Option<&str>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
+    if let Err(e) = crate::config::namespace_registry::validate_namespace_name(name) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid namespace name: {e}")}),
+        ));
+    }
+    if let Some(resp) =
+        maybe_enforce_namespace_claim(state, actor, name, &format!("/namespaces/{name}"))
+    {
+        return Ok(resp);
+    }
+    let db = match require_db(state) {
+        Ok(db) => db.clone(),
+        Err(resp) => return Ok(*resp),
+    };
+    if let Err(unsupported) = db.ensure_namespace_registry_atomicity_supported() {
+        return Ok(namespace_registry_atomicity_unsupported_response(
+            &unsupported,
+        ));
+    }
+    // The namespaces this process is configured to serve — resolved once at
+    // startup through EnvConfig (FERRUM_NAMESPACE, plus every explicit
+    // FERRUM_CP_NAMESPACES entry on a control plane), never re-read from the
+    // environment here. Re-checked inside the backend transaction; this
+    // precheck only avoids taking leases for a request that cannot succeed.
+    if db.is_protected_namespace(name) {
+        return Ok(protected_namespace_response(name));
+    }
+    let cascade = parse_restore_confirm(query);
+    // The last-remaining-namespace invariant is NOT prechecked here: two
+    // gateways could each observe two registry rows and concurrently delete a
+    // different one. It is re-evaluated at the backend commit boundary against
+    // remaining durable registry rows, under the global registry lease. Ordinary
+    // resource CRUD is not serialized by that lease and does not create
+    // registry rows, so derived-only names cannot be the authority.
+    let admission = match acquire_namespace_registry_admission(db.clone(), &[name]).await {
+        Ok(admission) => admission,
+        Err(resp) => return Ok(resp),
+    };
+    let before = match resolve_namespace_record(db.as_ref(), name).await {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": format!("namespace '{name}' not found")}),
+            ));
+        }
+        Err(error) => return Ok(map_namespace_registry_error(&error)),
+    };
+    // Scoped so the lease-hold borrows end before `admission` is moved into the
+    // completion pins below.
+    {
+        let holds = admission.holds();
+        match run_namespace_registry_mutation(
+            &admission,
+            db.delete_namespace(name, cascade, &holds),
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": format!("namespace '{name}' not found")}),
+                ));
+            }
+            Err(resp) => return Ok(resp),
+        }
+    }
+    let event = audit::AuditEvent::new(
+        actor,
+        "delete",
+        "namespace",
+        name,
+        name,
+        audit::delete_diff(before.audit_body()),
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db, event).await {
+        log_audit_enqueue_failure(&error);
+    }
+    // Only a confirmed cascade removes resource rows and writes polling
+    // tombstones. An unconfirmed delete can only remove an empty tenant's
+    // registry row, which the runtime snapshot does not contain.
+    let live_apply_candidates: Vec<&str> = if cascade { vec![name] } else { Vec::new() };
+    Ok(complete_namespace_registry_mutation(
+        state,
+        &live_apply_candidates,
+        (admission, _write_permit),
+        empty_response(StatusCode::NO_CONTENT),
+    )
+    .await)
 }
 
 // ---- Helpers ----
@@ -10043,6 +10758,7 @@ mod tests {
         for segs in [
             vec!["plugins"], // plugin *type* listing — global metadata
             vec!["namespaces"],
+            vec!["namespaces", "tenant-a"],
             vec!["cluster"],
             vec!["backend-capabilities"],
             vec!["metrics", "runtime"],
@@ -10101,6 +10817,38 @@ mod tests {
         // server-derived ceiling (admin has none).
         assert!(!AllowedNamespaces::empty().is_present());
         assert!(AllowedNamespaces::claimed(std::collections::HashSet::new()).is_present());
+    }
+
+    #[test]
+    fn list_namespaces_claim_filter_is_fail_closed() {
+        use crate::grpc::auth::AllowedNamespaces;
+
+        let actor = |allowed: AllowedNamespaces| AuditActor {
+            sub: "tester".to_string(),
+            role: AdminRole::Viewer,
+            allowed_namespaces: allowed,
+        };
+        let names = vec![
+            "alpha".to_string(),
+            "ferrum".to_string(),
+            "zeta".to_string(),
+        ];
+
+        assert_eq!(
+            filter_listed_namespaces(false, &actor(AllowedNamespaces::empty()), names.clone()),
+            names
+        );
+
+        let mut set = std::collections::HashSet::new();
+        set.insert("zeta".to_string());
+        assert_eq!(
+            filter_listed_namespaces(true, &actor(AllowedNamespaces::claimed(set)), names.clone()),
+            vec!["zeta".to_string()]
+        );
+        assert!(
+            filter_listed_namespaces(true, &actor(AllowedNamespaces::empty()), names).is_empty(),
+            "a token with no ns claim must not see any registry names"
+        );
     }
 
     #[test]

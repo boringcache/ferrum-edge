@@ -372,13 +372,22 @@ fn mongo_atomic_batch_refuses_standalone_and_uses_one_session_transaction() {
     // the transaction's write set or the transaction's read snapshot would hide
     // a competing acquirer.
     let lease_check = writer
-        .find("config_admission_locks_in_transaction()")
+        .find("verify_namespace_config_admission_lease_in_session(")
         .expect("in-session lease verification");
     let commit_fault = writer
         .find("AtomicBatchPhase::Commit")
         .expect("commit fault point");
-    assert!(writer[lease_check..].contains("update_one("));
-    assert!(writer[lease_check..].contains("result.matched_count != 1"));
+    let helper_start = MONGO_STORE_SOURCE
+        .find("        async fn verify_namespace_config_admission_lease_in_session(")
+        .expect("shared in-session lease verifier");
+    let helper_end = MONGO_STORE_SOURCE[helper_start..]
+        .find("\n        // ---------------------------------------------------------------")
+        .expect("namespace-registry section must follow the shared lease verifier")
+        + helper_start;
+    let helper = &MONGO_STORE_SOURCE[helper_start..helper_end];
+    assert!(helper.contains("config_admission_locks_in_transaction()"));
+    assert!(helper.contains("update_one("));
+    assert!(helper.contains("result.matched_count == 1"));
     assert!(
         lease_check < commit_fault,
         "the lease check is the last gate before the runner commits"
@@ -437,14 +446,22 @@ fn atomic_batch_lease_gate_compares_expiry_against_current_database_time() {
         .expect("plan struct must follow the in-session writer")
         + writer_start;
     let writer = &MONGO_STORE_SOURCE[writer_start..writer_end];
-    let gate_start = writer
-        .find("config_admission_locks_in_transaction()")
-        .expect("in-session lease verification");
-    let gate = &writer[gate_start..];
+    assert!(
+        writer.contains("verify_namespace_config_admission_lease_in_session("),
+        "the atomic writer must use the shared in-session lease verifier"
+    );
+    let gate_start = MONGO_STORE_SOURCE
+        .find("        async fn verify_namespace_config_admission_lease_in_session(")
+        .expect("shared in-session lease verifier");
+    let gate_end = MONGO_STORE_SOURCE[gate_start..]
+        .find("\n        // ---------------------------------------------------------------")
+        .expect("namespace-registry section must follow the shared lease verifier")
+        + gate_start;
+    let gate = &MONGO_STORE_SOURCE[gate_start..gate_end];
     // Owner and generation still have to match, and the expiry comparison is
     // evaluated by the server at this gate, on every runner retry.
-    assert!(gate.contains("\"owner\": owner.as_str(),"));
-    assert!(gate.contains("\"generation\": *generation,"));
+    assert!(gate.contains("\"owner\": owner,"));
+    assert!(gate.contains("\"generation\": generation,"));
     assert!(
         gate.contains("\"$expr\": { \"$gt\": [ \"$expires_at\", \"$$NOW\" ] },"),
         "the lease gate must compare expires_at against MongoDB's own $$NOW, following the \
@@ -464,8 +481,9 @@ fn atomic_batch_lease_gate_compares_expiry_against_current_database_time() {
         MONGO_STORE_SOURCE[touch_start..touch_end].contains("\"updated_at\": \"$$NOW\""),
         "the lease-gate write must stamp updated_at from the server clock"
     );
-    // The only fallback is the DocumentDB one, and it re-reads the server clock
-    // at the gate rather than reusing anything captured earlier.
+    // The only fallback is the DocumentDB one: reuse the same in-session
+    // `$expr`/`$$NOW` filter with a classic update. A client timestamp must
+    // never become the expiry predicate.
     assert!(
         gate.contains("is_pipeline_update_unsupported(&error)"),
         "pipeline-form rejection (AWS DocumentDB) must be the only fallback trigger"
@@ -473,16 +491,25 @@ fn atomic_batch_lease_gate_compares_expiry_against_current_database_time() {
     let fallback_start = gate
         .find("is_pipeline_update_unsupported(&error)")
         .expect("fallback arm");
+    let fallback = &gate[fallback_start..];
     assert!(
-        gate[fallback_start..].contains("self.lease_server_time().await"),
-        "the classic fallback must read the MongoDB server clock at the gate, never the \
-         client clock or a pre-transaction snapshot"
+        fallback.contains("$currentDate") && fallback.contains("filter"),
+        "the classic fallback must reuse the in-session $$NOW filter with a classic update"
     );
     assert!(
-        gate.contains("result.matched_count != 1"),
-        "a lapsed or stolen lease must still abort the transaction"
+        !fallback.contains("lease_server_time()"),
+        "the DocumentDB fallback must never reintroduce lease_server_time() as the expiry \
+         authority"
     );
-    assert!(gate.contains("AtomicBatchAbort::AdmissionLeaseLost"));
+    assert!(
+        !fallback.contains("\"expires_at\": { \"$gt\": now }"),
+        "a pre-read timestamp must not become the expiry predicate"
+    );
+    assert!(
+        gate.contains("result.matched_count == 1"),
+        "the shared verifier must report only one matched live lease as valid"
+    );
+    assert!(writer.contains("AtomicBatchAbort::AdmissionLeaseLost"));
 
     // ---- SQL --------------------------------------------------------------
     let sql_start = SQL_STORE_SOURCE

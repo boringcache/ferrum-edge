@@ -175,15 +175,52 @@ const CONFIG_ADMISSION_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) async fn lock_local_namespace_config_admission(
     namespace: &str,
 ) -> MutexGuard<'static, ()> {
-    let locks = NAMESPACE_CONFIG_ADMISSION_LOCKS.get_or_init(|| {
+    let shard = namespace_config_admission_shard(namespace);
+    namespace_config_admission_locks()[shard].lock().await
+}
+
+fn namespace_config_admission_locks() -> &'static Vec<Mutex<()>> {
+    NAMESPACE_CONFIG_ADMISSION_LOCKS.get_or_init(|| {
         (0..NAMESPACE_CONFIG_ADMISSION_LOCK_SHARDS)
             .map(|_| Mutex::new(()))
             .collect()
-    });
+    })
+}
+
+fn namespace_config_admission_shard(namespace: &str) -> usize {
     let mut hasher = DefaultHasher::new();
     namespace.hash(&mut hasher);
-    let shard = hasher.finish() as usize % NAMESPACE_CONFIG_ADMISSION_LOCK_SHARDS;
-    locks[shard].lock().await
+    hasher.finish() as usize % NAMESPACE_CONFIG_ADMISSION_LOCK_SHARDS
+}
+
+/// Take the process-local shard mutexes covering every admission key in one
+/// operation.
+///
+/// Two properties matter and neither is optional:
+///
+/// * **Deduplicated by shard.** The shard set is a bounded hash of the key, so
+///   two distinct keys — a rename's source and target, or the global registry
+///   key and a namespace name — can land on the same shard. `tokio::sync::Mutex`
+///   is not reentrant, so locking that shard twice would deadlock the request
+///   against itself.
+/// * **Ascending shard order.** Every multi-key caller acquires shards in the
+///   same total order, so two concurrent multi-key callers cannot each hold a
+///   shard the other needs.
+async fn lock_local_namespace_config_admission_multi<K: AsRef<str>>(
+    keys: &[K],
+) -> Vec<MutexGuard<'static, ()>> {
+    let mut shards: Vec<usize> = keys
+        .iter()
+        .map(|key| namespace_config_admission_shard(key.as_ref()))
+        .collect();
+    shards.sort_unstable();
+    shards.dedup();
+    let locks = namespace_config_admission_locks();
+    let mut guards = Vec::with_capacity(shards.len());
+    for shard in shards {
+        guards.push(locks[shard].lock().await);
+    }
+    guards
 }
 
 fn validate_candidate_plugin_graph(
@@ -197,7 +234,10 @@ fn validate_candidate_plugin_graph(
 }
 
 pub(crate) struct NamespaceConfigAdmissionGuard {
-    local: Option<MutexGuard<'static, ()>>,
+    /// Process-local shard mutexes held for this guard's lifetime. A
+    /// single-namespace guard holds exactly one; the last guard of a multi-key
+    /// registry acquisition holds the whole deduplicated set.
+    local: Vec<MutexGuard<'static, ()>>,
     db: Option<Arc<dyn DatabaseBackend>>,
     namespace: String,
     owner: String,
@@ -348,7 +388,7 @@ impl Drop for NamespaceConfigAdmissionGuard {
         let namespace = std::mem::take(&mut self.namespace);
         let owner = std::mem::take(&mut self.owner);
         let renew_task = self.renew_task.take();
-        let local = self.local.take();
+        let local = std::mem::take(&mut self.local);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 if let Some(task) = renew_task {
@@ -445,7 +485,15 @@ pub(crate) async fn lock_namespace_config_admission(
     db: Arc<dyn DatabaseBackend>,
     namespace: &str,
 ) -> Result<NamespaceConfigAdmissionGuard, anyhow::Error> {
-    let local = lock_local_namespace_config_admission(namespace).await;
+    let local = vec![lock_local_namespace_config_admission(namespace).await];
+    lock_namespace_config_admission_with_local(db, namespace, local).await
+}
+
+async fn lock_namespace_config_admission_with_local(
+    db: Arc<dyn DatabaseBackend>,
+    namespace: &str,
+    local: Vec<MutexGuard<'static, ()>>,
+) -> Result<NamespaceConfigAdmissionGuard, anyhow::Error> {
     let owner = Uuid::new_v4().to_string();
     let (lease_started_at, generation) = loop {
         let acquire_db = db.clone();
@@ -576,7 +624,7 @@ pub(crate) async fn lock_namespace_config_admission(
     });
 
     Ok(NamespaceConfigAdmissionGuard {
-        local: Some(local),
+        local,
         db: Some(db),
         namespace: namespace.to_string(),
         owner,
@@ -588,6 +636,83 @@ pub(crate) async fn lock_namespace_config_admission(
         valid_until_millis,
         lease_state_rx,
     })
+}
+
+/// Every admission lease one namespace **registry** mutation holds.
+///
+/// The guards are acquired — and therefore released — in a total order: the
+/// global `NAMESPACE_REGISTRY_ADMISSION_KEY` first, then the affected
+/// namespace names in ascending order. Because every create, rename, and delete
+/// takes the global key first, two gateway instances can never interleave two
+/// registry mutations, and a rename's two-name acquisition cannot deadlock
+/// against a concurrent single-name delete.
+pub(crate) struct NamespaceRegistryAdmission {
+    keys: Vec<String>,
+    guards: Vec<NamespaceConfigAdmissionGuard>,
+}
+
+impl NamespaceRegistryAdmission {
+    /// The exact lease identities the backend must re-verify inside the
+    /// transaction it is about to commit.
+    pub(crate) fn holds(&self) -> Vec<crate::config::db_backend::NamespaceAdmissionLeaseHold<'_>> {
+        self.keys
+            .iter()
+            .zip(self.guards.iter())
+            .map(
+                |(key, guard)| crate::config::db_backend::NamespaceAdmissionLeaseHold {
+                    key: key.as_str(),
+                    lease: guard.lease_ref(),
+                },
+            )
+            .collect()
+    }
+
+    /// Observe the global registry lease across a persistence future that is
+    /// not cancellation-safe. The per-name leases are verified at the commit
+    /// boundary by the backend; this is the local liveness view.
+    pub(crate) async fn run_to_completion_while_held<F, T>(
+        &self,
+        future: F,
+    ) -> Result<NamespaceConfigAdmissionCompletion<T>, anyhow::Error>
+    where
+        F: Future<Output = T>,
+    {
+        // `lock_namespace_registry_admission` always pushes the global registry
+        // guard first, so index 0 exists for every constructed value.
+        self.guards[0].run_to_completion_while_held(future).await
+    }
+}
+
+/// Acquire the global registry lease plus one lease per affected namespace.
+///
+/// `names` may contain duplicates (a description-only update passes the same
+/// name twice); they are deduplicated and sorted so the acquisition order is
+/// identical for every caller.
+pub(crate) async fn lock_namespace_registry_admission(
+    db: Arc<dyn DatabaseBackend>,
+    names: &[&str],
+) -> Result<NamespaceRegistryAdmission, anyhow::Error> {
+    let keys = crate::config::namespace_registry::namespace_registry_admission_keys(names);
+
+    // One deduplicated, ascending-shard acquisition for the whole key set: the
+    // per-key helper would self-deadlock the moment two keys hash to the same
+    // shard.
+    let mut local = lock_local_namespace_config_admission_multi(&keys).await;
+
+    let mut guards = Vec::with_capacity(keys.len());
+    for (index, key) in keys.iter().enumerate() {
+        // The process-local shard guards ride on the LAST datastore lease so
+        // they outlive every lease release. Earlier keys carry none.
+        let carried = if index + 1 == keys.len() {
+            std::mem::take(&mut local)
+        } else {
+            Vec::new()
+        };
+        // A failure here drops the guards acquired so far, which releases their
+        // datastore leases in the reverse of the acquisition order.
+        guards.push(lock_namespace_config_admission_with_local(db.clone(), key, carried).await?);
+    }
+    Ok(NamespaceRegistryAdmission { keys, guards })
 }
 
 async fn run_db_write_while_held<T, F>(

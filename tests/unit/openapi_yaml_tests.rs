@@ -1308,6 +1308,8 @@ fn admin_body_timeout_408_inventory() -> BTreeSet<(String, String)> {
         ("PUT", "/upstreams/{id}"),
         ("POST", "/gateway-trust-bundles"),
         ("PUT", "/gateway-trust-bundles/{id}"),
+        ("POST", "/namespaces"),
+        ("PUT", "/namespaces/{name}"),
         ("POST", "/batch"),
         ("POST", "/restore"),
         ("POST", "/mesh/egress-scope/test"),
@@ -8323,6 +8325,10 @@ fn namespace_admission_contention_is_documented_as_retryable() {
         "/paths/~1api-specs/post/responses/503",
         "/paths/~1api-specs~1{id}/put/responses/503",
         "/paths/~1api-specs~1{id}/delete/responses/503",
+        // Registry CRUD takes the same namespace-admission lease (issue #3955).
+        "/paths/~1namespaces/post/responses/503",
+        "/paths/~1namespaces~1{name}/put/responses/503",
+        "/paths/~1namespaces~1{name}/delete/responses/503",
     ] {
         assert_eq!(
             spec.pointer(pointer)
@@ -8342,6 +8348,66 @@ fn namespace_admission_contention_is_documented_as_retryable() {
         response["content"]["application/json"]["example"]["error"],
         "Namespace mutation is temporarily unavailable; retry later"
     );
+}
+
+/// Namespace registry mutations need multi-document transactions, so a
+/// standalone MongoDB deployment refuses them before mutating anything
+/// (issue #3955). The refusal must be documented on all three write
+/// operations, together with the `500` every persistence failure can produce.
+#[test]
+fn namespace_registry_mutations_document_atomicity_refusal_and_server_error() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for pointer in [
+        "/paths/~1namespaces/post/responses",
+        "/paths/~1namespaces~1{name}/put/responses",
+        "/paths/~1namespaces~1{name}/delete/responses",
+    ] {
+        let responses = spec
+            .pointer(pointer)
+            .unwrap_or_else(|| panic!("missing namespace responses: {pointer}"));
+        assert_eq!(
+            responses["501"]["$ref"],
+            "#/components/responses/NamespaceRegistryAtomicityUnsupported",
+            "namespace mutation is missing the standalone-MongoDB refusal: {pointer}"
+        );
+        assert_eq!(
+            responses["500"]["$ref"], "#/components/responses/InternalServerError",
+            "namespace mutation is missing the persistence-failure 500: {pointer}"
+        );
+    }
+
+    let response = spec
+        .pointer("/components/responses/NamespaceRegistryAtomicityUnsupported")
+        .expect("namespace registry atomicity refusal component");
+    assert_eq!(
+        response["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/NamespaceRegistryUnsupportedResponse"
+    );
+    let schema = spec
+        .pointer("/components/schemas/NamespaceRegistryUnsupportedResponse")
+        .expect("namespace registry atomicity refusal schema");
+    assert_eq!(schema["required"], json!(["error", "detail"]));
+}
+
+#[test]
+fn namespace_body_routes_document_payload_too_large() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for pointer in [
+        "/paths/~1namespaces/post/responses/413",
+        "/paths/~1namespaces~1{name}/put/responses/413",
+    ] {
+        assert_eq!(
+            spec.pointer(pointer)
+                .and_then(|value| value.get("$ref"))
+                .and_then(serde_json::Value::as_str),
+            Some("#/components/responses/PayloadTooLarge"),
+            "bounded namespace request body is missing its documented 413: {pointer}"
+        );
+    }
 }
 
 #[test]

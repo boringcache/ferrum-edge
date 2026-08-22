@@ -1891,6 +1891,29 @@ pub async fn run(
         .map_err(anyhow::Error::msg)?;
     let db_type = env_config.db_type.as_deref().unwrap_or("sqlite");
 
+    // Resolve the CP's namespace scope BEFORE the store is built. Empty
+    // `FERRUM_CP_NAMESPACES` keeps the pre-T2-A single-namespace behavior; `*`
+    // makes the CP cluster-wide; a CSV pins it to an explicit set. The scope
+    // determines which DPs may subscribe, which namespaces the polling loop
+    // loads, and — resolved here — which namespaces the store refuses to delete
+    // or rename away.
+    let cp_scope = CpScope::from_env(&env_config.cp_namespaces, &env_config.namespace);
+
+    // Namespaces this CP is configured to serve (issue #3955). `Single`/`Set`
+    // contribute their explicit names because `resolve_polled_namespaces` keeps
+    // polling exactly those forever: renaming or deleting one would leave the
+    // CP polling a namespace that no longer exists and every DP subscribed to
+    // it converging to empty configuration until the process restarted.
+    // `CpScope::All` is dynamic and contributes nothing beyond
+    // `FERRUM_NAMESPACE`, so a cluster-wide CP does not freeze every discovered
+    // tenant. Applied to the store below, before it becomes
+    // `Arc<dyn DatabaseBackend>` and therefore no longer mutable.
+    let protected_namespaces: Vec<String> = {
+        let mut names = cp_scope.explicit_namespaces().unwrap_or_default();
+        names.push(env_config.namespace.clone());
+        names
+    };
+
     // Build the database backend — SQL (sqlx) or MongoDB depending on FERRUM_DB_TYPE
     let db: Box<dyn DatabaseBackend> = match db_type {
         "mongodb" => {
@@ -1915,6 +1938,11 @@ pub async fn run(
             store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
             store.set_failover_allow_writes(env_config.db_failover_allow_writes);
+            // Resolved CP scope + FERRUM_NAMESPACE (issue #3955): the
+            // namespaces admin DELETE/rename-away protects. Applied here so no
+            // request-time code re-reads the process environment and bypasses
+            // config precedence.
+            store.set_protected_namespaces(&protected_namespaces);
             let retention_policy = crate::admin::audit::AuditRetentionPolicy {
                 retention_days: env_config.audit_retention_days,
                 max_rows_per_namespace: env_config.audit_retention_max_rows,
@@ -1946,6 +1974,11 @@ pub async fn run(
             store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
             store.set_failover_allow_writes(env_config.db_failover_allow_writes);
+            // Resolved CP scope + FERRUM_NAMESPACE (issue #3955): the
+            // namespaces admin DELETE/rename-away protects. Applied here so no
+            // request-time code re-reads the process environment and bypasses
+            // config precedence.
+            store.set_protected_namespaces(&protected_namespaces);
             let retention_policy = crate::admin::audit::AuditRetentionPolicy {
                 retention_days: env_config.audit_retention_days,
                 max_rows_per_namespace: env_config.audit_retention_max_rows,
@@ -1987,11 +2020,6 @@ pub async fn run(
     )
     .await?;
 
-    // Resolve the CP's namespace scope. Empty `FERRUM_CP_NAMESPACES` keeps
-    // the pre-T2-A single-namespace behavior; `*` makes the CP cluster-wide;
-    // a CSV pins it to an explicit set. The scope determines which DPs may
-    // subscribe AND which namespaces the polling loop loads from the DB.
-    let cp_scope = CpScope::from_env(&env_config.cp_namespaces, &env_config.namespace);
     info!("CP mode: serving {}", cp_scope.describe());
     if cp_scope.namespace_claim_required(env_config.cp_require_namespace_claim) {
         info!(

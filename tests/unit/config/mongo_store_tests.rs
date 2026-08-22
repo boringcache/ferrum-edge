@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::oneshot;
 
 const OWNER: &str = "test-owner-uuid";
+const ADMIN_SOURCE: &str = include_str!("../../../src/admin/mod.rs");
 const MONGO_STORE_SOURCE: &str = include_str!("../../../src/config/mongo_store.rs");
 const MONGODB_DOC: &str = include_str!("../../../docs/mongodb.md");
 // Fixed client-clock instant so the builders are deterministic (no DateTime::now).
@@ -195,6 +196,10 @@ fn list_namespaces_scans_gateway_trust_bundles() {
             "list_namespaces must scan {collection}: missing {needle}"
         );
     }
+    assert!(
+        body.contains("registry_namespace_names()"),
+        "list_namespaces must union the namespaces registry"
+    );
     assert!(
         body.contains("result.sort()"),
         "list_namespaces must keep deterministic ascending order"
@@ -1451,5 +1456,824 @@ fn gateway_trust_bundle_identity_parses_id_and_trust_domain_strictly() {
     assert!(
         body.contains("strict_stored_str_field"),
         "identity id/trust_domain must use strict stored-field decoding:\n{body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Namespace registry (issue #3955)
+// ---------------------------------------------------------------------------
+
+/// Every registry mutation must (a) refuse standalone MongoDB before touching
+/// a document, and (b) commit inside one transaction that re-verifies the
+/// caller's admission leases. A live replica set is not available in unit
+/// tests, so the decision is pinned at the source level — the same seam the
+/// other MongoDB shape contracts in this file use.
+#[test]
+fn namespace_registry_mutations_are_transactional_and_refuse_standalone() {
+    let preflight = mongo_fn_body("        fn ensure_namespace_registry_atomicity_supported(");
+    assert!(
+        preflight.contains("self.replica_set_configured()")
+            && preflight.contains("namespace_registry_standalone_refusal()"),
+        "the namespace registry capability preflight must refuse standalone MongoDB:\n{preflight}"
+    );
+
+    for (entry, in_session) in [
+        ("create_namespace(", "create_namespace_in_session("),
+        ("update_namespace(", "update_namespace_in_session("),
+        ("delete_namespace(", "delete_namespace_in_session("),
+    ] {
+        let body = mongo_method(entry);
+        assert!(
+            body.contains("if !self.replica_set_configured()"),
+            "{entry} must re-check topology before mutating:\n{body}"
+        );
+        assert!(
+            body.contains("namespace_registry_standalone_refusal()"),
+            "{entry} must fail closed on standalone MongoDB:\n{body}"
+        );
+        assert!(
+            body.contains("start_transaction()") && body.contains(in_session),
+            "{entry} must run {in_session} inside one transaction:\n{body}"
+        );
+
+        let session_body = mongo_method(in_session);
+        assert!(
+            session_body.contains("verify_namespace_registry_leases_in_session"),
+            "{in_session} must re-verify the admission leases before commit:\n{session_body}"
+        );
+    }
+}
+
+/// The public 501 promise includes admission-lock collections: an unsupported
+/// standalone deployment must be refused before the handler acquires a global,
+/// source, or target namespace lease. The backend mutation still re-checks
+/// topology to close the reconnect race after this preflight.
+#[test]
+fn namespace_registry_handlers_refuse_before_admission_mutation() {
+    for (handler, next_handler) in [
+        ("handle_create_namespace(", "handle_update_namespace("),
+        ("handle_update_namespace(", "handle_delete_namespace("),
+        ("handle_delete_namespace(", "handle_list_audit_logs("),
+    ] {
+        let start = ADMIN_SOURCE
+            .find(&format!("async fn {handler}"))
+            .unwrap_or_else(|| panic!("missing handler {handler}"));
+        let end = ADMIN_SOURCE[start..]
+            .find(&format!("\nasync fn {next_handler}"))
+            .map(|offset| start + offset)
+            .unwrap_or(ADMIN_SOURCE.len());
+        let body = &ADMIN_SOURCE[start..end];
+        let capability = body
+            .find("db.ensure_namespace_registry_atomicity_supported()")
+            .unwrap_or_else(|| panic!("{handler} is missing the capability preflight"));
+        let admission = body
+            .find("acquire_namespace_registry_admission(")
+            .unwrap_or_else(|| panic!("{handler} is missing namespace admission"));
+        assert!(
+            capability < admission,
+            "{handler} must return 501 before touching admission-lock documents:\n{body}"
+        );
+    }
+}
+
+/// The registry-lease gate is a conditional in-session WRITE compared against
+/// MongoDB's own clock, so a competing acquirer raises a write conflict rather
+/// than being masked by the transaction's read snapshot.
+#[test]
+fn namespace_registry_lease_gate_uses_server_time_and_joins_the_write_set() {
+    let body = mongo_method("verify_namespace_config_admission_lease_in_session(");
+    assert!(
+        body.contains("update_one"),
+        "the lease gate must be a conditional write, not a read:\n{body}"
+    );
+    assert!(
+        body.contains("$$NOW") && body.contains("server_time_lease_touch_pipeline"),
+        "expiry must be evaluated from MongoDB's clock at the gate:\n{body}"
+    );
+    assert!(
+        body.contains("$currentDate")
+            && body.contains("is_pipeline_update_unsupported")
+            && body.contains("is_server_time_expr_unsupported")
+            && body.contains("filter.clone()"),
+        "the DocumentDB fallback must reuse the in-session $$NOW predicate on a classic \
+         update and fail closed when that predicate is unavailable:\n{body}"
+    );
+    assert!(
+        !body.contains("lease_server_time()"),
+        "lease_server_time() must not be the expiry authority in this gate:\n{body}"
+    );
+    assert!(
+        !body.contains("\"expires_at\": { \"$gt\": now }"),
+        "a pre-read timestamp must not become the expiry predicate:\n{body}"
+    );
+}
+
+/// `proxy_route_locks` documents are keyed only by `_id` (`"{namespace}:{hash}"`)
+/// and carry NO `namespace` field, so a `{"namespace": ...}` filter is a silent
+/// no-op. Cleanup must use the anchored, regex-escaped `_id` prefix instead —
+/// and the id-rewriting helper (which DOES filter on `namespace`) must never be
+/// pointed at that collection again.
+#[test]
+fn proxy_route_lock_cleanup_uses_an_escaped_id_prefix_not_a_namespace_filter() {
+    let filter = mongo_fn_body("        fn namespace_id_prefix_filter(");
+    assert!(
+        filter.contains("regex_escape(namespace)") && filter.contains(r#""^{}:""#),
+        "the id-prefix filter must be anchored and regex-escaped:\n{filter}"
+    );
+
+    let cleanup = mongo_method("delete_namespace_guard_docs_in_session(");
+    assert!(
+        cleanup.contains("proxy_route_locks()")
+            && cleanup.contains("namespace_id_prefix_filter(namespace)"),
+        "route-lock cleanup must target the `_id` prefix:\n{cleanup}"
+    );
+    assert!(
+        !cleanup.contains("mtls_dns_admission_locks")
+            && !cleanup.contains("config_admission_locks"),
+        "the guard documents proving the mutation must not be deleted:\n{cleanup}"
+    );
+
+    // Single-line needles only: a multi-line source assertion breaks the
+    // moment rustfmt reflows the call it is pinning.
+    let rename = mongo_method("rename_namespace_documents_in_session(");
+    assert!(
+        !rename.contains("self.proxy_route_locks()") && !rename.contains("\"proxy_route_locks\","),
+        "the rename must not try to rewrite `proxy_route_locks` ids — those \
+         documents have no `namespace` field, so the filter never matches:\n{rename}"
+    );
+    assert!(
+        !MONGO_STORE_SOURCE.contains(r#""consumer_credential_index""#),
+        "the MongoDB backend has no consumer_credential_index collection"
+    );
+}
+
+#[test]
+fn namespace_prefixed_id_rewrite_requires_suffix_field_and_embedded_namespace() {
+    let body = mongo_method("rewrite_namespace_prefixed_ids_in_session(");
+    assert!(
+        body.contains("namespace_prefixed_id_suffix_field(collection_name)")
+            && body.contains("namespace_identity_scan_filter(current_name)")
+            && body.contains("require_namespace_prefixed_identity(")
+            && body.contains("document.get_str(\"namespace\").ok()")
+            && body.contains("document.get_str(suffix_field).ok()"),
+        "composite rewrite must require suffix-to-field equality and an embedded namespace:\n{body}"
+    );
+    let scan = mongo_fn_body("        fn namespace_identity_scan_filter(");
+    assert!(
+        scan.contains("\"$or\"")
+            && scan.contains("\"namespace\": namespace")
+            && scan.contains("namespace_id_prefix_filter(namespace)"),
+        "the scan must expose both halves of a split embedded/key identity:\n{scan}"
+    );
+    assert!(
+        !body.contains("unwrap_or(old_id.as_str())"),
+        "the silent strip_prefix fallback must not return:\n{body}"
+    );
+    let require_at = body
+        .find("require_namespace_prefixed_identity(")
+        .expect("require helper");
+    let delete_at = body.find("delete_one").expect("delete_one");
+    assert!(
+        require_at < delete_at,
+        "corrupt identities must abort before delete/insert so the rename rolls back:\n{body}"
+    );
+    let rename = mongo_method("rename_namespace_documents_in_session(");
+    assert!(
+        rename.contains("\"consumers\"")
+            && rename.contains("\"consumer_identity_index\"")
+            && rename.contains("\"gateway_trust_bundles\""),
+        "rename must still rewrite both composite collections and the keyed trust document:\n{rename}"
+    );
+}
+
+#[test]
+fn mongo_namespace_rename_does_not_rewrite_historical_audit_events() {
+    let rename = mongo_method("rename_namespace_documents_in_session(");
+    for collection in ["proxies", "plugin_configs", "upstreams", "api_specs"] {
+        assert!(
+            rename.contains(&format!("\"{collection}\"")),
+            "in-place Mongo rename must still rewrite live collection {collection}:\n{rename}"
+        );
+    }
+    assert!(
+        !rename.contains("self.audit_events()"),
+        "historical audit_events must retain the namespace recorded at event time; \
+         the rename may still enqueue a new event under the new name after commit:\n{rename}"
+    );
+}
+
+#[test]
+fn namespace_keyed_document_move_scans_split_identity_before_mutation() {
+    let body = mongo_method("move_namespace_keyed_document_in_session(");
+    let collect_at = body
+        .find("collect_validated_namespace_keyed_docs_in_session")
+        .expect("move must reuse the split-identity collector");
+    let find_at = body
+        .find("find_one(doc! { \"_id\": current_id })")
+        .expect("after validation, move only the durable source key");
+    let delete_at = body.find("delete_one").expect("delete_one");
+    assert!(
+        collect_at < find_at && find_at < delete_at,
+        "a key-only query would miss `_id = other` / `namespace = current` occupancy \
+         and leave that document behind while the rest of the tenant commits:\n{body}"
+    );
+    assert!(
+        body.contains("require_namespace_keyed_identity(")
+            && body.contains("NamespaceRegistryCorrupt::field(\"identity\")"),
+        "split-identity disagreement must abort as typed NamespaceRegistryCorrupt:\n{body}"
+    );
+    assert!(
+        !body.contains("update_many") && !body.contains("\"namespace\": current_id"),
+        "move must never rewrite or delete by embedded namespace (that would touch another tenant):\n{body}"
+    );
+}
+
+#[test]
+fn namespace_keyed_document_move_requires_embedded_namespace_equality() {
+    let body = mongo_method("move_namespace_keyed_document_in_session(");
+    assert!(
+        body.contains("require_namespace_keyed_identity(")
+            && body.contains("document.get_str(\"namespace\").ok()")
+            && body.contains("document.get_str(\"id\").ok()"),
+        "keyed trust documents must require source-matching `_id` and embedded namespace, \
+         plus a nonempty resource id:\n{body}"
+    );
+    assert!(
+        !body.contains("if document.get_str(\"namespace\").is_ok()"),
+        "a missing or non-string namespace must abort rather than being skipped:\n{body}"
+    );
+    let require_at = body
+        .find("require_namespace_keyed_identity(")
+        .expect("require helper");
+    let delete_at = body.find("delete_one").expect("delete_one");
+    assert!(
+        require_at < delete_at,
+        "a mismatched identity must abort before delete/insert:\n{body}"
+    );
+}
+
+#[test]
+fn namespace_registry_transaction_error_preserves_typed_corrupt() {
+    let body = mongo_fn_body("        fn namespace_registry_transaction_error(");
+    assert!(
+        body.contains("get_custom::<NamespaceRegistryCorrupt>()")
+            && body.contains("anyhow::Error::new(corrupt)"),
+        "typed rename corruption must surface as NamespaceRegistryCorrupt so admin stays on the static 500:\n{body}"
+    );
+}
+
+#[test]
+fn last_remaining_namespace_authority_is_the_registry_collection() {
+    let body = mongo_method("any_namespace_remains_in_session(");
+    assert!(
+        body.contains("namespaces()") && !body.contains("DERIVED_NAMESPACE_RESOURCE_TABLES"),
+        "last-remaining protection must be registry-row based; ordinary resource CRUD \
+         is not serialized by the global registry lease:\n{body}"
+    );
+}
+
+#[test]
+fn mongo_namespace_list_fails_closed_on_corrupt_registry_documents() {
+    let list = mongo_method("list_namespaces(");
+    assert!(
+        list.contains("registry_namespace_names()"),
+        "list must load registry documents, not only derived names:\n{list}"
+    );
+    let registry = mongo_method("registry_namespace_names(");
+    assert!(
+        registry.contains("document_to_namespace_record"),
+        "corrupt registry documents must fail the list rather than being skipped:\n{registry}"
+    );
+}
+
+#[test]
+fn namespace_rename_acquires_source_and_target_mtls_dns_fences_in_lock_order() {
+    let body = mongo_method("update_namespace(");
+    assert!(
+        body.contains("mtls_dns_admission_namespaces(")
+            && body.contains("acquire_mtls_dns_admission_leases(")
+            && body.contains("run_mtls_dns_mutations("),
+        "rename must acquire both source and target mTLS DNS fences through the \
+         multi-lease helper:\n{body}"
+    );
+    assert!(
+        !body.contains("acquire_mtls_dns_admission_lease(current_name)"),
+        "a single current_name fence would bypass a retained restore owner on the target:\n{body}"
+    );
+}
+
+#[test]
+fn mtls_dns_multi_lease_acquire_releases_already_held_guards_on_partial_failure() {
+    let body = mongo_method("acquire_mtls_dns_admission_leases_for_mode<'a>(");
+    assert!(
+        body.contains("release_mtls_dns_admission_leases(&mut leases)"),
+        "a later acquire error must release already-held guards rather than stranding \
+         them:\n{body}"
+    );
+}
+
+#[test]
+fn document_to_namespace_record_is_strict_and_does_not_synthesize() {
+    let body = mongo_fn_body("        fn document_to_namespace_record(");
+    assert!(
+        body.contains("require_namespace_identity")
+            && body.contains("parse_namespace_rfc3339")
+            && body.contains("require_canonical_stored_description")
+            && body.contains("NamespaceRegistryCorrupt::field"),
+        "corrupt durable documents must fail closed:\n{body}"
+    );
+    assert!(
+        !body.contains("Utc::now()")
+            && !body.contains("unwrap_or_else(|| fallback_name")
+            && !body.contains("normalize_description"),
+        "missing timestamps/names must not be fabricated and stored descriptions must not be normalized:\n{body}"
+    );
+}
+
+#[test]
+fn mongo_namespace_registry_mutations_require_canonical_lease_set_before_session() {
+    for (entry, names_needle) in [
+        ("create_namespace(", "&[record.name.as_str()]"),
+        ("update_namespace(", "&[current_name, new_name]"),
+        (
+            "delete_namespace(",
+            "owned_namespace_registry_leases_for_names(&[name], leases)",
+        ),
+    ] {
+        let body = mongo_method(entry);
+        assert!(
+            body.contains("owned_namespace_registry_leases_for_names"),
+            "{entry} must validate the canonical lease set at the backend boundary:\n{body}"
+        );
+        assert!(
+            body.contains(names_needle),
+            "{entry} must pass the canonical names {names_needle}:\n{body}"
+        );
+        let require_at = body
+            .find("owned_namespace_registry_leases_for_names")
+            .expect("lease-set gate");
+        let session_at = body.find("start_session()").expect("start_session");
+        assert!(
+            require_at < session_at,
+            "{entry} must reject a substituted lease set before opening a session:\n{body}"
+        );
+    }
+
+    let owned = mongo_fn_body("        fn owned_namespace_registry_leases_for_names(");
+    assert!(
+        owned.contains("require_namespace_registry_admission_leases(names, leases)")
+            && owned.contains("map_err(anyhow::Error::new)"),
+        "owned lease copy must fail closed as BatchAdmissionLeaseLost without echoing keys:\n{owned}"
+    );
+
+    let verify = mongo_method("verify_namespace_registry_leases_in_session(");
+    assert!(
+        verify.contains("require_namespace_registry_admission_keys(names, &supplied)")
+            && verify.contains("NamespaceRegistryAbort::AdmissionLeaseLost")
+            && verify.contains("verify_namespace_config_admission_lease_in_session"),
+        "in-session verify must re-check the canonical key set then owner/generation:\n{verify}"
+    );
+}
+
+#[test]
+fn mongo_namespace_occupancy_scans_split_durable_identities() {
+    let occupancy = mongo_method("namespace_has_resources_in_session(");
+    assert!(
+        occupancy.contains("collection_has_namespace_occupancy_in_session")
+            && occupancy.contains("\"consumer_identity_index\""),
+        "occupancy must inspect split-identity collections, including the identity index:\n{occupancy}"
+    );
+    assert!(
+        !occupancy.contains("doc! { \"namespace\": name }"),
+        "occupancy must not look only at the embedded namespace field:\n{occupancy}"
+    );
+
+    let filter = mongo_fn_body("        fn namespace_occupancy_filter(");
+    assert!(
+        filter.contains("\"consumers\"")
+            && filter.contains("\"consumer_identity_index\"")
+            && filter.contains("namespace_identity_scan_filter(namespace)")
+            && filter.contains("\"gateway_trust_bundles\"")
+            && filter.contains("namespace_keyed_identity_scan_filter(namespace)"),
+        "occupancy filters must union embedded and key identities for split collections:\n{filter}"
+    );
+
+    let keyed = mongo_fn_body("        fn namespace_keyed_identity_scan_filter(");
+    assert!(
+        keyed.contains("\"$or\"")
+            && keyed.contains("\"namespace\": namespace")
+            && keyed.contains("\"_id\": namespace")
+            && !keyed.contains("namespace_id_prefix_filter"),
+        "trust-bundle occupancy must use the exact `_id = namespace` key, not a prefix:\n{keyed}"
+    );
+
+    let in_use = mongo_method("namespace_name_in_use(");
+    assert!(
+        in_use.contains("namespace_has_resources(name)")
+            || in_use.contains("namespace_occupancy_filter"),
+        "unconfirmed delete must not treat a key-only split identity as absent:\n{in_use}"
+    );
+}
+
+#[test]
+fn mongo_namespace_cascade_validates_split_identities_before_delete() {
+    let delete_ns = mongo_method("delete_namespace_in_session(");
+    let trust_validate_at = delete_ns
+        .find("collect_validated_namespace_keyed_docs_in_session")
+        .expect("trust-bundle validation before cascade");
+    let resources_at = delete_ns
+        .find("delete_all_namespace_resources_in_session")
+        .expect("resource cascade");
+    assert!(
+        trust_validate_at < resources_at,
+        "a split trust-bundle identity must abort before any resource delete:\n{delete_ns}"
+    );
+
+    let cascade = mongo_method("delete_all_namespace_resources_in_session(");
+    let consumers_at = cascade
+        .find("collect_validated_namespace_prefixed_docs_in_session")
+        .expect("consumer validation");
+    let first_delete = cascade.find("delete_many").expect("delete_many");
+    assert!(
+        consumers_at < first_delete,
+        "split consumer identities must be validated before deleting anything:\n{cascade}"
+    );
+    assert!(
+        cascade.contains("\"consumers\"")
+            && cascade.contains("\"consumer_identity_index\"")
+            && cascade.contains("delete_validated_namespace_ids_in_session"),
+        "cascade must delete only validated consumer and identity-index `_id`s:\n{cascade}"
+    );
+    assert!(
+        !cascade.contains("self.consumers()")
+            && !cascade.contains("self.consumer_identity_index()"),
+        "cascade must not broad-delete consumers by embedded namespace:\n{cascade}"
+    );
+
+    let prefixed = mongo_method("collect_validated_namespace_prefixed_docs_in_session(");
+    assert!(
+        prefixed.contains("namespace_identity_scan_filter(namespace)")
+            && prefixed.contains("require_namespace_prefixed_identity(")
+            && prefixed.contains("document.get_str(\"namespace\").ok()")
+            && prefixed.contains("NamespaceRegistryCorrupt::field"),
+        "prefixed collect must scan both identity surfaces and fail closed on mismatch:\n{prefixed}"
+    );
+    assert!(
+        !prefixed.contains("delete_one") && !prefixed.contains("delete_many"),
+        "validation collect must not delete:\n{prefixed}"
+    );
+
+    let keyed = mongo_method("collect_validated_namespace_keyed_docs_in_session(");
+    assert!(
+        keyed.contains("namespace_keyed_identity_scan_filter(namespace)")
+            && keyed.contains("require_namespace_keyed_identity(")
+            && keyed.contains("document.get_str(\"namespace\").ok()")
+            && keyed.contains("document.get_str(\"id\").ok()")
+            && keyed.contains("NamespaceRegistryCorrupt::field"),
+        "keyed collect must require source-matching `_id` and embedded namespace, plus a \
+         nonempty resource id:\n{keyed}"
+    );
+    assert!(
+        !keyed.contains("delete_one") && !keyed.contains("delete_many"),
+        "keyed validation collect must not delete:\n{keyed}"
+    );
+
+    let delete_ids = mongo_method("delete_validated_namespace_ids_in_session(");
+    assert!(
+        delete_ids.contains("\"$in\"") && delete_ids.contains("ids.to_vec()"),
+        "deletes must target already-validated `_id`s only:\n{delete_ids}"
+    );
+    assert!(
+        !delete_ids.contains("\"namespace\""),
+        "validated-id deletes must not use a broad embedded-namespace filter:\n{delete_ids}"
+    );
+
+    let trust_delete = mongo_method("delete_namespace_trust_bundle_in_session(");
+    assert!(
+        trust_delete.contains("collect_validated_namespace_keyed_docs_in_session")
+            && trust_delete.contains("delete_validated_namespace_ids_in_session")
+            && trust_delete.contains("\"gateway_trust_bundles\""),
+        "trust-bundle cascade must delete only validated `_id`s:\n{trust_delete}"
+    );
+    assert!(
+        !trust_delete.contains("delete_many(doc! { \"namespace\": namespace })"),
+        "trust-bundle cascade must not broad-delete by embedded namespace:\n{trust_delete}"
+    );
+
+    let tx_error = mongo_fn_body("        fn namespace_registry_transaction_error(");
+    assert!(
+        tx_error.contains("get_custom::<NamespaceRegistryCorrupt>()"),
+        "split-identity corruption must abort the transaction as typed NamespaceRegistryCorrupt:\n{tx_error}"
+    );
+
+    let guards = mongo_method("delete_namespace_guard_docs_in_session(");
+    assert!(
+        guards.contains("namespace_id_prefix_filter(namespace)")
+            && guards.contains("proxy_route_locks()"),
+        "proxy_route_locks must remain escaped-prefix cleanup:\n{guards}"
+    );
+}
+
+#[test]
+fn mongo_namespace_rename_validates_split_trust_identity_before_any_mutation() {
+    let rename = mongo_method("rename_namespace_documents_in_session(");
+    let collect_at = rename
+        .find("collect_validated_namespace_keyed_docs_in_session")
+        .expect("rename must scan gateway-trust identity before rewriting");
+    let first_mutation = rename.find("delete_one").expect("registry-row delete");
+    assert!(
+        collect_at < first_mutation,
+        "a split trust-bundle identity must abort before any rename write:\n{rename}"
+    );
+    assert!(
+        rename.contains("\"gateway_trust_bundles\""),
+        "the pre-mutation scan must target gateway_trust_bundles:\n{rename}"
+    );
+}
+
+#[test]
+fn mongo_namespace_registry_reads_validate_both_identity_surfaces() {
+    let filter = mongo_fn_body("        fn namespace_registry_identity_scan_filter(");
+    assert!(
+        filter.contains("{ \"_id\": name }") && filter.contains("{ \"name\": name }"),
+        "registry reads must expose both halves of a split identity:\n{filter}"
+    );
+
+    let session_get = mongo_method("get_namespace_in_session(");
+    assert!(
+        session_get.contains("namespace_registry_identity_scan_filter(name)")
+            && session_get.contains("document_to_namespace_record(")
+            && session_get.contains("Some(name)"),
+        "transactional create/rename/delete vacancy checks must validate every registry \
+         document claiming the name:\n{session_get}"
+    );
+    assert!(
+        !session_get.contains("find_one(doc! { \"_id\": name })"),
+        "an _id-only read would ignore `_id = other, name = target` corruption:\n{session_get}"
+    );
+
+    let public_get = mongo_method("get_namespace(\n");
+    assert!(
+        public_get.contains("namespace_registry_identity_scan_filter(name)")
+            && public_get.contains("document_to_namespace_record("),
+        "the public GET/precheck path must fail closed on the same split identity:\n{public_get}"
+    );
+}
+
+#[test]
+fn mongo_namespace_delete_rechecks_protected_namespaces_in_session() {
+    let session = mongo_method("delete_namespace_in_session(");
+    assert!(
+        session.contains("plan.protected_namespaces")
+            && session.contains("PROTECTED_CONFIGURED_NAMESPACE")
+            && session.contains("namespace_protected_abort"),
+        "delete must recheck the whole configured set inside the committing transaction:\n{session}"
+    );
+    let start_at = session
+        .find("NamespaceRegistryPhase::Start")
+        .expect("start fault");
+    let protected_at = session
+        .find("plan.protected_namespaces")
+        .expect("protected namespaces");
+    let occupancy_at = session
+        .find("namespace_name_in_use_in_session")
+        .expect("existence check");
+    assert!(
+        start_at < protected_at && protected_at < occupancy_at,
+        "the protected set must be rechecked at the start of the session callback:\n{session}"
+    );
+
+    let outer = mongo_method("delete_namespace(");
+    assert!(
+        outer.contains("protected_namespaces_contains(&self.protected_namespaces")
+            && outer.contains("PROTECTED_CONFIGURED_NAMESPACE"),
+        "the outer precheck may stay for a fast response:\n{outer}"
+    );
+}
+
+/// `delete_namespace` used a single `MongoLockGuard` and propagated
+/// `mtls_lease.release().await?` after a confirmed commit. The global vector
+/// helper regression does not catch that form.
+#[test]
+fn mongo_namespace_delete_cannot_fail_the_response_after_commit() {
+    let body = mongo_method("delete_namespace(");
+    assert!(
+        body.contains("acquire_mtls_dns_admission_leases(")
+            && body.contains("run_mtls_dns_mutations(")
+            && body.contains(
+                "release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;"
+            ),
+        "delete must use the vector acquire/run/infallible-after-commit lease path:\n{body}"
+    );
+    assert!(
+        !body.contains("acquire_mtls_dns_admission_lease(name)")
+            && !body.contains(".release().await?")
+            && !body.contains("run_mutation(")
+            && !body.contains("release_mtls_dns_admission_leases(&mut mtls_leases).await?"),
+        "a single-guard .release().await? after commit turns a durable delete into an error \
+         and can suppress follow-up/audit behavior:\n{body}"
+    );
+}
+
+/// Every namespace this process is configured to serve — `FERRUM_NAMESPACE`
+/// plus each explicit `FERRUM_CP_NAMESPACES` entry — must reach the committing
+/// transaction, not just the one resolved default (issue #3955 review).
+#[test]
+fn mongo_namespace_registry_plan_carries_the_whole_protected_set() {
+    for method in [
+        "create_namespace(",
+        "update_namespace(",
+        "delete_namespace(",
+    ] {
+        let body = mongo_method(method);
+        assert!(
+            body.contains("protected_namespaces: self.protected_namespaces.clone()"),
+            "{method} must hand the whole configured set to the transaction plan:\n{body}"
+        );
+    }
+    let rename = mongo_method("update_namespace_in_session(");
+    assert!(
+        rename.contains("protected_namespaces_contains(&plan.protected_namespaces, current_name)")
+            && rename.contains("PROTECTED_CONFIGURED_NAMESPACE"),
+        "rename-away must be refused for every configured namespace in-session:\n{rename}"
+    );
+    assert!(
+        !MONGO_STORE_SOURCE.contains("effective_default_namespace"),
+        "the single-namespace protection field must be fully replaced by the protected set"
+    );
+}
+
+/// The one-time compatibility backfill must serialize against live namespace
+/// CRUD on the same global registry admission key, and it must commit as ONE
+/// transaction (issue #3955 review).
+///
+/// Renewals bracketing an unbounded run of durable upserts are not a fence: the
+/// lease can lapse mid-run, another gateway can acquire it and commit a
+/// namespace delete, and a later upsert from the pre-delete name set resurrects
+/// that document. The second renewal only notices afterwards, and an absent
+/// marker does not undo a durable write.
+#[test]
+fn mongo_namespace_registry_backfill_holds_the_global_registry_lease() {
+    let entry = mongo_method("backfill_namespaces_registry(");
+    let standalone_at = entry
+        .find("replica_set_configured()")
+        .expect("a topology with no transactions must be handled explicitly");
+    let acquire_at = entry
+        .find("try_acquire_namespace_config_admission_lease")
+        .expect("the pass must take the global registry admission lease");
+    let under_at = entry
+        .find(".backfill_namespaces_registry_under_lease(")
+        .expect("the pass must run under that lease");
+    let release_at = entry
+        .find("release_namespace_config_admission_lease")
+        .expect("the pass must release the lease");
+    assert!(
+        standalone_at < acquire_at,
+        "a standalone mongod must defer before taking the lease or writing anything:\n{entry}"
+    );
+    assert!(
+        acquire_at < under_at && under_at < release_at,
+        "the lease must be held across the whole compatibility pass:\n{entry}"
+    );
+    assert!(
+        entry.contains("NAMESPACE_REGISTRY_ADMISSION_KEY"),
+        "the pass must use the SAME global key live registry mutations take:\n{entry}"
+    );
+    assert!(
+        entry.contains("(Err(backfill_error), _) => Err(backfill_error)"),
+        "the lease must be released on the error path too, without masking the failure:\n{entry}"
+    );
+
+    let runner = mongo_method("backfill_namespaces_registry_under_lease(");
+    assert!(
+        runner.contains("start_transaction()")
+            && runner.contains("backfill_namespaces_registry_in_session("),
+        "the pass must commit as ONE transaction, not a sequence of unfenced upserts:\n{runner}"
+    );
+    assert!(
+        runner.contains("BatchAdmissionLeaseLost"),
+        "a lost lease must roll the pass back and defer to a later startup, not fail \
+         startup:\n{runner}"
+    );
+
+    assert!(
+        !MONGO_STORE_SOURCE.contains("namespaces_registry_backfill_lease_still_held"),
+        "conditional renewals bracketing unbounded durable writes are not a fence and must not \
+         come back"
+    );
+}
+
+/// A standalone `mongod` has no multi-document transactions, so the pass writes
+/// nothing at all there rather than claiming a cross-process atomicity the
+/// topology does not have. `GET /namespaces` is the union of registry names and
+/// derived resource names, and namespace create/rename/delete already return
+/// `501` before mutating anything, so nothing observable changes.
+#[test]
+fn mongo_namespace_registry_backfill_writes_nothing_without_transactions() {
+    let entry = mongo_method("backfill_namespaces_registry(");
+    let guard_at = entry
+        .find("replica_set_configured()")
+        .expect("standalone guard");
+    let acquire_at = entry
+        .find("try_acquire_namespace_config_admission_lease")
+        .expect("lease acquisition");
+    assert!(
+        guard_at < acquire_at,
+        "the standalone guard must run before any lease or write:\n{entry}"
+    );
+    assert!(
+        !entry.contains("namespaces()"),
+        "the entry point must not upsert registry documents outside the transaction:\n{entry}"
+    );
+
+    let in_session = mongo_method("backfill_namespaces_registry_in_session(");
+    assert!(
+        in_session.contains(".session(&mut *session)"),
+        "every read and write of the pass must run inside the caller's transaction:\n{in_session}"
+    );
+    assert!(
+        !in_session.contains("self.distinct_namespaces(")
+            && !in_session.contains("self.registry_namespace_names("),
+        "the sessionless scan helpers would read outside the transaction snapshot:\n{in_session}"
+    );
+
+    let scan = mongo_method("distinct_namespaces_in_session(");
+    assert!(
+        scan.contains("$group") && !scan.contains(".distinct("),
+        "the in-transaction scan must use an aggregation; `distinct` is not accepted inside a \
+         transaction on every supported server:\n{scan}"
+    );
+}
+
+#[test]
+fn mongo_namespace_registry_backfill_is_one_time_and_crash_retryable() {
+    let entry = mongo_method("backfill_namespaces_registry(");
+    assert!(
+        entry.contains("namespaces_registry_backfill_completed()"),
+        "a completed backfill must short-circuit before acquiring anything:\n{entry}"
+    );
+
+    let body = mongo_method("backfill_namespaces_registry_in_session(");
+    let completed_at = body
+        .find("namespaces_registry_backfill_completed_in_session")
+        .expect("authoritative completion check inside the transaction");
+    let scan_at = body
+        .find("distinct_namespaces_in_session")
+        .expect("derived-name scan");
+    let insert_at = body.find("namespaces()").expect("registry upserts");
+    let validate_at = body
+        .find("registry_namespace_names_in_session")
+        .expect("registry identity validation before completion");
+    let mark_at = body
+        .find("mark_namespaces_registry_backfill_complete")
+        .expect("completion mark");
+    let verify_at = body
+        .find("verify_namespace_config_admission_lease_in_session")
+        .expect("commit-boundary owner/generation lease proof");
+    assert!(
+        completed_at < scan_at && scan_at < insert_at,
+        "the name set must be discovered inside the same transaction that makes it durable, so \
+         no delete can commit in between:\n{body}"
+    );
+    assert!(
+        insert_at < validate_at && validate_at < mark_at,
+        "a split registry identity must abort before the compatibility marker is durable:\n{body}"
+    );
+    assert!(
+        mark_at < verify_at,
+        "the marker must be written last, and the owner/generation lease proof must be the final \
+         gate before the commit:\n{body}"
+    );
+
+    let completed = mongo_method("namespaces_registry_backfill_completed(");
+    assert!(
+        completed.contains("schema_compat()")
+            && completed.contains("NAMESPACES_REGISTRY_BACKFILL_ID")
+            && !completed.contains("namespaces()"),
+        "completion must not live as a fake namespaces document:\n{completed}"
+    );
+
+    let mark = mongo_method("mark_namespaces_registry_backfill_complete(");
+    assert!(
+        mark.contains("schema_compat()")
+            && mark.contains("NAMESPACES_REGISTRY_BACKFILL_ID")
+            && mark.contains("completed_at")
+            && !mark.contains("namespaces()"),
+        "the marker must be written to the internal compatibility collection:\n{mark}"
+    );
+
+    let migrations = mongo_method("run_migrations(");
+    let lease_at = migrations
+        .find("acquire_migration_lease")
+        .expect("migration lease");
+    let backfill_at = migrations
+        .find("backfill_namespaces_registry")
+        .expect("backfill still runs during migrate");
+    let release_at = migrations
+        .find("migration_lease.release()")
+        .expect("release");
+    assert!(
+        lease_at < backfill_at && backfill_at < release_at,
+        "the first compatibility run must stay serialized by the migration lease:\n{migrations}"
     );
 }

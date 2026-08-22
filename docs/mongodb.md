@@ -298,6 +298,7 @@ FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client.key
 | Single-document CRUD | Atomic | Atomic |
 | Multi-document operations (e.g., delete proxy + plugins) | Hand-managed proxy deletes use fail-safe sequential ordering; direct API-spec-owned proxy deletes are **rejected with `501` before mutation** | Transactional (ACID) via `ClientSession::start_transaction` |
 | `POST /batch` (all-or-nothing config graph) | **Rejected with `501` before any mutation** | Supported — the whole graph commits in one transaction |
+| `POST`/`PUT`/`DELETE /namespaces` (registry CRUD) | **Rejected with `501` before any mutation** | Supported — the whole tenant mutation commits in one transaction |
 | Change-stream-triggered config reloads | Not available (periodic polling only) | Available, opt-in via `FERRUM_MONGO_CHANGE_STREAM_ENABLED` |
 | Read preference routing | Not available | Available |
 | Automatic failover | Not available | Automatic |
@@ -325,6 +326,103 @@ partial failure can only leave orphaned plugin configs (no proxy references
 them). Orphans are recoverable; the previous order — plugin configs first —
 could leave a proxy in the DB referencing now-deleted plugin_config IDs, which
 validation rejects on every subsequent polling cycle until manually cleaned up.
+
+Namespace registry CRUD (`POST /namespaces`, `PUT /namespaces/{name}`,
+`DELETE /namespaces/{name}`, issue #3955) has the same requirement. A rename or
+confirmed cascade delete spans the registry document, every live resource
+document, the consumer identity index, the gateway trust bundle, the tenant's
+route-bucket lock documents, and the polling change records; and every registry
+mutation re-verifies its namespace-admission leases *inside* the committing
+transaction so a lost or stolen lease can never produce a durable write.
+The backend also requires the exact canonical lease-key sequence (global
+`!namespace-registry` first, then affected names sorted and de-duplicated)
+before opening that transaction; an incomplete or substituted set is the same
+retryable lost-lease refusal. Connect/migrate runs a **one-time** compatibility
+backfill of pre-existing derived names plus canonical `ferrum`, then records
+completion in `_ferrum_schema_compat` (not a registry document). That pass runs
+under the **same global `!namespace-registry` admission lease** every live
+create/rename/delete takes, **and inside one transaction**, so it cannot read
+derived names next to a concurrent confirmed `DELETE` and then resurrect the
+removed document. The derived-name discovery (an aggregation `$group`, because
+`distinct` is not accepted inside a transaction on every supported server), the
+registry upserts, the strict split-identity validation, the completion marker,
+and the owner/generation lease proof are all one atomic step. A pair of
+conditional renewals bracketing the upserts would *not* be a proof: the lease
+can lapse between them, another gateway can then acquire the global key and
+commit a delete, and a later upsert from the pre-delete name set would resurrect
+that document — the second renewal only detects the loss after those upserts are
+already durable, and leaving the marker absent does not undo them. The
+transaction closes that window on both sides: a delete that acquired the lease
+before the transaction's snapshot changed the lease document's `owner` and
+`generation`, so the in-session proof matches nothing and the pass aborts; a
+delete that tries to acquire it afterwards must write the same lease document
+the transaction writes and therefore write-conflicts, which orders its mutation
+strictly after the pass rather than inside it. Independently of the lease, an
+upsert of a registry document a concurrent transaction is deleting is itself a
+write conflict.
+
+On a **standalone `mongod` the pass writes nothing at all.** That topology has
+no multi-document transactions, so there is no honest way to make discovery and
+upsert one durable step, and no cross-process atomicity to claim. Nothing is
+lost by deferring: namespace `POST`/`PUT`/`DELETE` already return `501` before
+mutating anything there, so no registry document can be created or removed in
+the first place, and `GET /namespaces` is the union of registry names and
+derived resource names, so listing is identical whether or not the registry was
+seeded. The completion marker stays absent, so the first connect/migrate against
+a replica-set-capable topology runs the full fenced pass. The pass's strict
+split-identity validation moves inside that transaction with it, so on a
+standalone deployment it is not run at startup; `GET /namespaces` still refuses
+to serve a corrupt registry document (`500`) on every topology, which is where a
+standalone deployment would surface one.
+
+A lease held elsewhere defers the pass rather than failing startup, and the
+lease is released on every path, success or error. A failed
+attempt leaves that marker absent so a later startup retries; once complete,
+later migrate/reconnect/startup passes do not reseed deleted names. Registry
+lookups and vacancy checks scan both durable `_id` and embedded `name`, then
+require them to agree; a split identity is typed corruption, never an absent
+name that create or rename may reuse. Confirmed cascade delete scans both the
+embedded
+`namespace` field and the durable key identity for consumers, the consumer
+identity index, and the gateway trust bundle, and aborts as typed registry
+corruption if those identities disagree, so a key-only or mismatched document
+cannot be ignored or deleted under the wrong tenant. Rename uses the same
+split-identity scan for the gateway trust bundle before rewriting anything:
+`_id` and embedded `namespace` must agree with the source namespace; the
+separate operator-chosen resource `id` must be a nonempty string and is
+preserved. Otherwise the whole transaction aborts as typed corruption and never
+rewrites another tenant's document. Historical `audit_events`
+documents are immutable evidence and are **not**
+bulk-rewritten on rename: they retain the namespace recorded when the event
+occurred. A namespace name is therefore a durable audit identity: reusing a
+deleted or renamed name resumes that same history for callers authorized for
+the reused name, so an unrelated tenant must receive a fresh, previously unused
+name. Last-remaining protection is a remaining **registry document**, not
+the GET union of derived resource names: ordinary resource CRUD is not
+serialized by the global registry lease and does not insert registry documents.
+Neither guarantee is available on a standalone `mongod`, so all three write
+operations return `501 Not Implemented` before touching anything and name
+`FERRUM_MONGO_REPLICA_SET` (or the `replicaSet` URL option) as the remediation.
+`GET /namespaces` and `GET /namespaces/{name}` remain available, and SQL
+backends are unaffected.
+
+`POST /restore` shares that strict cascade. Its destructive clear no longer
+issues a blind `delete_many` over `consumers` and `consumer_identity_index`: it
+validates each document's durable `_id = "{namespace}:{suffix}"` against the
+embedded `namespace` and identity value first, and deletes only the identities it
+validated. This is a **behavior change on an existing endpoint** — a split
+identity that only a hand-edited database or an out-of-band writer can produce
+now aborts the restore as typed registry corruption (redacted `500`, rolled back,
+prior configuration retained) instead of being deleted blindly. Deleting a
+document whose durable key belongs to another tenant would be a cross-tenant
+deletion, and ignoring it would leave the target namespace half-cleared before
+the import, so this check is deliberately fail-closed. Repair or deliberately
+remove the offending document and re-run the restore.
+
+Namespace backup payloads carry namespace-scoped configuration resources, never
+the registry document itself, so restore never transplants a source tenant's
+description or registry timestamps into the authenticated target namespace. See
+[admin_api.md](admin_api.md) for the full boundary.
 
 A direct `DELETE /proxies/{id}` for an API-spec-owned proxy is different: its
 ownership cascade spans the proxy, scoped plugins, the `api_specs` owner

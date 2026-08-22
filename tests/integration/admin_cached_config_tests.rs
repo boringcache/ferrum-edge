@@ -1673,10 +1673,10 @@ async fn test_list_namespaces_returns_paginated_envelope() {
     assert_eq!(status, 200);
     let data = body["data"].as_array().expect("namespaces data array");
     let names: Vec<&str> = data.iter().filter_map(|v| v.as_str()).collect();
-    assert_eq!(names, ["alpha", "middle", "zeta"]);
+    assert_eq!(names, ["alpha", "ferrum", "middle", "zeta"]);
     assert_eq!(body["pagination"]["offset"], 0);
     assert_eq!(body["pagination"]["limit"], 100);
-    assert_eq!(body["pagination"]["total"], 3);
+    assert_eq!(body["pagination"]["total"], 4);
 }
 
 #[tokio::test]
@@ -1691,23 +1691,24 @@ async fn test_list_namespaces_with_pagination() {
     let (status, body, _) = admin_get(&base_url, "/namespaces?limit=2&offset=2", &token).await;
     assert_eq!(status, 200);
     let data = body["data"].as_array().unwrap();
-    assert_eq!(data.len(), 1);
-    assert_eq!(data[0], "zeta");
+    assert_eq!(data.len(), 2);
+    assert_eq!(data[0], "middle");
+    assert_eq!(data[1], "zeta");
     assert_eq!(body["pagination"]["offset"], 2);
     assert_eq!(body["pagination"]["limit"], 2);
-    assert_eq!(body["pagination"]["total"], 3);
+    assert_eq!(body["pagination"]["total"], 4);
 
     // An offset beyond the total is a valid empty page, not an error.
     let (status, body, _) = admin_get(&base_url, "/namespaces?offset=100&limit=10", &token).await;
     assert_eq!(status, 200);
     assert_eq!(body["data"].as_array().unwrap().len(), 0);
-    assert_eq!(body["pagination"]["total"], 3);
+    assert_eq!(body["pagination"]["total"], 4);
 
     // `0` keeps the documented "server default" meaning.
     let (status, body, _) = admin_get(&base_url, "/namespaces?limit=0", &token).await;
     assert_eq!(status, 200);
     assert_eq!(body["pagination"]["limit"], 100);
-    assert_eq!(body["data"].as_array().unwrap().len(), 3);
+    assert_eq!(body["data"].as_array().unwrap().len(), 4);
 }
 
 #[tokio::test]

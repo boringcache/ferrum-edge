@@ -2127,6 +2127,31 @@ pub mod _test_support {
         Lost(T),
     }
 
+    /// Acquire the namespace REGISTRY admission leases — the global registry
+    /// key plus one per affected name, in the same total order the admin
+    /// handlers use — so external tests can drive backend registry mutations
+    /// with real, verifiable lease identities (issue #3955).
+    pub async fn lock_namespace_registry_admission_for_test(
+        db: std::sync::Arc<dyn crate::config::db_backend::DatabaseBackend>,
+        names: &[&str],
+    ) -> Result<TestNamespaceRegistryAdmission, String> {
+        crate::admin::crud::lock_namespace_registry_admission(db, names)
+            .await
+            .map(TestNamespaceRegistryAdmission)
+            .map_err(|_error| "namespace registry admission unavailable".to_string())
+    }
+
+    /// Opaque handle around the production registry admission guards.
+    pub struct TestNamespaceRegistryAdmission(crate::admin::crud::NamespaceRegistryAdmission);
+
+    impl TestNamespaceRegistryAdmission {
+        /// The exact lease identities a backend re-verifies at its commit
+        /// boundary.
+        pub fn holds(&self) -> Vec<crate::config::db_backend::NamespaceAdmissionLeaseHold<'_>> {
+            self.0.holds()
+        }
+    }
+
     pub fn validate_plugin_configs_fatal_for_test(
         config: &mut crate::config::types::GatewayConfig,
         backend_allow_ips: &crate::config::BackendEgressPolicy,
@@ -4984,6 +5009,18 @@ pub mod _test_support {
     /// clear the fault when the test finishes.
     pub fn set_atomic_batch_fault_for_test(namespace: &str, fault: Option<AtomicBatchFault>) {
         crate::config::batch_atomicity::set_atomic_batch_fault(namespace, fault);
+    }
+
+    pub use crate::config::namespace_registry::NamespaceRegistryPhase;
+
+    /// Install (or clear) one deterministic namespace-registry transaction
+    /// abort. The production module keeps this installer crate-private; only
+    /// external tests reach it through this explicitly test-only seam.
+    pub fn set_namespace_registry_fault_for_test(
+        namespace: &str,
+        phase: Option<NamespaceRegistryPhase>,
+    ) {
+        crate::config::namespace_registry::set_namespace_registry_fault(namespace, phase);
     }
 
     /// Shrink the per-chunk write size for one namespace so a small fixture can

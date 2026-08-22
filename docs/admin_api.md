@@ -32,7 +32,9 @@ By default, admin JWTs are **global**: the `X-Ferrum-Namespace` header is a rout
 
 - The `ns` claim accepts the same shapes as the gRPC plane: a single string (`"ns": "prod"`) or an array of strings (`"ns": ["prod", "staging"]`).
 - A request whose `X-Ferrum-Namespace` (or the `ferrum` default when the header is omitted) is not in the token's `ns` set is rejected with `403 Forbidden`. With enforcement on, tokens without an `ns` claim are rejected on namespace-scoped routes — tenancy intent must be explicit.
-- Enforcement covers the namespace-scoped resource surfaces: `/proxies`, `/consumers` (including credentials), `/plugins/config`, `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/restore`, and `/audit`. Global surfaces (observability, `/cluster`, `/namespaces`, TLS management, backend capabilities, mesh introspection, `GET /plugins` type listing) are not tenant-selected and are unaffected.
+- Enforcement covers the namespace-scoped resource surfaces: `/proxies`, `/consumers` (including credentials), `/plugins/config`, `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/restore`, and `/audit`. Those routes are selected by `X-Ferrum-Namespace`.
+- The `/namespaces` registry is a global surface (the header does not select a tenant). When the flag is on, `GET /namespaces` is **filtered** to the JWT `ns` claim — a token with no claim receives an empty list rather than `403`. `GET`/`PUT`/`DELETE /namespaces/{name}` and `POST /namespaces` return `403` when the token cannot address that name; rename checks both the current and target names.
+- Other global surfaces (observability, `/cluster`, TLS management, backend capabilities, mesh introspection, `GET /plugins` type listing) remain unaffected.
 - Malformed `ns` claims (non-string entries, empty strings) are rejected at authentication time regardless of the flag — a garbled tenancy claim never widens access.
 
 With the flag off (default), behavior is unchanged and back-compatible.
@@ -41,7 +43,7 @@ With the flag off (default), behavior is unchanged and back-compatible.
 | --- | --- |
 | `viewer` | Read-only endpoints, including API spec metadata listing |
 | `operator` | Read-only endpoints plus proxy, upstream, plugin config, backend capability refresh, TLS inventory/events/validation/forced reload, and mesh egress-scope test operations |
-| `admin` | Full access, including consumers, credentials, raw API spec retrieval and mutations, TLS material and ACME state management, batch/restore, and audit logs |
+| `admin` | Full access, including consumers, credentials, namespace create/rename/delete, raw API spec retrieval and mutations, TLS material and ACME state management, batch/restore, and audit logs |
 
 Tokens without a valid `role` claim are rejected.
 
@@ -383,6 +385,132 @@ Both admin listeners (plaintext and HTTPS) serve HTTP/1.1 and HTTP/2 — HTTPS n
 - **Connection progress** is bounded by the same `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` window: a connection that neither delivers a new request nor holds one in flight for a whole window is closed. This covers the HTTP/1.1-vs-HTTP/2 version sniff (a peer that connects and sends nothing) and HTTP/2 streams whose header block never completes. An idle keep-alive admin connection is therefore closed after this long and the client reconnects, which is what the HTTP/1.1 header timer already did. A response still being written to a slow reader counts as in flight and is not interrupted.
 
 Sizing note: there is no listener-wide budget for concurrently buffered request bodies, so the theoretical ceiling on retained body bytes is `FERRUM_ADMIN_MAX_CONNECTIONS` x `FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS` x the route's size cap. Reaching it requires credentials for a body-consuming route (every one of them is role-gated, and the role gate runs before the body is read), and in practice the binding constraint is the caller's upload bandwidth times the body deadline rather than the stream product — a caller can only hold what it has actually transmitted. Deployments that expose the admin plane to lower-trust `operator` tokens should size `FERRUM_ADMIN_MAX_CONNECTIONS`, `FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP`, and `FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS` against the process memory limit rather than relying on the defaults.
+
+## Namespaces
+
+Namespaces are first-class registry objects. Historically `GET /namespaces` was a `DISTINCT` union over resource tables, so an empty tenant could not exist and there was no rename or delete. The durable `namespaces` table (SQL and Mongo) holds `name` (primary key), optional `description`, `created_at`, and `updated_at`. Connect/migrate runs a **one-time** compatibility backfill: a database that has never completed it inserts every pre-existing derived name from proxies, consumers, plugin configs, upstreams, and gateway trust bundles, plus the canonical `ferrum` row, then durably marks that backfill complete. A failed or partial attempt leaves the marker absent so a later startup retries the same idempotent inserts. That compatibility pass takes the **same global namespace-registry admission lease** every live create/rename/delete takes, and it commits as **one transaction** so it cannot read derived names next to a concurrent confirmed `DELETE` and then resurrect the removed row. On SQL the transaction's first statement verifies the lease row *and locks it* (`SELECT ... FOR UPDATE`; on SQLite the equivalent conditional `UPDATE`, which takes the single database writer lock), then holds that lock across the derived-name scan, the inserts, the marker, and the commit. Because every competing lease acquisition is a write to that same row, no other gateway can take the global key while the pass runs — so a pass that simply takes longer than one lease duration still commits instead of rolling back and starving; the commit-boundary check proves the same owner and generation, which only an ownership change could alter and nothing can alter under the lock. On MongoDB the pass runs the derived-name discovery, the registry upserts, the strict split-identity validation, the completion marker, and the owner/generation lease proof inside a single transaction, so the name set cannot go stale before it is durable; a delete that acquired the lease first fails the in-transaction proof, and one that tries to acquire it later write-conflicts with the same lease document the transaction touches. A standalone `mongod` has no multi-document transactions, so the pass **writes nothing at all** there rather than claiming an atomicity that topology does not have — `POST`/`PUT`/`DELETE /namespaces` already return `501` before mutating anything on that topology, `GET /namespaces` is the registry ∪ derived union either way, and the marker stays absent so the first replica-set-capable startup performs the full fenced pass. A lease already held elsewhere simply defers the pass — the marker stays absent, which is the same crash-retry state — and the lease is released on every path, success or error, so a failed pass never stalls namespace CRUD for its full lease duration. Once completion is durable, later connect/migrate/reconnect/startup passes do **not** reseed deleted names or materialize newer derived-only names. The marker lives in internal compatibility state (`_ferrum_schema_compat`), not as a fake registry row, and never appears in `GET /namespaces`. Nothing else is seeded: the backfill never reads the process environment, so a deployment-specific `FERRUM_NAMESPACE` that has no resources yet is created through `POST /namespaces`. Ordinary resource writes with a new `X-Ferrum-Namespace` still isolate data and appear in `GET /namespaces` as derived names, but they do **not** insert a registry row.
+
+Before either backend writes the compatibility marker, it validates every durable registry identity inside the same transaction. A legacy derived namespace that no longer satisfies the current namespace grammar therefore rolls the complete pass back with a redacted corruption diagnostic; it is never copied into a completed registry for a later admin read to discover.
+
+Writing a proxy (or other resource) with a new `X-Ferrum-Namespace` still isolates data without a prior `POST` — that implicit path remains valid. What the registry adds is the ability to create a tenant before any resource, and to rename or delete it.
+
+`GET /namespaces` stays a paginated list of **name strings** (`data: string[]`) so existing clients, including Ferrum Foundry, do not break. The list is the union of registry names and derived resource names, so nothing disappears during rollout and empty tenants appear. Viewer and operator may list and get; create, rename, and delete require `admin`. File mode and other read-only topologies return `403` on writes.
+
+```bash
+# List (string[] envelope — unchanged for existing clients)
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/namespaces
+
+# Create an empty tenant
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"staging","description":"pre-prod"}' \
+  http://localhost:9000/namespaces
+
+# Get / rename / delete
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/namespaces/staging
+curl -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"prod","description":"production"}' \
+  http://localhost:9000/namespaces/staging
+curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:9000/namespaces/prod
+# Non-empty tenants return 409 unless explicitly confirmed:
+curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:9000/namespaces/prod?confirm=true"
+```
+
+`name` uses the same rules as `X-Ferrum-Namespace`: `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`, max 254. Duplicate names (registry or derived) return `409`.
+
+### Request field semantics
+
+- `description` is trimmed; an empty or whitespace-only value is stored as absent and omitted from the response. The 1024 limit counts **Unicode characters** (scalar values), not bytes, matching the OpenAPI `maxLength`.
+- On `PUT`, an omitted field is left unchanged. `description: null` (or an empty string) clears it. `name` is valid only as a **string when present** — `name: null` is rejected, not treated as "unchanged". Presence-aware deserialization keeps a present JSON `null` distinct from an omitted field.
+- Any other JSON type for either field is `400` with nothing mutated. A malformed `description` never silently erases the stored value. An empty body or a non-object JSON value is `400`.
+
+### Atomicity and protected namespaces
+
+Create, rename, and delete are serialized across gateway processes by a **global namespace-registry admission lease** plus one lease per affected name, taken in a fixed order (global first, then names ascending) so concurrent creates, deletes, and a two-name rename cannot deadlock. Each backend requires that exact canonical lease-key sequence before mutating anything; an empty, incomplete, duplicated, reordered, or substituted set is a retryable `503` with nothing applied. The committing transaction then re-verifies every held lease's owner and generation against the datastore's own clock; a lost or stolen lease aborts with the same `503`.
+
+Every precondition that can race is evaluated inside that transaction, not by an earlier query: source existence, target vacancy, occupancy, protection of the configured namespace, and the last-remaining-namespace invariant. Handler prechecks exist only to produce better messages.
+
+- Rename rewrites the registry row, every live resource `namespace` column (proxies, consumers, plugin configs, upstreams, gateway trust bundles, API specs), the consumer identity index, and the polling change-log tombstones in that one transaction. SQL also rewrites its separate consumer credential-index rows; MongoDB's credential uniqueness index lives on the consumer documents that already move with the rename. Stale route-bucket lock rows under the old name are removed; the admission lease rows proving the mutation are never touched. Rename also holds both the source and target mTLS DNS admission fences (sorted and de-duplicated) and fails closed if either has a restore owner; a description-only update holds the current name's fence.
+- MongoDB registry lookups and vacancy checks scan both durable `_id` and embedded `name`, then require the two to agree. A split identity such as `_id = other, name = target` is a redacted corruption error; create, rename, and delete do not ignore it or insert a second identity for the same logical name.
+- Historical `audit_events` rows are immutable evidence and are **not** rewritten or deleted: they retain the namespace identity recorded when the event occurred. A namespace name is therefore a durable audit identity, not a reusable tenant slot. If a deleted or renamed name is later reused, `GET /audit` for that name resumes the same history and exposes it to callers authorized for the reused name; an unrelated tenant must receive a fresh, previously unused name. The rename itself may still emit a new audit event under the new name with a before/after diff.
+- Delete does not cascade by default; `?confirm=true` cascade-deletes occupancy resources (proxies, consumers, plugin configs, upstreams, API specs, the gateway trust bundle, the consumer indexes, and the tenant's route-bucket lock rows) and then the registry row. On MongoDB, cascade delete scans both the embedded `namespace` field and the durable key identity (`_id = "{namespace}:{suffix}"` for consumers and the consumer identity index, `_id = namespace` for the gateway trust bundle) before deleting anything. A missing, non-string, or mismatched identity aborts as a redacted `500` and rolls back; only identities already validated for the current namespace are deleted or tombstoned. `proxy_route_locks` remain prefix-keyed cleanup. Rename uses the same split-identity scan for the gateway trust bundle **before any rewrite**: `_id` and embedded `namespace` must agree with the source, while the separate operator-chosen resource `id` must be a nonempty string and is preserved. A document whose `_id` belongs to another tenant while its embedded `namespace` matches the source is occupancy, but the whole transaction aborts as typed registry corruption rather than leaving that document behind or rewriting another tenant.
+- Change-log tombstones and the namespace's change-log retention floor are deliberately **retained** after a rename or delete so a gateway still polling the old name converges instead of serving stale configuration.
+- The namespaces this gateway is configured to serve cannot be deleted **or renamed away** — a rename is semantically a removal of the old name. A description-only update of them is allowed. The set is resolved once from startup configuration (CLI > env > conf file > default), never from a request-time environment read, and it is enforced both in the handler precheck and inside the committing transaction so it cannot be raced or bypassed.
+  - **Database mode** protects its resolved `FERRUM_NAMESPACE` (default `ferrum`).
+  - **CP mode** additionally protects every explicitly configured `FERRUM_CP_NAMESPACES` entry. `CpScope::Single`/`Set` keeps polling exactly those names for the life of the process, so deleting or renaming one would leave the control plane polling a namespace that no longer exists and every DP subscribed to it converging to empty configuration until the process was restarted.
+  - `FERRUM_CP_NAMESPACES=*` is dynamic and does **not** freeze every discovered name; a cluster-wide CP protects only `FERRUM_NAMESPACE`, and any other tenant stays removable.
+  - The `409` reason is a fixed string naming the two configuration keys (`FERRUM_NAMESPACE` / `FERRUM_CP_NAMESPACES`). It never echoes the rest of the configured set, so the response cannot be used to enumerate which other tenants this gateway serves.
+- The last remaining **registry row** cannot be deleted, re-checked at the commit boundary so two gateway instances cannot each observe two registry rows and concurrently delete a different one. `GET /namespaces` remains the union of registry names and derived resource names; ordinary resource CRUD is not serialized by the global registry lease and does not insert registry rows, so a derived-only name cannot be the durable authority for that invariant.
+
+### Database-mode live apply for registry mutations
+
+Registry mutations follow the same read-your-write contract as ordinary
+config-database writes (see *Database-mode live apply*), but only when they
+actually change what this process serves:
+
+- `POST /namespaces` inserts one `namespaces` row and writes **no**
+  `config_changes` record. The runtime snapshot does not contain the registry
+  table, so `201` never waits for a poll-loop reload.
+- A description-only `PUT` likewise writes no change record and does not wait.
+- A **rename** rewrites resource `namespace` columns and writes `delete` /
+  `upsert` tombstones under both the source and the target name. If either name
+  is the namespace this process serves (`FERRUM_NAMESPACE`), the `200` is
+  withheld until the poll loop accepts a covering generation.
+- A **confirmed cascade delete** (`?confirm=true`) writes `delete` tombstones
+  under the deleted name. If that is the served namespace, the `204` is withheld
+  the same way. An unconfirmed delete can only remove an empty tenant's registry
+  row and does not wait.
+
+The covering `config_changes` watermark is captured from the pinned write
+topology *after* the registry transaction commits and *before* the write-topology
+permit and the registry admission leases are released; the wait itself happens
+after those pins drop, so the poll (or a reconnect) that has to publish the
+generation is never blocked by the waiting request. A reload that rejects, times
+out, or whose watermark cannot be read returns the shared `503` with
+`{"applied": false, "reason": "config_rejected" | "reload_timeout" |
+"sequence_unavailable"}` and no `Retry-After` — the mutation is durable but not
+yet live, which is a different outcome from the `Retry-After: 1` contention and
+lost-lease `503`s below, where nothing was applied. CP, DP, and file modes, and
+mutations targeting a namespace this process does not serve, never wait.
+
+### Retryable database conflicts
+
+A registry mutation can be aborted by the database itself rather than by the
+gateway. PostgreSQL runs a rename or delete under `REPEATABLE READ` (the same
+capture the namespace-wide delete path uses) and can answer `40001`
+(`serialization_failure`) or `40P01` (`deadlock_detected`) when the independent
+30-second admission-lease renewer updates `config_admission_locks` between the
+transaction's snapshot and its final `SELECT ... FOR UPDATE` on the same rows.
+MySQL reports a deadlock victim with the same `40001` SQLSTATE.
+
+Nothing commits in that case, so the endpoint answers `503 Service Unavailable`
+with `Retry-After: 1` and `{"rollback":"not_needed"}` — the same fail-closed,
+safe-to-retry shape a lost admission lease produces — instead of a `500`. The
+classification walks the whole error chain and looks **only** at the SQLSTATE:
+the driver's message is never rendered or logged, and the response body is a
+fixed redacted string. A uniqueness/name conflict (`23505` / `Duplicate entry`)
+stays a `409` and a connectivity failure stays its own error, because neither
+carries a retryable SQLSTATE.
+
+### Derived-only namespace timestamps
+
+`GET /namespaces/{name}` returns a **synthesized** detail record for a name that
+exists only as a derived resource namespace (written under
+`X-Ferrum-Namespace` with no registry row), and file mode synthesizes every
+record it returns. There is no durable registry row behind those responses, so
+`created_at` and `updated_at` are **observation timestamps stamped when the
+request was served** — not stable registry metadata. Two `GET`s of the same
+derived-only namespace return two different values. Do not compare them, cache
+them as identity, or order by them. `POST /namespaces` (or a `PUT` that
+materializes the row) is what gives a tenant durable timestamps. Both fields
+remain required in the response schema so clients never have to special-case a
+missing field.
+
+### MongoDB limitation
+
+Namespace `POST`/`PUT`/`DELETE` require MongoDB **multi-document transactions**. On a standalone `mongod` they are refused with `501 Not Implemented` before anything is modified, and the `detail` field names the configuration to change (`FERRUM_MONGO_REPLICA_SET`, or a `?replicaSet=` URL option). `GET /namespaces` and `GET /namespaces/{name}` remain available. SQL backends are unaffected.
+
+These routes are **not** selected by `X-Ferrum-Namespace`. See [Per-namespace tenancy](#per-namespace-tenancy-ferrum_admin_require_namespace_claim) for how the JWT `ns` claim applies to list filtering and per-name writes.
 
 ## Proxies
 
@@ -841,6 +969,49 @@ stored record, `revision` is assigned by the store, and `updated_by` is the
 restoring admin's verified JWT subject (at most 255 characters; an overlong subject
 is rejected rather than truncated).
 
+### Namespace metadata is not part of a backup
+
+A namespace backup payload carries namespace-**scoped configuration
+resources** — proxies, consumers, plugin configs, upstreams, API specs, and
+gateway trust bundles — and never the namespace registry row itself (its
+`description` and its `created_at`/`updated_at`). This boundary is deliberate:
+`POST /restore` writes into the **authenticated target namespace**, so
+transplanting the source tenant's registry metadata into a different target
+would silently relabel that target from an artifact taken elsewhere.
+
+The consequences are explicit rather than implied:
+
+- Restoring **in place** (same namespace the backup came from) leaves that
+  namespace's registry row untouched: description and timestamps are preserved
+  exactly as they were, including across the destructive clear.
+- Importing into a **fresh target** yields a namespace that holds resources but
+  has no registry row and therefore no description — a derived-only namespace.
+  It still appears in `GET /namespaces`, and `GET /namespaces/{name}` returns a
+  synthesized record with observation timestamps (see [Derived-only namespace
+  timestamps](#derived-only-namespace-timestamps)). Use `POST /namespaces` or
+  `PUT /namespaces/{name}` to materialize a durable registry row with the
+  description you want.
+
+### MongoDB restore now refuses malformed split identities
+
+`POST /restore` on MongoDB shares the strict namespace cascade introduced with
+namespace `DELETE ?confirm=true`. Its destructive clear no longer issues a blind
+`delete_many` over consumers and the consumer identity index: it first validates
+every document's durable key identity against its embedded `namespace`
+(`_id = "{namespace}:{suffix}"` plus a matching `namespace` field and identity
+value), and deletes only the identities it validated.
+
+This is a **behavior change on an existing endpoint**. A consumer or
+consumer-identity-index document whose `_id` and embedded `namespace` disagree
+— a split identity that only a hand-edited database or an out-of-band writer can
+produce — now aborts the restore as typed registry corruption (a redacted `500`,
+rolled back, prior configuration retained) instead of being deleted blindly. That
+fail-closed check is intentional and must not be weakened: silently deleting a
+document whose durable key belongs to another tenant is a cross-tenant deletion,
+and silently ignoring it would leave the target namespace half-cleared before the
+import. Repair the offending document (or remove it deliberately) and re-run the
+restore.
+
 See [admin_backup_restore.md](admin_backup_restore.md) for details.
 
 ## Audit Log
@@ -917,9 +1088,14 @@ no durable audit evidence.
   no-op assignment that mutates no column, not `INSERT IGNORE`, which would also
   downgrade unrelated errors; MongoDB `insert_one` with a duplicate key treated
   as success). A duplicate delivery of the same id is success, never
-  replacement: an `audit_events` row is immutable. The MongoDB path is a
-  single-document write, so it needs no multi-document transaction and works on
-  standalone deployments.
+  replacement: an `audit_events` row is immutable. Namespace rename does not
+  rewrite historical `audit_events.namespace` values; those rows retain the
+  tenant identity recorded when the event occurred. Namespace names are durable
+  audit identities: reusing a deleted or renamed name resumes that same history
+  under `GET /audit` and exposes it to callers authorized for the reused name,
+  so an unrelated tenant must receive a fresh, previously unused name. The
+  MongoDB path is a single-document write, so it needs no multi-document
+  transaction and works on standalone deployments.
 - **Unrecoverable evidence is retained, not dropped.** After the attempt budget
   is exhausted, the record moves to `<spool>/failed/` for operator remediation.
   Corrupt records (bad version, unparseable, oversized, non-finalized, or an id

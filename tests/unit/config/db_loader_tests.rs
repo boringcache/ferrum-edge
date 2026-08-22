@@ -13,7 +13,11 @@ use ferrum_edge::config::db_backend::{
     is_incremental_full_reload_required, is_mtls_dns_admission_unavailable,
     is_mtls_dns_identity_conflict, tcp_connection_throttle_attachment_conflict,
 };
-use ferrum_edge::config::db_loader::DatabaseStore;
+use ferrum_edge::config::db_loader::{
+    DatabaseStore, is_retryable_sql_transaction_conflict,
+    sqlstate_is_retryable_transaction_conflict,
+};
+use ferrum_edge::config::namespace_registry::NamespaceRegistryCorrupt;
 use ferrum_edge::config::plugin_trigger::PluginTrigger;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, PluginAssociation, PluginConfig,
@@ -2213,7 +2217,7 @@ async fn read_replica_tracks_primary_topology_across_failover_and_failback() {
     store.connect_read_replica(&replica_url).await.unwrap();
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["failover-ns".to_string()],
+        vec!["failover-ns".to_string(), "ferrum".to_string()],
         "admin reads must stay on the active failover topology"
     );
 
@@ -2227,7 +2231,7 @@ async fn read_replica_tracks_primary_topology_across_failover_and_failback() {
     store.reconnect_read_replica(&replica_url).await.unwrap();
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["replica-ns".to_string()],
+        vec!["ferrum".to_string(), "replica-ns".to_string()],
         "the configured read replica should become eligible again after primary failback"
     );
 }
@@ -2268,14 +2272,32 @@ async fn seed_namespace_trust_bundle_only(store: &DatabaseStore, namespace: &str
     .unwrap();
 }
 
+async fn registry_row_exists(store: &DatabaseStore, name: &str) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM namespaces WHERE name = ?")
+        .bind(name)
+        .fetch_one(&store.pool())
+        .await
+        .unwrap()
+        > 0
+}
+
+async fn namespace_registry_backfill_completed(store: &DatabaseStore) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _ferrum_schema_compat WHERE name = ?")
+        .bind(ferrum_edge::config::namespace_registry::NAMESPACES_REGISTRY_BACKFILL_ID)
+        .fetch_one(&store.pool())
+        .await
+        .unwrap()
+        > 0
+}
+
 #[tokio::test]
-async fn list_namespaces_paginated_empty_store_returns_zero_total() {
+async fn list_namespaces_paginated_empty_store_returns_default_ferrum() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let store = connect_namespaces_test_store(&temp_dir, "ns-empty").await;
 
     let page = store.list_namespaces_paginated(100, 0).await.unwrap();
-    assert_eq!(page.total, 0);
-    assert!(page.items.is_empty());
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items, vec!["ferrum"]);
 }
 
 #[tokio::test]
@@ -2303,8 +2325,8 @@ async fn list_namespaces_paginated_dedupes_across_tables_and_orders() {
         .unwrap();
 
     let page = store.list_namespaces_paginated(100, 0).await.unwrap();
-    assert_eq!(page.total, 3);
-    assert_eq!(page.items, vec!["alpha", "middle", "zeta"]);
+    assert_eq!(page.total, 4);
+    assert_eq!(page.items, vec!["alpha", "ferrum", "middle", "zeta"]);
 }
 
 #[tokio::test]
@@ -2316,25 +2338,25 @@ async fn list_namespaces_paginated_slices_pages_and_preserves_total() {
     }
 
     let page = store.list_namespaces_paginated(2, 0).await.unwrap();
-    assert_eq!(page.items, vec!["ns-00", "ns-01"]);
-    assert_eq!(page.total, 5);
+    assert_eq!(page.items, vec!["ferrum", "ns-00"]);
+    assert_eq!(page.total, 6);
 
     let page = store.list_namespaces_paginated(2, 2).await.unwrap();
-    assert_eq!(page.items, vec!["ns-02", "ns-03"]);
-    assert_eq!(page.total, 5);
+    assert_eq!(page.items, vec!["ns-01", "ns-02"]);
+    assert_eq!(page.total, 6);
 
     let page = store.list_namespaces_paginated(2, 4).await.unwrap();
-    assert_eq!(page.items, vec!["ns-04"]);
-    assert_eq!(page.total, 5);
+    assert_eq!(page.items, vec!["ns-03", "ns-04"]);
+    assert_eq!(page.total, 6);
 
     // An offset at or beyond the total is a valid empty page, not an error.
-    let page = store.list_namespaces_paginated(2, 5).await.unwrap();
+    let page = store.list_namespaces_paginated(2, 6).await.unwrap();
     assert!(page.items.is_empty());
-    assert_eq!(page.total, 5);
+    assert_eq!(page.total, 6);
 
     let page = store.list_namespaces_paginated(2, 100).await.unwrap();
     assert!(page.items.is_empty());
-    assert_eq!(page.total, 5);
+    assert_eq!(page.total, 6);
 }
 
 #[tokio::test]
@@ -2349,21 +2371,21 @@ async fn list_namespaces_paginated_large_collection_pages_stably() {
     let mut offset = 0i64;
     loop {
         let page = store.list_namespaces_paginated(50, offset).await.unwrap();
-        assert_eq!(page.total, 120);
+        assert_eq!(page.total, 121);
         if page.items.is_empty() {
             break;
         }
         offset += page.items.len() as i64;
         collected.extend(page.items);
     }
-    assert_eq!(collected.len(), 120);
+    assert_eq!(collected.len(), 121);
     let mut sorted = collected.clone();
     sorted.sort();
     assert_eq!(
         collected, sorted,
         "pages must concatenate in ascending order"
     );
-    assert_eq!(collected.first().map(String::as_str), Some("ns-000"));
+    assert_eq!(collected.first().map(String::as_str), Some("ferrum"));
     assert_eq!(collected.last().map(String::as_str), Some("ns-119"));
 }
 
@@ -2376,8 +2398,8 @@ async fn list_namespaces_paginated_insert_after_cursor_keeps_pages_stable() {
     }
 
     let first = store.list_namespaces_paginated(4, 0).await.unwrap();
-    assert_eq!(first.items, vec!["ns-00", "ns-01", "ns-02", "ns-03"]);
-    assert_eq!(first.total, 10);
+    assert_eq!(first.items, vec!["ferrum", "ns-00", "ns-01", "ns-02"]);
+    assert_eq!(first.total, 11);
 
     // Inserts that sort after the fetched window must not shift already-
     // returned rows into a later page.
@@ -2386,11 +2408,13 @@ async fn list_namespaces_paginated_insert_after_cursor_keeps_pages_stable() {
     }
 
     let second = store.list_namespaces_paginated(100, 4).await.unwrap();
-    assert_eq!(second.total, 15);
+    assert_eq!(second.total, 16);
     let remainder: Vec<&str> = second.items.iter().map(String::as_str).collect();
     assert_eq!(
-        remainder[..6],
-        ["ns-04", "ns-05", "ns-06", "ns-07", "ns-08", "ns-09"],
+        remainder[..7],
+        [
+            "ns-03", "ns-04", "ns-05", "ns-06", "ns-07", "ns-08", "ns-09"
+        ],
         "rows after the cursor keep their relative order; new inserts append"
     );
     assert!(
@@ -2413,7 +2437,11 @@ async fn list_namespaces_includes_trust_bundle_only_namespace() {
     let namespaces = store.list_namespaces().await.unwrap();
     assert_eq!(
         namespaces,
-        vec!["alpha".to_string(), "trust-only".to_string()],
+        vec![
+            "alpha".to_string(),
+            "ferrum".to_string(),
+            "trust-only".to_string()
+        ],
         "a namespace that only owns a gateway trust bundle must still enumerate"
     );
 }
@@ -2428,18 +2456,152 @@ async fn list_namespaces_paginated_includes_trust_bundle_only_namespace() {
     seed_namespace_upstream(&store, "alpha", "up-alpha").await;
 
     let page = store.list_namespaces_paginated(100, 0).await.unwrap();
-    assert_eq!(page.total, 3);
-    assert_eq!(page.items, vec!["alpha", "middle-trust", "zeta"]);
+    assert_eq!(page.total, 4);
+    assert_eq!(page.items, vec!["alpha", "ferrum", "middle-trust", "zeta"]);
 
     // Paginate so the trust-only name is not on the first page, proving the
     // count and ordered union both include gateway_trust_bundles.
-    let first = store.list_namespaces_paginated(1, 0).await.unwrap();
-    assert_eq!(first.items, vec!["alpha"]);
-    assert_eq!(first.total, 3);
+    let first = store.list_namespaces_paginated(2, 0).await.unwrap();
+    assert_eq!(first.items, vec!["alpha", "ferrum"]);
+    assert_eq!(first.total, 4);
 
-    let second = store.list_namespaces_paginated(1, 1).await.unwrap();
-    assert_eq!(second.items, vec!["middle-trust"]);
-    assert_eq!(second.total, 3);
+    let second = store.list_namespaces_paginated(2, 2).await.unwrap();
+    assert_eq!(second.items, vec!["middle-trust", "zeta"]);
+    assert_eq!(second.total, 4);
+}
+
+#[tokio::test]
+async fn namespace_registry_backfill_is_one_time_and_does_not_reseed() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let name = "ns-backfill-once";
+    let store = connect_namespaces_test_store(&temp_dir, name).await;
+    assert!(
+        registry_row_exists(&store, "ferrum").await,
+        "first-run backfill must still seed canonical ferrum"
+    );
+    assert!(
+        namespace_registry_backfill_completed(&store).await,
+        "first-run backfill must durably mark completion"
+    );
+    let listed = store.list_namespaces().await.unwrap();
+    assert!(listed.contains(&"ferrum".to_string()));
+    assert!(
+        !listed.iter().any(|item| item == "_ferrum_schema_compat"
+            || item == ferrum_edge::config::namespace_registry::NAMESPACES_REGISTRY_BACKFILL_ID),
+        "compatibility state must never appear in GET /namespaces: {listed:?}"
+    );
+
+    seed_namespace_upstream(&store, "derived-only", "up-derived").await;
+    assert!(
+        !registry_row_exists(&store, "derived-only").await,
+        "ordinary resource writes must not insert a registry row"
+    );
+    drop(store);
+
+    let store = connect_namespaces_test_store(&temp_dir, name).await;
+    assert!(registry_row_exists(&store, "ferrum").await);
+    assert!(
+        !registry_row_exists(&store, "derived-only").await,
+        "a later compatibility pass must not materialize newer derived-only names"
+    );
+    let listed = store.list_namespaces().await.unwrap();
+    assert!(
+        listed.contains(&"derived-only".to_string()),
+        "GET /namespaces remains the union of registry and derived names: {listed:?}"
+    );
+
+    sqlx::query("DELETE FROM namespaces WHERE name = 'ferrum'")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    assert!(!registry_row_exists(&store, "ferrum").await);
+    drop(store);
+
+    let store = connect_namespaces_test_store(&temp_dir, name).await;
+    assert!(
+        !registry_row_exists(&store, "ferrum").await,
+        "a later compatibility pass must not resurrect a deleted ferrum row"
+    );
+    assert!(!registry_row_exists(&store, "derived-only").await);
+    assert!(namespace_registry_backfill_completed(&store).await);
+}
+
+#[tokio::test]
+async fn unmarked_namespace_registry_backfill_retries_idempotently() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let name = "ns-backfill-retry";
+    let store = connect_namespaces_test_store(&temp_dir, name).await;
+    sqlx::query("DELETE FROM _ferrum_schema_compat")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM namespaces WHERE name = 'ferrum'")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    seed_namespace_upstream(&store, "legacy", "up-legacy").await;
+    assert!(
+        !namespace_registry_backfill_completed(&store).await,
+        "clearing the marker simulates an interrupted first-run attempt"
+    );
+    drop(store);
+
+    let store = connect_namespaces_test_store(&temp_dir, name).await;
+    assert!(
+        namespace_registry_backfill_completed(&store).await,
+        "an unmarked attempt must remain retryable"
+    );
+    assert!(
+        registry_row_exists(&store, "ferrum").await,
+        "retry must still seed canonical ferrum"
+    );
+    assert!(
+        registry_row_exists(&store, "legacy").await,
+        "retry must still insert pre-existing derived names"
+    );
+}
+
+#[tokio::test]
+async fn namespace_registry_backfill_rejects_invalid_derived_names_before_completion() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let name = "ns-backfill-invalid-derived";
+    let db_path = temp_dir.path().join(format!("{name}.db"));
+    let url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = connect_namespaces_test_store(&temp_dir, name).await;
+
+    sqlx::query("DELETE FROM _ferrum_schema_compat")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    seed_namespace_upstream(&store, "invalid/namespace", "up-invalid").await;
+
+    let error = match DatabaseStore::connect_with_pool_config(
+        "sqlite",
+        &url,
+        DbPoolConfig::default(),
+    )
+    .await
+    {
+        Ok(_) => panic!("an invalid legacy namespace must fail the compatibility pass"),
+        Err(error) => error,
+    };
+    let diagnostic = format!("{error:#}");
+    assert!(
+        diagnostic.contains(NamespaceRegistryCorrupt::MESSAGE),
+        "the failure must use the redacted registry-corruption diagnostic: {diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("invalid/namespace"),
+        "the hostile stored value must not be echoed: {diagnostic}"
+    );
+    assert!(
+        !namespace_registry_backfill_completed(&store).await,
+        "a rejected pass must leave the marker absent for a later repair and retry"
+    );
+    assert!(
+        !registry_row_exists(&store, "invalid/namespace").await,
+        "the derived registry insert must roll back with the rejected pass"
+    );
 }
 
 /// Source-level drift guard: issue #3727 trust bundles are a namespaced
@@ -2456,6 +2618,14 @@ fn list_namespaces_sql_unions_gateway_trust_bundles() {
     assert!(
         list_body.contains("UNION SELECT DISTINCT namespace FROM gateway_trust_bundles"),
         "list_namespaces_from_pool must union gateway_trust_bundles"
+    );
+    assert!(
+        list_body.contains("SELECT name FROM namespaces"),
+        "list_namespaces_from_pool must union the namespaces registry"
+    );
+    assert!(
+        !list_body.contains("_ferrum_schema_compat"),
+        "compatibility-state rows must not appear in GET /namespaces"
     );
 
     let page_body = source
@@ -2721,7 +2891,7 @@ async fn failover_write_gate_fences_primary_after_opt_in_admission() {
     );
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["failover-ns".to_string()],
+        vec!["failover-ns".to_string(), "ferrum".to_string()],
         "the failover-side write must remain visible"
     );
 }
@@ -2859,7 +3029,7 @@ async fn delayed_primary_reconnect_cannot_overwrite_later_failover_topology() {
     );
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["failover-ns".to_string()],
+        vec!["failover-ns".to_string(), "ferrum".to_string()],
         "active pool must match the later failover publication"
     );
 }
@@ -2990,7 +3160,7 @@ async fn delayed_failover_reconnect_cannot_race_later_primary_topology() {
     );
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["primary-ns".to_string()],
+        vec!["ferrum".to_string(), "primary-ns".to_string()],
         "active pool must match the later primary publication"
     );
 }
@@ -3031,7 +3201,7 @@ async fn write_topology_permit_blocks_failover_until_dropped() {
     assert_eq!(store.config_topology_epoch(), primary_epoch);
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["primary-ns".to_string()],
+        vec!["ferrum".to_string(), "primary-ns".to_string()],
         "pinned mutation must keep using the primary pool"
     );
 
@@ -3098,7 +3268,7 @@ async fn write_topology_permit_blocks_failover_until_dropped() {
     );
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["primary-ns".to_string()],
+        vec!["ferrum".to_string(), "primary-ns".to_string()],
         "pinned mutation must not observe the failover pool mid-flight"
     );
 
@@ -3122,7 +3292,7 @@ async fn write_topology_permit_blocks_failover_until_dropped() {
     assert_eq!(failover_permit.topology_epoch(), failover_epoch);
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["failover-ns".to_string()]
+        vec!["failover-ns".to_string(), "ferrum".to_string()]
     );
 }
 
@@ -3265,7 +3435,7 @@ async fn opt_in_write_permit_blocks_failback_until_dropped() {
     assert!(permit.is_pinned());
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["failover-ns".to_string()],
+        vec!["failover-ns".to_string(), "ferrum".to_string()],
         "opt-in mutation must stay on the pinned failover pool"
     );
 
@@ -3326,7 +3496,7 @@ async fn opt_in_write_permit_blocks_failback_until_dropped() {
     assert!(!store.failover_topology_status().primary_active);
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["failover-ns".to_string()]
+        vec!["failover-ns".to_string(), "ferrum".to_string()]
     );
 
     drop(permit);
@@ -3342,6 +3512,504 @@ async fn opt_in_write_permit_blocks_failback_until_dropped() {
     assert!(store.failover_topology_status().primary_active);
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["primary-ns".to_string()]
+        vec!["ferrum".to_string(), "primary-ns".to_string()]
+    );
+}
+
+#[test]
+fn last_remaining_sql_is_registry_row_authority_not_the_get_union() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+    let start = source
+        .find("const ANY_NAMESPACE_REMAINS_SQL")
+        .expect("ANY_NAMESPACE_REMAINS_SQL");
+    let sql = &source[start..start + 400];
+    assert!(
+        sql.contains("SELECT 1 AS present FROM namespaces LIMIT 1"),
+        "last-remaining protection must count durable registry rows only:\n{sql}"
+    );
+    assert!(
+        !sql.contains("UNION SELECT namespace FROM proxies"),
+        "the GET union must not be the delete authority; resource writers do not take \
+         the global registry lease:\n{sql}"
+    );
+}
+
+#[test]
+fn sql_namespace_rename_does_not_rewrite_historical_audit_events() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+    let start = source
+        .find("async fn rename_namespace_in_tx(")
+        .expect("rename_namespace_in_tx");
+    let body = source[start..]
+        .split("async fn delete_namespace_guard_rows_tx(")
+        .next()
+        .expect("rename_namespace_in_tx body");
+    assert!(
+        body.contains("NAMESPACE_RENAME_SIMPLE_TABLES"),
+        "in-place SQL rename must still walk the live resource table plan:\n{body}"
+    );
+    assert!(
+        !body.contains("UPDATE audit_events")
+            && !body.contains("\"audit_events\"")
+            && !body.contains("'audit_events'"),
+        "historical audit_events must retain the namespace recorded at event time:\n{body}"
+    );
+    for table in ["proxies", "plugin_configs", "upstreams", "api_specs"] {
+        assert!(
+            body.contains("NAMESPACE_RENAME_SIMPLE_TABLES") || body.contains(table),
+            "rename must still cover live resource table {table}:\n{body}"
+        );
+    }
+}
+
+#[test]
+fn sql_namespace_rename_locks_source_and_target_mtls_dns_fences_in_order() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+    let start = source
+        .find("pub async fn update_namespace(")
+        .expect("update_namespace");
+    let body = source[start..]
+        .split("async fn upsert_namespace_registry_row_tx(")
+        .next()
+        .expect("update_namespace body");
+    assert!(
+        body.contains("mtls_dns_admission_namespaces(")
+            && body.contains("lock_mtls_dns_admission_for_owner_tx"),
+        "rename must lock both names in sorted order inside the same transaction:\n{body}"
+    );
+    assert!(
+        !body.contains("lock_mtls_dns_admission_for_owner_tx(&mut tx, current_name, None)"),
+        "locking only current_name would bypass a restore owner on the target:\n{body}"
+    );
+}
+
+#[test]
+fn sql_namespace_row_mapper_fails_closed_on_corrupt_timestamps() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+    let start = source
+        .find("fn row_to_namespace_record(")
+        .expect("row_to_namespace_record");
+    let body = source[start..]
+        .split("const NAMESPACE_NAME_IN_USE_SQL")
+        .next()
+        .expect("row_to_namespace_record body");
+    assert!(
+        body.contains("parse_namespace_rfc3339")
+            && body.contains("NamespaceRegistryCorrupt")
+            && body.contains("require_namespace_identity")
+            && body.contains("require_canonical_stored_description"),
+        "corrupt registry rows must not be served as plausible API data:\n{body}"
+    );
+    assert!(
+        !body.contains("unwrap_or_else(Utc::now)")
+            && !body.contains("unwrap_or(created_at)")
+            && !body.contains("normalize_description"),
+        "missing timestamps must not be fabricated and stored descriptions must not be normalized:\n{body}"
+    );
+}
+
+#[test]
+fn sql_namespace_list_fails_closed_on_corrupt_registry_rows() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+    for marker in [
+        "async fn list_namespaces_from_pool(",
+        "async fn list_namespaces_paginated_from_pool(",
+    ] {
+        let start = source.find(marker).unwrap_or_else(|| panic!("{marker}"));
+        let body = &source[start..start + 600];
+        assert!(
+            body.contains("ensure_namespace_registry_rows_readable(pool)"),
+            "{marker} must refuse to serve names from an unreadable registry:\n{body}"
+        );
+    }
+}
+
+#[test]
+fn sql_namespace_registry_mutations_require_canonical_lease_set_before_begin() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+    for (marker, names) in [
+        (
+            "pub async fn create_namespace(",
+            "require_namespace_registry_admission_leases(&[&record.name], leases)",
+        ),
+        (
+            "pub async fn update_namespace(",
+            "require_namespace_registry_admission_leases(&[current_name, new_name], leases)",
+        ),
+        (
+            "pub async fn delete_namespace(",
+            "require_namespace_registry_admission_leases(&[name], leases)",
+        ),
+    ] {
+        let start = source.find(marker).expect(marker);
+        let body = source[start..]
+            .split("\n    pub async fn ")
+            .next()
+            .unwrap_or(&source[start..]);
+        let require_at = body
+            .find("require_namespace_registry_admission_leases")
+            .unwrap_or_else(|| panic!("{marker} must validate the canonical lease set:\n{body}"));
+        let begin_at = body
+            .find("pool().begin()")
+            .unwrap_or_else(|| panic!("{marker} must open a transaction:\n{body}"));
+        assert!(
+            body.contains(names),
+            "{marker} must require the canonical names {names}:\n{body}"
+        );
+        assert!(
+            require_at < begin_at,
+            "{marker} must reject a substituted lease set before opening a transaction:\n{body}"
+        );
+        assert!(
+            body.contains("verify_namespace_registry_leases_tx"),
+            "{marker} must still re-verify owner/generation inside the transaction:\n{body}"
+        );
+    }
+
+    let verify = source[source
+        .find("async fn verify_namespace_registry_leases_tx(")
+        .expect("verify helper")..]
+        .split("\n    pub async fn create_namespace(")
+        .next()
+        .expect("verify body");
+    assert!(
+        verify.contains("require_namespace_registry_admission_leases(names, leases)")
+            && verify.contains("verify_namespace_config_admission_lease_tx"),
+        "commit-boundary verification must re-check the canonical key set then owner/generation:\n{verify}"
+    );
+}
+
+// ── Retryable serialization/deadlock classification (issue #3955 review) ─────
+
+#[test]
+fn retryable_transaction_conflict_sqlstates_are_exactly_serialization_and_deadlock() {
+    for code in ["40001", "40P01"] {
+        assert!(
+            sqlstate_is_retryable_transaction_conflict(code),
+            "{code} is a database-aborted transaction and is safe to retry"
+        );
+    }
+    for code in [
+        // Uniqueness / name conflicts: a retry would only repeat them.
+        "23505", "23000",
+        "23503", // Connectivity, syntax, permissions, and MySQL's generic class.
+        "08006", "08001", "42601", "42501", "HY000", "40002", "400011", "4000", "",
+    ] {
+        assert!(
+            !sqlstate_is_retryable_transaction_conflict(code),
+            "{code} must not be classified as a safe-retry transaction conflict"
+        );
+    }
+}
+
+#[test]
+fn retryable_transaction_conflict_classification_is_chain_aware() {
+    // Persistence layers wrap driver errors in their own context, so the
+    // outermost message alone misses the abort.
+    for code in ["40001", "40P01"] {
+        let wrapped =
+            anyhow::Error::new(sqlx::Error::Database(Box::new(TestDatabaseError { code })))
+                .context("namespace registry transaction failed")
+                .context("delete_namespace");
+        assert!(
+            is_retryable_sql_transaction_conflict(&wrapped),
+            "a wrapped SQLSTATE {code} must still classify as retryable: {wrapped:#}"
+        );
+    }
+}
+
+#[test]
+fn retryable_transaction_conflict_classification_does_not_misclassify() {
+    // A unique-constraint violation is a real 409, not a retryable abort.
+    let unique = anyhow::Error::new(sqlx::Error::Database(Box::new(TestDatabaseError {
+        code: "23505",
+    })))
+    .context("namespace registry transaction failed");
+    assert!(!is_retryable_sql_transaction_conflict(&unique));
+
+    // Connectivity failures carry no SQLSTATE at all.
+    let connectivity = anyhow::Error::new(sqlx::Error::PoolTimedOut).context("acquire failed");
+    assert!(!is_retryable_sql_transaction_conflict(&connectivity));
+    assert!(!is_retryable_sql_transaction_conflict(&anyhow::anyhow!(
+        "connection refused"
+    )));
+
+    // A typed registry error must never be swallowed by the classifier.
+    use ferrum_edge::config::namespace_registry::NamespaceRegistryError as RegistryError;
+    let name_in_use = RegistryError::name_in_use("tenant-a");
+    assert!(!is_retryable_sql_transaction_conflict(&name_in_use));
+}
+
+#[test]
+fn sql_registry_mutations_map_database_aborts_to_the_typed_retryable_conflict() {
+    // The three public entry points must funnel through the classifier so the
+    // admin layer never has to inspect driver text, and the driver error is
+    // dropped rather than chained (it is the last place a `{:#}` rendering
+    // could leak the relation name and the conflicting statement).
+    let source = include_str!("../../../src/config/db_loader.rs");
+    for (public, inner) in [
+        ("pub async fn create_namespace(", "create_namespace_inner("),
+        ("pub async fn update_namespace(", "update_namespace_inner("),
+        ("pub async fn delete_namespace(", "delete_namespace_inner("),
+    ] {
+        let start = source.find(public).expect(public);
+        let body = source[start..]
+            .split("\n    async fn ")
+            .next()
+            .unwrap_or(&source[start..]);
+        assert!(
+            body.contains("classify_namespace_registry_result") && body.contains(inner),
+            "{public} must route its result through the retryable classifier:\n{body}"
+        );
+    }
+
+    let classifier_start = source
+        .find("fn classify_namespace_registry_result")
+        .expect("classifier");
+    let classifier_tail = &source[classifier_start..];
+    let classifier_end = classifier_tail
+        .find("\n}\n")
+        .map(|offset| offset + 3)
+        .unwrap_or(classifier_tail.len());
+    let classifier = &classifier_tail[..classifier_end];
+    assert!(
+        classifier.contains("is_retryable_sql_transaction_conflict")
+            && classifier.contains("NamespaceRegistryRetryableConflict"),
+        "the classifier must map a database-aborted transaction onto the typed conflict:\n{classifier}"
+    );
+    assert!(
+        !classifier.contains(".context(") && !classifier.contains("to_string()"),
+        "the driver error must be dropped, never rendered or chained:\n{classifier}"
+    );
+}
+
+// ── One-time backfill serialization (issue #3955 review) ────────────────────
+
+#[test]
+fn sql_namespace_registry_backfill_runs_under_the_global_registry_lease() {
+    let source = include_str!("../../../src/config/migrations/sql_dialect.rs");
+    let start = source
+        .find("async fn run_serialized_namespaces_registry_backfill(")
+        .expect("serialized backfill entry point");
+    let serialized = source[start..]
+        .split("\n    /// Conditionally take the global registry admission lease.")
+        .next()
+        .expect("serialized backfill body");
+
+    let acquire_at = serialized
+        .find("try_acquire_namespaces_registry_backfill_lease")
+        .expect("the pass must take the global registry admission lease");
+    let backfill_at = serialized
+        .find(".backfill_namespaces_registry(")
+        .expect("the pass must run the backfill under that lease");
+    let release_at = serialized
+        .find("release_namespaces_registry_backfill_lease")
+        .expect("the pass must release the lease");
+    assert!(
+        acquire_at < backfill_at && backfill_at < release_at,
+        "the lease must be held across the whole compatibility pass:\n{serialized}"
+    );
+    assert!(
+        serialized.contains("(Err(backfill_error), _) => Err(backfill_error)"),
+        "the lease must be released on the error path too, without masking the failure:\n{serialized}"
+    );
+    // The lock order stays total: the pass takes ONLY the global key, which is
+    // always first, so it can never invert the order against a live mutation.
+    let acquire = source[source
+        .find("async fn try_acquire_namespaces_registry_backfill_lease(")
+        .expect("acquire helper")..]
+        .split("\n    async fn ")
+        .next()
+        .expect("acquire body");
+    assert!(
+        acquire.contains("NAMESPACE_REGISTRY_ADMISSION_KEY")
+            && acquire.contains("config_admission_lease_acquire_sql"),
+        "acquisition must reuse the runtime store's non-stealing lease SQL:\n{acquire}"
+    );
+}
+
+#[test]
+fn sql_namespace_registry_backfill_commits_once_and_verifies_its_lease() {
+    let source = include_str!("../../../src/config/migrations/sql_dialect.rs");
+    let dispatcher = source[source
+        .find("async fn backfill_namespaces_registry(")
+        .expect("backfill dispatcher")..]
+        .split("\n    /// PostgreSQL / MySQL:")
+        .next()
+        .expect("dispatcher body");
+    assert!(
+        dispatcher.contains("is_sqlite()")
+            && dispatcher.contains("backfill_namespaces_registry_under_sqlite_savepoint")
+            && dispatcher.contains("backfill_namespaces_registry_in_explicit_transaction"),
+        "SQLite must take the savepoint path; PostgreSQL/MySQL keep an explicit transaction:\n\
+         {dispatcher}"
+    );
+    assert!(
+        !dispatcher.contains("connection.begin()") && !dispatcher.contains("tx.commit()"),
+        "the dispatcher must not itself begin or commit a nested transaction:\n{dispatcher}"
+    );
+
+    let explicit = source[source
+        .find("async fn backfill_namespaces_registry_in_explicit_transaction(")
+        .expect("explicit transaction helper")..]
+        .split("\n    /// SQLite: run the backfill")
+        .next()
+        .expect("explicit transaction body");
+    assert!(
+        explicit.contains("connection.begin()")
+            && explicit.contains("tx.commit()")
+            && explicit.contains("tx.rollback()")
+            && explicit.contains("backfill_namespaces_registry_body"),
+        "PostgreSQL/MySQL must retain one explicit backfill transaction:\n{explicit}"
+    );
+
+    let body = source[source
+        .find("async fn backfill_namespaces_registry_body(")
+        .expect("shared backfill body")..]
+        .split("\n    /// Authoritative namespace-keyed")
+        .next()
+        .expect("shared backfill body");
+    let pin_at = body
+        .find("pin_namespaces_registry_backfill_lease")
+        .expect("start-of-transaction lease pin");
+    let completed_at = body
+        .find("namespaces_registry_backfill_completed")
+        .expect("authoritative completion check");
+    let insert_at = body.find("insert_derived").expect("derived-name insert");
+    let mark_at = body
+        .find("mark_namespaces_registry_backfill_complete")
+        .expect("completion mark");
+    let verify_at = body
+        .find("namespaces_registry_backfill_lease_held")
+        .expect("commit-boundary lease verification");
+    let apply_at = body
+        .find("NamespacesRegistryBackfillOutcome::Apply")
+        .expect("apply outcome");
+    assert!(
+        pin_at < completed_at,
+        "the lease row must be verified and locked as the FIRST statement of the atomic unit, \
+         before anything is read or written:\n{body}"
+    );
+    assert!(
+        completed_at < insert_at,
+        "a completed backfill must skip the inserts:\n{body}"
+    );
+    assert!(
+        insert_at < mark_at,
+        "the marker must be written after the idempotent inserts so a crash retries:\n{body}"
+    );
+    assert!(
+        mark_at < verify_at && verify_at < apply_at,
+        "the lease must be re-verified immediately before the caller commits:\n{body}"
+    );
+    assert!(
+        !body.contains("connection.begin()")
+            && !body.contains("tx.commit()")
+            && !body.contains("tx.rollback()"),
+        "the shared body must not begin, commit, or roll back the caller's atomic unit:\n{body}"
+    );
+
+    let pin = source[source
+        .find("async fn pin_namespaces_registry_backfill_lease(")
+        .expect("lease pin helper")..]
+        .split("\n    /// Commit-boundary proof")
+        .next()
+        .expect("lease pin body");
+    assert!(
+        pin.contains("FOR UPDATE") && pin.contains("is_sqlite()"),
+        "the pin must take a real row lock on every dialect that has FOR UPDATE, with an \
+         explicit SQLite branch:\n{pin}"
+    );
+    assert!(
+        pin.contains("UPDATE config_admission_locks SET expires_at"),
+        "the SQLite branch must promote the transaction to a WRITE transaction so the single \
+         database writer lock excludes a competing acquisition:\n{pin}"
+    );
+    assert!(
+        pin.contains("generation = ?") && pin.contains("expires_at > {now}"),
+        "the pin must verify owner, generation, and database-clock expiry before locking:\n{pin}"
+    );
+
+    let verify = source[source
+        .find("async fn namespaces_registry_backfill_lease_held(")
+        .expect("lease verification helper")..]
+        .split("\n    /// Rewrite `?` placeholders")
+        .next()
+        .expect("lease verification body");
+    assert!(
+        verify.contains("FOR UPDATE") && verify.contains("is_sqlite()"),
+        "the lease row must stay pinned through the commit on every dialect that has \
+         FOR UPDATE:\n{verify}"
+    );
+    assert!(
+        verify.contains("owner = ?") && verify.contains("generation = ?"),
+        "the commit-boundary proof must still be owner- and generation-qualified:\n{verify}"
+    );
+    // Regression: an otherwise uncontended backfill that outruns the 120s lease
+    // TTL while the row is transactionally pinned must still commit. Re-testing
+    // `expires_at` here would roll it back and starve it on every retry.
+    assert!(
+        !verify.contains("expires_at"),
+        "elapsed wall time under the row pin is not lost ownership; the commit-boundary proof \
+         must not re-check the lease TTL:\n{verify}"
+    );
+}
+
+/// Hosted SQLite migrations already hold `BEGIN IMMEDIATE` on this connection
+/// (`MigrationConnectionLock`). A nested `connection.begin()` is the
+/// `(code: 1) cannot start a transaction within a transaction` failure.
+#[test]
+fn sql_namespace_registry_backfill_does_not_nest_a_sqlite_begin() {
+    let migrations = include_str!("../../../src/config/migrations/mod.rs");
+    assert!(
+        migrations.contains("BEGIN IMMEDIATE")
+            && migrations.contains("struct MigrationConnectionLock")
+            && migrations.contains("ensure_compatibility_tables(connection)"),
+        "SQLite migrations must take BEGIN IMMEDIATE before the compatibility pass, and that \
+         outer transaction remains the durable commit boundary"
+    );
+
+    let source = include_str!("../../../src/config/migrations/sql_dialect.rs");
+    let sqlite = source[source
+        .find("async fn backfill_namespaces_registry_under_sqlite_savepoint(")
+        .expect("sqlite savepoint helper")..]
+        .split("\n    async fn rollback_sqlite_namespaces_registry_backfill_savepoint(")
+        .next()
+        .expect("sqlite savepoint body");
+    assert!(
+        sqlite.contains("SAVEPOINT namespaces_registry_backfill")
+            && sqlite.contains("RELEASE SAVEPOINT namespaces_registry_backfill")
+            && sqlite.contains("rollback_sqlite_namespaces_registry_backfill_savepoint"),
+        "SQLite must isolate the backfill with a SAVEPOINT on the already-open migration \
+         transaction:\n{sqlite}"
+    );
+    assert!(
+        !sqlite.contains("connection.begin()")
+            && !sqlite.contains("tx.commit()")
+            && !sqlite.contains("tx.rollback()")
+            && !sqlite.contains("sqlx::query(\"BEGIN")
+            && !sqlite.contains("sqlx::query(\"COMMIT")
+            && !sqlite.contains("sqlx::query(\"ROLLBACK"),
+        "the SQLite savepoint path must never emit BEGIN/COMMIT/ROLLBACK that would close \
+         or nest inside the outer BEGIN IMMEDIATE:\n{sqlite}"
+    );
+
+    let rollback = source[source
+        .find("async fn rollback_sqlite_namespaces_registry_backfill_savepoint(")
+        .expect("sqlite savepoint rollback")..]
+        .split("\n    /// Shared pin / scan")
+        .next()
+        .expect("sqlite savepoint rollback body");
+    assert!(
+        rollback.contains("ROLLBACK TO SAVEPOINT namespaces_registry_backfill")
+            && rollback.contains("RELEASE SAVEPOINT namespaces_registry_backfill"),
+        "failure/defer must roll back only the savepoint, then release it:\n{rollback}"
+    );
+    assert!(
+        !rollback.contains("sqlx::query(\"COMMIT")
+            && !rollback.contains("sqlx::query(\"ROLLBACK\")")
+            && !rollback.contains("connection.begin()"),
+        "savepoint rollback must not COMMIT or ROLLBACK the outer migration transaction:\n\
+         {rollback}"
     );
 }

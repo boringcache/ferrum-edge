@@ -1141,8 +1141,8 @@ fn live_apply_handlers_capture_sequence_before_releasing_pins() {
         joined
             .matches("complete_live_config_mutation_after_commit_boxed(")
             .count(),
-        12,
-        "twelve wired mutation completions, every one through the boxed factory"
+        13,
+        "thirteen wired mutation completions, every one through the boxed factory"
     );
     // The inner async helper must have exactly one caller — the factory. Any
     // handler awaiting it directly would put the whole future back into that

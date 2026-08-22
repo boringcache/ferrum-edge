@@ -33,7 +33,10 @@ const SQLITE_MIGRATION_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100
 ///
 /// PostgreSQL advisory locks and MySQL named locks are session-scoped. SQLite
 /// has no advisory-lock primitive, so `BEGIN IMMEDIATE` holds the file's write
-/// reservation for the entire migration and tracking-row update. Keeping all
+/// reservation for the entire migration and tracking-row update. That outer
+/// transaction is the durable commit boundary: later work on this connection,
+/// including the namespace-registry compatibility backfill, must not issue
+/// another `BEGIN`, `COMMIT`, or unqualified `ROLLBACK`. Keeping all
 /// migration work on this same connection is required for the SQLite lock to
 /// serialize competing processes rather than deadlock against our own pool.
 struct MigrationConnectionLock {
