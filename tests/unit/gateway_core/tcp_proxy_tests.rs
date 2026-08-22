@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -172,6 +174,45 @@ struct ReadChunksThenErrorStream {
     reads: VecDeque<Vec<u8>>,
     error_kind: io::ErrorKind,
     error_msg: &'static str,
+}
+
+/// Backend whose read half stays open until the relay half-closes its write
+/// half, modelling a request/response server that waits for request EOF.
+struct ShutdownGatedBackend {
+    shutdown: Arc<AtomicBool>,
+}
+
+impl AsyncRead for ShutdownGatedBackend {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.shutdown.load(Ordering::SeqCst) {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl AsyncWrite for ShutdownGatedBackend {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.shutdown.store(true, Ordering::SeqCst);
+        Poll::Ready(Ok(()))
+    }
 }
 
 impl ReadChunksThenErrorStream {
@@ -2101,19 +2142,28 @@ async fn test_bidirectional_copy_tls_close_without_notify_is_graceful() {
         io::ErrorKind::UnexpectedEof,
         RUSTLS_EOF,
     );
-    let backend = ScriptedStream::new(vec![b"RESPONSE".to_vec()], vec![], WriteOutcome::Accept);
+    let backend_shutdown = Arc::new(AtomicBool::new(false));
+    let backend = ShutdownGatedBackend {
+        shutdown: Arc::clone(&backend_shutdown),
+    };
 
-    let result =
-        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024),
+    )
+    .await
+    .expect("missing close_notify must not leave the backend waiting for EOF");
 
     assert!(
         result.first_failure.is_none(),
         "missing close_notify on a userspace TLS read must be clean EOF, got {:?}",
         result.first_failure
     );
+    assert_eq!(result.bytes_client_to_backend, b"REQUEST".len() as u64);
+    assert_eq!(result.bytes_backend_to_client, 0);
     assert!(
-        result.bytes_client_to_backend > 0 && result.bytes_backend_to_client > 0,
-        "happy-path session must have transferred bytes before teardown"
+        backend_shutdown.load(Ordering::SeqCst),
+        "the backend writer must be half-closed before the TLS EOF is treated as clean"
     );
 }
 
