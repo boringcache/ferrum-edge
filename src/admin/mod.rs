@@ -9668,6 +9668,7 @@ fn map_namespace_registry_error(error: &anyhow::Error) -> Response<Full<Bytes>> 
 /// Acquire the global registry lease plus one lease per affected namespace, in
 /// the total order that makes concurrent registry mutations serializable across
 /// gateway processes.
+#[allow(clippy::result_large_err)]
 async fn acquire_namespace_registry_admission(
     db: Arc<dyn DatabaseBackend>,
     names: &[&str],
@@ -9693,6 +9694,7 @@ async fn acquire_namespace_registry_admission(
 /// failed is mapped from the backend's typed error (including a commit-boundary
 /// lease loss as the retryable fail-closed 503); a lease lost before persistence
 /// started is also 503. No unverified late write is ever reported as success.
+#[allow(clippy::result_large_err)]
 async fn run_namespace_registry_mutation<T, F>(
     admission: &crud::NamespaceRegistryAdmission,
     future: F,
