@@ -39,10 +39,34 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - A required live gate must decide its own relevance from a pinned trusted-base
   copy of `live_suite_path_filter.py`, never from the pull request's checkout.
   `verify_cross_build_policy.py` freezes that block byte-for-byte
-  (`LIVE_SUITE_RELEVANCE_JOB_TEMPLATE`) for `mesh-e2e-sidecar-live.yml` and
-  `multicluster-federation-live.yml`, together with the live job's
-  `needs`/`if` binding. See `docs/ci_cd.md` → "Trusted-base relevance for
-  required live gates".
+  (`LIVE_SUITE_RELEVANCE_JOB_TEMPLATE`) for every
+  `LIVE_SUITE_RELEVANCE_CONTRACTS` workflow — `ambient-host-udp-live.yml`,
+  `mesh-e2e-sidecar-live.yml`, `multicluster-federation-live.yml`, and
+  `multicluster-poller-partition-live.yml` — together with each live job's
+  `needs`/`if` binding. That block is protected: no pull request may edit
+  `verify_cross_build_policy.py`, so extending the contract set is a
+  direct-to-`main` change.
+- Governed live workflows carry NO workflow-level `paths:` trigger filter
+  (issue #3908): a filter in the pull request's own checkout can exclude the
+  change that broke the surface. `node-waypoint-ebpf-live.yml`,
+  `istio-status-cas-live.yml`, and `cni-lifecycle-live.yml` now trigger on
+  `pull_request`, `merge_group (checks_requested)`, `push: main`, and
+  `workflow_dispatch`, decide relevance from a trusted-base classifier
+  (`ci_runtime_plan.py` for NodeWaypoint, `live_suite_path_filter.py` for the
+  other two), and report through an `if: always()` aggregate. Their aggregates
+  (`NodeWaypoint eBPF Live`, `Istio Status CAS Live`, `CNI Lifecycle Live`) are
+  NOT branch-protection-required and must not be added to
+  `REQUIRED_MERGE_GROUP_WORKFLOWS` or `DEDICATED_REQUIRED_CHECKS`. The two new
+  `changes` jobs are not yet in `LIVE_SUITE_RELEVANCE_CONTRACTS`, and the
+  NodeWaypoint workflow's live-job binding and aggregate are not yet frozen by
+  trusted policy even though its classifier is trusted-base. Issue #3908 is
+  therefore not durably complete against future PR tampering until the
+  follow-up direct-to-`main` policy change adds the CNI/Istio contracts,
+  protects the NodeWaypoint `needs`/`if` plus aggregate contract, and deletes
+  the temporary `--list-suites` bootstrap blocks. The classifier refuses to classify
+  any change-set record that is not a normal repository-relative pathname and
+  forces the suite to run instead. See `docs/ci_cd.md` → "Trusted-base
+  relevance for required live gates".
 - The fuzz/property lane is admitted only as two byte-frozen shapes:
   `CI_FUZZ_SMOKE_JOB` (the whole `fuzz-smoke` job in `ci.yml`) and
   `FUZZ_WORKFLOW` (the whole of `.github/workflows/fuzz.yml`). Either may be
@@ -89,9 +113,10 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   for #3889, retired by #3943; re-armed for #3950 and spent when #3950 landed)
   is **re-armed for exactly one transition**: the issue #4018 FIPS
   test-binary memory mitigation, pair
-  `17bfb40f…e5e9e1` → `6bb669ab…7dfa84` (`CARGO_BUILD_JOBS=3`,
-  `line-tables-only` on the `dev` AND `test` profiles, and a best-effort swap
-  enlargement on `fips-test-build`; recompute if the workflow bytes change).
+  `17bfb40f…e5e9e1` → `7d995d79…2ca401` (`CARGO_BUILD_JOBS=3`,
+  `line-tables-only` on the `dev` AND `test` profiles, and a best-effort
+  additive Ferrum-owned swapfile on `fips-test-build`; recompute if the
+  workflow bytes change).
   One-way, retire again once the mitigation lands. Every other
   `fips-build.yml` edit is compared by the normal fail-closed Cross surface
   scan. See `docs/ci_cd.md` → "Admitted `fips-build.yml` generation

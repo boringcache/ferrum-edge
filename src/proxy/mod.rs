@@ -220,6 +220,17 @@ use self::http2_pool::Http2ConnectionPool;
 static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
+/// Precomputed circuit-breaker-open reject headers. Open-breaker 503s are
+/// still a reject path, but the map is rebuilt from this snapshot so the
+/// observability token is not `format!()`ed or assembled per request.
+static CIRCUIT_BREAKER_OPEN_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
+    std::sync::LazyLock::new(|| {
+        HashMap::from([(
+            X_GATEWAY_ERROR_HEADER.to_string(),
+            X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN.to_string(),
+        )])
+    });
+
 /// Hyper's HTTP/1 parser panics when `max_buf_size` is below 8 KiB. Ferrum's
 /// configured logical header limit may be lower; keep the parser floor safe
 /// and enforce the operator's lower limit in `check_protocol_headers`.
@@ -3785,7 +3796,9 @@ async fn buffer_request_body_for_before_proxy(
 /// secured-transport attempt. The returned `Bytes` are retained only when the
 /// retry loop needs replay; mesh pool acquisition, identity verification, and
 /// backend admission remain per attempt.
-#[allow(clippy::too_many_arguments)]
+// BackendResponse is the shared, protocol-aware fail-closed result for request
+// preparation; boxing it here would ripple through the mesh dispatch contract.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 async fn prepare_mesh_request_body(
     client_request_body: ClientRequestBody,
     method: &str,
@@ -5957,6 +5970,11 @@ pub enum ConfigApplyOutcome {
     Unchanged,
     /// Validation or cache construction rejected the candidate.
     Rejected { errors: Vec<String> },
+}
+
+enum IncrementalApplyResult {
+    Outcome(ConfigApplyOutcome),
+    TopologyChanged(u64),
 }
 
 impl ConfigApplyOutcome {
@@ -12448,12 +12466,39 @@ impl ProxyState {
     /// no-op candidates (`Unchanged`) from validation/build rejections
     /// (`Rejected`). The DB poller relies on this to avoid advancing
     /// `last_poll_at` on rejection — see `src/modes/database.rs`.
+    #[allow(dead_code)] // Integration-test seam; DB mode uses the topology-fenced entry point.
     pub async fn apply_incremental(
         &self,
         result: crate::config::db_loader::IncrementalResult,
     ) -> ConfigApplyOutcome {
-        self.apply_incremental_with_gateway_trust(result, None)
+        match self.apply_incremental_inner(result, None, None).await {
+            IncrementalApplyResult::Outcome(outcome) => outcome,
+            IncrementalApplyResult::TopologyChanged(_) => {
+                ConfigApplyOutcome::rejected_one("unexpected database topology fence")
+            }
+        }
+    }
+
+    /// Apply a database delta while fencing its final request-epoch publication
+    /// to the topology that produced it.
+    ///
+    /// File-backed plugin validation deliberately runs before the permit is
+    /// acquired because it may block off-thread. The permit covers only the
+    /// synchronous publication section, preventing a reconnect from swapping
+    /// the authoritative store between validation and the live epoch swap.
+    pub(crate) async fn apply_database_incremental(
+        &self,
+        result: crate::config::db_loader::IncrementalResult,
+        db: &Arc<dyn crate::config::db_backend::DatabaseBackend>,
+        expected_topology_epoch: u64,
+    ) -> Result<ConfigApplyOutcome, u64> {
+        match self
+            .apply_incremental_inner(result, None, Some((db, expected_topology_epoch)))
             .await
+        {
+            IncrementalApplyResult::Outcome(outcome) => Ok(outcome),
+            IncrementalApplyResult::TopologyChanged(actual_epoch) => Err(actual_epoch),
+        }
     }
 
     /// [`Self::apply_incremental`] carrying an out-of-band gateway trust
@@ -12469,6 +12514,26 @@ impl ProxyState {
         result: crate::config::db_loader::IncrementalResult,
         explicit_trust: Option<GatewayTrustCommit>,
     ) -> ConfigApplyOutcome {
+        match self
+            .apply_incremental_inner(result, explicit_trust, None)
+            .await
+        {
+            IncrementalApplyResult::Outcome(outcome) => outcome,
+            IncrementalApplyResult::TopologyChanged(_) => {
+                ConfigApplyOutcome::rejected_one("unexpected database topology fence")
+            }
+        }
+    }
+
+    async fn apply_incremental_inner(
+        &self,
+        result: crate::config::db_loader::IncrementalResult,
+        explicit_trust: Option<GatewayTrustCommit>,
+        database_topology_fence: Option<(
+            &Arc<dyn crate::config::db_backend::DatabaseBackend>,
+            u64,
+        )>,
+    ) -> IncrementalApplyResult {
         if result.is_empty() {
             // An empty resource delta still has to commit an explicit trust
             // decision: a CP trust-only update carries no resources at all.
@@ -12482,7 +12547,7 @@ impl ProxyState {
                     self.commit_gateway_trust_generation_locked(commit);
                 }
             }
-            return ConfigApplyOutcome::Unchanged;
+            return IncrementalApplyResult::Outcome(ConfigApplyOutcome::Unchanged);
         }
 
         // Patch the stored GatewayConfig: clone current, apply mutations, store.
@@ -12647,10 +12712,12 @@ impl ProxyState {
         // known-good configuration exactly like full reloads.
         if let Err(error) = crate::fips::policy::check_gateway_config(&new_config) {
             error!("Incremental config rejected — FIPS policy: {}", error);
-            return ConfigApplyOutcome::rejected_one(format!("FIPS policy: {error}"));
+            return IncrementalApplyResult::Outcome(ConfigApplyOutcome::rejected_one(format!(
+                "FIPS policy: {error}"
+            )));
         }
         if let Err(errors) = self.validate_full_config(&new_config) {
-            return ConfigApplyOutcome::rejected(errors);
+            return IncrementalApplyResult::Outcome(ConfigApplyOutcome::rejected(errors));
         }
 
         // Incremental database and CP/DP deltas stage plugin caches directly
@@ -12703,10 +12770,23 @@ impl ProxyState {
                 Err(error) => {
                     let message = format!("incremental plugin file validation failed: {error}");
                     error!("Incremental config rejected: {}", message);
-                    return ConfigApplyOutcome::rejected_one(message);
+                    return IncrementalApplyResult::Outcome(ConfigApplyOutcome::rejected_one(
+                        message,
+                    ));
                 }
             };
         }
+
+        let topology_permit = if let Some((db, expected_epoch)) = database_topology_fence {
+            let permit = db.acquire_write_topology_permit().await;
+            let actual_epoch = permit.topology_epoch();
+            if actual_epoch != expected_epoch {
+                return IncrementalApplyResult::TopologyChanged(actual_epoch);
+            }
+            Some(permit)
+        } else {
+            None
+        };
 
         let mut applied_delta = None;
         // See `update_config` rustdoc nearby for why this is a `Cell` and not
@@ -12771,12 +12851,18 @@ impl ProxyState {
                 self.mirror_request_epoch_wrappers(published, route_changed.get(), false);
             },
         );
+        // Release the database topology pin before listener, health-check, or
+        // service-discovery reconciliation can await. The live request epoch
+        // is already coherent at this point.
+        drop(topology_permit);
         let published = match publish_result {
             Ok(Some(epoch)) => epoch,
-            Ok(None) => return ConfigApplyOutcome::Unchanged,
+            Ok(None) => {
+                return IncrementalApplyResult::Outcome(ConfigApplyOutcome::Unchanged);
+            }
             Err(e) => {
                 let message = format!("configuration publication refused: {e}");
-                return ConfigApplyOutcome::rejected_one(message);
+                return IncrementalApplyResult::Outcome(ConfigApplyOutcome::rejected_one(message));
             }
         };
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
@@ -12800,7 +12886,7 @@ impl ProxyState {
 
         let Some(delta) = applied_delta else {
             debug!("Incremental config: accepted projected route/MMDB generation republished");
-            return ConfigApplyOutcome::Applied;
+            return IncrementalApplyResult::Outcome(ConfigApplyOutcome::Applied);
         };
 
         // --- CircuitBreakerCache ---
@@ -13000,7 +13086,7 @@ impl ProxyState {
                 .restart_with_shutdown(&new_cfg, self.health_check_shutdown_rx.clone());
         }
 
-        ConfigApplyOutcome::Applied
+        IncrementalApplyResult::Outcome(ConfigApplyOutcome::Applied)
     }
 
     pub fn current_config(&self) -> Arc<GatewayConfig> {
@@ -14715,6 +14801,9 @@ async fn handle_websocket_request_authenticated(
         // unchanged `current_backend_url` (Finding C) — so the disconnect log
         // records a valid backend URL, not the synthetic `mesh-xc-hbone|...` key.
         backend_target: strip_query_params(&ws_display_backend_url).to_string(),
+        http_method: ws_method.to_string(),
+        request_path: original_request_path.clone(),
+        handshake_status_code: ws_status_code,
         listen_port,
         // Same admission ID passed into the relay / on_ws_frame so disconnect
         // hooks (including upgrade-handoff failure below) correlate without a
@@ -16703,6 +16792,12 @@ pub struct WsSessionMeta {
     pub proxy_name: Option<String>,
     pub client_ip: String,
     pub backend_target: String,
+    /// Frontend HTTP method that admitted the upgrade (`GET` or `CONNECT`).
+    pub http_method: String,
+    /// Original client request path captured at upgrade admission.
+    pub request_path: String,
+    /// Successful handshake status (`101` for HTTP/1.1, `200` for Extended CONNECT).
+    pub handshake_status_code: u16,
     pub listen_port: u16,
     /// Process-local accepted session ID allocated at upgrade admission and
     /// preserved through every teardown path that builds `WsDisconnectContext`.
@@ -16930,6 +17025,9 @@ async fn fire_ws_tunnel_disconnect_hooks_with_reason(
         proxy_name: session_meta.proxy_name.clone(),
         client_ip: session_meta.client_ip.clone(),
         backend_target: session_meta.backend_target.clone(),
+        http_method: session_meta.http_method.clone(),
+        request_path: session_meta.request_path.clone(),
+        handshake_status_code: session_meta.handshake_status_code,
         listen_port: session_meta.listen_port,
         connection_id: session_meta.connection_id,
         duration_ms: disconnect_duration_ms,
@@ -16990,6 +17088,9 @@ pub(crate) async fn fire_ws_framed_disconnect_hooks_with_reason(
         proxy_name: session_meta.proxy_name,
         client_ip: session_meta.client_ip,
         backend_target: session_meta.backend_target,
+        http_method: session_meta.http_method,
+        request_path: session_meta.request_path,
+        handshake_status_code: session_meta.handshake_status_code,
         listen_port: session_meta.listen_port,
         connection_id: session_meta.connection_id,
         duration_ms: disconnect_duration_ms,
@@ -17346,6 +17447,25 @@ impl EffectiveWsSizeLimits {
             _ => return None,
         };
         Some((ws_global_capacity_close_frame(), kind, size, max_size))
+    }
+}
+
+/// Directional class for a WebSocket `Capacity` / FrameTooLong /
+/// MessageTooLong overflow.
+///
+/// Any `Capacity` failure is a valid RFC 6455 size-policy violation: the
+/// 64-bit extended length carries a 63-bit value (only its most-significant
+/// bit must be zero), so an advertised length above `u32::MAX` is not itself
+/// malformed. Genuine protocol junk — e.g. issue #4058's stray continuation
+/// frame — is parsed as `tungstenite::Error::Protocol` before the size ceiling
+/// is consulted, so `classify_boxed_error` maps it to `ProtocolError`. The
+/// advertised `size` therefore never changes this class and is retained only
+/// so tests can pin a valid >`u32::MAX` length to the size-limit outcome.
+pub(crate) fn ws_capacity_error_class(_size: usize, client_to_backend: bool) -> retry::ErrorClass {
+    if client_to_backend {
+        retry::ErrorClass::RequestBodyTooLarge
+    } else {
+        retry::ErrorClass::ResponseBodyTooLarge
     }
 }
 
@@ -18480,7 +18600,7 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut backend_sink, close).await;
-                                retry::ErrorClass::RequestBodyTooLarge
+                                ws_capacity_error_class(size, true)
                             } else if let Some((close, limit_kind, size, max_size)) =
                                 EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
                             {
@@ -18499,7 +18619,7 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut backend_sink, close).await;
-                                retry::ErrorClass::RequestBodyTooLarge
+                                ws_capacity_error_class(size, true)
                             } else if let Some((close, limit_kind)) =
                                 ws_fragment_policy_close_for_error(&e)
                             {
@@ -18787,7 +18907,7 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut ws_sink, close).await;
-                                retry::ErrorClass::ResponseBodyTooLarge
+                                ws_capacity_error_class(size, false)
                             } else if let Some((close, limit_kind, size, max_size)) =
                                 EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
                             {
@@ -18806,7 +18926,7 @@ where
                                     Some(close),
                                 );
                                 send_bounded_ws_close(&mut ws_sink, close).await;
-                                retry::ErrorClass::ResponseBodyTooLarge
+                                ws_capacity_error_class(size, false)
                             } else if let Some((close, limit_kind)) =
                                 ws_fragment_policy_close_for_error(&e)
                             {
@@ -23366,6 +23486,120 @@ pub(crate) fn restore_authoritative_allow_header(
 ) {
     response_headers.retain(|name, _| !name.eq_ignore_ascii_case("allow"));
     response_headers.insert("allow".to_string(), allow_value.to_string());
+}
+
+/// Wire name for the HTTP-family failure-class header. HashMap reject paths
+/// use this lowercase spelling; the H1/H2 response builder keeps the
+/// historical `X-Gateway-Error` casing. HTTP header names are
+/// case-insensitive either way.
+pub(crate) const X_GATEWAY_ERROR_HEADER: &str = "x-gateway-error";
+pub(crate) const X_GATEWAY_ERROR_CONNECTION_FAILURE: &str = "connection_failure";
+pub(crate) const X_GATEWAY_ERROR_BACKEND_TIMEOUT: &str = "backend_timeout";
+pub(crate) const X_GATEWAY_ERROR_BACKEND_ERROR: &str = "backend_error";
+/// Distinct from `backend_error`: the gateway never contacted a backend on
+/// this request, so reusing that bucket would make open-breaker 503s
+/// indistinguishable from a backend that actually returned 5xx.
+pub(crate) const X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN: &str = "circuit_breaker_open";
+
+/// RFC 9110 `Allow` for protocol-level 405s (TRACE and non-WebSocket CONNECT)
+/// that run before a proxy is matched, so no per-route `allowed_methods`
+/// exists. TRACE and CONNECT are omitted because this same filter rejected
+/// them. Static so the reject path does not allocate the value.
+pub(crate) const PROTOCOL_LEVEL_405_ALLOW: &str = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
+
+/// Client-visible `X-Gateway-Error` value for an HTTP-family backend
+/// dispatch or status failure. `None` for non-5xx. Circuit-breaker-open
+/// 503s must not use this helper — they are not a backend response.
+#[inline]
+pub(crate) fn x_gateway_error_for_backend_failure(
+    connection_error: bool,
+    status: u16,
+) -> Option<&'static str> {
+    if connection_error {
+        Some(X_GATEWAY_ERROR_CONNECTION_FAILURE)
+    } else if status == 504 {
+        Some(X_GATEWAY_ERROR_BACKEND_TIMEOUT)
+    } else if status >= 500 {
+        Some(X_GATEWAY_ERROR_BACKEND_ERROR)
+    } else {
+        None
+    }
+}
+
+/// Insert or replace the gateway-owned `X-Gateway-Error` value after generic
+/// response policy has run. Policy may decorate a 5xx, but it must not
+/// remove, replace, or duplicate this observability token.
+pub(crate) fn restore_authoritative_gateway_error_header(
+    response_headers: &mut HashMap<String, String>,
+    value: &'static str,
+) {
+    response_headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER));
+    response_headers.insert(X_GATEWAY_ERROR_HEADER.to_string(), value.to_string());
+}
+
+/// Apply the gateway-owned backend-failure token at the final post-hook /
+/// pre-wire boundary. Classification is the original typed dispatch signal
+/// (`connection_error`); `status` is the client-visible status after every
+/// later hook. Every case variant is stripped first so a hook cannot erase,
+/// replace, or duplicate the token. When the pair does not warrant a token
+/// (plugin-replaced non-5xx with no connection failure), a leftover spoofed
+/// value is removed rather than forwarded.
+///
+/// Returns whether the authoritative token was written.
+pub(crate) fn apply_authoritative_backend_gateway_error_header(
+    response_headers: &mut HashMap<String, String>,
+    connection_error: bool,
+    status: u16,
+) -> bool {
+    response_headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER));
+    if let Some(value) = x_gateway_error_for_backend_failure(connection_error, status) {
+        response_headers.insert(X_GATEWAY_ERROR_HEADER.to_string(), value.to_string());
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn insert_x_gateway_error_for_backend_failure(
+    response_headers: &mut HashMap<String, String>,
+    connection_error: bool,
+    status: u16,
+) {
+    let _ = apply_authoritative_backend_gateway_error_header(
+        response_headers,
+        connection_error,
+        status,
+    );
+}
+
+/// Snapshot of the open-breaker 503 header map. Callers clone it into the
+/// reject builder so the token is not assembled per request.
+pub(crate) fn circuit_breaker_open_reject_headers() -> HashMap<String, String> {
+    CIRCUIT_BREAKER_OPEN_HEADERS.clone()
+}
+
+/// Whether `method` is in the route's configured `allowed_methods`.
+/// Surrounding whitespace is ignored so a validated `" GET "` admits GET,
+/// matching [`allow_header_from_allowed_methods`] and config normalization.
+#[inline]
+pub(crate) fn request_method_is_allowed(allowed: &[String], method: &str) -> bool {
+    allowed
+        .iter()
+        .any(|configured| configured.trim().eq_ignore_ascii_case(method))
+}
+
+/// Comma-separated RFC 9110 `Allow` value for a route's configured methods.
+/// Uppercased in config order so the 405 is stable without sorting on the
+/// request path.
+pub(crate) fn allow_header_from_allowed_methods(methods: &[String]) -> String {
+    let mut out = String::new();
+    for (i, method) in methods.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&method.trim().to_ascii_uppercase());
+    }
+    out
 }
 
 fn finalize_synthesized_reject_headers(
@@ -28561,8 +28795,7 @@ async fn handle_proxy_request_inner(
     if method == "TRACE" {
         warn!("Rejected TRACE request");
         record_request(&state, 405);
-        return Ok(build_response(
-            StatusCode::METHOD_NOT_ALLOWED,
+        return Ok(build_method_not_allowed_response(
             r#"{"error":"TRACE method is not allowed"}"#,
         ));
     }
@@ -28579,8 +28812,7 @@ async fn handle_proxy_request_inner(
     if method == "CONNECT" && !is_h2_websocket_connect(&req) && !is_hbone_connect_any {
         warn!("Rejected non-WebSocket CONNECT request");
         record_request(&state, 405);
-        return Ok(build_response(
-            StatusCode::METHOD_NOT_ALLOWED,
+        return Ok(build_method_not_allowed_response(
             r#"{"error":"CONNECT method is not allowed"}"#,
         ));
     }
@@ -29246,10 +29478,10 @@ async fn handle_proxy_request_inner(
     // still runs from the protocol-filtered plugin-cache view so sinks can
     // attribute the matched-proxy 405.
     if let Some(ref allowed) = proxy.allowed_methods
-        && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
+        && !request_method_is_allowed(allowed, &method)
     {
         state.request_count.fetch_add(1, Ordering::Relaxed);
-        let allow_header = allowed.join(", ");
+        let allow_header = allow_header_from_allowed_methods(allowed);
         let mut reject_headers = HashMap::new();
         reject_headers.insert("allow".to_string(), allow_header.clone());
         let mut reject = normalize_reject_response(
@@ -29631,7 +29863,20 @@ async fn handle_proxy_request_inner(
                     }
                 }
             }
-            already_buffered => already_buffered,
+            ClientRequestBody::Buffered(buffered) => {
+                store_request_body_metadata(
+                    &mut ctx,
+                    &buffered.body,
+                    authenticate_body_requirements.needs_text,
+                    authenticate_body_requirements.needs_bytes,
+                    authenticate_body_requirements.needs_digests,
+                );
+                ctx.bytes_sent_observed.fetch_max(
+                    buffered.body.len() as u64,
+                    std::sync::atomic::Ordering::Release,
+                );
+                ClientRequestBody::Buffered(buffered)
+            }
         };
     }
 
@@ -31151,17 +31396,21 @@ async fn handle_proxy_request_inner(
         match backend_dispatch::check_circuit_breaker(&proxy, &state, upstream_target.as_deref()) {
             Ok(result) => result,
             Err(()) => {
-                let reject = finalize_reject_response_with_after_proxy_hooks(
+                let mut reject = finalize_reject_response_with_after_proxy_hooks(
                     &plugins,
                     &mut ctx,
                     StatusCode::SERVICE_UNAVAILABLE,
                     Bytes::from_static(
                         br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
                     ),
-                    HashMap::new(),
+                    circuit_breaker_open_reject_headers(),
                     is_grpc_request,
                 )
                 .await;
+                restore_authoritative_gateway_error_header(
+                    &mut reject.headers,
+                    X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN,
+                );
                 apply_grpc_reject_metadata(&mut ctx, &reject);
                 // Use `original_request_path` so the log records the path the
                 // client actually requested, not the VirtualService-rewritten
@@ -35441,6 +35690,12 @@ async fn handle_proxy_request_inner(
     // `StreamingH2` relay so native gRPC without a client deadline does not
     // fall back to the outer proxy default.
     let mut streaming_h2_read_timeout_ms;
+    // Unlimited direct-H2 passthrough publishes request bytes only at upload
+    // terminal states. Capture the latch so transaction summaries can wait
+    // without re-introducing a per-DATA-frame atomic on the hot path.
+    // Assigned on every continuing dispatch path before first read; leave
+    // uninitialized so an unused starter `None` cannot trip `-D warnings`.
+    let passthrough_request_bytes_latch: Option<Arc<body::DirectH2BytesLatch>>;
     // Set when the retry loop breaks on a gateway-synthesized dispatch refusal
     // for a ROTATED candidate that was never dialed (mesh-transport / secured
     // transport screens). `final_upstream_target` deliberately points at that
@@ -35523,10 +35778,12 @@ async fn handle_proxy_request_inner(
                 backend_admission_permits: permits,
                 request_body_exceeded,
                 streaming_h2_read_timeout_ms: mesh_read_timeout_ms,
+                passthrough_request_bytes,
             } => {
                 backend_admission_permits = permits;
                 mesh_request_body_exceeded = request_body_exceeded;
                 streaming_h2_read_timeout_ms = mesh_read_timeout_ms;
+                passthrough_request_bytes_latch = passthrough_request_bytes;
                 (*response, retained_body)
             }
             BackendDispatchResult::AdmissionRejected(rejection) => {
@@ -36224,11 +36481,13 @@ async fn handle_proxy_request_inner(
                 backend_admission_permits: permits,
                 request_body_exceeded,
                 streaming_h2_read_timeout_ms: effective_streaming_h2_read_timeout_ms,
+                passthrough_request_bytes,
                 ..
             } => {
                 backend_admission_permits = permits;
                 mesh_request_body_exceeded = request_body_exceeded;
                 streaming_h2_read_timeout_ms = effective_streaming_h2_read_timeout_ms;
+                passthrough_request_bytes_latch = passthrough_request_bytes;
                 *response
             }
             BackendDispatchResult::AdmissionRejected(rejection) => {
@@ -37244,11 +37503,15 @@ async fn handle_proxy_request_inner(
         !plugins.is_empty() || body_will_stream || backend_error_class.is_some();
     let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =
         if needs_transaction_summary {
-            // Request bytes: read the shared counter populated by the body
-            // handlers in `proxy_to_backend` / `proxy_to_backend_http2` /
-            // `proxy_to_backend_http3`. By this point the request has
-            // completed so the counter reflects the total (Acquire pairs with
-            // the Release stores in the body adapters).
+            // Request bytes: SizeLimitedIncoming / CountingIncoming publish
+            // per DATA frame, so this load is the total once those adapters
+            // have finished. Unlimited direct-H2 passthrough publishes only
+            // at EOS / error / cancel / Drop, and hyper can resolve response
+            // headers while that upload is still in the detached pipe
+            // (`body_completion_rx` is None). Do not treat this header-flush
+            // snapshot as final on that arm — streaming reloads after the
+            // latch in DeferredTransactionLogger, and buffered logs wait
+            // (without blocking TTFB when the latch is still open).
             let bytes_sent = ctx
                 .bytes_sent_observed
                 .load(std::sync::atomic::Ordering::Acquire);
@@ -37271,7 +37534,7 @@ async fn handle_proxy_request_inner(
             let grpc_response_messages = ctx
                 .grpc_response_messages_observed
                 .load(std::sync::atomic::Ordering::Acquire);
-            let summary = TransactionSummary {
+            let mut summary = TransactionSummary {
                 namespace: proxy.namespace.clone(),
                 timestamp_received: ctx.timestamp_received.to_rfc3339(),
                 client_ip: ctx.client_ip.clone(),
@@ -37314,7 +37577,8 @@ async fn handle_proxy_request_inner(
                         Arc::clone(&plugins),
                         ctx.clone(),
                         start_time,
-                    ),
+                    )
+                    .with_passthrough_request_bytes_latch(passthrough_request_bytes_latch.clone()),
                 )
             } else {
                 // ── Buffered commitment / audit boundary (#3815) ─────────────
@@ -37343,14 +37607,35 @@ async fn handle_proxy_request_inner(
                 //
                 // A request with NO authorization plan cannot expire here, so it
                 // keeps the historical sequential awaited contract byte for
-                // byte.
-                if has_authorization_plan {
-                    crate::plugins::spawn_bounded_terminal_summary_log(&plugins, summary, &ctx);
+                // byte — unless unlimited direct-H2 passthrough bytes are still
+                // unpublished. Waiting here would pin TTFB on a still-running
+                // upload after an early backend response; spawn the wait+log
+                // instead so chargeback sees forwarded bytes without restoring
+                // the header completion gate.
+                let pending_passthrough_latch = passthrough_request_bytes_latch
+                    .as_ref()
+                    .filter(|latch| !latch.is_done())
+                    .cloned();
+                if let Some(latch) = pending_passthrough_latch {
+                    spawn_buffered_summary_after_passthrough_bytes(&plugins, summary, &ctx, latch);
                 } else {
-                    crate::plugins::log_with_mirror_before_buffered_response(
-                        &plugins, summary, &ctx,
-                    )
-                    .await;
+                    if passthrough_request_bytes_latch
+                        .as_ref()
+                        .is_some_and(|latch| latch.is_done())
+                    {
+                        summary.bytes_sent = ctx
+                            .bytes_sent_observed
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            .max(summary.bytes_sent);
+                    }
+                    if has_authorization_plan {
+                        crate::plugins::spawn_bounded_terminal_summary_log(&plugins, summary, &ctx);
+                    } else {
+                        crate::plugins::log_with_mirror_before_buffered_response(
+                            &plugins, summary, &ctx,
+                        )
+                        .await;
+                    }
                 }
                 None
             }
@@ -37460,19 +37745,22 @@ async fn handle_proxy_request_inner(
             | ResponseBody::StreamingH3(_) => headers_mod::ClientResponseFraming::Streaming,
         }
     };
+    // Gateway-owned: strip every hook/backend case variant before sanitizing
+    // so a late phase cannot spoof or duplicate the token beside the builder
+    // write. Classification is the original dispatch signal; status is final.
+    let gateway_error_token =
+        x_gateway_error_for_backend_failure(backend_resp.connection_error, response_status);
+    response_headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER));
     resp_builder =
         headers_mod::apply_sanitized_response_headers(resp_builder, &mut response_headers, framing);
 
     // Add gateway error categorization headers so clients and ops teams
     // can distinguish different failure modes:
     //   X-Gateway-Error: connection_failure | backend_timeout | backend_error
+    //     | circuit_breaker_open (open-breaker 503s use the reject path)
     //   X-Gateway-Upstream-Status: degraded (when routing via all-unhealthy fallback)
-    if backend_resp.connection_error {
-        resp_builder = resp_builder.header("X-Gateway-Error", "connection_failure");
-    } else if response_status == 504 {
-        resp_builder = resp_builder.header("X-Gateway-Error", "backend_timeout");
-    } else if response_status >= 500 {
-        resp_builder = resp_builder.header("X-Gateway-Error", "backend_error");
+    if let Some(value) = gateway_error_token {
+        resp_builder = resp_builder.header("X-Gateway-Error", value);
     }
 
     if upstream_is_fallback {
@@ -40336,6 +40624,9 @@ enum BackendDispatchResult {
         backend_admission_permits: Option<BackendAdmissionPermitSet>,
         request_body_exceeded: Option<Arc<std::sync::atomic::AtomicBool>>,
         streaming_h2_read_timeout_ms: Option<u64>,
+        /// Join for unlimited direct-H2 passthrough byte publication. `None`
+        /// on every other dispatch (reqwest, limited H2, mesh, H3).
+        passthrough_request_bytes: Option<Arc<body::DirectH2BytesLatch>>,
     },
     AdmissionRejected(backend_dispatch::BackendAdmissionRejection),
 }
@@ -40392,6 +40683,34 @@ impl PreacquiredBackendAdmission {
     }
 }
 
+fn spawn_buffered_summary_after_passthrough_bytes(
+    plugins: &[Arc<dyn crate::plugins::Plugin>],
+    mut summary: crate::plugins::TransactionSummary,
+    ctx: &crate::plugins::RequestContext,
+    latch: Arc<body::DirectH2BytesLatch>,
+) {
+    let plugins = plugins.to_vec();
+    let observed = Arc::clone(&ctx.bytes_sent_observed);
+    let ctx = ctx.clone();
+    let _ = crate::observability_delivery::spawn_deadline_cleanup(async move {
+        latch.wait().await;
+        summary.bytes_sent = observed
+            .load(std::sync::atomic::Ordering::Acquire)
+            .max(summary.bytes_sent);
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::plugins::log_with_mirror(&plugins, &summary, &ctx),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                "Detached transaction logging exceeded the post-response cleanup timeout"
+            );
+        }
+    });
+}
+
 fn backend_dispatch_response(
     response: retry::BackendResponse,
     retained_body: Option<Bytes>,
@@ -40403,6 +40722,7 @@ fn backend_dispatch_response(
         backend_admission_permits,
         request_body_exceeded: None,
         streaming_h2_read_timeout_ms: None,
+        passthrough_request_bytes: None,
     }
 }
 
@@ -41527,6 +41847,7 @@ async fn proxy_to_backend(
             backend_admission_permits,
             request_body_exceeded,
             streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
+            passthrough_request_bytes: None,
         };
     }
 
@@ -41600,6 +41921,7 @@ async fn proxy_to_backend(
             backend_admission_permits,
             request_body_exceeded,
             streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
+            passthrough_request_bytes: None,
         };
     }
 
@@ -41732,6 +42054,7 @@ async fn proxy_to_backend(
             backend_admission_permits,
             request_body_exceeded,
             streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
+            passthrough_request_bytes: None,
         };
     }
 
@@ -42091,6 +42414,7 @@ async fn proxy_to_backend(
                         );
                     }
                 };
+                let mut passthrough_request_bytes = None;
                 let (backend_resp, request_body_exceeded) = proxy_to_backend_http2(
                     state,
                     direct_h2_proxy,
@@ -42110,6 +42434,7 @@ async fn proxy_to_backend(
                     ctx_bytes_sent_observed,
                     route_request_body_limit,
                     route_response_body_limit,
+                    &mut passthrough_request_bytes,
                 )
                 .await;
                 return BackendDispatchResult::Response {
@@ -42118,6 +42443,7 @@ async fn proxy_to_backend(
                     backend_admission_permits: h2_admission_permits.take(),
                     request_body_exceeded,
                     streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
+                    passthrough_request_bytes,
                 };
             }
             // Fall through to the reqwest path: `h2_admission_permits` drops here,
@@ -44476,6 +44802,19 @@ fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
+        .body(ProxyBody::from_string(body))
+        .unwrap_or_else(|_| {
+            Response::new(ProxyBody::from_string(
+                r#"{"error":"Internal server error"}"#,
+            ))
+        })
+}
+
+fn build_method_not_allowed_response(body: &str) -> Response<ProxyBody> {
+    Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .header("Content-Type", "application/json")
+        .header("Allow", PROTOCOL_LEVEL_405_ALLOW)
         .body(ProxyBody::from_string(body))
         .unwrap_or_else(|_| {
             Response::new(ProxyBody::from_string(
@@ -49336,9 +49675,10 @@ async fn proxy_to_backend_http2(
     xff_append_ip: &str,
     request_is_secure: bool,
     resolved_ip: Option<String>,
-    // Shared counter for request body bytes. SizeLimitedIncoming increments
-    // this as frames are polled so summary builders observe streamed uploads
-    // (not just Content-Length) once the response completes.
+    // Shared counter for request body bytes. The Limited arm increments it
+    // per DATA frame via SizeLimitedIncoming; the Passthrough arm tallies
+    // into a plain counter and publishes once so summary builders still
+    // observe streamed uploads (not just Content-Length).
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
     // Strictest active route-scoped request-body ceiling, or `None` when no
     // matched plugin enforces one.
@@ -49355,6 +49695,10 @@ async fn proxy_to_backend_http2(
     // rather than at the generally larger global allowance
     // (`GHSA-xrfj-852f-645j`).
     route_response_body_limit: Option<usize>,
+    // Out-parameter: the passthrough publication latch. Set only on the
+    // unlimited arm so transaction summaries can wait for forwarded bytes
+    // after an early backend response without gating those headers here.
+    passthrough_request_bytes: &mut Option<Arc<body::DirectH2BytesLatch>>,
 ) -> (
     retry::BackendResponse,
     Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -49436,51 +49780,88 @@ async fn proxy_to_backend_http2(
     // bidirectional RPC streaming is unaffected.
     let needs_upload_completion_gate =
         effective_max_request_body_size_bytes > 0 || upload_auth_deadline.is_some();
-    let (body, body_completion_rx, mut upload_pump) = if needs_upload_completion_gate {
-        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-        let mut body = body::SizeLimitedIncoming::new_with_counter_and_completion(
-            body,
-            max_request_body_size,
-            Arc::clone(&body_size_exceeded),
-            Arc::clone(ctx_bytes_sent_observed),
-            completion_tx,
-            cancel_rx,
-        );
-        if let Some(messages) = observe_grpc.clone() {
-            body = body.with_grpc_message_counter(messages);
-        }
-        // Full upload lifecycle (#3815). Direct-H2 is the one H1/H2 dispatcher
-        // whose upload is scoped to the handler — the completion gate below
-        // already waits for the upload's terminal state before any early
-        // backend response is exposed — so its join point is ARMED for
-        // cancel-on-drop and explicitly `cancel_and_join()`ed at every bounded
-        // exit. Once that join returns, the pump task has published its
-        // outcome, which it does after dropping the inbound client body: no
-        // gateway-owned upload survives this function.
-        let (body, upload_pump) =
-            install_streaming_upload_authorization(body, upload_auth_deadline.as_ref());
-        (
-            body,
-            Some(completion_rx),
-            upload_pump.map(crate::proxy::upload_pump::UploadPumpJoin::cancel_on_drop),
-        )
-    } else {
-        let mut body = body::SizeLimitedIncoming::new_with_counter(
-            body,
-            max_request_body_size,
-            Arc::clone(&body_size_exceeded),
-            Arc::clone(ctx_bytes_sent_observed),
-        )
-        .with_cancel(cancel_rx);
-        if let Some(messages) = observe_grpc {
-            body = body.with_grpc_message_counter(messages);
-        }
-        // Unreachable with an authorization plan present
-        // (`needs_upload_completion_gate` is true whenever
-        // `upload_auth_deadline.is_some()`), so this arm is the unauthenticated
-        // hot path and installs neither timer nor pump.
-        (body, None, None)
-    };
+    // Issue #3942: the protocol bench forces both body limits to 0 on an
+    // unauthenticated POST /echo. Wrapping that path in SizeLimitedIncoming
+    // (mapping 0 → usize::MAX) adds a per-DATA-frame atomic + limit compare
+    // that scales with payload size. Keep the limiter when a real cap, an
+    // upload-completion gate, or gRPC message counting is required; otherwise
+    // poll Incoming plus the early-return cancel channel.
+    let use_limit_adapter = body::direct_h2_uses_limit_adapter(
+        effective_max_request_body_size_bytes,
+        needs_upload_completion_gate,
+        observe_grpc.is_some(),
+    );
+    let (body, body_completion_rx, mut upload_pump) =
+        if use_limit_adapter && needs_upload_completion_gate {
+            let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+            let mut body = body::SizeLimitedIncoming::new_with_counter_and_completion(
+                body,
+                max_request_body_size,
+                Arc::clone(&body_size_exceeded),
+                Arc::clone(ctx_bytes_sent_observed),
+                completion_tx,
+                cancel_rx,
+            );
+            if let Some(messages) = observe_grpc.clone() {
+                body = body.with_grpc_message_counter(messages);
+            }
+            // Full upload lifecycle (#3815). Direct-H2 is the one H1/H2 dispatcher
+            // whose upload is scoped to the handler — the completion gate below
+            // already waits for the upload's terminal state before any early
+            // backend response is exposed — so its join point is ARMED for
+            // cancel-on-drop and explicitly `cancel_and_join()`ed at every bounded
+            // exit. Once that join returns, the pump task has published its
+            // outcome, which it does after dropping the inbound client body: no
+            // gateway-owned upload survives this function.
+            let (body, upload_pump) =
+                install_streaming_upload_authorization(body, upload_auth_deadline.as_ref());
+            (
+                body::DirectH2RequestBody::Limited(body),
+                Some(completion_rx),
+                upload_pump.map(crate::proxy::upload_pump::UploadPumpJoin::cancel_on_drop),
+            )
+        } else if let (true, Some(messages)) = (use_limit_adapter, observe_grpc) {
+            // gRPC message observation with no size cap and no auth deadline
+            // still needs the limiter's length-prefixed scanner.
+            let body = body::SizeLimitedIncoming::new_with_counter(
+                body,
+                max_request_body_size,
+                Arc::clone(&body_size_exceeded),
+                Arc::clone(ctx_bytes_sent_observed),
+            )
+            .with_cancel(cancel_rx)
+            .with_grpc_message_counter(messages);
+            (body::DirectH2RequestBody::Limited(body), None, None)
+        } else {
+            // Unlimited, unauthenticated, no gRPC observation: forward
+            // `Incoming` directly. Cancel stays armed so an early return after
+            // send_request still resets hyper's detached upload pipe. The
+            // passthrough arm tallies forwarded bytes in a plain counter and
+            // publishes `bytes_sent_observed` once, at end-of-stream, on a
+            // body error, or on drop — skipping the per-frame atomic without
+            // giving up the accounting `TransactionSummary.bytes_sent` and
+            // `api_chargeback` read. This arm is also the panic-free fallback
+            // if `direct_h2_uses_limit_adapter` ever drifts true without a
+            // gate or gRPC observer.
+            //
+            // Do NOT wait on that publication before exposing response
+            // headers: HTTP/2 is full duplex, and `body_completion_rx` is
+            // deliberately None here. Summaries wait on `latch` instead.
+            let latch = Arc::new(body::DirectH2BytesLatch::new());
+            *passthrough_request_bytes = Some(Arc::clone(&latch));
+            (
+                body::DirectH2RequestBody::Passthrough {
+                    inner: body,
+                    cancel: Some(cancel_rx),
+                    seen: 0,
+                    observed: Arc::clone(ctx_bytes_sent_observed),
+                    published: false,
+                    latch,
+                },
+                None,
+                None,
+            )
+        };
 
     // Set the URI
     parts.uri = uri;

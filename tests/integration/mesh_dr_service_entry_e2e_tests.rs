@@ -91,6 +91,38 @@ fn destination_rule_top_level_load_balancer_projects_to_upstream_algorithm() {
 }
 
 #[test]
+fn destination_rule_passthrough_projects_to_upstream_algorithm() {
+    let mut runtime = default_mesh_runtime();
+    runtime.namespace = DEFAULT_NAMESPACE.to_string();
+
+    let mut upstream = http_upstream("reviews-u", SERVICE_FQDN, 8080);
+    let mut proxy = {
+        let mut p = http_proxy("reviews-p", "reviews.example.com", 8080);
+        p.upstream_id = Some("reviews-u".to_string());
+        p
+    };
+    align_namespace(&mut proxy, &mut upstream);
+    let dr = destination_rule(Some(MeshTrafficPolicy {
+        load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::Passthrough)),
+        ..MeshTrafficPolicy::default()
+    }));
+    let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
+    mesh.destination_rules.push(dr);
+    let config = gateway_config_with_mesh(vec![proxy], vec![upstream], mesh);
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("dr prepared");
+    let upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| u.id == "reviews-u")
+        .expect("upstream survived");
+    assert_eq!(
+        upstream.algorithm,
+        LoadBalancerAlgorithm::Passthrough,
+        "Istio PASSTHROUGH maps to Ferrum Passthrough, not RoundRobin"
+    );
+}
+
+#[test]
 fn destination_rule_outlier_detection_projects_to_upstream_passive_health() {
     let mut runtime = default_mesh_runtime();
     runtime.namespace = DEFAULT_NAMESPACE.to_string();

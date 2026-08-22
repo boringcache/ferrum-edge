@@ -770,6 +770,32 @@ curl_tls_body() {
     "https://${host}${path}"
 }
 
+# Wait until the redirect rule is programmed before asserting the 302.
+#
+# Same class as the /weight RCA below (PR #3971): the redirect rule is one rule
+# among several on the same HTTPRoute, so an intermediate snapshot can 404 it
+# while sibling paths already answer. `curl_redirect` is a single shot, so that
+# propagation race failed the whole suite under `bash -e` with
+# "unexpected redirect response: 404" and no retry — unlike every assertion
+# above it, which polls through wait_for_body_contains.
+#
+# Always exits 0 and prints the last observed value so the caller's existing
+# comparison still reports a genuine mismatch.
+wait_for_redirect() {
+  local host="$1"
+  local path="$2"
+  local expected="$3"
+  local redirect=""
+  for _ in $(seq 1 60); do
+    redirect="$(curl_redirect "$host" "$path" 2>/dev/null || true)"
+    if [ "$redirect" = "$expected" ]; then
+      break
+    fi
+    sleep 2
+  done
+  printf '%s\n' "$redirect"
+}
+
 wait_for_body_contains() {
   local host="$1"
   local path="$2"
@@ -879,7 +905,8 @@ run_blackbox_tests() {
   wait_for_body_contains cross.blackbox.example /cross "backend=blackbox-cross" | tee -a "$report"
 
   local redirect
-  redirect="$(curl_redirect blackbox.example /redirect)"
+  redirect="$(wait_for_redirect blackbox.example /redirect \
+    "302 http://redirected.blackbox.example/redirected")"
   if [ "$redirect" != "302 http://redirected.blackbox.example/redirected" ]; then
     echo "unexpected redirect response: ${redirect}" >&2
     return 1

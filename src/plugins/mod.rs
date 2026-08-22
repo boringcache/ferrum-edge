@@ -1490,7 +1490,20 @@ pub struct WsDisconnectContext {
     pub client_ip: String,
     /// Backend target URL (scheme://host:port/path) — matches the
     /// `backend_target` field from the original upgrade request.
+    /// Query strings are stripped (`strip_query_params`) at capture time.
     pub backend_target: String,
+    /// Frontend HTTP method that admitted the upgrade: `GET` for HTTP/1.1,
+    /// `CONNECT` for HTTP/2 Extended CONNECT (RFC 8441) and HTTP/3 Extended
+    /// CONNECT (RFC 9220). Captured at upgrade admission; never inferred from
+    /// the backend target.
+    pub http_method: String,
+    /// Original client request path captured at upgrade admission. Matches the
+    /// handshake `TransactionSummary.request_path` (not a VirtualService-
+    /// rewritten backend path).
+    pub request_path: String,
+    /// Successful handshake status captured at upgrade admission: `101` for
+    /// HTTP/1.1 Switching Protocols, `200` for RFC 8441/9220 Extended CONNECT.
+    pub handshake_status_code: u16,
     /// Listener port on the gateway that accepted the upgrade.
     pub listen_port: u16,
     /// Process-local accepted WebSocket session ID allocated at upgrade
@@ -8113,6 +8126,18 @@ impl StreamConnectionContext {
             self.metadata.take().unwrap_or_default(),
             std::mem::take(&mut self.correlation_ids),
         )
+    }
+
+    /// Non-consuming snapshot of this connection's summary metadata, with
+    /// authoritative correlation ownership reprojected exactly as
+    /// `finalize_stream_summary_metadata` does for a session-owned summary.
+    ///
+    /// Used by setup-failure paths that must describe an admitted-but-never-
+    /// published stream while the context is still owned by the setup chain.
+    pub(crate) fn snapshot_summary_metadata(&self) -> HashMap<String, String> {
+        let mut metadata = self.metadata.clone().unwrap_or_default();
+        self.correlation_ids.project_correlation_ids(&mut metadata);
+        metadata
     }
 
     pub(crate) fn add_admission_permit(&mut self, permit: StreamAdmissionPermit) {

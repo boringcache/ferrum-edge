@@ -6427,6 +6427,13 @@ pub struct NodeWaypointUdpReplySourceState {
     /// the shared gate, so a quiet poll issues no map calls. `None` means
     /// unknown or fenced — the next pass must rewrite before acknowledging.
     applied: Option<Vec<(std::net::IpAddr, u16)>>,
+    /// The relay cgroup-v2 ids last successfully written to
+    /// `FERRUM_UDP_RELAY_CGROUPS` under the same fenced sequence. Tracked
+    /// beside [`Self::applied`] and compared with it, so a quiet poll can only
+    /// short-circuit when BOTH halves of the conjunction the classifier
+    /// evaluates are known live — never when the source proof converged and the
+    /// sender proof did not.
+    applied_relay_cgroups: Option<Vec<u64>>,
     /// The generation this agent has acknowledged on the channel. Only ever set
     /// after [`Self::applied`] holds that generation's complete, gated set.
     acknowledged: Option<ReplySourceGeneration>,
@@ -6469,9 +6476,17 @@ impl NodeWaypointUdpReplySourceState {
     }
 }
 
-/// Apply the proxy's published reply-source generation into
-/// `FERRUM_UDP_REPLY_SOURCES` / `FERRUM_UDP_REPLY_SOURCES6`, and acknowledge it
-/// only once the COMPLETE IPv4 + IPv6 set is live in both.
+/// Apply the proxy's published generation into `FERRUM_UDP_REPLY_SOURCES` /
+/// `FERRUM_UDP_REPLY_SOURCES6` **and** `FERRUM_UDP_RELAY_CGROUPS`, and
+/// acknowledge it only once the COMPLETE IPv4 + IPv6 source set and the
+/// resolved relay-cgroup set are live in all three.
+///
+/// The relay-cgroup half is the non-forgeable sender proof the tc UDP arms
+/// require before either source lane (issues #3956, #3957). It rides the same
+/// generation, the same gate, and the same acknowledgement precisely so the two
+/// halves of the classifier's conjunction can never be applied independently:
+/// a source tuple live without a sender proof is the replayable admission, and
+/// a sender proof live without its sources is a black hole.
 ///
 /// The generation is a whole-set statement owned by the serving proxy, so this
 /// is a whole-set replacement: a proxy crash, restart, or missed retraction
@@ -6546,6 +6561,24 @@ pub fn reconcile_node_waypoint_udp_reply_sources(
         return;
     }
 
+    // Resolve the NON-FORGEABLE half of the classifier's UDP conjunction
+    // (issues #3956, #3957). The manifest names a pod; this node-agent — not
+    // the publisher — decides which cgroup ids that pod actually owns, and
+    // refuses outright if the pod is one of the enrolled workloads this guard
+    // exists to protect.
+    let relay_cgroups = match resolve_node_waypoint_relay_cgroups(config, pod_states, &desired) {
+        Ok(cgroups) => cgroups,
+        Err(reason) => {
+            refuse_node_waypoint_udp_reply_sources(
+                backend,
+                registry_dir,
+                state,
+                Some((reason, None)),
+            );
+            return;
+        }
+    };
+
     if desired.sources.len() > ferrum_ebpf_common::UDP_REPLY_SOURCE_MAX_ENTRIES as usize {
         // Refuse the whole set: truncating would authorize an arbitrary subset
         // and silently black-hole the rest.
@@ -6565,6 +6598,7 @@ pub fn reconcile_node_waypoint_udp_reply_sources(
         .collect();
 
     let converged = state.applied.as_deref() == Some(sources.as_slice())
+        && state.applied_relay_cgroups.as_deref() == Some(relay_cgroups.as_slice())
         && state.acknowledged.as_ref() == Some(&desired.generation);
     if converged {
         // Quiet poll. Still confirm the acknowledgement is on disk: a wiped
@@ -6604,6 +6638,7 @@ pub fn reconcile_node_waypoint_udp_reply_sources(
     if let Err(error) = channel::clear_acknowledgement(registry_dir) {
         state.acknowledged = None;
         state.applied = None;
+        state.applied_relay_cgroups = None;
         match backend.set_udp_reply_sources_enabled(false) {
             Ok(()) => state.report(
                 Some("acknowledgement_retraction_failed"),
@@ -6618,6 +6653,7 @@ pub fn reconcile_node_waypoint_udp_reply_sources(
     }
     state.acknowledged = None;
     state.applied = None;
+    state.applied_relay_cgroups = None;
 
     // This is the coherence boundary. Once closed, stale IPv6 entries left by
     // a later IPv4-success/IPv6-failure (or any scan/remove/insert failure) are
@@ -6630,8 +6666,21 @@ pub fn reconcile_node_waypoint_udp_reply_sources(
         return;
     }
 
-    // One fresh whole-set replacement covering BOTH families for every
+    // One fresh whole-set replacement covering EVERY family for every
     // unacknowledged generation, even when its content matches the last set.
+    //
+    // The SENDER proof goes in first. Both orders are safe while the gate is
+    // closed, but this one keeps the failure modes honest: if the relay-cgroup
+    // write fails we return before any source tuple is written, so the maps
+    // never hold a source set whose sender proof was never applied.
+    match backend.replace_udp_relay_cgroups(&relay_cgroups) {
+        Ok(()) => state.applied_relay_cgroups = Some(relay_cgroups),
+        Err(error) => {
+            state.applied_relay_cgroups = None;
+            state.report(Some("relay_cgroup_write_failed"), Some(error.as_str()));
+            return;
+        }
+    }
     match backend.replace_udp_reply_sources(&sources) {
         Ok(()) => state.applied = Some(sources),
         Err(error) => {
@@ -6651,8 +6700,13 @@ pub fn reconcile_node_waypoint_udp_reply_sources(
         return;
     }
 
-    if let Err(error) = backend.set_udp_reply_sources_enabled(true) {
+    // An inactive generation proves a withdrawal: both maps are empty and the
+    // shared gate stays closed. Only an active generation may reopen the lane.
+    if desired.generation.active()
+        && let Err(error) = backend.set_udp_reply_sources_enabled(true)
+    {
         state.applied = None;
+        state.applied_relay_cgroups = None;
         // A failed update is not assumed atomic. Re-drive disabled once; if
         // that too fails, surface the hard residual instead of claiming the
         // entries are inert.
@@ -6688,6 +6742,104 @@ pub fn reconcile_node_waypoint_udp_reply_sources(
             );
         }
     }
+}
+
+/// Resolve the relay pod named by `desired` into the exact cgroup-v2 ids the tc
+/// UDP arms must see on `bpf_skb_cgroup_id()` (issues #3956, #3957).
+///
+/// Host-side and independent by design. The manifest supplies a NAME; every
+/// authorization decision below is made from this node's own cgroup hierarchy
+/// and its own enrolled-pod inventory, so a publisher cannot widen the sender
+/// proof by asserting an id.
+///
+/// Refusals, all whole-generation and all returning a closed-set reason:
+///
+/// * an INACTIVE generation resolves to an EMPTY relay set — a withdrawal
+///   authorizes nothing and needs no identity (the manifest parser already
+///   refuses inactive-with-identity and inactive-with-sources);
+/// * an ACTIVE generation, including one with zero ClusterIP sources, resolves
+///   the named relay pod's complete cgroup subtree so the direct-node lane
+///   stays usable without authorizing any ClusterIP tuple;
+/// * a pod UID that is one of THIS node's enrolled workloads: the relay may
+///   answer for a Service address, never as one of the pods this guard
+///   protects, and the same rule already governs reply-source addresses;
+/// * a pod UID with no resolvable cgroup path, or a path whose bounded tree
+///   walk yields nothing — an unresolvable identity is not evidence of one;
+/// * a resolved id that also belongs to an enrolled pod's cgroup subtree.
+///   `resolve_pod_cgroup_path` matches on UID-derived directory names, so a
+///   hostile or malformed UID that resolved onto a workload's tree is caught
+///   here even though the UID itself was not in the enrolled set;
+/// * a bounded tree walk that is not complete — more unique directory inodes
+///   than the map bound, deeper than the walk's depth bound, or a descendant
+///   that cannot be fully enumerated. Refused whole, never truncated, because
+///   a truncated set silently black-holes whichever container leaf fell off the
+///   end, including the leaf `bpf_skb_cgroup_id` reports for the active relay
+///   container.
+fn resolve_node_waypoint_relay_cgroups(
+    config: &NodeAgentConfig,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    desired: &crate::proxy::node_waypoint_udp_reply_source::DesiredReplySources,
+) -> Result<Vec<u64>, &'static str> {
+    if !desired.generation.active() {
+        return Ok(Vec::new());
+    }
+    let Some(pod_uid) = desired.relay_pod_uid.as_deref() else {
+        // Parser already refuses active-without-identity; fail closed if a
+        // caller constructs the struct by hand.
+        return Err("relay_identity_missing");
+    };
+    if pod_states.contains_key(pod_uid) {
+        return Err("relay_identity_names_enrolled_pod");
+    }
+
+    // Cached resolver: this runs on the `UDP_CAPTURE_READINESS_POLL` timer for
+    // the same relay pod, and the uncached one falls through to a bounded but
+    // unconditional 4096-directory walk on the kubeadm/kind `kubelet.slice`
+    // layout. The subtree walk below is NOT cached, so a container leaf that
+    // moves within the pod is still detected every poll.
+    let Some(cgroup_path) = cgroup::resolve_pod_cgroup_path_cached(&config.cgroup_root, pod_uid)
+    else {
+        return Err("relay_cgroup_unresolved");
+    };
+    let walk = cgroup::collect_cgroup_tree(&cgroup_path);
+    if walk.inodes.is_empty() {
+        return Err("relay_cgroup_unresolved");
+    }
+    // Completeness is decided by the walk, not by `len() > map bound` after a
+    // collector that already stops at that bound: a 257th unique directory must
+    // be distinguishable from a complete 256-inode tree, and a depth or
+    // enumeration failure must not look like a full sender-proof set.
+    match walk.status {
+        cgroup::CgroupTreeWalkStatus::Complete => {}
+        cgroup::CgroupTreeWalkStatus::ExceededEntryBound => {
+            return Err("relay_cgroup_set_exceeds_map_bound");
+        }
+        cgroup::CgroupTreeWalkStatus::ExceededDepthBound => {
+            return Err("relay_cgroup_tree_exceeds_depth_bound");
+        }
+        cgroup::CgroupTreeWalkStatus::IncompleteEnumeration => {
+            return Err("relay_cgroup_tree_incomplete");
+        }
+    }
+    let mut cgroups = walk.inodes;
+    // Canonical order so an unchanged tree produces an unchanged applied set and
+    // a quiet poll stays quiet.
+    cgroups.sort_unstable();
+    cgroups.dedup();
+
+    let mut enrolled_cgroups: HashSet<u64> = HashSet::new();
+    for entry in pod_states.iter() {
+        enrolled_cgroups.extend(entry.value().workload_identity_cgroup_ids.iter().copied());
+        enrolled_cgroups.extend(entry.value().include_ports_cgroup_ids.iter().copied());
+    }
+    if cgroups.iter().any(|id| enrolled_cgroups.contains(id)) {
+        return Err("relay_cgroup_names_enrolled_pod");
+    }
+
+    if cgroups.len() > ferrum_ebpf_common::UDP_RELAY_CGROUP_MAX_ENTRIES as usize {
+        return Err("relay_cgroup_set_exceeds_map_bound");
+    }
+    Ok(cgroups)
 }
 
 /// Confirm that the exact manifest read before map application is still the
@@ -6744,6 +6896,7 @@ fn refuse_node_waypoint_udp_reply_sources(
 
     if let Err(error) = backend.set_udp_reply_sources_enabled(false) {
         state.applied = None;
+        state.applied_relay_cgroups = None;
         state.report(
             Some("authorization_gate_disable_failed"),
             Some(error.as_str()),
@@ -6753,11 +6906,31 @@ fn refuse_node_waypoint_udp_reply_sources(
 
     if let Some(error) = acknowledgement_error {
         state.applied = None;
+        state.applied_relay_cgroups = None;
         state.report(
             Some("acknowledgement_retraction_failed"),
             Some(error.as_str()),
         );
         return;
+    }
+
+    // Revoke the sender proof as well. Closing the gate already made every
+    // entry inert, but leaving a dead relay's cgroup id in the map would let a
+    // LATER generation open the gate over a stale sender set, so the withdrawal
+    // has to be real and not merely fenced.
+    let relay_already_revoked = state
+        .applied_relay_cgroups
+        .as_deref()
+        .is_some_and(|applied| applied.is_empty());
+    if !relay_already_revoked {
+        match backend.replace_udp_relay_cgroups(&[]) {
+            Ok(()) => state.applied_relay_cgroups = Some(Vec::new()),
+            Err(error) => {
+                state.applied_relay_cgroups = None;
+                state.report(Some("relay_cgroup_write_failed"), Some(error.as_str()));
+                return;
+            }
+        }
     }
 
     let already_revoked = state

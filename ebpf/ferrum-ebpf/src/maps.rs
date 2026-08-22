@@ -10,7 +10,8 @@ use ferrum_ebpf_common::{
     InboundRedirectKey4, InboundRedirectKey6, IncludePortsPolicy, NodeProbePortKey4,
     NodeProbePortKey6, OrigDst4, OrigDst6, OrigDstKey, PodInfo, UdpReplySourceKey4,
     UdpReplySourceKey6, WorkloadIdentity, ACCEPT_FIRST_BYTE_MAP_MAX_ENTRIES,
-    SOCK_OPS_RINGBUF_DEFAULT_BYTES, SOCK_OPS_STATS_LEN, UDP_REPLY_SOURCE_MAX_ENTRIES,
+    SOCK_OPS_RINGBUF_DEFAULT_BYTES, SOCK_OPS_STATS_LEN, UDP_RELAY_CGROUP_MAX_ENTRIES,
+    UDP_REPLY_SOURCE_MAX_ENTRIES,
 };
 
 /// Original IPv4 destination before connect rewrite, keyed by socket cookie.
@@ -130,9 +131,42 @@ pub static FERRUM_UDP_REPLY_SOURCES: HashMap<UdpReplySourceKey4, u8> =
 pub static FERRUM_UDP_REPLY_SOURCES6: HashMap<UdpReplySourceKey6, u8> =
     HashMap::with_max_entries(UDP_REPLY_SOURCE_MAX_ENTRIES, 0);
 
-/// Shared fail-closed generation gate for both reply-source map families.
-/// Array values initialize to zero (disabled); userspace opens key zero only
-/// after both family maps contain one exact, revalidated generation.
+/// cgroup-v2 ids of the NodeWaypoint relay's OWN pod, keyed exactly as
+/// `bpf_skb_cgroup_id()` reports them at tc egress.
+///
+/// This is the NON-FORGEABLE half of UDP relay admission. Every other attribute
+/// the UDP arms consult — the socket mark, the source address, the source port —
+/// is chosen by whoever emits the packet, so a same-node workload in the HOST
+/// network namespace holding only SOCKET-level privilege (`CAP_NET_RAW`
+/// suffices for `IP_TRANSPARENT`, and for `SO_MARK` since Linux 5.17) can
+/// present all of them at once. It cannot present this one — nor can a
+/// `CAP_NET_ADMIN` holder: `bpf_skb_cgroup_id()` reads the cgroup of
+/// the SOCKET that generated the skb, which the kernel records at socket
+/// creation from the creating task's own cgroup. Producing a datagram that
+/// reports the waypoint's cgroup therefore requires already being a process
+/// inside the waypoint's cgroup.
+///
+/// The helper answers only where a socket is attached to the skb — the tc
+/// EGRESS hook of an enrolled pod's host-side veth, which is exactly the hook
+/// the relay's own datagrams traverse (host netns → pod). A forwarded packet
+/// (another pod's, or another node's) has been through `skb_scrub_packet` and
+/// carries no socket, so the helper returns zero and admission is refused. The
+/// tc INGRESS hook, which sees pod-originated traffic, likewise always reports
+/// zero: the relay never sends through it, so nothing legitimate is lost.
+///
+/// The node-agent is the sole writer, it derives the set host-side from the
+/// waypoint pod's own cgroup subtree rather than trusting a claimed id, and it
+/// refuses any id belonging to an enrolled workload — so this map can never
+/// authorize one of the pods the guard protects to answer as the relay.
+/// Consulted only while `FERRUM_UDP_REPLY_SOURCE_GATE` is open. TCP never reads
+/// it.
+#[map]
+pub static FERRUM_UDP_RELAY_CGROUPS: HashMap<u64, u8> =
+    HashMap::with_max_entries(UDP_RELAY_CGROUP_MAX_ENTRIES, 0);
+
+/// Shared fail-closed generation gate for every reply-source and relay-cgroup
+/// map. Array values initialize to zero (disabled); userspace opens key zero
+/// only after all three maps contain one exact, revalidated generation.
 #[map]
 pub static FERRUM_UDP_REPLY_SOURCE_GATE: Array<u8> = Array::with_max_entries(1, 0);
 

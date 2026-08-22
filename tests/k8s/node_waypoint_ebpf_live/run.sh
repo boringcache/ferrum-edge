@@ -27,6 +27,11 @@ UNMANAGED_NS="${FERRUM_LIVE_UNMANAGED_NAMESPACE:-$WORKLOAD_NS-unmanaged}"
 # (issue #3286), so co-located pods reach it at <node IP>:<this port>. Kept out
 # of the reserved mesh port range (15001/15006/15008/15011/15090/15443).
 UDP_LISTENER_PORT="${FERRUM_LIVE_UDP_LISTENER_PORT:-15353}"
+# `NODE_WAYPOINT_INBOUND_AUTH_MARK` (ferrum-ebpf-common). Public and fixed by
+# design — the forgery probe sets it with `SO_MARK` precisely to prove that on
+# its own, even beside a trusted node source or a published ClusterIP, it
+# authorizes nothing (issues #3956, #3957).
+NODE_WAYPOINT_INBOUND_AUTH_MARK="${FERRUM_LIVE_NODE_WAYPOINT_INBOUND_AUTH_MARK:-1844}"
 # Service port of the in-mesh `dtls-echo` Service. Same `protocol: UDP` L4
 # transport, but its `appProtocol: dtls` hint makes the NodeWaypoint TERMINATE
 # frontend DTLS on the materialized listener and forward PLAINTEXT datagrams to
@@ -107,6 +112,7 @@ REQUIRED_LIVE_ASSERTIONS=(
   node_waypoint.udp.listener_deny_scoped_policy
   node_waypoint.udp.listener_deny_unattributed_source
   node_waypoint.udp.listener_deny_spoofed_source
+  node_waypoint.udp.listener_deny_forged_relay_mark
   node_waypoint.udp.policy_change_denies_live
   node_waypoint.udp.policy_withdrawal_recovers_live
   node_waypoint.dtls.listener_bound
@@ -1939,6 +1945,50 @@ spec:
               # refusal for a datagram that was never emitted.
               add: ["NET_RAW"]
 ---
+# HOST-NETWORK forger for the UDP relay sender-proof check (issues #3956,
+# #3957). This is the actual threat model, and it is deliberately NOT the
+# pod-netns prober above: a datagram leaving a pod netns crosses a veth, where
+# `skb_scrub_packet` clears `skb->mark`, so a pod cannot deliver a forged mark
+# into the host namespace at all. A host-network workload with NET_ADMIN and
+# NET_RAW can: its socket IS in the host netns, so `SO_MARK` reaches the enrolled
+# pod's veth egress hook intact, and a raw datagram can carry a Service ClusterIP
+# and the occupied listener source port. That combination presents every packet
+# attribute the tc UDP guard used to accept. What it cannot present is
+# `bpf_skb_cgroup_id()`: its socket carries its OWN cgroup, not the NodeWaypoint
+# relay's.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udp-forger
+  namespace: $UNMANAGED_NS
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: udp-forger
+  template:
+    metadata:
+      labels:
+        app: udp-forger
+    spec:
+      nodeSelector:
+        ferrum.io/live-node: a
+      # The whole point: forge from the HOST network namespace, where a socket
+      # mark survives to the enrolled pod's veth egress hook.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: udp
+          image: python:3.12-alpine
+          command: ["sh", "-c", "sleep 365d"]
+          securityContext:
+            capabilities:
+              # NET_ADMIN for SO_MARK and NET_RAW for the exact raw source
+              # tuple. Explicit so the forgery is DETERMINISTIC: a sandbox that
+              # cannot forge FAILS the required gate rather than recording a
+              # refusal for an attack nothing attempted.
+              add: ["NET_ADMIN", "NET_RAW"]
+---
 # Unenrolled DTLS sender for the Service-path refusal check (issue #3286 root
 # review). Same posture as udp-unmanaged — outside the mesh namespace, no
 # registry binding for its veth — but carrying openssl, so it can attempt a real
@@ -1972,6 +2022,7 @@ EOF
   kubectl -n "$UNMANAGED_NS" rollout status deploy/unmanaged-a --timeout=3m
   kubectl -n "$UNMANAGED_NS" rollout status deploy/unmanaged-b --timeout=3m
   kubectl -n "$UNMANAGED_NS" rollout status deploy/udp-unmanaged --timeout=3m
+  kubectl -n "$UNMANAGED_NS" rollout status deploy/udp-forger --timeout=3m
   kubectl -n "$UNMANAGED_NS" rollout status deploy/dtls-unmanaged --timeout=3m
   if ! kubectl -n "$UNMANAGED_NS" exec deploy/dtls-unmanaged -c dtls -- openssl version >/dev/null; then
     echo "dtls-unmanaged is missing the openssl CLI; the DTLS live client image did not load" >&2
@@ -4420,6 +4471,79 @@ except OSError:
 ' "$target_ip" "$port" "$spoof_ip" "$payload" "$wait_secs" 2>/dev/null || echo "SPOOF-UNAVAILABLE"
 }
 
+# Forge the COMPLETE pre-#3956/#3957 UDP admission from the HOST network
+# namespace and send it straight at an enrolled pod, bypassing the waypoint.
+#
+# A raw IPv4 datagram is intentional: the live NodeWaypoint already owns the
+# wildcard listener port, so a second UDP socket cannot reliably bind the exact
+# `(ClusterIP, listener port)` tuple. The raw packet carries that exact source
+# port without colliding with the serving listener. This drives BOTH historical
+# bypass shapes from one helper: pass a trusted node source address for the
+# #3956 shape (node source + mark) and a published Service ClusterIP for the
+# #3957 shape (listener-wide reply tuple + mark, replayed at a destination its
+# Service never named). `mark` is the public NODE_WAYPOINT_INBOUND_AUTH_MARK.
+#
+# Output contract mirrors `udp_spoof_probe_from`, so a refusal can never be
+# recorded for an attack that was never mounted:
+#   FORGED-UNAVAILABLE:<detail>  — the socket, mark, header, or send FAILED.
+#   FORGED-SENT                  — the datagram WAS emitted.
+# The prefix is printed only after `sendto` returns.
+udp_forged_relay_probe_from() {
+  local ns="$1" app="$2" target_ip="$3" port="$4" source_ip="$5" mark="$6" payload="$7"
+  kubectl -n "$ns" exec "deploy/$app" -c udp -- python -u -c '
+import socket
+import struct
+import sys
+
+target, port, source, mark, payload = (
+    sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), sys.argv[5].encode()
+)
+
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+except OSError as exc:
+    sys.stdout.write("FORGED-UNAVAILABLE:socket:%s" % exc.errno)
+    raise SystemExit(0)
+
+# The relay mark. Public and fixed, and settable by anything holding
+# CAP_NET_ADMIN — which is exactly why it cannot be an authorization.
+try:
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, mark)
+except OSError as exc:
+    sys.stdout.write("FORGED-UNAVAILABLE:so_mark:%s" % exc.errno)
+    raise SystemExit(0)
+
+try:
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+except OSError as exc:
+    sys.stdout.write("FORGED-UNAVAILABLE:ip_hdrincl:%s" % exc.errno)
+    raise SystemExit(0)
+
+try:
+    udp_len = 8 + len(payload)
+    udp_header = struct.pack("!HHHH", port, port, udp_len, 0)
+    total_len = 20 + udp_len
+    ip_header = struct.pack(
+        "!BBHHHBBH4s4s",
+        0x45, 0, total_len, 0, 0, 64, socket.IPPROTO_UDP, 0,
+        socket.inet_aton(source), socket.inet_aton(target),
+    )
+except (OSError, struct.error) as exc:
+    sys.stdout.write("FORGED-UNAVAILABLE:header:%s" % type(exc).__name__)
+    raise SystemExit(0)
+
+try:
+    s.sendto(ip_header + udp_header + payload, (target, 0))
+except OSError as exc:
+    sys.stdout.write("FORGED-UNAVAILABLE:sendto:%s" % exc.errno)
+    raise SystemExit(0)
+
+# Past this point the forged datagram IS on the wire, so a backend that never
+# logged it is an observation about the guard rather than about the sandbox.
+sys.stdout.write("FORGED-SENT")
+' "$target_ip" "$port" "$source_ip" "$mark" "$payload" 2>/dev/null || echo "FORGED-UNAVAILABLE:exec"
+}
+
 udp_backend_received() {
   local ns="$1" deploy="$2" payload="$3"
   kubectl -n "$ns" logs "deploy/$deploy" --tail=-1 2>/dev/null |
@@ -4683,6 +4807,63 @@ refusal was observed" "" "$(spiffe_for_sa dst-a)" "node-waypoint-udp-listener"
       return 1
       ;;
   esac
+
+  # 4b. The actual pre-fix bypass (issues #3956, #3957): a HOST-NETWORK
+  #     workload with NET_ADMIN forges the complete admission and sends
+  #     DIRECTLY at the enrolled backend pod, bypassing the waypoint entirely.
+  #
+  #     Two shapes, one assertion, because the two competing fixes each closed
+  #     one and left the other open:
+  #       * node source + relay mark   (what #3957 removed, #3956 kept)
+  #       * ClusterIP tuple + relay mark, replayed at a destination that
+  #         Service never named (what #3956 removed, #3957 kept)
+  #
+  #     Both are refused only by the sender proof — `bpf_skb_cgroup_id()` names
+  #     the forger's own cgroup, never the relay's. The backend log is the
+  #     authority: a forged datagram addressed straight at the pod draws no
+  #     reply either way, so absence of a reply proves nothing on its own.
+  local forger_result forged_backend_hits shape
+  for shape in node-source cluster-ip; do
+    local forged_source forged_payload
+    case "$shape" in
+      node-source)
+        forged_source="$listener_ip"
+        forged_payload="ping-forged-node"
+        ;;
+      cluster-ip)
+        forged_source="$service_ip"
+        forged_payload="ping-forged-vip"
+        ;;
+    esac
+    forger_result="$(udp_forged_relay_probe_from "$UNMANAGED_NS" udp-forger \
+      "$echo_pod_ip" "$UDP_LISTENER_PORT" "$forged_source" \
+      "$NODE_WAYPOINT_INBOUND_AUTH_MARK" "$forged_payload")"
+    if [[ "$forger_result" != "FORGED-SENT" ]]; then
+      record_live_assertion node_waypoint.udp.listener_deny_forged_relay_mark fail \
+        udp-forger udp-echo \
+        "shape=$shape no forged datagram could be emitted despite hostNetwork+NET_ADMIN+NET_RAW \
+($forger_result), so no refusal was observed" "" "$(spiffe_for_sa dst-a)" \
+        "node-waypoint-udp-listener"
+      collect_traffic_failure_diagnostics
+      return 1
+    fi
+    sleep 2
+    forged_backend_hits="$(udp_echo_backend_received "$forged_payload")"
+    if [[ "$forged_backend_hits" != "0" ]]; then
+      record_live_assertion node_waypoint.udp.listener_deny_forged_relay_mark fail \
+        udp-forger udp-echo \
+        "shape=$shape forged_source=$forged_source mark=$NODE_WAYPOINT_INBOUND_AUTH_MARK \
+reached the enrolled pod hits=$forged_backend_hits" "" "$(spiffe_for_sa dst-a)" \
+        "node-waypoint-udp-listener"
+      collect_traffic_failure_diagnostics
+      return 1
+    fi
+  done
+  record_live_assertion node_waypoint.udp.listener_deny_forged_relay_mark pass \
+    udp-forger udp-echo \
+    "host_netns_forgery emitted=true shapes=node-source,cluster-ip \
+mark=$NODE_WAYPOINT_INBOUND_AUTH_MARK backend_hits=0" "" "$(spiffe_for_sa dst-a)" \
+    "node-waypoint-udp-listener"
 
   # 5. Policy CHANGE: deny the previously admitted source and prove the live
   #    data plane converges with no restart.

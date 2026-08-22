@@ -13,9 +13,10 @@ use ferrum_edge::admin::{
     serve_admin_on_listener,
 };
 use ferrum_edge::config::config_change_watch::wait_for_config_poll_wake;
+use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::env_config::OperatingMode;
-use ferrum_edge::config::runtime_config_apply::RuntimeConfigApply;
+use ferrum_edge::config::runtime_config_apply::{LiveApplyCursor, RuntimeConfigApply};
 use ferrum_edge::config::types::{GatewayConfig, default_namespace};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
@@ -202,8 +203,13 @@ fn spawn_authoritative_poller(
 ) {
     let wake = apply.wake_signal();
     tokio::spawn(async move {
-        let mut last_sequence = store.latest_change_sequence(&namespace).await.unwrap_or(0);
-        apply.record_accepted(last_sequence);
+        let db: Arc<dyn DatabaseBackend> = store;
+        let initial_permit = db.acquire_write_topology_permit().await;
+        let initial_epoch = initial_permit.topology_epoch();
+        let initial_sequence = db.latest_change_sequence(&namespace).await.unwrap_or(0);
+        let mut last_cursor = LiveApplyCursor::new(initial_epoch, initial_sequence);
+        apply.record_accepted_cursor(last_cursor);
+        drop(initial_permit);
         let mut interval = tokio::time::interval(Duration::from_secs(3600));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await;
@@ -219,26 +225,52 @@ fn spawn_authoritative_poller(
                         tokio::time::sleep(poll_delay).await;
                     }
                     if reject {
-                        if let Ok(sequence) = store.latest_change_sequence(&namespace).await {
-                            apply.record_rejected(sequence);
+                        let permit = db.acquire_write_topology_permit().await;
+                        let topology_epoch = permit.topology_epoch();
+                        if let Ok(sequence) = db.latest_change_sequence(&namespace).await {
+                            apply.record_rejected_cursor(LiveApplyCursor::new(
+                                topology_epoch,
+                                sequence,
+                            ));
                         }
+                        drop(permit);
                         polls_completed.fetch_add(1, Ordering::Relaxed);
                         apply.nudge_if_waiters_pending();
                         continue;
                     }
-                    if let Ok(result) =
-                        store.load_incremental_config(&namespace, last_sequence).await
+                    let load_permit = db.acquire_write_topology_permit().await;
+                    let load_epoch = load_permit.topology_epoch();
+                    if load_epoch != last_cursor.topology_epoch {
+                        apply.observe_topology(load_epoch);
+                        last_cursor = LiveApplyCursor::new(load_epoch, 0);
+                        drop(load_permit);
+                    } else if let Ok(result) = db
+                        .load_incremental_config(&namespace, last_cursor.sequence)
+                        .await
                     {
-                        let next = result.sequence_cursor;
+                        let next = LiveApplyCursor::new(load_epoch, result.sequence_cursor);
+                        drop(load_permit);
                         match proxy_state.apply_incremental(result).await {
                             ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged => {
-                                last_sequence = next;
-                                apply.record_accepted(next);
+                                let final_permit = db.acquire_write_topology_permit().await;
+                                if final_permit.topology_epoch() == load_epoch {
+                                    last_cursor = next;
+                                    apply.record_accepted_cursor(next);
+                                } else {
+                                    apply.observe_topology(final_permit.topology_epoch());
+                                }
                             }
                             ConfigApplyOutcome::Rejected { .. } => {
-                                apply.record_rejected(next);
+                                let final_permit = db.acquire_write_topology_permit().await;
+                                if final_permit.topology_epoch() == load_epoch {
+                                    apply.record_rejected_cursor(next);
+                                } else {
+                                    apply.observe_topology(final_permit.topology_epoch());
+                                }
                             }
                         }
+                    } else {
+                        drop(load_permit);
                     }
                     polls_completed.fetch_add(1, Ordering::Relaxed);
                     apply.nudge_if_waiters_pending();
@@ -263,7 +295,11 @@ async fn create_update_delete_are_live_on_success() {
     let ns = default_namespace();
     let proxy_state = proxy_state();
     let seq = store.latest_change_sequence(&ns).await.unwrap_or(0);
-    let apply = Arc::new(RuntimeConfigApply::new(ns.clone(), seq));
+    let apply = Arc::new(RuntimeConfigApply::at_epoch(
+        ns.clone(),
+        store.config_topology_epoch(),
+        seq,
+    ));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     spawn_authoritative_poller(
         store.clone(),
@@ -338,7 +374,11 @@ async fn concurrent_writes_coalesce_and_both_become_live() {
     let ns = default_namespace();
     let proxy_state = proxy_state();
     let seq = store.latest_change_sequence(&ns).await.unwrap_or(0);
-    let apply = Arc::new(RuntimeConfigApply::new(ns.clone(), seq));
+    let apply = Arc::new(RuntimeConfigApply::at_epoch(
+        ns.clone(),
+        store.config_topology_epoch(),
+        seq,
+    ));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     spawn_authoritative_poller(
         store.clone(),
@@ -391,7 +431,11 @@ async fn reload_failure_after_commit_returns_503_applied_false() {
     let ns = default_namespace();
     let proxy_state = proxy_state();
     let seq = store.latest_change_sequence(&ns).await.unwrap_or(0);
-    let apply = Arc::new(RuntimeConfigApply::new(ns.clone(), seq));
+    let apply = Arc::new(RuntimeConfigApply::at_epoch(
+        ns.clone(),
+        store.config_topology_epoch(),
+        seq,
+    ));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     spawn_authoritative_poller(
         store.clone(),
@@ -435,7 +479,11 @@ async fn write_during_in_flight_poll_and_after_empty_poll_still_becomes_live() {
     let ns = default_namespace();
     let proxy_state = proxy_state();
     let seq = store.latest_change_sequence(&ns).await.unwrap_or(0);
-    let apply = Arc::new(RuntimeConfigApply::new(ns.clone(), seq));
+    let apply = Arc::new(RuntimeConfigApply::at_epoch(
+        ns.clone(),
+        store.config_topology_epoch(),
+        seq,
+    ));
     let polls = Arc::new(AtomicU64::new(0));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     spawn_authoritative_poller(

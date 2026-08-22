@@ -612,7 +612,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "stdout_logging",
         classification: BuiltinPluginClassification::Public,
         priority: 9000,
-        active_phases: "log, on_stream_disconnect",
+        active_phases: "log, on_stream_disconnect, on_ws_disconnect",
         matrix_protocols: ALL_PROTOCOLS,
         protocol_rationale: "Observability applies everywhere",
     },

@@ -525,10 +525,11 @@ fn database_poll_tick_records_on_every_normal_exit_without_async_wrapper() {
     assert_every_continue_records_completion(tick, "database");
     assert_fallthrough_records_completion(tick, "database");
 
-    // Base main had 8 handled continues in this loop; keep that exit class count.
+    // Topology fencing adds five handled retry exits to base main's eight;
+    // keep that deliberate exit-class count pinned as the loop evolves.
     let continue_count = tick.lines().filter(|l| l.trim() == "continue;").count();
     assert_eq!(
-        continue_count, 8,
+        continue_count, 13,
         "database poll tick handled-continue exit count drifted"
     );
     let record_count = tick.matches("record_poll_completed()").count();

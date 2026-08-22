@@ -1141,8 +1141,8 @@ fn live_apply_handlers_capture_sequence_before_releasing_pins() {
         joined
             .matches("complete_live_config_mutation_after_commit_boxed(")
             .count(),
-        12,
-        "twelve wired mutation completions, every one through the boxed factory"
+        13,
+        "thirteen wired mutation completions, every one through the boxed factory"
     );
     // The inner async helper must have exactly one caller — the factory. Any
     // handler awaiting it directly would put the whole future back into that
@@ -1217,6 +1217,31 @@ fn live_apply_handlers_capture_sequence_before_releasing_pins() {
     assert!(
         restore.contains("(namespace_config_admission_guard, _write_permit)"),
         "restore must capture the covering sequence before releasing the namespace guard"
+    );
+}
+
+/// The aggregate admin route future must stay off the request worker stack.
+/// Instrumented, unoptimized coverage builds make the dispatcher large enough
+/// to overflow the same two-MiB default used by production Tokio workers.
+#[test]
+fn admin_route_dispatch_future_stays_behind_heap_factory() {
+    let admin_source = include_str!("../../../src/admin/mod.rs");
+    assert!(
+        admin_source.contains("#[inline(never)]\nfn boxed_handle_admin_request_inner("),
+        "the dispatcher factory must remain non-inlined"
+    );
+    assert_eq!(
+        admin_source
+            .matches("Box::pin(handle_admin_request_inner(req, state, client_ip))")
+            .count(),
+        1,
+        "only the non-inlined factory may construct the aggregate dispatcher future"
+    );
+    assert!(
+        admin_source.contains(
+            "Arc::clone(&slot),\n        boxed_handle_admin_request_inner(req, state, client_ip),"
+        ),
+        "the audit scope must retain only the boxed dispatcher pointer"
     );
 }
 

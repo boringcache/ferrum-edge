@@ -11,6 +11,7 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_otel_ldap
 
+use crate::common::probe_gateway_identity;
 use hickory_resolver::proto::{
     op::Message,
     rr::{RData, Record, RecordType},
@@ -20,7 +21,7 @@ use std::sync::{
     Arc, RwLock,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -135,12 +136,32 @@ fn gateway_binary_path() -> &'static str {
     }
 }
 
+fn otel_ldap_observability_token(proxy_port: u16, admin_port: u16, attempt: u32) -> String {
+    format!(
+        "ferrum-edge-otel-ldap-probe-{}-{}-{}-{}",
+        std::process::id(),
+        proxy_port,
+        admin_port,
+        attempt
+    )
+}
+
+#[test]
+fn otel_ldap_observability_token_is_unique_per_attempt_and_ports() {
+    let base = otel_ldap_observability_token(10_001, 20_002, 1);
+    assert_ne!(base, otel_ldap_observability_token(10_001, 20_002, 2));
+    assert_ne!(base, otel_ldap_observability_token(10_001, 20_003, 1));
+    assert_ne!(base, otel_ldap_observability_token(10_002, 20_002, 1));
+    assert!(base.contains(&std::process::id().to_string()));
+}
+
 /// Start the gateway in file mode with the given config and ports.
 fn start_gateway_with_dns(
     config_path: &str,
     proxy_port: u16,
     admin_port: u16,
     dns_resolver: Option<SocketAddr>,
+    observability_token: &str,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let binary_path = gateway_binary_path();
 
@@ -151,6 +172,9 @@ fn start_gateway_with_dns(
         .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_LOG_LEVEL", "debug")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .env("FERRUM_ACCEPT_THREADS", "1")
+        .env("FERRUM_METRICS_BEARER_TOKEN", observability_token)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -168,22 +192,77 @@ fn start_gateway(
     config_path: &str,
     proxy_port: u16,
     admin_port: u16,
+    observability_token: &str,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    start_gateway_with_dns(config_path, proxy_port, admin_port, None)
+    start_gateway_with_dns(
+        config_path,
+        proxy_port,
+        admin_port,
+        None,
+        observability_token,
+    )
 }
 
-/// Wait for the gateway health endpoint to respond.
-async fn wait_for_health(admin_port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
-    let deadline = std::time::SystemTime::now() + Duration::from_secs(30);
+/// Prove *this* child owns its admin/proxy listeners before returning.
+///
+/// Bare unauthenticated `/health` is not identity (issue #2132 / #3428): the
+/// bind-drop-rebind port reservation can let a parallel gateway answer on the
+/// released admin port while this child dies on proxy bind failure.
+async fn wait_for_owned_gateway(
+    child: &mut std::process::Child,
+    admin_port: u16,
+    observability_token: &str,
+    proxy_port: u16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    const STARTUP_TIMEOUT_SECS: u64 = 30;
+    const PROBE_SLICE: Duration = Duration::from_secs(1);
+    let deadline = Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
+    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+
+    let mut last_observation = String::from("no response yet");
     loop {
-        if std::time::SystemTime::now() >= deadline {
-            return Err("Gateway did not start within 30 seconds".into());
+        if let Some(status) = child.try_wait()? {
+            return Err(format!(
+                "Gateway exited during startup with {status} \
+                 (last observation: {last_observation})"
+            )
+            .into());
         }
-        match reqwest::get(&health_url).await {
-            Ok(r) if r.status().is_success() => return Ok(()),
-            _ => sleep(Duration::from_millis(500)).await,
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "Gateway did not prove ownership of admin port {admin_port} within \
+                 {STARTUP_TIMEOUT_SECS} seconds (last observation: {last_observation})"
+            )
+            .into());
         }
+        match probe_gateway_identity(admin_port, observability_token, remaining.min(PROBE_SLICE))
+            .await
+        {
+            Ok(()) => break,
+            Err(err) => last_observation = err.to_string(),
+        }
+    }
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(format!("Gateway exited after reporting ready with {status}").into());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Gateway port {proxy_port} did not accept TCP connections within \
+                 {STARTUP_TIMEOUT_SECS} seconds (last observation: {last_observation})"
+            )
+            .into());
+        }
+        match tokio::net::TcpStream::connect(&proxy_addr).await {
+            Ok(stream) => {
+                drop(stream);
+                return Ok(());
+            }
+            Err(err) => last_observation = err.to_string(),
+        }
+        sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -226,23 +305,35 @@ async fn start_otel_gateway_with_retry(
         sleep(Duration::from_millis(200)).await;
 
         // Start gateway
-        let mut gateway_process =
-            match start_gateway(&config_path.to_string_lossy(), proxy_port, admin_port) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!(
-                        "Gateway spawn attempt {}/{} failed: {}",
-                        attempt, MAX_ATTEMPTS, e
-                    );
-                    echo_handle.abort();
-                    if attempt < MAX_ATTEMPTS {
-                        sleep(Duration::from_secs(1)).await;
-                    }
-                    continue;
+        let observability_token = otel_ldap_observability_token(proxy_port, admin_port, attempt);
+        let mut gateway_process = match start_gateway(
+            &config_path.to_string_lossy(),
+            proxy_port,
+            admin_port,
+            &observability_token,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "Gateway spawn attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, e
+                );
+                echo_handle.abort();
+                if attempt < MAX_ATTEMPTS {
+                    sleep(Duration::from_secs(1)).await;
                 }
-            };
+                continue;
+            }
+        };
 
-        match wait_for_health(admin_port).await {
+        match wait_for_owned_gateway(
+            &mut gateway_process,
+            admin_port,
+            &observability_token,
+            proxy_port,
+        )
+        .await
+        {
             Ok(()) => {
                 return (
                     gateway_process,
@@ -490,23 +581,35 @@ async fn start_ldap_gateway_with_retry(
         let echo_handle = tokio::spawn(start_echo_server_on(backend_listener));
         sleep(Duration::from_millis(200)).await;
 
-        let mut gateway_process =
-            match start_gateway(&config_path.to_string_lossy(), proxy_port, admin_port) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!(
-                        "Gateway spawn attempt {}/{} failed: {}",
-                        attempt, MAX_ATTEMPTS, e
-                    );
-                    echo_handle.abort();
-                    if attempt < MAX_ATTEMPTS {
-                        sleep(Duration::from_secs(1)).await;
-                    }
-                    continue;
+        let observability_token = otel_ldap_observability_token(proxy_port, admin_port, attempt);
+        let mut gateway_process = match start_gateway(
+            &config_path.to_string_lossy(),
+            proxy_port,
+            admin_port,
+            &observability_token,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "Gateway spawn attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, e
+                );
+                echo_handle.abort();
+                if attempt < MAX_ATTEMPTS {
+                    sleep(Duration::from_secs(1)).await;
                 }
-            };
+                continue;
+            }
+        };
 
-        match wait_for_health(admin_port).await {
+        match wait_for_owned_gateway(
+            &mut gateway_process,
+            admin_port,
+            &observability_token,
+            proxy_port,
+        )
+        .await
+        {
             Ok(()) => {
                 return (
                     gateway_process,
@@ -567,11 +670,13 @@ async fn start_ldap_rebinding_gateway_with_retry(
 
         let echo_handle = tokio::spawn(start_echo_server_on(backend_listener));
         sleep(Duration::from_millis(200)).await;
+        let observability_token = otel_ldap_observability_token(proxy_port, admin_port, attempt);
         let mut gateway_process = match start_gateway_with_dns(
             &config_path.to_string_lossy(),
             proxy_port,
             admin_port,
             Some(dns_resolver),
+            &observability_token,
         ) {
             Ok(process) => process,
             Err(error) => {
@@ -586,7 +691,14 @@ async fn start_ldap_rebinding_gateway_with_retry(
             }
         };
 
-        match wait_for_health(admin_port).await {
+        match wait_for_owned_gateway(
+            &mut gateway_process,
+            admin_port,
+            &observability_token,
+            proxy_port,
+        )
+        .await
+        {
             Ok(()) => {
                 return (
                     gateway_process,

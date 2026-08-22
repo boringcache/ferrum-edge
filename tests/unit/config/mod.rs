@@ -54,6 +54,7 @@ mod plugin_migration_tests;
 mod plugin_trigger_tests;
 mod pool_config_tests;
 mod runtime_config_apply_tests;
+mod scheduled_scaling_tests;
 mod separate_listeners_tests;
 mod sidecar_inbound_same_pod_multi_service_tests;
 mod sidecar_ingress_bind_tests;

@@ -29,6 +29,36 @@
 //! still required, TCP never reads these maps, and nothing here admits an
 //! unmarked datagram.
 //!
+//! # The source tuple is not, and never was, a sender proof (issues #3956/#3957)
+//!
+//! A source address and a socket mark are both chosen by whoever emits the
+//! packet. A same-node workload in the HOST network namespace holding only
+//! SOCKET-level privilege (`CAP_NET_RAW` suffices for `IP_TRANSPARENT`, and for
+//! `SO_MARK` since Linux 5.17) can `SO_MARK` the relay's mark and bind either a
+//! configured node address or a published Service ClusterIP, and so present the
+//! complete admission this map was originally the second half of.
+//! Because the map is listener-wide, that replay works against ANY enrolled
+//! destination, not just the one whose Service was named.
+//!
+//! So the generation carries a THIRD field: the publishing proxy's own
+//! Kubernetes pod UID. The node-agent resolves it host-side to the relay pod's
+//! cgroup-v2 subtree and writes that into `FERRUM_UDP_RELAY_CGROUPS`, which the
+//! tc UDP arms require — via `bpf_skb_cgroup_id()`, the cgroup of the socket
+//! that generated the skb — BEFORE they consult a node source or a reply
+//! source. That id is assigned by the kernel at socket creation from the
+//! creating task's cgroup, so it cannot be presented by a process outside the
+//! relay's cgroup.
+//!
+//! The pod UID is a NAME on this channel, never an authorization. The
+//! node-agent resolves it against the real hierarchy and refuses it outright
+//! when it names an ENROLLED workload, so nothing published here can authorize
+//! one of the pods the guard protects to answer as the relay. A publication
+//! that cannot name a relay identity is refused rather than downgraded — except
+//! an INACTIVE generation, which authorizes nothing and must stay publishable
+//! so withdrawal is always provable. An ACTIVE generation with zero sources
+//! still names the relay: that is the bound headless/VIP-less listener whose
+//! marked backend dial needs the sender proof and names no ClusterIP tuple.
+//!
 //! # Ownership: why this is a file channel and not a map write
 //!
 //! The node-agent is the sole writer of every BPF map, and the mesh proxy's
@@ -50,17 +80,22 @@
 //!   observes either the entire previous generation or the entire new one. A
 //!   directory of one file per claim could be — and, on the 250 ms node-agent
 //!   poll, regularly would be — observed mid-rewrite as a partial set.
-//! * `applied` — written ONLY by the node-agent, and only after the COMPLETE
-//!   IPv4 + IPv6 set of that exact generation is in both BPF maps and their one
-//!   shared classifier gate is enabled. It names that generation and nothing
-//!   else. Map keys are inert while the gate is disabled.
+//! * `applied` — written ONLY by the node-agent, and only after that exact
+//!   generation's COMPLETE IPv4 + IPv6 source set AND its resolved relay-cgroup
+//!   set are in all three BPF maps and their one shared classifier gate is
+//!   enabled. It names that generation and nothing else. Map keys are inert
+//!   while the gate is disabled.
 //!
-//! A generation is `(owner, sequence)`. The owner is a per-process random token
-//! (16 lowercase hex digits, [`RegistryDirReplySourcePublisher::new`]) and the
-//! sequence is monotonic within that owner, bumped whenever the desired set
-//! changes. It is not a secret and is never treated as one: it exists so that an
-//! acknowledgement written for a predecessor process, for an earlier set, or for
-//! a differently ordered rendering of a set can never be read as proof about the
+//! A generation is `(owner, sequence, active)`. The owner is a per-process
+//! random token (16 lowercase hex digits,
+//! [`RegistryDirReplySourcePublisher::new`]) and the sequence is monotonic
+//! within that owner, bumped whenever the desired set OR serving bit changes.
+//! `active` is part of the identity so an active-empty ↔ inactive-empty
+//! transition is always a new generation and a stale acknowledgement of one
+//! can never satisfy the other. It is not a secret and is never treated as
+//! one: it exists so that an acknowledgement written for a predecessor
+//! process, for an earlier set, for a differently ordered rendering of a set,
+//! or for the opposite serving state can never be read as proof about the
 //! generation a live proxy is asking for. The manifest's claim lines are
 //! strictly ascending in the destination order, so one set has exactly one
 //! rendering and a reordered file is refused rather than normalized.
@@ -69,9 +104,10 @@
 //!
 //! Publication is bound to the SERVING lifecycle, not to configuration.
 //! [`NodeWaypointUdpSteering`](super::node_waypoint_udp_steering) owns the call
-//! and only ever passes destinations whose listeners are bound on the accepted
-//! serving generation, so a candidate config authorizes nothing by being parsed.
-//! Within one reconcile:
+//! and distinguishes a bound, started, non-finished UDP/DTLS listener
+//! (ACTIVE, sender proof live) from ClusterIP steering destinations (the
+//! source tuples). A candidate config authorizes nothing by being parsed, and
+//! a configured-but-unbound listener activates nothing. Within one reconcile:
 //!
 //! * steering rules for the outgoing generation are removed first,
 //! * the new generation is published, and then the reconcile waits for the
@@ -79,9 +115,11 @@
 //!   installed — publishing a claim is not evidence that a map holds it, and the
 //!   window between the two is exactly the steered-but-unanswerable black hole
 //!   this channel exists to close,
-//! * on teardown the order reverses — rules first, then the empty generation —
-//!   and the withdrawal is not proven until the node-agent acknowledges the
-//!   empty generation too.
+//! * on teardown the order reverses — rules first, then the INACTIVE
+//!   generation — and the withdrawal is not proven until the node-agent
+//!   acknowledges that inactive generation too. Removing ClusterIP
+//!   destinations while a listener stays bound publishes ACTIVE with an empty
+//!   source set rather than withdrawing the sender proof.
 //!
 //! Every failure is fail-closed: a publication that cannot be written refuses
 //! the whole generation and tears the datapath down, a pending or stale
@@ -113,19 +151,39 @@ pub const NODE_WAYPOINT_UDP_REPLY_SOURCE_APPLIED_FILE: &str = "applied";
 /// never be parsed as a desired generation, or the reverse.
 const MANIFEST_MAGIC: &str = "ferrum-udp-reply-src";
 const ACK_MAGIC: &str = "ferrum-udp-reply-src-ack";
-const PROTOCOL_VERSION: &str = "v1";
+/// `v3` adds an explicit `active`/`inactive` serving token so a bound
+/// headless/VIP-less listener can keep the relay-cgroup sender proof live with
+/// an empty source set. `v1` named no relay identity; `v2` still equated an
+/// empty source set with withdrawal. Both are unparseable: honouring either
+/// would authorize the wrong half of the classifier's conjunction.
+const PROTOCOL_VERSION: &str = "v3";
+/// Canonical serving-state tokens. Anything else, including empty, mixed case,
+/// or a synonym, refuses the whole generation.
+const STATE_ACTIVE: &str = "active";
+const STATE_INACTIVE: &str = "inactive";
 
 /// Owner tokens are exactly this many lowercase hex digits. Fixed width so the
 /// parse is total and a padded or truncated spelling is not a second name for
 /// one owner.
 const OWNER_TOKEN_CHARS: usize = 16;
 
+/// Header field spelling for "this generation names no relay identity". A
+/// single `-` cannot collide with a real pod UID because [`parse_relay_pod_uid`]
+/// refuses a leading dash.
+const NO_RELAY_POD_UID: &str = "-";
+
+/// Upper bound on the relay pod UID token. A Kubernetes pod UID is a 36-byte
+/// RFC 4122 UUID; the slack absorbs non-standard control planes without letting
+/// the field grow into an unbounded path component.
+const MAX_RELAY_POD_UID_CHARS: usize = 64;
+
 /// `6-` + 32 hex digits + `-` + 5 port digits + `\n`.
 const MAX_CLAIM_LINE_BYTES: usize = 41;
 
 /// Magic (20) + space + version (2) + space + owner (16) + space + a 20-digit
-/// `u64` + space + a 3-digit count + `\n`, with slack.
-const MAX_HEADER_BYTES: usize = 96;
+/// `u64` + space + state (`inactive` is 8) + space + a 3-digit count + space +
+/// the relay pod UID ([`MAX_RELAY_POD_UID_CHARS`]) + `\n`, with slack.
+const MAX_HEADER_BYTES: usize = 192;
 
 /// Hard read bound for the desired generation. Anything larger is refused
 /// outright rather than parsed: the writer is Ferrum, so an oversized file is a
@@ -136,15 +194,21 @@ const MAX_MANIFEST_BYTES: usize =
 /// Hard read bound for the acknowledgement, which is exactly one header line.
 const MAX_ACK_BYTES: usize = MAX_HEADER_BYTES;
 
-/// One coherent publication of the authorized reply-source set.
+/// One coherent publication of the authorized reply-source set AND the
+/// serving/active bit that decides whether the relay-cgroup sender proof is
+/// live.
 ///
-/// `owner` is process-unique and `sequence` is monotonic within it, so equality
-/// answers exactly one question: "is the set the node-agent proved applied the
-/// set this process is asking for right now?"
+/// `owner` is process-unique, `sequence` is monotonic within it, and `active`
+/// is part of the identity, so equality answers exactly one question: "is the
+/// set AND serving state the node-agent proved applied the set this process is
+/// asking for right now?" An active-empty generation and an inactive-empty
+/// generation are therefore distinct even when both have zero sources — a
+/// stale acknowledgement of one can never satisfy the other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplySourceGeneration {
     owner: String,
     sequence: u64,
+    active: bool,
 }
 
 impl ReplySourceGeneration {
@@ -160,16 +224,31 @@ impl ReplySourceGeneration {
         self.sequence
     }
 
-    /// Sentinel generation for a steering instance with no publication channel
-    /// (non-Linux, or no registry directory). Nothing is authorized and nothing
-    /// is materialized there, so the pair is trivially coherent. It can never be
+    /// Whether this generation keeps the relay-cgroup sender proof live.
+    ///
+    /// Active-empty (a bound headless/VIP-less listener) is true; a true
+    /// withdrawal is false. Part of canonical identity: an active-empty ↔
+    /// inactive-empty transition is a new generation.
+    #[allow(dead_code)] // Diagnostic/test accessor.
+    pub fn active(&self) -> bool {
+        self.active
+    }
+
+    /// Sentinel generation for a publisher-less steering instance (non-Linux,
+    /// or no registry directory). Nothing is authorized and nothing is
+    /// materialized there, so the pair is trivially coherent. It can never be
     /// confused with a real generation: the parser requires 16 lowercase hex
     /// digits for an owner and a nonzero sequence, so this value cannot come off
     /// disk and cannot be written to it.
-    pub(crate) fn inert() -> Self {
+    ///
+    /// Publisher-less steering still distinguishes active-empty from
+    /// inactive-empty so quiet-poll `generation_proven` cannot treat a bound
+    /// headless listener as a proven withdrawal.
+    pub(crate) fn inert_with_active(active: bool) -> Self {
         Self {
             owner: "inert".to_string(),
             sequence: 0,
+            active,
         }
     }
 }
@@ -178,11 +257,31 @@ impl ReplySourceGeneration {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesiredReplySources {
     /// The generation to acknowledge once — and only once — the whole set below
-    /// is live in BOTH BPF map families.
+    /// is live in EVERY BPF map family.
     pub generation: ReplySourceGeneration,
     /// The complete authorized set, ascending and deduplicated by construction:
     /// the parser refuses any other rendering.
     pub sources: Vec<NodeWaypointUdpSteerDestination>,
+    /// The Kubernetes pod UID of the publishing NodeWaypoint proxy, from which
+    /// the node-agent resolves the relay's cgroup-v2 subtree host-side (issues
+    /// #3956, #3957).
+    ///
+    /// This is a NAME, never an authorization: the node-agent resolves it
+    /// against the real cgroup hierarchy and refuses it outright when it names
+    /// an ENROLLED workload, so the channel can never authorize one of the pods
+    /// this guard protects to answer as the relay.
+    ///
+    /// `None` only for an INACTIVE generation — a withdrawal authorizes
+    /// nothing and therefore needs no identity, which is what keeps teardown
+    /// reliable on a proxy that cannot learn its own pod UID. An ACTIVE
+    /// generation, including one with zero ClusterIP sources (a bound
+    /// headless/VIP-less or direct-node listener), MUST name a usable relay
+    /// identity so the node-agent can keep `FERRUM_UDP_RELAY_CGROUPS` live.
+    /// [`parse_manifest`] refuses every other combination: active without
+    /// identity, inactive with sources, inactive with identity, a non-empty
+    /// source set that is not active, malformed state tokens, and inconsistent
+    /// counts.
+    pub relay_pod_uid: Option<String>,
 }
 
 /// Encode one authorized reply source as a manifest claim line.
@@ -272,7 +371,7 @@ fn decode_hex_octets(hex: &str, out: &mut [u8]) -> Option<()> {
     if bytes.len() != out.len() * 2 {
         return None;
     }
-    for (slot, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+    for (slot, pair) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
         let high = (pair[0] as char).to_digit(16)?;
         let low = (pair[1] as char).to_digit(16)?;
         *slot = ((high << 4) | low) as u8;
@@ -290,6 +389,36 @@ fn parse_canonical_u64(token: &str) -> Option<u64> {
     Some(value)
 }
 
+/// Strictly parse the relay-identity header field.
+///
+/// `Some(None)` is the `-` sentinel (no relay identity, valid only for an empty
+/// generation); `Some(Some(uid))` is a pod UID; `None` refuses the manifest.
+///
+/// The charset is deliberately narrower than "any pod UID a control plane might
+/// mint": lowercase alphanumerics and interior dashes only, bounded length, no
+/// leading or trailing dash. The node-agent turns this token into a filesystem
+/// path under the cgroup root, so `/`, `\\`, `.`, and `..` must be
+/// unrepresentable HERE, at the trust boundary, rather than sanitized later by
+/// whichever consumer happens to remember to.
+fn parse_relay_pod_uid(token: &str) -> Option<Option<String>> {
+    if token == NO_RELAY_POD_UID {
+        return Some(None);
+    }
+    if token.is_empty() || token.len() > MAX_RELAY_POD_UID_CHARS {
+        return None;
+    }
+    if token.starts_with('-') || token.ends_with('-') {
+        return None;
+    }
+    if !token
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return None;
+    }
+    Some(Some(token.to_string()))
+}
+
 fn parse_owner(token: &str) -> Option<String> {
     if token.len() != OWNER_TOKEN_CHARS {
         return None;
@@ -305,20 +434,28 @@ fn parse_owner(token: &str) -> Option<String> {
 
 /// Render the whole desired generation. `sources` must already be ascending and
 /// deduplicated — [`RegistryDirReplySourcePublisher::publish`] guarantees it,
-/// and [`parse_manifest`] refuses anything else.
+/// and [`parse_manifest`] refuses anything else. `active` is the serving bit:
+/// true keeps the relay-cgroup sender proof live even when `sources` is empty.
 fn render_manifest(
     generation: &ReplySourceGeneration,
     sources: &[NodeWaypointUdpSteerDestination],
+    relay_pod_uid: Option<&str>,
 ) -> String {
     use std::fmt::Write as _;
 
     let mut body = String::with_capacity(MAX_HEADER_BYTES + sources.len() * MAX_CLAIM_LINE_BYTES);
+    let state = if generation.active {
+        STATE_ACTIVE
+    } else {
+        STATE_INACTIVE
+    };
     let _ = writeln!(
         body,
-        "{MANIFEST_MAGIC} {PROTOCOL_VERSION} {} {} {}",
+        "{MANIFEST_MAGIC} {PROTOCOL_VERSION} {} {} {state} {} {}",
         generation.owner,
         generation.sequence,
-        sources.len()
+        sources.len(),
+        relay_pod_uid.unwrap_or(NO_RELAY_POD_UID)
     );
     for source in sources {
         let _ = writeln!(body, "{}", encode_claim(source));
@@ -348,12 +485,33 @@ fn parse_manifest(bytes: &[u8]) -> Option<DesiredReplySources> {
     }
     let owner = parse_owner(header.next()?)?;
     let sequence = parse_canonical_u64(header.next()?)?;
+    let active = match header.next()? {
+        STATE_ACTIVE => true,
+        STATE_INACTIVE => false,
+        _ => return None,
+    };
     let count = parse_canonical_u64(header.next()?)?;
+    let relay_pod_uid = parse_relay_pod_uid(header.next()?)?;
     if header.next().is_some() {
         return None;
     }
     // Sequence 0 is never published, so it can only be junk or a sentinel.
     if sequence == 0 || count > MAX_NODE_WAYPOINT_UDP_STEER_DESTINATIONS as u64 {
+        return None;
+    }
+    // Serving state, source count, and relay identity are one statement:
+    //
+    // * ACTIVE requires a usable relay identity even at count 0, so a bound
+    //   headless/VIP-less listener can keep the sender proof live without
+    //   authorizing any ClusterIP tuple.
+    // * INACTIVE is the only true withdrawal: zero sources and no identity.
+    // * A non-empty source set implies active; the inverse combinations
+    //   (active without identity, inactive with sources, inactive with
+    //   identity) are the shapes that would open the wrong half of the
+    //   classifier's conjunction and are refused whole.
+    if active {
+        relay_pod_uid.as_ref()?;
+    } else if count > 0 || relay_pod_uid.is_some() {
         return None;
     }
 
@@ -378,8 +536,13 @@ fn parse_manifest(bytes: &[u8]) -> Option<DesiredReplySources> {
     }
 
     Some(DesiredReplySources {
-        generation: ReplySourceGeneration { owner, sequence },
+        generation: ReplySourceGeneration {
+            owner,
+            sequence,
+            active,
+        },
         sources,
+        relay_pod_uid,
     })
 }
 
@@ -398,10 +561,19 @@ fn parse_ack(bytes: &[u8]) -> Option<ReplySourceGeneration> {
     }
     let owner = parse_owner(header.next()?)?;
     let sequence = parse_canonical_u64(header.next()?)?;
+    let active = match header.next()? {
+        STATE_ACTIVE => true,
+        STATE_INACTIVE => false,
+        _ => return None,
+    };
     if sequence == 0 || header.next().is_some() {
         return None;
     }
-    Some(ReplySourceGeneration { owner, sequence })
+    Some(ReplySourceGeneration {
+        owner,
+        sequence,
+        active,
+    })
 }
 
 /// Publishes the authorized reply-source set for the serving generation and
@@ -411,17 +583,26 @@ fn parse_ack(bytes: &[u8]) -> Option<ReplySourceGeneration> {
 /// and fail-closed behaviour are testable without a registry directory, a
 /// node-agent, or root.
 pub trait NodeWaypointUdpReplySourcePublisher: Send + Sync + 'static {
-    /// Publish exactly `sources` as the desired generation, replacing whatever
-    /// was published before, and return the generation that names it. An empty
-    /// slice is a retraction, and must be as reliable as a publication — a
-    /// failure here means the caller may NOT record the withdrawal as done.
+    /// Publish exactly `sources` as the desired generation with serving state
+    /// `active`, replacing whatever was published before, and return the
+    /// generation that names it.
     ///
-    /// Republishing an unchanged set returns the SAME generation, so a
-    /// reconcile that is merely waiting for the node-agent cannot walk the
-    /// sequence forward faster than the acknowledgement can chase it.
+    /// `active == true` keeps the relay-cgroup sender proof live, including
+    /// when `sources` is empty (a bound headless/VIP-less or direct-node
+    /// listener). `active == false` is the only true withdrawal: `sources`
+    /// must be empty and the generation names no relay identity. A non-empty
+    /// source set with `active == false`, or an active generation this proxy
+    /// cannot name a relay identity for, is refused rather than published.
+    ///
+    /// Republishing an unchanged `(active, sources)` pair returns the SAME
+    /// generation, so a reconcile that is merely waiting for the node-agent
+    /// cannot walk the sequence forward faster than the acknowledgement can
+    /// chase it. An active-empty ↔ inactive-empty transition is a changed
+    /// identity and always advances the sequence.
     fn publish(
         &self,
         sources: &[NodeWaypointUdpSteerDestination],
+        active: bool,
     ) -> Result<ReplySourceGeneration, String>;
 
     /// The generation the node-agent has proven live in BOTH BPF map families,
@@ -433,6 +614,20 @@ pub trait NodeWaypointUdpReplySourcePublisher: Send + Sync + 'static {
 /// directory the node-agent already polls.
 pub struct RegistryDirReplySourcePublisher {
     dir: PathBuf,
+    /// This proxy's own Kubernetes pod UID, from which the node-agent resolves
+    /// the relay cgroup subtree that makes a UDP relay datagram provable.
+    /// `None` when the deployment supplies no downward-API identity: every
+    /// ACTIVE publication then fails closed (nothing is steered and the sender
+    /// proof is not opened), while an INACTIVE withdrawal generation still
+    /// publishes so teardown stays reliable.
+    relay_pod_uid: Option<String>,
+    /// Whether `FERRUM_MESH_NODE_WAYPOINT_RELAY_POD_UID` was SET but rejected,
+    /// as opposed to simply absent. Both leave `relay_pod_uid` `None` and both
+    /// refuse every ACTIVE publication, but only one of them is a
+    /// misconfiguration the operator can correct — and the startup diagnostic
+    /// in `arm_mesh_runtime_startup` only fires for the ABSENT case.
+    #[allow(dead_code)] // Diagnostic/test accessor.
+    relay_pod_uid_rejected: bool,
     /// Secure-random process owner. `None` makes every publication fail closed;
     /// a predictable fallback could collide with a predecessor and let its
     /// acknowledgement satisfy this process.
@@ -442,24 +637,66 @@ pub struct RegistryDirReplySourcePublisher {
     /// set — which is what would let a stale acknowledgement satisfy a
     /// generation it never saw.
     next_sequence: AtomicU64,
-    /// The set most recently published, with its sequence, so an unchanged
-    /// republication keeps its generation.
-    last: Mutex<Option<(u64, Vec<NodeWaypointUdpSteerDestination>)>>,
+    /// The set most recently published, with its sequence and serving bit, so
+    /// an unchanged republication of the same `(active, sources)` pair keeps
+    /// its generation. Active-empty and inactive-empty are distinct here.
+    last: Mutex<Option<(u64, bool, Vec<NodeWaypointUdpSteerDestination>)>>,
 }
 
 impl RegistryDirReplySourcePublisher {
     /// `registry_dir` is the pod registry root
     /// (`FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`); the channel subdirectory
     /// is appended here so no caller can pick a different one.
-    pub fn new(registry_dir: impl AsRef<Path>) -> Self {
+    ///
+    /// `relay_pod_uid` is this proxy's own pod UID
+    /// (`FERRUM_MESH_NODE_WAYPOINT_RELAY_POD_UID`, downward API
+    /// `metadata.uid`). A blank or unrepresentable value is normalized to
+    /// `None` HERE rather than written to the channel, so an unusable identity
+    /// becomes a refusal to authorize rather than a manifest the node-agent has
+    /// to refuse later.
+    pub fn new(registry_dir: impl AsRef<Path>, relay_pod_uid: Option<&str>) -> Self {
+        let accepted = relay_pod_uid
+            .map(str::trim)
+            .filter(|uid| !uid.is_empty())
+            .and_then(|uid| parse_relay_pod_uid(uid).flatten());
+        // A value that was SUPPLIED and rejected is a different operator
+        // problem from one that was never supplied, and the startup warning in
+        // `arm_mesh_runtime_startup` only covers the latter. Without this the
+        // only symptom of a mistyped UID is the steering reconcile's generic
+        // "active generation could not be published", while the UDP relay stays
+        // permanently dark. The rejected value is NOT logged: it is a pod
+        // identity, and it is exactly the shape this parser refused to let
+        // reach a filesystem path.
+        let rejected = relay_pod_uid.is_some() && accepted.is_none();
+        if rejected {
+            tracing::warn!(
+                "FERRUM_MESH_NODE_WAYPOINT_RELAY_POD_UID is set but is not a usable pod \
+                 identity, so it is treated as unset: the node-agent cannot resolve this \
+                 relay's cgroup and NodeWaypoint UDP/DTLS admission fails closed at the \
+                 pod-veth guard. It must be lowercase alphanumerics and interior dashes \
+                 only, at most {MAX_RELAY_POD_UID_CHARS} characters, exactly as the \
+                 downward API `metadata.uid` renders it."
+            );
+        }
         Self {
             dir: registry_dir
                 .as_ref()
                 .join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DIR),
             owner: owner_token(),
+            relay_pod_uid: accepted,
+            relay_pod_uid_rejected: rejected,
             next_sequence: AtomicU64::new(1),
             last: Mutex::new(None),
         }
+    }
+
+    /// Whether construction saw a relay pod UID that was SET but unusable.
+    ///
+    /// `false` for both an accepted identity and an absent one; the two absent
+    /// cases are what this distinguishes.
+    #[allow(dead_code)] // Diagnostic/test accessor.
+    pub fn relay_pod_uid_rejected(&self) -> bool {
+        self.relay_pod_uid_rejected
     }
 }
 
@@ -467,6 +704,7 @@ impl NodeWaypointUdpReplySourcePublisher for RegistryDirReplySourcePublisher {
     fn publish(
         &self,
         sources: &[NodeWaypointUdpSteerDestination],
+        active: bool,
     ) -> Result<ReplySourceGeneration, String> {
         let owner = self.owner.as_deref().ok_or_else(|| {
             "secure randomness is unavailable for the NodeWaypoint UDP reply-source owner"
@@ -478,6 +716,30 @@ impl NodeWaypointUdpReplySourcePublisher for RegistryDirReplySourcePublisher {
                 sources.len(),
                 MAX_NODE_WAYPOINT_UDP_STEER_DESTINATIONS
             ));
+        }
+        if !active && !sources.is_empty() {
+            return Err(
+                "refusing to publish an inactive NodeWaypoint UDP/DTLS generation with reply \
+                 sources; a withdrawal authorizes nothing"
+                    .to_string(),
+            );
+        }
+        // Fail closed rather than publishing an ACTIVE generation with no
+        // sender proof behind it (issues #3956, #3957), including the
+        // active-empty headless/VIP-less shape: without a relay identity the
+        // node-agent cannot resolve FERRUM_UDP_RELAY_CGROUPS, and opening the
+        // gate over an empty sender map is the same replay. INACTIVE is
+        // exempt: it authorizes nothing, and a withdrawal that could not be
+        // published is exactly the state that leaves a predecessor's
+        // authorization live.
+        if active && self.relay_pod_uid.is_none() {
+            return Err(
+                "refusing to authorize NodeWaypoint UDP/DTLS relay sender proof: this proxy has no \
+                 usable relay pod identity, so the node-agent could not resolve the relay cgroup \
+                 the tc UDP guard requires. Set FERRUM_MESH_NODE_WAYPOINT_RELAY_POD_UID from the \
+                 downward API `metadata.uid`."
+                    .to_string(),
+            );
         }
         // Canonicalize here rather than trusting the caller: the manifest's
         // ascending-and-unique invariant is what makes one set have one
@@ -495,7 +757,11 @@ impl NodeWaypointUdpReplySourcePublisher for RegistryDirReplySourcePublisher {
 
         let mut last = lock_recovering(&self.last);
         let sequence = match last.as_ref() {
-            Some((sequence, published)) if published == &canonical => *sequence,
+            Some((sequence, published_active, published))
+                if *published_active == active && published == &canonical =>
+            {
+                *sequence
+            }
             _ => self
                 .next_sequence
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |sequence| {
@@ -508,8 +774,20 @@ impl NodeWaypointUdpReplySourcePublisher for RegistryDirReplySourcePublisher {
         let generation = ReplySourceGeneration {
             owner: owner.to_string(),
             sequence,
+            active,
         };
-        let body = render_manifest(&generation, &canonical);
+        // INACTIVE always renders the no-identity sentinel, whether or not
+        // this proxy has an identity: a withdrawal authorizes nothing, so
+        // naming a relay in it would be a claim the generation does not make.
+        // ACTIVE always names this proxy's identity, including at source count
+        // zero. `acknowledged` reconstructs the expected manifest by this same
+        // rule, so the two renderings must agree exactly.
+        let relay_pod_uid = if active {
+            self.relay_pod_uid.as_deref()
+        } else {
+            None
+        };
+        let body = render_manifest(&generation, &canonical, relay_pod_uid);
 
         // Forget the recorded set BEFORE the write: if the rename fails, what
         // the node-agent can read is unknown, and reusing this sequence for a
@@ -521,13 +799,13 @@ impl NodeWaypointUdpReplySourcePublisher for RegistryDirReplySourcePublisher {
             owner,
             body.as_bytes(),
         )?;
-        *last = Some((sequence, canonical));
+        *last = Some((sequence, active, canonical));
         Ok(generation)
     }
 
     fn acknowledged(&self) -> Result<Option<ReplySourceGeneration>, String> {
         let last = lock_recovering(&self.last);
-        let Some((sequence, sources)) = last.as_ref() else {
+        let Some((sequence, active, sources)) = last.as_ref() else {
             return Ok(None);
         };
         let Some(owner) = self.owner.as_ref() else {
@@ -537,16 +815,25 @@ impl NodeWaypointUdpReplySourcePublisher for RegistryDirReplySourcePublisher {
             generation: ReplySourceGeneration {
                 owner: owner.clone(),
                 sequence: *sequence,
+                active: *active,
             },
             sources: sources.clone(),
+            // Mirror `publish`'s own rendering rather than the field: inactive
+            // carries no identity even when this proxy has one; active always
+            // names it.
+            relay_pod_uid: if *active {
+                self.relay_pod_uid.clone()
+            } else {
+                None
+            },
         };
 
         // The acknowledgement alone is insufficient: a predecessor can write
         // a late proof after a successor has replaced `desired`, and hostile or
         // corrupt content can preserve `(owner, sequence)` while changing the
-        // set. Bind the proof to this publisher's exact manifest, checking on
-        // both sides of the acknowledgement read so an already-superseded
-        // publication never satisfies the serving reconcile.
+        // set or serving bit. Bind the proof to this publisher's exact
+        // manifest, checking on both sides of the acknowledgement read so an
+        // already-superseded publication never satisfies the serving reconcile.
         if read_desired_generation_in(&self.dir)?.as_ref() != Some(&expected) {
             return Ok(None);
         }
@@ -743,8 +1030,14 @@ pub fn write_acknowledgement(
 ) -> Result<(), String> {
     let dir = registry_dir.join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DIR);
     let body = format!(
-        "{ACK_MAGIC} {PROTOCOL_VERSION} {} {}\n",
-        generation.owner, generation.sequence
+        "{ACK_MAGIC} {PROTOCOL_VERSION} {} {} {}\n",
+        generation.owner,
+        generation.sequence,
+        if generation.active {
+            STATE_ACTIVE
+        } else {
+            STATE_INACTIVE
+        }
     );
     atomic_write(
         &dir,

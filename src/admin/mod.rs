@@ -44,13 +44,13 @@ use crate::admin::backup::{
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
     AtomicBatchGraph, BatchConfigWriteMode, DatabaseBackend, FullConfigLoadPurpose,
-    MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE, NamespaceResourceCounts, PROXY_ROUTE_CONFLICT_ERROR,
-    SnapshotDataIntegrityError, classify_atomic_clear_verification,
+    LiveApplyTopologyPins, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE, NamespaceResourceCounts,
+    PROXY_ROUTE_CONFLICT_ERROR, SnapshotDataIntegrityError, classify_atomic_clear_verification,
     is_mtls_dns_admission_unavailable, mtls_dns_identity_conflict,
     tcp_connection_throttle_attachment_conflict,
 };
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
-use crate::config::runtime_config_apply::{LiveApplyFailure, PreparedLiveApply};
+use crate::config::runtime_config_apply::{LiveApplyCursor, LiveApplyFailure, PreparedLiveApply};
 use crate::config::types::{
     ApiSpec, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
     max_credentials_per_type,
@@ -504,6 +504,7 @@ impl AdminState {
     pub async fn prepare_live_apply_after_commit(
         &self,
         namespace: &str,
+        topology_epoch: u64,
     ) -> Result<PreparedLiveApply, Response<Full<Bytes>>> {
         let Some(apply) = self.runtime_config_apply.as_ref() else {
             return Ok(PreparedLiveApply::noop());
@@ -517,8 +518,24 @@ impl AdminState {
                 LiveApplyFailure::SequenceUnavailable,
             ));
         };
+        if db.config_topology_epoch() != topology_epoch {
+            warn_persistence_failure_redacted("admin_write_live_apply_topology");
+            return Err(live_apply_failure_response(
+                LiveApplyFailure::SequenceUnavailable,
+            ));
+        }
         match db.latest_change_sequence(namespace).await {
-            Ok(sequence) => Ok(PreparedLiveApply::from_covering_sequence(sequence)),
+            Ok(sequence) if db.config_topology_epoch() == topology_epoch => {
+                Ok(PreparedLiveApply::from_covering_cursor(
+                    LiveApplyCursor::new(topology_epoch, sequence),
+                ))
+            }
+            Ok(_) => {
+                warn_persistence_failure_redacted("admin_write_live_apply_topology");
+                Err(live_apply_failure_response(
+                    LiveApplyFailure::SequenceUnavailable,
+                ))
+            }
             Err(_error) => {
                 warn_persistence_failure_redacted("admin_write_live_apply_sequence");
                 Err(live_apply_failure_response(
@@ -536,7 +553,7 @@ impl AdminState {
         &self,
         prepared: &PreparedLiveApply,
     ) -> Result<(), Response<Full<Bytes>>> {
-        let Some(sequence) = prepared.covering_sequence() else {
+        let Some(cursor) = prepared.covering_cursor() else {
             return Ok(());
         };
         let Some(apply) = self.runtime_config_apply.as_ref() else {
@@ -544,10 +561,29 @@ impl AdminState {
                 LiveApplyFailure::SequenceUnavailable,
             ));
         };
+        let Some(db) = self.db.as_ref() else {
+            return Err(live_apply_failure_response(
+                LiveApplyFailure::SequenceUnavailable,
+            ));
+        };
+        if db.config_topology_epoch() != cursor.topology_epoch {
+            return Err(live_apply_failure_response(
+                LiveApplyFailure::SequenceUnavailable,
+            ));
+        }
         apply
-            .await_committed(sequence)
+            .await_committed_cursor(cursor)
             .await
-            .map_err(live_apply_failure_response)
+            .map_err(live_apply_failure_response)?;
+        // The coordinator and database epoch are deliberately checked on both
+        // sides of the await. An old poll can finish concurrently with a
+        // reconnect, but it cannot turn that race into a successful response.
+        if db.config_topology_epoch() != cursor.topology_epoch {
+            return Err(live_apply_failure_response(
+                LiveApplyFailure::SequenceUnavailable,
+            ));
+        }
+        Ok(())
     }
 
     /// Overlay live-apply waiting onto a successful mutation response using a
@@ -596,7 +632,7 @@ impl AdminState {
         response: Response<Full<Bytes>>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response<Full<Bytes>>> + Send + 'a>>
     where
-        P: Send + 'a,
+        P: LiveApplyTopologyPins + Send + 'a,
     {
         Box::pin(self.complete_live_config_mutation_after_commit(namespace, pins, response))
     }
@@ -606,12 +642,19 @@ impl AdminState {
         namespace: &str,
         pins: P,
         response: Response<Full<Bytes>>,
-    ) -> Response<Full<Bytes>> {
+    ) -> Response<Full<Bytes>>
+    where
+        P: LiveApplyTopologyPins,
+    {
         if !response.status().is_success() {
             drop(pins);
             return response;
         }
-        let prepared = match self.prepare_live_apply_after_commit(namespace).await {
+        let topology_epoch = pins.topology_epoch();
+        let prepared = match self
+            .prepare_live_apply_after_commit(namespace, topology_epoch)
+            .await
+        {
             Ok(prepared) => prepared,
             Err(failure) => {
                 drop(pins);
@@ -638,6 +681,10 @@ impl AdminState {
     /// Use this for config-database mutations (CRUD, credentials, API specs,
     /// batch, restore). Managed TLS / ACME handlers mutate independent stores
     /// and must call [`Self::admit_non_config_db_write`] instead.
+    // Returning the constructed response by value matches the established admin
+    // admission contract; boxing would add allocation and API churn to a cold
+    // rejection path without reducing the successful-path footprint.
+    #[allow(clippy::result_large_err)]
     pub async fn admit_write(
         &self,
     ) -> Result<crate::config::db_backend::DbWriteTopologyPermit, Response<Full<Bytes>>> {
@@ -2265,7 +2312,7 @@ pub async fn handle_admin_request(
     );
     let result = audit::scope_request(
         Arc::clone(&slot),
-        handle_admin_request_inner(req, state, client_ip),
+        boxed_handle_admin_request_inner(req, state, client_ip),
     )
     .await;
     // The mutation returned, so the outcome is knowable. A prepared intent that
@@ -2278,6 +2325,27 @@ pub async fn handle_admin_request(
         .unwrap_or(500);
     audit::finalize_unconsumed_intent(&slot, status).await;
     result
+}
+
+type BoxedAdminResponseFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Response<Full<Bytes>>, hyper::Error>> + Send>,
+>;
+
+/// Construct the large route-dispatch future behind a non-inlined heap
+/// boundary.
+///
+/// The coverage profile instruments the unoptimized dispatcher, whose match
+/// includes every admin handler future. Keeping that aggregate future inline
+/// in [`handle_admin_request`] can exhaust the same two-MiB worker stack used
+/// by production Tokio runtimes as the route surface grows. The factory must
+/// return before the future is polled so the caller retains only a pointer.
+#[inline(never)]
+fn boxed_handle_admin_request_inner(
+    req: Request<Incoming>,
+    state: AdminState,
+    client_ip: std::net::IpAddr,
+) -> BoxedAdminResponseFuture {
+    Box::pin(handle_admin_request_inner(req, state, client_ip))
 }
 
 async fn handle_admin_request_inner(
@@ -3321,7 +3389,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_delete::<Proxy>(&state, &auth, id, &namespace).await
+            crud::handle_delete::<Proxy>(&state, &auth, id, &namespace, uri.query()).await
         }
 
         // Consumers CRUD
@@ -3348,7 +3416,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            crud::handle_delete::<Consumer>(&state, &auth, id, &namespace).await
+            crud::handle_delete::<Consumer>(&state, &auth, id, &namespace, uri.query()).await
         }
 
         // Consumer credentials
@@ -3426,7 +3494,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_delete::<PluginConfig>(&state, &auth, id, &namespace).await
+            crud::handle_delete::<PluginConfig>(&state, &auth, id, &namespace, uri.query()).await
         }
 
         // Upstreams CRUD
@@ -3453,7 +3521,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_delete::<Upstream>(&state, &auth, id, &namespace).await
+            crud::handle_delete::<Upstream>(&state, &auth, id, &namespace, uri.query()).await
         }
 
         // Gateway trust bundles CRUD (issue #3727).
@@ -3515,7 +3583,14 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            crud::handle_delete::<GatewayTrustBundleRecord>(&state, &auth, id, &namespace).await
+            crud::handle_delete::<GatewayTrustBundleRecord>(
+                &state,
+                &auth,
+                id,
+                &namespace,
+                uri.query(),
+            )
+            .await
         }
 
         // Batch create
@@ -4805,6 +4880,9 @@ async fn load_consumer_in_namespace(
     }
 }
 
+// Namespace admission failures return a full HTTP response; boxing would
+// diverge from the established admin handler error contract.
+#[allow(clippy::result_large_err)]
 async fn acquire_credential_namespace_admission(
     db: Arc<dyn DatabaseBackend>,
     namespace: &str,

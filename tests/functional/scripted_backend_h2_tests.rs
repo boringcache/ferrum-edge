@@ -37,7 +37,7 @@ use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{GrpcClient, Http2Client};
 use crate::scaffolding::file_mode_yaml_for_backend_with;
 use crate::scaffolding::harness::GatewayHarness;
-use crate::scaffolding::ports::reserve_port;
+use crate::scaffolding::ports::{reserve_port, reserve_refused_tcp_port};
 use crate::scaffolding::to_file_mode_yaml;
 use bytes::Bytes;
 use reqwest::StatusCode;
@@ -2584,13 +2584,13 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
         // warmup must not add an extra dial to the count. Note this does NOT
         // make the gateway cold: with warmup off, `modes::file::serve` sets
         // `run_initial_refresh = true` and the backend-capability refresh task
-        // immediately probes this plaintext backend via
-        // `ProxyState::probe_h2c` -> `grpc_pool.get_sender_for_capability_probe()`.
-        // That probe uses
-        // a clone of this proxy whose only delta is a clamped connect timeout —
-        // a field deliberately excluded from the pool key — so it lands on the
-        // SAME single-shard gRPC pool entry the request path uses, and it is
-        // spawned rather than awaited before readiness.
+        // probes this plaintext backend via `ProxyState::probe_h2c` ->
+        // `grpc_pool.get_sender_for_capability_probe()` after required
+        // listeners have bound (issue #4080). That probe uses a clone of this
+        // proxy whose only delta is a clamped connect timeout — a field
+        // deliberately excluded from the pool key — so it lands on the SAME
+        // single-shard gRPC pool entry the request path uses. The probe is
+        // spawned after `/health` flips ready rather than awaited.
         // `wait_for_grpc_h2c_probe_accept_armed` below waits until that probe
         // has finished inserting its sender *and* connection 0's AcceptRpc is
         // parked, so the warmup RPC reuses the healthy probe sender instead of
@@ -2683,9 +2683,10 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
 /// `AcceptRpc` is armed.
 ///
 /// With `FERRUM_POOL_WARMUP_ENABLED=false` the binary harness still gets
-/// `run_initial_refresh = true` (see `modes::file::serve`), so a spawned
-/// capability-refresh pass dials plaintext backends through the shared gRPC
-/// pool via `probe_h2c` → `get_sender_for_capability_probe()`. Under
+/// `run_initial_refresh = true` after required listeners bind (see
+/// `modes::file::serve`), so a spawned capability-refresh pass dials
+/// plaintext backends through the shared gRPC pool via `probe_h2c` →
+/// `get_sender_for_capability_probe()`. Under
 /// `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST=1` that probe occupies the only
 /// shard and inserts a pooled sender the request path will reuse.
 ///
@@ -2791,9 +2792,12 @@ async fn wait_for_backend_goaway_sent(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn grpc_retry_preserves_duplicate_metadata_on_second_attempt() {
-    let down = reserve_port().await.expect("reserve down port");
+    // Bound-but-not-listening: the kernel refuses the connect AND no parallel
+    // test can steal the port. A released port can be re-bound by another
+    // test, and then attempt 1 gets a real answer instead of a refusal, so
+    // the retry never fires and the metadata assertions below cannot run.
+    let down = reserve_refused_tcp_port().expect("reserve refused down port");
     let down_port = down.port;
-    drop(down); // refuse connections
 
     let up = reserve_port().await.expect("reserve up port");
     let up_port = up.port;

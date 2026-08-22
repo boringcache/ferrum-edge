@@ -23,7 +23,7 @@ use ferrum_edge::admin::{
 };
 use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::db_loader::DatabaseStore;
-use ferrum_edge::config::runtime_config_apply::RuntimeConfigApply;
+use ferrum_edge::config::runtime_config_apply::{LiveApplyFailure, RuntimeConfigApply};
 use ferrum_edge::config::types::{Proxy, default_namespace};
 use http_body_util::{BodyExt, Full};
 use hyper::{Response, StatusCode};
@@ -143,7 +143,7 @@ async fn prepare_is_noop_without_coordinator_or_served_namespace() {
 
     let none_state = live_apply_state(db.clone(), None);
     let prepared = none_state
-        .prepare_live_apply_after_commit(&default_namespace())
+        .prepare_live_apply_after_commit(&default_namespace(), 0)
         .await
         .expect("no coordinator must skip the sequence read");
     assert!(prepared.is_noop());
@@ -151,7 +151,7 @@ async fn prepare_is_noop_without_coordinator_or_served_namespace() {
     let apply = Arc::new(RuntimeConfigApply::new("ferrum", 0));
     let served = live_apply_state(db, Some(apply));
     let other = served
-        .prepare_live_apply_after_commit("other")
+        .prepare_live_apply_after_commit("other", 0)
         .await
         .expect("unserved namespace must skip the sequence read");
     assert!(other.is_noop());
@@ -172,10 +172,11 @@ async fn covering_watermark_is_max_sequence_not_an_exact_row() {
     );
 
     let apply = Arc::new(RuntimeConfigApply::new("ferrum", 0));
+    let topology_epoch = store.config_topology_epoch();
     let db: Arc<dyn DatabaseBackend> = Arc::new(store);
     let state = live_apply_state(db, Some(apply));
     let prepared = state
-        .prepare_live_apply_after_commit(&default_namespace())
+        .prepare_live_apply_after_commit(&default_namespace(), topology_epoch)
         .await
         .expect("sequence read on the pinned store");
     assert_eq!(prepared.covering_sequence(), Some(covering));
@@ -216,7 +217,7 @@ async fn active_coordinator_without_database_store_fails_closed() {
     };
 
     let failure = state
-        .prepare_live_apply_after_commit(&default_namespace())
+        .prepare_live_apply_after_commit(&default_namespace(), 0)
         .await
         .expect_err("an active live-apply coordinator requires its database store");
     let (status, body) = response_json(failure).await;
@@ -226,7 +227,7 @@ async fn active_coordinator_without_database_store_fails_closed() {
 }
 
 #[tokio::test]
-async fn sequence_is_captured_under_pin_and_not_re_queried_after_release() {
+async fn captured_sequence_fails_closed_after_pinned_topology_is_replaced() {
     let (store, _primary, failover_url, _tmp) = sqlite_pair().await;
     store
         .create_proxy(&make_http_proxy("p-pinned"))
@@ -236,12 +237,18 @@ async fn sequence_is_captured_under_pin_and_not_re_queried_after_release() {
     let primary_covering = store.latest_change_sequence(&ns).await.unwrap();
     assert!(primary_covering >= 1);
 
-    let apply = Arc::new(RuntimeConfigApply::new("ferrum", 0));
+    let primary_epoch = store.config_topology_epoch();
+    let apply = Arc::new(RuntimeConfigApply::at_epoch(
+        "ferrum",
+        primary_epoch,
+        primary_covering,
+    ));
     let db: Arc<dyn DatabaseBackend> = Arc::new(store.clone());
     let state = live_apply_state(db, Some(apply.clone()));
 
     let permit = state.admit_write().await.expect("admit on primary");
     assert!(permit.is_pinned());
+    assert_eq!(permit.topology_epoch(), primary_epoch);
 
     let (before_lock_tx, before_lock_rx) = oneshot::channel::<()>();
     let holding = Arc::new(AtomicBool::new(false));
@@ -291,7 +298,7 @@ async fn sequence_is_captured_under_pin_and_not_re_queried_after_release() {
     );
 
     let prepared = state
-        .prepare_live_apply_after_commit(&ns)
+        .prepare_live_apply_after_commit(&ns, primary_epoch)
         .await
         .expect("sequence query while pin is held");
     assert_eq!(
@@ -311,6 +318,8 @@ async fn sequence_is_captured_under_pin_and_not_re_queried_after_release() {
         .expect("failover reconnect after pin release");
     database_store_set_reconnect_transition_hooks_for_test(&store, None);
     assert!(!store.failover_topology_status().primary_active);
+    let failover_epoch = store.config_topology_epoch();
+    assert!(failover_epoch > primary_epoch);
     let stale = store.latest_change_sequence(&ns).await.unwrap();
     assert!(
         stale < primary_covering,
@@ -318,45 +327,32 @@ async fn sequence_is_captured_under_pin_and_not_re_queried_after_release() {
     );
 
     database_store_set_latest_change_sequence_fault_for_test(&store, true);
-    let waiter = apply.clone();
-    let covering = prepared.covering_sequence().expect("captured sequence");
-    let wait_handle = tokio::spawn(async move { waiter.await_committed(covering).await });
-    tokio::task::yield_now().await;
-    assert!(
-        !wait_handle.is_finished(),
-        "awaiting the captured covering sequence must not succeed on the stale failover watermark"
+    apply.observe_topology(failover_epoch);
+    let cursor = prepared.covering_cursor().expect("captured cursor");
+    assert_eq!(
+        apply.await_committed_cursor(cursor).await,
+        Err(LiveApplyFailure::SequenceUnavailable),
+        "an accepted watermark from the old topology must never cover failover data"
     );
 
-    let finish_state = state.clone();
-    let finish_handle = tokio::spawn(async move {
-        finish_state
+    let (status, body) = response_json(
+        state
             .finish_prepared_live_apply(prepared, ok_response())
-            .await
-    });
-    tokio::task::yield_now().await;
-    assert!(
-        !finish_handle.is_finished(),
-        "finish must wait on the captured sequence and must not re-query after release"
-    );
-
-    apply.record_accepted(primary_covering);
-    wait_handle
-        .await
-        .expect("waiter task")
-        .expect("captured covering sequence becomes live");
-    let (status, body) = response_json(finish_handle.await.expect("finish task")).await;
-    assert_eq!(status, 200, "{body}");
+            .await,
+    )
+    .await;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["reason"], "sequence_unavailable");
 }
 
 #[tokio::test]
-async fn complete_releases_pin_before_coordinator_wait() {
+async fn complete_releases_pin_and_fails_when_reconnect_replaces_topology() {
     let (store, _primary, failover_url, _tmp) = sqlite_pair().await;
     store
         .create_proxy(&make_http_proxy("p-complete"))
         .await
         .unwrap();
     let ns = default_namespace();
-    let covering = store.latest_change_sequence(&ns).await.unwrap();
     let apply = Arc::new(RuntimeConfigApply::new("ferrum", 0));
     let db: Arc<dyn DatabaseBackend> = Arc::new(store.clone());
     let state = live_apply_state(db, Some(apply.clone()));
@@ -408,12 +404,12 @@ async fn complete_releases_pin_before_coordinator_wait() {
         .expect("join failover")
         .expect("failover reconnect");
     database_store_set_reconnect_transition_hooks_for_test(&store, None);
-    assert!(
-        !complete_handle.is_finished(),
-        "complete must still be waiting on the captured covering sequence"
-    );
-
-    apply.record_accepted(covering);
-    let (status, body) = response_json(complete_handle.await.expect("complete task")).await;
-    assert_eq!(status, 200, "{body}");
+    apply.observe_topology(store.config_topology_epoch());
+    let response = tokio::time::timeout(Duration::from_secs(5), complete_handle)
+        .await
+        .expect("completion must fail promptly once topology changes")
+        .expect("complete task");
+    let (status, body) = response_json(response).await;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["reason"], "sequence_unavailable");
 }

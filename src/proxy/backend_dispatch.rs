@@ -1756,7 +1756,52 @@ fn concretize_retry_dial_target(
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::sync::Mutex;
+
+    use tracing_subscriber::fmt::MakeWriter;
+
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedLogWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_dispatch_warns<F, R>(f: F) -> (R, String)
+    where
+        F: FnOnce() -> R,
+    {
+        let writer = SharedLogWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_target(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(writer.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let log = String::from_utf8(writer.0.lock().unwrap().clone())
+            .expect("dispatch log must be utf-8");
+        (result, log)
+    }
 
     fn target(host: &str) -> Arc<UpstreamTarget> {
         Arc::new(UpstreamTarget {
@@ -2268,16 +2313,18 @@ mod tests {
     }
 
     /// PASSTHROUGH with no captured orig-dst falls back to round-robin
-    /// (selects a target, rotating across the pool).
+    /// (selects a target, rotating across the pool) and warns.
     #[tokio::test]
     async fn passthrough_absent_orig_dst_falls_back_to_round_robin() {
         let state = passthrough_state().await;
         let epoch = state.request_epoch.load();
         let proxy = &epoch.config.proxies[0];
-        let first =
-            select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &HashMap::new(), None);
-        let second =
-            select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &HashMap::new(), None);
+        let ((first, second), log) = capture_dispatch_warns(|| {
+            (
+                select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &HashMap::new(), None),
+                select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &HashMap::new(), None),
+            )
+        });
         assert!(first.target.is_some(), "RR fallback must select a target");
         assert!(second.target.is_some());
         // Two same-port targets under RR rotate.
@@ -2286,24 +2333,30 @@ mod tests {
             second.target.as_ref().map(|t| t.host.clone()),
             "RR fallback should rotate across the pool"
         );
+        assert!(
+            log.contains("PASSTHROUGH: original destination absent, falling back to round-robin"),
+            "absent orig-dst must warn before RR fallback, got {log:?}"
+        );
     }
 
     /// PASSTHROUGH with an orig-dst that matches no pool target falls back to
-    /// round-robin (still selects a healthy target).
+    /// round-robin (still selects a healthy target) and warns.
     #[tokio::test]
     async fn passthrough_unmatched_orig_dst_falls_back_to_round_robin() {
         let state = passthrough_state().await;
         let epoch = state.request_epoch.load();
         let proxy = &epoch.config.proxies[0];
         let orig: SocketAddr = "10.9.9.9:8080".parse().unwrap();
-        let selection = select_upstream_target(
-            proxy,
-            &state,
-            &epoch,
-            "192.0.2.10",
-            &HashMap::new(),
-            Some(orig),
-        );
+        let (selection, log) = capture_dispatch_warns(|| {
+            select_upstream_target(
+                proxy,
+                &state,
+                &epoch,
+                "192.0.2.10",
+                &HashMap::new(),
+                Some(orig),
+            )
+        });
         assert!(
             selection.target.is_some(),
             "unmatched orig-dst must fall back to a round-robin target"
@@ -2312,6 +2365,51 @@ mod tests {
         assert!(
             host == Some("10.0.0.1") || host == Some("10.0.0.2"),
             "RR fallback must pick a real pool target, got {host:?}"
+        );
+        assert!(
+            log.contains(
+                "PASSTHROUGH: original destination unmatched, falling back to round-robin"
+            ),
+            "unmatched orig-dst must warn before RR fallback, got {log:?}"
+        );
+    }
+
+    /// An orig-dst that matches a pool target but is actively unhealthy is not
+    /// dialed: PASSTHROUGH falls back to round-robin among remaining healthy
+    /// targets and emits the unmatched warning (select_passthrough returns None).
+    #[tokio::test]
+    async fn passthrough_ejected_orig_dst_falls_back_to_round_robin() {
+        let state = passthrough_state().await;
+        let epoch = state.request_epoch.load();
+        let proxy = &epoch.config.proxies[0];
+        let ejected = epoch.config.upstreams[0].targets[0].clone();
+        assert_eq!(ejected.host, "10.0.0.1");
+        let key = crate::load_balancer::target_key(
+            &crate::config::db_backend::namespaced_runtime_key(&proxy.namespace, "mesh-upstream"),
+            &ejected,
+        );
+        state.health_checker.active_unhealthy_targets.insert(key, 1);
+        let orig: SocketAddr = "10.0.0.1:8080".parse().unwrap();
+        let (selection, log) = capture_dispatch_warns(|| {
+            select_upstream_target(
+                proxy,
+                &state,
+                &epoch,
+                "192.0.2.10",
+                &HashMap::new(),
+                Some(orig),
+            )
+        });
+        assert_eq!(
+            selection.target.as_ref().map(|t| t.host.as_str()),
+            Some("10.0.0.2"),
+            "ejected orig-dst must fall back to the remaining healthy target"
+        );
+        assert!(
+            log.contains(
+                "PASSTHROUGH: original destination unmatched, falling back to round-robin"
+            ),
+            "ejected orig-dst must warn before RR fallback, got {log:?}"
         );
     }
 

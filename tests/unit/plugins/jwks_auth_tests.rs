@@ -15,7 +15,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::plugin_utils::{assert_continue, assert_reject, create_test_consumer};
+use super::plugin_utils::{
+    assert_continue, assert_reject, assert_reject_body, context_with_materialized_raw_header_lines,
+    create_test_consumer,
+};
 
 static JWKS_TEST_PATH_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -1855,6 +1858,48 @@ async fn dpop_required_but_header_missing_rejects_401() {
         .insert("authorization".to_string(), format!("Bearer {}", token));
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn dpop_present_but_non_materialized_rejects_invalid_not_missing() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks_uri": jwks_uri,
+                "issuer": "https://idp.example.com",
+                "require_dpop": true,
+                "dpop_replay_scope": "process"
+            }]
+        }),
+        default_client(),
+    )
+    .unwrap();
+    plugin.warmup_jwks().await;
+
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+    let token = create_rs256_token(
+        &json!({"sub": "idp-user", "iss": "https://idp.example.com", "cnf": {"jkt": "missing"}}),
+        private_key_pem,
+    );
+
+    // A present but non-materializable DPoP proof field line: raw bytes hold a
+    // non-ASCII suffix that `materialize_headers()` must omit. Extraction must
+    // report it as invalid proof material, not as a missing proof.
+    let mut ctx = context_with_materialized_raw_header_lines("dpop", &[b"proof\xe3\x80\x80"]);
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+    ctx.headers
+        .insert("host".to_string(), "example.com".to_string());
+    ctx.metadata
+        .insert("ferrum.frontend_scheme".to_string(), "http".to_string());
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject_body(result, r#"{"error":"Invalid DPoP proof"}"#);
+    assert!(ctx.identified_consumer.is_none());
 }
 
 #[tokio::test]

@@ -81,7 +81,11 @@ fn h1_h2_buffered_terminal_logging_precedes_response_construction() {
             // response the client actually receives (issue #3815).
             "let final_precommit_authorization_terminal = apply_precommit_authorization_terminal(",
             "let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =",
-            "let summary = TransactionSummary {",
+            // Binding is `mut` so unlimited direct-H2 passthrough can reload
+            // `bytes_sent` after the publish latch without changing order:
+            // summary construction still precedes the stream/buffered split
+            // and the buffered response builder.
+            "let mut summary = TransactionSummary {",
             "if body_will_stream {",
             "DeferredTransactionLogger::new_with_start_time(",
             "} else {",

@@ -17,7 +17,7 @@ use ferrum_edge::admin::{
 };
 use ferrum_edge::config::db_loader::{DatabaseBackend, DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, Consumer, DispatchKind, Proxy, default_namespace,
+    AuthMode, BackendScheme, Consumer, DispatchKind, Proxy, Upstream, default_namespace,
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
@@ -420,12 +420,25 @@ async fn undecodable_proxy_row_allows_delete_repair() {
     let (store, _tmp) = sqlite_store().await;
     let ns = default_namespace();
 
+    let upstream: Upstream = serde_json::from_value(json!({
+        "id": "u-preserve",
+        "namespace": ns,
+        "targets": [{"host": "target.internal", "port": 8080}]
+    }))
+    .expect("upstream deserialization");
+    store
+        .create_upstream(&upstream)
+        .await
+        .expect("create upstream to preserve");
+
     store
         .create_proxy(&test_proxy("p-keep", "/keep"))
         .await
         .expect("create surviving proxy");
+    let mut corrupt_proxy = test_proxy("p-bad", "/bad");
+    corrupt_proxy.upstream_id = Some(upstream.id.clone());
     store
-        .create_proxy(&test_proxy("p-bad", "/bad"))
+        .create_proxy(&corrupt_proxy)
         .await
         .expect("create proxy to corrupt");
     let good = store
@@ -511,7 +524,12 @@ async fn undecodable_proxy_row_allows_delete_repair() {
     let (base_url, _shutdown) = start_admin(state).await;
     let token = admin_token();
 
-    let (del_status, del_body) = admin_delete(&base_url, "/proxies/p-bad", &token).await;
+    let (del_status, del_body) = admin_delete(
+        &base_url,
+        "/proxies/p-bad?cleanup_orphaned_upstream=false",
+        &token,
+    )
+    .await;
     assert!(
         (200..300).contains(&del_status),
         "DELETE must repair an undecodable proxy row (got {del_status}): {del_body:?}"
@@ -528,6 +546,14 @@ async fn undecodable_proxy_row_allows_delete_repair() {
     assert!(
         repaired.proxies.iter().any(|p| p.id == "p-keep"),
         "unrelated proxy must survive the repair delete"
+    );
+    assert!(
+        store
+            .get_upstream(&ns, &upstream.id)
+            .await
+            .expect("read preserved upstream")
+            .is_some(),
+        "undecodable-row repair must honor cleanup_orphaned_upstream=false"
     );
 }
 

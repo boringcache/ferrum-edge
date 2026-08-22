@@ -22,7 +22,7 @@ use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::pool::{GenericPool, PoolManager};
-use crate::proxy::body::SizeLimitedIncoming;
+use crate::proxy::body::DirectH2RequestBody;
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{
     BackendSvidGeneration, BackendTlsConfigBuilder, BackendTlsConfigCache, SvidGenerationMatcher,
@@ -51,12 +51,14 @@ thread_local! {
 
 /// Multiplexed hyper H2 sender for the plain-HTTPS direct pool.
 ///
-/// Body type is [`SizeLimitedIncoming`] so ordinary and SNI direct-H2
-/// dispatches can enforce `max_request_body_size_bytes` while streaming
-/// the client upload — mirroring the mesh-mTLS / HBONE pools.
-/// Callers wrap with `usize::MAX` when the operator limit is disabled (`0`);
-/// note the adapter itself treats `max_bytes = 0` as deny-all.
-pub type Http2Sender = http2::SendRequest<SizeLimitedIncoming>;
+/// Body type is [`DirectH2RequestBody`]: ordinary unlimited uploads
+/// (`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0`, no upload-completion gate, no
+/// gRPC message counter) poll `Incoming` directly; limited / gated /
+/// gRPC-observed uploads still wrap [`super::body::SizeLimitedIncoming`]
+/// so in-path 413 enforcement is unchanged. The limiter treats
+/// `max_bytes = 0` as deny-all — callers must never pass the operator
+/// spelling `0` into it (issue #3942).
+pub type Http2Sender = http2::SendRequest<DirectH2RequestBody>;
 
 /// Terminal protocol outcome for one DNS candidate.
 ///
@@ -1051,9 +1053,9 @@ fn classify_typed_chain(err: &Http2PoolError) -> Option<crate::retry::ErrorClass
     // Every error it surfaces happens during DNS / TCP connect / TLS
     // handshake / h2 handshake, all of which are pre-wire. Pass
     // `phase_is_connect=true` so io::ErrorKind::TimedOut maps to
-    // `ConnectionTimeout` and io::ErrorKind::ConnectionReset maps to
-    // `ConnectionRefused` (a SYN-RST is functionally equivalent to
-    // ECONNREFUSED — request never reached the wire). Both classes
+    // `ConnectionTimeout` and a SYN-RST *without* rustls maps to
+    // `ConnectionRefused`. A rustls error under that io::Error is
+    // `TlsError` (TCP connected, handshake failed). Both classes
     // satisfy `request_reached_wire(class) == false`, so the gateway's
     // `retry_on_connect_failure` fires correctly.
     let phase_is_connect = true;
@@ -1066,9 +1068,17 @@ fn classify_typed_chain(err: &Http2PoolError) -> Option<crate::retry::ErrorClass
             source: Some(BackendUnavailableSource::Tls(io_err)),
             ..
         } => {
-            // Let typed ErrorKind win if set, otherwise fall back to TlsError.
-            if let Some(cls) = classify_io_error(io_err, phase_is_connect) {
-                return Some(cls);
+            // The `Tls` marker is a construction-site phase signal: TCP
+            // connected and the handshake then failed. Do not let a
+            // connect-phase RST/refused collapse win — that would label a
+            // TLS failure as `connection_refused`. TimedOut still maps to
+            // ConnectionTimeout (handshake stalled); port exhaustion is
+            // still PortExhaustion. Everything else is TlsError.
+            if matches!(io_err.raw_os_error(), Some(99) | Some(49) | Some(10049)) {
+                return Some(ErrorClass::PortExhaustion);
+            }
+            if io_err.kind() == std::io::ErrorKind::TimedOut {
+                return Some(ErrorClass::ConnectionTimeout);
             }
             return Some(ErrorClass::TlsError);
         }
@@ -1138,6 +1148,17 @@ fn classify_io_error(
     if matches!(io_err.raw_os_error(), Some(99) | Some(49) | Some(10049)) {
         return Some(ErrorClass::PortExhaustion);
     }
+    // rustls-under-io (`io::Error::get_ref()`, not `source()`) is a TLS
+    // handshake/record failure, not a SYN-RST. Peek before the
+    // connect-phase RST collapse so a plaintext origin that resets
+    // during ClientHello classifies as TlsError.
+    if crate::retry::rustls_error_in_chain(io_err as &(dyn std::error::Error + 'static)) {
+        return Some(if phase_is_connect {
+            ErrorClass::TlsError
+        } else {
+            ErrorClass::ConnectionReset
+        });
+    }
     match io_err.kind() {
         std::io::ErrorKind::TimedOut => Some(if phase_is_connect {
             ErrorClass::ConnectionTimeout
@@ -1145,18 +1166,22 @@ fn classify_io_error(
             ErrorClass::ReadWriteTimeout
         }),
         std::io::ErrorKind::ConnectionRefused => Some(ErrorClass::ConnectionRefused),
-        // Connect-phase RSTs (SYN answered with RST, TLS reset before
-        // handshake completes) must NOT classify as `ConnectionReset`
-        // because the unified `request_reached_wire` boundary treats
-        // that variant as post-wire (mid-stream reset). The H2 pool is
-        // a pure connection-establishment layer, so every io error here
-        // is pre-wire — collapse RSTs into `ConnectionRefused`.
+        // Connect-phase RSTs (SYN answered with RST) must NOT classify
+        // as `ConnectionReset` because the unified `request_reached_wire`
+        // boundary treats that variant as post-wire (mid-stream reset).
+        // The H2 pool is a pure connection-establishment layer, so a
+        // RST *without* rustls is pre-wire — collapse into
+        // `ConnectionRefused`. A TLS handshake that failed after TCP
+        // connect is handled by the rustls peek above.
         std::io::ErrorKind::ConnectionReset => Some(if phase_is_connect {
             ErrorClass::ConnectionRefused
         } else {
             ErrorClass::ConnectionReset
         }),
         std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionAborted => {
+            Some(ErrorClass::ConnectionClosed)
+        }
+        std::io::ErrorKind::UnexpectedEof if !phase_is_connect => {
             Some(ErrorClass::ConnectionClosed)
         }
         // Generic kinds (Other, InvalidData, etc.) commonly wrap

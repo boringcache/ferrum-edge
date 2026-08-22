@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — `DELETE /consumers/{id}` returns 409 while `access_control.allowed_consumers` still names the username**
+  (issue #4045). The previous 204 left live plugin configs authorizing an
+  identity that no longer exists. Ferrum now scans `access_control` plugin
+  configs in the same namespace and refuses the delete with
+  `{"error":"Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"}`.
+  Plugin configs are not rewritten. **Operator action**: remove or edit the
+  username in those plugin configs, then retry. A consumer named only in
+  `disallowed_consumers` can still be deleted. See
+  [docs/admin_api.md](docs/admin_api.md).
+
+- **`DELETE /upstreams/{id}` 409 is now documented** (issue #4044). The
+  behavior was already correct: a still-referenced upstream returns
+  `{"error":"Upstream is referenced by one or more proxies and cannot be deleted"}`
+  (and the equivalent `mesh_route_dispatch` 409). `docs/admin_api.md` and
+  `openapi.yaml` now carry those strings.
+
+- **`DELETE /proxies/{id}` orphan-cleans a last-referenced hand-owned upstream**
+  (issue #4046). This matches the existing `delete_proxy` transaction: when the
+  deleted proxy is hand-managed, a hand-owned (`api_spec_id` null) upstream
+  referenced only by that proxy is removed. A shared upstream survives. A
+  spec-owned proxy that drifted onto a hand-owned upstream leaves that
+  upstream in place. The cascade table in `docs/admin_api.md` and the OpenAPI
+  `deleteProxy` description now say so.
+
 - **BREAKING — untrusted `X-Forwarded-For` is no longer forwarded to backends**
   (issue #4034). With the default empty `FERRUM_TRUSTED_PROXIES`, Ferrum already
   ignored a client-supplied XFF chain for its own `client_ip` resolution, but
@@ -155,6 +179,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- HTTP backend error classification now labels three previously misleading
+  failure modes correctly. An HTTPS backend whose origin answers plaintext
+  (TLS handshake after TCP connect) is `tls_error`, not `connection_refused`.
+  The connect-phase RST/refused collapse is unchanged when no rustls error is
+  in the source chain. A backend FIN before a complete HTTP body is
+  `connection_closed`, not the `request_error` catch-all. WebSocket
+  post-upgrade protocol junk is `protocol_error`, a backend RST after upgrade
+  is `connection_reset`, and `stdout_logging` now writes the session-end
+  `error_class` on a 101 `TransactionSummary` via `on_ws_disconnect`.
+  `TlsError` remains pre-wire, so `retry_on_connect_failure` is unchanged
+  for the handshake case; `connection_closed` is post-wire like
+  `request_error`, so connect-failure retry still does not replay
+  non-idempotent requests.
+
+- Stream-family DNS setup failures now classify as `error_class=dns_lookup_error`
+  (TCP previously fell through to `request_error` because the live DNS-cache
+  wording `"DNS resolution returned no addresses"` missed the substring
+  fallback). UDP/DTLS setup DNS uses the same typed `StreamSetupKind::DnsLookup`.
+  Dashboards keyed on `dns_lookup_error` for TCP streams will start matching.
+
+- UDP session setup failures that never publish a session (DNS, empty pool,
+  plugin reject, connect) now emit a `StreamTransactionSummary` and invoke
+  `on_stream_disconnect`. Previously those failures were WARN-only, so logging
+  plugins never saw an `error_class`. Which side emits is decided by the setup
+  operation itself, not by probing the session map afterwards: a published
+  session owns every summary for its flow even when it is removed before the
+  spawned setup task observes the error, so no duplicate setup summary can
+  appear alongside the session's disconnect summary. The setup-failure summary
+  carries the epoch the attempt was *admitted* under — that generation's plugin
+  slice, proxy lifecycle generation, connect-time execution-trigger decisions,
+  identity/auth/SNI/metadata — and the backend target selection actually chose.
+  A failure before any epoch view resolved records the transaction but notifies
+  no plugins, so it can never be attributed to a later configuration
+  generation.
+
+- Stream-setup DNS resolves refused by the backend egress policy keep
+  classifying as `dispatch_policy_rejected` rather than becoming
+  `dns_lookup_error`. No query was answered and no backend was dialed, which is
+  also why those call sites already settle the circuit breaker neutrally.
+
+- Userspace TLS/DTLS teardown where the peer TCP-FINs without `close_notify`
+  no longer classifies as `tls_error`. The shared classifier maps rustls's
+  `UnexpectedEof` wording to `connection_closed`; the TCP direction-tracking
+  copy and DTLS session outcome treat it as graceful (omit `error_class`), while
+  the all-bounds-disabled `copy_bidirectional` fast path reports
+  `connection_closed`. Alerts keyed on `tls_error` for clean Python/`ssl` closes
+  will stop firing.
+  kTLS is unchanged: a bare FIN without an authenticated `close_notify` remains
+  truncation.
+
 - WAF `mode: enforce` admission now counts `on_body_too_large: block` as a
   reachable enforcement path (issue #4006). That setting already rejected
   oversize governed HTTP bodies and WebSocket application messages whenever
@@ -164,6 +238,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when a body inspection hook can actually run. `fail_closed` (the default),
   `scan_truncated`, and `skip` still do not satisfy the gate, and a config
   that cannot block anything is still refused.
+- WAF query SSRF mirrors `FE-SSRF-001-Q` / `FE-SSRF-002-Q` now compile at
+  paranoia 1, matching the documented body/query pack and the recommended
+  `{mode: enforce, default_rule_action: enforce, paranoia_level: 1}` posture
+  (issue #3936). They were present but gated at paranoia 2, so
+  `http://169.254.169.254/latest/meta-data/` and `gopher://127.0.0.1/` in a
+  query string produced `waf.action=clean` while the same payload in the body
+  blocked as `FE-SSRF-001` / `FE-SSRF-002`. Matching stays on decoded query
+  values (percent-decode plus the bounded layered variants used for bodies),
+  not raw whole-URI text, and keeps the existing dotted-IPv4 / metadata-host /
+  dangerous-scheme claims without expanding into IPv6 or alternate textual IP
+  forms.
 
 - Authenticated UDP/DTLS client-facing sends no longer emit after the
   authorization deadline (issues #3815, #3816, #3820). A pre-send commitment
@@ -202,6 +287,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (issue #3244) (issue #3317).
 
 ### Added
+
+- **`DELETE /proxies/{id}?cleanup_orphaned_upstream=` opt-out** (issue #4064).
+  This is a non-breaking feature addition: omitting the parameter preserves
+  existing behavior, which orphan-cleans a last-referenced hand-owned
+  (`api_spec_id` null) upstream when a hand-managed proxy is deleted.
+  `cleanup_orphaned_upstream=false` keeps that upstream so it can be reattached.
+  Only the exact strings `true` and `false` are accepted; any other value
+  returns `400` rather than guessing. Spec-owned upstreams and still-referenced
+  upstreams are never cleaned, regardless of the flag. Direct
+  `DELETE /upstreams/{id}` still returns `409` while referenced. See
+  [docs/admin_api.md](docs/admin_api.md).
 
 - Authorization lifetime for admitted streams and request uploads (issues
   #3815, #3816). An authenticated stream is bounded by the earliest of the

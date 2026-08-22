@@ -460,6 +460,37 @@
       ]
     },
     {
+      "id": "tungstenite-005-stray-continuation-ordering",
+      "label": "tungstenite stray-continuation protocol ordering",
+      "crate": "tungstenite",
+      "vendored_version": "0.29.0",
+      "vendor_path": "vendor/tungstenite-0.29.0-ferrum-patched",
+      "docs_path": "docs/upstream-tungstenite-patches/",
+      "owner": "@jeremyjpj0916",
+      "owner_github": "jeremyjpj0916",
+      "reason": "A stray continuation with a valid 63-bit declared length otherwise trips the caller size ceiling first and is misclassified as policy Close 1009 rather than an RFC 6455 protocol violation.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "snapview/tungstenite-rs",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Upstream rejects unexpected continuation state before caller frame-size policy, or the gateway no longer needs distinct protocol-vs-capacity attribution.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/unit/gateway_core/websocket_relay_join_tests.rs::test_malformed_continuation_frame_is_protocol_error",
+        "tests/unit/gateway_core/websocket_relay_join_tests.rs::test_ws_63_bit_oversize_frame_is_size_limit_not_protocol_error"
+      ]
+    },
+    {
       "id": "tokio-tungstenite-001-lossless-takeover",
       "label": "tokio-tungstenite lossless raw takeover",
       "crate": "tokio-tungstenite",

@@ -8,8 +8,8 @@
 //! See `tests/scaffolding/mod.rs` for the API docs.
 
 use crate::scaffolding::backends::{
-    HttpStep, RequestMatcher, ScriptedHttp1Backend, ScriptedTcpBackend, ScriptedTlsBackend,
-    TcpStep, TlsConfig,
+    GrpcStep, HttpStep, MatchRpc, RequestMatcher, ScriptedGrpcBackend, ScriptedHttp1Backend,
+    ScriptedTcpBackend, ScriptedTlsBackend, TcpStep, TlsConfig,
 };
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::Http1Client;
@@ -718,6 +718,206 @@ async fn serve_drains_spawned_tasks_when_late_startup_fails() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Regression (issue #4080): a file-mode launch that loses the exclusive proxy
+// bind must not start backend capability refresh. TestGateway retries with
+// fresh gateway ports but reuses the caller-owned scripted backend; an
+// abandoned child that probed before EADDRINUSE consumed connection script 0
+// (hosted on PR #3986 / pooled H2 GOAWAY).
+//
+// Recipe: occupy the env proxy port (no pre-bound proxy FD — that path skips
+// the bind signal). Point a plaintext HTTP proxy at a scripted gRPC backend
+// with `skip_initial_capability_refresh = false`. With warmup both off and on,
+// `serve()` must fail the bind and leave `accepted_connections == 0`; then a
+// warmup-off retry on fresh ports must run the initial probe exactly once.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abandoned_bind_failure_does_not_probe_backend_before_successful_retry() {
+    use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
+    use ferrum_edge::config::types::GatewayConfig;
+    use ferrum_edge::config::{EnvConfig, OperatingMode};
+    use ferrum_edge::modes::file::{self, ServeOptions};
+
+    let backend_reservation = reserve_port().await.expect("reserve backend");
+    let backend_port = backend_reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(backend_reservation.into_listener())
+        .connection_scripts([vec![
+            GrpcStep::AcceptRpc(MatchRpc::any()),
+            GrpcStep::SendInitialHeaders,
+            GrpcStep::RespondStatus {
+                code: 0,
+                message: "",
+            },
+        ]])
+        .spawn()
+        .expect("spawn scripted backend");
+
+    let config_json = serde_json::json!({
+        "version": "1",
+        "proxies": [{
+            "id": "scripted",
+            "listen_path": "/grpc",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [],
+    });
+    let mut config: GatewayConfig =
+        serde_json::from_value(config_json).expect("deserialize config");
+    config.resolve_dispatch_kind();
+
+    let jwt_config = JwtConfig {
+        secret: "regression-test-secret-32-chars-min-len".to_string(),
+        issuer: "regression-test".to_string(),
+        audience: None,
+        max_ttl_seconds: 3600,
+        algorithm: jsonwebtoken::Algorithm::HS256,
+    };
+    let make_env =
+        |proxy_http_port: u16, admin_http_port: u16, pool_warmup_enabled: bool| EnvConfig {
+            mode: OperatingMode::File,
+            proxy_http_port,
+            proxy_https_port: 0,
+            admin_http_port,
+            admin_https_port: 0,
+            admin_jwt_secret: Some("regression-test-secret-32-chars-min-len".to_string()),
+            admin_jwt_issuer: "regression-test".to_string(),
+            shutdown_drain_seconds: 0,
+            pool_warmup_enabled,
+            max_connections: 0,
+            proxy_bind_address: "127.0.0.1".to_string(),
+            stream_proxy_bind_address: "127.0.0.1".to_string(),
+            backend_capability_refresh_interval_secs: 86_400,
+            ..EnvConfig::default()
+        };
+
+    // Hold the exclusive proxy port so the first serve() bind fails the same
+    // way TestGateway's stolen ephemeral listen does.
+    let proxy_blocker = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy blocker");
+    let occupied_proxy_port = proxy_blocker.local_addr().unwrap().port();
+
+    // Exercise both ways capability work can begin: the asynchronous initial
+    // refresh when warmup is off and synchronous pool warmup when it is on.
+    for pool_warmup_enabled in [false, true] {
+        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind admin");
+        let admin_port = admin_listener.local_addr().unwrap().port();
+        let opts = ServeOptions {
+            admin_http: Some(admin_listener),
+            admin_jwt_manager: Some(JwtManager::new(jwt_config.clone())),
+            skip_initial_capability_refresh: false,
+            background_drain_timeout: Some(Duration::from_millis(200)),
+            ..ServeOptions::default()
+        };
+
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let result = file::serve(
+            make_env(occupied_proxy_port, admin_port, pool_warmup_enabled),
+            config.clone(),
+            opts,
+            shutdown_tx,
+        )
+        .await;
+        match result {
+            Ok(_) => {
+                panic!("serve() must fail when proxy port {occupied_proxy_port} is already taken")
+            }
+            Err(err) => {
+                let msg = err.to_string().to_lowercase();
+                assert!(
+                    msg.contains("listener")
+                        || msg.contains("bind")
+                        || msg.contains("startup")
+                        || msg.contains("address already in use"),
+                    "error must surface the required-listener bind failure; got {err}"
+                );
+            }
+        }
+
+        assert_eq!(
+            backend.accepted_connections(),
+            0,
+            "abandoned bind failure must not start backend capability work \
+             with pool_warmup_enabled={pool_warmup_enabled}; accepted={}, \
+             handshakes={}, acceptors_waiting={}",
+            backend.accepted_connections(),
+            backend.handshakes_completed(),
+            backend.acceptors_waiting()
+        );
+    }
+
+    // Successful retry on a free exclusive listen, same caller-owned backend.
+    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind retry proxy");
+    let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind retry admin");
+    let proxy_port = proxy_listener.local_addr().unwrap().port();
+    let admin_port = admin_listener.local_addr().unwrap().port();
+
+    let env_config = make_env(proxy_port, admin_port, false);
+
+    let opts = ServeOptions {
+        proxy_http: Some(proxy_listener),
+        admin_http: Some(admin_listener),
+        admin_jwt_manager: Some(JwtManager::new(jwt_config)),
+        skip_initial_capability_refresh: false,
+        background_drain_timeout: Some(Duration::from_millis(200)),
+        ..ServeOptions::default()
+    };
+
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let handles = file::serve(env_config, config, opts, shutdown_tx.clone())
+        .await
+        .expect("retry serve() must succeed on a free proxy port");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if backend.accepted_connections() >= 1 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "successful non-warmup file-mode start must run the initial \
+                 capability probe exactly once; accepted={}, handshakes={}, \
+                 acceptors_waiting={}",
+                backend.accepted_connections(),
+                backend.handshakes_completed(),
+                backend.acceptors_waiting()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(
+        backend.accepted_connections(),
+        1,
+        "retry must be the first backend-side-effect; a prior abandoned probe \
+         would have consumed connection 0; handshakes={}, acceptors_waiting={}",
+        backend.handshakes_completed(),
+        backend.acceptors_waiting()
+    );
+
+    shutdown_tx.send(true).expect("shutdown_tx send");
+    tokio::time::timeout(Duration::from_secs(2), handles.join())
+        .await
+        .expect("join() did not complete within 2 s of shutdown")
+        .expect("listener task panicked");
+
+    let _ = proxy_blocker;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Regression (PR #2722 / Codex): a pre-bound `ServeOptions.admin_https`
 // socket without both admin TLS paths must be dropped before reserved-port
 // calculation. Without the drop, `serve()` keeps the FD until shutdown and
@@ -855,14 +1055,8 @@ async fn serve_drop_prebound_admin_https_without_tls_does_not_reserve_env_https_
 
     // Ephemeral stand-in for a nonzero env admin HTTPS port (avoids hardcoding
     // 9443 and colliding with unrelated listeners on the host).
-    let env_admin_https_port = {
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("probe free port for env admin HTTPS");
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        port
-    };
+    let env_admin_https_reservation = reserve_port().await.expect("reserve env admin HTTPS port");
+    let env_admin_https_port = env_admin_https_reservation.port;
 
     let admin_https_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -920,6 +1114,7 @@ async fn serve_drop_prebound_admin_https_without_tls_does_not_reserve_env_https_
     };
 
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let _ = env_admin_https_reservation.drop_and_take_port();
     let handles = file::serve(env_config, config, opts, shutdown_tx.clone())
         .await
         .expect(
@@ -947,14 +1142,9 @@ async fn serve_still_reserves_env_admin_https_port_without_prebound_drop() {
     use ferrum_edge::config::{EnvConfig, OperatingMode};
     use ferrum_edge::modes::file::{self, ServeOptions};
 
-    let env_admin_https_port = {
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("probe free port for env admin HTTPS");
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        port
-    };
+    let env_admin_https_reservation = reserve_port().await.expect("reserve env admin HTTPS port");
+    let env_admin_https_port = env_admin_https_reservation.port;
+    let _hold_env_admin_https_port = env_admin_https_reservation;
 
     let config_json = serde_json::json!({
         "version": "1",

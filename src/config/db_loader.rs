@@ -51,7 +51,7 @@ use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -591,6 +591,25 @@ fn mesh_route_dispatch_referenced_upstream(
         .map(ToOwned::to_owned)
 }
 
+/// `access_control.allowed_consumers` names gateway Consumer usernames
+/// (byte-for-byte). A delete must refuse while any plugin config in the
+/// namespace still authorizes that username; the operator's policy is not
+/// rewritten.
+fn access_control_plugin_allows_consumer(plugin: &PluginConfig, username: &str) -> bool {
+    if plugin.plugin_name != "access_control" {
+        return false;
+    }
+    plugin
+        .config
+        .get("allowed_consumers")
+        .and_then(|value| value.as_array())
+        .is_some_and(|consumers| {
+            consumers
+                .iter()
+                .any(|entry| entry.as_str() == Some(username))
+        })
+}
+
 fn upstream_backend_tls_san_allow_list_json(
     upstream: &Upstream,
 ) -> Result<Option<String>, anyhow::Error> {
@@ -815,6 +834,11 @@ pub struct DatabaseStore {
     /// so a reconnect cannot redirect an in-flight write. Not taken on ordinary
     /// read/request hot paths.
     reconnect_transition: Arc<tokio::sync::RwLock<()>>,
+    /// Monotonic process-local generation of the pool published under
+    /// `reconnect_transition`. Captured by Admin writes and authoritative poll
+    /// loads so sequence watermarks from different databases are never
+    /// compared as one namespace history.
+    topology_epoch: Arc<AtomicU64>,
     /// External-test hooks around [`Self::reconnect_transition`]. Empty in
     /// production; see [`Self::set_reconnect_transition_hooks_for_test`].
     reconnect_transition_test_hooks: Arc<std::sync::Mutex<Option<SqlReconnectTransitionTestHooks>>>,
@@ -1916,6 +1940,7 @@ impl DatabaseStore {
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
             failover_topology: DbFailoverTopologyState::new(),
             reconnect_transition: Arc::new(tokio::sync::RwLock::new(())),
+            topology_epoch: Arc::new(AtomicU64::new(1)),
             reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
             latest_change_sequence_test_fault: Arc::new(AtomicBool::new(false)),
             db_type: db_type.to_string(),
@@ -1978,6 +2003,7 @@ impl DatabaseStore {
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
             failover_topology: DbFailoverTopologyState::new(),
             reconnect_transition: Arc::new(tokio::sync::RwLock::new(())),
+            topology_epoch: Arc::new(AtomicU64::new(1)),
             reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
             latest_change_sequence_test_fault: Arc::new(AtomicBool::new(false)),
             db_type: db_type.to_string(),
@@ -3456,7 +3482,7 @@ impl DatabaseStore {
         if let Some(old_upstream_id) = old_upstream_id.as_deref()
             && proxy.upstream_id.as_deref() != Some(old_upstream_id)
         {
-            self.cleanup_orphaned_upstream_tx(&mut tx, &proxy.namespace, old_upstream_id)
+            self.cleanup_orphaned_upstream_tx(&mut tx, &proxy.namespace, old_upstream_id, true)
                 .await?;
         }
 
@@ -3473,6 +3499,16 @@ impl DatabaseStore {
     }
 
     pub async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
+        self.delete_proxy_with_orphan_cleanup(namespace, id, true)
+            .await
+    }
+
+    pub async fn delete_proxy_with_orphan_cleanup(
+        &self,
+        namespace: &str,
+        id: &str,
+        cleanup_orphaned_upstream: bool,
+    ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
@@ -3586,7 +3622,7 @@ impl DatabaseStore {
         if spec_owner.is_none()
             && let Some(ref uid) = upstream_id
         {
-            self.cleanup_orphaned_upstream_tx(&mut tx, namespace, uid)
+            self.cleanup_orphaned_upstream_tx(&mut tx, namespace, uid, cleanup_orphaned_upstream)
                 .await?;
         }
 
@@ -3673,7 +3709,11 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
         upstream_id: &str,
+        cleanup_orphaned_upstream: bool,
     ) -> Result<(), anyhow::Error> {
+        if !cleanup_orphaned_upstream {
+            return Ok(());
+        }
         let upstream_row: Option<AnyRow> = sqlx::query(
             &self.q("SELECT api_spec_id FROM upstreams WHERE id = ? AND namespace = ? LIMIT 1"),
         )
@@ -3928,16 +3968,29 @@ impl DatabaseStore {
             .await?;
         // Scope the existence check to the caller's namespace (issue #2122):
         // consumer ids are only unique per namespace.
-        let existing: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT id FROM consumers WHERE id = ? AND namespace = ?"))
-                .bind(id)
-                .bind(namespace)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if existing.is_none() {
+        let existing: Option<AnyRow> = sqlx::query(
+            &self.q("SELECT id, username FROM consumers WHERE id = ? AND namespace = ?"),
+        )
+        .bind(id)
+        .bind(namespace)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(existing) = existing else {
             tx.rollback().await?;
             self.check_slow_query("delete_consumer", start);
             return Ok(false);
+        };
+        let username: String = existing.try_get("username")?;
+        if let Some(plugin) = self
+            .find_access_control_consumer_ref_tx(&mut tx, namespace, &username)
+            .await?
+        {
+            tx.rollback().await?;
+            anyhow::bail!(
+                "Consumer {} is referenced by access_control plugin_config '{}' and cannot be deleted",
+                id,
+                plugin.id
+            );
         }
         // The FK cascade on both index tables covers these deletes; keep them
         // explicit for defense in depth (mirrors delete_all_resources).
@@ -5104,6 +5157,29 @@ impl DatabaseStore {
         }))
     }
 
+    async fn find_access_control_consumer_ref_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        username: &str,
+    ) -> Result<Option<PluginConfig>, anyhow::Error> {
+        let rows: Vec<AnyRow> = sqlx::query(
+            &self.q("SELECT * FROM plugin_configs WHERE plugin_name = ? AND namespace = ?"),
+        )
+        .bind("access_control")
+        .bind(namespace)
+        .fetch_all(&mut **tx)
+        .await?;
+
+        for row in &rows {
+            let plugin = row_to_plugin_config(row)?;
+            if access_control_plugin_allows_consumer(&plugin, username) {
+                return Ok(Some(plugin));
+            }
+        }
+        Ok(None)
+    }
+
     /// Delete an upstream only if it is not referenced by any proxy.
     /// Returns `Err` if the upstream is still in use.
     /// Uses a transaction to prevent race conditions between the reference
@@ -5180,7 +5256,7 @@ impl DatabaseStore {
         let mut tx = self.pool().begin().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
 
-        self.cleanup_orphaned_upstream_tx(&mut tx, namespace, old_upstream_id)
+        self.cleanup_orphaned_upstream_tx(&mut tx, namespace, old_upstream_id, true)
             .await?;
 
         tx.commit().await?;
@@ -7413,6 +7489,9 @@ impl DatabaseStore {
         if topology == DatabaseTopology::Primary {
             self.failover_topology.ensure_primary_failback_allowed()?;
         }
+        let next_topology_epoch = crate::config::db_backend::checked_next_config_topology_epoch(
+            self.topology_epoch.load(Ordering::Acquire),
+        )?;
 
         // Disable and close the configured primary-topology replica before
         // exposing a failover pool. Keeping the dormant pool would make it
@@ -7429,6 +7508,8 @@ impl DatabaseStore {
 
         // Atomic swap — readers that already loaded the old pool keep using it.
         let old_pool = self.pool.swap(Arc::new(new_pool));
+        self.topology_epoch
+            .store(next_topology_epoch, Ordering::Release);
         info!(
             "Database pool reconnected (db_type={}). Old pool closing in background.",
             self.db_type
@@ -10738,7 +10819,12 @@ impl DatabaseBackend for DatabaseStore {
         // Shared read pin: blocks reconnect write publication for the
         // mutation's lifetime without serializing concurrent Admin writes.
         let guard = self.reconnect_transition.clone().read_owned().await;
-        crate::config::db_backend::DbWriteTopologyPermit::pinned(guard)
+        let topology_epoch = self.topology_epoch.load(Ordering::Acquire);
+        crate::config::db_backend::DbWriteTopologyPermit::pinned(guard, topology_epoch)
+    }
+
+    fn config_topology_epoch(&self) -> u64 {
+        self.topology_epoch.load(Ordering::Acquire)
     }
 
     fn pool_stats(&self) -> Option<crate::config::db_backend::DbPoolStats> {
@@ -10844,6 +10930,21 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         DatabaseStore::delete_proxy(self, namespace, id).await
+    }
+
+    async fn delete_proxy_with_orphan_cleanup(
+        &self,
+        namespace: &str,
+        id: &str,
+        cleanup_orphaned_upstream: bool,
+    ) -> Result<bool, anyhow::Error> {
+        DatabaseStore::delete_proxy_with_orphan_cleanup(
+            self,
+            namespace,
+            id,
+            cleanup_orphaned_upstream,
+        )
+        .await
     }
 
     async fn get_proxy(&self, namespace: &str, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
