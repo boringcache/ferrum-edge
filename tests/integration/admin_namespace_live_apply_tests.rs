@@ -75,8 +75,18 @@ fn test_pool_config() -> DbPoolConfig {
 }
 
 /// A poll-loop coordinator that serves `namespace` and has accepted nothing.
-fn coordinator(namespace: &str, timeout: Duration) -> Arc<RuntimeConfigApply> {
-    Arc::new(RuntimeConfigApply::with_timeout(namespace, 0, timeout))
+/// A poll-loop coordinator pinned to the store's CURRENT topology epoch.
+///
+/// `RuntimeConfigApply::with_timeout` pins epoch 0, but `DatabaseStore`
+/// initialises `topology_epoch` to 1. `prepare_live_apply_after_commit`
+/// captures the covering cursor at `db.config_topology_epoch()`, while
+/// `record_accepted` / `record_rejected` stamp the coordinator's own epoch —
+/// so an epoch-0 coordinator can never satisfy a waiter parked at epoch 1, and
+/// every outcome-recording test fell through to its own timeout instead.
+fn coordinator(namespace: &str, epoch: u64, timeout: Duration) -> Arc<RuntimeConfigApply> {
+    Arc::new(RuntimeConfigApply::with_timeout_at_epoch(
+        namespace, epoch, 0, timeout,
+    ))
 }
 
 async fn make_store(dir: &TempDir) -> DatabaseStore {
@@ -212,7 +222,7 @@ struct RenameFixture {
 async fn rename_fixture(dir: &TempDir, served: &str, timeout: Duration) -> RenameFixture {
     let store = make_store(dir).await;
     seed_upstream(&store, "tenant-a", "u-rename").await;
-    let apply = coordinator(served, timeout);
+    let apply = coordinator(served, store.config_topology_epoch(), timeout);
     let db: Arc<dyn DatabaseBackend> = Arc::new(store.clone());
     let (base, shutdown) = start_admin(namespace_admin_state(db, Some(apply.clone()))).await;
     RenameFixture {
@@ -337,7 +347,11 @@ async fn registry_only_create_does_not_wait_for_runtime_apply() {
     // A pending, unaccepted change record in the served namespace: a create
     // that waited on the namespace-wide MAX would block on this unrelated row.
     seed_config_change(&store, "served").await;
-    let apply = coordinator("served", Duration::from_millis(200));
+    let apply = coordinator(
+        "served",
+        store.config_topology_epoch(),
+        Duration::from_millis(200),
+    );
     let db: Arc<dyn DatabaseBackend> = Arc::new(store.clone());
     let (base, _shutdown) = start_admin(namespace_admin_state(db, Some(apply.clone()))).await;
 
@@ -358,7 +372,11 @@ async fn description_only_update_does_not_wait_for_runtime_apply() {
     let store = make_store(&dir).await;
     seed_upstream(&store, "served", "u-desc").await;
     seed_config_change(&store, "served").await;
-    let apply = coordinator("served", Duration::from_millis(200));
+    let apply = coordinator(
+        "served",
+        store.config_topology_epoch(),
+        Duration::from_millis(200),
+    );
     let db: Arc<dyn DatabaseBackend> = Arc::new(store.clone());
     let (base, _shutdown) = start_admin(namespace_admin_state(db, Some(apply))).await;
 
@@ -377,7 +395,11 @@ async fn description_only_update_does_not_wait_for_runtime_apply() {
 async fn unconfirmed_delete_of_an_empty_served_tenant_does_not_wait() {
     let dir = TempDir::new().expect("temp dir");
     let store = make_store(&dir).await;
-    let apply = coordinator("served", Duration::from_millis(200));
+    let apply = coordinator(
+        "served",
+        store.config_topology_epoch(),
+        Duration::from_millis(200),
+    );
     let db: Arc<dyn DatabaseBackend> = Arc::new(store.clone());
     let (base, _shutdown) = start_admin(namespace_admin_state(db, Some(apply))).await;
 
@@ -405,7 +427,11 @@ async fn confirmed_cascade_delete_of_the_served_namespace_waits() {
     // exercised rather than short-circuited by the 409.
     store.set_protected_namespaces(&["ferrum".to_string()]);
     seed_upstream(&store, "served", "u-cascade").await;
-    let apply = coordinator("served", Duration::from_secs(30));
+    let apply = coordinator(
+        "served",
+        store.config_topology_epoch(),
+        Duration::from_secs(30),
+    );
     let db: Arc<dyn DatabaseBackend> = Arc::new(store.clone());
     let (base, _shutdown) = start_admin(namespace_admin_state(db, Some(apply.clone()))).await;
 
@@ -433,7 +459,11 @@ async fn rename_between_unserved_namespaces_does_not_wait() {
     let store = make_store(&dir).await;
     seed_upstream(&store, "tenant-a", "u-unserved").await;
     // The coordinator serves a namespace neither side of this rename touches.
-    let apply = coordinator("served", Duration::from_millis(200));
+    let apply = coordinator(
+        "served",
+        store.config_topology_epoch(),
+        Duration::from_millis(200),
+    );
     let db: Arc<dyn DatabaseBackend> = Arc::new(store.clone());
     let (base, _shutdown) = start_admin(namespace_admin_state(db, Some(apply))).await;
 
