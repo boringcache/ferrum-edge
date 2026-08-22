@@ -18,8 +18,9 @@ use aya::maps::{Array as BpfArray, HashMap as BpfHashMap, LpmTrie, MapData};
 use ferrum_ebpf_common::{
     BpfCaptureConfig, FERRUM_CAPTURE_CONFIG_KEY, InboundRedirectKey4, InboundRedirectKey6,
     IncludePortsPolicy, NodeProbePortKey4, NodeProbePortKey6, PodInfo as BpfPodInfo,
-    UDP_REPLY_SOURCE_GATE_DISABLED, UDP_REPLY_SOURCE_GATE_ENABLED, UDP_REPLY_SOURCE_GATE_KEY,
-    UDP_REPLY_SOURCE_MAX_ENTRIES, UdpReplySourceKey4, UdpReplySourceKey6, WorkloadIdentity,
+    UDP_RELAY_CGROUP_MAX_ENTRIES, UDP_REPLY_SOURCE_GATE_DISABLED, UDP_REPLY_SOURCE_GATE_ENABLED,
+    UDP_REPLY_SOURCE_GATE_KEY, UDP_REPLY_SOURCE_MAX_ENTRIES, UdpReplySourceKey4,
+    UdpReplySourceKey6, WorkloadIdentity,
 };
 use ferrum_ebpf_common::{CidrKey4, CidrKey6};
 
@@ -27,8 +28,8 @@ use ferrum_ebpf_common::{CidrKey4, CidrKey6};
 use super::{
     BPF_MAP_CAPTURE_CONFIG, BPF_MAP_NODE_IPS, BPF_MAP_NODE_IPS6, BPF_MAP_NODE_PROBE_PORTS,
     BPF_MAP_NODE_PROBE_PORTS6, BPF_MAP_POD_INBOUND_PORTS, BPF_MAP_POD_INBOUND_PORTS6,
-    BPF_MAP_POD_IPS6, BPF_MAP_UDP_REPLY_SOURCE_GATE, BPF_MAP_UDP_REPLY_SOURCES,
-    BPF_MAP_UDP_REPLY_SOURCES6, BPF_MAP_WORKLOAD_IDENTITY, PodInfo,
+    BPF_MAP_POD_IPS6, BPF_MAP_UDP_RELAY_CGROUPS, BPF_MAP_UDP_REPLY_SOURCE_GATE,
+    BPF_MAP_UDP_REPLY_SOURCES, BPF_MAP_UDP_REPLY_SOURCES6, BPF_MAP_WORKLOAD_IDENTITY, PodInfo,
 };
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -43,6 +44,7 @@ pub struct BpfMaps {
     pod_inbound_ports6: Option<BpfHashMap<MapData, InboundRedirectKey6, u8>>,
     udp_reply_sources: Option<BpfHashMap<MapData, UdpReplySourceKey4, u8>>,
     udp_reply_sources6: Option<BpfHashMap<MapData, UdpReplySourceKey6, u8>>,
+    udp_relay_cgroups: Option<BpfHashMap<MapData, u64, u8>>,
     udp_reply_source_gate: Option<BpfArray<MapData, u8>>,
     bypass_uids: BpfHashMap<MapData, u32, u8>,
     cidr_exclude4: LpmTrie<MapData, CidrKey4, u8>,
@@ -184,6 +186,19 @@ impl BpfMaps {
             }
         };
 
+        let udp_relay_cgroups = match bpf.take_map(BPF_MAP_UDP_RELAY_CGROUPS) {
+            Some(map) => Some(
+                BpfHashMap::try_from(map)
+                    .map_err(|e| format!("FERRUM_UDP_RELAY_CGROUPS type mismatch: {e}"))?,
+            ),
+            None => {
+                tracing::warn!(
+                    "FERRUM_UDP_RELAY_CGROUPS map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
+                );
+                None
+            }
+        };
+
         let udp_reply_source_gate = match bpf.take_map(BPF_MAP_UDP_REPLY_SOURCE_GATE) {
             Some(map) => Some(
                 BpfArray::try_from(map)
@@ -293,6 +308,7 @@ impl BpfMaps {
             pod_inbound_ports6,
             udp_reply_sources,
             udp_reply_sources6,
+            udp_relay_cgroups,
             udp_reply_source_gate,
             bypass_uids,
             cidr_exclude4,
@@ -343,6 +359,13 @@ impl BpfMaps {
         }
         if require_workload_identity && self.udp_reply_sources6.is_none() {
             missing.push(BPF_MAP_UDP_REPLY_SOURCES6);
+        }
+        // The sender proof is not optional hardening: without it the tc UDP
+        // arms have nothing non-forgeable to require, and a NodeWaypoint that
+        // reported ready on such an ELF would serve the exact admission both
+        // #3956 and #3957 describe.
+        if require_workload_identity && self.udp_relay_cgroups.is_none() {
+            missing.push(BPF_MAP_UDP_RELAY_CGROUPS);
         }
         if require_workload_identity && self.udp_reply_source_gate.is_none() {
             missing.push(BPF_MAP_UDP_REPLY_SOURCE_GATE);
@@ -643,6 +666,64 @@ impl BpfMaps {
             &desired6,
             BPF_MAP_UDP_REPLY_SOURCES6,
         )
+    }
+
+    /// Replace `FERRUM_UDP_RELAY_CGROUPS` with exactly `cgroup_ids` — the
+    /// NodeWaypoint relay pod's own cgroup-v2 subtree (issues #3956, #3957).
+    ///
+    /// Same whole-set, gate-fenced discipline as
+    /// [`BpfMaps::replace_udp_reply_sources`], and the same reason the map must
+    /// be PRESENT for every generation including an empty withdrawal: the
+    /// caller acknowledges one applied generation, and an absent map is not
+    /// proof that the previous sender proof was revoked. A key-iteration error
+    /// is a hard error for the same reason — the scan is what finds the ids to
+    /// revoke, so swallowing it would report a withdrawal that never happened.
+    ///
+    /// An entry here is inert while the shared gate is closed, which is what
+    /// lets the node-agent apply the sender proof and the source proof as one
+    /// coherent generation.
+    pub fn replace_udp_relay_cgroups(&mut self, cgroup_ids: &[u64]) -> Result<(), String> {
+        if cgroup_ids.len() > UDP_RELAY_CGROUP_MAX_ENTRIES as usize {
+            return Err(format!(
+                "refusing to publish {} NodeWaypoint UDP relay cgroup id(s); the map holds at most {}",
+                cgroup_ids.len(),
+                UDP_RELAY_CGROUP_MAX_ENTRIES
+            ));
+        }
+        let Some(map) = self.udp_relay_cgroups.as_mut() else {
+            return Err(format!(
+                "{BPF_MAP_UDP_RELAY_CGROUPS} map is absent; cannot apply a NodeWaypoint UDP relay \
+                 sender proof"
+            ));
+        };
+
+        let mut stale: Vec<u64> = Vec::new();
+        for key in map.keys() {
+            let key = key.map_err(|e| {
+                format!(
+                    "Failed to scan {BPF_MAP_UDP_RELAY_CGROUPS} for withdrawn NodeWaypoint UDP \
+                     relay cgroups: {e}. Refusing to report the set replaced: a withdrawn relay \
+                     cgroup may still be authorized."
+                )
+            })?;
+            if !cgroup_ids.contains(&key) {
+                stale.push(key);
+            }
+        }
+        for key in stale {
+            tolerate_missing_map_remove(map.remove(&key), || {
+                format!("a withdrawn {BPF_MAP_UDP_RELAY_CGROUPS} entry")
+            })?;
+        }
+        for key in cgroup_ids {
+            map.insert(*key, 1u8, 0).map_err(|e| {
+                format!(
+                    "Failed to authorize a NodeWaypoint UDP relay cgroup in \
+                     {BPF_MAP_UDP_RELAY_CGROUPS}: {e}"
+                )
+            })?;
+        }
+        Ok(())
     }
 
     pub fn insert_bypass_uid(&mut self, uid: u32) -> Result<(), String> {

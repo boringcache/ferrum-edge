@@ -917,10 +917,10 @@ fn test_no_match() {
 use async_trait::async_trait;
 use ferrum_edge::_test_support::{
     apply_request_body_plugins, can_dispatch_direct_http2_pool, can_use_direct_http2_pool,
-    extract_grpc_reject_message, finalize_plugin_rejection_parts_for_test,
-    finalized_upload_deadline_response_for_test, insert_grpc_error_metadata,
-    map_http_reject_status_to_grpc_status, normalize_reject_response, request_may_have_body,
-    set_grpc_deadline_budget_for_test,
+    direct_h2_uses_limit_adapter, extract_grpc_reject_message,
+    finalize_plugin_rejection_parts_for_test, finalized_upload_deadline_response_for_test,
+    insert_grpc_error_metadata, map_http_reject_status_to_grpc_status, normalize_reject_response,
+    request_may_have_body, set_grpc_deadline_budget_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
@@ -3853,6 +3853,79 @@ fn test_direct_http2_pool_dispatch_allows_nonzero_body_limits() {
         true, false, true, 10_485_760, 10_485_760
     ));
     assert!(!can_dispatch_direct_http2_pool(false, false, false, 0, 0));
+}
+
+/// Issue #3942: operator `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0` is unlimited
+/// and must skip `SizeLimitedIncoming` on ordinary unauthenticated direct-H2.
+/// A real cap, an upload-completion gate, or gRPC message counting still
+/// takes the limiter so in-path 413 / gate / scanner stay intact.
+#[test]
+fn test_direct_h2_unlimited_skips_size_limited_incoming() {
+    assert!(
+        !direct_h2_uses_limit_adapter(0, false, false),
+        "bench-shaped unlimited unauthenticated POST must not wrap SizeLimitedIncoming"
+    );
+    assert!(
+        direct_h2_uses_limit_adapter(64, false, false),
+        "a nonzero request cap must still wrap SizeLimitedIncoming"
+    );
+    assert!(
+        direct_h2_uses_limit_adapter(0, true, false),
+        "upload-completion gate must still wrap SizeLimitedIncoming"
+    );
+    assert!(
+        direct_h2_uses_limit_adapter(0, false, true),
+        "gRPC message observation must still wrap SizeLimitedIncoming"
+    );
+}
+
+#[test]
+fn test_direct_h2_dispatch_uses_passthrough_body_when_unlimited() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let dispatch = source
+        .split("async fn proxy_to_backend_http2(")
+        .nth(1)
+        .expect("direct-H2 dispatch")
+        .split("\nstruct Http3BackendHeaderContext")
+        .next()
+        .expect("bounded direct-H2 dispatch");
+    assert!(
+        dispatch.contains("direct_h2_uses_limit_adapter("),
+        "direct-H2 upload must consult direct_h2_uses_limit_adapter"
+    );
+    assert!(
+        dispatch.contains("DirectH2RequestBody::Passthrough"),
+        "unlimited direct-H2 must construct DirectH2RequestBody::Passthrough"
+    );
+    assert!(
+        dispatch.contains("DirectH2RequestBody::Limited"),
+        "limited / gated direct-H2 must still wrap SizeLimitedIncoming"
+    );
+    assert!(
+        dispatch.contains("if use_limit_adapter && needs_upload_completion_gate {"),
+        "the completion-gate arm must remain the first dispatch choice"
+    );
+    assert!(
+        dispatch.contains("else if let (true, Some(messages)) = (use_limit_adapter, observe_grpc)"),
+        "gRPC observation without a gate must still take SizeLimitedIncoming"
+    );
+    let limited_ctors: Vec<&str> = dispatch.split("SizeLimitedIncoming::").skip(1).collect();
+    assert_eq!(
+        limited_ctors.len(),
+        2,
+        "proxy_to_backend_http2 must construct SizeLimitedIncoming only on the gated and gRPC arms"
+    );
+    for ctor in limited_ctors {
+        let args = ctor.split(')').next().expect("constructor argument list");
+        assert!(
+            args.contains("max_request_body_size"),
+            "limiter must receive the mapped budget, never a raw operator 0: {args}"
+        );
+        assert!(
+            !args.contains("effective_max_request_body_size_bytes"),
+            "passing the operator spelling 0 into SizeLimitedIncoming is deny-all: {args}"
+        );
+    }
 }
 
 #[test]

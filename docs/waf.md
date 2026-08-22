@@ -131,14 +131,19 @@ So a `<script>` written as `<script>`, `&lt;script&gt;`, or
 content-type-agnostic (an attacker controls the declared `Content-Type`), and
 bounded to a small number of variants.
 
-Query **values** (each `&`/`=`-split component — never the structural
-delimiters, and never the request path) run through that same bounded layered
+Query matching is per decoded parameter value, not the raw whole URI. Query
+**values** (each `&`/`=`-split component — never the structural delimiters,
+and never the request path) run through that same bounded layered
 percent-decode before matching, including reserved octets such as `%2f` /
-`%2F`. Path canonicalization still refuses encoded separators; that contract
-is not applied to query payload. At most three decode rounds are applied;
-deeper stacks are not fully reduced and are flagged as `encoding_evasion` on
-the raw URL/body rather than being decoded indefinitely. Decoding is
-inspection-only: the original query bytes are forwarded unchanged.
+`%2F` and `+`-as-space. Path canonicalization still refuses encoded
+separators; that contract is not applied to query payload. Each value is
+scanned as the percent-decoded form plus the same bounded layered variants,
+so stacked percent / HTML-entity / unicode encodings cannot evade query
+rules (including PATHTRAV/LFI canonical mirrors and the level-1 SSRF-Q
+mirrors). At most three decode rounds are applied; deeper stacks are not
+fully reduced and are flagged as `encoding_evasion` on the raw URL/body
+rather than being decoded indefinitely. Decoding is inspection-only: the
+original query bytes are forwarded unchanged.
 
 The layered decode runs a bounded number of rounds (a cost guard against
 decompression-style blowups), so double- and triple-stacked encodings are fully
@@ -211,7 +216,7 @@ and `rule_overrides`. Categories:
 | `xss` | FE-XSS-001..005 plus `-B`/`-Q` body/query mirrors | script-tag and js-URL now cover both query and body |
 | `path_traversal` | FE-PATHTRAV-001..003, FE-PATHTRAV-001-B | FE-PATHTRAV-001..003 (FullUrl) also scan percent-decoded query values (including `%2f`); 001-B covers request bodies. Category labels do not select scan targets. |
 | `lfi` / `rfi` | FE-LFI-001(+ -B), FE-RFI-001 (L2) | FE-LFI-001 (FullUrl) also inspects canonical query values; 001-B covers bodies. The `lfi` label itself does not. |
-| `ssrf` | FE-SSRF-001(+ -Q), FE-SSRF-002(+ -Q) | metadata/private-IP and dangerous schemes across body and query |
+| `ssrf` | FE-SSRF-001(+ -Q), FE-SSRF-002(+ -Q) | metadata/private-IP and dangerous schemes; **level 1** across body and decoded query values (not the raw whole URI). Same dotted-IPv4 / `metadata.google.internal` / `file|gopher|dict|jar|ldap://` claims as the body rules; IPv6 and alternate textual IP forms are out of scope |
 | `xxe` | FE-XXE-001 | external-entity markers; no longer trips on `<!DOCTYPE html>` |
 | `deserialization` | FE-DESER-001..003 | Java / .NET / PHP markers |
 | `header_anomaly` | FE-HEADER-001..003 | control chars, method-override, header-borne injection (L2) |

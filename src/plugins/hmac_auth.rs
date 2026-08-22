@@ -30,13 +30,17 @@
 //! altered or added without invalidating the signature. Clients must sign the
 //! byte-for-byte raw query string the gateway receives.
 //!
-//! The client must also include a legacy `Digest:` value such as
-//! `sha-256=<base64>` or an RFC 9530 `Content-Digest:` structured-field value
-//! such as `sha-256=:<base64>:`. The digest must match the SHA-256 / SHA-512 of
-//! the request body. The plugin
-//! verifies that the digest matches the actual buffered body bytes; tampering
-//! with the body, the query string, the nonce, or the digest header
-//! invalidates the HMAC.
+//! The client must also include exactly one body-integrity field: an RFC 9530
+//! `Content-Digest:` structured-field dictionary such as
+//! `sha-256=:<base64>:`, or a legacy RFC 3230 `Digest:` value such as
+//! `sha-256=<base64>`. Sending both headers is refused as ambiguous. The
+//! digest is SHA-256 and/or SHA-512 of the exact client bytes; unsupported
+//! algorithms, malformed members, duplicate algorithm keys, and mixed
+//! RFC 9530 / legacy spellings fail closed. The plugin verifies that digest
+//! against the hashed forwarding buffer (never an invented empty body);
+//! tampering with the body, the query string, the nonce, or the digest header
+//! invalidates the HMAC. `{DIGEST_HEADER_VALUE}` in the signing base is that
+//! field's literal value.
 //!
 //! ## Replay protection
 //!
@@ -86,7 +90,9 @@
 //! Consumer credentials should include:
 //!   { "hmac_auth": { "secret": "<shared-secret>" } }
 
-use crate::fips::approved::{HmacSha256, HmacSha512, Sha256, Sha512};
+#[cfg(test)]
+use crate::fips::approved::Sha512;
+use crate::fips::approved::{HmacSha256, HmacSha512, Sha256};
 use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::Value;
@@ -212,6 +218,27 @@ const MISSING_NONCE_BODY: &str = r#"{"error":"Missing nonce in HMAC authorizatio
 const MALFORMED_NONCE_BODY: &str = r#"{"error":"Malformed nonce in HMAC authorization"}"#;
 const UNEXPECTED_NONCE_BODY: &str =
     r#"{"error":"HMAC authorization nonce is not accepted by this signing profile"}"#;
+const MISSING_DIGEST_BODY: &str = r#"{"error":"Missing required Digest header"}"#;
+const AMBIGUOUS_DIGEST_BODY: &str = r#"{"error":"Ambiguous Digest and Content-Digest headers"}"#;
+const MALFORMED_DIGEST_BODY: &str = r#"{"error":"Malformed digest header"}"#;
+const UNSUPPORTED_DIGEST_BODY: &str = r#"{"error":"Unsupported digest algorithm"}"#;
+const DIGEST_MISMATCH_BODY: &str = r#"{"error":"Digest header does not match request body"}"#;
+
+/// Which body-integrity field the client presented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DigestSyntax {
+    /// RFC 9530 `Content-Digest` structured-field dictionary of byte sequences.
+    Rfc9530,
+    /// RFC 3230 `Digest` `algorithm=base64` list.
+    Rfc3230,
+}
+
+/// Decoded SHA-256 / SHA-512 members from one well-formed digest field.
+#[derive(Debug, Clone, Copy)]
+struct ParsedBodyDigest {
+    sha256: Option<[u8; 32]>,
+    sha512: Option<[u8; 64]>,
+}
 
 /// Whether `nonce` is an admissible `ferrum-hmac-v2` wire nonce.
 ///
@@ -232,6 +259,190 @@ fn nonce_wire_form_is_valid(nonce: &str) -> bool {
         return bytes.len() >= HMAC_NONCE_MIN_HEX_CHARS && bytes.len().is_multiple_of(2);
     }
     bytes.len() >= HMAC_NONCE_MIN_BASE64URL_CHARS
+}
+
+fn is_standard_base64_alphabet(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|&byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+}
+
+fn parse_standard_base64_digest(value: &str, expected_len: usize) -> Result<Vec<u8>, &'static str> {
+    if value.is_empty() || !is_standard_base64_alphabet(value.as_bytes()) {
+        return Err(MALFORMED_DIGEST_BODY);
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|_| MALFORMED_DIGEST_BODY)?;
+    if decoded.len() != expected_len {
+        return Err(MALFORMED_DIGEST_BODY);
+    }
+    Ok(decoded)
+}
+
+fn parse_sf_byte_sequence(value: &str) -> Result<&str, &'static str> {
+    let value = value.trim();
+    if value.len() < 2 || !value.starts_with(':') || !value.ends_with(':') {
+        return Err(MALFORMED_DIGEST_BODY);
+    }
+    let inner = &value[1..value.len() - 1];
+    if inner.is_empty() || inner.contains(':') || inner.contains(';') {
+        return Err(MALFORMED_DIGEST_BODY);
+    }
+    Ok(inner)
+}
+
+fn parse_legacy_digest_value(value: &str) -> Result<&str, &'static str> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.starts_with(':')
+        || value.starts_with('"')
+        || value.contains(';')
+        || value.contains(':')
+    {
+        return Err(MALFORMED_DIGEST_BODY);
+    }
+    Ok(value)
+}
+
+fn digest_algorithm_len(algorithm: &str) -> Result<usize, &'static str> {
+    match algorithm {
+        "sha-256" => Ok(32),
+        "sha-512" => Ok(64),
+        _ => Err(UNSUPPORTED_DIGEST_BODY),
+    }
+}
+
+fn parse_body_digest_header(
+    digest_header: &str,
+    syntax: DigestSyntax,
+) -> Result<ParsedBodyDigest, &'static str> {
+    if digest_header.trim().is_empty() {
+        return Err(MALFORMED_DIGEST_BODY);
+    }
+    let mut parsed = ParsedBodyDigest {
+        sha256: None,
+        sha512: None,
+    };
+    for member in digest_header.split(',') {
+        let member = member.trim();
+        if member.is_empty() {
+            return Err(MALFORMED_DIGEST_BODY);
+        }
+        let Some((raw_key, raw_value)) = member.split_once('=') else {
+            return Err(MALFORMED_DIGEST_BODY);
+        };
+        let algorithm = raw_key.trim().to_ascii_lowercase();
+        if algorithm.is_empty() {
+            return Err(MALFORMED_DIGEST_BODY);
+        }
+        let expected_len = digest_algorithm_len(&algorithm)?;
+        let encoded = match syntax {
+            DigestSyntax::Rfc9530 => parse_sf_byte_sequence(raw_value)?,
+            DigestSyntax::Rfc3230 => parse_legacy_digest_value(raw_value)?,
+        };
+        let decoded = parse_standard_base64_digest(encoded, expected_len)?;
+        match algorithm.as_str() {
+            "sha-256" => {
+                if parsed.sha256.is_some() {
+                    return Err(MALFORMED_DIGEST_BODY);
+                }
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&decoded);
+                parsed.sha256 = Some(hash);
+            }
+            "sha-512" => {
+                if parsed.sha512.is_some() {
+                    return Err(MALFORMED_DIGEST_BODY);
+                }
+                let mut hash = [0u8; 64];
+                hash.copy_from_slice(&decoded);
+                parsed.sha512 = Some(hash);
+            }
+            _ => return Err(UNSUPPORTED_DIGEST_BODY),
+        }
+    }
+    if parsed.sha256.is_none() && parsed.sha512.is_none() {
+        return Err(MALFORMED_DIGEST_BODY);
+    }
+    Ok(parsed)
+}
+
+fn digest_field_line_state(ctx: &RequestContext, name: &str) -> (bool, bool) {
+    let mut present = false;
+    let mut all_utf8 = true;
+    for value in ctx.header_field_lines(name) {
+        present = true;
+        all_utf8 &= std::str::from_utf8(value).is_ok();
+    }
+    (present, all_utf8)
+}
+
+fn select_digest_header(ctx: &RequestContext) -> Result<(&str, DigestSyntax), &'static str> {
+    // The materialized map comma-folds repeated valid field lines, which is
+    // exactly the list representation both supported digest syntaxes parse.
+    // It intentionally omits non-UTF-8 lines, however. Inspect the pristine
+    // HeaderMap as well so a valid signed line plus an unparseable duplicate
+    // cannot authenticate as though the competing wire line never existed.
+    let (content_present, content_all_utf8) = digest_field_line_state(ctx, "content-digest");
+    let (legacy_present, legacy_all_utf8) = digest_field_line_state(ctx, "digest");
+    match (content_present, legacy_present) {
+        (true, true) => Err(AMBIGUOUS_DIGEST_BODY),
+        (true, false) => {
+            if !content_all_utf8 {
+                return Err(MALFORMED_DIGEST_BODY);
+            }
+            let value = ctx
+                .headers
+                .get("content-digest")
+                .ok_or(MALFORMED_DIGEST_BODY)?;
+            if value.trim().is_empty() {
+                Err(MALFORMED_DIGEST_BODY)
+            } else {
+                Ok((value.as_str(), DigestSyntax::Rfc9530))
+            }
+        }
+        (false, true) => {
+            if !legacy_all_utf8 {
+                return Err(MALFORMED_DIGEST_BODY);
+            }
+            let value = ctx.headers.get("digest").ok_or(MALFORMED_DIGEST_BODY)?;
+            if value.trim().is_empty() {
+                Err(MALFORMED_DIGEST_BODY)
+            } else {
+                Ok((value.as_str(), DigestSyntax::Rfc3230))
+            }
+        }
+        (false, false) => Err(MISSING_DIGEST_BODY),
+    }
+}
+
+fn parsed_digest_matches_body(
+    parsed: &ParsedBodyDigest,
+    body_sha256: &[u8; 32],
+    body_sha512: &[u8; 64],
+) -> bool {
+    let mut matched = false;
+    let mut ok = true;
+    if let Some(expected) = parsed.sha256.as_ref() {
+        matched = true;
+        ok &= constant_time_eq(expected, body_sha256);
+    }
+    if let Some(expected) = parsed.sha512.as_ref() {
+        matched = true;
+        ok &= constant_time_eq(expected, body_sha512);
+    }
+    matched && ok
+}
+
+fn collected_body_hashes(ctx: &RequestContext) -> Option<(&[u8; 32], &[u8; 64])> {
+    match (
+        ctx.request_body_sha256.as_ref(),
+        ctx.request_body_sha512.as_ref(),
+    ) {
+        (Some(sha256), Some(sha512)) => Some((sha256, sha512)),
+        _ => None,
+    }
 }
 
 #[derive(Clone)]
@@ -1042,7 +1253,7 @@ impl HmacAuth {
                 self.clock_skew_seconds,
             )
         } else {
-            warn!("hmac_auth: unparseable Date header: {}", date_str);
+            warn!("hmac_auth: unparseable Date header");
             false
         }
     }
@@ -1055,97 +1266,27 @@ impl HmacAuth {
         now.saturating_sub(signed).unsigned_abs() <= clock_skew_seconds
     }
 
-    /// Verify that the `Digest:` header value matches the SHA-256/SHA-512 of
-    /// `body`. The header format is `<algo>=<base64>` per RFC 3230 §4.3.2,
-    /// where `<algo>` is `sha-256` or `sha-512` (case-insensitive).
-    ///
-    /// Multiple comma-separated entries are accepted; verification succeeds
-    /// if any one entry matches. Algorithms other than sha-256/sha-512 are
-    /// silently ignored (per RFC 3230, the receiver picks).
+    /// Verify that a digest field value matches `body` under `syntax`.
     #[cfg(test)]
-    pub(crate) fn verify_body_digest(digest_header: &str, body: &[u8]) -> bool {
-        for entry in digest_header.split(',') {
-            let entry = entry.trim();
-            // RFC 9530 Content-Digest wraps a byte sequence in colons
-            // (`sha-256=:base64:`); legacy Digest uses bare base64.
-            let Some((algo_raw, value_raw)) = entry.split_once('=') else {
-                continue;
-            };
-            let algo = algo_raw.trim().to_ascii_lowercase();
-            // RFC 9530 Content-Digest uses the `:<base64>:` structured-field
-            // byte-sequence form.
-            let value = value_raw.trim().trim_matches(':').trim_matches('"');
-
-            let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(value) else {
-                continue;
-            };
-
-            let actual = match algo.as_str() {
-                "sha-256" | "sha256" => {
-                    let mut hasher = Sha256::new();
-                    hasher.update(body);
-                    hasher.finalize().to_vec()
-                }
-                "sha-512" | "sha512" => {
-                    let mut hasher = Sha512::new();
-                    hasher.update(body);
-                    hasher.finalize().to_vec()
-                }
-                _ => continue,
-            };
-
-            if constant_time_eq(&decoded, &actual) {
-                return true;
-            }
-        }
-        false
+    fn verify_body_digest(digest_header: &str, body: &[u8], syntax: DigestSyntax) -> bool {
+        let Ok(parsed) = parse_body_digest_header(digest_header, syntax) else {
+            return false;
+        };
+        parsed_digest_matches_body(&parsed, &Sha256::digest(body), &Sha512::digest(body))
     }
 
-    fn verify_precomputed_body_digest(
-        digest_header: &str,
-        body_sha256: &[u8; 32],
-        body_sha512: &[u8; 64],
-    ) -> bool {
-        for entry in digest_header.split(',') {
-            let Some((algo_raw, value_raw)) = entry.trim().split_once('=') else {
-                continue;
-            };
-            let value = value_raw.trim().trim_matches(':').trim_matches('"');
-            let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(value) else {
-                continue;
-            };
-            match algo_raw.trim().to_ascii_lowercase().as_str() {
-                "sha-256" | "sha256" if constant_time_eq(body_sha256, &decoded) => return true,
-                "sha-512" | "sha512" if constant_time_eq(body_sha512, &decoded) => return true,
-                _ => {}
-            }
-        }
-        false
+    /// Look up the single digest field on the request. Prefers neither header
+    /// when both are present — that is ambiguous and fails closed.
+    fn extract_digest_header(ctx: &RequestContext) -> Result<(String, DigestSyntax), &'static str> {
+        let (value, syntax) = select_digest_header(ctx)?;
+        parse_body_digest_header(value, syntax)?;
+        Ok((value.to_string(), syntax))
     }
 
-    fn digest_header_has_supported_value(digest_header: &str) -> bool {
-        digest_header.split(',').any(|entry| {
-            let Some((algo_raw, value_raw)) = entry.trim().split_once('=') else {
-                return false;
-            };
-            let expected_len = match algo_raw.trim().to_ascii_lowercase().as_str() {
-                "sha-256" | "sha256" => 32,
-                "sha-512" | "sha512" => 64,
-                _ => return false,
-            };
-            let value = value_raw.trim().trim_matches(':').trim_matches('"');
-            base64::engine::general_purpose::STANDARD
-                .decode(value)
-                .is_ok_and(|decoded| decoded.len() == expected_len)
-        })
-    }
-
-    /// Look up the digest header on the request. Prefers RFC 9530
-    /// `Content-Digest` and falls back to RFC 3230 `Digest`.
-    fn lookup_digest_header(ctx: &RequestContext) -> ConfiguredHeaderLookup<'_> {
-        match lookup_configured_header(ctx, "content-digest", None) {
-            ConfiguredHeaderLookup::Absent => lookup_configured_header(ctx, "digest", None),
-            other => other,
+    fn digest_header_ref(ctx: &RequestContext) -> Option<&str> {
+        match select_digest_header(ctx) {
+            Ok((value, _)) => Some(value),
+            Err(_) => None,
         }
     }
 
@@ -1166,13 +1307,6 @@ impl HmacAuth {
         ctx.headers
             .get("authorization")
             .map(|header| Sha256::digest(header.as_bytes()))
-    }
-
-    fn digest_header_ref(ctx: &RequestContext) -> Option<&str> {
-        ctx.headers
-            .get("content-digest")
-            .or_else(|| ctx.headers.get("digest"))
-            .map(String::as_str)
     }
 
     fn consumer_for_valid_signature(
@@ -1259,12 +1393,11 @@ impl HmacAuth {
         };
 
         // The signing base binds only request-line/header data, so HMAC
-        // verification does not require body bytes. Only a valid secret-holder
+        // verification does not require body bytes. Extract already refused a
+        // malformed or unsupported digest field. Only a valid secret-holder
         // may enable collection; unknown and known-invalid identities both stay
         // on the same pre-auth 401 path without reaching the body-size limit.
-        if !self.validate_date(&credential.date)
-            || !Self::digest_header_has_supported_value(&credential.digest_header)
-        {
+        if !self.validate_date(&credential.date) {
             return false;
         }
         let Some(preverified_consumer) =
@@ -1336,19 +1469,20 @@ impl HmacAuth {
                 r#"{"error":"Missing or expired Date header"}"#.to_string()
             ));
         }
-        let (Some(body_sha256), Some(body_sha512)) = (
-            ctx.request_body_sha256.as_ref(),
-            ctx.request_body_sha512.as_ref(),
-        ) else {
-            return Some(Err(
-                r#"{"error":"Digest header does not match request body"}"#.to_string(),
-            ));
+        let Some((body_sha256, body_sha512)) = collected_body_hashes(ctx) else {
+            return Some(Err(DIGEST_MISMATCH_BODY.to_string()));
         };
-        if !Self::verify_precomputed_body_digest(&cached.digest_header, body_sha256, body_sha512) {
+        let syntax = match select_digest_header(ctx) {
+            Ok((_, syntax)) => syntax,
+            Err(body) => return Some(Err(body.to_string())),
+        };
+        let parsed = match parse_body_digest_header(&cached.digest_header, syntax) {
+            Ok(parsed) => parsed,
+            Err(body) => return Some(Err(body.to_string())),
+        };
+        if !parsed_digest_matches_body(&parsed, body_sha256, body_sha512) {
             debug!("hmac_auth: digest header does not match request body");
-            return Some(Err(
-                r#"{"error":"Digest header does not match request body"}"#.to_string(),
-            ));
+            return Some(Err(DIGEST_MISMATCH_BODY.to_string()));
         }
 
         Some(Ok((cached.preverified_consumer, cached.nonce)))
@@ -1415,18 +1549,9 @@ impl AuthMechanism for HmacAuth {
                 r#"{"error":"HBONE CONNECT is incompatible with hmac_auth request-body digest verification"}"#.to_string(),
             );
         }
-        let digest_header = match Self::lookup_digest_header(ctx) {
-            ConfiguredHeaderLookup::Value(header) => header.into_owned(),
-            ConfiguredHeaderLookup::PresentNonMaterialized => {
-                return ExtractedCredential::InvalidFormat(
-                    r#"{"error":"Invalid Digest header"}"#.to_string(),
-                );
-            }
-            ConfiguredHeaderLookup::Absent => {
-                return ExtractedCredential::InvalidFormat(
-                    r#"{"error":"Missing required Digest header"}"#.to_string(),
-                );
-            }
+        let (digest_header, digest_syntax) = match Self::extract_digest_header(ctx) {
+            Ok(header) => header,
+            Err(body) => return ExtractedCredential::InvalidFormat(body.to_string()),
         };
         let Some(authority) = ctx.request_authority.clone() else {
             return ExtractedCredential::InvalidFormat(
@@ -1464,13 +1589,10 @@ impl AuthMechanism for HmacAuth {
             // captured signed request with altered/added query parameters.
             query: ctx.raw_query_string().unwrap_or_default().to_string(),
             digest_header,
+            digest_is_rfc9530: matches!(digest_syntax, DigestSyntax::Rfc9530),
             nonce,
-            request_body_sha256: ctx
-                .request_body_sha256
-                .unwrap_or_else(|| Sha256::digest([])),
-            request_body_sha512: ctx
-                .request_body_sha512
-                .unwrap_or_else(|| Sha512::digest([])),
+            request_body_sha256: ctx.request_body_sha256,
+            request_body_sha512: ctx.request_body_sha512,
         }))
     }
 
@@ -1490,18 +1612,27 @@ impl AuthMechanism for HmacAuth {
             );
         }
 
-        // Verify that the Digest header matches the actual request body.
-        // Done before consumer lookup so a tampered body fails fast and the
-        // error message is independent of whether the consumer exists.
-        if !Self::verify_precomputed_body_digest(
-            &credential.digest_header,
-            &credential.request_body_sha256,
-            &credential.request_body_sha512,
+        let syntax = if credential.digest_is_rfc9530 {
+            DigestSyntax::Rfc9530
+        } else {
+            DigestSyntax::Rfc3230
+        };
+        let parsed = match parse_body_digest_header(&credential.digest_header, syntax) {
+            Ok(parsed) => parsed,
+            Err(body) => return VerifyOutcome::Invalid(body.to_string()),
+        };
+        let hashes = match (
+            credential.request_body_sha256.as_ref(),
+            credential.request_body_sha512.as_ref(),
         ) {
+            (Some(sha256), Some(sha512)) => Some((sha256, sha512)),
+            _ => None,
+        };
+        if let Some((body_sha256, body_sha512)) = hashes
+            && !parsed_digest_matches_body(&parsed, body_sha256, body_sha512)
+        {
             debug!("hmac_auth: digest header does not match request body");
-            return VerifyOutcome::Invalid(
-                r#"{"error":"Digest header does not match request body"}"#.to_string(),
-            );
+            return VerifyOutcome::Invalid(DIGEST_MISMATCH_BODY.to_string());
         }
 
         // Tampering with the digest header itself (without re-signing with
@@ -1509,6 +1640,13 @@ impl AuthMechanism for HmacAuth {
         // The query string is bound too, so altering query params invalidates
         // the signature.
         if let Some(consumer) = self.consumer_for_valid_signature(&credential, consumer_index) {
+            if hashes.is_none() {
+                // A valid signature must still prove the body. Missing hashes
+                // mean the forwarding buffer was never digested — fail closed
+                // rather than treating that as the empty body.
+                debug!("hmac_auth: signed request is missing collected body hashes");
+                return VerifyOutcome::Invalid(DIGEST_MISMATCH_BODY.to_string());
+            }
             return VerifyOutcome::consumer(consumer);
         }
 
@@ -1778,7 +1916,7 @@ mod tests {
     //! Inline tests for `pub(crate)` helpers. Public API tests live in
     //! `tests/unit/plugins/hmac_auth_tests.rs`.
 
-    use super::HmacAuth;
+    use super::{DigestSyntax, HmacAuth, UNSUPPORTED_DIGEST_BODY, parse_body_digest_header};
     use crate::fips::approved::{Sha256, Sha512};
     use base64::Engine as _;
 
@@ -1804,64 +1942,116 @@ mod tests {
     fn verify_body_digest_accepts_correct_sha256() {
         let body = b"hello world";
         let digest = sha256_digest_header(body);
-        assert!(HmacAuth::verify_body_digest(&digest, body));
+        assert!(HmacAuth::verify_body_digest(
+            &digest,
+            body,
+            DigestSyntax::Rfc3230
+        ));
     }
 
     #[test]
     fn verify_body_digest_accepts_correct_sha512() {
         let body = b"hello world";
         let digest = sha512_digest_header(body);
-        assert!(HmacAuth::verify_body_digest(&digest, body));
+        assert!(HmacAuth::verify_body_digest(
+            &digest,
+            body,
+            DigestSyntax::Rfc3230
+        ));
     }
 
     #[test]
     fn verify_body_digest_rejects_wrong_body() {
         let body = b"hello world";
         let digest = sha256_digest_header(body);
-        assert!(!HmacAuth::verify_body_digest(&digest, b"hello WORLD"));
+        assert!(!HmacAuth::verify_body_digest(
+            &digest,
+            b"hello WORLD",
+            DigestSyntax::Rfc3230
+        ));
     }
 
     #[test]
     fn verify_body_digest_rejects_unknown_algorithm() {
         let body = b"hello world";
-        // sha-1 is not supported by the verifier.
         let digest = "sha-1=abc123==";
-        assert!(!HmacAuth::verify_body_digest(digest, body));
+        assert!(!HmacAuth::verify_body_digest(
+            digest,
+            body,
+            DigestSyntax::Rfc3230
+        ));
+        assert_eq!(
+            parse_body_digest_header(digest, DigestSyntax::Rfc3230).unwrap_err(),
+            UNSUPPORTED_DIGEST_BODY
+        );
     }
 
     #[test]
     fn verify_body_digest_rejects_garbage_value() {
         let body = b"hello world";
         let digest = "sha-256=not-valid-base64!!!";
-        assert!(!HmacAuth::verify_body_digest(digest, body));
+        assert!(!HmacAuth::verify_body_digest(
+            digest,
+            body,
+            DigestSyntax::Rfc3230
+        ));
     }
 
     #[test]
     fn verify_body_digest_handles_empty_body() {
         let body = b"";
         let digest = sha256_digest_header(body);
-        assert!(HmacAuth::verify_body_digest(&digest, body));
+        assert!(HmacAuth::verify_body_digest(
+            &digest,
+            body,
+            DigestSyntax::Rfc3230
+        ));
     }
 
     #[test]
-    fn verify_body_digest_accepts_multiple_entries() {
-        // Per RFC 3230 the receiver picks any matching entry. The first one
-        // is unsupported (md5), the second is correct sha-256.
+    fn verify_body_digest_fails_closed_on_unsupported_companion_algorithm() {
         let body = b"hello";
         let valid = sha256_digest_header(body);
-        let combined = format!("md5=ignored, {}", valid);
-        assert!(HmacAuth::verify_body_digest(&combined, body));
+        let combined = format!("md5=ignored, {valid}");
+        assert!(!HmacAuth::verify_body_digest(
+            &combined,
+            body,
+            DigestSyntax::Rfc3230
+        ));
+        assert_eq!(
+            parse_body_digest_header(&combined, DigestSyntax::Rfc3230).unwrap_err(),
+            UNSUPPORTED_DIGEST_BODY
+        );
     }
 
     #[test]
     fn verify_body_digest_accepts_rfc9530_byte_sequence_form() {
-        // RFC 9530 wraps the byte sequence in `:base64:`.
         let body = b"hello";
         let mut hasher = Sha256::new();
         hasher.update(body);
         let b64 = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
         let digest = format!("sha-256=:{}:", b64);
-        assert!(HmacAuth::verify_body_digest(&digest, body));
+        assert!(HmacAuth::verify_body_digest(
+            &digest,
+            body,
+            DigestSyntax::Rfc9530
+        ));
+        assert!(!HmacAuth::verify_body_digest(
+            &digest,
+            body,
+            DigestSyntax::Rfc3230
+        ));
+    }
+
+    #[test]
+    fn verify_body_digest_rejects_legacy_form_as_content_digest() {
+        let body = b"hello";
+        let digest = sha256_digest_header(body);
+        assert!(!HmacAuth::verify_body_digest(
+            &digest,
+            body,
+            DigestSyntax::Rfc9530
+        ));
     }
 
     #[test]

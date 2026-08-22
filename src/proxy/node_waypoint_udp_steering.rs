@@ -104,7 +104,7 @@
 //! is the next ordinary reconcile tick, never a sleep, a spin, or a blocked
 //! runtime worker. The teardown side is symmetric: a withdrawal is not
 //! [`SteerReconcileOutcome::Removed`] until the node-agent acknowledges the
-//! EMPTY generation, and until then every pass re-publishes and re-checks. An
+//! INACTIVE generation, and until then every pass re-publishes and re-checks. An
 //! acknowledgement naming a different owner (a crashed predecessor) or a
 //! different sequence (an earlier set, or a differently ordered rendering of
 //! one) satisfies nothing.
@@ -112,9 +112,11 @@
 //! [`NodeWaypointUdpSteering::reconcile`] applies the pair only when it CHANGED
 //! and ALWAYS runs one strict exact-name teardown before this process trusts the
 //! datapath (so objects a crashed prior process left installed are reaped on the
-//! first pass rather than surviving until this process exits). Empty state and
-//! every owner exit invoke the same teardown, including task abort and panic;
-//! only success records proof, while an error remains unproven and retryable.
+//! first pass rather than surviving until this process exits). Losing the last
+//! serving listener, shutdown, and every owner exit invoke the same inactive
+//! teardown, including task abort and panic. An empty destination set while a
+//! listener is still bound publishes ACTIVE instead of withdrawing. Only
+//! success records proof, while an error remains unproven and retryable.
 //!
 //! Destination and interface updates share one cold-path mutex: each event
 //! mutates only its component, then the backend reconcile derives from the
@@ -128,6 +130,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
 use tracing::{debug, info, warn};
@@ -144,14 +147,19 @@ use crate::proxy::node_waypoint_udp_reply_source::{
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NodeWaypointUdpSteerPlan {
     /// Sorted, deduplicated `(ClusterIP, port)` pairs, one per materialized
-    /// listener address. Empty means "steer nothing" — which is a valid, fully
-    /// fail-closed posture, not an error.
+    /// listener address. Empty with [`Self::serving`] true is a bound
+    /// headless/VIP-less listener: nothing is steered, but the relay sender
+    /// proof stays live. Empty with serving false is a true withdrawal.
     pub destinations: Vec<NodeWaypointUdpSteerDestination>,
     /// Whether a generation has been published at all. An unpublished plan and
     /// an empty published plan are the same datapath posture (nothing steered),
     /// but only the latter is a positive statement, so they are distinguished in
     /// diagnostics.
     pub published: bool,
+    /// Whether at least one owned UDP/DTLS listener is actually bound and
+    /// serving. Distinct from "has ClusterIP destinations": a headless listener
+    /// is serving with an empty destination set.
+    pub serving: bool,
 }
 
 /// Process-wide diagnostic snapshot of the last serving plan a
@@ -176,6 +184,7 @@ pub fn publish_plan(destinations: Vec<NodeWaypointUdpSteerDestination>) {
     PUBLISHED_PLAN.store(Arc::new(NodeWaypointUdpSteerPlan {
         destinations,
         published: true,
+        serving: true,
     }));
 }
 
@@ -280,7 +289,7 @@ pub enum SteerReconcileOutcome {
     /// Steering rules were installed or rebuilt, against an acknowledged
     /// reply-source generation.
     Applied,
-    /// The datapath was torn down and the empty generation is acknowledged, so
+    /// The datapath was torn down and the INACTIVE generation is acknowledged, so
     /// the withdrawal is PROVEN, not merely requested.
     Removed,
     /// The desired generation is published but the node-agent has not
@@ -323,13 +332,20 @@ struct SteeringState {
     /// lock-free [`NodeWaypointUdpSteering::bound_destinations`] snapshot is
     /// only a diagnostic copy written while this mutex is held.
     desired_destinations: Vec<NodeWaypointUdpSteerDestination>,
+    /// Whether at least one owned UDP/DTLS listener is actually bound, started,
+    /// and not finished. Distinct from [`Self::desired_destinations`]: a
+    /// headless/VIP-less listener is serving with an empty destination set,
+    /// and adding/removing ClusterIP tuples while this stays true must not
+    /// withdraw the relay-cgroup sender proof.
+    desired_serving: bool,
     /// Latest published attribution interfaces. Paired with
     /// [`Self::desired_destinations`] inside the same critical section.
     desired_ifaces: Vec<String>,
     /// The reply-source set this process has PUBLISHED on the channel, with the
-    /// generation naming it (`Some((_, vec![]))` = the empty generation has been
-    /// published). `None` means the channel's content is unknown, so the next
-    /// pass must republish rather than settle.
+    /// generation naming it. `Some((_, vec![]))` is an empty source set — ACTIVE
+    /// when a bound listener is still serving (headless/VIP-less), INACTIVE when
+    /// it is a true withdrawal. `None` means the channel's content is unknown,
+    /// so the next pass must republish rather than settle.
     ///
     /// Kept separate from [`Self::applied`] because the two datapath halves
     /// fail independently: a successful `iptables` apply whose authorization
@@ -362,6 +378,8 @@ pub struct NodeWaypointUdpSteering {
     /// Lock-free diagnostic snapshot of the desired destination set. Written
     /// only while `state` is held; never the reconcile source of truth.
     bound_destinations: ArcSwap<Vec<NodeWaypointUdpSteerDestination>>,
+    /// Lock-free diagnostic snapshot of [`SteeringState::desired_serving`].
+    serving: AtomicBool,
 }
 
 impl NodeWaypointUdpSteering {
@@ -371,6 +389,7 @@ impl NodeWaypointUdpSteering {
             reply_sources: None,
             state: Mutex::new(SteeringState::default()),
             bound_destinations: ArcSwap::from_pointee(Vec::new()),
+            serving: AtomicBool::new(false),
         }
     }
 
@@ -394,6 +413,14 @@ impl NodeWaypointUdpSteering {
         self.bound_destinations.load_full().as_ref().clone()
     }
 
+    /// Whether this serving instance currently has at least one actually bound
+    /// NodeWaypoint UDP/DTLS listener. Distinct from
+    /// [`Self::bound_destinations`]: a headless listener is serving with none.
+    #[allow(dead_code)] // External tests assert serving independently of ClusterIP tuples.
+    pub fn serving(&self) -> bool {
+        self.serving.load(Ordering::Acquire)
+    }
+
     fn lock_state(&self) -> std::sync::MutexGuard<'_, SteeringState> {
         match self.state.lock() {
             Ok(guard) => guard,
@@ -405,6 +432,7 @@ impl NodeWaypointUdpSteering {
                 let mut guard = poisoned.into_inner();
                 *guard = SteeringState::default();
                 self.bound_destinations.store(Arc::new(Vec::new()));
+                self.serving.store(false, Ordering::Release);
                 guard
             }
         }
@@ -413,15 +441,24 @@ impl NodeWaypointUdpSteering {
     fn publish_desired_snapshot(&self, state: &SteeringState) {
         self.bound_destinations
             .store(Arc::new(state.desired_destinations.clone()));
+        self.serving.store(state.desired_serving, Ordering::Release);
     }
 
-    /// Replace the bound destination set and apply it immediately against the
-    /// last published attribution interfaces (or `ifaces` when supplied).
+    /// Replace the bound destination set and serving bit, then apply immediately
+    /// against the last published attribution interfaces (or `ifaces` when
+    /// supplied).
     ///
-    /// Whole-plan replacement: a generation is applied or it is not. An empty
-    /// set requests strict teardown and settles only after removal is proven.
+    /// Whole-plan replacement: a generation is applied or it is not. `serving`
+    /// is whether at least one owned UDP/DTLS listener is actually bound,
+    /// started, and not finished — not whether ClusterIP destinations exist.
+    /// `serving == false` requests strict teardown and settles only after the
+    /// INACTIVE generation is proven. `serving == true` with an empty
+    /// destination set (or empty attribution interfaces) keeps the relay
+    /// sender proof live and leaves steering rules absent.
+    ///
     /// Callers must pass only destinations whose listeners are actually bound
-    /// on the accepted serving generation.
+    /// on the accepted serving generation, and must pass `serving` from that
+    /// same bound inventory.
     ///
     /// The destination (and optional interface) update and the backend
     /// reconcile share one critical section so a concurrent later event cannot
@@ -430,12 +467,17 @@ impl NodeWaypointUdpSteering {
         &self,
         destinations: Vec<NodeWaypointUdpSteerDestination>,
         ifaces: Option<&[String]>,
+        serving: bool,
     ) -> SteerReconcileOutcome {
         let mut destinations = destinations;
         destinations.sort_unstable();
         destinations.dedup();
+        if !serving {
+            destinations.clear();
+        }
         let mut state = self.lock_state();
         state.desired_destinations = destinations;
+        state.desired_serving = serving;
         if let Some(ifaces) = ifaces {
             state.desired_ifaces = ifaces.to_vec();
         }
@@ -484,13 +526,18 @@ impl NodeWaypointUdpSteering {
         &self,
         ifaces: &[String],
         destinations: &[NodeWaypointUdpSteerDestination],
+        serving: bool,
     ) -> SteerReconcileOutcome {
         let mut destinations = destinations.to_vec();
         destinations.sort_unstable();
         destinations.dedup();
+        if !serving {
+            destinations.clear();
+        }
         let mut state = self.lock_state();
         state.desired_ifaces = ifaces.to_vec();
         state.desired_destinations = destinations;
+        state.desired_serving = serving;
         self.publish_desired_snapshot(&state);
         self.reconcile_locked(&mut state)
     }
@@ -521,22 +568,36 @@ impl NodeWaypointUdpSteering {
             return SteerReconcileOutcome::Failed;
         }
 
-        if desired.ifaces.is_empty() || desired.destinations.is_empty() {
-            // Nothing to steer. Run the exact-name teardown unless this process
-            // has already PROVEN the node holds no Ferrum-owned steering
-            // objects AND the node-agent has acknowledged the empty
-            // reply-source generation — which is exactly what makes the first
-            // pass reap a crashed predecessor's rules and authorizations while
-            // every later quiet poll runs no command at all.
-            if state.reaped && state.applied.is_none() && Self::generation_proven(state, &[]) {
+        if !state.desired_serving {
+            // Nothing is serving. Run the exact-name teardown unless this
+            // process has already PROVEN the node holds no Ferrum-owned
+            // steering objects AND the node-agent has acknowledged the
+            // INACTIVE generation — which is exactly what makes the first
+            // pass reap a crashed predecessor's rules and authorizations
+            // while every later quiet poll runs no command at all.
+            if state.reaped && state.applied.is_none() && Self::generation_proven(state, &[], false)
+            {
                 return SteerReconcileOutcome::Unchanged;
             }
-            return self.converge_empty(state);
+            return self.converge_inactive(state);
+        }
+
+        if desired.ifaces.is_empty() || desired.destinations.is_empty() {
+            // A bound listener is serving, but there is nothing to steer
+            // (headless/VIP-less, or no attribution interfaces). Keep the
+            // relay sender proof live; leave steering rules absent.
+            if state.reaped
+                && state.applied.is_none()
+                && Self::generation_proven(state, &desired.destinations, true)
+            {
+                return SteerReconcileOutcome::Unchanged;
+            }
+            return self.converge_serving_unsteered(state);
         }
 
         if state.reaped
             && state.applied.as_ref() == Some(&desired)
-            && Self::generation_proven(state, &desired.destinations)
+            && Self::generation_proven(state, &desired.destinations, true)
         {
             return SteerReconcileOutcome::Unchanged;
         }
@@ -546,7 +607,7 @@ impl NodeWaypointUdpSteering {
             &desired.destinations,
         ) {
             Ok(Some(script)) => script,
-            Ok(None) => return self.converge_empty(state),
+            Ok(None) => return self.converge_serving_unsteered(state),
             Err(error) => {
                 warn!(
                     interfaces = desired.ifaces.len(),
@@ -581,7 +642,7 @@ impl NodeWaypointUdpSteering {
         // which a workload's datagram reaches the listener but the listener's
         // source-pinned reply is dropped by this node's own pod-veth guard; the
         // reverse order would make every new generation start with one.
-        let generation = match self.publish_reply_sources(state, &desired.destinations) {
+        let generation = match self.publish_reply_sources(state, &desired.destinations, true) {
             Ok(generation) => generation,
             Err(error) => {
                 warn!(
@@ -666,13 +727,16 @@ impl NodeWaypointUdpSteering {
     fn generation_proven(
         state: &SteeringState,
         desired: &[NodeWaypointUdpSteerDestination],
+        active: bool,
     ) -> bool {
         match (
             state.published_reply_sources.as_ref(),
             state.acknowledged_reply_sources.as_ref(),
         ) {
             (Some((generation, published)), Some(acknowledged)) => {
-                published.as_slice() == desired && acknowledged == generation
+                published.as_slice() == desired
+                    && generation.active() == active
+                    && acknowledged == generation
             }
             _ => false,
         }
@@ -680,13 +744,13 @@ impl NodeWaypointUdpSteering {
 
     /// Converge on "nothing steered, nothing authorized".
     ///
-    /// Rules first, then the empty generation, then the proof: a withdrawal is
-    /// only [`SteerReconcileOutcome::Removed`] once the node-agent has
-    /// acknowledged the empty generation. Until then the pass reports
+    /// Rules first, then the INACTIVE generation, then the proof: a withdrawal
+    /// is only [`SteerReconcileOutcome::Removed`] once the node-agent has
+    /// acknowledged the inactive generation. Until then the pass reports
     /// [`SteerReconcileOutcome::PendingAck`] and the next reconcile re-checks,
     /// so one lost acknowledgement cannot leave a revoked ClusterIP recorded as
     /// withdrawn.
-    fn converge_empty(&self, state: &mut SteeringState) -> SteerReconcileOutcome {
+    fn converge_inactive(&self, state: &mut SteeringState) -> SteerReconcileOutcome {
         let rules_removed = if !state.reaped || state.applied.is_some() {
             self.remove_rules(state)
         } else {
@@ -701,7 +765,7 @@ impl NodeWaypointUdpSteering {
             return SteerReconcileOutcome::Failed;
         }
 
-        match self.publish_reply_sources(state, &[]) {
+        match self.publish_reply_sources(state, &[], false) {
             Ok(generation) => match self.observe_acknowledgement(state) {
                 Ok(Some(acknowledged)) if acknowledged == generation => {
                     SteerReconcileOutcome::Removed
@@ -722,6 +786,48 @@ impl NodeWaypointUdpSteering {
                     %error,
                     "NodeWaypoint UDP/DTLS reply-source withdrawal reported an error; the \
                      authorizations stay recorded as unproven and are retried on the next reconcile"
+                );
+                SteerReconcileOutcome::Failed
+            }
+        }
+    }
+
+    /// A bound listener is serving but steering rules must stay absent (no
+    /// ClusterIP destinations, or no attribution interfaces). Publish ACTIVE
+    /// — including the active-empty headless shape — so the relay-cgroup
+    /// sender proof stays live for the direct-node lane.
+    fn converge_serving_unsteered(&self, state: &mut SteeringState) -> SteerReconcileOutcome {
+        let rules_removed = if !state.reaped || state.applied.is_some() {
+            self.remove_rules(state)
+        } else {
+            true
+        };
+        if !rules_removed {
+            return SteerReconcileOutcome::Failed;
+        }
+
+        let sources = state.desired_destinations.clone();
+        match self.publish_reply_sources(state, &sources, true) {
+            Ok(generation) => match self.observe_acknowledgement(state) {
+                Ok(Some(acknowledged)) if acknowledged == generation => {
+                    SteerReconcileOutcome::Applied
+                }
+                Ok(_) => SteerReconcileOutcome::PendingAck,
+                Err(error) => {
+                    warn!(
+                        %error,
+                        "NodeWaypoint UDP/DTLS active-empty reply-source generation could not be \
+                         proven; the sender proof stays unproven and is retried on the next \
+                         reconcile rather than withdrawing a bound listener"
+                    );
+                    SteerReconcileOutcome::Failed
+                }
+            },
+            Err(error) => {
+                warn!(
+                    %error,
+                    "NodeWaypoint UDP/DTLS active generation could not be published; a bound \
+                     listener stays unproven rather than being recorded as withdrawn"
                 );
                 SteerReconcileOutcome::Failed
             }
@@ -759,13 +865,13 @@ impl NodeWaypointUdpSteering {
         true
     }
 
-    /// Rules first, then the empty generation. The recovery path for every hard
+    /// Rules first, then the INACTIVE generation. The recovery path for every hard
     /// failure, and the shutdown path.
     fn tear_down(&self, state: &mut SteeringState) {
         if !self.remove_rules(state) {
             return;
         }
-        if let Err(error) = self.publish_reply_sources(state, &[]) {
+        if let Err(error) = self.publish_reply_sources(state, &[], false) {
             warn!(
                 %error,
                 "NodeWaypoint UDP/DTLS reply-source withdrawal reported an error; the \
@@ -791,14 +897,15 @@ impl NodeWaypointUdpSteering {
         &self,
         state: &mut SteeringState,
         sources: &[NodeWaypointUdpSteerDestination],
+        active: bool,
     ) -> Result<ReplySourceGeneration, String> {
         let Some(publisher) = self.reply_sources.as_ref() else {
-            let generation = ReplySourceGeneration::inert();
+            let generation = ReplySourceGeneration::inert_with_active(active);
             state.published_reply_sources = Some((generation.clone(), sources.to_vec()));
             state.acknowledged_reply_sources = Some(generation.clone());
             return Ok(generation);
         };
-        match publisher.publish(sources) {
+        match publisher.publish(sources, active) {
             Ok(generation) => {
                 state.published_reply_sources = Some((generation.clone(), sources.to_vec()));
                 Ok(generation)
@@ -851,6 +958,7 @@ impl NodeWaypointUdpSteering {
     pub fn shutdown(&self) {
         let mut state = self.lock_state();
         state.desired_destinations.clear();
+        state.desired_serving = false;
         self.publish_desired_snapshot(&state);
         self.tear_down(&mut state);
     }

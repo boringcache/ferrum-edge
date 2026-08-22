@@ -208,6 +208,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- HTTP backend error classification now labels three previously misleading
+  failure modes correctly. An HTTPS backend whose origin answers plaintext
+  (TLS handshake after TCP connect) is `tls_error`, not `connection_refused`.
+  The connect-phase RST/refused collapse is unchanged when no rustls error is
+  in the source chain. A backend FIN before a complete HTTP body is
+  `connection_closed`, not the `request_error` catch-all. WebSocket
+  post-upgrade protocol junk is `protocol_error`, a backend RST after upgrade
+  is `connection_reset`, and `stdout_logging` now writes the session-end
+  `error_class` on a 101 `TransactionSummary` via `on_ws_disconnect`.
+  `TlsError` remains pre-wire, so `retry_on_connect_failure` is unchanged
+  for the handshake case; `connection_closed` is post-wire like
+  `request_error`, so connect-failure retry still does not replay
+  non-idempotent requests.
+
 - `POST /proxies` and `POST /batch` accept a proxy that sets `upstream_id`
   without `backend_host` / `backend_port` (issue #4029). Validation already
   allowed an empty host when an upstream is referenced; serde required the
@@ -265,6 +279,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when a body inspection hook can actually run. `fail_closed` (the default),
   `scan_truncated`, and `skip` still do not satisfy the gate, and a config
   that cannot block anything is still refused.
+- WAF query SSRF mirrors `FE-SSRF-001-Q` / `FE-SSRF-002-Q` now compile at
+  paranoia 1, matching the documented body/query pack and the recommended
+  `{mode: enforce, default_rule_action: enforce, paranoia_level: 1}` posture
+  (issue #3936). They were present but gated at paranoia 2, so
+  `http://169.254.169.254/latest/meta-data/` and `gopher://127.0.0.1/` in a
+  query string produced `waf.action=clean` while the same payload in the body
+  blocked as `FE-SSRF-001` / `FE-SSRF-002`. Matching stays on decoded query
+  values (percent-decode plus the bounded layered variants used for bodies),
+  not raw whole-URI text, and keeps the existing dotted-IPv4 / metadata-host /
+  dangerous-scheme claims without expanding into IPv6 or alternate textual IP
+  forms.
 
 - Authenticated UDP/DTLS client-facing sends no longer emit after the
   authorization deadline (issues #3815, #3816, #3820). A pre-send commitment
@@ -303,6 +328,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (issue #3244) (issue #3317).
 
 ### Added
+
+- **`DELETE /proxies/{id}?cleanup_orphaned_upstream=` opt-out** (issue #4064).
+  This is a non-breaking feature addition: omitting the parameter preserves
+  existing behavior, which orphan-cleans a last-referenced hand-owned
+  (`api_spec_id` null) upstream when a hand-managed proxy is deleted.
+  `cleanup_orphaned_upstream=false` keeps that upstream so it can be reattached.
+  Only the exact strings `true` and `false` are accepted; any other value
+  returns `400` rather than guessing. Spec-owned upstreams and still-referenced
+  upstreams are never cleaned, regardless of the flag. Direct
+  `DELETE /upstreams/{id}` still returns `409` while referenced. See
+  [docs/admin_api.md](docs/admin_api.md).
 
 - Authorization lifetime for admitted streams and request uploads (issues
   #3815, #3816). An authenticated stream is bounded by the earliest of the
