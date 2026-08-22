@@ -9774,7 +9774,7 @@ fn complete_namespace_registry_mutation<'a, P>(
     response: Response<Full<Bytes>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response<Full<Bytes>>> + Send + 'a>>
 where
-    P: Send + 'a,
+    P: LiveApplyTopologyPins + Send + 'a,
 {
     match served_live_apply_namespace(state, candidates) {
         Some(namespace) => {
