@@ -1055,14 +1055,8 @@ async fn serve_drop_prebound_admin_https_without_tls_does_not_reserve_env_https_
 
     // Ephemeral stand-in for a nonzero env admin HTTPS port (avoids hardcoding
     // 9443 and colliding with unrelated listeners on the host).
-    let env_admin_https_port = {
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("probe free port for env admin HTTPS");
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        port
-    };
+    let env_admin_https_reservation = reserve_port().await.expect("reserve env admin HTTPS port");
+    let env_admin_https_port = env_admin_https_reservation.port;
 
     let admin_https_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1120,6 +1114,7 @@ async fn serve_drop_prebound_admin_https_without_tls_does_not_reserve_env_https_
     };
 
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let _ = env_admin_https_reservation.drop_and_take_port();
     let handles = file::serve(env_config, config, opts, shutdown_tx.clone())
         .await
         .expect(
@@ -1147,14 +1142,9 @@ async fn serve_still_reserves_env_admin_https_port_without_prebound_drop() {
     use ferrum_edge::config::{EnvConfig, OperatingMode};
     use ferrum_edge::modes::file::{self, ServeOptions};
 
-    let env_admin_https_port = {
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("probe free port for env admin HTTPS");
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        port
-    };
+    let env_admin_https_reservation = reserve_port().await.expect("reserve env admin HTTPS port");
+    let env_admin_https_port = env_admin_https_reservation.port;
+    let _hold_env_admin_https_port = env_admin_https_reservation;
 
     let config_json = serde_json::json!({
         "version": "1",

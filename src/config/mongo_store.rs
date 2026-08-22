@@ -95,7 +95,7 @@ mod inner {
     use std::ops::Deref;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
     use tracing::{debug, error, info, warn};
     use uuid::Uuid;
@@ -943,6 +943,9 @@ mod inner {
         // `connection_generation`. Readers never take both locks nested on the
         // same fair RwLock.
         admin_write_topology: Arc<tokio::sync::RwLock<()>>,
+        /// Monotonic process-local generation of `connection`, published under
+        /// the same Admin + admission write guards as the ArcSwap.
+        topology_epoch: Arc<AtomicU64>,
         // Multi-step admission guards outlive an individual trait call. Their owner
         // token indexes the exact connection bundle and generation pin that
         // every clear/replay batch must borrow until explicit release.
@@ -1050,6 +1053,7 @@ mod inner {
                 connection: Arc::new(ArcSwap::from_pointee(connection)),
                 connection_generation: Arc::new(tokio::sync::RwLock::new(())),
                 admin_write_topology: Arc::new(tokio::sync::RwLock::new(())),
+                topology_epoch: Arc::new(AtomicU64::new(1)),
                 persistent_admission_pins: Arc::new(DashMap::new()),
                 retained_admission_pins: Arc::new(DashMap::new()),
                 conn_settings,
@@ -1570,10 +1574,16 @@ mod inner {
             if topology == MongoReconnectTopology::Primary {
                 self.failover_topology.ensure_primary_failback_allowed()?;
             }
+            let next_topology_epoch =
+                crate::config::db_backend::checked_next_config_topology_epoch(
+                    self.topology_epoch.load(Ordering::Acquire),
+                )?;
             if topology == MongoReconnectTopology::Failover {
                 self.failover_topology.mark_failover(url_redacted);
             }
             let _old_connection = self.connection.swap(Arc::new(new_connection));
+            self.topology_epoch
+                .store(next_topology_epoch, Ordering::Release);
             self.replica_set_configured
                 .store(replica_set_configured, Ordering::Release);
             // Test seam: hold publication guards across the primary
@@ -1679,6 +1689,7 @@ mod inner {
                 connection: Arc::new(ArcSwap::from_pointee(connection)),
                 connection_generation: Arc::new(tokio::sync::RwLock::new(())),
                 admin_write_topology: Arc::new(tokio::sync::RwLock::new(())),
+                topology_epoch: Arc::new(AtomicU64::new(1)),
                 persistent_admission_pins: Arc::new(DashMap::new()),
                 retained_admission_pins: Arc::new(DashMap::new()),
                 conn_settings: settings,
@@ -6183,7 +6194,12 @@ mod inner {
             // an in-flight mutation cannot be redirected and reconnect stays
             // fail-fast while either pin is held.
             let guard = self.admin_write_topology.clone().read_owned().await;
-            crate::config::db_backend::DbWriteTopologyPermit::pinned(guard)
+            let topology_epoch = self.topology_epoch.load(Ordering::Acquire);
+            crate::config::db_backend::DbWriteTopologyPermit::pinned(guard, topology_epoch)
+        }
+
+        fn config_topology_epoch(&self) -> u64 {
+            self.topology_epoch.load(Ordering::Acquire)
         }
 
         fn set_slow_query_threshold(&mut self, threshold_ms: Option<u64>) {
@@ -7307,6 +7323,16 @@ mod inner {
         }
 
         async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
+            self.delete_proxy_with_orphan_cleanup(namespace, id, true)
+                .await
+        }
+
+        async fn delete_proxy_with_orphan_cleanup(
+            &self,
+            namespace: &str,
+            id: &str,
+            cleanup_orphaned_upstream: bool,
+        ) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
             if !self.replica_set_configured()
                 && self
@@ -7337,8 +7363,13 @@ mod inner {
                 ) = session
                     .start_transaction()
                     .and_run(
-                        (self, namespace.to_string(), id.to_string()),
-                        |s, (this, namespace, id)| {
+                        (
+                            self,
+                            namespace.to_string(),
+                            id.to_string(),
+                            cleanup_orphaned_upstream,
+                        ),
+                        |s, (this, namespace, id, cleanup_orphaned_upstream)| {
                             Box::pin(async move {
                                 // Capture upstream_id before deleting the proxy.
                                 // Namespace-predicated so a cross-namespace admin
@@ -7462,40 +7493,56 @@ mod inner {
                                     // orphan cleanup. A spec-owned proxy can
                                     // drift to a hand-owned upstream, which
                                     // must survive deletion of the spec graph.
-                                    if spec_owner.is_none()
+                                    // Spec-owned upstreams are skipped here
+                                    // (parity with SQL cleanup_orphaned_upstream_tx).
+                                    if *cleanup_orphaned_upstream
+                                        && spec_owner.is_none()
                                         && let Some(ref uid) = upstream_id_to_check
                                     {
-                                        let still_referenced = this
-                                            .proxies()
-                                            .count_documents(mongodb::bson::doc! {
-                                                "upstream_id": uid.as_str()
+                                        let spec_owned = this
+                                            .upstreams()
+                                            .find_one(mongodb::bson::doc! {
+                                                "_id": uid.as_str(),
+                                                "namespace": namespace.as_str(),
                                             })
                                             .session(&mut *s)
                                             .await?
-                                            > 0;
-                                        let dispatch_ref = if !still_referenced {
-                                            this.find_mesh_route_dispatch_upstream_ref_opt_session(
-                                                Some(&mut *s),
-                                                uid,
-                                            )
-                                            .await
-                                            .map_err(
-                                                |e| mongodb::error::Error::custom(e.to_string()),
-                                            )?
-                                        } else {
-                                            None
-                                        };
-                                        if !still_referenced && dispatch_ref.is_none() {
-                                            let upstream_delete = this
-                                                .upstreams()
-                                                .delete_one(mongodb::bson::doc! {
-                                                    "_id": uid.as_str(),
-                                                    "namespace": namespace.as_str(),
+                                            .is_some_and(|doc| {
+                                                doc.get_str("api_spec_id").is_ok()
+                                            });
+                                        if !spec_owned {
+                                            let still_referenced = this
+                                                .proxies()
+                                                .count_documents(mongodb::bson::doc! {
+                                                    "upstream_id": uid.as_str()
                                                 })
                                                 .session(&mut *s)
-                                                .await?;
-                                            if upstream_delete.deleted_count > 0 {
-                                                deleted_orphaned_upstream_id = Some(uid.clone());
+                                                .await?
+                                                > 0;
+                                            let dispatch_ref = if !still_referenced {
+                                                this.find_mesh_route_dispatch_upstream_ref_opt_session(
+                                                    Some(&mut *s),
+                                                    uid,
+                                                )
+                                                .await
+                                                .map_err(
+                                                    |e| mongodb::error::Error::custom(e.to_string()),
+                                                )?
+                                            } else {
+                                                None
+                                            };
+                                            if !still_referenced && dispatch_ref.is_none() {
+                                                let upstream_delete = this
+                                                    .upstreams()
+                                                    .delete_one(mongodb::bson::doc! {
+                                                        "_id": uid.as_str(),
+                                                        "namespace": namespace.as_str(),
+                                                    })
+                                                    .session(&mut *s)
+                                                    .await?;
+                                                if upstream_delete.deleted_count > 0 {
+                                                    deleted_orphaned_upstream_id = Some(uid.clone());
+                                                }
                                             }
                                         }
                                     }
@@ -7625,33 +7672,49 @@ mod inner {
                 self.plugin_configs()
                     .delete_many(doc! { "proxy_id": id })
                     .await?;
-                if let Some(ref uid) = upstream_id_to_check {
-                    let still_referenced = self
-                        .proxies()
-                        .count_documents(doc! { "upstream_id": uid })
+                if cleanup_orphaned_upstream
+                    && let Some(ref uid) = upstream_id_to_check
+                {
+                    let spec_owned = self
+                        .upstreams()
+                        .find_one(doc! {
+                            "_id": uid.as_str(),
+                            "namespace": namespace,
+                        })
                         .await?
-                        > 0;
-                    let dispatch_ref = if !still_referenced {
-                        self.find_mesh_route_dispatch_upstream_ref_opt_session(None, uid)
+                        .is_some_and(|doc| doc.get_str("api_spec_id").is_ok());
+                    if !spec_owned {
+                        let still_referenced = self
+                            .proxies()
+                            .count_documents(doc! { "upstream_id": uid })
                             .await?
-                    } else {
-                        None
-                    };
-                    if !still_referenced && dispatch_ref.is_none() {
-                        info!("Cascade-deleting orphaned upstream {}", uid);
-                        match self
-                            .upstreams()
-                            .delete_one(doc! { "_id": uid, "namespace": namespace })
-                            .await
-                        {
-                            Ok(delete_result) if delete_result.deleted_count > 0 => {
-                                deleted_orphaned_upstream_id_for_changes = Some(uid.clone());
+                            > 0;
+                        let dispatch_ref = if !still_referenced {
+                            self.find_mesh_route_dispatch_upstream_ref_opt_session(None, uid)
+                                .await?
+                        } else {
+                            None
+                        };
+                        if !still_referenced && dispatch_ref.is_none() {
+                            info!("Cascade-deleting orphaned upstream {}", uid);
+                            match self
+                                .upstreams()
+                                .delete_one(doc! {
+                                    "_id": uid,
+                                    "namespace": namespace,
+                                })
+                                .await
+                            {
+                                Ok(delete_result) if delete_result.deleted_count > 0 => {
+                                    deleted_orphaned_upstream_id_for_changes =
+                                        Some(uid.clone());
+                                }
+                                Ok(_) => {}
+                                Err(e) => warn!(
+                                    "MongoDB best-effort orphan upstream delete failed for {}: {}",
+                                    uid, e
+                                ),
                             }
-                            Ok(_) => {}
-                            Err(e) => warn!(
-                                "MongoDB best-effort orphan upstream delete failed for {}: {}",
-                                uid, e
-                            ),
                         }
                     }
                 }
@@ -15109,6 +15172,7 @@ mod inner {
                 connection: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(connection)),
                 connection_generation: std::sync::Arc::new(tokio::sync::RwLock::new(())),
                 admin_write_topology: std::sync::Arc::new(tokio::sync::RwLock::new(())),
+                topology_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
                 persistent_admission_pins: std::sync::Arc::new(DashMap::new()),
                 retained_admission_pins: std::sync::Arc::new(DashMap::new()),
                 conn_settings: settings,
@@ -15570,6 +15634,53 @@ mod inner {
                 "standalone delete_proxy must delete the proxy document before \
                  proxy-scoped plugin_configs so partial failure leaves a \
                  runtime-safe database shape"
+            );
+        }
+
+        #[test]
+        fn delete_proxy_orphan_cleanup_honors_opt_out_in_both_paths() {
+            let source = include_str!("mongo_store.rs");
+            let method_start = source
+                .find("async fn delete_proxy_with_orphan_cleanup(")
+                .expect("delete_proxy_with_orphan_cleanup");
+            let next_fn = source[method_start + 1..]
+                .find("\n        async fn ")
+                .map(|offset| method_start + 1 + offset)
+                .expect("method after delete_proxy_with_orphan_cleanup");
+            let method = &source[method_start..next_fn];
+
+            let replica_flag = method
+                .find("if *cleanup_orphaned_upstream")
+                .expect("replica-set path must consult cleanup_orphaned_upstream");
+            let replica_spec = method
+                .find("doc.get_str(\"api_spec_id\").is_ok()")
+                .expect("replica-set path must skip spec-owned upstreams");
+            let replica_delete = method
+                .find("deleted_orphaned_upstream_id = Some(uid.clone())")
+                .expect("replica-set orphan upstream delete");
+            assert!(
+                replica_flag < replica_spec && replica_spec < replica_delete,
+                "replica-set orphan cleanup must honor the opt-out flag and \
+                 skip spec-owned upstreams before deleting"
+            );
+
+            let standalone_start = method
+                .find("// Non-replica-set best-effort path.")
+                .expect("standalone delete_proxy marker");
+            let standalone = &method[standalone_start..];
+            let standalone_flag = standalone
+                .find("if cleanup_orphaned_upstream")
+                .expect("standalone path must consult cleanup_orphaned_upstream");
+            let standalone_spec = standalone
+                .find("doc.get_str(\"api_spec_id\").is_ok()")
+                .expect("standalone path must skip spec-owned upstreams");
+            let standalone_delete = standalone
+                .find("Cascade-deleting orphaned upstream")
+                .expect("standalone orphan upstream delete");
+            assert!(
+                standalone_flag < standalone_spec && standalone_spec < standalone_delete,
+                "standalone orphan cleanup must honor the opt-out flag and \
+                 skip spec-owned upstreams before deleting"
             );
         }
 

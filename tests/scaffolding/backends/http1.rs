@@ -94,6 +94,18 @@ pub enum HttpStep {
     /// the sleep ≫ the timeout, so the gateway's watchdog fires before the
     /// script returns.
     Sleep(Duration),
+    /// Complete an RFC 6455 HTTP upgrade: write `101 Switching Protocols`
+    /// plus `Upgrade` / `Connection` / `Sec-WebSocket-Accept` derived from
+    /// the last parsed request's `Sec-WebSocket-Key`, then keep the TCP
+    /// socket for subsequent `HoldUntilPeerClose` / `Reset` steps.
+    RespondWebSocketUpgrade,
+    /// Read until the peer closes (EOF or read error). Used after a
+    /// successful WebSocket upgrade so the backend stays up while the
+    /// client injects frames or junk.
+    HoldUntilPeerClose,
+    /// Send a TCP RST (`SO_LINGER=0` then drop). After
+    /// [`RespondWebSocketUpgrade`] this is a post-upgrade backend reset.
+    Reset,
 }
 
 /// A matcher closure wrapped for `Clone` + `Debug`.
@@ -652,6 +664,7 @@ async fn run_http_script(
     // Persistent pre-read buffer carried across steps: body tail past a
     // previous request's `Content-Length`, pipelined next request, etc.
     let mut carryover: Vec<u8> = Vec::new();
+    let mut last_ws_key: Option<String> = None;
 
     // Always read one request first unless the very first step is
     // `CloseBeforeStatus` (in which case the client may not even get to
@@ -671,6 +684,9 @@ async fn run_http_script(
                         if !(matcher.0)(&req) {
                             state.matcher_mismatches.fetch_add(1, Ordering::SeqCst);
                         }
+                        last_ws_key = req
+                            .header("sec-websocket-key")
+                            .map(|value| value.to_string());
                         state.requests.lock().await.push(req);
                         request_consumed = true;
                     }
@@ -829,6 +845,68 @@ async fn run_http_script(
             }
             HttpStep::Sleep(d) => {
                 tokio::time::sleep(d).await;
+            }
+            HttpStep::RespondWebSocketUpgrade => {
+                if !request_consumed {
+                    match read_http_prelude(&mut stream, &mut carryover).await {
+                        Ok(Some(mut req)) => {
+                            drain_body(&mut stream, &req, &mut carryover)
+                                .await
+                                .apply_to(&mut req);
+                            last_ws_key = req
+                                .header("sec-websocket-key")
+                                .map(|value| value.to_string());
+                            state.requests.lock().await.push(req);
+                            request_consumed = true;
+                        }
+                        Ok(None) => {
+                            state.step_errors.lock().await.push(
+                                "RespondWebSocketUpgrade: peer closed before a full request".into(),
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            state.step_errors.lock().await.push(format!(
+                                "RespondWebSocketUpgrade: failed to parse request: {e}"
+                            ));
+                            return Ok(());
+                        }
+                    }
+                }
+                let Some(key) = last_ws_key.as_deref() else {
+                    state
+                        .step_errors
+                        .lock()
+                        .await
+                        .push("RespondWebSocketUpgrade: missing Sec-WebSocket-Key".into());
+                    return Ok(());
+                };
+                let accept =
+                    tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+                let response = format!(
+                    "HTTP/1.1 101 Switching Protocols\r\n\
+                     Upgrade: websocket\r\n\
+                     Connection: Upgrade\r\n\
+                     Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                );
+                stream.write_all(response.as_bytes()).await?;
+            }
+            HttpStep::HoldUntilPeerClose => {
+                let mut buf = [0u8; 1024];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+                return Ok(());
+            }
+            HttpStep::Reset => {
+                let std_stream = stream.into_std()?;
+                let sock = socket2::Socket::from(std_stream);
+                sock.set_linger(Some(Duration::from_secs(0)))?;
+                drop(sock);
+                return Ok(());
             }
         }
     }

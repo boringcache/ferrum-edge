@@ -1474,6 +1474,91 @@ fn test_classify_boxed_setup_error_keeps_rustls_as_tls_error_pre_wire() {
 }
 
 #[test]
+fn test_connect_phase_io_reset_wrapping_rustls_is_tls_error_not_refused() {
+    // tokio-rustls / reqwest wrap handshake failures as io::Error
+    // (often ConnectionReset) with rustls::Error in get_ref(), not
+    // source(). TCP connected; the failure is TLS. Must not take the
+    // connect-phase RST → ConnectionRefused collapse.
+    let io_err = std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        rustls::Error::HandshakeNotComplete,
+    );
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(io_err);
+    let class = classify_boxed_setup_error(&*err);
+    assert_eq!(class, ErrorClass::TlsError);
+    assert!(
+        !ferrum_edge::retry::request_reached_wire(class),
+        "TLS handshake after TCP connect stays pre-wire; retry_on_connect_failure \
+         is unchanged versus the previous ConnectionRefused label"
+    );
+}
+
+#[test]
+fn test_connect_phase_io_reset_without_rustls_still_collapses_to_refused() {
+    let io_err = std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "connection reset by peer",
+    );
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(io_err);
+    let class = classify_boxed_setup_error(&*err);
+    assert_eq!(class, ErrorClass::ConnectionRefused);
+    assert!(!ferrum_edge::retry::request_reached_wire(class));
+}
+
+#[test]
+fn test_post_connect_io_reset_without_rustls_is_connection_reset() {
+    let io_err = std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "connection reset by peer",
+    );
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(io_err);
+    let class = classify_boxed_error(&*err);
+    assert_eq!(class, ErrorClass::ConnectionReset);
+    assert!(ferrum_edge::retry::request_reached_wire(class));
+}
+
+#[test]
+fn test_post_connect_unexpected_eof_is_connection_closed() {
+    let io_err = std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "failed to fill whole buffer",
+    );
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(io_err);
+    let class = classify_boxed_error(&*err);
+    assert_eq!(class, ErrorClass::ConnectionClosed);
+    assert!(
+        ferrum_edge::retry::request_reached_wire(class),
+        "a truncated body is post-wire: retry_on_connect_failure must not \
+         replay a non-idempotent request the backend may already have processed"
+    );
+}
+
+#[test]
+fn test_connect_phase_unexpected_eof_without_rustls_is_not_connection_closed() {
+    // Connect-phase EOF without rustls is not a completed handshake and
+    // must not become post-wire ConnectionClosed.
+    let io_err = std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "failed to fill whole buffer",
+    );
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(io_err);
+    let class = classify_boxed_setup_error(&*err);
+    assert_ne!(class, ErrorClass::ConnectionClosed);
+    assert_ne!(class, ErrorClass::TlsError);
+}
+
+#[test]
+fn test_classify_body_error_unexpected_eof_is_connection_closed() {
+    let io_err = std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "failed to fill whole buffer",
+    );
+    let (class, disconnected) = classify_body_error(&io_err);
+    assert_eq!(class, ErrorClass::ConnectionClosed);
+    assert!(!disconnected);
+}
+
+#[test]
 fn test_substring_fallback_matches_capitalized_os_wording() {
     // Several stream paths stringify io::Error before classifying (TCP
     // fast-path copy errors, UDP backend recv/send errors). The OS wording

@@ -413,15 +413,28 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" \
 
 # Delete a proxy
 curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:9000/proxies/{proxy_id}
+
+# Delete a proxy but keep a last-referenced hand-owned upstream
+curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:9000/proxies/{proxy_id}?cleanup_orphaned_upstream=false"
 ```
 
 `DELETE /proxies/{id}` of a **hand-managed** proxy (no owning API-spec row) also
 orphan-cleans that proxy's current `upstream_id` when the upstream is itself
 hand-owned (`api_spec_id` is null) and no remaining proxy or
-`mesh_route_dispatch` plugin still references it. A shared hand-owned upstream
-survives. Spec-owned upstreams are removed by the spec cascade, not this
-generic orphan path; a spec-owned proxy that drifted onto a hand-owned
-upstream leaves that upstream in place. See
+`mesh_route_dispatch` plugin still references it. That cascade is the **default**
+(omitting the query parameter, or passing `cleanup_orphaned_upstream=true`).
+Pass `cleanup_orphaned_upstream=false` to keep the upstream so it can be
+reattached. Exactly one occurrence with the exact string `true` or `false` is
+accepted; any other value or duplicate occurrence returns **400** rather than
+guessing. A shared hand-owned upstream
+survives regardless of the flag. Spec-owned upstreams are removed by the spec
+cascade, not this generic orphan path; a spec-owned proxy that drifted onto a
+hand-owned upstream leaves that upstream in place.
+
+This is the opposite of `DELETE /upstreams/{id}`, which returns **409 Conflict**
+while any proxy or `mesh_route_dispatch` plugin still references the upstream
+and never cascades. See
 [Cascade and ownership summary](#cascade-and-ownership-summary).
 
 ### Stream Proxy (TCP/UDP)
@@ -448,6 +461,27 @@ The Admin API validates `listen_port` at creation and update time:
 - **409 Conflict** if the port is already bound by another process on the host (OS-level probe)
 
 In **CP mode**, the gateway reserved port and OS-level checks are skipped since stream proxies run on remote Data Plane nodes.
+
+### Database-mode live apply
+
+In `FERRUM_MODE=database`, a successful create, update, or delete (proxies,
+consumers, plugins, upstreams, credentials, API specs, batch, and restore)
+returns 2xx only after the same authoritative poll-loop reload that periodic
+ticks use has published a covering `config_changes` generation. The covering
+cursor pairs the sequence with the process-local database topology epoch and is
+captured from the pinned write topology after persist and before the
+topology/namespace pins are released; a later concurrent same-namespace writer
+may raise that watermark above this mutation's own row. A reconnect/failover
+invalidates waiters from the replaced topology rather than comparing their old
+high watermark with the new database's potentially lower sequence. The existing
+`GET /proxies` route already reads the database, so a 201 with an empty live
+snapshot is no longer possible on this process. If reload cannot apply or the
+covering cursor becomes unverifiable, the API returns `503` with
+`{"error":"...","applied":false,"reason":"config_rejected"|"reload_timeout"|"sequence_unavailable"}`.
+The row is durable; retry or repair the rejected candidate. Writes to a
+namespace this process does not serve, and writes in CP/file/DP modes, do not
+wait. External writers still become live on the next poll interval or
+change-stream wake.
 
 ## Consumers
 
@@ -629,9 +663,14 @@ proxies are left unchanged. A `mesh_route_dispatch` plugin config that still
 names the upstream likewise returns 409 with
 `{"error":"Upstream is referenced by a mesh_route_dispatch plugin_config and cannot be deleted"}`.
 
+This is the opposite of `DELETE /proxies/{id}`, which orphan-cleans a
+last-referenced **hand-owned** upstream by default. To keep that upstream when
+deleting the last referencing proxy, pass `cleanup_orphaned_upstream=false` on
+the proxy delete. See the [Proxies](#proxies) section.
+
 Supported algorithms: `round_robin`, `weighted_round_robin`, `least_connections`, `least_latency`, `consistent_hashing`, `random`, `passthrough`.
 
-To use an upstream with a proxy, set the proxy's `upstream_id` field. When set, the upstream's targets override the proxy's `backend_host`/`backend_port`. Each target may also specify an optional `path` field which overrides the proxy's `backend_path` when that target is selected.
+To use an upstream with a proxy, set the proxy's `upstream_id` field. When set, the upstream's targets supply the dial address and `backend_host`/`backend_port` may be omitted (they are ignored if sent). Each target may also specify an optional `path` field which overrides the proxy's `backend_path` when that target is selected.
 
 ## Gateway Trust Bundles
 
@@ -778,7 +817,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://localhost:9000/restore?confirm=true"
 ```
 
-The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Successful exports and authenticated denied/failed attempts are always audited with request context before (or instead of) releasing unredacted bytes — independent of `FERRUM_ADMIN_AUDIT_ENABLED`, which gates ordinary mutation audit events only — see [Audit Log](#audit-log) and [admin_backup_restore.md](admin_backup_restore.md). Before replacement, restore acquires a persistent namespace guard and snapshots the current namespace with a non-validating raw load from the primary, so an already-invalid-but-present config still snapshots and keeps rollback available while it is repaired. If that snapshot cannot be taken at all — a genuine database/connectivity failure — restore **aborts with `503` before deleting anything** and leaves the prior config intact (retry once the database is reachable). Database inserts are chunked into 1,000-record transactions for large-scale imports. Conditional mTLS DNS-identity uniqueness is checked under the same namespace-scoped datastore admission guard used by ordinary Consumer, plugin, proxy-association, upstream, and API-spec writes, so a concurrent admin process cannot race a batch/restore policy activation with a case-variant credential. Restore retains one persistent guard owner from before its snapshot through the clear and every import or compensating-replay batch. All non-owning namespace resource writers and replays fail closed for that full interval, so no concurrent resource can be lost merely because it was absent from the restore payload. The compensating replay intentionally does not apply newly introduced mTLS DNS admission to the old snapshot: otherwise a pre-existing ambiguity would be deleted successfully and then become impossible to restore. Normal batch/restore admission never receives this rollback-only bypass. The endpoint returns `500 Internal Server Error` with a `rollback` field (`completed` / `incomplete` / `not_needed` / `unknown_outcome`). `not_needed` means the clear definitively aborted atomically (SQL / replica-set MongoDB), so nothing was deleted and the prior config was retained without any re-import. An unknown MongoDB commit remains `unknown_outcome` with the guard retained even when immediate verification still sees the prior counts, because the clear can become visible later. API specs are included in backup and restore as a versioned `api_specs` section (`section_version: "2"`). Legacy backups that omit the section require `?confirm_api_spec_deletion=true` (in addition to `?confirm=true`) when the target namespace still holds specs. `api_specs_not_restored` / `api_specs_note` appear only when rollback is `incomplete` and the prior namespace carried specs — see [admin_backup_restore.md](admin_backup_restore.md).
+The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Backup resources always include `id`s; restore requires them, while batch will auto-generate them if a caller strips them. Successful exports and authenticated denied/failed attempts are always audited with request context before (or instead of) releasing unredacted bytes — independent of `FERRUM_ADMIN_AUDIT_ENABLED`, which gates ordinary mutation audit events only — see [Audit Log](#audit-log) and [admin_backup_restore.md](admin_backup_restore.md). Before replacement, restore acquires a persistent namespace guard and snapshots the current namespace with a non-validating raw load from the primary, so an already-invalid-but-present config still snapshots and keeps rollback available while it is repaired. If that snapshot cannot be taken at all — a genuine database/connectivity failure — restore **aborts with `503` before deleting anything** and leaves the prior config intact (retry once the database is reachable). Database inserts are chunked into 1,000-record transactions for large-scale imports. Conditional mTLS DNS-identity uniqueness is checked under the same namespace-scoped datastore admission guard used by ordinary Consumer, plugin, proxy-association, upstream, and API-spec writes, so a concurrent admin process cannot race a batch/restore policy activation with a case-variant credential. Restore retains one persistent guard owner from before its snapshot through the clear and every import or compensating-replay batch. All non-owning namespace resource writers and replays fail closed for that full interval, so no concurrent resource can be lost merely because it was absent from the restore payload. The compensating replay intentionally does not apply newly introduced mTLS DNS admission to the old snapshot: otherwise a pre-existing ambiguity would be deleted successfully and then become impossible to restore. Normal batch/restore admission never receives this rollback-only bypass. The endpoint returns `500 Internal Server Error` with a `rollback` field (`completed` / `incomplete` / `not_needed` / `unknown_outcome`). `not_needed` means the clear definitively aborted atomically (SQL / replica-set MongoDB), so nothing was deleted and the prior config was retained without any re-import. An unknown MongoDB commit remains `unknown_outcome` with the guard retained even when immediate verification still sees the prior counts, because the clear can become visible later. API specs are included in backup and restore as a versioned `api_specs` section (`section_version: "2"`). Legacy backups that omit the section require `?confirm_api_spec_deletion=true` (in addition to `?confirm=true`) when the target namespace still holds specs. `api_specs_not_restored` / `api_specs_note` appear only when rollback is `incomplete` and the prior namespace carried specs — see [admin_backup_restore.md](admin_backup_restore.md).
 
 Gateway trust bundles ride along as a `gateway_trust_bundles` array on full,
 unfiltered database-backed exports (possibly empty). Resource-filtered and
@@ -1297,7 +1336,7 @@ Deletes the spec and cascades:
 | `POST /api-specs` | Created; tagged with `api_spec_id` | — |
 | `PUT /api-specs/{id}` | Replaced (deleted + re-inserted) | Survive unchanged |
 | `DELETE /api-specs/{id}` | Proxy + plugins deleted; spec-owned upstream deleted | Non-spec upstreams survive |
-| `DELETE /proxies/{id}` | Proxy, spec row, scoped plugins, and generated (spec-owned) upstreams deleted atomically on SQL/replica-set MongoDB; standalone MongoDB refuses before mutation | Last-referenced **hand-owned** upstream (`api_spec_id` null) is orphan-cleaned when the deleted proxy is itself hand-managed and no remaining proxy or `mesh_route_dispatch` plugin still references it. A shared hand-owned upstream survives. A spec-owned proxy that drifted onto a hand-owned upstream leaves that upstream in place. |
+| `DELETE /proxies/{id}` | Proxy, spec row, scoped plugins, and generated (spec-owned) upstreams deleted atomically on SQL/replica-set MongoDB; standalone MongoDB refuses before mutation | Last-referenced **hand-owned** upstream (`api_spec_id` null) is orphan-cleaned by default when the deleted proxy is itself hand-managed and no remaining proxy or `mesh_route_dispatch` plugin still references it. Pass `?cleanup_orphaned_upstream=false` to keep it. A shared hand-owned upstream survives. A spec-owned proxy that drifted onto a hand-owned upstream leaves that upstream in place. Direct `DELETE /upstreams/{id}` still returns 409 while referenced. |
 
 ### Mode behavior
 

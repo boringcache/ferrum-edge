@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — `POST /batch` rejects unknown top-level envelope keys**
+  (issue #4042). The request is create-only (`consumers`, `upstreams`,
+  `proxies`, `plugin_configs`). Sending `updates`, `deletes`, or `dry_run`
+  previously returned `201` and created only the resource arrays while
+  silently ignoring the other keys. Unknown envelope keys now return `400`.
+  `GET /backup` metadata (`version`, `ferrum_version`, `exported_at`,
+  `source`, `counts`) and the backup-only `api_specs` /
+  `gateway_trust_bundles` sections remain accepted and ignored so a backup
+  file is still a valid additive import. **Operator action**: stop sending
+  unimplemented mutation verbs on `/batch`; use per-resource PUT/DELETE or
+  `POST /restore` for replacement.
+
+- **BREAKING — file/DP `POST /restore` returns `503` instead of `403`**
+  (issue #4027). Restore requires a database. File and data-plane mode now
+  answer `{"error":"No database"}` with `503`, matching
+  [docs/admin_backup_restore.md](docs/admin_backup_restore.md). Other
+  file-mode writes still return `403` `{"error":"Admin API is in read-only
+  mode"}`. Database mode with `FERRUM_ADMIN_READ_ONLY=true` still returns
+  that `403` for restore. **Operator action**: match file/DP restore
+  unavailability on `503` / `No database`, not on the generic read-only
+  `403`.
+
+- `POST /restore` requires resource ids and does not auto-generate them
+  (issue #4043). `GET /backup` always includes ids, and a second restore of
+  the same body must not invent new identities on a destructive replacement.
+  A batch-shaped body that omits ids returns `400` with `validation_errors`
+  and does not delete existing config. `POST /batch` still mints omitted
+  ids. Backup → restore and backup → batch remain the supported directions.
+
 - **BREAKING — `DELETE /consumers/{id}` returns 409 while `access_control.allowed_consumers` still names the username**
   (issue #4045). The previous 204 left live plugin configs authorizing an
   identity that no longer exists. Ferrum now scans `access_control` plugin
@@ -179,6 +208,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- HTTP backend error classification now labels three previously misleading
+  failure modes correctly. An HTTPS backend whose origin answers plaintext
+  (TLS handshake after TCP connect) is `tls_error`, not `connection_refused`.
+  The connect-phase RST/refused collapse is unchanged when no rustls error is
+  in the source chain. A backend FIN before a complete HTTP body is
+  `connection_closed`, not the `request_error` catch-all. WebSocket
+  post-upgrade protocol junk is `protocol_error`, a backend RST after upgrade
+  is `connection_reset`, and `stdout_logging` now writes the session-end
+  `error_class` on a 101 `TransactionSummary` via `on_ws_disconnect`.
+  `TlsError` remains pre-wire, so `retry_on_connect_failure` is unchanged
+  for the handshake case; `connection_closed` is post-wire like
+  `request_error`, so connect-failure retry still does not replay
+  non-idempotent requests.
+
+- `POST /proxies` and `POST /batch` accept a proxy that sets `upstream_id`
+  without `backend_host` / `backend_port` (issue #4029). Validation already
+  allowed an empty host when an upstream is referenced; serde required the
+  fields anyway, so callers had to send dummy values the runtime then
+  ignored. File-mode YAML and OpenAPI match the same optional-when-upstream
+  contract. Direct-backend proxies still require a non-empty host and a
+  port greater than 0.
+
+- `docs/admin_batch_api.md` plugin-config examples now use `plugin_name`
+  (and `scope`) matching `POST /plugins/config` (issue #4031). Copy-pasting
+  `"name": "key_auth"` was a `400` unknown field.
+
 - HTTP-family `backend_write_timeout_ms` now bounds request-body upload
   inactivity on H1, H2 (reqwest, the direct H2 pool, and native gRPC), and
   native H3, not only TCP streams. It covers streamed and buffered uploads
@@ -251,6 +306,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when a body inspection hook can actually run. `fail_closed` (the default),
   `scan_truncated`, and `skip` still do not satisfy the gate, and a config
   that cannot block anything is still refused.
+- WAF query SSRF mirrors `FE-SSRF-001-Q` / `FE-SSRF-002-Q` now compile at
+  paranoia 1, matching the documented body/query pack and the recommended
+  `{mode: enforce, default_rule_action: enforce, paranoia_level: 1}` posture
+  (issue #3936). They were present but gated at paranoia 2, so
+  `http://169.254.169.254/latest/meta-data/` and `gopher://127.0.0.1/` in a
+  query string produced `waf.action=clean` while the same payload in the body
+  blocked as `FE-SSRF-001` / `FE-SSRF-002`. Matching stays on decoded query
+  values (percent-decode plus the bounded layered variants used for bodies),
+  not raw whole-URI text, and keeps the existing dotted-IPv4 / metadata-host /
+  dangerous-scheme claims without expanding into IPv6 or alternate textual IP
+  forms.
 
 - Authenticated UDP/DTLS client-facing sends no longer emit after the
   authorization deadline (issues #3815, #3816, #3820). A pre-send commitment
@@ -289,6 +355,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (issue #3244) (issue #3317).
 
 ### Added
+
+- **`DELETE /proxies/{id}?cleanup_orphaned_upstream=` opt-out** (issue #4064).
+  This is a non-breaking feature addition: omitting the parameter preserves
+  existing behavior, which orphan-cleans a last-referenced hand-owned
+  (`api_spec_id` null) upstream when a hand-managed proxy is deleted.
+  `cleanup_orphaned_upstream=false` keeps that upstream so it can be reattached.
+  Only the exact strings `true` and `false` are accepted; any other value
+  returns `400` rather than guessing. Spec-owned upstreams and still-referenced
+  upstreams are never cleaned, regardless of the flag. Direct
+  `DELETE /upstreams/{id}` still returns `409` while referenced. See
+  [docs/admin_api.md](docs/admin_api.md).
 
 - Authorization lifetime for admitted streams and request uploads (issues
   #3815, #3816). An authenticated stream is bounded by the earliest of the

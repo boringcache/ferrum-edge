@@ -13724,10 +13724,30 @@ async fn arm_mesh_runtime_startup(
                 // serving `(ClusterIP, port)` reply sources through the pod
                 // registry directory the node-agent already polls; the
                 // node-agent stays the sole writer of every BPF map.
+                // The publisher also carries this proxy's own pod identity, from
+                // which the node-agent resolves the relay cgroup subtree the tc
+                // UDP guard requires as a non-forgeable sender proof (issues
+                // #3956, #3957). Without it every non-empty publication is
+                // refused, so the Service path stays unsteered and no UDP relay
+                // source is authorized — fail-closed, never a plaintext lane.
                 use crate::proxy::node_waypoint_udp_reply_source::RegistryDirReplySourcePublisher;
                 let reply_sources = std::sync::Arc::new(RegistryDirReplySourcePublisher::new(
                     &env_config.mesh_node_waypoint_pod_registry_dir,
+                    env_config.mesh_node_waypoint_relay_pod_uid.as_deref(),
                 ));
+                // ABSENT only. A value that is SET but unrepresentable warns
+                // from `RegistryDirReplySourcePublisher::new` above, which is
+                // the one place that knows the parser rejected it (issue
+                // #4021) — the two cases are different operator problems and
+                // must not share one diagnostic.
+                if env_config.mesh_node_waypoint_relay_pod_uid.is_none() {
+                    warn!(
+                        "FERRUM_MESH_NODE_WAYPOINT_RELAY_POD_UID is unset; the node-agent cannot \
+                         resolve this relay's cgroup, so NodeWaypoint UDP/DTLS admission fails \
+                         closed at the pod-veth guard. Set it from the downward API \
+                         `metadata.uid`."
+                    );
+                }
                 let steering = std::sync::Arc::new(
                     crate::proxy::node_waypoint_udp_steering::NodeWaypointUdpSteering::new(
                         std::sync::Arc::new(
@@ -15048,6 +15068,7 @@ fn start_mesh_admin_listeners(
                 fixtures: std::collections::HashMap::new(),
             },
         ),
+        runtime_config_apply: None,
     };
 
     let mut handles = Vec::new();

@@ -78,8 +78,23 @@ pub const BPF_MAP_POD_INBOUND_PORTS6: &str = "FERRUM_POD_INBOUND_PORTS6";
 /// Service ClusterIP rather than a configured node IP.
 pub const BPF_MAP_UDP_REPLY_SOURCES: &str = "FERRUM_UDP_REPLY_SOURCES";
 pub const BPF_MAP_UDP_REPLY_SOURCES6: &str = "FERRUM_UDP_REPLY_SOURCES6";
-/// Shared enable gate consulted by both tc UDP classifier families before
-/// either reply-source map. Key zero is disabled by default.
+/// cgroup-v2 ids of the NodeWaypoint relay pod itself (issues #3956, #3957).
+///
+/// The NON-FORGEABLE half of UDP relay admission. The tc UDP arms read
+/// `bpf_skb_cgroup_id()` — the cgroup of the socket that generated the skb,
+/// recorded by the kernel at socket creation — and require a hit here before
+/// either source lane is even consulted, so a same-node `CAP_NET_ADMIN`
+/// workload that forges the relay socket mark plus a node source address or a
+/// listener-wide reply-source tuple is still refused.
+///
+/// Written ONLY by the node-agent, which derives the set host-side by walking
+/// the relay pod's own cgroup subtree rather than trusting a claimed id, and
+/// refuses any id belonging to an enrolled workload.
+pub const BPF_MAP_UDP_RELAY_CGROUPS: &str = "FERRUM_UDP_RELAY_CGROUPS";
+/// Shared enable gate consulted by both tc UDP classifier families before the
+/// relay-cgroup map or either reply-source map. Key zero is disabled by
+/// default, and one gate for all three is what keeps the sender proof and the
+/// source proof halves of a single coherent generation.
 pub const BPF_MAP_UDP_REPLY_SOURCE_GATE: &str = "FERRUM_UDP_REPLY_SOURCE_GATE";
 pub const BPF_MAP_BYPASS_UIDS: &str = "FERRUM_BYPASS_UIDS";
 pub const BPF_MAP_CIDR_EXCLUDE4: &str = "FERRUM_CIDR_EXCLUDE4";
@@ -193,6 +208,7 @@ pub struct CaptureBpfMaps {
     pub pod_inbound_ports6: &'static str,
     pub udp_reply_sources: &'static str,
     pub udp_reply_sources6: &'static str,
+    pub udp_relay_cgroups: &'static str,
     pub udp_reply_source_gate: &'static str,
     pub bypass_uids: &'static str,
     pub cidr_exclude4: &'static str,
@@ -219,6 +235,7 @@ impl Default for CaptureBpfMaps {
             pod_inbound_ports6: BPF_MAP_POD_INBOUND_PORTS6,
             udp_reply_sources: BPF_MAP_UDP_REPLY_SOURCES,
             udp_reply_sources6: BPF_MAP_UDP_REPLY_SOURCES6,
+            udp_relay_cgroups: BPF_MAP_UDP_RELAY_CGROUPS,
             udp_reply_source_gate: BPF_MAP_UDP_REPLY_SOURCE_GATE,
             bypass_uids: BPF_MAP_BYPASS_UIDS,
             cidr_exclude4: BPF_MAP_CIDR_EXCLUDE4,
@@ -940,12 +957,27 @@ pub trait EbpfBackend: Send + Sync {
 
     fn clear_pod_inbound_ports6(&mut self, ip: Ipv6Addr) -> Result<(), String>;
 
-    /// Open or close the BPF-visible NodeWaypoint UDP/DTLS reply-source gate.
-    /// Both tc classifier families consult this one gate before either family
-    /// map, so closing it makes every entry inert even if a later scan/remove/
-    /// insert fails. Failure to close is a hard fencing failure: callers must
-    /// not mutate or acknowledge a new generation.
+    /// Open or close the BPF-visible NodeWaypoint UDP/DTLS relay authorization
+    /// gate. Both tc classifier families consult this one gate before the
+    /// relay-cgroup map and before either reply-source family map, so closing
+    /// it makes every entry inert even if a later scan/remove/insert fails.
+    /// Failure to close is a hard fencing failure: callers must not mutate or
+    /// acknowledge a new generation.
     fn set_udp_reply_sources_enabled(&mut self, enabled: bool) -> Result<(), String>;
+
+    /// Replace `FERRUM_UDP_RELAY_CGROUPS` with exactly `cgroup_ids` (issues
+    /// #3956, #3957). An empty slice removes every entry, which withdraws the
+    /// sender proof and therefore closes BOTH UDP relay source lanes at once.
+    ///
+    /// Whole-set for the same reason [`Self::replace_udp_reply_sources`] is: the
+    /// relay's cgroup subtree changes wholesale when its process restarts, and
+    /// an enumerated removal list would go stale exactly then.
+    ///
+    /// The caller MUST close [`Self::set_udp_reply_sources_enabled`] before
+    /// invoking this operation and leave it closed after any error, and MUST
+    /// have resolved `cgroup_ids` from the relay pod's own cgroup subtree
+    /// host-side — never from an id a publisher merely claimed.
+    fn replace_udp_relay_cgroups(&mut self, cgroup_ids: &[u64]) -> Result<(), String>;
 
     /// Replace both NodeWaypoint UDP/DTLS reply-source map contents with
     /// exactly `sources` (issue #3286). An empty slice removes every entry.
@@ -1077,6 +1109,13 @@ pub struct MockEbpfBackend {
     /// can assert publication/retraction ORDER (not just the final set) across
     /// a listener's serving lifecycle.
     pub udp_reply_source_updates: Vec<Vec<(IpAddr, u16)>>,
+    /// Raw `FERRUM_UDP_RELAY_CGROUPS` contents — the non-forgeable sender proof.
+    /// Authorizes only while [`Self::udp_reply_sources_enabled`] is true.
+    pub udp_relay_cgroups: HashSet<u64>,
+    /// Ordered whole-set replacements of [`Self::udp_relay_cgroups`], so tests
+    /// can assert that the sender proof is withdrawn and re-applied in the same
+    /// fenced sequence as the source proof.
+    pub udp_relay_cgroup_updates: Vec<Vec<u64>>,
     /// Node capture interfaces the ingress redirect classifier is attached to.
     pub ingress_redirect_attachments: Vec<String>,
     /// Number of times `detach_ingress_redirect` ran, so lifecycle tests can
@@ -1169,6 +1208,14 @@ pub struct MockEbpfBackend {
     /// then fails before IPv6, mirroring a partial family failure in the real
     /// remove-before-insert sequence. The generation must remain unacknowledged.
     pub fail_replace_udp_reply_sources_after_ipv4: bool,
+    /// When `true`, `replace_udp_relay_cgroups` fails, so tests can prove that a
+    /// generation whose SENDER proof could not be applied is never acknowledged
+    /// and never leaves the source proof authorized on its own.
+    pub fail_replace_udp_relay_cgroups: bool,
+    /// Treat `FERRUM_UDP_RELAY_CGROUPS` as ABSENT from the loaded program.
+    /// Every generation, including an empty withdrawal, is then a hard error:
+    /// without that map the classifier has no sender proof to consult.
+    pub udp_relay_cgroup_map_absent: bool,
     /// Treat the shared reply-source gate map as absent.
     pub udp_reply_source_gate_absent: bool,
     /// Inject a hard failure while closing the shared gate. The mock leaves the
@@ -1469,6 +1516,28 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
+    fn replace_udp_relay_cgroups(&mut self, cgroup_ids: &[u64]) -> Result<(), String> {
+        if self.fail_replace_udp_relay_cgroups {
+            return Err(format!(
+                "injected NodeWaypoint UDP relay cgroup publication failure for {} id(s)",
+                cgroup_ids.len()
+            ));
+        }
+        if self.udp_relay_cgroup_map_absent {
+            return Err(
+                "injected absent NodeWaypoint UDP relay cgroup map; the sender proof cannot be \
+                 authorized"
+                    .to_string(),
+            );
+        }
+        let desired: HashSet<u64> = cgroup_ids.iter().copied().collect();
+        self.udp_relay_cgroups.retain(|id| desired.contains(id));
+        self.udp_relay_cgroups.extend(desired.iter().copied());
+        self.udp_relay_cgroup_updates.push(cgroup_ids.to_vec());
+        self.record_operation(format!("replace_udp_relay_cgroups:{}", cgroup_ids.len()));
+        Ok(())
+    }
+
     fn update_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {
         if self.fail_update_node_probe_port {
             return Err(format!(
@@ -1623,6 +1692,7 @@ impl EbpfBackend for MockEbpfBackend {
         // the real backend's maps are destroyed with the program, so the mock
         // must not keep reporting a revoked authorization either.
         self.udp_reply_sources.clear();
+        self.udp_relay_cgroups.clear();
         self.udp_reply_sources_enabled = false;
         self.include_ports.clear();
         self.workload_identities.clear();
@@ -1656,6 +1726,11 @@ impl EbpfBackend for MockEbpfBackend {
         }
         if self.capture_config.is_none() {
             return Err("BPF capture config map not initialized".to_string());
+        }
+        if require_sock_ops && self.udp_relay_cgroup_map_absent {
+            return Err(format!(
+                "BPF ELF is missing required map(s) for the selected capture topology: {BPF_MAP_UDP_RELAY_CGROUPS}"
+            ));
         }
         if require_sock_ops && self.udp_reply_source_maps_absent {
             return Err(format!(

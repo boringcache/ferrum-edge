@@ -46,7 +46,7 @@ use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -703,9 +703,17 @@ pub struct DatabaseStore {
     /// so a reconnect cannot redirect an in-flight write. Not taken on ordinary
     /// read/request hot paths.
     reconnect_transition: Arc<tokio::sync::RwLock<()>>,
+    /// Monotonic process-local generation of the pool published under
+    /// `reconnect_transition`. Captured by Admin writes and authoritative poll
+    /// loads so sequence watermarks from different databases are never
+    /// compared as one namespace history.
+    topology_epoch: Arc<AtomicU64>,
     /// External-test hooks around [`Self::reconnect_transition`]. Empty in
     /// production; see [`Self::set_reconnect_transition_hooks_for_test`].
     reconnect_transition_test_hooks: Arc<std::sync::Mutex<Option<SqlReconnectTransitionTestHooks>>>,
+    /// When true, [`Self::latest_change_sequence`] fails closed so tests can
+    /// prove `sequence_unavailable` after a durable commit (issue #3926).
+    latest_change_sequence_test_fault: Arc<AtomicBool>,
     db_type: String,
     failover_urls: Vec<String>,
     pool_config: DbPoolConfig,
@@ -1838,7 +1846,9 @@ impl DatabaseStore {
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
             failover_topology: DbFailoverTopologyState::new(),
             reconnect_transition: Arc::new(tokio::sync::RwLock::new(())),
+            topology_epoch: Arc::new(AtomicU64::new(1)),
             reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
+            latest_change_sequence_test_fault: Arc::new(AtomicBool::new(false)),
             db_type: db_type.to_string(),
             failover_urls: Vec::new(),
             pool_config,
@@ -1898,7 +1908,9 @@ impl DatabaseStore {
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
             failover_topology: DbFailoverTopologyState::new(),
             reconnect_transition: Arc::new(tokio::sync::RwLock::new(())),
+            topology_epoch: Arc::new(AtomicU64::new(1)),
             reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
+            latest_change_sequence_test_fault: Arc::new(AtomicBool::new(false)),
             db_type: db_type.to_string(),
             failover_urls: failover_urls.to_vec(),
             pool_config,
@@ -3374,7 +3386,7 @@ impl DatabaseStore {
         if let Some(old_upstream_id) = old_upstream_id.as_deref()
             && proxy.upstream_id.as_deref() != Some(old_upstream_id)
         {
-            self.cleanup_orphaned_upstream_tx(&mut tx, &proxy.namespace, old_upstream_id)
+            self.cleanup_orphaned_upstream_tx(&mut tx, &proxy.namespace, old_upstream_id, true)
                 .await?;
         }
 
@@ -3391,6 +3403,16 @@ impl DatabaseStore {
     }
 
     pub async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
+        self.delete_proxy_with_orphan_cleanup(namespace, id, true)
+            .await
+    }
+
+    pub async fn delete_proxy_with_orphan_cleanup(
+        &self,
+        namespace: &str,
+        id: &str,
+        cleanup_orphaned_upstream: bool,
+    ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
@@ -3504,7 +3526,7 @@ impl DatabaseStore {
         if spec_owner.is_none()
             && let Some(ref uid) = upstream_id
         {
-            self.cleanup_orphaned_upstream_tx(&mut tx, namespace, uid)
+            self.cleanup_orphaned_upstream_tx(&mut tx, namespace, uid, cleanup_orphaned_upstream)
                 .await?;
         }
 
@@ -3591,7 +3613,11 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
         upstream_id: &str,
+        cleanup_orphaned_upstream: bool,
     ) -> Result<(), anyhow::Error> {
+        if !cleanup_orphaned_upstream {
+            return Ok(());
+        }
         let upstream_row: Option<AnyRow> = sqlx::query(
             &self.q("SELECT api_spec_id FROM upstreams WHERE id = ? AND namespace = ? LIMIT 1"),
         )
@@ -5134,7 +5160,7 @@ impl DatabaseStore {
         let mut tx = self.pool().begin().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
 
-        self.cleanup_orphaned_upstream_tx(&mut tx, namespace, old_upstream_id)
+        self.cleanup_orphaned_upstream_tx(&mut tx, namespace, old_upstream_id, true)
             .await?;
 
         tx.commit().await?;
@@ -5568,6 +5594,12 @@ impl DatabaseStore {
     // ---- Incremental Polling ----
 
     pub async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error> {
+        if self
+            .latest_change_sequence_test_fault
+            .load(Ordering::Acquire)
+        {
+            anyhow::bail!("latest_change_sequence test fault");
+        }
         let row = sqlx::query(
             &self.q("SELECT COALESCE(MAX(sequence), 0) AS max_sequence FROM config_changes WHERE namespace = ?"),
         )
@@ -7286,6 +7318,13 @@ impl DatabaseStore {
         *guard = hooks;
     }
 
+    /// Fail the next [`Self::latest_change_sequence`] reads (issue #3926 tests).
+    #[allow(dead_code)] // exercised via external unit tests through the lib target
+    pub fn set_latest_change_sequence_fault_for_test(&self, fail: bool) {
+        self.latest_change_sequence_test_fault
+            .store(fail, Ordering::Release);
+    }
+
     async fn invoke_reconnect_transition_hook(
         &self,
         select: impl Fn(&SqlReconnectTransitionTestHooks) -> Option<&SqlReconnectTransitionHook>,
@@ -7336,6 +7375,9 @@ impl DatabaseStore {
         if topology == DatabaseTopology::Primary {
             self.failover_topology.ensure_primary_failback_allowed()?;
         }
+        let next_topology_epoch = crate::config::db_backend::checked_next_config_topology_epoch(
+            self.topology_epoch.load(Ordering::Acquire),
+        )?;
 
         // Disable and close the configured primary-topology replica before
         // exposing a failover pool. Keeping the dormant pool would make it
@@ -7352,6 +7394,8 @@ impl DatabaseStore {
 
         // Atomic swap — readers that already loaded the old pool keep using it.
         let old_pool = self.pool.swap(Arc::new(new_pool));
+        self.topology_epoch
+            .store(next_topology_epoch, Ordering::Release);
         info!(
             "Database pool reconnected (db_type={}). Old pool closing in background.",
             self.db_type
@@ -9944,7 +9988,12 @@ impl DatabaseBackend for DatabaseStore {
         // Shared read pin: blocks reconnect write publication for the
         // mutation's lifetime without serializing concurrent Admin writes.
         let guard = self.reconnect_transition.clone().read_owned().await;
-        crate::config::db_backend::DbWriteTopologyPermit::pinned(guard)
+        let topology_epoch = self.topology_epoch.load(Ordering::Acquire);
+        crate::config::db_backend::DbWriteTopologyPermit::pinned(guard, topology_epoch)
+    }
+
+    fn config_topology_epoch(&self) -> u64 {
+        self.topology_epoch.load(Ordering::Acquire)
     }
 
     fn pool_stats(&self) -> Option<crate::config::db_backend::DbPoolStats> {
@@ -10050,6 +10099,21 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         DatabaseStore::delete_proxy(self, namespace, id).await
+    }
+
+    async fn delete_proxy_with_orphan_cleanup(
+        &self,
+        namespace: &str,
+        id: &str,
+        cleanup_orphaned_upstream: bool,
+    ) -> Result<bool, anyhow::Error> {
+        DatabaseStore::delete_proxy_with_orphan_cleanup(
+            self,
+            namespace,
+            id,
+            cleanup_orphaned_upstream,
+        )
+        .await
     }
 
     async fn get_proxy(&self, namespace: &str, id: &str) -> Result<Option<Proxy>, anyhow::Error> {

@@ -9,7 +9,7 @@ import sys
 import tempfile
 from pathlib import Path, PurePosixPath
 
-from live_suite_path_filter import matched_files, self_test as live_suite_self_test
+from live_suite_path_filter import self_test as live_suite_self_test
 
 
 # This planner is copied from the trusted base branch before CI executes it.
@@ -551,6 +551,10 @@ FULL_CI_DOCUMENTATION_PATHS = frozenset(
         "docs/mesh_multicluster_federation_runbook.md",
         "docs/mesh_supported_matrix.md",
         "docs/node_agent.md",
+        # Trigger of the CNI install-lifecycle live suite (issue #3908); the
+        # required-CI verifier proves this set covers every live-suite
+        # documentation trigger.
+        "docs/node_agent_security.md",
         "docs/plans/node_waypoint_transport_adr.md",
         "docs/spire_deployment.md",
         "docs/tcp_udp_proxy.md",
@@ -639,7 +643,8 @@ LIVE_SUITE_SHARED_PATTERNS = (
 # narrowing per issue #3900 re-homes each to the dedicated workflows or leaves
 # it compiler-gated by the always-run cargo jobs:
 # - `src/k8s_controller/`: K8s watch/reconcile; no ci.yml live job boots a
-#   cluster (owned by node-waypoint-ebpf-live / mesh-federation / mesh-e2e-sidecar).
+#   cluster (owned by node-waypoint-ebpf-live and the dedicated
+#   mesh-e2e-sidecar-live / multicluster-federation-live workflows).
 # - `src/service_discovery/**` except `mesh.rs`: consul/DNS-SD/HTTP discovery
 #   polls; only the `service_discovery/mesh.rs` leg the meshes traverse is kept
 #   in netns + two-cluster.
@@ -812,8 +817,6 @@ PKCS11_PATTERNS = [
 
 JOB_GATE_NAMES = (
     "run_helm",
-    "run_mesh_federation",
-    "run_mesh_sidecar_smoke",
     "run_ebpf_kernel_live",
     "run_netns_capture_live",
     "run_two_cluster_live",
@@ -936,12 +939,6 @@ def select_job_gates(event_name: str, changed_files: list[str]) -> dict[str, boo
 
     return {
         "run_helm": any_path_matches(HELM_PATTERNS, changed_files),
-        "run_mesh_federation": bool(
-            matched_files("mesh-federation", changed_files)
-        ),
-        "run_mesh_sidecar_smoke": bool(
-            matched_files("mesh-e2e-sidecar", changed_files)
-        ),
         "run_ebpf_kernel_live": any_path_matches(
             EBPF_KERNEL_LIVE_PATTERNS, changed_files
         ),
@@ -1229,22 +1226,22 @@ def self_test() -> int:
         (
             "pull_request",
             ["tests/k8s/multicluster-federation/run.sh"],
-            {"run_mesh_federation": True},
+            {name: False for name in JOB_GATE_NAMES},
         ),
         (
             "pull_request",
             ["src/backend_conn_limit.rs"],
-            {"run_mesh_sidecar_smoke": True},
+            {name: False for name in JOB_GATE_NAMES},
         ),
         (
             "pull_request",
             ["docs/cp_dp_mode.md"],
-            {"run_mesh_sidecar_smoke": True},
+            {name: False for name in JOB_GATE_NAMES},
         ),
         (
             "pull_request",
             ["src/modes/grpc_tls_reload.rs"],
-            {"run_mesh_sidecar_smoke": True},
+            {"run_helm": True},
         ),
         # Per-suite positives: kernel loader/program, netns capture, two-cluster.
         (

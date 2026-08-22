@@ -74,7 +74,13 @@ Content-Type: application/json
 
 ## Request Body
 
-The request body is a JSON object with optional arrays for each resource type:
+The request body is a JSON object with optional arrays for each resource type.
+Unknown top-level keys are rejected with `400` — there is no `updates`,
+`deletes`, or `dry_run`. `GET /backup` metadata (`version`, `ferrum_version`,
+`exported_at`, `source`, `counts`) and the backup-only `api_specs` /
+`gateway_trust_bundles` sections are accepted and ignored so a backup file
+remains a valid additive import. Batch does not persist those backup-only
+sections; use `POST /restore` or the dedicated endpoints.
 
 ```json
 {
@@ -93,7 +99,7 @@ All fields are optional. Include only the resource types you need to create. Res
 
 ### Resource Schemas
 
-Each resource in the arrays uses the same schema as the individual `POST` endpoint for that resource type. The `id`, `created_at`, and `updated_at` fields are auto-generated if omitted.
+Each resource in the arrays uses the same schema as the individual `POST` endpoint for that resource type. The `id`, `created_at`, and `updated_at` fields are auto-generated if omitted. Plugin configs use `plugin_name` (not `name`). A proxy that sets `upstream_id` may omit `backend_host` and `backend_port`; the upstream's targets supply the dial address.
 
 Plaintext Basic-auth passwords are hashed during batch preparation. This requires `FERRUM_BASIC_AUTH_HMAC_SECRET` to be configured with at least 32 bytes; a missing or weak operator secret returns `500 Internal Server Error` before any batch resource is persisted. Invalid Basic credential shapes remain request errors and return `400`.
 
@@ -142,14 +148,16 @@ Plaintext Basic-auth passwords are hashed during batch preparation. This require
 {
   "plugin_configs": [
     {
-      "name": "key_auth",
+      "plugin_name": "key_auth",
       "enabled": true,
+      "scope": "proxy",
       "proxy_id": "<proxy-id>",
       "config": {}
     },
     {
-      "name": "access_control",
+      "plugin_name": "access_control",
       "enabled": true,
+      "scope": "proxy",
       "proxy_id": "<proxy-id>",
       "config": {
         "allowed_consumers": ["user-1"]
@@ -212,26 +220,30 @@ Create consumers, proxies, and plugin configs in a single request:
   ],
   "plugin_configs": [
     {
-      "name": "key_auth",
+      "plugin_name": "key_auth",
       "enabled": true,
+      "scope": "proxy",
       "proxy_id": "proxy-1",
       "config": {}
     },
     {
-      "name": "access_control",
+      "plugin_name": "access_control",
       "enabled": true,
+      "scope": "proxy",
       "proxy_id": "proxy-1",
       "config": {"allowed_consumers": ["tenant-1"]}
     },
     {
-      "name": "key_auth",
+      "plugin_name": "key_auth",
       "enabled": true,
+      "scope": "proxy",
       "proxy_id": "proxy-2",
       "config": {}
     },
     {
-      "name": "access_control",
+      "plugin_name": "access_control",
       "enabled": true,
+      "scope": "proxy",
       "proxy_id": "proxy-2",
       "config": {"allowed_consumers": ["tenant-2"]}
     }
@@ -289,20 +301,23 @@ curl -X POST http://localhost:9000/batch \
     ],
     "plugin_configs": [
       {
-        "name": "key_auth",
+        "plugin_name": "key_auth",
         "enabled": true,
+        "scope": "proxy",
         "proxy_id": "payments-proxy",
         "config": {}
       },
       {
-        "name": "access_control",
+        "plugin_name": "access_control",
         "enabled": true,
+        "scope": "proxy",
         "proxy_id": "payments-proxy",
         "config": {"allowed_consumers": ["mobile-app"]}
       },
       {
-        "name": "rate_limiting",
+        "plugin_name": "rate_limiting",
         "enabled": true,
+        "scope": "proxy",
         "proxy_id": "payments-proxy",
         "config": {"limits": [{"scope": "default", "requests_per_second": 100}]}
       }
@@ -400,14 +415,16 @@ for i in range(0, len(tenants), CHUNK_SIZE):
             "backend_port": int(t["backend_port"]),
         })
         plugin_configs.append({
-            "name": "key_auth",
+            "plugin_name": "key_auth",
             "enabled": True,
+            "scope": "proxy",
             "proxy_id": proxy_id,
             "config": {},
         })
         plugin_configs.append({
-            "name": "access_control",
+            "plugin_name": "access_control",
             "enabled": True,
+            "scope": "proxy",
             "proxy_id": proxy_id,
             "config": {"allowed_consumers": [consumer_name]},
         })
@@ -477,7 +494,7 @@ Each resource in the batch is validated before any database writes. If validatio
 - **Consumers**: Non-empty username, no duplicate usernames or custom_ids within the batch, custom_id normalization (empty string → null)
 - **Proxies**: listen_path format (`/` prefix, `=/` exact path, or `~` regex with compilation check), host entry format validation and lowercase normalization, no duplicate proxy IDs within the batch
 - **Upstreams**: At least one target or service_discovery config, no duplicate names within the batch
-- **Plugin configs**: Known plugin name, scope/proxy_id consistency (proxy scope requires proxy_id, global and proxy_group scopes reject proxy_id), no duplicate plugin config IDs within the batch
+- **Plugin configs**: Known plugin name (`plugin_name`, same field as `POST /plugins/config`), scope/proxy_id consistency (proxy scope requires proxy_id, global and proxy_group scopes reject proxy_id), no duplicate plugin config IDs within the batch
 
 **Note**: Within-batch uniqueness is checked, but cross-batch uniqueness (against existing DB records) is enforced by database constraints. Database constraint violations are returned as errors in the response.
 
@@ -486,7 +503,7 @@ Each resource in the batch is validated before any database writes. If validatio
 | Status | Condition | Applied? |
 |--------|-----------|----------|
 | 201 | Whole graph committed | Yes, in full |
-| 400 | Invalid JSON body, or graph validation failed | No |
+| 400 | Invalid JSON body, unknown top-level envelope key, or graph validation failed | No |
 | 403 | Admin API is in read-only mode | No |
 | 409 | A resource conflicts with an existing resource or with another resource in the same request (duplicate ID, name, listen path, or consumer identity) | No |
 | 500 | Server-side resource preparation failed, including a missing or weak `FERRUM_BASIC_AUTH_HMAC_SECRET` for plaintext Basic credentials | No |

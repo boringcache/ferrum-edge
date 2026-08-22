@@ -257,7 +257,7 @@ fn mongo_plugin_graph_validation_runs_under_the_durable_namespace_fence() {
     for method_name in [
         "create_proxy(&self, proxy: &Proxy)",
         "update_proxy(&self, proxy: &Proxy)",
-        "delete_proxy(&self, namespace: &str, id: &str)",
+        "delete_proxy_with_orphan_cleanup(",
         "create_plugin_config(&self, pc: &PluginConfig)",
         "update_plugin_config(&self, pc: &PluginConfig)",
         "delete_plugin_config(",
@@ -1089,10 +1089,12 @@ async fn admin_permit_defers_publish_while_nested_admission_pin_succeeds() {
     assert!(store.failover_topology_status().primary_active);
 
     let permit = store.acquire_write_topology_permit().await;
+    let pinned_epoch = permit.topology_epoch();
     assert!(
         permit.is_pinned(),
         "Mongo write admit must retain an admin_write_topology read pin"
     );
+    assert_eq!(store.config_topology_epoch(), pinned_epoch);
 
     let (admission_ready_tx, admission_ready_rx) = oneshot::channel::<()>();
     let (release_admission_tx, release_admission_rx) = oneshot::channel::<()>();
@@ -1141,6 +1143,11 @@ async fn admin_permit_defers_publish_while_nested_admission_pin_succeeds() {
         "test",
         "deferred reconnect must not ArcSwap the connection"
     );
+    assert_eq!(
+        store.config_topology_epoch(),
+        pinned_epoch,
+        "a deferred publication must not consume a topology epoch"
+    );
 
     release_admission_tx.send(()).expect("release admission");
     admission_task.await.expect("join admission task");
@@ -1155,6 +1162,13 @@ async fn admin_permit_defers_publish_while_nested_admission_pin_succeeds() {
     .await
     .expect("publish must succeed after Admin + admission pins drop");
     assert!(!store.failover_topology_status().primary_active);
+    let published_epoch = store.config_topology_epoch();
+    assert!(
+        published_epoch > pinned_epoch,
+        "a published Mongo topology must advance its process-local epoch"
+    );
+    let published_permit = store.acquire_write_topology_permit().await;
+    assert_eq!(published_permit.topology_epoch(), published_epoch);
     assert_eq!(
         mongo_store_published_database_name_for_test(&store),
         "after_admin_pin"

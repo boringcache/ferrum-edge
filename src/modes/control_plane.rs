@@ -2415,6 +2415,7 @@ pub async fn run(
                 fixtures: std::collections::HashMap::new(),
             },
         ),
+        runtime_config_apply: None,
     };
     // Clone admin_state before the HTTP listener moves it, so we can reuse
     // the same JwtManager instance for the HTTPS listener (instead of calling

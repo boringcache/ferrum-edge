@@ -4047,6 +4047,12 @@ paths:
         `FERRUM_BASIC_AUTH_HMAC_SECRET` of at least 32 bytes; missing or weak
         operator configuration fails the batch with 500 before persistence.
 
+        The envelope is closed: unknown top-level keys return `400`. There is
+        no `updates`, `deletes`, or `dry_run`. `GET /backup` metadata
+        (`version`, `ferrum_version`, `exported_at`, `source`, `counts`) and
+        the backup-only `api_specs` / `gateway_trust_bundles` sections are
+        accepted and ignored so a backup file remains a valid additive import.
+
         ### Backend support
 
         PostgreSQL, MySQL, and SQLite always support the guarantee. MongoDB
@@ -4083,7 +4089,9 @@ paths:
               $ref: "#/components/schemas/BatchCreateRequest"
       responses:
         "201":
-          description: All resources created successfully
+          description: |
+            All resources created successfully. In database mode the committed
+            generation is already live on this process.
           content:
             application/json:
               schema:
@@ -4134,7 +4142,9 @@ paths:
 
         The output format is compatible with `POST /batch` (additive import)
         and `POST /restore` (full replacement). Consumer credentials are
-        included **unredacted** since this is a backup endpoint.
+        included **unredacted** since this is a backup endpoint. Backup
+        resources always include `id`s; `POST /restore` requires those ids,
+        while `POST /batch` will auto-generate them if a caller strips them.
 
         Falls back to the in-memory cached configuration when the database is
         unavailable, indicated by the `X-Data-Source: cached` response header.
@@ -4249,7 +4259,13 @@ paths:
 
         Accepts the same JSON format produced by `GET /backup`. Resources are
         imported in dependency order (consumers & upstreams first, then proxies,
-        then plugin configs, then API specs).
+        then plugin configs, then API specs). Every restored proxy, consumer,
+        plugin config, and upstream must carry a non-empty `id` — the ids
+        `GET /backup` always emits. `POST /batch` auto-generates omitted ids;
+        restore does not, because repeating the same body would otherwise
+        invent different identities on a destructive replacement. A
+        batch-shaped body without ids is a `400` and does not delete existing
+        config.
 
         Restore normalizes the submitted payload once before validation — the
         same `normalize_fields()` admission used by CRUD, batch, file mode, and
@@ -4405,13 +4421,15 @@ paths:
           description: Request body too large (default max 100 MiB, configurable via FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB)
         "503":
           description: >-
-            Restore aborted because the pre-snapshot namespace guard could not
-            be acquired or the prior configuration could not be snapshotted for
-            rollback. A database/connectivity failure has `failure_class:
-            connectivity`. Existing config was NOT deleted; retry once the
-            database is reachable. Guard contention or an intentionally retained
-            uncertain operation instead returns the stable retryable
-            namespace-admission error.
+            Restore aborted because there is no database (file/DP mode returns
+            `{"error":"No database"}`), the pre-snapshot namespace guard could
+            not be acquired, or the prior configuration could not be
+            snapshotted for rollback. A database/connectivity failure has
+            `failure_class: connectivity`. Existing config was NOT deleted;
+            retry once the database is reachable. Guard contention or an
+            intentionally retained uncertain operation instead returns the
+            stable retryable namespace-admission error. Database mode with
+            `FERRUM_ADMIN_READ_ONLY=true` still returns `403`.
           headers:
             Retry-After:
               description: Present as `1` for namespace-admission contention.
@@ -4484,6 +4502,12 @@ paths:
       description: |
         Creates a new proxy route. A UUID is generated when `id` is omitted or
         empty. `created_at` and `updated_at` are set automatically.
+
+        In database mode a `201` means a covering `config_changes` generation is
+        live on this process: the handler captures that watermark under the
+        write-topology pin, then waits for the same poll-loop reload that
+        periodic ticks use. If that reload cannot apply, the API returns `503`
+        with `applied: false` even though the row is durable.
       tags: [Proxies]
       requestBody:
         required: true
@@ -4493,7 +4517,9 @@ paths:
               $ref: "#/components/schemas/ProxyCreate"
       responses:
         "201":
-          description: Proxy created
+          description: |
+            Proxy created. In database mode a covering `config_changes`
+            generation is already live on this process.
           content:
             application/json:
               schema:
@@ -4550,6 +4576,10 @@ paths:
         Replaces the proxy with the given body. The `id` field in the body is
         ignored — the path parameter is authoritative. `updated_at` is set
         automatically.
+
+        In database mode a `200` means a covering `config_changes` generation
+        is live on this process. If reload cannot apply, the API returns `503`
+        with `applied: false` even though the row is durable.
       tags: [Proxies]
       requestBody:
         required: true
@@ -4559,7 +4589,9 @@ paths:
               $ref: "#/components/schemas/ProxyCreate"
       responses:
         "200":
-          description: Proxy updated
+          description: |
+            Proxy updated. In database mode a covering `config_changes`
+            generation is already live on this process.
           content:
             application/json:
               schema:
@@ -4587,17 +4619,22 @@ paths:
       operationId: deleteProxy
       summary: Delete a proxy
       description: |
-        Deletes the proxy and its proxy-owned cascade resources. If the proxy is
+        Deletes the proxy and its proxy-owned cascade resources. In database
+        mode a `204` means a covering `config_changes` generation is live on
+        this process; if reload cannot apply, the API returns `503` with
+        `applied: false` even though the delete is durable. If the proxy is
         owned by an API spec, the spec row and spec-owned resources are also
         deleted. When the deleted proxy is hand-managed (no owning API-spec
         row), a last-referenced **hand-owned** upstream (`api_spec_id` null) is
-        orphan-cleaned if no remaining proxy or `mesh_route_dispatch` plugin
-        still references it. A shared hand-owned upstream survives. A spec-owned
-        proxy that drifted onto a hand-owned upstream leaves that upstream in
-        place. Spec-owned upstreams are removed by the spec cascade, not that
-        generic orphan path. When namespace admission is lost after that
-        deletion commits, SQL backends and replica-set MongoDB use the
-        API-spec compensation
+        orphan-cleaned by default if no remaining proxy or `mesh_route_dispatch`
+        plugin still references it. Pass `cleanup_orphaned_upstream=false` to
+        keep that upstream. A shared hand-owned upstream survives. Spec-owned
+        upstreams are removed by the spec cascade, not this generic orphan path;
+        a spec-owned proxy that drifted onto a hand-owned upstream leaves that
+        upstream in place. Direct `DELETE /upstreams/{id}` does not cascade: it
+        returns `409` while the upstream is still referenced. When namespace
+        admission is lost after that deletion commits,
+        SQL backends and replica-set MongoDB use the API-spec compensation
         transaction to restore the stamped spec resources, an orphaned
         hand-owned upstream, hand-owned cascade plugins, associations, and
         config-change records together. Before persistence, the namespace
@@ -4616,11 +4653,13 @@ paths:
         an API-spec-owned proxy with `501` before the first ownership-graph
         mutation; configure a replica set and retry.
       tags: [Proxies]
+      parameters:
+        - $ref: "#/components/parameters/CleanupOrphanedUpstream"
       responses:
         "204":
           description: Proxy deleted
         "400":
-          description: Deletion would leave an invalid plugin-composition graph, or an API-spec-owned proxy has foreign/missing ownership metadata or another restore-snapshot shape that atomic compensation cannot reproduce safely
+          description: Deletion would leave an invalid plugin-composition graph, or an API-spec-owned proxy has foreign/missing ownership metadata or another restore-snapshot shape that atomic compensation cannot reproduce safely, or `cleanup_orphaned_upstream` was duplicated or supplied with a value other than the exact strings `true` or `false`
           content:
             application/json:
               schema:
@@ -5440,7 +5479,9 @@ paths:
         when any proxy still has this `upstream_id`. A `mesh_route_dispatch`
         plugin_config that still names the upstream returns `409` with
         `{"error":"Upstream is referenced by a mesh_route_dispatch plugin_config and cannot be deleted"}`.
-        The upstream and referencing resources are left unchanged.
+        The upstream and referencing resources are left unchanged. This is the
+        opposite of `DELETE /proxies/{id}`, which orphan-cleans a last-referenced
+        hand-owned upstream by default unless `cleanup_orphaned_upstream=false`.
       tags: [Upstreams]
       responses:
         "204":
@@ -6547,6 +6588,31 @@ components:
         wire). Resources from other namespaces are not visible to this
         request and uniqueness constraints apply per-namespace.
 
+    CleanupOrphanedUpstream:
+      name: cleanup_orphaned_upstream
+      in: query
+      required: false
+      schema:
+        type: boolean
+        default: true
+      description: |
+        Controls last-referenced **hand-owned** upstream orphan cleanup when
+        deleting a hand-managed proxy. The default `true` is today's behavior:
+        if no remaining proxy or `mesh_route_dispatch` plugin references the
+        proxy's `upstream_id`, that hand-owned (`api_spec_id` null) upstream is
+        removed with the proxy. `false` keeps the upstream so it can be
+        reattached. Spec-owned upstreams and still-referenced upstreams are
+        never cleaned, regardless of this parameter.
+
+        Exactly one occurrence with the exact string `true` or `false` is
+        accepted. Any other value — including `1`, `0`, `yes`, or an empty
+        value — or any duplicate occurrence returns `400` rather than guessing,
+        because this flag decides whether operator data is deleted. Omitting
+        the parameter is equivalent to `true`. Direct
+        `DELETE /upstreams/{id}` is the opposite shape: it returns `409` while
+        any proxy or `mesh_route_dispatch` plugin still references the
+        upstream and never cascades.
+
     PaginationOffset:
       name: offset
       in: query
@@ -6692,6 +6758,15 @@ components:
         namespace is fenced by another mutation or an intentionally retained
         uncertain operation; retry after the indicated delay. Operators must
         recover a retained uncertain fence before retries can succeed.
+
+        In database mode this status is also returned after a config-database
+        write has committed when the in-process poll-loop reload cannot make
+        that generation live. That body includes `applied: false` and a closed
+        `reason` (`config_rejected`, `reload_timeout`, or `sequence_unavailable`).
+        The covering sequence is bound to the pinned database topology epoch;
+        reconnect/failover invalidates the old cursor instead of comparing it
+        with the replacement database's potentially lower watermark.
+        The row is durable; `Retry-After` is not used for this case.
       headers:
         Retry-After:
           required: false
@@ -6745,6 +6820,25 @@ components:
             - no_durable_spool
             - destination_mismatch
             - prepare_failed
+        applied:
+          type: boolean
+          description: |
+            Present on database-mode `503` responses after a config-database
+            mutation committed but the in-process poll-loop reload did not make
+            that generation live (issue #3926). Always `false` when present.
+            Omitted when the mutation was not performed (admission, audit gate,
+            validation).
+        reason:
+          type: string
+          description: |
+            Closed static label for why a committed database-mode mutation is
+            not live. `sequence_unavailable` also covers a reconnect/failover
+            that replaced the topology which produced the captured sequence.
+            Never a resource id, namespace, or driver error string.
+          enum:
+            - config_rejected
+            - reload_timeout
+            - sequence_unavailable
 
     AcmeCertificateRecordListResponse:
       type: object
@@ -7630,9 +7724,6 @@ components:
     # ── Proxy ───────────────────────────────────────────────────────
     Proxy:
       type: object
-      required:
-        - backend_host
-        - backend_port
       properties:
         id:
           type: string
@@ -7784,17 +7875,18 @@ components:
         backend_host:
           type: string
           description: >-
-            Backend server hostname or IP. Required when `upstream_id` is not set.
-            When `upstream_id` is set, this field is ignored (upstream targets
-            provide the backend address).
+            Backend server hostname or IP. Required when `upstream_id` is not
+            set. When `upstream_id` is set, this field may be omitted (empty
+            on the wire) and is ignored — upstream targets provide the dial
+            address.
         backend_port:
           type: integer
           format: uint16
           default: 0
           description: >-
             Backend server port. Required (>= 1) when `upstream_id` is not set.
-            When `upstream_id` is set, this field is ignored (upstream targets
-            provide the backend port).
+            When `upstream_id` is set, this field may be omitted (0 on the
+            wire) and is ignored — upstream targets provide the dial port.
         backend_path:
           type: [string, "null"]
 
@@ -7970,9 +8062,10 @@ components:
           type: [string, "null"]
           description: |
             Reference to an existing Upstream for load-balanced backends. When set,
-            `backend_host` and `backend_port` are overridden by the selected
-            upstream target. The referenced upstream must exist at creation time.
-            Deleting an upstream that is referenced by a proxy is blocked.
+            `backend_host` and `backend_port` may be omitted; the selected
+            upstream target supplies the dial address. The referenced upstream
+            must exist at creation time. Deleting an upstream that is referenced
+            by a proxy is blocked.
         upstream_subset:
           type: [string, "null"]
           maxLength: 128
@@ -8259,11 +8352,25 @@ components:
           and `backend_scheme` MUST be set explicitly.
         - Unknown fields are rejected. Backend H3 selection is runtime
           capability-driven for `Https` backends — there is no scheme for it.
+        - `backend_host` and `backend_port` may be omitted when `upstream_id`
+          is set. They remain required for a direct-backend proxy.
       allOf:
         - $ref: "#/components/schemas/Proxy"
-      required:
-        - backend_host
-        - backend_port
+        - anyOf:
+            - required: [upstream_id]
+              properties:
+                upstream_id:
+                  type: string
+                  minLength: 1
+            - required: [backend_host, backend_port]
+              properties:
+                backend_host:
+                  type: string
+                  minLength: 1
+                backend_port:
+                  type: integer
+                  format: uint16
+                  minimum: 1
 
     StreamMatchCriteria:
       type: object
@@ -15562,9 +15669,15 @@ components:
     # ── Batch ──────────────────────────────────────────────────────────
     BatchCreateRequest:
       type: object
+      additionalProperties: false
       description: |
-        Batch create request. All fields are optional — include only the
-        resource types you want to create.
+        Batch create request. Resource arrays are optional — include only the
+        resource types you want to create. Unknown top-level keys are rejected
+        (`400`); there is no `updates`, `deletes`, or `dry_run`. Backup
+        metadata and backup-only sections are accepted and ignored so
+        `GET /backup` output remains a valid additive import. Batch does not
+        persist `api_specs` or `gateway_trust_bundles` — use `POST /restore`
+        or the dedicated endpoints.
       properties:
         proxies:
           type: array
@@ -15586,6 +15699,35 @@ components:
           items:
             $ref: "#/components/schemas/UpstreamCreate"
           description: Upstreams to create
+        version:
+          type: string
+          description: Backup metadata. Accepted and ignored on `POST /batch`.
+        ferrum_version:
+          type: string
+          description: Backup metadata. Accepted and ignored on `POST /batch`.
+        exported_at:
+          type: string
+          format: date-time
+          description: Backup metadata. Accepted and ignored on `POST /batch`.
+        source:
+          type: string
+          description: Backup metadata. Accepted and ignored on `POST /batch`.
+        counts:
+          type: object
+          additionalProperties: true
+          description: Backup metadata. Accepted and ignored on `POST /batch`.
+        api_specs:
+          $ref: "#/components/schemas/ApiSpecsBackupSection"
+          description: >-
+            Backup-only section. Accepted and ignored on `POST /batch`; use
+            `POST /restore` or `/api-specs` to persist specs.
+        gateway_trust_bundles:
+          type: array
+          description: >-
+            Backup-only section. Accepted and ignored on `POST /batch`; use
+            `POST /restore` or `/gateway-trust-bundles` to persist trust.
+          items:
+            $ref: "#/components/schemas/GatewayTrustBundle"
 
     BatchCreateResponse:
       type: object
@@ -15845,11 +15987,15 @@ components:
     RestoreRequest:
       type: object
       description: |
-        Same format as the backup output or the batch create request.
-        All fields are optional — omitted resource types are treated as empty.
-        Omitting `api_specs` entirely means a legacy backup (preflight may
-        require `confirm_api_spec_deletion=true`). An empty `api_specs.items`
-        array is an intentional wipe of API specs.
+        Same format as the backup output. All resource arrays are optional —
+        omitted types are treated as empty. Every included proxy, consumer,
+        plugin config, and upstream must carry a non-empty `id` (`GET /backup`
+        always includes them). A batch-shaped body that omits ids is not
+        restorable. Omitting `api_specs` entirely means a legacy backup
+        (preflight may require `confirm_api_spec_deletion=true`). An empty
+        `api_specs.items` array is an intentional wipe of API specs.
+        Backup metadata (`exported_at`, `source`, `counts`, `ferrum_version`)
+        is ignored if present.
       properties:
         proxies:
           type: array
@@ -19060,9 +19206,11 @@ components:
         Plugin: hmac_auth — Ferrum-specific versioned HMAC authorization with
         mandatory request-body integrity protection. RFC 9530 defines
         Content-Digest; this is not RFC 9421 HTTP Message Signatures. Requests
-        must include Digest or Content-Digest matching the original body.
-        The signing base's FIRST field is the profile version, so a signature
-        produced under one profile can never verify under another.
+        must include exactly one of Digest or Content-Digest matching the
+        original body. Sending both headers is refused as ambiguous;
+        unsupported algorithms and malformed members fail closed. The signing
+        base's FIRST field is the profile version, so a signature produced
+        under one profile can never verify under another.
         `ferrum-hmac-v2` (the default) signs the profile version, matched proxy
         namespace, credential identity, normalized authority, method, raw path,
         raw query, Date, literal digest value, and a mandatory client nonce, and

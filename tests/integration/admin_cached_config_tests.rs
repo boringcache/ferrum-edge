@@ -356,6 +356,7 @@ async fn test_list_proxies_falls_back_to_cached_config() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -422,6 +423,7 @@ async fn test_list_consumers_falls_back_to_cached_config() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -483,6 +485,7 @@ async fn test_list_plugin_configs_falls_back_to_cached_config() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -546,6 +549,7 @@ async fn test_get_proxy_by_id_falls_back_to_cached_config() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -604,6 +608,7 @@ async fn test_get_proxy_not_found_in_cache() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -660,6 +665,7 @@ async fn test_get_consumer_by_id_falls_back_to_cached_config() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -718,6 +724,7 @@ async fn test_get_consumer_not_found_in_cache() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -774,6 +781,7 @@ async fn test_get_plugin_config_by_id_falls_back_to_cached_config() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -833,6 +841,7 @@ async fn test_get_plugin_config_not_found_in_cache() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -889,6 +898,7 @@ async fn test_list_proxies_no_db_no_cache_returns_503() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -948,6 +958,7 @@ async fn test_list_consumers_no_db_no_cache_returns_503() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -1007,6 +1018,7 @@ async fn test_get_proxy_no_db_no_cache_returns_503() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -1070,6 +1082,7 @@ async fn test_health_endpoint_shows_cached_config_info() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -1139,6 +1152,7 @@ async fn test_health_endpoint_shows_no_cached_config() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -1205,6 +1219,7 @@ async fn test_health_endpoint_returns_503_until_startup_is_ready() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -1279,6 +1294,7 @@ async fn test_cached_config_reflects_live_updates() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -1403,6 +1419,7 @@ fn create_pagination_admin_state(tc: &TestConfig) -> AdminState {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     }
 }
 
@@ -1634,6 +1651,7 @@ async fn create_seeded_db_admin_state(
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     }
 }
 
@@ -1913,6 +1931,7 @@ fn db_admin_state(
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     }
 }
 
@@ -2276,6 +2295,7 @@ async fn create_db_admin_state_with_availability(
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     (state, temp_dir)
 }
@@ -3370,6 +3390,7 @@ async fn test_batch_create_read_only_rejected() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -5616,7 +5637,7 @@ async fn test_backup_then_restore_roundtrip_with_proxy_plugin_association() {
 }
 
 #[tokio::test]
-async fn test_restore_read_only_rejected() {
+async fn test_restore_file_mode_returns_503_no_database() {
     let tc = TestConfig::default();
     let state = AdminState {
         db: None,
@@ -5624,7 +5645,7 @@ async fn test_restore_read_only_rejected() {
         metrics_auth: Default::default(),
         cached_config: None,
         proxy_state: None,
-        mode: "test".to_string(),
+        mode: "file".to_string(),
         read_only: true,
         admin_audit_enabled: false,
         admin_audit_fallback_dir: Some(crate::common::isolated_audit_fallback_dir()),
@@ -5659,13 +5680,278 @@ async fn test_restore_read_only_rejected() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
 
     let (status, body) = admin_post(&base_url, "/restore?confirm=true", &token, &json!({})).await;
-    assert_eq!(status, 403);
-    assert!(body["error"].as_str().unwrap().contains("read-only"));
+    assert_eq!(
+        status, 503,
+        "file/DP restore must report no database, not read-only: {body:?}"
+    );
+    assert_eq!(body["error"], "No database");
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &json!({"proxies": []})).await;
+    assert_eq!(
+        status, 403,
+        "other file-mode writes must stay read-only 403: {body:?}"
+    );
+    assert!(
+        body["error"].as_str().unwrap().contains("read-only"),
+        "batch in file mode must keep the generic RO body: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_restore_read_only_with_database_still_forbidden() {
+    let tc = TestConfig::default();
+    let (mut state, _dir) = create_db_admin_state(&tc).await;
+    state.read_only = true;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/restore?confirm=true",
+        &token,
+        &json!({
+            "proxies": [{
+                "id": "should-not-land",
+                "listen_path": "/nope",
+                "backend_scheme": "http",
+                "backend_host": "localhost",
+                "backend_port": 8080
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 403,
+        "database-mode read-only restore must not fall through to a write: {body:?}"
+    );
+    assert!(
+        body["error"].as_str().unwrap().contains("read-only"),
+        "genuine read-only restore must keep the 403 body: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_restore_rejects_omitted_resource_ids() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let seed = json!({
+        "proxies": [{
+            "id": "restore-keep",
+            "listen_path": "/keep",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201, "seed failed: {body:?}");
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/restore?confirm=true",
+        &token,
+        &json!({
+            "consumers": [{
+                "username": "noid-user",
+                "credentials": {"keyauth": [{"key": "k"}]}
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "restore without ids must 400: {body:?}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("existing config was NOT deleted"),
+        "omitted-id restore must stay fail-safe: {body:?}"
+    );
+    let errors = body["validation_errors"]
+        .as_array()
+        .expect("validation_errors");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.as_str().unwrap_or("").contains("POST /restore does not")),
+        "restore must explain that ids are required: {body:?}"
+    );
+
+    let (status, _, _) = admin_get(&base_url, "/proxies/restore-keep", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "omitted-id restore must not delete existing config"
+    );
+}
+
+#[tokio::test]
+async fn test_batch_rejects_unknown_envelope_keys() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/batch",
+        &token,
+        &json!({
+            "updates": {"proxies": [{"id": "keep-a", "listen_path": "/keep-a-UPDATED"}]},
+            "deletes": {"proxies": ["keep-a"]},
+            "dry_run": true,
+            "proxies": [{
+                "id": "unk-created",
+                "listen_path": "/unk",
+                "backend_scheme": "http",
+                "backend_host": "localhost",
+                "backend_port": 8080
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "unknown batch envelope keys must 400: {body:?}"
+    );
+    let error = body["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("unknown field"),
+        "batch must name the unknown field: {body:?}"
+    );
+    assert!(
+        error.contains("updates") || error.contains("deletes") || error.contains("dry_run"),
+        "batch must reject unimplemented mutation verbs: {body:?}"
+    );
+
+    let (status, _, _) = admin_get(&base_url, "/proxies/unk-created", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "rejected envelope must not persist the nested create"
+    );
+}
+
+#[tokio::test]
+async fn test_batch_accepts_backup_metadata_keys() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/batch",
+        &token,
+        &json!({
+            "version": "1",
+            "ferrum_version": "0.9.0",
+            "exported_at": "2026-08-19T00:00:00Z",
+            "source": "database",
+            "counts": {
+                "proxies": 1,
+                "consumers": 0,
+                "plugin_configs": 0,
+                "upstreams": 0,
+                "api_specs": 0,
+                "gateway_trust_bundles": 0
+            },
+            "api_specs": {"section_version": "2", "items": []},
+            "gateway_trust_bundles": [],
+            "proxies": [{
+                "id": "from-backup",
+                "listen_path": "/from-backup",
+                "backend_scheme": "http",
+                "backend_host": "localhost",
+                "backend_port": 8080
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "GET /backup metadata must still be a valid additive import: {body:?}"
+    );
+    assert_eq!(body["created"]["proxies"], 1);
+}
+
+#[tokio::test]
+async fn test_proxy_and_batch_accept_upstream_id_without_backend_host() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/upstreams",
+        &token,
+        &json!({
+            "id": "user-svc-upstream",
+            "name": "user-service-pool",
+            "algorithm": "round_robin",
+            "targets": [
+                {"host": "10.0.1.10", "port": 3000, "weight": 100}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "upstream create failed: {body:?}");
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/proxies",
+        &token,
+        &json!({
+            "id": "via-up",
+            "listen_path": "/via-up",
+            "backend_scheme": "http",
+            "upstream_id": "user-svc-upstream"
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "POST /proxies with upstream_id and no host must succeed: {body:?}"
+    );
+    assert_eq!(body["backend_host"], "");
+    assert_eq!(body["backend_port"], 0);
+    assert_eq!(body["upstream_id"], "user-svc-upstream");
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/batch",
+        &token,
+        &json!({
+            "upstreams": [{
+                "id": "batch-up",
+                "name": "batch-up-pool",
+                "algorithm": "round_robin",
+                "targets": [{"host": "10.0.1.11", "port": 3000, "weight": 100}]
+            }],
+            "proxies": [{
+                "name": "user-service",
+                "listen_path": "/api/users",
+                "backend_scheme": "http",
+                "upstream_id": "batch-up"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "POST /batch load-balanced example without host must succeed: {body:?}"
+    );
+    assert_eq!(body["created"]["upstreams"], 1);
+    assert_eq!(body["created"]["proxies"], 1);
 }
 
 #[tokio::test]
@@ -6085,6 +6371,7 @@ async fn test_list_upstreams_falls_back_to_cached_config() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -6151,6 +6438,7 @@ async fn test_get_upstream_by_id_falls_back_to_cached_config() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -6209,6 +6497,7 @@ async fn test_get_upstream_not_found_in_cache() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -6263,6 +6552,7 @@ async fn test_list_upstreams_no_db_no_cache_returns_503() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -6322,6 +6612,7 @@ async fn test_get_upstream_no_db_no_cache_returns_503() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -6724,6 +7015,257 @@ async fn test_delete_hand_managed_proxy_orphan_cleans_last_referenced_hand_owned
 }
 
 #[tokio::test]
+async fn test_delete_proxy_orphan_cleans_last_referenced_hand_owned_upstream_by_default() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let upstream = json!({
+        "id": "orphan-up-default",
+        "name": "orphan-up-default",
+        "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+    });
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 201, "Create upstream failed: {:?}", body);
+
+    let proxy = json!({
+        "id": "orphan-px-default",
+        "listen_path": "/orphan-default",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true,
+        "upstream_id": "orphan-up-default"
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "Create proxy failed: {:?}", body);
+
+    let (status, _) = admin_delete(&base_url, "/proxies/orphan-px-default", &token).await;
+    assert_eq!(status, 204);
+    let (status, body, _) = admin_get(&base_url, "/upstreams/orphan-up-default", &token).await;
+    assert_eq!(
+        status, 404,
+        "omitting cleanup_orphaned_upstream must keep today's orphan cleanup: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_delete_proxy_opt_out_preserves_last_referenced_hand_owned_upstream() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let upstream = json!({
+        "id": "orphan-up-keep",
+        "name": "orphan-up-keep",
+        "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+    });
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 201, "Create upstream failed: {:?}", body);
+
+    let proxy = json!({
+        "id": "orphan-px-keep",
+        "listen_path": "/orphan-keep",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true,
+        "upstream_id": "orphan-up-keep"
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "Create proxy failed: {:?}", body);
+
+    let (status, body) = admin_delete(
+        &base_url,
+        "/proxies/orphan-px-keep?cleanup_orphaned_upstream=false",
+        &token,
+    )
+    .await;
+    assert_eq!(status, 204, "opt-out delete must succeed: {:?}", body);
+    let (status, body, _) = admin_get(&base_url, "/upstreams/orphan-up-keep", &token).await;
+    assert_eq!(
+        status, 200,
+        "cleanup_orphaned_upstream=false must leave the upstream queryable: {:?}",
+        body
+    );
+    assert_eq!(body["id"].as_str().unwrap_or(""), "orphan-up-keep");
+}
+
+#[tokio::test]
+async fn test_delete_proxy_explicit_true_orphan_cleans_last_referenced_upstream() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let upstream = json!({
+        "id": "orphan-up-true",
+        "name": "orphan-up-true",
+        "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+    });
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 201, "Create upstream failed: {:?}", body);
+
+    let proxy = json!({
+        "id": "orphan-px-true",
+        "listen_path": "/orphan-true",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true,
+        "upstream_id": "orphan-up-true"
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "Create proxy failed: {:?}", body);
+
+    let (status, _) = admin_delete(
+        &base_url,
+        "/proxies/orphan-px-true?cleanup_orphaned_upstream=true",
+        &token,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, _, _) = admin_get(&base_url, "/upstreams/orphan-up-true", &token).await;
+    assert_eq!(
+        status, 404,
+        "cleanup_orphaned_upstream=true must orphan-clean the last-referenced upstream"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_proxy_rejects_unrecognized_cleanup_orphaned_upstream_value() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let upstream = json!({
+        "id": "orphan-up-badflag",
+        "name": "orphan-up-badflag",
+        "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+    });
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 201, "Create upstream failed: {:?}", body);
+
+    let proxy = json!({
+        "id": "orphan-px-badflag",
+        "listen_path": "/orphan-badflag",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true,
+        "upstream_id": "orphan-up-badflag"
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "Create proxy failed: {:?}", body);
+
+    let (status, body) = admin_delete(
+        &base_url,
+        "/proxies/orphan-px-badflag?cleanup_orphaned_upstream=yes",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "unrecognized cleanup_orphaned_upstream must 400, not guess: {:?}",
+        body
+    );
+    let error = body["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("cleanup_orphaned_upstream") && error.contains("true"),
+        "400 body must name the flag and accepted values: {:?}",
+        body
+    );
+
+    let (status, body) = admin_delete(
+        &base_url,
+        "/proxies/orphan-px-badflag?cleanup_orphaned_upstream=false&cleanup_orphaned_upstream=false",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "duplicate cleanup_orphaned_upstream must fail closed even when values agree: {:?}",
+        body
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("more than once"),
+        "duplicate-value 400 must explain the ambiguity: {:?}",
+        body
+    );
+
+    let (status, _, _) = admin_get(&base_url, "/proxies/orphan-px-badflag", &token).await;
+    assert_eq!(status, 200, "invalid flag must not delete the proxy");
+    let (status, _, _) = admin_get(&base_url, "/upstreams/orphan-up-badflag", &token).await;
+    assert_eq!(status, 200, "invalid flag must not delete the upstream");
+}
+
+#[tokio::test]
+async fn test_delete_proxy_still_referenced_upstream_survives_with_or_without_flag() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    for (suffix, query) in [
+        ("default", ""),
+        ("optout", "?cleanup_orphaned_upstream=false"),
+        ("explicit", "?cleanup_orphaned_upstream=true"),
+    ] {
+        let upstream_id = format!("orphan-up-shared-{suffix}");
+        let p1 = format!("orphan-px-shared-a-{suffix}");
+        let p2 = format!("orphan-px-shared-b-{suffix}");
+        let upstream = json!({
+            "id": upstream_id,
+            "name": upstream_id,
+            "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+        });
+        let (status, body) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+        assert_eq!(status, 201, "Create upstream failed: {:?}", body);
+
+        let proxy_a = json!({
+            "id": p1,
+            "listen_path": format!("/orphan-shared-a-{suffix}"),
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "upstream_id": upstream_id
+        });
+        let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy_a).await;
+        assert_eq!(status, 201, "Create proxy A failed: {:?}", body);
+
+        let proxy_b = json!({
+            "id": p2,
+            "listen_path": format!("/orphan-shared-b-{suffix}"),
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "upstream_id": upstream_id
+        });
+        let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy_b).await;
+        assert_eq!(status, 201, "Create proxy B failed: {:?}", body);
+
+        let (status, body) =
+            admin_delete(&base_url, &format!("/proxies/{p1}{query}"), &token).await;
+        assert_eq!(status, 204, "delete proxy A must succeed: {:?}", body);
+        let (status, _, _) =
+            admin_get(&base_url, &format!("/upstreams/{upstream_id}"), &token).await;
+        assert_eq!(
+            status, 200,
+            "shared upstream must survive deleting one referencer (query={query:?})"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_upstream_update_rejects_removing_referenced_subset() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;
@@ -7087,6 +7629,7 @@ async fn test_backup_falls_back_to_cached_config_when_no_db() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -7150,6 +7693,7 @@ async fn test_backup_no_db_no_cache_returns_503() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -7212,6 +7756,7 @@ async fn test_create_proxy_returns_503_when_no_db() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -7271,6 +7816,7 @@ async fn test_create_upstream_returns_503_when_no_db() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -7376,6 +7922,7 @@ async fn test_cached_config_reflects_upstream_updates() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -8042,6 +8589,7 @@ async fn test_health_endpoint_shows_db_availability() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -8309,6 +8857,7 @@ async fn test_cluster_endpoint_requires_auth() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -8367,6 +8916,7 @@ async fn test_cluster_endpoint_cp_mode_empty_registry() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -8440,6 +8990,7 @@ async fn test_cluster_endpoint_cp_mode_with_connected_dps() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -8517,6 +9068,7 @@ async fn test_cluster_endpoint_cp_mode_with_connected_mesh_nodes() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -8592,6 +9144,7 @@ async fn test_cluster_endpoint_dp_mode_connected() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -8658,6 +9211,7 @@ async fn test_cluster_endpoint_dp_mode_disconnected() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -8719,6 +9273,7 @@ async fn test_cluster_endpoint_database_mode() {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);

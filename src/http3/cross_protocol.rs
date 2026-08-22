@@ -1084,7 +1084,15 @@ where
 // Plain flavor — reqwest + streaming response with coalescing
 // ---------------------------------------------------------------------------
 
+// `#[inline(never)]`: 89 lines with 11 parameters, called twice from the
+// prebuffered arm of `dispatch_plain` and 13 times in this file. At
+// `opt-level = 0` every temporary it inlines becomes a permanent frame slot in
+// each caller, and `dispatch_plain` is the largest coroutine on the H3 path —
+// the same reasoning that already keeps `write_plain_backend_timeout_terminal`
+// out of line after three copies of that terminal overflowed a tokio worker
+// stack (issue #4074).
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 fn build_plain_request_builder(
     client: &reqwest::Client,
     state: &ProxyState,

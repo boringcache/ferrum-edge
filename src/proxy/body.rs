@@ -2334,11 +2334,15 @@ impl SizeLimitedIncoming {
     /// Arm the upload cancellation channel without installing a completion
     /// signal.
     ///
-    /// The direct-H2 dispatch path uses this when request-size limits are
-    /// disabled: there is no response-side gate to satisfy, but an early return
-    /// after `send_request` (a response-header timeout) must still be able to
-    /// tear down hyper's detached HTTP/2 upload pipe instead of leaving it
-    /// draining the client body toward a response nobody will read.
+    /// Ordinary unlimited unauthenticated direct-H2 does **not** use this
+    /// (issue #3942): that path is [`DirectH2RequestBody::Passthrough`], which
+    /// owns the cancel receiver itself. This builder is for
+    /// [`SizeLimitedIncoming`] arms that still need the limiter (gRPC message
+    /// observation with no size cap and no auth deadline) but have no
+    /// response-side completion gate. An early return after `send_request` (a
+    /// response-header timeout) must still tear down hyper's detached HTTP/2
+    /// upload pipe instead of leaving it draining the client body toward a
+    /// response nobody will read.
     #[must_use]
     pub fn with_cancel(mut self, cancel: tokio::sync::oneshot::Receiver<()>) -> Self {
         self.cancel = Some(cancel);
@@ -2489,6 +2493,207 @@ fn poll_upload_cancel(
             UploadCancelSignal::Idle
         }
         Poll::Pending => UploadCancelSignal::Idle,
+    }
+}
+
+/// Whether ordinary direct-H2 must wrap the client upload in
+/// [`SizeLimitedIncoming`].
+///
+/// Operator `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0` is unlimited. Wrapping
+/// that spelling as `usize::MAX` still pays a per-DATA-frame atomic and
+/// limit compare on every echo POST — a tax that scales with payload size
+/// and showed up as the Jun 19 → Aug 15 HTTP/2 regression (issue #3942).
+/// Skip the limiter when none of the enforcement / observation features
+/// are required; keep it whenever a real cap, an upload-completion gate,
+/// or gRPC message counting is on. Early-return cancel stays on the
+/// passthrough arm so hyper's detached pipe still resets.
+#[inline]
+pub(crate) fn direct_h2_uses_limit_adapter(
+    max_request_body_bytes: usize,
+    needs_upload_completion_gate: bool,
+    observes_grpc_messages: bool,
+) -> bool {
+    max_request_body_bytes > 0 || needs_upload_completion_gate || observes_grpc_messages
+}
+
+/// One-shot join for unlimited direct-H2 passthrough byte publication.
+///
+/// Hyper can resolve backend response headers while the detached HTTP/2
+/// upload pipe is still running (`body_completion_rx` is `None` on this
+/// arm). Transaction summaries and `api_chargeback` must wait for this
+/// latch instead of snapshotting `bytes_sent_observed` at header flush.
+/// The hot path still tallies frames into a plain `u64`; this notify is
+/// signaled once at EOS / error / cancel / Drop, not per DATA frame.
+pub struct DirectH2BytesLatch {
+    done: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl Default for DirectH2BytesLatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DirectH2BytesLatch {
+    pub fn new() -> Self {
+        Self {
+            done: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+
+    pub fn finish(&self) {
+        if !self.done.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    pub async fn wait(&self) {
+        let notified = self.notify.notified();
+        if self.is_done() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// Publish passthrough forwarded bytes once and release waiters.
+///
+/// `fetch_max` matches [`SizeLimitedIncoming`]'s contract: a retry whose
+/// plugin transforms shrink the body must not lower an earlier observation.
+/// `seen == 0` still finishes the latch so GET / empty-body waiters cannot
+/// hang.
+pub(crate) fn publish_passthrough_request_bytes(
+    observed: &AtomicU64,
+    seen: u64,
+    published: &mut bool,
+    latch: &DirectH2BytesLatch,
+) {
+    if *published {
+        return;
+    }
+    *published = true;
+    if seen > 0 {
+        observed.fetch_max(seen, Ordering::Release);
+    }
+    latch.finish();
+}
+
+/// Request body for the ordinary direct-H2 pool ([`super::http2_pool::Http2Sender`]).
+///
+/// [`Self::Passthrough`] is the Jun 19 hot path: hyper polls `Incoming`
+/// (plus the early-return cancel oneshot that tears down the detached
+/// pipe). [`Self::Limited`] preserves in-path 413 / upload-gate /
+/// gRPC-message counting when those features are actually configured.
+pub enum DirectH2RequestBody {
+    Passthrough {
+        inner: Incoming,
+        cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+        /// Bytes polled out of the client body so far. A PLAIN counter, not an
+        /// atomic: skipping the per-frame atomic is the whole point of this
+        /// arm (issue #3942). It is published once, in
+        /// [`publish_passthrough_request_bytes`].
+        seen: u64,
+        /// `ctx.bytes_sent_observed`. `TransactionSummary.bytes_sent` and the
+        /// `api_chargeback` plugin bill on this, so the passthrough arm must
+        /// still report the bytes it actually forwarded — seeding from
+        /// `Content-Length` would report nothing for a streaming H2 upload
+        /// that omits it, and would over-report an aborted one.
+        observed: Arc<AtomicU64>,
+        /// Guards against double publication when end-of-stream is followed by
+        /// `Drop`.
+        published: bool,
+        /// Signaled from the same publication as `observed` so a summary
+        /// built after an early backend response can wait for the real tally.
+        latch: Arc<DirectH2BytesLatch>,
+    },
+    Limited(SizeLimitedIncoming),
+}
+
+impl Drop for DirectH2RequestBody {
+    fn drop(&mut self) {
+        // A client that aborts mid-upload, or an early return that drops the
+        // body before end-of-stream, still has to account for what was
+        // forwarded. The clean-EOS path has already published by this point.
+        if let DirectH2RequestBody::Passthrough {
+            seen,
+            observed,
+            published,
+            latch,
+            ..
+        } = self
+        {
+            publish_passthrough_request_bytes(observed, *seen, published, latch);
+        }
+    }
+}
+
+impl http_body::Body for DirectH2RequestBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.get_mut() {
+            DirectH2RequestBody::Passthrough {
+                inner,
+                cancel,
+                seen,
+                observed,
+                published,
+                latch,
+            } => {
+                if poll_upload_cancel(cancel, cx) == UploadCancelSignal::Cancelled {
+                    publish_passthrough_request_bytes(observed, *seen, published, latch);
+                    return Poll::Ready(Some(Err(
+                        "request body forwarding cancelled after upload timeout".into(),
+                    )));
+                }
+                // `Incoming` implements BOTH this module's `FrameSource` and
+                // `http_body::Body`, so the call must name the trait (E0034).
+                // `http_body::Body` is the one whose error converts into
+                // `BoxError` below.
+                match http_body::Body::poll_frame(Pin::new(inner), cx) {
+                    Poll::Ready(Some(Ok(frame))) => {
+                        if let Some(data) = frame.data_ref() {
+                            *seen = seen.saturating_add(data.len() as u64);
+                        }
+                        Poll::Ready(Some(Ok(frame)))
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        publish_passthrough_request_bytes(observed, *seen, published, latch);
+                        Poll::Ready(Some(Err(e.into())))
+                    }
+                    Poll::Ready(None) => {
+                        publish_passthrough_request_bytes(observed, *seen, published, latch);
+                        Poll::Ready(None)
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+            DirectH2RequestBody::Limited(limited) => Pin::new(limited).poll_frame(cx),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            DirectH2RequestBody::Passthrough { inner, .. } => inner.is_end_stream(),
+            DirectH2RequestBody::Limited(limited) => limited.is_end_stream(),
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        match self {
+            DirectH2RequestBody::Passthrough { inner, .. } => inner.size_hint(),
+            DirectH2RequestBody::Limited(limited) => limited.size_hint(),
+        }
     }
 }
 

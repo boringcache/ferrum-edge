@@ -11,6 +11,7 @@
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_circuit_breaker
 
 use crate::common::TestGateway;
+use crate::scaffolding::ports::reserve_refused_tcp_port;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -523,13 +524,10 @@ async fn test_retry_succeeds_on_second_attempt() {
 #[tokio::test]
 #[ignore]
 async fn test_retry_on_connect_failure() {
-    // Use a port where nothing is listening to simulate connect failure.
-    let dead_port = {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        port
-    };
+    // Bound-but-not-listening port: kernel ECONNREFUSED and parallel tests
+    // cannot steal the port while this reservation is held.
+    let dead_port_reservation = reserve_refused_tcp_port().expect("reserve refused backend port");
+    let dead_port = dead_port_reservation.port;
 
     let mut gateway = spawn_gateway().await;
     let client = reqwest::Client::new();
@@ -587,4 +585,6 @@ async fn test_retry_on_connect_failure() {
         "Should have waited for retries, elapsed: {:?}",
         elapsed
     );
+
+    let _keep_dead_port = dead_port_reservation;
 }

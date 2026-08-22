@@ -7,6 +7,79 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+/// Single-entry memo for [`resolve_pod_cgroup_path_cached`].
+///
+/// Deliberately one slot, not a map: exactly one NodeWaypoint relay pod is
+/// resolved on a timer at any moment, so a single `(cgroup_root, pod_uid,
+/// path)` tuple is inherently bounded and cannot grow as pods churn.
+static RELAY_POD_CGROUP_PATH_MEMO: OnceLock<Mutex<Option<(String, String, PathBuf)>>> =
+    OnceLock::new();
+
+/// [`resolve_pod_cgroup_path`] for callers that resolve the SAME pod on a
+/// timer rather than once per pod event.
+///
+/// `resolve_pod_cgroup_path`'s six fast paths only cover the plain
+/// `kubepods.slice` / `kubepods` layouts. On the kubeadm/kind systemd layout
+/// (`kubelet.slice/kubelet-kubepods.slice/...`, pinned by
+/// `resolve_pod_cgroup_path_finds_kubelet_slice_systemd_pod`) every call falls
+/// through to `discover_pod_cgroup_paths`, a breadth-first walk bounded at
+/// `POD_CGROUP_DISCOVERY_MAX_DIRS` directories that does not early-exit on a
+/// match. The NodeWaypoint relay reconcile runs every
+/// `UDP_CAPTURE_READINESS_POLL` (250 ms), so calling the uncached resolver
+/// there costs thousands of directory reads per second, forever, on a
+/// steady-state node.
+///
+/// The memo is validated by a single `exists()` check before reuse. That is
+/// sound because the resolved path embeds the pod UID: if the pod's cgroup
+/// moves to a different parent slice the cached path stops existing and the
+/// walk is redone. Callers still re-run [`collect_cgroup_tree`] on the
+/// returned path every poll, so a container leaf that moves WITHIN the pod
+/// subtree is still detected — only the discovery is cached, never the inode
+/// set.
+pub fn resolve_pod_cgroup_path_cached(cgroup_root: &str, pod_uid: &str) -> Option<PathBuf> {
+    let memo = RELAY_POD_CGROUP_PATH_MEMO.get_or_init(|| Mutex::new(None));
+    let mut slot = match memo.lock() {
+        Ok(slot) => slot,
+        // A poisoned memo is a cache, not state: recover and keep serving.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    resolve_pod_cgroup_path_with_memo(
+        &mut slot,
+        cgroup_root,
+        pod_uid,
+        resolve_pod_cgroup_path,
+        |path| path.exists(),
+    )
+}
+
+/// Memo policy for [`resolve_pod_cgroup_path_cached`], with the slot, the
+/// resolver, and the liveness probe injected so the cache-hit, stale-path, and
+/// changed-identity transitions are testable without touching the process
+/// global or the real filesystem.
+fn resolve_pod_cgroup_path_with_memo(
+    slot: &mut Option<(String, String, PathBuf)>,
+    cgroup_root: &str,
+    pod_uid: &str,
+    mut resolve: impl FnMut(&str, &str) -> Option<PathBuf>,
+    mut still_exists: impl FnMut(&Path) -> bool,
+) -> Option<PathBuf> {
+    if let Some((cached_root, cached_uid, cached_path)) = slot.as_ref()
+        && cached_root == cgroup_root
+        && cached_uid == pod_uid
+        && still_exists(cached_path)
+    {
+        return Some(cached_path.clone());
+    }
+    let resolved = resolve(cgroup_root, pod_uid)?;
+    *slot = Some((
+        cgroup_root.to_string(),
+        pod_uid.to_string(),
+        resolved.clone(),
+    ));
+    Some(resolved)
+}
 
 /// Resolve the cgroup v2 path for a Kubernetes pod.
 ///
@@ -68,6 +141,9 @@ fn discover_pod_cgroup_paths(
 
     while let Some((dir, depth)) = queue.pop_front() {
         if scanned >= POD_CGROUP_DISCOVERY_MAX_DIRS {
+            // A cap-hit is a miss for [`resolve_pod_cgroup_path`] (None), not a
+            // partial authorization set. Unlike [`collect_cgroup_tree`], this
+            // walk is a name search: failing to find the pod fail-closes.
             break;
         }
         scanned += 1;
@@ -108,17 +184,188 @@ pub fn cgroup_path_for_qos(cgroup_root: &str, pod_uid: &str, qos_class: &str) ->
     }
 }
 
-/// Bounds for [`collect_cgroup_tree_inodes`]. Kubernetes pod cgroups nest only
-/// a level or two deep (the pod slice plus a `.scope`/dir per container, plus
+/// Bounds for [`collect_cgroup_tree`]. Kubernetes pod cgroups nest only a
+/// level or two deep (the pod slice plus a `.scope`/dir per container, plus
 /// the pause container), so these are generous; they exist solely to keep a
 /// pathological or adversarial cgroup tree from turning enrollment into an
 /// unbounded directory walk.
-const CGROUP_TREE_MAX_DEPTH: usize = 8;
-const CGROUP_TREE_MAX_INODES: usize = 256;
+///
+/// Exactly [`CGROUP_TREE_MAX_INODES`] complete directory inodes remain
+/// representable. Observing a further unique directory, a descendant past
+/// [`CGROUP_TREE_MAX_DEPTH`], or a child that cannot be fully enumerated is
+/// reported via [`CgroupTreeWalkStatus`] rather than silently truncated.
+pub const CGROUP_TREE_MAX_DEPTH: usize = 8;
+pub const CGROUP_TREE_MAX_INODES: usize = 256;
+/// Per-directory and whole-walk visit bounds. Only the Unix walk reads them —
+/// the non-Unix [`collect_cgroup_tree`] has no hierarchy to enumerate — so they
+/// are gated with the code that uses them rather than left dead on Windows.
+#[cfg(unix)]
+const CGROUP_TREE_MAX_DIR_ENTRIES: usize = 512;
+#[cfg(unix)]
+const CGROUP_TREE_MAX_VISITS: usize = 512;
+
+// The walk bound and the `FERRUM_UDP_RELAY_CGROUPS` map bound are ONE number,
+// not two that happen to agree. This walk produces the set the node-agent
+// publishes, and the node-agent refuses any set larger than
+// `ferrum_ebpf_common::UDP_RELAY_CGROUP_MAX_ENTRIES`. Raise only the map and
+// complete-looking sets are silently short of a container leaf; raise only the
+// walk and legitimate generations start being refused. The two constants live
+// in separate crates, so make the coupling a compile error rather than a doc
+// comment two people have to read.
+const _: () =
+    assert!(CGROUP_TREE_MAX_INODES == ferrum_ebpf_common::UDP_RELAY_CGROUP_MAX_ENTRIES as usize);
+
+/// How many times [`collect_cgroup_tree`] restarts the walk after a descendant
+/// vanished (`ENOENT`) partway through it.
+///
+/// A pod cgroup subtree is static except at container start/stop, so one
+/// re-walk almost always settles. The bound is what keeps a tree churning
+/// under the walker from spinning: after this many restarts the walk gives up
+/// and reports [`CgroupTreeWalkStatus::IncompleteEnumeration`], so total work
+/// stays at `(CGROUP_TREE_MAX_REWALKS + 1) * CGROUP_TREE_MAX_VISITS`.
+const CGROUP_TREE_MAX_REWALKS: usize = 3;
+
+/// Why a bounded cgroup-tree walk could not prove the inode set complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CgroupTreeWalkStatus {
+    /// Every reachable descendant directory was enumerated; [`CgroupTreeWalk::inodes`]
+    /// is the full set.
+    Complete,
+    /// A unique directory inode past [`CGROUP_TREE_MAX_INODES`] was observed, or
+    /// the pending-visit queue could not be extended without exceeding that bound.
+    ExceededEntryBound,
+    /// A directory at [`CGROUP_TREE_MAX_DEPTH`] has a descendant that would
+    /// require walking deeper.
+    ExceededDepthBound,
+    /// A descendant could not be `stat`ed or `read_dir`ed, so remaining
+    /// children may exist unseen.
+    IncompleteEnumeration,
+}
+
+/// Bounded walk of a pod cgroup subtree.
+///
+/// `inodes` is the pod directory first, then descendants in breadth-first
+/// order, capped at [`CGROUP_TREE_MAX_INODES`]. It is an authorization set
+/// only when [`Self::status`] is [`CgroupTreeWalkStatus::Complete`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CgroupTreeWalk {
+    pub inodes: Vec<u64>,
+    pub status: CgroupTreeWalkStatus,
+}
+
+impl CgroupTreeWalk {
+    pub fn is_complete(&self) -> bool {
+        self.status == CgroupTreeWalkStatus::Complete
+    }
+
+    fn complete(inodes: Vec<u64>) -> Self {
+        Self {
+            inodes,
+            status: CgroupTreeWalkStatus::Complete,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn record_incomplete(status: &mut CgroupTreeWalkStatus, reason: CgroupTreeWalkStatus) {
+    // A Complete "reason" is not a failure and must not clobber a prior one.
+    // Callers only pass incomplete statuses; ignore Complete rather than
+    // panicking in debug builds over an internal invariant with no extra
+    // diagnostic value.
+    if reason == CgroupTreeWalkStatus::Complete {
+        return;
+    }
+    if *status == CgroupTreeWalkStatus::Complete {
+        *status = reason;
+    }
+}
+
+/// Why one directory operation inside the walk could not answer.
+///
+/// The distinction is the whole point: `Vanished` is EVIDENCE about the tree
+/// (it is smaller than it was a moment ago), while `Unreadable` is an inability
+/// to observe the tree at all. The module's doctrine — an inability to prove a
+/// claim is not evidence for it — refuses the second. It must not refuse the
+/// first, because a NodeWaypoint UDP refusal costs every relay datagram on the
+/// node plus a steering teardown/reinstall cycle.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirFailure {
+    /// `ENOENT`: the directory is gone. A descendant can disappear between its
+    /// parent's `readdir` and its own `stat` whenever a container exits.
+    Vanished,
+    /// The directory exists but could not be fully enumerated (permissions,
+    /// I/O error, a `readdir` stream longer than the per-directory bound).
+    Unreadable,
+}
+
+#[cfg(unix)]
+fn classify_dir_failure(error: &std::io::Error) -> DirFailure {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        DirFailure::Vanished
+    } else {
+        DirFailure::Unreadable
+    }
+}
+
+/// What one pass of the bounded walk observed.
+#[cfg(unix)]
+struct CgroupTreeWalkPass {
+    walk: CgroupTreeWalk,
+    /// A descendant vanished mid-pass, so `walk` describes a tree that no
+    /// longer has the shape it was observed in. The driver re-walks rather
+    /// than publishing a set stitched together from two different trees.
+    shrank: bool,
+}
+
+#[cfg(unix)]
+struct PassOutcome {
+    status: CgroupTreeWalkStatus,
+    shrank: bool,
+}
+
+#[cfg(unix)]
+impl PassOutcome {
+    fn new() -> Self {
+        Self {
+            status: CgroupTreeWalkStatus::Complete,
+            shrank: false,
+        }
+    }
+
+    fn record(&mut self, reason: CgroupTreeWalkStatus) {
+        record_incomplete(&mut self.status, reason);
+    }
+
+    fn record_dir_failure(&mut self, failure: DirFailure) {
+        match failure {
+            DirFailure::Vanished => self.shrank = true,
+            DirFailure::Unreadable => {
+                self.record(CgroupTreeWalkStatus::IncompleteEnumeration);
+            }
+        }
+    }
+}
 
 /// Collect the inode of `pod_cgroup_path` plus every descendant cgroup
 /// directory inode, breadth-first and bounded by [`CGROUP_TREE_MAX_DEPTH`] /
 /// [`CGROUP_TREE_MAX_INODES`]. The pod inode is returned first.
+///
+/// This is the best-effort prefix used by workload-identity and
+/// includeOutboundPorts enrollment: a truncated or incomplete walk still
+/// enrolls the inodes that were observed, and a missed container leaf fails
+/// closed at the connect hook. Authorization callers that must publish a
+/// whole set (NodeWaypoint UDP relay cgroups) must use [`collect_cgroup_tree`]
+/// and refuse unless [`CgroupTreeWalk::is_complete`] is true.
+///
+/// Returns an empty Vec on a missing/unreadable root or on non-Unix builds;
+/// those callers treat empty as "nothing enrolled".
+pub fn collect_cgroup_tree_inodes(pod_cgroup_path: &Path) -> Vec<u64> {
+    collect_cgroup_tree(pod_cgroup_path).inodes
+}
+
+/// Collect the inode of `pod_cgroup_path` plus every descendant cgroup
+/// directory inode, and report whether the walk proved that set complete.
 ///
 /// This exists because the `connect4`/`connect6` hooks read
 /// `bpf_get_current_cgroup_id()`, which returns the *leaf* cgroup the calling
@@ -129,23 +376,104 @@ const CGROUP_TREE_MAX_INODES: usize = 256;
 /// the hook's lookup key — per-cgroup maps keyed only by the pod inode miss and
 /// the hook falls back to its sentinel. Enrolling every descendant inode (the
 /// container leaves) as well as the pod inode keys those maps with the same id
-/// the hook reads. Returns an empty Vec on stat failure or on non-Unix builds;
-/// the caller treats empty as "nothing enrolled".
+/// the hook reads.
+///
+/// A missing or non-directory root returns an empty complete walk (nothing to
+/// enroll). A `read_dir` or `stat` failure on a descendant, a unique directory
+/// past [`CGROUP_TREE_MAX_INODES`], or a child past [`CGROUP_TREE_MAX_DEPTH`]
+/// return the inodes observed so far with a non-complete status. The walk
+/// itself stays bounded against hostile trees.
+///
+/// A descendant that vanished (`ENOENT`) is the one failure that does NOT make
+/// the walk incomplete. A container exiting removes its cgroup directory, and
+/// it can do so between its parent's `readdir` and its own `stat`. That is
+/// evidence the tree shrank — not an inability to enumerate it — so the walk
+/// restarts (bounded by `CGROUP_TREE_MAX_REWALKS`) and reports the smaller
+/// tree as complete. Without that, one transient `ENOENT` would refuse the
+/// whole NodeWaypoint UDP relay generation: acknowledgement cleared, gate
+/// closed, every relay datagram on the node dropped until the next reconcile.
+/// A tree still shrinking after the last re-walk is reported as
+/// [`CgroupTreeWalkStatus::IncompleteEnumeration`], because at that point no
+/// single coherent set was ever observed.
 #[cfg(unix)]
-pub fn collect_cgroup_tree_inodes(pod_cgroup_path: &Path) -> Vec<u64> {
-    use std::collections::VecDeque;
+pub fn collect_cgroup_tree(pod_cgroup_path: &Path) -> CgroupTreeWalk {
+    collect_cgroup_tree_with_vanished(pod_cgroup_path, &|_: &Path| false)
+}
+
+/// [`collect_cgroup_tree`] with a fault-injection seam.
+///
+/// `vanished` names paths this walk must treat as `ENOENT` regardless of what
+/// the filesystem reports. It exists solely for the regression tests: the race
+/// this function must tolerate — a descendant removed between its parent's
+/// `readdir` and its own `stat` — cannot be staged from a single-threaded test
+/// against a real directory tree, because the test would have to delete the
+/// directory from inside the walk. The predicate is called with each directory
+/// the walk is about to `stat` or `read_dir`, so a test can also perform the
+/// real removal there. Production callers use [`collect_cgroup_tree`], whose
+/// predicate is a constant `false`.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn collect_cgroup_tree_with_vanished(
+    pod_cgroup_path: &Path,
+    vanished: &dyn Fn(&Path) -> bool,
+) -> CgroupTreeWalk {
+    let mut rewalks = 0usize;
+    loop {
+        let pass = collect_cgroup_tree_pass(pod_cgroup_path, vanished);
+        if !pass.shrank {
+            return pass.walk;
+        }
+        rewalks += 1;
+        if rewalks > CGROUP_TREE_MAX_REWALKS {
+            // The tree kept shrinking under every attempt, so no pass ever saw
+            // one coherent set. Refuse rather than publish a stitched one.
+            let mut walk = pass.walk;
+            record_incomplete(
+                &mut walk.status,
+                CgroupTreeWalkStatus::IncompleteEnumeration,
+            );
+            return walk;
+        }
+    }
+}
+
+/// One bounded breadth-first pass over the subtree.
+#[cfg(unix)]
+fn collect_cgroup_tree_pass(
+    pod_cgroup_path: &Path,
+    vanished: &dyn Fn(&Path) -> bool,
+) -> CgroupTreeWalkPass {
+    use std::collections::HashSet;
     use std::os::unix::fs::MetadataExt;
 
     let mut inodes: Vec<u64> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::new();
     let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
+    let mut outcome = PassOutcome::new();
     queue.push_back((pod_cgroup_path.to_path_buf(), 0));
+    let mut visits = 0usize;
 
     while let Some((path, depth)) = queue.pop_front() {
-        if inodes.len() >= CGROUP_TREE_MAX_INODES {
+        visits += 1;
+        if visits > CGROUP_TREE_MAX_VISITS {
+            outcome.record(CgroupTreeWalkStatus::IncompleteEnumeration);
             break;
         }
-        let Ok(meta) = std::fs::metadata(&path) else {
-            continue;
+
+        let meta = match stat_directory(&path, vanished) {
+            Ok(meta) => meta,
+            Err(_) if inodes.is_empty() => {
+                // Missing or unreadable root: nothing enrolled, not a truncated
+                // descendant set, and nothing a re-walk would recover.
+                return CgroupTreeWalkPass {
+                    walk: CgroupTreeWalk::complete(Vec::new()),
+                    shrank: false,
+                };
+            }
+            Err(failure) => {
+                outcome.record_dir_failure(failure);
+                continue;
+            }
         };
         // Only directories are cgroups; the files inside a cgroup dir
         // (`cgroup.procs`, `cgroup.controllers`, ...) are not.
@@ -153,31 +481,136 @@ pub fn collect_cgroup_tree_inodes(pod_cgroup_path: &Path) -> Vec<u64> {
             continue;
         }
         let inode = meta.ino();
-        if !inodes.contains(&inode) {
+        if seen.insert(inode) {
+            if inodes.len() >= CGROUP_TREE_MAX_INODES {
+                outcome.record(CgroupTreeWalkStatus::ExceededEntryBound);
+                break;
+            }
             inodes.push(inode);
-        }
-        if depth >= CGROUP_TREE_MAX_DEPTH {
+        } else {
+            // Already walked this cgroup (bind-mount / duplicate path). Do not
+            // re-descend: a cycle must not restart the bound.
             continue;
         }
-        if let Ok(entries) = std::fs::read_dir(&path) {
-            for entry in entries.flatten() {
-                // Use the readdir `d_type` when available (cgroupfs/kernfs
-                // supplies it without a stat); if it's unknown, enqueue anyway
-                // and let the loop's own `is_dir` check filter it out, so a
-                // child cgroup is never skipped.
-                let descend = entry.file_type().map(|t| t.is_dir()).unwrap_or(true);
-                if descend {
-                    queue.push_back((entry.path(), depth + 1));
+
+        if depth >= CGROUP_TREE_MAX_DEPTH {
+            match directory_has_directory_children(&path, vanished) {
+                Ok(true) => {
+                    outcome.record(CgroupTreeWalkStatus::ExceededDepthBound);
                 }
+                Ok(false) => {}
+                Err(failure) => outcome.record_dir_failure(failure),
             }
+            continue;
+        }
+
+        match read_directory(&path, vanished) {
+            Ok(entries) => {
+                enqueue_directory_children(&mut queue, entries, depth, &mut outcome);
+            }
+            Err(failure) => outcome.record_dir_failure(failure),
         }
     }
-    inodes
+
+    CgroupTreeWalkPass {
+        walk: CgroupTreeWalk {
+            inodes,
+            status: outcome.status,
+        },
+        shrank: outcome.shrank,
+    }
+}
+
+/// `stat` one directory, honouring the vanish seam and classifying the failure.
+#[cfg(unix)]
+fn stat_directory(
+    path: &Path,
+    vanished: &dyn Fn(&Path) -> bool,
+) -> Result<std::fs::Metadata, DirFailure> {
+    if vanished(path) {
+        return Err(DirFailure::Vanished);
+    }
+    std::fs::metadata(path).map_err(|error| classify_dir_failure(&error))
+}
+
+/// `read_dir` one directory, honouring the vanish seam and classifying the
+/// failure.
+#[cfg(unix)]
+fn read_directory(
+    path: &Path,
+    vanished: &dyn Fn(&Path) -> bool,
+) -> Result<std::fs::ReadDir, DirFailure> {
+    if vanished(path) {
+        return Err(DirFailure::Vanished);
+    }
+    std::fs::read_dir(path).map_err(|error| classify_dir_failure(&error))
+}
+
+/// Enqueue directory children of one cgroup dir. Stops enqueueing once the
+/// pending queue would exceed [`CGROUP_TREE_MAX_INODES`], which is itself
+/// evidence the tree is over the entry bound.
+#[cfg(unix)]
+fn enqueue_directory_children(
+    queue: &mut VecDeque<(PathBuf, usize)>,
+    entries: std::fs::ReadDir,
+    depth: usize,
+    outcome: &mut PassOutcome,
+) {
+    let mut inspected = 0usize;
+    for entry in entries {
+        inspected += 1;
+        if inspected > CGROUP_TREE_MAX_DIR_ENTRIES {
+            outcome.record(CgroupTreeWalkStatus::IncompleteEnumeration);
+            return;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                outcome.record_dir_failure(classify_dir_failure(&error));
+                continue;
+            }
+        };
+        // Use the readdir `d_type` when available (cgroupfs/kernfs supplies it
+        // without a stat); if it's unknown, enqueue anyway and let the loop's
+        // own `is_dir` check filter it out, so a child cgroup is never skipped.
+        let descend = entry.file_type().map(|t| t.is_dir()).unwrap_or(true);
+        if !descend {
+            continue;
+        }
+        if queue.len() >= CGROUP_TREE_MAX_INODES {
+            outcome.record(CgroupTreeWalkStatus::ExceededEntryBound);
+            return;
+        }
+        queue.push_back((entry.path(), depth + 1));
+    }
+}
+
+/// Whether `path` (already at [`CGROUP_TREE_MAX_DEPTH`]) has a directory child
+/// that would require walking deeper. Unknown `d_type` is treated as a possible
+/// directory so a child cgroup is never mistaken for a leaf.
+#[cfg(unix)]
+fn directory_has_directory_children(
+    path: &Path,
+    vanished: &dyn Fn(&Path) -> bool,
+) -> Result<bool, DirFailure> {
+    let entries = read_directory(path, vanished)?;
+    let mut inspected = 0usize;
+    for entry in entries {
+        inspected += 1;
+        if inspected > CGROUP_TREE_MAX_DIR_ENTRIES {
+            return Err(DirFailure::Unreadable);
+        }
+        let entry = entry.map_err(|error| classify_dir_failure(&error))?;
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(true) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(not(unix))]
-pub fn collect_cgroup_tree_inodes(_pod_cgroup_path: &Path) -> Vec<u64> {
-    Vec::new()
+pub fn collect_cgroup_tree(_pod_cgroup_path: &Path) -> CgroupTreeWalk {
+    CgroupTreeWalk::complete(Vec::new())
 }
 
 #[cfg(test)]
@@ -303,5 +736,130 @@ mod tests {
     fn collect_cgroup_tree_inodes_empty_for_missing_path() {
         let dir = tempfile::tempdir().unwrap();
         assert!(collect_cgroup_tree_inodes(&dir.path().join("does-not-exist")).is_empty());
+    }
+
+    /// The relay reconcile calls this on a 250 ms timer, and the uncached
+    /// resolver walks up to 4096 directories on the kubeadm/kind
+    /// `kubelet.slice` layout. A repeat call for the same live pod must not
+    /// re-walk.
+    #[test]
+    fn memoized_relay_path_reuses_a_live_entry_without_re_resolving() {
+        let mut slot = None;
+        let mut resolves = 0usize;
+        let mut resolve = |_root: &str, _uid: &str| {
+            resolves += 1;
+            Some(PathBuf::from("/sys/fs/cgroup/kubelet.slice/pod-a"))
+        };
+
+        let first = resolve_pod_cgroup_path_with_memo(
+            &mut slot,
+            "/sys/fs/cgroup",
+            "uid-a",
+            &mut resolve,
+            |_| true,
+        );
+        let second = resolve_pod_cgroup_path_with_memo(
+            &mut slot,
+            "/sys/fs/cgroup",
+            "uid-a",
+            &mut resolve,
+            |_| true,
+        );
+
+        assert_eq!(first, second);
+        assert_eq!(resolves, 1, "a live cached path must not be re-walked");
+    }
+
+    /// The cached path embeds the pod UID, so it stopping existing means the
+    /// pod's cgroup moved to a different parent slice. That must re-walk.
+    #[test]
+    fn memoized_relay_path_rewalks_when_the_cached_path_is_gone() {
+        let mut slot = Some((
+            "/sys/fs/cgroup".to_string(),
+            "uid-a".to_string(),
+            PathBuf::from("/sys/fs/cgroup/kubepods.slice/old"),
+        ));
+        let mut resolves = 0usize;
+        let resolved = resolve_pod_cgroup_path_with_memo(
+            &mut slot,
+            "/sys/fs/cgroup",
+            "uid-a",
+            |_root, _uid| {
+                resolves += 1;
+                Some(PathBuf::from("/sys/fs/cgroup/kubelet.slice/new"))
+            },
+            |_| false,
+        );
+
+        assert_eq!(
+            resolved,
+            Some(PathBuf::from("/sys/fs/cgroup/kubelet.slice/new"))
+        );
+        assert_eq!(resolves, 1);
+        assert_eq!(
+            slot.as_ref().map(|(_, _, path)| path.clone()),
+            Some(PathBuf::from("/sys/fs/cgroup/kubelet.slice/new")),
+            "the memo must adopt the new path"
+        );
+    }
+
+    /// A different relay identity (pod restart mints a new UID) must never be
+    /// served the previous pod's cgroup path, even while that path still
+    /// exists.
+    #[test]
+    fn memoized_relay_path_never_serves_a_different_identity() {
+        let mut slot = Some((
+            "/sys/fs/cgroup".to_string(),
+            "uid-a".to_string(),
+            PathBuf::from("/sys/fs/cgroup/kubepods.slice/pod-a"),
+        ));
+        let resolved = resolve_pod_cgroup_path_with_memo(
+            &mut slot,
+            "/sys/fs/cgroup",
+            "uid-b",
+            |_root, uid| {
+                Some(PathBuf::from(format!(
+                    "/sys/fs/cgroup/kubepods.slice/{uid}"
+                )))
+            },
+            |_| true,
+        );
+        assert_eq!(
+            resolved,
+            Some(PathBuf::from("/sys/fs/cgroup/kubepods.slice/uid-b"))
+        );
+
+        // Same UID, different cgroup root, is also a different identity.
+        let mut slot = Some((
+            "/sys/fs/cgroup".to_string(),
+            "uid-a".to_string(),
+            PathBuf::from("/sys/fs/cgroup/kubepods.slice/pod-a"),
+        ));
+        let resolved = resolve_pod_cgroup_path_with_memo(
+            &mut slot,
+            "/host/sys/fs/cgroup",
+            "uid-a",
+            |root, uid| Some(PathBuf::from(format!("{root}/kubepods.slice/{uid}"))),
+            |_| true,
+        );
+        assert_eq!(
+            resolved,
+            Some(PathBuf::from("/host/sys/fs/cgroup/kubepods.slice/uid-a"))
+        );
+    }
+
+    /// A resolver miss must not poison the memo with a stale entry.
+    #[test]
+    fn memoized_relay_path_leaves_the_slot_untouched_on_a_miss() {
+        let mut slot = None;
+        let resolved = resolve_pod_cgroup_path_with_memo(
+            &mut slot,
+            "/sys/fs/cgroup",
+            "uid-a",
+            |_root, _uid| None,
+            |_| true,
+        );
+        assert_eq!(resolved, None);
+        assert!(slot.is_none(), "a miss must not cache anything");
     }
 }

@@ -6,6 +6,7 @@ mod admin_batch_atomicity_tests;
 mod admin_cached_config_tests;
 mod admin_cross_namespace_refs_tests;
 mod admin_db_api_specs_tests;
+mod admin_db_live_apply_tests;
 mod admin_mesh_config_drift_tests;
 mod admin_mesh_egress_scope_tests;
 mod admin_mesh_policy_denies_tests;

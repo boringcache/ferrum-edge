@@ -92,6 +92,9 @@ impl ConfigChangeWatchDegradedReason {
 #[derive(Debug, Default)]
 pub struct ConfigChangeWakeSignal {
     notify: Notify,
+    /// Set when an in-process admin writer needs the next wake to skip the
+    /// change-stream debounce and rejected-delta backoff (issue #3926).
+    immediate: AtomicBool,
     signals_total: AtomicU64,
     wakes_total: AtomicU64,
 }
@@ -106,6 +109,19 @@ impl ConfigChangeWakeSignal {
     pub fn signal(&self) {
         self.signals_total.fetch_add(1, Ordering::Relaxed);
         self.notify.notify_one();
+    }
+
+    /// Raise a coalesced wake-up that skips debounce and rejected-delta backoff.
+    /// Used by in-process database-mode admin writers waiting for live apply.
+    pub fn signal_immediate(&self) {
+        self.immediate.store(true, Ordering::Release);
+        self.signal();
+    }
+
+    /// Consume the immediate-wake flag. Returns `true` when at least one admin
+    /// writer asked this iteration to skip debounce/backoff.
+    pub fn take_immediate(&self) -> bool {
+        self.immediate.swap(false, Ordering::AcqRel)
     }
 
     /// Await the next wake-up. Cancel-safe: a permit consumed by a dropped
@@ -431,6 +447,8 @@ pub enum ConfigPollWake {
     Interval,
     /// A backend watcher signalled a committed config change.
     ChangeStream,
+    /// An in-process admin mutation is waiting for this reload (issue #3926).
+    AdminWrite,
 }
 
 /// Await the next authoritative poll iteration.
@@ -443,9 +461,11 @@ pub enum ConfigPollWake {
 /// both paths run the same authoritative cursor work.
 ///
 /// `earliest_wake` is the caller's active retry deadline (today: the
-/// rejected-delta backoff). A wake-up never runs before it, so a stream of
-/// committed-but-rejected changes cannot defeat the poll loop's backoff. A
-/// deadline in the past is a no-op.
+/// rejected-delta backoff). A change-stream wake-up never runs before it, so a
+/// stream of committed-but-rejected changes cannot defeat the poll loop's
+/// backoff. An [`ConfigPollWake::AdminWrite`] wake skips debounce and backoff:
+/// an in-process operator mutation is waiting for this reload. A deadline in
+/// the past is a no-op.
 ///
 /// Cancel-safe — the caller may race this against a shutdown signal.
 pub async fn wait_for_config_poll_wake(
@@ -461,17 +481,50 @@ pub async fn wait_for_config_poll_wake(
     tokio::select! {
         _ = interval.tick() => ConfigPollWake::Interval,
         _ = wake.wait() => {
-            if let Some(deadline) = earliest_wake {
-                tokio::time::sleep_until(deadline).await;
+            let mut immediate = wake.take_immediate();
+            if !immediate {
+                if let Some(deadline) = earliest_wake {
+                    immediate = wait_until_deadline_or_immediate(wake, deadline).await;
+                }
+                if !immediate && !debounce.is_zero() {
+                    let debounce_deadline = tokio::time::Instant::now() + debounce;
+                    immediate = wait_until_deadline_or_immediate(wake, debounce_deadline).await;
+                }
             }
-            if !debounce.is_zero() {
-                tokio::time::sleep(debounce).await;
-            }
+            // An admin writer that landed during debounce/backoff still wants
+            // this poll (the reload about to run covers that commit).
+            immediate |= wake.take_immediate();
             // One authoritative poll covers every change committed during the
             // window, so drop the permits they raised.
             wake.take_pending();
             interval.reset();
-            ConfigPollWake::ChangeStream
+            if immediate {
+                ConfigPollWake::AdminWrite
+            } else {
+                ConfigPollWake::ChangeStream
+            }
+        }
+    }
+}
+
+/// Sleep until `deadline`, returning early only when an admin writer raises an
+/// immediate wake. Extra change-stream signals during the wait stay coalesced
+/// and do not defeat rejected-delta backoff.
+async fn wait_until_deadline_or_immediate(
+    wake: &ConfigChangeWakeSignal,
+    deadline: tokio::time::Instant,
+) -> bool {
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return false,
+            _ = wake.wait() => {
+                if wake.take_immediate() {
+                    return true;
+                }
+            }
         }
     }
 }

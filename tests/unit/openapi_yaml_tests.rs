@@ -1011,12 +1011,45 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
         Some(&json!("#/components/schemas/ConsumerCreate"))
     );
     assert_eq!(
+        spec.pointer("/components/schemas/BatchCreateRequest/additionalProperties"),
+        Some(&json!(false)),
+        "POST /batch envelope must reject unknown top-level keys"
+    );
+    assert_eq!(
         spec.pointer("/components/schemas/BackupResponse/properties/consumers/items/$ref"),
         Some(&json!("#/components/schemas/ConsumerBackup"))
     );
     assert_eq!(
         spec.pointer("/components/schemas/RestoreRequest/properties/consumers/items/$ref"),
         Some(&json!("#/components/schemas/ConsumerRestore"))
+    );
+}
+
+#[test]
+fn proxy_create_schema_requires_upstream_or_direct_backend() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let choices = spec
+        .pointer("/components/schemas/ProxyCreate/allOf/1/anyOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("ProxyCreate must require an upstream or direct backend");
+
+    assert_eq!(choices[0]["required"], json!(["upstream_id"]));
+    assert_eq!(
+        choices[0]["properties"]["upstream_id"]["minLength"],
+        json!(1)
+    );
+    assert_eq!(
+        choices[1]["required"],
+        json!(["backend_host", "backend_port"])
+    );
+    assert_eq!(
+        choices[1]["properties"]["backend_host"]["minLength"],
+        json!(1)
+    );
+    assert_eq!(
+        choices[1]["properties"]["backend_port"]["minimum"],
+        json!(1)
     );
 }
 
@@ -8110,6 +8143,68 @@ fn mtls_dns_admission_mutations_document_conflict_responses() {
             "mTLS DNS admission mutation is missing 409 response: {pointer}"
         );
     }
+}
+
+#[test]
+fn delete_proxy_cleanup_orphaned_upstream_query_has_openapi_parity() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let param = spec
+        .pointer("/components/parameters/CleanupOrphanedUpstream")
+        .expect("CleanupOrphanedUpstream parameter");
+    assert_eq!(param["name"], "cleanup_orphaned_upstream");
+    assert_eq!(param["in"], "query");
+    assert_eq!(param["required"], false);
+    assert_eq!(param["schema"]["type"], "boolean");
+    assert_eq!(param["schema"]["default"], true);
+    let param_desc = param["description"]
+        .as_str()
+        .expect("cleanup_orphaned_upstream description");
+    assert!(
+        param_desc.contains("false") && param_desc.contains("400"),
+        "parameter must document the opt-out and the 400: {param_desc}"
+    );
+
+    let delete = spec
+        .pointer("/paths/~1proxies~1{id}/delete")
+        .expect("DELETE /proxies/{id}");
+    let params = delete["parameters"]
+        .as_array()
+        .expect("DELETE /proxies/{id} parameters");
+    assert!(
+        params.iter().any(|parameter| {
+            parameter["$ref"] == "#/components/parameters/CleanupOrphanedUpstream"
+        }),
+        "DELETE /proxies/{{id}} must declare cleanup_orphaned_upstream: {params:?}"
+    );
+    let desc = delete["description"]
+        .as_str()
+        .expect("DELETE /proxies/{id} description");
+    assert!(
+        desc.contains("cleanup_orphaned_upstream=false") && desc.contains("409"),
+        "DELETE /proxies/{{id}} must document the opt-out and the DELETE /upstreams 409 pair: {desc}"
+    );
+    let four_hundred = delete["responses"]["400"]["description"]
+        .as_str()
+        .expect("DELETE /proxies/{id} 400 description");
+    assert!(
+        four_hundred.contains("cleanup_orphaned_upstream"),
+        "DELETE /proxies/{{id}} 400 must name the strict-parse flag: {four_hundred}"
+    );
+
+    let upstream_desc = spec["paths"]["/upstreams/{id}"]["delete"]["description"]
+        .as_str()
+        .expect("DELETE /upstreams/{id} description");
+    assert!(
+        upstream_desc
+            .contains("Upstream is referenced by one or more proxies and cannot be deleted"),
+        "DELETE /upstreams/{{id}} must name the proxy-reference 409: {upstream_desc}"
+    );
+    assert!(
+        upstream_desc.contains("cleanup_orphaned_upstream=false"),
+        "DELETE /upstreams/{{id}} must point at the proxy-delete opt-out: {upstream_desc}"
+    );
 }
 
 #[test]

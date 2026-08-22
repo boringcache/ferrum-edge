@@ -189,19 +189,104 @@ def extract_pull_request_paths(workflow: str) -> list[str]:
     return paths
 
 
-def gh_path_filter_matches(filter_pattern: str, file_path: str) -> bool:
-    pattern = filter_pattern.strip().lstrip("/")
-    path = file_path.strip().lstrip("/")
-    if pattern.endswith("/**"):
-        prefix = pattern[:-3]
-        return path == prefix or path.startswith(prefix + "/")
-    if pattern.endswith("**"):
-        prefix = pattern[:-2]
-        return path == prefix or path.startswith(prefix)
-    if "**" in pattern or "*" in pattern:
-        escaped = re.escape(pattern).replace(r"\*\*", ".*").replace(r"\*", "[^/]*")
-        return re.fullmatch(escaped, path) is not None
-    return path == pattern
+def extract_on_block(workflow: str) -> str:
+    """Return the body of the single top-level `on:` mapping, or "".
+
+    Scoped rather than whole-file so a `paths:` key nested inside a job step
+    (or a second `on:`-looking line) cannot be mistaken for a trigger filter,
+    and so a workflow with a duplicated `on:` fails closed.
+    """
+
+    lines = workflow.splitlines(keepends=True)
+    headers = [index for index, line in enumerate(lines) if line.rstrip("\r\n") == "on:"]
+    if len(headers) != 1:
+        return ""
+    start = headers[0]
+    end = next(
+        (
+            index
+            for index in range(start + 1, len(lines))
+            if re.match(r"^[A-Za-z0-9_-]+:", lines[index])
+        ),
+        len(lines),
+    )
+    return "".join(lines[start + 1 : end])
+
+
+# Repository canonical live-suite event bodies after dropping blank and
+# full-line comment rows. This is not a general YAML parser: quoted event
+# keys, flow mappings, aliases, and duplicate event blocks fail closed.
+_BLANK_OR_COMMENT_LINE = re.compile(r"^\s*(?:#.*)?$")
+_CANONICAL_EVENT_HEADER = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
+_PATH_FILTER_KEY = re.compile(
+    r"""^[ \t]{2,}["']?(paths|paths-ignore)["']?[ \t]*:"""
+)
+_FLOW_PATH_FILTER = re.compile(
+    r"""^  ["']?[A-Za-z0-9_-]+["']?[ \t]*:[ \t]*\{[^}\n]*["']?(paths(?:-ignore)?)["']?[ \t]*:"""
+)
+
+CANONICAL_PULL_REQUEST_BODY: tuple[str, ...] = ()
+CANONICAL_MERGE_GROUP_BODY: tuple[str, ...] = (
+    "    types:",
+    "      - checks_requested",
+)
+CANONICAL_PUSH_MAIN_BODY: tuple[str, ...] = (
+    "    branches:",
+    "      - main",
+)
+
+
+def parse_canonical_on_events(workflow: str) -> dict[str, tuple[str, ...]] | None:
+    """Parse the single top-level `on:` mapping into event -> body lines.
+
+    Accepts only the repository's canonical block shape: unquoted indent-2
+    event keys, mapping form `  event:` with no same-line value, and unique
+    events. Blank and full-line comment rows are ignored. Returns None when
+    the `on:` block is missing, duplicated, quoted, flow-form, aliased,
+    or otherwise malformed.
+    """
+
+    on_block = extract_on_block(workflow)
+    if not on_block:
+        return None
+    events: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in on_block.splitlines():
+        raw = line.rstrip("\r\n")
+        if _BLANK_OR_COMMENT_LINE.match(raw):
+            continue
+        header = _CANONICAL_EVENT_HEADER.match(raw)
+        if header:
+            name = header.group(1)
+            if name in events:
+                return None
+            events[name] = []
+            current = name
+            continue
+        if current is None:
+            return None
+        if re.match(r'^  ["\']', raw) or re.match(r"^  [A-Za-z0-9_-]+:\s*\S", raw):
+            return None
+        if re.match(r"^  \S", raw) and not raw.startswith("    "):
+            return None
+        events[current].append(raw)
+    return {name: tuple(body) for name, body in events.items()}
+
+
+def on_block_path_filters(on_block: str) -> list[str]:
+    """Return `paths` / `paths-ignore` keys, including quoted and flow spellings."""
+
+    found: list[str] = []
+    for line in on_block.splitlines():
+        raw = line.rstrip("\r\n")
+        match = _PATH_FILTER_KEY.match(raw)
+        if match:
+            found.append(match.group(1))
+            continue
+        flow = _FLOW_PATH_FILTER.match(raw)
+        if flow:
+            found.append(flow.group(1))
+    return found
 
 
 # Sentinels for a planner pattern this verifier has no probe for. Named so
@@ -250,19 +335,87 @@ def production_dockerfile_probe_paths() -> list[str]:
     return probes
 
 
-def check_production_trigger_superset(
+# Issue #3908 retired the workflow-level `paths:` filter that used to decide
+# whether this workflow started at all. A `paths:` list lives in the pull
+# request's own checkout, so the commit that broke a surface could delete its
+# own trigger and skip the suite; the superset check below was the guard that
+# the trigger at least reached every planner-sensitive input. With no trigger
+# filter the workflow starts on every event and the trusted-base planner is the
+# only relevance authority, so the contract inverts: any restored `paths:` /
+# `paths-ignore` filter is a regression, and all four events must be present so
+# merge-group and main-push runs actually happen.
+GOVERNED_LIVE_TRIGGER_EVENTS = (
+    "workflow_dispatch",
+    "pull_request",
+    "merge_group",
+    "push",
+)
+
+
+def check_governed_live_trigger_shape(
     workflow: str,
     source: str,
     failures: list[str],
 ) -> None:
-    trigger_paths = extract_pull_request_paths(workflow)
     require(
-        bool(trigger_paths),
-        f"{source} must declare pull_request.paths so production-image changes "
-        "can reach the trusted planner",
+        not extract_pull_request_paths(workflow),
+        f"{source} must not restore a pull_request.paths filter; a filter the "
+        "pull request itself supplies can skip the suite that would have "
+        "caught the same commit",
         failures,
     )
-    uncovered: list[str] = []
+    on_block = extract_on_block(workflow)
+    require(
+        bool(on_block),
+        f"{source} must declare a single top-level `on:` block",
+        failures,
+    )
+    events = parse_canonical_on_events(workflow)
+    require(
+        events is not None,
+        f"{source} must use the canonical block event shape (unquoted event "
+        "keys, no flow/alias mappings, no duplicate event blocks)",
+        failures,
+    )
+    for filtered in on_block_path_filters(on_block):
+        failures.append(
+            f"{source} must not filter a governed live trigger by `{filtered}:`"
+        )
+    if events is None:
+        return
+    require(
+        set(events) == set(GOVERNED_LIVE_TRIGGER_EVENTS),
+        f"{source} trigger events must be exactly "
+        f"{list(GOVERNED_LIVE_TRIGGER_EVENTS)}; extra events such as "
+        "pull_request_target must not execute a candidate-controlled live "
+        "workflow",
+        failures,
+    )
+    for event in GOVERNED_LIVE_TRIGGER_EVENTS:
+        require(
+            event in events,
+            f"{source} must trigger on `{event}` so relevance is re-evaluated "
+            "on pull requests, merge-queue combinations, and main pushes",
+            failures,
+        )
+    require(
+        events.get("pull_request") == CANONICAL_PULL_REQUEST_BODY,
+        f"{source} pull_request trigger must be an input-less block event",
+        failures,
+    )
+    require(
+        events.get("merge_group") == CANONICAL_MERGE_GROUP_BODY,
+        f"{source} merge_group trigger must request checks on the synthesized "
+        "queue commit",
+        failures,
+    )
+    require(
+        events.get("push") == CANONICAL_PUSH_MAIN_BODY,
+        f"{source} push trigger must cover exactly the main branch",
+        failures,
+    )
+    # Every probe the planner treats as sensitive must still be reachable; with
+    # no trigger filter that is now a statement about the planner alone.
     for probe in production_dockerfile_probe_paths():
         if probe.startswith(PRODUCTION_UNMAPPED_PREFIX):
             failures.append(
@@ -271,16 +424,15 @@ def check_production_trigger_superset(
                 f"({probe.removeprefix(PRODUCTION_UNMAPPED_PREFIX)})"
             )
             continue
-        if not any(
-            gh_path_filter_matches(trigger, probe) for trigger in trigger_paths
-        ):
-            uncovered.append(probe)
-    require(
-        not uncovered,
-        f"{source} pull_request.paths must be a superset of production-dockerfile-smoke "
-        f"sensitive inputs; uncovered probes: {', '.join(uncovered)}",
-        failures,
-    )
+        relevant, _reason, _matched = decide_relevance(
+            "production-dockerfile-smoke", [probe]
+        )
+        require(
+            relevant,
+            f"{source} production-image sensitive path {probe} must run the "
+            "image jobs",
+            failures,
+        )
 
 
 def job_if(job_body: str) -> str:
@@ -314,12 +466,22 @@ def node_waypoint_probe_paths() -> list[str]:
             probes.append(".github/actions/package-ferrum-runtime-image/action.yml")
         elif pattern == r"^\.github/actions/setup-kubernetes-tools/":
             probes.append(".github/actions/setup-kubernetes-tools/action.yml")
+        elif pattern == r"^\.github/actions/setup-rust-ci/":
+            probes.append(".github/actions/setup-rust-ci/action.yml")
+        elif pattern == r"^\.github/actions/setup-sccache/":
+            probes.append(".github/actions/setup-sccache/action.yml")
+        elif pattern == r"^\.github/actions/setup-fast-linker/":
+            probes.append(".github/actions/setup-fast-linker/action.yml")
+        elif pattern == r"^\.github/actions/setup-bpf-linker/":
+            probes.append(".github/actions/setup-bpf-linker/action.yml")
         elif pattern == r"^Cargo\.(toml|lock)$":
             probes.extend(["Cargo.toml", "Cargo.lock"])
         elif pattern == r"^Dockerfile$":
             probes.append("Dockerfile")
         elif pattern == r"^Dockerfile\.iproute2-layer$":
             probes.append("Dockerfile.iproute2-layer")
+        elif pattern == r"^Dockerfile\.ebpf-tools-layer$":
+            probes.append("Dockerfile.ebpf-tools-layer")
         elif pattern == r"^Dockerfile\.release$":
             probes.append("Dockerfile.release")
         elif pattern == r"^\.github/scripts/stage_iproute2_runtime\.sh$":
@@ -557,6 +719,115 @@ def check_node_waypoint_live_job(
     )
 
 
+# Issue #3908 gives the Kind/eBPF live job an always-reporting aggregate of its
+# own, `NodeWaypoint eBPF Live`. It must be consistent with the live job's
+# binding: the ONLY outcome that legitimately skips the live job is an exact
+# `false` verdict from the trusted-base planner, so that is the only outcome the
+# aggregate may report green without a successful live run. A planner failure
+# fails the aggregate, and a blank / malformed verdict runs the live job (the
+# `!= 'false'` binding) and is then judged on the live result.
+NODE_WAYPOINT_AGGREGATE_JOB = "node-waypoint-ebpf-live-gate"
+NODE_WAYPOINT_AGGREGATE_NAME = "NodeWaypoint eBPF Live"
+
+
+def check_node_waypoint_aggregate(
+    workflow: str,
+    source: str,
+    failures: list[str],
+) -> None:
+    aggregate = extract_job(workflow, NODE_WAYPOINT_AGGREGATE_JOB)
+    require(
+        bool(aggregate),
+        f"{source} must declare the {NODE_WAYPOINT_AGGREGATE_JOB!r} aggregate so "
+        "an irrelevant run still reports a result",
+        failures,
+    )
+    if not aggregate:
+        return
+    require(
+        re.search(
+            rf"(?m)^    name: {re.escape(NODE_WAYPOINT_AGGREGATE_NAME)}$", aggregate
+        )
+        is not None,
+        f"{source} aggregate must keep the check name "
+        f"{NODE_WAYPOINT_AGGREGATE_NAME!r}",
+        failures,
+    )
+    require(
+        re.search(r"(?m)^    if: always\(\)$", aggregate) is not None,
+        f"{source} aggregate must run with if: always() so a skipped or failed "
+        "live job still reports",
+        failures,
+    )
+    require(
+        job_needs_list(aggregate)
+        == {"production-dockerfile-plan", "node-waypoint-ebpf-live"},
+        f"{source} aggregate must depend on exactly the trusted planner and the "
+        "live job",
+        failures,
+    )
+    steps = job_steps(aggregate)
+    planner_condition = "needs.production-dockerfile-plan.result != 'success'"
+    planner_steps = [step for step in steps if step_if(step) == planner_condition]
+    require(
+        len(planner_steps) == 1,
+        f"{source} aggregate must declare exactly one planner-failure step "
+        f"with if: {planner_condition}",
+        failures,
+    )
+    if planner_steps:
+        require(
+            step_run_ends_with_exit(planner_steps[0], 1),
+            f"{source} planner-failure step must terminate with an effective exit 1",
+            failures,
+        )
+
+    skip_steps = [
+        step
+        for step in steps
+        if re.search(
+            r"(?m)^      - name: Skip NodeWaypoint eBPF live datapath for unrelated changes$",
+            step,
+        )
+    ]
+    require(
+        len(skip_steps) == 1,
+        f"{source} aggregate must declare exactly one exact-false skip step",
+        failures,
+    )
+    skip_if = step_if(skip_steps[0]) if skip_steps else ""
+    require(
+        skip_if == f"{NODE_WAYPOINT_PLANNER_OUTPUT} == 'false'",
+        f"{source} aggregate skip must use exact {NODE_WAYPOINT_PLANNER_OUTPUT} "
+        f"== 'false', found: {skip_if}",
+        failures,
+    )
+    require(
+        "!= 'true'" not in skip_if,
+        f"{source} aggregate skip must not treat a blank verdict as irrelevance",
+        failures,
+    )
+    live_failure_condition = (
+        f"{NODE_WAYPOINT_PLANNER_OUTPUT} != 'false' && "
+        "needs.node-waypoint-ebpf-live.result != 'success'"
+    )
+    live_failure_steps = [
+        step for step in steps if step_if(step) == live_failure_condition
+    ]
+    require(
+        len(live_failure_steps) == 1,
+        f"{source} aggregate must fail whenever the live job was scheduled and "
+        f"did not succeed, using exactly one step with if: {live_failure_condition}",
+        failures,
+    )
+    if live_failure_steps:
+        require(
+            step_run_ends_with_exit(live_failure_steps[0], 1),
+            f"{source} live-failure step must terminate with an effective exit 1",
+            failures,
+        )
+
+
 def check_aggregate_planner_contract(
     aggregate_body: str,
     planner_job: str,
@@ -722,6 +993,40 @@ def step_if(step: str) -> str:
     if match:
         return match.group(1).strip()
     return ""
+
+
+def step_run_ends_with_exit(step: str, code: int) -> bool:
+    """Return whether a run step has one effective terminal `exit CODE`.
+
+    Same-line scalars must be exactly `exit CODE` on the `run:` line. Only
+    horizontal whitespace may surround that command, so a `run: |` introducer
+    cannot be captured as a scalar and whitespace cannot cross a newline.
+    Literal blocks accept `|`, `|-`, and `|+` on that same line; folded `>`
+    blocks are refused. Merely mentioning `exit 1` in a comment, echo, or an
+    earlier unreachable command is insufficient: the block must contain
+    exactly one executable `exit` line and it must be the final non-empty,
+    non-comment command.
+    """
+
+    expected = f"exit {code}"
+    if re.search(rf"(?m)^        run:[ \t]+{re.escape(expected)}[ \t]*$", step):
+        return True
+
+    block = re.search(
+        r"(?ms)^        run:[ \t]+\|[-+]?[ \t]*\n(?P<body>.*)\Z",
+        step,
+    )
+    if block is None:
+        return False
+    commands = [
+        line.strip()
+        for line in block.group("body").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not commands:
+        return False
+    exits = [line for line in commands if re.fullmatch(r"exit\s+\d+", line)]
+    return exits == [expected] and commands[-1] == expected
 
 
 def step_uses(step: str) -> str:
@@ -4146,12 +4451,17 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
         "Production Dockerfile eBPF image smoke",
         failures,
     )
-    check_production_trigger_superset(
+    check_governed_live_trigger_shape(
         workflow,
         "node-waypoint-ebpf-live.yml",
         failures,
     )
     check_node_waypoint_live_job(
+        workflow,
+        "node-waypoint-ebpf-live.yml",
+        failures,
+    )
+    check_node_waypoint_aggregate(
         workflow,
         "node-waypoint-ebpf-live.yml",
         failures,
@@ -4418,8 +4728,10 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
-        "pull_request.paths" in ci_cd or "trigger superset" in ci_cd.lower(),
-        "docs/ci_cd.md must document production-image trigger superset over planner inputs",
+        "merge_group" in ci_cd and "no workflow-level `paths:`" in ci_cd.lower(),
+        "docs/ci_cd.md must document that the governed live workflows carry no "
+        "pull-request-supplied `paths:` trigger filter and re-evaluate on "
+        "merge_group",
         failures,
     )
     require(
@@ -7124,59 +7436,283 @@ def self_test() -> int:
         failures,
     )
 
-    incomplete_trigger = (
+    filtered_trigger = (
         "name: demo\n"
         "on:\n"
+        "  workflow_dispatch:\n"
         "  pull_request:\n"
         "    paths:\n"
         "      - Dockerfile\n"
-        "      - Cargo.toml\n"
+        "  merge_group:\n"
+        "    types:\n"
+        "      - checks_requested\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
     )
-    incomplete_trigger_failures: list[str] = []
-    check_production_trigger_superset(
-        incomplete_trigger,
-        "self-test-incomplete-trigger",
-        incomplete_trigger_failures,
+    filtered_trigger_failures: list[str] = []
+    check_governed_live_trigger_shape(
+        filtered_trigger,
+        "self-test-filtered-trigger",
+        filtered_trigger_failures,
     )
     require(
-        any("must be a superset of production-dockerfile-smoke" in item for item in incomplete_trigger_failures),
-        "self-test: incomplete pull_request.paths must fail trigger superset check",
+        any(
+            "must not restore a pull_request.paths filter" in item
+            for item in filtered_trigger_failures
+        )
+        and any(
+            "must not filter a governed live trigger by `paths:`" in item
+            for item in filtered_trigger_failures
+        ),
+        "self-test: a restored pull_request.paths filter must fail the governed "
+        "trigger shape",
         failures,
     )
 
+    ignored_paths_trigger = (
+        "name: demo\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "  pull_request:\n"
+        "  merge_group:\n"
+        "    types:\n"
+        "      - checks_requested\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+        "    paths-ignore:\n"
+        "      - docs/**\n"
+    )
+    ignored_paths_failures: list[str] = []
+    check_governed_live_trigger_shape(
+        ignored_paths_trigger,
+        "self-test-paths-ignore-trigger",
+        ignored_paths_failures,
+    )
+    require(
+        any(
+            "must not filter a governed live trigger by `paths-ignore:`" in item
+            for item in ignored_paths_failures
+        ),
+        "self-test: a paths-ignore filter must fail the governed trigger shape",
+        failures,
+    )
+
+    wrong_branch_trigger = (
+        "name: demo\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "  pull_request:\n"
+        "  merge_group:\n"
+        "    types:\n"
+        "      - checks_requested\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - release\n"
+    )
+    wrong_branch_failures: list[str] = []
+    check_governed_live_trigger_shape(
+        wrong_branch_trigger,
+        "self-test-wrong-branch-trigger",
+        wrong_branch_failures,
+    )
+    require(
+        any(
+            "push trigger must cover exactly the main branch" in item
+            for item in wrong_branch_failures
+        ),
+        "self-test: a non-main push trigger must fail the governed trigger shape",
+        failures,
+    )
+
+    wrong_merge_group_trigger = (
+        "name: demo\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "  pull_request:\n"
+        "  merge_group:\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+    )
+    wrong_merge_group_failures: list[str] = []
+    check_governed_live_trigger_shape(
+        wrong_merge_group_trigger,
+        "self-test-merge-group-types",
+        wrong_merge_group_failures,
+    )
+    require(
+        any(
+            "merge_group trigger must request checks on the synthesized" in item
+            for item in wrong_merge_group_failures
+        ),
+        "self-test: a merge_group trigger without checks_requested must fail",
+        failures,
+    )
+
+    pr_only_trigger = (
+        "name: demo\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "  pull_request:\n"
+    )
+    pr_only_failures: list[str] = []
+    check_governed_live_trigger_shape(
+        pr_only_trigger,
+        "self-test-pr-only-trigger",
+        pr_only_failures,
+    )
+    require(
+        any("must trigger on `merge_group`" in item for item in pr_only_failures)
+        and any("must trigger on `push`" in item for item in pr_only_failures),
+        "self-test: a pull-request-only live trigger must fail closed",
+        failures,
+    )
+
+    # A `paths:` key inside a job step must not be mistaken for a trigger
+    # filter, and the complete four-event shape must pass.
     good_trigger = (
         "name: demo\n"
         "on:\n"
+        "  workflow_dispatch:\n"
         "  pull_request:\n"
-        "    paths:\n"
-        "      - Dockerfile\n"
-        "      - .dockerignore\n"
-        "      - Cargo.toml\n"
-        "      - Cargo.lock\n"
-        "      - rust-toolchain.toml\n"
-        "      - .cargo/**\n"
-        "      - vendor/**\n"
-        "      - build.rs\n"
-        "      - proto/**\n"
-        "      - src/**\n"
-        "      - custom_plugins/**\n"
-        "      - ebpf/**\n"
-        "      - .github/scripts/stage_iproute2_runtime.sh\n"
-        "      - .github/workflows/node-waypoint-ebpf-live.yml\n"
-        "      - .github/scripts/ci_runtime_plan.py\n"
-        "      - .github/scripts/ci_runtime_telemetry.py\n"
-        "      - .github/scripts/verify_ci_runtime_cache.py\n"
+        "  merge_group:\n"
+        "    types:\n"
+        "      - checks_requested\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+        "\n"
+        "jobs:\n"
+        "  demo:\n"
+        "    steps:\n"
+        "      - uses: actions/upload-artifact@0000000000000000000000000000000000000000\n"
+        "        with:\n"
+        "          paths: target/demo\n"
     )
     good_trigger_failures: list[str] = []
-    check_production_trigger_superset(
+    check_governed_live_trigger_shape(
         good_trigger,
         "self-test-good-trigger",
         good_trigger_failures,
     )
     require(
         not good_trigger_failures,
-        "self-test: complete production trigger superset should pass: "
+        "self-test: the governed four-event live trigger should pass: "
         + "; ".join(good_trigger_failures),
+        failures,
+    )
+
+    extra_event_trigger = good_trigger.replace(
+        "  pull_request:\n",
+        "  pull_request_target:\n  pull_request:\n",
+    )
+    extra_event_failures: list[str] = []
+    check_governed_live_trigger_shape(
+        extra_event_trigger,
+        "self-test-extra-trigger",
+        extra_event_failures,
+    )
+    require(
+        any("trigger events must be exactly" in item for item in extra_event_failures),
+        "self-test: an extra pull_request_target trigger must fail closed",
+        failures,
+    )
+
+    quoted_paths_trigger = (
+        "name: demo\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "  pull_request:\n"
+        '    "paths":\n'
+        "      - Dockerfile\n"
+        "  merge_group:\n"
+        "    types:\n"
+        "      - checks_requested\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+    )
+    quoted_paths_failures: list[str] = []
+    check_governed_live_trigger_shape(
+        quoted_paths_trigger,
+        "self-test-quoted-paths-trigger",
+        quoted_paths_failures,
+    )
+    require(
+        any(
+            "must not filter a governed live trigger by `paths:`" in item
+            for item in quoted_paths_failures
+        )
+        and any(
+            "pull_request trigger must be an input-less block event" in item
+            for item in quoted_paths_failures
+        ),
+        "self-test: a quoted pull_request \"paths\" key must fail the governed "
+        "trigger shape",
+        failures,
+    )
+
+    quoted_ignore_trigger = (
+        "name: demo\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "  pull_request:\n"
+        "  merge_group:\n"
+        "    types:\n"
+        "      - checks_requested\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+        '    "paths-ignore":\n'
+        "      - docs/**\n"
+    )
+    quoted_ignore_failures: list[str] = []
+    check_governed_live_trigger_shape(
+        quoted_ignore_trigger,
+        "self-test-quoted-paths-ignore-trigger",
+        quoted_ignore_failures,
+    )
+    require(
+        any(
+            "must not filter a governed live trigger by `paths-ignore:`" in item
+            for item in quoted_ignore_failures
+        )
+        and any(
+            "push trigger must cover exactly the main branch" in item
+            for item in quoted_ignore_failures
+        ),
+        "self-test: a quoted push \"paths-ignore\" key must fail the governed "
+        "trigger shape",
+        failures,
+    )
+
+    flow_paths_trigger = (
+        "name: demo\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "  pull_request: {paths: [Dockerfile]}\n"
+        "  merge_group:\n"
+        "    types:\n"
+        "      - checks_requested\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+    )
+    flow_paths_failures: list[str] = []
+    check_governed_live_trigger_shape(
+        flow_paths_trigger,
+        "self-test-flow-paths-trigger",
+        flow_paths_failures,
+    )
+    require(
+        any(
+            "must use the canonical block event shape" in item
+            for item in flow_paths_failures
+        ),
+        "self-test: a flow-form pull_request.paths mapping must fail the "
+        "governed trigger shape",
         failures,
     )
 
@@ -7393,6 +7929,222 @@ def self_test() -> int:
     require(
         any("must depend on the trusted planner job" in item for item in unbound_failures),
         "self-test: NodeWaypoint live job without needs must fail",
+        failures,
+    )
+
+    def _node_waypoint_aggregate(
+        skip_if: str,
+        fail_if: str,
+        planner_run: str = "exit 1",
+    ) -> str:
+        return (
+            "  node-waypoint-ebpf-live-gate:\n"
+            "    name: NodeWaypoint eBPF Live\n"
+            "    runs-on: ubuntu-latest\n"
+            "    needs:\n"
+            "      - production-dockerfile-plan\n"
+            "      - node-waypoint-ebpf-live\n"
+            "    if: always()\n"
+            "    steps:\n"
+            "      - name: Fail when NodeWaypoint relevance planning fails\n"
+            "        if: needs.production-dockerfile-plan.result != 'success'\n"
+            f"        run: {planner_run}\n"
+            "      - name: Skip NodeWaypoint eBPF live datapath for unrelated changes\n"
+            f"        if: {skip_if}\n"
+            "        run: echo skip\n"
+            "      - name: Fail when the NodeWaypoint eBPF live datapath did not succeed\n"
+            f"        if: {fail_if}\n"
+            "        run: exit 1\n"
+        )
+
+    exact_false_skip = f"{NODE_WAYPOINT_PLANNER_OUTPUT} == 'false'"
+    scheduled_fail = (
+        f"{NODE_WAYPOINT_PLANNER_OUTPUT} != 'false' && "
+        "needs.node-waypoint-ebpf-live.result != 'success'"
+    )
+
+    good_aggregate_failures: list[str] = []
+    check_node_waypoint_aggregate(
+        _node_waypoint_aggregate(exact_false_skip, scheduled_fail),
+        "self-test-node-waypoint-aggregate",
+        good_aggregate_failures,
+    )
+    require(
+        not good_aggregate_failures,
+        "self-test: the exact-false NodeWaypoint aggregate should pass: "
+        + "; ".join(good_aggregate_failures),
+        failures,
+    )
+
+    loose_aggregate_failures: list[str] = []
+    check_node_waypoint_aggregate(
+        _node_waypoint_aggregate(
+            f"{NODE_WAYPOINT_PLANNER_OUTPUT} != 'true'", scheduled_fail
+        ),
+        "self-test-node-waypoint-aggregate-loose",
+        loose_aggregate_failures,
+    )
+    require(
+        any(
+            "aggregate skip must use exact" in item
+            for item in loose_aggregate_failures
+        )
+        and any(
+            "must not treat a blank verdict as irrelevance" in item
+            for item in loose_aggregate_failures
+        ),
+        "self-test: a `!= 'true'` NodeWaypoint aggregate skip must fail",
+        failures,
+    )
+
+    unscheduled_aggregate_failures: list[str] = []
+    check_node_waypoint_aggregate(
+        _node_waypoint_aggregate(
+            exact_false_skip,
+            f"{NODE_WAYPOINT_PLANNER_OUTPUT} == 'true' && "
+            "needs.node-waypoint-ebpf-live.result != 'success'",
+        ),
+        "self-test-node-waypoint-aggregate-unscheduled",
+        unscheduled_aggregate_failures,
+    )
+    require(
+        any(
+            "must fail whenever the live job was scheduled and did not succeed"
+            in item
+            for item in unscheduled_aggregate_failures
+        ),
+        "self-test: a NodeWaypoint aggregate that only judges exact-true runs "
+        "must fail",
+        failures,
+    )
+
+    missing_aggregate_failures: list[str] = []
+    check_node_waypoint_aggregate(
+        "  other-job:\n    steps:\n      - run: true\n",
+        "self-test-node-waypoint-aggregate-missing",
+        missing_aggregate_failures,
+    )
+    require(
+        any(
+            "aggregate so an irrelevant run still reports a result" in item
+            for item in missing_aggregate_failures
+        ),
+        "self-test: a missing NodeWaypoint aggregate must fail",
+        failures,
+    )
+
+    inert_exit_failures: list[str] = []
+    check_node_waypoint_aggregate(
+        _node_waypoint_aggregate(
+            exact_false_skip,
+            scheduled_fail,
+            planner_run="echo 'exit 1'",
+        ),
+        "self-test-node-waypoint-inert-exit",
+        inert_exit_failures,
+    )
+    require(
+        any("effective exit 1" in item for item in inert_exit_failures),
+        "self-test: inert exit text must not satisfy a NodeWaypoint failure step",
+        failures,
+    )
+
+    def _exit_step(run_header: str, *body_lines: str) -> str:
+        body = "".join(f"{line}\n" for line in body_lines)
+        return f"      - name: Fail\n        run: {run_header}\n{body}"
+
+    require(
+        step_run_ends_with_exit("      - name: Fail\n        run: exit 1\n", 1),
+        "self-test: same-line scalar `run: exit 1` must pass",
+        failures,
+    )
+    real_literal = _exit_step(
+        "|",
+        "          {",
+        '            echo "## NodeWaypoint eBPF Live"',
+        '            echo ""',
+        '            echo "Failed before trusted-base relevance planning completed."',
+        '          } >> "$GITHUB_STEP_SUMMARY"',
+        "          exit 1",
+    )
+    require(
+        step_run_ends_with_exit(real_literal, 1),
+        "self-test: `run: |` must reach the literal-block parser and accept "
+        "summary commands then terminal exit 1",
+        failures,
+    )
+    require(
+        step_run_ends_with_exit(
+            _exit_step("|-", "          echo summary", "          exit 1"),
+            1,
+        ),
+        "self-test: literal `run: |-` with terminal exit 1 must pass",
+        failures,
+    )
+    require(
+        step_run_ends_with_exit(
+            _exit_step("|+", "          echo summary", "          exit 1"),
+            1,
+        ),
+        "self-test: literal `run: |+` with terminal exit 1 must pass",
+        failures,
+    )
+    require(
+        not step_run_ends_with_exit(
+            "      - name: Fail\n        run: echo 'exit 1'\n",
+            1,
+        ),
+        "self-test: `echo 'exit 1'` must not count as an effective exit",
+        failures,
+    )
+    require(
+        not step_run_ends_with_exit(
+            _exit_step("|", "          # exit 1", "          echo skip"),
+            1,
+        ),
+        "self-test: a comment-only `exit 1` mention must not count",
+        failures,
+    )
+    require(
+        not step_run_ends_with_exit(
+            _exit_step("|", "          exit 1", "          echo still running"),
+            1,
+        ),
+        "self-test: a non-terminal `exit 1` must not count",
+        failures,
+    )
+    require(
+        not step_run_ends_with_exit(
+            _exit_step(">", "          echo summary", "          exit 1"),
+            1,
+        ),
+        "self-test: folded `run: >` blocks must not count as an effective exit",
+        failures,
+    )
+
+    real_block_planner = (
+        "|\n"
+        "          {\n"
+        '            echo "## NodeWaypoint eBPF Live"\n'
+        '            echo ""\n'
+        '            echo "Failed before trusted-base relevance planning completed."\n'
+        '          } >> "$GITHUB_STEP_SUMMARY"\n'
+        "          exit 1"
+    )
+    real_block_failures: list[str] = []
+    check_node_waypoint_aggregate(
+        _node_waypoint_aggregate(
+            exact_false_skip,
+            scheduled_fail,
+            planner_run=real_block_planner,
+        ),
+        "self-test-node-waypoint-literal-block",
+        real_block_failures,
+    )
+    require(
+        not real_block_failures,
+        "self-test: NodeWaypoint planner `run: |` with summary then exit 1 "
+        "should pass: " + "; ".join(real_block_failures),
         failures,
     )
 

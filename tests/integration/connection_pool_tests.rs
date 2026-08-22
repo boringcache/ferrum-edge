@@ -881,14 +881,54 @@ fn test_direct_h2_dispatch_allows_default_nonzero_body_limits() {
 /// dispatch gate must not confuse that adapter contract with the operator
 /// spelling FERRUM_MAX_*_BODY_SIZE_BYTES=0 (unlimited): unlimited is still
 /// eligible for direct-H2, and a positive limit is also eligible because
-/// enforcement happens in-path after the gateway maps 0→unbounded.
+/// enforcement happens in-path. Issue #3942: unlimited ordinary direct-H2
+/// must skip the limiter entirely rather than wrapping `usize::MAX`.
 #[test]
 fn test_direct_h2_dispatch_unlimited_and_deny_all_semantics_are_distinct() {
-    use ferrum_edge::_test_support::can_dispatch_direct_http2_pool;
+    use ferrum_edge::_test_support::{
+        can_dispatch_direct_http2_pool, direct_h2_uses_limit_adapter,
+    };
 
     // Operator "unlimited" (both zero) — still eligible.
     assert!(can_dispatch_direct_http2_pool(true, false, false, 0, 0));
     // Positive limits — eligible; SizeLimitedIncoming sees the positive
     // budget (never a raw 0 from the unlimited spelling).
     assert!(can_dispatch_direct_http2_pool(true, false, false, 64, 64));
+    assert!(
+        !direct_h2_uses_limit_adapter(0, false, false),
+        "operator 0 must not wrap SizeLimitedIncoming on ordinary direct-H2"
+    );
+    assert!(direct_h2_uses_limit_adapter(64, false, false));
+}
+
+/// Issue #3942: skipping SizeLimitedIncoming is ordinary-direct-H2 only.
+/// Mesh/HBONE/Unix limiter-typed senders still wrap the adapter and map
+/// operator 0 to usize::MAX.
+#[test]
+fn test_mesh_hbone_unix_senders_stay_limiter_typed() {
+    let mesh = include_str!("../../src/proxy/mesh_mtls_pool.rs");
+    assert!(
+        mesh.contains("Streaming(SizeLimitedIncoming)"),
+        "mesh-mTLS streaming uploads must stay SizeLimitedIncoming"
+    );
+    assert!(
+        !mesh.contains("DirectH2RequestBody"),
+        "mesh-mTLS must not share the ordinary direct-H2 passthrough body"
+    );
+
+    let hbone = include_str!("../../src/proxy/hbone_pool.rs");
+    assert!(
+        !hbone.contains("DirectH2RequestBody"),
+        "HBONE must not share the ordinary direct-H2 passthrough body"
+    );
+
+    let unix = include_str!("../../src/proxy/unix_backend_pool.rs");
+    assert!(
+        unix.contains("SizeLimitedIncoming"),
+        "Unix H1 streaming uploads must stay SizeLimitedIncoming"
+    );
+    assert!(
+        !unix.contains("DirectH2RequestBody"),
+        "Unix backend pool must not share the ordinary direct-H2 passthrough body"
+    );
 }

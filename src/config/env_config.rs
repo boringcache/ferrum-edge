@@ -2384,6 +2384,15 @@ pub struct EnvConfig {
     /// file per pod, name=pod_uid, contents=cgroup path) for the mesh proxy's
     /// in-netns capture listeners to consume.
     pub mesh_node_waypoint_pod_registry_dir: String,
+    /// This NodeWaypoint proxy's own Kubernetes pod UID (downward API
+    /// `metadata.uid`), published on the reply-source channel so the node-agent
+    /// can resolve the relay's cgroup-v2 subtree and write the non-forgeable
+    /// sender proof the tc UDP guard requires (issues #3956, #3957).
+    ///
+    /// Unset means UDP/DTLS Service-path steering and direct-node UDP relay
+    /// authorization fail closed: nothing is steered and nothing is authorized.
+    /// It is a pod identity, not a credential, and is never logged as a value.
+    pub mesh_node_waypoint_relay_pod_uid: Option<String>,
     /// Seconds to wait after a backend client SVID rotation before force-draining
     /// old-generation backend pool entries. 0 leaves existing connections to
     /// expire naturally.
@@ -3735,6 +3744,7 @@ impl Default for EnvConfig {
             mesh_node_waypoint_cgroup_sweep_interval_secs: 30,
             mesh_node_waypoint_idle_gc_interval_secs: 30,
             mesh_node_waypoint_pod_registry_dir: "/run/ferrum/node-waypoint-pods".to_string(),
+            mesh_node_waypoint_relay_pod_uid: None,
             mesh_svid_rotation_drain_seconds: 0,
             mesh_policy_deny_log_capacity: crate::modes::mesh::policy_deny_log::DEFAULT_CAPACITY,
             node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
@@ -4309,6 +4319,7 @@ impl EnvConfig {
             mesh_node_waypoint_cgroup_sweep_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS" => 30u64;
             mesh_node_waypoint_idle_gc_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS" => 30u64;
             mesh_node_waypoint_pod_registry_dir: String = "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR" => "/run/ferrum/node-waypoint-pods".to_string();
+            mesh_node_waypoint_relay_pod_uid: Option<String> = "FERRUM_MESH_NODE_WAYPOINT_RELAY_POD_UID";
             mesh_svid_rotation_drain_seconds: u64 = "FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS" => 0u64;
             mesh_policy_deny_log_capacity: usize = "FERRUM_MESH_POLICY_DENY_LOG_CAPACITY" => crate::modes::mesh::policy_deny_log::DEFAULT_CAPACITY;
             node_agent_proxy_mode: NodeAgentProxyMode = "FERRUM_NODE_AGENT_PROXY_MODE" => NodeAgentProxyMode::LocalPod;
@@ -5133,6 +5144,7 @@ impl EnvConfig {
             mesh_node_waypoint_cgroup_sweep_interval_secs,
             mesh_node_waypoint_idle_gc_interval_secs,
             mesh_node_waypoint_pod_registry_dir,
+            mesh_node_waypoint_relay_pod_uid,
             mesh_svid_rotation_drain_seconds,
             mesh_policy_deny_log_capacity,
             node_agent_proxy_mode,

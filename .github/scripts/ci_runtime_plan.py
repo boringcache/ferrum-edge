@@ -64,7 +64,7 @@ SUITE_PATTERNS: dict[str, tuple[str, ...]] = {
         r"^\.github/actions/setup-rust-ci/",
     ),
     # Kind/eBPF NodeWaypoint live datapath. Sensitive paths started as the
-    # pre-#3888 `pull_request.paths` set: the workflow trigger is a
+    # pre-#3888 `pull_request.paths` set: the workflow trigger was a
     # production-image superset, but this suite must not inherit that
     # broadening. That historical set enumerated `src/proxy/` file by file and
     # was already stale when #3888 froze it, so every NodeWaypoint datapath
@@ -72,14 +72,35 @@ SUITE_PATTERNS: dict[str, tuple[str, ...]] = {
     # `^src/proxy/node_waypoint_` is a prefix on purpose: those modules exist
     # solely to implement this suite, so a new one must be sensitive by
     # construction rather than by remembering to extend a list.
+    #
+    # Since #3908 this suite is the ONLY relevance authority for the live job:
+    # `node-waypoint-ebpf-live.yml` carries no workflow-level `paths:` filter
+    # any more, so a diff that reaches none of these patterns (and none of the
+    # `SUITE_SAFE_PATTERNS` allowlist) is what decides the Kind/eBPF job skips.
+    # `verify_ci_runtime_cache.py` probes every pattern here.
     "node-waypoint-ebpf-live": (
         r"^\.github/workflows/node-waypoint-ebpf-live\.yml$",
         r"^\.dockerignore$",
         r"^\.github/actions/package-ferrum-runtime-image/",
         r"^\.github/actions/setup-kubernetes-tools/",
+        # Local composite actions the live job also executes: `setup-rust-ci`
+        # (which itself runs `setup-sccache` and `setup-fast-linker`) builds
+        # both runtime binaries, and `setup-bpf-linker` installs the linker the
+        # nightly BPF ELF build needs. The retired `paths:` list named none of
+        # them, so an edit could change what the live datapath compiled without
+        # ever re-running it.
+        r"^\.github/actions/setup-rust-ci/",
+        r"^\.github/actions/setup-sccache/",
+        r"^\.github/actions/setup-fast-linker/",
+        r"^\.github/actions/setup-bpf-linker/",
         r"^Cargo\.(toml|lock)$",
         r"^Dockerfile$",
         r"^Dockerfile\.iproute2-layer$",
+        # The live job builds the tools-capable UDP steering image from this
+        # layer (`docker build --file Dockerfile.ebpf-tools-layer`) and asserts
+        # the steering tools it ships. Neither the retired `paths:` list nor
+        # this suite reached it: the workflow started and every job skipped.
+        r"^Dockerfile\.ebpf-tools-layer$",
         r"^Dockerfile\.release$",
         r"^\.github/scripts/stage_iproute2_runtime\.sh$",
         r"^build\.rs$",
@@ -136,6 +157,17 @@ KNOWN_SAFE_PATTERNS: tuple[str, ...] = (
     r"^NOTICE",
     r"^AGENTS\.md$",
     r"^CLAUDE\.md$",
+    # Any root-level SHOUTY Markdown document (ARCHITECTURE.md, CHANGELOG.md,
+    # CONFORMANCE.md, FEATURES.md, PRODUCTION_READINESS.md, WEBSOCKET.md, ...).
+    # `.dockerignore` excludes `*.md` and no Dockerfile stage COPYs one, so such
+    # a file cannot reach either production image; it is not compiled, so it
+    # cannot reach the FIPS build; and it is not a NodeWaypoint datapath input.
+    # The class holds no `/`, so it can never match a path inside a directory.
+    #
+    # Issue #3908 makes this load-bearing: with the workflow-level `paths:`
+    # filter retired, an unknown path force-runs the 120-minute Kind/eBPF live
+    # job, and a documentation-only pull request must not pay for that.
+    r"^[A-Z0-9_-]+\.md$",
     r"^CODE_OF_CONDUCT",
     r"^SECURITY\.md$",
     r"^docs/",
@@ -539,6 +571,29 @@ def self_test() -> int:
             [".github/actions/setup-kubernetes-tools/action.yml"],
             True,
         ),
+        # Local composite actions the live job executes directly, or through
+        # `setup-rust-ci`, which runs `setup-sccache` and `setup-fast-linker`.
+        (
+            "node-waypoint-ebpf-live",
+            [".github/actions/setup-rust-ci/action.yml"],
+            True,
+        ),
+        (
+            "node-waypoint-ebpf-live",
+            [".github/actions/setup-sccache/action.yml"],
+            True,
+        ),
+        (
+            "node-waypoint-ebpf-live",
+            [".github/actions/setup-fast-linker/action.yml"],
+            True,
+        ),
+        (
+            "node-waypoint-ebpf-live",
+            [".github/actions/setup-bpf-linker/action.yml"],
+            True,
+        ),
+        ("node-waypoint-ebpf-live", ["Dockerfile.ebpf-tools-layer"], True),
         ("node-waypoint-ebpf-live", ["charts/ferrum-mesh/values.yaml"], True),
         (
             "node-waypoint-ebpf-live",
@@ -564,6 +619,17 @@ def self_test() -> int:
         ("node-waypoint-ebpf-live", ["rust-toolchain.toml"], False),
         ("node-waypoint-ebpf-live", ["custom_plugins/mod.rs"], False),
         ("node-waypoint-ebpf-live", ["README.md"], False),
+        # Root-level documentation must not pay for the 120-minute Kind/eBPF
+        # cluster now that the workflow-level `paths:` filter is retired.
+        ("node-waypoint-ebpf-live", ["ARCHITECTURE.md"], False),
+        ("node-waypoint-ebpf-live", ["PRODUCTION_READINESS.md"], False),
+        ("node-waypoint-ebpf-live", ["CHANGELOG.md"], False),
+        ("production-dockerfile-smoke", ["PRODUCTION_READINESS.md"], False),
+        ("fips-build", ["PRODUCTION_READINESS.md"], False),
+        # The allowlist entry holds no `/`, so it cannot reach into a directory
+        # and turn a real source path into a skip.
+        ("node-waypoint-ebpf-live", ["src/ebpf/README.md"], True),
+        ("production-dockerfile-smoke", ["src/ebpf/README.md"], True),
         (
             "node-waypoint-ebpf-live",
             [".github/scripts/ci_runtime_plan.py"],

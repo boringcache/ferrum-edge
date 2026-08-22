@@ -120,7 +120,7 @@ set -euo pipefail
 #   FERRUM_MESH_E2E_LIVE_ACK_DISPOSABLE=true tests/k8s/mesh_e2e_sidecar/run.sh
 #
 # Set FERRUM_MESH_E2E_DEPLOY_ONLY=1 to run only the SPIRE/workload deploy
-# without driving traffic or gating (the ci.yml smoke).
+# without driving traffic or gating (local smoke; not a CI job).
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/.context/mesh-e2e-sidecar}"

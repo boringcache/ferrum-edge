@@ -37,7 +37,7 @@ use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{GrpcClient, Http2Client};
 use crate::scaffolding::file_mode_yaml_for_backend_with;
 use crate::scaffolding::harness::GatewayHarness;
-use crate::scaffolding::ports::reserve_port;
+use crate::scaffolding::ports::{reserve_port, reserve_refused_tcp_port};
 use crate::scaffolding::to_file_mode_yaml;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -2796,9 +2796,12 @@ async fn wait_for_backend_goaway_sent(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn grpc_retry_preserves_duplicate_metadata_on_second_attempt() {
-    let down = reserve_port().await.expect("reserve down port");
+    // Bound-but-not-listening: the kernel refuses the connect AND no parallel
+    // test can steal the port. A released port can be re-bound by another
+    // test, and then attempt 1 gets a real answer instead of a refusal, so
+    // the retry never fires and the metadata assertions below cannot run.
+    let down = reserve_refused_tcp_port().expect("reserve refused down port");
     let down_port = down.port;
-    drop(down); // refuse connections
 
     let up = reserve_port().await.expect("reserve up port");
     let up_port = up.port;

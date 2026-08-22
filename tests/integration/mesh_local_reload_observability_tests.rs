@@ -164,6 +164,7 @@ fn build_mesh_admin_state(config_rejected: Arc<AtomicBool>) -> AdminState {
         external_ref_loader: std::sync::Arc::new(
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
+        runtime_config_apply: None,
     }
 }
 

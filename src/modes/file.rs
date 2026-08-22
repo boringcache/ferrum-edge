@@ -1129,6 +1129,7 @@ pub async fn serve(
                 fixtures: std::collections::HashMap::new(),
             },
         ),
+        runtime_config_apply: None,
     };
 
     // Shared admin connection limiter (plaintext + HTTPS listeners share one
