@@ -63,6 +63,7 @@ pub mod gateway_harness;
 pub mod hmac_helpers;
 pub mod isolated_audit_fallback;
 pub mod protocol_managed_response_headers;
+pub mod scheduled_scaling;
 pub mod trusted_projected_gateway;
 
 pub use backend_availability::{
@@ -87,11 +88,15 @@ pub use gateway_harness::{
     scrub_gateway_capture_for_diagnostics, shutdown_gateway_child,
 };
 pub use hmac_helpers::{
-    HmacV2Request, empty_digest_header, generate_hmac_signature,
+    HmacV2Request, content_digest_sha256_header, empty_digest_header, generate_hmac_signature,
     generate_hmac_signature_with_digest, generate_hmac_signature_with_query,
     hmac_authority_from_url, hmac_v2_authorization_header, hmac_v2_nonce,
 };
 pub use isolated_audit_fallback::isolated_audit_fallback_dir;
+pub use scheduled_scaling::{
+    SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, post_admin_batch,
+    scheduled_scaling_admin_jwt_max_ttl_value,
+};
 pub use trusted_projected_gateway::{
     TrustedProjectedGateway, TrustedProjectedGatewayOptions, run_trusted_projected_gateway_test,
     trusted_projected_config_from_yaml,

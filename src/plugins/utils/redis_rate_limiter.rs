@@ -1153,10 +1153,79 @@ async fn screen_connection_memory_policy(
 /// Packed `(shared_authorities << 32) | shared_authorities_unavailable`.
 ///
 /// Published on shared-replay lifecycle transitions and read by `/health`,
-/// `/status`, and `/metrics/runtime` as a single acquire-load. There is no
-/// registry to scan, no mutex, and no work proportional to configured or
-/// historical authorities.
+/// `/status`, and `/metrics/runtime` as a single acquire-load. The read path
+/// has no registry to scan, no mutex, and no work proportional to configured
+/// or historical authorities; writers serialize their transitions behind
+/// [`SHARED_REPLAY_TRANSITION_LOCK`].
 static SHARED_REPLAY_HEALTH: AtomicU64 = AtomicU64::new(0);
+
+/// Serializes each registration's per-state transition with its corresponding
+/// global packed-count update.
+///
+/// Registration, availability transitions, and Drop/retirement are all cold
+/// (plugin commit, backend flap, config reload), while `/health`, `/status`,
+/// and `/metrics/runtime` still read [`SHARED_REPLAY_HEALTH`] with a single
+/// lock-free acquire-load. Holding this mutex across both the per-registration
+/// word store and the packed delta closes the tear between them: a newer
+/// transition cannot publish its delta before an older transition's delta (out
+/// of epoch order), and a retired generation cannot resurrect because its
+/// retirement delta and the competing transition are serialized.
+static SHARED_REPLAY_TRANSITION_LOCK: Mutex<()> = Mutex::new(());
+
+/// Test-only `armed`/`entered` pair for the apply pause gate below. `armed`
+/// forces the pause; `entered` lets an external test observe deterministically
+/// that a transition reached the tear point (and is therefore holding the
+/// transition lock while its global delta is still unapplied).
+static REPLAY_HEALTH_APPLY_PAUSE_ARMED: AtomicBool = AtomicBool::new(false);
+static REPLAY_HEALTH_APPLY_PAUSE_ENTERED: AtomicUsize = AtomicUsize::new(0);
+
+/// Pause an in-flight [`SharedReplayHealthRegistration`] transition exactly
+/// between publishing its per-registration word and applying the global packed
+/// delta — the tear point that [`SHARED_REPLAY_TRANSITION_LOCK`] closes.
+///
+/// Production never arms the gate and it is consulted only on the cold
+/// transition path, so the lock-free read path is unaffected.
+fn pause_shared_replay_apply_for_test() {
+    if !REPLAY_HEALTH_APPLY_PAUSE_ARMED.load(Ordering::Acquire) {
+        return;
+    }
+    REPLAY_HEALTH_APPLY_PAUSE_ENTERED.fetch_add(1, Ordering::AcqRel);
+    while REPLAY_HEALTH_APPLY_PAUSE_ARMED.load(Ordering::Acquire) {
+        std::hint::spin_loop();
+    }
+}
+
+/// Arm the apply-pause gate, resetting the reached-tear-point counter. External
+/// unit tests use this to deterministically reproduce the previously dangerous
+/// transition/global-publish reordering.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn arm_shared_replay_apply_pause_for_test() {
+    REPLAY_HEALTH_APPLY_PAUSE_ENTERED.store(0, Ordering::Release);
+    REPLAY_HEALTH_APPLY_PAUSE_ARMED.store(true, Ordering::Release);
+}
+
+/// Disarm the apply-pause gate so a paused transition can proceed.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn disarm_shared_replay_apply_pause_for_test() {
+    REPLAY_HEALTH_APPLY_PAUSE_ARMED.store(false, Ordering::Release);
+}
+
+/// Number of transitions currently (or previously) paused at the tear point.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn shared_replay_apply_pause_entered_for_test() -> usize {
+    REPLAY_HEALTH_APPLY_PAUSE_ENTERED.load(Ordering::Acquire)
+}
+
+/// Whether the shared-replay transition lock is currently held. External tests
+/// use this to prove a transition spans the tear point under the lock.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn shared_replay_transition_lock_held_for_test() -> bool {
+    SHARED_REPLAY_TRANSITION_LOCK.try_lock().is_err()
+}
 
 const SHARED_REPLAY_COUNT_SHIFT: u64 = 32;
 const SHARED_REPLAY_COUNT_MASK: u64 = 0xFFFF_FFFF;
@@ -1221,10 +1290,16 @@ fn bump_shared_replay_health(authorities_delta: i8, unavailable_delta: i8) {
 /// Holds only the local state machine that publishes into
 /// [`SHARED_REPLAY_HEALTH`]. It does not retain the Redis client, cached
 /// connections, endpoints, credentials, or any other secret-bearing data.
-/// Drop retires this generation's contribution immediately. Concurrent
-/// availability transitions CAS a packed `(epoch, state)` word so a stale
-/// registration sample cannot overwrite a newer notification, and a drop
-/// cannot underflow, double-count, or resurrect a retired generation.
+/// Drop retires this generation's contribution immediately.
+///
+/// Every transition (registration, availability change, Drop) runs its
+/// per-registration `(epoch, state)` word update and its corresponding global
+/// packed-count delta inside [`SHARED_REPLAY_TRANSITION_LOCK`]. The packed
+/// `(epoch, state)` word still rejects a stale registration sample that cannot
+/// overwrite a newer notification, and the lock guarantees those rejects are
+/// evaluated in the same critical section as the delta, so a drop cannot
+/// underflow, double-count, or resurrect a retired generation while another
+/// transition is mid-publish.
 struct SharedReplayHealthRegistration {
     /// Packed `(applied_epoch << 8) | state`.
     word: AtomicU64,
@@ -1248,45 +1323,43 @@ impl SharedReplayHealthRegistration {
     /// Linearizability: [`EnforcementAvailability`] increments `epoch` in the
     /// same CAS that changes semantic state, and notifies with that new epoch
     /// after the health `Weak` is attached. A sample taken before a transition
-    /// therefore carries a smaller epoch than the notification, and this CAS
-    /// rejects it. Equivalent-provider re-registration is idempotent: the same
-    /// epoch is a no-op. No resample loop is required, and this path never
-    /// waits on backend flapping — a stale apply returns, a newer notify wins.
+    /// therefore carries a smaller epoch than the notification, and the epoch
+    /// check below rejects it. Equivalent-provider re-registration is
+    /// idempotent: the same epoch is a no-op. No resample loop is required, and
+    /// this path never waits on backend flapping — a stale apply returns, a
+    /// newer notify wins.
+    ///
+    /// The epoch check and the global packed delta run together inside
+    /// [`SHARED_REPLAY_TRANSITION_LOCK`], so once a transition's word update
+    /// wins, its delta is published before any newer (or retiring) transition
+    /// can touch the shared word. Deltas therefore cannot execute out of epoch
+    /// order and a retired registration cannot resurrect.
     fn apply_availability(&self, available: bool, epoch: u64) {
+        let _guard = SHARED_REPLAY_TRANSITION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let target = if available {
             Self::AVAILABLE
         } else {
             Self::UNAVAILABLE
         };
-        loop {
-            let raw = self.word.load(Ordering::Acquire);
-            let (current_state, current_epoch) = unpack_epoch_state(raw);
-            if current_state == Self::RETIRED {
-                return;
-            }
-            if current_state != Self::UNREGISTERED && epoch <= current_epoch {
-                return;
-            }
-            if self
-                .word
-                .compare_exchange(
-                    raw,
-                    pack_epoch_state(target, epoch),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
-                continue;
-            }
-            match (current_state, target) {
-                (Self::UNREGISTERED, Self::AVAILABLE) => bump_shared_replay_health(1, 0),
-                (Self::UNREGISTERED, Self::UNAVAILABLE) => bump_shared_replay_health(1, 1),
-                (Self::AVAILABLE, Self::UNAVAILABLE) => bump_shared_replay_health(0, 1),
-                (Self::UNAVAILABLE, Self::AVAILABLE) => bump_shared_replay_health(0, -1),
-                _ => {}
-            }
+        let raw = self.word.load(Ordering::Acquire);
+        let (current_state, current_epoch) = unpack_epoch_state(raw);
+        if current_state == Self::RETIRED {
             return;
+        }
+        if current_state != Self::UNREGISTERED && epoch <= current_epoch {
+            return;
+        }
+        self.word
+            .store(pack_epoch_state(target, epoch), Ordering::Release);
+        pause_shared_replay_apply_for_test();
+        match (current_state, target) {
+            (Self::UNREGISTERED, Self::AVAILABLE) => bump_shared_replay_health(1, 0),
+            (Self::UNREGISTERED, Self::UNAVAILABLE) => bump_shared_replay_health(1, 1),
+            (Self::AVAILABLE, Self::UNAVAILABLE) => bump_shared_replay_health(0, 1),
+            (Self::UNAVAILABLE, Self::AVAILABLE) => bump_shared_replay_health(0, -1),
+            _ => {}
         }
     }
 
@@ -1298,8 +1371,15 @@ impl SharedReplayHealthRegistration {
 
 impl Drop for SharedReplayHealthRegistration {
     fn drop(&mut self) {
-        // Swap to RETIRED first so a concurrent apply's CAS cannot land after
-        // we have already subtracted, and cannot resurrect this generation.
+        // Serialize retirement against any in-flight apply so a concurrent
+        // transition cannot publish its word or delta after we have already
+        // subtracted, and cannot resurrect this generation.
+        let _guard = SHARED_REPLAY_TRANSITION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Swap to RETIRED first so a concurrent apply's store cannot land
+        // after we have already subtracted, and cannot resurrect this
+        // generation.
         let (previous, _) = unpack_epoch_state(
             self.word
                 .swap(pack_epoch_state(Self::RETIRED, 0), Ordering::AcqRel),
@@ -3040,6 +3120,8 @@ impl RedisRateLimitClient {
     ///
     /// Uses a Redis pipeline to send `INCR` + `EXPIRE` in a single round-trip.
     /// This is the core primitive for fixed-window rate limiting.
+    // Redis command failures are intentionally collapsed to () at this boundary.
+    #[allow(clippy::result_unit_err)]
     pub async fn incr_with_expire(&self, key: &str, ttl_seconds: u64) -> Result<i64, ()> {
         let mut conn = self.get_connection().await.ok_or(())?;
 
@@ -3078,6 +3160,7 @@ impl RedisRateLimitClient {
     /// The caller makes its allow/deny decision from the returned post-INCR
     /// current count, tying admission to the mutation even when many gateway
     /// instances race on the same key.
+    #[allow(clippy::result_unit_err)]
     pub async fn sliding_window_increment(
         &self,
         previous_key: &str,
@@ -3095,6 +3178,7 @@ impl RedisRateLimitClient {
     /// message in a single round trip rather than one round trip per fragment.
     /// `amount` must be positive; the caller owns the bound on how large it can
     /// grow.
+    #[allow(clippy::result_unit_err)]
     pub async fn sliding_window_increment_by(
         &self,
         previous_key: &str,
@@ -3142,6 +3226,7 @@ impl RedisRateLimitClient {
     /// Uses a Redis pipeline to send `INCRBY` + `EXPIRE` in a single round-trip.
     /// Used by the AI token rate limiter where each request may consume a variable
     /// number of tokens.
+    #[allow(clippy::result_unit_err)]
     pub async fn incrby_with_expire(
         &self,
         key: &str,
@@ -3209,6 +3294,7 @@ impl RedisRateLimitClient {
     /// in the conservative direction (a concurrent add during the race can
     /// leave a transient over-count, which is safe for a rate limiter — it
     /// never under-counts usage).
+    #[allow(clippy::result_unit_err)]
     pub async fn incrby_with_expire_floor_zero(
         &self,
         key: &str,
@@ -3248,6 +3334,7 @@ impl RedisRateLimitClient {
 
     /// Increment one counter by 1 and another by a specific amount in a single
     /// pipelined round-trip. Returns `(new_count, new_total)`.
+    #[allow(clippy::result_unit_err)]
     pub async fn incr_and_incrby_with_expire(
         &self,
         count_key: &str,
@@ -3297,6 +3384,7 @@ impl RedisRateLimitClient {
     ///
     /// Used by the AI token rate limiter to fetch both the previous and current
     /// window counters without two separate round-trips.
+    #[allow(clippy::result_unit_err)]
     pub async fn get_two_counters(&self, key1: &str, key2: &str) -> Result<(i64, i64), ()> {
         let mut conn = self.get_connection().await.ok_or(())?;
 
@@ -3330,6 +3418,7 @@ impl RedisRateLimitClient {
     ///
     /// Used by plugins that need arbitrary key-value storage (e.g., request
     /// deduplication, AI semantic cache) rather than rate limiting counters.
+    #[allow(clippy::result_unit_err)]
     pub async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>, ()> {
         let mut conn = self.get_connection().await.ok_or(())?;
 
@@ -3367,6 +3456,7 @@ impl RedisRateLimitClient {
     /// independently verified against the bound before admission. Callers treat
     /// [`BoundedRedisValue::Oversized`] and [`BoundedRedisValue::Empty`] as
     /// invalid entries and quarantine them.
+    #[allow(clippy::result_unit_err)]
     pub async fn get_bytes_bounded(
         &self,
         key: &str,
@@ -3450,6 +3540,7 @@ impl RedisRateLimitClient {
 
     /// Best-effort unconditional key deletion, used to quarantine a poisoned or
     /// invalid cache entry so it is not re-served on the next request.
+    #[allow(clippy::result_unit_err)]
     pub async fn delete(&self, key: &str) -> Result<(), ()> {
         let mut conn = self.get_connection().await.ok_or(())?;
 
@@ -3478,6 +3569,7 @@ impl RedisRateLimitClient {
     ///
     /// Uses a pipelined `SET` + `EXPIRE` in a single round-trip.
     /// Used by plugins that need arbitrary key-value storage.
+    #[allow(clippy::result_unit_err)]
     pub async fn set_bytes_with_expire(
         &self,
         key: &str,
@@ -3521,6 +3613,7 @@ impl RedisRateLimitClient {
     ///
     /// Returns `Ok(true)` when the caller acquired the key, `Ok(false)` when an
     /// existing key prevented the write, and `Err(())` when Redis is unavailable.
+    #[allow(clippy::result_unit_err)]
     pub async fn set_bytes_nx_with_expire(
         &self,
         key: &str,
@@ -3582,6 +3675,7 @@ impl RedisRateLimitClient {
     /// fail-closed result. A timeout marks the client unavailable exactly like
     /// any other command failure, so the background recovery checker owns
     /// restoring it.
+    #[allow(clippy::result_unit_err)]
     pub async fn set_bytes_nx_with_expire_bounded(
         &self,
         key: &str,
@@ -3672,6 +3766,7 @@ impl RedisRateLimitClient {
     /// connection-local `WATCH` state can neither be interleaved by another
     /// command nor silently dropped by a transparent reconnect. Any I/O failure
     /// at `WATCH`, `GET`, `UNWATCH`, or `EXEC` fails closed as `Err(())`.
+    #[allow(clippy::result_unit_err)]
     pub async fn delete_if_value_matches(&self, key: &str, expected: &[u8]) -> Result<bool, ()> {
         // Owned for the duration of the transaction; never cloned or shared.
         let mut conn = self.get_dedicated_connection().await.ok_or(())?;
@@ -3786,6 +3881,7 @@ impl RedisRateLimitClient {
     ///
     /// Any I/O failure at `WATCH`, `GET`, `UNWATCH`, or `EXEC` fails closed;
     /// a partial transaction is never retried on a fresh connection.
+    #[allow(clippy::result_unit_err)]
     pub async fn set_bytes_with_expire_if_value_matches(
         &self,
         key: &str,

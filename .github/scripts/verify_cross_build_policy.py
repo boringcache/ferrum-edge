@@ -11909,25 +11909,31 @@ def validate_workflow_collection(
 #     appended before the comparison is reached and are still reported; only the
 #     surface-equality verdict for this one pair is withheld.
 #
-# RETIREMENT IS MANDATORY. Once PR #3950 is on `main` the trusted base IS the
-# adopted generation, so the admission is permanently unreachable: the retired
-# generation can only become a trusted base again by first passing the one-way
-# refusal above. Delete this block, the `admitted_generation_transition`
-# parameter, and the matching self-tests in the next trusted-policy change,
-# exactly as #3943 retired the #3889 admission this mechanism previously
-# served. See `docs/ci_cd.md` and `docs/dependency-policy.md`.
+# RETIREMENT IS MANDATORY. Once the issue #4018 mitigation is on `main` the
+# trusted base IS the adopted generation, so the admission is permanently
+# unreachable: the retired generation can only become a trusted base again by
+# first passing the one-way refusal above. Delete this block, the
+# `admitted_generation_transition` parameter, and the matching self-tests in
+# the next trusted-policy change, exactly as #3943 retired the #3889 admission
+# this mechanism previously served. See `docs/ci_cd.md` and
+# `docs/dependency-policy.md`.
 FIPS_BUILD_WORKFLOW_FILENAME = "fips-build.yml"
-# `.github/workflows/fips-build.yml` as it stands on the trusted base
-# after PR #3952's landed static-path planner hardening.
+# `.github/workflows/fips-build.yml` as it stands on the trusted base after
+# PR #3950's landed artifact-based same-run producer handoff. This digest was
+# the ADOPTED end of the previous admission, which is now spent.
 FIPS_BUILD_RETIRED_GENERATION_SHA256 = (
-    "0be313579a66265ef1f54e0a611f519e8d109a536ba29b0d6c4244530b9d6a08"
-)
-# `.github/workflows/fips-build.yml` at PR #3950 head df1223520: the same-run
-# producer handoff moves off the eviction-prone repository cache onto the
-# immutable run artifact, and restored runner-local AWS-LC CMake intermediates
-# are quarantined before Cargo can reuse them on another runner.
-FIPS_BUILD_ADOPTED_GENERATION_SHA256 = (
     "17bfb40fbd31e80e6ae1a0efca922069c54ec485ec7a611c3420840da3e5e9e1"
+)
+# `.github/workflows/fips-build.yml` carrying the issue #4018 memory mitigation
+# on the `fips-test-build` job. "Precompile FIPS test binaries for consumers"
+# is killed with `exit code 143` and a runner shutdown signal while building the
+# `unit_tests` / `integration_tests` binaries — the hosted runner's memory
+# ceiling, not a compile error. The destination caps `CARGO_BUILD_JOBS` at 3,
+# sets `line-tables-only` debuginfo on the `dev` AND `test` profiles, and adds a
+# best-effort 8 GiB Ferrum-owned swapfile alongside the runner image's existing
+# swap immediately before that step. It never disables or rewrites image swap.
+FIPS_BUILD_ADOPTED_GENERATION_SHA256 = (
+    "7d995d79d9932c9595d3f19eddf16c1dbd1a0d2842230f1d92eb1b24502ca401"
 )
 FIPS_BUILD_ADMITTED_GENERATION_TRANSITION = (
     FIPS_BUILD_WORKFLOW_FILENAME,

@@ -220,6 +220,17 @@ use self::http2_pool::Http2ConnectionPool;
 static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
+/// Precomputed circuit-breaker-open reject headers. Open-breaker 503s are
+/// still a reject path, but the map is rebuilt from this snapshot so the
+/// observability token is not `format!()`ed or assembled per request.
+static CIRCUIT_BREAKER_OPEN_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
+    std::sync::LazyLock::new(|| {
+        HashMap::from([(
+            X_GATEWAY_ERROR_HEADER.to_string(),
+            X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN.to_string(),
+        )])
+    });
+
 /// Hyper's HTTP/1 parser panics when `max_buf_size` is below 8 KiB. Ferrum's
 /// configured logical header limit may be lower; keep the parser floor safe
 /// and enforce the operator's lower limit in `check_protocol_headers`.
@@ -3785,7 +3796,9 @@ async fn buffer_request_body_for_before_proxy(
 /// secured-transport attempt. The returned `Bytes` are retained only when the
 /// retry loop needs replay; mesh pool acquisition, identity verification, and
 /// backend admission remain per attempt.
-#[allow(clippy::too_many_arguments)]
+// BackendResponse is the shared, protocol-aware fail-closed result for request
+// preparation; boxing it here would ripple through the mesh dispatch contract.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 async fn prepare_mesh_request_body(
     client_request_body: ClientRequestBody,
     method: &str,
@@ -4518,15 +4531,19 @@ fn insert_outbound_header_or_warn(
 
 /// Remove client/plugin forwarding assertions that Ferrum regenerates for the
 /// selected backend attempt. This is the `HeaderMap` counterpart of the
-/// string-map filters used by reqwest/H3 builders.
+/// string-map filters used by reqwest/H3 builders. An untrusted peer's
+/// `X-Real-IP` is stripped here too — Ferrum never regenerates that header,
+/// so leaving it would hand backends a spoofable client-IP assertion.
 fn strip_proxy_owned_forwarding_headers(
     headers: &mut hyper::HeaderMap,
     add_forwarded_header: bool,
+    peer_trusted: bool,
 ) {
     let to_remove: Vec<hyper::header::HeaderName> = headers
         .keys()
         .filter(|name| {
             headers_mod::is_proxy_owned_forwarding_header(name.as_str(), add_forwarded_header)
+                || headers_mod::is_untrusted_real_ip_header(name.as_str(), peer_trusted)
         })
         .cloned()
         .collect();
@@ -4535,24 +4552,37 @@ fn strip_proxy_owned_forwarding_headers(
     }
 }
 
+/// True when `peer_ip` is in `FERRUM_TRUSTED_PROXIES`.
+///
+/// An empty trust list matches nothing, so the default edge deployment treats
+/// every peer as untrusted. An unparseable peer address is also untrusted —
+/// fail closed rather than forwarding a client-supplied identity chain.
+#[inline]
+pub(crate) fn forwarding_peer_is_trusted(
+    peer_ip: &str,
+    trusted_proxies: &client_ip::TrustedProxies,
+) -> bool {
+    peer_ip
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| trusted_proxies.contains(&ip))
+}
+
 /// Build the outbound X-Forwarded-For header value.
 ///
-/// Standard `proxy_add_x_forwarded_for` semantics: append the immediate
-/// socket peer (`peer_ip`) to the inbound chain. When there is no inbound
+/// Append the immediate socket peer (`peer_ip`) to the inbound chain only
+/// when that peer is in `FERRUM_TRUSTED_PROXIES`. When there is no inbound
 /// chain but trusted-proxy resolution produced a real client IP that differs
 /// from the peer (e.g. `FERRUM_REAL_IP_HEADER` from a trusted LB that does
 /// not send XFF), seed the generated chain with the resolved client so the
 /// real client is not lost.
 ///
-/// Trust gate: when `FERRUM_TRUSTED_PROXIES` is configured and the immediate
-/// peer is NOT in it, the inbound XFF is attacker-controlled and is dropped —
-/// the same rule `client_ip::resolve_client_ip` applies when resolving
-/// `ctx.client_ip`. Forwarding it (`spoofed, peer`) would hand backends an
-/// attacker-seeded chain the gateway itself refused to trust. With no
-/// trusted-proxy policy configured, the inbound chain passes through
-/// untouched (transparent nginx-style behavior).
+/// Trust gate: if the immediate peer is NOT in `FERRUM_TRUSTED_PROXIES`
+/// (including the default empty list), the inbound XFF is attacker-controlled
+/// and is dropped — the same rule `client_ip::resolve_client_ip` applies when
+/// resolving `ctx.client_ip`. Forwarding it (`spoofed, peer`) would hand
+/// backends an attacker-seeded chain the gateway itself refused to trust.
 ///
-/// Truth table (identical across H1/H2/H3 frontends):
+/// Truth table (identical across H1/H2/H3 frontends, gRPC, and WebSocket):
 ///
 /// | Deployment shape                   | inbound XFF | client vs peer | outbound XFF          |
 /// |------------------------------------|-------------|----------------|-----------------------|
@@ -4574,16 +4604,12 @@ pub(crate) fn build_xff_value(
     peer_ip: &str,
     trusted_proxies: &client_ip::TrustedProxies,
 ) -> String {
-    // Drop attacker-controlled inbound XFF: a trust policy exists and the
-    // immediate peer is not part of it. The peer-IP parse only runs when an
-    // inbound chain is present AND a policy is configured.
-    let existing_xff = existing_xff.filter(|_| {
-        trusted_proxies.is_empty()
-            || peer_ip
-                .parse::<std::net::IpAddr>()
-                .map(|ip| trusted_proxies.contains(&ip))
-                .unwrap_or(false)
-    });
+    // Drop attacker-controlled inbound XFF unless the immediate peer is in
+    // the configured trust set. An empty `FERRUM_TRUSTED_PROXIES` matches
+    // no address, so the default edge deployment never forwards a
+    // client-supplied chain.
+    let existing_xff =
+        existing_xff.filter(|_| forwarding_peer_is_trusted(peer_ip, trusted_proxies));
     match existing_xff {
         Some(xff) => {
             // Real-IP-header deployments: a trusted proxy can resolve the
@@ -5236,26 +5262,41 @@ pub fn build_forwarded_value(client_ip: &str, proto: &str, host: Option<&str>) -
     val
 }
 
-/// Replace proxy-managed scheme metadata with the effective browser-facing
-/// request scheme. Direct gRPC and WebSocket dispatch start from a sanitized
-/// request map instead of the canonical HTTP backend builders, so normalize
-/// these fields before those protocol-specific paths merge or forward it.
+/// Replace proxy-managed forwarding identity with gateway-owned values.
+/// Direct gRPC and WebSocket dispatch start from a sanitized request map
+/// instead of the canonical HTTP backend builders, so normalize these
+/// fields before those protocol-specific paths merge or forward it.
 /// Remove every case-insensitive variant first because this string-keyed map
 /// does not otherwise provide HTTP header-name equality.
 pub(crate) fn apply_effective_backend_scheme_headers(
     headers: &mut HashMap<String, String>,
     client_ip: &str,
+    peer_ip: &str,
+    trusted_proxies: &client_ip::TrustedProxies,
     request_is_secure: bool,
     add_forwarded_header: bool,
 ) {
     let scheme = if request_is_secure { "https" } else { "http" };
+    let existing_xff = headers.iter().find_map(|(name, value)| {
+        name.eq_ignore_ascii_case("x-forwarded-for")
+            .then_some(value.as_str())
+    });
+    let xff_val = build_xff_value(existing_xff, client_ip, peer_ip, trusted_proxies);
     let forwarded = add_forwarded_header
         .then(|| build_forwarded_value(client_ip, scheme, headers.get("host").map(String::as_str)));
+    let peer_trusted = forwarding_peer_is_trusted(peer_ip, trusted_proxies);
     headers.retain(|name, _| {
-        !name.eq_ignore_ascii_case("x-forwarded-proto")
+        !name.eq_ignore_ascii_case("x-forwarded-for")
+            && !name.eq_ignore_ascii_case("x-forwarded-proto")
+            && !name.eq_ignore_ascii_case("x-forwarded-host")
             && (!add_forwarded_header || !name.eq_ignore_ascii_case("forwarded"))
+            && (peer_trusted || !name.eq_ignore_ascii_case("x-real-ip"))
     });
+    headers.insert("x-forwarded-for".to_string(), xff_val);
     headers.insert("x-forwarded-proto".to_string(), scheme.to_string());
+    if let Some(host) = headers.get("host").cloned() {
+        headers.insert("x-forwarded-host".to_string(), host);
+    }
     if let Some(forwarded) = forwarded {
         headers.insert("forwarded".to_string(), forwarded);
     }
@@ -23340,6 +23381,120 @@ pub(crate) fn restore_authoritative_allow_header(
     response_headers.insert("allow".to_string(), allow_value.to_string());
 }
 
+/// Wire name for the HTTP-family failure-class header. HashMap reject paths
+/// use this lowercase spelling; the H1/H2 response builder keeps the
+/// historical `X-Gateway-Error` casing. HTTP header names are
+/// case-insensitive either way.
+pub(crate) const X_GATEWAY_ERROR_HEADER: &str = "x-gateway-error";
+pub(crate) const X_GATEWAY_ERROR_CONNECTION_FAILURE: &str = "connection_failure";
+pub(crate) const X_GATEWAY_ERROR_BACKEND_TIMEOUT: &str = "backend_timeout";
+pub(crate) const X_GATEWAY_ERROR_BACKEND_ERROR: &str = "backend_error";
+/// Distinct from `backend_error`: the gateway never contacted a backend on
+/// this request, so reusing that bucket would make open-breaker 503s
+/// indistinguishable from a backend that actually returned 5xx.
+pub(crate) const X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN: &str = "circuit_breaker_open";
+
+/// RFC 9110 `Allow` for protocol-level 405s (TRACE and non-WebSocket CONNECT)
+/// that run before a proxy is matched, so no per-route `allowed_methods`
+/// exists. TRACE and CONNECT are omitted because this same filter rejected
+/// them. Static so the reject path does not allocate the value.
+pub(crate) const PROTOCOL_LEVEL_405_ALLOW: &str = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
+
+/// Client-visible `X-Gateway-Error` value for an HTTP-family backend
+/// dispatch or status failure. `None` for non-5xx. Circuit-breaker-open
+/// 503s must not use this helper — they are not a backend response.
+#[inline]
+pub(crate) fn x_gateway_error_for_backend_failure(
+    connection_error: bool,
+    status: u16,
+) -> Option<&'static str> {
+    if connection_error {
+        Some(X_GATEWAY_ERROR_CONNECTION_FAILURE)
+    } else if status == 504 {
+        Some(X_GATEWAY_ERROR_BACKEND_TIMEOUT)
+    } else if status >= 500 {
+        Some(X_GATEWAY_ERROR_BACKEND_ERROR)
+    } else {
+        None
+    }
+}
+
+/// Insert or replace the gateway-owned `X-Gateway-Error` value after generic
+/// response policy has run. Policy may decorate a 5xx, but it must not
+/// remove, replace, or duplicate this observability token.
+pub(crate) fn restore_authoritative_gateway_error_header(
+    response_headers: &mut HashMap<String, String>,
+    value: &'static str,
+) {
+    response_headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER));
+    response_headers.insert(X_GATEWAY_ERROR_HEADER.to_string(), value.to_string());
+}
+
+/// Apply the gateway-owned backend-failure token at the final post-hook /
+/// pre-wire boundary. Classification is the original typed dispatch signal
+/// (`connection_error`); `status` is the client-visible status after every
+/// later hook. Every case variant is stripped first so a hook cannot erase,
+/// replace, or duplicate the token. When the pair does not warrant a token
+/// (plugin-replaced non-5xx with no connection failure), a leftover spoofed
+/// value is removed rather than forwarded.
+///
+/// Returns whether the authoritative token was written.
+pub(crate) fn apply_authoritative_backend_gateway_error_header(
+    response_headers: &mut HashMap<String, String>,
+    connection_error: bool,
+    status: u16,
+) -> bool {
+    response_headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER));
+    if let Some(value) = x_gateway_error_for_backend_failure(connection_error, status) {
+        response_headers.insert(X_GATEWAY_ERROR_HEADER.to_string(), value.to_string());
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn insert_x_gateway_error_for_backend_failure(
+    response_headers: &mut HashMap<String, String>,
+    connection_error: bool,
+    status: u16,
+) {
+    let _ = apply_authoritative_backend_gateway_error_header(
+        response_headers,
+        connection_error,
+        status,
+    );
+}
+
+/// Snapshot of the open-breaker 503 header map. Callers clone it into the
+/// reject builder so the token is not assembled per request.
+pub(crate) fn circuit_breaker_open_reject_headers() -> HashMap<String, String> {
+    CIRCUIT_BREAKER_OPEN_HEADERS.clone()
+}
+
+/// Whether `method` is in the route's configured `allowed_methods`.
+/// Surrounding whitespace is ignored so a validated `" GET "` admits GET,
+/// matching [`allow_header_from_allowed_methods`] and config normalization.
+#[inline]
+pub(crate) fn request_method_is_allowed(allowed: &[String], method: &str) -> bool {
+    allowed
+        .iter()
+        .any(|configured| configured.trim().eq_ignore_ascii_case(method))
+}
+
+/// Comma-separated RFC 9110 `Allow` value for a route's configured methods.
+/// Uppercased in config order so the 405 is stable without sorting on the
+/// request path.
+pub(crate) fn allow_header_from_allowed_methods(methods: &[String]) -> String {
+    let mut out = String::new();
+    for (i, method) in methods.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&method.trim().to_ascii_uppercase());
+    }
+    out
+}
+
 fn finalize_synthesized_reject_headers(
     reject: &mut NormalizedRejectResponse,
     request_protocol: ProxyProtocol,
@@ -28533,8 +28688,7 @@ async fn handle_proxy_request_inner(
     if method == "TRACE" {
         warn!("Rejected TRACE request");
         record_request(&state, 405);
-        return Ok(build_response(
-            StatusCode::METHOD_NOT_ALLOWED,
+        return Ok(build_method_not_allowed_response(
             r#"{"error":"TRACE method is not allowed"}"#,
         ));
     }
@@ -28551,8 +28705,7 @@ async fn handle_proxy_request_inner(
     if method == "CONNECT" && !is_h2_websocket_connect(&req) && !is_hbone_connect_any {
         warn!("Rejected non-WebSocket CONNECT request");
         record_request(&state, 405);
-        return Ok(build_response(
-            StatusCode::METHOD_NOT_ALLOWED,
+        return Ok(build_method_not_allowed_response(
             r#"{"error":"CONNECT method is not allowed"}"#,
         ));
     }
@@ -29218,10 +29371,10 @@ async fn handle_proxy_request_inner(
     // still runs from the protocol-filtered plugin-cache view so sinks can
     // attribute the matched-proxy 405.
     if let Some(ref allowed) = proxy.allowed_methods
-        && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
+        && !request_method_is_allowed(allowed, &method)
     {
         state.request_count.fetch_add(1, Ordering::Relaxed);
-        let allow_header = allowed.join(", ");
+        let allow_header = allow_header_from_allowed_methods(allowed);
         let mut reject_headers = HashMap::new();
         reject_headers.insert("allow".to_string(), allow_header.clone());
         let mut reject = normalize_reject_response(
@@ -29603,7 +29756,20 @@ async fn handle_proxy_request_inner(
                     }
                 }
             }
-            already_buffered => already_buffered,
+            ClientRequestBody::Buffered(buffered) => {
+                store_request_body_metadata(
+                    &mut ctx,
+                    &buffered.body,
+                    authenticate_body_requirements.needs_text,
+                    authenticate_body_requirements.needs_bytes,
+                    authenticate_body_requirements.needs_digests,
+                );
+                ctx.bytes_sent_observed.fetch_max(
+                    buffered.body.len() as u64,
+                    std::sync::atomic::Ordering::Release,
+                );
+                ClientRequestBody::Buffered(buffered)
+            }
         };
     }
 
@@ -31123,17 +31289,21 @@ async fn handle_proxy_request_inner(
         match backend_dispatch::check_circuit_breaker(&proxy, &state, upstream_target.as_deref()) {
             Ok(result) => result,
             Err(()) => {
-                let reject = finalize_reject_response_with_after_proxy_hooks(
+                let mut reject = finalize_reject_response_with_after_proxy_hooks(
                     &plugins,
                     &mut ctx,
                     StatusCode::SERVICE_UNAVAILABLE,
                     Bytes::from_static(
                         br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
                     ),
-                    HashMap::new(),
+                    circuit_breaker_open_reject_headers(),
                     is_grpc_request,
                 )
                 .await;
+                restore_authoritative_gateway_error_header(
+                    &mut reject.headers,
+                    X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN,
+                );
                 apply_grpc_reject_metadata(&mut ctx, &reject);
                 // Use `original_request_path` so the log records the path the
                 // client actually requested, not the VirtualService-rewritten
@@ -31562,6 +31732,8 @@ async fn handle_proxy_request_inner(
         apply_effective_backend_scheme_headers(
             &mut websocket_proxy_headers,
             &ctx.client_ip,
+            &socket_ip,
+            &state.trusted_proxies,
             ctx.request_is_secure,
             state.add_forwarded_header,
         );
@@ -31650,6 +31822,8 @@ async fn handle_proxy_request_inner(
             apply_effective_backend_scheme_headers(
                 grpc_proxy_headers,
                 &ctx.client_ip,
+                &socket_ip,
+                &state.trusted_proxies,
                 ctx.request_is_secure,
                 state.add_forwarded_header,
             );
@@ -35409,6 +35583,12 @@ async fn handle_proxy_request_inner(
     // `StreamingH2` relay so native gRPC without a client deadline does not
     // fall back to the outer proxy default.
     let mut streaming_h2_read_timeout_ms;
+    // Unlimited direct-H2 passthrough publishes request bytes only at upload
+    // terminal states. Capture the latch so transaction summaries can wait
+    // without re-introducing a per-DATA-frame atomic on the hot path.
+    // Assigned on every continuing dispatch path before first read; leave
+    // uninitialized so an unused starter `None` cannot trip `-D warnings`.
+    let passthrough_request_bytes_latch: Option<Arc<body::DirectH2BytesLatch>>;
     // Set when the retry loop breaks on a gateway-synthesized dispatch refusal
     // for a ROTATED candidate that was never dialed (mesh-transport / secured
     // transport screens). `final_upstream_target` deliberately points at that
@@ -35491,10 +35671,12 @@ async fn handle_proxy_request_inner(
                 backend_admission_permits: permits,
                 request_body_exceeded,
                 streaming_h2_read_timeout_ms: mesh_read_timeout_ms,
+                passthrough_request_bytes,
             } => {
                 backend_admission_permits = permits;
                 mesh_request_body_exceeded = request_body_exceeded;
                 streaming_h2_read_timeout_ms = mesh_read_timeout_ms;
+                passthrough_request_bytes_latch = passthrough_request_bytes;
                 (*response, retained_body)
             }
             BackendDispatchResult::AdmissionRejected(rejection) => {
@@ -36192,11 +36374,13 @@ async fn handle_proxy_request_inner(
                 backend_admission_permits: permits,
                 request_body_exceeded,
                 streaming_h2_read_timeout_ms: effective_streaming_h2_read_timeout_ms,
+                passthrough_request_bytes,
                 ..
             } => {
                 backend_admission_permits = permits;
                 mesh_request_body_exceeded = request_body_exceeded;
                 streaming_h2_read_timeout_ms = effective_streaming_h2_read_timeout_ms;
+                passthrough_request_bytes_latch = passthrough_request_bytes;
                 *response
             }
             BackendDispatchResult::AdmissionRejected(rejection) => {
@@ -37212,11 +37396,15 @@ async fn handle_proxy_request_inner(
         !plugins.is_empty() || body_will_stream || backend_error_class.is_some();
     let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =
         if needs_transaction_summary {
-            // Request bytes: read the shared counter populated by the body
-            // handlers in `proxy_to_backend` / `proxy_to_backend_http2` /
-            // `proxy_to_backend_http3`. By this point the request has
-            // completed so the counter reflects the total (Acquire pairs with
-            // the Release stores in the body adapters).
+            // Request bytes: SizeLimitedIncoming / CountingIncoming publish
+            // per DATA frame, so this load is the total once those adapters
+            // have finished. Unlimited direct-H2 passthrough publishes only
+            // at EOS / error / cancel / Drop, and hyper can resolve response
+            // headers while that upload is still in the detached pipe
+            // (`body_completion_rx` is None). Do not treat this header-flush
+            // snapshot as final on that arm — streaming reloads after the
+            // latch in DeferredTransactionLogger, and buffered logs wait
+            // (without blocking TTFB when the latch is still open).
             let bytes_sent = ctx
                 .bytes_sent_observed
                 .load(std::sync::atomic::Ordering::Acquire);
@@ -37239,7 +37427,7 @@ async fn handle_proxy_request_inner(
             let grpc_response_messages = ctx
                 .grpc_response_messages_observed
                 .load(std::sync::atomic::Ordering::Acquire);
-            let summary = TransactionSummary {
+            let mut summary = TransactionSummary {
                 namespace: proxy.namespace.clone(),
                 timestamp_received: ctx.timestamp_received.to_rfc3339(),
                 client_ip: ctx.client_ip.clone(),
@@ -37282,7 +37470,8 @@ async fn handle_proxy_request_inner(
                         Arc::clone(&plugins),
                         ctx.clone(),
                         start_time,
-                    ),
+                    )
+                    .with_passthrough_request_bytes_latch(passthrough_request_bytes_latch.clone()),
                 )
             } else {
                 // ── Buffered commitment / audit boundary (#3815) ─────────────
@@ -37311,14 +37500,35 @@ async fn handle_proxy_request_inner(
                 //
                 // A request with NO authorization plan cannot expire here, so it
                 // keeps the historical sequential awaited contract byte for
-                // byte.
-                if has_authorization_plan {
-                    crate::plugins::spawn_bounded_terminal_summary_log(&plugins, summary, &ctx);
+                // byte — unless unlimited direct-H2 passthrough bytes are still
+                // unpublished. Waiting here would pin TTFB on a still-running
+                // upload after an early backend response; spawn the wait+log
+                // instead so chargeback sees forwarded bytes without restoring
+                // the header completion gate.
+                let pending_passthrough_latch = passthrough_request_bytes_latch
+                    .as_ref()
+                    .filter(|latch| !latch.is_done())
+                    .cloned();
+                if let Some(latch) = pending_passthrough_latch {
+                    spawn_buffered_summary_after_passthrough_bytes(&plugins, summary, &ctx, latch);
                 } else {
-                    crate::plugins::log_with_mirror_before_buffered_response(
-                        &plugins, summary, &ctx,
-                    )
-                    .await;
+                    if passthrough_request_bytes_latch
+                        .as_ref()
+                        .is_some_and(|latch| latch.is_done())
+                    {
+                        summary.bytes_sent = ctx
+                            .bytes_sent_observed
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            .max(summary.bytes_sent);
+                    }
+                    if has_authorization_plan {
+                        crate::plugins::spawn_bounded_terminal_summary_log(&plugins, summary, &ctx);
+                    } else {
+                        crate::plugins::log_with_mirror_before_buffered_response(
+                            &plugins, summary, &ctx,
+                        )
+                        .await;
+                    }
                 }
                 None
             }
@@ -37428,19 +37638,22 @@ async fn handle_proxy_request_inner(
             | ResponseBody::StreamingH3(_) => headers_mod::ClientResponseFraming::Streaming,
         }
     };
+    // Gateway-owned: strip every hook/backend case variant before sanitizing
+    // so a late phase cannot spoof or duplicate the token beside the builder
+    // write. Classification is the original dispatch signal; status is final.
+    let gateway_error_token =
+        x_gateway_error_for_backend_failure(backend_resp.connection_error, response_status);
+    response_headers.retain(|name, _| !name.eq_ignore_ascii_case(X_GATEWAY_ERROR_HEADER));
     resp_builder =
         headers_mod::apply_sanitized_response_headers(resp_builder, &mut response_headers, framing);
 
     // Add gateway error categorization headers so clients and ops teams
     // can distinguish different failure modes:
     //   X-Gateway-Error: connection_failure | backend_timeout | backend_error
+    //     | circuit_breaker_open (open-breaker 503s use the reject path)
     //   X-Gateway-Upstream-Status: degraded (when routing via all-unhealthy fallback)
-    if backend_resp.connection_error {
-        resp_builder = resp_builder.header("X-Gateway-Error", "connection_failure");
-    } else if response_status == 504 {
-        resp_builder = resp_builder.header("X-Gateway-Error", "backend_timeout");
-    } else if response_status >= 500 {
-        resp_builder = resp_builder.header("X-Gateway-Error", "backend_error");
+    if let Some(value) = gateway_error_token {
+        resp_builder = resp_builder.header("X-Gateway-Error", value);
     }
 
     if upstream_is_fallback {
@@ -39116,6 +39329,7 @@ pub(crate) async fn proxy_to_backend_retry(
     // `parse_connection_listed_from_str_map` for the spec rationale and
     // smuggling defence.
     let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
+    let peer_trusted = forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
     let remaining_grpc_timeout_header = request_ctx
         .grpc_deadline_at()
         .filter(|_| {
@@ -39137,6 +39351,9 @@ pub(crate) async fn proxy_to_backend_retry(
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
             n if headers_mod::is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => {
+                continue;
+            }
+            n if headers_mod::is_untrusted_real_ip_header(n, peer_trusted) => {
                 continue;
             }
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
@@ -40300,6 +40517,9 @@ enum BackendDispatchResult {
         backend_admission_permits: Option<BackendAdmissionPermitSet>,
         request_body_exceeded: Option<Arc<std::sync::atomic::AtomicBool>>,
         streaming_h2_read_timeout_ms: Option<u64>,
+        /// Join for unlimited direct-H2 passthrough byte publication. `None`
+        /// on every other dispatch (reqwest, limited H2, mesh, H3).
+        passthrough_request_bytes: Option<Arc<body::DirectH2BytesLatch>>,
     },
     AdmissionRejected(backend_dispatch::BackendAdmissionRejection),
 }
@@ -40356,6 +40576,34 @@ impl PreacquiredBackendAdmission {
     }
 }
 
+fn spawn_buffered_summary_after_passthrough_bytes(
+    plugins: &[Arc<dyn crate::plugins::Plugin>],
+    mut summary: crate::plugins::TransactionSummary,
+    ctx: &crate::plugins::RequestContext,
+    latch: Arc<body::DirectH2BytesLatch>,
+) {
+    let plugins = plugins.to_vec();
+    let observed = Arc::clone(&ctx.bytes_sent_observed);
+    let ctx = ctx.clone();
+    let _ = crate::observability_delivery::spawn_deadline_cleanup(async move {
+        latch.wait().await;
+        summary.bytes_sent = observed
+            .load(std::sync::atomic::Ordering::Acquire)
+            .max(summary.bytes_sent);
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::plugins::log_with_mirror(&plugins, &summary, &ctx),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                "Detached transaction logging exceeded the post-response cleanup timeout"
+            );
+        }
+    });
+}
+
 fn backend_dispatch_response(
     response: retry::BackendResponse,
     retained_body: Option<Bytes>,
@@ -40367,6 +40615,7 @@ fn backend_dispatch_response(
         backend_admission_permits,
         request_body_exceeded: None,
         streaming_h2_read_timeout_ms: None,
+        passthrough_request_bytes: None,
     }
 }
 
@@ -41491,6 +41740,7 @@ async fn proxy_to_backend(
             backend_admission_permits,
             request_body_exceeded,
             streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
+            passthrough_request_bytes: None,
         };
     }
 
@@ -41564,6 +41814,7 @@ async fn proxy_to_backend(
             backend_admission_permits,
             request_body_exceeded,
             streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
+            passthrough_request_bytes: None,
         };
     }
 
@@ -41696,6 +41947,7 @@ async fn proxy_to_backend(
             backend_admission_permits,
             request_body_exceeded,
             streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
+            passthrough_request_bytes: None,
         };
     }
 
@@ -42055,6 +42307,7 @@ async fn proxy_to_backend(
                         );
                     }
                 };
+                let mut passthrough_request_bytes = None;
                 let (backend_resp, request_body_exceeded) = proxy_to_backend_http2(
                     state,
                     direct_h2_proxy,
@@ -42074,6 +42327,7 @@ async fn proxy_to_backend(
                     ctx_bytes_sent_observed,
                     route_request_body_limit,
                     route_response_body_limit,
+                    &mut passthrough_request_bytes,
                 )
                 .await;
                 return BackendDispatchResult::Response {
@@ -42082,6 +42336,7 @@ async fn proxy_to_backend(
                     backend_admission_permits: h2_admission_permits.take(),
                     request_body_exceeded,
                     streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
+                    passthrough_request_bytes,
                 };
             }
             // Fall through to the reqwest path: `h2_admission_permits` drops here,
@@ -42300,6 +42555,7 @@ async fn proxy_to_backend(
     // (canonical predicate in `proxy::headers`). Also strip every header
     // NAMED in the request's `Connection` field.
     let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
+    let peer_trusted = forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
     let remaining_grpc_timeout_header = request_ctx
         .grpc_deadline_at()
         .filter(|_| {
@@ -42321,6 +42577,9 @@ async fn proxy_to_backend(
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
             n if headers_mod::is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => {
+                continue;
+            }
+            n if headers_mod::is_untrusted_real_ip_header(n, peer_trusted) => {
                 continue;
             }
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
@@ -44444,6 +44703,19 @@ fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
         })
 }
 
+fn build_method_not_allowed_response(body: &str) -> Response<ProxyBody> {
+    Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .header("Content-Type", "application/json")
+        .header("Allow", PROTOCOL_LEVEL_405_ALLOW)
+        .body(ProxyBody::from_string(body))
+        .unwrap_or_else(|_| {
+            Response::new(ProxyBody::from_string(
+                r#"{"error":"Internal server error"}"#,
+            ))
+        })
+}
+
 fn build_request_body_timeout_response(
     is_grpc_request: bool,
     grpc_web_response_content_type: Option<&str>,
@@ -46468,7 +46740,11 @@ async fn proxy_to_backend_hbone_after_ready(
     let headers = owned_hbone_headers.as_ref().unwrap_or(headers);
     headers_mod::merge_proxy_headers_preserving_repeated(&mut parts.headers, headers);
     headers_mod::strip_backend_request_headers(&mut parts.headers);
-    strip_proxy_owned_forwarding_headers(&mut parts.headers, state.add_forwarded_header);
+    strip_proxy_owned_forwarding_headers(
+        &mut parts.headers,
+        state.add_forwarded_header,
+        forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies),
+    );
     if !proxy.preserve_host_header {
         parts.headers.remove(hyper::header::HOST);
     }
@@ -47166,7 +47442,11 @@ async fn proxy_to_backend_unix(
     };
     headers_mod::merge_proxy_headers_preserving_repeated(&mut parts.headers, headers);
     headers_mod::strip_backend_request_headers(&mut parts.headers);
-    strip_proxy_owned_forwarding_headers(&mut parts.headers, state.add_forwarded_header);
+    strip_proxy_owned_forwarding_headers(
+        &mut parts.headers,
+        state.add_forwarded_header,
+        forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies),
+    );
     if !proxy.preserve_host_header {
         parts.headers.remove(hyper::header::HOST);
     }
@@ -48655,7 +48935,11 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
     } else {
         headers_mod::strip_backend_request_headers(&mut parts.headers);
     }
-    strip_proxy_owned_forwarding_headers(&mut parts.headers, state.add_forwarded_header);
+    strip_proxy_owned_forwarding_headers(
+        &mut parts.headers,
+        state.add_forwarded_header,
+        forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies),
+    );
     // H2 carries the routing authority in the URI set above. A materialized
     // Host header would duplicate it and can trigger the peer's consistency
     // guard, so remove every raw/plugin value after it has served as the source
@@ -49284,9 +49568,10 @@ async fn proxy_to_backend_http2(
     xff_append_ip: &str,
     request_is_secure: bool,
     resolved_ip: Option<String>,
-    // Shared counter for request body bytes. SizeLimitedIncoming increments
-    // this as frames are polled so summary builders observe streamed uploads
-    // (not just Content-Length) once the response completes.
+    // Shared counter for request body bytes. The Limited arm increments it
+    // per DATA frame via SizeLimitedIncoming; the Passthrough arm tallies
+    // into a plain counter and publishes once so summary builders still
+    // observe streamed uploads (not just Content-Length).
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
     // Strictest active route-scoped request-body ceiling, or `None` when no
     // matched plugin enforces one.
@@ -49303,6 +49588,10 @@ async fn proxy_to_backend_http2(
     // rather than at the generally larger global allowance
     // (`GHSA-xrfj-852f-645j`).
     route_response_body_limit: Option<usize>,
+    // Out-parameter: the passthrough publication latch. Set only on the
+    // unlimited arm so transaction summaries can wait for forwarded bytes
+    // after an early backend response without gating those headers here.
+    passthrough_request_bytes: &mut Option<Arc<body::DirectH2BytesLatch>>,
 ) -> (
     retry::BackendResponse,
     Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -49384,51 +49673,88 @@ async fn proxy_to_backend_http2(
     // bidirectional RPC streaming is unaffected.
     let needs_upload_completion_gate =
         effective_max_request_body_size_bytes > 0 || upload_auth_deadline.is_some();
-    let (body, body_completion_rx, mut upload_pump) = if needs_upload_completion_gate {
-        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-        let mut body = body::SizeLimitedIncoming::new_with_counter_and_completion(
-            body,
-            max_request_body_size,
-            Arc::clone(&body_size_exceeded),
-            Arc::clone(ctx_bytes_sent_observed),
-            completion_tx,
-            cancel_rx,
-        );
-        if let Some(messages) = observe_grpc.clone() {
-            body = body.with_grpc_message_counter(messages);
-        }
-        // Full upload lifecycle (#3815). Direct-H2 is the one H1/H2 dispatcher
-        // whose upload is scoped to the handler — the completion gate below
-        // already waits for the upload's terminal state before any early
-        // backend response is exposed — so its join point is ARMED for
-        // cancel-on-drop and explicitly `cancel_and_join()`ed at every bounded
-        // exit. Once that join returns, the pump task has published its
-        // outcome, which it does after dropping the inbound client body: no
-        // gateway-owned upload survives this function.
-        let (body, upload_pump) =
-            install_streaming_upload_authorization(body, upload_auth_deadline.as_ref());
-        (
-            body,
-            Some(completion_rx),
-            upload_pump.map(crate::proxy::upload_pump::UploadPumpJoin::cancel_on_drop),
-        )
-    } else {
-        let mut body = body::SizeLimitedIncoming::new_with_counter(
-            body,
-            max_request_body_size,
-            Arc::clone(&body_size_exceeded),
-            Arc::clone(ctx_bytes_sent_observed),
-        )
-        .with_cancel(cancel_rx);
-        if let Some(messages) = observe_grpc {
-            body = body.with_grpc_message_counter(messages);
-        }
-        // Unreachable with an authorization plan present
-        // (`needs_upload_completion_gate` is true whenever
-        // `upload_auth_deadline.is_some()`), so this arm is the unauthenticated
-        // hot path and installs neither timer nor pump.
-        (body, None, None)
-    };
+    // Issue #3942: the protocol bench forces both body limits to 0 on an
+    // unauthenticated POST /echo. Wrapping that path in SizeLimitedIncoming
+    // (mapping 0 → usize::MAX) adds a per-DATA-frame atomic + limit compare
+    // that scales with payload size. Keep the limiter when a real cap, an
+    // upload-completion gate, or gRPC message counting is required; otherwise
+    // poll Incoming plus the early-return cancel channel.
+    let use_limit_adapter = body::direct_h2_uses_limit_adapter(
+        effective_max_request_body_size_bytes,
+        needs_upload_completion_gate,
+        observe_grpc.is_some(),
+    );
+    let (body, body_completion_rx, mut upload_pump) =
+        if use_limit_adapter && needs_upload_completion_gate {
+            let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+            let mut body = body::SizeLimitedIncoming::new_with_counter_and_completion(
+                body,
+                max_request_body_size,
+                Arc::clone(&body_size_exceeded),
+                Arc::clone(ctx_bytes_sent_observed),
+                completion_tx,
+                cancel_rx,
+            );
+            if let Some(messages) = observe_grpc.clone() {
+                body = body.with_grpc_message_counter(messages);
+            }
+            // Full upload lifecycle (#3815). Direct-H2 is the one H1/H2 dispatcher
+            // whose upload is scoped to the handler — the completion gate below
+            // already waits for the upload's terminal state before any early
+            // backend response is exposed — so its join point is ARMED for
+            // cancel-on-drop and explicitly `cancel_and_join()`ed at every bounded
+            // exit. Once that join returns, the pump task has published its
+            // outcome, which it does after dropping the inbound client body: no
+            // gateway-owned upload survives this function.
+            let (body, upload_pump) =
+                install_streaming_upload_authorization(body, upload_auth_deadline.as_ref());
+            (
+                body::DirectH2RequestBody::Limited(body),
+                Some(completion_rx),
+                upload_pump.map(crate::proxy::upload_pump::UploadPumpJoin::cancel_on_drop),
+            )
+        } else if let (true, Some(messages)) = (use_limit_adapter, observe_grpc) {
+            // gRPC message observation with no size cap and no auth deadline
+            // still needs the limiter's length-prefixed scanner.
+            let body = body::SizeLimitedIncoming::new_with_counter(
+                body,
+                max_request_body_size,
+                Arc::clone(&body_size_exceeded),
+                Arc::clone(ctx_bytes_sent_observed),
+            )
+            .with_cancel(cancel_rx)
+            .with_grpc_message_counter(messages);
+            (body::DirectH2RequestBody::Limited(body), None, None)
+        } else {
+            // Unlimited, unauthenticated, no gRPC observation: forward
+            // `Incoming` directly. Cancel stays armed so an early return after
+            // send_request still resets hyper's detached upload pipe. The
+            // passthrough arm tallies forwarded bytes in a plain counter and
+            // publishes `bytes_sent_observed` once, at end-of-stream, on a
+            // body error, or on drop — skipping the per-frame atomic without
+            // giving up the accounting `TransactionSummary.bytes_sent` and
+            // `api_chargeback` read. This arm is also the panic-free fallback
+            // if `direct_h2_uses_limit_adapter` ever drifts true without a
+            // gate or gRPC observer.
+            //
+            // Do NOT wait on that publication before exposing response
+            // headers: HTTP/2 is full duplex, and `body_completion_rx` is
+            // deliberately None here. Summaries wait on `latch` instead.
+            let latch = Arc::new(body::DirectH2BytesLatch::new());
+            *passthrough_request_bytes = Some(Arc::clone(&latch));
+            (
+                body::DirectH2RequestBody::Passthrough {
+                    inner: body,
+                    cancel: Some(cancel_rx),
+                    seen: 0,
+                    observed: Arc::clone(ctx_bytes_sent_observed),
+                    published: false,
+                    latch,
+                },
+                None,
+                None,
+            )
+        };
 
     // Set the URI
     parts.uri = uri;
@@ -49458,6 +49784,7 @@ async fn proxy_to_backend_http2(
     parts.headers.clear();
     let effective_host = &proxy.backend_host;
     let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
+    let peer_trusted = forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -49493,6 +49820,9 @@ async fn proxy_to_backend_http2(
             // fail-closed ownership predicate as reqwest/H3 so a capability
             // flip cannot change which Forwarded element backends observe.
             n if headers_mod::is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => {
+                continue;
+            }
+            n if headers_mod::is_untrusted_real_ip_header(n, peer_trusted) => {
                 continue;
             }
             // RFC 9110 §7.6.1: also strip every header NAMED in the
@@ -50085,6 +50415,7 @@ fn build_http3_backend_headers(
 ) -> Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> {
     let mut http3_headers = Vec::with_capacity(headers.len() + 5);
     let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
+    let peer_trusted = forwarding_peer_is_trusted(ctx.xff_append_ip, &state.trusted_proxies);
     for (name, value) in headers {
         match name.as_str() {
             n if headers_mod::is_backend_request_strip_header(n) => continue,
@@ -50100,6 +50431,9 @@ fn build_http3_backend_headers(
             // backend consume the spoofed value instead of Ferrum's canonical
             // value. Same fail-closed ownership as reqwest / direct-H2.
             n if headers_mod::is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => {
+                continue;
+            }
+            n if headers_mod::is_untrusted_real_ip_header(n, peer_trusted) => {
                 continue;
             }
             "host" => {
@@ -56055,6 +56389,7 @@ mod tests {
         let env_config = crate::config::env_config::EnvConfig {
             add_via_header: true,
             add_forwarded_header: true,
+            trusted_proxies: "127.0.0.1".to_string(),
             ..Default::default()
         };
         let state = make_test_proxy_state_with_env(GatewayConfig::default(), env_config);
@@ -56104,6 +56439,39 @@ mod tests {
         assert!(
             header_value(&out, "x-strip").is_none(),
             "headers named by Connection must not be forwarded to H3 backends"
+        );
+
+        // Same builder with the default empty trust list: the spoofed inbound
+        // XFF and X-Real-IP must not reach the H3 backend.
+        let untrusted_state = make_test_proxy_state_with_env(
+            GatewayConfig::default(),
+            crate::config::env_config::EnvConfig::default(),
+        );
+        let untrusted_headers = HashMap::from([
+            ("host".to_string(), "edge.example".to_string()),
+            ("x-forwarded-for".to_string(), "198.51.100.7".to_string()),
+            ("x-real-ip".to_string(), "8.8.8.8".to_string()),
+        ]);
+        let untrusted_out = build_http3_backend_headers(
+            &untrusted_state,
+            &proxy,
+            &untrusted_headers,
+            Http3BackendHeaderContext {
+                client_ip: "127.0.0.1",
+                xff_append_ip: "127.0.0.1",
+                effective_host: "backend.internal",
+                request_is_secure: false,
+                inbound_version: hyper::Version::HTTP_11,
+                content_length: None,
+            },
+        );
+        assert_eq!(
+            header_value(&untrusted_out, "x-forwarded-for"),
+            Some("127.0.0.1")
+        );
+        assert!(
+            header_value(&untrusted_out, "x-real-ip").is_none(),
+            "untrusted X-Real-IP must not reach the H1→H3 backend"
         );
     }
 
@@ -58928,7 +59296,7 @@ mod tests {
     /// | no proxy in front                  | none        | equal          | peer               |
     /// | trusted LB sending XFF             | chain       | differ         | chain, peer        |
     /// | trusted LB sending real-IP header  | none        | differ         | client, peer       |
-    /// | untrusted peer                     | none        | equal          | peer               |
+    /// | untrusted peer (incl. empty trust) | dropped     | equal          | peer               |
     #[test]
     fn build_xff_value_appends_peer_and_seeds_resolved_client() {
         let no_policy =
@@ -58986,11 +59354,12 @@ mod tests {
             "192.0.2.6"
         );
 
-        // No trust policy configured: transparent nginx-style passthrough —
-        // the inbound chain is preserved and the peer appended.
+        // Empty trust list (the default): every peer is untrusted, so a
+        // client-supplied chain is dropped and outbound XFF is the socket
+        // peer only — matching docs/client_ip_resolution.md.
         assert_eq!(
             build_xff_value(Some("198.51.100.7"), "192.0.2.6", "192.0.2.6", &no_policy),
-            "198.51.100.7, 192.0.2.6"
+            "192.0.2.6"
         );
 
         // Trusted LB resolving via FERRUM_REAL_IP_HEADER while passing an

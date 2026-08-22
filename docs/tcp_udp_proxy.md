@@ -34,7 +34,6 @@ proxies:
     backend_scheme: tcp
     backend_host: "db.internal"
     backend_port: 5432
-    enabled: true
 
   - id: "secure-redis"
     name: "Redis TLS Proxy"
@@ -44,7 +43,6 @@ proxies:
     backend_port: 6379
     frontend_tls: true        # Terminate TLS on incoming connections
     tcp_idle_timeout_seconds: 600  # 10 min (override global default for long-lived DB connections)
-    enabled: true
 
   - id: "dns-proxy"
     name: "DNS Proxy"
@@ -53,7 +51,6 @@ proxies:
     backend_host: "dns.internal"
     backend_port: 53
     udp_idle_timeout_seconds: 30
-    enabled: true
 
   - id: "secure-iot"
     name: "IoT DTLS Proxy"
@@ -63,8 +60,11 @@ proxies:
     backend_port: 5684
     backend_tls_verify_server_cert: false   # Skip cert verification (testing)
     udp_idle_timeout_seconds: 120
-    enabled: true
 ```
+
+Stream proxies have no `enabled` field (`Proxy` rejects unknown fields at load).
+To stop serving a stream proxy, remove it from file-mode YAML (or delete it
+through the Admin API in database mode).
 
 ### Key Fields
 

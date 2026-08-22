@@ -415,6 +415,15 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" \
 curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:9000/proxies/{proxy_id}
 ```
 
+`DELETE /proxies/{id}` of a **hand-managed** proxy (no owning API-spec row) also
+orphan-cleans that proxy's current `upstream_id` when the upstream is itself
+hand-owned (`api_spec_id` is null) and no remaining proxy or
+`mesh_route_dispatch` plugin still references it. A shared hand-owned upstream
+survives. Spec-owned upstreams are removed by the spec cascade, not this
+generic orphan path; a spec-owned proxy that drifted onto a hand-owned
+upstream leaves that upstream in place. See
+[Cascade and ownership summary](#cascade-and-ownership-summary).
+
 ### Stream Proxy (TCP/UDP)
 
 Stream proxies use `listen_port` instead of `listen_path`:
@@ -478,6 +487,15 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
 curl -X DELETE -H "Authorization: Bearer $TOKEN" \
   http://localhost:9000/consumers/{consumer_id}/credentials/keyauth
 ```
+
+`DELETE /consumers/{id}` returns **409 Conflict** with
+`{"error":"Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"}`
+when any `access_control` plugin config in the same namespace still lists that
+consumer's **username** in `allowed_consumers`. The consumer and plugin configs
+are left unchanged; Ferrum does not rewrite the operator's authorization
+policy. Remove or edit the username in those plugin configs, then retry. A
+consumer named only in `disallowed_consumers`, or not named in any
+`access_control` allow-list, can still be deleted.
 
 Credential rotation workflow:
 1. `POST .../credentials/keyauth` with the new key — both old and new are now active
@@ -603,6 +621,13 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" \
 # Delete an upstream
 curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams/{upstream_id}
 ```
+
+`DELETE /upstreams/{id}` returns **409 Conflict** with
+`{"error":"Upstream is referenced by one or more proxies and cannot be deleted"}`
+when any proxy still has that `upstream_id`. The upstream and referencing
+proxies are left unchanged. A `mesh_route_dispatch` plugin config that still
+names the upstream likewise returns 409 with
+`{"error":"Upstream is referenced by a mesh_route_dispatch plugin_config and cannot be deleted"}`.
 
 Supported algorithms: `round_robin`, `weighted_round_robin`, `least_connections`, `least_latency`, `consistent_hashing`, `random`, `passthrough`.
 
@@ -1272,7 +1297,7 @@ Deletes the spec and cascades:
 | `POST /api-specs` | Created; tagged with `api_spec_id` | — |
 | `PUT /api-specs/{id}` | Replaced (deleted + re-inserted) | Survive unchanged |
 | `DELETE /api-specs/{id}` | Proxy + plugins deleted; spec-owned upstream deleted | Non-spec upstreams survive |
-| `DELETE /proxies/{id}` | Proxy, spec row, scoped plugins, and generated upstreams deleted atomically on SQL/replica-set MongoDB; standalone MongoDB refuses before mutation | — |
+| `DELETE /proxies/{id}` | Proxy, spec row, scoped plugins, and generated (spec-owned) upstreams deleted atomically on SQL/replica-set MongoDB; standalone MongoDB refuses before mutation | Last-referenced **hand-owned** upstream (`api_spec_id` null) is orphan-cleaned when the deleted proxy is itself hand-managed and no remaining proxy or `mesh_route_dispatch` plugin still references it. A shared hand-owned upstream survives. A spec-owned proxy that drifted onto a hand-owned upstream leaves that upstream in place. |
 
 ### Mode behavior
 
@@ -1397,7 +1422,7 @@ The registry stores only protocol classifications and probe timestamps — never
 
 The node-waypoint topology accepts traffic on behalf of many pods on the same node. Each pod's identity is enrolled into a per-resolver index keyed by Kubernetes pod UID; the eBPF data path records the socket cookie and original destination per outbound connection. `GET /node-waypoint/identities` exposes the live snapshot of that index so operators can answer "which pods is this waypoint actually serving?" without scraping eBPF maps.
 
-The endpoint returns `404 Not Found` when the node-waypoint resolver is not installed on `ProxyState` — including all non-mesh modes and mesh modes other than `NodeWaypoint` topology. This avoids surfacing an empty stub list that could be mistaken for "no pods enrolled yet" on a sidecar/ambient/east-west/egress-gateway DP.
+The endpoint returns `503 Service Unavailable` with `"proxy_state unavailable in this mode"` when `proxy_state` is not wired (typical `cp` mode). It returns `404 Not Found` when the node-waypoint resolver is not installed on `ProxyState` — including mesh modes other than `NodeWaypoint` topology. This avoids surfacing an empty stub list that could be mistaken for "no pods enrolled yet" on a sidecar/ambient/east-west/egress-gateway DP.
 
 ### `GET /node-waypoint/identities`
 
@@ -1493,6 +1518,38 @@ Field semantics:
 
 `services` are returned in slice order. The payload exposes service names, namespaces, ports, and workload counts, but no request bodies, credentials, or backend TLS material.
 
+## Mesh Config Drift (mesh mode)
+
+`GET /mesh/config-drift` is JWT-authenticated and mesh-only. It returns a structured "where is this DP relative to the CP's last push?" view: accepted-slice fingerprint, per-kind resource counts, `source_protocol`/`source_cp_url`, optional xDS `convergence`, RTDS `runtime_overlay` (when `?include_overlay=true`), and the authoritative `revision` block. It sees only what this DP has accepted into the proxy runtime — cross-DP comparison is done by operator tooling that walks `/mesh/config-drift` on every member of a deployment and diffs the fingerprints.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/mesh/config-drift
+```
+
+Returns `404 Not Found` outside mesh mode (no `mesh_runtime_state`). Returns `200 OK` with zeroed `resources` and omitted/null `last_received_at` when mesh runtime is wired but no slice has been accepted yet — operators rely on the difference between **`404` = wrong mode** and **`200` + null `last_received_at` = mesh mode, not converged yet**. See [docs/mesh.md](mesh.md#authoritative-config-revisions-and-stale-fallback-rejection) for revision semantics and [openapi.yaml](../openapi.yaml) for the full response schema.
+
+## Mesh Config Revision Reset (mesh mode)
+
+`POST /mesh/config-revision/reset` clears this DP's accepted authoritative config revision so the next mesh slice from **any** config authority is eligible again. Requires JWT authentication and the **`operator`** role (`403 Forbidden` without it). Returns `404 Not Found` outside mesh mode. On success returns `200 OK`:
+
+```json
+{
+  "status": "reset",
+  "cleared_revision": {
+    "authority": "db",
+    "sequence": 4821
+  }
+}
+```
+
+`cleared_revision` is `null` when the gate held no accepted revision.
+
+Use this for the one case that is never auto-adopted: a sequence rewind **inside** one authority (for example a config store restored from backup without bumping `FERRUM_MESH_CONFIG_AUTHORITY_ID`). Foreign-authority adoption uses `FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS` instead; fleet-wide ordering-domain resets are preferably done by bumping `FERRUM_MESH_CONFIG_AUTHORITY_ID` or `FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID` so every DP adopts through the normal grace period without a per-DP call. The reset installs nothing itself — the next slice still has to pass subscription binding and update validation. Pair with `GET /mesh/config-drift` to confirm convergence after recovery.
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:9000/mesh/config-revision/reset
+```
+
 ## Mesh Slice Drift (CP mode)
 
 `GET /mesh/slice-drift` is JWT-authenticated and **control-plane only** (issue #3265). It reports per-authenticated mesh data plane desired / sent / acknowledged / rejected slice-version watermarks so operators can spot stuck, partitioned, or repeatedly rejecting DPs after a successful CP reconciliation.
@@ -1551,7 +1608,7 @@ The graph is node-local. In CP/DP or multi-replica mesh deployments, query each 
 
 ## Mesh Egress Scope (mesh mode)
 
-Two JWT-authenticated endpoints expose the live Sidecar egress scope for operability and pre-enforcement validation. They are mesh-only: requests return `404 Not Found` when no mesh slice has been installed (for example, during DP startup before the first CP push or when running on a non-mesh mode).
+Two JWT-authenticated endpoints expose the live Sidecar egress scope for operability and pre-enforcement validation. They are mesh-only. `GET /mesh/egress-scope` returns `503 Service Unavailable` with `"No proxy state available"` when `proxy_state` is unwired (typical `cp` mode). Both endpoints return `404 Not Found` outside mesh mode or before an egress-scope snapshot exists.
 
 ### `GET /mesh/egress-scope`
 

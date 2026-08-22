@@ -22,7 +22,7 @@ use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::pool::{GenericPool, PoolManager};
-use crate::proxy::body::SizeLimitedIncoming;
+use crate::proxy::body::DirectH2RequestBody;
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{
     BackendSvidGeneration, BackendTlsConfigBuilder, BackendTlsConfigCache, SvidGenerationMatcher,
@@ -51,12 +51,14 @@ thread_local! {
 
 /// Multiplexed hyper H2 sender for the plain-HTTPS direct pool.
 ///
-/// Body type is [`SizeLimitedIncoming`] so ordinary and SNI direct-H2
-/// dispatches can enforce `max_request_body_size_bytes` while streaming
-/// the client upload — mirroring the mesh-mTLS / HBONE pools.
-/// Callers wrap with `usize::MAX` when the operator limit is disabled (`0`);
-/// note the adapter itself treats `max_bytes = 0` as deny-all.
-pub type Http2Sender = http2::SendRequest<SizeLimitedIncoming>;
+/// Body type is [`DirectH2RequestBody`]: ordinary unlimited uploads
+/// (`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0`, no upload-completion gate, no
+/// gRPC message counter) poll `Incoming` directly; limited / gated /
+/// gRPC-observed uploads still wrap [`super::body::SizeLimitedIncoming`]
+/// so in-path 413 enforcement is unchanged. The limiter treats
+/// `max_bytes = 0` as deny-all — callers must never pass the operator
+/// spelling `0` into it (issue #3942).
+pub type Http2Sender = http2::SendRequest<DirectH2RequestBody>;
 
 /// Terminal protocol outcome for one DNS candidate.
 ///

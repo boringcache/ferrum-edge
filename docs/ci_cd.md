@@ -50,7 +50,8 @@ adding, removing, or materially changing a workflow.
 | `multicluster-poller-partition-live.yml` | Multicluster Poller Partition Live | PRs, `merge_group`, push to `main`, manual | Release-blocking two-CP/two-DP trust/discovery partition and bounded last-good-retention validation; `Multicluster Poller Partition Live` is directly required. |
 | `dependency-audit.yml` | Dependency Audit | Weekly schedule, manual | Scheduled supply-chain governance beyond the per-PR audit gate. |
 | `fuzz.yml` | Fuzz | Weekly schedule, manual | Sanitizer-backed libFuzzer lane for hostile parser targets; see [fuzz.md](fuzz.md). |
-| `scaling-regression.yml` | Scheduled Scaling Regression | Weekly schedule, manual | Runs the 30k proxy scale and 10k proxy load-stress tests excluded from PR CI. |
+| `scaling-regression.yml` | Scheduled Scaling Regression | Weekly schedule, manual | Runs the 30k proxy scale and 10k proxy load-stress tests excluded from PR CI. A follow-on publisher upserts a `severity:high` issue when the matrix is red. Publisher jobs share `scaling-gate-publisher` with `queue: max` and `cancel-in-progress: false` so overlapping weekly/daily work stays queued; GitHub does not guarantee FIFO, so issue mutation is generation-aware and close is compare-and-set against the recorded run id. |
+| `scaling-gate-freshness.yml` | Scheduled Scaling Gate Freshness | Daily schedule, manual | Fail-closed freshness check of the latest scaling-regression run on `main`. Only a completed success within eight days may close that issue; a newer failure, cancel, timeout, skip, or in-progress run keeps it open, as does stale or missing history. The publish step runs even when static verification fails so a broken contract cannot stay silent. Shares the generation-aware publisher concurrency group (`queue: max`). |
 | `protocol-perf-regression.yml` | Protocol Performance Regression | Weekly schedule, manual | Scheduled multi-protocol throughput/latency regression with churn, soak, resource plateaus, reload-under-load, versioned alert-only budgets, and machine-readable trends. Not a required PR check; see [protocol_perf_regression.md](protocol_perf_regression.md). |
 | `mesh-performance-baselines.yml` | Mesh Performance Baselines | Manual (`workflow_dispatch`) and reusable (`workflow_call`) | Provenance-complete collection of mesh Criterion + HBONE/DNS E2E baseline artifacts for [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) on pinned `ubuntu-24.04`. Uploads `mesh-performance-baselines-<sha>`; fails selected-suite acceptance when gates are false (artifacts still upload); does not invent `baseline.md` numbers. |
 | `claude-review.yml` | Claude PR Review | `@claude review` issue comment on PRs | Maintainer-triggered AI review comments. |
@@ -891,7 +892,25 @@ The excluded 30k scale variants (SQLite, PostgreSQL, and MongoDB) and the 10k
 PostgreSQL load-stress test run weekly and on manual dispatch in the
 `Scheduled Scaling Regression` workflow. Its matrix jobs have independent
 failure signals and a three-hour timeout for the large provisioning and load
-phases.
+phases. A red matrix, or a latest main scaling-regression run that is not a
+completed success within eight days (the daily
+`Scheduled Scaling Gate Freshness` workflow), upserts a `severity:high`
+issue so the streak cannot stay silent. Weekly and daily publisher jobs
+share `concurrency.group: scaling-gate-publisher` with `queue: max` and
+`cancel-in-progress: false` so a newer publisher does not replace queued
+work; they do not claim FIFO dispatch. The publisher always inspects the
+API's newest-first `scaling-regression.yml` run on `main` and treats the
+current weekly `SCALING_JOB_RESULT` as authoritative only when
+`GITHUB_RUN_ID` is that exact run. An older publisher derives the issue
+from that latest run instead, so a stale success cannot close over a
+newer red or in-progress run and a stale failure cannot reopen over a
+newer fresh success. Close also refuses to mutate when the existing issue
+body records a newer run id, or when that id cannot be parsed. Issue
+discovery lists `state=all` issues created by `github-actions[bot]`,
+sorted by `updated` descending, so ordinary `severity:high` history cannot
+exhaust the pagination bound. Missing identity, malformed history, or API
+failure keeps the issue open. Public issue reasons are truncated and
+stripped of newlines and backticks before they are written.
 
 **What it tests**:
 - Unit tests in `tests/unit_tests.rs`
@@ -1219,6 +1238,24 @@ pass-through to Swatinem/rust-cache; omitting it leaves rust-cache's default
 `. -> target`, so other jobs keep root-only caching. Do not list only the mesh
 workspace, and do not add unrelated workspaces, `cache-all-crates`, or extra
 `cache-directories` here.
+
+The checksum-pinned installer deliberately gives every hosted job a fresh
+runner-private wrapper path. Swatinem/rust-cache hashes every non-empty
+`RUST*` and `CARGO*` variable into its environment key, so hashing that path
+would prevent an otherwise equivalent `ci-perf` job from restoring the cache
+seeded by `main`. The `performance-regression` invocation therefore sets
+`RUSTC_WRAPPER` and `CARGO_BUILD_RUSTC_WRAPPER` to empty values only on the
+`setup-rust-ci` composite step. That step scope makes the nested rust-cache
+action omit the runner-unique values while `setup-sccache` still publishes its
+checksum-verified path through `FERRUM_SCCACHE_BIN`. Immediately after the
+composite returns, the workflow copies that verified executable to the fixed
+`${RUNNER_TEMP}/ferrum-performance-sccache/bin/sccache` path and republishes
+both wrapper variables, so Cargo's own compiler identity is stable as well as
+the rust-cache key. If the installer failed or its verified executable is no
+longer available, the step clears both variables and the benchmarks continue
+uncached. Do not move the initial empty values to job scope, which would
+override the later activation and disable sccache for the builds whose reuse
+this cache is intended to accelerate.
 
 Hosted follow-ups that still need measured evidence before changing
 measurement fidelity or trigger breadth:
@@ -2218,23 +2255,40 @@ modification of the verifier it protects, and the landing is administrative afte
 root review), then an ordinary pull request that adopts the release workflow
 under the now-trusted policy and runs the full hosted matrix.
 
-##### Admitted `fips-build.yml` generation transition (issue #3888 lineage / PR #3950, temporary)
+##### Admitted `fips-build.yml` generation transition (issue #3888 lineage / issue #4018, temporary)
 
-The temporary whole-file SHA-256 admission first used for PR #3889 (and retired
-by #3943 once #3889 landed) is **re-armed for exactly one transition**: PR
-#3950 moves the FIPS same-run producer→consumer handoff off the eviction-prone
-repository cache onto the immutable run artifact, which necessarily edits four
-digest-frozen `fips-build.yml` job bodies. The destination also quarantines only
-restored `aws-lc-fips-sys-*/out/build` CMake intermediates before a cross-runner
-incremental build can reparse them. The pair is exact and one-way:
-trusted-base `0be313579a66265ef1f54e0a611f519e8d109a536ba29b0d6c4244530b9d6a08`
-(the workflow after PR #3952's landed static-path planner hardening) →
-`17bfb40fbd31e80e6ae1a0efca922069c54ec485ec7a611c3420840da3e5e9e1` (PR #3950
-head `df1223520`; recompute and re-pin if review changes the workflow bytes).
-The digest is over universal-newline-decoded text. RETIREMENT IS MANDATORY
-once #3950 lands, exactly as #3943 retired the #3889 pair. Any other
-`fips-build.yml` edit is still compared by the normal fail-closed Cross
-surface scan.
+The temporary whole-file SHA-256 admission first used for PR #3889 (retired by
+#3943), then re-armed for PR #3950 and spent when #3950 landed, is **re-armed
+for exactly one transition**: the issue #4018 mitigation for the
+`fips-test-build` job.
+
+`Precompile FIPS test binaries for consumers` is killed with `exit code 143`
+and `The runner has received a shutdown signal` on a large minority of runs.
+The log always ends the same way — the dependency graph finishes, the run goes
+silent for several minutes while Cargo builds `unit_tests` and
+`integration_tests`, and the runner dies mid-tail with no diagnostic. That is
+the hosted runner's memory ceiling, not a compile error: `[profile.dev]` sets
+`debug = true` and the `test` profile inherits it, so every concurrent codegen
+thread holds a full-debuginfo LLVM module for the whole crate.
+
+The destination adds a job-level `env` capping `CARGO_BUILD_JOBS` at 3 and
+setting `line-tables-only` debuginfo on the `dev` **and** `test` profiles (both,
+rather than relying on `test` inheriting from `dev`), plus a best-effort
+additive 8 GiB Ferrum-owned swapfile immediately before that step. The swap
+step is deliberately not fail-closed — it is insurance rather than a
+correctness gate, and this file is digest-frozen. It never disables, removes,
+or rewrites the runner image's existing swap; failure cleanup targets only
+`/mnt/ferrum-fips-swapfile`. It cannot pass silently: any failure raises a
+warning annotation and the resulting `SwapTotal` is always printed.
+
+The pair is exact and one-way: trusted-base
+`17bfb40fbd31e80e6ae1a0efca922069c54ec485ec7a611c3420840da3e5e9e1` (the workflow
+after PR #3950's landed artifact handoff — the previous admission's adopted end)
+→ `7d995d79d9932c9595d3f19eddf16c1dbd1a0d2842230f1d92eb1b24502ca401`. Recompute
+and re-pin if review changes the workflow bytes. The digest is over
+universal-newline-decoded text. RETIREMENT IS MANDATORY once the mitigation
+lands, exactly as #3943 retired the #3889 pair. Any other `fips-build.yml` edit
+is still compared by the normal fail-closed Cross surface scan.
 
 ##### Admitted CI job SHA-256 generation transitions (temporary)
 
