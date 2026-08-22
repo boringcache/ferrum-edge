@@ -1659,6 +1659,64 @@ mod tests {
         port
     }
 
+    /// Parallel tests can steal a bind-drop-rebind reservation before the
+    /// manager's first reconcile binds it (see CLAUDE.md / functional harness).
+    const MAX_PORT_BIND_ATTEMPTS: u32 = 3;
+
+    async fn bind_manager_with_retry<F>(mut build: F) -> (u16, GatewayListenerManager)
+    where
+        F: FnMut(u16) -> GatewayListenerManager,
+    {
+        let mut last_port = 0u16;
+        let mut last_failures = Vec::new();
+        for attempt in 1..=MAX_PORT_BIND_ATTEMPTS {
+            let port = free_port().await;
+            last_port = port;
+            let manager = build(port);
+            let failures = manager.reconcile().await;
+            if failures.is_empty() {
+                return (port, manager);
+            }
+            last_failures = failures;
+            manager.shutdown_all().await;
+            if attempt == MAX_PORT_BIND_ATTEMPTS {
+                break;
+            }
+        }
+        panic!(
+            "could not bind gateway listener on 127.0.0.1:{last_port} after \
+             {MAX_PORT_BIND_ATTEMPTS} attempts; last reconcile failures: {last_failures:?}"
+        );
+    }
+
+    async fn bind_manager_with_retry_state<F>(
+        mut build: F,
+    ) -> (u16, ProxyState, GatewayListenerManager)
+    where
+        F: FnMut(u16) -> (ProxyState, GatewayListenerManager),
+    {
+        let mut last_port = 0u16;
+        let mut last_failures = Vec::new();
+        for attempt in 1..=MAX_PORT_BIND_ATTEMPTS {
+            let port = free_port().await;
+            last_port = port;
+            let (state, manager) = build(port);
+            let failures = manager.reconcile().await;
+            if failures.is_empty() {
+                return (port, state, manager);
+            }
+            last_failures = failures;
+            manager.shutdown_all().await;
+            if attempt == MAX_PORT_BIND_ATTEMPTS {
+                break;
+            }
+        }
+        panic!(
+            "could not bind gateway listener on 127.0.0.1:{last_port} after \
+             {MAX_PORT_BIND_ATTEMPTS} attempts; last reconcile failures: {last_failures:?}"
+        );
+    }
+
     fn cumulative_series(
         status: &crate::proxy::gateway_listener_status::GatewayListenerStatus,
         protocol: GatewayListenerProtocolHalf,
@@ -1682,20 +1740,21 @@ mod tests {
     /// the next reconcile would read the port as healthy.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dead_listener_task_is_reaped_surfaced_and_rebound() {
-        let port = free_port().await;
         // A locally-owned status handle, never the process-global one: killing
         // a live accept-loop task is private-state behavior (see the module
         // note above), and the published category is the only way to prove the
         // observability surface distinguishes a dead accept loop from a bind
         // refusal.
         let status = Arc::new(crate::proxy::gateway_listener_status::GatewayListenerStatus::new());
-        let manager = GatewayListenerManager::new(
-            test_state(port_scoped_config(port)),
-            std::net::IpAddr::from([127, 0, 0, 1]),
-            GatewayListenerTls::default(),
-        )
-        .with_status(status.clone());
-        assert!(manager.reconcile().await.is_empty());
+        let (port, manager) = bind_manager_with_retry(|port| {
+            GatewayListenerManager::new(
+                test_state(port_scoped_config(port)),
+                std::net::IpAddr::from([127, 0, 0, 1]),
+                GatewayListenerTls::default(),
+            )
+            .with_status(status.clone())
+        })
+        .await;
         assert_eq!(manager.active_ports().await, vec![port]);
         assert!(
             !status.snapshot().degraded(),
@@ -1806,15 +1865,16 @@ mod tests {
     /// `bind_failures()`, and the failed bind is the durable active failure.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dead_listener_task_failed_rebind_is_not_published_as_recovered() {
-        let port = free_port().await;
         let status = Arc::new(crate::proxy::gateway_listener_status::GatewayListenerStatus::new());
-        let manager = GatewayListenerManager::new(
-            test_state(port_scoped_config(port)),
-            std::net::IpAddr::from([127, 0, 0, 1]),
-            GatewayListenerTls::default(),
-        )
-        .with_status(status.clone());
-        assert!(manager.reconcile().await.is_empty());
+        let (port, manager) = bind_manager_with_retry(|port| {
+            GatewayListenerManager::new(
+                test_state(port_scoped_config(port)),
+                std::net::IpAddr::from([127, 0, 0, 1]),
+                GatewayListenerTls::default(),
+            )
+            .with_status(status.clone())
+        })
+        .await;
         assert_eq!(manager.active_ports().await, vec![port]);
 
         {
@@ -1916,14 +1976,16 @@ mod tests {
     /// completed handles cannot accumulate until process exit.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn finished_drain_handles_do_not_accumulate() {
-        let port = free_port().await;
-        let state = test_state(port_scoped_config(port));
-        let manager = GatewayListenerManager::new(
-            state.clone(),
-            std::net::IpAddr::from([127, 0, 0, 1]),
-            GatewayListenerTls::default(),
-        );
-        manager.reconcile().await;
+        let (port, state, manager) = bind_manager_with_retry_state(|port| {
+            let state = test_state(port_scoped_config(port));
+            let manager = GatewayListenerManager::new(
+                state.clone(),
+                std::net::IpAddr::from([127, 0, 0, 1]),
+                GatewayListenerTls::default(),
+            );
+            (state, manager)
+        })
+        .await;
         assert_eq!(manager.active_ports().await, vec![port]);
 
         // Withdraw the listener; its accept loop drains asynchronously.
@@ -1952,7 +2014,20 @@ mod tests {
     /// could let plaintext and TLS accept loops coexist via SO_REUSEPORT).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_pending_retirement_blocks_rebind_across_reconcile_passes() {
-        let port = free_port().await;
+        // Reserve a port that can bind, then run the deferred-retirement scenario
+        // on a fresh manager without an initial reconcile (the behavior under test).
+        let port = {
+            let (port, manager) = bind_manager_with_retry(|port| {
+                GatewayListenerManager::new(
+                    test_state(port_scoped_config(port)),
+                    std::net::IpAddr::from([127, 0, 0, 1]),
+                    GatewayListenerTls::default(),
+                )
+            })
+            .await;
+            manager.shutdown_all().await;
+            port
+        };
         let manager = GatewayListenerManager::new(
             test_state(port_scoped_config(port)),
             std::net::IpAddr::from([127, 0, 0, 1]),
@@ -1995,19 +2070,26 @@ mod tests {
         let _ = rustls::crypto::CryptoProvider::install_default(
             rustls::crypto::ring::default_provider(),
         );
-        let port = free_port().await;
-        let https = port_scoped_config(port);
-        let mut tls_https = https.clone();
-        tls_https
-            .http_tls_listen_ports
-            .insert((crate::config::types::default_namespace(), port));
-        let state = test_state(tls_https.clone());
-        let manager = tls_h3_manager(state.clone());
-        assert!(manager.reconcile().await.is_empty());
+        let (port, state, manager) = bind_manager_with_retry_state(|port| {
+            let mut tls_https = port_scoped_config(port);
+            tls_https
+                .http_tls_listen_ports
+                .insert((crate::config::types::default_namespace(), port));
+            let state = test_state(tls_https);
+            let manager = tls_h3_manager(state.clone());
+            (state, manager)
+        })
+        .await;
         assert_eq!(manager.active_http3_ports().await, vec![port]);
         let stale_generation = state.request_epoch.load().config_generation;
 
-        let mut with_udp = tls_https;
+        let mut with_udp = {
+            let mut tls_https = port_scoped_config(port);
+            tls_https
+                .http_tls_listen_ports
+                .insert((crate::config::types::default_namespace(), port));
+            tls_https
+        };
         let udp: crate::config::types::Proxy = serde_json::from_value(serde_json::json!({
             "id": "udp-stream",
             "backend_scheme": "udp",
@@ -2089,14 +2171,15 @@ mod tests {
         let _ = rustls::crypto::CryptoProvider::install_default(
             rustls::crypto::ring::default_provider(),
         );
-        let port = free_port().await;
-        let mut config = port_scoped_config(port);
-        config
-            .http_tls_listen_ports
-            .insert((crate::config::types::default_namespace(), port));
         let status = Arc::new(crate::proxy::gateway_listener_status::GatewayListenerStatus::new());
-        let manager = tls_h3_manager(test_state(config)).with_status(status.clone());
-        assert!(manager.reconcile().await.is_empty());
+        let (port, manager) = bind_manager_with_retry(|port| {
+            let mut config = port_scoped_config(port);
+            config
+                .http_tls_listen_ports
+                .insert((crate::config::types::default_namespace(), port));
+            tls_h3_manager(test_state(config)).with_status(status.clone())
+        })
+        .await;
         assert_eq!(manager.active_ports().await, vec![port]);
         assert_eq!(manager.active_http3_ports().await, vec![port]);
         assert!(!status.snapshot().degraded());
@@ -2243,14 +2326,15 @@ mod tests {
         let _ = rustls::crypto::CryptoProvider::install_default(
             rustls::crypto::ring::default_provider(),
         );
-        let port = free_port().await;
-        let mut config = port_scoped_config(port);
-        config
-            .http_tls_listen_ports
-            .insert((crate::config::types::default_namespace(), port));
         let status = Arc::new(crate::proxy::gateway_listener_status::GatewayListenerStatus::new());
-        let manager = tls_h3_manager(test_state(config)).with_status(status.clone());
-        assert!(manager.reconcile().await.is_empty());
+        let (port, manager) = bind_manager_with_retry(|port| {
+            let mut config = port_scoped_config(port);
+            config
+                .http_tls_listen_ports
+                .insert((crate::config::types::default_namespace(), port));
+            tls_h3_manager(test_state(config)).with_status(status.clone())
+        })
+        .await;
         assert_eq!(manager.active_ports().await, vec![port]);
         assert_eq!(manager.active_http3_ports().await, vec![port]);
 
@@ -2422,18 +2506,20 @@ mod tests {
     /// socket and rebind — port/class alone are not enough restart identity.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bind_address_change_restarts_live_listener() {
-        let port = free_port().await;
         let first = IpAddr::from([127, 0, 0, 1]);
         let second = IpAddr::from([127, 0, 0, 2]);
-        let state = test_state(config_with_dedicated_bind(port, first));
-        let manager = GatewayListenerManager::new(
-            state.clone(),
-            // Distinct default so the override is visibly ownership, not the
-            // process-wide proxy bind.
-            IpAddr::from([0, 0, 0, 0]),
-            GatewayListenerTls::default(),
-        );
-        assert!(manager.reconcile().await.is_empty());
+        let (port, state, manager) = bind_manager_with_retry_state(|port| {
+            let state = test_state(config_with_dedicated_bind(port, first));
+            let manager = GatewayListenerManager::new(
+                state.clone(),
+                // Distinct default so the override is visibly ownership, not the
+                // process-wide proxy bind.
+                IpAddr::from([0, 0, 0, 0]),
+                GatewayListenerTls::default(),
+            );
+            (state, manager)
+        })
+        .await;
         assert_eq!(manager.active_binds().await, vec![(port, first)]);
 
         state.update_config(config_with_dedicated_bind(port, second));
@@ -2481,18 +2567,19 @@ mod tests {
                 .expect("backend response");
         });
 
-        let frontend_port = free_port().await;
         let bind = IpAddr::from([127, 0, 0, 1]);
-        let manager = GatewayListenerManager::new(
-            test_state(routable_dedicated_bind_config(
-                frontend_port,
-                backend_port,
-                bind,
-            )),
-            IpAddr::from([0, 0, 0, 0]),
-            GatewayListenerTls::default(),
-        );
-        assert!(manager.reconcile().await.is_empty());
+        let (frontend_port, manager) = bind_manager_with_retry(|frontend_port| {
+            GatewayListenerManager::new(
+                test_state(routable_dedicated_bind_config(
+                    frontend_port,
+                    backend_port,
+                    bind,
+                )),
+                IpAddr::from([0, 0, 0, 0]),
+                GatewayListenerTls::default(),
+            )
+        })
+        .await;
 
         let mut client = tokio::time::timeout(
             std::time::Duration::from_secs(5),

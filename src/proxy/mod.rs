@@ -29829,7 +29829,20 @@ async fn handle_proxy_request_inner(
                     }
                 }
             }
-            already_buffered => already_buffered,
+            ClientRequestBody::Buffered(buffered) => {
+                store_request_body_metadata(
+                    &mut ctx,
+                    &buffered.body,
+                    authenticate_body_requirements.needs_text,
+                    authenticate_body_requirements.needs_bytes,
+                    authenticate_body_requirements.needs_digests,
+                );
+                ctx.bytes_sent_observed.fetch_max(
+                    buffered.body.len() as u64,
+                    std::sync::atomic::Ordering::Release,
+                );
+                ClientRequestBody::Buffered(buffered)
+            }
         };
     }
 

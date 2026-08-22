@@ -3767,8 +3767,10 @@ impl StreamListenerManager {
     }
 
     /// Publish desired ∩ actually-bound NodeWaypoint UDP destinations into the
-    /// serving steering instance. `exclude` are listener keys about to stop, so
-    /// their destinations are retracted before the sockets go away.
+    /// serving steering instance, along with whether any owned UDP/DTLS
+    /// listener is actually bound. `exclude` are listener keys about to stop,
+    /// so their destinations are retracted before the sockets go away and they
+    /// do not keep serving state live.
     async fn publish_serving_node_waypoint_udp_steering(
         &self,
         listeners: &std::collections::HashMap<String, ListenerHandle>,
@@ -4048,13 +4050,21 @@ fn publish_bound_node_waypoint_udp_destinations(
         })
         .map(|(_, handle)| handle.listen_port)
         .collect();
-    let destinations: Vec<crate::capture::NodeWaypointUdpSteerDestination> = desired
-        .iter()
-        .copied()
-        .filter(|destination| serving_ports.contains(&destination.port))
-        .collect();
+    // Serving is bound-listener ownership, not ClusterIP inventory. An empty
+    // destination set with `serving == true` is a headless/VIP-less listener
+    // whose relay-cgroup sender proof must stay live.
+    let serving = !serving_ports.is_empty();
+    let destinations: Vec<crate::capture::NodeWaypointUdpSteerDestination> = if serving {
+        desired
+            .iter()
+            .copied()
+            .filter(|destination| serving_ports.contains(&destination.port))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let ifaces = node_waypoint_udp_published_ifaces(source_index);
-    steering.set_bound_destinations(destinations, Some(&ifaces));
+    steering.set_bound_destinations(destinations, Some(&ifaces), serving);
 }
 
 /// Mark this exact listener generation non-serving and republish the
