@@ -373,6 +373,80 @@ impl ApiSpecBackupItem {
     }
 }
 
+/// Create-only `POST /batch` envelope. Resource items still use the same
+/// schemas as the individual POST endpoints. Unknown top-level keys are
+/// rejected so unimplemented verbs (`updates`, `deletes`, `dry_run`) cannot
+/// look like a successful no-op. Backup metadata keys are accepted and
+/// ignored so `GET /backup` output remains a valid additive import.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BatchCreateRequest {
+    #[serde(default)]
+    pub proxies: Vec<Proxy>,
+    #[serde(default)]
+    pub consumers: Vec<Consumer>,
+    #[serde(default)]
+    pub plugin_configs: Vec<PluginConfig>,
+    #[serde(default)]
+    pub upstreams: Vec<Upstream>,
+    #[serde(default, rename = "version")]
+    _version: String,
+    #[serde(default, rename = "ferrum_version")]
+    _ferrum_version: Option<String>,
+    #[serde(default, rename = "exported_at")]
+    _exported_at: Option<String>,
+    #[serde(default, rename = "source")]
+    _source: Option<String>,
+    #[serde(default, rename = "counts")]
+    _counts: Option<serde_json::Value>,
+    #[serde(default, rename = "api_specs")]
+    _api_specs: Option<serde_json::Value>,
+    #[serde(default, rename = "gateway_trust_bundles")]
+    _gateway_trust_bundles: Option<serde_json::Value>,
+}
+
+impl From<BatchCreateRequest> for RestorePayload {
+    fn from(request: BatchCreateRequest) -> Self {
+        RestorePayload {
+            version: String::new(),
+            proxies: request.proxies,
+            consumers: request.consumers,
+            plugin_configs: request.plugin_configs,
+            upstreams: request.upstreams,
+            api_specs: None,
+            gateway_trust_bundles: None,
+        }
+    }
+}
+
+/// Why restore refuses an omitted resource id that `POST /batch` would mint.
+pub(crate) const RESTORE_MISSING_ID_MESSAGE: &str = "Restore requires a non-empty resource id \
+     (GET /backup always includes ids). POST /batch auto-generates omitted ids; POST /restore \
+     does not, because a second restore of the same body would invent different identities.";
+
+/// Collect restore validation errors for resources whose `id` was omitted.
+pub(crate) fn restore_missing_resource_id_errors(payload: &RestorePayload) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut push = |kind: &str, id: &str| {
+        if id.is_empty() {
+            errors.push(format!("{kind} ID: {RESTORE_MISSING_ID_MESSAGE}"));
+        }
+    };
+    for proxy in &payload.proxies {
+        push("Proxy", &proxy.id);
+    }
+    for consumer in &payload.consumers {
+        push("Consumer", &consumer.id);
+    }
+    for plugin in &payload.plugin_configs {
+        push("PluginConfig", &plugin.id);
+    }
+    for upstream in &payload.upstreams {
+        push("Upstream", &upstream.id);
+    }
+    errors
+}
+
 #[derive(Deserialize)]
 pub(crate) struct RestorePayload {
     #[serde(default)]

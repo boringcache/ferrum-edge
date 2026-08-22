@@ -1011,12 +1011,45 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
         Some(&json!("#/components/schemas/ConsumerCreate"))
     );
     assert_eq!(
+        spec.pointer("/components/schemas/BatchCreateRequest/additionalProperties"),
+        Some(&json!(false)),
+        "POST /batch envelope must reject unknown top-level keys"
+    );
+    assert_eq!(
         spec.pointer("/components/schemas/BackupResponse/properties/consumers/items/$ref"),
         Some(&json!("#/components/schemas/ConsumerBackup"))
     );
     assert_eq!(
         spec.pointer("/components/schemas/RestoreRequest/properties/consumers/items/$ref"),
         Some(&json!("#/components/schemas/ConsumerRestore"))
+    );
+}
+
+#[test]
+fn proxy_create_schema_requires_upstream_or_direct_backend() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let choices = spec
+        .pointer("/components/schemas/ProxyCreate/allOf/1/anyOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("ProxyCreate must require an upstream or direct backend");
+
+    assert_eq!(choices[0]["required"], json!(["upstream_id"]));
+    assert_eq!(
+        choices[0]["properties"]["upstream_id"]["minLength"],
+        json!(1)
+    );
+    assert_eq!(
+        choices[1]["required"],
+        json!(["backend_host", "backend_port"])
+    );
+    assert_eq!(
+        choices[1]["properties"]["backend_host"]["minLength"],
+        json!(1)
+    );
+    assert_eq!(
+        choices[1]["properties"]["backend_port"]["minimum"],
+        json!(1)
     );
 }
 

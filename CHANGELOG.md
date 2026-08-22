@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — `POST /batch` rejects unknown top-level envelope keys**
+  (issue #4042). The request is create-only (`consumers`, `upstreams`,
+  `proxies`, `plugin_configs`). Sending `updates`, `deletes`, or `dry_run`
+  previously returned `201` and created only the resource arrays while
+  silently ignoring the other keys. Unknown envelope keys now return `400`.
+  `GET /backup` metadata (`version`, `ferrum_version`, `exported_at`,
+  `source`, `counts`) and the backup-only `api_specs` /
+  `gateway_trust_bundles` sections remain accepted and ignored so a backup
+  file is still a valid additive import. **Operator action**: stop sending
+  unimplemented mutation verbs on `/batch`; use per-resource PUT/DELETE or
+  `POST /restore` for replacement.
+
+- **BREAKING — file/DP `POST /restore` returns `503` instead of `403`**
+  (issue #4027). Restore requires a database. File and data-plane mode now
+  answer `{"error":"No database"}` with `503`, matching
+  [docs/admin_backup_restore.md](docs/admin_backup_restore.md). Other
+  file-mode writes still return `403` `{"error":"Admin API is in read-only
+  mode"}`. Database mode with `FERRUM_ADMIN_READ_ONLY=true` still returns
+  that `403` for restore. **Operator action**: match file/DP restore
+  unavailability on `503` / `No database`, not on the generic read-only
+  `403`.
+
+- `POST /restore` requires resource ids and does not auto-generate them
+  (issue #4043). `GET /backup` always includes ids, and a second restore of
+  the same body must not invent new identities on a destructive replacement.
+  A batch-shaped body that omits ids returns `400` with `validation_errors`
+  and does not delete existing config. `POST /batch` still mints omitted
+  ids. Backup → restore and backup → batch remain the supported directions.
+
 - **BREAKING — `DELETE /consumers/{id}` returns 409 while `access_control.allowed_consumers` still names the username**
   (issue #4045). The previous 204 left live plugin configs authorizing an
   identity that no longer exists. Ferrum now scans `access_control` plugin
@@ -192,6 +221,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for the handshake case; `connection_closed` is post-wire like
   `request_error`, so connect-failure retry still does not replay
   non-idempotent requests.
+
+- `POST /proxies` and `POST /batch` accept a proxy that sets `upstream_id`
+  without `backend_host` / `backend_port` (issue #4029). Validation already
+  allowed an empty host when an upstream is referenced; serde required the
+  fields anyway, so callers had to send dummy values the runtime then
+  ignored. File-mode YAML and OpenAPI match the same optional-when-upstream
+  contract. Direct-backend proxies still require a non-empty host and a
+  port greater than 0.
+
+- `docs/admin_batch_api.md` plugin-config examples now use `plugin_name`
+  (and `scope`) matching `POST /plugins/config` (issue #4031). Copy-pasting
+  `"name": "key_auth"` was a `400` unknown field.
 
 - Stream-family DNS setup failures now classify as `error_class=dns_lookup_error`
   (TCP previously fell through to `request_error` because the live DNS-cache

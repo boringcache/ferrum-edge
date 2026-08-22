@@ -4047,6 +4047,12 @@ paths:
         `FERRUM_BASIC_AUTH_HMAC_SECRET` of at least 32 bytes; missing or weak
         operator configuration fails the batch with 500 before persistence.
 
+        The envelope is closed: unknown top-level keys return `400`. There is
+        no `updates`, `deletes`, or `dry_run`. `GET /backup` metadata
+        (`version`, `ferrum_version`, `exported_at`, `source`, `counts`) and
+        the backup-only `api_specs` / `gateway_trust_bundles` sections are
+        accepted and ignored so a backup file remains a valid additive import.
+
         ### Backend support
 
         PostgreSQL, MySQL, and SQLite always support the guarantee. MongoDB
@@ -4136,7 +4142,9 @@ paths:
 
         The output format is compatible with `POST /batch` (additive import)
         and `POST /restore` (full replacement). Consumer credentials are
-        included **unredacted** since this is a backup endpoint.
+        included **unredacted** since this is a backup endpoint. Backup
+        resources always include `id`s; `POST /restore` requires those ids,
+        while `POST /batch` will auto-generate them if a caller strips them.
 
         Falls back to the in-memory cached configuration when the database is
         unavailable, indicated by the `X-Data-Source: cached` response header.
@@ -4251,7 +4259,13 @@ paths:
 
         Accepts the same JSON format produced by `GET /backup`. Resources are
         imported in dependency order (consumers & upstreams first, then proxies,
-        then plugin configs, then API specs).
+        then plugin configs, then API specs). Every restored proxy, consumer,
+        plugin config, and upstream must carry a non-empty `id` — the ids
+        `GET /backup` always emits. `POST /batch` auto-generates omitted ids;
+        restore does not, because repeating the same body would otherwise
+        invent different identities on a destructive replacement. A
+        batch-shaped body without ids is a `400` and does not delete existing
+        config.
 
         Restore normalizes the submitted payload once before validation — the
         same `normalize_fields()` admission used by CRUD, batch, file mode, and
@@ -4407,13 +4421,15 @@ paths:
           description: Request body too large (default max 100 MiB, configurable via FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB)
         "503":
           description: >-
-            Restore aborted because the pre-snapshot namespace guard could not
-            be acquired or the prior configuration could not be snapshotted for
-            rollback. A database/connectivity failure has `failure_class:
-            connectivity`. Existing config was NOT deleted; retry once the
-            database is reachable. Guard contention or an intentionally retained
-            uncertain operation instead returns the stable retryable
-            namespace-admission error.
+            Restore aborted because there is no database (file/DP mode returns
+            `{"error":"No database"}`), the pre-snapshot namespace guard could
+            not be acquired, or the prior configuration could not be
+            snapshotted for rollback. A database/connectivity failure has
+            `failure_class: connectivity`. Existing config was NOT deleted;
+            retry once the database is reachable. Guard contention or an
+            intentionally retained uncertain operation instead returns the
+            stable retryable namespace-admission error. Database mode with
+            `FERRUM_ADMIN_READ_ONLY=true` still returns `403`.
           headers:
             Retry-After:
               description: Present as `1` for namespace-admission contention.
@@ -7708,9 +7724,6 @@ components:
     # ── Proxy ───────────────────────────────────────────────────────
     Proxy:
       type: object
-      required:
-        - backend_host
-        - backend_port
       properties:
         id:
           type: string
@@ -7862,17 +7875,18 @@ components:
         backend_host:
           type: string
           description: >-
-            Backend server hostname or IP. Required when `upstream_id` is not set.
-            When `upstream_id` is set, this field is ignored (upstream targets
-            provide the backend address).
+            Backend server hostname or IP. Required when `upstream_id` is not
+            set. When `upstream_id` is set, this field may be omitted (empty
+            on the wire) and is ignored — upstream targets provide the dial
+            address.
         backend_port:
           type: integer
           format: uint16
           default: 0
           description: >-
             Backend server port. Required (>= 1) when `upstream_id` is not set.
-            When `upstream_id` is set, this field is ignored (upstream targets
-            provide the backend port).
+            When `upstream_id` is set, this field may be omitted (0 on the
+            wire) and is ignored — upstream targets provide the dial port.
         backend_path:
           type: [string, "null"]
 
@@ -8048,9 +8062,10 @@ components:
           type: [string, "null"]
           description: |
             Reference to an existing Upstream for load-balanced backends. When set,
-            `backend_host` and `backend_port` are overridden by the selected
-            upstream target. The referenced upstream must exist at creation time.
-            Deleting an upstream that is referenced by a proxy is blocked.
+            `backend_host` and `backend_port` may be omitted; the selected
+            upstream target supplies the dial address. The referenced upstream
+            must exist at creation time. Deleting an upstream that is referenced
+            by a proxy is blocked.
         upstream_subset:
           type: [string, "null"]
           maxLength: 128
@@ -8337,11 +8352,25 @@ components:
           and `backend_scheme` MUST be set explicitly.
         - Unknown fields are rejected. Backend H3 selection is runtime
           capability-driven for `Https` backends — there is no scheme for it.
+        - `backend_host` and `backend_port` may be omitted when `upstream_id`
+          is set. They remain required for a direct-backend proxy.
       allOf:
         - $ref: "#/components/schemas/Proxy"
-      required:
-        - backend_host
-        - backend_port
+        - anyOf:
+            - required: [upstream_id]
+              properties:
+                upstream_id:
+                  type: string
+                  minLength: 1
+            - required: [backend_host, backend_port]
+              properties:
+                backend_host:
+                  type: string
+                  minLength: 1
+                backend_port:
+                  type: integer
+                  format: uint16
+                  minimum: 1
 
     StreamMatchCriteria:
       type: object
@@ -15640,9 +15669,15 @@ components:
     # ── Batch ──────────────────────────────────────────────────────────
     BatchCreateRequest:
       type: object
+      additionalProperties: false
       description: |
-        Batch create request. All fields are optional — include only the
-        resource types you want to create.
+        Batch create request. Resource arrays are optional — include only the
+        resource types you want to create. Unknown top-level keys are rejected
+        (`400`); there is no `updates`, `deletes`, or `dry_run`. Backup
+        metadata and backup-only sections are accepted and ignored so
+        `GET /backup` output remains a valid additive import. Batch does not
+        persist `api_specs` or `gateway_trust_bundles` — use `POST /restore`
+        or the dedicated endpoints.
       properties:
         proxies:
           type: array
@@ -15664,6 +15699,35 @@ components:
           items:
             $ref: "#/components/schemas/UpstreamCreate"
           description: Upstreams to create
+        version:
+          type: string
+          description: Backup metadata. Accepted and ignored on `POST /batch`.
+        ferrum_version:
+          type: string
+          description: Backup metadata. Accepted and ignored on `POST /batch`.
+        exported_at:
+          type: string
+          format: date-time
+          description: Backup metadata. Accepted and ignored on `POST /batch`.
+        source:
+          type: string
+          description: Backup metadata. Accepted and ignored on `POST /batch`.
+        counts:
+          type: object
+          additionalProperties: true
+          description: Backup metadata. Accepted and ignored on `POST /batch`.
+        api_specs:
+          $ref: "#/components/schemas/ApiSpecsBackupSection"
+          description: >-
+            Backup-only section. Accepted and ignored on `POST /batch`; use
+            `POST /restore` or `/api-specs` to persist specs.
+        gateway_trust_bundles:
+          type: array
+          description: >-
+            Backup-only section. Accepted and ignored on `POST /batch`; use
+            `POST /restore` or `/gateway-trust-bundles` to persist trust.
+          items:
+            $ref: "#/components/schemas/GatewayTrustBundle"
 
     BatchCreateResponse:
       type: object
@@ -15923,11 +15987,15 @@ components:
     RestoreRequest:
       type: object
       description: |
-        Same format as the backup output or the batch create request.
-        All fields are optional — omitted resource types are treated as empty.
-        Omitting `api_specs` entirely means a legacy backup (preflight may
-        require `confirm_api_spec_deletion=true`). An empty `api_specs.items`
-        array is an intentional wipe of API specs.
+        Same format as the backup output. All resource arrays are optional —
+        omitted types are treated as empty. Every included proxy, consumer,
+        plugin config, and upstream must carry a non-empty `id` (`GET /backup`
+        always includes them). A batch-shaped body that omits ids is not
+        restorable. Omitting `api_specs` entirely means a legacy backup
+        (preflight may require `confirm_api_spec_deletion=true`). An empty
+        `api_specs.items` array is an intentional wipe of API specs.
+        Backup metadata (`exported_at`, `source`, `counts`, `ferrum_version`)
+        is ignored if present.
       properties:
         proxies:
           type: array
