@@ -497,6 +497,10 @@ impl AdminState {
     /// Use this for config-database mutations (CRUD, credentials, API specs,
     /// batch, restore). Managed TLS / ACME handlers mutate independent stores
     /// and must call [`Self::admit_non_config_db_write`] instead.
+    // Returning the constructed response by value matches the established admin
+    // admission contract; boxing would add allocation and API churn to a cold
+    // rejection path without reducing the successful-path footprint.
+    #[allow(clippy::result_large_err)]
     pub async fn admit_write(
         &self,
     ) -> Result<crate::config::db_backend::DbWriteTopologyPermit, Response<Full<Bytes>>> {
@@ -3175,7 +3179,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_delete::<Proxy>(&state, &auth, id, &namespace).await
+            crud::handle_delete::<Proxy>(&state, &auth, id, &namespace, uri.query()).await
         }
 
         // Consumers CRUD
@@ -3202,7 +3206,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            crud::handle_delete::<Consumer>(&state, &auth, id, &namespace).await
+            crud::handle_delete::<Consumer>(&state, &auth, id, &namespace, uri.query()).await
         }
 
         // Consumer credentials
@@ -3280,7 +3284,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_delete::<PluginConfig>(&state, &auth, id, &namespace).await
+            crud::handle_delete::<PluginConfig>(&state, &auth, id, &namespace, uri.query()).await
         }
 
         // Upstreams CRUD
@@ -3307,7 +3311,7 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_delete::<Upstream>(&state, &auth, id, &namespace).await
+            crud::handle_delete::<Upstream>(&state, &auth, id, &namespace, uri.query()).await
         }
 
         // Gateway trust bundles CRUD (issue #3727).
@@ -3369,7 +3373,14 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            crud::handle_delete::<GatewayTrustBundleRecord>(&state, &auth, id, &namespace).await
+            crud::handle_delete::<GatewayTrustBundleRecord>(
+                &state,
+                &auth,
+                id,
+                &namespace,
+                uri.query(),
+            )
+            .await
         }
 
         // Batch create
@@ -4640,6 +4651,9 @@ async fn load_consumer_in_namespace(
     }
 }
 
+// Namespace admission failures return a full HTTP response; boxing would
+// diverge from the established admin handler error contract.
+#[allow(clippy::result_large_err)]
 async fn acquire_credential_namespace_admission(
     db: Arc<dyn DatabaseBackend>,
     namespace: &str,

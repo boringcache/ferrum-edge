@@ -468,6 +468,14 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
 ///    collapses connect-phase RSTs into `ConnectionRefused` so the unified
 ///    `request_reached_wire` boundary stays consistent (a SYN-RST'd
 ///    connection is functionally `ECONNREFUSED`, not a mid-stream reset).
+///    That collapse is skipped when a `rustls::Error` sits under the
+///    `io::Error`: TCP connected and the handshake then failed, so the
+///    class is `TlsError` (connect) / `ConnectionReset` (post-connect),
+///    not "refused". `UnexpectedEof` with rustls's missing-`close_notify`
+///    wording is `ConnectionClosed` (teardown, not handshake) and is
+///    matched *before* the typed rustls walk so a rustls payload cannot
+///    steal it as `TlsError`. Other post-connect `UnexpectedEof` maps to
+///    `ConnectionClosed` (backend FIN before a complete body).
 /// 5. `hyper::Error` — `is_timeout` → `ReadWriteTimeout`;
 ///    `is_incomplete_message` → `ConnectionClosed`.
 ///
@@ -624,6 +632,34 @@ fn classify_typed_chain(
             if matches!(io_err.raw_os_error(), Some(99) | Some(49) | Some(10049)) {
                 return Some(ErrorClass::PortExhaustion);
             }
+            // Peer TCP FIN without TLS `close_notify` is ordinary teardown
+            // (Python `ssl`, many clients), not a handshake failure. Check
+            // it *before* `rustls_error_in_chain`: a rustls payload in
+            // `get_ref()` would otherwise steal this as `TlsError` /
+            // `ConnectionReset` and override the close-notify substring
+            // (the same class of bug as typing DNS over an egress-policy
+            // denial). Post-wire `ConnectionClosed` so alerts keyed on
+            // `tls_error` stay handshake-only.
+            if matches!(io_err.kind(), std::io::ErrorKind::UnexpectedEof)
+                && error_is_tls_close_without_notify(io_err)
+            {
+                return Some(ErrorClass::ConnectionClosed);
+            }
+            // rustls often surfaces as `io::Error` wrapping `rustls::Error`
+            // in `get_ref()`. `source()` skips that payload and returns
+            // the inner error's source instead. Walk `get_ref()` *before*
+            // mapping the io kind: a TLS handshake that fails after TCP
+            // connect can look like `ConnectionReset` ("peer closed the
+            // TLS record layer") and must not take the connect-phase RST
+            // → `ConnectionRefused` collapse. Distinguish by typed rustls
+            // presence, not by string matching on "tls" / "refused".
+            if rustls_error_in_chain(io_err as &(dyn std::error::Error + 'static)) {
+                return Some(if phase_is_connect {
+                    ErrorClass::TlsError
+                } else {
+                    ErrorClass::ConnectionReset
+                });
+            }
             match io_err.kind() {
                 std::io::ErrorKind::TimedOut => {
                     return Some(if phase_is_connect {
@@ -652,11 +688,11 @@ fn classify_typed_chain(
                         ErrorClass::ConnectionClosed
                     });
                 }
-                std::io::ErrorKind::UnexpectedEof if error_is_tls_close_without_notify(io_err) => {
-                    // Peer TCP FIN without TLS `close_notify`. Extremely
-                    // common teardown (Python `ssl`, many clients) — not a
-                    // handshake failure. Post-wire `ConnectionClosed` so
-                    // alerts keyed on `tls_error` stay handshake-only.
+                // Post-connect FIN / truncated body. Do *not* map connect-phase
+                // UnexpectedEof: without rustls (already checked above) that is
+                // an incomplete handshake, and treating it as `ConnectionClosed`
+                // would make it post-wire and skip `retry_on_connect_failure`.
+                std::io::ErrorKind::UnexpectedEof if !phase_is_connect => {
                     return Some(ErrorClass::ConnectionClosed);
                 }
                 _ => {}
@@ -673,6 +709,37 @@ fn classify_typed_chain(
         current = err.source();
     }
     None
+}
+
+/// True when a `rustls::Error` appears anywhere in `e`'s chain, including
+/// `e` itself.
+///
+/// Distinguishes a TLS-layer failure wrapped as `io::Error` (TCP
+/// connected, handshake then failed) from a connect-phase RST that really
+/// is equivalent to ECONNREFUSED. Typed walk only — no Display matching.
+///
+/// `std::io::Error::source()` returns the *payload's* source, not the
+/// payload. A custom error passed to [`std::io::Error::new`] is reachable
+/// only via [`std::io::Error::get_ref`]. tokio-rustls / reqwest wrap
+/// handshake failures that way (often as `ErrorKind::ConnectionReset`),
+/// so walking `source()` alone would miss rustls and the connect-phase
+/// RST collapse would label a TLS handshake failure as
+/// `ConnectionRefused`.
+pub(crate) fn rustls_error_in_chain(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(e);
+    while let Some(err) = current {
+        if err.downcast_ref::<rustls::Error>().is_some() {
+            return true;
+        }
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>()
+            && let Some(inner) = io_err.get_ref()
+        {
+            current = Some(inner as &(dyn std::error::Error + 'static));
+            continue;
+        }
+        current = err.source();
+    }
+    false
 }
 
 /// Pre-dial refusal emitted by `proxy::connect_websocket_backend` when the
@@ -955,9 +1022,11 @@ fn classify_boxed_with_phase(
 /// 2. `is_connect()` branch — pre-wire by construction:
 ///    - `is_timeout()` → `ConnectionTimeout`.
 ///    - [`classify_typed_chain`] with `phase_is_connect = true`. Connect-phase
-///      RSTs collapse to `ConnectionRefused`; rustls errors become `TlsError`;
-///      io errors map per-kind. Every class here MUST satisfy
-///      `request_reached_wire == false` so `retry_on_connect_failure` fires.
+///      RSTs collapse to `ConnectionRefused` unless a `rustls::Error` is in
+///      `io::Error::get_ref()` (then `TlsError` — TCP connected, handshake
+///      failed). rustls errors become `TlsError`; io errors map per-kind.
+///      Every class here MUST satisfy `request_reached_wire == false` so
+///      `retry_on_connect_failure` fires.
 ///    - DNS substring fallback (no typed DNS error from reqwest/hyper-util).
 ///    - Generic refused fallback.
 /// 3. `is_timeout()` (post-connect) → `ReadWriteTimeout`.
@@ -1040,7 +1109,12 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
     {
         return ErrorClass::ProtocolError;
     }
-    if source_chain.contains("closed before") {
+    if source_chain.contains("closed before")
+        || source_chain.contains("incomplete message")
+        || source_chain.contains("IncompleteMessage")
+        || source_chain.contains("unexpected end")
+        || source_chain.contains("UnexpectedEof")
+    {
         return ErrorClass::ConnectionClosed;
     }
 
@@ -1184,6 +1258,10 @@ pub fn classify_body_error(e: &(dyn std::error::Error + 'static)) -> (ErrorClass
         || error_str_lower.contains("connection aborted")
         || debug_str.contains("ConnectionAborted")
         || error_str_lower.contains("closed before")
+        || error_str_lower.contains("incomplete message")
+        || debug_str.contains("IncompleteMessage")
+        || error_str_lower.contains("unexpected end")
+        || debug_str.contains("UnexpectedEof")
     {
         // Backend-side close during body streaming — keep client_disconnected
         // false so backend resets don't inflate client-disconnect metrics.

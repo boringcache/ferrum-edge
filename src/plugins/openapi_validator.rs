@@ -3427,7 +3427,7 @@ fn object_tokens_to_value(
     let empty_properties = serde_json::Map::new();
     let properties = merged_object_properties(schema, conversion).unwrap_or(&empty_properties);
     let mut out = serde_json::Map::new();
-    for pair in tokens.chunks_exact(2) {
+    for pair in tokens.as_chunks::<2>().0 {
         let key = pair[0].clone();
         if key.is_empty() {
             return Err("Serialized object property contains an empty key".to_string());

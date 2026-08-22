@@ -861,6 +861,7 @@ impl WebSocketContext {
                 self.config.max_frame_size,
                 matches!(self.role, Role::Server),
                 self.config.accept_unmasked_frames,
+                self.incomplete.is_none(),
             )
             .check_connection_reset(self.state)?
         {

@@ -119,7 +119,9 @@ pub fn classify_http3_error(err: &(dyn std::error::Error + 'static)) -> crate::r
                 std::io::ErrorKind::TimedOut => return ErrorClass::ConnectionTimeout,
                 std::io::ErrorKind::ConnectionRefused => return ErrorClass::ConnectionRefused,
                 std::io::ErrorKind::ConnectionReset => return ErrorClass::ConnectionReset,
-                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionAborted => {
+                std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::UnexpectedEof => {
                     return ErrorClass::ConnectionClosed;
                 }
                 // Generic kinds (Other, etc.) commonly wrap QUIC/H3 typed

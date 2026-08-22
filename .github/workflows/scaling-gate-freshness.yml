@@ -1,0 +1,58 @@
+name: Scheduled Scaling Gate Freshness
+
+# Daily fail-closed check of the latest Scheduled Scaling Regression run on
+# main. Only a completed success within eight days may close the blocker; a
+# newer red, skipped, or still-running run, or stale/missing history, keeps
+# it open. Reuses the same issue publisher as scaling-regression.yml. Does
+# not run the 10k/30k suites. The publisher job shares
+# scaling-gate-publisher with queue: max and cancel-in-progress: false so
+# overlapping weekly/daily publishers stay queued. GitHub does not
+# guarantee FIFO among queued jobs; issue mutation follows the latest
+# scaling-regression.yml run on main, not this workflow's own run id.
+
+on:
+  schedule:
+    # 12:00 UTC sits after the Saturday 04:00 scaling matrix (180-minute
+    # timeout ends by 07:00). Workflow concurrency stays distinct from the
+    # weekly matrix; the publisher job shares scaling-gate-publisher with
+    # queue: max so pending weekly/daily publishers are not replaced.
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: scaling-gate-freshness
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scaling-gate-freshness:
+    name: Scaling gate freshness
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: scaling-gate-publisher
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Verify scaling-gate contracts (static)
+        run: |
+          python3 -I .github/scripts/verify_scaling_regression_workflow.py --self-test
+          python3 -I .github/scripts/verify_scaling_regression_workflow.py
+          python3 -I .github/scripts/publish_scaling_gate_signal.py --self-test
+
+      - name: Publish scaling gate freshness
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SCALING_JOB_RESULT: skipped
+        run: python3 -I .github/scripts/publish_scaling_gate_signal.py

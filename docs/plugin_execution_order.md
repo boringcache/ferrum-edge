@@ -1587,7 +1587,7 @@ Given all built-in plugins enabled, the execution order is:
 | 63 | `security_headers` | 4080 | after_proxy, initial response-header boundary |
 | 64 | `ai_token_metrics` | 4100 | on_response_body |
 | 65 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body, response_stream_inspector, on_response_stream_terminated |
-| 66 | `stdout_logging` | 9000 | log, on_stream_disconnect |
+| 66 | `stdout_logging` | 9000 | log, on_stream_disconnect, on_ws_disconnect |
 | 67 | `ws_frame_logging` | 9050 | on_ws_frame |
 | 68 | `statsd_logging` | 9075 | log, on_stream_disconnect, on_ws_disconnect |
 | 69 | `http_logging` | 9100 | log, on_stream_disconnect |
