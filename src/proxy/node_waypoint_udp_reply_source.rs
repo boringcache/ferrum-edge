@@ -626,6 +626,7 @@ pub struct RegistryDirReplySourcePublisher {
     /// refuse every ACTIVE publication, but only one of them is a
     /// misconfiguration the operator can correct — and the startup diagnostic
     /// in `arm_mesh_runtime_startup` only fires for the ABSENT case.
+    #[allow(dead_code)] // Diagnostic/test accessor.
     relay_pod_uid_rejected: bool,
     /// Secure-random process owner. `None` makes every publication fail closed;
     /// a predictable fallback could collide with a predecessor and let its
@@ -693,6 +694,7 @@ impl RegistryDirReplySourcePublisher {
     ///
     /// `false` for both an accepted identity and an absent one; the two absent
     /// cases are what this distinguishes.
+    #[allow(dead_code)] // Diagnostic/test accessor.
     pub fn relay_pod_uid_rejected(&self) -> bool {
         self.relay_pod_uid_rejected
     }
