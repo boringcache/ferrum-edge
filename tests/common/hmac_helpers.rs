@@ -183,9 +183,24 @@ pub fn hmac_authority_from_url(url: &str) -> String {
 
 /// Return the SHA-256 digest header value for an empty body.
 pub fn empty_digest_header() -> String {
-    let digest = Sha256::digest([]);
+    legacy_digest_sha256_header(&[])
+}
+
+/// RFC 3230 `Digest` SHA-256 value for `body` (`sha-256=<standard-base64>`).
+fn legacy_digest_sha256_header(body: &[u8]) -> String {
     format!(
         "sha-256={}",
-        base64::engine::general_purpose::STANDARD.encode(digest)
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body))
+    )
+}
+
+/// RFC 9530 `Content-Digest` SHA-256 structured field for `body`.
+///
+/// The value is `sha-256=:<standard-base64>:`. It is not valid on a legacy
+/// `Digest` header, and a legacy `Digest` value is not valid on `Content-Digest`.
+pub fn content_digest_sha256_header(body: &[u8]) -> String {
+    format!(
+        "sha-256=:{}:",
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body))
     )
 }

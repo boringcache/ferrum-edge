@@ -257,7 +257,7 @@ fn mongo_plugin_graph_validation_runs_under_the_durable_namespace_fence() {
     for method_name in [
         "create_proxy(&self, proxy: &Proxy)",
         "update_proxy(&self, proxy: &Proxy)",
-        "delete_proxy(&self, namespace: &str, id: &str)",
+        "delete_proxy_with_orphan_cleanup(",
         "create_plugin_config(&self, pc: &PluginConfig)",
         "update_plugin_config(&self, pc: &PluginConfig)",
         "delete_plugin_config(",

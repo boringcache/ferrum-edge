@@ -3374,7 +3374,7 @@ impl DatabaseStore {
         if let Some(old_upstream_id) = old_upstream_id.as_deref()
             && proxy.upstream_id.as_deref() != Some(old_upstream_id)
         {
-            self.cleanup_orphaned_upstream_tx(&mut tx, &proxy.namespace, old_upstream_id)
+            self.cleanup_orphaned_upstream_tx(&mut tx, &proxy.namespace, old_upstream_id, true)
                 .await?;
         }
 
@@ -3391,6 +3391,16 @@ impl DatabaseStore {
     }
 
     pub async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
+        self.delete_proxy_with_orphan_cleanup(namespace, id, true)
+            .await
+    }
+
+    pub async fn delete_proxy_with_orphan_cleanup(
+        &self,
+        namespace: &str,
+        id: &str,
+        cleanup_orphaned_upstream: bool,
+    ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
@@ -3504,7 +3514,7 @@ impl DatabaseStore {
         if spec_owner.is_none()
             && let Some(ref uid) = upstream_id
         {
-            self.cleanup_orphaned_upstream_tx(&mut tx, namespace, uid)
+            self.cleanup_orphaned_upstream_tx(&mut tx, namespace, uid, cleanup_orphaned_upstream)
                 .await?;
         }
 
@@ -3591,7 +3601,11 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
         upstream_id: &str,
+        cleanup_orphaned_upstream: bool,
     ) -> Result<(), anyhow::Error> {
+        if !cleanup_orphaned_upstream {
+            return Ok(());
+        }
         let upstream_row: Option<AnyRow> = sqlx::query(
             &self.q("SELECT api_spec_id FROM upstreams WHERE id = ? AND namespace = ? LIMIT 1"),
         )
@@ -5134,7 +5148,7 @@ impl DatabaseStore {
         let mut tx = self.pool().begin().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
 
-        self.cleanup_orphaned_upstream_tx(&mut tx, namespace, old_upstream_id)
+        self.cleanup_orphaned_upstream_tx(&mut tx, namespace, old_upstream_id, true)
             .await?;
 
         tx.commit().await?;
@@ -10050,6 +10064,21 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         DatabaseStore::delete_proxy(self, namespace, id).await
+    }
+
+    async fn delete_proxy_with_orphan_cleanup(
+        &self,
+        namespace: &str,
+        id: &str,
+        cleanup_orphaned_upstream: bool,
+    ) -> Result<bool, anyhow::Error> {
+        DatabaseStore::delete_proxy_with_orphan_cleanup(
+            self,
+            namespace,
+            id,
+            cleanup_orphaned_upstream,
+        )
+        .await
     }
 
     async fn get_proxy(&self, namespace: &str, id: &str) -> Result<Option<Proxy>, anyhow::Error> {

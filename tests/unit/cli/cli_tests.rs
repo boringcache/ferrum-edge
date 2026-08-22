@@ -1202,6 +1202,55 @@ fn test_execute_reload_invalid_pid() {
 
 #[cfg(unix)]
 #[test]
+fn test_execute_reload_rejects_pid_zero() {
+    // Must fail closed before POSIX kill: pid 0 means this process group.
+    let result = ferrum_edge::cli::execute_reload(&ReloadArgs { pid: Some(0) });
+    assert!(result.is_err(), "reload --pid 0 must not invoke kill");
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("invalid --pid 0") && msg.contains("process group"),
+        "expected process-group diagnostic, got: {msg}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_execute_reload_rejects_self_pid() {
+    let self_pid = std::process::id();
+    let result = ferrum_edge::cli::execute_reload(&ReloadArgs {
+        pid: Some(self_pid),
+    });
+    assert!(result.is_err(), "reload must not signal this CLI process");
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("invalid --pid") && msg.contains("this CLI process"),
+        "expected self-PID diagnostic, got: {msg}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_execute_reload_rejects_pid_outside_pid_t() {
+    let result = ferrum_edge::cli::execute_reload(&ReloadArgs {
+        pid: Some(u32::MAX),
+    });
+    assert!(result.is_err());
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("invalid --pid") && msg.contains("outside the range"),
+        "expected pid_t range diagnostic, got: {msg}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_parse_reload_rejects_pid_zero_at_clap() {
+    let result = Cli::try_parse_from(["ferrum-edge", "reload", "--pid", "0"]);
+    assert!(result.is_err(), "clap must reject the POSIX special PID 0");
+}
+
+#[cfg(unix)]
+#[test]
 fn test_execute_reload_no_pid_when_no_process_running() {
     // With no ferrum-edge process running, auto-detect should fail gracefully.
     let result = ferrum_edge::cli::execute_reload(&ReloadArgs { pid: None });

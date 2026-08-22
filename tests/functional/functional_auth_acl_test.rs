@@ -11,8 +11,8 @@
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_auth_acl
 
 use crate::common::{
-    TestGateway, empty_digest_header, generate_hmac_signature, generate_hmac_signature_with_digest,
-    hmac_authority_from_url,
+    TestGateway, content_digest_sha256_header, empty_digest_header, generate_hmac_signature,
+    generate_hmac_signature_with_digest, hmac_authority_from_url,
 };
 
 use base64::Engine;
@@ -20,6 +20,7 @@ use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub(super) fn create_rs256_token(claims: &serde_json::Value, private_key_pem: &[u8]) -> String {
@@ -531,6 +532,95 @@ fn start_echo_backend_on(listener: tokio::net::TcpListener) -> tokio::task::Join
             });
         }
     })
+}
+
+/// Shared slot holding the last mutating request body the capturing backend
+/// saw, or `None` if it has not seen one yet.
+type CapturedBody = Arc<Mutex<Option<Vec<u8>>>>;
+
+/// Capture the last mutating HTTP/1.1 request body. Health probes and
+/// `GET`/`HEAD` warmup must not overwrite application POSTs.
+fn start_capturing_backend(
+    listener: tokio::net::TcpListener,
+) -> (tokio::task::JoinHandle<()>, CapturedBody) {
+    let captured = Arc::new(Mutex::new(None));
+    let captured_for_task = Arc::clone(&captured);
+    let handle = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let captured = Arc::clone(&captured_for_task);
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = Vec::new();
+                loop {
+                    let mut tmp = [0u8; 1024];
+                    let n = match socket.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&tmp[..n]);
+                    let Some(header_end) = buf.windows(4).position(|window| window == b"\r\n\r\n")
+                    else {
+                        if buf.len() > 64 * 1024 {
+                            break;
+                        }
+                        continue;
+                    };
+                    // Own everything parsed out of the header before the body
+                    // loop below extends `buf`: `header_text` borrows `buf`, and
+                    // `method` / `path` borrow `header_text`, so holding either
+                    // across `buf.extend_from_slice` is a borrow conflict.
+                    let (method, path, content_length) = {
+                        let header_text = String::from_utf8_lossy(&buf[..header_end]);
+                        let mut lines = header_text.lines();
+                        let request_line = lines.next().unwrap_or_default();
+                        let mut parts = request_line.split_whitespace();
+                        let method = parts.next().unwrap_or("").to_string();
+                        let path = parts.next().unwrap_or("/").to_string();
+                        let mut content_length = 0usize;
+                        for line in header_text.lines().skip(1) {
+                            let Some((name, value)) = line.split_once(':') else {
+                                continue;
+                            };
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = value.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        (method, path, content_length)
+                    };
+                    let body_start = header_end + 4;
+                    while buf.len() < body_start + content_length {
+                        let mut tmp = [0u8; 1024];
+                        let n = match socket.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let body_end = (body_start + content_length).min(buf.len());
+                    let body = buf[body_start..body_end].to_vec();
+                    let mutating = method.eq_ignore_ascii_case("POST")
+                        || method.eq_ignore_ascii_case("PUT")
+                        || method.eq_ignore_ascii_case("PATCH")
+                        || method.eq_ignore_ascii_case("DELETE");
+                    if mutating
+                        && path != "/health"
+                        && let Ok(mut slot) = captured.lock()
+                    {
+                        *slot = Some(body);
+                    }
+                    let response_body = r#"{"status":"ok","echo":true}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    break;
+                }
+            });
+        }
+    });
+    (handle, captured)
 }
 
 /// Helper: create a consumer via admin API
@@ -3080,5 +3170,238 @@ async fn test_hmac_v2_backend_sees_exactly_one_mutation_for_a_replayed_request()
         mutations.load(std::sync::atomic::Ordering::SeqCst),
         2,
         "a malformed nonce must never reach the backend"
+    );
+}
+
+async fn send_hmac_v2_content_digest(
+    client: &reqwest::Client,
+    url: &str,
+    authorization: &str,
+    date: &str,
+    digest: &str,
+    body: &[u8],
+) -> reqwest::Response {
+    client
+        .post(url)
+        .header("Authorization", authorization)
+        .header("Date", date)
+        .header("Content-Digest", digest)
+        .header("Content-Type", "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+        .expect("hmac v2 Content-Digest request should complete")
+}
+
+/// Issue #3932 — a correctly signed nonempty RFC 9530 `Content-Digest`
+/// request authenticates and the backend sees the original client bytes.
+#[tokio::test]
+#[ignore]
+async fn test_hmac_v2_content_digest_forwards_original_body() {
+    let harness = AuthTestHarness::new()
+        .await
+        .expect("Failed to create test harness");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind capturing HMAC backend");
+    let backend_port = listener
+        .local_addr()
+        .expect("capturing HMAC backend addr")
+        .port();
+    let (_backend, captured) = start_capturing_backend(listener);
+
+    let client = reqwest::Client::new();
+    let admin_token = harness
+        .generate_admin_token()
+        .expect("Failed to generate admin token");
+    let auth_header = format!("Bearer {}", admin_token);
+    let admin_url = &harness.admin_base_url;
+    let proxy_url = &harness.proxy_base_url;
+
+    const SECRET: &str = "v2-hmac-content-digest-secret-32b";
+    create_consumer(
+        &client,
+        admin_url,
+        &auth_header,
+        "v2-cd-consumer",
+        "v2cduser",
+    )
+    .await
+    .unwrap();
+    add_credential(
+        &client,
+        admin_url,
+        &auth_header,
+        "v2-cd-consumer",
+        "hmac_auth",
+        &json!({"secret": SECRET}),
+    )
+    .await
+    .unwrap();
+
+    create_proxy(
+        &client,
+        admin_url,
+        &auth_header,
+        &json!({
+            "id": "proxy-hmac-v2-cd",
+            "listen_path": "/hmacv2cd",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "auth_mode": "single",
+        }),
+    )
+    .await
+    .unwrap();
+    create_plugin_config(
+        &client,
+        admin_url,
+        &auth_header,
+        &json!({
+            "id": "plugin-hmac-v2-cd",
+            "plugin_name": "hmac_auth",
+            "scope": "proxy",
+            "proxy_id": "proxy-hmac-v2-cd",
+            "enabled": true,
+            "config": {
+                "clock_skew_seconds": 300,
+                "replay_scope": "process"
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    update_proxy(
+        &client,
+        admin_url,
+        &auth_header,
+        &json!({
+            "id": "proxy-hmac-v2-cd",
+            "listen_path": "/hmacv2cd",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "auth_mode": "single",
+            "plugins": [{"plugin_config_id": "plugin-hmac-v2-cd"}]
+        }),
+    )
+    .await
+    .unwrap();
+
+    let url = format!("{}/hmacv2cd", proxy_url);
+    wait_until_hmac_v2_route_and_plugin_active(&client, &url).await;
+
+    let authority = hmac_authority_from_url(&url);
+    let date = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    let nonempty = br#"{"ping":1}"#;
+    let nonempty_digest = content_digest_sha256_header(nonempty);
+    let nonce = crate::common::hmac_v2_nonce(0x3932_0001);
+    let request = crate::common::HmacV2Request {
+        method: "POST",
+        path: "/hmacv2cd",
+        date: &date,
+        username: "v2cduser",
+        authority: &authority,
+        secret: SECRET,
+        digest_header: &nonempty_digest,
+        nonce: &nonce,
+    };
+    let authorization = crate::common::hmac_v2_authorization_header(&request, None);
+
+    let first = send_hmac_v2_content_digest(
+        &client,
+        &url,
+        &authorization,
+        &date,
+        &nonempty_digest,
+        nonempty,
+    )
+    .await;
+    assert_eq!(
+        first.status().as_u16(),
+        200,
+        "a valid nonempty Content-Digest v2 request must be accepted: {}",
+        first.status()
+    );
+    assert_eq!(
+        captured.lock().unwrap().as_deref(),
+        Some(nonempty.as_slice()),
+        "the backend must receive the original client body bytes"
+    );
+
+    let replay = send_hmac_v2_content_digest(
+        &client,
+        &url,
+        &authorization,
+        &date,
+        &nonempty_digest,
+        nonempty,
+    )
+    .await;
+    assert_eq!(replay.status().as_u16(), 401, "verbatim replay must be 401");
+    assert_eq!(
+        captured.lock().unwrap().as_deref(),
+        Some(nonempty.as_slice()),
+        "a replay must not replace the captured body"
+    );
+
+    let empty_digest = content_digest_sha256_header(&[]);
+    let empty_nonce = crate::common::hmac_v2_nonce(0x3932_0002);
+    let empty_request = crate::common::HmacV2Request {
+        digest_header: &empty_digest,
+        nonce: &empty_nonce,
+        ..request
+    };
+    let empty_authorization = crate::common::hmac_v2_authorization_header(&empty_request, None);
+    let empty = send_hmac_v2_content_digest(
+        &client,
+        &url,
+        &empty_authorization,
+        &date,
+        &empty_digest,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        empty.status().as_u16(),
+        200,
+        "a valid empty-body Content-Digest v2 request must be accepted"
+    );
+    assert_eq!(
+        captured.lock().unwrap().as_deref(),
+        Some(&[][..]),
+        "the backend must receive the empty body"
+    );
+
+    let wrong_digest = content_digest_sha256_header(b"not-the-body");
+    let wrong_nonce = crate::common::hmac_v2_nonce(0x3932_0003);
+    let wrong_request = crate::common::HmacV2Request {
+        digest_header: &wrong_digest,
+        nonce: &wrong_nonce,
+        ..request
+    };
+    let wrong_authorization = crate::common::hmac_v2_authorization_header(&wrong_request, None);
+    let mismatched = send_hmac_v2_content_digest(
+        &client,
+        &url,
+        &wrong_authorization,
+        &date,
+        &wrong_digest,
+        nonempty,
+    )
+    .await;
+    assert_eq!(
+        mismatched.status().as_u16(),
+        401,
+        "a digest that does not match the body must be rejected"
+    );
+    assert_eq!(
+        captured.lock().unwrap().as_deref(),
+        Some(&[][..]),
+        "a digest mismatch must not reach the backend"
     );
 }

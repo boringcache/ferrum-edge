@@ -55,8 +55,8 @@ async fn spawn_backend(identifier: &'static str) -> (u16, JoinHandle<()>) {
 /// Reserve two distinct ephemeral port numbers, then release both sockets so
 /// the gateway binds them itself. Holding both reservations at the same time
 /// prevents the kernel from immediately returning the first port for the
-/// second request. The gateway's readiness barrier still proves it won the
-/// later bind race; a lost race shows up as an explicit "never bound" failure.
+/// second request. Reload callers retry when an undeclared port reservation is
+/// stolen before the negative assertion runs.
 async fn reserve_free_port_pair() -> (u16, u16) {
     let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -66,6 +66,41 @@ async fn reserve_free_port_pair() -> (u16, u16) {
     );
     drop((first, second));
     ports
+}
+
+const GATEWAY_LISTENER_STARTUP_ATTEMPTS: u32 = 3;
+
+async fn gateway_listener_counts(gateway: &TestGateway) -> (u32, u32) {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(gateway.admin_url("/status"))
+        .header("Authorization", gateway.auth_header())
+        .send()
+        .await
+        .expect("fetch /status");
+    let body: serde_json::Value = resp.json().await.expect("status json");
+    let listeners = &body["gateway_listeners"];
+    (
+        listeners["desired_listeners"]
+            .as_u64()
+            .expect("desired_listeners") as u32,
+        listeners["active_listeners"]
+            .as_u64()
+            .expect("active_listeners") as u32,
+    )
+}
+
+/// True when another test bound `port` after we released the reservation but
+/// the gateway still reports only the single declared listener active.
+async fn undeclared_port_stolen_externally(gateway: &TestGateway, port: u16) -> bool {
+    if tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let (desired, active) = gateway_listener_counts(gateway).await;
+    desired == 1 && active == 1
 }
 
 async fn get_on_port(client: &reqwest::Client, port: u16, path: &str) -> (u16, String) {
@@ -300,83 +335,108 @@ plugin_configs: []
 async fn functional_port_aware_routes_reload_adds_and_withdraws_listeners() {
     let (backend_a, _ha) = spawn_backend("listener-a").await;
     let (backend_b, _hb) = spawn_backend("listener-b").await;
-    let (port_a, port_b) = reserve_free_port_pair().await;
-    assert_ne!(port_a, port_b);
 
-    let initial = format!(
-        r#"
+    for attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+        let (port_a, port_b) = reserve_free_port_pair().await;
+        if port_a == port_b {
+            continue;
+        }
+
+        let initial = format!(
+            r#"
 version: "1"
 proxies:{}
 consumers: []
 plugin_configs: []
 "#,
-        plaintext_proxy("gw-a", port_a, backend_a),
-    );
+            plaintext_proxy("gw-a", port_a, backend_a),
+        );
 
-    let gateway = TestGateway::builder()
-        .mode_file(initial)
-        .reserve_listener_port(port_a)
-        .reserve_listener_port(port_b)
-        .log_level("warn")
-        .spawn()
-        .await
-        .expect("start gateway");
-    let client = reqwest::Client::new();
-
-    wait_until_listening(port_a, "Gateway listener A").await;
-    assert_eq!(get_on_port(&client, port_a, "/api/x").await.1, "listener-a");
-    assert!(
-        tokio::net::TcpStream::connect(("127.0.0.1", port_b))
+        let gateway = TestGateway::builder()
+            .mode_file(initial)
+            .reserve_listener_port(port_a)
+            .reserve_listener_port(port_b)
+            .log_level("warn")
+            .spawn()
             .await
-            .is_err(),
-        "an undeclared listener port must not be bound"
-    );
+            .expect("start gateway");
+        let client = reqwest::Client::new();
 
-    let config_path = gateway
-        .config_path
-        .as_ref()
-        .expect("file-mode harness must populate config_path");
+        wait_until_listening(port_a, "Gateway listener A").await;
+        assert_eq!(get_on_port(&client, port_a, "/api/x").await.1, "listener-a");
+        if undeclared_port_stolen_externally(&gateway, port_b).await {
+            eprintln!(
+                "functional reload add/withdraw attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
+                 lost undeclared-port reservation race on port {port_b}"
+            );
+            drop(gateway);
+            if attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+                panic!(
+                    "an undeclared listener port must not be bound, but port {port_b} was \
+                     stolen by another test in all {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
+                );
+            }
+            continue;
+        }
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port_b))
+                .await
+                .is_err(),
+            "an undeclared listener port must not be bound"
+        );
 
-    // ── Reload 1: add listener B ─────────────────────────────────────────
-    let with_both = format!(
-        r#"
+        let config_path = gateway
+            .config_path
+            .as_ref()
+            .expect("file-mode harness must populate config_path");
+
+        // ── Reload 1: add listener B ─────────────────────────────────────────
+        let with_both = format!(
+            r#"
 version: "1"
 proxies:{}{}
 consumers: []
 plugin_configs: []
 "#,
-        plaintext_proxy("gw-a", port_a, backend_a),
-        plaintext_proxy("gw-b", port_b, backend_b),
-    );
-    std::fs::write(config_path, with_both).expect("rewrite config");
-    sighup(&gateway);
-    wait_until_listening(port_b, "added Gateway listener B").await;
+            plaintext_proxy("gw-a", port_a, backend_a),
+            plaintext_proxy("gw-b", port_b, backend_b),
+        );
+        std::fs::write(config_path, with_both).expect("rewrite config");
+        sighup(&gateway);
+        wait_until_listening(port_b, "added Gateway listener B").await;
 
-    assert_eq!(get_on_port(&client, port_b, "/api/x").await.1, "listener-b");
-    assert_eq!(
-        get_on_port(&client, port_a, "/api/x").await.1,
-        "listener-a",
-        "adding a listener must not disturb the existing one"
-    );
+        assert_eq!(get_on_port(&client, port_b, "/api/x").await.1, "listener-b");
+        assert_eq!(
+            get_on_port(&client, port_a, "/api/x").await.1,
+            "listener-a",
+            "adding a listener must not disturb the existing one"
+        );
 
-    // ── Reload 2: withdraw listener A ────────────────────────────────────
-    let only_b = format!(
-        r#"
+        // ── Reload 2: withdraw listener A ────────────────────────────────────
+        let only_b = format!(
+            r#"
 version: "1"
 proxies:{}
 consumers: []
 plugin_configs: []
 "#,
-        plaintext_proxy("gw-b", port_b, backend_b),
-    );
-    std::fs::write(config_path, only_b).expect("rewrite config");
-    sighup(&gateway);
-    wait_until_not_listening(port_a, "withdrawn Gateway listener A").await;
+            plaintext_proxy("gw-b", port_b, backend_b),
+        );
+        std::fs::write(config_path, only_b).expect("rewrite config");
+        sighup(&gateway);
+        wait_until_not_listening(port_a, "withdrawn Gateway listener A").await;
 
-    assert_eq!(
-        get_on_port(&client, port_b, "/api/x").await.1,
-        "listener-b",
-        "the surviving sibling listener keeps serving across the withdrawal"
+        assert_eq!(
+            get_on_port(&client, port_b, "/api/x").await.1,
+            "listener-b",
+            "the surviving sibling listener keeps serving across the withdrawal"
+        );
+        return;
+    }
+
+    panic!(
+        "could not reserve two distinct Gateway listener ports in \
+         {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
     );
 }
 

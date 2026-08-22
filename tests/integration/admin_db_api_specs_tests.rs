@@ -4837,6 +4837,152 @@ async fn delete_proxy_cleans_up_orphaned_upstream() {
 }
 
 #[tokio::test]
+async fn delete_proxy_opt_out_preserves_orphaned_hand_owned_upstream() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let upstream_id = uid("upstream-preserve");
+    let proxy_id = uid("proxy-preserve");
+    store
+        .create_upstream(&make_upstream(&upstream_id, ns))
+        .await
+        .expect("create upstream");
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.upstream_id = Some(upstream_id.clone());
+    store.create_proxy(&proxy).await.expect("create proxy");
+
+    let deleted = store
+        .delete_proxy_with_orphan_cleanup(ns, &proxy_id, false)
+        .await
+        .expect("delete proxy with opt-out");
+    assert!(deleted, "delete_proxy must return true");
+
+    let upstream_after = store
+        .get_upstream(ns, &upstream_id)
+        .await
+        .expect("get_upstream after opt-out delete");
+    assert!(
+        upstream_after.is_some(),
+        "hand-owned upstream must survive when cleanup_orphaned_upstream is false"
+    );
+}
+
+#[tokio::test]
+async fn delete_proxy_never_cleans_spec_owned_upstream_regardless_of_flag() {
+    for cleanup in [true, false] {
+        let dir = TempDir::new().unwrap();
+        let store = make_store(&dir).await;
+        let ns = "ferrum";
+
+        let spec_id = uid("spec");
+        let spec_proxy_id = uid("spec-proxy");
+        let spec_upstream_id = uid("spec-upstream");
+        let hand_proxy_id = uid("hand-proxy");
+        let drift_upstream_id = uid("drift-upstream");
+
+        let mut spec_proxy = make_proxy(&spec_proxy_id, ns);
+        spec_proxy.upstream_id = Some(spec_upstream_id.clone());
+        let bundle = ExtractedBundle {
+            proxy: spec_proxy,
+            upstream: Some(make_upstream(&spec_upstream_id, ns)),
+            plugins: vec![],
+        };
+        let spec = make_spec(&spec_id, &spec_proxy_id, ns, br#"{"openapi":"3.1.0"}"#);
+        store
+            .submit_api_spec_bundle(&bundle, &spec)
+            .await
+            .expect("submit api spec bundle");
+
+        store
+            .create_upstream(&make_upstream(&drift_upstream_id, ns))
+            .await
+            .expect("create drift upstream");
+        let mut hand_proxy = make_proxy(&hand_proxy_id, ns);
+        hand_proxy.upstream_id = Some(spec_upstream_id.clone());
+        store
+            .create_proxy(&hand_proxy)
+            .await
+            .expect("create hand-managed proxy pointing at spec-owned upstream");
+
+        let mut drifted = store
+            .get_proxy(ns, &spec_proxy_id)
+            .await
+            .expect("get spec proxy")
+            .expect("spec proxy exists");
+        drifted.upstream_id = Some(drift_upstream_id.clone());
+        store
+            .update_proxy(&drifted)
+            .await
+            .expect("drift spec proxy off spec-owned upstream");
+
+        let deleted = store
+            .delete_proxy_with_orphan_cleanup(ns, &hand_proxy_id, cleanup)
+            .await
+            .expect("delete hand-managed last referencer");
+        assert!(deleted, "delete_proxy must return true");
+
+        let spec_upstream = store
+            .get_upstream(ns, &spec_upstream_id)
+            .await
+            .expect("get spec-owned upstream");
+        assert!(
+            spec_upstream.is_some(),
+            "spec-owned upstream must never be orphan-cleaned \
+             (cleanup_orphaned_upstream={cleanup})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delete_proxy_never_cleans_still_referenced_upstream_regardless_of_flag() {
+    for cleanup in [true, false] {
+        let dir = TempDir::new().unwrap();
+        let store = make_store(&dir).await;
+        let ns = "ferrum";
+
+        let upstream_id = uid("shared-upstream");
+        let proxy_id_1 = uid("shared-p1");
+        let proxy_id_2 = uid("shared-p2");
+        store
+            .create_upstream(&make_upstream(&upstream_id, ns))
+            .await
+            .expect("create upstream");
+
+        let mut p1 = make_proxy(&proxy_id_1, ns);
+        p1.upstream_id = Some(upstream_id.clone());
+        store.create_proxy(&p1).await.expect("create P1");
+
+        let p2: Proxy = serde_json::from_value(serde_json::json!({
+            "id": proxy_id_2,
+            "namespace": ns,
+            "backend_host": "backend.example.com",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id_2}"),
+            "upstream_id": upstream_id
+        }))
+        .expect("p2 deserialization");
+        store.create_proxy(&p2).await.expect("create P2");
+
+        let deleted = store
+            .delete_proxy_with_orphan_cleanup(ns, &proxy_id_1, cleanup)
+            .await
+            .expect("delete P1");
+        assert!(deleted, "delete_proxy P1 must return true");
+
+        let upstream_after = store
+            .get_upstream(ns, &upstream_id)
+            .await
+            .expect("get_upstream after P1 delete");
+        assert!(
+            upstream_after.is_some(),
+            "upstream still referenced by P2 must survive \
+             (cleanup_orphaned_upstream={cleanup})"
+        );
+    }
+}
+
+#[tokio::test]
 async fn update_proxy_reassignment_cleans_up_orphaned_old_upstream() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;

@@ -25,6 +25,7 @@ correct close reason when frame and reassembled-message ceilings are equal.
 | `tungstenite` frame-limit origin | **Deliberate fork — not yet filed upstream** | Ferrum local | 0.29.0 |
 | `tungstenite` optional auto-pong | **Deliberate fork — not yet filed upstream** ([003](003-optional-auto-pong/)) | Ferrum local | 0.29.0 |
 | `tungstenite` / `tokio-tungstenite` fragment accounting | **Deliberate fork — not yet filed upstream** ([004](004-fragment-accounting/)) | Ferrum local | 0.29.0 |
+| `tungstenite` stray-continuation ordering | **Deliberate fork — not yet filed upstream** | Ferrum local | 0.29.0 |
 | `tokio-tungstenite` | <https://github.com/snapview/tokio-tungstenite/pull/380> | `ba1d8f8897a09e4cdf1088456667e8c24ee15832` | 0.29.0 |
 
 Both PRs were open when vendored. The local API names and return types match the
@@ -55,6 +56,14 @@ upstream proposals:
   upstream or explicitly re-affirmed before the first stable release under the
   dependency-policy SLA. It preserves frame-vs-reassembly attribution without
   weakening either parser ceiling.
+- Ordered the stray-continuation opcode/state check ahead of the frame-size
+  policy: a Continue frame received with no fragmented message in progress is
+  reported as `ProtocolError::UnexpectedContinueFrame` before the declared
+  63-bit length is compared to the ceiling. A genuinely oversized frame whose
+  63-bit length is above `u32::MAX` but has its high bit clear therefore stays
+  a `FrameTooLong` size-policy failure (Close 1009) rather than being misread
+  as protocol junk. This is a deliberate Ferrum extension owned by
+  `@jeremyjpj0916` under the dependency-policy SLA.
 - Added `WebSocketConfig::auto_pong` (default `true`) so the shared H1/H2/H3
   WebSocket relay can disable local auto-Pong while forwarding Ping frames
   (issue #2963). Documented under
@@ -116,7 +125,10 @@ compatible releases consumed by ferrum-edge and the consumed tungstenite
 surface preserves an equivalent frame-vs-message capacity origin, an
 equivalent opt-out for automatic Ping replies (`auto_pong` or successor),
 **and** an equivalent pre-reassembly fragment hook with independent
-incomplete-message count/duration bounds. If
+incomplete-message count/duration bounds. The stray-continuation extension may
+retire only when the consumed parser rejects invalid continuation state before
+applying caller frame-size policy, or when Ferrum no longer needs distinct
+protocol-vs-capacity attribution. If
 an extension has not shipped upstream, carry forward only that documented
 minimal extension until its own retirement condition is met.
 

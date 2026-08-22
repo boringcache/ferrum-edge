@@ -2,7 +2,9 @@
 #
 # Populates machine-readable Criterion + E2E artifacts for issue #3332. Does not
 # invent numbers: baseline.md tables stay `_TBD_` until a follow-up commit copies
-# validated hosted results. Trigger manually against the branch under test.
+# validated hosted results with the exact SHA, Actions run, artifact, collection
+# time, runner-health gate, and suite-specific acceptance evidence. Trigger
+# manually against the branch under test.
 #
 # Usage:
 #   Actions -> "Mesh Performance Baselines" -> Run workflow

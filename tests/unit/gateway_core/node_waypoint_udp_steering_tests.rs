@@ -30,6 +30,11 @@ use ferrum_edge::proxy::node_waypoint_udp_steering::{
     NodeWaypointUdpSteerBackend, NodeWaypointUdpSteering, SteerReconcileOutcome,
 };
 
+/// The publishing NodeWaypoint proxy's own pod identity. The node-agent
+/// resolves it host-side into the relay cgroup set that makes a UDP relay
+/// datagram provable (issues #3956, #3957).
+const RELAY_POD_UID: &str = "11111111-2222-3333-4444-555555555555";
+
 /// Records every script the reconcile runs, and can fail on demand.
 struct RecordingBackend {
     scripts: Mutex<Vec<String>>,
@@ -123,7 +128,7 @@ fn the_first_reconcile_reaps_a_previous_process_even_with_an_empty_plan() {
     let steering = NodeWaypointUdpSteering::new(backend.clone());
 
     assert_eq!(
-        steering.reconcile_with(&["veth0".to_string()], &[]),
+        steering.reconcile_with(&["veth0".to_string()], &[], false),
         SteerReconcileOutcome::Removed,
         "an empty destination plan on the FIRST pass must still tear the node down"
     );
@@ -150,7 +155,7 @@ fn the_first_reconcile_reaps_when_no_interface_is_attributable() {
     let steering = NodeWaypointUdpSteering::new(backend.clone());
 
     assert_eq!(
-        steering.reconcile_with(&[], &[destination("10.96.0.10", 5300)]),
+        steering.reconcile_with(&[], &[destination("10.96.0.10", 5300)], false),
         SteerReconcileOutcome::Removed
     );
     let scripts = backend.take();
@@ -168,14 +173,14 @@ fn later_empty_reconciles_are_idempotent_and_run_no_command() {
     let steering = NodeWaypointUdpSteering::new(backend.clone());
 
     assert_eq!(
-        steering.reconcile_with(&[], &[]),
+        steering.reconcile_with(&[], &[], false),
         SteerReconcileOutcome::Removed
     );
     assert_eq!(backend.take().len(), 1, "the first pass reaps");
 
     for _ in 0..5 {
         assert_eq!(
-            steering.reconcile_with(&[], &[]),
+            steering.reconcile_with(&[], &[], false),
             SteerReconcileOutcome::Unchanged
         );
     }
@@ -195,7 +200,7 @@ fn an_unchanged_generation_runs_no_command_after_it_is_applied() {
     let destinations = vec![destination("10.96.0.10", 5300)];
 
     assert_eq!(
-        steering.reconcile_with(&ifaces, &destinations),
+        steering.reconcile_with(&ifaces, &destinations, true),
         SteerReconcileOutcome::Applied
     );
     let first = backend.take();
@@ -209,7 +214,7 @@ fn an_unchanged_generation_runs_no_command_after_it_is_applied() {
 
     for _ in 0..3 {
         assert_eq!(
-            steering.reconcile_with(&ifaces, &destinations),
+            steering.reconcile_with(&ifaces, &destinations, true),
             SteerReconcileOutcome::Unchanged
         );
     }
@@ -228,7 +233,7 @@ fn a_failed_apply_tears_down_and_is_retried_on_the_next_reconcile() {
     let destinations = vec![destination("10.96.0.10", 5300)];
 
     assert_eq!(
-        steering.reconcile_with(&ifaces, &destinations),
+        steering.reconcile_with(&ifaces, &destinations, true),
         SteerReconcileOutcome::Failed
     );
     let first = backend.take();
@@ -238,7 +243,7 @@ fn a_failed_apply_tears_down_and_is_retried_on_the_next_reconcile() {
     );
 
     assert_eq!(
-        steering.reconcile_with(&ifaces, &destinations),
+        steering.reconcile_with(&ifaces, &destinations, true),
         SteerReconcileOutcome::Failed,
         "the identical plan must be attempted again, not reported Unchanged"
     );
@@ -1275,7 +1280,9 @@ fn every_rule_is_scoped_by_interface_and_exact_service_address() {
 }
 
 /// Bound destinations are instance-owned. Setting them applies immediately
-/// against the supplied interfaces; clearing them tears the datapath down.
+/// against the supplied interfaces. Clearing them with `serving == false` is a
+/// true withdrawal; an empty destination set with `serving == true` keeps the
+/// sender proof live.
 #[test]
 fn set_bound_destinations_applies_immediately_and_empty_tears_down() {
     let backend = RecordingBackend::new(false);
@@ -1284,7 +1291,7 @@ fn set_bound_destinations_applies_immediately_and_empty_tears_down() {
     let destinations = vec![destination("10.96.0.10", 5300)];
 
     assert_eq!(
-        steering.set_bound_destinations(destinations.clone(), Some(&ifaces)),
+        steering.set_bound_destinations(destinations.clone(), Some(&ifaces), true),
         SteerReconcileOutcome::Applied
     );
     assert_eq!(steering.bound_destinations(), destinations);
@@ -1293,7 +1300,7 @@ fn set_bound_destinations_applies_immediately_and_empty_tears_down() {
     assert!(!is_teardown(&first[1]));
 
     assert_eq!(
-        steering.set_bound_destinations(Vec::new(), Some(&ifaces)),
+        steering.set_bound_destinations(Vec::new(), Some(&ifaces), false),
         SteerReconcileOutcome::Removed
     );
     assert!(steering.bound_destinations().is_empty());
@@ -1315,6 +1322,7 @@ fn retract_port_drops_only_that_destination() {
             destination("10.96.0.11", 5301),
         ],
         Some(&ifaces),
+        true,
     );
     backend.take();
 
@@ -1386,7 +1394,7 @@ fn later_bound_destination_update_owns_the_installed_plan() {
     let ifaces_b = ifaces.clone();
     let plan_b_thread = plan_b.clone();
     let handle_b = std::thread::spawn(move || {
-        steering_b.set_bound_destinations(plan_b_thread, Some(&ifaces_b))
+        steering_b.set_bound_destinations(plan_b_thread, Some(&ifaces_b), true)
     });
     entered.wait();
 
@@ -1394,7 +1402,7 @@ fn later_bound_destination_update_owns_the_installed_plan() {
     let ifaces_c = ifaces.clone();
     let plan_c_thread = plan_c.clone();
     let handle_c = std::thread::spawn(move || {
-        steering_c.set_bound_destinations(plan_c_thread, Some(&ifaces_c))
+        steering_c.set_bound_destinations(plan_c_thread, Some(&ifaces_c), true)
     });
 
     release.wait();
@@ -1434,7 +1442,7 @@ fn retract_filters_the_latest_desired_set_not_a_stale_snapshot() {
     ];
 
     assert_eq!(
-        steering.set_bound_destinations(initial, Some(&ifaces)),
+        steering.set_bound_destinations(initial, Some(&ifaces), true),
         SteerReconcileOutcome::Applied
     );
 
@@ -1443,7 +1451,7 @@ fn retract_filters_the_latest_desired_set_not_a_stale_snapshot() {
     let ifaces_full = ifaces.clone();
     let full_thread = full.clone();
     let handle_full = std::thread::spawn(move || {
-        steering_full.set_bound_destinations(full_thread, Some(&ifaces_full))
+        steering_full.set_bound_destinations(full_thread, Some(&ifaces_full), true)
     });
     entered.wait();
 
@@ -1480,7 +1488,7 @@ fn later_full_plan_owns_the_installed_plan_over_an_in_flight_retract() {
     ];
 
     assert_eq!(
-        steering.set_bound_destinations(initial, Some(&ifaces)),
+        steering.set_bound_destinations(initial, Some(&ifaces), true),
         SteerReconcileOutcome::Applied
     );
 
@@ -1493,7 +1501,7 @@ fn later_full_plan_owns_the_installed_plan_over_an_in_flight_retract() {
     let ifaces_full = ifaces.clone();
     let full_thread = full.clone();
     let handle_full = std::thread::spawn(move || {
-        steering_full.set_bound_destinations(full_thread, Some(&ifaces_full))
+        steering_full.set_bound_destinations(full_thread, Some(&ifaces_full), true)
     });
 
     release.wait();
@@ -1545,9 +1553,12 @@ impl NodeWaypointUdpReplySourcePublisher for RecordingPublisher {
     fn publish(
         &self,
         sources: &[NodeWaypointUdpSteerDestination],
+        active: bool,
     ) -> Result<ReplySourceGeneration, String> {
-        let entry = if sources.is_empty() {
+        let entry = if !active {
             "publish:withdraw".to_string()
+        } else if sources.is_empty() {
+            "publish:active:0".to_string()
         } else {
             format!("publish:{}", sources.len())
         };
@@ -1558,7 +1569,7 @@ impl NodeWaypointUdpReplySourcePublisher for RecordingPublisher {
                 .push(format!("{entry}:failed"));
             return Err("injected reply-source publication failure".to_string());
         }
-        let generation = self.inner.publish(sources)?;
+        let generation = self.inner.publish(sources, active)?;
         if self
             .auto_acknowledge
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -1648,7 +1659,7 @@ fn acknowledged_steering(auto_acknowledge: bool) -> (NodeWaypointUdpSteering, No
     let fail_read_ack = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let fail_teardown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let publisher = RecordingPublisher {
-        inner: RegistryDirReplySourcePublisher::new(registry.path()),
+        inner: RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID)),
         registry: registry.path().to_path_buf(),
         log: log.clone(),
         fail_publish: fail_publish.clone(),
@@ -1690,6 +1701,7 @@ fn a_generation_authorizes_its_reply_sources_before_it_steers_anything() {
                 destination("10.96.0.10", 5300),
                 destination("fd00::a", 5300),
             ],
+            true,
         ),
         SteerReconcileOutcome::Applied
     );
@@ -1720,7 +1732,7 @@ fn no_setup_runs_until_the_exact_generation_is_acknowledged() {
     let destinations = [destination("10.96.0.10", 5300)];
 
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &destinations),
+        steering.reconcile_with(&ifaces(), &destinations, true),
         SteerReconcileOutcome::PendingAck,
         "an unacknowledged generation must not install steering rules"
     );
@@ -1737,7 +1749,7 @@ fn no_setup_runs_until_the_exact_generation_is_acknowledged() {
     // The node-agent converges. The very next ordinary reconcile installs.
     agent.acknowledge_latest();
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &destinations),
+        steering.reconcile_with(&ifaces(), &destinations, true),
         SteerReconcileOutcome::Applied
     );
     let applied = agent.take_entries();
@@ -1752,7 +1764,7 @@ fn no_setup_runs_until_the_exact_generation_is_acknowledged() {
 
     // And it settles: no republish, no command.
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &destinations),
+        steering.reconcile_with(&ifaces(), &destinations, true),
         SteerReconcileOutcome::Unchanged
     );
     assert!(agent.entries().is_empty());
@@ -1769,7 +1781,7 @@ fn a_pending_generation_is_retried_without_advancing_it() {
 
     for _ in 0..4 {
         assert_eq!(
-            steering.reconcile_with(&ifaces(), &destinations),
+            steering.reconcile_with(&ifaces(), &destinations, true),
             SteerReconcileOutcome::PendingAck
         );
     }
@@ -1780,7 +1792,7 @@ fn a_pending_generation_is_retried_without_advancing_it() {
 
     agent.acknowledge_latest();
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &destinations),
+        steering.reconcile_with(&ifaces(), &destinations, true),
         SteerReconcileOutcome::Applied,
         "the sequence must not have advanced past the acknowledgement"
     );
@@ -1797,17 +1809,17 @@ fn a_stale_acknowledgement_never_satisfies_a_new_generation() {
     let first = [destination("10.96.0.10", 5300)];
     let second = [destination("10.96.0.11", 5301)];
 
-    steering.reconcile_with(&ifaces(), &first);
+    steering.reconcile_with(&ifaces(), &first, true);
     agent.acknowledge_latest();
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &first),
+        steering.reconcile_with(&ifaces(), &first, true),
         SteerReconcileOutcome::Applied
     );
     agent.take_entries();
 
     // The serving set changes; the node-agent has not caught up.
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &second),
+        steering.reconcile_with(&ifaces(), &second, true),
         SteerReconcileOutcome::PendingAck,
         "the previous generation's acknowledgement must not satisfy the new one"
     );
@@ -1820,7 +1832,7 @@ fn a_stale_acknowledgement_never_satisfies_a_new_generation() {
 
     agent.acknowledge_latest();
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &second),
+        steering.reconcile_with(&ifaces(), &second, true),
         SteerReconcileOutcome::Applied
     );
     forget(steering);
@@ -1836,7 +1848,7 @@ fn a_withdrawn_acknowledgement_reverts_the_installed_steering() {
     let destinations = [destination("10.96.0.10", 5300)];
 
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &destinations),
+        steering.reconcile_with(&ifaces(), &destinations, true),
         SteerReconcileOutcome::Applied
     );
     agent.take_entries();
@@ -1848,7 +1860,7 @@ fn a_withdrawn_acknowledgement_reverts_the_installed_steering() {
     agent.withdraw_acknowledgement();
 
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &destinations),
+        steering.reconcile_with(&ifaces(), &destinations, true),
         SteerReconcileOutcome::PendingAck
     );
     let reverted = agent.take_entries();
@@ -1863,7 +1875,7 @@ fn a_withdrawn_acknowledgement_reverts_the_installed_steering() {
 
     agent.acknowledge_latest();
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &destinations),
+        steering.reconcile_with(&ifaces(), &destinations, true),
         SteerReconcileOutcome::Applied
     );
     forget(steering);
@@ -1876,14 +1888,14 @@ fn a_teardown_unsteers_before_it_withdraws_authorization() {
     let (steering, agent) = acknowledged_steering(true);
 
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &[destination("10.96.0.10", 5300)]),
+        steering.reconcile_with(&ifaces(), &[destination("10.96.0.10", 5300)], true),
         SteerReconcileOutcome::Applied
     );
     agent.take_entries();
 
     // Withdrawing the last destination is the ordinary listener-stop path.
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &[]),
+        steering.reconcile_with(&ifaces(), &[], false),
         SteerReconcileOutcome::Removed
     );
     assert_eq!(
@@ -1906,7 +1918,7 @@ fn a_failed_rule_teardown_does_not_publish_or_settle_the_withdrawal() {
     let (steering, agent) = acknowledged_steering(true);
     let destinations = [destination("10.96.0.10", 5300)];
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &destinations),
+        steering.reconcile_with(&ifaces(), &destinations, true),
         SteerReconcileOutcome::Applied
     );
     agent.take_entries();
@@ -1916,7 +1928,7 @@ fn a_failed_rule_teardown_does_not_publish_or_settle_the_withdrawal() {
         .store(true, std::sync::atomic::Ordering::SeqCst);
     for _ in 0..2 {
         assert_eq!(
-            steering.reconcile_with(&ifaces(), &[]),
+            steering.reconcile_with(&ifaces(), &[], false),
             SteerReconcileOutcome::Failed
         );
         assert_eq!(
@@ -1930,7 +1942,7 @@ fn a_failed_rule_teardown_does_not_publish_or_settle_the_withdrawal() {
         .fail_teardown
         .store(false, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &[]),
+        steering.reconcile_with(&ifaces(), &[], false),
         SteerReconcileOutcome::Removed
     );
     assert_eq!(
@@ -1952,7 +1964,7 @@ fn a_failed_rule_teardown_fences_replacement_publication_and_setup() {
     let first = [destination("10.96.0.10", 5300)];
     let second = [destination("10.96.0.11", 5301)];
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &first),
+        steering.reconcile_with(&ifaces(), &first, true),
         SteerReconcileOutcome::Applied
     );
     agent.take_entries();
@@ -1961,7 +1973,7 @@ fn a_failed_rule_teardown_fences_replacement_publication_and_setup() {
         .fail_teardown
         .store(true, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &second),
+        steering.reconcile_with(&ifaces(), &second, true),
         SteerReconcileOutcome::Failed
     );
     assert_eq!(agent.take_entries(), vec!["script:teardown".to_string()]);
@@ -1970,7 +1982,7 @@ fn a_failed_rule_teardown_fences_replacement_publication_and_setup() {
         .fail_teardown
         .store(false, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &second),
+        steering.reconcile_with(&ifaces(), &second, true),
         SteerReconcileOutcome::Applied
     );
     assert_eq!(
@@ -1994,17 +2006,17 @@ fn a_withdrawal_is_not_proven_until_the_empty_generation_is_acknowledged() {
     let (steering, agent) = acknowledged_steering(false);
     let destinations = [destination("10.96.0.10", 5300)];
 
-    steering.reconcile_with(&ifaces(), &destinations);
+    steering.reconcile_with(&ifaces(), &destinations, true);
     agent.acknowledge_latest();
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &destinations),
+        steering.reconcile_with(&ifaces(), &destinations, true),
         SteerReconcileOutcome::Applied
     );
     agent.take_entries();
 
     // The listener stops. The rules go immediately; the proof does not.
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &[]),
+        steering.reconcile_with(&ifaces(), &[], false),
         SteerReconcileOutcome::PendingAck,
         "an unacknowledged withdrawal must not be reported as removed"
     );
@@ -2018,7 +2030,7 @@ fn a_withdrawal_is_not_proven_until_the_empty_generation_is_acknowledged() {
 
     // Still unproven: the next quiet poll must RE-attempt rather than settle.
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &[]),
+        steering.reconcile_with(&ifaces(), &[], false),
         SteerReconcileOutcome::PendingAck
     );
     let retried = agent.take_entries();
@@ -2035,7 +2047,7 @@ fn a_withdrawal_is_not_proven_until_the_empty_generation_is_acknowledged() {
     // settled, so the loop stops issuing commands entirely.
     agent.acknowledge_latest();
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &[]),
+        steering.reconcile_with(&ifaces(), &[], false),
         SteerReconcileOutcome::Unchanged
     );
     assert!(
@@ -2056,7 +2068,7 @@ fn a_failed_withdrawal_is_retried_rather_than_settled() {
     let destinations = [destination("10.96.0.10", 5300)];
 
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &destinations),
+        steering.reconcile_with(&ifaces(), &destinations, true),
         SteerReconcileOutcome::Applied
     );
 
@@ -2065,7 +2077,7 @@ fn a_failed_withdrawal_is_retried_rather_than_settled() {
         .fail_publish
         .store(true, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &[]),
+        steering.reconcile_with(&ifaces(), &[], false),
         SteerReconcileOutcome::Failed
     );
     agent.take_entries();
@@ -2073,7 +2085,7 @@ fn a_failed_withdrawal_is_retried_rather_than_settled() {
     // Still failing: the next quiet poll must RE-attempt the withdrawal instead
     // of settling.
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &[]),
+        steering.reconcile_with(&ifaces(), &[], false),
         SteerReconcileOutcome::Failed
     );
     let retried = agent.take_entries();
@@ -2089,12 +2101,12 @@ fn a_failed_withdrawal_is_retried_rather_than_settled() {
         .fail_publish
         .store(false, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &[]),
+        steering.reconcile_with(&ifaces(), &[], false),
         SteerReconcileOutcome::Removed
     );
     agent.take_entries();
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &[]),
+        steering.reconcile_with(&ifaces(), &[], false),
         SteerReconcileOutcome::Unchanged
     );
     assert!(agent.entries().is_empty());
@@ -2113,7 +2125,7 @@ fn a_failed_publication_refuses_the_generation_and_steers_nothing() {
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &[destination("10.96.0.10", 5300)]),
+        steering.reconcile_with(&ifaces(), &[destination("10.96.0.10", 5300)], true),
         SteerReconcileOutcome::Failed
     );
     let recorded = agent.entries();
@@ -2140,7 +2152,7 @@ fn an_unreadable_acknowledgement_fails_the_generation_closed() {
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &[destination("10.96.0.10", 5300)]),
+        steering.reconcile_with(&ifaces(), &[destination("10.96.0.10", 5300)], true),
         SteerReconcileOutcome::Failed,
         "an acknowledgement that cannot be read proves nothing"
     );
@@ -2154,7 +2166,7 @@ fn an_unreadable_acknowledgement_fails_the_generation_closed() {
         .fail_read_ack
         .store(false, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &[destination("10.96.0.10", 5300)]),
+        steering.reconcile_with(&ifaces(), &[destination("10.96.0.10", 5300)], true),
         SteerReconcileOutcome::Applied,
         "and the recovery is the ordinary next reconcile"
     );
@@ -2171,14 +2183,16 @@ fn a_predecessor_acknowledgement_does_not_let_a_successor_steer() {
     let destinations = [destination("10.96.0.10", 5300)];
 
     // The predecessor publishes and is acknowledged, then the process dies.
-    let predecessor = RegistryDirReplySourcePublisher::new(registry.path());
-    let old = predecessor.publish(&destinations).expect("predecessor");
+    let predecessor = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
+    let old = predecessor
+        .publish(&destinations, true)
+        .expect("predecessor");
     write_acknowledgement(registry.path(), &old).expect("predecessor acknowledgement");
 
     let log = Arc::new(Mutex::new(Vec::new()));
     let auto = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let publisher = RecordingPublisher {
-        inner: RegistryDirReplySourcePublisher::new(registry.path()),
+        inner: RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID)),
         registry: registry.path().to_path_buf(),
         log: log.clone(),
         fail_publish: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2192,7 +2206,7 @@ fn a_predecessor_acknowledgement_does_not_let_a_successor_steer() {
     .with_reply_source_publisher(Arc::new(publisher));
 
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &destinations),
+        steering.reconcile_with(&ifaces(), &destinations, true),
         SteerReconcileOutcome::PendingAck,
         "a predecessor's acknowledgement must not prove the successor's generation"
     );
@@ -2208,7 +2222,7 @@ fn a_predecessor_acknowledgement_does_not_let_a_successor_steer() {
         .expect("a generation is published");
     write_acknowledgement(registry.path(), &desired.generation).expect("acknowledgement");
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &destinations),
+        steering.reconcile_with(&ifaces(), &destinations, true),
         SteerReconcileOutcome::Applied
     );
     forget(steering);
@@ -2223,15 +2237,129 @@ fn an_unchanged_generation_republishes_nothing() {
     let destinations = [destination("10.96.0.10", 5300)];
 
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &destinations),
+        steering.reconcile_with(&ifaces(), &destinations, true),
         SteerReconcileOutcome::Applied
     );
     agent.take_entries();
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &destinations),
+        steering.reconcile_with(&ifaces(), &destinations, true),
         SteerReconcileOutcome::Unchanged
     );
     assert!(agent.entries().is_empty());
+    forget(steering);
+}
+
+/// A bound listener with no ClusterIP destinations still publishes ACTIVE so
+/// the relay-cgroup sender proof stays live. Steering rules stay absent.
+#[test]
+fn a_serving_headless_listener_keeps_the_sender_proof_without_steering() {
+    let (steering, agent) = acknowledged_steering(true);
+
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &[], true),
+        SteerReconcileOutcome::Applied,
+        "a bound headless listener is serving, not withdrawn"
+    );
+    assert_eq!(
+        agent.entries(),
+        vec![
+            "script:teardown".to_string(),
+            "publish:active:0".to_string(),
+        ],
+        "rules stay absent; the active-empty generation is published so the sender proof can settle"
+    );
+    assert!(steering.serving());
+    assert!(steering.bound_destinations().is_empty());
+
+    agent.take_entries();
+
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &[], true),
+        SteerReconcileOutcome::Unchanged
+    );
+    assert!(
+        agent.take_entries().is_empty(),
+        "a quiet poll of a proven active-empty generation must run no command"
+    );
+    forget(steering);
+}
+
+/// Adding and removing ClusterIP destinations while the listener stays bound
+/// must not withdraw the sender proof. Only losing the last serving listener
+/// (or shutdown) is a true withdrawal.
+#[test]
+fn clusterip_churn_while_serving_does_not_withdraw_the_sender_proof() {
+    let (steering, agent) = acknowledged_steering(true);
+    let dest = [
+        destination("10.96.0.10", 5300),
+        destination("fd00::a", 5300),
+    ];
+
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &dest, true),
+        SteerReconcileOutcome::Applied
+    );
+    agent.take_entries();
+
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &[], true),
+        SteerReconcileOutcome::Applied,
+        "dropping every ClusterIP while the listener stays bound is still ACTIVE"
+    );
+    let emptied = agent.take_entries();
+    assert!(
+        emptied.contains(&"script:teardown".to_string())
+            && emptied.contains(&"publish:active:0".to_string())
+            && !emptied.contains(&"publish:withdraw".to_string()),
+        "ClusterIP removal must not publish a withdrawal: {emptied:?}"
+    );
+
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &dest, true),
+        SteerReconcileOutcome::Applied
+    );
+    let restored = agent.take_entries();
+    assert!(
+        restored.contains(&"publish:2".to_string())
+            && restored.contains(&"script:setup".to_string()),
+        "restoring ClusterIPs while still serving must re-authorize then steer: {restored:?}"
+    );
+
+    assert_eq!(
+        steering.reconcile_with(&ifaces(), &[], false),
+        SteerReconcileOutcome::Removed
+    );
+    assert_eq!(
+        agent.entries(),
+        vec![
+            "script:teardown".to_string(),
+            "publish:withdraw".to_string()
+        ],
+        "losing the last serving listener is the only true withdrawal"
+    );
+    forget(steering);
+}
+
+/// Empty attribution interfaces leave steering rules absent, but a bound
+/// listener still publishes ACTIVE (with its ClusterIP tuples, if any) so the
+/// direct-node sender proof stays live.
+#[test]
+fn serving_without_attribution_interfaces_keeps_the_sender_proof() {
+    let (steering, agent) = acknowledged_steering(true);
+    let dest = [destination("10.96.0.10", 5300)];
+
+    assert_eq!(
+        steering.reconcile_with(&[], &dest, true),
+        SteerReconcileOutcome::Applied
+    );
+    let entries = agent.entries();
+    assert!(
+        entries.contains(&"script:teardown".to_string())
+            && entries.contains(&"publish:1".to_string())
+            && !entries.contains(&"script:setup".to_string())
+            && !entries.contains(&"publish:withdraw".to_string()),
+        "no interfaces means no steering rules, but the sender proof stays live: {entries:?}"
+    );
     forget(steering);
 }
 
@@ -2243,7 +2371,7 @@ fn shutdown_withdraws_every_authorized_reply_source() {
     let (steering, agent) = acknowledged_steering(true);
 
     assert_eq!(
-        steering.reconcile_with(&ifaces(), &[destination("10.96.0.10", 5300)]),
+        steering.reconcile_with(&ifaces(), &[destination("10.96.0.10", 5300)], true),
         SteerReconcileOutcome::Applied
     );
     agent.take_entries();

@@ -32,7 +32,7 @@ use crate::modes::mesh::access_log_filter::{
 };
 
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
-use super::{Plugin, StreamTransactionSummary, TransactionSummary};
+use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 
 pub struct StdoutLogging {
     /// When set, only log transactions matching all filter predicates.
@@ -134,6 +134,16 @@ impl StdoutLogging {
         Ok(Self { filter, schema })
     }
 
+    /// Project a WebSocket disconnect into the HTTP access-log schema.
+    ///
+    /// Hidden test helper so external unit tests can assert handshake
+    /// method/status/original-path without going through stdout.
+    #[doc(hidden)]
+    #[allow(dead_code)] // exercised by external unit tests; dead in the binary target
+    pub fn project_ws_disconnect(ctx: &WsDisconnectContext) -> TransactionSummary {
+        transaction_summary_from_ws_disconnect(ctx)
+    }
+
     /// Apply the configured HTTP-family predicates to a finalized summary.
     pub fn should_log_transaction(&self, summary: &TransactionSummary) -> bool {
         let Some(filter) = &self.filter else {
@@ -205,6 +215,39 @@ impl StdoutLogging {
             return false;
         }
         true
+    }
+}
+
+/// Project a WebSocket session-end into the HTTP-family access-log schema.
+///
+/// Handshake `log()` already emitted the upgrade row (usually without
+/// `error_class`). In-session faults live on `WsDisconnectContext`; this
+/// conversion lets operators grep the same `error_class` key. Method, path,
+/// and status are the values captured at upgrade admission (`GET`/`101` for
+/// HTTP/1.1, `CONNECT`/`200` for RFC 8441/9220 Extended CONNECT) so a
+/// rewritten backend target cannot corrupt those fields. BASE schema only —
+/// this is not the `websocket_disconnect` capability family.
+fn transaction_summary_from_ws_disconnect(ctx: &WsDisconnectContext) -> TransactionSummary {
+    TransactionSummary {
+        namespace: ctx.namespace.clone(),
+        timestamp_received: ctx.timestamp_connected.clone(),
+        client_ip: ctx.client_ip.clone(),
+        consumer_username: ctx.consumer_username.clone(),
+        auth_method: ctx.auth_method,
+        http_method: ctx.http_method.clone(),
+        request_path: ctx.request_path.clone(),
+        proxy_id: Some(ctx.proxy_id.clone()),
+        proxy_name: ctx.proxy_name.clone(),
+        backend_target: Some(ctx.backend_target.clone()),
+        response_status_code: ctx.handshake_status_code,
+        latency_total_ms: ctx.duration_ms,
+        latency_gateway_processing_ms: ctx.duration_ms,
+        bytes_sent: ctx.bytes_client_to_backend,
+        bytes_received: ctx.bytes_backend_to_client,
+        error_class: ctx.error_class,
+        metadata: ctx.metadata.clone(),
+        proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
+        ..TransactionSummary::default()
     }
 }
 
@@ -311,6 +354,15 @@ impl Plugin for StdoutLogging {
         if let Err(error) = result {
             warn!("stdout_logging: failed to serialize stream summary: {error}");
         }
+    }
+
+    fn requires_ws_disconnect_hooks(&self) -> bool {
+        true
+    }
+
+    async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
+        let summary = transaction_summary_from_ws_disconnect(ctx);
+        self.log(&summary).await;
     }
 }
 
@@ -569,5 +621,68 @@ mod tests {
 
         assert!(plugin.should_log_transaction(&http_summary(503, 1.0, None)));
         assert!(!plugin.should_log_transaction(&http_summary(200, 1.0, None)));
+    }
+
+    fn ws_disconnect(error_class: Option<ErrorClass>, backend_target: &str) -> WsDisconnectContext {
+        WsDisconnectContext {
+            namespace: "ferrum".to_string(),
+            proxy_id: "proxy-ws".to_string(),
+            proxy_lifecycle_generation: None,
+            proxy_name: Some("websocket-proxy".to_string()),
+            client_ip: "10.0.0.1".to_string(),
+            backend_target: backend_target.to_string(),
+            http_method: "GET".to_string(),
+            request_path: "/chat".to_string(),
+            handshake_status_code: 101,
+            listen_port: 8080,
+            duration_ms: 42.0,
+            frames_client_to_backend: 1,
+            frames_backend_to_client: 0,
+            bytes_client_to_backend: 16,
+            bytes_backend_to_client: 0,
+            timestamp_connected: "2026-01-01T00:00:00Z".to_string(),
+            timestamp_disconnected: "2026-01-01T00:00:01Z".to_string(),
+            direction: Some(crate::plugins::Direction::ClientToBackend),
+            io_side: None,
+            error_class,
+            consumer_username: None,
+            auth_method: None,
+            connection_id: 7,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn ws_disconnect_summary_carries_error_class_and_path() {
+        let summary = transaction_summary_from_ws_disconnect(&ws_disconnect(
+            Some(ErrorClass::ProtocolError),
+            "ws://backend.local:9000/chat",
+        ));
+        assert_eq!(summary.response_status_code, 101);
+        assert_eq!(summary.http_method, "GET");
+        assert_eq!(summary.request_path, "/chat");
+        assert_eq!(summary.error_class, Some(ErrorClass::ProtocolError));
+        assert_eq!(summary.bytes_sent, 16);
+        assert_eq!(
+            summary.backend_target.as_deref(),
+            Some("ws://backend.local:9000/chat")
+        );
+        assert!(summary.is_terminal_failure());
+    }
+
+    #[test]
+    fn errors_only_filter_logs_ws_session_end_with_error_class() {
+        let plugin = StdoutLogging::new(&json!({
+            "filter": { "errors_only": true }
+        }))
+        .expect("plugin config");
+        let failed = transaction_summary_from_ws_disconnect(&ws_disconnect(
+            Some(ErrorClass::ConnectionReset),
+            "http://127.0.0.1:9/",
+        ));
+        let clean =
+            transaction_summary_from_ws_disconnect(&ws_disconnect(None, "http://127.0.0.1:9/"));
+        assert!(plugin.should_log_transaction(&failed));
+        assert!(!plugin.should_log_transaction(&clean));
     }
 }

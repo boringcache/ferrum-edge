@@ -12,7 +12,7 @@ pub use self::{
     utf8::Utf8Bytes,
 };
 
-use self::coding::{Control, OpCode};
+use self::coding::{Control, Data, OpCode};
 use crate::{
     error::{CapacityError, Error, ProtocolError, Result},
     protocol::frame::mask::apply_mask,
@@ -67,7 +67,7 @@ where
 {
     /// Read a frame from stream.
     pub fn read(&mut self, max_size: Option<usize>) -> Result<Option<Frame>> {
-        self.codec.read_frame(&mut self.stream, max_size, false, true)
+        self.codec.read_frame(&mut self.stream, max_size, false, true, false)
     }
 }
 
@@ -183,6 +183,7 @@ impl FrameCodec {
         max_size: Option<usize>,
         unmask: bool,
         accept_unmasked: bool,
+        reject_unexpected_continue: bool,
     ) -> Result<Option<Frame>> {
         let max_size = max_size.unwrap_or_else(usize::max_value);
 
@@ -204,6 +205,18 @@ impl FrameCodec {
                     // trigger an unbounded reservation.
                     if matches!(header.opcode, OpCode::Control(_)) && len > 125 {
                         return Err(Error::Protocol(ProtocolError::ControlFrameTooBig));
+                    }
+
+                    // A continuation frame is only valid while a fragmented
+                    // message is being reassembled (RFC 6455 §5.4). Reject a
+                    // stray Continue opcode before the frame-size policy so
+                    // protocol junk whose 63-bit length is well-formed but
+                    // whose opcode/state is not surfaces as
+                    // `UnexpectedContinueFrame` rather than a size-policy 1009.
+                    if reject_unexpected_continue
+                        && matches!(header.opcode, OpCode::Data(Data::Continue))
+                    {
+                        return Err(Error::Protocol(ProtocolError::UnexpectedContinueFrame));
                     }
 
                     // Enforce the caller's frame-size policy before reserving
