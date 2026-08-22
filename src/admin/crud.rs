@@ -1013,6 +1013,7 @@ async fn persist_update_to_settlement<R: AdminResource>(
 async fn persist_undecodable_delete_repair<R: AdminResource>(
     context: OwnedWriteSettlementContext,
     id: String,
+    delete_query: R::DeleteQuery,
 ) -> DbResult<bool> {
     let OwnedWriteSettlementContext {
         db,
@@ -1023,23 +1024,25 @@ async fn persist_undecodable_delete_repair<R: AdminResource>(
         actor,
     } = context;
     let success_db = db.clone();
-    let result =
-        match run_db_write_while_held(guard.as_ref(), R::db_delete(db.as_ref(), &namespace, &id))
-            .await
-        {
-            Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
-            Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
-                Ok(false) => Ok(false),
-                // Without a hydratable previous row or namespace snapshot we cannot
-                // compensate a late write. Fail closed rather than claiming success
-                // after an unverified admission loss.
-                Ok(true) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                    "namespace config admission was lost during undecodable-row delete repair"
-                ))),
-                Err(persistence_error) => Err(persistence_error),
-            },
-            Err(error) => Err(error),
-        };
+    let result = match run_db_write_while_held(
+        guard.as_ref(),
+        R::db_delete_from_request(db.as_ref(), &namespace, &id, delete_query),
+    )
+    .await
+    {
+        Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
+        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
+            Ok(false) => Ok(false),
+            // Without a hydratable previous row or namespace snapshot we cannot
+            // compensate a late write. Fail closed rather than claiming success
+            // after an unverified admission loss.
+            Ok(true) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                "namespace config admission was lost during undecodable-row delete repair"
+            ))),
+            Err(persistence_error) => Err(persistence_error),
+        },
+        Err(error) => Err(error),
+    };
     if matches!(&result, Ok(true)) {
         let event = AuditEvent::new(
             &actor,
@@ -1115,6 +1118,7 @@ async fn persist_delete_to_settlement<R: AdminResource>(
     context: OwnedWriteSettlementContext,
     id: String,
     recovery: OwnedLateDeleteRecovery<R>,
+    delete_query: R::DeleteQuery,
 ) -> DbResult<bool> {
     let OwnedWriteSettlementContext {
         db,
@@ -1127,7 +1131,7 @@ async fn persist_delete_to_settlement<R: AdminResource>(
     let success_db = db.clone();
     let result = match run_db_write_while_held(
         guard.as_ref(),
-        R::db_delete(db.as_ref(), &namespace, &id),
+        R::db_delete_from_request(db.as_ref(), &namespace, &id, delete_query),
     )
     .await
     {
@@ -2050,6 +2054,26 @@ pub(crate) trait AdminResource:
     async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<bool>;
     async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool>;
 
+    /// Extra query-string state for DELETE. Default is unused.
+    type DeleteQuery: Send + Sync + Clone + Default + 'static;
+
+    /// Parse resource-specific DELETE query parameters. Default ignores the
+    /// query string. Return `Err` for a 400 before any persistence.
+    fn parse_delete_query(_query: Option<&str>) -> Result<Self::DeleteQuery, String> {
+        Ok(Self::DeleteQuery::default())
+    }
+
+    /// Persist a DELETE using options parsed from the request query.
+    /// Default ignores `opts` and calls [`Self::db_delete`].
+    async fn db_delete_from_request(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        id: &str,
+        _opts: Self::DeleteQuery,
+    ) -> DbResult<bool> {
+        Self::db_delete(db, namespace, id).await
+    }
+
     async fn compensate_late_delete(
         db: &dyn DatabaseBackend,
         _namespace: &str,
@@ -2252,11 +2276,46 @@ pub(crate) async fn handle_update<R: AdminResource>(
     handle_write::<R>(state, actor, body, namespace, WriteAction::Update { id }).await
 }
 
+/// Parse `cleanup_orphaned_upstream` from `DELETE /proxies/{id}`.
+///
+/// The parameter is absent → `true` (today's last-referenced hand-owned
+/// orphan cleanup). Exactly one occurrence with the exact string `true` or
+/// `false` is accepted; any other value or duplicate occurrence is an error
+/// because this flag decides whether operator data is deleted.
+pub(crate) fn parse_cleanup_orphaned_upstream_query(query: Option<&str>) -> Result<bool, String> {
+    let Some(query) = query else {
+        return Ok(true);
+    };
+    let mut parsed = None;
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key.as_ref() != "cleanup_orphaned_upstream" {
+            continue;
+        }
+        let this = match value.as_ref() {
+            "true" => true,
+            "false" => false,
+            other => {
+                return Err(format!(
+                    "cleanup_orphaned_upstream must be 'true' or 'false', not '{other}'"
+                ));
+            }
+        };
+        if parsed.is_some() {
+            return Err(
+                "cleanup_orphaned_upstream must not be supplied more than once".to_string(),
+            );
+        }
+        parsed = Some(this);
+    }
+    Ok(parsed.unwrap_or(true))
+}
+
 pub(crate) async fn handle_delete<R: AdminResource>(
     state: &AdminState,
     actor: &AuditActor,
     id: &str,
     namespace: &str,
+    query: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -2269,6 +2328,16 @@ pub(crate) async fn handle_delete<R: AdminResource>(
             &json!({"error": message}),
         ));
     }
+
+    let delete_query = match R::parse_delete_query(query) {
+        Ok(opts) => opts,
+        Err(message) => {
+            return Ok(super::json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": message}),
+            ));
+        }
+    };
 
     let db_arc = match state.db.as_ref() {
         Some(db) => db.clone(),
@@ -2307,6 +2376,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
                         actor: actor.clone(),
                     },
                     id.to_string(),
+                    delete_query.clone(),
                 ))
                 .await
                 {
@@ -2366,6 +2436,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
             config: previous_snapshot,
             api_spec: previous_api_spec,
         },
+        delete_query,
     ))
     .await
     {
@@ -2905,6 +2976,8 @@ impl AdminResource for Upstream {
         db.delete_upstream(namespace, id).await
     }
 
+    type DeleteQuery = ();
+
     async fn check_uniqueness(
         db: &dyn DatabaseBackend,
         namespace: &str,
@@ -3157,6 +3230,8 @@ impl AdminResource for GatewayTrustBundleRecord {
         db.delete_gateway_trust_bundle(namespace, id).await
     }
 
+    type DeleteQuery = ();
+
     async fn check_uniqueness(
         db: &dyn DatabaseBackend,
         namespace: &str,
@@ -3298,6 +3373,8 @@ impl AdminResource for PluginConfig {
     async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool> {
         db.delete_plugin_config(namespace, id).await
     }
+
+    type DeleteQuery = ();
 
     async fn compensate_late_delete(
         db: &dyn DatabaseBackend,
@@ -3663,7 +3740,7 @@ impl AdminResource for Proxy {
         self.api_spec_id = None;
         if let Some(methods) = self.allowed_methods.as_mut() {
             for method in methods {
-                *method = method.to_uppercase();
+                *method = crate::config::types::normalize_http_method_token(method);
             }
         }
         self.normalize_fields();
@@ -3776,6 +3853,22 @@ impl AdminResource for Proxy {
 
     async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool> {
         db.delete_proxy(namespace, id).await
+    }
+
+    type DeleteQuery = bool;
+
+    fn parse_delete_query(query: Option<&str>) -> Result<bool, String> {
+        parse_cleanup_orphaned_upstream_query(query)
+    }
+
+    async fn db_delete_from_request(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        id: &str,
+        cleanup_orphaned_upstream: bool,
+    ) -> DbResult<bool> {
+        db.delete_proxy_with_orphan_cleanup(namespace, id, cleanup_orphaned_upstream)
+            .await
     }
 
     async fn late_create_compensation_safe(
@@ -4352,6 +4445,33 @@ impl AdminResource for Consumer {
         super::json_response(StatusCode::CONFLICT, &json!({"error": errors.join("; ")}))
     }
 
+    fn map_delete_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
+        if is_mtls_dns_admission_unavailable(error) {
+            return super::mtls_dns_admission_unavailable_response();
+        }
+        if let Some(conflict) = mtls_dns_identity_conflict(error) {
+            return super::json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": conflict.to_string()}),
+            );
+        }
+        let error_chain_contains = |needle| {
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains(needle))
+        };
+        if error_chain_contains("referenced by access_control plugin_config") {
+            return super::json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": "Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"}),
+            );
+        }
+        super::json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &super::db_error_response(error),
+        )
+    }
+
     fn prepare_for_write(&mut self) -> Result<(), PrepareWriteError> {
         let consumer_id = self.id.clone();
         hash_consumer_credentials(self).map_err(|error| match error {
@@ -4406,6 +4526,8 @@ impl AdminResource for Consumer {
     async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool> {
         db.delete_consumer(namespace, id).await
     }
+
+    type DeleteQuery = ();
 
     async fn check_uniqueness(
         db: &dyn DatabaseBackend,

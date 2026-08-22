@@ -2037,6 +2037,7 @@ async fn a_later_protocol_upload_join_bound_loses_to_the_authorization_lifetime(
 const PROXY_SOURCE: &str = include_str!("../../../src/proxy/mod.rs");
 const GRPC_PROXY_SOURCE: &str = include_str!("../../../src/proxy/grpc_proxy.rs");
 const H3_SERVER_SOURCE: &str = include_str!("../../../src/http3/server.rs");
+const PROXY_BODY_SOURCE: &str = include_str!("../../../src/proxy/body.rs");
 
 #[test]
 fn every_post_admission_buffered_upload_collect_carries_the_authorization_plan() {
@@ -2161,8 +2162,30 @@ fn the_direct_h2_upload_completion_gate_is_installed_for_authenticated_requests(
         "an authenticated direct-H2 request needs the upload join even with limits off: {gate}"
     );
     assert!(
-        PROXY_SOURCE.contains("if needs_upload_completion_gate {"),
+        PROXY_SOURCE.contains("if use_limit_adapter && needs_upload_completion_gate {"),
         "the gate decision must drive the completion-channel installation"
+    );
+    // The `&&` above is only safe because the limiter predicate takes the gate
+    // as a disjunct, so `needs_upload_completion_gate` implies
+    // `use_limit_adapter`. If that disjunct were ever dropped, an
+    // authenticated request could take the passthrough arm and lose its
+    // upload-completion join (issue #3942 / #3815).
+    // Slice the BODY, not the signature: the parameter list repeats every name,
+    // so splitting on the fn header alone would still match after the disjunct
+    // was deleted from the expression.
+    let predicate = PROXY_BODY_SOURCE
+        .split("pub(crate) fn direct_h2_uses_limit_adapter(")
+        .nth(1)
+        .expect("limit-adapter predicate")
+        .split("-> bool {")
+        .nth(1)
+        .expect("limit-adapter predicate body")
+        .split('}')
+        .next()
+        .expect("bounded predicate body");
+    assert!(
+        predicate.contains("needs_upload_completion_gate"),
+        "the limiter predicate must keep the upload gate as a disjunct: {predicate}"
     );
 }
 
@@ -2336,7 +2359,7 @@ fn buffered_terminal_logging_never_awaits_after_the_authorization_gate() {
     // The summary is built AFTER the gate, so it records the terminal status,
     // the buffered classification, and the bounded class the gate latched.
     let summary_at = PROXY_SOURCE[gate_at..builder_at]
-        .find("let summary = TransactionSummary {")
+        .find("let mut summary = TransactionSummary {")
         .map(|offset| gate_at + offset)
         .expect("the terminal transaction summary is built between the gate and the builder");
 

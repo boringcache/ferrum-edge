@@ -1153,6 +1153,74 @@ fn test_classify_boxed_error_typed_backend_dtls_error() {
 }
 
 #[test]
+fn test_classify_boxed_error_typed_dns_lookup() {
+    use ferrum_edge::proxy::stream_error::StreamSetupError;
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(StreamSetupError::dns_lookup(
+        "backend.example.com",
+        anyhow::Error::from(std::io::Error::other(
+            "DNS resolution returned no addresses",
+        )),
+    ));
+    assert_eq!(classify_boxed_error(&*err), ErrorClass::DnsLookupError);
+}
+
+/// A resolve refused by the backend egress policy dialed nothing and answered
+/// no query. Typing it as a DNS setup error would take precedence over the
+/// `"egress policy"` anchor in the typed walk and silently move it from
+/// `dispatch_policy_rejected` (non-retryable, backend-health-neutral) to
+/// `dns_lookup_error`, contradicting the neutral circuit-breaker accounting the
+/// same call sites already perform.
+#[test]
+fn test_stream_dns_setup_error_keeps_egress_policy_denials_dispatch_rejected() {
+    let denied = ferrum_edge::_test_support::stream_dns_setup_error_for_test(
+        "10.0.0.5",
+        anyhow::anyhow!("literal backend 10.0.0.5 denied by backend egress policy"),
+    );
+    assert_eq!(
+        classify_boxed_error(denied.as_ref()),
+        ErrorClass::DispatchPolicyRejected
+    );
+
+    let genuine = ferrum_edge::_test_support::stream_dns_setup_error_for_test(
+        "backend.local",
+        anyhow::anyhow!("DNS resolution returned no addresses for backend.local"),
+    );
+    assert_eq!(
+        classify_boxed_error(genuine.as_ref()),
+        ErrorClass::DnsLookupError
+    );
+}
+
+#[test]
+fn test_classify_boxed_error_live_dns_no_addresses_wording() {
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        "DNS resolution returned no addresses for backend.local".into();
+    assert_eq!(classify_boxed_error(&*err), ErrorClass::DnsLookupError);
+}
+
+#[test]
+fn test_classify_boxed_error_tls_close_without_notify_is_connection_closed() {
+    use ferrum_edge::retry::TLS_CLOSE_WITHOUT_NOTIFY;
+    let io_err = std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        format!(
+            "peer closed connection {TLS_CLOSE_WITHOUT_NOTIFY}: \
+             https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
+        ),
+    );
+    assert_eq!(classify_boxed_error(&io_err), ErrorClass::ConnectionClosed);
+}
+
+#[test]
+fn test_classify_boxed_setup_error_handshake_alert_is_tls_error() {
+    let rustls_err = rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure);
+    assert_eq!(
+        classify_boxed_setup_error(&rustls_err),
+        ErrorClass::TlsError
+    );
+}
+
+#[test]
 fn test_classify_boxed_error_typed_no_healthy_targets() {
     use ferrum_edge::proxy::stream_error::{StreamSetupError, StreamSetupKind};
     let err: Box<dyn std::error::Error + Send + Sync> = Box::new(StreamSetupError::new(
@@ -1403,6 +1471,91 @@ fn test_classify_boxed_setup_error_keeps_rustls_as_tls_error_pre_wire() {
         !ferrum_edge::retry::request_reached_wire(class),
         "setup-phase rustls error must be pre-wire"
     );
+}
+
+#[test]
+fn test_connect_phase_io_reset_wrapping_rustls_is_tls_error_not_refused() {
+    // tokio-rustls / reqwest wrap handshake failures as io::Error
+    // (often ConnectionReset) with rustls::Error in get_ref(), not
+    // source(). TCP connected; the failure is TLS. Must not take the
+    // connect-phase RST → ConnectionRefused collapse.
+    let io_err = std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        rustls::Error::HandshakeNotComplete,
+    );
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(io_err);
+    let class = classify_boxed_setup_error(&*err);
+    assert_eq!(class, ErrorClass::TlsError);
+    assert!(
+        !ferrum_edge::retry::request_reached_wire(class),
+        "TLS handshake after TCP connect stays pre-wire; retry_on_connect_failure \
+         is unchanged versus the previous ConnectionRefused label"
+    );
+}
+
+#[test]
+fn test_connect_phase_io_reset_without_rustls_still_collapses_to_refused() {
+    let io_err = std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "connection reset by peer",
+    );
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(io_err);
+    let class = classify_boxed_setup_error(&*err);
+    assert_eq!(class, ErrorClass::ConnectionRefused);
+    assert!(!ferrum_edge::retry::request_reached_wire(class));
+}
+
+#[test]
+fn test_post_connect_io_reset_without_rustls_is_connection_reset() {
+    let io_err = std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "connection reset by peer",
+    );
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(io_err);
+    let class = classify_boxed_error(&*err);
+    assert_eq!(class, ErrorClass::ConnectionReset);
+    assert!(ferrum_edge::retry::request_reached_wire(class));
+}
+
+#[test]
+fn test_post_connect_unexpected_eof_is_connection_closed() {
+    let io_err = std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "failed to fill whole buffer",
+    );
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(io_err);
+    let class = classify_boxed_error(&*err);
+    assert_eq!(class, ErrorClass::ConnectionClosed);
+    assert!(
+        ferrum_edge::retry::request_reached_wire(class),
+        "a truncated body is post-wire: retry_on_connect_failure must not \
+         replay a non-idempotent request the backend may already have processed"
+    );
+}
+
+#[test]
+fn test_connect_phase_unexpected_eof_without_rustls_is_not_connection_closed() {
+    // Connect-phase EOF without rustls is not a completed handshake and
+    // must not become post-wire ConnectionClosed.
+    let io_err = std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "failed to fill whole buffer",
+    );
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(io_err);
+    let class = classify_boxed_setup_error(&*err);
+    assert_ne!(class, ErrorClass::ConnectionClosed);
+    assert_ne!(class, ErrorClass::TlsError);
+}
+
+#[test]
+fn test_classify_body_error_unexpected_eof_is_connection_closed() {
+    let io_err = std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "failed to fill whole buffer",
+    );
+    let (class, disconnected) = classify_body_error(&io_err);
+    assert_eq!(class, ErrorClass::ConnectionClosed);
+    assert!(!disconnected);
 }
 
 #[test]

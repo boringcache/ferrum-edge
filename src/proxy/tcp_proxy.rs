@@ -42,7 +42,9 @@ use crate::plugins::{
     Direction, Plugin, PluginResult, ProxyProtocol, StreamBytesKind, StreamConnectionContext,
     StreamTransactionSummary,
 };
-use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
+use crate::proxy::stream_error::{
+    StreamSetupError, StreamSetupKind, find_stream_setup_error, stream_dns_setup_error,
+};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 use crate::retry::ErrorClass;
 
@@ -353,6 +355,7 @@ pub(crate) const STREAM_ERR_BACKEND_TLS_HANDSHAKE_FAILED: &str = "Backend TLS ha
 pub(crate) const STREAM_ERR_REJECTED_BY_PLUGIN: &str = "rejected by plugin";
 pub(crate) const STREAM_ERR_CLIENT_DISCONNECTED_DURING_ADMISSION: &str =
     "client disconnected during plugin admission";
+pub(crate) const STREAM_ERR_DNS_LOOKUP_FAILED: &str = "DNS resolution failed";
 pub(crate) const STREAM_ERR_NO_HEALTHY_TARGETS: &str = "No healthy targets";
 pub(crate) const STREAM_ERR_CIRCUIT_BREAKER_OPEN: &str = "circuit breaker open";
 pub(crate) const STREAM_ERR_BACKEND_MAX_CONNECTIONS: &str = "Backend maxConnections reached";
@@ -3934,11 +3937,7 @@ async fn handle_tcp_connection_inner(
                         cb.record_failure(502, true, cb_info.is_half_open_probe);
                     }
                 }
-                return Err(anyhow::anyhow!(
-                    "DNS resolution failed for {}: {}",
-                    params.backend_host,
-                    e
-                ));
+                return Err(stream_dns_setup_error(&params.backend_host, e));
             }
         };
         // DestinationRule `connectionPool.tcp.maxConnections` enforcement on
@@ -4793,7 +4792,7 @@ async fn handle_tcp_connection_inner(
                 } else {
                     record_cb_failure(circuit_breaker_cache, proxy_id, &current_cb_info);
                 }
-                let err_msg = format!("DNS resolution failed for {}: {}", current_host, e);
+                let setup_err: anyhow::Error = stream_dns_setup_error(&current_host, e);
                 if can_retry
                     && attempt < max_retries
                     && let Some(next) = try_next_enforced_target(
@@ -4831,7 +4830,7 @@ async fn handle_tcp_connection_inner(
                     backend_info.backend_target =
                         format_backend_target(&current_host, current_port);
                     backend_info.backend_resolved_ip = None;
-                    last_connect_err = Some(anyhow::anyhow!(err_msg));
+                    last_connect_err = Some(setup_err);
                     attempt += 1;
                     // The backoff is part of the admitted session's setup, so
                     // it is bounded by the same absolute plan — and the same
@@ -4862,7 +4861,7 @@ async fn handle_tcp_connection_inner(
                     }
                     continue;
                 }
-                return Err(anyhow::anyhow!(err_msg));
+                return Err(setup_err);
             }
         };
         // DestinationRule `connectionPool.tcp.maxConnections` enforcement on
@@ -8150,9 +8149,17 @@ fn classify_phase1_copy_failure(
     direction: Direction,
     side: StreamIoSide,
     e: std::io::Error,
-) -> (StreamFirstFailure, bool) {
+) -> (Option<StreamFirstFailure>, bool) {
     // Capture raw kind before `e` is consumed by anyhow::Error::new.
-    let benign_write = is_post_eof_benign_write_error(side, e.kind());
+    let kind = e.kind();
+    if is_userspace_tls_close_without_notify(side, kind, &e) {
+        // Peer TCP FIN without TLS `close_notify` is ordinary teardown on
+        // the userspace rustls path — treat the read as clean EOF so the
+        // summary omits `error_class`. kTLS is unchanged: a bare FIN there
+        // remains truncation.
+        return (None, false);
+    }
+    let benign_write = is_post_eof_benign_write_error(side, kind);
     let label = direction_label(direction);
     let msg = format!("Bidirectional copy error ({}, {:?}): {}", label, side, e);
     // Wrap via `anyhow::Error::new(e)` so the source chain keeps the
@@ -8161,9 +8168,23 @@ fn classify_phase1_copy_failure(
     let err: anyhow::Error =
         anyhow::Error::new(e).context(format!("Bidirectional copy error ({}, {:?})", label, side));
     (
-        (direction, classify_stream_error(&err), Some(side), msg),
+        Some((direction, classify_stream_error(&err), Some(side), msg)),
         benign_write,
     )
+}
+
+/// Userspace rustls surfaces a peer that TCP-FINs without `close_notify` as
+/// `UnexpectedEof` whose Display contains [`crate::retry::TLS_CLOSE_WITHOUT_NOTIFY`].
+/// Restricted to the read side: a write error with that wording is not a
+/// clean EOF.
+fn is_userspace_tls_close_without_notify(
+    side: StreamIoSide,
+    kind: std::io::ErrorKind,
+    e: &std::io::Error,
+) -> bool {
+    side == StreamIoSide::Read
+        && kind == std::io::ErrorKind::UnexpectedEof
+        && crate::retry::error_is_tls_close_without_notify(e)
 }
 
 fn phase1_watchdog_failure(
@@ -8513,7 +8534,7 @@ where
             if let Err((side, e)) = result {
                 let (failure, benign_write) =
                     classify_phase1_copy_failure(Direction::ClientToBackend, side, e);
-                first_failure = Some(failure);
+                first_failure = failure;
                 phase1_benign_write_candidate = benign_write;
             }
         }
@@ -8522,7 +8543,7 @@ where
             if let Err((side, e)) = result {
                 let (failure, benign_write) =
                     classify_phase1_copy_failure(Direction::BackendToClient, side, e);
-                first_failure = Some(failure);
+                first_failure = failure;
                 phase1_benign_write_candidate = benign_write;
             }
         }
@@ -8612,7 +8633,7 @@ where
                     if first_failure.is_none() {
                         let (failure, _) =
                             classify_phase1_copy_failure(Direction::ClientToBackend, side, e);
-                        first_failure = Some(failure);
+                        first_failure = failure;
                     }
                 }
                 Err(_) => { /* grace expired — leave counters as-is */ }
@@ -8668,7 +8689,7 @@ where
                     if first_failure.is_none() {
                         let (failure, _) =
                             classify_phase1_copy_failure(Direction::BackendToClient, side, e);
-                        first_failure = Some(failure);
+                        first_failure = failure;
                     }
                 }
                 Err(_) => { /* grace expired — leave counters as-is */ }
@@ -8780,8 +8801,13 @@ where
                     // immediately half-closed" or "backend died before
                     // responding" (asymmetric truncation) as graceful and
                     // hide real failures from operator dashboards.
-                    if is_post_eof_benign_write_error(side, e.kind())
-                        && both_directions_transferred(c2b_bytes, b2c_bytes)
+                    //
+                    // A userspace rustls missing-`close_notify` read is the
+                    // same clean EOF as a TCP FIN: it does not require the
+                    // both-directions gate.
+                    if is_userspace_tls_close_without_notify(side, e.kind(), &e)
+                        || (is_post_eof_benign_write_error(side, e.kind())
+                            && both_directions_transferred(c2b_bytes, b2c_bytes))
                     {
                         return Poll::Ready(None);
                     }
@@ -10972,6 +10998,19 @@ mod cause_direction_tests {
         );
         assert_eq!(
             pre_copy_disconnect_direction(&e, &ErrorClass::RequestError),
+            Direction::BackendToClient
+        );
+    }
+
+    #[test]
+    fn typed_dns_lookup_maps_to_backend_error_and_backend_direction() {
+        let e = err(StreamSetupKind::DnsLookup);
+        assert_eq!(
+            pre_copy_disconnect_cause(&e, &ErrorClass::DnsLookupError),
+            DisconnectCause::BackendError
+        );
+        assert_eq!(
+            pre_copy_disconnect_direction(&e, &ErrorClass::DnsLookupError),
             Direction::BackendToClient
         );
     }

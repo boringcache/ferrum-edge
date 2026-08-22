@@ -766,7 +766,7 @@ async fn manager_task_abort_retracts_retained_steering_too() {
         ip: "10.96.0.10".parse().expect("ClusterIP"),
         port: 5300,
     };
-    steering.set_bound_destinations(vec![destination], None);
+    steering.set_bound_destinations(vec![destination], None, true);
 
     let manager = NodeWaypointUdpSourceIndexManager::new(
         fixture.registry.clone(),
@@ -1927,7 +1927,7 @@ fn preparation_attaches_desired_steering_metadata_without_publishing_the_live_pl
         ip: "10.96.0.99".parse().expect("ip"),
         port: 9999,
     }];
-    serving.set_bound_destinations(prior.clone(), Some(&["veth0".to_string()]));
+    serving.set_bound_destinations(prior.clone(), Some(&["veth0".to_string()]), true);
     let before_global = published_plan();
 
     let config = prepare(
@@ -2017,6 +2017,8 @@ fn a_withdrawn_or_disabled_generation_clears_desired_steering_metadata() {
 
 use dashmap::DashMap;
 use ferrum_edge::capture::{CaptureConfig, CaptureMode, NodeWaypointUdpSteerDestination};
+#[cfg(unix)]
+use ferrum_edge::ebpf::cgroup::{CGROUP_TREE_MAX_DEPTH, CGROUP_TREE_MAX_INODES};
 use ferrum_edge::ebpf::{
     BPF_MAP_UDP_REPLY_SOURCE_GATE, CaptureContract, EbpfBackend, FallbackMode, MockEbpfBackend,
     NodeAgentProxyMode, PodAttachmentState,
@@ -2032,6 +2034,11 @@ use ferrum_edge::proxy::node_waypoint_udp_reply_source::{
     read_desired_generation,
 };
 
+/// The publishing NodeWaypoint proxy's own pod identity. The node-agent
+/// resolves it host-side into the relay cgroup set that makes a UDP relay
+/// datagram provable (issues #3956, #3957).
+const RELAY_POD_UID: &str = "11111111-2222-3333-4444-555555555555";
+
 fn reply_source(ip: &str, port: u16) -> NodeWaypointUdpSteerDestination {
     NodeWaypointUdpSteerDestination {
         ip: ip.parse().expect("reply source address"),
@@ -2039,7 +2046,54 @@ fn reply_source(ip: &str, port: u16) -> NodeWaypointUdpSteerDestination {
     }
 }
 
+/// A real cgroup-v2 tree for [`RELAY_POD_UID`].
+///
+/// The node-agent deliberately does NOT trust a published cgroup id — it
+/// resolves the relay pod's ids from this node's own hierarchy — so a test that
+/// wants a generation applied has to give it a hierarchy to resolve against.
+/// Process-lived so every reconcile in this file resolves the same inode set,
+/// exactly as a live node would across the node-agent's poll loop.
+fn relay_cgroup_root() -> &'static std::path::Path {
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("relay cgroup root");
+        std::fs::create_dir_all(dir.path().join(format!(
+            "kubepods/pod{RELAY_POD_UID}/cri-containerd-relay.scope"
+        )))
+        .expect("relay cgroup tree");
+        dir
+    })
+    .path()
+}
+
+/// The exact ids `relay_cgroup_root` should resolve to: the pod slice plus its
+/// one container leaf. `bpf_skb_cgroup_id` reports the LEAF, so a set missing it
+/// would authorize nothing; the pod slice rides along because the walk enrolls
+/// the whole subtree.
+#[cfg(unix)]
+fn relay_cgroup_ids() -> Vec<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let pod = relay_cgroup_root().join(format!("kubepods/pod{RELAY_POD_UID}"));
+    let mut ids = vec![
+        std::fs::metadata(&pod).expect("pod cgroup").ino(),
+        std::fs::metadata(pod.join("cri-containerd-relay.scope"))
+            .expect("container cgroup")
+            .ino(),
+    ];
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 fn node_waypoint_config(registry_dir: Option<&std::path::Path>) -> NodeAgentConfig {
+    node_waypoint_config_with_cgroup_root(registry_dir, relay_cgroup_root())
+}
+
+fn node_waypoint_config_with_cgroup_root(
+    registry_dir: Option<&std::path::Path>,
+    cgroup_root: &std::path::Path,
+) -> NodeAgentConfig {
     let mut capture_config = CaptureConfig::explicit(15006, 15001);
     capture_config.mode = CaptureMode::Ebpf;
     let mut capture_contract = CaptureContract::local_pod_defaults();
@@ -2047,7 +2101,7 @@ fn node_waypoint_config(registry_dir: Option<&std::path::Path>) -> NodeAgentConf
     NodeAgentConfig {
         node_name: "node-a".to_string(),
         capture_config,
-        cgroup_root: "/nonexistent".to_string(),
+        cgroup_root: cgroup_root.to_string_lossy().into_owned(),
         bpf_fs_path: "/nonexistent".to_string(),
         fallback_mode: FallbackMode::Fail,
         excluded_namespaces: std::collections::HashSet::new(),
@@ -2055,6 +2109,26 @@ fn node_waypoint_config(registry_dir: Option<&std::path::Path>) -> NodeAgentConf
         trust_domain: "cluster.local".to_string(),
         node_waypoint_pod_registry_dir: registry_dir.map(|dir| dir.to_path_buf()),
     }
+}
+
+#[cfg(unix)]
+fn relay_pod_cgroup(cgroup_root: &std::path::Path) -> std::path::PathBuf {
+    let pod = cgroup_root.join(format!("kubepods/pod{RELAY_POD_UID}"));
+    std::fs::create_dir_all(&pod).expect("relay pod cgroup");
+    pod
+}
+
+#[cfg(unix)]
+fn assert_generation_refused_whole(backend: &MockEbpfBackend, registry: &std::path::Path) {
+    assert!(
+        backend.udp_relay_cgroups.is_empty() && backend.udp_reply_sources.is_empty(),
+        "an incomplete relay cgroup walk must authorize neither half of the conjunction"
+    );
+    assert!(
+        !backend.udp_reply_sources_enabled,
+        "an incomplete walk must close the shared authorization gate"
+    );
+    assert_eq!(acknowledgement(registry), None);
 }
 
 fn enrolled_pod(uid: &str, pod_ip: &str) -> PodAttachmentState {
@@ -2082,8 +2156,15 @@ fn authorized(backend: &MockEbpfBackend) -> Vec<(std::net::IpAddr, u16)> {
     sources
 }
 
+/// What the tc UDP arms would actually admit for `source`.
+///
+/// The gate, the SENDER proof, and the source proof — all three, because the
+/// classifier evaluates a conjunction and any two of them without the third is
+/// precisely one of the two bypasses this channel closes (issues #3956, #3957).
 fn effectively_authorized(backend: &MockEbpfBackend, source: (std::net::IpAddr, u16)) -> bool {
-    backend.udp_reply_sources_enabled && backend.udp_reply_sources.contains(&source)
+    backend.udp_reply_sources_enabled
+        && !backend.udp_relay_cgroups.is_empty()
+        && backend.udp_reply_sources.contains(&source)
 }
 
 /// The generation the proxy is currently asking for, as the node-agent reads it.
@@ -2104,10 +2185,10 @@ fn acknowledgement(registry: &std::path::Path) -> Option<ReplySourceGeneration> 
 #[test]
 fn a_published_generation_is_applied_then_acknowledged() {
     let registry = tempfile::tempdir().expect("registry dir");
-    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
     let v4 = reply_source("10.96.0.10", 5300);
     let v6 = reply_source("fd00:10:96::a", 5300);
-    let generation = publisher.publish(&[v4, v6]).expect("publication");
+    let generation = publisher.publish(&[v4, v6], true).expect("publication");
     assert_eq!(
         acknowledgement(registry.path()),
         None,
@@ -2131,10 +2212,12 @@ fn a_published_generation_is_applied_then_acknowledged() {
         backend.operations,
         vec![
             "set_udp_reply_sources_enabled:false".to_string(),
+            "replace_udp_relay_cgroups:2".to_string(),
             "replace_udp_reply_sources:2".to_string(),
             "set_udp_reply_sources_enabled:true".to_string(),
         ],
-        "the maps mutate only inside the shared closed-gate window"
+        "every map — sender proof included — mutates only inside the shared closed-gate window, \
+         and the sender proof is written before any source tuple"
     );
     assert_eq!(
         acknowledgement(registry.path()),
@@ -2149,10 +2232,10 @@ fn a_published_generation_is_applied_then_acknowledged() {
 #[test]
 fn a_partially_rewritten_generation_is_never_acknowledged() {
     let registry = tempfile::tempdir().expect("registry dir");
-    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
     let kept = reply_source("10.96.0.11", 5301);
     publisher
-        .publish(&[reply_source("10.96.0.10", 5300), kept])
+        .publish(&[reply_source("10.96.0.10", 5300), kept], true)
         .expect("publication");
 
     let mut backend = MockEbpfBackend::default();
@@ -2194,10 +2277,10 @@ fn a_partially_rewritten_generation_is_never_acknowledged() {
 #[test]
 fn withdrawing_a_source_revokes_its_authorization_under_a_new_generation() {
     let registry = tempfile::tempdir().expect("registry dir");
-    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
     let kept = reply_source("10.96.0.11", 5301);
     let first = publisher
-        .publish(&[reply_source("10.96.0.10", 5300), kept])
+        .publish(&[reply_source("10.96.0.10", 5300), kept], true)
         .expect("publication");
 
     let mut backend = MockEbpfBackend::default();
@@ -2208,7 +2291,7 @@ fn withdrawing_a_source_revokes_its_authorization_under_a_new_generation() {
     assert_eq!(authorized(&backend).len(), 2);
     assert_eq!(acknowledgement(registry.path()), Some(first.clone()));
 
-    let second = publisher.publish(&[kept]).expect("withdrawal");
+    let second = publisher.publish(&[kept], true).expect("withdrawal");
     assert_ne!(first, second);
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
     assert_eq!(
@@ -2218,11 +2301,15 @@ fn withdrawing_a_source_revokes_its_authorization_under_a_new_generation() {
     );
     assert_eq!(acknowledgement(registry.path()), Some(second));
 
-    let empty = publisher.publish(&[]).expect("full retraction");
+    let empty = publisher.publish(&[], false).expect("full retraction");
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
     assert!(
         authorized(&backend).is_empty(),
         "a full retraction must leave nothing authorized"
+    );
+    assert!(
+        !backend.udp_reply_sources_enabled,
+        "an inactive retraction must leave the shared classifier gate closed"
     );
     assert_eq!(
         acknowledgement(registry.path()),
@@ -2239,11 +2326,11 @@ fn withdrawing_a_source_revokes_its_authorization_under_a_new_generation() {
 #[test]
 fn a_generation_naming_an_enrolled_pod_address_is_refused_whole() {
     let registry = tempfile::tempdir().expect("registry dir");
-    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
     let service = reply_source("10.96.0.10", 5300);
     let pod_address = reply_source("10.244.1.7", 5300);
     publisher
-        .publish(&[service, pod_address])
+        .publish(&[service, pod_address], true)
         .expect("publication");
 
     let mut backend = MockEbpfBackend::default();
@@ -2270,9 +2357,9 @@ fn a_generation_naming_an_enrolled_pod_address_is_refused_whole() {
 #[test]
 fn an_over_bound_generation_is_refused_and_unacknowledged() {
     let registry = tempfile::tempdir().expect("registry dir");
-    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
     let generation = publisher
-        .publish(&[reply_source("10.96.0.10", 5300)])
+        .publish(&[reply_source("10.96.0.10", 5300)], true)
         .expect("publication");
 
     let mut backend = MockEbpfBackend::default();
@@ -2292,7 +2379,7 @@ fn an_over_bound_generation_is_refused_and_unacknowledged() {
         .join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DESIRED_FILE);
     let owner = desired_generation(registry.path());
     let mut body = format!(
-        "ferrum-udp-reply-src v1 {} {} 200\n",
+        "ferrum-udp-reply-src v3 {} {} active 200 {RELAY_POD_UID}\n",
         owner.owner(),
         owner.sequence() + 1
     );
@@ -2313,15 +2400,317 @@ fn an_over_bound_generation_is_refused_and_unacknowledged() {
     );
 }
 
+/// The node-agent resolves the SENDER proof host-side and applies it in the
+/// same fenced generation as the source proof (issues #3956, #3957).
+///
+/// The published manifest names a POD; what reaches `FERRUM_UDP_RELAY_CGROUPS`
+/// is this node's own resolution of that pod's cgroup subtree — including the
+/// container LEAF, which is the id `bpf_skb_cgroup_id` actually reports.
+#[cfg(unix)]
+#[test]
+fn a_generation_authorizes_the_relays_resolved_cgroup_subtree() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
+    let source = reply_source("10.96.0.10", 5300);
+    let generation = publisher.publish(&[source], true).expect("publication");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+
+    let mut applied: Vec<u64> = backend.udp_relay_cgroups.iter().copied().collect();
+    applied.sort_unstable();
+    assert_eq!(
+        applied,
+        relay_cgroup_ids(),
+        "the authorized sender set must be this node's resolution of the relay pod's cgroup tree"
+    );
+    assert_eq!(acknowledgement(registry.path()), Some(generation));
+    assert!(
+        effectively_authorized(&backend, (source.ip, source.port)),
+        "gate, sender proof, and source proof must all be live together"
+    );
+
+    // Withdrawal revokes the sender proof as well: leaving a dead relay's
+    // cgroup behind would let a LATER generation open the gate over a stale
+    // sender set.
+    publisher.publish(&[], false).expect("withdrawal");
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert!(
+        backend.udp_relay_cgroups.is_empty() && backend.udp_reply_sources.is_empty(),
+        "an inactive generation must revoke the sender proof, not merely fence it"
+    );
+}
+
+/// An ACTIVE generation with zero ClusterIP sources still resolves and applies
+/// the complete relay cgroup set, opens the shared gate, and is acknowledged.
+/// That is the bound headless/VIP-less listener: the direct-node lane stays
+/// usable without authorizing any ClusterIP tuple.
+#[cfg(unix)]
+#[test]
+fn an_active_empty_generation_applies_the_relay_cgroup_set_and_opens_the_gate() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
+    let generation = publisher.publish(&[], true).expect("active-empty");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+
+    let mut applied: Vec<u64> = backend.udp_relay_cgroups.iter().copied().collect();
+    applied.sort_unstable();
+    assert_eq!(
+        applied,
+        relay_cgroup_ids(),
+        "active-empty must still enroll the relay cgroup subtree"
+    );
+    assert!(
+        backend.udp_reply_sources.is_empty(),
+        "active-empty authorizes no ClusterIP tuple"
+    );
+    assert!(
+        backend.udp_reply_sources_enabled,
+        "the shared gate must open so the node-source lane can use the sender proof"
+    );
+    assert_eq!(acknowledgement(registry.path()), Some(generation.clone()));
+
+    let with_vip = publisher
+        .publish(
+            &[
+                reply_source("10.96.0.10", 5300),
+                reply_source("fd00:10:96::a", 5300),
+            ],
+            true,
+        )
+        .expect("ClusterIP");
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert_eq!(authorized(&backend).len(), 2);
+    assert_eq!(acknowledgement(registry.path()), Some(with_vip));
+    assert!(backend.udp_reply_sources_enabled);
+
+    let headless_again = publisher.publish(&[], true).expect("back to headless");
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert!(backend.udp_reply_sources.is_empty());
+    let mut applied: Vec<u64> = backend.udp_relay_cgroups.iter().copied().collect();
+    applied.sort_unstable();
+    assert_eq!(applied, relay_cgroup_ids());
+    assert!(backend.udp_reply_sources_enabled);
+    assert_eq!(acknowledgement(registry.path()), Some(headless_again));
+
+    publisher.publish(&[], false).expect("last listener gone");
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+    assert!(
+        backend.udp_relay_cgroups.is_empty()
+            && backend.udp_reply_sources.is_empty()
+            && !backend.udp_reply_sources_enabled,
+        "inactive withdrawal must close the gate and clear both maps"
+    );
+}
+
+/// A generation naming an ENROLLED pod as the relay is refused WHOLE.
+///
+/// The mirror of the enrolled-pod-ADDRESS refusal, and the reason a pod UID on
+/// this channel is a name rather than an authorization: the relay may answer
+/// for a Service address, but never as one of the workloads this guard protects.
+#[test]
+fn a_generation_naming_an_enrolled_pod_as_the_relay_is_refused() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
+    publisher
+        .publish(&[reply_source("10.96.0.10", 5300)], true)
+        .expect("publication");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    pods.insert(
+        RELAY_POD_UID.to_string(),
+        enrolled_pod(RELAY_POD_UID, "10.244.0.7"),
+    );
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+
+    assert!(
+        backend.udp_relay_cgroups.is_empty() && backend.udp_reply_sources.is_empty(),
+        "a relay identity naming an enrolled workload must authorize nothing"
+    );
+    assert!(!backend.udp_reply_sources_enabled);
+    assert_eq!(acknowledgement(registry.path()), None);
+}
+
+/// A relay identity this node cannot resolve to a live cgroup authorizes
+/// nothing. An inability to prove the sender is not evidence about it.
+#[test]
+fn an_unresolvable_relay_identity_authorizes_nothing() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    // A well-formed pod UID that simply has no cgroup on this node.
+    let publisher = RegistryDirReplySourcePublisher::new(
+        registry.path(),
+        Some("99999999-8888-7777-6666-555555555555"),
+    );
+    publisher
+        .publish(&[reply_source("10.96.0.10", 5300)], true)
+        .expect("publication");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+
+    assert!(
+        backend.udp_reply_sources.is_empty() && backend.udp_relay_cgroups.is_empty(),
+        "an unresolvable relay identity must leave both halves of the proof empty"
+    );
+    assert!(!backend.udp_reply_sources_enabled);
+    assert_eq!(acknowledgement(registry.path()), None);
+}
+
+/// A relay pod whose cgroup tree is larger than the map must be refused WHOLE.
+/// Silently truncating would omit an arbitrary container leaf — including the
+/// one `bpf_skb_cgroup_id` reports for the active relay container.
+#[cfg(unix)]
+#[test]
+fn an_over_bound_relay_cgroup_tree_is_refused_whole() {
+    let cgroup_root = tempfile::tempdir().expect("cgroup root");
+    let pod = relay_pod_cgroup(cgroup_root.path());
+    for index in 0..CGROUP_TREE_MAX_INODES {
+        std::fs::create_dir(pod.join(format!("cri-containerd-{index:03}.scope")))
+            .expect("container cgroup");
+    }
+
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
+    publisher
+        .publish(&[reply_source("10.96.0.10", 5300)], true)
+        .expect("publication");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config_with_cgroup_root(Some(registry.path()), cgroup_root.path());
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+
+    assert_generation_refused_whole(&backend, registry.path());
+}
+
+/// A relay pod nested past the walk's depth bound is refused WHOLE. The count
+/// may look small; the missing deeper leaf is still a truncated sender proof.
+#[cfg(unix)]
+#[test]
+fn a_too_deep_relay_cgroup_tree_is_refused_whole() {
+    let cgroup_root = tempfile::tempdir().expect("cgroup root");
+    let mut path = relay_pod_cgroup(cgroup_root.path());
+    for index in 0..=CGROUP_TREE_MAX_DEPTH {
+        path.push(format!("n{index}"));
+        std::fs::create_dir(&path).expect("depth chain");
+    }
+
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
+    publisher
+        .publish(&[reply_source("10.96.0.10", 5300)], true)
+        .expect("publication");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config_with_cgroup_root(Some(registry.path()), cgroup_root.path());
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+
+    assert_generation_refused_whole(&backend, registry.path());
+}
+
+/// A descendant that cannot be enumerated is not a complete sender-proof set.
+/// Publishing the readable prefix would omit the unreadable container leaf.
+#[cfg(unix)]
+#[test]
+fn an_incompletely_enumerated_relay_cgroup_tree_is_refused_whole() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // SAFETY: `geteuid` is a pure read of this process's credentials.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let cgroup_root = tempfile::tempdir().expect("cgroup root");
+    let pod = relay_pod_cgroup(cgroup_root.path());
+    let hidden = pod.join("cri-containerd-hidden.scope");
+    std::fs::create_dir(&hidden).expect("hidden container");
+    std::fs::create_dir(hidden.join("nested-leaf")).expect("nested leaf");
+    std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    struct RestoreMode<'a>(&'a std::path::Path);
+    impl Drop for RestoreMode<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    let _restore = RestoreMode(&hidden);
+
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
+    publisher
+        .publish(&[reply_source("10.96.0.10", 5300)], true)
+        .expect("publication");
+
+    let mut backend = MockEbpfBackend::default();
+    let pods = DashMap::new();
+    let config = node_waypoint_config_with_cgroup_root(Some(registry.path()), cgroup_root.path());
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+
+    assert_generation_refused_whole(&backend, registry.path());
+}
+
+/// A generation whose SENDER proof cannot be written is never acknowledged, and
+/// never leaves the source proof authorized on its own.
+///
+/// This is the failure mode the ordering exists for: sources live in the maps
+/// with no relay cgroup beside them is exactly the #3957 replay, so the
+/// relay-cgroup write happens FIRST and its failure returns before any source
+/// tuple is written.
+#[test]
+fn a_generation_whose_sender_proof_fails_is_never_acknowledged() {
+    let registry = tempfile::tempdir().expect("registry dir");
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
+    publisher
+        .publish(&[reply_source("10.96.0.10", 5300)], true)
+        .expect("publication");
+
+    let mut backend = MockEbpfBackend {
+        fail_replace_udp_relay_cgroups: true,
+        ..MockEbpfBackend::default()
+    };
+    let pods = DashMap::new();
+    let config = node_waypoint_config(Some(registry.path()));
+    let mut state = NodeWaypointUdpReplySourceState::default();
+    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
+
+    assert!(
+        backend.udp_reply_sources.is_empty(),
+        "no source tuple may reach the maps once the sender proof has failed"
+    );
+    assert!(
+        !backend.udp_reply_sources_enabled,
+        "the shared gate must stay closed"
+    );
+    assert_eq!(acknowledgement(registry.path()), None);
+}
+
 /// Nothing published means nothing authorized — and a channel that has never
 /// existed is exactly that, not an error that would make the agent retain a
 /// previous generation. The acknowledgement goes with it.
 #[test]
 fn an_absent_channel_authorizes_nothing() {
     let registry = tempfile::tempdir().expect("registry dir");
-    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
     publisher
-        .publish(&[reply_source("10.96.0.10", 5300)])
+        .publish(&[reply_source("10.96.0.10", 5300)], true)
         .expect("publication");
 
     let mut backend = MockEbpfBackend::default();
@@ -2355,9 +2744,9 @@ fn an_absent_channel_authorizes_nothing() {
 #[test]
 fn a_failed_map_write_is_never_acknowledged_and_is_retried() {
     let registry = tempfile::tempdir().expect("registry dir");
-    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
     let service = reply_source("10.96.0.10", 5300);
-    let generation = publisher.publish(&[service]).expect("publication");
+    let generation = publisher.publish(&[service], true).expect("publication");
 
     let mut backend = MockEbpfBackend {
         fail_replace_udp_reply_sources: true,
@@ -2390,10 +2779,10 @@ fn a_failed_map_write_is_never_acknowledged_and_is_retried() {
 #[test]
 fn a_partial_family_failure_is_never_acknowledged() {
     let registry = tempfile::tempdir().expect("registry dir");
-    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
     let v4 = reply_source("10.96.0.10", 5300);
     let v6 = reply_source("fd00:10:96::a", 5300);
-    let generation = publisher.publish(&[v4, v6]).expect("publication");
+    let generation = publisher.publish(&[v4, v6], true).expect("publication");
 
     let stale_v6 = ("fd00:10:96::dead".parse().expect("stale IPv6"), 5353);
     let mut backend = MockEbpfBackend {
@@ -2479,9 +2868,9 @@ fn backend_cleanup_closes_and_clears_reply_source_authorization() {
 #[test]
 fn an_absent_required_map_never_produces_an_acknowledgement() {
     let registry = tempfile::tempdir().expect("registry dir");
-    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
     publisher
-        .publish(&[reply_source("10.96.0.10", 5300)])
+        .publish(&[reply_source("10.96.0.10", 5300)], true)
         .expect("publication");
 
     let mut backend = MockEbpfBackend {
@@ -2500,12 +2889,14 @@ fn an_absent_required_map_never_produces_an_acknowledgement() {
         "an ELF without the reply-source maps must never look converged"
     );
 
-    publisher.publish(&[]).expect("empty withdrawal generation");
+    publisher
+        .publish(&[], false)
+        .expect("empty withdrawal generation");
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
     assert_eq!(
         acknowledgement(registry.path()),
         None,
-        "even an empty generation is unproven when either family map is absent"
+        "even an inactive withdrawal is unproven when either family map is absent"
     );
 }
 
@@ -2516,16 +2907,17 @@ fn an_absent_required_map_never_produces_an_acknowledgement() {
 #[test]
 fn a_generation_superseded_during_map_apply_is_never_acknowledged() {
     let registry = tempfile::tempdir().expect("registry dir");
-    let predecessor = RegistryDirReplySourcePublisher::new(registry.path());
+    let predecessor = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
     predecessor
-        .publish(&[reply_source("10.96.0.10", 5300)])
+        .publish(&[reply_source("10.96.0.10", 5300)], true)
         .expect("predecessor generation");
 
     let successor_registry = tempfile::tempdir().expect("successor registry");
-    let successor = RegistryDirReplySourcePublisher::new(successor_registry.path());
+    let successor =
+        RegistryDirReplySourcePublisher::new(successor_registry.path(), Some(RELAY_POD_UID));
     let successor_source = reply_source("10.96.0.11", 5301);
     let successor_generation = successor
-        .publish(&[successor_source])
+        .publish(&[successor_source], true)
         .expect("successor generation");
     let successor_manifest = std::fs::read(
         successor_registry
@@ -2576,9 +2968,9 @@ fn a_generation_superseded_during_map_apply_is_never_acknowledged() {
 #[test]
 fn a_new_generation_retracts_the_previous_acknowledgement_before_applying() {
     let registry = tempfile::tempdir().expect("registry dir");
-    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
     let first = publisher
-        .publish(&[reply_source("10.96.0.10", 5300)])
+        .publish(&[reply_source("10.96.0.10", 5300)], true)
         .expect("first");
 
     let mut backend = MockEbpfBackend::default();
@@ -2591,10 +2983,13 @@ fn a_new_generation_retracts_the_previous_acknowledgement_before_applying() {
     // A new generation the agent cannot apply. The old acknowledgement must be
     // gone even though the new one is never written.
     publisher
-        .publish(&[
-            reply_source("10.96.0.10", 5300),
-            reply_source("10.96.0.11", 5301),
-        ])
+        .publish(
+            &[
+                reply_source("10.96.0.10", 5300),
+                reply_source("10.96.0.11", 5301),
+            ],
+            true,
+        )
         .expect("second");
     backend.fail_replace_udp_reply_sources = true;
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
@@ -2611,9 +3006,9 @@ fn a_new_generation_retracts_the_previous_acknowledgement_before_applying() {
 #[test]
 fn successor_acknowledgement_unlink_failure_closes_the_gate_and_retries() {
     let registry = tempfile::tempdir().expect("registry dir");
-    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
     let old_source = reply_source("10.96.0.10", 5300);
-    publisher.publish(&[old_source]).expect("first");
+    publisher.publish(&[old_source], true).expect("first");
 
     let mut backend = MockEbpfBackend::default();
     let pods = DashMap::new();
@@ -2623,7 +3018,7 @@ fn successor_acknowledgement_unlink_failure_closes_the_gate_and_retries() {
     assert!(backend.udp_reply_sources_enabled);
 
     let successor = reply_source("10.96.0.11", 5301);
-    let generation = publisher.publish(&[successor]).expect("successor");
+    let generation = publisher.publish(&[successor], true).expect("successor");
     let applied = registry
         .path()
         .join(NODE_WAYPOINT_UDP_REPLY_SOURCE_DIR)
@@ -2657,9 +3052,9 @@ fn successor_acknowledgement_unlink_failure_closes_the_gate_and_retries() {
 #[test]
 fn refusal_acknowledgement_unlink_failure_closes_the_gate_and_retries() {
     let registry = tempfile::tempdir().expect("registry dir");
-    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
     let source = reply_source("10.96.0.10", 5300);
-    publisher.publish(&[source]).expect("publication");
+    publisher.publish(&[source], true).expect("publication");
 
     let mut backend = MockEbpfBackend::default();
     let pods = DashMap::new();
@@ -2693,9 +3088,9 @@ fn refusal_acknowledgement_unlink_failure_closes_the_gate_and_retries() {
 #[test]
 fn gate_disable_failure_never_mutates_or_acknowledges_a_successor() {
     let registry = tempfile::tempdir().expect("registry dir");
-    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
     let old_source = reply_source("10.96.0.10", 5300);
-    publisher.publish(&[old_source]).expect("first");
+    publisher.publish(&[old_source], true).expect("first");
 
     let mut backend = MockEbpfBackend::default();
     let pods = DashMap::new();
@@ -2705,7 +3100,7 @@ fn gate_disable_failure_never_mutates_or_acknowledges_a_successor() {
     let replacements = backend.udp_reply_source_updates.len();
 
     let successor = reply_source("10.96.0.11", 5301);
-    publisher.publish(&[successor]).expect("successor");
+    publisher.publish(&[successor], true).expect("successor");
     backend.fail_disable_udp_reply_sources = true;
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
 
@@ -2725,9 +3120,9 @@ fn gate_disable_failure_never_mutates_or_acknowledges_a_successor() {
 #[test]
 fn a_lost_acknowledgement_is_rewritten_on_the_next_pass() {
     let registry = tempfile::tempdir().expect("registry dir");
-    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
     let generation = publisher
-        .publish(&[reply_source("10.96.0.10", 5300)])
+        .publish(&[reply_source("10.96.0.10", 5300)], true)
         .expect("publication");
 
     let mut backend = MockEbpfBackend::default();
@@ -2758,14 +3153,16 @@ fn a_successor_generation_gets_its_own_acknowledgement() {
     let config = node_waypoint_config(Some(registry.path()));
     let mut state = NodeWaypointUdpReplySourceState::default();
 
-    let predecessor = RegistryDirReplySourcePublisher::new(registry.path());
-    let old = predecessor.publish(&destinations).expect("predecessor");
+    let predecessor = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
+    let old = predecessor
+        .publish(&destinations, true)
+        .expect("predecessor");
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
     assert_eq!(acknowledgement(registry.path()), Some(old.clone()));
     assert_eq!(backend.udp_reply_source_updates.len(), 1);
 
-    let successor = RegistryDirReplySourcePublisher::new(registry.path());
-    let new = successor.publish(&destinations).expect("successor");
+    let successor = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
+    let new = successor.publish(&destinations, true).expect("successor");
     assert_ne!(old, new);
 
     reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
@@ -2787,9 +3184,9 @@ fn a_successor_generation_gets_its_own_acknowledgement() {
 #[test]
 fn a_quiet_poll_issues_no_map_write() {
     let registry = tempfile::tempdir().expect("registry dir");
-    let publisher = RegistryDirReplySourcePublisher::new(registry.path());
+    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
     publisher
-        .publish(&[reply_source("10.96.0.10", 5300)])
+        .publish(&[reply_source("10.96.0.10", 5300)], true)
         .expect("publication");
 
     let mut backend = MockEbpfBackend::default();

@@ -7,51 +7,34 @@ on:
         description: Skip BuildKit cache restore to prove cold-path image contracts
         type: boolean
         default: false
+  # No workflow-level `paths:` filter (issue #3908). A `paths:` list lives in
+  # the pull request's own checkout, so the same commit that breaks the
+  # NodeWaypoint datapath could delete its trigger and skip this suite. The
+  # workflow now starts on every event and relevance is decided by the
+  # trusted-base `production-dockerfile-plan` job below, which reads
+  # `ci_runtime_plan.py` from the base branch.
   pull_request:
-    paths:
-      - ".github/workflows/node-waypoint-ebpf-live.yml"
-      - ".dockerignore"
-      - ".github/actions/package-ferrum-runtime-image/**"
-      - ".github/actions/setup-kubernetes-tools/**"
-      - ".cargo/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "Dockerfile"
-      - "Dockerfile.iproute2-layer"
-      - "Dockerfile.ebpf-tools-layer"
-      - "Dockerfile.release"
-      - ".github/scripts/stage_iproute2_runtime.sh"
-      - ".github/scripts/ci_runtime_plan.py"
-      - ".github/scripts/ci_runtime_telemetry.py"
-      - ".github/scripts/verify_ci_runtime_cache.py"
-      - "build.rs"
-      - "rust-toolchain.toml"
-      - "proto/**"
-      - "vendor/**"
-      - "src/**"
-      - "custom_plugins/**"
-      - "ebpf/**"
-      - "charts/ferrum-mesh/**"
-      - "tests/integration/mesh_node_waypoint_udp_scope_tests.rs"
-      - "tests/unit/gateway_core/node_waypoint_dtls_socket_options_tests.rs"
-      - "tests/unit/gateway_core/node_waypoint_udp_identity_tests.rs"
-      - "tests/unit/gateway_core/node_waypoint_udp_reply_source_tests.rs"
-      - "tests/unit/gateway_core/node_waypoint_udp_steering_tests.rs"
-      - "tests/unit/gateway_core/socket_opts_tests.rs"
-      - "tests/k8s/lib/**"
-      - "tests/k8s/node_waypoint_ebpf_live/**"
-      - "docs/mesh.md"
-      - "docs/mesh_supported_matrix.md"
-      - "docs/node_agent.md"
-      - "docs/ci_cd.md"
-      - "docs/plans/node_waypoint_transport_adr.md"
+  merge_group:
+    types:
+      - checks_requested
+  # Queue entries are COMBINED commits: two individually green pull requests
+  # can interact in the chart/image/eBPF surfaces this suite covers. Running on
+  # merge_group re-evaluates the combination, and running on the main push
+  # surfaces a queue-combined regression immediately rather than on whichever
+  # later pull request happens to touch the same paths.
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
 
+# Cancel a superseded PR/main run on rapid re-push. Merge-group runs are keyed
+# by the synthesized head so a queue entry never cancels a pull-request run, and
+# manual dispatches share one lane and run to completion.
 concurrency:
-  group: node-waypoint-ebpf-live-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'pull_request' && format('node-waypoint-ebpf-live-pr-{0}', github.event.pull_request.number) || (github.event_name == 'merge_group' && format('node-waypoint-ebpf-live-merge-group-{0}', github.event.merge_group.head_sha) || (github.event_name == 'push' && format('node-waypoint-ebpf-live-{0}', github.ref) || 'node-waypoint-ebpf-live-shared')) }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 env:
   FERRUM_IMAGE_REPOSITORY: ferrum-edge
@@ -962,3 +945,63 @@ jobs:
       - name: Delete kind cluster
         if: always()
         run: kind delete cluster --name "$KIND_CLUSTER" || true
+
+  node-waypoint-ebpf-live-gate:
+    name: NodeWaypoint eBPF Live
+    runs-on: ubuntu-latest
+    needs:
+      - production-dockerfile-plan
+      - node-waypoint-ebpf-live
+    if: always()
+    steps:
+      # `NodeWaypoint eBPF Live` is deliberately NOT branch-protection-required
+      # (.claude/rules/testing.md); verify_required_ci.py asserts it stays out
+      # of REQUIRED_MERGE_GROUP_WORKFLOWS and DEDICATED_REQUIRED_CHECKS. It is
+      # an always-reporting aggregate so that a skipped-for-irrelevance run is
+      # visibly green rather than absent, and so a planner failure cannot look
+      # like a pass.
+      #
+      # The live job's own binding is `always() && ... != 'false'`, so the only
+      # outcome that legitimately skips it is an exact `false` verdict from the
+      # trusted-base planner. Every other shape reaches the live job, and this
+      # aggregate then reports whatever the live job did.
+      - name: Fail when NodeWaypoint relevance planning fails
+        if: needs.production-dockerfile-plan.result != 'success'
+        run: |
+          {
+            echo "## NodeWaypoint eBPF Live"
+            echo ""
+            echo "Failed before trusted-base relevance planning completed."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Skip NodeWaypoint eBPF live datapath for unrelated changes
+        if: needs.production-dockerfile-plan.outputs.node_waypoint_relevant == 'false'
+        run: |
+          {
+            echo "## NodeWaypoint eBPF Live"
+            echo ""
+            echo "Skipped the Kind/eBPF live datapath: the trusted-base classifier"
+            echo "proved no NodeWaypoint eBPF, chart, image, harness, or"
+            echo "documentation surface changed. The production-image contract is"
+            echo "reported separately by \`Production Dockerfile eBPF image smoke\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail when the NodeWaypoint eBPF live datapath did not succeed
+        if: needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false' && needs.node-waypoint-ebpf-live.result != 'success'
+        run: |
+          {
+            echo "## NodeWaypoint eBPF Live"
+            echo ""
+            echo "Live datapath validation failed or did not complete: ${{ needs.node-waypoint-ebpf-live.result }}."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Report NodeWaypoint eBPF live datapath
+        if: needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false' && needs.node-waypoint-ebpf-live.result == 'success'
+        run: |
+          {
+            echo "## NodeWaypoint eBPF Live"
+            echo ""
+            echo "Live datapath validation passed."
+          } >> "$GITHUB_STEP_SUMMARY"

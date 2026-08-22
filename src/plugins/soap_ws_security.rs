@@ -7222,17 +7222,22 @@ fn decode_utf16(payload: &[u8], big_endian: bool) -> Result<String, SoapBodyDeco
     }
     // UTF-8 output is at most 3/2 of the UTF-16 wire length (see module note).
     let mut out = String::with_capacity(payload.len().saturating_mul(3) / 2);
-    let mut chunks = payload.chunks_exact(2);
-    while let Some(pair) = chunks.next() {
+    let (pairs, remainder) = payload.as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    let mut index = 0;
+    while index < pairs.len() {
+        let pair = &pairs[index];
         let unit = if big_endian {
             u16::from_be_bytes([pair[0], pair[1]])
         } else {
             u16::from_le_bytes([pair[0], pair[1]])
         };
         if (0xD800..=0xDBFF).contains(&unit) {
-            let Some(low_pair) = chunks.next() else {
+            index += 1;
+            if index >= pairs.len() {
                 return Err(SoapBodyDecodeError::MalformedEncoding);
-            };
+            }
+            let low_pair = &pairs[index];
             let low = if big_endian {
                 u16::from_be_bytes([low_pair[0], low_pair[1]])
             } else {
@@ -7251,6 +7256,7 @@ fn decode_utf16(payload: &[u8], big_endian: bool) -> Result<String, SoapBodyDeco
                 char::from_u32(u32::from(unit)).ok_or(SoapBodyDecodeError::MalformedEncoding)?;
             out.push(ch);
         }
+        index += 1;
     }
     Ok(out)
 }

@@ -154,8 +154,8 @@ impl Waf {
         // still collapses `?q=<script>&q=ok` to `q=ok`, so relying on the
         // monitor-only HPP rule alone would miss enforced query-value rules.
         // Split on `&`/`=` first, then canonicalize each component (including
-        // `%2f`) so PATHTRAV/LFI see decoded slashes without treating encoded
-        // separators as extra pairs.
+        // `%2f`) so PATHTRAV/LFI and QueryValues (SSRF-Q) see the same decoded
+        // slashes without treating encoded separators as extra pairs.
         if let Some(raw) = raw_query {
             for pair in raw.split('&') {
                 if pair.is_empty() {
@@ -511,6 +511,11 @@ impl Waf {
         raw_value: &str,
         subject: ScanSubject<'_>,
     ) {
+        // One shared decode: split components are already isolated, then
+        // `canonical_query_component_views` percent-decodes `%2f` and produces
+        // the bounded layered variants. PATHTRAV/LFI (canonical_query_values)
+        // and QueryValues including SSRF-Q must scan those same views — not a
+        // second, weaker decode of the already-normalized string.
         let key_views = normalize::canonical_query_component_views(raw_key);
         let value_views = normalize::canonical_query_component_views(raw_value);
         for key in key_views.iter() {
@@ -530,13 +535,7 @@ impl Waf {
             );
         }
         for value in value_views.iter() {
-            self.scan_text_set(
-                outcome,
-                self.compiled.query_values.as_ref(),
-                value,
-                subject,
-                None,
-            );
+            self.scan_query_value(outcome, value, subject);
             self.scan_text_set(
                 outcome,
                 self.compiled.canonical_query_values.as_ref(),
@@ -544,14 +543,24 @@ impl Waf {
                 subject,
                 None,
             );
-            self.scan_cidr_rules_matching(
-                outcome,
-                value,
-                &self.compiled.text_cidr_rules,
-                subject,
-                |target| matches!(target, RuleTarget::QueryValues),
-            );
         }
+    }
+
+    fn scan_query_value(&self, outcome: &mut ScanOutcome, value: &str, subject: ScanSubject<'_>) {
+        self.scan_text_set(
+            outcome,
+            self.compiled.query_values.as_ref(),
+            value,
+            subject,
+            None,
+        );
+        self.scan_cidr_rules_matching(
+            outcome,
+            value,
+            &self.compiled.text_cidr_rules,
+            subject,
+            |target| matches!(target, RuleTarget::QueryValues),
+        );
     }
 
     fn scan_luhn_rules(

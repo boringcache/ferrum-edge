@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::plugins::{Plugin, RequestContext, TransactionSummary, log_with_mirror};
+use crate::proxy::body::DirectH2BytesLatch;
 use crate::retry::ErrorClass;
 
 /// Observed outcome of a streaming response body.
@@ -165,6 +166,12 @@ struct LogState {
     /// `latency_total_ms` value (captured at summary construction) is
     /// preserved.
     start_time: Option<Instant>,
+    /// Unlimited direct-H2 passthrough publishes `bytes_sent_observed` only
+    /// at upload EOS / error / cancel / Drop. An early backend response can
+    /// flush headers — and build this skeleton — while that upload is still
+    /// in hyper's detached pipe. Wait for the latch before emitting so
+    /// `TransactionSummary.bytes_sent` / `api_chargeback` see forwarded bytes.
+    request_bytes_latch: Option<Arc<DirectH2BytesLatch>>,
 }
 
 impl DeferredTransactionLogger {
@@ -192,6 +199,7 @@ impl DeferredTransactionLogger {
                 plugins,
                 ctx,
                 start_time: None,
+                request_bytes_latch: None,
             })),
             fired: AtomicBool::new(false),
             #[cfg(test)]
@@ -232,11 +240,39 @@ impl DeferredTransactionLogger {
                 plugins,
                 ctx,
                 start_time: Some(start_time),
+                request_bytes_latch: None,
             })),
             fired: AtomicBool::new(false),
             #[cfg(test)]
             delivery: None,
         })
+    }
+
+    /// Attach the unlimited direct-H2 passthrough publication latch.
+    ///
+    /// Must be called before the first `fire` / Drop. A missing latch keeps
+    /// the historical header-flush snapshot and only reloads whatever the
+    /// atomic already holds (limited / reqwest paths publish per frame).
+    pub fn with_passthrough_request_bytes_latch(
+        self: Arc<Self>,
+        latch: Option<Arc<DirectH2BytesLatch>>,
+    ) -> Arc<Self> {
+        if let Some(latch) = latch {
+            match self.state.lock() {
+                Ok(mut guard) => {
+                    if let Some(state) = guard.as_mut() {
+                        state.request_bytes_latch = Some(latch);
+                    }
+                }
+                Err(poisoned) => {
+                    let mut guard = poisoned.into_inner();
+                    if let Some(state) = guard.as_mut() {
+                        state.request_bytes_latch = Some(latch);
+                    }
+                }
+            }
+        }
+        self
     }
 
     /// Fire the deferred log with the given outcome. Only the first call
@@ -276,6 +312,7 @@ impl DeferredTransactionLogger {
             plugins,
             mut ctx,
             start_time,
+            request_bytes_latch,
         } = state;
         summary.body_completed = outcome.body_completed;
         summary.body_error_class = outcome.body_error_class;
@@ -284,14 +321,6 @@ impl DeferredTransactionLogger {
         // body wrapper finishes or is dropped. Buffered responses populate
         // `bytes_received` synchronously and never reach the deferred logger.
         summary.bytes_received = outcome.bytes_streamed;
-        summary.grpc_request_messages = ctx
-            .grpc_request_messages_observed
-            .load(Ordering::Acquire)
-            .max(summary.grpc_request_messages);
-        summary.grpc_response_messages = ctx
-            .grpc_response_messages_observed
-            .load(Ordering::Acquire)
-            .max(summary.grpc_response_messages);
         // Bounded, fixed-cardinality termination class so a policy expiry stays
         // distinguishable from a backend or transport fault in every log sink.
         // Stamped inside the single-fire `fire()` guard, so exactly once.
@@ -325,13 +354,32 @@ impl DeferredTransactionLogger {
         // `new_with_start_time`. Gateway fields follow
         // `TransactionSummary::refresh_gateway_latencies` so an unknown
         // streaming backend total never inflates gateway overhead via TTFB
-        // substitution.
+        // substitution. Do this BEFORE waiting on request-byte publication
+        // so a still-running upload cannot stretch client-visible latency.
         if let Some(start) = start_time {
             summary.latency_total_ms = start.elapsed().as_secs_f64() * 1000.0;
             summary.refresh_gateway_latencies();
         }
 
         let task = async move {
+            if let Some(latch) = request_bytes_latch.as_ref() {
+                latch.wait().await;
+            }
+            // Reload after the passthrough publish (or after the limited
+            // adapter's per-frame atomics). `max` preserves fetch_max retry
+            // semantics if a skeleton already captured a larger value.
+            summary.bytes_sent = ctx
+                .bytes_sent_observed
+                .load(Ordering::Acquire)
+                .max(summary.bytes_sent);
+            summary.grpc_request_messages = ctx
+                .grpc_request_messages_observed
+                .load(Ordering::Acquire)
+                .max(summary.grpc_request_messages);
+            summary.grpc_response_messages = ctx
+                .grpc_response_messages_observed
+                .load(Ordering::Acquire)
+                .max(summary.grpc_response_messages);
             let response_status = summary.response_status_code;
             run_response_stream_termination_hooks(
                 plugins.as_slice(),
@@ -392,6 +440,7 @@ impl DeferredTransactionLogger {
                 plugins,
                 ctx,
                 start_time,
+                request_bytes_latch: None,
             })),
             fired: AtomicBool::new(false),
             delivery: Some(delivery),

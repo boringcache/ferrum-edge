@@ -551,6 +551,10 @@ FULL_CI_DOCUMENTATION_PATHS = frozenset(
         "docs/mesh_multicluster_federation_runbook.md",
         "docs/mesh_supported_matrix.md",
         "docs/node_agent.md",
+        # Trigger of the CNI install-lifecycle live suite (issue #3908); the
+        # required-CI verifier proves this set covers every live-suite
+        # documentation trigger.
+        "docs/node_agent_security.md",
         "docs/plans/node_waypoint_transport_adr.md",
         "docs/spire_deployment.md",
         "docs/tcp_udp_proxy.md",

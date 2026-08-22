@@ -32,6 +32,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
+use crate::scaffolding::ports::reserve_refused_tcp_port;
 use crate::scaffolding::{H3WebSocketFrame, Http3Client, WebSocketOptions};
 
 // ============================================================================
@@ -3249,7 +3250,8 @@ async fn test_h3_websocket_origin_allowlist_enforced_before_backend_connect() {
 #[ignore]
 #[tokio::test]
 async fn test_h3_websocket_retry_rotates_to_next_upstream_target() {
-    let dead_port = free_port().await;
+    let dead_port_reservation = reserve_refused_tcp_port().expect("reserve refused dead port");
+    let dead_port = dead_port_reservation.port;
     let backend_port = free_port().await;
 
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
@@ -3281,6 +3283,7 @@ async fn test_h3_websocket_retry_rotates_to_next_upstream_target() {
     let _ = gateway.kill();
     let _ = gateway.wait();
     echo_handle.abort();
+    let _keep_dead_port = dead_port_reservation;
 }
 
 /// A failed H3 WebSocket backend setup should be surfaced as the same 502 JSON
@@ -3288,7 +3291,8 @@ async fn test_h3_websocket_retry_rotates_to_next_upstream_target() {
 #[ignore]
 #[tokio::test]
 async fn test_h3_websocket_failed_backend_upgrade_returns_502() {
-    let dead_port = free_port().await;
+    let dead_port_reservation = reserve_refused_tcp_port().expect("reserve refused dead port");
+    let dead_port = dead_port_reservation.port;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
@@ -3320,6 +3324,7 @@ async fn test_h3_websocket_failed_backend_upgrade_returns_502() {
 
     let _ = gateway.kill();
     let _ = gateway.wait();
+    let _keep_dead_port = dead_port_reservation;
 }
 
 /// The H3 bridge releases the per-IP request guard after the 200 upgrade

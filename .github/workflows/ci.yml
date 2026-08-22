@@ -5144,11 +5144,39 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
         if: steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true' || steps.perf_changes.outputs.run_wrr_benchmark == 'true' || steps.perf_changes.outputs.run_rr_benchmark == 'true' || steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true'
+        # setup-sccache deliberately installs the verified wrapper under a fresh
+        # runner-private path. Hide that runner-unique identity only from the
+        # nested rust-cache key calculation; setup-sccache still publishes the
+        # verified path through GITHUB_ENV for the benchmark steps below.
+        env:
+          RUSTC_WRAPPER: ""
+          CARGO_BUILD_RUSTC_WRAPPER: ""
         with:
           shared-key: "ci-perf"
           workspaces: |
             . -> target
             tests/performance/mesh -> target
+
+      - name: Stabilize performance compiler wrapper identity
+        run: |
+          set -euo pipefail
+          source="${FERRUM_SCCACHE_BIN:-}"
+          if [ -z "$source" ] || [ ! -x "$source" ]; then
+            printf '%s\n' 'RUSTC_WRAPPER=' 'CARGO_BUILD_RUSTC_WRAPPER=' >> "$GITHUB_ENV"
+            echo "sccache is unavailable; performance builds will run uncached"
+            exit 0
+          fi
+
+          stable_root="${RUNNER_TEMP}/ferrum-performance-sccache"
+          stable_wrapper="${stable_root}/bin/sccache"
+          rm -rf "$stable_root"
+          mkdir -p "${stable_root}/bin"
+          cp -- "$source" "$stable_wrapper"
+          chmod 0755 "$stable_wrapper"
+          printf '%s\n' \
+            "RUSTC_WRAPPER=${stable_wrapper}" \
+            "CARGO_BUILD_RUSTC_WRAPPER=${stable_wrapper}" >> "$GITHUB_ENV"
+          echo "Performance compiler wrapper activated at a deterministic runner-local path"
 
       - name: Run IP restriction worst-case microbenchmark
         if: steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true'

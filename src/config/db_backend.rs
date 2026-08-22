@@ -1784,7 +1784,20 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
 
     async fn create_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error>;
     async fn update_proxy(&self, proxy: &Proxy) -> Result<bool, anyhow::Error>;
-    async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error>;
+    async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
+        self.delete_proxy_with_orphan_cleanup(namespace, id, true)
+            .await
+    }
+    /// Delete a proxy. When `cleanup_orphaned_upstream` is `true` (the
+    /// default, matching [`Self::delete_proxy`]), a last-referenced
+    /// hand-owned upstream is orphan-cleaned. Spec-owned upstreams and
+    /// still-referenced upstreams are never cleaned regardless of the flag.
+    async fn delete_proxy_with_orphan_cleanup(
+        &self,
+        namespace: &str,
+        id: &str,
+        cleanup_orphaned_upstream: bool,
+    ) -> Result<bool, anyhow::Error>;
     async fn get_proxy(&self, namespace: &str, id: &str) -> Result<Option<Proxy>, anyhow::Error>;
     /// Load an existing proxy for write prechecks/audit without rejecting
     /// repairable proxy-plugin reference corruption. Backends that store

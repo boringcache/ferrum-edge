@@ -4,36 +4,44 @@ name: CNI Install Lifecycle Live
 # tests/k8s/cni_lifecycle_live/run.sh so this workflow stays a thin launcher
 # (checkout → build → package → kind tools → harness), matching the other
 # live datapath suites and staying inside the trusted Cross-build policy.
+#
+# `CNI Lifecycle Live` is an OPTIONAL always-reporting aggregate: it is
+# deliberately not branch-protection-required (.claude/rules/testing.md), and
+# verify_required_ci.py asserts it stays out of REQUIRED_MERGE_GROUP_WORKFLOWS
+# and DEDICATED_REQUIRED_CHECKS. The `changes` job below follows the same
+# trusted-base relevance shape the required live suites use, with the
+# suite/slug/display substitutions and a temporary #3908 bootstrap handshake
+# until the classifier suite reaches `main`. It is not byte-frozen until a
+# later trusted-policy change adds it to LIVE_SUITE_RELEVANCE_CONTRACTS; until
+# then a pull request can still rewrite this job. Comments are written for the
+# required case so the block can be frozen verbatim by that follow-up.
 
 on:
   workflow_dispatch:
+  # No workflow-level `paths:` filter (issue #3908): a `paths:` list lives in
+  # the pull request's own checkout, so the same commit that breaks CNI
+  # install/uninstall recovery could delete its trigger and skip this suite.
+  # Relevance is decided by the trusted-base classifier in `changes` instead.
   pull_request:
-    paths:
-      - ".github/workflows/cni-lifecycle-live.yml"
-      - ".github/actions/package-ferrum-runtime-image/**"
-      - ".github/actions/setup-kubernetes-tools/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "build.rs"
-      - "proto/**"
-      - "src/bin/ferrum-cni.rs"
-      - "src/cni/**"
-      - "charts/ferrum-mesh/templates/cni-uninstall-hook.yaml"
-      - "charts/ferrum-mesh/templates/cni-cleanup-rbac.yaml"
-      - "charts/ferrum-mesh/templates/node-agent-daemonset.yaml"
-      - "charts/ferrum-mesh/templates/node-agent-rbac.yaml"
-      - "charts/ferrum-mesh/values.yaml"
-      - "tests/k8s/cni_lifecycle_live/**"
-      - "docs/node_agent.md"
-      - "docs/node_agent_security.md"
-      - "PRODUCTION_READINESS.md"
+  merge_group:
+    types:
+      - checks_requested
+  # A queue entry is a COMBINED commit -- for example one pull request renaming
+  # a chart value another one's CNI template consumes -- and the main push is
+  # the first place such a regression can surface at all.
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
 
+# Cancel a superseded PR/main run on rapid re-push. Merge-group runs are keyed
+# by the synthesized head so a queue entry never cancels a pull-request run, and
+# manual dispatches share one lane and run to completion.
 concurrency:
-  group: cni-lifecycle-live-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'pull_request' && format('cni-lifecycle-live-pr-{0}', github.event.pull_request.number) || (github.event_name == 'merge_group' && format('cni-lifecycle-live-merge-group-{0}', github.event.merge_group.head_sha) || (github.event_name == 'push' && format('cni-lifecycle-live-{0}', github.ref) || 'cni-lifecycle-live-shared')) }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 env:
   FERRUM_IMAGE_REPOSITORY: ferrum-edge
@@ -41,8 +49,207 @@ env:
   KIND_CLUSTER: ferrum-cni-lifecycle
 
 jobs:
+  changes:
+    name: CNI lifecycle trigger
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+
+      # Relevance decides whether a REQUIRED live gate runs at all, so it must
+      # never be computed by code the pull request supplies: a PR that widens
+      # its own suite patterns could declare itself irrelevant, skip the live
+      # job, and still turn the required check green.
+      #
+      # Everything below reads ONE immutable trusted commit. The base-branch
+      # tip is fetched from the base repository, pinned once to a full object
+      # id, checked to hold the filter as a regular blob, and then read BY
+      # OBJECT ID rather than by path. A fork head, a rewritten head, or a push
+      # to the base branch mid-run therefore cannot swap the script between
+      # validation and execution, and every failure exits non-zero so the gate
+      # fails closed instead of quietly declaring itself irrelevant.
+      #
+      # This block is frozen by .github/scripts/verify_cross_build_policy.py
+      # (see live_suite_relevance_errors); it is byte-identical across every
+      # live-suite workflow apart from the suite, slug, and display name.
+      - name: Check for cni-lifecycle changes
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+
+          filter_path=.github/scripts/live_suite_path_filter.py
+          changed_files="$RUNNER_TEMP/cni-lifecycle-changed-files.txt"
+          trusted_filter="$RUNNER_TEMP/cni-lifecycle-trusted-filter.py"
+          rm -f -- "$changed_files" "$trusted_filter"
+          : > "$changed_files"
+
+          filter_args=(--suite cni-lifecycle --changed-files "$changed_files")
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # `github.base_ref` names a branch in the BASE repository, so a fork
+            # cannot control its contents -- but it is still untrusted text.
+            # Reject anything outside a conservative branch charset before it
+            # reaches a refspec so no option, pathspec, or revision-syntax
+            # metacharacter can be smuggled into a git invocation.
+            if ! printf '%s' "$BASE_REF" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$'; then
+              echo "::error::refusing to resolve an unsafe base ref" >&2
+              exit 1
+            fi
+            case "$BASE_REF" in
+              *..*|*//*|*/|*.lock|*/.*)
+                echo "::error::refusing to resolve an unsafe base ref" >&2
+                exit 1
+                ;;
+            esac
+            fetched=false
+            for attempt in 1 2 3; do
+              if git fetch --no-tags --no-recurse-submodules origin \
+                "+refs/heads/${BASE_REF}:refs/ferrum/trusted-base"; then
+                fetched=true
+                break
+              fi
+              echo "git fetch of ${BASE_REF} failed (attempt ${attempt}/3); retrying" >&2
+              sleep $(( attempt * 10 ))
+            done
+            if [ "$fetched" != true ]; then
+              echo "::error::git fetch of ${BASE_REF} failed after 3 attempts" >&2
+              exit 1
+            fi
+            # Pin the moving tip exactly once; nothing below re-resolves a ref.
+            trusted_sha="$(git rev-parse --verify --quiet refs/ferrum/trusted-base^{commit} || true)"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            # Merge queues synthesize a combined SHA. Use the event's base_sha
+            # as the trusted filter source and the change-set base so a missing
+            # pull_request payload cannot force-skip or check only main.
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              fetched=false
+              for attempt in 1 2 3; do
+                if git fetch --no-tags --no-recurse-submodules origin \
+                  "${MERGE_BASE_SHA}"; then
+                  fetched=true
+                  break
+                fi
+                echo "git fetch of merge_group base failed (attempt ${attempt}/3); retrying" >&2
+                sleep $(( attempt * 10 ))
+              done
+              if [ "$fetched" != true ]; then
+                echo "::error::git fetch of merge_group base_sha failed after 3 attempts" >&2
+                exit 1
+              fi
+            fi
+            trusted_sha="$MERGE_BASE_SHA"
+          else
+            # A push to the default branch and a manual dispatch already run
+            # trusted code, so the checked-out commit IS the trusted base.
+            trusted_sha="$(git rev-parse --verify --quiet 'HEAD^{commit}' || true)"
+            filter_args+=(--force-run)
+          fi
+
+          if ! printf '%s' "$trusted_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::trusted base did not resolve to a full commit id" >&2
+            exit 1
+          fi
+
+          # Reject anything that is not a regular blob at that exact commit: a
+          # symlink (mode 120000) would make a content read emit its target
+          # path, a gitlink (160000) or tree (040000) carries no script at all,
+          # and a missing entry must fail closed rather than fall back to the
+          # pull request's own copy.
+          entry="$(git ls-tree --full-tree "$trusted_sha" -- "$filter_path")"
+          if [ "$(printf '%s\n' "$entry" | grep -c . || true)" != "1" ]; then
+            echo "::error::${filter_path} is not a single tree entry at ${trusted_sha}" >&2
+            exit 1
+          fi
+          entry_mode="$(printf '%s\n' "$entry" | awk '{print $1}')"
+          entry_type="$(printf '%s\n' "$entry" | awk '{print $2}')"
+          entry_object="$(printf '%s\n' "$entry" | awk '{print $3}')"
+          entry_path="$(printf '%s\n' "$entry" | awk -F'\t' '{print $2}')"
+          if [ "$entry_type" != "blob" ] || [ "$entry_path" != "$filter_path" ]; then
+            echo "::error::${filter_path} is not a blob at ${trusted_sha}" >&2
+            exit 1
+          fi
+          case "$entry_mode" in
+            100644|100755) ;;
+            *)
+              echo "::error::${filter_path} has non-regular mode ${entry_mode}" >&2
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$entry_object" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::${filter_path} did not resolve to an object id" >&2
+            exit 1
+          fi
+          if [ "$(git cat-file -s "$entry_object")" -gt 262144 ]; then
+            echo "::error::${filter_path} exceeds the 256 KiB trusted-filter ceiling" >&2
+            exit 1
+          fi
+          git cat-file blob "$entry_object" > "$trusted_filter"
+
+          # Bootstrap handshake for issue #3908. ONE-WAY and temporary: this
+          # workflow and the `cni-lifecycle` entry in the classifier land in the
+          # same commit, so while the introducing pull request is open the
+          # TRUSTED copy extracted above still predates the suite name and
+          # rejects it with an argparse usage error. That is a hard failure
+          # rather than a skip, but it is indistinguishable from a broken
+          # classifier, so ask the trusted copy which suites it knows and force
+          # this one to RUN when it cannot classify it. The verdict is never
+          # taken from the pull request's own checkout, and every OTHER failure
+          # below still fails the job closed. Delete this block once the
+          # classifier suite is on the trusted base.
+          if ! trusted_suites="$(python3 -I "$trusted_filter" --list-suites)"; then
+            trusted_suites=""
+          fi
+          if ! printf '%s\n' "$trusted_suites" | grep -Fqx -- 'cni-lifecycle'; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "## CNI lifecycle trigger"
+              echo ""
+              echo "Trusted base ${trusted_sha} predates the \`cni-lifecycle\` classifier"
+              echo "suite, so relevance cannot be decided there. Running the suite."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
+            git diff --name-only --no-renames "${trusted_sha}...HEAD" \
+              | sort > "$changed_files"
+          fi
+
+          # Isolated interpreter: no user site directory, no PYTHON* overrides,
+          # and no implicit path entry, so nothing the pull request committed
+          # can be imported by the trusted filter.
+          python3 -I "$trusted_filter" --self-test
+          plan="$(python3 -I "$trusted_filter" "${filter_args[@]}")"
+          relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
+          case "$relevant" in
+            true|false) ;;
+            *)
+              echo "::error::trusted relevance filter produced no usable verdict" >&2
+              exit 1
+              ;;
+          esac
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          echo "Relevance decided by trusted base ${trusted_sha}." >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
+
   cni-lifecycle-live:
     name: CNI install lifecycle live recovery
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -83,3 +290,59 @@ jobs:
           path: ${{ runner.temp }}/cni-lifecycle-live
           if-no-files-found: ignore
           retention-days: 14
+
+  gate:
+    name: CNI Lifecycle Live
+    needs:
+      - changes
+      - cni-lifecycle-live
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail when CNI lifecycle relevance planning fails
+        if: needs.changes.result != 'success'
+        run: |
+          {
+            echo "## CNI Lifecycle Live"
+            echo ""
+            echo "Failed before change detection completed."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Skip CNI lifecycle live recovery for unrelated changes
+        if: needs.changes.outputs.relevant == 'false'
+        run: |
+          {
+            echo "## CNI Lifecycle Live"
+            echo ""
+            echo "Skipped the CNI install/uninstall lifecycle recovery proof: no CNI binary, plugin, chart template, harness, workflow, local-action, or documentation surfaces changed."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail when CNI lifecycle relevance output is unusable
+        if: needs.changes.result == 'success' && needs.changes.outputs.relevant != 'true' && needs.changes.outputs.relevant != 'false'
+        run: |
+          {
+            echo "## CNI Lifecycle Live"
+            echo ""
+            echo "Change detection returned an invalid relevance result: ${{ needs.changes.outputs.relevant }}."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Fail when CNI lifecycle live recovery did not succeed
+        if: needs.changes.outputs.relevant == 'true' && needs.cni-lifecycle-live.result != 'success'
+        run: |
+          {
+            echo "## CNI Lifecycle Live"
+            echo ""
+            echo "CNI lifecycle live recovery failed or did not complete: ${{ needs.cni-lifecycle-live.result }}."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Report CNI lifecycle live recovery
+        if: needs.changes.outputs.relevant == 'true' && needs.cni-lifecycle-live.result == 'success'
+        run: |
+          {
+            echo "## CNI Lifecycle Live"
+            echo ""
+            echo "CNI lifecycle live recovery passed."
+          } >> "$GITHUB_STEP_SUMMARY"

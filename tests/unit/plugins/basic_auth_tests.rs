@@ -8,7 +8,9 @@ use ferrum_edge::plugins::{
 use hmac::{KeyInit, Mac};
 use serde_json::json;
 
-use super::plugin_utils::assert_continue;
+use super::plugin_utils::{
+    assert_continue, assert_reject_body, context_with_materialized_raw_header,
+};
 
 /// A fixed test secret used for all basic_auth tests.
 /// Tests set `FERRUM_BASIC_AUTH_HMAC_SECRET` to this value before constructing
@@ -643,4 +645,17 @@ fn test_verification_rounds_are_bounded_by_serializable_credential_capacity() {
         bounded(usize::MAX),
         ferrum_edge::config::types::MAX_CREDENTIALS_SIZE / ("hmac_sha256:".len() + 64)
     );
+}
+
+#[tokio::test]
+async fn test_basic_auth_non_ascii_authorization_returns_invalid_not_missing() {
+    set_test_hmac_secret();
+    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx =
+        context_with_materialized_raw_header("Authorization", "Basic dXNlcjpwYXNz\u{3000}");
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject_body(result, r#"{"error":"Invalid Authorization header"}"#);
+    assert!(ctx.identified_consumer.is_none());
 }

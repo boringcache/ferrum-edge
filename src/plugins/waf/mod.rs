@@ -996,11 +996,10 @@ impl Waf {
     ///
     /// `request_body_policy_applies` answers "would this be scanned"; claiming
     /// additionally requires a disposition that can refuse. A `monitor`-mode
-    /// instance — or one whose only applicable body rules are `monitor` without
-    /// anomaly scoring — observes and logs, so an unscannable body there is a
-    /// lost observation, never a protection-mechanism failure. Claiming it would
-    /// convert a non-blocking configuration into a fail-closed `400` on an
-    /// ordinary compressed upload.
+    /// instance observes and logs, so an unscannable body there is a lost
+    /// observation. In enforce mode, `on_body_too_large: block` is itself a
+    /// blocking disposition even when every applicable body rule is monitor-only;
+    /// that posture must claim encoded bodies so the cap is applied to plaintext.
     ///
     /// The `on_body_too_large: skip` exemption folds in on exactly the terms
     /// `should_buffer_request_body` uses: an operator who opted a body of this
@@ -1012,7 +1011,9 @@ impl Waf {
     ) -> bool {
         self.request_body_policy_applies(ctx, headers)
             && !self.request_body_scan_skipped_as_too_large(headers)
-            && self.has_enforcing_body_policy(BodyDirection::Request, ctx)
+            && (self.has_enforcing_body_policy(BodyDirection::Request, ctx)
+                || (self.config.mode == GlobalMode::Enforce
+                    && self.config.on_body_too_large == TooLargeAction::Block))
     }
 
     /// The `should_buffer_request_body` size opt-out, evaluated over the

@@ -4589,7 +4589,16 @@ paths:
       description: |
         Deletes the proxy and its proxy-owned cascade resources. If the proxy is
         owned by an API spec, the spec row and spec-owned resources are also
-        deleted. When namespace admission is lost after that deletion commits,
+        deleted. When the deleted proxy is hand-managed (no owning API-spec
+        row), a last-referenced **hand-owned** upstream (`api_spec_id` null) is
+        orphan-cleaned by default if no remaining proxy or `mesh_route_dispatch`
+        plugin still references it. Pass `cleanup_orphaned_upstream=false` to
+        keep that upstream. A shared hand-owned upstream survives. Spec-owned
+        upstreams are removed by the spec cascade, not this generic orphan path;
+        a spec-owned proxy that drifted onto a hand-owned upstream leaves that
+        upstream in place. Direct `DELETE /upstreams/{id}` does not cascade: it
+        returns `409` while the upstream is still referenced. When namespace
+        admission is lost after that deletion commits,
         SQL backends and replica-set MongoDB use the API-spec compensation
         transaction to restore the stamped spec resources, an orphaned
         hand-owned upstream, hand-owned cascade plugins, associations, and
@@ -4609,11 +4618,13 @@ paths:
         an API-spec-owned proxy with `501` before the first ownership-graph
         mutation; configure a replica set and retry.
       tags: [Proxies]
+      parameters:
+        - $ref: "#/components/parameters/CleanupOrphanedUpstream"
       responses:
         "204":
           description: Proxy deleted
         "400":
-          description: Deletion would leave an invalid plugin-composition graph, or an API-spec-owned proxy has foreign/missing ownership metadata or another restore-snapshot shape that atomic compensation cannot reproduce safely
+          description: Deletion would leave an invalid plugin-composition graph, or an API-spec-owned proxy has foreign/missing ownership metadata or another restore-snapshot shape that atomic compensation cannot reproduce safely, or `cleanup_orphaned_upstream` was duplicated or supplied with a value other than the exact strings `true` or `false`
           content:
             application/json:
               schema:
@@ -4791,6 +4802,14 @@ paths:
     delete:
       operationId: deleteConsumer
       summary: Delete a consumer
+      description: |
+        Deletes the consumer. Returns `409 Conflict` with
+        `{"error":"Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"}`
+        when any `access_control` plugin config in the same namespace still lists
+        this consumer's username in `allowed_consumers`. The consumer and plugin
+        configs are left unchanged; the delete does not rewrite authorization
+        policy. A consumer named only in `disallowed_consumers` can still be
+        deleted.
       tags: [Consumers]
       responses:
         "204":
@@ -4802,7 +4821,15 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/Conflict"
+          description: |
+            Conflict — mTLS DNS identity repair cannot proceed, or an
+            `access_control` plugin_config still lists this consumer's username
+            in `allowed_consumers`. Body for the allow-list case:
+            `{"error":"Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"}`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -5411,6 +5438,15 @@ paths:
     delete:
       operationId: deleteUpstream
       summary: Delete an upstream
+      description: |
+        Deletes the upstream. Returns `409 Conflict` with
+        `{"error":"Upstream is referenced by one or more proxies and cannot be deleted"}`
+        when any proxy still has this `upstream_id`. A `mesh_route_dispatch`
+        plugin_config that still names the upstream returns `409` with
+        `{"error":"Upstream is referenced by a mesh_route_dispatch plugin_config and cannot be deleted"}`.
+        The upstream and referencing resources are left unchanged. This is the
+        opposite of `DELETE /proxies/{id}`, which orphan-cleans a last-referenced
+        hand-owned upstream by default unless `cleanup_orphaned_upstream=false`.
       tags: [Upstreams]
       responses:
         "204":
@@ -5421,6 +5457,17 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            The upstream is still referenced by a proxy or by a
+            `mesh_route_dispatch` plugin_config and cannot be deleted. Bodies:
+            `{"error":"Upstream is referenced by one or more proxies and cannot be deleted"}`
+            or
+            `{"error":"Upstream is referenced by a mesh_route_dispatch plugin_config and cannot be deleted"}`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -6505,6 +6552,31 @@ components:
         the request body (which is therefore effectively read-only on the
         wire). Resources from other namespaces are not visible to this
         request and uniqueness constraints apply per-namespace.
+
+    CleanupOrphanedUpstream:
+      name: cleanup_orphaned_upstream
+      in: query
+      required: false
+      schema:
+        type: boolean
+        default: true
+      description: |
+        Controls last-referenced **hand-owned** upstream orphan cleanup when
+        deleting a hand-managed proxy. The default `true` is today's behavior:
+        if no remaining proxy or `mesh_route_dispatch` plugin references the
+        proxy's `upstream_id`, that hand-owned (`api_spec_id` null) upstream is
+        removed with the proxy. `false` keeps the upstream so it can be
+        reattached. Spec-owned upstreams and still-referenced upstreams are
+        never cleaned, regardless of this parameter.
+
+        Exactly one occurrence with the exact string `true` or `false` is
+        accepted. Any other value — including `1`, `0`, `yes`, or an empty
+        value — or any duplicate occurrence returns `400` rather than guessing,
+        because this flag decides whether operator data is deleted. Omitting
+        the parameter is equivalent to `true`. Direct
+        `DELETE /upstreams/{id}` is the opposite shape: it returns `409` while
+        any proxy or `mesh_route_dispatch` plugin still references the
+        upstream and never cascades.
 
     PaginationOffset:
       name: offset
@@ -19019,9 +19091,11 @@ components:
         Plugin: hmac_auth — Ferrum-specific versioned HMAC authorization with
         mandatory request-body integrity protection. RFC 9530 defines
         Content-Digest; this is not RFC 9421 HTTP Message Signatures. Requests
-        must include Digest or Content-Digest matching the original body.
-        The signing base's FIRST field is the profile version, so a signature
-        produced under one profile can never verify under another.
+        must include exactly one of Digest or Content-Digest matching the
+        original body. Sending both headers is refused as ambiguous;
+        unsupported algorithms and malformed members fail closed. The signing
+        base's FIRST field is the profile version, so a signature produced
+        under one profile can never verify under another.
         `ferrum-hmac-v2` (the default) signs the profile version, matched proxy
         namespace, credential identity, normalized authority, method, raw path,
         raw query, Date, literal digest value, and a mandatory client nonce, and

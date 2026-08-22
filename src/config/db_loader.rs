@@ -460,6 +460,25 @@ fn mesh_route_dispatch_referenced_upstream(
         .map(ToOwned::to_owned)
 }
 
+/// `access_control.allowed_consumers` names gateway Consumer usernames
+/// (byte-for-byte). A delete must refuse while any plugin config in the
+/// namespace still authorizes that username; the operator's policy is not
+/// rewritten.
+fn access_control_plugin_allows_consumer(plugin: &PluginConfig, username: &str) -> bool {
+    if plugin.plugin_name != "access_control" {
+        return false;
+    }
+    plugin
+        .config
+        .get("allowed_consumers")
+        .and_then(|value| value.as_array())
+        .is_some_and(|consumers| {
+            consumers
+                .iter()
+                .any(|entry| entry.as_str() == Some(username))
+        })
+}
+
 fn upstream_backend_tls_san_allow_list_json(
     upstream: &Upstream,
 ) -> Result<Option<String>, anyhow::Error> {
@@ -3355,7 +3374,7 @@ impl DatabaseStore {
         if let Some(old_upstream_id) = old_upstream_id.as_deref()
             && proxy.upstream_id.as_deref() != Some(old_upstream_id)
         {
-            self.cleanup_orphaned_upstream_tx(&mut tx, &proxy.namespace, old_upstream_id)
+            self.cleanup_orphaned_upstream_tx(&mut tx, &proxy.namespace, old_upstream_id, true)
                 .await?;
         }
 
@@ -3372,6 +3391,16 @@ impl DatabaseStore {
     }
 
     pub async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
+        self.delete_proxy_with_orphan_cleanup(namespace, id, true)
+            .await
+    }
+
+    pub async fn delete_proxy_with_orphan_cleanup(
+        &self,
+        namespace: &str,
+        id: &str,
+        cleanup_orphaned_upstream: bool,
+    ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
@@ -3485,7 +3514,7 @@ impl DatabaseStore {
         if spec_owner.is_none()
             && let Some(ref uid) = upstream_id
         {
-            self.cleanup_orphaned_upstream_tx(&mut tx, namespace, uid)
+            self.cleanup_orphaned_upstream_tx(&mut tx, namespace, uid, cleanup_orphaned_upstream)
                 .await?;
         }
 
@@ -3572,7 +3601,11 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
         upstream_id: &str,
+        cleanup_orphaned_upstream: bool,
     ) -> Result<(), anyhow::Error> {
+        if !cleanup_orphaned_upstream {
+            return Ok(());
+        }
         let upstream_row: Option<AnyRow> = sqlx::query(
             &self.q("SELECT api_spec_id FROM upstreams WHERE id = ? AND namespace = ? LIMIT 1"),
         )
@@ -3827,16 +3860,29 @@ impl DatabaseStore {
             .await?;
         // Scope the existence check to the caller's namespace (issue #2122):
         // consumer ids are only unique per namespace.
-        let existing: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT id FROM consumers WHERE id = ? AND namespace = ?"))
-                .bind(id)
-                .bind(namespace)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if existing.is_none() {
+        let existing: Option<AnyRow> = sqlx::query(
+            &self.q("SELECT id, username FROM consumers WHERE id = ? AND namespace = ?"),
+        )
+        .bind(id)
+        .bind(namespace)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(existing) = existing else {
             tx.rollback().await?;
             self.check_slow_query("delete_consumer", start);
             return Ok(false);
+        };
+        let username: String = existing.try_get("username")?;
+        if let Some(plugin) = self
+            .find_access_control_consumer_ref_tx(&mut tx, namespace, &username)
+            .await?
+        {
+            tx.rollback().await?;
+            anyhow::bail!(
+                "Consumer {} is referenced by access_control plugin_config '{}' and cannot be deleted",
+                id,
+                plugin.id
+            );
         }
         // The FK cascade on both index tables covers these deletes; keep them
         // explicit for defense in depth (mirrors delete_all_resources).
@@ -5003,6 +5049,29 @@ impl DatabaseStore {
         }))
     }
 
+    async fn find_access_control_consumer_ref_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        username: &str,
+    ) -> Result<Option<PluginConfig>, anyhow::Error> {
+        let rows: Vec<AnyRow> = sqlx::query(
+            &self.q("SELECT * FROM plugin_configs WHERE plugin_name = ? AND namespace = ?"),
+        )
+        .bind("access_control")
+        .bind(namespace)
+        .fetch_all(&mut **tx)
+        .await?;
+
+        for row in &rows {
+            let plugin = row_to_plugin_config(row)?;
+            if access_control_plugin_allows_consumer(&plugin, username) {
+                return Ok(Some(plugin));
+            }
+        }
+        Ok(None)
+    }
+
     /// Delete an upstream only if it is not referenced by any proxy.
     /// Returns `Err` if the upstream is still in use.
     /// Uses a transaction to prevent race conditions between the reference
@@ -5079,7 +5148,7 @@ impl DatabaseStore {
         let mut tx = self.pool().begin().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
 
-        self.cleanup_orphaned_upstream_tx(&mut tx, namespace, old_upstream_id)
+        self.cleanup_orphaned_upstream_tx(&mut tx, namespace, old_upstream_id, true)
             .await?;
 
         tx.commit().await?;
@@ -9995,6 +10064,21 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         DatabaseStore::delete_proxy(self, namespace, id).await
+    }
+
+    async fn delete_proxy_with_orphan_cleanup(
+        &self,
+        namespace: &str,
+        id: &str,
+        cleanup_orphaned_upstream: bool,
+    ) -> Result<bool, anyhow::Error> {
+        DatabaseStore::delete_proxy_with_orphan_cleanup(
+            self,
+            namespace,
+            id,
+            cleanup_orphaned_upstream,
+        )
+        .await
     }
 
     async fn get_proxy(&self, namespace: &str, id: &str) -> Result<Option<Proxy>, anyhow::Error> {

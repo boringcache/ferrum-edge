@@ -23,6 +23,7 @@ use tracing::debug;
 use crate::consumer_index::ConsumerIndex;
 
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
+use super::utils::header_extract::{ConfiguredHeaderLookup, lookup_configured_header};
 use super::utils::token_extract::bearer_credential_from_authorization_value;
 use super::{RequestContext, strip_auth_scheme};
 
@@ -128,23 +129,29 @@ impl JwtAuth {
                 lower_name,
                 original_name,
             } => {
-                let Some(value) = ctx
-                    .headers
-                    .get(lower_name.as_str())
-                    .or_else(|| ctx.headers.get(original_name.as_str()))
-                else {
-                    return ExtractedCredential::Missing;
+                let value = match lookup_configured_header(
+                    ctx,
+                    lower_name.as_str(),
+                    Some(original_name.as_str()),
+                ) {
+                    ConfiguredHeaderLookup::Absent => return ExtractedCredential::Missing,
+                    ConfiguredHeaderLookup::PresentNonMaterialized => {
+                        return ExtractedCredential::InvalidFormat(
+                            r#"{"error":"Invalid JWT token"}"#.into(),
+                        );
+                    }
+                    ConfiguredHeaderLookup::Value(value) => value,
                 };
                 if lower_name.eq_ignore_ascii_case("authorization") {
                     // Shared with JWKS/OAuth: a foreign scheme is not
                     // applicable, but an empty `Bearer` value must reject so
                     // single mode cannot skip a malformed applicable
                     // credential and authenticate via a later mechanism.
-                    bearer_credential_from_authorization_value(value)
+                    bearer_credential_from_authorization_value(&value)
                 } else {
                     ExtractedCredential::BearerToken(
-                        strip_auth_scheme(value, "Bearer")
-                            .unwrap_or(value.as_str())
+                        strip_auth_scheme(&value, "Bearer")
+                            .unwrap_or(value.as_ref())
                             .to_string(),
                     )
                 }

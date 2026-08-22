@@ -8113,6 +8113,113 @@ fn mtls_dns_admission_mutations_document_conflict_responses() {
 }
 
 #[test]
+fn delete_proxy_cleanup_orphaned_upstream_query_has_openapi_parity() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let param = spec
+        .pointer("/components/parameters/CleanupOrphanedUpstream")
+        .expect("CleanupOrphanedUpstream parameter");
+    assert_eq!(param["name"], "cleanup_orphaned_upstream");
+    assert_eq!(param["in"], "query");
+    assert_eq!(param["required"], false);
+    assert_eq!(param["schema"]["type"], "boolean");
+    assert_eq!(param["schema"]["default"], true);
+    let param_desc = param["description"]
+        .as_str()
+        .expect("cleanup_orphaned_upstream description");
+    assert!(
+        param_desc.contains("false") && param_desc.contains("400"),
+        "parameter must document the opt-out and the 400: {param_desc}"
+    );
+
+    let delete = spec
+        .pointer("/paths/~1proxies~1{id}/delete")
+        .expect("DELETE /proxies/{id}");
+    let params = delete["parameters"]
+        .as_array()
+        .expect("DELETE /proxies/{id} parameters");
+    assert!(
+        params.iter().any(|parameter| {
+            parameter["$ref"] == "#/components/parameters/CleanupOrphanedUpstream"
+        }),
+        "DELETE /proxies/{{id}} must declare cleanup_orphaned_upstream: {params:?}"
+    );
+    let desc = delete["description"]
+        .as_str()
+        .expect("DELETE /proxies/{id} description");
+    assert!(
+        desc.contains("cleanup_orphaned_upstream=false") && desc.contains("409"),
+        "DELETE /proxies/{{id}} must document the opt-out and the DELETE /upstreams 409 pair: {desc}"
+    );
+    let four_hundred = delete["responses"]["400"]["description"]
+        .as_str()
+        .expect("DELETE /proxies/{id} 400 description");
+    assert!(
+        four_hundred.contains("cleanup_orphaned_upstream"),
+        "DELETE /proxies/{{id}} 400 must name the strict-parse flag: {four_hundred}"
+    );
+
+    let upstream_desc = spec["paths"]["/upstreams/{id}"]["delete"]["description"]
+        .as_str()
+        .expect("DELETE /upstreams/{id} description");
+    assert!(
+        upstream_desc
+            .contains("Upstream is referenced by one or more proxies and cannot be deleted"),
+        "DELETE /upstreams/{{id}} must name the proxy-reference 409: {upstream_desc}"
+    );
+    assert!(
+        upstream_desc.contains("cleanup_orphaned_upstream=false"),
+        "DELETE /upstreams/{{id}} must point at the proxy-delete opt-out: {upstream_desc}"
+    );
+}
+
+#[test]
+fn admin_referential_delete_conflicts_have_openapi_parity() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let consumer_409 = spec
+        .pointer("/paths/~1consumers~1{id}/delete/responses/409")
+        .expect("DELETE /consumers/{id} must document 409");
+    let consumer_desc = consumer_409["description"]
+        .as_str()
+        .expect("DELETE /consumers/{id} 409 description");
+    assert!(
+        consumer_desc.contains(
+            "Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"
+        ),
+        "DELETE /consumers/{{id}} 409 must name the access_control error string: {consumer_desc}"
+    );
+
+    let upstream_409 = spec
+        .pointer("/paths/~1upstreams~1{id}/delete/responses/409")
+        .expect("DELETE /upstreams/{id} must document 409");
+    let upstream_desc = upstream_409["description"]
+        .as_str()
+        .expect("DELETE /upstreams/{id} 409 description");
+    assert!(
+        upstream_desc
+            .contains("Upstream is referenced by one or more proxies and cannot be deleted"),
+        "DELETE /upstreams/{{id}} 409 must name the proxy-reference error string: {upstream_desc}"
+    );
+    assert!(
+        upstream_desc.contains(
+            "Upstream is referenced by a mesh_route_dispatch plugin_config and cannot be deleted"
+        ),
+        "DELETE /upstreams/{{id}} 409 must name the mesh_route_dispatch error string: {upstream_desc}"
+    );
+
+    let proxy_desc = spec["paths"]["/proxies/{id}"]["delete"]["description"]
+        .as_str()
+        .expect("DELETE /proxies/{id} description");
+    assert!(
+        proxy_desc.contains("hand-owned") && proxy_desc.contains("orphan-cleaned"),
+        "DELETE /proxies/{{id}} must document hand-owned upstream orphan cleanup: {proxy_desc}"
+    );
+}
+
+#[test]
 fn plugin_graph_delete_rejections_have_openapi_parity() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
