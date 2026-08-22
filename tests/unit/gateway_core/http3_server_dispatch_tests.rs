@@ -90,6 +90,37 @@ fn h3_plain_bridge_dispatches_mesh_through_shared_pools() {
 }
 
 #[test]
+fn h3_plain_dispatcher_is_boxed_off_the_cross_protocol_run_stack() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let run = source
+        .split("pub(crate) async fn run<S>(")
+        .nth(1)
+        .expect("cross-protocol run dispatcher")
+        .split("type BoxedPlainDispatchFuture<'a>")
+        .next()
+        .expect("bounded run dispatcher");
+    assert!(
+        run.contains("boxed_dispatch_plain(") && !run.contains("\n            dispatch_plain("),
+        "run must not materialize the oversized plain bridge future in its poll frame"
+    );
+
+    let boxed = source
+        .split("fn boxed_dispatch_plain<'a, S>(")
+        .nth(1)
+        .expect("boxed plain-dispatch factory")
+        .split("async fn dispatch_plain<S>(")
+        .next()
+        .expect("bounded boxed plain-dispatch factory");
+    assert!(
+        source.contains("#[inline(never)]\nfn boxed_dispatch_plain<'a, S>(")
+            && boxed.contains("Box::pin(async move {")
+            && boxed.contains("dispatch_plain(")
+            && !boxed.contains("Box::pin(dispatch_plain("),
+        "plain-dispatch boxing must use an out-of-line trampoline, not a stack temporary"
+    );
+}
+
+#[test]
 fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_write() {
     let source = include_str!("../../../src/http3/cross_protocol.rs");
     let plain = source
@@ -832,7 +863,10 @@ fn h3_cross_protocol_streaming_grpc_consumes_deadline_and_read_bounds() {
          offered DATA"
     );
     assert!(relay.contains("abort_response_stream(stream)"));
-    assert!(relay.contains("_ = &mut read_deadline"));
+    // `read_deadline` is an `Option<Sleep>`, so its arm goes through the
+    // optional-sleep helper rather than taking `&mut` on a bare `Sleep`
+    // the way `grpc_deadline` above does.
+    assert!(relay.contains("optional_sleep_elapsed(read_deadline.as_mut())"));
     assert!(relay.contains("await_response_write_before_deadline("));
     assert!(relay.contains("await_downstream_write!(stream.send_data"));
 }
@@ -4445,5 +4479,209 @@ fn h3_native_grpc_zero_data_trailer_uses_the_message_safe_rule() {
     assert!(
         trailer.contains("grpc_deadline_can_send_terminal_status("),
         "authorization trailer expiry must keep the zero-DATA vs post-DATA message-safe split"
+    );
+}
+
+// --- Buffered native-H3 request bodies write under an IDLE watermark (#4055) -
+
+#[test]
+fn every_buffered_h3_entry_point_writes_through_the_shared_chunked_sender() {
+    let client = include_str!("../../../src/http3/client.rs");
+    for (label, anchor) in [
+        ("pooled buffered request", "async fn do_request("),
+        (
+            "pooled streaming-response request",
+            "async fn do_request_streaming(",
+        ),
+        (
+            "integration/diagnostic client",
+            "/// Send an HTTP/3 request to the specified backend.\n    pub async fn request(",
+        ),
+    ] {
+        let entry = client
+            .split(anchor)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{label} entry point"))
+            .split("stream.finish(),")
+            .next()
+            .unwrap_or_else(|| panic!("bounded {label} entry point"));
+        assert!(
+            entry.contains(
+                "send_h3_buffered_request_body(&mut stream, body, proxy.backend_write_timeout_ms)"
+            ),
+            "{label} must send its buffered body through the shared chunked sender"
+        );
+        assert!(
+            !entry.contains("stream.send_data("),
+            "{label} must not write the whole buffered body as one send_data under one deadline"
+        );
+    }
+
+    let sender = client
+        .split("async fn send_h3_buffered_request_body<S>(")
+        .nth(1)
+        .expect("shared chunked sender")
+        .split("/// The bounded slices a buffered native-H3 request body")
+        .next()
+        .expect("bounded shared chunked sender");
+    assert!(
+        sender.contains("for chunk in H3BufferedBodyChunks::new(body)")
+            && sender.contains("await_h3_client_write_with_timeout(")
+            && sender.contains("stream.send_data(chunk),"),
+        "each bounded slice must get its own write-timeout wrapper call"
+    );
+    assert!(
+        client.contains("Some(self.remaining.split_to(take))"),
+        "slicing must stay zero-copy — `split_to` hands out a refcounted view"
+    );
+
+    // `finish()` keeps its own separate bound, exactly as before. The
+    // `backend_stream.finish(),` writes on the streaming paths are deliberately
+    // excluded by the leading indentation anchor.
+    assert_eq!(
+        client.matches("\n            stream.finish(),").count(),
+        3,
+        "the three buffered entry points must each keep their separately bounded finish()"
+    );
+}
+
+#[test]
+fn the_buffered_h3_sender_slices_are_bounded_complete_and_in_order() {
+    use ferrum_edge::_test_support::{
+        h3_buffered_body_chunk_sizes_for_test, h3_buffered_body_chunks_are_complete_for_test,
+        h3_buffered_send_chunk_bytes,
+    };
+
+    let chunk = h3_buffered_send_chunk_bytes();
+    assert_eq!(
+        h3_buffered_body_chunk_sizes_for_test(0),
+        Vec::<usize>::new(),
+        "an empty buffered body must write nothing at all"
+    );
+    assert_eq!(h3_buffered_body_chunk_sizes_for_test(1), vec![1]);
+    assert_eq!(h3_buffered_body_chunk_sizes_for_test(chunk), vec![chunk]);
+    assert_eq!(
+        h3_buffered_body_chunk_sizes_for_test(chunk * 2 + 9),
+        vec![chunk, chunk, 9],
+        "every slice but the last must be exactly the bounded chunk size"
+    );
+    for len in [0, 1, chunk - 1, chunk, chunk + 1, chunk * 3 + 17] {
+        assert!(
+            h3_buffered_body_chunks_are_complete_for_test(len),
+            "the slices of a {len}-byte body must reassemble to it byte for byte, in order"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_but_progressing_buffered_h3_upload_is_not_falsely_timed_out() {
+    use ferrum_edge::_test_support::{
+        h3_buffered_body_send_for_test, h3_buffered_send_chunk_bytes,
+    };
+
+    let chunk = h3_buffered_send_chunk_bytes();
+    let total = chunk * 4 + 5;
+
+    // Each write takes 600ms against an 800ms watermark: the WHOLE body takes
+    // far longer than one interval, but no single write stalls for one. Before
+    // the repair this was a single `send_data` under one 800ms deadline.
+    assert_eq!(
+        h3_buffered_body_send_for_test(total, 800, 600).await,
+        Ok(vec![chunk, chunk, chunk, chunk, 5]),
+        "a slow-but-progressing upload must reset the idle window on every slice"
+    );
+
+    // A genuine stall on the very first write still expires it.
+    match h3_buffered_body_send_for_test(total, 800, 5_000).await {
+        Err(message) => assert!(
+            message.contains("backend request body write timeout after 800ms"),
+            "unexpected write-timeout text: {message}"
+        ),
+        Ok(written) => panic!("a stalled write must not succeed, wrote {written:?}"),
+    }
+
+    // `0` stays unbounded: no timer, however long each write takes.
+    assert_eq!(
+        h3_buffered_body_send_for_test(chunk + 1, 0, 60_000).await,
+        Ok(vec![chunk, 1]),
+        "backend_write_timeout_ms == 0 must remain the unbounded operator opt-out"
+    );
+}
+
+/// #4074 (finding M3): the H3 -> plain-HTTP PREBUFFERED arm used to hand
+/// reqwest a reusable `Vec<u8>` and bound only the response-header wait, so a
+/// buffering-forcing route (a request-body plugin, a mesh-tagged target, or an
+/// early authenticate-body phase) pointed at a backend that accepts and never
+/// reads reproduced #4055 on the H3 path alone.
+///
+/// It must now install the SAME gateway-owned buffered upload pump the H1/H2
+/// buffered dispatches use, race that pump's typed terminal against the header
+/// wait, and — because pumping makes reqwest's carrier streaming and so
+/// disables reqwest's own `ProtocolNacks` replay — carry the buffered
+/// protocol-NACK replay too.
+#[test]
+fn the_h3_prebuffered_plain_arm_writes_under_the_backend_write_watermark() {
+    let cross = include_str!("../../../src/http3/cross_protocol.rs");
+    let dispatch = cross
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("cross-protocol plain dispatcher")
+        .split("async fn dispatch_grpc<S>(")
+        .next()
+        .expect("bounded cross-protocol plain dispatcher");
+
+    let install = dispatch
+        .find("install_buffered_upload_write_watermark(")
+        .expect("the prebuffered arm must install the shared buffered upload pump");
+    let replay = dispatch
+        .find("replay_after_protocol_nack(")
+        .expect("the prebuffered arm must advance through the shared replay state");
+    assert!(
+        install < replay,
+        "the pump must exist before the attempt that races it"
+    );
+    assert!(
+        !dispatch.contains(".body(buffered_body.clone())"),
+        "the prebuffered arm must not hand reqwest an unwatermarked buffer"
+    );
+    assert!(
+        dispatch.contains("BufferedUploadReplay::capture("),
+        "pumping disables reqwest's own protocol-NACK replay, so Ferrum must \
+         retain the buffer and reproduce it"
+    );
+
+    // Precedence: the raced future is polled FIRST, so an authorization /
+    // client deadline, a peer-gone, and a completed exchange all still win over
+    // the write watermark. The watermark terminal is the LAST arm added, and it
+    // is the typed 504 backend-timeout terminal, never a generic 502.
+    // Slice the whole `Err(())` arm, not just the tail after the watermark
+    // field: the arm halts the request half BEFORE it emits the attributing
+    // `warn!`, so a window opened at the watermark marker would exclude the
+    // very call this asserts.
+    let arm = dispatch
+        .split("let send_result = match header_bound {")
+        .nth(1)
+        .expect("the prebuffered arm must bound its response headers")
+        .split("Ok(Err(())) => {")
+        .next()
+        .expect("bounded prebuffered write-watermark terminal");
+    assert!(
+        arm.contains("watermark = \"backend_write_timeout_ms\","),
+        "the prebuffered write stall must attribute its own watermark"
+    );
+    assert!(
+        arm.contains("write_plain_backend_timeout_terminal("),
+        "a prebuffered write stall must use the shared 504 backend-timeout terminal"
+    );
+    assert!(
+        arm.contains("halt_request_body(stream)"),
+        "the H3 request half must be halted rather than left dangling"
+    );
+
+    // ONE absolute response-header instant, so a replay cannot re-arm the
+    // operator's bound once per attempt.
+    assert!(
+        dispatch.contains("absolute_response_header_read_bound("),
+        "the prebuffered header bound must be captured as one absolute instant"
     );
 }

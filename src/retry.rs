@@ -1012,6 +1012,47 @@ fn classify_boxed_with_phase(
     classify_substring_fallback(&error_str, &debug_str).unwrap_or(ErrorClass::RequestError)
 }
 
+/// Is this `reqwest::Error` an HTTP/2 **protocol NACK** — a per-RFC-9113
+/// guarantee that the backend did NOT process this request (issue #4074)?
+///
+/// Two shapes, and only these two:
+///
+/// * a REMOTE `GOAWAY` with `NO_ERROR` — a graceful shutdown, so this stream
+///   was never started (RFC 9113 §6.8), and
+/// * a REMOTE `RST_STREAM` with `REFUSED_STREAM` — explicitly "not processed"
+///   (RFC 9113 §8.7).
+///
+/// This is the exact predicate reqwest's own default retry policy
+/// (`retry::Builder::default()` → `Classifier::ProtocolNacks`) uses to replay a
+/// request internally, and it only does so for a body it can `try_clone()` —
+/// i.e. a `Bytes` it holds in full. Handing reqwest a streaming carrier (which
+/// is what the `backend_write_timeout_ms` upload pump does for a buffered
+/// upload, issue #4055) makes `try_clone()` return `None` and silently disables
+/// that replay. Ferrum re-establishes it at its own dispatch layer, where the
+/// collected buffer is still owned, using this predicate — see
+/// `proxy::send_buffered_upload_with_protocol_nack_replay`.
+///
+/// Typed only: the walk downcasts to `h2::Error` (reqwest and Ferrum resolve the
+/// same `h2` 0.4 crate) and reads `reason()`. There is deliberately no substring
+/// fallback — a mis-detected NACK would replay a non-idempotent request the
+/// backend may already have processed.
+///
+/// Error path only.
+pub fn reqwest_error_is_protocol_nack(e: &reqwest::Error) -> bool {
+    let mut source = StdError::source(e);
+    while let Some(err) = source {
+        if let Some(h2_err) = err.downcast_ref::<h2::Error>()
+            && h2_err.is_remote()
+            && ((h2_err.is_go_away() && h2_err.reason() == Some(h2::Reason::NO_ERROR))
+                || (h2_err.is_reset() && h2_err.reason() == Some(h2::Reason::REFUSED_STREAM)))
+        {
+            return true;
+        }
+        source = StdError::source(err);
+    }
+    false
+}
+
 /// Classify a `reqwest::Error` into an `ErrorClass` by walking its typed
 /// source chain and falling back to anchored substring matches.
 ///

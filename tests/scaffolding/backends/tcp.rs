@@ -139,6 +139,7 @@ pub struct ScriptedTcpBackendBuilder {
     listener: TcpListener,
     steps: Vec<TcpStep>,
     mode: ExecutionMode,
+    receive_buffer_size: Option<usize>,
 }
 
 impl ScriptedTcpBackendBuilder {
@@ -151,7 +152,17 @@ impl ScriptedTcpBackendBuilder {
             listener,
             steps: Vec::new(),
             mode: ExecutionMode::RepeatEachConnection,
+            receive_buffer_size: None,
         }
+    }
+
+    /// Pin the listener receive buffer before accepting connections. Accepted
+    /// sockets inherit this value, which lets tests create deterministic
+    /// backpressure without racing a post-accept `setsockopt` against the peer's
+    /// first write.
+    pub fn receive_buffer_size(mut self, bytes: usize) -> Self {
+        self.receive_buffer_size = Some(bytes);
+        self
     }
 
     /// Append a step to the script.
@@ -180,6 +191,9 @@ impl ScriptedTcpBackendBuilder {
 
     /// Spawn the backend. Returns a handle whose `port` is the reserved port.
     pub fn spawn(self) -> io::Result<ScriptedTcpBackend> {
+        if let Some(bytes) = self.receive_buffer_size {
+            socket2::SockRef::from(&self.listener).set_recv_buffer_size(bytes)?;
+        }
         let port = self.listener.local_addr()?.port();
         let state = Arc::new(BackendState::default());
         let state_task = state.clone();

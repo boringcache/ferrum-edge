@@ -556,6 +556,148 @@ where
     result.map_err(recv_response_err)
 }
 
+/// Bound one native-H3 request-body write (`send_data` / `send_trailers` /
+/// `finish`) by `backend_write_timeout_ms`. `0` leaves the write unbounded.
+/// A stall maps to [`H3PoolError::write_timeout`] so dispatch sites surface
+/// the same 504 / `ReadWriteTimeout` as a response-side read timeout.
+async fn await_h3_client_write_with_timeout<F, T, E>(
+    backend_write_timeout_ms: u64,
+    fut: F,
+    op: &'static str,
+) -> H3PoolResult<T>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    if backend_write_timeout_ms == 0 {
+        return fut
+            .await
+            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("{op} failed: {e}")));
+    }
+    match tokio::time::timeout(Duration::from_millis(backend_write_timeout_ms), fut).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(H3PoolError::post_wire(anyhow::anyhow!("{op} failed: {e}"))),
+        Err(_) => Err(H3PoolError::write_timeout(anyhow::anyhow!(
+            "backend request body write timeout after {backend_write_timeout_ms}ms"
+        ))),
+    }
+}
+
+/// Slice size a fully buffered native-H3 request body is written in.
+///
+/// `backend_write_timeout_ms` is an IDLE watermark everywhere else in the
+/// gateway: it bounds how long a backend may go without taking the next unit of
+/// request body, not how long the whole upload may take. One `send_data` call
+/// carrying a multi-megabyte buffer collapses that into a single per-BODY
+/// ceiling, so an upload that is slow but continuously progressing is falsely
+/// timed out after one interval. Writing in bounded slices restores the idle
+/// semantics: every completed slice re-arms the wrapper's timer, so only an
+/// actual stall expires it (issue #4055).
+///
+/// 64 KiB matches the granularity `crate::proxy::upload_pump` slices its
+/// buffered H1/H2 uploads at, and costs no copy — `Bytes::split_to` hands out a
+/// refcounted view of the same allocation.
+const H3_BUFFERED_SEND_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Bounded, zero-copy cursor over a fully buffered native-H3 request body.
+///
+/// Shared by every buffered H3 send path, so slice boundaries, byte order, and
+/// completeness cannot drift between them.
+struct H3BufferedBodyChunks {
+    remaining: bytes::Bytes,
+}
+
+impl H3BufferedBodyChunks {
+    const fn new(remaining: bytes::Bytes) -> Self {
+        Self { remaining }
+    }
+}
+
+impl Iterator for H3BufferedBodyChunks {
+    type Item = bytes::Bytes;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining.is_empty() {
+            return None;
+        }
+        let take = self.remaining.len().min(H3_BUFFERED_SEND_CHUNK_BYTES);
+        Some(self.remaining.split_to(take))
+    }
+}
+
+/// Write a fully buffered native-H3 request body under the backend write
+/// watermark, one bounded slice at a time (issue #4055).
+///
+/// Each slice gets its OWN [`await_h3_client_write_with_timeout`] call, so a
+/// completed write resets the effective idle window and only a genuine stall
+/// expires it. `backend_write_timeout_ms == 0` stays unbounded and arms no
+/// timer, and an empty body writes nothing — identical to the single-`send_data`
+/// shape this replaces, minus the per-body ceiling. Classification is unchanged:
+/// the wrapper still reports a stall as [`H3PoolError::write_timeout`] and a
+/// transport failure as post-wire.
+async fn send_h3_buffered_request_body<S>(
+    stream: &mut h3::client::RequestStream<S, bytes::Bytes>,
+    body: bytes::Bytes,
+    backend_write_timeout_ms: u64,
+) -> H3PoolResult<()>
+where
+    S: h3::quic::SendStream<bytes::Bytes>,
+{
+    for chunk in H3BufferedBodyChunks::new(body) {
+        await_h3_client_write_with_timeout(
+            backend_write_timeout_ms,
+            stream.send_data(chunk),
+            "send_data",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// The bounded slices a buffered native-H3 request body is written in, in
+/// order. Reached through `crate::_test_support`.
+#[allow(dead_code)]
+pub(crate) fn h3_buffered_body_chunks_for_test(body: bytes::Bytes) -> Vec<bytes::Bytes> {
+    H3BufferedBodyChunks::new(body).collect()
+}
+
+/// The slice size each buffered native-H3 write is bounded at. Reached through
+/// `crate::_test_support`.
+#[allow(dead_code)]
+pub(crate) const fn h3_buffered_send_chunk_bytes() -> usize {
+    H3_BUFFERED_SEND_CHUNK_BYTES
+}
+
+/// Drive the buffered native-H3 send loop against a scripted sink so the
+/// per-write watermark is provable without a live QUIC peer. Reached through
+/// `crate::_test_support`.
+///
+/// Uses the production chunker AND the production per-write wrapper, so a pass
+/// proves the shipped idle semantics rather than a re-implementation of them:
+/// `per_chunk_delay_ms` is how long each simulated write takes, and a body whose
+/// TOTAL write time far exceeds `backend_write_timeout_ms` still completes as
+/// long as no single write does.
+#[allow(dead_code)]
+pub(crate) async fn drive_h3_buffered_body_send_for_test(
+    body: bytes::Bytes,
+    backend_write_timeout_ms: u64,
+    per_chunk_delay_ms: u64,
+) -> Result<Vec<usize>, String> {
+    let mut written = Vec::new();
+    for chunk in H3BufferedBodyChunks::new(body) {
+        let len = chunk.len();
+        let write = async {
+            tokio::time::sleep(Duration::from_millis(per_chunk_delay_ms)).await;
+            Ok::<(), std::convert::Infallible>(())
+        };
+        await_h3_client_write_with_timeout(backend_write_timeout_ms, write, "send_data")
+            .await
+            .map_err(|e| e.as_error().to_string())?;
+        written.push(len);
+    }
+    Ok(written)
+}
+
 #[inline]
 fn connection_listed_headers_if_present(headers: &http::HeaderMap) -> Vec<http::HeaderName> {
     if headers.contains_key(http::header::CONNECTION) {
@@ -904,6 +1046,14 @@ impl H3PoolError {
         }
     }
 
+    /// Alias of [`Self::read_timeout`] for a `backend_write_timeout_ms`
+    /// stall while sending request-body DATA, trailers, or FIN. Dispatch
+    /// sites keep the typed `is_read_timeout` flag so the client-visible
+    /// 504 / `ReadWriteTimeout` mapping does not fork.
+    pub fn write_timeout(error: impl Into<anyhow::Error>) -> Self {
+        Self::read_timeout(error)
+    }
+
     /// Borrow the underlying error for downcast / display / `tracing` use.
     pub fn as_error(&self) -> &anyhow::Error {
         &self.inner
@@ -928,12 +1078,12 @@ impl H3PoolError {
     }
 
     /// Returns `true` if this error originates from a
-    /// `backend_read_timeout_ms` deadline expiring while waiting for the
-    /// backend response (header wait or buffered body drain). Gateway
-    /// dispatch sites use this typed signal to return 504 Backend timeout
-    /// (consistent with the direct-H2 / HBONE read-timeout arms) and to
-    /// classify as `ReadWriteTimeout` deterministically. Read timeouts do
-    /// not trigger `mark_h3_unsupported`.
+    /// `backend_read_timeout_ms` or `backend_write_timeout_ms` deadline
+    /// expiring (header wait, buffered body drain, or a parked request-body
+    /// write). Gateway dispatch sites use this typed signal to return 504
+    /// Backend timeout (consistent with the direct-H2 / HBONE timeout arms)
+    /// and to classify as `ReadWriteTimeout` deterministically. These
+    /// timeouts do not trigger `mark_h3_unsupported`.
     pub fn is_read_timeout(&self) -> bool {
         self.read_timeout
     }
@@ -2374,16 +2524,13 @@ impl Http3ConnectionPool {
             .await
             .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))?;
 
-        if !body.is_empty() {
-            stream
-                .send_data(body)
-                .await
-                .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
-        }
-        stream
-            .finish()
-            .await
-            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
+        send_h3_buffered_request_body(&mut stream, body, proxy.backend_write_timeout_ms).await?;
+        await_h3_client_write_with_timeout(
+            proxy.backend_write_timeout_ms,
+            stream.finish(),
+            "finish",
+        )
+        .await?;
 
         let response =
             recv_h3_response_with_timeout(&mut stream, proxy.backend_read_timeout_ms).await?;
@@ -2470,16 +2617,13 @@ impl Http3ConnectionPool {
             .await
             .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("send_request failed: {}", e)))?;
 
-        if !body.is_empty() {
-            stream
-                .send_data(body)
-                .await
-                .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
-        }
-        stream
-            .finish()
-            .await
-            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
+        send_h3_buffered_request_body(&mut stream, body, proxy.backend_write_timeout_ms).await?;
+        await_h3_client_write_with_timeout(
+            proxy.backend_write_timeout_ms,
+            stream.finish(),
+            "finish",
+        )
+        .await?;
 
         let response =
             recv_h3_response_with_timeout(&mut stream, proxy.backend_read_timeout_ms).await?;
@@ -2597,10 +2741,12 @@ impl Http3ConnectionPool {
             }
             let data = chunk.copy_to_bytes(len);
             let metric_data = grpc_scanner.as_ref().map(|_| data.clone());
-            backend_stream
-                .send_data(data)
-                .await
-                .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
+            await_h3_client_write_with_timeout(
+                proxy.backend_write_timeout_ms,
+                backend_stream.send_data(data),
+                "send_data",
+            )
+            .await?;
             if let (Some(messages), Some(scanner), Some(metric_data)) = (
                 grpc_messages.as_ref(),
                 grpc_scanner.as_mut(),
@@ -2633,12 +2779,12 @@ impl Http3ConnectionPool {
                 // Only forward a still-non-empty block; an all-reserved trailer set
                 // collapses to nothing and must not emit an empty trailer frame.
                 if !trailers.is_empty() {
-                    backend_stream.send_trailers(trailers).await.map_err(|e| {
-                        H3PoolError::post_wire(anyhow::anyhow!(
-                            "send request trailers failed: {}",
-                            e
-                        ))
-                    })?;
+                    await_h3_client_write_with_timeout(
+                        proxy.backend_write_timeout_ms,
+                        backend_stream.send_trailers(trailers),
+                        "send request trailers",
+                    )
+                    .await?;
                 }
             }
             Ok(_) => {}
@@ -2649,10 +2795,12 @@ impl Http3ConnectionPool {
                 )));
             }
         }
-        backend_stream
-            .finish()
-            .await
-            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
+        await_h3_client_write_with_timeout(
+            proxy.backend_write_timeout_ms,
+            backend_stream.finish(),
+            "finish",
+        )
+        .await?;
         // The client upload (body + trailers) is fully forwarded and the backend
         // send side is FINished — any timeout from here on is the backend being slow
         // to return response headers, NOT a stalled client upload.
@@ -2995,10 +3143,12 @@ impl Http3ConnectionPool {
             }
             let data = chunk.copy_to_bytes(len);
             let metric_data = grpc_scanner.as_ref().map(|_| data.clone());
-            backend_stream
-                .send_data(data)
-                .await
-                .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("send_data failed: {}", e)))?;
+            await_h3_client_write_with_timeout(
+                proxy.backend_write_timeout_ms,
+                backend_stream.send_data(data),
+                "send_data",
+            )
+            .await?;
             if let (Some(messages), Some(scanner), Some(metric_data)) = (
                 grpc_messages.as_ref(),
                 grpc_scanner.as_mut(),
@@ -3008,10 +3158,12 @@ impl Http3ConnectionPool {
             }
             bytes_seen.fetch_add(len as u64, Ordering::Release);
         }
-        backend_stream
-            .finish()
-            .await
-            .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
+        await_h3_client_write_with_timeout(
+            proxy.backend_write_timeout_ms,
+            backend_stream.finish(),
+            "finish",
+        )
+        .await?;
 
         let response =
             recv_h3_response_with_timeout(&mut backend_stream, proxy.backend_read_timeout_ms)
@@ -3963,11 +4115,23 @@ impl Http3Client {
         // Send request
         let mut stream = send_request.send_request(req).await?;
 
-        // Send body if present
-        if !body.is_empty() {
-            stream.send_data(body).await?;
-        }
-        stream.finish().await?;
+        // Send the body in bounded slices, each under its own write watermark.
+        //
+        // The typed `H3PoolError` is preserved verbatim rather than flattened
+        // into a formatted string (issue #4074): it implements `Error` with a
+        // `source()` that walks straight through to the underlying cause, so a
+        // caller can still downcast and read `is_read_timeout()` /
+        // `request_on_wire()` instead of substring-matching a message.
+        send_h3_buffered_request_body(&mut stream, body, proxy.backend_write_timeout_ms)
+            .await
+            .map_err(anyhow::Error::new)?;
+        await_h3_client_write_with_timeout(
+            proxy.backend_write_timeout_ms,
+            stream.finish(),
+            "finish",
+        )
+        .await
+        .map_err(anyhow::Error::new)?;
 
         // Receive response
         let response = stream.recv_response().await?;

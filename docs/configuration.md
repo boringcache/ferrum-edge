@@ -1197,15 +1197,51 @@ plugin_configs:
 ```
 
 `backend_read_timeout_ms` defaults to `30000` (30 seconds). For HTTP and gRPC
-proxies it has two roles: it bounds backend response reads, and it is the total
-(not idle) deadline for collecting a client request body whenever retries or
-body-processing policy require Ferrum to buffer that upload before dispatch.
-Buffered uploads that take longer than the configured total deadline are
-deliberately rejected with HTTP `408 Request Timeout` or gRPC
-`DEADLINE_EXCEEDED`, even if the client is still making progress; increase the
-value for legitimate slow buffered uploads. Streaming pass-through uploads are
-unaffected. Set the value to `0` to disable both the backend read bound and this
-buffered-upload collection deadline.
+proxies it has three roles:
+
+- **Header wait:** time from `send()` (or native-H3 `recv_response`) until
+  response headers arrive.
+- **Streaming / SSE bodies:** idle time *between frames*. A slow-but-progressing
+  stream keeps the watermark fresh; a stall after headers is a read timeout.
+  `0` disables this idle bound so long-lived SSE connections are not killed.
+- **Buffered client uploads:** the total (not idle) deadline for collecting a
+  client request body whenever retries or body-processing policy require Ferrum
+  to buffer that upload before dispatch. Buffered uploads that take longer than
+  the configured total deadline are deliberately rejected with HTTP
+  `408 Request Timeout` or gRPC `DEADLINE_EXCEEDED`, even if the client is
+  still making progress; increase the value for legitimate slow buffered
+  uploads.
+
+`backend_write_timeout_ms` defaults to `30000` (30 seconds) and is the
+per-direction *idle* bound on writing the request body to the backend. HTTP-family
+uploads arm it in the gateway-owned upload pump (H1/H2/reqwest and native gRPC)
+or on each native-H3 `send_data`/`finish` — streaming uploads through their body
+adapter, and buffered uploads (retries, body-processing policy, retry replays)
+by handing the collected buffer to the same pump in bounded slices; a backend
+that accepts and never reads
+surfaces as `504` / `X-Gateway-Error: backend_timeout` /
+`error_class=read_write_timeout`. `0` disables the write bound. Because the
+bound is idle rather than total, a buffered body is written in bounded slices
+and every slice that the backend takes re-arms it, so a large upload that is
+slow but continuously progressing is not timed out. Streaming
+pass-through uploads are otherwise unaffected by the buffered-upload collection
+deadline above.
+
+The bound starts when the backend transport begins consuming the request body —
+the first moment a connection provably exists and the request head is written —
+not when the gateway prepares the upload. DNS resolution, TCP connect, and the
+TLS handshake are therefore bounded by `backend_connect_timeout_ms` alone, so a
+slow dial stays a pre-wire connect failure (retryable under
+`retry_on_connect_failure`) instead of being reported as a post-wire
+`read_write_timeout`. Native gRPC arms the same bound explicitly after it
+acquires a backend sender. A stall while no transport is consuming the body is
+consequently NOT a write timeout: there is nothing to write to yet.
+
+A live write bound also changes how a *buffered* upload is handed to the HTTP
+client, which would otherwise disable that client's built-in replay of HTTP/2
+protocol NACKs (a remote `GOAWAY NO_ERROR` or `RST_STREAM REFUSED_STREAM` — the
+backend proving it did not process the request). Ferrum reproduces that replay
+itself with the same budget; see [Retry](retry.md#reqwest-protocol-nacks-http2-buffered-uploads).
 
 ### Stream Proxy (TCP/UDP/DTLS)
 

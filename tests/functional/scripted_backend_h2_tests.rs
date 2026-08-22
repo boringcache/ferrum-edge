@@ -30,8 +30,8 @@
 #![allow(clippy::bool_assert_comparison)]
 
 use crate::scaffolding::backends::{
-    ConnectionSettings, GrpcStep, H2Step, MatchHeaders, MatchRpc, ScriptedGrpcBackend,
-    ScriptedH2Backend,
+    ConnectionSettings, GrpcStep, H2Step, HttpStep, MatchHeaders, MatchRpc, RequestMatcher,
+    ScriptedGrpcBackend, ScriptedH2Backend, ScriptedHttp1Backend, ScriptedTcpBackend, TcpStep,
 };
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{GrpcClient, Http2Client};
@@ -40,6 +40,7 @@ use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::{reserve_port, reserve_refused_tcp_port};
 use crate::scaffolding::to_file_mode_yaml;
 use bytes::Bytes;
+use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -1640,9 +1641,12 @@ async fn h2_grpc_response_trailers_strip_hop_by_hop_names() {
 // dispatch). That single knob covers both the body-upload stall AND the
 // time-to-first-byte wait, which is why this test asserts against it.
 //
-// `backend_write_timeout_ms` is TCP-proxy-only (`src/proxy/tcp_proxy.rs`
-// direction-tracking watchdog); it does NOT apply to the gRPC H2 path and
-// is intentionally omitted from the overrides below so the assertion is
+// HTTP-family `backend_write_timeout_ms` is the upload idle bound
+// (`src/proxy/upload_pump.rs`). This gRPC window-stall happens before
+// response headers, and the gRPC path still bounds it with
+// `backend_read_timeout_ms` around `send_request`. HTTP POST write-timeout
+// coverage lives in the `h2_backend_write_timeout_*` tests below. It is
+// intentionally omitted from the overrides here so the assertion is
 // load-bearing on the read-timeout knob.
 //
 // Timing tolerance: ±200ms below, +1500ms above — same envelope as the
@@ -3412,5 +3416,571 @@ async fn direct_h2_rejects_oversized_declared_response_under_nonzero_limits() {
     assert!(
         body.contains("Backend response body exceeds maximum size"),
         "unexpected 502 body: {body}"
+    );
+}
+
+fn assert_timeout_envelope(elapsed: Duration, timeout_ms: u64) {
+    let expected = Duration::from_millis(timeout_ms);
+    let floor = expected.saturating_sub(Duration::from_millis(200));
+    let ceiling = expected + Duration::from_millis(1500);
+    assert!(
+        elapsed >= floor,
+        "timed out too fast: {elapsed:?} < floor {floor:?} (timeout was {timeout_ms}ms)"
+    );
+    assert!(
+        elapsed <= ceiling,
+        "timed out too slowly: {elapsed:?} > ceiling {ceiling:?} (timeout was {timeout_ms}ms)"
+    );
+}
+
+fn has_read_write_timeout_class(logs: &str) -> bool {
+    logs.contains("\"body_error_class\":\"read_write_timeout\"")
+        || logs.contains("\\\"body_error_class\\\":\\\"read_write_timeout\\\"")
+        || logs.contains("\"error_class\":\"read_write_timeout\"")
+        || logs.contains("\\\"error_class\\\":\\\"read_write_timeout\\\"")
+}
+
+fn http_timeout_access_log_yaml(
+    port: u16,
+    read_timeout_ms: u64,
+    write_timeout_ms: u64,
+    extra: Value,
+) -> String {
+    let mut proxy = json!({
+        "id": "scripted",
+        "listen_path": "/api",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": port,
+        "strip_listen_path": true,
+        "backend_connect_timeout_ms": 2000,
+        "backend_read_timeout_ms": read_timeout_ms,
+        "backend_write_timeout_ms": write_timeout_ms,
+    });
+    if let (Some(proxy_obj), Some(extra_obj)) = (proxy.as_object_mut(), extra.as_object()) {
+        for (k, v) in extra_obj {
+            proxy_obj.insert(k.clone(), v.clone());
+        }
+    }
+    to_file_mode_yaml(&json!({
+        "version": "1",
+        "proxies": [proxy],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "access-log",
+            "plugin_name": "stdout_logging",
+            "config": {},
+            "scope": "global",
+            "enabled": true,
+        }],
+    }))
+}
+
+const H2_UPLOAD_STALL_BYTES: usize = 8 * 1024 * 1024;
+const H2_SSE_FIRST_EVENT: &[u8] = b"data: hello\r\n\n";
+// Pin the listener before accept so the backend cannot autotune a large receive
+// window. The upload remains larger than ordinary sender buffers, guaranteeing
+// that a backend which never reads eventually backpressures the upload pump.
+const BACKEND_RECEIVE_BUFFER_BYTES: usize = 1024;
+
+// #4055 H2 frontend → reqwest (H1 backend that never reads).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_reqwest_backend_write_timeout_maps_to_504() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .receive_buffer_size(BACKEND_RECEIVE_BUFFER_BYTES)
+        .step(TcpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let write_timeout_ms: u64 = 800;
+    let yaml = http_timeout_access_log_yaml(backend_port, 8_000, write_timeout_ms, Value::Null);
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
+    let started = Instant::now();
+    let resp = client
+        .as_reqwest()
+        .post(format!("{}/api/twrite", harness.proxy_base_url()))
+        .header("content-type", "application/octet-stream")
+        .body(vec![b'x'; H2_UPLOAD_STALL_BYTES])
+        .send()
+        .await
+        .expect("gateway returns a response");
+    let elapsed = started.elapsed();
+    let status = resp.status();
+    let gateway_error = resp
+        .headers()
+        .get("x-gateway-error")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = resp.text().await.expect("body");
+
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "H2/reqwest write timeout must be 504, got {status} body={body}"
+    );
+    assert_eq!(gateway_error.as_deref(), Some("backend_timeout"));
+    assert_eq!(body, r#"{"error":"Backend timeout"}"#);
+    assert_timeout_envelope(elapsed, write_timeout_ms);
+
+    let logs = harness
+        .wait_for_log_contains(&has_read_write_timeout_class, Duration::from_secs(5))
+        .await;
+    assert!(
+        has_read_write_timeout_class(&logs),
+        "write timeout must classify as read_write_timeout; logs:\n{logs}"
+    );
+}
+
+// #4055 direct-H2 pool: HTTPS backend with a 1-byte window that never reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_direct_backend_write_timeout_maps_to_504() {
+    let ca = TestCa::new("h2-write-timeout").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let settings = ConnectionSettings {
+        initial_window_size: Some(1),
+        initial_connection_window_size: Some(1),
+        max_concurrent_streams: Some(16),
+    };
+    let _backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls backend")
+        .with_settings(settings)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::StallWindowFor(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn backend");
+
+    let write_timeout_ms: u64 = 800;
+    let yaml = http_timeout_access_log_yaml(
+        backend_port,
+        8_000,
+        write_timeout_ms,
+        json!({
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_tls_verify_server_cert": false,
+            "pool_enable_http2": true,
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .env("RUST_LOG", "info")
+        .pool_warmup_enabled(true)
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let _ = wait_for_h2_tls_supported(&harness, Duration::from_secs(15))
+        .await
+        .expect("backend must be classified h2_tls=supported for the direct-H2 arm");
+
+    let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
+    let started = Instant::now();
+    let resp = client
+        .as_reqwest()
+        .post(format!("{}/api/twrite", harness.proxy_base_url()))
+        .header("content-type", "application/octet-stream")
+        .body(vec![b'x'; H2_UPLOAD_STALL_BYTES])
+        .send()
+        .await
+        .expect("gateway returns a response");
+    let elapsed = started.elapsed();
+    let status = resp.status();
+    let gateway_error = resp
+        .headers()
+        .get("x-gateway-error")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = resp.text().await.expect("body");
+
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "direct-H2 write timeout must be 504, got {status} body={body}"
+    );
+    assert_eq!(gateway_error.as_deref(), Some("backend_timeout"));
+    assert_eq!(body, r#"{"error":"Backend timeout"}"#);
+    assert_timeout_envelope(elapsed, write_timeout_ms);
+}
+
+// #4055 direct-H2 pool, EARLY response: the backend sends response HEADERS
+// before it drains the upload, then stalls reading the request body. The
+// upload-completion gate must surface the pump's write-watermark expiry as a
+// deterministic 504 `read_write_timeout` — the backend response was never
+// committed — rather than the 502 `protocol_error` an indeterminate size
+// outcome would produce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_direct_early_response_write_stall_maps_to_504_not_502() {
+    let ca = TestCa::new("h2-early-response-write-stall").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let settings = ConnectionSettings {
+        initial_window_size: Some(1),
+        initial_connection_window_size: Some(1),
+        max_concurrent_streams: Some(16),
+    };
+    let _backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls backend")
+        .with_settings(settings)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        // Response headers land while the upload is still open; `StallWindowFor`
+        // then keeps the 1-byte window closed so the backend reads no further
+        // DATA and the gateway's write watermark fires.
+        .step(H2Step::RespondHeaders(vec![(":status", "200".into())]))
+        .step(H2Step::StallWindowFor(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn backend");
+
+    let write_timeout_ms: u64 = 800;
+    let yaml = http_timeout_access_log_yaml(
+        backend_port,
+        8_000,
+        write_timeout_ms,
+        json!({
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_tls_verify_server_cert": false,
+            "pool_enable_http2": true,
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .env("RUST_LOG", "info")
+        .pool_warmup_enabled(true)
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let _ = wait_for_h2_tls_supported(&harness, Duration::from_secs(15))
+        .await
+        .expect("backend must be classified h2_tls=supported for the direct-H2 arm");
+
+    let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
+    let started = Instant::now();
+    let resp = client
+        .as_reqwest()
+        .post(format!("{}/api/twrite", harness.proxy_base_url()))
+        .header("content-type", "application/octet-stream")
+        .body(vec![b'x'; H2_UPLOAD_STALL_BYTES])
+        .send()
+        .await
+        .expect("gateway returns a response");
+    let elapsed = started.elapsed();
+    let status = resp.status();
+    let gateway_error = resp
+        .headers()
+        .get("x-gateway-error")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = resp.text().await.expect("body");
+
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "early-response direct-H2 write stall must be 504, got {status} body={body}"
+    );
+    assert_eq!(gateway_error.as_deref(), Some("backend_timeout"));
+    assert_eq!(body, r#"{"error":"Backend timeout"}"#);
+    assert_timeout_envelope(elapsed, write_timeout_ms);
+
+    let logs = harness
+        .wait_for_log_contains(&has_read_write_timeout_class, Duration::from_secs(5))
+        .await;
+    assert!(
+        has_read_write_timeout_class(&logs),
+        "early-response write stall must classify as read_write_timeout; logs:\n{logs}"
+    );
+}
+
+// #4057 H2 frontend → reqwest streaming body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_reqwest_sse_stall_after_first_event_classifies_read_write_timeout() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Type".into(),
+            value: "text/event-stream".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(H2_SSE_FIRST_EVENT.to_vec()))
+        .step(HttpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let read_timeout_ms: u64 = 800;
+    let yaml = http_timeout_access_log_yaml(backend_port, read_timeout_ms, 5_000, Value::Null);
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
+    let resp = client
+        .as_reqwest()
+        .get(format!("{}/api/ssestall", harness.proxy_base_url()))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("headers");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.version(), reqwest::Version::HTTP_2);
+    let mut stream = resp.bytes_stream();
+    let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("first SSE event bounded")
+        .expect("first SSE event present")
+        .expect("first SSE event readable");
+    assert!(
+        first
+            .windows(b"data: hello".len())
+            .any(|w| w == b"data: hello"),
+        "first event missing from {first:?}"
+    );
+
+    let stall_started = Instant::now();
+    let rest = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(item) = stream.next().await {
+            item?;
+        }
+        Ok::<(), reqwest::Error>(())
+    })
+    .await;
+    let stall_elapsed = stall_started.elapsed();
+    match rest {
+        Ok(Ok(())) => panic!("H2 SSE stall closed cleanly; stall_elapsed={stall_elapsed:?}"),
+        Ok(Err(_)) | Err(_) => {
+            assert_timeout_envelope(stall_elapsed, read_timeout_ms);
+        }
+    }
+
+    let logs = harness
+        .wait_for_log_contains(&has_read_write_timeout_class, Duration::from_secs(5))
+        .await;
+    assert!(
+        has_read_write_timeout_class(&logs),
+        "H2 SSE stall must classify as read_write_timeout; logs:\n{logs}"
+    );
+}
+
+// #4057 direct-H2 streaming body after HEADERS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_direct_sse_stall_after_first_event_classifies_read_write_timeout() {
+    let ca = TestCa::new("h2-sse-stall").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls backend")
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "text/event-stream".into()),
+        ]))
+        .step(H2Step::RespondData {
+            data: Bytes::from_static(H2_SSE_FIRST_EVENT),
+            end_stream: false,
+        })
+        .step(H2Step::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn backend");
+
+    let read_timeout_ms: u64 = 800;
+    let yaml = http_timeout_access_log_yaml(
+        backend_port,
+        read_timeout_ms,
+        5_000,
+        json!({
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_tls_verify_server_cert": false,
+            "pool_enable_http2": true,
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .env("RUST_LOG", "info")
+        .pool_warmup_enabled(true)
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let _ = wait_for_h2_tls_supported(&harness, Duration::from_secs(15))
+        .await
+        .expect("backend must be classified h2_tls=supported for the direct-H2 arm");
+
+    let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
+    let resp = client
+        .as_reqwest()
+        .get(format!("{}/api/ssestall", harness.proxy_base_url()))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("headers");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut stream = resp.bytes_stream();
+    let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("first SSE event bounded")
+        .expect("first SSE event present")
+        .expect("first SSE event readable");
+    assert!(
+        first
+            .windows(b"data: hello".len())
+            .any(|w| w == b"data: hello"),
+        "first event missing from {first:?}"
+    );
+
+    let stall_started = Instant::now();
+    let rest = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(item) = stream.next().await {
+            item?;
+        }
+        Ok::<(), reqwest::Error>(())
+    })
+    .await;
+    let stall_elapsed = stall_started.elapsed();
+    match rest {
+        Ok(Ok(())) => panic!("direct-H2 SSE stall closed cleanly; stall_elapsed={stall_elapsed:?}"),
+        Ok(Err(_)) | Err(_) => {
+            assert_timeout_envelope(stall_elapsed, read_timeout_ms);
+        }
+    }
+
+    let logs = harness
+        .wait_for_log_contains(&has_read_write_timeout_class, Duration::from_secs(5))
+        .await;
+    assert!(
+        has_read_write_timeout_class(&logs),
+        "direct-H2 SSE stall must classify as read_write_timeout; logs:\n{logs}"
+    );
+}
+
+// #4074 (finding H1): direct-H2 with request-size limits DISABLED and no
+// authenticated principal takes the arm that installs NO upload-completion
+// gate, so `proxy_to_backend_http2` returns the instant response headers
+// arrive. Arming cancel-on-drop on that arm cancelled the still-live upload
+// when the dispatcher's join handle dropped, which errored the transport body
+// and reset a healthy full-duplex exchange. The backend here answers early,
+// keeps the response open, THEN drains the rest of the upload — so the
+// response can only complete if the upload survived the dispatcher's return.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn direct_h2_early_response_survives_an_unlimited_unauthenticated_upload() {
+    let ca = TestCa::new("h2-early-response-upload").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls backend")
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        // One DATA frame proves the upload started; the rest is still in
+        // flight when the response head goes out.
+        .step(H2Step::ReadRequestData)
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "text/plain".into()),
+        ]))
+        .step(H2Step::RespondData {
+            data: Bytes::from_static(b"early"),
+            end_stream: false,
+        })
+        // Only reachable if the gateway is still writing the client upload
+        // after `proxy_to_backend_http2` returned.
+        .step(H2Step::DrainRequestBody)
+        .step(H2Step::RespondData {
+            data: Bytes::from_static(b"tail"),
+            end_stream: true,
+        })
+        .spawn()
+        .expect("spawn backend");
+
+    // 30s: the shipped `backend_write_timeout_ms` default, so this proves the
+    // default configuration, not a special one.
+    let yaml = http_timeout_access_log_yaml(
+        backend_port,
+        30_000,
+        30_000,
+        json!({
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_tls_verify_server_cert": false,
+            "pool_enable_http2": true,
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .env("RUST_LOG", "info")
+        // Unlimited request bodies: this is what disables the upload-completion
+        // gate and selects the arm under test. No consumer/auth is configured,
+        // so no authorization lifetime is armed either.
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "0")
+        .pool_warmup_enabled(true)
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let _ = wait_for_h2_tls_supported(&harness, Duration::from_secs(15))
+        .await
+        .expect("backend must be classified h2_tls=supported for the direct-H2 arm");
+
+    let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
+    // Larger than the backend's default 65,535-byte stream window, so the
+    // upload is provably unfinished when the response head arrives.
+    let upload = vec![b'x'; 2 * 1024 * 1024];
+    let resp = client
+        .as_reqwest()
+        .post(format!("{}/api/early", harness.proxy_base_url()))
+        .header("content-type", "application/octet-stream")
+        .body(upload)
+        .send()
+        .await
+        .expect("gateway returns a response");
+    let status = resp.status();
+    let body = resp.text().await.expect("response body");
+
+    assert_eq!(status, StatusCode::OK, "unexpected status; body={body}");
+    assert_eq!(
+        body, "earlytail",
+        "the early response must complete: a truncated body means the \
+         dispatcher cancelled the still-live upload on return"
+    );
+    assert_eq!(
+        backend.received_stream_count(),
+        1,
+        "the exchange must complete on a single backend stream, not a retry"
     );
 }

@@ -234,6 +234,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (and `scope`) matching `POST /plugins/config` (issue #4031). Copy-pasting
   `"name": "key_auth"` was a `400` unknown field.
 
+- HTTP-family `backend_write_timeout_ms` now bounds request-body upload
+  inactivity on H1, H2 (reqwest, the direct H2 pool, and native gRPC), and
+  native H3, not only TCP streams. It covers streamed and buffered uploads
+  alike, including retry replays, and it stays an *idle* watermark: a buffered
+  body is written in bounded slices, so an upload that is slow but continuously
+  progressing is not timed out. A backend that accepts and never reads surfaces
+  as `504` / `X-Gateway-Error: backend_timeout` /
+  `error_class=read_write_timeout`. `0` still disables the bound.
+
+- HTTP-family `backend_read_timeout_ms` is an idle-between-frames watermark
+  on streaming response bodies (including SSE after headers). A stall after
+  the first event no longer tears the stream down immediately as
+  `request_error`; headers-already-committed stalls abort the body and
+  classify `read_write_timeout` in the access log. Slow-but-progressing
+  streams keep the watermark fresh. `0` still disables the bound.
+
+  The write watermark arms when the backend transport begins consuming the
+  request body rather than when the upload is prepared, so DNS/TCP/TLS
+  connection acquisition stays bounded by `backend_connect_timeout_ms` and a
+  slow dial keeps its retryable pre-wire classification. Because a live write
+  bound hands the HTTP client a streaming carrier for buffered uploads — which
+  disables that client's built-in replay of HTTP/2 protocol NACKs (remote
+  `GOAWAY NO_ERROR` / `RST_STREAM REFUSED_STREAM`) — Ferrum now reproduces that
+  replay itself, with the same budget, for buffered H1/H2 and H3-to-HTTP
+  uploads. The H3-to-plain prebuffered arm, which previously bounded only the
+  response-header wait, is covered by the same watermark.
+
 - Stream-family DNS setup failures now classify as `error_class=dns_lookup_error`
   (TCP previously fell through to `request_error` because the live DNS-cache
   wording `"DNS resolution returned no addresses"` missed the substring

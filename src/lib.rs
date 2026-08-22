@@ -9167,6 +9167,7 @@ pub mod _test_support {
         Cancelled,
         AuthorizationExpired,
         ConsumerGone,
+        WriteTimeout,
         /// The join point resolved without an outcome (task aborted).
         Aborted,
     }
@@ -9231,7 +9232,7 @@ pub mod _test_support {
                 receiver,
                 released: std::sync::Arc::clone(&released),
             };
-            let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(body, plan);
+            let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(body, Some(plan), 0);
             Self {
                 feed: Some(feed),
                 source: Some(source),
@@ -9298,6 +9299,597 @@ pub mod _test_support {
         }
     }
 
+    /// One gateway-owned BUFFERED upload pump under test (issue #4055).
+    ///
+    /// The buffered reqwest dispatch has no body adapter to hang a deadline
+    /// on, so `backend_write_timeout_ms` is enforceable only if the collected
+    /// buffer is handed to a pump. As with [`UploadPumpProbe`], the transport
+    /// side is held and DELIBERATELY NOT DRAINED — the shape of a reqwest
+    /// connection task parked on socket writability against a backend that
+    /// accepts and never reads.
+    pub struct BufferedUploadPumpProbe {
+        body: Option<crate::proxy::upload_pump::PumpedUploadBody>,
+        join: Option<crate::proxy::upload_pump::UploadPumpJoin>,
+    }
+
+    impl BufferedUploadPumpProbe {
+        /// Start a buffered pump over `len` bytes under `write_timeout_ms`.
+        ///
+        /// `None` means the dispatcher keeps the reusable `Bytes` path — the
+        /// `0` opt-out, or an empty upload — and installs no task, channel, or
+        /// timer at all.
+        pub fn start(len: usize, write_timeout_ms: u64) -> Option<Self> {
+            let body = bytes::Bytes::from(vec![b'x'; len]);
+            crate::proxy::upload_pump::spawn_buffered_upload_pump(body, write_timeout_ms)
+                .ok()
+                .map(|(body, join)| Self {
+                    body: Some(body),
+                    join: Some(join),
+                })
+        }
+
+        /// The bounded frame size the buffered source is sliced into.
+        pub fn frame_size() -> usize {
+            crate::proxy::upload_pump::buffered_upload_frame_bytes()
+        }
+
+        /// What hyper would derive `Content-Length` from.
+        pub fn declared_content_length(&self) -> Option<u64> {
+            self.body
+                .as_ref()
+                .and_then(|body| http_body::Body::size_hint(body).exact())
+        }
+
+        /// Poll the transport side exactly once with a no-op waker.
+        pub fn poll_transport_once(&mut self) -> ProbeTransportPoll {
+            let Some(body) = self.body.as_mut() else {
+                return ProbeTransportPoll::Ended;
+            };
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            match http_body::Body::poll_frame(std::pin::Pin::new(body), &mut cx) {
+                std::task::Poll::Pending => ProbeTransportPoll::Pending,
+                std::task::Poll::Ready(None) => ProbeTransportPoll::Ended,
+                std::task::Poll::Ready(Some(Ok(frame))) => {
+                    ProbeTransportPoll::Data(frame.data_ref().map_or(0, bytes::Bytes::len))
+                }
+                std::task::Poll::Ready(Some(Err(e))) => ProbeTransportPoll::Errored(e.to_string()),
+            }
+        }
+
+        /// Race the dispatcher's response-header wait against the pump's
+        /// backend write watermark, exactly as `proxy_to_backend` does.
+        ///
+        /// `true` means the watermark won, which is what makes the request end
+        /// as 504 / `ReadWriteTimeout` at `backend_write_timeout_ms` instead of
+        /// running on to `backend_read_timeout_ms`.
+        pub async fn write_watermark_wins_header_wait(&mut self, header_wait: Duration) -> bool {
+            let Some(join) = self.join.as_mut() else {
+                return false;
+            };
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(header_wait) => false,
+                () = join.backend_write_watermark_expired() => true,
+            }
+        }
+
+        /// Observe the watermark WITHOUT the transport ever polling the body.
+        ///
+        /// This is the connect phase: reqwest has not resolved DNS, opened a
+        /// socket, or written the request head, so it has not polled this body
+        /// once. `true` means the watermark correctly stayed dormant for the
+        /// whole window; `false` proves connection acquisition was charged to a
+        /// per-direction write policy (issue #4074).
+        pub async fn write_watermark_stays_dormant(&mut self, observation: Duration) -> bool {
+            let Some(join) = self.join.as_mut() else {
+                return true;
+            };
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(observation) => true,
+                () = join.backend_write_watermark_expired() => false,
+            }
+        }
+
+        /// Wait for the pump to finish on its own — no cancellation.
+        pub async fn join(&mut self) -> ProbePumpOutcome {
+            map_probe_outcome(match self.join.take() {
+                Some(join) => join.join().await,
+                None => None,
+            })
+        }
+
+        /// Drop the transport side, modelling reqwest releasing the body.
+        pub fn drop_transport(&mut self) {
+            self.body = None;
+        }
+    }
+
+    /// Drive [`crate::proxy::send_buffered_upload_with_protocol_nack_replay`]
+    /// against a scripted attempt sequence (issue #4074).
+    ///
+    /// Uses the PRODUCTION replay loop, the production buffered-pump installer,
+    /// and the production `BufferedUploadReplay` capture, so a pass proves the
+    /// shipped contract rather than a re-implementation of it. No socket is
+    /// opened: the attempt closure discards the builder it is handed and
+    /// returns a canned verdict, and `nacking_attempts` is how many leading
+    /// attempts report an HTTP/2 protocol NACK.
+    ///
+    /// Returns the TOTAL number of attempts the loop made.
+    pub async fn buffered_upload_protocol_nack_replay_attempts_for_test(
+        nacking_attempts: usize,
+        write_timeout_ms: u64,
+    ) -> usize {
+        let client = reqwest::Client::new();
+        // Never dialled — the attempt closure below drops the builder.
+        let builder = client.post("http://127.0.0.1:9/upload-replay-probe");
+        let body = bytes::Bytes::from(vec![b'x'; 256 * 1024]);
+        let (upload_body, mut pump) =
+            crate::proxy::install_buffered_upload_write_watermark(body.clone(), write_timeout_ms);
+        let replay = if pump.is_some() {
+            crate::proxy::BufferedUploadReplay::capture(&builder, &body, write_timeout_ms)
+        } else {
+            None
+        };
+        let attempts = std::cell::Cell::new(0usize);
+        let _ = crate::proxy::send_buffered_upload_with_protocol_nack_replay(
+            builder.body(upload_body),
+            replay,
+            &mut pump,
+            |builder| {
+                drop(builder);
+                attempts.set(attempts.get() + 1);
+                std::future::ready(attempts.get())
+            },
+            |attempt: &usize| *attempt <= nacking_attempts,
+        )
+        .await;
+        if let Some(pump) = pump.take() {
+            pump.cancel_and_join().await;
+        }
+        attempts.get()
+    }
+
+    /// The replay budget the buffered-upload dispatch reproduces from reqwest's
+    /// own default policy (issue #4074).
+    pub fn buffered_upload_protocol_nack_replays() -> usize {
+        crate::proxy::BUFFERED_UPLOAD_PROTOCOL_NACK_REPLAYS as usize
+    }
+
+    /// One transport-side frame observed from a probed REPLAYABLE upload.
+    ///
+    /// Separate from [`ProbeTransportPoll`] because the replayable bodies are
+    /// the only pumped source that can carry a validated terminal TRAILERS
+    /// frame, and preserving it — after the last DATA slice — is part of the
+    /// contract.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ProbeReplayFrame {
+        Pending,
+        Data(usize),
+        Trailers(Vec<(String, String)>),
+        Ended,
+        Errored(String),
+    }
+
+    /// One gateway-owned REPLAYABLE upload pump under test (issue #4055).
+    ///
+    /// The buffered/body-policy/retry-replay bodies dispatched by the
+    /// specialized HBONE, sidecar-mTLS, and Unix HTTP transports have no body
+    /// adapter to hang a deadline on, and their transports park OUTSIDE a body
+    /// poll (H2 send capacity, H1 socket writability) exactly when a backend
+    /// accepts and stops reading. As with [`BufferedUploadPumpProbe`], the
+    /// transport side is held and DELIBERATELY NOT DRAINED.
+    pub struct ReplayableUploadPumpProbe {
+        body: Option<crate::proxy::body::ReplayableRequestBody>,
+        join: Option<crate::proxy::upload_pump::UploadPumpJoin>,
+    }
+
+    impl ReplayableUploadPumpProbe {
+        /// Build the replayable body exactly as the specialized dispatches do.
+        ///
+        /// `trailers` is the gRPC-Web plugin's validated staging shape.
+        pub fn start(len: usize, trailers: &[(&str, &str)], write_timeout_ms: u64) -> Self {
+            let data = bytes::Bytes::from(vec![b'x'; len]);
+            let trailers = if trailers.is_empty() {
+                None
+            } else {
+                let mut map = http::HeaderMap::new();
+                for (name, value) in trailers {
+                    let name = http::header::HeaderName::from_bytes(name.as_bytes())
+                        .expect("test trailer name is a valid header name");
+                    let value = http::header::HeaderValue::from_str(value)
+                        .expect("test trailer value is a valid header value");
+                    map.append(name, value);
+                }
+                Some(map)
+            };
+            let (body, join) = crate::proxy::body::ReplayableRequestBody::with_gateway_upload_pump(
+                data,
+                trailers,
+                write_timeout_ms,
+            );
+            Self {
+                body: Some(body),
+                join,
+            }
+        }
+
+        /// Whether a pump was installed at all.
+        ///
+        /// `false` is the allocation-, task-, and timer-free direct path: the
+        /// `backend_write_timeout_ms == 0` operator opt-out, or an upload with
+        /// neither DATA nor trailers to write.
+        pub fn pumped(&self) -> bool {
+            self.join.is_some()
+        }
+
+        /// The bounded frame size the buffered source is sliced into.
+        pub fn frame_size() -> usize {
+            crate::proxy::upload_pump::buffered_upload_frame_bytes()
+        }
+
+        /// What hyper would derive `Content-Length` from.
+        pub fn declared_content_length(&self) -> Option<u64> {
+            self.body
+                .as_ref()
+                .and_then(|body| http_body::Body::size_hint(body).exact())
+        }
+
+        /// Whether the transport would frame this request as end-of-stream at
+        /// headers.
+        pub fn is_end_stream(&self) -> bool {
+            match self.body.as_ref() {
+                Some(body) => http_body::Body::is_end_stream(body),
+                None => true,
+            }
+        }
+
+        /// Poll the transport side exactly once with a no-op waker.
+        pub fn poll_transport_once(&mut self) -> ProbeReplayFrame {
+            let Some(body) = self.body.as_mut() else {
+                return ProbeReplayFrame::Ended;
+            };
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            match http_body::Body::poll_frame(std::pin::Pin::new(body), &mut cx) {
+                std::task::Poll::Pending => ProbeReplayFrame::Pending,
+                std::task::Poll::Ready(None) => ProbeReplayFrame::Ended,
+                std::task::Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) => ProbeReplayFrame::Data(data.len()),
+                    Err(frame) => match frame.into_trailers() {
+                        Ok(trailers) => ProbeReplayFrame::Trailers(
+                            trailers
+                                .iter()
+                                .map(|(name, value)| {
+                                    (
+                                        name.as_str().to_string(),
+                                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                                    )
+                                })
+                                .collect(),
+                        ),
+                        Err(_) => ProbeReplayFrame::Ended,
+                    },
+                },
+                std::task::Poll::Ready(Some(Err(e))) => ProbeReplayFrame::Errored(e.to_string()),
+            }
+        }
+
+        /// Drain the transport side until it blocks, ends, or errors, yielding
+        /// to the runtime between polls so the pump task can refill the bridge.
+        ///
+        /// Returns every frame observed, in order.
+        pub async fn drain_transport(&mut self, max_polls: usize) -> Vec<ProbeReplayFrame> {
+            let mut frames = Vec::new();
+            for _ in 0..max_polls {
+                match self.poll_transport_once() {
+                    ProbeReplayFrame::Pending => tokio::task::yield_now().await,
+                    ProbeReplayFrame::Ended => {
+                        frames.push(ProbeReplayFrame::Ended);
+                        break;
+                    }
+                    frame => {
+                        let errored = matches!(frame, ProbeReplayFrame::Errored(_));
+                        frames.push(frame);
+                        if errored {
+                            break;
+                        }
+                    }
+                }
+            }
+            frames
+        }
+
+        /// Observe the watermark WITHOUT the transport ever polling the body.
+        ///
+        /// The pooled HBONE / mesh-mTLS / Unix dispatchers build this body
+        /// BEFORE they check out a sender, so this window is connection
+        /// acquisition. `true` means the watermark correctly stayed dormant
+        /// (issue #4074).
+        pub async fn write_watermark_stays_dormant(&mut self, observation: Duration) -> bool {
+            let Some(join) = self.join.as_mut() else {
+                return true;
+            };
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(observation) => true,
+                () = join.backend_write_watermark_expired() => false,
+            }
+        }
+
+        /// Race the dispatcher's response-header wait against the pump's
+        /// backend write watermark, exactly as the specialized dispatches do.
+        ///
+        /// `true` means the watermark won, which is what makes the request end
+        /// as 504 / `ReadWriteTimeout` at `backend_write_timeout_ms` instead of
+        /// running on to `backend_read_timeout_ms`.
+        pub async fn write_watermark_wins_header_wait(&mut self, header_wait: Duration) -> bool {
+            let Some(join) = self.join.as_mut() else {
+                return false;
+            };
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(header_wait) => false,
+                () = join.backend_write_watermark_expired() => true,
+            }
+        }
+
+        /// Wait for the pump to finish on its own — no cancellation.
+        pub async fn join(&mut self) -> ProbePumpOutcome {
+            map_probe_outcome(match self.join.take() {
+                Some(join) => join.join().await,
+                None => None,
+            })
+        }
+
+        /// Cancel the pump and wait for it to finish.
+        pub async fn cancel_and_join(&mut self) -> ProbePumpOutcome {
+            map_probe_outcome(match self.join.take() {
+                Some(join) => join.cancel_and_join().await,
+                None => None,
+            })
+        }
+
+        /// Drop the transport side, modelling hyper releasing the request body.
+        pub fn drop_transport(&mut self) {
+            self.body = None;
+        }
+    }
+
+    /// One BUFFERED native-gRPC request body under test (issue #4055).
+    ///
+    /// `proxy_grpc_request_core` used to hand hyper one potentially
+    /// multi-megabyte DATA frame (plus, for gRPC-Web, one terminal TRAILERS
+    /// frame) and race only the response/read deadlines, so an HTTP/2 backend
+    /// that accepted the stream and stopped reading parked hyper's pipe in
+    /// `poll_capacity` and bypassed `backend_write_timeout_ms` entirely. This
+    /// probe drives the SHIPPED body selection, and — as with the other pump
+    /// probes — the transport side is held and DELIBERATELY NOT DRAINED.
+    pub struct GrpcBufferedUploadPumpProbe {
+        body: Option<crate::proxy::grpc_proxy::GrpcBody>,
+        join: Option<crate::proxy::upload_pump::UploadPumpJoin>,
+    }
+
+    impl GrpcBufferedUploadPumpProbe {
+        /// Build the buffered gRPC request body exactly as
+        /// `proxy_grpc_request_core` does.
+        ///
+        /// `trailers` is the gRPC-Web plugin's validated staging shape.
+        pub fn start(len: usize, trailers: &[(&str, &str)], write_timeout_ms: u64) -> Self {
+            let data = bytes::Bytes::from(vec![b'x'; len]);
+            let trailers = if trailers.is_empty() {
+                None
+            } else {
+                let mut map = http::HeaderMap::new();
+                for (name, value) in trailers {
+                    let name = http::header::HeaderName::from_bytes(name.as_bytes())
+                        .expect("test trailer name is a valid header name");
+                    let value = http::header::HeaderValue::from_str(value)
+                        .expect("test trailer value is a valid header value");
+                    map.append(name, value);
+                }
+                Some(map)
+            };
+            let (body, join) =
+                crate::proxy::grpc_proxy::buffered_grpc_request_body_with_write_watermark(
+                    data,
+                    trailers,
+                    write_timeout_ms,
+                );
+            Self {
+                body: Some(body),
+                join,
+            }
+        }
+
+        /// Whether a pump was installed at all.
+        ///
+        /// `false` is the allocation-, task-, and timer-free direct path: the
+        /// `backend_write_timeout_ms == 0` operator opt-out, or an upload with
+        /// neither DATA nor trailers to write.
+        pub fn pumped(&self) -> bool {
+            self.join.is_some()
+        }
+
+        /// The bounded frame size the buffered source is sliced into.
+        pub fn frame_size() -> usize {
+            crate::proxy::upload_pump::buffered_upload_frame_bytes()
+        }
+
+        /// What hyper would derive `Content-Length` from.
+        pub fn declared_content_length(&self) -> Option<u64> {
+            self.body
+                .as_ref()
+                .and_then(|body| http_body::Body::size_hint(body).exact())
+        }
+
+        /// Whether hyper would frame this request as end-of-stream at headers.
+        pub fn is_end_stream(&self) -> bool {
+            match self.body.as_ref() {
+                Some(body) => http_body::Body::is_end_stream(body),
+                None => true,
+            }
+        }
+
+        /// Poll the transport side exactly once with a no-op waker.
+        pub fn poll_transport_once(&mut self) -> ProbeReplayFrame {
+            let Some(body) = self.body.as_mut() else {
+                return ProbeReplayFrame::Ended;
+            };
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            match http_body::Body::poll_frame(std::pin::Pin::new(body), &mut cx) {
+                std::task::Poll::Pending => ProbeReplayFrame::Pending,
+                std::task::Poll::Ready(None) => ProbeReplayFrame::Ended,
+                std::task::Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) => ProbeReplayFrame::Data(data.len()),
+                    Err(frame) => match frame.into_trailers() {
+                        Ok(trailers) => ProbeReplayFrame::Trailers(
+                            trailers
+                                .iter()
+                                .map(|(name, value)| {
+                                    (
+                                        name.as_str().to_string(),
+                                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                                    )
+                                })
+                                .collect(),
+                        ),
+                        Err(_) => ProbeReplayFrame::Ended,
+                    },
+                },
+                std::task::Poll::Ready(Some(Err(e))) => ProbeReplayFrame::Errored(e.to_string()),
+            }
+        }
+
+        /// Drain the transport side until it blocks, ends, or errors, yielding
+        /// to the runtime between polls so the pump task can refill the bridge.
+        pub async fn drain_transport(&mut self, max_polls: usize) -> Vec<ProbeReplayFrame> {
+            let mut frames = Vec::new();
+            for _ in 0..max_polls {
+                match self.poll_transport_once() {
+                    ProbeReplayFrame::Pending => tokio::task::yield_now().await,
+                    ProbeReplayFrame::Ended => {
+                        frames.push(ProbeReplayFrame::Ended);
+                        break;
+                    }
+                    frame => {
+                        let errored = matches!(frame, ProbeReplayFrame::Errored(_));
+                        frames.push(frame);
+                        if errored {
+                            break;
+                        }
+                    }
+                }
+            }
+            frames
+        }
+
+        /// Race the dispatcher's response-header wait against the pump's
+        /// backend write watermark, exactly as `proxy_grpc_request_core` does.
+        ///
+        /// `true` means the watermark won, which is what makes the RPC end as a
+        /// `ReadWriteTimeout`-classified backend timeout at
+        /// `backend_write_timeout_ms` instead of running on to the client
+        /// deadline or `backend_read_timeout_ms`.
+        pub async fn write_watermark_wins_header_wait(&mut self, header_wait: Duration) -> bool {
+            let Some(join) = self.join.as_mut() else {
+                return false;
+            };
+            join.arm_write_watermark();
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(header_wait) => false,
+                () = join.backend_write_watermark_expired() => true,
+            }
+        }
+
+        /// Observe a deferred native-gRPC write watermark without arming it.
+        ///
+        /// `true` means the observation window elapsed while the watermark
+        /// correctly stayed dormant during the simulated pool-acquisition
+        /// phase. A fired watermark returns `false` and proves connection time
+        /// was incorrectly counted as backend-body write inactivity.
+        pub async fn write_watermark_stays_dormant(&mut self, observation: Duration) -> bool {
+            let Some(join) = self.join.as_mut() else {
+                return true;
+            };
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(observation) => true,
+                () = join.backend_write_watermark_expired() => false,
+            }
+        }
+
+        /// Wait for the pump to finish on its own — no cancellation.
+        pub async fn join(&mut self) -> ProbePumpOutcome {
+            map_probe_outcome(match self.join.take() {
+                Some(join) => join.join().await,
+                None => None,
+            })
+        }
+
+        /// Cancel the pump and wait for it to finish, as the dispatcher does
+        /// once the write watermark wins the header wait.
+        pub async fn cancel_and_join(&mut self) -> ProbePumpOutcome {
+            map_probe_outcome(match self.join.take() {
+                Some(join) => join.cancel_and_join().await,
+                None => None,
+            })
+        }
+
+        /// Drop the transport side, modelling hyper releasing the request body.
+        pub fn drop_transport(&mut self) {
+            self.body = None;
+        }
+    }
+
+    /// The slice size each buffered native-H3 `send_data` write is bounded at
+    /// (issue #4055).
+    pub fn h3_buffered_send_chunk_bytes() -> usize {
+        crate::http3::client::h3_buffered_send_chunk_bytes()
+    }
+
+    /// The bounded slice sizes a buffered native-H3 request body of `len` bytes
+    /// is written in, in order.
+    pub fn h3_buffered_body_chunk_sizes_for_test(len: usize) -> Vec<usize> {
+        crate::http3::client::h3_buffered_body_chunks_for_test(bytes::Bytes::from(vec![0u8; len]))
+            .iter()
+            .map(bytes::Bytes::len)
+            .collect()
+    }
+
+    /// Whether the bounded slices reassemble to the original body, byte for
+    /// byte and in order — a slicing bug that reordered or dropped bytes would
+    /// corrupt every buffered H3 upload.
+    pub fn h3_buffered_body_chunks_are_complete_for_test(len: usize) -> bool {
+        let body: Vec<u8> = (0..len).map(|index| (index % 251) as u8).collect();
+        let source = bytes::Bytes::from(body.clone());
+        let mut rebuilt = Vec::with_capacity(len);
+        for chunk in crate::http3::client::h3_buffered_body_chunks_for_test(source) {
+            rebuilt.extend_from_slice(&chunk);
+        }
+        rebuilt == body
+    }
+
+    /// Drive the shipped buffered native-H3 send loop against a scripted sink.
+    ///
+    /// `Ok(sizes)` lists the slices that completed; `Err(message)` is the
+    /// redacted error text the dispatch site would surface. A body whose TOTAL
+    /// write time far exceeds `backend_write_timeout_ms` must still succeed as
+    /// long as no SINGLE write stalls for that long — that is the difference
+    /// between an idle watermark and a per-body ceiling.
+    pub async fn h3_buffered_body_send_for_test(
+        len: usize,
+        backend_write_timeout_ms: u64,
+        per_chunk_delay_ms: u64,
+    ) -> Result<Vec<usize>, String> {
+        crate::http3::client::drive_h3_buffered_body_send_for_test(
+            bytes::Bytes::from(vec![0u8; len]),
+            backend_write_timeout_ms,
+            per_chunk_delay_ms,
+        )
+        .await
+    }
+
     fn map_probe_outcome(
         outcome: Option<crate::proxy::upload_pump::UploadPumpOutcome>,
     ) -> ProbePumpOutcome {
@@ -9308,6 +9900,7 @@ pub mod _test_support {
             Some(UploadPumpOutcome::Cancelled) => ProbePumpOutcome::Cancelled,
             Some(UploadPumpOutcome::AuthorizationExpired) => ProbePumpOutcome::AuthorizationExpired,
             Some(UploadPumpOutcome::ConsumerGone) => ProbePumpOutcome::ConsumerGone,
+            Some(UploadPumpOutcome::WriteTimeout) => ProbePumpOutcome::WriteTimeout,
             None => ProbePumpOutcome::Aborted,
         }
     }
@@ -10059,7 +10652,21 @@ pub mod _test_support {
     pub enum DirectH2UploadGateForTest {
         Forward,
         RequestBodyTooLarge,
+        AuthorizationExpired,
+        BackendWriteTimeout,
         FailClosed,
+    }
+
+    /// Public mirror of the crate-private upload-pump terminal state, limited to
+    /// the variants the direct-H2 gate can observe through a join point.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum UploadPumpOutcomeForTest {
+        Completed,
+        SourceError,
+        Cancelled,
+        AuthorizationExpired,
+        ConsumerGone,
+        WriteTimeout,
     }
 
     /// Terminal outcome the size-limit adapter reports when it is dropped
@@ -10071,15 +10678,38 @@ pub mod _test_support {
         crate::proxy::body::request_body_drop_outcome(inner_is_end_stream)
     }
 
-    /// Gate a direct-H2 backend response on the terminal upload outcome.
-    /// `None` models a completion sender dropped without reporting.
+    /// Gate a direct-H2 backend response on the terminal upload outcome plus the
+    /// typed pump terminal. `None` models a completion sender dropped without
+    /// reporting (or a pump that never ran).
     pub fn direct_h2_upload_gate_for_test(
         outcome: Option<crate::proxy::body::RequestBodyOutcome>,
+        pump_outcome: Option<UploadPumpOutcomeForTest>,
+        authorization_expired: bool,
     ) -> DirectH2UploadGateForTest {
-        match crate::proxy::classify_direct_h2_upload_outcome(outcome) {
+        let pump = pump_outcome.map(|outcome| {
+            use crate::proxy::upload_pump::UploadPumpOutcome;
+            match outcome {
+                UploadPumpOutcomeForTest::Completed => UploadPumpOutcome::Completed,
+                UploadPumpOutcomeForTest::SourceError => UploadPumpOutcome::SourceError,
+                UploadPumpOutcomeForTest::Cancelled => UploadPumpOutcome::Cancelled,
+                UploadPumpOutcomeForTest::AuthorizationExpired => {
+                    UploadPumpOutcome::AuthorizationExpired
+                }
+                UploadPumpOutcomeForTest::ConsumerGone => UploadPumpOutcome::ConsumerGone,
+                UploadPumpOutcomeForTest::WriteTimeout => UploadPumpOutcome::WriteTimeout,
+            }
+        });
+        match crate::proxy::classify_direct_h2_upload_outcome(outcome, pump, authorization_expired)
+        {
             crate::proxy::DirectH2UploadGate::Forward => DirectH2UploadGateForTest::Forward,
             crate::proxy::DirectH2UploadGate::RequestBodyTooLarge => {
                 DirectH2UploadGateForTest::RequestBodyTooLarge
+            }
+            crate::proxy::DirectH2UploadGate::AuthorizationExpired => {
+                DirectH2UploadGateForTest::AuthorizationExpired
+            }
+            crate::proxy::DirectH2UploadGate::BackendWriteTimeout => {
+                DirectH2UploadGateForTest::BackendWriteTimeout
             }
             crate::proxy::DirectH2UploadGate::FailClosed => DirectH2UploadGateForTest::FailClosed,
         }

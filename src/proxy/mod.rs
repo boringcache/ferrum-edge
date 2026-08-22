@@ -3467,6 +3467,16 @@ pub(crate) enum DirectH2UploadGate {
     /// The configured request body limit was exceeded — deterministic 413,
     /// never the backend's early response.
     RequestBodyTooLarge,
+    /// The admitted request's authorization lifetime elapsed before the
+    /// backend response was committed. This gateway security decision wins
+    /// over transport classification once the authoritative 413 check has
+    /// passed.
+    AuthorizationExpired,
+    /// The upload pump terminated on the backend write watermark
+    /// (`backend_write_timeout_ms`) before the upload completed. The backend
+    /// response was never committed, so this is a deterministic 504
+    /// `ReadWriteTimeout`, never the backend's early response.
+    BackendWriteTimeout,
     /// The complete upload was not observed, so the size decision is unknown.
     /// Fail closed: an unvetted early backend response must not reach the client.
     FailClosed,
@@ -3478,16 +3488,35 @@ pub(crate) enum DirectH2UploadGate {
 /// configured limit. `Errored` and `Abandoned` leave the size decision unknown:
 /// unread frames may still take the upload over the limit, so they fail closed
 /// along with a missing completion signal.
+///
+/// One typed terminal is safe to report through it: the adapter collapses the
+/// pump's write-watermark expiry into a transport error, so the pump's own
+/// outcome — kept by the join point — distinguishes a backend write stall
+/// (504 `ReadWriteTimeout`) from an indeterminate size outcome. The pump's
+/// biased `select!` ranks its authorization-expiry arm above the write-idle
+/// arm, so a `WriteTimeout` terminal proves the credential had not expired at
+/// that poll. The caller rechecks the absolute deadline before committing its
+/// replacement response; every other terminal (client/source error,
+/// cancellation, consumer drop) keeps failing closed.
 pub(crate) fn classify_direct_h2_upload_outcome(
     outcome: Option<body::RequestBodyOutcome>,
+    pump_outcome: Option<upload_pump::UploadPumpOutcome>,
+    authorization_expired: bool,
 ) -> DirectH2UploadGate {
-    let Some(outcome) = outcome else {
-        return DirectH2UploadGate::FailClosed;
-    };
     match outcome {
-        body::RequestBodyOutcome::Exceeded => DirectH2UploadGate::RequestBodyTooLarge,
-        body::RequestBodyOutcome::Completed => DirectH2UploadGate::Forward,
-        body::RequestBodyOutcome::Errored | body::RequestBodyOutcome::Abandoned => {
+        Some(body::RequestBodyOutcome::Exceeded) => DirectH2UploadGate::RequestBodyTooLarge,
+        _ if authorization_expired => DirectH2UploadGate::AuthorizationExpired,
+        Some(body::RequestBodyOutcome::Completed) => DirectH2UploadGate::Forward,
+        // A write-watermark terminal is authoritative for BOTH shapes of an
+        // unfinished upload: the adapter reporting a transport error, and the
+        // adapter never reporting at all. The second is what the dispatcher
+        // sees when its own wait ended on the pump's watermark rather than on
+        // the completion channel, so collapsing it into `FailClosed` would turn
+        // a diagnosed backend write stall back into an anonymous 502 (#4055).
+        _ if pump_outcome == Some(upload_pump::UploadPumpOutcome::WriteTimeout) => {
+            DirectH2UploadGate::BackendWriteTimeout
+        }
+        Some(body::RequestBodyOutcome::Errored | body::RequestBodyOutcome::Abandoned) | None => {
             DirectH2UploadGate::FailClosed
         }
     }
@@ -37918,6 +37947,7 @@ async fn handle_proxy_request_inner(
                     inspector,
                     tx,
                     effective_max_response_body_size_bytes,
+                    proxy.backend_read_timeout_ms,
                     reqwest_backend_guard,
                     lb_connection_guard,
                 ));
@@ -37960,7 +37990,11 @@ async fn handle_proxy_request_inner(
                 let base = if state.response_buffer_cutoff_bytes == 0
                     && effective_max_response_body_size_bytes == 0
                 {
-                    crate::proxy::body::direct_streaming_body(response, advertised_cl)
+                    crate::proxy::body::direct_streaming_body(
+                        response,
+                        advertised_cl,
+                        proxy.backend_read_timeout_ms,
+                    )
                 } else if effective_max_response_body_size_bytes > 0 && cl.is_none() {
                     // No Content-Length — enforce size limit while streaming instead
                     // of buffering the entire body into memory.
@@ -37968,9 +38002,14 @@ async fn handle_proxy_request_inner(
                         response,
                         effective_max_response_body_size_bytes,
                         advertised_cl,
+                        proxy.backend_read_timeout_ms,
                     )
                 } else {
-                    crate::proxy::body::coalescing_body(response, advertised_cl)
+                    crate::proxy::body::coalescing_body(
+                        response,
+                        advertised_cl,
+                        proxy.backend_read_timeout_ms,
+                    )
                 };
                 let base = if let Some(guard) = reqwest_backend_guard {
                     base.with_reqwest_backend_guard(guard)
@@ -39423,12 +39462,10 @@ pub(crate) async fn proxy_to_backend_retry(
             req_builder = req_builder.connect_timeout(operator_timeout);
         }
     }
-    if proxy.backend_read_timeout_ms > 0 {
-        let operator_timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
-        if client_deadline_remaining.is_none_or(|remaining| operator_timeout < remaining) {
-            req_builder = req_builder.timeout(operator_timeout);
-        }
-    }
+    // Header wait is bounded below by `tokio::time::timeout` around `send()`.
+    // Do not install reqwest `RequestBuilder::timeout()`: that is a total
+    // deadline from `send()` start that is transferred onto the response as
+    // `TotalTimeoutBody` and would kill a slow-but-progressing SSE stream.
 
     // Forward headers, stripping hop-by-hop headers per RFC 9110 §7.6.1
     // (canonical predicate in `proxy::headers`). Also strip every header
@@ -39516,10 +39553,36 @@ pub(crate) async fn proxy_to_backend_retry(
 
     // Replay the original request body on retry if available.
     // On connection failures the body was never sent, so replaying is safe.
+    //
+    // A replay is still an upload the gateway has to write, so it carries the
+    // same gateway-owned backend write watermark as the initial attempt
+    // (#4055): without it a retry against a backend that accepts and never
+    // reads would run on to `backend_read_timeout_ms`. `0` keeps the reusable
+    // `Bytes` path.
+    let mut upload_pump: Option<upload_pump::UploadPumpJoin> = None;
+    // Pumping the replayed buffer makes reqwest's carrier streaming, which
+    // disables its own HTTP/2 protocol-NACK replay. Capture the bodiless
+    // builder plus the buffer so Ferrum can reproduce that replay itself
+    // (issue #4074); nothing is captured when no pump is installed, because
+    // reqwest still owns a reusable `Bytes` on that path.
+    let mut buffered_replay: Option<BufferedUploadReplay> = None;
     if let Some(body) = request_body
         && !body.is_empty()
     {
-        req_builder = req_builder.body(body.to_vec());
+        let body_bytes = Bytes::copy_from_slice(body);
+        let (upload_body, pump) = install_buffered_upload_write_watermark(
+            body_bytes.clone(),
+            proxy.backend_write_timeout_ms,
+        );
+        if pump.is_some() {
+            buffered_replay = BufferedUploadReplay::capture(
+                &req_builder,
+                &body_bytes,
+                proxy.backend_write_timeout_ms,
+            );
+        }
+        upload_pump = pump;
+        req_builder = req_builder.body(upload_body);
     }
 
     // DestinationRule `connectionPool.http.http1MaxPendingRequests`: re-enter the
@@ -39618,8 +39681,55 @@ pub(crate) async fn proxy_to_backend_retry(
         request_ctx.grpc_deadline_at(),
         send_auth_deadline.as_ref(),
     );
-    let send_future = crate::plugins::await_deadline_first(send_bound.at, req_builder.send());
-    let send_result = match send_future.await {
+    // Both per-direction watermarks bound this wait, exactly as they do on the
+    // initial attempt: the operator's response-header read bound, and the
+    // buffered upload's backend write bound. Both end the attempt as 504 /
+    // `ReadWriteTimeout`. The response-header bound is turned into ONE absolute
+    // instant up front so an HTTP/2 protocol-NACK replay cannot re-arm it
+    // (issue #4074) — reqwest's own internal replay ran inside a single timer,
+    // and Ferrum's stand-in must not be more generous.
+    let header_deadline_at = absolute_response_header_read_bound(proxy.backend_read_timeout_ms);
+    let send_bound_at = send_bound.at;
+    let bounded = send_buffered_upload_with_protocol_nack_replay(
+        req_builder,
+        buffered_replay.take(),
+        &mut upload_pump,
+        |builder| {
+            crate::plugins::await_deadline_first(
+                header_deadline_at,
+                crate::plugins::await_deadline_first(send_bound_at, builder.send()),
+            )
+        },
+        reqwest_send_is_protocol_nack,
+    )
+    .await;
+    let header_wait = match bounded {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(())) => {
+            return http_backend_dispatch_error_response(
+                retry::ErrorClass::ReadWriteTimeout,
+                resolved_ip,
+            );
+        }
+        Err(()) => {
+            // Stop writing the replayed body now rather than leaving the task
+            // to notice when reqwest eventually drops its source.
+            if let Some(pump) = upload_pump.as_mut() {
+                pump.cancel();
+            }
+            warn!(
+                proxy_id = %proxy.id,
+                watermark = "backend_write_timeout_ms",
+                watermark_ms = proxy.backend_write_timeout_ms,
+                "reqwest retry dispatch: backend write watermark expired before response headers"
+            );
+            return http_backend_dispatch_error_response(
+                retry::ErrorClass::ReadWriteTimeout,
+                resolved_ip,
+            );
+        }
+    };
+    let send_result = match header_wait {
         Ok(result) => result,
         Err(()) => {
             if dispatch_phase_authorization_expiry(send_bound, send_auth_deadline.as_ref())
@@ -39733,6 +39843,7 @@ pub(crate) async fn proxy_to_backend_retry(
                             response,
                             retained_ceiling,
                             declared_len,
+                            proxy.backend_read_timeout_ms,
                         ),
                     )
                     .await
@@ -39790,7 +39901,11 @@ pub(crate) async fn proxy_to_backend_retry(
                     let collected = match collect_response_under_authorization(
                         request_ctx.grpc_deadline_at(),
                         send_auth_deadline.as_ref(),
-                        collect_response_with_limit(response, max_size),
+                        collect_response_with_limit(
+                            response,
+                            max_size,
+                            proxy.backend_read_timeout_ms,
+                        ),
                     )
                     .await
                     {
@@ -40777,6 +40892,8 @@ fn record_h2_pool_admission_failure(
 enum EagerRetainFailure {
     /// Mid-body transport failure after the response headers arrived.
     Read(reqwest::Error),
+    /// `backend_read_timeout_ms` elapsed between buffered body chunks.
+    ReadTimeout,
     /// The retained bounds refused the body.
     Retain(response_buffer_budget::RetainRejection),
 }
@@ -40791,8 +40908,8 @@ async fn eager_collect_charged_backend_body(
     response: reqwest::Response,
     ceiling: usize,
     preallocation_hint: usize,
+    read_timeout_ms: u64,
 ) -> Result<Bytes, EagerRetainFailure> {
-    use futures_util::StreamExt as _;
     let mut collector = response_buffer_budget::ChargedBodyCollector::with_preallocation(
         response_buffer_budget::BudgetRef::global(),
         ceiling,
@@ -40800,7 +40917,12 @@ async fn eager_collect_charged_backend_body(
     )
     .map_err(EagerRetainFailure::Retain)?;
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let chunk = match next_reqwest_chunk_idle(&mut stream, read_timeout_ms).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(()) => return Err(EagerRetainFailure::ReadTimeout),
+        };
         match chunk {
             Ok(chunk) => {
                 if let Err(rejection) = collector.append(&chunk) {
@@ -40890,6 +41012,22 @@ fn buffered_backend_response_from_eager_collect(
                 error_class: Some(error_class),
             }
         }
+        Err(EagerRetainFailure::ReadTimeout) => {
+            let (status_code, body) =
+                http_backend_failure_status_and_body(retry::ErrorClass::ReadWriteTimeout);
+            warn!(
+                error_kind = retry::error_class_log_kind(retry::ErrorClass::ReadWriteTimeout),
+                "Backend response body read timed out while buffering"
+            );
+            retry::BackendResponse {
+                status_code,
+                body: ResponseBody::buffered(body.as_bytes().to_vec()),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+            }
+        }
     }
 }
 
@@ -40938,15 +41076,14 @@ pub(crate) fn http_backend_dispatch_error_response(
 /// Status + `ErrorClass` for a reqwest body-read failure on an eager-buffering
 /// path, given the classifier's verdict for the underlying error (#2953).
 ///
-/// The per-request `RequestBuilder::timeout()` (`backend_read_timeout_ms`)
-/// covers through body completion in reqwest, so a read **timeout** during
-/// eager buffering lands here. Hardcoding `ConnectionReset`/502 made the same
-/// backend fault surface as 502/`connection_reset` over reqwest and
-/// 504/`read_write_timeout` over direct H2 (`HyperBodyCollectError::ReadTimeout`)
-/// — a transport-dependent split in `TransactionSummary.error_class`, operator
-/// dashboards, and circuit-breaker `failure_status_codes` matching. Map
-/// `ReadWriteTimeout` to 504 for parity with the H2/H3 arms; everything else
-/// keeps the 502.
+/// Idle `backend_read_timeout_ms` between buffered chunks
+/// (`next_reqwest_chunk_idle`) surfaces here as `ReadWriteTimeout`. Hardcoding
+/// `ConnectionReset`/502 made the same backend fault surface as
+/// 502/`connection_reset` over reqwest and 504/`read_write_timeout` over
+/// direct H2 (`HyperBodyCollectError::ReadTimeout`) — a transport-dependent
+/// split in `TransactionSummary.error_class`, operator dashboards, and
+/// circuit-breaker `failure_status_codes` matching. Map `ReadWriteTimeout` to
+/// 504 for parity with the H2/H3 arms; everything else keeps the 502.
 ///
 /// Response headers have already arrived at every call site, so the fault is
 /// post-wire by construction and callers keep `connection_error: false`. A
@@ -42651,12 +42788,10 @@ async fn proxy_to_backend(
             req_builder = req_builder.connect_timeout(operator_timeout);
         }
     }
-    if proxy.backend_read_timeout_ms > 0 {
-        let operator_timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
-        if client_deadline_remaining.is_none_or(|remaining| operator_timeout < remaining) {
-            req_builder = req_builder.timeout(operator_timeout);
-        }
-    }
+    // Header wait is bounded below by `tokio::time::timeout` around `send()`.
+    // Do not install reqwest `RequestBuilder::timeout()`: that is a total
+    // deadline from `send()` start that is transferred onto the response as
+    // `TotalTimeoutBody` and would kill a slow-but-progressing SSE stream.
 
     // Forward headers, stripping hop-by-hop headers per RFC 9110 §7.6.1
     // (canonical predicate in `proxy::headers`). Also strip every header
@@ -42745,6 +42880,20 @@ async fn proxy_to_backend(
     // Shared flag for detecting size-limit exceeded during streaming.
     // Only allocated when we actually stream a request body.
     let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Join point for the gateway-owned upload pump, when a body arm below
+    // installs one — streaming OR buffered, since both directions are written
+    // through reqwest and both must honour `backend_write_timeout_ms`. Kept in
+    // the dispatcher's scope for exactly one reason: the response-header wait
+    // must be able to end on the backend write watermark (#4055). It is never
+    // joined to completion here — this dispatcher returns while the response
+    // streams, and the transport body owns the upload from that point — so
+    // `cancel_on_drop` stays disarmed.
+    let mut upload_pump: Option<upload_pump::UploadPumpJoin> = None;
+    // Replay source for a PUMPED buffered upload (issue #4074). Pumping makes
+    // reqwest's carrier streaming, which disables its own HTTP/2 protocol-NACK
+    // replay; this is what lets Ferrum reproduce it. Streaming uploads leave it
+    // `None` — an unreplayable body must never be retried.
+    let mut buffered_replay: Option<BufferedUploadReplay> = None;
 
     if has_body {
         // Enforce request body size limit via Content-Length fast path.
@@ -42845,7 +42994,23 @@ async fn proxy_to_backend(
                     if retain_request_body {
                         retained_body = Some(body_bytes.clone());
                     }
-                    req_builder = req_builder.body(body_bytes);
+                    // A buffered upload still has to be WRITTEN, so it needs the
+                    // same gateway-owned write watermark the streaming arms get
+                    // (#4055). With `backend_write_timeout_ms == 0` this hands
+                    // reqwest the reusable `Bytes` back unchanged.
+                    let (upload_body, pump) = install_buffered_upload_write_watermark(
+                        body_bytes.clone(),
+                        proxy.backend_write_timeout_ms,
+                    );
+                    if pump.is_some() {
+                        buffered_replay = BufferedUploadReplay::capture(
+                            &req_builder,
+                            &body_bytes,
+                            proxy.backend_write_timeout_ms,
+                        );
+                    }
+                    upload_pump = pump;
+                    req_builder = req_builder.body(upload_body);
                 }
             }
             ClientRequestBody::Streaming(original_req) if stream_request_body => {
@@ -42877,16 +43042,19 @@ async fn proxy_to_backend(
                     // negotiate HTTP/2, in which case its connection task parks
                     // on stream send capacity exactly like the direct-H2 pipe
                     // and stops polling the body; the pump's deadline is not
-                    // subject to that. The join point is deliberately released
-                    // here rather than awaited: this dispatcher returns while
-                    // the response still streams, so the upload's lifetime is
-                    // the transport body's, and `UploadPumpSource`'s abort
-                    // guard ends the task when reqwest drops that body. The
-                    // pump self-terminates at the deadline regardless.
-                    let (limited, _upload_pump) = install_streaming_upload_authorization(
+                    // subject to that. The join point is KEPT — but only to
+                    // observe the backend write watermark alongside the
+                    // response-header wait (#4055). It is never awaited to
+                    // completion here: this dispatcher returns while the
+                    // response still streams, so the upload's lifetime stays
+                    // the transport body's and `UploadPumpSource`'s abort guard
+                    // ends the task when reqwest drops that body.
+                    let (limited, pump) = install_streaming_upload_authorization(
                         limited,
                         upload_auth_deadline.as_ref(),
+                        proxy.backend_write_timeout_ms,
                     );
+                    upload_pump = pump;
                     let limited =
                         if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
                             &request_ctx.metadata,
@@ -42909,11 +43077,14 @@ async fn proxy_to_backend(
                         Arc::clone(ctx_bytes_sent_observed),
                     );
                     // Same pairing as the size-limited arm above; see there for
-                    // why the join point is released rather than awaited.
-                    let (counting, _upload_pump) = install_counting_upload_authorization(
+                    // why the join point is observed rather than awaited to
+                    // completion.
+                    let (counting, pump) = install_counting_upload_authorization(
                         counting,
                         upload_auth_deadline.as_ref(),
+                        proxy.backend_write_timeout_ms,
                     );
+                    upload_pump = pump;
                     let counting =
                         if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
                             &request_ctx.metadata,
@@ -43109,7 +43280,23 @@ async fn proxy_to_backend(
                     if retain_request_body {
                         retained_body = Some(body_bytes.clone());
                     }
-                    req_builder = req_builder.body(body_bytes);
+                    // Collected-then-buffered is still an upload the gateway has
+                    // to write; same watermark, same `0` opt-out, as the
+                    // pre-buffered arm above (#4055). Same protocol-NACK replay
+                    // capture as that arm (#4074).
+                    let (upload_body, pump) = install_buffered_upload_write_watermark(
+                        body_bytes.clone(),
+                        proxy.backend_write_timeout_ms,
+                    );
+                    if pump.is_some() {
+                        buffered_replay = BufferedUploadReplay::capture(
+                            &req_builder,
+                            &body_bytes,
+                            proxy.backend_write_timeout_ms,
+                        );
+                    }
+                    upload_pump = pump;
+                    req_builder = req_builder.body(upload_body);
                 }
             }
         }
@@ -43285,8 +43472,64 @@ async fn proxy_to_backend(
         request_ctx.grpc_deadline_at(),
         send_auth_deadline.as_ref(),
     );
-    let send_future = crate::plugins::await_deadline_first(send_bound.at, req_builder.send());
-    let send_result = match send_future.await {
+    // Two per-direction watermarks bound this wait, and both end the request as
+    // 504 / `ReadWriteTimeout`: the operator's response-header read bound, and
+    // the upload pump's backend write bound. The write arm is what makes a
+    // backend that accepts and never reads fail at `backend_write_timeout_ms`
+    // instead of running on to `backend_read_timeout_ms` (#4055). The header
+    // bound is one ABSOLUTE instant so an HTTP/2 protocol-NACK replay of a
+    // buffered upload cannot re-arm it (#4074).
+    let mut write_watermark_expired = false;
+    let header_deadline_at = absolute_response_header_read_bound(proxy.backend_read_timeout_ms);
+    let send_bound_at = send_bound.at;
+    let bounded = send_buffered_upload_with_protocol_nack_replay(
+        req_builder,
+        buffered_replay.take(),
+        &mut upload_pump,
+        |builder| {
+            crate::plugins::await_deadline_first(
+                header_deadline_at,
+                crate::plugins::await_deadline_first(send_bound_at, builder.send()),
+            )
+        },
+        reqwest_send_is_protocol_nack,
+    )
+    .await;
+    let header_wait = match bounded {
+        Ok(Ok(inner)) => Some(inner),
+        Ok(Err(())) => None,
+        Err(()) => {
+            write_watermark_expired = true;
+            None
+        }
+    };
+    let Some(header_wait) = header_wait else {
+        if let Some(pump) = upload_pump.as_mut() {
+            // Stop reading the client body now rather than leaving the task to
+            // notice when the transport eventually drops its source.
+            pump.cancel();
+        }
+        // One macro, two attributions: `proxy_to_backend` is one of the two
+        // deepest coroutines on the request path and every `warn!` site it
+        // inlines is a permanent frame slot at `opt-level = 0`.
+        let (watermark, watermark_ms) = if write_watermark_expired {
+            ("backend_write_timeout_ms", proxy.backend_write_timeout_ms)
+        } else {
+            ("backend_read_timeout_ms", proxy.backend_read_timeout_ms)
+        };
+        warn!(
+            proxy_id = %proxy.id,
+            watermark,
+            watermark_ms,
+            "reqwest dispatch: per-direction watermark expired before response headers"
+        );
+        return backend_dispatch_response(
+            http_backend_dispatch_error_response(retry::ErrorClass::ReadWriteTimeout, resolved_ip),
+            retained_body,
+            backend_admission_permits,
+        );
+    };
+    let send_result = match header_wait {
         Ok(result) => result,
         Err(()) => {
             // Attribute the fired bound. An authorization expiry cancels the
@@ -43450,6 +43693,7 @@ async fn proxy_to_backend(
                                 response,
                                 retained_ceiling,
                                 declared_len,
+                                proxy.backend_read_timeout_ms,
                             ),
                         )
                         .await
@@ -43538,7 +43782,7 @@ async fn proxy_to_backend(
                 let collected = match collect_response_under_authorization(
                     request_ctx.grpc_deadline_at(),
                     send_auth_deadline.as_ref(),
-                    collect_response_with_limit(response, max_size),
+                    collect_response_with_limit(response, max_size, proxy.backend_read_timeout_ms),
                 )
                 .await
                 {
@@ -43608,6 +43852,7 @@ async fn proxy_to_backend(
                             response,
                             retained_ceiling,
                             declared_len,
+                            proxy.backend_read_timeout_ms,
                         ),
                     )
                     .await
@@ -43666,7 +43911,7 @@ async fn proxy_to_backend(
                 let collected = match collect_response_under_authorization(
                     request_ctx.grpc_deadline_at(),
                     send_auth_deadline.as_ref(),
-                    collect_response_with_limit(response, max_size),
+                    collect_response_with_limit(response, max_size, proxy.backend_read_timeout_ms),
                 )
                 .await
                 {
@@ -43843,6 +44088,16 @@ impl BufferedCollectFailure {
         }
     }
 
+    fn read_timeout() -> Self {
+        let (status_code, body) =
+            http_backend_failure_status_and_body(retry::ErrorClass::ReadWriteTimeout);
+        Self {
+            status_code,
+            body: body.as_bytes().to_vec(),
+            error_class: retry::ErrorClass::ReadWriteTimeout,
+        }
+    }
+
     /// Aggregate buffered-response budget exhausted. Carries the neutral
     /// gateway-capacity class, NOT `ResponseBodyTooLarge`: the backend behaved
     /// correctly and stayed within every configured per-response ceiling, so
@@ -43876,14 +44131,19 @@ impl BufferedCollectFailure {
 async fn collect_response_with_limit(
     response: reqwest::Response,
     max_size: usize,
+    read_timeout_ms: u64,
 ) -> Result<(Bytes, usize), BufferedCollectFailure> {
-    use futures_util::StreamExt as _;
     let mut body = response_buffer_budget::ChargedBodyCollector::new(
         response_buffer_budget::BudgetRef::global(),
         max_size,
     );
     let mut stream = response.bytes_stream();
-    while let Some(chunk_result) = stream.next().await {
+    loop {
+        let chunk_result = match next_reqwest_chunk_idle(&mut stream, read_timeout_ms).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(()) => return Err(BufferedCollectFailure::read_timeout()),
+        };
         match chunk_result {
             Ok(chunk) => {
                 // The collector owns BOTH bounds. It charges the growth target
@@ -43906,6 +44166,25 @@ async fn collect_response_with_limit(
             response_buffer_budget::RetainRejection::BudgetExhausted,
             max_size,
         )),
+    }
+}
+
+/// Wait for the next reqwest body chunk, bounded by an idle
+/// `backend_read_timeout_ms`. `0` disables the idle arm.
+async fn next_reqwest_chunk_idle<S, T>(
+    stream: &mut S,
+    read_timeout_ms: u64,
+) -> Result<Option<T>, ()>
+where
+    S: futures_util::Stream<Item = T> + Unpin,
+{
+    use futures_util::StreamExt as _;
+    if read_timeout_ms == 0 {
+        return Ok(stream.next().await);
+    }
+    match tokio::time::timeout(Duration::from_millis(read_timeout_ms), stream.next()).await {
+        Ok(item) => Ok(item),
+        Err(_) => Err(()),
     }
 }
 
@@ -45664,6 +45943,86 @@ pub(crate) fn request_upload_auth_deadline(
     ))
 }
 
+/// The operator's `backend_read_timeout_ms` response-header bound as ONE
+/// absolute instant.
+///
+/// `None` when the operator disabled it (`0`), preserving the documented
+/// "0 = no timeout" contract. Every caller feeds this to
+/// [`crate::plugins::await_deadline_first`], whose `Err(())` is the operator
+/// read timeout and maps to 504 / `ReadWriteTimeout`.
+///
+/// Absolute rather than a fresh `timeout()` per attempt (issue #4074): a
+/// buffered upload may be replayed after an HTTP/2 protocol NACK, and reqwest's
+/// own internal replay ran inside ONE header clock. Re-arming the bound per
+/// attempt would let a replaying request outlive the operator's configured
+/// header wait by a multiple of it.
+///
+/// This is deliberately NOT reqwest's `RequestBuilder::timeout()`: that clock
+/// runs from `send()` through response-body completion and is transferred onto
+/// the response body, so it kills a slow-but-progressing SSE stream (#4057).
+/// The per-direction watermark on the body is installed separately.
+pub(crate) fn absolute_response_header_read_bound(
+    read_timeout_ms: u64,
+) -> Option<tokio::time::Instant> {
+    (read_timeout_ms > 0)
+        .then(|| tokio::time::Instant::now().checked_add(Duration::from_millis(read_timeout_ms)))
+        .flatten()
+}
+
+/// Await a per-direction idle deadline that may not exist (issue #4074).
+///
+/// Relay loops on the proxy hot path arm `backend_read_timeout_ms` /
+/// `backend_write_timeout_ms` as a stack-pinned `Sleep` they `reset()` on every
+/// progress step. Constructing that `Sleep` unconditionally means a relay whose
+/// bound is DISABLED (`0`, the documented opt-out — long-lived SSE routes use
+/// it) still builds timer state and reads the clock for a timer it will never
+/// poll. Holding the sleep as `Pin<&mut Option<Sleep>>` keeps the enabled path
+/// byte-for-byte what it was — same stack slot, same `reset()` — while the
+/// disabled path allocates and registers nothing.
+///
+/// `None` is a future that never resolves, expressed as a type rather than as a
+/// proxy-path panic. Cancel-safe: `Sleep` is, and re-creating this wrapper each
+/// `select!` iteration re-borrows the same pinned sleep.
+pub(crate) async fn optional_sleep_elapsed(sleep: std::pin::Pin<&mut Option<tokio::time::Sleep>>) {
+    match sleep.as_pin_mut() {
+        Some(sleep) => sleep.await,
+        None => match std::future::pending::<std::convert::Infallible>().await {},
+    }
+}
+
+/// Race a dispatch-phase wait against the gateway-owned upload pump's backend
+/// write watermark (`backend_write_timeout_ms`, issue #4055).
+///
+/// The pump terminates the transport body on expiry, but that error is only
+/// observable when the transport POLLS the body — and a transport whose backend
+/// stopped reading is parked somewhere else entirely: hyper's HTTP/2 pipe in
+/// `poll_capacity`, an HTTP/1.1 connection task on socket writability, reqwest's
+/// connection task in either. Without this arm the dispatcher keeps waiting and
+/// the request ends on whatever LATER bound is configured
+/// (`backend_read_timeout_ms`), which is why a configured 800 ms write watermark
+/// used to surface as an 8 s read timeout.
+///
+/// `Err(())` means the watermark fired first. The wrapped future is polled
+/// FIRST, so a backend that answered in the same poll still wins the race and a
+/// completed exchange is never reclassified as a write stall.
+pub(crate) async fn await_upload_write_watermark_first<F>(
+    fut: F,
+    pump: Option<&mut upload_pump::UploadPumpJoin>,
+) -> Result<F::Output, ()>
+where
+    F: std::future::Future,
+{
+    let Some(pump) = pump else {
+        return Ok(fut.await);
+    };
+    tokio::pin!(fut);
+    tokio::select! {
+        biased;
+        output = &mut fut => Ok(output),
+        () = pump.backend_write_watermark_expired() => Err(()),
+    }
+}
+
 /// Install the FULL upload lifecycle on a size-limited streaming client body
 /// (issue #3815 / #3816).
 ///
@@ -45686,21 +46045,28 @@ pub(crate) fn request_upload_auth_deadline(
 /// `cancel_and_join()` resolves only after the pump published its outcome,
 /// which it does after dropping the client body.
 ///
-/// Unauthenticated requests get neither (`auth` is `None`), so the no-auth-plan
-/// hot path is byte-for-byte the previous one: no task, no channel, no timer.
+/// Unauthenticated requests with `backend_write_timeout_ms == 0` get neither,
+/// so that hot path stays byte-for-byte the previous one: no task, no channel,
+/// no timer. A live write timeout installs the pump even without a credential
+/// so a backend that accepts and never reads cannot hang the upload.
 pub(crate) fn install_streaming_upload_authorization(
     body: body::SizeLimitedIncoming,
     auth: Option<&RequestAuthLifetimePlan>,
+    write_timeout_ms: u64,
 ) -> (
     body::SizeLimitedIncoming,
     Option<upload_pump::UploadPumpJoin>,
 ) {
-    let Some(plan) = auth else {
-        return (body, None);
+    let body = if let Some(plan) = auth {
+        let (deadline, family, latch) = plan;
+        body.with_authorization_deadline(*deadline, *family, latch.clone())
+    } else {
+        body
     };
-    let (deadline, family, latch) = plan;
-    body.with_authorization_deadline(*deadline, *family, latch.clone())
-        .with_gateway_upload_pump(plan)
+    if auth.is_none() && write_timeout_ms == 0 {
+        return (body, None);
+    }
+    body.with_gateway_upload_pump(auth, write_timeout_ms)
 }
 
 /// [`install_streaming_upload_authorization`] for the unlimited-size streaming
@@ -45708,13 +46074,195 @@ pub(crate) fn install_streaming_upload_authorization(
 pub(crate) fn install_counting_upload_authorization(
     body: body::CountingIncoming,
     auth: Option<&RequestAuthLifetimePlan>,
+    write_timeout_ms: u64,
 ) -> (body::CountingIncoming, Option<upload_pump::UploadPumpJoin>) {
-    let Some(plan) = auth else {
-        return (body, None);
+    let body = if let Some(plan) = auth {
+        let (deadline, family, latch) = plan;
+        body.with_authorization_deadline(*deadline, *family, latch.clone())
+    } else {
+        body
     };
-    let (deadline, family, latch) = plan;
-    body.with_authorization_deadline(*deadline, *family, latch.clone())
-        .with_gateway_upload_pump(plan)
+    if auth.is_none() && write_timeout_ms == 0 {
+        return (body, None);
+    }
+    body.with_gateway_upload_pump(auth, write_timeout_ms)
+}
+
+/// Install the gateway-owned backend write watermark on a fully BUFFERED
+/// reqwest upload (issue #4055).
+///
+/// The streaming arms reach the pump through their body adapters; a buffered
+/// upload has no adapter, and handing reqwest a reusable `Bytes` leaves the
+/// dispatcher with no pump to observe. A backend that accepts the connection
+/// and never reads would then run past `backend_write_timeout_ms` and end on
+/// `backend_read_timeout_ms` instead, which is not the unqualified HTTP-family
+/// contract `docs/configuration.md` states.
+///
+/// The pump slices the buffer into bounded refcounted frames, so the bridge's
+/// backpressure stays coupled to what the transport has actually taken rather
+/// than completing the moment hyper pulls one giant frame. The size hint stays
+/// exact, so `Content-Length` is unchanged.
+///
+/// `backend_write_timeout_ms == 0` (and an empty body) keeps the previous
+/// reusable-`Bytes` path exactly: no task, no channel, no timer, and reqwest
+/// retains the body it can replay internally.
+///
+/// When a pump IS installed reqwest sees a streaming carrier, so its own
+/// `ProtocolNacks` replay (`try_clone()`) is unavailable. Ferrum re-establishes
+/// that exact behaviour at its own layer — see
+/// [`send_buffered_upload_with_protocol_nack_replay`] — so a dispatch site must
+/// pair this installer with a [`BufferedUploadReplay`] capture rather than
+/// calling `send()` directly (issue #4074).
+///
+/// No authorization plan is armed here. A buffered upload was already collected
+/// under `collect_request_body_under_authorization`, and the response-header
+/// wait still composes the admitted stream's deadline through
+/// `compose_dispatch_phase_auth_bound`, so expiry precedence is unchanged.
+pub(crate) fn install_buffered_upload_write_watermark(
+    body_bytes: Bytes,
+    write_timeout_ms: u64,
+) -> (reqwest::Body, Option<upload_pump::UploadPumpJoin>) {
+    match upload_pump::spawn_buffered_upload_pump(body_bytes, write_timeout_ms) {
+        Ok((body, join)) => (body.into_reqwest_body(), Some(join)),
+        Err(body_bytes) => (reqwest::Body::from(body_bytes), None),
+    }
+}
+
+/// Did this reqwest dispatch outcome carry an HTTP/2 protocol NACK (issue
+/// #4074)?
+///
+/// The shape is the reqwest dispatch sites' composed outcome: the operator's
+/// absolute response-header bound outside, the composed authorization/client
+/// deadline inside, and reqwest's own result innermost. Anything that is not a
+/// transport error — a response, either bound firing — is not a NACK.
+fn reqwest_send_is_protocol_nack(
+    outcome: &Result<Result<reqwest::Result<reqwest::Response>, ()>, ()>,
+) -> bool {
+    match outcome {
+        Ok(Ok(Err(e))) => retry::reqwest_error_is_protocol_nack(e),
+        _ => false,
+    }
+}
+
+/// How many times a buffered upload may be replayed after an HTTP/2 protocol
+/// NACK (issue #4074).
+///
+/// Matches reqwest's own default policy (`max_retries_per_request: 2`, on top of
+/// the original attempt) so installing the write watermark neither weakens nor
+/// amplifies the retry behaviour a buffered upload had before.
+pub(crate) const BUFFERED_UPLOAD_PROTOCOL_NACK_REPLAYS: u8 = 2;
+
+/// Everything needed to rebuild one buffered reqwest attempt (issue #4074).
+///
+/// Captured BEFORE the body is attached, so `builder` is bodiless and
+/// `RequestBuilder::try_clone()` succeeds; `body` is the same refcounted
+/// `Bytes` the first attempt was built from, so a replay costs a refcount bump
+/// rather than a copy.
+pub(crate) struct BufferedUploadReplay {
+    builder: reqwest::RequestBuilder,
+    body: Bytes,
+    write_timeout_ms: u64,
+    replays_left: u8,
+}
+
+impl BufferedUploadReplay {
+    /// Capture a replay source for a buffered upload that IS pumped.
+    ///
+    /// `None` when the builder cannot be cloned (it carries an unclonable
+    /// body or is already in an error state) — the caller then simply gets the
+    /// single-attempt behaviour.
+    ///
+    /// Deliberately NOT captured when no pump was installed: on that path
+    /// reqwest still holds a reusable `Bytes` and applies its OWN protocol-NACK
+    /// retry, so capturing here would double the replay budget.
+    pub(crate) fn capture(
+        builder: &reqwest::RequestBuilder,
+        body: &Bytes,
+        write_timeout_ms: u64,
+    ) -> Option<Self> {
+        Some(Self {
+            builder: builder.try_clone()?,
+            body: body.clone(),
+            write_timeout_ms,
+            replays_left: BUFFERED_UPLOAD_PROTOCOL_NACK_REPLAYS,
+        })
+    }
+
+    /// Rebuild the next pumped attempt after the backend proved that the
+    /// previous HTTP/2 attempt was not processed.
+    ///
+    /// The replay budget and pump replacement live here so callers that need
+    /// to construct transport-specific cancellation futures per attempt still
+    /// share exactly the same reqwest-compatible replay contract. The old pump
+    /// is cancelled and joined before the fresh body carrier is installed.
+    pub(crate) async fn replay_after_protocol_nack(
+        &mut self,
+        pump: &mut Option<upload_pump::UploadPumpJoin>,
+    ) -> Option<reqwest::RequestBuilder> {
+        if self.replays_left == 0 {
+            return None;
+        }
+        let next = self.builder.try_clone()?;
+        self.replays_left -= 1;
+        if let Some(previous) = pump.take() {
+            previous.cancel_and_join().await;
+        }
+        let (body, next_pump) =
+            install_buffered_upload_write_watermark(self.body.clone(), self.write_timeout_ms);
+        *pump = next_pump;
+        Some(next.body(body))
+    }
+}
+
+/// Send a buffered reqwest upload, replaying it on an HTTP/2 protocol NACK
+/// (issue #4074), with every attempt raced against its own upload pump's
+/// backend write watermark.
+///
+/// `attempt` builds ONE dispatch future from a request builder — the caller's
+/// composed authorization/client deadline and response-header read bound live
+/// inside it, so this helper does not reinterpret either. `should_replay`
+/// inspects whatever shape that future resolved to and answers the ONE question
+/// this loop asks: did the backend prove it did not process the request? Call
+/// sites reach [`retry::reqwest_error_is_protocol_nack`] through it; anything
+/// else — a success, a deadline, a peer-gone, any other transport failure —
+/// ends the loop immediately.
+///
+/// `Err(())` means the backend write watermark fired, exactly as
+/// [`await_upload_write_watermark_first`] reports it, so call sites keep their
+/// existing match shape.
+///
+/// Why this exists: `install_buffered_upload_write_watermark` hands reqwest a
+/// STREAMING carrier, which makes `reqwest::Body::try_clone()` return `None` and
+/// silently disables reqwest's default `ProtocolNacks` replay for every buffered
+/// HTTP-family upload whenever `backend_write_timeout_ms` is live (the shipped
+/// default is `30000`). Ferrum still owns the collected buffer, so the replay is
+/// re-established here instead of being documented away. Each replay installs a
+/// FRESH pump (the previous one is cancelled and joined first), so the watermark
+/// stays per attempt rather than accumulating across them.
+pub(crate) async fn send_buffered_upload_with_protocol_nack_replay<F, Fut, A>(
+    mut builder: reqwest::RequestBuilder,
+    mut replay: Option<BufferedUploadReplay>,
+    pump: &mut Option<upload_pump::UploadPumpJoin>,
+    mut attempt: F,
+    should_replay: impl Fn(&A) -> bool,
+) -> Result<A, ()>
+where
+    F: FnMut(reqwest::RequestBuilder) -> Fut,
+    Fut: std::future::Future<Output = A>,
+{
+    loop {
+        let outcome = await_upload_write_watermark_first(attempt(builder), pump.as_mut()).await?;
+        if !should_replay(&outcome) {
+            return Ok(outcome);
+        }
+        let Some(source) = replay.as_mut() else {
+            return Ok(outcome);
+        };
+        let Some(next) = source.replay_after_protocol_nack(pump).await else {
+            return Ok(outcome);
+        };
+        builder = next;
+    }
 }
 
 /// Compose the admitted request's absolute authorization deadline over the
@@ -46768,7 +47316,7 @@ async fn proxy_to_backend_hbone_after_ready(
         &client_request_body,
         MeshClientRequestBody::Replayable { .. }
     );
-    let (mut parts, body) = match client_request_body {
+    let (mut parts, body, mut upload_pump) = match client_request_body {
         MeshClientRequestBody::Streaming(request) => {
             let (parts, body) = request.into_parts();
             let body = body::SizeLimitedIncoming::new_with_counter(
@@ -46780,17 +47328,18 @@ async fn proxy_to_backend_hbone_after_ready(
             // Full upload lifecycle for the UPLOAD direction (#3815): the
             // adapter deadline plus a gateway-owned pump, so the bound still
             // fires while this pooled connection task is parked and not
-            // polling the body. The join point is released here — the response
-            // streams past this dispatcher, so the upload's lifetime is the
-            // transport body's, bounded by `UploadPumpSource`'s abort guard —
-            // and the pump self-terminates at the deadline regardless.
-            let (body, _upload_pump) = install_streaming_upload_authorization(
+            // polling the body. Retain the join through the response-header
+            // wait so `backend_write_timeout_ms` is client-visible even when
+            // the transport is parked outside a body poll; after headers, the
+            // transport body and `UploadPumpSource` abort guard own teardown.
+            let (body, upload_pump) = install_streaming_upload_authorization(
                 body,
                 request_upload_auth_deadline(
                     ctx,
                     state.env_config.authenticated_stream_max_lifetime_seconds,
                 )
                 .as_ref(),
+                proxy.backend_write_timeout_ms,
             );
             let body = match ctx {
                 Some(c)
@@ -46804,7 +47353,7 @@ async fn proxy_to_backend_hbone_after_ready(
                 }
                 _ => body,
             };
-            (parts, http_body_util::Either::Left(body))
+            (parts, http_body_util::Either::Left(body), upload_pump)
         }
         MeshClientRequestBody::Replayable {
             body,
@@ -46813,10 +47362,21 @@ async fn proxy_to_backend_hbone_after_ready(
         } => {
             let (mut parts, ()) = Request::new(()).into_parts();
             parts.headers = headers;
-            (
-                parts,
-                http_body_util::Either::Right(body::ReplayableRequestBody::new(body, trailers)),
-            )
+            // Same backend write watermark the streaming arm installs
+            // (#4055). A replayable body is already collected, so the pump
+            // arms no second authorization lifetime — the response-header wait
+            // below still composes the admitted stream's deadline — but its
+            // DATA is sliced into bounded refcounted views so backpressure
+            // stays coupled to what the transport has actually taken, through
+            // the last byte and the validated terminal trailers frame.
+            // `backend_write_timeout_ms == 0` keeps the allocation-, task-,
+            // and timer-free direct path.
+            let (body, upload_pump) = body::ReplayableRequestBody::with_gateway_upload_pump(
+                body,
+                trailers,
+                proxy.backend_write_timeout_ms,
+            );
+            (parts, http_body_util::Either::Right(body), upload_pump)
         }
     };
     parts.uri = tunneled_uri;
@@ -46943,9 +47503,14 @@ async fn proxy_to_backend_hbone_after_ready(
     let send_bound = compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
     let send_fut = sender.send_request(backend_req);
     let response = if let Some(send_deadline) = send_bound.at {
-        match crate::plugins::await_deadline_first(Some(send_deadline), send_fut).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(err)) => {
+        let bounded = await_upload_write_watermark_first(
+            crate::plugins::await_deadline_first(Some(send_deadline), send_fut),
+            upload_pump.as_mut(),
+        )
+        .await;
+        match bounded {
+            Ok(Ok(Ok(response))) => Some(response),
+            Ok(Ok(Err(err))) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
                     return (
                         hbone_request_body_too_large_response(
@@ -46964,7 +47529,7 @@ async fn proxy_to_backend_hbone_after_ready(
                     None,
                 );
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
                     return (
                         hbone_request_body_too_large_response(
@@ -47002,11 +47567,12 @@ async fn proxy_to_backend_hbone_after_ready(
                     None,
                 );
             }
+            Err(()) => None,
         }
     } else {
-        match send_fut.await {
-            Ok(response) => response,
-            Err(err) => {
+        match await_upload_write_watermark_first(send_fut, upload_pump.as_mut()).await {
+            Ok(Ok(response)) => Some(response),
+            Ok(Err(err)) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
                     return (
                         hbone_request_body_too_large_response(
@@ -47025,6 +47591,40 @@ async fn proxy_to_backend_hbone_after_ready(
                     None,
                 );
             }
+            Err(()) => None,
+        }
+    };
+    let response = match response {
+        Some(response) => response,
+        None => {
+            if let Some(pump) = upload_pump.take() {
+                pump.cancel_and_join().await;
+            }
+            if body_size_exceeded.load(Ordering::Acquire) {
+                return (
+                    hbone_request_body_too_large_response(
+                        proxy,
+                        resolved_ip,
+                        None,
+                        effective_request_body_size_limit,
+                    ),
+                    None,
+                    None,
+                );
+            }
+            warn!(
+                proxy_id = %proxy.id,
+                watermark_ms = proxy.backend_write_timeout_ms,
+                "HBONE tunneled HTTP backend write watermark expired before response headers"
+            );
+            return (
+                http_backend_dispatch_error_response(
+                    retry::ErrorClass::ReadWriteTimeout,
+                    resolved_ip,
+                ),
+                None,
+                None,
+            );
         }
     };
 
@@ -47473,7 +48073,7 @@ async fn proxy_to_backend_unix(
         &client_request_body,
         MeshClientRequestBody::Replayable { .. }
     );
-    let (mut parts, body) = match client_request_body {
+    let (mut parts, body, mut upload_pump) = match client_request_body {
         MeshClientRequestBody::Streaming(request) => {
             let (parts, body) = request.into_parts();
             let body = body::SizeLimitedIncoming::new_with_counter(
@@ -47485,17 +48085,18 @@ async fn proxy_to_backend_unix(
             // Full upload lifecycle for the UPLOAD direction (#3815): the
             // adapter deadline plus a gateway-owned pump, so the bound still
             // fires while this pooled connection task is parked and not
-            // polling the body. The join point is released here — the response
-            // streams past this dispatcher, so the upload's lifetime is the
-            // transport body's, bounded by `UploadPumpSource`'s abort guard —
-            // and the pump self-terminates at the deadline regardless.
-            let (body, _upload_pump) = install_streaming_upload_authorization(
+            // polling the body. Retain the join through the response-header
+            // wait so `backend_write_timeout_ms` is client-visible even when
+            // the transport is parked outside a body poll; after headers, the
+            // transport body and `UploadPumpSource` abort guard own teardown.
+            let (body, upload_pump) = install_streaming_upload_authorization(
                 body,
                 request_upload_auth_deadline(
                     ctx,
                     state.env_config.authenticated_stream_max_lifetime_seconds,
                 )
                 .as_ref(),
+                proxy.backend_write_timeout_ms,
             );
             let body = match ctx {
                 Some(c)
@@ -47509,7 +48110,7 @@ async fn proxy_to_backend_unix(
                 }
                 _ => body,
             };
-            (parts, http_body_util::Either::Left(body))
+            (parts, http_body_util::Either::Left(body), upload_pump)
         }
         MeshClientRequestBody::Replayable {
             body,
@@ -47518,10 +48119,21 @@ async fn proxy_to_backend_unix(
         } => {
             let (mut parts, ()) = Request::new(()).into_parts();
             parts.headers = headers;
-            (
-                parts,
-                http_body_util::Either::Right(body::ReplayableRequestBody::new(body, trailers)),
-            )
+            // Same backend write watermark the streaming arm installs
+            // (#4055). A replayable body is already collected, so the pump
+            // arms no second authorization lifetime — the response-header wait
+            // below still composes the admitted stream's deadline — but its
+            // DATA is sliced into bounded refcounted views so backpressure
+            // stays coupled to what the transport has actually taken, through
+            // the last byte and the validated terminal trailers frame.
+            // `backend_write_timeout_ms == 0` keeps the allocation-, task-,
+            // and timer-free direct path.
+            let (body, upload_pump) = body::ReplayableRequestBody::with_gateway_upload_pump(
+                body,
+                trailers,
+                proxy.backend_write_timeout_ms,
+            );
+            (parts, http_body_util::Either::Right(body), upload_pump)
         }
     };
     parts.uri = origin_form_uri;
@@ -47658,9 +48270,14 @@ async fn proxy_to_backend_unix(
             let send_bound =
                 compose_dispatch_phase_auth_bound(read_deadline, send_auth_deadline.as_ref());
             if let Some(send_deadline) = send_bound.at {
-                match crate::plugins::await_deadline_first(Some(send_deadline), send_fut).await {
-                    Ok(result) => result,
-                    Err(_) => {
+                let bounded = await_upload_write_watermark_first(
+                    crate::plugins::await_deadline_first(Some(send_deadline), send_fut),
+                    upload_pump.as_mut(),
+                )
+                .await;
+                match bounded {
+                    Ok(Ok(result)) => Some(result),
+                    Ok(Err(_)) => {
                         if body_size_exceeded.load(Ordering::Acquire) {
                             return (
                                 unix_request_body_too_large_response(
@@ -47704,10 +48321,42 @@ async fn proxy_to_backend_unix(
                             None,
                         );
                     }
+                    Err(()) => None,
                 }
             } else {
-                send_fut.await
+                await_upload_write_watermark_first(send_fut, upload_pump.as_mut())
+                    .await
+                    .ok()
             }
+        };
+        let Some(send_result) = send_result else {
+            if let Some(pump) = upload_pump.take() {
+                pump.cancel_and_join().await;
+            }
+            if body_size_exceeded.load(Ordering::Acquire) {
+                return (
+                    unix_request_body_too_large_response(
+                        proxy,
+                        resolved_ip,
+                        effective_request_body_size_limit,
+                    ),
+                    None,
+                    None,
+                );
+            }
+            warn!(
+                proxy_id = %proxy.id,
+                watermark_ms = proxy.backend_write_timeout_ms,
+                "Unix backend write watermark expired before response headers"
+            );
+            return (
+                http_backend_dispatch_error_response(
+                    retry::ErrorClass::ReadWriteTimeout,
+                    resolved_ip,
+                ),
+                None,
+                None,
+            );
         };
         match send_result {
             Ok(response) => break response,
@@ -48959,7 +49608,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
         &client_request_body,
         MeshClientRequestBody::Replayable { .. }
     );
-    let (mut parts, body) = match client_request_body {
+    let (mut parts, body, mut upload_pump) = match client_request_body {
         MeshClientRequestBody::Streaming(request) => {
             let (parts, body) = request.into_parts();
             let body = body::SizeLimitedIncoming::new_with_counter(
@@ -48971,17 +49620,18 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
             // Full upload lifecycle for the UPLOAD direction (#3815): the
             // adapter deadline plus a gateway-owned pump, so the bound still
             // fires while this pooled connection task is parked and not
-            // polling the body. The join point is released here — the response
-            // streams past this dispatcher, so the upload's lifetime is the
-            // transport body's, bounded by `UploadPumpSource`'s abort guard —
-            // and the pump self-terminates at the deadline regardless.
-            let (body, _upload_pump) = install_streaming_upload_authorization(
+            // polling the body. Retain the join through the response-header
+            // wait so `backend_write_timeout_ms` is client-visible even when
+            // the transport is parked outside a body poll; after headers, the
+            // transport body and `UploadPumpSource` abort guard own teardown.
+            let (body, upload_pump) = install_streaming_upload_authorization(
                 body,
                 request_upload_auth_deadline(
                     Some(request_ctx),
                     state.env_config.authenticated_stream_max_lifetime_seconds,
                 )
                 .as_ref(),
+                proxy.backend_write_timeout_ms,
             );
             let body = if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
                 &request_ctx.metadata,
@@ -48992,7 +49642,11 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
             } else {
                 body
             };
-            (parts, mesh_mtls_pool::MeshMtlsRequestBody::Streaming(body))
+            (
+                parts,
+                mesh_mtls_pool::MeshMtlsRequestBody::Streaming(body),
+                upload_pump,
+            )
         }
         MeshClientRequestBody::Replayable {
             body,
@@ -49001,11 +49655,24 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
         } => {
             let (mut parts, ()) = Request::new(()).into_parts();
             parts.headers = headers;
+            // Same backend write watermark the streaming arm installs
+            // (#4055). A replayable body is already collected, so the pump
+            // arms no second authorization lifetime — the response-header wait
+            // below still composes the admitted stream's deadline — but its
+            // DATA is sliced into bounded refcounted views so backpressure
+            // stays coupled to what the transport has actually taken, through
+            // the last byte and the validated terminal trailers frame.
+            // `backend_write_timeout_ms == 0` keeps the allocation-, task-,
+            // and timer-free direct path.
+            let (body, upload_pump) = body::ReplayableRequestBody::with_gateway_upload_pump(
+                body,
+                trailers,
+                proxy.backend_write_timeout_ms,
+            );
             (
                 parts,
-                mesh_mtls_pool::MeshMtlsRequestBody::Replayable(body::ReplayableRequestBody::new(
-                    body, trailers,
-                )),
+                mesh_mtls_pool::MeshMtlsRequestBody::Replayable(body),
+                upload_pump,
             )
         }
     };
@@ -49162,9 +49829,14 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
         send_auth_deadline.as_ref(),
     );
     let send_result = if let Some(deadline) = send_bound.at {
-        match crate::plugins::await_deadline_first(Some(deadline), send_fut).await {
-            Ok(result) => result,
-            Err(_) => {
+        let bounded = await_upload_write_watermark_first(
+            crate::plugins::await_deadline_first(Some(deadline), send_fut),
+            upload_pump.as_mut(),
+        )
+        .await;
+        match bounded {
+            Ok(Ok(result)) => Some(result),
+            Ok(Err(_)) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
                     return (
                         mesh_mtls_request_body_too_large_response(
@@ -49230,9 +49902,47 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                     None,
                 );
             }
+            Err(()) => None,
         }
     } else {
-        send_fut.await
+        await_upload_write_watermark_first(send_fut, upload_pump.as_mut())
+            .await
+            .ok()
+    };
+    let Some(send_result) = send_result else {
+        if let Some(pump) = upload_pump.take() {
+            pump.cancel_and_join().await;
+        }
+        if body_size_exceeded.load(Ordering::Acquire) {
+            return (
+                mesh_mtls_request_body_too_large_response(
+                    proxy,
+                    resolved_ip,
+                    is_grpc_flavored,
+                    request_body_limit,
+                ),
+                None,
+                None,
+            );
+        }
+        warn!(
+            proxy_id = %proxy.id,
+            watermark_ms = proxy.backend_write_timeout_ms,
+            is_grpc_flavored,
+            "sidecar mTLS backend write watermark expired before response headers"
+        );
+        return (
+            if is_grpc_flavored {
+                mesh_grpc_deadline_exceeded_response(resolved_ip)
+            } else {
+                http_backend_dispatch_error_response(
+                    retry::ErrorClass::ReadWriteTimeout,
+                    resolved_ip,
+                )
+            },
+            None,
+            None,
+        );
     };
     let response = match send_result {
         Ok(response) => response,
@@ -49813,8 +50523,11 @@ async fn proxy_to_backend_http2(
             // exit. Once that join returns, the pump task has published its
             // outcome, which it does after dropping the inbound client body: no
             // gateway-owned upload survives this function.
-            let (body, upload_pump) =
-                install_streaming_upload_authorization(body, upload_auth_deadline.as_ref());
+            let (body, upload_pump) = install_streaming_upload_authorization(
+                body,
+                upload_auth_deadline.as_ref(),
+                proxy.backend_write_timeout_ms,
+            );
             (
                 body::DirectH2RequestBody::Limited(body),
                 Some(completion_rx),
@@ -49831,7 +50544,16 @@ async fn proxy_to_backend_http2(
             )
             .with_cancel(cancel_rx)
             .with_grpc_message_counter(messages);
-            (body::DirectH2RequestBody::Limited(body), None, None)
+            // No auth plan on this arm, but a live `backend_write_timeout_ms`
+            // still needs its watermark (issue #4055): the adapter exists
+            // here, so the pump can be installed. `cancel_on_drop` stays
+            // DISARMED — like the pre-#4020 unauthenticated arm, this
+            // dispatcher returns at response headers with the upload still
+            // in flight, and arming it would truncate a healthy full-duplex
+            // response.
+            let (body, upload_pump) =
+                install_streaming_upload_authorization(body, None, proxy.backend_write_timeout_ms);
+            (body::DirectH2RequestBody::Limited(body), None, upload_pump)
         } else {
             // Unlimited, unauthenticated, no gRPC observation: forward
             // `Incoming` directly. Cancel stays armed so an early return after
@@ -50079,11 +50801,28 @@ async fn proxy_to_backend_http2(
         ),
         upload_auth_deadline.as_ref(),
     );
+    // The gateway-owned pump's backend write watermark is raced against BOTH
+    // header-wait shapes below. Direct-H2 is the sharpest case for it: hyper's
+    // `PipeToSendStream` parks in `poll_capacity` when the backend stops
+    // granting flow-control credit, so it never polls the transport body and
+    // never observes the pump's terminal error. Without this arm a configured
+    // `backend_write_timeout_ms` was invisible until `backend_read_timeout_ms`
+    // expired (#4055).
+    let mut header_write_watermark_expired = false;
     let response = if let Some((deadline, deadline_source)) = header_deadline {
-        match crate::plugins::await_deadline_first(Some(deadline), h2_send_fut).await {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => return map_h2_err(e),
-            Err(_) => {
+        let bounded = await_upload_write_watermark_first(
+            crate::plugins::await_deadline_first(Some(deadline), h2_send_fut),
+            upload_pump.as_mut(),
+        )
+        .await;
+        match bounded {
+            Ok(Ok(Ok(resp))) => Some(resp),
+            Ok(Ok(Err(e))) => return map_h2_err(e),
+            Err(()) => {
+                header_write_watermark_expired = true;
+                None
+            }
+            Ok(Err(_)) => {
                 // The request body already moved into hyper's detached HTTP/2
                 // pipe task when `send_request` was called, so returning here
                 // does not by itself stop the upload. Two things do.
@@ -50153,9 +50892,47 @@ async fn proxy_to_backend_http2(
             }
         }
     } else {
-        match h2_send_fut.await {
-            Ok(resp) => resp,
-            Err(e) => return map_h2_err(e),
+        let bounded = await_upload_write_watermark_first(h2_send_fut, upload_pump.as_mut()).await;
+        match bounded {
+            Ok(Ok(resp)) => Some(resp),
+            Ok(Err(e)) => return map_h2_err(e),
+            Err(()) => {
+                header_write_watermark_expired = true;
+                None
+            }
+        }
+    };
+    // One terminal for both header-wait shapes. The upload is stopped first —
+    // `cancel_and_join` resolves only after the pump published its outcome,
+    // which it does after dropping the inbound client body — so the gateway
+    // owns no part of the upload once this returns. Nothing was committed
+    // downstream, and the authoritative 413 still wins over a transport
+    // classification.
+    let response = match response {
+        Some(response) => response,
+        None => {
+            debug_assert!(header_write_watermark_expired);
+            if let Some(cancel_tx) = body_cancel_tx.take() {
+                let _ = cancel_tx.send(());
+            }
+            if let Some(pump) = upload_pump.take() {
+                pump.cancel_and_join().await;
+            }
+            if body_size_exceeded.load(std::sync::atomic::Ordering::Acquire) {
+                return request_body_too_large();
+            }
+            warn!(
+                proxy_id = %proxy.id,
+                "HTTP/2: backend stopped reading the request body ({}ms write watermark) before response headers",
+                proxy.backend_write_timeout_ms
+            );
+            return (
+                http_backend_dispatch_error_response(
+                    retry::ErrorClass::ReadWriteTimeout,
+                    resolved_ip,
+                ),
+                None,
+            );
         }
     };
 
@@ -50186,14 +50963,20 @@ async fn proxy_to_backend_http2(
         );
         let outcome = match upload_bound {
             Some((upload_deadline, bound_kind)) => {
-                match crate::plugins::await_deadline_first(
-                    Some(upload_deadline),
-                    body_completion_rx,
+                let joined = await_upload_write_watermark_first(
+                    crate::plugins::await_deadline_first(Some(upload_deadline), body_completion_rx),
+                    upload_pump.as_mut(),
                 )
-                .await
-                {
-                    Ok(received) => received.ok(),
-                    Err(_) => {
+                .await;
+                match joined {
+                    Ok(Ok(received)) => received.ok(),
+                    // The backend answered early and then stopped reading. The
+                    // pump has already published its terminal and released the
+                    // client body, so fall through to the join + gate below,
+                    // which reads that typed terminal and returns a
+                    // deterministic 504 / `ReadWriteTimeout` (#4055).
+                    Err(()) => None,
+                    Ok(Err(_)) => {
                         // `send_request` has already yielded response headers, so
                         // hyper moved the request body into a detached H2 pipe
                         // task. Dropping this handler or the response does not
@@ -50282,7 +51065,15 @@ async fn proxy_to_backend_http2(
             // the upload holds this request until the client body terminates or
             // the connection drops. Do not add a hidden floor here — that would
             // silently break the documented contract.
-            None => body_completion_rx.await.ok(),
+            None => {
+                let joined =
+                    await_upload_write_watermark_first(body_completion_rx, upload_pump.as_mut())
+                        .await;
+                match joined {
+                    Ok(received) => received.ok(),
+                    Err(()) => None,
+                }
+            }
         };
         // Normal completion: dropping the sender makes the adapter stop
         // polling the cancellation channel without changing its outcome.
@@ -50292,28 +51083,60 @@ async fn proxy_to_backend_http2(
         // belongs to. A pump that already finished resolves immediately; one
         // whose adapter reported a terminal state without the pump having
         // observed it yet (an authorization expiry seen first on the adapter
-        // side) is stopped here.
-        if let Some(pump) = upload_pump.take() {
-            pump.cancel_and_join().await;
-        }
-        match classify_direct_h2_upload_outcome(outcome) {
+        // side) is stopped here. The join's own outcome is KEPT: the adapter
+        // collapses the pump's write-watermark expiry into a transport error, so
+        // the typed terminal is what distinguishes a backend write stall (504
+        // `ReadWriteTimeout`) from an indeterminate size decision (502).
+        let pump_outcome = if let Some(pump) = upload_pump.take() {
+            pump.cancel_and_join().await
+        } else {
+            None
+        };
+        // A `WriteTimeout` pump terminal only proves that the write watermark
+        // won at the pump's last poll. The absolute authorization deadline can
+        // elapse before this dispatcher commits its replacement response, so
+        // recheck it here and publish the same once-only latch every other
+        // upload seam uses. The gate keeps authoritative 413 precedence, then
+        // makes this security decision win over transport classification.
+        let authorization_expired =
+            upload_auth_deadline
+                .as_ref()
+                .is_some_and(|(plan, family, latch)| {
+                    if latch.observed().is_some() {
+                        return true;
+                    }
+                    let Some(termination) =
+                        crate::proxy::auth_lifetime::expired_authorization(Some(*plan))
+                    else {
+                        return false;
+                    };
+                    latch.record_once(termination, *family);
+                    true
+                });
+        match classify_direct_h2_upload_outcome(outcome, pump_outcome, authorization_expired) {
             DirectH2UploadGate::Forward => {}
             DirectH2UploadGate::RequestBodyTooLarge => return request_body_too_large(),
+            DirectH2UploadGate::AuthorizationExpired => {
+                return (
+                    authorization_expired_dispatch_placeholder(resolved_ip),
+                    None,
+                );
+            }
+            DirectH2UploadGate::BackendWriteTimeout => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    "HTTP/2: backend response arrived before the upload finished, then the backend stopped reading the request body ({}ms)",
+                    proxy.backend_write_timeout_ms
+                );
+                return (
+                    http_backend_dispatch_error_response(
+                        retry::ErrorClass::ReadWriteTimeout,
+                        resolved_ip,
+                    ),
+                    None,
+                );
+            }
             DirectH2UploadGate::FailClosed => {
-                // An upload the AUTHORIZATION deadline ended reports `Abandoned`
-                // too, but it is the gateway's own security decision rather than
-                // an indeterminate size outcome. Report it as such — health-neutral
-                // and already latched/counted by the adapter — instead of a 502.
-                if upload_auth_deadline
-                    .as_ref()
-                    .and_then(|(_, _, latch)| latch.observed())
-                    .is_some()
-                {
-                    return (
-                        authorization_expired_dispatch_placeholder(resolved_ip),
-                        None,
-                    );
-                }
                 error!(
                     proxy_id = %proxy.id,
                     outcome = ?outcome,

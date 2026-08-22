@@ -28,7 +28,8 @@
 #![allow(clippy::bool_assert_comparison)]
 
 use crate::scaffolding::backends::{
-    H2Step, H3Step, H3TlsConfig, MatchHeaders, QuicRefuser, ScriptedH2Backend, ScriptedH3Backend,
+    H2Step, H3Step, H3TlsConfig, HttpStep, MatchHeaders, QuicRefuser, RequestMatcher,
+    ScriptedH2Backend, ScriptedH3Backend, ScriptedHttp1Backend, ScriptedTcpBackend,
     ScriptedTlsBackend, TcpStep, TlsConfig,
 };
 use crate::scaffolding::certs::TestCa;
@@ -37,8 +38,10 @@ use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::{
     reserve_colocated_tcp_udp, reserve_port, reserve_refused_tcp_port,
 };
+use crate::scaffolding::to_file_mode_yaml;
+use bytes::Bytes;
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Spawn a protocol-honest H2-only TLS responder for capability probes,
 /// reqwest warmup, and H3 cross-protocol bridge requests.
@@ -5025,4 +5028,225 @@ async fn h3_streaming_grpc_named_trailer_from_a_plain_backend_is_not_exempt() {
     );
     assert_eq!(resp.trailer("grpc-message"), None);
     assert_eq!(resp.trailer("x-backend-finished"), None);
+}
+
+fn assert_timeout_envelope(elapsed: Duration, timeout_ms: u64) {
+    let expected = Duration::from_millis(timeout_ms);
+    let floor = expected.saturating_sub(Duration::from_millis(200));
+    let ceiling = expected + Duration::from_millis(1500);
+    assert!(
+        elapsed >= floor,
+        "timed out too fast: {elapsed:?} < floor {floor:?} (timeout was {timeout_ms}ms)"
+    );
+    assert!(
+        elapsed <= ceiling,
+        "timed out too slowly: {elapsed:?} > ceiling {ceiling:?} (timeout was {timeout_ms}ms)"
+    );
+}
+
+fn has_read_write_timeout_class(logs: &str) -> bool {
+    logs.contains("\"body_error_class\":\"read_write_timeout\"")
+        || logs.contains("\\\"body_error_class\\\":\\\"read_write_timeout\\\"")
+        || logs.contains("\"error_class\":\"read_write_timeout\"")
+        || logs.contains("\\\"error_class\\\":\\\"read_write_timeout\\\"")
+}
+
+fn h3_http_backend_timeout_yaml(port: u16, read_timeout_ms: u64, write_timeout_ms: u64) -> String {
+    to_file_mode_yaml(&json!({
+        "version": "1",
+        "proxies": [{
+            "id": "scripted-h3",
+            "listen_path": "/api",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": read_timeout_ms,
+            "backend_write_timeout_ms": write_timeout_ms,
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "access-log",
+            "plugin_name": "stdout_logging",
+            "config": {},
+            "scope": "global",
+            "enabled": true,
+        }],
+    }))
+}
+
+const H3_UPLOAD_STALL_BYTES: usize = 8 * 1024 * 1024;
+const H3_SSE_FIRST_EVENT: &[u8] = b"data: hello\r\n\n";
+// Pin the listener before accept so the backend cannot autotune a large receive
+// window. The upload remains larger than ordinary sender buffers, guaranteeing
+// that a backend which never reads eventually backpressures the upload pump.
+const BACKEND_RECEIVE_BUFFER_BYTES: usize = 1024;
+
+// #4055 H3 frontend → HTTP backend that accepts and never reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_backend_write_timeout_maps_to_504() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .receive_buffer_size(BACKEND_RECEIVE_BUFFER_BYTES)
+        .step(TcpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let write_timeout_ms: u64 = 800;
+    let yaml = h3_http_backend_timeout_yaml(backend_port, 8_000, write_timeout_ms);
+    let (harness, _ca, https_port) =
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, false, None).await;
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/twrite");
+    let started = Instant::now();
+    let result = client
+        .post_bytes(&url, Bytes::from(vec![b'x'; H3_UPLOAD_STALL_BYTES]))
+        .await;
+    let elapsed = started.elapsed();
+    assert_timeout_envelope(elapsed, write_timeout_ms);
+    match result {
+        Ok(resp) => {
+            assert_eq!(
+                resp.status.as_u16(),
+                504,
+                "H3 write timeout must be 504, got {} body={:?}",
+                resp.status.as_u16(),
+                resp.body_text()
+            );
+            let gw = resp
+                .headers
+                .get("x-gateway-error")
+                .and_then(|v| v.to_str().ok());
+            assert_eq!(gw, Some("backend_timeout"));
+            assert!(
+                resp.body_text().contains("Backend timeout"),
+                "timeout body={:?}",
+                resp.body_text()
+            );
+        }
+        Err(err) => {
+            // H3 clients can observe a stream reset (status 0) once headers
+            // cannot be committed. Timing + classification still bind.
+            let _ = err;
+        }
+    }
+
+    let logs = harness
+        .wait_for_log_contains(&has_read_write_timeout_class, Duration::from_secs(5))
+        .await;
+    assert!(
+        has_read_write_timeout_class(&logs),
+        "H3 write timeout must classify as read_write_timeout; logs:\n{logs}"
+    );
+}
+
+// #4057 H3 frontend → HTTP SSE stall after the first event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_sse_stall_after_first_event_classifies_read_write_timeout() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        // Drain the request before answering. Unlike the H1/H2 arms of this
+        // matrix — where the gateway forwards a bodiless GET as a bodiless
+        // request — the H3 bridge always hands reqwest a STREAMING request
+        // body, so a backend that answers without ever reading is a
+        // simultaneous early-response/unread-upload case rather than the plain
+        // response stall #4057 is about. `TrickleBody`, used by the
+        // progressing-SSE sibling below, consumes the request implicitly for
+        // the same reason.
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Type".into(),
+            value: "text/event-stream".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(H3_SSE_FIRST_EVENT.to_vec()))
+        .step(HttpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn");
+
+    let read_timeout_ms: u64 = 800;
+    let yaml = h3_http_backend_timeout_yaml(backend_port, read_timeout_ms, 5_000);
+    let (harness, _ca, https_port) =
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, false, None).await;
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/ssestall");
+    let started = Instant::now();
+    let resp = client
+        .get_with_options(
+            &url,
+            GetOptions::default().header("accept", "text/event-stream"),
+        )
+        .await
+        .expect("H3 SSE headers");
+    let elapsed = started.elapsed();
+    assert_eq!(resp.status.as_u16(), 200, "body={:?}", resp.body_text());
+    assert!(
+        resp.body_text().contains("data: hello"),
+        "first SSE event missing from {:?}",
+        resp.body_text()
+    );
+    assert!(
+        resp.body_error.is_some(),
+        "committed SSE stall must abort the body, not finish cleanly; \
+         body_error={:?} body={:?}",
+        resp.body_error,
+        resp.body_text()
+    );
+    assert_timeout_envelope(elapsed, read_timeout_ms);
+
+    let logs = harness
+        .wait_for_log_contains(&has_read_write_timeout_class, Duration::from_secs(5))
+        .await;
+    assert!(
+        has_read_write_timeout_class(&logs),
+        "H3 SSE stall must classify as read_write_timeout; logs:\n{logs}"
+    );
+}
+
+// Slow-but-progressing SSE over H3 must complete under an 800ms idle watermark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_progressing_sse_survives_idle_read_timeout() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let body = b"data: a\n\ndata: b\n\ndata: c\n\n".to_vec();
+    let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::TrickleBody {
+            status: 200,
+            reason: "OK".into(),
+            headers: vec![("Content-Type".into(), "text/event-stream".into())],
+            body,
+            chunk_size: 8,
+            pause: Duration::from_millis(200),
+        })
+        .spawn()
+        .expect("spawn");
+
+    let yaml = h3_http_backend_timeout_yaml(backend_port, 800, 5_000);
+    let (_harness, _ca, https_port) =
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, false, None).await;
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/ssetrickle");
+    let resp = client.get(&url).await.expect("progressing SSE");
+    assert_eq!(resp.status.as_u16(), 200);
+    assert!(
+        resp.body_error.is_none(),
+        "progressing SSE must complete; body_error={:?} body={:?}",
+        resp.body_error,
+        resp.body_text()
+    );
+    let text = resp.body_text();
+    assert!(
+        text.contains("data: a") && text.contains("data: c"),
+        "progressing SSE body truncated: {text:?}"
+    );
 }

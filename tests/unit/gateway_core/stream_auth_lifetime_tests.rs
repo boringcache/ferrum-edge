@@ -9,9 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ferrum_edge::_test_support::{
-    BufferedUploadWaitOutcomeForTest, DtlsAuthorizationExpiryForTest, EarlyUploadBoundKind,
-    H3AuthorizedHeadersWrite, H3BackendOrPeerForTest, H3UploadWaitOutcomeForTest,
-    PrecommitPhaseOutcomeForTest, ProbePumpOutcome, ProbeTransportPoll,
+    BufferedUploadPumpProbe, BufferedUploadWaitOutcomeForTest, DtlsAuthorizationExpiryForTest,
+    EarlyUploadBoundKind, GrpcBufferedUploadPumpProbe, H3AuthorizedHeadersWrite,
+    H3BackendOrPeerForTest, H3UploadWaitOutcomeForTest, PrecommitPhaseOutcomeForTest,
+    ProbePumpOutcome, ProbeReplayFrame, ProbeTransportPoll, ReplayableUploadPumpProbe,
     ResponseCollectBoundForTest, StreamIoSide, UploadPumpProbe,
     attribute_dispatch_phase_bound_for_test, authorization_bounded_header_deadline_for_test,
     authorization_expired_dispatch_placeholder_for_test,
@@ -19,6 +20,7 @@ use ferrum_edge::_test_support::{
     await_authorized_headers_write_for_test, await_deadline_first_for_test,
     await_h3_backend_or_peer_for_test, await_precommit_response_phase_for_test,
     bidirectional_copy_with_authorization_for_test,
+    buffered_upload_protocol_nack_replay_attempts_for_test, buffered_upload_protocol_nack_replays,
     collect_buffered_upload_under_authorization_for_test,
     collect_buffered_upload_under_composed_bound_for_test,
     collect_h3_upload_under_authorization_for_test, compose_aggregate_sse_bound_for_test,
@@ -2191,19 +2193,40 @@ fn the_direct_h2_upload_completion_gate_is_installed_for_authenticated_requests(
 
 #[test]
 fn the_direct_h2_upload_join_reports_authorization_rather_than_an_indeterminate_size() {
-    // An authorization-terminated upload also reports `Abandoned`, which the
-    // size gate classifies as FailClosed. That must not surface as a 502
-    // backend fault.
-    let fail_closed = PROXY_SOURCE
-        .split("DirectH2UploadGate::FailClosed => {")
+    // A write timeout can win at the pump's last poll immediately before the
+    // credential expires. The dispatcher must recheck the absolute deadline
+    // and route the typed authorization gate before its timeout/502 arms.
+    let authorization = PROXY_SOURCE
+        .split("DirectH2UploadGate::AuthorizationExpired => {")
         .nth(1)
-        .expect("direct-H2 fail-closed arm")
-        .split("\"HTTP/2 request upload did not establish an authoritative size decision")
+        .expect("direct-H2 authorization-expired arm")
+        .split("DirectH2UploadGate::BackendWriteTimeout => {")
         .next()
-        .expect("bounded fail-closed arm");
-    assert!(fail_closed.contains("upload_auth_deadline"));
-    assert!(fail_closed.contains("latch.observed()"));
-    assert!(fail_closed.contains("authorization_expired_dispatch_placeholder("));
+        .expect("bounded authorization-expired arm");
+    assert!(authorization.contains("authorization_expired_dispatch_placeholder("));
+    // The recheck itself, bounded by its own binding rather than pinned to one
+    // line. rustfmt is free to move `upload_auth_deadline` onto the next line
+    // (and has), so a single-line `contains` would be a formatting contract,
+    // not a semantic one.
+    let recheck = PROXY_SOURCE
+        .split("let authorization_expired =")
+        .nth(1)
+        .expect("direct-H2 pre-commit authorization recheck")
+        .split("match classify_direct_h2_upload_outcome(")
+        .next()
+        .expect("bounded authorization recheck");
+    assert!(
+        recheck.contains("upload_auth_deadline"),
+        "the recheck must read the request's own absolute plan: {recheck}"
+    );
+    assert!(
+        recheck.contains("latch.observed().is_some()"),
+        "an expiry already latched elsewhere must short-circuit: {recheck}"
+    );
+    assert!(
+        recheck.contains("auth_lifetime::expired_authorization(Some(*plan))"),
+        "the recheck must consult the absolute deadline, not a cached flag: {recheck}"
+    );
 }
 
 #[test]
@@ -2811,6 +2834,764 @@ fn the_upload_bridge_is_bounded_rather_than_a_buffer() {
     );
 }
 
+// --- Backend write watermark on a BUFFERED upload (#4055) -------------------
+//
+// A buffered reqwest upload has no body adapter, so before #4055's repair the
+// dispatcher held no pump at all and a backend that accepted and never read ran
+// on to `backend_read_timeout_ms`. These hold the transport side and
+// DELIBERATELY DO NOT DRAIN IT, which is what a reqwest connection task parked
+// on socket writability looks like.
+
+#[tokio::test(start_paused = true)]
+async fn the_backend_write_watermark_ends_a_buffered_upload_the_transport_stopped_taking() {
+    let mut probe = BufferedUploadPumpProbe::start(1024 * 1024, 800).expect("buffered pump");
+
+    // The watermark arms on the transport's FIRST body poll (#4074), which is
+    // the first moment reqwest provably owns a connection and is writing this
+    // request. One poll, then nothing — a socket whose peer stopped reading
+    // once the kernel buffers filled.
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Data(_) | ProbeTransportPoll::Pending
+    ));
+
+    // A much longer response-header wait, i.e. the operator's read watermark.
+    // The write watermark has to win it, or the request ends on the wrong bound.
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "backend_write_timeout_ms must end the header wait before backend_read_timeout_ms"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
+
+    match probe.poll_transport_once() {
+        ProbeTransportPoll::Errored(message) => assert!(
+            message.contains("backend request body write timeout"),
+            "unexpected termination message: {message}"
+        ),
+        other => panic!("expected a transport error, got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_buffered_upload_crosses_the_bridge_in_bounded_slices_not_one_giant_frame() {
+    let frame = BufferedUploadPumpProbe::frame_size();
+    let total = frame * 3 + 7;
+    // Long enough that the watermark cannot fire while the transport drains.
+    let mut probe = BufferedUploadPumpProbe::start(total, 600_000).expect("buffered pump");
+    assert_eq!(
+        probe.declared_content_length(),
+        Some(total as u64),
+        "the bridge must not degrade a known Content-Length"
+    );
+
+    let mut sizes = Vec::new();
+    for _ in 0..64 {
+        match probe.poll_transport_once() {
+            ProbeTransportPoll::Data(len) => sizes.push(len),
+            ProbeTransportPoll::Pending => tokio::task::yield_now().await,
+            ProbeTransportPoll::Ended => break,
+            other => panic!("unexpected transport poll: {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        sizes.iter().sum::<usize>(),
+        total,
+        "every buffered byte must cross the bridge: {sizes:?}"
+    );
+    assert_eq!(
+        sizes,
+        vec![frame, frame, frame, 7],
+        "the source must be sliced so backpressure stays coupled to the transport"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_partly_drained_buffered_upload_still_ends_on_the_write_watermark() {
+    let frame = BufferedUploadPumpProbe::frame_size();
+    let mut probe = BufferedUploadPumpProbe::start(frame * 4, 800).expect("buffered pump");
+    // The transport takes one frame and then stops, exactly as a socket whose
+    // peer stopped reading does once the kernel buffers fill.
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Data(_) | ProbeTransportPoll::Pending
+    ));
+
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "the watermark must still fire once the transport stops taking frames"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
+}
+
+#[test]
+fn a_zero_backend_write_timeout_keeps_the_reusable_buffered_body() {
+    assert!(
+        BufferedUploadPumpProbe::start(1024 * 1024, 0).is_none(),
+        "the operator opt-out must install no task, channel, or timer"
+    );
+}
+
+#[test]
+fn an_empty_buffered_upload_installs_no_pump() {
+    assert!(
+        BufferedUploadPumpProbe::start(0, 800).is_none(),
+        "an empty upload must stay end-of-stream at headers"
+    );
+}
+
+// --- Backend write watermark on a REPLAYABLE upload (#4055) ----------------
+//
+// The buffered/body-policy/retry-replay bodies dispatched by the specialized
+// HBONE HTTP/1, Unix HTTP/1, and sidecar-mTLS HTTP/2 transports had no pump at
+// all before this repair, so a backend that accepted and never read bypassed
+// `backend_write_timeout_ms` entirely on those paths. As above, the transport
+// side is held and DELIBERATELY NOT DRAINED: an HTTP/2 pipe parked in
+// `poll_capacity`, or an HTTP/1 connection task parked on socket writability.
+
+#[tokio::test(start_paused = true)]
+async fn the_backend_write_watermark_ends_a_replayable_upload_the_transport_stopped_taking() {
+    let mut probe = ReplayableUploadPumpProbe::start(1024 * 1024, &[], 800);
+    assert!(probe.pumped(), "a live write watermark must install a pump");
+
+    // One transport poll arms the watermark (#4074) — the pooled sender exists
+    // and the request head is written. Then the transport stops taking frames.
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeReplayFrame::Data(_) | ProbeReplayFrame::Pending
+    ));
+
+    // A much longer response-header wait, i.e. the operator's read watermark.
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "backend_write_timeout_ms must end the header wait before backend_read_timeout_ms"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
+
+    match probe.poll_transport_once() {
+        ProbeReplayFrame::Errored(message) => assert!(
+            message.contains("backend request body write timeout"),
+            "unexpected termination message: {message}"
+        ),
+        other => panic!("expected a transport error, got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_replayable_upload_crosses_the_bridge_in_bounded_slices_not_one_giant_frame() {
+    let frame = ReplayableUploadPumpProbe::frame_size();
+    let total = frame * 3 + 11;
+    // Long enough that the watermark cannot fire while the transport drains.
+    let mut probe = ReplayableUploadPumpProbe::start(total, &[], 600_000);
+    assert_eq!(
+        probe.declared_content_length(),
+        Some(total as u64),
+        "the bridge must not degrade the replayable body's exact Content-Length"
+    );
+
+    let frames = probe.drain_transport(64).await;
+    let sizes: Vec<usize> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            ProbeReplayFrame::Data(len) => Some(*len),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sizes,
+        vec![frame, frame, frame, 11],
+        "the source must be sliced so backpressure stays coupled to the transport: {frames:?}"
+    );
+    assert_eq!(
+        frames.last(),
+        Some(&ProbeReplayFrame::Ended),
+        "a fully drained upload must end cleanly: {frames:?}"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pumped_replayable_upload_preserves_its_terminal_trailers_after_the_data() {
+    let frame = ReplayableUploadPumpProbe::frame_size();
+    let mut probe = ReplayableUploadPumpProbe::start(
+        frame + 5,
+        &[("grpc-status", "0"), ("grpc-message", "ok")],
+        600_000,
+    );
+    assert!(probe.pumped());
+    assert_eq!(
+        probe.declared_content_length(),
+        Some((frame + 5) as u64),
+        "trailers carry no DATA bytes, so the declared length is unchanged"
+    );
+
+    let frames = probe.drain_transport(64).await;
+    assert_eq!(
+        frames,
+        vec![
+            ProbeReplayFrame::Data(frame),
+            ProbeReplayFrame::Data(5),
+            ProbeReplayFrame::Trailers(vec![
+                ("grpc-status".to_string(), "0".to_string()),
+                ("grpc-message".to_string(), "ok".to_string()),
+            ]),
+            ProbeReplayFrame::Ended,
+        ],
+        "validated gRPC-Web trailers must survive the bridge, strictly after the DATA"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_replayable_upload_with_only_trailers_is_still_pumped_and_still_watermarked() {
+    let mut probe = ReplayableUploadPumpProbe::start(0, &[("grpc-status", "0")], 800);
+    assert!(
+        probe.pumped(),
+        "an empty body with trailers is transport work, not a no-work opt-out"
+    );
+    assert!(
+        !probe.is_end_stream(),
+        "a trailers-only replayable upload must not be framed as end-of-stream at headers"
+    );
+    assert_eq!(
+        probe.declared_content_length(),
+        Some(0),
+        "a trailers-only upload still declares an exact zero-length body"
+    );
+    // Connect phase: the dispatcher built this body before checking out a
+    // sender, so nothing has polled it. The watermark must stay dormant rather
+    // than charge connection acquisition to a write policy (#4074).
+    assert!(
+        probe
+            .write_watermark_stays_dormant(Duration::from_secs(5))
+            .await,
+        "an unpolled upload must not fire the backend write watermark"
+    );
+    // Once the transport takes the terminal trailers frame there is nothing
+    // left for the gateway to hand over, so the pump completes rather than
+    // stalling: the watermark bounds work that REMAINS, never a finished one.
+    assert_eq!(
+        probe.poll_transport_once(),
+        ProbeReplayFrame::Trailers(vec![("grpc-status".to_string(), "0".to_string())])
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+// --- The write watermark starts at transport consumption (#4074) -----------
+//
+// The pump is installed before reqwest has resolved DNS, opened a socket, or
+// finished a TLS handshake. Arming `backend_write_timeout_ms` at spawn charged
+// that connect phase to a per-direction WRITE policy: with a write timeout
+// shorter than `backend_connect_timeout_ms`, a slow dial surfaced as a
+// post-wire `ReadWriteTimeout` and suppressed the pre-wire connect retry the
+// failure warranted. `backend_connect_timeout_ms` bounds that window instead.
+
+#[tokio::test(start_paused = true)]
+async fn a_buffered_upload_write_watermark_stays_dormant_until_the_transport_consumes() {
+    let mut probe = BufferedUploadPumpProbe::start(1024 * 1024, 800).expect("buffered pump");
+
+    // Far longer than the 800ms watermark: with spawn-time arming this window
+    // fired a write timeout while no transport existed at all.
+    assert!(
+        probe
+            .write_watermark_stays_dormant(Duration::from_secs(30))
+            .await,
+        "connection acquisition must not be charged to backend_write_timeout_ms"
+    );
+
+    // The transport connects and takes its first frame — from here the
+    // watermark is live and a backend that stops reading still ends the
+    // request at the configured bound.
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Data(_) | ProbeTransportPoll::Pending
+    ));
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "once the transport is consuming, the watermark must still fire"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_replayable_upload_write_watermark_stays_dormant_until_the_transport_consumes() {
+    let mut probe = ReplayableUploadPumpProbe::start(1024 * 1024, &[], 800);
+    assert!(probe.pumped());
+    assert!(
+        probe
+            .write_watermark_stays_dormant(Duration::from_secs(30))
+            .await,
+        "pooled sender acquisition must not be charged to backend_write_timeout_ms"
+    );
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeReplayFrame::Data(_) | ProbeReplayFrame::Pending
+    ));
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
+}
+
+// --- Terminal fuse of the transport-side pump body (#4074, finding L1) ------
+
+#[tokio::test(start_paused = true)]
+async fn a_terminated_pump_body_reports_its_error_once_and_never_a_clean_eof() {
+    let mut probe = BufferedUploadPumpProbe::start(1024 * 1024, 800).expect("buffered pump");
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeTransportPoll::Data(_) | ProbeTransportPoll::Pending
+    ));
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
+
+    // Exactly one error...
+    match probe.poll_transport_once() {
+        ProbeTransportPoll::Errored(message) => assert!(
+            message.contains("backend request body write timeout"),
+            "unexpected termination message: {message}"
+        ),
+        other => panic!("expected a transport error, got {other:?}"),
+    }
+    // ...then the body is fused. Repeating the error would spin a consumer
+    // that polls past one; every transport that matters stops at the first.
+    for _ in 0..4 {
+        assert_eq!(
+            probe.poll_transport_once(),
+            ProbeTransportPoll::Ended,
+            "the pump body must fuse after its single terminal error"
+        );
+    }
+    // The fuse is NOT a completed upload: the declared length still accounts
+    // for the bytes that never crossed the bridge, so a truncated request can
+    // never present itself as a whole one.
+    assert!(
+        probe.declared_content_length().is_some_and(|len| len > 0),
+        "a fused, non-clean terminal must keep advertising its residual bytes"
+    );
+}
+
+// --- Buffered-upload protocol-NACK replay (#4074, finding M2) ---------------
+//
+// Handing reqwest the pumped (streaming) carrier makes `Body::try_clone()`
+// return `None`, which silently disables reqwest's default `ProtocolNacks`
+// replay for EVERY buffered HTTP-family upload whenever
+// `backend_write_timeout_ms` is live — and the shipped default is 30000. Ferrum
+// still owns the collected buffer, so the replay is reproduced at its own
+// dispatch layer with the same budget.
+
+#[tokio::test(start_paused = true)]
+async fn a_pumped_buffered_upload_replays_a_protocol_nack_with_reqwests_own_budget() {
+    let budget = buffered_upload_protocol_nack_replays();
+    assert_eq!(budget, 2, "the budget must mirror reqwest's default policy");
+
+    // Every attempt NACKs: original + the whole replay budget, then stop.
+    assert_eq!(
+        buffered_upload_protocol_nack_replay_attempts_for_test(usize::MAX, 800).await,
+        1 + budget,
+        "a pumped buffered upload must replay a protocol NACK, and must stop at the budget"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_buffered_upload_that_is_not_nacked_is_never_replayed() {
+    assert_eq!(
+        buffered_upload_protocol_nack_replay_attempts_for_test(0, 800).await,
+        1,
+        "only a proven not-processed verdict may replay a request"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_disabled_write_timeout_leaves_the_replay_to_reqwest() {
+    assert_eq!(
+        buffered_upload_protocol_nack_replay_attempts_for_test(usize::MAX, 0).await,
+        1,
+        "with no pump reqwest still holds a reusable body and applies its OWN \
+         replay; replaying here too would double the budget"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_partly_drained_replayable_upload_still_ends_on_the_write_watermark() {
+    let frame = ReplayableUploadPumpProbe::frame_size();
+    let mut probe = ReplayableUploadPumpProbe::start(frame * 4, &[], 800);
+    // The transport takes one frame and then stops, exactly as a socket whose
+    // peer stopped reading does once the kernel buffers fill.
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeReplayFrame::Data(_) | ProbeReplayFrame::Pending
+    ));
+
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "the watermark must still fire once the transport stops taking frames"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
+}
+
+#[tokio::test(start_paused = true)]
+async fn releasing_a_replayable_transport_body_never_leaves_the_pump_running() {
+    let mut probe = ReplayableUploadPumpProbe::start(1024 * 1024, &[], 800);
+    probe.drop_transport();
+    assert_eq!(probe.join().await, ProbePumpOutcome::ConsumerGone);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_zero_backend_write_timeout_keeps_the_direct_replayable_body() {
+    let total = ReplayableUploadPumpProbe::frame_size() * 2;
+    let mut probe = ReplayableUploadPumpProbe::start(total, &[("grpc-status", "0")], 0);
+    assert!(
+        !probe.pumped(),
+        "the operator opt-out must install no task, channel, or timer"
+    );
+    assert_eq!(
+        probe.declared_content_length(),
+        Some(total as u64),
+        "the opt-out must keep the exact Content-Length"
+    );
+    assert_eq!(
+        probe.drain_transport(8).await,
+        vec![
+            ProbeReplayFrame::Data(total),
+            ProbeReplayFrame::Trailers(vec![("grpc-status".to_string(), "0".to_string())]),
+            ProbeReplayFrame::Ended,
+        ],
+        "the direct path keeps its single DATA frame plus terminal trailers"
+    );
+}
+
+#[test]
+fn an_empty_replayable_upload_with_no_trailers_installs_no_pump() {
+    let probe = ReplayableUploadPumpProbe::start(0, &[], 800);
+    assert!(
+        !probe.pumped(),
+        "an upload with nothing to write must stay end-of-stream at headers"
+    );
+    assert!(probe.is_end_stream());
+    assert_eq!(probe.declared_content_length(), Some(0));
+}
+
+// --- Backend write watermark on a BUFFERED native-gRPC upload (#4055) -------
+//
+// `proxy_grpc_request_core` handed hyper one `Full<Bytes>` (or one DATA frame
+// plus a gRPC-Web terminal TRAILERS frame) and raced only the response/read
+// deadlines. An H2 backend that opens the stream, exhausts its receive window
+// and stops reading parks hyper's pipe in `poll_capacity` — polling nothing —
+// so the RPC ran to the LATER read deadline instead of the configured write
+// watermark. As above, the transport side is DELIBERATELY NOT DRAINED.
+
+#[tokio::test(start_paused = true)]
+async fn the_buffered_grpc_write_watermark_starts_after_sender_acquisition() {
+    let mut probe = GrpcBufferedUploadPumpProbe::start(4 * 1024 * 1024, &[], 800);
+    assert!(probe.pumped());
+
+    assert!(
+        probe
+            .write_watermark_stays_dormant(Duration::from_secs(30))
+            .await,
+        "pool acquisition is connect work and must not consume the backend-write watermark"
+    );
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "the same watermark must start once the dispatcher has a sender"
+    );
+    assert_eq!(
+        probe.cancel_and_join().await,
+        ProbePumpOutcome::WriteTimeout
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_backend_write_watermark_ends_a_buffered_grpc_upload_hyper_stopped_taking() {
+    let mut probe = GrpcBufferedUploadPumpProbe::start(4 * 1024 * 1024, &[], 800);
+    assert!(
+        probe.pumped(),
+        "a live write watermark must install a pump on a buffered gRPC upload"
+    );
+
+    // A much longer header wait, i.e. the client deadline or the operator's
+    // `backend_read_timeout_ms`.
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "backend_write_timeout_ms must end the gRPC header wait before the later read bound"
+    );
+    assert_eq!(
+        probe.cancel_and_join().await,
+        ProbePumpOutcome::WriteTimeout
+    );
+
+    match probe.poll_transport_once() {
+        ProbeReplayFrame::Errored(message) => assert!(
+            message.contains("backend request body write timeout"),
+            "unexpected termination message: {message}"
+        ),
+        other => panic!("expected a transport error, got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_buffered_grpc_upload_crosses_the_bridge_in_bounded_slices_not_one_giant_frame() {
+    let frame = GrpcBufferedUploadPumpProbe::frame_size();
+    let total = frame * 3 + 7;
+    // Long enough that the watermark cannot fire while the transport drains.
+    let mut probe = GrpcBufferedUploadPumpProbe::start(total, &[], 600_000);
+    assert_eq!(
+        probe.declared_content_length(),
+        Some(total as u64),
+        "the bridge must not degrade the buffered gRPC body's exact Content-Length"
+    );
+
+    let frames = probe.drain_transport(64).await;
+    let sizes: Vec<usize> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            ProbeReplayFrame::Data(len) => Some(*len),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sizes,
+        vec![frame, frame, frame, 7],
+        "one giant frame would let hyper 'consume' the whole upload before a byte \
+         reached the wire: {frames:?}"
+    );
+    assert_eq!(
+        frames.last(),
+        Some(&ProbeReplayFrame::Ended),
+        "a fully drained buffered gRPC upload must end cleanly: {frames:?}"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pumped_buffered_grpc_upload_keeps_its_terminal_trailers_after_the_data() {
+    let frame = GrpcBufferedUploadPumpProbe::frame_size();
+    let mut probe = GrpcBufferedUploadPumpProbe::start(
+        frame + 3,
+        &[("grpc-status", "0"), ("grpc-message", "ok")],
+        600_000,
+    );
+    assert!(probe.pumped());
+    assert_eq!(
+        probe.declared_content_length(),
+        Some((frame + 3) as u64),
+        "trailers carry no DATA bytes, so the declared length is unchanged"
+    );
+
+    assert_eq!(
+        probe.drain_transport(64).await,
+        vec![
+            ProbeReplayFrame::Data(frame),
+            ProbeReplayFrame::Data(3),
+            ProbeReplayFrame::Trailers(vec![
+                ("grpc-status".to_string(), "0".to_string()),
+                ("grpc-message".to_string(), "ok".to_string()),
+            ]),
+            ProbeReplayFrame::Ended,
+        ],
+        "the validated gRPC-Web trailers must reach the backend strictly after all DATA"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_trailers_only_buffered_grpc_upload_still_arms_the_write_watermark() {
+    let mut probe = GrpcBufferedUploadPumpProbe::start(0, &[("grpc-status", "0")], 800);
+    assert!(
+        probe.pumped(),
+        "a trailers-only gRPC request is transport work, not a no-work opt-out"
+    );
+    assert!(
+        !probe.is_end_stream(),
+        "a trailers-only upload must not be framed as end-of-stream at headers"
+    );
+    assert_eq!(
+        probe.declared_content_length(),
+        Some(0),
+        "a trailers-only upload still declares an exact zero-length body"
+    );
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "the watermark must be enforceable for a trailers-only gRPC upload too"
+    );
+    assert_eq!(probe.join().await, ProbePumpOutcome::WriteTimeout);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_partly_drained_buffered_grpc_upload_still_ends_on_the_write_watermark() {
+    let frame = GrpcBufferedUploadPumpProbe::frame_size();
+    let mut probe = GrpcBufferedUploadPumpProbe::start(frame * 4, &[], 800);
+    // hyper takes one frame and then parks in `poll_capacity`, exactly as it
+    // does once the backend's receive window is exhausted.
+    assert!(matches!(
+        probe.poll_transport_once(),
+        ProbeReplayFrame::Data(_) | ProbeReplayFrame::Pending
+    ));
+
+    assert!(
+        probe
+            .write_watermark_wins_header_wait(Duration::from_secs(30))
+            .await,
+        "the watermark must still fire once hyper stops taking frames"
+    );
+    assert_eq!(
+        probe.cancel_and_join().await,
+        ProbePumpOutcome::WriteTimeout
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn releasing_a_buffered_grpc_transport_body_never_leaves_the_pump_running() {
+    let mut probe = GrpcBufferedUploadPumpProbe::start(1024 * 1024, &[], 800);
+    // An early backend response, or a reset, drops the request body hyper owns.
+    probe.drop_transport();
+    assert_eq!(probe.join().await, ProbePumpOutcome::ConsumerGone);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_zero_backend_write_timeout_keeps_the_direct_buffered_grpc_body() {
+    let total = GrpcBufferedUploadPumpProbe::frame_size() * 2;
+    let mut probe = GrpcBufferedUploadPumpProbe::start(total, &[("grpc-status", "0")], 0);
+    assert!(
+        !probe.pumped(),
+        "the operator opt-out must install no task, channel, or timer"
+    );
+    assert_eq!(
+        probe.declared_content_length(),
+        Some(total as u64),
+        "the opt-out must keep the exact Content-Length"
+    );
+    assert_eq!(
+        probe.drain_transport(8).await,
+        vec![
+            ProbeReplayFrame::Data(total),
+            ProbeReplayFrame::Trailers(vec![("grpc-status".to_string(), "0".to_string())]),
+            ProbeReplayFrame::Ended,
+        ],
+        "the direct path keeps its single DATA frame plus terminal trailers"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_empty_buffered_grpc_upload_with_no_trailers_installs_no_pump() {
+    let mut probe = GrpcBufferedUploadPumpProbe::start(0, &[], 800);
+    assert!(
+        !probe.pumped(),
+        "an empty unary request has nothing to write, so it keeps the direct body"
+    );
+    assert!(
+        probe.is_end_stream(),
+        "an empty gRPC request must stay end-of-stream at headers"
+    );
+    assert_eq!(probe.declared_content_length(), Some(0));
+    assert_eq!(
+        probe.drain_transport(4).await,
+        vec![ProbeReplayFrame::Ended],
+        "the direct empty body yields no frame at all"
+    );
+}
+
+#[test]
+fn the_buffered_grpc_dispatch_races_every_header_wait_shape_against_the_watermark() {
+    let source = include_str!("../../../src/proxy/grpc_proxy.rs");
+    let core = source
+        .split("pub(crate) async fn proxy_grpc_request_core(")
+        .nth(1)
+        .expect("buffered gRPC dispatch core")
+        .split("// Extract response status and headers through the shared collector")
+        .next()
+        .expect("bounded buffered gRPC dispatch core");
+
+    assert!(
+        core.contains("buffered_grpc_request_body_with_write_watermark("),
+        "the buffered gRPC body must be built through the shared write-watermark selection"
+    );
+    let sender_acquired = core
+        .find("transport.get_sender(proxy).await?")
+        .expect("buffered gRPC sender acquisition");
+    let pump_installed = core
+        .find("buffered_grpc_request_body_with_write_watermark(")
+        .expect("buffered gRPC pump installation");
+    let pump_armed = core
+        .find("pump.arm_write_watermark();")
+        .expect("buffered gRPC write-watermark arm");
+    let request_sent = core
+        .find("sender.send_request(backend_req)")
+        .expect("buffered gRPC dispatch");
+    assert!(
+        sender_acquired < pump_installed
+            && pump_installed < pump_armed
+            && pump_armed < request_sent,
+        "connection acquisition must finish before the write pump is installed and armed"
+    );
+    // One race, wrapping the whole header wait, is what covers all three
+    // shapes: the absolute client deadline, the operator per-phase read
+    // timeout, and the unbounded wait.
+    assert_eq!(
+        core.matches("await_upload_write_watermark_first(").count(),
+        1,
+        "the response-header wait must be raced against the pump exactly once, around every shape"
+    );
+    for shape in [
+        "tokio::time::timeout_at(deadline, send_fut)",
+        "tokio::time::timeout(Duration::from_millis(timeout_ms), send_fut)",
+        "send_fut.await.map_err(map_send_err)",
+    ] {
+        assert!(
+            core.contains(shape),
+            "every header-wait shape must stay inside the raced future ({shape})"
+        );
+    }
+    assert!(
+        core.contains("pump.cancel_and_join().await;"),
+        "a won watermark must cancel and join the gateway-owned pump"
+    );
+    assert!(
+        core.contains("kind: GrpcTimeoutKind::Read,")
+            && core.contains("gRPC backend request body write timeout after {}ms"),
+        "the watermark must surface the typed backend-timeout family that classifies as \
+         ReadWriteTimeout"
+    );
+    // The wire boundary is hyper's, not the carrier's: every `Kind::Canceled`
+    // producer in hyper 1.x fires before the request reaches the h2 layer, and
+    // the caller still owns the buffered `Bytes` it cloned into this attempt.
+    // Slicing that same buffer across the pump's capacity-1 bridge must
+    // therefore not fork the classification (issue #4074). Behavioural proof
+    // lives in `tests/functional/scripted_backend_h2_tests.rs`
+    // (`pooled_h2_goaway_canceled_send_retries_buffered_unary`), which runs
+    // with `backend_write_timeout_ms: 5000` — i.e. WITH the pump installed —
+    // and requires the GOAWAY'd attempt to redial and complete.
+    assert!(
+        !core.contains("request_upload_pumped"),
+        "the buffered gRPC dispatch must not classify hyper's wire boundary by \
+         request-body carrier shape"
+    );
+}
+
 // --- Composed dispatch-phase attribution under delayed observation (#3815) ---
 
 #[tokio::test(start_paused = true)]
@@ -2928,7 +3709,7 @@ fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
         PROXY_SOURCE
             .matches("install_streaming_upload_authorization(")
             .count(),
-        6,
+        7,
         "an H1/H2 streaming upload lost its gateway-owned lifecycle"
     );
     assert_eq!(
@@ -2941,7 +3722,9 @@ fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
     // Native gRPC keeps its own body type, so it installs the pump directly on
     // the shared upload source rather than through the H1/H2 adapters.
     assert!(
-        GRPC_PROXY_SOURCE.contains("UploadSource::for_streaming_upload(body, auth)"),
+        GRPC_PROXY_SOURCE.contains("UploadSource::for_streaming_upload_with_deferred_write(")
+            && GRPC_PROXY_SOURCE.contains("proxy.backend_write_timeout_ms")
+            && GRPC_PROXY_SOURCE.contains("pump.arm_write_watermark();"),
         "the fully-streamed native-gRPC upload lost its gateway-owned lifecycle"
     );
     let native_grpc_poll = GRPC_PROXY_SOURCE
@@ -2980,24 +3763,131 @@ fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
         .expect("bounded installer body");
     assert!(installer.contains("with_authorization_deadline("));
     assert!(installer.contains("with_gateway_upload_pump("));
-    // Unauthenticated requests keep the previous zero-overhead path.
-    assert!(installer.contains("let Some(plan) = auth else {"));
+    // Unauthenticated requests with write timeout disabled keep the previous
+    // zero-overhead path (no pump, no timer).
+    assert!(installer.contains("write_timeout_ms == 0"));
 }
 
 #[test]
 fn the_direct_h2_handler_joins_its_upload_before_returning() {
     // Every bounded direct-H2 exit, plus the normal completion path, joins the
-    // pump; the residual error exits are covered by `cancel_on_drop`.
+    // pump; the residual error exits are covered by `cancel_on_drop`. The three
+    // bounded exits are the response-header deadline, the early-response upload
+    // join, and the backend write watermark (#4055).
+    let direct_h2 = PROXY_SOURCE
+        .split("async fn proxy_to_backend_http2(")
+        .nth(1)
+        .expect("direct-H2 dispatcher")
+        .split("fn build_http3_backend_headers(")
+        .next()
+        .expect("bounded direct-H2 dispatcher");
     assert_eq!(
-        PROXY_SOURCE
-            .matches("pump.cancel_and_join().await;")
-            .count(),
+        direct_h2.matches("pump.cancel_and_join().await;").count(),
         3,
-        "a direct-H2 exit stopped joining the gateway-owned upload"
+        "a direct-H2 bounded exit stopped joining the gateway-owned upload"
     );
     assert!(
-        PROXY_SOURCE.contains("UploadPumpJoin::cancel_on_drop"),
-        "direct-H2 must arm cancel-on-drop so residual early returns still release the upload"
+        direct_h2.contains("pump.cancel_and_join().await\n"),
+        "the normal-completion path must capture the join outcome instead of \
+         discarding it"
+    );
+    // Cancel-on-drop is armed on EXACTLY the arm that also joins the pump
+    // before returning — the one with the upload-completion gate (issue #4074).
+    // The ungated arm (request limits disabled AND unauthenticated) has no
+    // later join point: it returns the moment response headers arrive, so on a
+    // full-duplex HTTP/2 exchange the upload is still in flight and arming
+    // cancel-on-drop there errored the transport body and truncated (or
+    // `RST_STREAM`ed) a healthy response. There the upload legitimately
+    // outlives the dispatcher, bounded by `UploadPumpSource`'s abort guard.
+    assert_eq!(
+        direct_h2.matches("UploadPumpJoin::cancel_on_drop").count(),
+        1,
+        "cancel-on-drop belongs only to the direct-H2 arm that joins its pump"
+    );
+    // #4020 split this into three arms gated by `direct_h2_uses_limit_adapter`,
+    // so the condition now carries that predicate and the arm closes into an
+    // `else if` rather than a bare `else`.
+    let gate_arm = direct_h2
+        .split("if use_limit_adapter && needs_upload_completion_gate {")
+        .nth(1)
+        .expect("direct-H2 upload-gate arm")
+        .split("\n        } else if let")
+        .next()
+        .expect("bounded direct-H2 upload-gate arm");
+    assert!(
+        gate_arm.contains("UploadPumpJoin::cancel_on_drop"),
+        "the gated arm — the one that joins the pump before returning — keeps it"
+    );
+}
+
+#[test]
+fn specialized_streaming_dispatchers_race_the_backend_write_watermark() {
+    for (start, end, label) in [
+        (
+            "async fn proxy_to_backend_hbone_after_ready(",
+            "fn unix_backend_dispatch_unavailable_response(",
+            "HBONE",
+        ),
+        (
+            "async fn proxy_to_backend_unix(",
+            "async fn proxy_to_backend_unix(\n    _state:",
+            "Unix HTTP/1.1",
+        ),
+        (
+            "async fn proxy_to_backend_mesh_mtls_after_ready(",
+            "async fn proxy_to_backend_http2(",
+            "sidecar mesh mTLS",
+        ),
+    ] {
+        let dispatch = PROXY_SOURCE
+            .split(start)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{label} streaming dispatcher"))
+            .split(end)
+            .next()
+            .unwrap_or_else(|| panic!("bounded {label} streaming dispatcher"));
+        assert!(
+            dispatch.contains("let (mut parts, body, mut upload_pump)")
+                && dispatch.contains("await_upload_write_watermark_first(")
+                && dispatch.contains("upload_pump.as_mut()")
+                && dispatch.contains("pump.cancel_and_join().await;")
+                && dispatch.contains("backend write watermark expired before response headers"),
+            "{label} must make backend_write_timeout_ms observable while response headers are pending"
+        );
+        assert!(
+            !dispatch
+                .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .any(|token| token == "_upload_pump"),
+            "{label} must not discard the write-watermark receiver"
+        );
+    }
+
+    let native_grpc = GRPC_PROXY_SOURCE
+        .split("pub async fn proxy_grpc_request_streaming(")
+        .nth(1)
+        .expect("native gRPC streaming entry")
+        .split("pub async fn proxy_grpc_request_streaming_channel(")
+        .next()
+        .expect("bounded native gRPC streaming entry");
+    assert!(
+        native_grpc.contains("let (body, upload_pump)")
+            && native_grpc.contains("held_frontend_upload,\n        upload_pump,"),
+        "native gRPC must retain the upload-pump join through dispatch"
+    );
+    let native_grpc_dispatch = GRPC_PROXY_SOURCE
+        .split("async fn proxy_grpc_streaming_dispatch(")
+        .nth(1)
+        .expect("native gRPC streaming dispatcher")
+        .split("/// Collect the incoming gRPC request body")
+        .next()
+        .expect("bounded native gRPC streaming dispatcher");
+    assert!(
+        native_grpc_dispatch.contains("await_upload_write_watermark_first(")
+            && native_grpc_dispatch.contains("upload_pump.as_mut()")
+            && native_grpc_dispatch.contains("pump.cancel_and_join().await;")
+            && native_grpc_dispatch
+                .contains("gRPC backend write watermark expired before response headers"),
+        "native gRPC must surface backend_write_timeout_ms before the later read/client deadline"
     );
 }
 
@@ -3638,6 +4528,34 @@ fn the_native_h3_grpc_precommit_terminal_is_unauthenticated_and_health_neutral()
     );
 }
 
+/// Body of the block `marker` opens, bounded by ITS matching close brace.
+///
+/// Bounding an arm with a far-away end marker instead makes the slice grow
+/// whenever unrelated code is inserted between the two. That is not
+/// hypothetical: the mid-body read-timeout arm added for issue #4055 calls
+/// `write_plain_gateway_error(` to emit its 504, nowhere near the
+/// authorization-expiry path, and a marker-bounded slice read that as this
+/// contract being violated. Brace matching keeps the assertion about the arm
+/// rather than about its neighbourhood, so a false positive here means the
+/// arm really did change.
+fn balanced_block_after<'a>(haystack: &'a str, marker: &str) -> Option<&'a str> {
+    let start = haystack.find(marker)? + marker.len();
+    let mut depth = 1usize;
+    for (offset, ch) in haystack[start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&haystack[start..start + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Cross-protocol plain pre-commitment authorization expiry writes the fixed
 /// redacted 401 under a fresh gateway-owned grace, then resets if QUIC credit
 /// is withheld. The already-expired authorization instant must not race the
@@ -3653,13 +4571,8 @@ fn cross_protocol_plain_precommit_401_is_grace_bounded_and_health_neutral() {
         .next()
         .expect("bounded cross-protocol plain dispatcher");
 
-    let upload = dispatch
-        .split("if let Some(termination) = upload_auth_expired {")
-        .nth(1)
-        .expect("streaming upload authorization-expiry arm")
-        .split("record_plain_grpc_web_client_deadline(")
-        .next()
-        .expect("bounded streaming upload authorization-expiry arm");
+    let upload = balanced_block_after(dispatch, "if let Some(termination) = upload_auth_expired {")
+        .expect("streaming upload authorization-expiry arm");
     assert!(upload.contains("record_authorization_termination_once("));
     assert!(upload.contains("write_plain_authorization_expired_terminal("));
     assert!(
@@ -5533,12 +6446,22 @@ fn composed_authorization_waits_use_the_shared_expiry_first_primitive() {
     assert!(collect.contains("await_deadline_first(bound.at, collect)"));
     assert!(!collect.contains("timeout_at("));
 
-    assert!(
+    // Both reqwest dispatch sites (initial attempt and retry attempt) now build
+    // their attempt inside the buffered protocol-NACK replay loop (issue
+    // #4074), so `send_bound.at` is captured once per dispatch and reused for
+    // every attempt. The primitive is unchanged and still expiry-first.
+    assert_eq!(
         proxy
-            .matches("await_deadline_first(send_bound.at, req_builder.send())")
-            .count()
-            >= 2,
+            .matches("crate::plugins::await_deadline_first(send_bound_at, builder.send()),")
+            .count(),
+        2,
         "reqwest response-header waits must use the expiry-first primitive"
+    );
+    assert_eq!(
+        proxy.matches("let send_bound_at = send_bound.at;").count(),
+        2,
+        "the composed authorization/client bound must be captured ONCE per \
+         dispatch, so a protocol-NACK replay cannot re-arm it"
     );
 
     let cross = include_str!("../../../src/http3/cross_protocol.rs");

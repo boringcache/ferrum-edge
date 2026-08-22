@@ -148,11 +148,12 @@ impl http_body::Body for MeshMtlsRequestBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match self.get_mut() {
             MeshMtlsRequestBody::Streaming(body) => http_body::Body::poll_frame(Pin::new(body), cx),
-            // `ReplayableRequestBody` is infallible; the `match never {}` keeps
-            // that provable rather than boxing an impossible error.
+            // `ReplayableRequestBody` already speaks the shared boxed error:
+            // its DATA can now cross a gateway-owned upload pump, whose
+            // terminal (`backend_write_timeout_ms`, cancellation) is delivered
+            // to the transport as an error rather than a clean end-of-stream.
             MeshMtlsRequestBody::Replayable(body) => {
                 http_body::Body::poll_frame(Pin::new(body), cx)
-                    .map(|polled| polled.map(|frame| frame.map_err(|never| match never {})))
             }
             MeshMtlsRequestBody::Grpc(body) => http_body::Body::poll_frame(Pin::new(body), cx),
         }
