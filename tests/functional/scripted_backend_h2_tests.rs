@@ -873,6 +873,13 @@ async fn grpc_close_after_headers_surfaces_clean_error_family() {
     assert_eq!(backend.received_stream_count(), 1);
 }
 
+// Marker so a foreign RPC that lands on this fixture (issue #4106: a sibling
+// test dialing a stolen ephemeral port) is distinguishable from this test's
+// own Echo/Ping. `received_stream_count()` increments on every inbound
+// HEADERS frame the script accepts — not on completed RPCs — so a sibling
+// unary is enough to move the count from 1 to 2.
+const STALL_READ_TIMEOUT_MARK: (&str, &str) = ("x-ferrum-test", "stall-read-timeout");
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn grpc_stall_after_headers_is_bounded_by_backend_read_timeout() {
@@ -901,7 +908,14 @@ async fn grpc_stall_after_headers_is_bounded_by_backend_read_timeout() {
     let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
     let response = tokio::time::timeout(
         Duration::from_secs(3),
-        client.unary("/grpc/ferrum.Echo/Ping", Bytes::new()),
+        client.unary_with_headers(
+            "/grpc/ferrum.Echo/Ping",
+            Bytes::new(),
+            &[(
+                STALL_READ_TIMEOUT_MARK.0,
+                STALL_READ_TIMEOUT_MARK.1.to_string(),
+            )],
+        ),
     )
     .await
     .expect("gateway read timeout must beat the scripted 30s stall")
@@ -911,7 +925,21 @@ async fn grpc_stall_after_headers_is_bounded_by_backend_read_timeout() {
         response.effective_grpc_status() != 0 || response.stream_error.is_some(),
         "stalled backend must not become a successful RPC; response={response:?}"
     );
-    assert_eq!(backend.received_stream_count(), 1);
+    let streams = backend.received_streams().await;
+    assert_eq!(
+        backend.received_stream_count(),
+        1,
+        "exactly one backend HEADERS (this test's RPC); accepted={} \
+         mismatches={} streams={streams:?}",
+        backend.accepted_connections(),
+        backend.matcher_mismatches(),
+    );
+    assert_eq!(
+        streams[0].header(STALL_READ_TIMEOUT_MARK.0),
+        Some(STALL_READ_TIMEOUT_MARK.1),
+        "the counted stream must be this test's RPC, not a sibling; stream={:?}",
+        streams[0]
+    );
 }
 
 // #2498 / #2497 — an end-to-end grpc_deadline expiry after the backend's
@@ -2798,8 +2826,13 @@ async fn wait_for_backend_goaway_sent(
 async fn grpc_retry_preserves_duplicate_metadata_on_second_attempt() {
     // Bound-but-not-listening: the kernel refuses the connect AND no parallel
     // test can steal the port. A released port can be re-bound by another
-    // test, and then attempt 1 gets a real answer instead of a refusal, so
-    // the retry never fires and the metadata assertions below cannot run.
+    // test, and then attempt 1 gets a real answer instead of a refusal.
+    // Issue #4106: that stolen listener was `grpc_stall_after_headers_*`'s
+    // scripted backend in the same protocols shard — attempt 1 sent a real
+    // unary there (stall HEADERS, no trailers; this test then saw
+    // `trailers: None`) and the stall fixture's stream count went 1 to 2.
+    // Hold the reservation for the whole test so neither this assertion nor
+    // a sibling stream-count can be perturbed. Same helper as #4114.
     let down = reserve_refused_tcp_port().expect("reserve refused down port");
     let down_port = down.port;
 
@@ -2882,7 +2915,13 @@ async fn grpc_retry_preserves_duplicate_metadata_on_second_attempt() {
         )
         .await
         .expect("RPC response");
-    assert_eq!(response.grpc_status(), Some(0), "{response:?}");
+    let streams = backend.received_streams().await;
+    assert_eq!(
+        response.grpc_status(),
+        Some(0),
+        "{response:?}; accepted={} live_target_streams={streams:?}",
+        backend.accepted_connections(),
+    );
 
     // Prove the observed stream came from a RETRY, not from a first attempt
     // that happened to select the live target. Without this the duplicate-
@@ -2897,7 +2936,6 @@ async fn grpc_retry_preserves_duplicate_metadata_on_second_attempt() {
          without a retry this test cannot observe retry headers"
     );
 
-    let streams = backend.received_streams().await;
     assert_eq!(streams.len(), 1, "only the live target should see the RPC");
     let md_values: Vec<&str> = streams[0]
         .headers
