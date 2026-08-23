@@ -96,10 +96,12 @@ struct CapturedRequest {
 /// Read a complete HTTP/1.1 request: headers, then exactly `Content-Length`
 /// body bytes.
 ///
-/// Returns whatever was read if the peer closes early, so a malformed or
-/// truncated request still surfaces in the assertion message rather than
-/// hanging the test.
+/// Returns whatever was read if the peer closes early or stalls, so a
+/// malformed, truncated, or stalled request still surfaces in the assertion
+/// message rather than hanging the test until the job timeout. The bound is
+/// per-read and generous: the only writer here is the gateway on loopback.
 async fn read_full_request(stream: &mut tokio::net::TcpStream) -> String {
+    const READ_BOUND: Duration = Duration::from_secs(10);
     let mut raw: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 8192];
 
@@ -107,9 +109,9 @@ async fn read_full_request(stream: &mut tokio::net::TcpStream) -> String {
         if let Some(idx) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
             break idx + 4;
         }
-        match stream.read(&mut chunk).await {
-            Ok(0) | Err(_) => return String::from_utf8_lossy(&raw).into_owned(),
-            Ok(n) => raw.extend_from_slice(&chunk[..n]),
+        match tokio::time::timeout(READ_BOUND, stream.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => raw.extend_from_slice(&chunk[..n]),
+            _ => return String::from_utf8_lossy(&raw).into_owned(),
         }
     };
 
@@ -126,9 +128,9 @@ async fn read_full_request(stream: &mut tokio::net::TcpStream) -> String {
         .unwrap_or(0);
 
     while raw.len() < header_end + content_length {
-        match stream.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => raw.extend_from_slice(&chunk[..n]),
+        match tokio::time::timeout(READ_BOUND, stream.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => raw.extend_from_slice(&chunk[..n]),
+            _ => break,
         }
     }
 
