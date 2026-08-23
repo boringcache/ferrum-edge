@@ -46,6 +46,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import statistics
+import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 
@@ -64,6 +67,9 @@ HEAVY_TARGET_WEIGHT = 5
 # Hosted 4- vs 32-target 1-thread means were within ~1%; allow runner noise
 # while still catching a small-cardinality path that blew up relative to 32.
 SMALL_CARDINALITY_SERIAL_RATIO_CEILING = 2.0
+# Independent CPU control (issue #4108): median of N process-pool speedups.
+CONTROL_REPEATS = 5
+CONTROL_ITERS = 6_000_000
 
 
 def heavy_arc_share(target_count: int) -> float:
@@ -124,6 +130,91 @@ def throughput_speedup(serial_ns: float, parallel_ns: float, parallel_threads: i
             f"parallel_threads={parallel_threads}"
         )
     return (parallel_threads * serial_ns) / parallel_ns
+
+
+def classify_parallel_floor(
+    selection_speedup: float,
+    control_speedup: float | None,
+    min_parallel_speedup: float,
+) -> str:
+    """Classify a parallel-floor reading.
+
+    Returns:
+      pass — selection cleared the floor
+      regression — selection missed and the control still scaled (or was
+        unavailable: fail closed)
+      runner_contention — both selection and the independent-work control
+        missed, so the runner is oversubscribed and the reading is not a
+        load-balancer signal
+    """
+    if selection_speedup >= min_parallel_speedup:
+        return "pass"
+    if control_speedup is None:
+        return "regression"
+    if control_speedup < min_parallel_speedup:
+        return "runner_contention"
+    return "regression"
+
+
+def apply_runner_contention_guard(
+    failures: list[str],
+    control_speedup: float | None,
+    min_parallel_speedup: float,
+) -> tuple[list[str], list[str]]:
+    """Demote parallel-floor failures when the independent-work control also missed.
+
+    Serial-ratio and missing-fixture failures are never demoted: they are not
+    explained by CPU oversubscription.
+    """
+    notes: list[str] = []
+    floor_failures = [
+        item for item in failures if "throughput speedup" in item and "below floor" in item
+    ]
+    other = [item for item in failures if item not in floor_failures]
+    if not floor_failures:
+        return failures, notes
+    if control_speedup is None:
+        notes.append(
+            "independent-work control unavailable; enforcing parallel floor (fail closed)"
+        )
+        return failures, notes
+    notes.append(
+        f"independent-work control throughput_speedup={control_speedup:.2f}x "
+        f"(median of {CONTROL_REPEATS} repeats, {PARALLEL_THREADS} processes)"
+    )
+    if control_speedup < min_parallel_speedup:
+        notes.append(
+            f"::warning::runner oversubscription: control {control_speedup:.2f}x "
+            f"is below floor {min_parallel_speedup:.2f}x; selection parallel-floor "
+            "misses are advisory (no signal about src/load_balancer.rs)"
+        )
+        for item in floor_failures:
+            notes.append(f"::warning::{item}")
+        return other, notes
+    return failures, notes
+
+
+def _independent_cpu_work(iterations: int) -> int:
+    acc = 0
+    for i in range(iterations):
+        acc = (acc + (i * 1_103_515_245) + 12_345) & 0x7FFFFFFF
+    return acc
+
+
+def measure_independent_speedup(parallel_threads: int) -> float:
+    """Median throughput speedup of independent CPU work at `parallel_threads`."""
+    speedups: list[float] = []
+    with ProcessPoolExecutor(max_workers=parallel_threads) as pool:
+        list(pool.map(_independent_cpu_work, [CONTROL_ITERS] * parallel_threads))
+        for _ in range(CONTROL_REPEATS):
+            started = time.perf_counter()
+            _independent_cpu_work(CONTROL_ITERS)
+            serial = time.perf_counter() - started
+            started = time.perf_counter()
+            list(pool.map(_independent_cpu_work, [CONTROL_ITERS] * parallel_threads))
+            parallel = time.perf_counter() - started
+            speedups.append(throughput_speedup(serial, parallel, parallel_threads))
+    return statistics.median(speedups)
 
 
 def mean_point_estimate(criterion_root: Path, targets: int, threads: int) -> float:
@@ -345,6 +436,43 @@ def self_test() -> int:
             "small-cardinality serial-ratio ceiling"
         )
 
+    if classify_parallel_floor(2.0, 3.0, HOSTED_CONTENTION_FLOOR) != "pass":
+        failures.append("healthy selection must pass regardless of control")
+    if classify_parallel_floor(1.0, 3.0, HOSTED_CONTENTION_FLOOR) != "regression":
+        failures.append("serialized 1.0x with a healthy control must be a regression")
+    if classify_parallel_floor(0.48, 0.50, HOSTED_CONTENTION_FLOOR) != "runner_contention":
+        failures.append(
+            "0.48x selection with 0.50x control is runner contention, not a regression"
+        )
+    if classify_parallel_floor(0.48, None, HOSTED_CONTENTION_FLOOR) != "regression":
+        failures.append("missing control must fail closed and enforce the floor")
+    if statistics.median([0.4, 3.0, 3.2]) < HOSTED_CONTENTION_FLOOR:
+        failures.append("median-of-N must not follow a single oversubscribed sample")
+
+    demoted, notes = apply_runner_contention_guard(
+        ser_failures, control_speedup=0.50, min_parallel_speedup=HOSTED_CONTENTION_FLOOR
+    )
+    if any("throughput speedup" in item and "below floor" in item for item in demoted):
+        failures.append(
+            "serialized 32/129 floor misses must become advisory when the control also misses"
+        )
+    if not any("runner oversubscription" in line for line in notes):
+        failures.append("contention guard must emit an oversubscription warning")
+    kept, _ = apply_runner_contention_guard(
+        ser_failures, control_speedup=3.0, min_parallel_speedup=HOSTED_CONTENTION_FLOOR
+    )
+    if not any("32_targets" in item and "throughput speedup" in item for item in kept):
+        failures.append(
+            "serialized 1.0x with a healthy control must remain a hard 32_targets failure"
+        )
+    blow_demoted, _ = apply_runner_contention_guard(
+        blow_failures, control_speedup=0.50, min_parallel_speedup=HOSTED_CONTENTION_FLOOR
+    )
+    if not any("4_targets 1_thread wall" in item for item in blow_demoted):
+        failures.append(
+            "serial-ratio failure must remain hard even when the control misses the floor"
+        )
+
     if failures:
         for failure in failures:
             print(f"::error::self-test: {failure}")
@@ -383,6 +511,18 @@ def main() -> int:
     for line in logs:
         print(line)
 
+    if any("throughput speedup" in item and "below floor" in item for item in failures):
+        try:
+            control_speedup = measure_independent_speedup(PARALLEL_THREADS)
+        except (OSError, RuntimeError, ValueError) as error:
+            print(f"::warning::control measurement failed ({error}); enforcing floor")
+            control_speedup = None
+        failures, notes = apply_runner_contention_guard(
+            failures, control_speedup, args.min_parallel_speedup
+        )
+        for line in notes:
+            print(line)
+
     if failures:
         for failure in failures:
             print(f"::error::{failure}")
@@ -391,7 +531,8 @@ def main() -> int:
     print(
         "WRR selection benchmark is within hosted contention guardrails "
         f"(mandatory {MANDATORY_SERIALIZATION_TARGETS} throughput speedup; "
-        "4_targets secondary Arc-hotspot + serial-ratio contracts)."
+        "4_targets secondary Arc-hotspot + serial-ratio contracts; "
+        "parallel floor is hard only when independent-work still scales)."
     )
     return 0
 
