@@ -207,14 +207,18 @@ fn namespace_fence_retries_are_bounded_by_wall_clock_not_attempt_count() {
     // The first exhausted body aborts provisioning, so the budget plus one
     // in-flight request timeout is the entire added cost of a fence that never
     // clears.
-    assert!(
-        NAMESPACE_FENCE_MAX_TOTAL_RETRY_SECS + ADMIN_BATCH_REQUEST_TIMEOUT_SECS < 180 * 60,
-        "one atomic body's fence-retry budget must stay inside the job timeout"
-    );
-    assert!(
-        NAMESPACE_FENCE_MAX_TOTAL_RETRY_SECS > 10 * NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS,
-        "the retry budget must not collapse back onto the server's minimum"
-    );
+    const {
+        assert!(
+            NAMESPACE_FENCE_MAX_TOTAL_RETRY_SECS + ADMIN_BATCH_REQUEST_TIMEOUT_SECS < 180 * 60,
+            "one atomic body's fence-retry budget must stay inside the job timeout"
+        )
+    };
+    const {
+        assert!(
+            NAMESPACE_FENCE_MAX_TOTAL_RETRY_SECS > 10 * NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS,
+            "the retry budget must not collapse back onto the server's minimum"
+        )
+    };
 
     let helper = include_str!("../../common/scheduled_scaling.rs");
     assert!(
@@ -322,11 +326,13 @@ fn both_harnesses_gate_measurement_on_bounded_convergence_not_a_fixed_sleep() {
     // fixed five seconds, and measured anyway. Convergence must be a gate, not
     // a warning.
     assert_eq!(CONFIG_CONVERGENCE_MAX_WAIT_SECS, 5 * 60);
-    assert!(CONFIG_CONVERGENCE_POLL_INTERVAL_SECS > 0);
-    assert!(
-        CONFIG_CONVERGENCE_POLL_INTERVAL_SECS < CONFIG_CONVERGENCE_MAX_WAIT_SECS,
-        "the poll interval must fit many times inside the convergence bound"
-    );
+    const { assert!(CONFIG_CONVERGENCE_POLL_INTERVAL_SECS > 0) };
+    const {
+        assert!(
+            CONFIG_CONVERGENCE_POLL_INTERVAL_SECS < CONFIG_CONVERGENCE_MAX_WAIT_SECS,
+            "the poll interval must fit many times inside the convergence bound"
+        )
+    };
     // The scale harness pays this bound once per batch, so the worst case must
     // still leave the 180-minute job room for provisioning and measurement.
     let scale_batches = 30_000 / 3_000;
