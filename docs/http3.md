@@ -121,10 +121,30 @@ the wire before the response-termination hooks and transaction logging await;
 `Drop` is only the backstop.
 
 The sibling relays `stream_h3_open_response_to_client` and
-`proxy_to_backend_h3_streaming` borrow their send half rather than owning it and
-still rely on per-branch resets plus their `H3TrailerFinishError::Client` /
-`ClientWriteFailed` arms; folding them onto the same fail-closed terminal is
-tracked separately.
+`proxy_to_backend_h3_streaming` receive their send half as a `&mut` from the H3
+request handler, so they cannot move it into the owning guard. They hold it in
+`stream_util::BorrowedCommittedH3ResponseStream` instead (issue #4125) — the
+same inverted predicate, the same `Drop` backstop, the same explicit settle
+after the relay loop, differing only in that the guard borrows rather than owns.
+Every reset site in the committed region reborrows through the guard
+(`&mut *h3_stream`), so a write can no longer reach the send half around it.
+
+In both borrowing relays the disarm is a SINGLE site, and the invariant that
+makes that safe is stronger than the native relay's: inside the committed region
+neither has an inline `finish()` at all. The only client-facing FIN comes from
+`finish_h3_response_with_backend_trailers`, which returns `Ok(())` exactly when
+its `h3_stream.finish()` produced `H3AuthorizedWrite::Written`, and that one
+match arm is also the relay's only `body_completed = true`. One disarm per
+relay, coinciding with one clean-completion latch, is therefore the complete
+set — locked by
+`committed_borrowed_h3_streaming_responses_reset_unless_a_finish_landed` in
+`tests/unit/gateway_core/http3_server_dispatch_tests.rs`.
+
+As with the native relay, the behaviour change beyond the drop hazard is that
+the `H3TrailerFinishError::Client` and header-commit `ClientWriteFailed` exits
+now RESET instead of implicitly finishing. The client's stream is already gone
+in those cases, so it is not observable; it matches what `cross_protocol.rs`
+already ships.
 
 ### Full-duplex native H3 gRPC (issue #3283)
 

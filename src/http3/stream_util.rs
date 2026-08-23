@@ -489,6 +489,86 @@ impl<S: SendStream<Bytes>> Drop for CommittedH3ResponseStream<S> {
     }
 }
 
+/// The BORROWING counterpart of [`CommittedH3ResponseStream`] (issue #4125).
+///
+/// Same contract, same inverted predicate, same `Drop` backstop; the only
+/// difference is that it holds `&mut RequestStream` instead of owning it, for
+/// the relays whose send half arrives as a borrow from the H3 request handler
+/// and so cannot be moved into the owning guard without re-shaping their
+/// signatures. `stream_h3_open_response_to_client` and
+/// `proxy_to_backend_h3_streaming` are those relays.
+///
+/// The terminal is a RESET unless [`Self::record_clean_finish`] proved a
+/// downstream `finish()` returned `Ok` — never a re-assertion over accumulated
+/// `body_error_class` / `client_disconnected` bookkeeping. Keep the settle body
+/// byte-identical to the owning guard's: the source-shape guard in
+/// `tests/unit/gateway_core/http3_server_dispatch_tests.rs` asserts both carry
+/// the same predicate so the two cannot drift apart.
+pub(crate) struct BorrowedCommittedH3ResponseStream<'a, S: SendStream<Bytes>> {
+    stream: &'a mut RequestStream<S, Bytes>,
+    /// Set ONLY where a downstream `finish()` returned `Ok`. The single thing
+    /// that disarms the reset.
+    clean_finish: bool,
+    /// Keeps the explicit settle and the `Drop` backstop from both resetting.
+    /// `stop_stream` is idempotent at the quinn layer, but tracking it here
+    /// keeps the intent readable and the wire behaviour exactly one terminal.
+    reset_applied: bool,
+}
+
+impl<'a, S: SendStream<Bytes>> BorrowedCommittedH3ResponseStream<'a, S> {
+    /// Arm the fail-closed terminal for the borrowed `stream`.
+    pub(crate) fn new(stream: &'a mut RequestStream<S, Bytes>) -> Self {
+        Self {
+            stream,
+            clean_finish: false,
+            reset_applied: false,
+        }
+    }
+
+    /// Record that a downstream `finish()` returned `Ok`, i.e. the relay landed
+    /// a real clean end of body. Never call this for a finish that failed, was
+    /// cancelled, or was skipped.
+    pub(crate) fn record_clean_finish(&mut self) {
+        self.clean_finish = true;
+    }
+
+    /// Apply the terminal now rather than at drop, so the `RESET_STREAM`
+    /// reaches the wire before the relay's response-termination hooks and
+    /// transaction logging await. Idempotent, and a no-op once a clean FIN was
+    /// recorded, so it can never clobber a successful `finish()`.
+    pub(crate) fn settle_committed_terminal(&mut self) {
+        if self.clean_finish || self.reset_applied {
+            return;
+        }
+        self.reset_applied = true;
+        abort_response_stream(&mut *self.stream);
+    }
+}
+
+impl<S: SendStream<Bytes>> Deref for BorrowedCommittedH3ResponseStream<'_, S> {
+    type Target = RequestStream<S, Bytes>;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.stream
+    }
+}
+
+impl<S: SendStream<Bytes>> DerefMut for BorrowedCommittedH3ResponseStream<'_, S> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.stream
+    }
+}
+
+impl<S: SendStream<Bytes>> Drop for BorrowedCommittedH3ResponseStream<'_, S> {
+    /// The backstop the explicit settle cannot cover: a request task dropped
+    /// while its `send_data` is parked in QUIC flow control never reaches any
+    /// post-relay statement at all. The borrow ends with the guard, so the
+    /// caller's `&mut` is usable again only after the terminal was applied.
+    fn drop(&mut self) {
+        self.settle_committed_terminal();
+    }
+}
+
 /// Whether a COMMITTED H3 streaming response must leave its send half RESET.
 ///
 /// Quinn implicitly `finish()`es a send stream that was neither finished nor
