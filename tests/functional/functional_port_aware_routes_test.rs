@@ -133,9 +133,7 @@ async fn gateway_listener_realization(gateway: &TestGateway) -> GatewayListenerR
         active: listeners["active_listeners"]
             .as_u64()
             .expect("active_listeners") as u32,
-        failed_ports: listeners["failed_ports"]
-            .as_u64()
-            .expect("failed_ports") as u32,
+        failed_ports: listeners["failed_ports"].as_u64().expect("failed_ports") as u32,
         failures,
     }
 }
@@ -465,7 +463,11 @@ plugin_configs: []
         let client = reqwest::Client::new();
 
         if let Err(reason) = wait_for_owned_gateway_listeners(&gateway, 1).await {
-            abort_listener_attempt(attempt, "functional port-aware reload add/withdraw", &reason);
+            abort_listener_attempt(
+                attempt,
+                "functional port-aware reload add/withdraw",
+                &reason,
+            );
             drop(gateway);
             continue;
         }
@@ -510,7 +512,11 @@ plugin_configs: []
         std::fs::write(config_path, with_both).expect("rewrite config");
         sighup(&gateway);
         if let Err(reason) = wait_for_owned_gateway_listeners(&gateway, 2).await {
-            abort_listener_attempt(attempt, "functional port-aware reload add/withdraw", &reason);
+            abort_listener_attempt(
+                attempt,
+                "functional port-aware reload add/withdraw",
+                &reason,
+            );
             drop(gateway);
             continue;
         }
@@ -537,7 +543,11 @@ plugin_configs: []
         // Prove this child released A via its own /status. A TCP "not listening"
         // probe can hang if a sibling grabs the withdrawn port.
         if let Err(reason) = wait_for_owned_gateway_listeners(&gateway, 1).await {
-            abort_listener_attempt(attempt, "functional port-aware reload add/withdraw", &reason);
+            abort_listener_attempt(
+                attempt,
+                "functional port-aware reload add/withdraw",
+                &reason,
+            );
             drop(gateway);
             continue;
         }
