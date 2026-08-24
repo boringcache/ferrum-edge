@@ -33,7 +33,9 @@ use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::proxy::client_ip::TrustedProxies;
-use ferrum_edge::proxy::gateway_listener::{GatewayListenerManager, GatewayListenerTls};
+use ferrum_edge::proxy::gateway_listener::{
+    GatewayListenerBindFailure, GatewayListenerManager, GatewayListenerTls,
+};
 use ferrum_edge::proxy::gateway_listener_status::{
     GatewayListenerFailureCategory, GatewayListenerFailureObservation, GatewayListenerProtocolHalf,
     GatewayListenerStatus,
@@ -95,27 +97,72 @@ async fn free_port() -> u16 {
     port
 }
 
+const PORT_STEAL_ATTEMPTS: u32 = 5;
+
+fn bind_failed_on_port(failures: &[GatewayListenerBindFailure], port: u16) -> bool {
+    failures.iter().any(|failure| {
+        failure.port == port && failure.category == GatewayListenerFailureCategory::BindFailed
+    })
+}
+
+/// `free_port()` is bind-drop-rebind, so a parallel test can steal the
+/// released port before this manager's first reconcile binds it (the
+/// standard port-allocation race — see the functional-test port rules).
+///
+/// Re-roll only when that steal shows up as `BindFailed` on `port`. Bind
+/// failures on a different port are the scenario's own signal (an occupied
+/// sibling) and must reach the caller unchanged. Each attempt's returned
+/// state is dropped before the next roll so partial binds close.
+async fn reconcile_fresh_port<F, Fut, T>(mut attempt: F) -> (T, Vec<GatewayListenerBindFailure>, u16)
+where
+    F: FnMut(u16) -> Fut,
+    Fut: std::future::Future<Output = (T, Vec<GatewayListenerBindFailure>)>,
+{
+    let mut last_failures = Vec::new();
+    let mut last_port = 0u16;
+    for n in 1..=PORT_STEAL_ATTEMPTS {
+        let port = free_port().await;
+        let (owned, failures) = attempt(port).await;
+        if !bind_failed_on_port(&failures, port) {
+            return (owned, failures, port);
+        }
+        last_failures = failures;
+        last_port = port;
+        drop(owned);
+        assert!(
+            n < PORT_STEAL_ATTEMPTS,
+            "could not bind a fresh listener port in {PORT_STEAL_ATTEMPTS} attempts after \
+             parallel-test steals; last port {last_port}, last failures: {last_failures:?}"
+        );
+    }
+    unreachable!("retry loop returns or asserts");
+}
+
 /// An occupied Gateway listener port must become a bounded, structured active
 /// failure — while the sibling listener on the same generation keeps serving
 /// and the process keeps running.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_occupied_port_is_surfaced_while_the_sibling_listener_keeps_serving() {
-    let healthy_port = free_port().await;
-    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("occupy a port before the gateway can bind it");
-    let occupied_port = occupied.local_addr().expect("addr").port();
-    assert_ne!(healthy_port, occupied_port);
+    let ((manager, occupied, occupied_port, status), _failures, healthy_port) =
+        reconcile_fresh_port(|healthy_port| async move {
+            let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("occupy a port before the gateway can bind it");
+            let occupied_port = occupied.local_addr().expect("addr").port();
+            assert_ne!(healthy_port, occupied_port);
 
-    let status = Arc::new(GatewayListenerStatus::new());
-    let manager = GatewayListenerManager::new(
-        test_state(port_scoped_config(&[healthy_port, occupied_port])),
-        std::net::IpAddr::from([127, 0, 0, 1]),
-        GatewayListenerTls::default(),
-    )
-    .with_status(status.clone());
+            let status = Arc::new(GatewayListenerStatus::new());
+            let manager = GatewayListenerManager::new(
+                test_state(port_scoped_config(&[healthy_port, occupied_port])),
+                std::net::IpAddr::from([127, 0, 0, 1]),
+                GatewayListenerTls::default(),
+            )
+            .with_status(status.clone());
 
-    manager.reconcile().await;
+            let failures = manager.reconcile().await;
+            ((manager, occupied, occupied_port, status), failures)
+        })
+        .await;
 
     assert_eq!(
         manager.active_ports().await,
