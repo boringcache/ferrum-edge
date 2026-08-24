@@ -113,7 +113,9 @@ fn bind_failed_on_port(failures: &[GatewayListenerBindFailure], port: u16) -> bo
 /// failures on a different port are the scenario's own signal (an occupied
 /// sibling) and must reach the caller unchanged. Each attempt's returned
 /// state is dropped before the next roll so partial binds close.
-async fn reconcile_fresh_port<F, Fut, T>(mut attempt: F) -> (T, Vec<GatewayListenerBindFailure>, u16)
+async fn reconcile_fresh_port<F, Fut, T>(
+    mut attempt: F,
+) -> (T, Vec<GatewayListenerBindFailure>, u16)
 where
     F: FnMut(u16) -> Fut,
     Fut: std::future::Future<Output = (T, Vec<GatewayListenerBindFailure>)>,
