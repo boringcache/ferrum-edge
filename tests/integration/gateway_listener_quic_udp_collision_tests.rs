@@ -241,21 +241,17 @@ where
     F: FnMut(u16) -> Fut,
     Fut: std::future::Future<Output = (T, Vec<GatewayListenerBindFailure>)>,
 {
-    let mut last_failures = Vec::new();
-    let mut last_port = 0u16;
     for n in 1..=PORT_STEAL_ATTEMPTS {
         let port = free_port().await;
         let (owned, failures) = attempt(port).await;
         if !bind_failed_on_port(&failures, port) {
             return (owned, failures, port);
         }
-        last_failures = failures;
-        last_port = port;
         drop(owned);
         assert!(
             n < PORT_STEAL_ATTEMPTS,
             "could not bind a fresh listener port in {PORT_STEAL_ATTEMPTS} attempts after \
-             parallel-test steals; last port {last_port}, last failures: {last_failures:?}"
+             parallel-test steals; last port {port}, last failures: {failures:?}"
         );
     }
     unreachable!("retry loop returns or asserts");
