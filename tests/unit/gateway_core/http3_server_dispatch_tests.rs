@@ -4769,3 +4769,139 @@ fn committed_native_h3_streaming_responses_reset_unless_a_finish_landed() {
         "every clean-completion latch in the guarded relay must disarm the reset with it"
     );
 }
+
+/// Issue #4125. The same fail-closed terminal, for the two H3 streaming relays
+/// that only BORROW their send half.
+///
+/// `stream_h3_open_response_to_client` and `proxy_to_backend_h3_streaming`
+/// receive `h3_stream: &mut RequestStream<..>` from the H3 request handler, so
+/// they cannot move it into the owning `CommittedH3ResponseStream` #4112 added.
+/// They get `BorrowedCommittedH3ResponseStream` instead: same inverted
+/// predicate (reset UNLESS a `finish()` proved it returned `Ok`), same `Drop`
+/// backstop for a task dropped while parked in `send_data`, and the same
+/// explicit settle after the relay loop.
+///
+/// The structural invariant that makes the disarm safe in both relays is
+/// stronger than the native relay's: inside the committed region neither has an
+/// inline `finish()` at all. The ONLY client-facing FIN comes from
+/// `finish_h3_response_with_backend_trailers`, whose `Ok(())` is returned
+/// exactly when `h3_stream.finish()` produced `H3AuthorizedWrite::Written` — and
+/// that one match arm is also the relay's only `body_completed = true`. So one
+/// disarm per relay, coinciding with one clean-completion latch, is the whole
+/// set.
+#[test]
+fn committed_borrowed_h3_streaming_responses_reset_unless_a_finish_landed() {
+    let stream_util = include_str!("../../../src/http3/stream_util.rs");
+
+    assert!(
+        stream_util.contains(
+            "pub(crate) struct BorrowedCommittedH3ResponseStream<'a, S: SendStream<Bytes>>"
+        ),
+        "the borrowing relays need a fail-closed committed-response send half too"
+    );
+    assert!(
+        stream_util.contains("stream: &'a mut RequestStream<S, Bytes>,"),
+        "the borrowing guard must hold the send half by mutable borrow, not by value"
+    );
+    // Drop is the backstop a post-loop statement cannot provide: a request task
+    // dropped while parked in `send_data` never reaches one. It matters more
+    // here than for the owning guard, because the borrow outlives nothing —
+    // the caller's `&mut` becomes usable again only once the terminal landed.
+    let drop_impl = stream_util
+        .split("impl<S: SendStream<Bytes>> Drop for BorrowedCommittedH3ResponseStream<'_, S> {")
+        .nth(1)
+        .expect("the borrowed committed-response send half must reset on drop");
+    assert!(
+        drop_impl
+            .split("\n}")
+            .next()
+            .is_some_and(|body| body.contains("settle_committed_terminal()")),
+        "dropping a borrowed committed response send half must apply the fail-closed terminal"
+    );
+
+    // The owning and the borrowing guard must decide the terminal the SAME way.
+    // Two copies of the predicate is the drift risk this pins shut.
+    let settle_bodies: Vec<&str> = stream_util
+        .split("pub(crate) fn settle_committed_terminal(&mut self) {")
+        .skip(1)
+        .filter_map(|rest| rest.split("\n    }").next())
+        .collect();
+    assert_eq!(
+        settle_bodies.len(),
+        2,
+        "exactly two committed-response guards may exist: the owning and the borrowing one"
+    );
+    for body in &settle_bodies {
+        assert!(
+            body.contains("if self.clean_finish || self.reset_applied {"),
+            "the terminal must be skipped only for a proven clean FIN, and stay idempotent"
+        );
+        assert!(
+            body.contains("self.reset_applied = true;"),
+            "a settled committed-response terminal must record that it fired"
+        );
+        assert!(
+            body.contains("abort_response_stream("),
+            "the fail-closed terminal must RESET the send half"
+        );
+    }
+    assert!(
+        stream_util
+            .contains("impl<'a, S: SendStream<Bytes>> BorrowedCommittedH3ResponseStream<'a, S> {"),
+        "the borrowing guard must expose the same disarm/settle surface"
+    );
+
+    let server = include_str!("../../../src/http3/server.rs");
+    // The guard has to be armed BEFORE the HEADERS commit, not after it: the
+    // commit's own `ClientWriteFailed` / expiry arms are inside the region a
+    // partially written HEADERS frame can already have committed.
+    for relay_fn in [
+        "async fn stream_h3_open_response_to_client(",
+        "async fn proxy_to_backend_h3_streaming(",
+    ] {
+        let body = server
+            .split(relay_fn)
+            .nth(1)
+            .expect("both borrowing H3 streaming relays must still exist");
+        let pre_commit = body
+            .split("commit_authorized_streaming_response_headers(")
+            .next()
+            .expect("each relay must still commit its streaming response headers");
+        assert!(
+            pre_commit.contains("BorrowedCommittedH3ResponseStream::new(h3_stream)"),
+            "{relay_fn} must arm the fail-closed terminal before it commits response headers"
+        );
+    }
+
+    let guarded_relays: Vec<&str> = server
+        .split("BorrowedCommittedH3ResponseStream::new(h3_stream)")
+        .skip(1)
+        .collect();
+    assert_eq!(
+        guarded_relays.len(),
+        2,
+        "exactly the two borrowing H3 streaming relays may guard a committed send half"
+    );
+    for relay in guarded_relays {
+        let guarded = relay
+            .split("h3_stream.settle_committed_terminal();")
+            .next()
+            .expect("each guarded relay must end at its explicit settle");
+        let disarms = guarded.matches("h3_stream.record_clean_finish();").count();
+        assert_eq!(
+            disarms, 1,
+            "only the single FIN-success site in a borrowing relay may disarm the reset"
+        );
+        assert_eq!(
+            guarded.matches("body_completed = true;").count(),
+            disarms,
+            "every clean-completion latch in a borrowing relay must disarm the reset with it"
+        );
+        // A bare `h3_stream` pass would be a use of the guard's target that
+        // bypasses the guard's own borrow — every write site must go through it.
+        assert!(
+            !guarded.contains("abort_response_stream(h3_stream)"),
+            "guarded relay resets must reborrow through the committed-response guard"
+        );
+    }
+}
