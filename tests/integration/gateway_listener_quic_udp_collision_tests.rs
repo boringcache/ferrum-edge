@@ -27,7 +27,7 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::http3::config::Http3ServerConfig;
 use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::proxy::gateway_listener::{
-    GatewayListenerHttp3, GatewayListenerManager, GatewayListenerTls,
+    GatewayListenerBindFailure, GatewayListenerHttp3, GatewayListenerManager, GatewayListenerTls,
 };
 use ferrum_edge::proxy::gateway_listener_status::{
     GatewayListenerFailureCategory, GatewayListenerProtocolHalf,
@@ -218,6 +218,45 @@ async fn free_port() -> u16 {
     port
 }
 
+const PORT_STEAL_ATTEMPTS: u32 = 5;
+
+fn bind_failed_on_port(failures: &[GatewayListenerBindFailure], port: u16) -> bool {
+    failures.iter().any(|failure| {
+        failure.port == port && failure.category == GatewayListenerFailureCategory::BindFailed
+    })
+}
+
+/// `free_port()` is bind-drop-rebind, so a parallel test can steal the
+/// released port before this manager's first reconcile binds it (the
+/// standard port-allocation race — see the functional-test port rules).
+///
+/// Re-roll only when that steal shows up as `BindFailed` on `port`. Every
+/// other failure set — including an expected `UdpStreamCollision` — is the
+/// scenario's own signal and must reach the caller unchanged. Each attempt's
+/// returned state is dropped before the next roll so partial binds close.
+async fn reconcile_fresh_port<F, Fut, T>(
+    mut attempt: F,
+) -> (T, Vec<GatewayListenerBindFailure>, u16)
+where
+    F: FnMut(u16) -> Fut,
+    Fut: std::future::Future<Output = (T, Vec<GatewayListenerBindFailure>)>,
+{
+    for n in 1..=PORT_STEAL_ATTEMPTS {
+        let port = free_port().await;
+        let (owned, failures) = attempt(port).await;
+        if !bind_failed_on_port(&failures, port) {
+            return (owned, failures, port);
+        }
+        drop(owned);
+        assert!(
+            n < PORT_STEAL_ATTEMPTS,
+            "could not bind a fresh listener port in {PORT_STEAL_ATTEMPTS} attempts after \
+             parallel-test steals; last port {port}, last failures: {failures:?}"
+        );
+    }
+    unreachable!("retry loop returns or asserts");
+}
+
 async fn start_body_backend(body: &'static [u8]) -> (u16, tokio::task::JoinHandle<()>) {
     use hyper::server::conn::http1;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -334,26 +373,28 @@ fn assert_quic_udp_collision(
 async fn initial_udp_collision_preserves_tcp_and_suppresses_alt_svc() {
     ensure_crypto_provider();
     let (backend, _b) = start_body_backend(b"https-ok").await;
-    let port = free_port().await;
-    let config = tls_config_with(
-        vec![
-            port_scoped_https_proxy("https-gw", backend, port),
-            stream_proxy("udp-stream", BackendScheme::Udp, port),
-        ],
-        port,
-    );
-    let state = ProxyState::new(
-        config,
-        DnsCache::new(DnsConfig::default()),
-        test_env(),
-        None,
-        None,
-    )
-    .expect("proxy state")
-    .0;
-    let manager = build_manager(state.clone(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-
-    let failures = manager.reconcile().await;
+    let ((state, manager), failures, port) = reconcile_fresh_port(|port| async move {
+        let config = tls_config_with(
+            vec![
+                port_scoped_https_proxy("https-gw", backend, port),
+                stream_proxy("udp-stream", BackendScheme::Udp, port),
+            ],
+            port,
+        );
+        let state = ProxyState::new(
+            config,
+            DnsCache::new(DnsConfig::default()),
+            test_env(),
+            None,
+            None,
+        )
+        .expect("proxy state")
+        .0;
+        let manager = build_manager(state.clone(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let failures = manager.reconcile().await;
+        ((state, manager), failures)
+    })
+    .await;
     assert_quic_udp_collision(&failures, port);
     assert_eq!(manager.active_ports().await, vec![port]);
     assert!(
@@ -389,26 +430,28 @@ async fn initial_udp_collision_preserves_tcp_and_suppresses_alt_svc() {
 async fn initial_dtls_collision_preserves_tcp_and_suppresses_alt_svc() {
     ensure_crypto_provider();
     let (backend, _b) = start_body_backend(b"https-dtls").await;
-    let port = free_port().await;
-    let config = tls_config_with(
-        vec![
-            port_scoped_https_proxy("https-gw", backend, port),
-            stream_proxy("dtls-stream", BackendScheme::Dtls, port),
-        ],
-        port,
-    );
-    let state = ProxyState::new(
-        config,
-        DnsCache::new(DnsConfig::default()),
-        test_env(),
-        None,
-        None,
-    )
-    .expect("proxy state")
-    .0;
-    let manager = build_manager(state.clone(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-
-    let failures = manager.reconcile().await;
+    let ((state, manager), failures, port) = reconcile_fresh_port(|port| async move {
+        let config = tls_config_with(
+            vec![
+                port_scoped_https_proxy("https-gw", backend, port),
+                stream_proxy("dtls-stream", BackendScheme::Dtls, port),
+            ],
+            port,
+        );
+        let state = ProxyState::new(
+            config,
+            DnsCache::new(DnsConfig::default()),
+            test_env(),
+            None,
+            None,
+        )
+        .expect("proxy state")
+        .0;
+        let manager = build_manager(state.clone(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let failures = manager.reconcile().await;
+        ((state, manager), failures)
+    })
+    .await;
     assert_quic_udp_collision(&failures, port);
     assert_eq!(manager.active_ports().await, vec![port]);
     assert!(manager.active_http3_ports().await.is_empty());
@@ -425,15 +468,7 @@ async fn initial_dtls_collision_preserves_tcp_and_suppresses_alt_svc() {
 async fn live_udp_claim_stops_only_quic_and_keeps_tcp_connection() {
     ensure_crypto_provider();
     let (backend, _b) = start_body_backend(b"keep-alive").await;
-    // `free_port()` is bind-drop-rebind, so a parallel test can steal the
-    // released port before this manager's first reconcile binds it (the
-    // standard port-allocation race — see the functional-test port rules).
-    // A collision-free initial config must therefore retry with a fresh port
-    // instead of asserting on the first attempt; every attempt's manager is
-    // dropped before the next roll so its partial binds close.
-    let mut attempt = 0;
-    let (state, manager, port) = loop {
-        let port = free_port().await;
+    let ((state, manager), failures, port) = reconcile_fresh_port(|port| async move {
         let initial = tls_config_with(
             vec![port_scoped_https_proxy("https-gw", backend, port)],
             port,
@@ -449,16 +484,13 @@ async fn live_udp_claim_stops_only_quic_and_keeps_tcp_connection() {
         .0;
         let manager = build_manager(state.clone(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         let failures = manager.reconcile().await;
-        if failures.is_empty() {
-            break (state, manager, port);
-        }
-        attempt += 1;
-        assert!(
-            attempt < 5,
-            "could not bind a collision-free HTTPS listener in 5 attempts; \
-             last failures: {failures:?}"
-        );
-    };
+        ((state, manager), failures)
+    })
+    .await;
+    assert!(
+        failures.is_empty(),
+        "collision-free HTTPS listener must bind: {failures:?}"
+    );
     assert_eq!(manager.active_http3_ports().await, vec![port]);
     assert!(state.gateway_h3_alt_svc.load().get(&port).is_some());
 
@@ -518,25 +550,29 @@ async fn live_udp_claim_stops_only_quic_and_keeps_tcp_connection() {
 async fn removing_udp_claim_starts_quic_and_restores_alt_svc() {
     ensure_crypto_provider();
     let (backend, _b) = start_body_backend(b"recovered").await;
-    let port = free_port().await;
-    let with_udp = tls_config_with(
-        vec![
-            port_scoped_https_proxy("https-gw", backend, port),
-            stream_proxy("udp-stream", BackendScheme::Udp, port),
-        ],
-        port,
-    );
-    let state = ProxyState::new(
-        with_udp,
-        DnsCache::new(DnsConfig::default()),
-        test_env(),
-        None,
-        None,
-    )
-    .expect("proxy state")
-    .0;
-    let manager = build_manager(state.clone(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-    assert_quic_udp_collision(&manager.reconcile().await, port);
+    let ((state, manager), failures, port) = reconcile_fresh_port(|port| async move {
+        let with_udp = tls_config_with(
+            vec![
+                port_scoped_https_proxy("https-gw", backend, port),
+                stream_proxy("udp-stream", BackendScheme::Udp, port),
+            ],
+            port,
+        );
+        let state = ProxyState::new(
+            with_udp,
+            DnsCache::new(DnsConfig::default()),
+            test_env(),
+            None,
+            None,
+        )
+        .expect("proxy state")
+        .0;
+        let manager = build_manager(state.clone(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let failures = manager.reconcile().await;
+        ((state, manager), failures)
+    })
+    .await;
+    assert_quic_udp_collision(&failures, port);
     assert!(manager.active_http3_ports().await.is_empty());
 
     let without_udp = tls_config_with(
@@ -568,25 +604,28 @@ async fn removing_udp_claim_starts_quic_and_restores_alt_svc() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tcp_stream_collision_still_refuses_whole_listener() {
     ensure_crypto_provider();
-    let port = free_port().await;
-    let config = tls_config_with(
-        vec![
-            port_scoped_https_proxy("https-gw", 1, port),
-            stream_proxy("tcp-stream", BackendScheme::Tcp, port),
-        ],
-        port,
-    );
-    let state = ProxyState::new(
-        config,
-        DnsCache::new(DnsConfig::default()),
-        test_env(),
-        None,
-        None,
-    )
-    .expect("proxy state")
-    .0;
-    let manager = build_manager(state.clone(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-    let failures = manager.reconcile().await;
+    let ((state, manager), failures, port) = reconcile_fresh_port(|port| async move {
+        let config = tls_config_with(
+            vec![
+                port_scoped_https_proxy("https-gw", 1, port),
+                stream_proxy("tcp-stream", BackendScheme::Tcp, port),
+            ],
+            port,
+        );
+        let state = ProxyState::new(
+            config,
+            DnsCache::new(DnsConfig::default()),
+            test_env(),
+            None,
+            None,
+        )
+        .expect("proxy state")
+        .0;
+        let manager = build_manager(state.clone(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let failures = manager.reconcile().await;
+        ((state, manager), failures)
+    })
+    .await;
     assert!(
         failures.iter().any(|failure| {
             failure.port == port
@@ -609,36 +648,39 @@ async fn tcp_stream_collision_still_refuses_whole_listener() {
 async fn plaintext_listener_ignores_udp_same_port_with_http3_enabled() {
     ensure_crypto_provider();
     let (backend, _b) = start_body_backend(b"plain-ok").await;
-    let port = free_port().await;
-    let config = plaintext_config_with(vec![
-        port_scoped_https_proxy("http-gw", backend, port),
-        stream_proxy("udp-stream", BackendScheme::Udp, port),
-    ]);
-    let state = ProxyState::new(
-        config,
-        DnsCache::new(DnsConfig::default()),
-        test_env(),
-        None,
-        None,
-    )
-    .expect("proxy state")
-    .0;
-    // Plaintext listeners need no TLS material / HTTP/3 attachment.
-    let manager = GatewayListenerManager::new(
-        state.clone(),
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        GatewayListenerTls::default(),
-    )
-    .with_http3(GatewayListenerHttp3 {
-        config: Http3ServerConfig::default(),
-        tls_policy: test_tls_policy(),
-        client_ca_bundle_path: None,
-        client_crls: Arc::new(Vec::new()),
-        tls_slot: None,
-        tls_accepted_slot: None,
-        tls_revision_rx: None,
-    });
-    let failures = manager.reconcile().await;
+    let (manager, failures, port) = reconcile_fresh_port(|port| async move {
+        let config = plaintext_config_with(vec![
+            port_scoped_https_proxy("http-gw", backend, port),
+            stream_proxy("udp-stream", BackendScheme::Udp, port),
+        ]);
+        let state = ProxyState::new(
+            config,
+            DnsCache::new(DnsConfig::default()),
+            test_env(),
+            None,
+            None,
+        )
+        .expect("proxy state")
+        .0;
+        // Plaintext listeners need no TLS material / HTTP/3 attachment.
+        let manager = GatewayListenerManager::new(
+            state.clone(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            GatewayListenerTls::default(),
+        )
+        .with_http3(GatewayListenerHttp3 {
+            config: Http3ServerConfig::default(),
+            tls_policy: test_tls_policy(),
+            client_ca_bundle_path: None,
+            client_crls: Arc::new(Vec::new()),
+            tls_slot: None,
+            tls_accepted_slot: None,
+            tls_revision_rx: None,
+        });
+        let failures = manager.reconcile().await;
+        (manager, failures)
+    })
+    .await;
     assert!(
         !failures.iter().any(|failure| failure.port == port),
         "plaintext + UDP must not fail: {failures:?}"
@@ -651,26 +693,29 @@ async fn plaintext_listener_ignores_udp_same_port_with_http3_enabled() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn process_global_same_class_frontend_is_not_dynamically_bound() {
     ensure_crypto_provider();
-    let port = free_port().await;
-    let config = tls_config_with(
-        vec![
-            port_scoped_https_proxy("https-gw", 1, port),
-            stream_proxy("udp-stream", BackendScheme::Udp, port),
-        ],
-        port,
-    );
-    let state = ProxyState::new(
-        config,
-        DnsCache::new(DnsConfig::default()),
-        test_env(),
-        None,
-        None,
-    )
-    .expect("proxy state")
-    .0;
-    let manager = build_manager(state, IpAddr::V4(Ipv4Addr::LOCALHOST))
-        .with_existing_frontends(None, Some(port));
-    let failures = manager.reconcile().await;
+    let (manager, failures, port) = reconcile_fresh_port(|port| async move {
+        let config = tls_config_with(
+            vec![
+                port_scoped_https_proxy("https-gw", 1, port),
+                stream_proxy("udp-stream", BackendScheme::Udp, port),
+            ],
+            port,
+        );
+        let state = ProxyState::new(
+            config,
+            DnsCache::new(DnsConfig::default()),
+            test_env(),
+            None,
+            None,
+        )
+        .expect("proxy state")
+        .0;
+        let manager = build_manager(state, IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .with_existing_frontends(None, Some(port));
+        let failures = manager.reconcile().await;
+        (manager, failures)
+    })
+    .await;
     assert!(
         !failures.iter().any(|failure| failure.port == port),
         "already-served same-class frontend must not become a dynamic failure: {failures:?}"
@@ -686,25 +731,28 @@ async fn process_global_same_class_frontend_is_not_dynamically_bound() {
 async fn ipv6_bind_still_preserves_tcp_on_udp_collision() {
     ensure_crypto_provider();
     let (backend, _b) = start_body_backend(b"v6-ok").await;
-    let port = free_port().await;
-    let config = tls_config_with(
-        vec![
-            port_scoped_https_proxy("https-gw", backend, port),
-            stream_proxy("udp-stream", BackendScheme::Udp, port),
-        ],
-        port,
-    );
-    let state = ProxyState::new(
-        config,
-        DnsCache::new(DnsConfig::default()),
-        test_env(),
-        None,
-        None,
-    )
-    .expect("proxy state")
-    .0;
-    let manager = build_manager(state.clone(), IpAddr::V6(Ipv6Addr::LOCALHOST));
-    let failures = manager.reconcile().await;
+    let ((state, manager), failures, port) = reconcile_fresh_port(|port| async move {
+        let config = tls_config_with(
+            vec![
+                port_scoped_https_proxy("https-gw", backend, port),
+                stream_proxy("udp-stream", BackendScheme::Udp, port),
+            ],
+            port,
+        );
+        let state = ProxyState::new(
+            config,
+            DnsCache::new(DnsConfig::default()),
+            test_env(),
+            None,
+            None,
+        )
+        .expect("proxy state")
+        .0;
+        let manager = build_manager(state.clone(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        let failures = manager.reconcile().await;
+        ((state, manager), failures)
+    })
+    .await;
     assert_quic_udp_collision(&failures, port);
     assert_eq!(manager.active_ports().await, vec![port]);
     assert!(manager.active_http3_ports().await.is_empty());
