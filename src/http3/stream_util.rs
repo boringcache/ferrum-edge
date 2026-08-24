@@ -11,6 +11,7 @@
 //! See RFC 9114 §8.1 (H3 error codes) and RFC 9000 §4.5 (STOP_SENDING).
 
 use std::future::Future;
+use std::ops::{Deref, DerefMut};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -397,6 +398,95 @@ where
     S: SendStream<Bytes>,
 {
     stream.stop_stream(Code::H3_INTERNAL_ERROR);
+}
+
+/// A COMMITTED HTTP/3 streaming response's request stream, with a fail-closed
+/// terminal (issue #4112).
+///
+/// `quinn::SendStream::drop` implicitly `finish()`es a send half that was
+/// neither finished nor reset, so EVERY way a relay can stop writing without
+/// landing its own FIN hands a stalled client a well-formed end of response:
+/// an authorization expiry, a backend body fault, a downstream write failure,
+/// an early `break` a later change adds between the response-header commit and
+/// the finish sites, or the request task being cancelled while parked in
+/// `send_data`. RFC 9114 has no in-band way to retract a response whose HEADERS
+/// already committed, so `RESET_STREAM` is the only honest terminal for all of
+/// them.
+///
+/// This is deliberately NOT another conditional re-assertion over accumulated
+/// `auth_termination` / `body_error_class` / `client_disconnected` bookkeeping
+/// (compare [`committed_response_requires_reset`], which the cross-protocol
+/// relays apply after their loops). The predicate is INVERTED and lives in the
+/// type: the terminal is a reset unless the relay PROVED it landed a clean FIN,
+/// so a branch that stops writing without latching a class — or a branch that
+/// never runs to the post-loop check at all because the task was dropped — is
+/// still fail-closed. Same shape as `ConnectUdpSendHalf` (issue #4072).
+///
+/// Wrap the stream once the relay is committed to writing a streaming response,
+/// deref it exactly as before, and call [`Self::record_clean_finish`] at each
+/// point a `finish()` toward the client actually returned `Ok`.
+pub(crate) struct CommittedH3ResponseStream<S: SendStream<Bytes>> {
+    stream: RequestStream<S, Bytes>,
+    /// Set ONLY where a downstream `finish()` returned `Ok`. The single thing
+    /// that disarms the reset.
+    clean_finish: bool,
+    /// Keeps the explicit settle and the `Drop` backstop from both resetting.
+    /// `stop_stream` is idempotent at the quinn layer, but tracking it here
+    /// keeps the intent readable and the wire behaviour exactly one terminal.
+    reset_applied: bool,
+}
+
+impl<S: SendStream<Bytes>> CommittedH3ResponseStream<S> {
+    /// Arm the fail-closed terminal for `stream`.
+    pub(crate) fn new(stream: RequestStream<S, Bytes>) -> Self {
+        Self {
+            stream,
+            clean_finish: false,
+            reset_applied: false,
+        }
+    }
+
+    /// Record that a downstream `finish()` returned `Ok`, i.e. the relay landed
+    /// a real clean end of body. Never call this for a finish that failed, was
+    /// cancelled, or was skipped.
+    pub(crate) fn record_clean_finish(&mut self) {
+        self.clean_finish = true;
+    }
+
+    /// Apply the terminal now rather than at drop, so the `RESET_STREAM`
+    /// reaches the wire before the relay's response-termination hooks and
+    /// transaction logging await. Idempotent, and a no-op once a clean FIN was
+    /// recorded, so it can never clobber a successful `finish()`.
+    pub(crate) fn settle_committed_terminal(&mut self) {
+        if self.clean_finish || self.reset_applied {
+            return;
+        }
+        self.reset_applied = true;
+        abort_response_stream(&mut self.stream);
+    }
+}
+
+impl<S: SendStream<Bytes>> Deref for CommittedH3ResponseStream<S> {
+    type Target = RequestStream<S, Bytes>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.stream
+    }
+}
+
+impl<S: SendStream<Bytes>> DerefMut for CommittedH3ResponseStream<S> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.stream
+    }
+}
+
+impl<S: SendStream<Bytes>> Drop for CommittedH3ResponseStream<S> {
+    /// The backstop the explicit settle cannot cover: a request task dropped
+    /// while its `send_data` is parked in QUIC flow control never reaches any
+    /// post-relay statement at all.
+    fn drop(&mut self) {
+        self.settle_committed_terminal();
+    }
 }
 
 /// Whether a COMMITTED H3 streaming response must leave its send half RESET.
