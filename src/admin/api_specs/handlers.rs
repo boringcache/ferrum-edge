@@ -2750,6 +2750,15 @@ pub async fn handle_post_api_spec(
     actor: &AuditActor,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let apply_mode = match crate::admin::parse_live_apply_mode_query(req.uri().query()) {
+        Ok(mode) => mode,
+        Err(message) => {
+            return Ok(json_resp(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error": message}),
+            ));
+        }
+    };
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
         Err(response) => return Ok(response),
@@ -2900,7 +2909,12 @@ pub async fn handle_post_api_spec(
         resp.headers_mut().insert("Location", hv);
     }
     Ok(state
-        .complete_live_config_mutation_after_commit_boxed(namespace, _write_permit, resp)
+        .complete_live_config_mutation_after_commit_boxed(
+            namespace,
+            _write_permit,
+            resp,
+            apply_mode,
+        )
         .await)
 }
 
@@ -2915,6 +2929,15 @@ pub async fn handle_put_api_spec(
     namespace: &str,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let apply_mode = match crate::admin::parse_live_apply_mode_query(req.uri().query()) {
+        Ok(mode) => mode,
+        Err(message) => {
+            return Ok(json_resp(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error": message}),
+            ));
+        }
+    };
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
         Err(response) => return Ok(response),
@@ -3161,6 +3184,7 @@ pub async fn handle_put_api_spec(
             namespace,
             _write_permit,
             json_resp(StatusCode::OK, &resp_body),
+            apply_mode,
         )
         .await)
 }
@@ -3294,6 +3318,7 @@ pub async fn handle_delete_api_spec(
     actor: &AuditActor,
     namespace: &str,
     id: &str,
+    apply_mode: crate::config::runtime_config_apply::LiveApplyMode,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -3652,7 +3677,12 @@ pub async fn handle_delete_api_spec(
             .body(Full::new(Bytes::new()))
             .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
         Ok(state
-            .complete_live_config_mutation_after_commit_boxed(namespace, _write_permit, response)
+            .complete_live_config_mutation_after_commit_boxed(
+                namespace,
+                _write_permit,
+                response,
+                apply_mode,
+            )
             .await)
     } else {
         Ok(error_response(ApiSpecError::NotFound))

@@ -558,3 +558,379 @@ async fn tests_without_a_poll_loop_do_not_wait() {
         "without a poll loop the runtime snapshot stays unchanged"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #4139 — deferred apply (`?apply=async`) + `GET /config/apply-status`.
+// ---------------------------------------------------------------------------
+
+async fn admin_request(
+    method: reqwest::Method,
+    base_url: &str,
+    path: &str,
+    token: &str,
+    body: Option<&Value>,
+) -> (u16, reqwest::header::HeaderMap, Value) {
+    let mut req = reqwest::Client::new()
+        .request(method, format!("{base_url}{path}"))
+        .bearer_auth(token);
+    if let Some(body) = body {
+        req = req.json(body);
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
+    let body = resp.json().await.unwrap_or_else(|_| json!({}));
+    (status, headers, body)
+}
+
+/// Parse `X-Ferrum-Config-Cursor: {epoch}:{sequence}`.
+fn cursor_from_headers(headers: &reqwest::header::HeaderMap) -> (u64, u64) {
+    let raw = headers
+        .get("x-ferrum-config-cursor")
+        .expect("mutation response must carry the covering cursor header")
+        .to_str()
+        .expect("cursor header is ascii");
+    let (epoch, sequence) = raw.split_once(':').expect("cursor is epoch:sequence");
+    (
+        epoch.parse().expect("epoch u64"),
+        sequence.parse().expect("sequence u64"),
+    )
+}
+
+struct DeferredHarness {
+    proxy_state: ProxyState,
+    base: String,
+    token: String,
+    shutdown_tx: watch::Sender<bool>,
+    _admin_shutdown: watch::Sender<bool>,
+    _tmp: TempDir,
+}
+
+/// Poller-backed admin server for the deferred-apply tests. `poll_delay` and
+/// `reject` mirror `spawn_authoritative_poller`'s knobs.
+async fn deferred_harness(poll_delay: Duration, reject: bool) -> DeferredHarness {
+    let (store, tmp) = sqlite_store().await;
+    let ns = default_namespace();
+    let proxy_state = proxy_state();
+    let seq = store.latest_change_sequence(&ns).await.unwrap_or(0);
+    let apply = Arc::new(RuntimeConfigApply::at_epoch(
+        ns.clone(),
+        store.config_topology_epoch(),
+        seq,
+    ));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    spawn_authoritative_poller(
+        store.clone(),
+        ns,
+        proxy_state.clone(),
+        apply.clone(),
+        shutdown_rx,
+        poll_delay,
+        Arc::new(AtomicU64::new(0)),
+        reject,
+    );
+    let state = live_admin_state(store, proxy_state.clone(), apply);
+    let (base, admin_shutdown) = start_admin(state).await;
+    DeferredHarness {
+        proxy_state,
+        base,
+        token: admin_token(),
+        shutdown_tx,
+        _admin_shutdown: admin_shutdown,
+        _tmp: tmp,
+    }
+}
+
+#[tokio::test]
+async fn deferred_create_returns_202_with_cursor_and_apply_status_converges() {
+    let h = deferred_harness(Duration::from_millis(50), false).await;
+
+    let (status, headers, body) = tokio::time::timeout(
+        Duration::from_secs(5),
+        admin_request(
+            reqwest::Method::POST,
+            &h.base,
+            "/proxies?apply=async",
+            &h.token,
+            Some(&proxy_payload("/deferred-create")),
+        ),
+    )
+    .await
+    .expect("deferred create must not wait on the reload");
+    assert_eq!(status, 202, "deferred create is accepted, not live: {body}");
+    assert!(
+        body["id"].as_str().is_some(),
+        "202 keeps the created-resource body: {body}"
+    );
+    let (epoch, sequence) = cursor_from_headers(&headers);
+
+    let (status, _headers, status_body) = tokio::time::timeout(
+        Duration::from_secs(10),
+        admin_request(
+            reqwest::Method::GET,
+            &h.base,
+            &format!("/config/apply-status?epoch={epoch}&sequence={sequence}&wait_ms=5000"),
+            &h.token,
+            None,
+        ),
+    )
+    .await
+    .expect("blocking apply-status must nudge the poll, not sit on the interval");
+    assert_eq!(status, 200, "{status_body}");
+    assert_eq!(status_body["state"], "applied", "{status_body}");
+    assert!(
+        runtime_has_listen_path(&h.proxy_state, "/deferred-create"),
+        "applied means the runtime snapshot serves the write"
+    );
+    let _ = h.shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn deferred_writes_converge_with_one_final_wait() {
+    let h = deferred_harness(Duration::from_millis(30), false).await;
+
+    let mut last_cursor = (0u64, 0u64);
+    for path in ["/bulk-a", "/bulk-b", "/bulk-c"] {
+        let (status, headers, body) = tokio::time::timeout(
+            Duration::from_secs(5),
+            admin_request(
+                reqwest::Method::POST,
+                &h.base,
+                "/proxies?apply=async",
+                &h.token,
+                Some(&proxy_payload(path)),
+            ),
+        )
+        .await
+        .expect("deferred writes must pipeline without per-write reloads");
+        assert_eq!(status, 202, "{path}: {body}");
+        let cursor = cursor_from_headers(&headers);
+        assert!(
+            cursor >= last_cursor,
+            "cursors are monotone per topology: {cursor:?} < {last_cursor:?}"
+        );
+        last_cursor = cursor;
+    }
+
+    // ONE wait on the LAST cursor covers every prior deferred write — this is
+    // the bulk-provisioning recipe from issue #4139.
+    let (status, _headers, body) = tokio::time::timeout(
+        Duration::from_secs(10),
+        admin_request(
+            reqwest::Method::GET,
+            &h.base,
+            &format!(
+                "/config/apply-status?epoch={}&sequence={}&wait_ms=5000",
+                last_cursor.0, last_cursor.1
+            ),
+            &h.token,
+            None,
+        ),
+    )
+    .await
+    .expect("single final wait");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "applied", "{body}");
+    for path in ["/bulk-a", "/bulk-b", "/bulk-c"] {
+        assert!(
+            runtime_has_listen_path(&h.proxy_state, path),
+            "{path} must be live once the covering cursor is applied"
+        );
+    }
+    let _ = h.shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn deferred_write_rejected_candidate_is_reported_by_apply_status() {
+    let h = deferred_harness(Duration::ZERO, true).await;
+
+    let (status, headers, body) = tokio::time::timeout(
+        Duration::from_secs(5),
+        admin_request(
+            reqwest::Method::POST,
+            &h.base,
+            "/proxies?apply=async",
+            &h.token,
+            Some(&proxy_payload("/deferred-rejected")),
+        ),
+    )
+    .await
+    .expect("deferred write returns before the poll rejects");
+    assert_eq!(status, 202, "{body}");
+    let (epoch, sequence) = cursor_from_headers(&headers);
+
+    let (status, _headers, body) = tokio::time::timeout(
+        Duration::from_secs(10),
+        admin_request(
+            reqwest::Method::GET,
+            &h.base,
+            &format!("/config/apply-status?epoch={epoch}&sequence={sequence}&wait_ms=5000"),
+            &h.token,
+            None,
+        ),
+    )
+    .await
+    .expect("apply-status resolves the rejection fail-closed");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["state"], "rejected",
+        "a rejected generation must not read as pending or applied: {body}"
+    );
+    assert!(
+        !runtime_has_listen_path(&h.proxy_state, "/deferred-rejected"),
+        "rejected generation must not be served"
+    );
+    let _ = h.shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn sync_mutations_carry_the_covering_cursor_header() {
+    let h = deferred_harness(Duration::ZERO, false).await;
+
+    let (status, headers, body) = tokio::time::timeout(
+        Duration::from_secs(5),
+        admin_request(
+            reqwest::Method::POST,
+            &h.base,
+            "/proxies",
+            &h.token,
+            Some(&proxy_payload("/sync-cursor")),
+        ),
+    )
+    .await
+    .expect("sync create");
+    assert_eq!(status, 201, "{body}");
+    let (epoch, sequence) = cursor_from_headers(&headers);
+
+    // The sync path already proved liveness; the header names the same cursor
+    // apply-status classifies as applied without waiting.
+    let (status, _headers, body) = admin_request(
+        reqwest::Method::GET,
+        &h.base,
+        &format!("/config/apply-status?epoch={epoch}&sequence={sequence}"),
+        &h.token,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "applied", "{body}");
+    let _ = h.shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn apply_status_and_apply_mode_inputs_are_strictly_validated() {
+    let h = deferred_harness(Duration::ZERO, false).await;
+
+    for (path, expect) in [
+        ("/config/apply-status", "epoch and sequence are required"),
+        (
+            "/config/apply-status?epoch=1",
+            "epoch and sequence are required",
+        ),
+        (
+            "/config/apply-status?epoch=1&sequence=x",
+            "sequence must be an unsigned integer",
+        ),
+        (
+            "/config/apply-status?epoch=1&epoch=2&sequence=3",
+            "epoch must not be supplied more than once",
+        ),
+        (
+            "/config/apply-status?epoch=1&sequence=2&wait_ms=999999",
+            "wait_ms must be at most 30000",
+        ),
+    ] {
+        let (status, _headers, body) =
+            admin_request(reqwest::Method::GET, &h.base, path, &h.token, None).await;
+        assert_eq!(status, 400, "{path}: {body}");
+        assert_eq!(body["error"].as_str(), Some(expect), "{path}");
+    }
+
+    for path in ["/proxies?apply=deferred", "/proxies?apply=async&apply=sync"] {
+        let (status, _headers, body) = admin_request(
+            reqwest::Method::POST,
+            &h.base,
+            path,
+            &h.token,
+            Some(&proxy_payload("/never-created")),
+        )
+        .await;
+        assert_eq!(status, 400, "{path}: {body}");
+    }
+    assert!(!runtime_has_listen_path(&h.proxy_state, "/never-created"));
+    let _ = h.shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn apply_status_is_unverifiable_for_a_foreign_topology_epoch() {
+    let h = deferred_harness(Duration::ZERO, false).await;
+
+    let (status, headers, _body) = admin_request(
+        reqwest::Method::POST,
+        &h.base,
+        "/proxies",
+        &h.token,
+        Some(&proxy_payload("/epoch-probe")),
+    )
+    .await;
+    assert_eq!(status, 201);
+    let (epoch, sequence) = cursor_from_headers(&headers);
+
+    // A cursor from a replaced (or never-issued) topology cannot be proven
+    // live by this process — truthfully unverifiable, never a false applied.
+    let (status, _headers, body) = admin_request(
+        reqwest::Method::GET,
+        &h.base,
+        &format!(
+            "/config/apply-status?epoch={}&sequence={sequence}",
+            epoch + 1
+        ),
+        &h.token,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "unverifiable", "{body}");
+    let _ = h.shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn deferred_without_poll_loop_stays_plain_success_and_status_is_absent() {
+    let (store, _tmp) = sqlite_store().await;
+    let proxy_state = proxy_state();
+    let mut state = live_admin_state(
+        store,
+        proxy_state.clone(),
+        Arc::new(RuntimeConfigApply::new(default_namespace(), 0)),
+    );
+    state.runtime_config_apply = None;
+    let (base, _shutdown) = start_admin(state).await;
+    let token = admin_token();
+
+    // No coordinator → nothing to defer: the write stays a plain 201 with no
+    // cursor header, exactly like the sync no-coordinator contract.
+    let (status, headers, body) = tokio::time::timeout(
+        Duration::from_secs(2),
+        admin_request(
+            reqwest::Method::POST,
+            &base,
+            "/proxies?apply=async",
+            &token,
+            Some(&proxy_payload("/deferred-no-coordinator")),
+        ),
+    )
+    .await
+    .expect("None coordinator must not block");
+    assert_eq!(status, 201, "{body}");
+    assert!(headers.get("x-ferrum-config-cursor").is_none());
+
+    let (status, _headers, body) = admin_request(
+        reqwest::Method::GET,
+        &base,
+        "/config/apply-status?epoch=0&sequence=0",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+}

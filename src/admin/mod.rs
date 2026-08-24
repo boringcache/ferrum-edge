@@ -50,7 +50,10 @@ use crate::config::db_backend::{
     tcp_connection_throttle_attachment_conflict,
 };
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
-use crate::config::runtime_config_apply::{LiveApplyCursor, LiveApplyFailure, PreparedLiveApply};
+use crate::config::runtime_config_apply::{
+    ADMIN_WRITE_LIVE_APPLY_TIMEOUT, LiveApplyCursor, LiveApplyCursorState, LiveApplyFailure,
+    LiveApplyMode, PreparedLiveApply,
+};
 use crate::config::types::{
     ApiSpec, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
     max_credentials_per_type,
@@ -630,11 +633,12 @@ impl AdminState {
         namespace: &'a str,
         pins: P,
         response: Response<Full<Bytes>>,
+        mode: LiveApplyMode,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response<Full<Bytes>>> + Send + 'a>>
     where
         P: LiveApplyTopologyPins + Send + 'a,
     {
-        Box::pin(self.complete_live_config_mutation_after_commit(namespace, pins, response))
+        Box::pin(self.complete_live_config_mutation_after_commit(namespace, pins, response, mode))
     }
 
     pub async fn complete_live_config_mutation_after_commit<P>(
@@ -642,6 +646,7 @@ impl AdminState {
         namespace: &str,
         pins: P,
         response: Response<Full<Bytes>>,
+        mode: LiveApplyMode,
     ) -> Response<Full<Bytes>>
     where
         P: LiveApplyTopologyPins,
@@ -662,7 +667,37 @@ impl AdminState {
             }
         };
         drop(pins);
-        self.finish_prepared_live_apply(prepared, response).await
+        let Some(cursor) = prepared.covering_cursor() else {
+            // No poll-loop coordinator, or a namespace this process does not
+            // serve: there is no local generation to wait for or defer, in
+            // either mode (documented in docs/admin_api.md).
+            return response;
+        };
+        match mode {
+            LiveApplyMode::Sync => {
+                // The cursor header rides on BOTH outcomes: on 2xx it names the
+                // proven-live generation; on the committed-but-not-live `503`
+                // (`reload_timeout` / `config_rejected`) it is what lets the
+                // caller keep gating on `GET /config/apply-status` instead of
+                // guessing whether a durable commit ever converged.
+                let response = self.finish_prepared_live_apply(prepared, response).await;
+                attach_config_cursor_header(response, cursor)
+            }
+            LiveApplyMode::Deferred => {
+                // Explicit `?apply=async` (issue #4139): the row is durable and
+                // the covering cursor was captured fail-closed under the pins,
+                // but the client chose not to pay the synchronous reload.
+                // Answer 202 — never a 2xx that claims live — and kick a
+                // coalesced immediate poll so background convergence does not
+                // sit on `FERRUM_DB_POLL_INTERVAL`.
+                if let Some(apply) = self.runtime_config_apply.as_ref() {
+                    apply.signal_deferred_mutation();
+                }
+                let mut response = attach_config_cursor_header(response, cursor);
+                *response.status_mut() = StatusCode::ACCEPTED;
+                response
+            }
+        }
     }
 
     /// Admit an Admin API mutation under a write-topology pin (issue #3001).
@@ -3227,11 +3262,22 @@ async fn handle_admin_request_inner(
                 return Ok(json_response(StatusCode::BAD_REQUEST, &json!({"error": e})));
             }
             let id = id.to_string();
+            let apply_mode = match parse_live_apply_mode_query(req.uri().query()) {
+                Ok(mode) => mode,
+                Err(message) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        &json!({"error": message}),
+                    ));
+                }
+            };
             // DELETE should have no body. Drop the receiver so hyper discards
             // any remaining bytes via Drop without buffering them in userspace.
             drop(req.into_body());
-            return api_specs::handlers::handle_delete_api_spec(&state, &auth, &namespace, &id)
-                .await;
+            return api_specs::handlers::handle_delete_api_spec(
+                &state, &auth, &namespace, &id, apply_mode,
+            )
+            .await;
         }
         _ => {}
     }
@@ -3364,6 +3410,23 @@ async fn handle_admin_request_inner(
         };
     }
 
+    // `?apply=sync|async` on config-database mutations (issue #4139). Strict:
+    // an unknown value or duplicate is a 400, because this flag decides
+    // whether 2xx still means live.
+    macro_rules! route_live_apply_mode {
+        () => {
+            match parse_live_apply_mode_query(uri.query()) {
+                Ok(mode) => mode,
+                Err(message) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        &json!({"error": message}),
+                    ));
+                }
+            }
+        };
+    }
+
     let response = match (method.clone(), segments.as_slice()) {
         // Proxies CRUD
         (Method::GET, ["proxies"]) => {
@@ -3377,19 +3440,42 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_create::<Proxy>(&state, &auth, &body_bytes, &namespace).await
+            crud::handle_create::<Proxy>(
+                &state,
+                &auth,
+                &body_bytes,
+                &namespace,
+                route_live_apply_mode!(),
+            )
+            .await
         }
         (Method::PUT, ["proxies", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_update::<Proxy>(&state, &auth, id, &body_bytes, &namespace).await
+            crud::handle_update::<Proxy>(
+                &state,
+                &auth,
+                id,
+                &body_bytes,
+                &namespace,
+                route_live_apply_mode!(),
+            )
+            .await
         }
         (Method::DELETE, ["proxies", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_delete::<Proxy>(&state, &auth, id, &namespace, uri.query()).await
+            crud::handle_delete::<Proxy>(
+                &state,
+                &auth,
+                id,
+                &namespace,
+                uri.query(),
+                route_live_apply_mode!(),
+            )
+            .await
         }
 
         // Consumers CRUD
@@ -3401,7 +3487,14 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            crud::handle_create::<Consumer>(&state, &auth, &body_bytes, &namespace).await
+            crud::handle_create::<Consumer>(
+                &state,
+                &auth,
+                &body_bytes,
+                &namespace,
+                route_live_apply_mode!(),
+            )
+            .await
         }
         (Method::GET, ["consumers", id]) => {
             crud::handle_get::<Consumer>(&state, id, auth.role, &namespace).await
@@ -3410,13 +3503,29 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            crud::handle_update::<Consumer>(&state, &auth, id, &body_bytes, &namespace).await
+            crud::handle_update::<Consumer>(
+                &state,
+                &auth,
+                id,
+                &body_bytes,
+                &namespace,
+                route_live_apply_mode!(),
+            )
+            .await
         }
         (Method::DELETE, ["consumers", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            crud::handle_delete::<Consumer>(&state, &auth, id, &namespace, uri.query()).await
+            crud::handle_delete::<Consumer>(
+                &state,
+                &auth,
+                id,
+                &namespace,
+                uri.query(),
+                route_live_apply_mode!(),
+            )
+            .await
         }
 
         // Consumer credentials
@@ -3431,6 +3540,7 @@ async fn handle_admin_request_inner(
                 cred_type,
                 &body_bytes,
                 &namespace,
+                route_live_apply_mode!(),
             )
             .await
         }
@@ -3445,6 +3555,7 @@ async fn handle_admin_request_inner(
                 cred_type,
                 &body_bytes,
                 &namespace,
+                route_live_apply_mode!(),
             )
             .await
         }
@@ -3459,6 +3570,7 @@ async fn handle_admin_request_inner(
                 cred_type,
                 index,
                 &namespace,
+                route_live_apply_mode!(),
             )
             .await
         }
@@ -3466,7 +3578,15 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            handle_delete_credentials(&state, &auth, consumer_id, cred_type, &namespace).await
+            handle_delete_credentials(
+                &state,
+                &auth,
+                consumer_id,
+                cred_type,
+                &namespace,
+                route_live_apply_mode!(),
+            )
+            .await
         }
 
         // Plugins
@@ -3479,7 +3599,14 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_create::<PluginConfig>(&state, &auth, &body_bytes, &namespace).await
+            crud::handle_create::<PluginConfig>(
+                &state,
+                &auth,
+                &body_bytes,
+                &namespace,
+                route_live_apply_mode!(),
+            )
+            .await
         }
         (Method::GET, ["plugins", "config", id]) => {
             crud::handle_get::<PluginConfig>(&state, id, auth.role, &namespace).await
@@ -3488,13 +3615,29 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_update::<PluginConfig>(&state, &auth, id, &body_bytes, &namespace).await
+            crud::handle_update::<PluginConfig>(
+                &state,
+                &auth,
+                id,
+                &body_bytes,
+                &namespace,
+                route_live_apply_mode!(),
+            )
+            .await
         }
         (Method::DELETE, ["plugins", "config", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_delete::<PluginConfig>(&state, &auth, id, &namespace, uri.query()).await
+            crud::handle_delete::<PluginConfig>(
+                &state,
+                &auth,
+                id,
+                &namespace,
+                uri.query(),
+                route_live_apply_mode!(),
+            )
+            .await
         }
 
         // Upstreams CRUD
@@ -3506,7 +3649,14 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_create::<Upstream>(&state, &auth, &body_bytes, &namespace).await
+            crud::handle_create::<Upstream>(
+                &state,
+                &auth,
+                &body_bytes,
+                &namespace,
+                route_live_apply_mode!(),
+            )
+            .await
         }
         (Method::GET, ["upstreams", id]) => {
             crud::handle_get::<Upstream>(&state, id, auth.role, &namespace).await
@@ -3515,13 +3665,29 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_update::<Upstream>(&state, &auth, id, &body_bytes, &namespace).await
+            crud::handle_update::<Upstream>(
+                &state,
+                &auth,
+                id,
+                &body_bytes,
+                &namespace,
+                route_live_apply_mode!(),
+            )
+            .await
         }
         (Method::DELETE, ["upstreams", id]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            crud::handle_delete::<Upstream>(&state, &auth, id, &namespace, uri.query()).await
+            crud::handle_delete::<Upstream>(
+                &state,
+                &auth,
+                id,
+                &namespace,
+                uri.query(),
+                route_live_apply_mode!(),
+            )
+            .await
         }
 
         // Gateway trust bundles CRUD (issue #3727).
@@ -3549,8 +3715,14 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            crud::handle_create::<GatewayTrustBundleRecord>(&state, &auth, &body_bytes, &namespace)
-                .await
+            crud::handle_create::<GatewayTrustBundleRecord>(
+                &state,
+                &auth,
+                &body_bytes,
+                &namespace,
+                route_live_apply_mode!(),
+            )
+            .await
         }
         // Process-wide load/convergence status. Placed BEFORE the `{id}` arm is
         // unnecessary — it is a distinct path prefix, so no id can shadow it.
@@ -3576,6 +3748,7 @@ async fn handle_admin_request_inner(
                 id,
                 &body_bytes,
                 &namespace,
+                route_live_apply_mode!(),
             )
             .await
         }
@@ -3589,6 +3762,7 @@ async fn handle_admin_request_inner(
                 id,
                 &namespace,
                 uri.query(),
+                route_live_apply_mode!(),
             )
             .await
         }
@@ -3604,7 +3778,14 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
                 return Ok(resp);
             }
-            handle_batch_create(&state, &auth, &body_bytes, &namespace).await
+            handle_batch_create(
+                &state,
+                &auth,
+                &body_bytes,
+                &namespace,
+                route_live_apply_mode!(),
+            )
+            .await
         }
 
         // Backup & Restore
@@ -4025,6 +4206,20 @@ async fn handle_admin_request_inner(
 
         // Cluster status (CP/DP connection info)
         (Method::GET, ["cluster"]) => handle_cluster_status(&state).await,
+
+        // Live-apply cursor status (issue #4139). Operator-gated like the
+        // other convergence/status surfaces: it discloses only change-log
+        // sequence numbers and topology epochs — no resource data — and is
+        // how a `?apply=async` bulk client proves its writes are live. Not
+        // namespace-scoped: cursors are process-topology values, not
+        // tenant-addressed resources (writes to non-served namespaces never
+        // mint one).
+        (Method::GET, ["config", "apply-status"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            handle_config_apply_status(&state, query.as_deref()).await
+        }
 
         // Backend capability registry introspection + refresh.
         //
@@ -6490,6 +6685,7 @@ async fn handle_update_credentials(
     cred_type: &str,
     body: &[u8],
     namespace: &str,
+    apply_mode: LiveApplyMode,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -6595,7 +6791,12 @@ async fn handle_update_credentials(
     })
     .await;
     Ok(state
-        .complete_live_config_mutation_after_commit_boxed(namespace, _write_permit, response)
+        .complete_live_config_mutation_after_commit_boxed(
+            namespace,
+            _write_permit,
+            response,
+            apply_mode,
+        )
         .await)
 }
 
@@ -6605,6 +6806,7 @@ async fn handle_delete_credentials(
     consumer_id: &str,
     cred_type: &str,
     namespace: &str,
+    apply_mode: LiveApplyMode,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -6681,7 +6883,12 @@ async fn handle_delete_credentials(
     })
     .await;
     Ok(state
-        .complete_live_config_mutation_after_commit_boxed(namespace, _write_permit, response)
+        .complete_live_config_mutation_after_commit_boxed(
+            namespace,
+            _write_permit,
+            response,
+            apply_mode,
+        )
         .await)
 }
 
@@ -6693,6 +6900,7 @@ async fn handle_append_credential(
     cred_type: &str,
     body: &[u8],
     namespace: &str,
+    apply_mode: LiveApplyMode,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -6821,7 +7029,12 @@ async fn handle_append_credential(
     })
     .await;
     Ok(state
-        .complete_live_config_mutation_after_commit_boxed(namespace, _write_permit, response)
+        .complete_live_config_mutation_after_commit_boxed(
+            namespace,
+            _write_permit,
+            response,
+            apply_mode,
+        )
         .await)
 }
 
@@ -6834,6 +7047,7 @@ async fn handle_delete_credential_by_index(
     cred_type: &str,
     index_str: &str,
     namespace: &str,
+    apply_mode: LiveApplyMode,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -6948,7 +7162,12 @@ async fn handle_delete_credential_by_index(
     })
     .await;
     Ok(state
-        .complete_live_config_mutation_after_commit_boxed(namespace, _write_permit, response)
+        .complete_live_config_mutation_after_commit_boxed(
+            namespace,
+            _write_permit,
+            response,
+            apply_mode,
+        )
         .await)
 }
 
@@ -7188,6 +7407,7 @@ async fn handle_batch_create(
     actor: &AuditActor,
     body: &[u8],
     namespace: &str,
+    apply_mode: LiveApplyMode,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -7746,6 +7966,7 @@ async fn handle_batch_create(
             namespace,
             (namespace_config_admission_guard, _write_permit),
             json_response(StatusCode::CREATED, &response),
+            apply_mode,
         )
         .await)
 }
@@ -8526,6 +8747,15 @@ async fn handle_restore(
     query: Option<&str>,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let apply_mode = match parse_live_apply_mode_query(query) {
+        Ok(mode) => mode,
+        Err(message) => {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": message}),
+            ));
+        }
+    };
     // File/DP have no database. Report that before the generic read-only
     // gate so operators get the documented 503 rather than 403. Modes that
     // do have a database still run `admit_write` next, so
@@ -9436,6 +9666,7 @@ async fn handle_restore(
             namespace,
             (namespace_config_admission_guard, _write_permit),
             json_response(StatusCode::OK, &response),
+            apply_mode,
         )
         .await)
 }
@@ -9794,7 +10025,15 @@ where
 {
     match served_live_apply_namespace(state, candidates) {
         Some(namespace) => {
-            state.complete_live_config_mutation_after_commit_boxed(namespace, pins, response)
+            // Namespace-registry mutations are rare, whole-tenant operations;
+            // they stay on the synchronous read-your-write path and do not
+            // accept `?apply=async` (issue #4139 scope).
+            state.complete_live_config_mutation_after_commit_boxed(
+                namespace,
+                pins,
+                response,
+                LiveApplyMode::Sync,
+            )
         }
         None => {
             drop(pins);
@@ -10258,6 +10497,54 @@ async fn handle_delete_namespace(
 
 // ---- Helpers ----
 
+/// Response header naming the covering live-apply cursor of a config-database
+/// mutation as `"{topology_epoch}:{sequence}"` (issue #4139). Clients feed it
+/// to `GET /config/apply-status`. Cursors are monotone per topology, so a bulk
+/// client only needs to keep the last one it saw.
+pub const CONFIG_CURSOR_HEADER: &str = "x-ferrum-config-cursor";
+
+fn attach_config_cursor_header(
+    mut response: Response<Full<Bytes>>,
+    cursor: LiveApplyCursor,
+) -> Response<Full<Bytes>> {
+    if let Ok(value) = hyper::header::HeaderValue::from_str(&format!(
+        "{}:{}",
+        cursor.topology_epoch, cursor.sequence
+    )) {
+        response.headers_mut().insert(CONFIG_CURSOR_HEADER, value);
+    }
+    response
+}
+
+/// Parse `apply` from a config-mutation query string (issue #4139).
+///
+/// Absent → [`LiveApplyMode::Sync`] (the issue #3926 read-your-write default).
+/// Exactly one occurrence of `sync` or `async` is accepted; anything else is an
+/// error because this flag decides whether 2xx still means live.
+pub(crate) fn parse_live_apply_mode_query(query: Option<&str>) -> Result<LiveApplyMode, String> {
+    let Some(query) = query else {
+        return Ok(LiveApplyMode::Sync);
+    };
+    let mut parsed = None;
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key.as_ref() != "apply" {
+            continue;
+        }
+        let mode = match value.as_ref() {
+            "sync" => LiveApplyMode::Sync,
+            "async" => LiveApplyMode::Deferred,
+            other => {
+                return Err(format!("apply must be 'sync' or 'async', not '{other}'"));
+            }
+        };
+        if parsed.is_some() {
+            return Err("apply must not be supplied more than once".to_string());
+        }
+        parsed = Some(mode);
+    }
+    Ok(parsed.unwrap_or_default())
+}
+
 fn live_apply_failure_response(failure: LiveApplyFailure) -> Response<Full<Bytes>> {
     json_response(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -10267,6 +10554,128 @@ fn live_apply_failure_response(failure: LiveApplyFailure) -> Response<Full<Bytes
             "reason": failure.as_str(),
         }),
     )
+}
+
+/// Parsed `GET /config/apply-status` query (issue #4139).
+struct ApplyStatusQuery {
+    cursor: LiveApplyCursor,
+    wait: Option<Duration>,
+}
+
+/// Parse `epoch`, `sequence`, and optional `wait_ms` for
+/// `GET /config/apply-status`. `epoch`/`sequence` are required u64s;
+/// `wait_ms` is bounded by [`ADMIN_WRITE_LIVE_APPLY_TIMEOUT`] so a status
+/// probe can never out-wait the synchronous mutation path. Duplicates are
+/// rejected; unrelated keys are ignored for forward compatibility.
+fn parse_apply_status_query(query: Option<&str>) -> Result<ApplyStatusQuery, String> {
+    let mut epoch: Option<u64> = None;
+    let mut sequence: Option<u64> = None;
+    let mut wait_ms: Option<u64> = None;
+    if let Some(query) = query {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            let slot = match key.as_ref() {
+                "epoch" => &mut epoch,
+                "sequence" => &mut sequence,
+                "wait_ms" => &mut wait_ms,
+                _ => continue,
+            };
+            if slot.is_some() {
+                return Err(format!("{} must not be supplied more than once", key));
+            }
+            match value.as_ref().parse::<u64>() {
+                Ok(parsed) => *slot = Some(parsed),
+                Err(_) => {
+                    return Err(format!("{} must be an unsigned integer", key));
+                }
+            }
+        }
+    }
+    let (Some(epoch), Some(sequence)) = (epoch, sequence) else {
+        return Err("epoch and sequence are required".to_string());
+    };
+    let wait = match wait_ms {
+        None | Some(0) => None,
+        Some(ms) => {
+            let max_ms = ADMIN_WRITE_LIVE_APPLY_TIMEOUT.as_millis() as u64;
+            if ms > max_ms {
+                return Err(format!("wait_ms must be at most {max_ms}"));
+            }
+            Some(Duration::from_millis(ms))
+        }
+    };
+    Ok(ApplyStatusQuery {
+        cursor: LiveApplyCursor::new(epoch, sequence),
+        wait,
+    })
+}
+
+/// `GET /config/apply-status?epoch=&sequence=[&wait_ms=]` (issue #4139).
+///
+/// Classifies a previously returned `X-Ferrum-Config-Cursor` against the
+/// poll-loop coordinator: `applied` / `pending` / `rejected` / `unverifiable`.
+/// With `wait_ms`, blocks (bounded) until the cursor resolves, registering as
+/// a live-apply waiter so it inherits the immediate poll nudge — this is how a
+/// bulk `?apply=async` client converges with ONE reload instead of one per
+/// write. Never reads the database; the topology-epoch checks on both sides of
+/// the wait mirror `await_prepared_live_apply` so a concurrent reconnect can
+/// never turn into a false `applied`.
+async fn handle_config_apply_status(
+    state: &AdminState,
+    query: Option<&str>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let params = match parse_apply_status_query(query) {
+        Ok(params) => params,
+        Err(message) => {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": message}),
+            ));
+        }
+    };
+    let Some(apply) = state.runtime_config_apply.as_ref() else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "Live-apply status is only available in database mode with an active poll loop"}),
+        ));
+    };
+    let Some(db) = state.db.as_ref() else {
+        return Ok(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": "No database"}),
+        ));
+    };
+    let cursor = params.cursor;
+    let cursor_state = if db.config_topology_epoch() != cursor.topology_epoch {
+        // Replaced topology (failover/reconnect) — or a cursor this process
+        // never minted. Either way liveness cannot be proven here.
+        LiveApplyCursorState::Unverifiable
+    } else if let Some(wait) = params.wait {
+        match apply
+            .await_committed_cursor_with_timeout(cursor, wait)
+            .await
+        {
+            Ok(()) if db.config_topology_epoch() == cursor.topology_epoch => {
+                LiveApplyCursorState::Applied
+            }
+            Ok(()) => LiveApplyCursorState::Unverifiable,
+            Err(LiveApplyFailure::Timeout) => LiveApplyCursorState::Pending,
+            Err(LiveApplyFailure::ConfigRejected) => LiveApplyCursorState::Rejected,
+            Err(LiveApplyFailure::SequenceUnavailable) => LiveApplyCursorState::Unverifiable,
+        }
+    } else {
+        apply.cursor_state(cursor)
+    };
+    let accepted = apply.accepted_cursor();
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "topology_epoch": cursor.topology_epoch,
+            "sequence": cursor.sequence,
+            "state": cursor_state.as_str(),
+            "accepted_topology_epoch": accepted.topology_epoch,
+            "accepted_sequence": accepted.sequence,
+        }),
+    ))
 }
 
 pub(in crate::admin) fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {

@@ -23,7 +23,9 @@ use ferrum_edge::admin::{
 };
 use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::db_loader::DatabaseStore;
-use ferrum_edge::config::runtime_config_apply::{LiveApplyFailure, RuntimeConfigApply};
+use ferrum_edge::config::runtime_config_apply::{
+    LiveApplyFailure, LiveApplyMode, RuntimeConfigApply,
+};
 use ferrum_edge::config::types::{Proxy, default_namespace};
 use http_body_util::{BodyExt, Full};
 use hyper::{Response, StatusCode};
@@ -197,7 +199,12 @@ async fn sequence_unavailable_returns_applied_false() {
     let permit = state.admit_write().await.expect("admit on primary");
     let (status, body) = response_json(
         state
-            .complete_live_config_mutation_after_commit(&default_namespace(), permit, ok_response())
+            .complete_live_config_mutation_after_commit(
+                &default_namespace(),
+                permit,
+                ok_response(),
+                LiveApplyMode::Sync,
+            )
             .await,
     )
     .await;
@@ -394,7 +401,12 @@ async fn complete_releases_pin_and_fails_when_reconnect_replaces_topology() {
     let complete_ns = ns.clone();
     let complete_handle = tokio::spawn(async move {
         complete_state
-            .complete_live_config_mutation_after_commit(&complete_ns, permit, ok_response())
+            .complete_live_config_mutation_after_commit(
+                &complete_ns,
+                permit,
+                ok_response(),
+                LiveApplyMode::Sync,
+            )
             .await
     });
 

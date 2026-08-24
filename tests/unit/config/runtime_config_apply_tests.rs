@@ -221,3 +221,79 @@ fn database_incremental_publication_is_fenced_after_async_validation() {
         "the database topology pin must cover only final synchronous publication"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #4139 — deferred apply: cursor classification + bounded status waits.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cursor_state_classifies_against_the_published_snapshot() {
+    use ferrum_edge::config::runtime_config_apply::LiveApplyCursorState;
+    let apply = RuntimeConfigApply::at_epoch("ferrum", 3, 10);
+    assert_eq!(
+        apply.cursor_state(LiveApplyCursor::new(3, 10)),
+        LiveApplyCursorState::Applied,
+        "covered sequence in the current topology is applied"
+    );
+    assert_eq!(
+        apply.cursor_state(LiveApplyCursor::new(3, 11)),
+        LiveApplyCursorState::Pending,
+        "uncovered sequence in the current topology is pending"
+    );
+    assert_eq!(
+        apply.cursor_state(LiveApplyCursor::new(2, 1)),
+        LiveApplyCursorState::Unverifiable,
+        "a cursor from a replaced topology can no longer be proven"
+    );
+    assert_eq!(
+        apply.cursor_state(LiveApplyCursor::new(4, 1)),
+        LiveApplyCursorState::Pending,
+        "a cursor ahead of the observed topology classifies pending; the \
+         admin handler pairs this with the process topology-epoch check"
+    );
+    apply.record_rejected_cursor(LiveApplyCursor::new(3, 12));
+    assert_eq!(
+        apply.cursor_state(LiveApplyCursor::new(3, 12)),
+        LiveApplyCursorState::Rejected,
+        "a rejected poll covers pending cursors at or below its sequence"
+    );
+}
+
+#[test]
+fn cursor_state_labels_are_closed() {
+    use ferrum_edge::config::runtime_config_apply::LiveApplyCursorState;
+    assert_eq!(LiveApplyCursorState::Applied.as_str(), "applied");
+    assert_eq!(LiveApplyCursorState::Pending.as_str(), "pending");
+    assert_eq!(LiveApplyCursorState::Rejected.as_str(), "rejected");
+    assert_eq!(LiveApplyCursorState::Unverifiable.as_str(), "unverifiable");
+}
+
+#[tokio::test]
+async fn bounded_status_wait_times_out_without_failing_the_cursor() {
+    let apply = Arc::new(RuntimeConfigApply::new("ferrum", 0));
+    let err = apply
+        .await_committed_cursor_with_timeout(LiveApplyCursor::new(0, 5), Duration::from_millis(20))
+        .await
+        .expect_err("nothing published; the bounded wait must elapse");
+    assert_eq!(err, LiveApplyFailure::Timeout);
+    // The cursor itself is merely pending — a later accepted generation still
+    // resolves it, which is what lets a status probe retry harmlessly.
+    apply.record_accepted(5);
+    apply
+        .await_committed_cursor_with_timeout(LiveApplyCursor::new(0, 5), Duration::from_millis(20))
+        .await
+        .expect("accepted generation resolves the same cursor");
+}
+
+#[tokio::test]
+async fn deferred_mutation_signal_is_a_coalesced_immediate_wake() {
+    let apply = RuntimeConfigApply::new("ferrum", 0);
+    let wake = apply.wake_signal();
+    let before = wake.signals_total();
+    apply.signal_deferred_mutation();
+    apply.signal_deferred_mutation();
+    assert!(
+        wake.signals_total() > before,
+        "a deferred write must raise a wake so convergence does not sit on FERRUM_DB_POLL_INTERVAL"
+    );
+}
