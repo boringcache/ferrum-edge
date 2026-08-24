@@ -85,9 +85,16 @@ pub enum BatchProvisionDecision {
     /// committed but is not live"). The resources EXIST, so re-posting the same
     /// all-or-nothing body would collide with itself; the caller must move on
     /// and gate on convergence instead.
-    CommittedNotLive { reason: String },
-    Retry { delay: Duration },
-    Fatal { status: u16, body: String },
+    CommittedNotLive {
+        reason: String,
+    },
+    Retry {
+        delay: Duration,
+    },
+    Fatal {
+        status: u16,
+        body: String,
+    },
 }
 
 /// Env value paired with [`SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS`] so the
