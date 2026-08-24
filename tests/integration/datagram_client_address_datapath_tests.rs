@@ -1060,6 +1060,19 @@ async fn two_live_listeners_sharing_one_secret_refuse_cross_listener_replay() {
     let mut balancer_b = Balancer::new(2);
     let mut expected_b_drops = 0u64;
     let mut expected_b_admissions = 0u64;
+    // Hold every admitted-flow socket until the listeners shut down.
+    //
+    // UDP sessions live for `udp_idle_timeout_seconds` (60s here) and are
+    // keyed by the balancer's socket 4-tuple, then pinned to the forwarded
+    // identity of the first admitted datagram. Dropping `native` at the end
+    // of an iteration frees that ephemeral source port; the kernel can reuse
+    // it on the next `bind("127.0.0.1:0")`. The new envelope then hits the
+    // still-live session, fails the identity pin, and is dropped — which
+    // surfaces as the positive admit returning `None`. IPv6 is last in
+    // `ALL_FORMS`, so it is the form that observes a reused 4-tuple. Keeping
+    // the sockets bound makes each 4-tuple unique for the whole test, which
+    // is also how a real balancer allocates one source port per client flow.
+    let mut native_flows: Vec<UdpSocket> = Vec::with_capacity(ALL_FORMS.len());
 
     for label in ALL_FORMS {
         let mut balancer = Balancer::new(1);
@@ -1125,6 +1138,9 @@ async fn two_live_listeners_sharing_one_secret_refuse_cross_listener_replay() {
             expected_b_drops,
             "{label} admission must not have been counted as a drop"
         );
+        // Keep the source port bound so a later form cannot reuse this
+        // 4-tuple against a still-pinned session.
+        native_flows.push(native);
     }
 
     // Listener A never saw any of it: the replays were aimed at B.
@@ -1147,6 +1163,8 @@ async fn two_live_listeners_sharing_one_secret_refuse_cross_listener_replay() {
 
     gateway_a.shutdown().await;
     gateway_b.shutdown().await;
+    // Source ports stay bound until the listeners (and their sessions) are gone.
+    drop(native_flows);
 }
 
 /// A stale authenticated envelope — outside the freshness horizon — is refused
