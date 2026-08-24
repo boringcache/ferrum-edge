@@ -6162,10 +6162,7 @@ mod inner {
                 .await?;
 
             // Collections whose `_id` is independent of the namespace: rewrite
-            // the field in place. Historical `audit_events` are immutable
-            // evidence and are deliberately excluded: they retain the namespace
-            // recorded when the event occurred. The rename mutation may still
-            // enqueue a new audit event under the new name after commit.
+            // the field in place.
             for collection in ["proxies", "plugin_configs", "upstreams", "api_specs"] {
                 self.collection(collection)
                     .update_many(
@@ -6175,6 +6172,15 @@ mod inner {
                     .session(&mut *session)
                     .await?;
             }
+            // Audit history follows the tenant so it cannot be disclosed to a
+            // caller authorized for a later reuse of the old namespace name.
+            self.audit_events()
+                .update_many(
+                    doc! { "namespace": current_name },
+                    doc! { "$set": { "namespace": new_name } },
+                )
+                .session(&mut *session)
+                .await?;
 
             // Composite `_id` = "{namespace}:{suffix}", plus a `namespace`
             // field: the document must be reinserted under a new `_id`.

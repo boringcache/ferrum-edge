@@ -17,7 +17,9 @@ use ferrum_edge::config::db_loader::{
     DatabaseStore, is_retryable_sql_transaction_conflict,
     sqlstate_is_retryable_transaction_conflict,
 };
-use ferrum_edge::config::namespace_registry::NamespaceRegistryCorrupt;
+use ferrum_edge::config::namespace_registry::{
+    NAMESPACE_RENAME_SIMPLE_TABLES, NamespaceRegistryCorrupt,
+};
 use ferrum_edge::config::plugin_trigger::PluginTrigger;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, PluginAssociation, PluginConfig,
@@ -3535,7 +3537,7 @@ fn last_remaining_sql_is_registry_row_authority_not_the_get_union() {
 }
 
 #[test]
-fn sql_namespace_rename_does_not_rewrite_historical_audit_events() {
+fn sql_namespace_rename_rewrites_historical_audit_events() {
     let source = include_str!("../../../src/config/db_loader.rs");
     let start = source
         .find("async fn rename_namespace_in_tx(")
@@ -3549,10 +3551,8 @@ fn sql_namespace_rename_does_not_rewrite_historical_audit_events() {
         "in-place SQL rename must still walk the live resource table plan:\n{body}"
     );
     assert!(
-        !body.contains("UPDATE audit_events")
-            && !body.contains("\"audit_events\"")
-            && !body.contains("'audit_events'"),
-        "historical audit_events must retain the namespace recorded at event time:\n{body}"
+        NAMESPACE_RENAME_SIMPLE_TABLES.contains(&"audit_events"),
+        "historical audit_events must follow the renamed tenant:\n{body}"
     );
     for table in ["proxies", "plugin_configs", "upstreams", "api_specs"] {
         assert!(
