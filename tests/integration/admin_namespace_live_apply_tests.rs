@@ -33,6 +33,24 @@ const JWT_ISSUER: &str = "test-ferrum-edge";
 /// that the suite stays fast. Never used as the success path's only signal.
 const SETTLE: Duration = Duration::from_millis(300);
 
+/// A live-apply budget chosen so it can never fire in these tests.
+///
+/// Three of these tests park a request on the poll-acceptance wait, assert it
+/// is still parked, and then drive the coordinator to the outcome under test.
+/// The budget is scaffolding there, not the property — only
+/// `rename_into_served_namespace_times_out_closed` exercises the timeout path,
+/// and it sets its own 200ms budget explicitly.
+///
+/// It used to be 30s, which a heavily loaded runner can beat: the task can be
+/// starved between the `SETTLE` sleep and the call that drives the outcome, and
+/// the request then answers `reload_timeout` instead of the expected reason.
+/// Observed on PR #4121 (`Integration Tests (admin-platform)`), where the job
+/// recorded 30.42s for `rename_into_served_namespace_fails_closed_on_rejection`
+/// and got `reload_timeout` where `config_rejected` was required — on a PR that
+/// touches no live-apply code. Five minutes is far outside any plausible
+/// scheduling stall while still bounding a genuinely wedged coordinator.
+const NEVER_FIRES: Duration = Duration::from_secs(300);
+
 fn jwt_manager() -> JwtManager {
     JwtManager::new(JwtConfig {
         secret: JWT_SECRET.to_string(),
@@ -236,7 +254,7 @@ async fn rename_fixture(dir: &TempDir, served: &str, timeout: Duration) -> Renam
 #[tokio::test]
 async fn rename_into_served_namespace_waits_for_poll_acceptance() {
     let dir = TempDir::new().expect("temp dir");
-    let fx = rename_fixture(&dir, "served", Duration::from_secs(30)).await;
+    let fx = rename_fixture(&dir, "served", NEVER_FIRES).await;
 
     let handle = spawn_send(
         reqwest::Method::PUT,
@@ -264,7 +282,7 @@ async fn rename_into_served_namespace_waits_for_poll_acceptance() {
 #[tokio::test]
 async fn rename_into_served_namespace_fails_closed_on_rejection() {
     let dir = TempDir::new().expect("temp dir");
-    let fx = rename_fixture(&dir, "served", Duration::from_secs(30)).await;
+    let fx = rename_fixture(&dir, "served", NEVER_FIRES).await;
 
     let handle = spawn_send(
         reqwest::Method::PUT,
@@ -307,7 +325,7 @@ async fn rename_into_served_namespace_times_out_closed() {
 #[tokio::test]
 async fn waiting_rename_releases_the_registry_admission_lease() {
     let dir = TempDir::new().expect("temp dir");
-    let fx = rename_fixture(&dir, "served", Duration::from_secs(30)).await;
+    let fx = rename_fixture(&dir, "served", NEVER_FIRES).await;
 
     let rename = spawn_send(
         reqwest::Method::PUT,
@@ -430,7 +448,7 @@ async fn confirmed_cascade_delete_of_the_served_namespace_waits() {
     let apply = coordinator(
         "served",
         store.config_topology_epoch(),
-        Duration::from_secs(30),
+        NEVER_FIRES,
     );
     let db: Arc<dyn DatabaseBackend> = Arc::new(store.clone());
     let (base, _shutdown) = start_admin(namespace_admin_state(db, Some(apply.clone()))).await;
