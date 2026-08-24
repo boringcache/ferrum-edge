@@ -624,3 +624,58 @@ fn scaling_gate_publisher_spoof_and_discovery_contracts_are_pr_gated() {
         "public issue reasons must be sanitized and truncated before they reach the issue body"
     );
 }
+
+/// A committed-but-not-live `POST /batch` answer must not abort provisioning.
+///
+/// Observed on the 2026-08-24 dispatched scaling run (32675684731) on `main`
+/// AFTER read-your-write live apply (#3960) landed: both 30k legs — SQLite as
+/// well as PostgreSQL — died at batch 2 with
+/// `503 {"applied":false,"reason":"reload_timeout"}`. The write is DURABLE
+/// there ("Configuration was committed but is not live"), so failing loses
+/// nothing but the run, and retrying the same all-or-nothing body would
+/// collide with the resources it just created. The only correct move is to
+/// carry on and let the bounded convergence gate decide.
+#[test]
+fn committed_but_not_live_batches_continue_to_the_convergence_gate() {
+    for reason in ["reload_timeout", "sequence_unavailable"] {
+        let body = json!({
+            "error": "Configuration was committed but is not live: runtime reload did not apply in time",
+            "applied": false,
+            "reason": reason,
+        })
+        .to_string();
+        assert!(
+            matches!(
+                classify_admin_batch_response(503, None, &body),
+                BatchProvisionDecision::CommittedNotLive { .. }
+            ),
+            "{reason} must be treated as committed, not fatal and not retryable"
+        );
+    }
+
+    // `config_rejected` is the opposite case: the runtime REFUSED the
+    // candidate, so it will never go live and the harness must fail loudly.
+    let rejected = json!({
+        "error": "Configuration was committed but is not live: runtime reload rejected the candidate",
+        "applied": false,
+        "reason": "config_rejected",
+    })
+    .to_string();
+    assert!(
+        matches!(
+            classify_admin_batch_response(503, None, &rejected),
+            BatchProvisionDecision::Fatal { .. }
+        ),
+        "a rejected candidate must never be mistaken for a committed one"
+    );
+
+    // A 503 that does not carry the documented shape stays fatal.
+    let opaque = json!({"error": "something else"}).to_string();
+    assert!(
+        matches!(
+            classify_admin_batch_response(503, None, &opaque),
+            BatchProvisionDecision::Fatal { .. }
+        ),
+        "only the documented applied/reason shape may be treated as committed"
+    );
+}

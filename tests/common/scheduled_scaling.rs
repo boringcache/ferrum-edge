@@ -77,6 +77,15 @@ pub const ADMIN_BATCH_REQUEST_TIMEOUT_SECS: u64 = 5 * 60;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchProvisionDecision {
     Success,
+    /// The batch COMMITTED durably but the runtime had not published it yet.
+    ///
+    /// `POST /batch` answers 503 with `applied: false` and
+    /// `reason: reload_timeout` / `sequence_unavailable` when the live-apply
+    /// wait elapses (`LiveApplyFailure::error_message`, "Configuration was
+    /// committed but is not live"). The resources EXIST, so re-posting the same
+    /// all-or-nothing body would collide with itself; the caller must move on
+    /// and gate on convergence instead.
+    CommittedNotLive { reason: String },
     Retry { delay: Duration },
     Fatal { status: u16, body: String },
 }
@@ -138,6 +147,28 @@ fn is_documented_retryable_batch_503_body(body: &str) -> bool {
     }
 }
 
+/// Recognize the documented "committed but not live" `POST /batch` answer.
+///
+/// `reload_timeout` and `sequence_unavailable` both mean the write is DURABLE
+/// and only its publication is unconfirmed, so provisioning must continue and
+/// let the convergence gate decide when the data plane caught up. Retrying is
+/// wrong (the resources already exist) and failing is wrong (nothing was lost).
+///
+/// `config_rejected` is deliberately NOT included: there the runtime refused
+/// the candidate, so it will never go live and the harness must fail loudly.
+fn committed_not_live_reason(status: u16, body: &str) -> Option<String> {
+    if status != 503 {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let map = value.as_object()?;
+    if map.get("applied").and_then(serde_json::Value::as_bool) != Some(false) {
+        return None;
+    }
+    let reason = map.get("reason").and_then(serde_json::Value::as_str)?;
+    matches!(reason, "reload_timeout" | "sequence_unavailable").then(|| reason.to_string())
+}
+
 /// Classify a completed HTTP response to an atomic `POST /batch`.
 ///
 /// Transport errors and unreadable bodies never reach this function and must
@@ -157,6 +188,9 @@ pub fn classify_admin_batch_response(
         return BatchProvisionDecision::Retry {
             delay: namespace_fence_retry_after_delay(retry_after),
         };
+    }
+    if let Some(reason) = committed_not_live_reason(status, body) {
+        return BatchProvisionDecision::CommittedNotLive { reason };
     }
     BatchProvisionDecision::Fatal {
         status,
@@ -212,6 +246,16 @@ pub async fn post_admin_batch(
 
         match classify_admin_batch_response(status, retry_after.as_deref(), &body_text) {
             BatchProvisionDecision::Success => return Ok(()),
+            BatchProvisionDecision::CommittedNotLive { reason } => {
+                // Durable, just not published yet. Carry on: the caller's
+                // bounded convergence gate is what decides when the data plane
+                // has caught up, and it reports far better than a retry here.
+                eprintln!(
+                    "{operation}: committed but not yet live ({reason}); \
+                     continuing to the convergence gate"
+                );
+                return Ok(());
+            }
             BatchProvisionDecision::Fatal { status, body } => {
                 return Err(format!("{operation} failed: {status} - {body}").into());
             }
