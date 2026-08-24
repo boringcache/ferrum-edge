@@ -120,7 +120,7 @@ cargo test --test functional_tests test_load_stress_10k_proxies \
 
 ### Phase 1: Provisioning
 
-Resources are created via the batch admin API (`POST /batch`) in chunks of 100:
+Resources are created via the batch admin API (`POST /batch?apply=async`, issue #4139) in chunks of 100 — each chunk commits durably and answers `202 Accepted` with a covering `X-Ferrum-Config-Cursor` instead of paying a synchronous poll-loop reload; the harness proves the whole graph live with one blocking `GET /config/apply-status` on the highest cursor before its convergence gates run:
 
 1. **Consumers** (10,000) - Created first for referential integrity
 2. **Proxies** (10,000) - Created with backend pointing to embedded hyper server

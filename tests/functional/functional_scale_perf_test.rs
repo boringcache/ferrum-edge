@@ -38,8 +38,9 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use crate::common::scheduled_scaling::{
-    CONFIG_CONVERGENCE_MAX_WAIT_SECS, SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, post_admin_batch,
-    scheduled_scaling_admin_jwt_max_ttl_value, wait_for_config_convergence,
+    BatchApplyCursor, CONFIG_CONVERGENCE_MAX_WAIT_SECS, SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS,
+    post_admin_batch, scheduled_scaling_admin_jwt_max_ttl_value, wait_for_batch_apply_cursor,
+    wait_for_config_convergence,
 };
 
 const BATCH_SIZE: usize = 3_000;
@@ -349,7 +350,11 @@ async fn start_echo_backend(
 
 /// Create a batch of proxies, consumers, and plugin configs via the batch admin API.
 /// Each proxy gets key_auth + access_control plugins, and one unique consumer.
-/// Uses `POST /batch` to send resources in chunks of `API_BATCH_CHUNK` at a time.
+/// Uses `POST /batch?apply=async` to send resources in chunks of
+/// `API_BATCH_CHUNK` at a time, and returns the highest covering live-apply
+/// cursor it saw so the caller can prove the whole wave live with ONE blocking
+/// `GET /config/apply-status` instead of paying one synchronous reload per
+/// chunk (issues #4136 / #4139).
 async fn create_batch(
     client: &reqwest::Client,
     admin_url: &str,
@@ -357,7 +362,7 @@ async fn create_batch(
     backend_port: u16,
     batch_start: usize,
     batch_end: usize,
-) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+) -> Result<(Vec<(String, String)>, Option<BatchApplyCursor>), Box<dyn std::error::Error>> {
     let mut entries = Vec::with_capacity(batch_end - batch_start);
 
     // Pre-generate all resource data
@@ -418,12 +423,16 @@ async fn create_batch(
     // This ensures referential integrity: consumers exist before ACL plugins reference them,
     // proxies exist before plugin_configs reference proxy_id.
 
-    // `POST /batch` is all-or-nothing and succeeds only with 201. Only the
-    // documented all-or-nothing 503s are retried, so repeating the same atomic
-    // body cannot accept or compound a partial graph.
+    // `POST /batch?apply=async` is all-or-nothing and succeeds only with the
+    // deferred 202 (durably committed, cursor returned). Only the documented
+    // all-or-nothing 503s are retried, so repeating the same atomic body
+    // cannot accept or compound a partial graph. Cursors are monotone
+    // (epoch-major), so keeping the max makes the final cursor cover every
+    // chunk in the wave.
+    let mut last_cursor: Option<BatchApplyCursor> = None;
     for chunk in all_consumers.chunks(API_BATCH_CHUNK) {
         let batch_body = json!({ "consumers": chunk });
-        post_admin_batch(
+        let cursor = post_admin_batch(
             client,
             admin_url,
             auth_header,
@@ -431,11 +440,12 @@ async fn create_batch(
             "Batch consumer create",
         )
         .await?;
+        last_cursor = last_cursor.max(cursor);
     }
 
     for chunk in all_proxies.chunks(API_BATCH_CHUNK) {
         let batch_body = json!({ "proxies": chunk });
-        post_admin_batch(
+        let cursor = post_admin_batch(
             client,
             admin_url,
             auth_header,
@@ -443,11 +453,12 @@ async fn create_batch(
             "Batch proxy create",
         )
         .await?;
+        last_cursor = last_cursor.max(cursor);
     }
 
     for chunk in all_plugins.chunks(API_BATCH_CHUNK) {
         let batch_body = json!({ "plugin_configs": chunk });
-        post_admin_batch(
+        let cursor = post_admin_batch(
             client,
             admin_url,
             auth_header,
@@ -455,9 +466,10 @@ async fn create_batch(
             "Batch plugin create",
         )
         .await?;
+        last_cursor = last_cursor.max(cursor);
     }
 
-    Ok(entries)
+    Ok((entries, last_cursor))
 }
 
 /// Perf test results for a single run
@@ -701,7 +713,7 @@ async fn run_scale_perf_test(harness: &ScalePerfHarness) {
         );
 
         let batch_timer = Instant::now();
-        let new_entries = create_batch(
+        let (new_entries, wave_cursor) = create_batch(
             &client,
             &harness.admin_base_url,
             &auth_header,
@@ -722,8 +734,36 @@ async fn run_scale_perf_test(harness: &ScalePerfHarness) {
 
         all_entries.extend(new_entries);
 
-        // Gate the measurement on the gateway having actually published this
-        // batch. Provisioning appends ~12,000 `config_changes` rows, which
+        // First gate: prove the deferred wave's covering cursor was accepted
+        // by the poll loop (issue #4139). Every chunk answered 202 without
+        // paying a reload; this single blocking wait is where the wave's one
+        // reload is paid, and a `rejected`/`unverifiable` cursor aborts loudly
+        // instead of surfacing as mysterious 404s in the probe gate below.
+        if let Some(cursor) = wave_cursor {
+            println!(
+                "  Waiting for live-apply cursor {}:{} (bound {}s)...",
+                cursor.epoch, cursor.sequence, CONFIG_CONVERGENCE_MAX_WAIT_SECS
+            );
+            let waited = wait_for_batch_apply_cursor(
+                &client,
+                &harness.admin_base_url,
+                &auth_header,
+                cursor,
+                "the scale harness",
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "Scale harness aborted before measuring {} proxies: {}",
+                    all_entries.len(),
+                    error
+                )
+            });
+            println!("  Live apply converged after {:.1}s", waited.as_secs_f64());
+        }
+
+        // Second gate: prove the published config actually routes end to end.
+        // Provisioning appends ~12,000 `config_changes` rows, which
         // pushes the poller past `CHANGE_LOG_BATCH_LIMIT` and forces a full
         // reload; measuring inside that reload measures convergence, not
         // routing throughput. Sample across the new batch — not only its first

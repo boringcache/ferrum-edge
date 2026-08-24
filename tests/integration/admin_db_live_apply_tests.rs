@@ -934,3 +934,52 @@ async fn deferred_without_poll_loop_stays_plain_success_and_status_is_absent() {
     .await;
     assert_eq!(status, 404, "{body}");
 }
+
+#[tokio::test]
+async fn deferred_batch_returns_202_with_cursor_and_converges() {
+    // The exact shape the 30k scaling harness relies on (issues #4136/#4139):
+    // POST /batch?apply=async answers 202 + cursor for an all-or-nothing
+    // graph, and one blocking apply-status wait proves it live.
+    let h = deferred_harness(Duration::from_millis(30), false).await;
+
+    let batch = json!({
+        "proxies": [
+            proxy_payload("/batch-deferred-a"),
+            proxy_payload("/batch-deferred-b"),
+        ]
+    });
+    let (status, headers, body) = tokio::time::timeout(
+        Duration::from_secs(5),
+        admin_request(
+            reqwest::Method::POST,
+            &h.base,
+            "/batch?apply=async",
+            &h.token,
+            Some(&batch),
+        ),
+    )
+    .await
+    .expect("deferred batch must not wait on the reload");
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["created"]["proxies"], 2, "{body}");
+    let (epoch, sequence) = cursor_from_headers(&headers);
+
+    let (status, _headers, body) = tokio::time::timeout(
+        Duration::from_secs(10),
+        admin_request(
+            reqwest::Method::GET,
+            &h.base,
+            &format!("/config/apply-status?epoch={epoch}&sequence={sequence}&wait_ms=5000"),
+            &h.token,
+            None,
+        ),
+    )
+    .await
+    .expect("blocking apply-status");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "applied", "{body}");
+    for path in ["/batch-deferred-a", "/batch-deferred-b"] {
+        assert!(runtime_has_listen_path(&h.proxy_state, path));
+    }
+    let _ = h.shutdown_tx.send(true);
+}

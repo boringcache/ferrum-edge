@@ -47,8 +47,9 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use crate::common::scheduled_scaling::{
-    CONFIG_CONVERGENCE_MAX_WAIT_SECS, SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, post_admin_batch,
-    scheduled_scaling_admin_jwt_max_ttl_value, wait_for_config_convergence,
+    BatchApplyCursor, CONFIG_CONVERGENCE_MAX_WAIT_SECS, SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS,
+    post_admin_batch, scheduled_scaling_admin_jwt_max_ttl_value, wait_for_batch_apply_cursor,
+    wait_for_config_convergence,
 };
 
 // --- Configuration constants ---
@@ -608,15 +609,21 @@ fn generate_consumer_jwt(username: &str, secret: &str) -> String {
 // --- Resource provisioning ---
 
 /// Provision all resources: 10k proxies, 10k consumers, 30k plugins, plus open proxies.
-/// Returns (auth_entries, open_proxy_paths).
+/// Returns (auth_entries, open_proxy_paths, covering_live_apply_cursor).
+///
+/// Every chunk posts with `?apply=async` (issue #4139), so provisioning never
+/// pays a synchronous poll-loop reload per chunk; the caller proves the whole
+/// graph live with one blocking `GET /config/apply-status` on the returned
+/// cursor before its data-plane convergence gates run.
 async fn provision_resources(
     client: &reqwest::Client,
     admin_url: &str,
     auth_header: &str,
     backend_port: u16,
-) -> Result<(Vec<AuthEntry>, Vec<String>), Box<dyn std::error::Error>> {
+) -> Result<(Vec<AuthEntry>, Vec<String>, Option<BatchApplyCursor>), Box<dyn std::error::Error>> {
     let total_start = Instant::now();
     let mut entries: Vec<AuthEntry> = Vec::with_capacity(NUM_PROXIES);
+    let mut last_cursor: Option<BatchApplyCursor> = None;
 
     // We provision in 4 phases to respect referential integrity:
     // Phase 1: Consumers, with their credentials carried inline (batch)
@@ -690,11 +697,12 @@ async fn provision_resources(
             "credentials": credentials,
         }));
     }
-    // `POST /batch` is all-or-nothing and succeeds only with 201. Only the
-    // documented all-or-nothing 503s are retried, so repeating the same atomic
-    // body cannot accept or compound a partial graph.
+    // `POST /batch?apply=async` is all-or-nothing and succeeds only with the
+    // deferred 202 (durably committed, cursor returned). Only the documented
+    // all-or-nothing 503s are retried, so repeating the same atomic body
+    // cannot accept or compound a partial graph.
     for chunk in all_consumers.chunks(API_BATCH_CHUNK) {
-        post_admin_batch(
+        let cursor = post_admin_batch(
             client,
             admin_url,
             auth_header,
@@ -702,6 +710,7 @@ async fn provision_resources(
             "Batch consumer create",
         )
         .await?;
+        last_cursor = last_cursor.max(cursor);
     }
     println!(
         "    Created {} consumers with credentials in {:.1}s",
@@ -723,7 +732,7 @@ async fn provision_resources(
         }));
     }
     for chunk in all_proxies.chunks(API_BATCH_CHUNK) {
-        post_admin_batch(
+        let cursor = post_admin_batch(
             client,
             admin_url,
             auth_header,
@@ -731,6 +740,7 @@ async fn provision_resources(
             "Batch proxy create",
         )
         .await?;
+        last_cursor = last_cursor.max(cursor);
     }
     println!(
         "    Created {} proxies in {:.1}s",
@@ -809,7 +819,7 @@ async fn provision_resources(
     }
 
     for chunk in all_plugins.chunks(API_BATCH_CHUNK) {
-        post_admin_batch(
+        let cursor = post_admin_batch(
             client,
             admin_url,
             auth_header,
@@ -817,6 +827,7 @@ async fn provision_resources(
             "Batch plugin create",
         )
         .await?;
+        last_cursor = last_cursor.max(cursor);
     }
     println!(
         "    Created {} plugins in {:.1}s",
@@ -845,7 +856,7 @@ async fn provision_resources(
         }));
     }
     for chunk in open_proxies.chunks(API_BATCH_CHUNK) {
-        post_admin_batch(
+        let cursor = post_admin_batch(
             client,
             admin_url,
             auth_header,
@@ -853,6 +864,7 @@ async fn provision_resources(
             "Batch open proxy create",
         )
         .await?;
+        last_cursor = last_cursor.max(cursor);
     }
     println!(
         "    Created {} open proxies in {:.1}s",
@@ -873,7 +885,7 @@ async fn provision_resources(
         NUM_PROXIES * 3
     );
 
-    Ok((entries, open_paths))
+    Ok((entries, open_paths, last_cursor))
 }
 
 // --- Perf result ---
@@ -1598,7 +1610,7 @@ async fn run_load_stress_test(harness: &LoadTestHarness) {
 
     // --- Provision resources ---
     println!("\n=== Provisioning Resources ===");
-    let (entries, open_paths) = provision_resources(
+    let (entries, open_paths, provision_cursor) = provision_resources(
         &client,
         &harness.admin_base_url,
         &auth_header,
@@ -1606,6 +1618,28 @@ async fn run_load_stress_test(harness: &LoadTestHarness) {
     )
     .await
     .expect("Failed to provision resources");
+
+    // First gate: prove the deferred graph's covering cursor was accepted by
+    // the poll loop (issue #4139). Every chunk answered 202 without paying a
+    // reload; this single blocking wait is where the graph's one reload is
+    // paid, and a rejected/unverifiable cursor aborts loudly instead of
+    // surfacing as mysterious 404s in the probe gates below.
+    if let Some(cursor) = provision_cursor {
+        println!(
+            "\nWaiting for live-apply cursor {}:{} (bound {}s)...",
+            cursor.epoch, cursor.sequence, CONFIG_CONVERGENCE_MAX_WAIT_SECS
+        );
+        let waited = wait_for_batch_apply_cursor(
+            &client,
+            &harness.admin_base_url,
+            &auth_header,
+            cursor,
+            "the load harness",
+        )
+        .await
+        .unwrap_or_else(|error| panic!("Load harness aborted before measuring: {error}"));
+        println!("Live apply converged after {:.1}s", waited.as_secs_f64());
+    }
 
     // Gate every measurement on the gateway having actually published the
     // provisioned graph. Provisioning appends tens of thousands of
