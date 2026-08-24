@@ -1331,15 +1331,35 @@ override the later activation and disable sccache for the builds whose reuse
 this cache is intended to accelerate.
 
 Hosted follow-ups that still need measured evidence before changing
-measurement fidelity or trigger breadth:
+measurement fidelity:
 
 - sccache hit rates on the `ci-release` gateway build (thin LTO). Do not
   introduce a dedicated non-LTO perf profile until those stats are attached
   and budgets are re-baselined.
-- whether workflow-only `.github/workflows/ci.yml` edits can skip the four
-  microbenchmarks. Today's static verifiers do not encode the `cargo bench`
-  invocation surface tightly enough to drop the `.github/workflows/ci.yml`
-  trigger safely.
+
+On `pull_request` and `merge_group`, the four Criterion microbenchmarks
+(IP restriction, WRR, RoundRobin, AI semantic-cache cleanup) are scheduled
+from path matches on their measured sources, fixtures, and verifiers. A
+change to `.github/workflows/ci.yml` schedules them only when the `ci.yml`
+hunks can affect Criterion behavior: `bench`, `criterion`,
+`verify_*_benchmark`, `--min-parallel-speedup`, scaling / ns-per-instance
+caps, `--manifest-path`, or this job's `ci-release` / `CARGO_PROFILE` /
+`RUSTFLAGS` surface. Workflow-only edits (comments, unrelated `env:`
+blocks, path filters on other jobs) do not. If the name-only diff or the
+`ci.yml` hunk diff cannot be computed, the microbenchmarks run (fail
+closed), matching the smoke benchmark. `push` to `main` and
+`workflow_dispatch` still force-run every microbenchmark. The
+`verify_*_benchmark.py --self-test` helpers for RoundRobin and WRR run on
+every full-mode job, including when the Criterion benches themselves are
+skipped.
+
+The RoundRobin and WRR parallel-speedup floors stay at 1.10x. On a miss,
+the verifier measures an independent-process CPU control (median of five
+repeats) at the same thread count. If that control also misses 1.10x, the
+runner is oversubscribed and the floor is advisory (`::warning::`) rather
+than a required failure. If the control clears 1.10x, a selection miss is
+still a hard failure. Serial-ratio and missing-artifact contracts stay
+hard either way. The floor value is not lowered.
 
 **Failures**:
 - Indicate performance regression issues

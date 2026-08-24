@@ -5038,6 +5038,12 @@ jobs:
           python3 .github/scripts/verify_mesh_performance_baselines_workflow.py --self-test
           python3 .github/scripts/verify_mesh_performance_baselines_workflow.py
 
+      - name: Self-test RR and WRR selection benchmark verifiers
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_rr_selection_benchmark.py --self-test
+          python3 .github/scripts/verify_wrr_selection_benchmark.py --self-test
+
       - name: Detect performance-sensitive changes
         id: perf_changes
         shell: bash
@@ -5115,19 +5121,42 @@ jobs:
             fi
           fi
 
-          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || grep -Eq '^(src/plugins/(ip_restriction\.rs|mod\.rs)|tests/performance/mesh/(Cargo\.(toml|lock)|benches/ip_restriction\.rs)|\.github/scripts/verify_ip_restriction_benchmark\.py|\.github/workflows/ci\.yml)$' <<<"${changed_files}"; then
+          # Issue #4105: a ci.yml path hit is not enough to schedule the four
+          # Criterion microbenchmarks. Inspect ci.yml hunks and only count
+          # edits that can change Criterion invocation, verifier inputs, or
+          # this job's build profile. Unreadable diffs fail closed.
+          ci_yml_schedules_microbenchmarks=false
+          if [ "${EVENT_NAME}" = "pull_request" ] || [ "${EVENT_NAME}" = "merge_group" ]; then
+            if [ -z "${changed_files}" ] && [ "${run_benchmark}" = "true" ]; then
+              ci_yml_schedules_microbenchmarks=true
+            elif printf '%s\n' "${changed_files}" | grep -Fxq '.github/workflows/ci.yml'; then
+              if ci_yml_diff="$(git diff -U0 --no-renames "${perf_base}...HEAD" -- .github/workflows/ci.yml 2>/dev/null)"; then
+                if printf '%s\n' "${ci_yml_diff}" \
+                  | grep -E '^[+-]' \
+                  | grep -Ev '^[+-]{3} ' \
+                  | grep -Eqi 'bench|criterion|verify_[a-z0-9_]*_benchmark|min-parallel-speedup|max-scaling-ratio|max-ns-per-instance|manifest-path|ci-release|CARGO_PROFILE|RUSTFLAGS'; then
+                  ci_yml_schedules_microbenchmarks=true
+                fi
+              else
+                ci_yml_schedules_microbenchmarks=true
+              fi
+            fi
+          fi
+          echo "ci.yml microbenchmark trigger (content-sensitive): ${ci_yml_schedules_microbenchmarks}"
+
+          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || [ "${ci_yml_schedules_microbenchmarks}" = "true" ] || grep -Eq '^(src/plugins/(ip_restriction\.rs|mod\.rs)|tests/performance/mesh/(Cargo\.(toml|lock)|benches/ip_restriction\.rs)|\.github/scripts/verify_ip_restriction_benchmark\.py)$' <<<"${changed_files}"; then
             run_ip_restriction_benchmark=true
           fi
 
-          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || grep -Eq '^(src/load_balancer\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/wrr_selection\.rs)|\.github/scripts/verify_wrr_selection_benchmark\.py|\.github/workflows/ci\.yml)$' <<<"${changed_files}"; then
+          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || [ "${ci_yml_schedules_microbenchmarks}" = "true" ] || grep -Eq '^(src/load_balancer\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/wrr_selection\.rs)|\.github/scripts/verify_wrr_selection_benchmark\.py)$' <<<"${changed_files}"; then
             run_wrr_benchmark=true
           fi
 
-          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || grep -Eq '^(src/load_balancer\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/rr_selection\.rs)|\.github/scripts/verify_rr_selection_benchmark\.py|\.github/workflows/ci\.yml)$' <<<"${changed_files}"; then
+          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || [ "${ci_yml_schedules_microbenchmarks}" = "true" ] || grep -Eq '^(src/load_balancer\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/rr_selection\.rs)|\.github/scripts/verify_rr_selection_benchmark\.py)$' <<<"${changed_files}"; then
             run_rr_benchmark=true
           fi
 
-          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || grep -Eq '^(src/plugins/ai_semantic_cache\.rs|tests/unit/plugins/ai_semantic_cache_tests\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/ai_semantic_cache_cleanup\.rs)|\.github/scripts/verify_ai_semantic_cache_cleanup_benchmark\.py|\.github/workflows/ci\.yml)$' <<<"${changed_files}"; then
+          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${EVENT_NAME}" != "merge_group" ] || [ "${ci_yml_schedules_microbenchmarks}" = "true" ] || grep -Eq '^(src/plugins/ai_semantic_cache\.rs|tests/unit/plugins/ai_semantic_cache_tests\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/ai_semantic_cache_cleanup\.rs)|\.github/scripts/verify_ai_semantic_cache_cleanup_benchmark\.py)$' <<<"${changed_files}"; then
             run_ai_semantic_cache_benchmark=true
           fi
 
@@ -5326,13 +5355,13 @@ jobs:
           fi
           if [ "${RUN_WRR}" = "true" ]; then
             {
-              echo "WRR selection contention guard executed: mandatory 4-thread/1-thread throughput speedup >= 1.10x on 32/129-target fixtures; 4-target 5:1:1:1 fixture remains measured (informational parallel speedup under Arc strong-count hotspot; 4/32 1-thread serial-wall ratio ceiling)."
+              echo "WRR selection contention guard executed: mandatory 4-thread/1-thread throughput speedup >= 1.10x on 32/129-target fixtures; 4-target 5:1:1:1 fixture remains measured (informational parallel speedup under Arc strong-count hotspot; 4/32 1-thread serial-wall ratio ceiling). A parallel-floor miss is a hard failure only when an independent-process CPU control at the same thread count still clears 1.10x (median of 5); if the control also misses, the floor is advisory because the runner is oversubscribed."
               echo ""
             } >> "${GITHUB_STEP_SUMMARY}"
           fi
           if [ "${RUN_RR}" = "true" ]; then
             {
-              echo "RoundRobin selection contention guard executed: 8-thread/1-thread throughput speedup >= 1.10x for the 2-target fixture."
+              echo "RoundRobin selection contention guard executed: 8-thread/1-thread throughput speedup >= 1.10x for the 2-target fixture. A miss is a hard failure only when an independent-process CPU control at the same thread count still clears 1.10x (median of 5); if the control also misses, the floor is advisory because the runner is oversubscribed."
               echo ""
             } >> "${GITHUB_STEP_SUMMARY}"
           fi
