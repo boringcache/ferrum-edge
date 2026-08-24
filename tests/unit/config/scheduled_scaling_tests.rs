@@ -13,11 +13,13 @@ mod scheduled_scaling;
 
 use scheduled_scaling::{
     ADMIN_BATCH_REQUEST_TIMEOUT_SECS, BATCH_ROLLBACK_NOT_NEEDED, BatchProvisionDecision,
+    CONFIG_CONVERGENCE_MAX_WAIT_SECS, CONFIG_CONVERGENCE_POLL_INTERVAL_SECS,
     NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS, NAMESPACE_FENCE_MAX_ATTEMPTS,
     NAMESPACE_FENCE_MAX_BACKOFF_SECS, NAMESPACE_FENCE_MAX_RETRY_AFTER_SECS,
-    NAMESPACE_FENCE_RETRY_MESSAGE, SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS,
-    classify_admin_batch_response, documented_batch_rollback_not_needed_body,
-    documented_namespace_fence_body, namespace_fence_backoff, namespace_fence_retry_after_delay,
+    NAMESPACE_FENCE_MAX_TOTAL_RETRY_SECS, NAMESPACE_FENCE_RETRY_MESSAGE,
+    SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, classify_admin_batch_response,
+    documented_batch_rollback_not_needed_body, documented_namespace_fence_body,
+    namespace_fence_backoff, namespace_fence_retry_after_delay,
     scheduled_scaling_admin_jwt_max_ttl_value,
 };
 
@@ -156,43 +158,76 @@ fn documented_retryable_503s_are_retried_and_other_outcomes_stay_fatal() {
         "Namespace mutation is temporarily unavailable; retry later"
     );
     assert_eq!(BATCH_ROLLBACK_NOT_NEEDED, "not_needed");
-    assert_eq!(NAMESPACE_FENCE_MAX_ATTEMPTS, 10);
 }
 
 #[test]
-fn namespace_fence_retries_back_off_past_the_servers_one_second_minimum() {
+fn namespace_fence_retries_are_bounded_by_wall_clock_not_attempt_count() {
     // The gateway always answers the fence with `Retry-After: 1`, so a
-    // header-only schedule would exhaust the whole attempt budget in about
-    // five seconds — far shorter than the fenced windows observed in the red
-    // scheduled-scaling runs this harness exists to survive (issue #3892).
+    // header-only schedule would retry roughly once a second and add load to
+    // the serialized admission queue it is waiting on (issue #3895).
     assert_eq!(
         namespace_fence_retry_after_delay(Some("1")),
         Duration::from_secs(1)
     );
-    let mut schedule = Vec::new();
-    for attempt in 1..NAMESPACE_FENCE_MAX_ATTEMPTS {
-        let header = namespace_fence_retry_after_delay(Some("1"));
-        let wait = header.max(namespace_fence_backoff(attempt));
-        schedule.push(wait.as_secs());
-    }
-    assert_eq!(schedule, [1, 2, 4, 8, 16, 30, 30, 30, 30]);
+    let ramp: Vec<u64> = (1..=6)
+        .map(|attempt| {
+            namespace_fence_retry_after_delay(Some("1"))
+                .max(namespace_fence_backoff(attempt))
+                .as_secs()
+        })
+        .collect();
+    assert_eq!(ramp, [1, 2, 4, 8, 16, 30]);
     assert_eq!(
         namespace_fence_backoff(NAMESPACE_FENCE_MAX_ATTEMPTS).as_secs(),
         NAMESPACE_FENCE_MAX_BACKOFF_SECS,
         "backoff must saturate rather than grow without bound"
     );
 
-    // The first exhausted body aborts provisioning, so this is the entire
-    // added cost of a fence that never clears.
-    let total: u64 = schedule.iter().sum();
-    assert_eq!(total, 151);
+    // An attempt-counted budget is the wrong shape for a documented-transient
+    // contention 503: what decides whether the fence clears is how long the
+    // serialized admission queue takes to drain, not how many times the client
+    // asks (issue #4116). The attempt ceiling must therefore only ever be a
+    // spin guard — the backoff schedule has to outrun the wall-clock budget
+    // before the ceiling can bind.
+    let attempt_ceiling_wait: u64 = (1..NAMESPACE_FENCE_MAX_ATTEMPTS)
+        .map(|attempt| {
+            namespace_fence_retry_after_delay(Some("1"))
+                .max(namespace_fence_backoff(attempt))
+                .as_secs()
+        })
+        .sum();
     assert!(
-        total < 180 * 60,
-        "one atomic body's fence-retry budget must stay inside the job timeout"
+        attempt_ceiling_wait > NAMESPACE_FENCE_MAX_TOTAL_RETRY_SECS,
+        "the attempt ceiling ({NAMESPACE_FENCE_MAX_ATTEMPTS}) must not bind before the \
+         wall-clock budget ({NAMESPACE_FENCE_MAX_TOTAL_RETRY_SECS}s); schedule totals \
+         {attempt_ceiling_wait}s"
+    );
+
+    assert_eq!(NAMESPACE_FENCE_MAX_TOTAL_RETRY_SECS, 10 * 60);
+    // The first exhausted body aborts provisioning, so the budget plus one
+    // in-flight request timeout is the entire added cost of a fence that never
+    // clears.
+    const {
+        assert!(
+            NAMESPACE_FENCE_MAX_TOTAL_RETRY_SECS + ADMIN_BATCH_REQUEST_TIMEOUT_SECS < 180 * 60,
+            "one atomic body's fence-retry budget must stay inside the job timeout"
+        )
+    };
+    const {
+        assert!(
+            NAMESPACE_FENCE_MAX_TOTAL_RETRY_SECS > 10 * NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS,
+            "the retry budget must not collapse back onto the server's minimum"
+        )
+    };
+
+    let helper = include_str!("../../common/scheduled_scaling.rs");
+    assert!(
+        helper.contains("if started.elapsed() + wait >= retry_budget {"),
+        "the wall-clock budget must be checked before sleeping, not after"
     );
     assert!(
-        total > 10 * NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS,
-        "the retry budget must not collapse back onto the server's minimum"
+        helper.contains("was still refused as transient namespace-admission contention after"),
+        "an exhausted budget must be reported as an admission outage, not as a retry count"
     );
 }
 
@@ -279,6 +314,87 @@ fn both_harnesses_route_every_batch_phase_through_the_shared_helper() {
         !SCALE.contains(".post(format!(\"{}/batch\"")
             && !LOAD.contains(".post(format!(\"{}/batch\""),
         "neither harness may POST /batch outside the shared helper"
+    );
+}
+
+#[test]
+fn both_harnesses_gate_measurement_on_bounded_convergence_not_a_fixed_sleep() {
+    // The red PostgreSQL legs of issue #4116 measured throughput while the
+    // gateway was still executing the full reload that provisioning forced
+    // (`load_config_changes_after` bails past `CHANGE_LOG_BATCH_LIMIT`). Both
+    // harnesses detected the unroutable sample, printed a warning, slept a
+    // fixed five seconds, and measured anyway. Convergence must be a gate, not
+    // a warning.
+    assert_eq!(CONFIG_CONVERGENCE_MAX_WAIT_SECS, 5 * 60);
+    const { assert!(CONFIG_CONVERGENCE_POLL_INTERVAL_SECS > 0) };
+    const {
+        assert!(
+            CONFIG_CONVERGENCE_POLL_INTERVAL_SECS < CONFIG_CONVERGENCE_MAX_WAIT_SECS,
+            "the poll interval must fit many times inside the convergence bound"
+        )
+    };
+    // The scale harness pays this bound once per batch, so the worst case must
+    // still leave the 180-minute job room for provisioning and measurement.
+    let scale_batches = 30_000 / 3_000;
+    assert!(
+        scale_batches * CONFIG_CONVERGENCE_MAX_WAIT_SECS < 60 * 60,
+        "a per-batch convergence bound must not be able to consume the job budget"
+    );
+
+    let helper = include_str!("../../common/scheduled_scaling.rs");
+    assert!(
+        helper.contains("config convergence never completed for"),
+        "an exhausted convergence bound must name itself explicitly"
+    );
+    assert!(
+        helper.contains("This is a configuration-publication failure, not a throughput"),
+        "the convergence failure must not be mistakable for a throughput regression"
+    );
+
+    for (name, source) in [("scale", SCALE), ("load", LOAD)] {
+        assert!(
+            source.contains("wait_for_config_convergence("),
+            "{name} harness must gate measurement on the bounded convergence helper"
+        );
+        assert!(
+            !source.contains("waiting longer"),
+            "{name} harness must not fall back to a fixed sleep after a failed sample probe"
+        );
+    }
+}
+
+#[test]
+fn load_harness_provisions_credentials_on_the_atomic_consumer_batch() {
+    // 10,000 individual `PUT /consumers/{id}/credentials/{type}` calls are
+    // 10,000 separate namespace mutations against a deliberately serialized
+    // admission critical section. That self-inflicted contention is what
+    // produced the transient 503s the harness then reported as a provisioning
+    // failure, and the per-consumer path logged those failures to stderr while
+    // still handing back an `AuthEntry` for a credential that was never
+    // written (issue #4116).
+    for path in [
+        "/credentials/keyauth",
+        "/credentials/basicauth",
+        "/credentials/jwt",
+    ] {
+        assert!(
+            !LOAD.contains(path),
+            "load harness must not provision credentials through per-consumer {path} mutations"
+        );
+    }
+    assert!(
+        !LOAD.contains("Credential set failed"),
+        "provisioning must not swallow failed credential writes and keep measuring"
+    );
+    assert!(
+        LOAD.contains("\"keyauth\": [{ \"key\": api_key.clone() }]")
+            && LOAD.contains("\"basicauth\": [{ \"password\": password.clone() }]")
+            && LOAD.contains("\"jwt\": [{ \"secret\": jwt_secret.clone() }]"),
+        "each auth group's credentials must ride the atomic consumer batch"
+    );
+    assert!(
+        SCALE.contains("\"keyauth\": [{\"key\": api_key}]"),
+        "the scale harness's inline-credential batch shape is the reference"
     );
 }
 
@@ -506,5 +622,60 @@ fn scaling_gate_publisher_spoof_and_discovery_contracts_are_pr_gated() {
         production.contains("def public_issue_reason")
             && production.contains("ISSUE_REASON_MAX_CHARS = 200"),
         "public issue reasons must be sanitized and truncated before they reach the issue body"
+    );
+}
+
+/// A committed-but-not-live `POST /batch` answer must not abort provisioning.
+///
+/// Observed on the 2026-08-24 dispatched scaling run (32675684731) on `main`
+/// AFTER read-your-write live apply (#3960) landed: both 30k legs — SQLite as
+/// well as PostgreSQL — died at batch 2 with
+/// `503 {"applied":false,"reason":"reload_timeout"}`. The write is DURABLE
+/// there ("Configuration was committed but is not live"), so failing loses
+/// nothing but the run, and retrying the same all-or-nothing body would
+/// collide with the resources it just created. The only correct move is to
+/// carry on and let the bounded convergence gate decide.
+#[test]
+fn committed_but_not_live_batches_continue_to_the_convergence_gate() {
+    for reason in ["reload_timeout", "sequence_unavailable"] {
+        let body = json!({
+            "error": "Configuration was committed but is not live: runtime reload did not apply in time",
+            "applied": false,
+            "reason": reason,
+        })
+        .to_string();
+        assert!(
+            matches!(
+                classify_admin_batch_response(503, None, &body),
+                BatchProvisionDecision::CommittedNotLive { .. }
+            ),
+            "{reason} must be treated as committed, not fatal and not retryable"
+        );
+    }
+
+    // `config_rejected` is the opposite case: the runtime REFUSED the
+    // candidate, so it will never go live and the harness must fail loudly.
+    let rejected = json!({
+        "error": "Configuration was committed but is not live: runtime reload rejected the candidate",
+        "applied": false,
+        "reason": "config_rejected",
+    })
+    .to_string();
+    assert!(
+        matches!(
+            classify_admin_batch_response(503, None, &rejected),
+            BatchProvisionDecision::Fatal { .. }
+        ),
+        "a rejected candidate must never be mistaken for a committed one"
+    );
+
+    // A 503 that does not carry the documented shape stays fatal.
+    let opaque = json!({"error": "something else"}).to_string();
+    assert!(
+        matches!(
+            classify_admin_batch_response(503, None, &opaque),
+            BatchProvisionDecision::Fatal { .. }
+        ),
+        "only the documented applied/reason shape may be treated as committed"
     );
 }

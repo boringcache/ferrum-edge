@@ -47,8 +47,8 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use crate::common::scheduled_scaling::{
-    SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, post_admin_batch,
-    scheduled_scaling_admin_jwt_max_ttl_value,
+    CONFIG_CONVERGENCE_MAX_WAIT_SECS, SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, post_admin_batch,
+    scheduled_scaling_admin_jwt_max_ttl_value, wait_for_config_convergence,
 };
 
 // --- Configuration constants ---
@@ -581,6 +581,16 @@ impl AuthEntry {
     }
 }
 
+/// Credential material for one bounded convergence probe.
+///
+/// The probe future must own everything it uses, so the borrowed `AuthEntry`
+/// is projected into this before the request is built.
+enum SampleAuth {
+    KeyAuth(String),
+    BasicAuth(String, String),
+    Bearer(String),
+}
+
 // --- Consumer JWT generation ---
 
 fn generate_consumer_jwt(username: &str, secret: &str) -> String {
@@ -609,18 +619,75 @@ async fn provision_resources(
     let mut entries: Vec<AuthEntry> = Vec::with_capacity(NUM_PROXIES);
 
     // We provision in 4 phases to respect referential integrity:
-    // Phase 1: Consumers (batch)
+    // Phase 1: Consumers, with their credentials carried inline (batch)
     // Phase 2: Proxies (batch)
     // Phase 3: Plugin configs (batch)
-    // Phase 4: Consumer credentials via individual PUT calls (needed for hashing)
+    // Phase 4: Open proxies for the no-plugin baseline (batch)
+    //
+    // Credentials ride the atomic consumer batch rather than 10,000 separate
+    // `PUT /consumers/{id}/credentials/{type}` calls (issue #4116). `POST
+    // /batch` runs every consumer through the same
+    // `prepare_for_write` -> `hash_consumer_secrets` path the credential
+    // endpoint uses, so Basic-auth passwords are hashed identically. The
+    // per-consumer path issued 10,000 individual namespace mutations against a
+    // deliberately serialized admission critical section, which is what
+    // manufactured the transient-contention 503s this harness then reported as
+    // a provisioning failure — and it logged those failures to stderr while
+    // still returning an `AuthEntry` for a credential that was never
+    // persisted, so the measurement ran against consumers that could not
+    // authenticate.
 
-    println!("  Phase 1: Creating {} consumers...", NUM_CONSUMERS);
+    println!(
+        "  Phase 1: Creating {} consumers with inline credentials...",
+        NUM_CONSUMERS
+    );
     let phase_start = Instant::now();
     let mut all_consumers = Vec::with_capacity(NUM_CONSUMERS);
     for i in 0..NUM_CONSUMERS {
+        let consumer_id = format!("consumer-{}", i);
+        let username = format!("user-{}", i);
+        let listen_path = format!("/svc/{}", i);
+
+        let (credentials, entry) = if i < KEY_AUTH_END {
+            let api_key = format!("key-{}-{}", i, &Uuid::new_v4().to_string()[..8]);
+            (
+                json!({ "keyauth": [{ "key": api_key.clone() }] }),
+                AuthEntry::KeyAuth {
+                    listen_path,
+                    api_key,
+                },
+            )
+        } else if i < BASIC_AUTH_END {
+            let password = format!("pass-{}", i);
+            (
+                json!({ "basicauth": [{ "password": password.clone() }] }),
+                AuthEntry::BasicAuth {
+                    listen_path,
+                    username: username.clone(),
+                    password,
+                },
+            )
+        } else {
+            let jwt_secret = format!(
+                "jwt-secret-padding-1234567890-{}-{}",
+                i,
+                &Uuid::new_v4().to_string()[..8]
+            );
+            (
+                json!({ "jwt": [{ "secret": jwt_secret.clone() }] }),
+                AuthEntry::JwtAuth {
+                    listen_path,
+                    consumer_username: username.clone(),
+                    jwt_secret,
+                },
+            )
+        };
+
+        entries.push(entry);
         all_consumers.push(json!({
-            "id": format!("consumer-{}", i),
-            "username": format!("user-{}", i),
+            "id": consumer_id,
+            "username": username,
+            "credentials": credentials,
         }));
     }
     // `POST /batch` is all-or-nothing and succeeds only with 201. Only the
@@ -637,7 +704,7 @@ async fn provision_resources(
         .await?;
     }
     println!(
-        "    Created {} consumers in {:.1}s",
+        "    Created {} consumers with credentials in {:.1}s",
         NUM_CONSUMERS,
         phase_start.elapsed().as_secs_f64()
     );
@@ -757,130 +824,9 @@ async fn provision_resources(
         phase_start.elapsed().as_secs_f64()
     );
 
-    println!("  Phase 4: Setting consumer credentials...");
-    let phase_start = Instant::now();
-
-    // Use concurrent credential creation for speed
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(20)); // 20 concurrent requests
-    let mut credential_handles = Vec::with_capacity(NUM_CONSUMERS);
-
-    for i in 0..NUM_CONSUMERS {
-        let client = client.clone();
-        let admin_url = admin_url.to_string();
-        let auth_header = auth_header.to_string();
-        let sem = semaphore.clone();
-
-        let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            let consumer_id = format!("consumer-{}", i);
-
-            if i < KEY_AUTH_END {
-                let api_key = format!("key-{}-{}", i, &Uuid::new_v4().to_string()[..8]);
-                let resp = client
-                    .put(format!(
-                        "{}/consumers/{}/credentials/keyauth",
-                        admin_url, consumer_id
-                    ))
-                    .header("Authorization", &auth_header)
-                    .json(&json!([{ "key": api_key }]))
-                    .send()
-                    .await;
-                match resp {
-                    Ok(r) if r.status().is_success() => {}
-                    Ok(r) => {
-                        let status = r.status();
-                        let body = r.text().await.unwrap_or_default();
-                        eprintln!(
-                            "Credential set failed for {}: {} {}",
-                            consumer_id, status, body
-                        );
-                    }
-                    Err(e) => eprintln!("Credential set error for {}: {}", consumer_id, e),
-                }
-                AuthEntry::KeyAuth {
-                    listen_path: format!("/svc/{}", i),
-                    api_key,
-                }
-            } else if i < BASIC_AUTH_END {
-                let password = format!("pass-{}", i);
-                let resp = client
-                    .put(format!(
-                        "{}/consumers/{}/credentials/basicauth",
-                        admin_url, consumer_id
-                    ))
-                    .header("Authorization", &auth_header)
-                    .json(&json!([{ "password": password }]))
-                    .send()
-                    .await;
-                match resp {
-                    Ok(r) if r.status().is_success() => {}
-                    Ok(r) => {
-                        let status = r.status();
-                        let body = r.text().await.unwrap_or_default();
-                        eprintln!(
-                            "Credential set failed for {}: {} {}",
-                            consumer_id, status, body
-                        );
-                    }
-                    Err(e) => eprintln!("Credential set error for {}: {}", consumer_id, e),
-                }
-                let username = format!("user-{}", i);
-                AuthEntry::BasicAuth {
-                    listen_path: format!("/svc/{}", i),
-                    username,
-                    password,
-                }
-            } else {
-                let jwt_secret = format!(
-                    "jwt-secret-padding-1234567890-{}-{}",
-                    i,
-                    &Uuid::new_v4().to_string()[..8]
-                );
-                let resp = client
-                    .put(format!(
-                        "{}/consumers/{}/credentials/jwt",
-                        admin_url, consumer_id
-                    ))
-                    .header("Authorization", &auth_header)
-                    .json(&json!([{ "secret": jwt_secret }]))
-                    .send()
-                    .await;
-                match resp {
-                    Ok(r) if r.status().is_success() => {}
-                    Ok(r) => {
-                        let status = r.status();
-                        let body = r.text().await.unwrap_or_default();
-                        eprintln!(
-                            "Credential set failed for {}: {} {}",
-                            consumer_id, status, body
-                        );
-                    }
-                    Err(e) => eprintln!("Credential set error for {}: {}", consumer_id, e),
-                }
-                let username = format!("user-{}", i);
-                AuthEntry::JwtAuth {
-                    listen_path: format!("/svc/{}", i),
-                    consumer_username: username,
-                    jwt_secret,
-                }
-            }
-        });
-        credential_handles.push(handle);
-    }
-
-    for handle in credential_handles {
-        let entry = handle.await?;
-        entries.push(entry);
-    }
+    // Phase 4: Open proxies (no plugins) for baseline measurement
     println!(
-        "    Set {} credentials in {:.1}s",
-        NUM_CONSUMERS,
-        phase_start.elapsed().as_secs_f64()
-    );
-
-    // Phase 5: Open proxies (no plugins) for baseline measurement
-    println!(
-        "  Phase 5: Creating {} open proxies (no plugins)...",
+        "  Phase 4: Creating {} open proxies (no plugins)...",
         NUM_OPEN_PROXIES
     );
     let phase_start = Instant::now();
@@ -1661,70 +1607,101 @@ async fn run_load_stress_test(harness: &LoadTestHarness) {
     .await
     .expect("Failed to provision resources");
 
-    // Wait for DB poller to load the config
-    println!("Waiting for DB poll to load config...");
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    // Verify a sample from each auth group
-    println!("Verifying sample proxies...");
-    let sample_indices = [0, KEY_AUTH_END, BASIC_AUTH_END]; // one per auth type
-    for &idx in &sample_indices {
-        let entry = &entries[idx];
+    // Gate every measurement on the gateway having actually published the
+    // provisioned graph. Provisioning appends tens of thousands of
+    // `config_changes` rows, which pushes the poller past
+    // `CHANGE_LOG_BATCH_LIMIT` and forces a full reload; a load phase started
+    // inside that reload measures convergence, not proxy throughput. Both
+    // safety valves are correct, so the harness waits them out under an
+    // explicit bound instead of sleeping a fixed interval and measuring anyway.
+    println!("\nWaiting for config convergence before measuring...");
+    let sample_indices = [0, KEY_AUTH_END, BASIC_AUTH_END, NUM_PROXIES - 1];
+    let sample_labels: Vec<String> = sample_indices
+        .iter()
+        .map(|&index| entries[index].listen_path().to_string())
+        .collect();
+    let convergence = wait_for_config_convergence("the load harness", &sample_labels, |i| {
+        let entry = &entries[sample_indices[i]];
         let url = format!("{}{}", harness.proxy_base_url, entry.listen_path());
-
-        let result = match entry {
-            AuthEntry::KeyAuth { api_key, .. } => {
-                client
-                    .get(&url)
-                    .header("X-API-Key", api_key.as_str())
-                    .send()
-                    .await
-            }
+        let client = client.clone();
+        let auth = match entry {
+            AuthEntry::KeyAuth { api_key, .. } => SampleAuth::KeyAuth(api_key.clone()),
             AuthEntry::BasicAuth {
                 username, password, ..
-            } => {
-                client
-                    .get(&url)
-                    .basic_auth(username, Some(password))
-                    .send()
-                    .await
-            }
+            } => SampleAuth::BasicAuth(username.clone(), password.clone()),
             AuthEntry::JwtAuth {
                 consumer_username,
                 jwt_secret,
                 ..
-            } => {
-                let token = generate_consumer_jwt(consumer_username, jwt_secret);
-                client
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .send()
-                    .await
-            }
+            } => SampleAuth::Bearer(generate_consumer_jwt(consumer_username, jwt_secret)),
         };
-
-        match result {
-            Ok(r) if r.status().is_success() => {
-                println!("  OK: {} ({})", entry.listen_path(), r.status());
-            }
-            Ok(r) => {
-                println!(
-                    "  WARNING: {} returned {} — waiting longer...",
-                    entry.listen_path(),
-                    r.status()
-                );
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-            Err(e) => {
-                println!(
-                    "  WARNING: {} failed: {} — waiting longer...",
-                    entry.listen_path(),
-                    e
-                );
-                tokio::time::sleep(Duration::from_secs(5)).await;
+        async move {
+            let request = client.get(&url);
+            let request = match auth {
+                SampleAuth::KeyAuth(key) => request.header("X-API-Key", key),
+                SampleAuth::BasicAuth(username, password) => {
+                    request.basic_auth(username, Some(password))
+                }
+                SampleAuth::Bearer(token) => {
+                    request.header("Authorization", format!("Bearer {}", token))
+                }
+            };
+            match request.send().await {
+                Ok(response) => Ok(response.status().as_u16()),
+                Err(error) => Err(error.to_string()),
             }
         }
-    }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "Load harness aborted before measuring {} proxies: {}",
+            NUM_PROXIES + NUM_OPEN_PROXIES,
+            error
+        )
+    });
+    println!(
+        "  Config converged after {:.1}s ({} polls, bound {}s)",
+        convergence.waited.as_secs_f64(),
+        convergence.polls,
+        CONFIG_CONVERGENCE_MAX_WAIT_SECS
+    );
+
+    // Open proxies are provisioned last, so they are the tail of the change
+    // log: Phase 2's no-plugin baseline gets its own bounded gate rather than
+    // inheriting the authenticated set's verdict.
+    let open_sample_indices = [0usize, open_paths.len() - 1];
+    let open_sample_labels: Vec<String> = open_sample_indices
+        .iter()
+        .map(|&index| open_paths[index].clone())
+        .collect();
+    let open_convergence = wait_for_config_convergence(
+        "the load harness open-proxy baseline",
+        &open_sample_labels,
+        |i| {
+            let path = &open_paths[open_sample_indices[i]];
+            let url = format!("{}{}", harness.proxy_base_url, path);
+            let client = client.clone();
+            async move {
+                match client.get(&url).send().await {
+                    Ok(response) => Ok(response.status().as_u16()),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+        },
+    )
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "Load harness aborted before measuring {} open proxies: {}",
+            NUM_OPEN_PROXIES, error
+        )
+    });
+    println!(
+        "  Open-proxy config converged after {:.1}s ({} polls)",
+        open_convergence.waited.as_secs_f64(),
+        open_convergence.polls
+    );
 
     // --- Phase 1: Ramp concurrency ---
     println!("\n=== Phase 1: Concurrency Ramp (mixed payloads, mixed auth) ===");

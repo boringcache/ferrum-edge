@@ -38,8 +38,8 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use crate::common::scheduled_scaling::{
-    SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, post_admin_batch,
-    scheduled_scaling_admin_jwt_max_ttl_value,
+    CONFIG_CONVERGENCE_MAX_WAIT_SECS, SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, post_admin_batch,
+    scheduled_scaling_admin_jwt_max_ttl_value, wait_for_config_convergence,
 };
 
 const BATCH_SIZE: usize = 3_000;
@@ -649,6 +649,24 @@ fn print_perf_result(r: &PerfResult) {
     println!("└─────────────────────────────────────────────────────────┘");
 }
 
+/// Sample indices used to prove a freshly created batch has been published.
+///
+/// Covers the first, middle and last proxy of the new batch plus proxy 0, so a
+/// forced full reload that has published only part of the graph — or that has
+/// transiently dropped already-published config — cannot be mistaken for
+/// convergence.
+fn convergence_sample_indices(batch_start: usize, total: usize) -> Vec<usize> {
+    let mut indices = vec![
+        0,
+        batch_start,
+        batch_start + (total - batch_start) / 2,
+        total - 1,
+    ];
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
 /// Core test runner shared between SQLite and PostgreSQL variants.
 async fn run_scale_perf_test(harness: &ScalePerfHarness) {
     println!("Gateway started ({}):", harness.db_label);
@@ -704,39 +722,49 @@ async fn run_scale_perf_test(harness: &ScalePerfHarness) {
 
         all_entries.extend(new_entries);
 
-        // Wait for the DB poller to pick up the new config
-        println!("  Waiting for DB poll to load new config...");
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
-        // Verify a sample of the new proxies are routable
-        let sample_idx = batch_start;
-        let (ref path, ref key) = all_entries[sample_idx];
-        let verify_url = format!("{}{}", harness.proxy_base_url, path);
-        let verify_resp = client
-            .get(&verify_url)
-            .header("X-API-Key", key.as_str())
-            .send()
-            .await;
-        match verify_resp {
-            Ok(r) if r.status().is_success() => {
-                println!("  Verified proxy {} is routable", path);
+        // Gate the measurement on the gateway having actually published this
+        // batch. Provisioning appends ~12,000 `config_changes` rows, which
+        // pushes the poller past `CHANGE_LOG_BATCH_LIMIT` and forces a full
+        // reload; measuring inside that reload measures convergence, not
+        // routing throughput. Sample across the new batch — not only its first
+        // proxy — plus the oldest proxy, so a reload that drops already-published
+        // config is caught too.
+        let sample_indices = convergence_sample_indices(batch_start, all_entries.len());
+        let sample_labels: Vec<String> = sample_indices
+            .iter()
+            .map(|&index| all_entries[index].0.clone())
+            .collect();
+        println!(
+            "  Waiting for config convergence on {} sample proxies (bound {}s)...",
+            sample_labels.len(),
+            CONFIG_CONVERGENCE_MAX_WAIT_SECS
+        );
+        let convergence = wait_for_config_convergence("the scale harness", &sample_labels, |i| {
+            let index = sample_indices[i];
+            let (ref path, ref key) = all_entries[index];
+            let url = format!("{}{}", harness.proxy_base_url, path);
+            let key = key.clone();
+            let client = client.clone();
+            async move {
+                match client.get(&url).header("X-API-Key", key).send().await {
+                    Ok(response) => Ok(response.status().as_u16()),
+                    Err(error) => Err(error.to_string()),
+                }
             }
-            Ok(r) => {
-                println!(
-                    "  WARNING: proxy {} returned status {}, waiting longer...",
-                    path,
-                    r.status()
-                );
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-            Err(e) => {
-                println!(
-                    "  WARNING: proxy {} failed verification: {}, waiting longer...",
-                    path, e
-                );
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
+        })
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "Scale harness aborted before measuring {} proxies: {}",
+                all_entries.len(),
+                error
+            )
+        });
+        println!(
+            "  Config converged after {:.1}s ({} polls)",
+            convergence.waited.as_secs_f64(),
+            convergence.polls
+        );
 
         // Run perf test against all proxies accumulated so far
         println!(
