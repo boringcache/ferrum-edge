@@ -6873,9 +6873,17 @@ async fn handle_h3_request(
         // write past the credential's lifetime.
         let mut client_disconnected = false;
         let mut body_error_class: Option<crate::retry::ErrorClass> = None;
+        // Fail-closed terminal for the COMMITTED streaming response (issue #4112).
+        // From here to the end of this relay the send half is only ever handed a
+        // clean FIN where a `finish()` actually returned `Ok`; every other exit —
+        // including one that never reaches the post-relay settle because the
+        // request task was dropped while parked in `send_data` — RESETS, because
+        // `quinn::SendStream::drop` would otherwise present it as a normal end of
+        // response. Derefs to the same `RequestStream` for every write below.
+        let mut stream = crate::http3::stream_util::CommittedH3ResponseStream::new(stream);
         let headers_commit =
             crate::http3::stream_util::commit_authorized_streaming_response_headers(
-                &mut stream,
+                &mut *stream,
                 resp,
                 &mut ctx,
                 state.env_config.authenticated_stream_max_lifetime_seconds,
@@ -6892,7 +6900,7 @@ async fn handle_h3_request(
                 body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
             }
             crate::http3::stream_util::H3AuthorizedHeadersWrite::ProtocolDeadlineExceeded => {
-                crate::http3::stream_util::abort_response_stream(&mut stream);
+                crate::http3::stream_util::abort_response_stream(&mut *stream);
                 client_disconnected = true;
                 body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
             }
@@ -6901,7 +6909,7 @@ async fn handle_h3_request(
                     "HTTP/3 streaming response reached its authorization lifetime before \
                      response headers committed; resetting the stream"
                 );
-                crate::http3::stream_util::abort_response_stream(&mut stream);
+                crate::http3::stream_util::abort_response_stream(&mut *stream);
                 body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
             }
         }
@@ -6991,7 +6999,7 @@ async fn handle_h3_request(
                              while the client was not consuming; resetting the stream"
                         );
                         coalesce_buf.clear();
-                        crate::http3::stream_util::abort_response_stream(&mut stream);
+                        crate::http3::stream_util::abort_response_stream(&mut *stream);
                         // Health-neutral: a gateway policy expiry must not move
                         // the circuit breaker, passive health, or the H3
                         // capability registry.
@@ -7043,7 +7051,7 @@ async fn handle_h3_request(
                                     "Backend response exceeded {} byte limit during streaming",
                                     effective_max_response_body_size_bytes
                                 );
-                                crate::http3::stream_util::abort_response_stream(&mut stream);
+                                crate::http3::stream_util::abort_response_stream(&mut *stream);
                                 body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
                                 break 'outer;
                             }
@@ -7087,6 +7095,7 @@ async fn handle_h3_request(
                                         // park it past the credential.
                                         if authorized_send!(stream.finish()) {
                                             body_completed = true;
+                                            stream.record_clean_finish();
                                         }
                                         break 'outer;
                                     }
@@ -7138,7 +7147,7 @@ async fn handle_h3_request(
                             } else {
                                 error!("Error reading backend h3 response during streaming: {}", e);
                                 coalesce_buf.clear();
-                                crate::http3::stream_util::abort_response_stream(&mut stream);
+                                crate::http3::stream_util::abort_response_stream(&mut *stream);
                                 let class = crate::http3::client::classify_http3_error(&e);
                                 // Mid-stream QUIC/H3 transport failure is a
                                 // capability-downgrade signal — same rule as the
@@ -7177,7 +7186,7 @@ async fn handle_h3_request(
                         backend_read_timeout_ms
                     );
                     coalesce_buf.clear();
-                    crate::http3::stream_util::abort_response_stream(&mut stream);
+                    crate::http3::stream_util::abort_response_stream(&mut *stream);
                     body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
                     break 'outer;
                 }
@@ -7202,7 +7211,7 @@ async fn handle_h3_request(
                          resetting the stream"
                     );
                     coalesce_buf.clear();
-                    crate::http3::stream_util::abort_response_stream(&mut stream);
+                    crate::http3::stream_util::abort_response_stream(&mut *stream);
                     body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                     // Through the REQUEST latch: `break 'outer` makes this arm
                     // reachable at most once, and the latch additionally keeps a
@@ -7258,7 +7267,7 @@ async fn handle_h3_request(
                     }
                 } else {
                     finish_h3_response_with_backend_trailers(
-                        &mut stream,
+                        &mut *stream,
                         &mut h3_resp.recv_stream,
                         backend_read_timeout_ms,
                         H3StreamingTrailerPolicy {
@@ -7275,13 +7284,16 @@ async fn handle_h3_request(
                     .await
                 };
                 match finish_result {
-                    Ok(_) => body_completed = true,
+                    Ok(_) => {
+                        body_completed = true;
+                        stream.record_clean_finish();
+                    }
                     Err(H3TrailerFinishError::AuthorizationExpired(termination)) => {
                         debug!(
                             "HTTP/3 streaming response reached its authorization lifetime while \
                              the client was not consuming the terminal trailers; resetting"
                         );
-                        crate::http3::stream_util::abort_response_stream(&mut stream);
+                        crate::http3::stream_util::abort_response_stream(&mut *stream);
                         body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                         ctx.latch_authorization_termination(termination);
                     }
@@ -7290,7 +7302,7 @@ async fn handle_h3_request(
                             "Error reading backend h3 response trailers during streaming: {}",
                             err
                         );
-                        crate::http3::stream_util::abort_response_stream(&mut stream);
+                        crate::http3::stream_util::abort_response_stream(&mut *stream);
                         let class = crate::http3::client::classify_http3_error(&err);
                         // Trailer-boundary transport faults are the same
                         // capability signal as mid-body resets (issue #2939),
@@ -7309,7 +7321,7 @@ async fn handle_h3_request(
                             "Backend trailer read timeout ({}ms) during HTTP/3 streaming response",
                             backend_read_timeout_ms
                         );
-                        crate::http3::stream_util::abort_response_stream(&mut stream);
+                        crate::http3::stream_util::abort_response_stream(&mut *stream);
                         body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
                     }
                     Err(H3TrailerFinishError::Client) => {
@@ -7320,6 +7332,13 @@ async fn handle_h3_request(
                 break;
             }
         }
+
+        // Apply the committed-response terminal now (issue #4112): the RESET must
+        // reach the wire before the response-termination hooks and transaction
+        // logging below await. A no-op once a `finish()` landed, so a cleanly
+        // completed body is never clobbered; the `Drop` backstop still covers a
+        // task that never reaches this statement at all.
+        stream.settle_committed_terminal();
 
         // Record outcome.
         //

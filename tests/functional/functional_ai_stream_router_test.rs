@@ -93,6 +93,50 @@ struct CapturedRequest {
     raw: String,
 }
 
+/// Read a complete HTTP/1.1 request: headers, then exactly `Content-Length`
+/// body bytes.
+///
+/// Returns whatever was read if the peer closes early or stalls, so a
+/// malformed, truncated, or stalled request still surfaces in the assertion
+/// message rather than hanging the test until the job timeout. The bound is
+/// per-read and generous: the only writer here is the gateway on loopback.
+async fn read_full_request(stream: &mut tokio::net::TcpStream) -> String {
+    const READ_BOUND: Duration = Duration::from_secs(10);
+    let mut raw: Vec<u8> = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 8192];
+
+    let header_end = loop {
+        if let Some(idx) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            break idx + 4;
+        }
+        match tokio::time::timeout(READ_BOUND, stream.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => raw.extend_from_slice(&chunk[..n]),
+            _ => return String::from_utf8_lossy(&raw).into_owned(),
+        }
+    };
+
+    let content_length = String::from_utf8_lossy(&raw[..header_end])
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
+    while raw.len() < header_end + content_length {
+        match tokio::time::timeout(READ_BOUND, stream.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => raw.extend_from_slice(&chunk[..n]),
+            _ => break,
+        }
+    }
+
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
 async fn anthropic_provider(
     listener: TcpListener,
     body: &'static str,
@@ -104,9 +148,12 @@ async fn anthropic_provider(
         };
         let capture = Arc::clone(&capture);
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536];
-            let n = stream.read(&mut buf).await.unwrap_or(0);
-            let raw = String::from_utf8_lossy(&buf[..n]).into_owned();
+            // Read the WHOLE request before capturing it. A single `read()` is
+            // only guaranteed to return whatever one TCP segment carried, so a
+            // request whose body lands in a later segment used to be captured
+            // as headers-only — and the tool-history assertion below then failed
+            // against a `raw` that legitimately contained no body at all.
+            let raw = read_full_request(&mut stream).await;
             *capture.lock().unwrap() = Some(CapturedRequest { raw });
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
