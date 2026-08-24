@@ -6,6 +6,14 @@
 //! regression that stops binding those ports fails these tests rather than
 //! being papered over by a helper.
 //!
+//! Reservation is bind-drop-rebind: a sibling test can steal a port after we
+//! drop the sockets and before this child binds them. A Gateway-listener bind
+//! failure is non-fatal, so a TCP accept on the reserved port is not proof
+//! this child owns it. Before any routing assertion, each test waits until
+//! **this child's** authenticated `/status` `gateway_listeners` object reports
+//! the declared listener count as both `desired_listeners` and
+//! `active_listeners` with no bind failures (issue #4134).
+//!
 //! Covered:
 //! - two **same-protocol** listener ports (`:A` and `:B`, both plaintext)
 //!   carrying identical `host` + `listen_path`, each reaching only its own
@@ -55,8 +63,10 @@ async fn spawn_backend(identifier: &'static str) -> (u16, JoinHandle<()>) {
 /// Reserve two distinct ephemeral port numbers, then release both sockets so
 /// the gateway binds them itself. Holding both reservations at the same time
 /// prevents the kernel from immediately returning the first port for the
-/// second request. Reload callers retry when an undeclared port reservation is
-/// stolen before the negative assertion runs.
+/// second request. Callers must still prove this child won both binds via
+/// [`wait_for_owned_gateway_listeners`] before issuing traffic: a TCP accept
+/// after the drop can belong to a sibling. Reload callers also retry when an
+/// undeclared port reservation is stolen before the negative assertion runs.
 async fn reserve_free_port_pair() -> (u16, u16) {
     let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -70,7 +80,17 @@ async fn reserve_free_port_pair() -> (u16, u16) {
 
 const GATEWAY_LISTENER_STARTUP_ATTEMPTS: u32 = 3;
 
-async fn gateway_listener_counts(gateway: &TestGateway) -> (u32, u32) {
+struct GatewayListenerRealization {
+    desired: u32,
+    active: u32,
+    failed_ports: u32,
+    failures: Vec<String>,
+}
+
+/// Authenticated `/status` `gateway_listeners` for **this** child. The admin
+/// JWT is minted per spawn, so a sibling answering on a stolen data-plane
+/// port cannot produce this object.
+async fn gateway_listener_realization(gateway: &TestGateway) -> GatewayListenerRealization {
     let client = reqwest::Client::new();
     let resp = client
         .get(gateway.admin_url("/status"))
@@ -80,14 +100,99 @@ async fn gateway_listener_counts(gateway: &TestGateway) -> (u32, u32) {
         .expect("fetch /status");
     let body: serde_json::Value = resp.json().await.expect("status json");
     let listeners = &body["gateway_listeners"];
-    (
-        listeners["desired_listeners"]
+    if listeners.is_null() {
+        return GatewayListenerRealization {
+            desired: 0,
+            active: 0,
+            failed_ports: 0,
+            failures: Vec::new(),
+        };
+    }
+    let failures = listeners["failures"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "port={} protocol={} category={} origin={} detail={}",
+                        entry["port"],
+                        entry["protocol"],
+                        entry["category"],
+                        entry["origin"],
+                        entry["detail"]
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    GatewayListenerRealization {
+        desired: listeners["desired_listeners"]
             .as_u64()
             .expect("desired_listeners") as u32,
-        listeners["active_listeners"]
+        active: listeners["active_listeners"]
             .as_u64()
             .expect("active_listeners") as u32,
-    )
+        failed_ports: listeners["failed_ports"]
+            .as_u64()
+            .expect("failed_ports") as u32,
+        failures,
+    }
+}
+
+async fn gateway_listener_counts(gateway: &TestGateway) -> (u32, u32) {
+    let realization = gateway_listener_realization(gateway).await;
+    (realization.desired, realization.active)
+}
+
+/// Poll this child's authenticated `/status` until it reports `expected`
+/// Gateway listeners as both desired and active, with no bind failures.
+///
+/// `/status` does not list admitted ports, but `desired_listeners` /
+/// `active_listeners` are counts of sockets **this process** must bind and
+/// currently holds. Combined with `failed_ports` / `failures`, that is enough
+/// to distinguish "this child bound the declared set" from "a sibling is
+/// listening on a port we failed to bind". A TCP connect cannot make that
+/// distinction.
+async fn wait_for_owned_gateway_listeners(
+    gateway: &TestGateway,
+    expected: u32,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let realization = gateway_listener_realization(gateway).await;
+        if realization.failed_ports > 0 || !realization.failures.is_empty() {
+            return Err(format!(
+                "child reported Gateway listener bind failure(s) realizing {expected} listener(s): \
+                 desired={} active={} failed_ports={} failures=[{}]",
+                realization.desired,
+                realization.active,
+                realization.failed_ports,
+                realization.failures.join("; ")
+            ));
+        }
+        if realization.desired == expected && realization.active == expected {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "child never realized {expected} owned Gateway listener(s): \
+                 desired={} active={} failed_ports={}",
+                realization.desired, realization.active, realization.failed_ports
+            ));
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn abort_listener_attempt(attempt: u32, what: &str, reason: &str) {
+    eprintln!("{what} attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS}: {reason}");
+    if attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+        panic!(
+            "{what}: never proved ownership of this child's Gateway listeners in \
+             {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts: {reason}"
+        );
+    }
 }
 
 /// True when another test bound `port` after we released the reservation but
@@ -127,41 +232,6 @@ async fn get_on_tls_port(client: &reqwest::Client, port: u16, path: &str) -> (u1
     (status, body)
 }
 
-/// Poll until the gateway is accepting on `port`, or fail with a clear
-/// "never bound" message. The listener lifecycle is asynchronous relative to
-/// process readiness, so a bounded poll is correct here — a sleep is not.
-async fn wait_until_listening(port: u16, what: &str) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
-            return;
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!("gateway never bound {what} on port {port}");
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-}
-
-async fn wait_until_not_listening(port: u16, what: &str) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_err()
-        {
-            return;
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!("gateway never released {what} on port {port}");
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-}
-
 fn plaintext_proxy(id: &str, listen_port: u16, backend_port: u16) -> String {
     format!(
         r#"
@@ -183,53 +253,69 @@ fn plaintext_proxy(id: &str, listen_port: u16, backend_port: u16) -> String {
 async fn functional_port_aware_routes_two_same_protocol_listeners() {
     let (backend_a, _ha) = spawn_backend("listener-a").await;
     let (backend_b, _hb) = spawn_backend("listener-b").await;
-    let (port_a, port_b) = reserve_free_port_pair().await;
-    assert_ne!(port_a, port_b);
 
-    let config = format!(
-        r#"
+    for attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+        let (port_a, port_b) = reserve_free_port_pair().await;
+        assert_ne!(port_a, port_b);
+
+        let config = format!(
+            r#"
 version: "1"
 proxies:{}{}
 consumers: []
 plugin_configs: []
 "#,
-        plaintext_proxy("gw-a", port_a, backend_a),
-        plaintext_proxy("gw-b", port_b, backend_b),
-    );
+            plaintext_proxy("gw-a", port_a, backend_a),
+            plaintext_proxy("gw-b", port_b, backend_b),
+        );
 
-    let gateway = TestGateway::builder()
-        .mode_file(config)
-        .reserve_listener_port(port_a)
-        .reserve_listener_port(port_b)
-        .log_level("warn")
-        .spawn()
-        .await
-        .expect("start gateway");
-    let client = reqwest::Client::new();
+        let gateway = TestGateway::builder()
+            .mode_file(config)
+            .reserve_listener_port(port_a)
+            .reserve_listener_port(port_b)
+            .log_level("warn")
+            .spawn()
+            .await
+            .expect("start gateway");
+        let client = reqwest::Client::new();
 
-    wait_until_listening(port_a, "Gateway listener A").await;
-    wait_until_listening(port_b, "Gateway listener B").await;
+        if let Err(reason) = wait_for_owned_gateway_listeners(&gateway, 2).await {
+            abort_listener_attempt(
+                attempt,
+                "functional port-aware two-same-protocol listeners",
+                &reason,
+            );
+            drop(gateway);
+            continue;
+        }
 
-    let (status_a, body_a) = get_on_port(&client, port_a, "/api/x").await;
-    assert_eq!(status_a, 200, "listener A must serve: {body_a}");
-    assert_eq!(body_a, "listener-a");
+        let (status_a, body_a) = get_on_port(&client, port_a, "/api/x").await;
+        assert_eq!(status_a, 200, "listener A must serve: {body_a}");
+        assert_eq!(body_a, "listener-a");
 
-    let (status_b, body_b) = get_on_port(&client, port_b, "/api/x").await;
-    assert_eq!(status_b, 200, "listener B must serve: {body_b}");
-    assert_eq!(body_b, "listener-b");
+        let (status_b, body_b) = get_on_port(&client, port_b, "/api/x").await;
+        assert_eq!(status_b, 200, "listener B must serve: {body_b}");
+        assert_eq!(body_b, "listener-b");
 
-    // With two same-protocol listener ports the compatibility remap is off, so
-    // the global process bind is not a stand-in for either listener.
-    let resp = client
-        .get(gateway.proxy_url("/api/x"))
-        .header("Host", HOST)
-        .send()
-        .await
-        .expect("global bind answers");
-    assert_eq!(
-        resp.status().as_u16(),
-        404,
-        "the global plaintext bind must not guess between two same-protocol listeners"
+        // With two same-protocol listener ports the compatibility remap is off, so
+        // the global process bind is not a stand-in for either listener.
+        let resp = client
+            .get(gateway.proxy_url("/api/x"))
+            .header("Host", HOST)
+            .send()
+            .await
+            .expect("global bind answers");
+        assert_eq!(
+            resp.status().as_u16(),
+            404,
+            "the global plaintext bind must not guess between two same-protocol listeners"
+        );
+        return;
+    }
+
+    panic!(
+        "could not start a gateway that owns both declared listeners in \
+         {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
     );
 }
 
@@ -241,13 +327,15 @@ plugin_configs: []
 async fn functional_port_aware_routes_http_and_https_listeners() {
     let (plain_backend, _hp) = spawn_backend("plain-backend").await;
     let (tls_backend, _ht) = spawn_backend("tls-backend").await;
-    let (plain_port, tls_port) = reserve_free_port_pair().await;
-    assert_ne!(plain_port, tls_port);
 
-    // `http_tls_listen_ports` is namespace-qualified: the entry is the
-    // `(namespace, port)` pair the listener was admitted under.
-    let config = format!(
-        r#"
+    for attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+        let (plain_port, tls_port) = reserve_free_port_pair().await;
+        assert_ne!(plain_port, tls_port);
+
+        // `http_tls_listen_ports` is namespace-qualified: the entry is the
+        // `(namespace, port)` pair the listener was admitted under.
+        let config = format!(
+            r#"
 version: "1"
 http_tls_listen_ports:
   - ["ferrum", {tls_port}]
@@ -255,76 +343,90 @@ proxies:{}{}
 consumers: []
 plugin_configs: []
 "#,
-        plaintext_proxy("gw-plain", plain_port, plain_backend),
-        plaintext_proxy("gw-tls", tls_port, tls_backend),
-    );
+            plaintext_proxy("gw-plain", plain_port, plain_backend),
+            plaintext_proxy("gw-tls", tls_port, tls_backend),
+        );
 
-    let gateway = TestGateway::builder()
-        .mode_file(config)
-        .reserve_listener_port(plain_port)
-        .reserve_listener_port(tls_port)
-        .log_level("warn")
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
-        .spawn()
-        .await
-        .expect("start gateway");
+        let gateway = TestGateway::builder()
+            .mode_file(config)
+            .reserve_listener_port(plain_port)
+            .reserve_listener_port(tls_port)
+            .log_level("warn")
+            .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+            .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+            .spawn()
+            .await
+            .expect("start gateway");
 
-    wait_until_listening(plain_port, "plaintext Gateway listener").await;
-    wait_until_listening(tls_port, "TLS Gateway listener").await;
+        if let Err(reason) = wait_for_owned_gateway_listeners(&gateway, 2).await {
+            abort_listener_attempt(
+                attempt,
+                "functional port-aware HTTP and HTTPS listeners",
+                &reason,
+            );
+            drop(gateway);
+            continue;
+        }
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        // These helpers connect to the loopback socket while routing by an
-        // explicit Host header. HTTP/2 would also send the loopback URI as
-        // `:authority`, correctly tripping Ferrum's authority-conflict guard;
-        // this test is about listener TLS classification, so keep it on H1.
-        .http1_only()
-        .build()
-        .expect("build TLS client");
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            // These helpers connect to the loopback socket while routing by an
+            // explicit Host header. HTTP/2 would also send the loopback URI as
+            // `:authority`, correctly tripping Ferrum's authority-conflict guard;
+            // this test is about listener TLS classification, so keep it on H1.
+            .http1_only()
+            .build()
+            .expect("build TLS client");
 
-    let (status_plain, body_plain) = get_on_port(&client, plain_port, "/api/x").await;
-    assert_eq!(status_plain, 200, "HTTP listener must serve: {body_plain}");
-    assert_eq!(body_plain, "plain-backend");
+        let (status_plain, body_plain) = get_on_port(&client, plain_port, "/api/x").await;
+        assert_eq!(status_plain, 200, "HTTP listener must serve: {body_plain}");
+        assert_eq!(body_plain, "plain-backend");
 
-    let (status_tls, body_tls) = get_on_tls_port(&client, tls_port, "/api/x").await;
-    assert_eq!(status_tls, 200, "HTTPS listener must serve: {body_tls}");
-    assert_eq!(body_tls, "tls-backend");
+        let (status_tls, body_tls) = get_on_tls_port(&client, tls_port, "/api/x").await;
+        assert_eq!(status_tls, 200, "HTTPS listener must serve: {body_tls}");
+        assert_eq!(body_tls, "tls-backend");
 
-    // Cross-protocol must fail closed. A plaintext request to the TLS
-    // listener's socket either fails at the transport (the socket speaks TLS)
-    // or is refused — it must never be served by the TLS-scoped route.
-    let plaintext_to_tls_listener = client
-        .get(format!("http://127.0.0.1:{tls_port}/api/x"))
-        .header("Host", HOST)
-        .send()
-        .await;
-    match plaintext_to_tls_listener {
-        Err(_) => {}
-        Ok(response) => assert_ne!(
-            response.status().as_u16(),
-            200,
-            "a plaintext request must never be served by the TLS listener's route"
-        ),
+        // Cross-protocol must fail closed. A plaintext request to the TLS
+        // listener's socket either fails at the transport (the socket speaks TLS)
+        // or is refused — it must never be served by the TLS-scoped route.
+        let plaintext_to_tls_listener = client
+            .get(format!("http://127.0.0.1:{tls_port}/api/x"))
+            .header("Host", HOST)
+            .send()
+            .await;
+        match plaintext_to_tls_listener {
+            Err(_) => {}
+            Ok(response) => assert_ne!(
+                response.status().as_u16(),
+                200,
+                "a plaintext request must never be served by the TLS listener's route"
+            ),
+        }
+
+        // The gateway's own plaintext bind is not a Gateway listener. Exactly one
+        // plaintext listener port is declared, so the documented single-listener
+        // compatibility remap admits it — assert that documented behaviour rather
+        // than leaving the surface untested.
+        let global = client
+            .get(gateway.proxy_url("/api/x"))
+            .header("Host", HOST)
+            .send()
+            .await
+            .expect("global plaintext bind answers");
+        let status_global = global.status().as_u16();
+        let body_global = global.text().await.unwrap_or_default();
+        assert_eq!(
+            status_global, 200,
+            "with one plaintext listener port the global bind remaps onto it: {body_global}"
+        );
+        assert_eq!(body_global, "plain-backend");
+        return;
     }
 
-    // The gateway's own plaintext bind is not a Gateway listener. Exactly one
-    // plaintext listener port is declared, so the documented single-listener
-    // compatibility remap admits it — assert that documented behaviour rather
-    // than leaving the surface untested.
-    let global = client
-        .get(gateway.proxy_url("/api/x"))
-        .header("Host", HOST)
-        .send()
-        .await
-        .expect("global plaintext bind answers");
-    let status_global = global.status().as_u16();
-    let body_global = global.text().await.unwrap_or_default();
-    assert_eq!(
-        status_global, 200,
-        "with one plaintext listener port the global bind remaps onto it: {body_global}"
+    panic!(
+        "could not start a gateway that owns both declared listeners in \
+         {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
     );
-    assert_eq!(body_global, "plain-backend");
 }
 
 /// Reload lifecycle through SIGHUP on the real binary: add a listener port,
@@ -362,7 +464,11 @@ plugin_configs: []
             .expect("start gateway");
         let client = reqwest::Client::new();
 
-        wait_until_listening(port_a, "Gateway listener A").await;
+        if let Err(reason) = wait_for_owned_gateway_listeners(&gateway, 1).await {
+            abort_listener_attempt(attempt, "functional port-aware reload add/withdraw", &reason);
+            drop(gateway);
+            continue;
+        }
         assert_eq!(get_on_port(&client, port_a, "/api/x").await.1, "listener-a");
         if undeclared_port_stolen_externally(&gateway, port_b).await {
             eprintln!(
@@ -403,7 +509,11 @@ plugin_configs: []
         );
         std::fs::write(config_path, with_both).expect("rewrite config");
         sighup(&gateway);
-        wait_until_listening(port_b, "added Gateway listener B").await;
+        if let Err(reason) = wait_for_owned_gateway_listeners(&gateway, 2).await {
+            abort_listener_attempt(attempt, "functional port-aware reload add/withdraw", &reason);
+            drop(gateway);
+            continue;
+        }
 
         assert_eq!(get_on_port(&client, port_b, "/api/x").await.1, "listener-b");
         assert_eq!(
@@ -424,7 +534,13 @@ plugin_configs: []
         );
         std::fs::write(config_path, only_b).expect("rewrite config");
         sighup(&gateway);
-        wait_until_not_listening(port_a, "withdrawn Gateway listener A").await;
+        // Prove this child released A via its own /status. A TCP "not listening"
+        // probe can hang if a sibling grabs the withdrawn port.
+        if let Err(reason) = wait_for_owned_gateway_listeners(&gateway, 1).await {
+            abort_listener_attempt(attempt, "functional port-aware reload add/withdraw", &reason);
+            drop(gateway);
+            continue;
+        }
 
         assert_eq!(
             get_on_port(&client, port_b, "/api/x").await.1,
@@ -464,15 +580,15 @@ fn sighup(gateway: &TestGateway) {
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn functional_port_aware_routes_two_tls_listeners_serve_http3() {
-    use crate::scaffolding::clients::{GetOptions, Http3Client};
-
     let (backend_a, _ha) = spawn_backend("tls-a").await;
     let (backend_b, _hb) = spawn_backend("tls-b").await;
-    let (port_a, port_b) = reserve_free_port_pair().await;
-    assert_ne!(port_a, port_b);
 
-    let both = format!(
-        r#"
+    for attempt in 1..=GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+        let (port_a, port_b) = reserve_free_port_pair().await;
+        assert_ne!(port_a, port_b);
+
+        let both = format!(
+            r#"
 version: "1"
 http_tls_listen_ports:
   - ["ferrum", {port_a}]
@@ -481,44 +597,51 @@ proxies:{}{}
 consumers: []
 plugin_configs: []
 "#,
-        loopback_proxy("gw-a", port_a, backend_a),
-        loopback_proxy("gw-b", port_b, backend_b),
-    );
+            loopback_proxy("gw-a", port_a, backend_a),
+            loopback_proxy("gw-b", port_b, backend_b),
+        );
 
-    let gateway = TestGateway::builder()
-        .mode_file(both)
-        .reserve_listener_port(port_a)
-        .reserve_listener_port(port_b)
-        .log_level("warn")
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
-        .spawn()
-        .await
-        .expect("start gateway");
+        let gateway = TestGateway::builder()
+            .mode_file(both)
+            .reserve_listener_port(port_a)
+            .reserve_listener_port(port_b)
+            .log_level("warn")
+            .env("FERRUM_ENABLE_HTTP3", "true")
+            .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+            .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+            .spawn()
+            .await
+            .expect("start gateway");
 
-    wait_until_listening(port_a, "TLS Gateway listener A").await;
-    wait_until_listening(port_b, "TLS Gateway listener B").await;
+        if let Err(reason) = wait_for_owned_gateway_listeners(&gateway, 2).await {
+            abort_listener_attempt(
+                attempt,
+                "functional port-aware two TLS listeners serve HTTP/3",
+                &reason,
+            );
+            drop(gateway);
+            continue;
+        }
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .expect("build TLS client");
-    assert_eq!(tls_body(&client, port_a, "/api/x").await, "tls-a");
-    assert_eq!(tls_body(&client, port_b, "/api/x").await, "tls-b");
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .expect("build TLS client");
+        assert_eq!(tls_body(&client, port_a, "/api/x").await, "tls-a");
+        assert_eq!(tls_body(&client, port_b, "/api/x").await, "tls-b");
 
-    // HTTP/3 on BOTH TLS listener ports — the case a single global UDP socket
-    // cannot cover.
-    assert_eq!(h3_body(port_a, "/api/x").await, "tls-a");
-    assert_eq!(h3_body(port_b, "/api/x").await, "tls-b");
+        // HTTP/3 on BOTH TLS listener ports — the case a single global UDP socket
+        // cannot cover. Bind-failure re-roll above already refused a QUIC steal.
+        assert_eq!(h3_body(port_a, "/api/x").await, "tls-a");
+        assert_eq!(h3_body(port_b, "/api/x").await, "tls-b");
 
-    // ── Withdraw listener B ──────────────────────────────────────────────
-    let config_path = gateway
-        .config_path
-        .as_ref()
-        .expect("file-mode harness must populate config_path");
-    let only_a = format!(
-        r#"
+        // ── Withdraw listener B ──────────────────────────────────────────────
+        let config_path = gateway
+            .config_path
+            .as_ref()
+            .expect("file-mode harness must populate config_path");
+        let only_a = format!(
+            r#"
 version: "1"
 http_tls_listen_ports:
   - ["ferrum", {port_a}]
@@ -526,33 +649,30 @@ proxies:{}
 consumers: []
 plugin_configs: []
 "#,
-        loopback_proxy("gw-a", port_a, backend_a),
-    );
-    std::fs::write(config_path, only_a).expect("rewrite config");
-    sighup(&gateway);
-    wait_until_not_listening(port_b, "withdrawn TLS Gateway listener B").await;
-
-    // The withdrawn port's QUIC socket goes with it; the survivor keeps
-    // serving HTTP/3.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let client = Http3Client::insecure().expect("H3 client");
-        let attempt = client
-            .get_with_options(
-                &format!("https://127.0.0.1:{port_b}/api/x"),
-                GetOptions::default(),
-            )
-            .await;
-        if attempt.is_err() {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the withdrawn TLS listener kept serving HTTP/3"
+            loopback_proxy("gw-a", port_a, backend_a),
         );
-        sleep(Duration::from_millis(100)).await;
+        std::fs::write(config_path, only_a).expect("rewrite config");
+        sighup(&gateway);
+        // This child's /status is the proof the withdrawn listener (TCP + QUIC)
+        // is gone. A connect/H3 probe of port_b can succeed against a sibling
+        // that grabbed the freed port.
+        if let Err(reason) = wait_for_owned_gateway_listeners(&gateway, 1).await {
+            abort_listener_attempt(
+                attempt,
+                "functional port-aware two TLS listeners serve HTTP/3",
+                &reason,
+            );
+            drop(gateway);
+            continue;
+        }
+        assert_eq!(h3_body(port_a, "/api/x").await, "tls-a");
+        return;
     }
-    assert_eq!(h3_body(port_a, "/api/x").await, "tls-a");
+
+    panic!(
+        "could not start a gateway that owns both TLS listeners in \
+         {GATEWAY_LISTENER_STARTUP_ATTEMPTS} attempts"
+    );
 }
 
 /// A route keyed on the loopback authority the test clients send.
