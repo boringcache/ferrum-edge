@@ -34,9 +34,15 @@ const CI_CD: &str = include_str!("../../../docs/ci_cd.md");
 const PUBLISHER_CONCURRENCY_GROUP: &str = "scaling-gate-publisher";
 
 #[test]
-fn admin_jwt_ttl_covers_the_180_minute_job_and_is_accepted_by_configured_max_ttl() {
-    assert_eq!(SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, 4 * 60 * 60);
-    const { assert!(SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS >= 180 * 60) };
+fn admin_jwt_ttl_covers_the_300_minute_job_and_is_accepted_by_configured_max_ttl() {
+    assert_eq!(SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, 6 * 60 * 60);
+    // The harness mints ONE admin JWT for the whole run and hands its TTL to
+    // the gateway as FERRUM_ADMIN_JWT_MAX_TTL, so the token must outlive the
+    // job budget or provisioning fails on auth partway through. Asserted
+    // against the real budget: at the old `>= 180 * 60` a 300-minute job
+    // (issue #4136) satisfied this with a 240-minute token and would have
+    // expired at minute 240, on whichever leg ran long enough to reach it.
+    const { assert!(SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS >= 300 * 60) };
     assert_eq!(
         scheduled_scaling_admin_jwt_max_ttl_value(),
         SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS.to_string()
@@ -209,7 +215,7 @@ fn namespace_fence_retries_are_bounded_by_wall_clock_not_attempt_count() {
     // clears.
     const {
         assert!(
-            NAMESPACE_FENCE_MAX_TOTAL_RETRY_SECS + ADMIN_BATCH_REQUEST_TIMEOUT_SECS < 180 * 60,
+            NAMESPACE_FENCE_MAX_TOTAL_RETRY_SECS + ADMIN_BATCH_REQUEST_TIMEOUT_SECS < 300 * 60,
             "one atomic body's fence-retry budget must stay inside the job timeout"
         )
     };
@@ -334,7 +340,7 @@ fn both_harnesses_gate_measurement_on_bounded_convergence_not_a_fixed_sleep() {
         )
     };
     // The scale harness pays this bound once per batch, so the worst case must
-    // still leave the 180-minute job room for provisioning and measurement.
+    // still leave the 300-minute job room for provisioning and measurement.
     let scale_batches = 30_000 / 3_000;
     assert!(
         scale_batches * CONFIG_CONVERGENCE_MAX_WAIT_SECS < 60 * 60,
@@ -399,8 +405,8 @@ fn load_harness_provisions_credentials_on_the_atomic_consumer_batch() {
 }
 
 #[test]
-fn scheduled_scaling_workflow_keeps_the_180_minute_matrix_and_signal_job() {
-    assert!(WORKFLOW.contains("timeout-minutes: 180"));
+fn scheduled_scaling_workflow_keeps_the_300_minute_matrix_and_signal_job() {
+    assert!(WORKFLOW.contains("timeout-minutes: 300"));
     assert!(WORKFLOW.contains("cron: \"0 4 * * 6\""));
     assert!(WORKFLOW.contains("  scaling-gate-signal:"));
     assert!(WORKFLOW.contains("issues: write"));

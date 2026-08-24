@@ -1,7 +1,7 @@
 //! Shared policy for the scheduled 10k/30k scaling harnesses (issue #3892).
 //!
 //! Admin JWT lifetime is sized to the Scheduled Scaling Regression job timeout
-//! (180 minutes) plus a one-hour margin, and the spawned gateway is configured
+//! (300 minutes) plus a one-hour margin, and the spawned gateway is configured
 //! to accept that same maximum TTL. Consumer JWTs stay on their own 1-hour
 //! minting path and must not reuse this constant.
 //!
@@ -26,15 +26,20 @@ pub const NAMESPACE_FENCE_RETRY_MESSAGE: &str =
 
 /// Admin JWT TTL for the scheduled scale/load harnesses, in seconds.
 ///
-/// The workflow job timeout is 180 minutes (10800s). Tokens are minted after
-/// setup, so 4 hours covers the remaining job budget with a bounded margin.
-pub const SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS: i64 = 4 * 60 * 60;
+/// The workflow job timeout is 300 minutes (issue #4136). Tokens are minted
+/// after setup, so 6 hours covers the remaining budget with margin.
+///
+/// This MUST stay above the job budget: the harness mints ONE token for the
+/// whole run and hands its TTL to the gateway as `FERRUM_ADMIN_JWT_MAX_TTL`,
+/// so a token shorter than the job makes provisioning fail on auth partway
+/// through — on whichever leg runs long enough to reach it.
+pub const SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS: i64 = 6 * 60 * 60;
 
 /// Default sleep when `Retry-After` is absent or unusable (documented value).
 pub const NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS: u64 = 1;
 
 /// Cap on honored `Retry-After` delay-seconds so a huge header cannot stall
-/// a 180-minute job.
+/// a 300-minute job.
 pub const NAMESPACE_FENCE_MAX_RETRY_AFTER_SECS: u64 = 5;
 
 /// Wall-clock budget for retrying ONE atomic `POST /batch` body.
@@ -129,7 +134,7 @@ pub fn namespace_fence_retry_after_delay(header: Option<&str>) -> Duration {
 /// The first exhausted body aborts provisioning, so
 /// [`NAMESPACE_FENCE_MAX_TOTAL_RETRY_SECS`] plus one in-flight
 /// [`ADMIN_BATCH_REQUEST_TIMEOUT_SECS`] is the total added cost of a fence that
-/// never clears — bounded well inside the 180-minute job budget.
+/// never clears — bounded well inside the 300-minute job budget.
 pub fn namespace_fence_backoff(attempt: u32) -> Duration {
     let shift = attempt.saturating_sub(1).min(6);
     Duration::from_secs((1u64 << shift).min(NAMESPACE_FENCE_MAX_BACKOFF_SECS))
@@ -313,7 +318,7 @@ pub async fn post_admin_batch(
 /// reload observed at 9,000 proxies consumed roughly half of a 30-second
 /// window, so 300s is an order of magnitude above a linear extrapolation to
 /// 30,000 proxies. It also keeps the scale harness's ten-batch worst case
-/// (50 minutes) plus provisioning inside the 180-minute job budget, so a
+/// (50 minutes) plus provisioning inside the 300-minute job budget, so a
 /// chronically non-converging gateway reports this explicit diagnostic rather
 /// than a silent job timeout.
 pub const CONFIG_CONVERGENCE_MAX_WAIT_SECS: u64 = 5 * 60;
