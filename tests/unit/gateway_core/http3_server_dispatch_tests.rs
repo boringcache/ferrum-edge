@@ -4685,3 +4685,87 @@ fn the_h3_prebuffered_plain_arm_writes_under_the_backend_write_watermark() {
         "the prebuffered header bound must be captured as one absolute instant"
     );
 }
+
+/// Issue #4112. A COMMITTED native-H3 streaming response must present a
+/// `RESET_STREAM` on every exit that did not land its own FIN.
+///
+/// `quinn::SendStream::drop` implicitly `finish()`es a send half that was
+/// neither finished nor reset, so a relay branch that merely stops writing —
+/// an authorization expiry, a downstream write failure, a future early
+/// `break`, or a task cancelled while parked in `send_data` — would otherwise
+/// hand a stalled client a well-formed end of response on an authorization
+/// failure.
+///
+/// The guard is deliberately the INVERSE of
+/// `committed_response_requires_reset`: it resets unless a `finish()` proved
+/// it returned `Ok`, so it cannot be defeated by a branch that forgets to
+/// latch an error class.
+#[test]
+fn committed_native_h3_streaming_responses_reset_unless_a_finish_landed() {
+    let stream_util = include_str!("../../../src/http3/stream_util.rs");
+
+    assert!(
+        stream_util.contains("pub(crate) struct CommittedH3ResponseStream<S: SendStream<Bytes>>"),
+        "the committed-response send half must carry its own fail-closed type"
+    );
+    // Drop is the backstop a post-relay statement cannot provide: a request
+    // task dropped while parked in `send_data` never reaches one.
+    let drop_impl = stream_util
+        .split("impl<S: SendStream<Bytes>> Drop for CommittedH3ResponseStream<S> {")
+        .nth(1)
+        .expect("the committed-response send half must reset on drop");
+    assert!(
+        drop_impl
+            .split("}")
+            .next()
+            .is_some_and(|body| body.contains("settle_committed_terminal()")),
+        "dropping a committed response send half must apply the fail-closed terminal"
+    );
+    let settle = stream_util
+        .split("pub(crate) fn settle_committed_terminal(&mut self) {")
+        .nth(1)
+        .expect("the fail-closed terminal must be applicable before the relay's awaits");
+    let settle_body = settle.split("\n    }").next().expect("bounded settle body");
+    assert!(
+        settle_body.contains("if self.clean_finish || self.reset_applied {"),
+        "the terminal must be skipped only for a proven clean FIN, and stay idempotent"
+    );
+    assert!(
+        settle_body.contains("abort_response_stream(&mut self.stream)"),
+        "the fail-closed terminal must RESET the send half"
+    );
+    assert!(
+        stream_util.contains("pub(crate) fn record_clean_finish(&mut self) {"),
+        "only an actual clean FIN may disarm the reset"
+    );
+
+    let server = include_str!("../../../src/http3/server.rs");
+    assert!(
+        server.contains("CommittedH3ResponseStream::new(stream)"),
+        "the inline native-H3 streaming relay must own its committed send half"
+    );
+    assert!(
+        server.contains("stream.settle_committed_terminal();"),
+        "the relay must apply the terminal before its termination hooks await"
+    );
+    // Inside the guarded relay the reset is disarmed at exactly the sites where
+    // a downstream `finish()` returned `Ok` — one per clean-completion latch,
+    // and nowhere else.
+    let relay = server
+        .split("CommittedH3ResponseStream::new(stream)")
+        .nth(1)
+        .expect("the guarded relay must start at the wrap")
+        .split("stream.settle_committed_terminal();")
+        .next()
+        .expect("the guarded relay must end at its explicit settle");
+    let disarms = relay.matches("stream.record_clean_finish();").count();
+    assert_eq!(
+        disarms, 2,
+        "only the two FIN-success sites in the guarded relay may disarm the reset"
+    );
+    assert_eq!(
+        relay.matches("body_completed = true;").count(),
+        disarms,
+        "every clean-completion latch in the guarded relay must disarm the reset with it"
+    );
+}
