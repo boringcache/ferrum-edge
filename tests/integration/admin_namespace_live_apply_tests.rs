@@ -445,11 +445,7 @@ async fn confirmed_cascade_delete_of_the_served_namespace_waits() {
     // exercised rather than short-circuited by the 409.
     store.set_protected_namespaces(&["ferrum".to_string()]);
     seed_upstream(&store, "served", "u-cascade").await;
-    let apply = coordinator(
-        "served",
-        store.config_topology_epoch(),
-        NEVER_FIRES,
-    );
+    let apply = coordinator("served", store.config_topology_epoch(), NEVER_FIRES);
     let db: Arc<dyn DatabaseBackend> = Arc::new(store.clone());
     let (base, _shutdown) = start_admin(namespace_admin_state(db, Some(apply.clone()))).await;
 
