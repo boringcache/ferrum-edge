@@ -44,14 +44,17 @@ replicaCount: 2
 # use the binary default.
 ferrumNamespace: ""
 
-# Graceful shutdown. terminationGracePeriodSeconds must be >= shutdownDrainSeconds
-# + ~5s cleanup or the chart fails render. On SIGTERM the gateway stops accept
-# loops, marks itself draining, adds `Connection: close`, and waits up to
-# FERRUM_SHUTDOWN_DRAIN_SECONDS for in-flight work before exiting. A value of 0
-# is honored (skip draining) and rendered explicitly; set to null to omit the
-# env and take the binary's 30s default.
+# Graceful shutdown. terminationGracePeriodSeconds must cover the binary's full
+# sequential shutdown budget or the chart fails render:
+#   drain + 6s transport pool + 5s background + clamp(drain,5,60)s audit
+#   + 2s observability + 5s finalizer slack
+# With the defaults below that is 30+6+5+30+2+5 = 78s (see docs/graceful_shutdown.md).
+# On SIGTERM the gateway stops accept loops, marks itself draining, adds
+# `Connection: close`, and waits up to FERRUM_SHUTDOWN_DRAIN_SECONDS for in-flight
+# work before exiting. A value of 0 is honored (skip draining) and rendered
+# explicitly; set to null to omit the env and take the binary's 30s default.
 shutdownDrainSeconds: 30
-terminationGracePeriodSeconds: 40
+terminationGracePeriodSeconds: 80
 
 serviceAccount:
   create: true
