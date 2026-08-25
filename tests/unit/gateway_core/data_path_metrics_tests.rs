@@ -281,7 +281,10 @@ fn process_families_render_both_tls_reason_buckets_and_the_retry_counter() {
 
     // Values are process-global and other tests in this binary share them, so
     // assert the shape and monotonicity rather than an exact count.
-    assert_eq!(samples(&out, "ferrum_backend_retry_attempts_total").len(), 1);
+    assert_eq!(
+        samples(&out, "ferrum_backend_retry_attempts_total").len(),
+        1
+    );
     assert_eq!(
         samples(&out, "ferrum_frontend_tls_handshake_failures_total").len(),
         2
