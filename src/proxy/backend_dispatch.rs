@@ -2915,9 +2915,11 @@ mod tests {
             active,
             crate::config::types::BackendTlsConfig::from_upstream(upstream),
         );
-        assert!(state
-            .health_checker
-            .has_running_active_probes(&proxy.namespace, "sd-ll-upstream"));
+        assert!(
+            state
+                .health_checker
+                .has_running_active_probes(&proxy.namespace, "sd-ll-upstream")
+        );
 
         record_backend_outcome_no_conn_end(
             &state,

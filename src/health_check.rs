@@ -1866,9 +1866,7 @@ impl HealthChecker {
                         // Only clear unhealthy under the still-current
                         // generation so a retired success cannot drop a mark
                         // the replacement probe just wrote.
-                        let removed = unhealthy_targets.remove_if(&key, |_, _| {
-                            !is_retired()
-                        });
+                        let removed = unhealthy_targets.remove_if(&key, |_, _| !is_retired());
                         if removed.is_some() {
                             info!(
                                 "Active health check: target {} is healthy ({:?} probe)",
@@ -2639,9 +2637,11 @@ async fn build_grpc_probe_channel_san_pinned(
 
     let cert_path = tls_config.client_cert_path.as_deref().or(global_cert_path);
     let key_path = tls_config.client_key_path.as_deref().or(global_key_path);
-    let builder = backend_client_config_builder(None)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let builder = builder.dangerous().with_custom_certificate_verifier(verifier);
+    let builder =
+        backend_client_config_builder(None).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let builder = builder
+        .dangerous()
+        .with_custom_certificate_verifier(verifier);
     let mut client_config = match (cert_path, key_path) {
         (Some(cert_path), Some(key_path)) => {
             let certs = load_probe_tls_certificates(
@@ -3001,9 +3001,10 @@ fn load_probe_rustls_client_auth(
             )
             .map_err(HealthCheckClientError::ClientIdentityUnavailable)?;
             let key_source = CertSource::parse(key_path, MaterialKind::Key);
-            let key_material = load_material_blocking(&key_source, MaterialKind::Key).map_err(
-                |error| HealthCheckClientError::ClientIdentityUnavailable(error.to_string()),
-            )?;
+            let key_material =
+                load_material_blocking(&key_source, MaterialKind::Key).map_err(|error| {
+                    HealthCheckClientError::ClientIdentityUnavailable(error.to_string())
+                })?;
             let key = crate::tls::parse_pem_private_key(
                 key_material.bytes.expose_secret(),
                 "Health check client key",
@@ -3056,13 +3057,13 @@ fn build_health_check_client_with_san_pinning(
     let builder = builder.dangerous().with_custom_certificate_verifier(verifier);
     let mut rustls_config = match client_auth {
         ProbeRustlsClientAuth::None => builder.with_no_client_auth(),
-        ProbeRustlsClientAuth::Materialized { certs, key } => builder
-            .with_client_auth_cert(certs, key)
-            .map_err(|e| {
+        ProbeRustlsClientAuth::Materialized { certs, key } => {
+            builder.with_client_auth_cert(certs, key).map_err(|e| {
                 HealthCheckClientError::ClientIdentityUnavailable(format!(
                     "invalid client certificate/key pair: {e}"
                 ))
-            })?,
+            })?
+        }
     };
     if dial_host_pin.is_some() || !pool_config.enable_http2 {
         rustls_config.alpn_protocols = vec![b"http/1.1".to_vec()];

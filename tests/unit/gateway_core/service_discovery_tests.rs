@@ -6073,9 +6073,10 @@ async fn discovered_snapshot_starts_active_probes_for_sd_only_upstream() {
     let dns_cache = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default());
     let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let mut state = ferrum_edge::_test_support::DiscoveryLoopStateForTest::new();
-    let snapshot = ferrum_edge::service_discovery::DiscoverySnapshot::from_targets(vec![
-        make_target("10.0.0.9", 8080),
-    ]);
+    let snapshot =
+        ferrum_edge::service_discovery::DiscoverySnapshot::from_targets(vec![make_target(
+            "10.0.0.9", 8080,
+        )]);
     let outcome = ferrum_edge::_test_support::apply_service_discovery_snapshot_for_test(
         "ferrum",
         "sd-hc",

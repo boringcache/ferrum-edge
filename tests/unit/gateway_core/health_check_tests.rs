@@ -1887,10 +1887,7 @@ async fn restart_upstream_probes_starts_and_shrinks_discovered_targets() {
     checker.restart_upstream_probes(
         DEFAULT_NAMESPACE,
         "sd-up",
-        &[
-            make_target("10.0.0.1", 8080),
-            make_target("10.0.0.2", 8080),
-        ],
+        &[make_target("10.0.0.1", 8080), make_target("10.0.0.2", 8080)],
         active.clone(),
         tls.clone(),
     );
@@ -1900,10 +1897,7 @@ async fn restart_upstream_probes_starts_and_shrinks_discovered_targets() {
     checker.restart_upstream_probes(
         DEFAULT_NAMESPACE,
         "sd-up",
-        &[
-            make_target("10.0.0.1", 8080),
-            make_target("10.0.0.2", 8080),
-        ],
+        &[make_target("10.0.0.1", 8080), make_target("10.0.0.2", 8080)],
         active.clone(),
         tls.clone(),
     );
@@ -1946,10 +1940,7 @@ async fn restart_upstream_probes_does_not_cancel_other_upstreams() {
     checker.restart_upstream_probes(
         DEFAULT_NAMESPACE,
         "up-a",
-        &[
-            make_target("a1.local", 9001),
-            make_target("a2.local", 9002),
-        ],
+        &[make_target("a1.local", 9001), make_target("a2.local", 9002)],
         active,
         tls,
     );
