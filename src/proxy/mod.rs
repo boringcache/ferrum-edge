@@ -43254,11 +43254,12 @@ async fn proxy_to_backend(
                             return backend_dispatch_response(
                                 retry::BackendResponse {
                                     status_code: 413,
-                                    body: ResponseBody::buffered(
-                                        r#"{"error":"Request body exceeds maximum size"}"#
-                                            .as_bytes()
-                                            .to_vec(),
-                                    ),
+                                    body:
+                                        ResponseBody::buffered(
+                                            r#"{"error":"Request body exceeds maximum size"}"#
+                                                .as_bytes()
+                                                .to_vec(),
+                                        ),
                                     headers: HashMap::new(),
                                     connection_error: false,
                                     backend_resolved_ip: resolved_ip.clone(),
@@ -51968,9 +51969,7 @@ async fn proxy_to_backend_http3(
                     retry::BackendResponse {
                         status_code: 413,
                         body: ResponseBody::buffered(
-                            r#"{"error":"Request body exceeds maximum size"}"#
-                                .as_bytes()
-                                .to_vec(),
+                            r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
                         connection_error: false,
@@ -52062,7 +52061,10 @@ async fn proxy_to_backend_http3(
                 // Latched and counted once; no H3 backend was dialed and
                 // nothing was committed downstream.
                 Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {
-                    return (authorization_expired_dispatch_placeholder(resolved_ip), None);
+                    return (
+                        authorization_expired_dispatch_placeholder(resolved_ip),
+                        None,
+                    );
                 }
             }
         }

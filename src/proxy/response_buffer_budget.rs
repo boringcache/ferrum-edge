@@ -452,8 +452,7 @@ pub(crate) const REQUEST_BUFFER_OVERLOAD_BODY: &str =
 
 /// Fixed `grpc-message` for the same refusal, redaction-safe for the same
 /// reason.
-pub(crate) const REQUEST_BUFFER_OVERLOAD_GRPC_MESSAGE: &str =
-    "Request buffering capacity exceeded";
+pub(crate) const REQUEST_BUFFER_OVERLOAD_GRPC_MESSAGE: &str = "Request buffering capacity exceeded";
 
 /// Telemetry/retry class for the refusal. Gateway-local by construction, so it
 /// is neutral to the circuit breaker, passive health, and adaptive concurrency,
