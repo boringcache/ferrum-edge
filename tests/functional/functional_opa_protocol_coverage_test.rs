@@ -28,7 +28,7 @@ async fn opa_policy_denial_applies_to_http_websocket_upgrade_and_grpc() {
         .mount(&opa)
         .await;
 
-    let (backend, mutations) = spawn_http_counting_mutations()
+    let (mut backend, mutations) = spawn_http_counting_mutations()
         .await
         .expect("start counting backend");
     let config = opa_deny_config(backend.port, &opa.uri());
