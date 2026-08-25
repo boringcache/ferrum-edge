@@ -776,7 +776,9 @@ pub(crate) fn lock_wait_timeout_sql(timeout_seconds: u64, is_mysql: bool) -> Opt
     if timeout_seconds == 0 || !is_mysql {
         return None;
     }
-    Some(format!("SET SESSION innodb_lock_wait_timeout = {timeout_seconds}"))
+    Some(format!(
+        "SET SESSION innodb_lock_wait_timeout = {timeout_seconds}"
+    ))
 }
 
 /// Build the `SET` SQL for per-statement timeouts, or `None` when disabled.

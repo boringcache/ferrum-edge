@@ -272,7 +272,8 @@ impl LeaseRenewalState {
         let elapsed = anchor.duration_since(self.lease_started_at);
         let elapsed_millis = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         let valid_until_millis = elapsed_millis.saturating_add(self.lease_duration_millis);
-        self.valid_until_millis.store(valid_until_millis, Ordering::Release);
+        self.valid_until_millis
+            .store(valid_until_millis, Ordering::Release);
         let _ = self.lease_state_tx.send(valid_until_millis);
         anchor + Duration::from_millis(self.lease_duration_millis)
     }
@@ -513,7 +514,7 @@ where
                         }
                     }
                 }
-                Ok(Err(_error)) | Err(_elapsed) => {
+                Ok(Err(_)) | Err(_) => {
                     counters.retries = counters.retries.saturating_add(1);
                     tracing::warn!(
                         namespace = %namespace,
