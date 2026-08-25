@@ -311,7 +311,7 @@ impl AdminMetricsUnhealthyTarget {
 /// Returns `None` when the key is missing the `|` delimiter, has an empty
 /// namespace/id, or has an empty target suffix after `::`. Fail-closed: callers
 /// must skip malformed keys rather than inventing identity.
-fn parse_namespaced_runtime_key(key: &str) -> Option<(&str, &str, Option<&str>)> {
+pub(crate) fn parse_namespaced_runtime_key(key: &str) -> Option<(&str, &str, Option<&str>)> {
     let (namespace, rest) = key.split_once('|')?;
     if namespace.is_empty() || rest.is_empty() {
         return None;

@@ -25,6 +25,7 @@ pub mod connection_pool;
 pub mod consumer_index;
 #[path = "../custom_plugins/mod.rs"]
 pub mod custom_plugins;
+pub mod data_path_metrics;
 pub mod date_cache;
 pub mod dns;
 pub mod dp_config_freshness;

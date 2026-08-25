@@ -819,6 +819,15 @@ impl CircuitBreakerCache {
         });
     }
 
+    /// Configured admission ceiling for distinct breaker keys.
+    ///
+    /// Exported as `ferrum_circuit_breaker_cache_max_entries` so operators can
+    /// alert on the cache approaching the ceiling at which new proxy/target
+    /// breakers stop being admitted.
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+
     /// Current number of entries in the cache.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {

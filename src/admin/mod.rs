@@ -2994,6 +2994,14 @@ async fn handle_admin_request_inner(
         metrics_output.push_str(&crate::notifications::render_delivery_prometheus());
         metrics_output.push_str(&crate::plugins::kafka_logging::render_prometheus());
         metrics_output.push_str(&crate::plugins::api_chargeback_sink::render_prometheus());
+        // Data-path families (issue #4156): load shedding, upstream health,
+        // circuit-breaker state, backend retries, pool saturation, and frontend
+        // TLS admission. Sampled here on the cold scrape path from state the
+        // gateway already keeps; nothing is added to the proxy hot path.
+        metrics_output.push_str(&crate::data_path_metrics::render_prometheus(
+            state.proxy_state.as_ref(),
+            &registry.namespace_label_fragment(),
+        ));
         // Append the active `__mesh_bpf_metrics` surface exactly once from the
         // current plugin-cache generation. Absent when the plugin is not in
         // the published configuration; zero-valued when active without an

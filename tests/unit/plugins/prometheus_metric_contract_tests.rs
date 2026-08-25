@@ -795,519 +795,87 @@ fn representative_exposition() -> String {
             .render_prometheus_uncached()
             .expect("chargeback prometheus render"),
     );
+    // Data-path families (issue #4156). Rendered through the same public
+    // sub-renderers the `/metrics` handler uses, seeded with one upstream, one
+    // active ejection, one passive ejection, and one breaker so every label key
+    // the inventory declares is actually exercised by a sample line.
+    let data_ns_label = ",namespace=\"contract-ns\"";
+    let mut data_path = String::new();
+    ferrum_edge::data_path_metrics::render_process_families(&mut data_path, data_ns_label);
+
+    let overload = ferrum_edge::overload::OverloadState::new();
+    overload
+        .disable_keepalive
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    overload
+        .port_exhaustion_events
+        .store(3, std::sync::atomic::Ordering::Relaxed);
+    ferrum_edge::data_path_metrics::render_overload(&mut data_path, &overload, data_ns_label);
+
+    let upstream_json = serde_json::json!({
+        "id": "contract-upstream",
+        "namespace": "contract-ns",
+        "targets": [
+            {"host": "backend-a.internal", "port": 8080},
+            {"host": "backend-b.internal", "port": 8080}
+        ]
+    });
+    let mut data_config = ferrum_edge::config::types::GatewayConfig::default();
+    data_config
+        .upstreams
+        .push(serde_json::from_value(upstream_json).expect("contract fixture upstream"));
+
+    let health = ferrum_edge::health_check::HealthChecker::new();
+    let active_key = "contract-ns|contract-upstream::backend-b.internal:8080".to_string();
+    health.active_unhealthy_targets.insert(active_key, 1);
+    let passive_json = serde_json::json!({"unhealthy_threshold": 1});
+    let passive: ferrum_edge::config::types::PassiveHealthCheck =
+        serde_json::from_value(passive_json).expect("contract fixture passive policy");
+    let target_json = serde_json::json!({"host": "backend-a.internal", "port": 8080});
+    let passive_target: ferrum_edge::config::types::UpstreamTarget =
+        serde_json::from_value(target_json).expect("contract fixture target");
+    health.report_response(
+        "contract-ns",
+        "contract-proxy",
+        "contract-upstream",
+        &passive_target,
+        503,
+        false,
+        Some(&passive),
+    );
+    ferrum_edge::data_path_metrics::render_upstream_health(
+        &mut data_path,
+        &data_config,
+        &health,
+        data_ns_label,
+    );
+
+    let breakers = ferrum_edge::circuit_breaker::CircuitBreakerCache::with_max_entries(64);
+    breakers.get_or_create(
+        "contract-ns",
+        "contract-proxy",
+        Some("backend-a.internal:8080"),
+        &ferrum_edge::config::types::CircuitBreakerConfig::default(),
+    );
+    ferrum_edge::data_path_metrics::render_circuit_breakers(
+        &mut data_path,
+        &breakers,
+        data_ns_label,
+    );
+
+    ferrum_edge::data_path_metrics::render_connection_pools(
+        &mut data_path,
+        &[
+            ("http", 2),
+            ("grpc", 1),
+            ("http2", 1),
+            ("http3", 0),
+            ("hbone", 0),
+            ("mesh_mtls", 0),
+        ],
+        32,
+        data_ns_label,
+    );
+    output.push_str(&data_path);
     output
-}
-
-#[test]
-fn prometheus_metric_contract_is_sorted_unique_and_well_formed() {
-    let contract = load_contract();
-    assert!(!contract.is_empty(), "contract must not be empty");
-    // Assert over the array order in the file. `load_contract` returns a
-    // BTreeMap, so asserting over its keys would be sorted by construction and
-    // could never fail. Uniqueness is already enforced there on insert.
-    let contract_value: Value =
-        serde_json::from_str(PROMETHEUS_METRIC_CONTRACT_JSON).expect("contract JSON parses");
-    let file_order: Vec<&str> = contract_value
-        .as_array()
-        .expect("contract JSON is an array")
-        .iter()
-        .map(|item| item["name"].as_str().expect("name"))
-        .collect();
-    assert!(
-        file_order.windows(2).all(|w| w[0] < w[1]),
-        "docs/prometheus_metric_contract.json family names must be strictly sorted"
-    );
-    for fam in contract.values() {
-        assert!(
-            matches!(
-                fam.metric_type.as_str(),
-                "counter" | "gauge" | "histogram" | "summary"
-            ),
-            "{} has invalid type {}",
-            fam.name,
-            fam.metric_type
-        );
-        assert!(!fam.help.is_empty(), "{} missing help", fam.name);
-        assert!(
-            !fam.help.ends_with("\\n"),
-            "{} HELP includes the exposition line terminator",
-            fam.name
-        );
-        assert!(
-            matches!(
-                fam.bundled.as_str(),
-                "alert" | "dashboard" | "alert_and_dashboard" | "documented_only"
-            ),
-            "{} has invalid bundled {}",
-            fam.name,
-            fam.bundled
-        );
-        assert!(
-            matches!(
-                fam.emission.as_str(),
-                "always"
-                    | "conditional"
-                    | "when_series_present"
-                    | "when_plugin_enabled"
-                    | "when_process_initialized"
-            ),
-            "{} has invalid emission {}",
-            fam.name,
-            fam.emission
-        );
-    }
-    for required in [
-        "ferrum_database_delta_consecutive_identical_rejections",
-        "ferrum_mesh_tcp_egress_connections_total",
-        "ferrum_mesh_remote_discovery_poll_failures_total",
-        "ferrum_mesh_remote_discovery_poll_successes_total",
-        "ferrum_mesh_remote_discovery_last_success_timestamp_seconds",
-        "ferrum_mesh_remote_discovery_endpoint_age_seconds",
-    ] {
-        assert!(
-            contract.contains_key(required),
-            "DOC-10 required family missing from contract: {required}"
-        );
-    }
-    for required in API_CHARGEBACK_FAMILIES {
-        let fam = contract
-            .get(*required)
-            .unwrap_or_else(|| panic!("api_chargeback family missing from contract: {required}"));
-        assert_eq!(fam.emission, "when_plugin_enabled");
-        assert_eq!(fam.subsystem, "api_chargeback");
-        assert_eq!(fam.bundled, "documented_only");
-    }
-    let calls = &contract["ferrum_api_chargeable_calls_total"];
-    assert_eq!(calls.metric_type, "counter");
-    assert_eq!(
-        calls.labels,
-        BTreeSet::from([
-            "consumer".into(),
-            "proxy_id".into(),
-            "proxy_name".into(),
-            "status_code".into(),
-            "currency".into(),
-            "namespace".into(),
-        ])
-    );
-    let bandwidth = &contract["ferrum_api_bandwidth_charges_total"];
-    assert_eq!(bandwidth.metric_type, "counter");
-    assert!(bandwidth.labels.contains("direction"));
-    assert!(bandwidth.labels.contains("protocol_family"));
-    let entries = &contract["ferrum_api_chargeback_registry_entries"];
-    assert_eq!(entries.metric_type, "gauge");
-    assert!(entries.labels.is_empty());
-    let asserted_identity = &contract["ferrum_mesh_node_waypoint_asserted_identity_total"];
-    assert_eq!(
-        asserted_identity.labels,
-        BTreeSet::from(["gateway_namespace".into(), "reason".into(), "result".into(),])
-    );
-}
-
-#[test]
-fn prometheus_metrics_reference_documents_every_contract_family() {
-    let contract = load_contract();
-    let doc = PROMETHEUS_METRICS_REFERENCE_MD;
-    assert!(
-        doc.contains("# Prometheus Metrics Contract (DOC-10)"),
-        "operator reference missing DOC-10 title"
-    );
-    let inventory_section = doc
-        .split_once("## Complete family inventory")
-        .and_then(|(_, rest)| rest.split_once("## Bundled observability surfaces"))
-        .map(|(inventory, _)| inventory)
-        .expect("operator reference has a bounded complete-inventory section");
-    let actual_rows = inventory_section
-        .lines()
-        .filter(|line| line.starts_with("| `"))
-        .collect::<Vec<_>>();
-    let expected_rows = contract
-        .values()
-        .map(|fam| {
-            let labels = if fam.label_order.is_empty() {
-                "—".to_string()
-            } else {
-                fam.label_order
-                    .iter()
-                    .map(|label| format!("`{label}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            format!(
-                "| `{}` | {} | {} | `{}` | `{}` | `{}` | {} |",
-                fam.name,
-                fam.metric_type,
-                labels,
-                fam.subsystem,
-                fam.bundled,
-                fam.emission,
-                fam.help
-            )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        actual_rows, expected_rows,
-        "docs/prometheus_metrics.md complete inventory must be generated exactly from the contract"
-    );
-    for section in [
-        "Database rejected-delta polling",
-        "Mesh remote-cluster endpoint discovery",
-        "Raw-TCP mesh egress",
-        "Endpoint-age runbook",
-        "Poll-failure runbook",
-        "Istio status CAS",
-    ] {
-        assert!(
-            doc.contains(section),
-            "operator reference missing runbook section: {section}"
-        );
-    }
-}
-
-#[test]
-fn representative_metrics_exposition_matches_contract() {
-    let contract = load_contract();
-    let exposition = representative_exposition();
-    let emitted = parse_exposition_families(&exposition);
-
-    assert!(
-        !emitted.is_empty(),
-        "representative exposition produced no metric families"
-    );
-
-    let mut undocumented = Vec::new();
-    for (name, observed) in &emitted {
-        let Some(fam) = contract.get(name) else {
-            undocumented.push(name.clone());
-            continue;
-        };
-        assert_eq!(
-            fam.metric_type, observed.metric_type,
-            "type drift for {name}: contract={} exposition={}",
-            fam.metric_type, observed.metric_type
-        );
-        assert_eq!(fam.help, observed.help, "HELP drift for family {name}");
-        assert_eq!(
-            fam.labels, observed.labels,
-            "label-key drift for family {name}"
-        );
-    }
-    assert!(
-        undocumented.is_empty(),
-        "undocumented metric families in representative /metrics exposition: {undocumented:?}"
-    );
-
-    for fam in contract.values().filter(|f| f.emission == "always") {
-        // Log-sink families are inventoried as when_process_initialized; the
-        // remaining `always` set must appear in this fixture.
-        assert!(
-            emitted.contains_key(&fam.name),
-            "always-emitted family missing from representative exposition: {}",
-            fam.name
-        );
-    }
-
-    for required in [
-        "ferrum_database_delta_consecutive_identical_rejections",
-        "ferrum_mesh_tcp_egress_connections_total",
-        "ferrum_mesh_remote_discovery_poll_failures_total",
-        "ferrum_mesh_remote_discovery_poll_successes_total",
-        "ferrum_mesh_remote_discovery_last_success_timestamp_seconds",
-        "ferrum_mesh_remote_discovery_endpoint_age_seconds",
-        "ferrum_mesh_bpf_tcp_events_total",
-        "ferrum_api_chargeable_calls_total",
-        "ferrum_api_charges_total",
-        "ferrum_api_bandwidth_charges_total",
-        "ferrum_api_chargeback_registry_entries",
-        "ferrum_database_delta_backoff_bucket",
-        "ferrum_k8s_controller_istio_status_conflicts_total",
-        "ferrum_k8s_controller_istio_status_missing_uid_total",
-        "ferrum_k8s_controller_istio_status_retries_total",
-    ] {
-        assert!(
-            emitted.contains_key(required),
-            "representative exposition missing required family {required}"
-        );
-    }
-    let backoff = &emitted["ferrum_database_delta_backoff_bucket"];
-    assert_eq!(backoff.metric_type, "gauge");
-    assert!(
-        backoff.labels.contains("bucket"),
-        "backoff bucket gauge labels must include the bucket key: {:?}",
-        backoff.labels
-    );
-}
-
-#[test]
-fn bundled_prometheus_rule_metric_refs_are_inventoried_or_allowlisted() {
-    let contract = load_contract();
-    let allow: BTreeSet<&str> = BUNDLED_EXTERNAL_METRIC_ALLOWLIST.iter().copied().collect();
-    let names = ferrum_metric_names_in_text(BUNDLED_PROMETHEUS_RULE_TEMPLATE, &contract);
-    let mut unknown = Vec::new();
-    for name in &names {
-        if allow.contains(name.as_str()) {
-            continue;
-        }
-        if !contract.contains_key(name) {
-            unknown.push(name.clone());
-        }
-    }
-    assert!(
-        unknown.is_empty(),
-        "PrometheusRule references unknown Ferrum families: {unknown:?}"
-    );
-
-    // The allowlist records deliberate non-Ferrum references. Keep it honest:
-    // a stale entry (its alert deleted) or an entry that is really a Ferrum
-    // family must not sit here unnoticed.
-    for external in BUNDLED_EXTERNAL_METRIC_ALLOWLIST {
-        assert!(
-            names.contains(*external),
-            "stale external metric allowlist entry: {external} is no longer \
-             referenced by the bundled PrometheusRule"
-        );
-        assert!(
-            !contract.contains_key(*external),
-            "external allowlist shadows an inventoried family: {external}"
-        );
-    }
-}
-
-#[test]
-fn bundled_grafana_dashboard_metric_refs_are_inventoried() {
-    let contract = load_contract();
-    const DASHBOARDS: &[&str] = &[
-        include_str!("../../../charts/ferrum-mesh/dashboards/certificate-posture.json"),
-        include_str!("../../../charts/ferrum-mesh/dashboards/egress-scope.json"),
-        include_str!("../../../charts/ferrum-mesh/dashboards/gateway-overview.json"),
-        include_str!("../../../charts/ferrum-mesh/dashboards/mesh-overview.json"),
-        include_str!("../../../charts/ferrum-mesh/dashboards/policy-deny.json"),
-    ];
-    let mut unknown = Vec::new();
-    for dash in DASHBOARDS {
-        for name in ferrum_metric_names_in_text(dash, &contract) {
-            if BUNDLED_EXTERNAL_METRIC_ALLOWLIST.contains(&name.as_str()) {
-                continue;
-            }
-            if !contract.contains_key(&name) {
-                unknown.push(name);
-            }
-        }
-    }
-    unknown.sort();
-    unknown.dedup();
-    assert!(
-        unknown.is_empty(),
-        "Grafana dashboards reference unknown Ferrum families: {unknown:?}"
-    );
-}
-
-#[test]
-fn bundled_classification_matches_chart_references() {
-    let contract = load_contract();
-    let mut referenced = ferrum_metric_names_in_text(BUNDLED_PROMETHEUS_RULE_TEMPLATE, &contract);
-    for dash in [
-        include_str!("../../../charts/ferrum-mesh/dashboards/certificate-posture.json"),
-        include_str!("../../../charts/ferrum-mesh/dashboards/egress-scope.json"),
-        include_str!("../../../charts/ferrum-mesh/dashboards/gateway-overview.json"),
-        include_str!("../../../charts/ferrum-mesh/dashboards/mesh-overview.json"),
-        include_str!("../../../charts/ferrum-mesh/dashboards/policy-deny.json"),
-    ] {
-        referenced.extend(ferrum_metric_names_in_text(dash, &contract));
-    }
-    for fam in contract.values() {
-        let is_ref = referenced.contains(&fam.name);
-        match fam.bundled.as_str() {
-            "documented_only" => assert!(
-                !is_ref,
-                "{} is documented_only but appears in bundled charts/alerts",
-                fam.name
-            ),
-            "alert" | "dashboard" | "alert_and_dashboard" => assert!(
-                is_ref,
-                "{} is classified as {} but is not referenced by bundled charts/alerts",
-                fam.name, fam.bundled
-            ),
-            other => panic!("unexpected bundled value {other}"),
-        }
-    }
-}
-
-#[test]
-fn sample_suffix_normalization_preserves_semantic_bucket_gauges() {
-    let contract = load_contract();
-    assert_eq!(
-        normalize_family_name("ferrum_database_delta_backoff_bucket", &contract),
-        "ferrum_database_delta_backoff_bucket"
-    );
-    assert_eq!(
-        normalize_family_name("ferrum_request_duration_ms_bucket", &contract),
-        "ferrum_request_duration_ms"
-    );
-    assert_eq!(
-        normalize_family_name("ferrum_request_duration_ms_sum", &contract),
-        "ferrum_request_duration_ms"
-    );
-    assert_eq!(
-        normalize_family_name("ferrum_request_duration_ms_count", &contract),
-        "ferrum_request_duration_ms"
-    );
-
-    let exposition = "\
-# HELP ferrum_database_delta_backoff_bucket Current rejected-delta retry backoff bucket. Exactly one bucket is 1.\n\
-# TYPE ferrum_database_delta_backoff_bucket gauge\n\
-ferrum_database_delta_backoff_bucket{bucket=\"none\",namespace=\"ns\"} 1\n\
-# HELP ferrum_request_duration_ms Backend response time in milliseconds.\n\
-# TYPE ferrum_request_duration_ms histogram\n\
-ferrum_request_duration_ms_bucket{le=\"10\",proxy_id=\"p\"} 1\n\
-ferrum_request_duration_ms_sum{proxy_id=\"p\"} 1\n\
-ferrum_request_duration_ms_count{proxy_id=\"p\"} 1\n\
-";
-    let parsed = parse_exposition_families(exposition);
-    assert_eq!(
-        parsed["ferrum_database_delta_backoff_bucket"].metric_type,
-        "gauge"
-    );
-    assert!(
-        parsed["ferrum_database_delta_backoff_bucket"]
-            .labels
-            .contains("bucket")
-    );
-    assert_eq!(
-        parsed["ferrum_request_duration_ms"].metric_type,
-        "histogram"
-    );
-    assert!(parsed["ferrum_request_duration_ms"].labels.contains("le"));
-    assert!(!parsed.contains_key("ferrum_database_delta_backoff"));
-}
-
-#[test]
-fn production_type_literals_are_inventoried_with_matching_types() {
-    let contract = load_contract();
-    let found = scan_production_type_literals();
-    assert!(
-        !found.is_empty(),
-        "expected production Rust # TYPE string literals under src/"
-    );
-
-    let mut missing = Vec::new();
-    let mut mismatched = Vec::new();
-    for (name, types) in &found {
-        let Some(fam) = contract.get(name) else {
-            missing.push(name.clone());
-            continue;
-        };
-        if types != &BTreeSet::from([fam.metric_type.clone()]) {
-            mismatched.push(format!(
-                "{name}: contract={} source={types:?}",
-                fam.metric_type
-            ));
-        }
-    }
-    assert!(
-        missing.is_empty(),
-        "production # TYPE families missing from inventory: {missing:?}"
-    );
-    assert!(
-        mismatched.is_empty(),
-        "production # TYPE type mismatches: {mismatched:?}"
-    );
-
-    for name in API_CHARGEBACK_FAMILIES {
-        assert!(
-            found.contains_key(*name),
-            "api_chargeback family missing production # TYPE literal: {name}"
-        );
-    }
-}
-
-#[test]
-fn production_type_literal_scanner_has_mutation_and_noise_regressions() {
-    let contract = load_contract();
-    let synthetic =
-        r##"output.push_str("# TYPE ferrum_contract_mutation_missing_total counter\n");"##;
-    let detected = type_literals_in_rust_source(synthetic);
-    assert!(
-        detected.contains_key("ferrum_contract_mutation_missing_total"),
-        "synthetic undocumented # TYPE literal was not detected"
-    );
-    assert!(
-        !contract.contains_key("ferrum_contract_mutation_missing_total"),
-        "mutation sentinel must not be present in the inventory"
-    );
-
-    let noise = r#"
-        // # TYPE ferrum_comment_noise_total counter
-        let ferrum_identifier_noise_total = 1;
-        /* # TYPE ferrum_block_comment_noise_total gauge */
-    "#;
-    assert!(
-        type_literals_in_rust_source(noise).is_empty(),
-        "comment/identifier noise must not be treated as exported # TYPE literals"
-    );
-
-    // A Rust char literal holding a quote must not desynchronize the string
-    // tracker and mask a later `# TYPE` literal in the same file.
-    let char_literal_source = r##"
-        fn scan(ch: char) { if ch == '"' { return; } }
-        output.push_str("# TYPE ferrum_after_char_literal_total counter\n");
-    "##;
-    let detected_after_char_literal = type_literals_in_rust_source(char_literal_source);
-    assert!(
-        detected_after_char_literal.contains_key("ferrum_after_char_literal_total"),
-        "a Rust char literal containing a quote masked a later # TYPE literal"
-    );
-    assert!(
-        !contract.contains_key("ferrum_after_char_literal_total"),
-        "char-literal sentinel must not be present in the inventory"
-    );
-}
-
-#[test]
-fn parse_exposition_families_handles_quoted_label_values() {
-    let exposition = "\
-# HELP ferrum_api_bandwidth_charges_total Chargeable bandwidth by direction.\n\
-# TYPE ferrum_api_bandwidth_charges_total counter\n\
-ferrum_api_bandwidth_charges_total{consumer=\"contract-consumer\",proxy_id=\"contract-proxy\",proxy_name=\"Contract API\",currency=\"USD\",namespace=\"contract-ns\",direction=\"ingress\",protocol_family=\"http\"} 0.0002\n\
-# HELP ferrum_api_escape_fixture_total Parser regression for escaped label values.\n\
-# TYPE ferrum_api_escape_fixture_total counter\n\
-ferrum_api_escape_fixture_total{note=\"quote: \\\" and slash: \\\\\",proxy_id=\"p\"} 1\n\
-";
-    let parsed = parse_exposition_families(exposition);
-    assert_eq!(
-        parsed["ferrum_api_bandwidth_charges_total"].labels,
-        BTreeSet::from([
-            "consumer".into(),
-            "currency".into(),
-            "direction".into(),
-            "namespace".into(),
-            "protocol_family".into(),
-            "proxy_id".into(),
-            "proxy_name".into(),
-        ])
-    );
-    assert_eq!(
-        parsed["ferrum_api_escape_fixture_total"].labels,
-        BTreeSet::from(["note".into(), "proxy_id".into()])
-    );
-}
-
-#[test]
-fn exposition_label_parser_rejects_ambiguous_or_truncated_samples() {
-    for malformed in [
-        r#"first="one"second="two""#,
-        r#"first="one","#,
-        r#"first="one",first="two""#,
-        r#"first="bad\q""#,
-    ] {
-        assert!(
-            std::panic::catch_unwind(|| parse_label_keys(malformed)).is_err(),
-            "malformed label block was accepted: {malformed:?}"
-        );
-    }
-    assert!(
-        std::panic::catch_unwind(|| split_sample_prefix(r#"ferrum_fixture{key="value"} "#))
-            .is_err(),
-        "sample without a value was accepted"
-    );
 }
