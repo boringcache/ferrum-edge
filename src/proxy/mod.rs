@@ -28897,6 +28897,15 @@ async fn handle_proxy_request_inner(
     // lines, never a single `get()`, so duplicate lines cannot hide a competing
     // attacker-supplied value (advisory GHSA-fx4w-68hx-mj7r).
     if !state.trusted_proxies.is_empty() {
+        // Latch the immediate-peer trust verdict for the whole request, before
+        // any plugin phase runs. Plugin phases that build their own outbound
+        // request (`request_mirror`, `load_testing`) read it so the secondary
+        // boundary refuses a client-asserted `X-Real-IP` under exactly the rule
+        // the primary backend builders apply at dispatch (issue #4164). The
+        // default is `false`, so an empty trust list or an unparseable peer
+        // keeps the fail-closed verdict without extra work here.
+        ctx.forwarding_peer_trusted =
+            forwarding_peer_is_trusted(&socket_ip, &state.trusted_proxies);
         let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
         if let Some(ref addr) = socket_addr {
             if let Some(forwarded_scheme) =
