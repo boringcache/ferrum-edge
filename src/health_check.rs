@@ -416,7 +416,11 @@ struct ActiveProbeSpec {
 /// the data path uses (`SanAllowListVerifier`).
 #[derive(Debug)]
 enum ProbeServerVerifier {
-    WebPki(Arc<WebPkiServerVerifier>),
+    /// No SAN allow-list was configured, so probes use the plain webpki
+    /// verifier the builder installs by default. Carries no payload: every
+    /// consumer treats this variant as "not SAN-pinned" and installs nothing,
+    /// unlike `SanAllowList`, whose verifier IS installed.
+    WebPki,
     SanAllowList(Arc<SanAllowListVerifier>),
 }
 
@@ -2626,7 +2630,7 @@ async fn build_grpc_probe_channel_san_pinned(
 
     let verifier = match build_probe_server_verifier(tls_config, global_ca_path) {
         Ok(ProbeServerVerifier::SanAllowList(verifier)) => verifier,
-        Ok(ProbeServerVerifier::WebPki(_)) => {
+        Ok(ProbeServerVerifier::WebPki) => {
             return Err(std::io::Error::other(
                 "gRPC health probe SAN allow-list was empty after verifier build",
             )
@@ -2972,7 +2976,7 @@ fn build_probe_server_verifier(
         ))
     })?;
     if tls_config.san_allow_list.is_empty() {
-        Ok(ProbeServerVerifier::WebPki(inner))
+        Ok(ProbeServerVerifier::WebPki)
     } else {
         let wrapped = SanAllowListVerifier::new(inner, tls_config.san_allow_list.clone())
             .map_err(|e| HealthCheckClientError::SanPinningUnavailable(e.to_string()))?;
@@ -3045,7 +3049,7 @@ fn build_health_check_client_with_san_pinning(
 ) -> Result<reqwest::Client, HealthCheckClientError> {
     let verifier = match build_probe_server_verifier(tls_config, global_ca_path.as_deref())? {
         ProbeServerVerifier::SanAllowList(verifier) => verifier,
-        ProbeServerVerifier::WebPki(_) => {
+        ProbeServerVerifier::WebPki => {
             return Err(HealthCheckClientError::SanPinningUnavailable(
                 "SAN allow-list was empty after verifier build".to_string(),
             ));
@@ -4431,7 +4435,7 @@ mod tests {
         ensure_crypto_provider();
         let verifier = build_probe_server_verifier(&BackendTlsConfig::default_verify(), None)
             .expect("empty SAN list must still build a verifier");
-        assert!(matches!(verifier, ProbeServerVerifier::WebPki(_)));
+        assert!(matches!(verifier, ProbeServerVerifier::WebPki));
     }
 
     #[test]
