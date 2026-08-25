@@ -150,12 +150,13 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 
-use ferrum_edge::admin::{
-    AdminConnLimiter, AdminState, serve_admin_on_listener,
-    jwt_auth::{JwtConfig, JwtManager},
-};
 use ferrum_edge::admin::audit::{AuditPipelineConfig, AuditUnavailablePolicy, initialize};
 use ferrum_edge::admin::audit_spool::SpooledAuditRecord;
+use ferrum_edge::admin::{
+    AdminConnLimiter, AdminState,
+    jwt_auth::{JwtConfig, JwtManager},
+    serve_admin_on_listener,
+};
 use ferrum_edge::modes::mesh::revision::MeshConfigRevision;
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::slice::MeshSlice;
@@ -382,28 +383,18 @@ async fn mesh_config_revision_reset_requires_confirm_and_records_audit_on_succes
     let runtime = MeshRuntimeState::new();
     install_mesh_revision(&runtime, "db", 4821);
 
-    let state = mesh_reset_admin_state(
-        mesh_reset_jwt_manager(&tc),
-        runtime,
-        true,
-        true,
-    );
+    let state = mesh_reset_admin_state(mesh_reset_jwt_manager(&tc), runtime, true, true);
     let addr = start_mesh_reset_admin(state).await;
 
-    let (status, body) =
-        post_mesh_reset(addr, "/mesh/config-revision/reset", &token).await;
+    let (status, body) = post_mesh_reset(addr, "/mesh/config-revision/reset", &token).await;
     assert_eq!(status, 400, "unconfirmed reset must be rejected: {body}");
     assert!(
         body.contains("confirm=true"),
         "rejection must name the confirmation knob: {body}"
     );
 
-    let (status, body) = post_mesh_reset(
-        addr,
-        "/mesh/config-revision/reset?confirm=true",
-        &token,
-    )
-    .await;
+    let (status, body) =
+        post_mesh_reset(addr, "/mesh/config-revision/reset?confirm=true", &token).await;
     assert_eq!(status, 200, "confirmed reset must succeed: {body}");
     assert!(body.contains("\"status\":\"reset\""), "body: {body}");
 
@@ -422,12 +413,8 @@ async fn mesh_config_revision_reset_requires_confirm_and_records_audit_on_succes
     assert_eq!(event.diff["cleared_authority"], "db");
     assert_eq!(event.diff["cleared_sequence"], 4821);
 
-    let (status, body) = post_mesh_reset(
-        addr,
-        "/mesh/config-revision/reset?confirm=true",
-        &token,
-    )
-    .await;
+    let (status, body) =
+        post_mesh_reset(addr, "/mesh/config-revision/reset?confirm=true", &token).await;
     assert_eq!(
         status, 503,
         "fail-closed audit saturation must refuse a second reset: {body}"

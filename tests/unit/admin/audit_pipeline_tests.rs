@@ -1532,7 +1532,10 @@ fn mesh_config_revision_reset_uses_admit_audited_operation_in_handler() {
     let reset_handler = admin_source
         .split("async fn handle_mesh_config_revision_reset")
         .nth(1)
-        .and_then(|tail| tail.split("fn mesh_config_revision_reset_audit_diff").next())
+        .and_then(|tail| {
+            tail.split("fn mesh_config_revision_reset_audit_diff")
+                .next()
+        })
         .expect("mesh config-revision reset handler remains inspectable");
     assert!(
         reset_handler.contains("admit_audited_operation().await"),
