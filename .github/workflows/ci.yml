@@ -4011,7 +4011,7 @@ jobs:
             --set admin.bindAddress=0.0.0.0 \
             --set admin.service.enabled=true \
             --set ports.adminHttp=0 \
-            --set tls.admin.existingSecret.name=admin-tls \
+            --set tls.admin.enabled=true --set tls.admin.secretName=admin-tls \
             --show-only templates/metrics-servicemonitor.yaml \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-https-no-tlsconfig.yaml" 2>&1; then
             echo "::error title=HTTPS metrics scrape rendered without tlsConfig::the bearer-token scrape must not default to an unverified endpoint"
@@ -4024,7 +4024,7 @@ jobs:
             --set admin.bindAddress=0.0.0.0 \
             --set admin.service.enabled=true \
             --set ports.adminHttp=0 \
-            --set tls.admin.existingSecret.name=admin-tls \
+            --set tls.admin.enabled=true --set tls.admin.secretName=admin-tls \
             --set metrics.serviceMonitor.tlsConfig.serverName=ferrum-admin.ferrum.svc \
             --show-only templates/metrics-servicemonitor.yaml \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-https-tlsconfig.yaml"
