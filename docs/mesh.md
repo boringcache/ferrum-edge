@@ -3452,6 +3452,7 @@ Keep all three nonzero on any injector reachable beyond the API server; a nonzer
 
 - **Pod-kind check:** the request must target a core (`apiGroup: ""`) `Pod` — confirmed via `request.kind` (a `GroupVersionKind`) or, when `kind` is absent, the core `pods` `request.resource`. A mis-scoped `MutatingWebhookConfiguration` that routes other kinds (or a request carrying no kind/resource metadata) is **admitted with `allowed: true` and no patch**, and a warning is logged. The injector never patches an unknown kind.
 - **`dryRun`:** the patch-only webhook has no side effects, so a `dryRun: true` request returns the identical computed patch without implying any side effect.
+- **`spec.hostNetwork: true`:** never injected — see [Host-Network Pods Are Never Injected](#host-network-pods-are-never-injected) below.
 
 These complement the existing boundary checks: the body-size limit (returns `413`), reserved-container-name conflicts (`ferrum-edge` / `ferrum-edge-init`) refuse injection, and invalid port/CIDR annotations are rejected with a webhook error that names the offending annotation.
 
@@ -3491,6 +3492,32 @@ The injector checks annotations and labels to decide whether to inject:
 | `ferrum.io/injected` | Written by the injector as an observability marker only; not trusted as a skip signal. Re-invocation is rejected by reserved `ferrum-edge` / `ferrum-edge-init` name conflicts |
 
 When `FERRUM_INJECTOR_REQUIRE_ANNOTATION=true` (default), pods must explicitly opt in via `ferrum.io/inject: "true"`, `sidecar.istio.io/inject: "true"` (Istio compat), or the `ferrum.io/mesh: "enabled"` label. When `false`, all pods are injected unless explicitly opted out.
+
+### Host-Network Pods Are Never Injected
+
+A pod with `spec.hostNetwork: true` shares the **node's** network namespace, so every pod-scoped mesh surface becomes node-scoped. The injector therefore **skips such pods unconditionally**, matching Istio's `injectRequired()` host-networking skip:
+
+- In `CaptureMode::Iptables` the init container runs with `NET_ADMIN`+`NET_RAW` and appends the mesh `nat/PREROUTING` and `nat/OUTPUT` jumps into what is really the node's own nat table. That redirects **all** node TCP at `127.0.0.1:15001` / `:15006` — hijacking kubelet, CNI, DNS, the node's egress, and every other host-network pod, into a proxy that is not listening. The init container installs no cleanup trap, so the outage outlives the pod.
+- Even with capture off (`ebpf` / `explicit`), the sidecar's own listeners (`15001`, `15006`, and `15008` for HBONE) would bind on the **node**, colliding with host ports and exposing a mesh inbound listener node-wide while having nothing captured to proxy.
+
+The skip is therefore the whole injection, not just the capture half. It is evaluated **before** the opt-in gate, so neither `ferrum.io/inject: "true"` nor `FERRUM_INJECTOR_REQUIRE_ANNOTATION=false` can re-enable injection for a host-network pod. (An explicit opt-out is still honored first; it reaches the same skip.)
+
+The pod is **admitted unmodified** (`allowed: true`, no `patch`, no `patchType`) rather than denied. Denying would turn a capture hazard into an admission outage: host-network system pods (CNI agents, node exporters, `kube-proxy`) must still be creatable in a meshed namespace, and with `failurePolicy: Fail` a denial would block them.
+
+Because the skip is invisible from the workload's side, it is logged. Each skipped pod emits one structured `WARN` carrying the pod name (falling back to `generateName`, which is all a controller-created pod has at CREATE admission), the namespace, and the configured capture mode:
+
+```
+WARN Injector skipping pod with spec.hostNetwork=true: the pod shares the node's
+     network namespace, so capture rules and sidecar listeners would apply
+     node-wide; admitting the pod unmodified
+     pod=kube-proxy-abcde namespace=payments capture_mode=Iptables
+```
+
+Ordinary opt-out / not-selected skips stay quiet — they are the steady-state outcome for most pods the webhook sees. Only the node-safety skip is logged.
+
+To mesh a workload that currently requests `hostNetwork`, move it to a pod network namespace; there is no annotation that overrides this guard.
+
+**Adjacent host-namespace fields.** `hostPID` and `hostIPC` are **not** treated as skip conditions. They share the node's PID and IPC namespaces, which no injected surface writes to: the init container's rules are scoped to the network namespace, and the sidecar's listeners are network-namespace-scoped. A `hostPID`/`hostIPC` pod that keeps its own network namespace is meshed normally.
 
 ### Port and IP-Range Capture Overrides
 

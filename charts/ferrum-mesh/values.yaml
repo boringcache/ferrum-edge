@@ -147,6 +147,12 @@ injector:
   enabled: false
   replicas: 1
   listenPort: 9443
+  # Per-pod opt-in gate. `false` injects every pod the namespaceSelector admits.
+  # Either way, pods with `spec.hostNetwork: true` are NEVER injected: they share
+  # the node's network namespace, so the capture rules would rewrite the node's
+  # own iptables and the sidecar listeners would bind node-wide. Those pods are
+  # admitted unmodified and the webhook logs a WARN naming each one. See
+  # docs/mesh.md "Host-Network Pods Are Never Injected".
   requireAnnotation: true
   failurePolicy: Fail
   caBundle: ""
