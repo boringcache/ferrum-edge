@@ -392,9 +392,11 @@ split-identity scan for the gateway trust bundle before rewriting anything:
 separate operator-chosen resource `id` must be a nonempty string and is
 preserved. Otherwise the whole transaction aborts as typed corruption and never
 rewrites another tenant's document. Historical `audit_events` documents are
-retained, but rename bulk-rewrites their namespace so the history follows the
-tenant and cannot be disclosed to a caller authorized for a later reuse of the
-old name. Last-remaining protection is a remaining **registry document**, not
+retained, but rename bulk-rewrites their authorization-scoping `namespace` so
+the history follows the tenant and cannot be disclosed to a caller authorized
+for a later reuse of the old name. The immutable `namespace_at_event` field
+keeps the namespace recorded when the event occurred and is never rewritten.
+Last-remaining protection is a remaining **registry document**, not
 the GET union of derived resource names: ordinary resource CRUD is not
 serialized by the global registry lease and does not insert registry documents.
 Neither guarantee is available on a standalone `mongod`, so all three write

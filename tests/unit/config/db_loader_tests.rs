@@ -3554,6 +3554,10 @@ fn sql_namespace_rename_rewrites_historical_audit_events() {
         NAMESPACE_RENAME_SIMPLE_TABLES.contains(&"audit_events"),
         "historical audit_events must follow the renamed tenant:\n{body}"
     );
+    assert!(
+        !body.contains("namespace_at_event"),
+        "namespace_at_event is immutable evidence and must not be rewritten on rename:\n{body}"
+    );
     for table in ["proxies", "plugin_configs", "upstreams", "api_specs"] {
         assert!(
             body.contains("NAMESPACE_RENAME_SIMPLE_TABLES") || body.contains(table),

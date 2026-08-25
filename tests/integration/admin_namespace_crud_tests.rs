@@ -2,8 +2,9 @@
 //!
 //! Covers create/get/list, malformed update bodies, Unicode description
 //! bounds, rename (resources move, target collision, derived-only tenants,
-//! historical audit history follows the tenant), delete (empty, occupied,
-//! confirmed cascade over every occupancy and ancillary surface), protection of the
+//! historical audit history follows the tenant while namespace_at_event is
+//! retained), delete (empty, occupied, confirmed cascade over every occupancy
+//! and ancillary surface), protection of the
 //! effective configured namespace from both delete and rename-away, the
 //! last-remaining-namespace invariant under concurrent deletes, commit-boundary
 //! lease loss, late-step rollback, file-mode 403s, and the
@@ -1539,6 +1540,7 @@ async fn namespace_rename_moves_historical_audit_namespace() {
             resource_type: "upstream".to_string(),
             resource_id: "up-hist".to_string(),
             namespace: "hist-a".to_string(),
+            namespace_at_event: "hist-a".to_string(),
             source_address: String::new(),
             request_id: String::new(),
             outcome: "success".to_string(),
@@ -1610,6 +1612,10 @@ async fn namespace_rename_moves_historical_audit_namespace() {
     );
     assert_eq!(renamed.items[0].id, "hist-event-1");
     assert_eq!(renamed.items[0].namespace, "hist-b");
+    assert_eq!(
+        renamed.items[0].namespace_at_event, "hist-a",
+        "namespace_at_event must keep the namespace recorded when the event was written"
+    );
 }
 
 #[tokio::test]

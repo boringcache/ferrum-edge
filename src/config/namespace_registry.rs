@@ -314,6 +314,13 @@ pub const NAMESPACE_OCCUPANCY_TABLES: &[&str] = &[
 /// rename writes `delete` tombstones under the OLD name so pollers of the old
 /// namespace converge, and those tombstones need the old name's history and
 /// retention floor to stay where they are.
+///
+/// `audit_events` is included so the authorization-scoping `namespace` column
+/// follows the renamed tenant. Leaving those rows under the old name would
+/// disclose the previous tenant's history to a later occupant of that name
+/// (rename removes the source `namespaces` row and frees the name). The
+/// immutable `namespace_at_event` column is not part of this rewrite: it
+/// preserves the namespace identity recorded when the event occurred.
 pub const NAMESPACE_RENAME_SIMPLE_TABLES: &[&str] = &[
     "proxies",
     "plugin_configs",

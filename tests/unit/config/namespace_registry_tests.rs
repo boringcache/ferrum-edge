@@ -463,8 +463,10 @@ fn schema_compat_marker_cannot_collide_with_tenant_namespaces() {
 
 #[test]
 fn namespace_rename_simple_tables_move_audit_history_with_tenant() {
-    // In-place SQL rename rewrites live resource rows and audit history so an
-    // old namespace name cannot expose the renamed tenant's events.
+    // In-place SQL rename rewrites live resource rows and the authorization-
+    // scoping audit_events.namespace column so an old namespace name cannot
+    // expose the renamed tenant's events. namespace_at_event is a different
+    // column and is not part of this rewrite.
     assert_eq!(
         NAMESPACE_RENAME_SIMPLE_TABLES,
         &[
@@ -472,7 +474,7 @@ fn namespace_rename_simple_tables_move_audit_history_with_tenant() {
             "plugin_configs",
             "upstreams",
             "api_specs",
-            "audit_events"
+            "audit_events",
         ]
     );
     assert!(

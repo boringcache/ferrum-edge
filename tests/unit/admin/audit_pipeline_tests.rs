@@ -47,6 +47,7 @@ fn event_with(id: &str, diff: serde_json::Value) -> AuditEvent {
         resource_type: "proxy".to_string(),
         resource_id: "proxy-1".to_string(),
         namespace: "ferrum".to_string(),
+        namespace_at_event: "ferrum".to_string(),
         source_address: "203.0.113.7".to_string(),
         request_id: "req-1".to_string(),
         outcome: String::new(),
