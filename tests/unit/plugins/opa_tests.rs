@@ -194,7 +194,11 @@ fn opa_plugin_contract() {
     assert_eq!(plugin.priority(), priority::OPA);
     assert_eq!(plugin.supported_protocols(), HTTP_FAMILY_PROTOCOLS);
     assert!(plugin.supported_protocols().contains(&ProxyProtocol::Grpc));
-    assert!(plugin.supported_protocols().contains(&ProxyProtocol::WebSocket));
+    assert!(
+        plugin
+            .supported_protocols()
+            .contains(&ProxyProtocol::WebSocket)
+    );
     assert!(!plugin.requires_request_body_buffering());
     assert!(!plugin.needs_request_body_bytes());
 
@@ -228,8 +232,13 @@ fn opa_plugin_contract() {
 }
 
 fn websocket_upgrade_ctx(method: &str, path: &str) -> RequestContext {
-    let mut ctx = RequestContext::new("127.0.0.1".to_string(), method.to_string(), path.to_string());
-    ctx.headers.insert("connection".to_string(), "upgrade".to_string());
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        method.to_string(),
+        path.to_string(),
+    );
+    ctx.headers
+        .insert("connection".to_string(), "upgrade".to_string());
     ctx.headers
         .insert("upgrade".to_string(), "websocket".to_string());
     ctx.headers.insert(
@@ -243,7 +252,11 @@ fn websocket_upgrade_ctx(method: &str, path: &str) -> RequestContext {
 }
 
 fn grpc_ctx(method: &str, path: &str) -> RequestContext {
-    let mut ctx = RequestContext::new("127.0.0.1".to_string(), method.to_string(), path.to_string());
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        method.to_string(),
+        path.to_string(),
+    );
     ctx.headers
         .insert("content-type".to_string(), "application/grpc".to_string());
     ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
