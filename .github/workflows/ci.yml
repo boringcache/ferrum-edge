@@ -3611,6 +3611,25 @@ jobs:
             exit 1
           fi
           grep -Fq 'port: 50051' "$RUNNER_TEMP/ferrum-gateway-helm-results/networkpolicy-cp-grpc.yaml"
+          # Fail-closed with no peers: a NetworkPolicy ingress rule with an empty
+          # `from` matches ALL sources, so the restricted rule must be OMITTED
+          # rather than rendered as `from: []` — otherwise enabling the policy
+          # would publish admin cluster-wide while appearing to restrict it.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            --set admin.bindAddress=0.0.0.0 --set admin.allowInsecureHttp=true \
+            --set networkPolicy.enabled=true \
+            --show-only templates/networkpolicy.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/networkpolicy-no-selectors.yaml"
+          if grep -Fq 'from: []' "$RUNNER_TEMP/ferrum-gateway-helm-results/networkpolicy-no-selectors.yaml"; then
+            echo "::error title=NetworkPolicy renders an empty from::an empty from matches ALL sources; omit the restricted rule instead"
+            exit 1
+          fi
+          if grep -Fq 'port: 9000' "$RUNNER_TEMP/ferrum-gateway-helm-results/networkpolicy-no-selectors.yaml"; then
+            echo "::error title=Admin port published without selectors::admin must be denied when no NetworkPolicy peers are configured"
+            exit 1
+          fi
+          grep -Fq 'port: 8000' "$RUNNER_TEMP/ferrum-gateway-helm-results/networkpolicy-no-selectors.yaml"
           # dp mode publishes the HTTPS Service port on the port alone (CP-managed TLS).
           helm template ferrum-dp ./charts/ferrum-gateway --namespace ferrum \
             -f ./charts/ferrum-gateway/examples/dp-values.yaml \

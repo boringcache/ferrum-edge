@@ -513,6 +513,17 @@ podDisruptionBudget:
 # are limited to the configured selectors — pair with admin.allowInsecureHttp or
 # grpc.allowPlaintext when using non-loopback plaintext binds.
 networkPolicy:
+  # Renders an Ingress-only NetworkPolicy selecting this release's pods. Proxy and
+  # stream ports stay open to all sources; the admin ports and CP gRPC are
+  # reachable only from the peers named below.
+  #
+  # FAIL-CLOSED: if BOTH selector lists are empty, no restricted ingress rule is
+  # emitted at all, so the admin ports and CP gRPC are denied to every in-cluster
+  # peer. This is deliberate — a NetworkPolicy ingress rule with an empty `from`
+  # matches ALL sources, so emitting one here would publish admin cluster-wide
+  # while appearing to restrict it. Configure at least one selector before
+  # relying on networkPolicy.enabled=true to reach admin or (in cp mode) to let
+  # data planes dial gRPC.
   enabled: false
   # Each entry is a NetworkPolicy namespaceSelector (matchLabels and/or
   # matchExpressions). When allowedPodSelectors is non-empty, every namespace

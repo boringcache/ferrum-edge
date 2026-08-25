@@ -11,7 +11,15 @@
 {{- $hasAdminHttp := and (hasKey $ports "adminHttp") (ne ($ports.adminHttp | toString) "0") -}}
 {{- $hasAdminHttps := and (hasKey $ports "adminHttps") (ne ($ports.adminHttps | toString) "0") $adminTlsSet -}}
 {{- $hasCpGrpc := and (eq .Values.mode "cp") (ne (include "ferrum-gateway.cpGrpcPort" . | toString) "0") -}}
-{{- $hasRestricted := or $hasAdminHttp $hasAdminHttps $hasCpGrpc -}}
+{{- $hasSelectors := or (gt (len $nsSelectors) 0) (gt (len $podSelectors) 0) -}}
+{{/* A NetworkPolicyIngressRule with an EMPTY `from` matches ALL sources
+     (networking.k8s.io/v1: "If this field is empty or missing, this rule matches
+     all sources"). Rendering `from: []` for the admin / CP-gRPC ports would
+     therefore publish them cluster-wide while the chart's hard-fail messages
+     advertise networkPolicy.enabled=true as the mitigation. With no peers
+     configured we emit no restricted rule at all: the policy still selects this
+     pod with policyTypes[Ingress], so those ports stay denied. Fail closed. */}}
+{{- $hasRestricted := and $hasSelectors (or $hasAdminHttp $hasAdminHttps $hasCpGrpc) -}}
 {{- $hasStreamSvc := false -}}
 {{- range .Values.streamPorts -}}{{- if .service -}}{{- $hasStreamSvc = true -}}{{- end -}}{{- end -}}
 {{- $hasOpen := or $hasProxyHttp $hasProxyHttps $hasStreamSvc -}}
@@ -51,10 +59,7 @@ spec:
         {{- end }}
     {{- end }}
     {{- if $hasRestricted }}
-    - {{- if and (eq (len $nsSelectors) 0) (eq (len $podSelectors) 0) }}
-      from: []
-      {{- else }}
-      from:
+    - from:
         {{- if eq (len $nsSelectors) 0 }}
         {{- range $podSelectors }}
         - podSelector:
@@ -76,7 +81,6 @@ spec:
         {{- end }}
         {{- end }}
         {{- end }}
-      {{- end }}
       ports:
         {{- if $hasAdminHttp }}
         - protocol: TCP
