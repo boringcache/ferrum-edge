@@ -2004,6 +2004,7 @@ fn classify_tcp_accept_peer_exit(
                 ))
             }
         }
+        #[cfg(panic = "unwind")]
         Err(join_err) if join_err.is_panic() => TcpAcceptPeerExit::Failed(anyhow::anyhow!(
             "TCP accept loop {class} panicked: {join_err}"
         )),

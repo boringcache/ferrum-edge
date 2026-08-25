@@ -1394,9 +1394,10 @@ Notes:
 
 #### Task supervision
 
-Each upstream's poller runs under a supervisor (issues #3721 / #3722):
+Each upstream's poller runs under a supervisor (issues #3721 / #3722 / #4166):
 
-- An unexpected exit or panic is restarted with bounded, jittered exponential backoff (1s → 30s), never a hot loop; clean cancel/shutdown is distinguished from a panic and does not count as a crash.
+- Shipping profiles (`release`, `ci-release`, `max-perf`) set `panic = "abort"`: a panicking poller terminates the whole gateway. Run Ferrum under a process supervisor (systemd, Kubernetes) so the host restarts the process. Dev/test builds unwind, and only those builds can restart a panicking poller in-process.
+- An unexpected non-panic exit is restarted with bounded, jittered exponential backoff (1s → 30s), never a hot loop; clean cancel/shutdown is distinguished from a crash and does not count as one.
 - Restarts are fenced on a monotonic task generation, so a task superseded by a config reconcile can neither restart nor publish.
 - A config reconcile keeps every task whose effective specification (provider config, poll interval, static targets, load-balancer settings, staleness policy) is unchanged. Unrelated config changes therefore no longer restart every poller, drop each Consul blocking-query cursor, or cancel in-flight registry calls before they publish.
 - Per-upstream state (provider, task state, staleness, withdrawal, restart count, last-success age, closed-set last error) is exposed on the **authenticated** `/health` and `/status` tiers under `service_discovery`; `/metrics` carries only fixed-cardinality process aggregates, never upstream identity as a label.

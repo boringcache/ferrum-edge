@@ -8,6 +8,7 @@ mod backend_capability_probe_merge_tests;
 mod backend_dispatch_tests;
 mod backend_pending_limit_scope_tests;
 mod backend_reqwest_no_proxy_tests;
+mod build_profile_panic_strategy_tests;
 mod cached_synthetic_bytes_share_tests;
 #[cfg(unix)]
 mod cgroup_tree_walk_tests;
