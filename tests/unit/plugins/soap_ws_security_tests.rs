@@ -8195,7 +8195,10 @@ async fn test_saml_audience_comment_truncation_rejected() {
         "https://idp.example.com/metadata",
         "alice@example.com",
     );
-    builder.audience = Some(format!("{}<!---->.evil.example", saml_fixtures::TEST_AUDIENCE));
+    builder.audience = Some(format!(
+        "{}<!---->.evil.example",
+        saml_fixtures::TEST_AUDIENCE
+    ));
     let assertion = builder.build();
 
     let body = wrap_saml_assertion(&assertion);
