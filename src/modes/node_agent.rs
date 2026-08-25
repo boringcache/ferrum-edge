@@ -10739,6 +10739,7 @@ mod tests {
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
+            host_network: false,
         }
     }
 
@@ -12627,6 +12628,7 @@ mod tests {
                 node_probe_ports: Vec::new(),
                 inbound_redirect_ports: Vec::new(),
                 pod_pid: None,
+                host_network: false,
             },
             &failed_cleanup_state,
         );
@@ -12748,6 +12750,7 @@ mod tests {
                 node_probe_ports: Vec::new(),
                 inbound_redirect_ports: Vec::new(),
                 pod_pid: None,
+                host_network: false,
             },
             &failed_cleanup_state,
         );
@@ -13127,6 +13130,7 @@ mod tests {
                 node_probe_ports: Vec::new(),
                 inbound_redirect_ports: Vec::new(),
                 pod_pid: None,
+                host_network: false,
             },
         );
 
