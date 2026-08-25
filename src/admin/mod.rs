@@ -11036,13 +11036,17 @@ async fn handle_backend_capabilities_refresh(
             ));
         }
     };
-    // Run synchronously so the caller can assert on the post-refresh
-    // snapshot immediately. The request handler is already on a tokio
-    // worker task so .await is fine.
-    proxy_state.refresh_backend_capabilities().await;
+    // Run synchronously through the shared RefreshCoalescer so concurrent
+    // admin callers collapse onto one probe pass while the response still
+    // reflects a completed refresh snapshot.
+    let outcome = proxy_state.refresh_backend_capabilities_coalesced().await;
+    let status = match outcome {
+        crate::proxy::backend_capabilities::BackendCapabilityRefreshOutcome::Ran => "refreshed",
+        crate::proxy::backend_capabilities::BackendCapabilityRefreshOutcome::Joined => "joined",
+    };
     Ok(json_response(
         StatusCode::OK,
-        &json!({"status": "refreshed"}),
+        &json!({"status": status}),
     ))
 }
 

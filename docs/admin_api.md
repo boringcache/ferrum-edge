@@ -1656,7 +1656,7 @@ Use cases:
 
 ### `POST /backend-capabilities/refresh`
 
-Force an immediate, synchronous classification pass over every HTTP-family backend in the current config. Blocks until every probe completes (bounded by `FERRUM_POOL_WARMUP_CONCURRENCY` parallelism + per-probe timeout).
+Force an immediate, synchronous classification pass over every HTTP-family backend in the current config. Blocks until the coalesced refresh pass completes (bounded by `FERRUM_POOL_WARMUP_CONCURRENCY` parallelism + per-probe timeout). Concurrent requests collapse onto the shared `RefreshCoalescer`, so at most one probe fan-out runs at a time; additional callers wait for the in-flight pass instead of spawning duplicate work.
 
 This operational recovery endpoint is available in every proxy-serving mode,
 including read-only file, DP, and mesh admin states. It does not persist a
@@ -1666,11 +1666,19 @@ configuration or database mutation and still requires a valid admin JWT.
 curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:9000/backend-capabilities/refresh
 ```
 
-Response:
+Response when this request drove the pass:
 
 ```json
 {
   "status": "refreshed"
+}
+```
+
+Response when a refresh was already in flight and this request joined it:
+
+```json
+{
+  "status": "joined"
 }
 ```
 

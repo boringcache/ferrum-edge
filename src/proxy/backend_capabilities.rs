@@ -10,6 +10,7 @@ use std::cell::RefCell;
 use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
 
 use crate::config::types::{BackendScheme, Proxy, UpstreamTarget};
 use crate::tls::backend::{append_optional_pool_key_component, append_pool_key_component};
@@ -671,6 +672,17 @@ pub fn now_unix_secs() -> u64 {
 
 pub type SharedBackendCapabilityRegistry = Arc<BackendCapabilityRegistry>;
 
+/// Outcome of a synchronous, coalesced capability refresh request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendCapabilityRefreshOutcome {
+    /// This caller became the runner and executed at least one refresh pass.
+    Ran,
+    /// A refresh was already in flight; this caller coalesced and waited for
+    /// the in-flight runner (including any re-drains triggered by coalesced
+    /// `pending` flags) to finish.
+    Joined,
+}
+
 /// Single-flight + coalesce guard for `refresh_backend_capabilities`.
 ///
 /// Callers flip `pending` to request a refresh. The first caller also flips
@@ -686,10 +698,21 @@ pub type SharedBackendCapabilityRegistry = Arc<BackendCapabilityRegistry>;
 ///   runner observes the new pending flag in `try_finish()` and either
 ///   re-acquires the runner role itself or hands off to a freshly-spawned
 ///   task — no silent work loss.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RefreshCoalescer {
     running: AtomicBool,
     pending: AtomicBool,
+    idle_notify: Notify,
+}
+
+impl Default for RefreshCoalescer {
+    fn default() -> Self {
+        Self {
+            running: AtomicBool::new(false),
+            pending: AtomicBool::new(false),
+            idle_notify: Notify::new(),
+        }
+    }
 }
 
 impl RefreshCoalescer {
@@ -739,6 +762,21 @@ impl RefreshCoalescer {
         //   runner): they own the drain → return `true` so the caller
         //   exits cleanly.
         self.running.swap(true, Ordering::AcqRel)
+    }
+
+    /// Wake synchronous waiters blocked on [`Self::wait_until_idle`].
+    pub fn signal_idle(&self) {
+        self.idle_notify.notify_waiters();
+    }
+
+    /// Block until no refresh runner is active and no pending work remains.
+    pub async fn wait_until_idle(&self) {
+        loop {
+            if !self.running.load(Ordering::Acquire) && !self.pending.load(Ordering::Acquire) {
+                return;
+            }
+            self.idle_notify.notified().await;
+        }
     }
 }
 
