@@ -1813,12 +1813,15 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     /// incremental polls start from an authoritative snapshot boundary.
     async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error>;
 
-    /// Return the store-wide durable config-change high-water mark.
+    /// Return the All-scope durable config-change high-water mark.
     ///
-    /// `config_changes.sequence` is allocated globally, not per namespace.
-    /// Control-plane mesh revision publication uses this value so a namespace
-    /// disappearing from the active scope cannot rewind the advertised
-    /// generation after a CP restart.
+    /// Incremental polling and DP broadcast are per-namespace. All-scope mesh
+    /// revision publication uses the sum of each namespace's
+    /// `MAX(sequence)` so a namespace disappearing from the active scope cannot
+    /// rewind the advertised generation after a CP restart, and so a write in
+    /// one namespace still advances the stamp when another namespace already
+    /// holds a higher auto-increment id (per-namespace sequence locks, issue
+    /// #4130).
     async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error>;
 
     /// Load only resources changed after `after_sequence`.

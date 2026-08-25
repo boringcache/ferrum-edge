@@ -1118,10 +1118,10 @@ impl DatabaseStore {
 
     fn config_change_lock_insert_sql(&self) -> String {
         match self.db_type.as_str() {
-            // Cross-namespace writers share the single 'global' row and are not
-            // serialized by per-namespace admission. INSERT IGNORE + FOR UPDATE
-            // deadlocks on the S->X upgrade under concurrent namespaces; the
-            // no-op upsert acquires the exclusive lock immediately.
+            // Each namespace owns its own lock row. INSERT IGNORE + FOR UPDATE
+            // deadlocks on the S->X upgrade under concurrent first-writers of
+            // the same namespace; the no-op upsert acquires the exclusive lock
+            // immediately.
             "mysql" => MYSQL_CONFIG_CHANGE_LOCK_INSERT_SQL.to_string(),
             "sqlite" => "INSERT OR IGNORE INTO config_change_locks \
                  (lock_name, updated_at) VALUES (?, ?)"
@@ -1294,13 +1294,17 @@ impl DatabaseStore {
     async fn lock_config_change_sequence_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
     ) -> Result<(), anyhow::Error> {
-        // Serialize SQL change-log inserts so auto-incremented sequences become
-        // visible to pollers in commit order.
+        // Serialize SQL change-log inserts for this namespace so auto-incremented
+        // sequences become visible to that namespace's poller in commit order.
+        // Distinct namespaces take distinct lock rows and do not wait on each
+        // other. Multi-namespace transactions acquire these rows in sorted name
+        // order before inserting change-log rows, matching mTLS DNS admission.
         let now = Utc::now().to_rfc3339();
         let insert_sql = self.config_change_lock_insert_sql();
         sqlx::query(&insert_sql)
-            .bind(Self::CONFIG_CHANGE_LOCK_NAME)
+            .bind(namespace)
             .bind(&now)
             .execute(&mut **tx)
             .await?;
@@ -1311,7 +1315,7 @@ impl DatabaseStore {
             // insert the change-log row.
             sqlx::query("UPDATE config_change_locks SET updated_at = ? WHERE lock_name = ?")
                 .bind(Utc::now().to_rfc3339())
-                .bind(Self::CONFIG_CHANGE_LOCK_NAME)
+                .bind(namespace)
                 .execute(&mut **tx)
                 .await?;
         } else if self.db_type != "mysql" {
@@ -1322,11 +1326,25 @@ impl DatabaseStore {
             let lock_sql =
                 self.q("SELECT lock_name FROM config_change_locks WHERE lock_name = ? FOR UPDATE");
             sqlx::query(&lock_sql)
-                .bind(Self::CONFIG_CHANGE_LOCK_NAME)
+                .bind(namespace)
                 .fetch_optional(&mut **tx)
                 .await?;
         }
 
+        Ok(())
+    }
+
+    async fn lock_config_change_sequences_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespaces: &[&str],
+    ) -> Result<(), anyhow::Error> {
+        let mut ordered = namespaces.to_vec();
+        ordered.sort_unstable();
+        ordered.dedup();
+        for namespace in ordered {
+            self.lock_config_change_sequence_tx(tx, namespace).await?;
+        }
         Ok(())
     }
 
@@ -2771,6 +2789,7 @@ impl DatabaseStore {
             self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                 .await?;
         }
+        self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces).await?;
         for spec in specs {
             // Defense in depth: the owning proxy must already exist. Ownership
             // tags are stamped separately because ordinary batch inserts omit
@@ -5707,12 +5726,29 @@ impl DatabaseStore {
     }
 
     pub async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error> {
-        let row =
-            sqlx::query("SELECT COALESCE(MAX(sequence), 0) AS max_sequence FROM config_changes")
-                .fetch_one(&self.pool())
-                .await?;
-        let max_sequence: i64 = row.try_get("max_sequence")?;
-        Ok(max_sequence.max(0) as u64)
+        // All-scope mesh revision cannot use store-wide MAX(sequence). With
+        // per-namespace sequence locks, a later-committed lower sequence in
+        // another namespace does not advance MAX, so a mesh DP would observe
+        // Same revision with different content. The sum of each namespace's
+        // high-water mark is strictly monotonic when any namespace advances
+        // and still includes deleted namespaces whose change-log rows remain.
+        let rows = sqlx::query(&self.q(
+            "SELECT COALESCE(MAX(sequence), 0) AS max_sequence \
+             FROM config_changes GROUP BY namespace",
+        ))
+        .fetch_all(&self.pool())
+        .await?;
+        let mut total: u64 = 0;
+        for row in rows {
+            let ns_max: i64 = row.try_get("max_sequence")?;
+            if ns_max < 0 {
+                anyhow::bail!("config change sequence is out of range");
+            }
+            total = total.checked_add(ns_max as u64).ok_or_else(|| {
+                anyhow::anyhow!("all-scope config-change sequence overflowed u64")
+            })?;
+        }
+        Ok(total)
     }
 
     /// Load only resources referenced by durable change records after `after_sequence`.
@@ -6217,7 +6253,7 @@ impl DatabaseStore {
         resource_id: &str,
         operation: &str,
     ) -> Result<(), anyhow::Error> {
-        self.lock_config_change_sequence_tx(tx).await?;
+        self.lock_config_change_sequence_tx(tx, namespace).await?;
         sqlx::query(&self.q("INSERT INTO config_changes \
              (namespace, resource_type, resource_id, operation, created_at) \
              VALUES (?, ?, ?, ?, ?)"))
@@ -6236,11 +6272,11 @@ impl DatabaseStore {
     ///
     /// `config_changes.sequence` is a database-assigned auto-increment key that
     /// is never reused, and [`Self::lock_config_change_sequence_tx`] — taken
-    /// inside [`Self::record_config_change_tx`] and held for the rest of this
-    /// transaction — is the only way a row reaches the table. No other
-    /// transaction can therefore commit a change row for this namespace between
-    /// the insert above and the read below, which makes `MAX(sequence)` for the
-    /// namespace exactly the row this call just wrote.
+    /// inside [`Self::record_config_change_tx`] on this namespace's lock row and
+    /// held for the rest of this transaction — is the only way a row reaches
+    /// the table. No other transaction can therefore commit a change row for
+    /// this namespace between the insert above and the read below, which makes
+    /// `MAX(sequence)` for the namespace exactly the row this call just wrote.
     ///
     /// This is the monotonic source gateway trust-bundle revisions come from:
     /// it advances on every mutation *including a delete*, so a delete/recreate
@@ -6404,7 +6440,6 @@ impl DatabaseStore {
     /// Keeps transaction WAL/redo log size manageable and reduces lock hold time.
     const BATCH_CHUNK_SIZE: usize = 1000;
     const ASSOCIATION_LOOKUP_CHUNK_SIZE: usize = 500;
-    const CONFIG_CHANGE_LOCK_NAME: &str = "global";
     const CHANGE_LOG_BATCH_LIMIT: i64 = 10_000;
     const CHANGE_LOG_RETAIN_PER_NAMESPACE: u64 = 100_000;
 
@@ -6472,6 +6507,7 @@ impl DatabaseStore {
             self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                 .await?;
         }
+        self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces).await?;
         let mut touched_namespaces = HashSet::new();
         self.insert_proxies_in_tx(&mut tx, proxies, attach_plugins, &mut touched_namespaces)
             .await?;
@@ -6672,6 +6708,7 @@ impl DatabaseStore {
                 self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                     .await?;
             }
+            self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces).await?;
             let mut touched_namespaces = HashSet::new();
             self.attach_proxy_plugins_in_tx(&mut tx, chunk, &mut touched_namespaces)
                 .await?;
@@ -6783,6 +6820,7 @@ impl DatabaseStore {
             self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                 .await?;
         }
+        self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces).await?;
         let mut touched_namespaces = HashSet::new();
         self.insert_consumers_in_tx(&mut tx, consumers, &mut touched_namespaces)
             .await?;
@@ -6890,6 +6928,7 @@ impl DatabaseStore {
             self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                 .await?;
         }
+        self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces).await?;
         let mut touched_namespaces = HashSet::new();
         self.insert_plugin_configs_in_tx(&mut tx, configs, &mut touched_namespaces)
             .await?;
@@ -7003,6 +7042,7 @@ impl DatabaseStore {
             self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                 .await?;
         }
+        self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces).await?;
         let mut touched_namespaces = HashSet::new();
         self.insert_upstreams_in_tx(&mut tx, upstreams, &mut touched_namespaces)
             .await?;
@@ -7126,6 +7166,7 @@ impl DatabaseStore {
             self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                 .await?;
         }
+        self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces).await?;
         let mut touched_namespaces = HashSet::new();
 
         Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Consumers, 0)?;
@@ -8405,6 +8446,7 @@ impl DatabaseStore {
         {
             self.lock_mtls_dns_admission_for_owner_tx(&mut tx, name, None)
                 .await?;
+            self.lock_config_change_sequence_tx(&mut tx, name).await?;
         }
 
         let now = Utc::now();

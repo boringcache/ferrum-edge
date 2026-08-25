@@ -12194,6 +12194,7 @@ pub mod _test_support {
             cp_scope,
             mesh_update_tx,
             mesh_registry,
+            &std::collections::HashMap::new(),
         );
         let mut accepted: Vec<String> = outcome.accepted.keys().cloned().collect();
         accepted.sort();
@@ -12245,7 +12246,11 @@ pub mod _test_support {
         Vec<String>,
     ) {
         use crate::modes::control_plane::cas_publish_incremental_partitions;
-        let outcome = cas_publish_incremental_partitions(config_arc, partitions);
+        let outcome = cas_publish_incremental_partitions(
+            config_arc,
+            partitions,
+            &std::collections::HashMap::new(),
+        );
         let published = (*config_arc.load_full()).clone();
         let mut accepted: Vec<String> = outcome.accepted.keys().cloned().collect();
         accepted.sort();

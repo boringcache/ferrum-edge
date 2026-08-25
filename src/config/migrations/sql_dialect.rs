@@ -1621,7 +1621,7 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS config_change_locks (
-                lock_name VARCHAR(64) COLLATE utf8mb4_0900_bin PRIMARY KEY,
+                lock_name VARCHAR(255) COLLATE utf8mb4_0900_bin PRIMARY KEY,
                 updated_at VARCHAR(64) NOT NULL
             )
             "#

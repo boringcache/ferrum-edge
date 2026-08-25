@@ -113,7 +113,7 @@ fn mysql_sequence_and_route_lock_helpers_skip_redundant_for_update() {
     let config_change = source
         .split("async fn lock_config_change_sequence_tx(")
         .nth(1)
-        .and_then(|rest| rest.split("async fn lock_mtls_dns_admission_tx(").next())
+        .and_then(|rest| rest.split("async fn lock_config_change_sequences_tx(").next())
         .expect("lock_config_change_sequence_tx body");
     assert!(
         config_change.contains("db_type != \"mysql\""),
@@ -122,6 +122,14 @@ fn mysql_sequence_and_route_lock_helpers_skip_redundant_for_update() {
     assert!(
         config_change.contains("FOR UPDATE"),
         "PostgreSQL config_change lock path must retain SELECT ... FOR UPDATE:\n{config_change}"
+    );
+    assert!(
+        config_change.contains(".bind(namespace)"),
+        "config-change sequence lock must key the row by namespace:\n{config_change}"
+    );
+    assert!(
+        !config_change.contains("CONFIG_CHANGE_LOCK_NAME"),
+        "the global lock-name constant must not remain on the sequence lock path:\n{config_change}"
     );
 
     let proxy_route = source

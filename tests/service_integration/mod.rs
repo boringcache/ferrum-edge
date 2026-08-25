@@ -23,7 +23,8 @@
 //!   - **mysql** — MySQL 8.4. Exercises custom-plugin migration recovery
 //!     across implicit-commit DDL boundaries, the example audit schema's
 //!     SQLx Any text bindings, a cross-namespace `config_change_locks`
-//!     concurrency regression against ER_LOCK_DEADLOCK 1213, and byte-exact
+//!     concurrency regression against ER_LOCK_DEADLOCK 1213 plus per-namespace
+//!     sequence-lock isolation (issue #4130), and byte-exact
 //!     NFC/NFD consumer identity uniqueness under `utf8mb4_0900_bin` (#2994).
 //!   - **oidc** — Ory Hydra. Drives `oidc_relying_party` through live discovery,
 //!     authorization-code + PKCE, JWKS/UserInfo/end-session, encrypted sessions,

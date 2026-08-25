@@ -198,11 +198,14 @@ impl CpScope {
     /// The sequence domain must match what incremental polling advances from,
     /// otherwise identical-scope replicas diverge across a restart:
     ///
-    /// - [`CpScope::Single`] / [`CpScope::Set`]: maximum of the durable
+    /// - [`CpScope::Single`] / [`CpScope::Set`]: saturating sum of the durable
     ///   per-namespace `latest_change_sequence` cursors for the explicit scope.
-    ///   An unrelated namespace's change must not advance (or permanently
-    ///   quarantine) a restarted peer that never observed that namespace.
-    /// - [`CpScope::All`]: the store-global `config_changes` high-water mark,
+    ///   Sum (not max) is strictly monotonic when any scoped namespace advances,
+    ///   which is required once change-log sequence locks are per-namespace
+    ///   (issue #4130). An unrelated namespace's change must not advance (or
+    ///   permanently quarantine) a restarted peer that never observed that
+    ///   namespace.
+    /// - [`CpScope::All`]: the store-wide sum of per-namespace high-water marks,
     ///   because the dynamically discovered namespace list can shrink after the
     ///   last resource in a namespace is deleted and a restarted CP would
     ///   otherwise rewind past that deleted namespace's sequences.
@@ -216,15 +219,21 @@ impl CpScope {
         floor: u64,
     ) -> u64 {
         let domain = match self {
-            CpScope::Single(_) | CpScope::Set(_) => scoped_namespace_sequences
-                .values()
-                .copied()
-                .max()
-                .unwrap_or(0),
+            CpScope::Single(_) | CpScope::Set(_) => {
+                sum_namespace_change_sequences(scoped_namespace_sequences)
+            }
             CpScope::All => store_global_sequence,
         };
         domain.max(floor)
     }
+}
+
+/// Saturating sum of per-namespace durable change-log cursors.
+pub(crate) fn sum_namespace_change_sequences(sequences: &HashMap<String, u64>) -> u64 {
+    sequences
+        .values()
+        .copied()
+        .fold(0u64, u64::saturating_add)
 }
 
 /// Per-namespace broadcast channel set.
