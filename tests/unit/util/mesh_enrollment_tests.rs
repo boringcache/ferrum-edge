@@ -64,7 +64,9 @@ fn parse_mesh_label_enabled_spellings() {
 
 #[test]
 fn parse_mesh_label_opt_out_spellings() {
-    for value in ["disabled", "Disabled", "false", "False", "FALSE", "0", "f", "F"] {
+    for value in [
+        "disabled", "Disabled", "false", "False", "FALSE", "0", "f", "F",
+    ] {
         assert_eq!(parse_mesh_label(value), MeshLabelValue::OptOut, "{value:?}");
         assert!(!mesh_label_opts_in(Some(value)));
         assert!(mesh_label_blocks_injection(Some(value)));
@@ -74,7 +76,11 @@ fn parse_mesh_label_opt_out_spellings() {
 #[test]
 fn parse_mesh_label_unrecognized_fails_closed() {
     for value in ["true", "True", "maybe", ""] {
-        assert_eq!(parse_mesh_label(value), MeshLabelValue::Unrecognized, "{value:?}");
+        assert_eq!(
+            parse_mesh_label(value),
+            MeshLabelValue::Unrecognized,
+            "{value:?}"
+        );
         assert!(mesh_label_is_unrecognized(Some(value)));
         assert!(mesh_label_blocks_injection(Some(value)));
         assert!(!mesh_label_opts_in(Some(value)));

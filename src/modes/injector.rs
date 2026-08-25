@@ -1038,10 +1038,7 @@ fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
             .and_then(|m| m.get("sidecar.istio.io/inject"))
             .and_then(Value::as_str),
     ) {
-        log_unrecognized_inject_annotation(
-            annotations,
-            "sidecar.istio.io/inject",
-        );
+        log_unrecognized_inject_annotation(annotations, "sidecar.istio.io/inject");
         return false;
     }
     if inject_annotation_blocks_injection(
@@ -2035,7 +2032,9 @@ mod tests {
 
     #[test]
     fn mesh_label_false_spellings_opt_out() {
-        for value in ["false", "False", "FALSE", "0", "f", "F", "disabled", "Disabled"] {
+        for value in [
+            "false", "False", "FALSE", "0", "f", "F", "disabled", "Disabled",
+        ] {
             let pod = json!({
                 "metadata": {"labels": {"ferrum.io/mesh": value}},
                 "spec": {"containers": [{"name": "app", "image": "app:test"}]}
@@ -2046,10 +2045,7 @@ mod tests {
                 None,
             )
             .expect("patch");
-            assert!(
-                patch.is_empty(),
-                "ferrum.io/mesh={value:?} must opt out"
-            );
+            assert!(patch.is_empty(), "ferrum.io/mesh={value:?} must opt out");
         }
     }
 
