@@ -2829,12 +2829,22 @@ fn xml_array_item_name<'a>(
 
 /// Concatenate every direct text child of `node` in document order.
 ///
-/// `roxmltree::Node::text()` returns only the first text run; an XML comment
-/// splits character data into separate runs while a backend that drops comments
-/// concatenates them. Reject comments inside value elements so validation never
-/// acts on a prefix the backend would not read.
+/// `roxmltree::Node::text()` returns only the first text run, and only when the
+/// first child IS text; an XML comment splits character data into separate runs
+/// while a backend that drops comments concatenates them. Both spellings are
+/// dangerous — `<qty>1<!--x-->000</qty>` reads as `1`, and
+/// `<qty><!--x-->1000</qty>` reads as nothing at all — so an element carrying a
+/// comment ALONGSIDE character data is refused rather than validated on a value
+/// the backend would not read.
+///
+/// A comment that merely sits BETWEEN child elements
+/// (`<order><!-- hint --><qty>3</qty></order>`) splits no character data and is
+/// accepted: rejecting it would refuse ordinary annotated documents. Only
+/// non-whitespace character data makes a comment dangerous, so the incidental
+/// whitespace around a pretty-printed comment is not itself a rejection.
 fn xml_direct_text_children(node: roxmltree::Node<'_, '_>) -> Result<String, String> {
     let mut text = String::new();
+    let mut saw_comment = false;
     for child in node.children() {
         if child.is_text() {
             if let Some(chunk) = child.text() {
@@ -2843,8 +2853,11 @@ fn xml_direct_text_children(node: roxmltree::Node<'_, '_>) -> Result<String, Str
             continue;
         }
         if child.is_comment() {
-            return Err(XML_COMMENT_IN_VALUE_DETAIL.to_string());
+            saw_comment = true;
         }
+    }
+    if saw_comment && !text.trim().is_empty() {
+        return Err(XML_COMMENT_IN_VALUE_DETAIL.to_string());
     }
     Ok(text)
 }
