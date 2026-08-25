@@ -384,17 +384,6 @@ impl RuntimeConfigApply {
         }
     }
 
-    /// Coalesced immediate poll wake for a deferred (`?apply=async`) mutation
-    /// (issue #4139). The writer does not register as a waiter — nothing
-    /// blocks on this write — but background convergence must not sit on
-    /// `FERRUM_DB_POLL_INTERVAL` either. Extra signals raised while a poll is
-    /// in flight coalesce onto the next wake, so a bulk stream of deferred
-    /// writes produces back-to-back polls that each absorb everything
-    /// committed since the previous watermark.
-    pub fn signal_deferred_mutation(&self) {
-        self.wake.signal_immediate();
-    }
-
     /// Wait until the poll loop has accepted a generation covering `sequence`
     /// or a truthful failure is known. `sequence` must already have been
     /// captured under the write-topology pin; this method never reads the

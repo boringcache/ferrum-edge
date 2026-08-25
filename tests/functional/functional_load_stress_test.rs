@@ -47,8 +47,9 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use crate::common::scheduled_scaling::{
-    BatchApplyCursor, CONFIG_CONVERGENCE_MAX_WAIT_SECS, SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS,
-    post_admin_batch, scheduled_scaling_admin_jwt_max_ttl_value, wait_for_batch_apply_cursor,
+    BatchApplyCursor, CONFIG_CONVERGENCE_MAX_WAIT_SECS, LIVE_APPLY_CURSOR_MAX_WAIT_SECS,
+    SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, post_admin_batch,
+    scheduled_scaling_admin_jwt_max_ttl_value, wait_for_batch_apply_cursor,
     wait_for_config_convergence,
 };
 
@@ -1627,7 +1628,7 @@ async fn run_load_stress_test(harness: &LoadTestHarness) {
     if let Some(cursor) = provision_cursor {
         println!(
             "\nWaiting for live-apply cursor {}:{} (bound {}s)...",
-            cursor.epoch, cursor.sequence, CONFIG_CONVERGENCE_MAX_WAIT_SECS
+            cursor.epoch, cursor.sequence, LIVE_APPLY_CURSOR_MAX_WAIT_SECS
         );
         let waited = wait_for_batch_apply_cursor(
             &client,

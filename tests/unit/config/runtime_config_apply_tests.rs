@@ -285,15 +285,22 @@ async fn bounded_status_wait_times_out_without_failing_the_cursor() {
         .expect("accepted generation resolves the same cursor");
 }
 
+/// A deferred (`?apply=async`) mutation must NOT raise a per-write poll wake:
+/// bulk deferred writes with per-write wakes turn the poll loop into gapless
+/// back-to-back reloads that saturate the database (issue #4139 follow-up —
+/// observed starving the admission lease renewer on the 30k PostgreSQL leg).
+/// The blocking status probe is the only demand-driven wake source.
 #[tokio::test]
-async fn deferred_mutation_signal_is_a_coalesced_immediate_wake() {
-    let apply = RuntimeConfigApply::new("ferrum", 0);
+async fn only_a_blocking_status_wait_raises_the_immediate_wake() {
+    let apply = Arc::new(RuntimeConfigApply::new("ferrum", 0));
     let wake = apply.wake_signal();
     let before = wake.signals_total();
-    apply.signal_deferred_mutation();
-    apply.signal_deferred_mutation();
+    // A bounded wait registers demand and nudges the poll.
+    let _ = apply
+        .await_committed_cursor_with_timeout(LiveApplyCursor::new(0, 5), Duration::from_millis(10))
+        .await;
     assert!(
         wake.signals_total() > before,
-        "a deferred write must raise a wake so convergence does not sit on FERRUM_DB_POLL_INTERVAL"
+        "a blocking status wait must nudge the poll loop"
     );
 }
