@@ -2486,6 +2486,12 @@ pub mod _test_support {
         plugin.completed_size_snapshot_for_tests()
     }
 
+    pub fn request_deduplication_inflight_count_snapshot_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+    ) -> usize {
+        plugin.inflight_count_snapshot_for_tests()
+    }
+
     pub fn request_deduplication_request_identity_for_test(
         plugin: &crate::plugins::request_deduplication::RequestDeduplication,
         ctx: &crate::plugins::RequestContext,
