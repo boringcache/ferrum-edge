@@ -1460,7 +1460,7 @@ pub(crate) async fn validate_plugin_graph_candidates(
     // are filtered before broadcast and file/database modes load one namespace,
     // so cross-namespace plugins must never create false admission conflicts.
     let mut candidate = db
-        .load_namespace_snapshot(namespace)
+        .load_namespace_policy_graph(namespace)
         .await
         .map_err(AfterValidateError::Db)?;
 
@@ -1507,7 +1507,7 @@ pub(crate) async fn validate_plugin_graph_proxy_deletion_candidate(
     removed_proxy_id: &str,
 ) -> Result<(), AfterValidateError> {
     let mut candidate = db
-        .load_namespace_snapshot(namespace)
+        .load_namespace_policy_graph(namespace)
         .await
         .map_err(AfterValidateError::Db)?;
     candidate

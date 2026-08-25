@@ -181,6 +181,30 @@ impl AtomicBatchGraph<'_> {
         namespaces.dedup();
         namespaces
     }
+
+    /// True when post-write namespace admission must re-read the policy
+    /// graph after this graph is inserted.
+    ///
+    /// HTTP-only consumer/proxy chunks with empty plugin associations cannot
+    /// change mTLS SAN uniqueness or TCP-throttle attachments. Skipping the
+    /// O(namespace) candidate reload keeps per-chunk persist cost bounded by
+    /// the chunk plus point uniqueness lookups (issue #4234).
+    pub fn requires_post_write_policy_admission(&self) -> bool {
+        if self
+            .consumers
+            .iter()
+            .any(|consumer| consumer.has_credential("mtls_auth"))
+        {
+            return true;
+        }
+        if self.plugin_configs.iter().any(|plugin| {
+            plugin.plugin_name == "mtls_auth"
+                || plugin.plugin_name == "tcp_connection_throttle"
+        }) {
+            return true;
+        }
+        self.proxies.iter().any(|proxy| !proxy.plugins.is_empty())
+    }
 }
 
 /// Per-family counts for a graph that committed in full.

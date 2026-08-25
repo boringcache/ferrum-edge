@@ -548,6 +548,18 @@ fn consumer_identity_values(consumer: &Consumer) -> Vec<&str> {
     values
 }
 
+fn consumer_identity_probe_fields<'a>(
+    consumer_id: &'a str,
+    username: &'a str,
+    custom_id: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut candidates = vec![("id", consumer_id), ("username", username)];
+    if let Some(custom_id) = custom_id {
+        candidates.push(("custom_id", custom_id));
+    }
+    candidates
+}
+
 pub(crate) fn proxy_route_key_hash(listen_path: Option<&str>) -> String {
     let mut hasher = Sha256::new();
     match listen_path {
@@ -560,7 +572,7 @@ pub(crate) fn proxy_route_key_hash(listen_path: Option<&str>) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn format_consumer_identity_conflict(
+pub(crate) fn format_consumer_identity_conflict(
     candidate_field: &str,
     candidate_value: &str,
     existing_field: &str,
@@ -2724,6 +2736,35 @@ impl DatabaseStore {
         // managed relationships rather than converting them to hand-managed.
 
         self.check_slow_query("load_namespace_snapshot", start);
+        Ok(config)
+    }
+
+    /// Load proxies + plugin_configs for plugin-graph admission without
+    /// decoding every Consumer or Upstream row (issue #4234).
+    pub async fn load_namespace_policy_graph(
+        &self,
+        namespace: &str,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        let start = Instant::now();
+        let loaded_at = Utc::now();
+        let mut tx = self.pool().begin().await?;
+        self.configure_full_load_snapshot(&mut tx).await?;
+        let purpose = FullLoadPurpose::AdmissionValidation;
+        let proxies = self.load_proxies_tx(namespace, purpose, &mut tx).await?;
+        let plugin_configs = self
+            .load_plugin_configs_tx(namespace, purpose, &mut tx)
+            .await?;
+        tx.commit().await?;
+        let mut config = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+            proxies,
+            plugin_configs,
+            loaded_at,
+            known_namespaces: Vec::new(),
+            ..Default::default()
+        };
+        config.normalize_fields();
+        self.check_slow_query("load_namespace_policy_graph", start);
         Ok(config)
     }
 
@@ -5407,6 +5448,10 @@ impl DatabaseStore {
 
     /// Check that a consumer id/username/custom_id combination does not collide
     /// with another consumer's shared identity namespace.
+    ///
+    /// Point-lookup on `consumer_identity_index` (PK `(namespace,
+    /// identity_value)`). A full `consumers` scan would make namespace
+    /// admission O(namespace size) under the serialized lease (issue #4234).
     pub async fn check_consumer_identity_unique(
         &self,
         namespace: &str,
@@ -5416,31 +5461,31 @@ impl DatabaseStore {
         exclude_id: Option<&str>,
     ) -> Result<Option<String>, anyhow::Error> {
         let start = Instant::now();
-        let mut candidates = vec![("id", consumer_id), ("username", username)];
-        if let Some(custom_id) = custom_id {
-            candidates.push(("custom_id", custom_id));
-        }
+        let candidates = consumer_identity_probe_fields(consumer_id, username, custom_id);
+        let mut values: Vec<&str> = candidates
+            .iter()
+            .map(|(_, value)| *value)
+            .collect();
+        values.sort_unstable();
+        values.dedup();
 
-        let placeholders = std::iter::repeat_n("?", candidates.len())
+        let placeholders = std::iter::repeat_n("?", values.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!(
-            "SELECT id, username, custom_id FROM consumers \
-             WHERE namespace = ? AND (id IN ({}) OR username IN ({}) OR custom_id IN ({}))",
-            placeholders, placeholders, placeholders
-        );
-        let sql = if exclude_id.is_some() {
-            format!("{} AND id != ?", sql)
+        let exclude_filter = if exclude_id.is_some() {
+            " AND consumer_id != ?"
         } else {
-            sql
+            ""
         };
-
-        let sql = self.q(&sql);
+        let sql = self.q(&format!(
+            "SELECT identity_value, consumer_id \
+             FROM consumer_identity_index \
+             WHERE namespace = ? \
+             AND identity_value IN ({placeholders}){exclude_filter}"
+        ));
         let mut query = sqlx::query(&sql).bind(namespace);
-        for _ in 0..3 {
-            for (_, value) in &candidates {
-                query = query.bind(*value);
-            }
+        for value in &values {
+            query = query.bind(*value);
         }
         if let Some(exclude_id) = exclude_id {
             query = query.bind(exclude_id);
@@ -5448,31 +5493,71 @@ impl DatabaseStore {
 
         let rows = query.fetch_all(&self.pool()).await?;
         for row in rows {
-            let id: String = row.try_get("id")?;
-            let existing_username: String = row.try_get("username")?;
-            let existing_custom_id: Option<String> = row.try_get("custom_id").ok();
-
-            let existing_fields = [
-                ("id", Some(id.as_str())),
-                ("username", Some(existing_username.as_str())),
-                ("custom_id", existing_custom_id.as_deref()),
-            ];
-            for (candidate_field, candidate_value) in &candidates {
-                for (existing_field, existing_value) in existing_fields {
-                    if existing_value == Some(*candidate_value) {
-                        return Ok(Some(format_consumer_identity_conflict(
-                            candidate_field,
-                            candidate_value,
-                            existing_field,
-                            &id,
-                        )));
-                    }
-                }
-            }
+            let identity_value: String = row.try_get("identity_value")?;
+            let owner_id: String = row.try_get("consumer_id")?;
+            let conflict = self
+                .format_indexed_consumer_identity_conflict(
+                    namespace,
+                    &candidates,
+                    &identity_value,
+                    &owner_id,
+                )
+                .await?;
+            self.check_slow_query("check_consumer_identity_unique", start);
+            return Ok(Some(conflict));
         }
 
         self.check_slow_query("check_consumer_identity_unique", start);
         Ok(None)
+    }
+
+    async fn format_indexed_consumer_identity_conflict(
+        &self,
+        namespace: &str,
+        candidates: &[(&str, &str)],
+        identity_value: &str,
+        owner_id: &str,
+    ) -> Result<String, anyhow::Error> {
+        let row: Option<AnyRow> = sqlx::query(&self.q(
+            "SELECT id, username, custom_id FROM consumers \
+             WHERE namespace = ? AND id = ?",
+        ))
+        .bind(namespace)
+        .bind(owner_id)
+        .fetch_optional(&self.pool())
+        .await?;
+        let Some(row) = row else {
+            // Index claimed a collision but the owner row is gone. Fail
+            // closed rather than treating an inconclusive index hit as unique.
+            return Ok(format!(
+                "Consumer identity '{}' conflicts with consumer '{}'",
+                identity_value, owner_id
+            ));
+        };
+        let existing_id: String = row.try_get("id")?;
+        let existing_username: String = row.try_get("username")?;
+        let existing_custom_id: Option<String> = row.try_get("custom_id").ok();
+        let existing_fields = [
+            ("id", Some(existing_id.as_str())),
+            ("username", Some(existing_username.as_str())),
+            ("custom_id", existing_custom_id.as_deref()),
+        ];
+        for (candidate_field, candidate_value) in candidates {
+            for (existing_field, existing_value) in existing_fields {
+                if existing_value == Some(*candidate_value) {
+                    return Ok(format_consumer_identity_conflict(
+                        candidate_field,
+                        candidate_value,
+                        existing_field,
+                        owner_id,
+                    ));
+                }
+            }
+        }
+        Ok(format!(
+            "Consumer identity '{}' conflicts with consumer '{}'",
+            identity_value, owner_id
+        ))
     }
 
     /// Check if a keyauth API key is unique across all consumers.
@@ -7193,7 +7278,7 @@ impl DatabaseStore {
         }
 
         Self::check_atomic_batch_fault(fault, AtomicBatchPhase::AdmissionRevalidation, 0)?;
-        if mode.validates_mtls_dns() {
+        if mode.validates_mtls_dns() && graph.requires_post_write_policy_admission() {
             for namespace in &admission_namespaces {
                 self.validate_namespace_admission_tx(&mut tx, namespace)
                     .await?;
@@ -10945,6 +11030,13 @@ impl DatabaseBackend for DatabaseStore {
         namespace: &str,
     ) -> Result<GatewayConfig, anyhow::Error> {
         DatabaseStore::load_namespace_snapshot(self, namespace).await
+    }
+
+    async fn load_namespace_policy_graph(
+        &self,
+        namespace: &str,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        DatabaseStore::load_namespace_policy_graph(self, namespace).await
     }
 
     async fn count_namespace_resources(

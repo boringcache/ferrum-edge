@@ -4129,3 +4129,141 @@ fn sql_namespace_registry_backfill_does_not_nest_a_sqlite_begin() {
          {rollback}"
     );
 }
+
+fn http_route_proxy(
+    id: &str,
+    namespace: &str,
+    listen_path: Option<&str>,
+    hosts: &[&str],
+) -> Proxy {
+    let mut proxy = serde_json::from_value(json!({
+        "id": id,
+        "namespace": namespace,
+        "hosts": hosts,
+        "listen_path": listen_path,
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 8080
+    }))
+    .unwrap();
+    proxy.normalize_fields();
+    proxy
+}
+
+async fn sqlite_uniqueness_store() -> (DatabaseStore, tempfile::TempDir) {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("admission_point_lookups.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    (store, temp_dir)
+}
+
+#[tokio::test]
+async fn check_listen_path_unique_rejects_catch_all_and_isolates_namespaces() {
+    let (store, _tmp) = sqlite_uniqueness_store().await;
+
+    let catch_all = http_route_proxy("p-catch", "ferrum", Some("/svc/1"), &[]);
+    store.create_proxy(&catch_all).await.unwrap();
+
+    let same_path_other_hosts =
+        http_route_proxy("p-overlap", "ferrum", Some("/svc/1"), &["api.example.com"]);
+    assert!(
+        !store
+            .check_listen_path_unique(
+                "ferrum",
+                same_path_other_hosts.listen_path.as_deref(),
+                &same_path_other_hosts.hosts,
+                None,
+            )
+            .await
+            .unwrap(),
+        "empty hosts is a catch-all that overlaps every host on the same listen_path"
+    );
+
+    let other_namespace = http_route_proxy("p-other-ns", "tenant-b", Some("/svc/1"), &[]);
+    assert!(
+        store
+            .check_listen_path_unique(
+                "tenant-b",
+                other_namespace.listen_path.as_deref(),
+                &other_namespace.hosts,
+                None,
+            )
+            .await
+            .unwrap(),
+        "the same listen_path in another namespace must not collide"
+    );
+
+    let host_only = http_route_proxy("p-host-only", "ferrum", None, &["api.example.com"]);
+    store.create_proxy(&host_only).await.unwrap();
+    let path_carrying =
+        http_route_proxy("p-path", "ferrum", Some("/svc/path"), &["api.example.com"]);
+    assert!(
+        store
+            .check_listen_path_unique(
+                "ferrum",
+                path_carrying.listen_path.as_deref(),
+                &path_carrying.hosts,
+                None,
+            )
+            .await
+            .unwrap(),
+        "host-only and path-carrying proxies on the same host occupy different match tiers"
+    );
+}
+
+#[tokio::test]
+async fn check_consumer_identity_unique_is_namespace_isolated() {
+    let (store, _tmp) = sqlite_uniqueness_store().await;
+
+    let mut alice = make_consumer("c-alice", "alice");
+    alice.namespace = "ferrum".to_string();
+    store.create_consumer(&alice).await.unwrap();
+
+    let conflict = store
+        .check_consumer_identity_unique("ferrum", "c-other", "alice", None, None)
+        .await
+        .unwrap();
+    assert!(
+        conflict.is_some(),
+        "the same username in the same namespace must collide: {conflict:?}"
+    );
+
+    let isolated = store
+        .check_consumer_identity_unique("tenant-b", "c-other", "alice", None, None)
+        .await
+        .unwrap();
+    assert!(
+        isolated.is_none(),
+        "the same username in another namespace must be unique: {isolated:?}"
+    );
+}
+
+#[test]
+fn consumer_identity_uniqueness_queries_the_identity_index() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+    let start = source
+        .find("    pub async fn check_consumer_identity_unique(")
+        .expect("SQL identity uniqueness check");
+    let end = source[start..]
+        .find("\n    pub async fn check_keyauth_key_unique(")
+        .expect("keyauth uniqueness follows identity uniqueness")
+        + start;
+    let body = &source[start..end];
+    assert!(
+        body.contains("FROM consumer_identity_index"),
+        "identity uniqueness must probe the identity index, not scan consumers:\n{body}"
+    );
+    assert!(
+        body.contains("WHERE namespace = ?"),
+        "identity uniqueness must carry the namespace predicate in the query:\n{body}"
+    );
+    assert!(
+        !body.contains("id IN (")
+            && !body.contains("username IN (")
+            && !body.contains("custom_id IN ("),
+        "identity uniqueness must not scan the consumers table:\n{body}"
+    );
+}
