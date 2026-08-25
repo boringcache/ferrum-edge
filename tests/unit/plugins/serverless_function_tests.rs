@@ -5590,14 +5590,7 @@ async fn test_pre_proxy_rejects_non_object_2xx_response_bodies() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    let malformed_bodies: &[&[u8]] = &[
-        b"not json",
-        b"",
-        b"[]",
-        b"\"string\"",
-        b"42",
-        b"null",
-    ];
+    let malformed_bodies: &[&[u8]] = &[b"not json", b"", b"[]", b"\"string\"", b"42", b"null"];
 
     for body in malformed_bodies {
         let server = MockServer::start().await;

@@ -3014,11 +3014,9 @@ impl Plugin for ServerlessFunction {
                         candidates.insert(name.as_str().to_string(), value.to_string());
                     }
                     let connection_listed: HashSet<String> =
-                        crate::proxy::headers::parse_connection_listed_from_str_map(
-                            &candidates,
-                        )
-                        .into_iter()
-                        .collect();
+                        crate::proxy::headers::parse_connection_listed_from_str_map(&candidates)
+                            .into_iter()
+                            .collect();
                     for (key, value) in candidates {
                         if connection_listed.contains(&key)
                             || crate::proxy::headers::is_backend_request_strip_header(&key)
