@@ -293,6 +293,19 @@ see [`docs/gateway_api_conformance.md`](../../docs/gateway_api_conformance.md).
 Gateway API `GRPCRoute` attaches to HTTP/HTTPS listeners and is release-gated by
 the upstream `GATEWAY-GRPC` profile (same doc).
 
+## High availability and disruption
+
+`replicaCount` defaults to **2** so a rolling upgrade or node drain can evict one
+gateway pod without dropping the front door to zero. The optional
+PodDisruptionBudget (`podDisruptionBudget.enabled`, default **true**,
+`minAvailable: 1`) renders only when at least two replicas are configured (or
+`autoscaling.minReplicas >= 2` when HPA is enabled).
+
+Single-replica installs (`replicaCount: 1`) are an explicit non-HA choice: the
+chart skips the PDB so `minAvailable: 1` cannot block all voluntary evictions
+during a drain. Pair multi-replica installs with `topologySpreadConstraints` if
+you need hostname spread beyond the PDB alone.
+
 ## TLS material
 
 Each surface under `tls.*` (`frontend`, `admin`, `backend`, `cpGrpc`, `dpGrpc`)

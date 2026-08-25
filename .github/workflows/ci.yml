@@ -2688,6 +2688,41 @@ jobs:
             echo "::error title=Development example still uses cluster-wide CP without trust binding::development-values.yaml must stay single-namespace or mount a trust bundle (GHSA-3f2j-wwqw-grmg)"
             exit 1
           fi
+          # PodDisruptionBudget: data-path workloads with replicas >= 2 get
+          # minAvailable protection; single-replica workloads skip PDB so drains
+          # are not deadlocked.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set eastWest.enabled=true \
+            --set injector.enabled=true \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            --show-only templates/pdb.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/pdb-data-path.yaml"
+          grep -c 'kind: PodDisruptionBudget' "$RUNNER_TEMP/ferrum-helm-results/pdb-data-path.yaml" | grep -Fxq '2'
+          grep -Fq 'name: ferrum-mesh-east-west' "$RUNNER_TEMP/ferrum-helm-results/pdb-data-path.yaml"
+          grep -Fq 'name: ferrum-mesh-injector' "$RUNNER_TEMP/ferrum-helm-results/pdb-data-path.yaml"
+          grep -Fq 'minAvailable: 1' "$RUNNER_TEMP/ferrum-helm-results/pdb-data-path.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --show-only templates/pdb.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/pdb-cp-single.yaml"
+          if grep -Fq 'kind: PodDisruptionBudget' "$RUNNER_TEMP/ferrum-helm-results/pdb-cp-single.yaml"; then
+            echo "::error title=Single-replica CP PDB rendered::controlPlane.replicas=1 must not render a minAvailable PDB"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.replicas=2 \
+            --show-only templates/pdb.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/pdb-cp-ha.yaml"
+          grep -Fq 'name: ferrum-mesh-control-plane' "$RUNNER_TEMP/ferrum-helm-results/pdb-cp-ha.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set eastWest.enabled=true \
+            --set injector.enabled=true \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            --show-only templates/east-west-gateway-deployment.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/east-west-spread.yaml"
+          grep -Fq 'topologyKey: kubernetes.io/hostname' "$RUNNER_TEMP/ferrum-helm-results/east-west-spread.yaml"
+          grep -Fq 'replicas: 2' "$RUNNER_TEMP/ferrum-helm-results/east-west-spread.yaml"
           # Mesh workload probes (#2450): helm stays in this trusted workflow shell;
           # assertions live in .github/scripts/verify_mesh_workload_probes.py so the
           # trusted ARM64 build-policy gate does not freeze probe-shape edits here.
@@ -3019,6 +3054,16 @@ jobs:
           # Default (file mode) renders a runnable, Secret-free gateway.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
+          grep -Fq 'kind: PodDisruptionBudget' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
+          grep -Fq 'minAvailable: 1' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set replicaCount=1 \
+            --show-only templates/pdb.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/pdb-single-replica.yaml"
+          if grep -Fq 'kind: PodDisruptionBudget' "$RUNNER_TEMP/ferrum-gateway-helm-results/pdb-single-replica.yaml"; then
+            echo "::error title=Single-replica gateway PDB rendered::replicaCount=1 must not render a minAvailable PDB"
+            exit 1
+          fi
           grep -Fq 'name: FERRUM_FILE_CONFIG_PATH' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
           # GatewayConfig deserialization requires all four top-level lists (version,
           # proxies, consumers, plugin_configs) with no serde defaults, so the default
