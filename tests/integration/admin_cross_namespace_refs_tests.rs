@@ -842,14 +842,12 @@ async fn seed_store_mesh_route_dispatch(
 }
 
 async fn upstream_exists(store: &DatabaseStore, namespace: &str, id: &str) -> bool {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM upstreams WHERE id = ? AND namespace = ?",
-    )
-    .bind(id)
-    .bind(namespace)
-    .fetch_one(store.pool())
-    .await
-    .expect("upstream count must succeed")
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM upstreams WHERE id = ? AND namespace = ?")
+        .bind(id)
+        .bind(namespace)
+        .fetch_one(store.pool())
+        .await
+        .expect("upstream count must succeed")
         > 0
 }
 

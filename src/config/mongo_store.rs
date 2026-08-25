@@ -17805,9 +17805,7 @@ mod inner {
                 .find(".count_documents(doc! { \"upstream_id\": id })")
                 .expect("proxy reference check");
             let plugin_refs = standalone_path
-                .find(
-                    ".find_mesh_route_dispatch_upstream_ref_opt_session(None, namespace, id)",
-                )
+                .find(".find_mesh_route_dispatch_upstream_ref_opt_session(None, namespace, id)")
                 .expect("plugin reference check");
 
             assert!(
