@@ -355,7 +355,7 @@ The test configures the gateway with optimized connection pool settings matching
 | Env Var | Value | Purpose |
 |---------|-------|---------|
 | `FERRUM_LOG_LEVEL` | error | Minimize logging overhead during load |
-| `FERRUM_DB_POLL_INTERVAL` | 2 | Fast config reload for mutation testing (default is 30s) |
+| `FERRUM_DB_POLL_INTERVAL` | 30 | Production default. Wave-end convergence is driven by the blocking `GET /config/apply-status` cursor gate (which raises an immediate poll wake), not the interval; a 2s interval kept the poller in continuous full reloads during deferred provisioning and starved the database (issue #4139) |
 | `FERRUM_BASIC_AUTH_HMAC_SECRET` | (set) | HMAC-SHA256 hashing for `basic_auth` |
 
 > **Note on `FERRUM_POOL_MAX_IDLE_PER_HOST`**: This value must be >= your peak concurrency level. If set too low, the gateway creates new TCP connections per request instead of reusing pooled ones, causing massive performance degradation (10x+ RPS drop). The performance tests use 200 to match the wrk connection count.
