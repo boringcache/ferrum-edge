@@ -76,15 +76,23 @@ fn dev_and_pr_build_do_not_set_panic_abort() {
 
 #[test]
 fn compiled_panic_cfg_matches_documented_split() {
+    // `cfg!` folds to a literal, so these are compile-time invariants rather
+    // than runtime checks — clippy::assertions_on_constants says so. Asserting
+    // them in a `const` block keeps the guarantee and states it honestly: the
+    // build either has the right panic strategy or it does not compile.
     if cfg!(debug_assertions) {
-        assert!(
-            cfg!(panic = "unwind"),
-            "dev/test/pr-build must unwind so JoinError::is_panic() is observable"
-        );
+        const {
+            assert!(
+                cfg!(panic = "unwind"),
+                "dev/test/pr-build must unwind so JoinError::is_panic() is observable"
+            )
+        };
     } else {
-        assert!(
-            cfg!(panic = "abort"),
-            "shipping profiles must abort on panic; see Cargo.toml [profile.release]"
-        );
+        const {
+            assert!(
+                cfg!(panic = "abort"),
+                "shipping profiles must abort on panic; see Cargo.toml [profile.release]"
+            )
+        };
     }
 }
