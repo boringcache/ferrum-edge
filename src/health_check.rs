@@ -35,7 +35,6 @@ use crate::tls::backend::SanAllowListVerifier;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use crate::tls::{backend_client_config_builder, build_server_verifier_with_crls};
 use dashmap::DashMap;
-use rustls::client::WebPkiServerVerifier;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
