@@ -2086,7 +2086,7 @@ impl LoadBalancerCache {
     /// Called from one of two sources (active takes precedence):
     /// - **Active path**: `health_check.rs` after each successful probe RTT
     /// - **Passive path**: `proxy/mod.rs` after each successful non-5xx backend
-    ///   response (TTFB) -- only when no active health checks are configured
+    ///   response (TTFB) -- only when no active health-check probes are running
     pub fn record_latency(
         &self,
         namespace: &str,

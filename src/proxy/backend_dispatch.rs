@@ -1334,7 +1334,9 @@ fn record_backend_outcome_inner(
     //      from fast-failing backends, which would skew the EWMA toward broken targets)
     //   4. No active health checks configured for this upstream — when active probes
     //      exist, they provide consistent, controlled RTT measurements and take
-    //      precedence over passive TTFB which includes variable application processing time
+    //      precedence over passive TTFB which includes variable application processing time.
+    //      Use running probes (not merely configured active checks) so SD-only
+    //      upstreams sample TTFB until discovery actually starts probe tasks.
     let client_side_no_backend_signal = client_side_no_backend_signal(error_class);
     // A post-wire backend failure (a streaming `ReadWriteTimeout`, or a
     // mid-response reset/close) is NOT a `connection_error` — the request
@@ -1347,13 +1349,9 @@ fn record_backend_outcome_inner(
     if !client_side_no_backend_signal
         && let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), upstream_target)
     {
-        let upstream =
-            LoadBalancerCache::get_upstream_from(lb_snapshot, &proxy.namespace, upstream_id);
-        let has_active_hc = upstream
-            .as_ref()
-            .and_then(|u| u.health_checks.as_ref())
-            .and_then(|hc| hc.active.as_ref())
-            .is_some();
+        let has_active_hc = state
+            .health_checker
+            .has_running_active_probes(&proxy.namespace, upstream_id);
         if !has_active_hc && let Some(balancer) = selected_balancer {
             if backend_failure || response_status >= 500 {
                 // Failed attempts count toward warm-up exit with a penalty EWMA
@@ -2810,6 +2808,139 @@ mod tests {
         assert!(
             is_unhealthy(),
             "a real backend 502 in unhealthy_status_codes must mark the target unhealthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn sd_only_active_health_check_still_records_passive_latency_until_probes_run() {
+        let mut config: crate::config::types::GatewayConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": "1",
+                "consumers": [],
+                "plugin_configs": [],
+                "proxies": [{
+                    "id": "sd-ll-proxy",
+                    "listen_path": "/",
+                    "backend_scheme": "http",
+                    "backend_host": "unused.local",
+                    "backend_port": 0,
+                    "upstream_id": "sd-ll-upstream"
+                }],
+                "upstreams": [{
+                    "id": "sd-ll-upstream",
+                    "targets": [],
+                    "algorithm": "least_latency",
+                    "health_checks": {
+                        "active": {
+                            "probe_type": "tcp",
+                            "interval_seconds": 60,
+                            "timeout_ms": 100
+                        }
+                    },
+                    "service_discovery": {
+                        "provider": "dns_sd",
+                        "dns_sd": {
+                            "service_name": "_http._tcp.svc.local"
+                        }
+                    }
+                }]
+            }))
+            .expect("test config should deserialize");
+        config.normalize_fields();
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        let (state, _) = crate::proxy::ProxyState::new(config, dns_cache, env_config, None, None)
+            .expect("SD-only upstream with active health checks should build");
+        let epoch = state.request_epoch.load();
+        let proxy = &epoch.config.proxies[0];
+
+        assert!(
+            !state
+                .health_checker
+                .has_running_active_probes(&proxy.namespace, "sd-ll-upstream"),
+            "empty static targets must not spawn active probes"
+        );
+
+        let target = UpstreamTarget {
+            host: "10.0.0.1".to_string(),
+            port: 8080,
+            service_port_policy_key: None,
+            weight: 1,
+            tags: HashMap::new(),
+            locality: None,
+            path: None,
+        };
+        let balancer = Arc::new(LoadBalancer::new(
+            "sd-ll-upstream",
+            LoadBalancerAlgorithm::LeastLatency,
+            std::slice::from_ref(&target),
+            None,
+        ));
+
+        record_backend_outcome_no_conn_end(
+            &state,
+            proxy,
+            &epoch.load_balancer,
+            Some(&balancer),
+            Some(&target),
+            None,
+            200,
+            false,
+            None,
+            false,
+            true,
+            Duration::from_micros(2500),
+        );
+
+        let samples = balancer
+            .latency_sample_count
+            .get("10.0.0.1:8080")
+            .map(|count| count.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0);
+        assert!(
+            samples >= 1,
+            "passive TTFB must sample until active probes are actually running, got {samples}"
+        );
+
+        let upstream = &epoch.config.upstreams[0];
+        let active = upstream
+            .health_checks
+            .as_ref()
+            .and_then(|hc| hc.active.clone())
+            .expect("active health check");
+        state.health_checker.restart_upstream_probes(
+            &proxy.namespace,
+            "sd-ll-upstream",
+            std::slice::from_ref(&target),
+            active,
+            crate::config::types::BackendTlsConfig::from_upstream(upstream),
+        );
+        assert!(state
+            .health_checker
+            .has_running_active_probes(&proxy.namespace, "sd-ll-upstream"));
+
+        record_backend_outcome_no_conn_end(
+            &state,
+            proxy,
+            &epoch.load_balancer,
+            Some(&balancer),
+            Some(&target),
+            None,
+            200,
+            false,
+            None,
+            false,
+            true,
+            Duration::from_micros(2500),
+        );
+        let samples_after = balancer
+            .latency_sample_count
+            .get("10.0.0.1:8080")
+            .map(|count| count.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0);
+        assert_eq!(
+            samples_after, samples,
+            "running active probes must suppress passive TTFB sampling"
         );
     }
 }
