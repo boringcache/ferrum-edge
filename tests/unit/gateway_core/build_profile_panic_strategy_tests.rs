@@ -80,19 +80,22 @@ fn compiled_panic_cfg_matches_documented_split() {
     // than runtime checks — clippy::assertions_on_constants says so. Asserting
     // them in a `const` block keeps the guarantee and states it honestly: the
     // build either has the right panic strategy or it does not compile.
-    if cfg!(debug_assertions) {
-        const {
+    // The `if` must live INSIDE the const block. A `const { .. }` nested in a
+    // runtime branch is still const-evaluated whether or not that branch is
+    // taken, so putting one in each arm makes BOTH assertions fire and the
+    // build dies on whichever profile it is not. With the branch inside, const
+    // evaluation follows it and only the applicable assertion is checked.
+    const {
+        if cfg!(debug_assertions) {
             assert!(
                 cfg!(panic = "unwind"),
                 "dev/test/pr-build must unwind so JoinError::is_panic() is observable"
             )
-        };
-    } else {
-        const {
+        } else {
             assert!(
                 cfg!(panic = "abort"),
                 "shipping profiles must abort on panic; see Cargo.toml [profile.release]"
             )
-        };
-    }
+        }
+    };
 }
