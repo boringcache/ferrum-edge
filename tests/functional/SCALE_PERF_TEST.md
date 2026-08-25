@@ -106,7 +106,9 @@ Constants at the top of the test file control the test parameters:
 
 ## Batch Admin API
 
-The test uses the `POST /batch` endpoint introduced to improve admin write throughput at scale. Instead of 12,000 individual HTTP requests per batch (4 resources x 3,000), it sends ~120 batch requests (3,000 / 100 chunks x 4 resource types). Each request is persisted in a single database transaction covering its whole graph, eliminating per-row transaction overhead. Because the request is all-or-nothing, any non-2xx response means nothing from that request was applied.
+The test uses the `POST /batch` endpoint introduced to improve admin write throughput at scale. Instead of 12,000 individual HTTP requests per batch (4 resources x 3,000), it sends ~120 batch requests (3,000 / 100 chunks x 4 resource types). Each request is persisted in a single database transaction covering its whole graph, eliminating per-row transaction overhead. Because the request is all-or-nothing, any non-success response means nothing from that request was applied.
+
+Every chunk posts with **`?apply=async`** (issue #4139): the graph commits durably and the gateway answers `202 Accepted` with an `X-Ferrum-Config-Cursor` header instead of paying one synchronous poll-loop reload per chunk — the per-chunk reload cost is what pushed the MongoDB leg past its job budget (issue #4136), because reload time grows with total config size. The harness keeps the highest cursor it saw across the wave and, before each measurement, proves the whole wave live with ONE blocking `GET /config/apply-status?epoch=E&sequence=S&wait_ms=30000` — a `rejected` or `unverifiable` cursor aborts loudly. The pre-existing data-plane convergence gate (probing sample proxies end to end) still runs afterwards as the routability proof. This is the recommended bulk-provisioning recipe for any client doing high-churn admin writes at scale.
 
 ## Example Output
 

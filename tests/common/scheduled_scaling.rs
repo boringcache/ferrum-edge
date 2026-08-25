@@ -9,6 +9,13 @@
 //! HTTP 503 bodies: the namespace-fence object
 //! `{"error":"Namespace mutation is temporarily unavailable; retry later"}` and
 //! the persistence/lease object `{"error": <string>, "rollback": "not_needed"}`.
+//!
+//! Provisioning posts with `?apply=async` (issue #4139): each atomic body
+//! commits durably and answers `202 Accepted` with an `X-Ferrum-Config-Cursor`
+//! instead of paying one synchronous poll-loop reload per chunk — the cost
+//! that outgrew the 30k job budget in issue #4136. The harness keeps the
+//! highest cursor it saw and proves the whole wave live with ONE blocking
+//! `GET /config/apply-status` before the data-plane convergence gate runs.
 
 #![allow(dead_code)]
 
@@ -185,10 +192,14 @@ pub fn classify_admin_batch_response(
     retry_after: Option<&str>,
     body: &str,
 ) -> BatchProvisionDecision {
-    // POST /batch documents exactly one successful outcome. Treat every other
-    // status, including generic 2xx and partial-success responses, as fatal so
-    // a scaling gate cannot accept a partially or unexpectedly applied graph.
-    if status == 201 {
+    // POST /batch documents exactly two successful outcomes: the synchronous
+    // 201 (covering generation proven live) and the deferred `?apply=async`
+    // 202 (durably committed, cursor returned, liveness proven later through
+    // GET /config/apply-status). Both are the whole graph — 202 is never a
+    // partial apply. Treat every other status, including generic 2xx and
+    // partial-success responses, as fatal so a scaling gate cannot accept a
+    // partially or unexpectedly applied graph.
+    if status == 201 || status == 202 {
         return BatchProvisionDecision::Success;
     }
     if status == 503 && is_documented_retryable_batch_503_body(body) {
@@ -205,15 +216,42 @@ pub fn classify_admin_batch_response(
     }
 }
 
-/// POST one atomic batch body, retrying only the documented all-or-nothing 503s.
+/// Covering live-apply cursor parsed from `X-Ferrum-Config-Cursor` (issue
+/// #4139). `Ord` is epoch-major: a cursor from a later database topology
+/// supersedes any sequence from an earlier one, which makes "keep the highest
+/// cursor seen" correct across a mid-provisioning reconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BatchApplyCursor {
+    pub epoch: u64,
+    pub sequence: u64,
+}
+
+/// Parse the documented `{topology_epoch}:{sequence}` cursor header value.
+pub fn parse_config_cursor_header(raw: &str) -> Option<BatchApplyCursor> {
+    let (epoch, sequence) = raw.split_once(':')?;
+    Some(BatchApplyCursor {
+        epoch: epoch.parse().ok()?,
+        sequence: sequence.parse().ok()?,
+    })
+}
+
+/// POST one atomic batch body with `?apply=async`, retrying only the
+/// documented all-or-nothing 503s.
+///
+/// Returns the covering [`BatchApplyCursor`] from the deferred `202` so the
+/// caller can prove the whole wave live with one blocking
+/// `GET /config/apply-status` (issue #4139). `None` means no cursor was
+/// returned — a topology with no poll-loop coordinator (plain `201`) or a
+/// committed-but-not-live `503` from a pre-#4140 gateway — and the caller
+/// must rely on its data-plane convergence gate alone.
 pub async fn post_admin_batch(
     client: &reqwest::Client,
     admin_url: &str,
     auth_header: &str,
     body: &serde_json::Value,
     operation: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let url = format!("{}/batch", admin_url);
+) -> Result<Option<BatchApplyCursor>, Box<dyn std::error::Error>> {
+    let url = format!("{}/batch?apply=async", admin_url);
     let mut last_status = 0u16;
     let mut last_body = String::new();
     let started = Instant::now();
@@ -242,6 +280,11 @@ pub async fn post_admin_batch(
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        let cursor = response
+            .headers()
+            .get("x-ferrum-config-cursor")
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_config_cursor_header);
         let body_text = match response.text().await {
             Ok(text) => text,
             Err(err) => {
@@ -252,7 +295,7 @@ pub async fn post_admin_batch(
         };
 
         match classify_admin_batch_response(status, retry_after.as_deref(), &body_text) {
-            BatchProvisionDecision::Success => return Ok(()),
+            BatchProvisionDecision::Success => return Ok(cursor),
             BatchProvisionDecision::CommittedNotLive { reason } => {
                 // Durable, just not published yet. Carry on: the caller's
                 // bounded convergence gate is what decides when the data plane
@@ -261,7 +304,7 @@ pub async fn post_admin_batch(
                     "{operation}: committed but not yet live ({reason}); \
                      continuing to the convergence gate"
                 );
-                return Ok(());
+                return Ok(cursor);
             }
             BatchProvisionDecision::Fatal { status, body } => {
                 return Err(format!("{operation} failed: {status} - {body}").into());
@@ -402,6 +445,118 @@ where
         }
 
         tokio::time::sleep(Duration::from_secs(CONFIG_CONVERGENCE_POLL_INTERVAL_SECS)).await;
+    }
+}
+
+/// Per-probe blocking wait for `GET /config/apply-status`, in milliseconds.
+/// Matches the endpoint's documented maximum (the synchronous mutation path's
+/// own 30s budget); larger values are rejected with `400`.
+pub const APPLY_STATUS_WAIT_MS: u64 = 30_000;
+
+/// Block until the poll loop has accepted a generation covering `cursor`, or
+/// fail with an explicit fail-closed diagnostic (issue #4139).
+///
+/// This is the amortization that keeps 30k-scale provisioning inside the job
+/// budget: every `?apply=async` chunk answered `202` without paying a reload,
+/// and this ONE bounded wait (shared [`CONFIG_CONVERGENCE_MAX_WAIT_SECS`]
+/// budget) proves the whole wave live, because cursors are monotone and the
+/// caller kept the highest one it saw.
+///
+/// `rejected` and `unverifiable` abort loudly: the first means the runtime
+/// refused the candidate and the wave will never go live; the second means the
+/// database topology was replaced mid-provisioning and liveness can no longer
+/// be proven from this process. Neither may fall through to a throughput
+/// measurement. Transport errors are retried inside the same wall-clock
+/// budget — a transient admin-plane hiccup must not abort a multi-hour job.
+pub async fn wait_for_batch_apply_cursor(
+    client: &reqwest::Client,
+    admin_url: &str,
+    auth_header: &str,
+    cursor: BatchApplyCursor,
+    label: &str,
+) -> Result<Duration, String> {
+    let budget = Duration::from_secs(CONFIG_CONVERGENCE_MAX_WAIT_SECS);
+    let started = Instant::now();
+    let url = format!(
+        "{admin_url}/config/apply-status?epoch={}&sequence={}&wait_ms={APPLY_STATUS_WAIT_MS}",
+        cursor.epoch, cursor.sequence
+    );
+    let mut last_outcome = "not probed".to_string();
+    loop {
+        if started.elapsed() >= budget {
+            return Err(format!(
+                "live apply never converged for {label}: cursor {}:{} still unresolved after \
+                 {elapsed:.1}s (bound {CONFIG_CONVERGENCE_MAX_WAIT_SECS}s); last outcome: \
+                 {last_outcome}. This is a configuration-publication failure, not a throughput \
+                 regression.",
+                cursor.epoch,
+                cursor.sequence,
+                elapsed = started.elapsed().as_secs_f64()
+            ));
+        }
+        let response = match client
+            .get(&url)
+            .header("Authorization", auth_header)
+            // Must exceed the server-side blocking wait so the bound that
+            // fires is the documented endpoint budget, not the client's.
+            .timeout(Duration::from_secs(APPLY_STATUS_WAIT_MS / 1000 + 30))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                last_outcome = format!("transport error: {error}");
+                tokio::time::sleep(Duration::from_secs(CONFIG_CONVERGENCE_POLL_INTERVAL_SECS))
+                    .await;
+                continue;
+            }
+        };
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        if status != 200 {
+            // Non-200 is a contract violation (bad cursor, missing
+            // coordinator, auth): retrying the identical request cannot
+            // succeed, so fail with the server's own diagnostic.
+            return Err(format!(
+                "{label}: GET /config/apply-status answered {status} for cursor {}:{} - {body}",
+                cursor.epoch, cursor.sequence
+            ));
+        }
+        let state = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("state")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        match state.as_deref() {
+            Some("applied") => return Ok(started.elapsed()),
+            Some("pending") => {
+                // The bounded server-side wait elapsed without acceptance;
+                // re-probe until the shared convergence budget runs out.
+                last_outcome = format!("pending ({body})");
+            }
+            Some("rejected") => {
+                return Err(format!(
+                    "{label}: the runtime REJECTED the generation covering cursor {}:{}; the \
+                     provisioned graph is durable but will never go live - {body}",
+                    cursor.epoch, cursor.sequence
+                ));
+            }
+            Some("unverifiable") => {
+                return Err(format!(
+                    "{label}: cursor {}:{} became unverifiable (database topology replaced \
+                     mid-provisioning); liveness cannot be proven from this process - {body}",
+                    cursor.epoch, cursor.sequence
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "{label}: GET /config/apply-status answered an unknown state {other:?}: {body}"
+                ));
+            }
+        }
     }
 }
 

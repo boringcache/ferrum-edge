@@ -12,15 +12,15 @@ use serde_json::json;
 mod scheduled_scaling;
 
 use scheduled_scaling::{
-    ADMIN_BATCH_REQUEST_TIMEOUT_SECS, BATCH_ROLLBACK_NOT_NEEDED, BatchProvisionDecision,
-    CONFIG_CONVERGENCE_MAX_WAIT_SECS, CONFIG_CONVERGENCE_POLL_INTERVAL_SECS,
-    NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS, NAMESPACE_FENCE_MAX_ATTEMPTS,
-    NAMESPACE_FENCE_MAX_BACKOFF_SECS, NAMESPACE_FENCE_MAX_RETRY_AFTER_SECS,
-    NAMESPACE_FENCE_MAX_TOTAL_RETRY_SECS, NAMESPACE_FENCE_RETRY_MESSAGE,
-    SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, classify_admin_batch_response,
-    documented_batch_rollback_not_needed_body, documented_namespace_fence_body,
-    namespace_fence_backoff, namespace_fence_retry_after_delay,
-    scheduled_scaling_admin_jwt_max_ttl_value,
+    ADMIN_BATCH_REQUEST_TIMEOUT_SECS, APPLY_STATUS_WAIT_MS, BATCH_ROLLBACK_NOT_NEEDED,
+    BatchApplyCursor, BatchProvisionDecision, CONFIG_CONVERGENCE_MAX_WAIT_SECS,
+    CONFIG_CONVERGENCE_POLL_INTERVAL_SECS, NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS,
+    NAMESPACE_FENCE_MAX_ATTEMPTS, NAMESPACE_FENCE_MAX_BACKOFF_SECS,
+    NAMESPACE_FENCE_MAX_RETRY_AFTER_SECS, NAMESPACE_FENCE_MAX_TOTAL_RETRY_SECS,
+    NAMESPACE_FENCE_RETRY_MESSAGE, SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS,
+    classify_admin_batch_response, documented_batch_rollback_not_needed_body,
+    documented_namespace_fence_body, namespace_fence_backoff, namespace_fence_retry_after_delay,
+    parse_config_cursor_header, scheduled_scaling_admin_jwt_max_ttl_value,
 };
 
 const WORKFLOW: &str = include_str!("../../../.github/workflows/scaling-regression.yml");
@@ -677,5 +677,92 @@ fn committed_but_not_live_batches_continue_to_the_convergence_gate() {
             BatchProvisionDecision::Fatal { .. }
         ),
         "only the documented applied/reason shape may be treated as committed"
+    );
+}
+
+/// Issue #4139: deferred provisioning contracts.
+///
+/// `POST /batch?apply=async` answers `202 Accepted` for a durably committed
+/// whole graph; the harness treats that as success, keeps the highest
+/// `X-Ferrum-Config-Cursor` seen, and proves the wave live with one blocking
+/// `GET /config/apply-status` instead of one synchronous reload per chunk —
+/// the cost that outgrew the 30k job budget in issue #4136.
+#[test]
+fn deferred_batch_202_is_success_and_cursors_parse_epoch_major() {
+    assert_eq!(
+        classify_admin_batch_response(202, None, "{}"),
+        BatchProvisionDecision::Success,
+        "the deferred 202 is a fully committed graph, not a partial apply"
+    );
+    // Other 2xx stay fatal: only the two documented success shapes exist.
+    assert!(matches!(
+        classify_admin_batch_response(204, None, ""),
+        BatchProvisionDecision::Fatal { .. }
+    ));
+
+    assert_eq!(
+        parse_config_cursor_header("3:41"),
+        Some(BatchApplyCursor {
+            epoch: 3,
+            sequence: 41
+        })
+    );
+    for bad in ["", "3", "3:", ":41", "3:41:5", "a:b", "-1:2"] {
+        assert_eq!(
+            parse_config_cursor_header(bad),
+            None,
+            "malformed cursor {bad:?} must not parse"
+        );
+    }
+
+    // Epoch-major ordering: a cursor from a later database topology
+    // supersedes any sequence from an earlier one, so max-tracking across a
+    // mid-provisioning reconnect keeps the right cursor.
+    let old_topology_high = BatchApplyCursor {
+        epoch: 1,
+        sequence: 999_999,
+    };
+    let new_topology_low = BatchApplyCursor {
+        epoch: 2,
+        sequence: 1,
+    };
+    assert!(new_topology_low > old_topology_high);
+    assert_eq!(
+        Some(new_topology_low).max(Some(old_topology_high)),
+        Some(new_topology_low)
+    );
+    assert_eq!(None.max(Some(old_topology_high)), Some(old_topology_high));
+}
+
+/// The status probe's server-side wait must match the endpoint's documented
+/// maximum (the synchronous mutation path's own budget); a larger value is a
+/// `400` and a smaller one only adds probe round-trips.
+#[test]
+fn apply_status_wait_matches_the_documented_endpoint_bound() {
+    assert_eq!(APPLY_STATUS_WAIT_MS, 30_000);
+    let openapi = include_str!("../../../openapi.yaml");
+    assert!(
+        openapi.contains("maximum: 30000"),
+        "openapi.yaml must pin the same wait_ms bound the harness relies on"
+    );
+}
+
+/// Both harnesses must post through the deferred helper and then gate on the
+/// covering cursor before any measurement phase.
+#[test]
+fn harnesses_provision_deferred_and_gate_on_the_cursor() {
+    assert!(
+        SCALE.contains("wait_for_batch_apply_cursor(")
+            && LOAD.contains("wait_for_batch_apply_cursor("),
+        "both harnesses must prove the deferred wave live before measuring"
+    );
+    let helper = include_str!("../../common/scheduled_scaling.rs");
+    assert!(
+        helper.contains("/batch?apply=async"),
+        "the shared helper must provision with the deferred opt-in"
+    );
+    assert!(
+        helper.contains("/config/apply-status?epoch="),
+        "the cursor gate must use the documented status endpoint"
     );
 }
