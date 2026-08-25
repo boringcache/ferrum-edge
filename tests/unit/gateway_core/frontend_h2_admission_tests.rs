@@ -59,7 +59,7 @@ impl ProxyHarness {
             admin_http_port: 0,
             admin_https_port: 0,
             max_connections: 0,
-            http_header_read_timeout_seconds,
+            http_header_read_timeout_seconds: header_read_timeout_seconds,
             shutdown_drain_seconds: 2,
             ..ferrum_edge::config::EnvConfig::default()
         };
