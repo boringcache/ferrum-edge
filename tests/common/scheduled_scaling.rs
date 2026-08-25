@@ -351,8 +351,10 @@ pub async fn post_admin_batch(
 /// measurement window. Both safety valves are correct — but a throughput
 /// measurement started inside that window measures convergence, not routing.
 ///
-/// Five minutes is the bound on waiting it out. Both harnesses poll the
-/// database every 2 seconds (`FERRUM_DB_POLL_INTERVAL=2`), and the forced full
+/// Five minutes is the bound on waiting it out. Both harnesses run the
+/// production default `FERRUM_DB_POLL_INTERVAL=30` (the live-apply cursor
+/// gate's demand-driven wake, not the interval, is what drives wave-end
+/// convergence since issue #4139), and the forced full
 /// reload observed at 9,000 proxies consumed roughly half of a 30-second
 /// window, so 300s is an order of magnitude above a linear extrapolation to
 /// 30,000 proxies. It also keeps the scale harness's ten-batch worst case
