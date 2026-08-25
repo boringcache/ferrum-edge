@@ -542,6 +542,20 @@ metrics:
     scrapeTimeout: 10s
     labels: {}
     annotations: {}
+    # Required when the scrape falls through to admin HTTPS (no plaintext admin
+    # port): rendered verbatim as the endpoint's tlsConfig. The HTTPS scrape
+    # carries the metrics bearer token, so the chart refuses to render an
+    # unverified endpoint implicitly — either point at the CA, e.g.
+    #   tlsConfig:
+    #     ca:
+    #       secret:
+    #         name: ferrum-admin-tls
+    #         key: ca.crt
+    #     serverName: ferrum-gateway-admin.ferrum.svc
+    # or accept an unverified endpoint deliberately with
+    #   tlsConfig:
+    #     insecureSkipVerify: true
+    tlsConfig: {}
   alerts:
     # When `metrics.enabled` is true, render a PrometheusRule with core gateway
     # alerts (5xx rate, P99 latency, TLS cert expiry, config poll freshness,

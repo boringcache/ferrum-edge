@@ -578,7 +578,8 @@
             "annotations": {
               "type": "object",
               "additionalProperties": { "type": ["string", "number", "integer", "boolean"] }
-            }
+            },
+            "tlsConfig": { "type": "object" }
           }
         },
         "alerts": {

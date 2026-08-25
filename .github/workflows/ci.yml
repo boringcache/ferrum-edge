@@ -3999,6 +3999,40 @@ jobs:
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-enabled.yaml"
           grep -Fq 'kind: ServiceMonitor' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-enabled.yaml"
           grep -Fq 'path: /metrics' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-enabled.yaml"
+          if grep -Fq 'insecureSkipVerify' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-enabled.yaml"; then
+            echo "::error title=Plaintext admin scrape emitted a tlsConfig::admin-http scrapes must not carry TLS settings"
+            exit 1
+          fi
+          # An HTTPS-only admin scrape carries the metrics bearer token, so the
+          # chart must refuse to render an unverified endpoint implicitly.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set metrics.enabled=true \
+            --set metrics.allowedCidrs=10.0.0.0/8 \
+            --set admin.bindAddress=0.0.0.0 \
+            --set admin.service.enabled=true \
+            --set ports.adminHttp=0 \
+            --set tls.admin.existingSecret.name=admin-tls \
+            --show-only templates/metrics-servicemonitor.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-https-no-tlsconfig.yaml" 2>&1; then
+            echo "::error title=HTTPS metrics scrape rendered without tlsConfig::the bearer-token scrape must not default to an unverified endpoint"
+            exit 1
+          fi
+          # ... and must render exactly what the operator asked for when they say it.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set metrics.enabled=true \
+            --set metrics.allowedCidrs=10.0.0.0/8 \
+            --set admin.bindAddress=0.0.0.0 \
+            --set admin.service.enabled=true \
+            --set ports.adminHttp=0 \
+            --set tls.admin.existingSecret.name=admin-tls \
+            --set metrics.serviceMonitor.tlsConfig.serverName=ferrum-admin.ferrum.svc \
+            --show-only templates/metrics-servicemonitor.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-https-tlsconfig.yaml"
+          grep -Fq 'serverName: ferrum-admin.ferrum.svc' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-https-tlsconfig.yaml"
+          if grep -Fq 'insecureSkipVerify' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-https-tlsconfig.yaml"; then
+            echo "::error title=Chart injected insecureSkipVerify::tlsConfig must render verbatim"
+            exit 1
+          fi
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set metrics.enabled=true \
             --set metrics.allowedCidrs=10.0.0.0/8 \

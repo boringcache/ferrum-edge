@@ -363,9 +363,9 @@ def validate_bundled(root: Path, items: list[dict]) -> None:
         root / "charts" / "ferrum-mesh" / "templates" / "alerts-prometheusrule.yaml",
         root / "charts" / "ferrum-gateway" / "templates" / "metrics-prometheusrule.yaml",
     ]
-    alert_text = "\n".join(
-        path.read_text(encoding="utf-8") for path in alert_paths if path.is_file()
-    )
+    # Both rule files ship in-tree, so a missing one is a contract regression,
+    # not a case to skip: reading unconditionally keeps deletion loud.
+    alert_text = "\n".join(path.read_text(encoding="utf-8") for path in alert_paths)
     dash_text = ""
     dash_dir = root / "charts" / "ferrum-mesh" / "dashboards"
     for path in sorted(dash_dir.glob("*.json")):
