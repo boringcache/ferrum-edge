@@ -2351,7 +2351,7 @@ async fn apply_incremental_preserves_live_breaker_state_for_all_target_kinds() {
         .cloned()
         .expect("unrelated proxy");
     unrelated.backend_host = "other-v2.internal".to_string();
-    unrelated.updated_at = unrelated.updated_at + chrono::Duration::seconds(1);
+    unrelated.updated_at += chrono::Duration::seconds(1);
 
     let outcome = state
         .apply_incremental(IncrementalResult {
