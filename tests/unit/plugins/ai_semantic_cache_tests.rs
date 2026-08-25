@@ -3040,9 +3040,29 @@ async fn type_tolerant_max_tokens_stream_and_cohere_history_isolate_exact_keys()
         key_int, key_int_repeat,
         "byte-identical requests must produce the same cache key"
     );
-    assert!(
-        key_int.contains("mt:256"),
-        "integer `max_tokens` must keep the mt:256 key fragment"
+    // The staged key is `KeyParts::finish`'s partition hash, not the readable
+    // key input, so bind the field by DIFFERENCE rather than by substring: a
+    // request that omits `max_tokens`, and one that sets a neighbouring integer,
+    // must both key differently from `max_tokens: 256`.
+    let no_tokens = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let key_absent = miss_cache_key(&plugin, &serde_json::to_string(&no_tokens).unwrap()).await;
+    assert_ne!(
+        key_int, key_absent,
+        "integer `max_tokens` must bind into the exact key"
+    );
+    let adjacent_tokens = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 257
+    });
+    let key_adjacent =
+        miss_cache_key(&plugin, &serde_json::to_string(&adjacent_tokens).unwrap()).await;
+    assert_ne!(
+        key_int, key_adjacent,
+        "adjacent integer `max_tokens` values must not collide"
     );
 
     let with_stream = json!({
