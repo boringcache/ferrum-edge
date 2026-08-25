@@ -2701,12 +2701,21 @@ jobs:
           grep -Fq 'name: ferrum-mesh-east-west' "$RUNNER_TEMP/ferrum-helm-results/pdb-data-path.yaml"
           grep -Fq 'name: ferrum-mesh-injector' "$RUNNER_TEMP/ferrum-helm-results/pdb-data-path.yaml"
           grep -Fq 'minAvailable: 1' "$RUNNER_TEMP/ferrum-helm-results/pdb-data-path.yaml"
-          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+          # A single-replica CP renders NO PodDisruptionBudget, and `--show-only`
+          # exits non-zero with "could not find template" when the selected
+          # template produces nothing — which is the pass condition here, not a
+          # failure. Tolerate that one error and still fail on any other.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
             --show-only templates/pdb.yaml \
-            > "$RUNNER_TEMP/ferrum-helm-results/pdb-cp-single.yaml"
-          if grep -Fq 'kind: PodDisruptionBudget' "$RUNNER_TEMP/ferrum-helm-results/pdb-cp-single.yaml"; then
-            echo "::error title=Single-replica CP PDB rendered::controlPlane.replicas=1 must not render a minAvailable PDB"
+            > "$RUNNER_TEMP/ferrum-helm-results/pdb-cp-single.yaml" 2>&1; then
+            if grep -Fq 'kind: PodDisruptionBudget' "$RUNNER_TEMP/ferrum-helm-results/pdb-cp-single.yaml"; then
+              echo "::error title=Single-replica CP PDB rendered::controlPlane.replicas=1 must not render a minAvailable PDB"
+              exit 1
+            fi
+          elif ! grep -Fq 'could not find template' "$RUNNER_TEMP/ferrum-helm-results/pdb-cp-single.yaml"; then
+            echo "::error title=Unexpected helm failure rendering the single-replica CP PDB::see the chart artifact"
+            cat "$RUNNER_TEMP/ferrum-helm-results/pdb-cp-single.yaml"
             exit 1
           fi
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
