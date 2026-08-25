@@ -1,11 +1,11 @@
 //! Tests for the CORS plugin
 
 use chrono::Utc;
+use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{GatewayConfig, PluginAssociation, PluginConfig, PluginScope};
 use ferrum_edge::plugins::cors::CorsPlugin;
 use ferrum_edge::plugins::response_mock::ResponseMock;
 use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
-use ferrum_edge::PluginCache;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 

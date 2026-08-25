@@ -352,9 +352,9 @@ fn warn_if_cors_ws_origin_policy_gap(proxy: &Proxy, merged: &[Arc<dyn Plugin>]) 
     if !proxy.allowed_ws_origins.is_empty() {
         return;
     }
-    let has_strict_cors = merged.iter().any(|plugin| {
-        plugin.name() == CORS_NAME && plugin.cors_uses_strict_origin_policy()
-    });
+    let has_strict_cors = merged
+        .iter()
+        .any(|plugin| plugin.name() == CORS_NAME && plugin.cors_uses_strict_origin_policy());
     if !has_strict_cors {
         return;
     }
