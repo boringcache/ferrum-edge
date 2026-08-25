@@ -1105,7 +1105,12 @@ fn test_circuit_breaker_prune_stale_targets() {
     cache.get_or_create("ferrum", "proxy1", Some("10.0.0.2:8080"), &config);
     cache.get_or_create("ferrum", "proxy1", Some("10.0.0.3:8080"), &config);
     // HTTP dispatch mints a target-scoped key for direct backends too.
-    cache.get_or_create("ferrum", "proxy-direct", Some("backend.example:443"), &config);
+    cache.get_or_create(
+        "ferrum",
+        "proxy-direct",
+        Some("backend.example:443"),
+        &config,
+    );
     // UDP/DTLS direct backends still use the proxy-scoped key (no "::").
     cache.get_or_create("ferrum", "proxy-udp-direct", None, &config);
 
