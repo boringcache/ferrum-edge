@@ -1978,9 +1978,16 @@ impl AiToolGovernor {
         target: &mut HashMap<String, String>,
         source: &HashMap<String, String>,
     ) {
-        let Some(label) = source.get("ai_tool_governor.decision") else {
-            return;
-        };
+        // Observation keys are merged BEFORE the decision gate (issue #4232).
+        // `write_unrecognized_shape_observation_into` deliberately records
+        // `enabled` + `uninspectable_reason` and sets NO `decision`, so an
+        // early return on a missing decision dropped the unknown-shape
+        // observation on the streaming path — it never reached `ctx.metadata`,
+        // the transaction summary, or any logging sink. That made the
+        // documented "an uninspectable payload is never silent" guarantee
+        // false for exactly the `unknown_shape_action: "allow"` case that
+        // forwards the body. The buffered path was unaffected because it
+        // writes into `ctx.metadata` directly.
         if let Some(enabled) = source.get("ai_tool_governor.enabled") {
             target.insert("ai_tool_governor.enabled".to_string(), enabled.clone());
         }
@@ -1994,6 +2001,12 @@ impl AiToolGovernor {
                 .entry(UNINSPECTABLE_REASON_KEY.to_string())
                 .or_insert_with(|| reason.clone());
         }
+
+        // An observation-only batch carries no decision and must not fabricate
+        // one: the remaining merge below is decision-scoped.
+        let Some(label) = source.get("ai_tool_governor.decision") else {
+            return;
+        };
 
         let previous_rank = target
             .get("ai_tool_governor.decision")

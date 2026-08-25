@@ -11722,3 +11722,84 @@ async fn json_shaped_stream_ambiguous_arguments_are_observed_in_dry_run() {
         .await;
     assert_dry_run_ambiguity_observation(&ctx);
 }
+
+// ---------------------------------------------------------------------------
+// Streaming unknown-shape observation survives the per-stream metadata merge
+//
+// Regression cover for issue #4232. The observation is written into the
+// per-stream slot and only reaches `ctx.metadata` through
+// `merge_stream_metadata`, which used to return early unless the batch also
+// carried an `ai_tool_governor.decision`. An unknown-shape observation
+// deliberately sets NO decision, so it was dropped on the streaming path and
+// never reached the transaction summary or any logging sink — the buffered
+// path was unaffected because it writes `ctx.metadata` directly.
+// ---------------------------------------------------------------------------
+
+/// The documented `unknown_shape_action: "allow"` opt-out forwards the body, so
+/// the observation is the ONLY signal the operator gets. Losing it on the
+/// streaming path is the silent-forward this plugin exists to prevent.
+#[tokio::test]
+async fn streaming_unknown_shape_opt_out_records_observation_into_ctx_metadata() {
+    let mut config = provider_streaming_config("deny");
+    config["unknown_shape_action"] = json!("allow");
+    let plugin = Arc::new(make(config));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("stream inspector");
+    let bytes = ANTHROPIC_UNREADABLE_FRAMES[0].as_bytes();
+    let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
+    assert!(
+        !terminated,
+        "the documented opt-out must forward an unreadable shape"
+    );
+    drop(inspector);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(out.len() as u64))
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.uninspectable_reason")
+            .map(String::as_str),
+        Some("unrecognized_tool_call_shape"),
+        "a forwarded unreadable stream must never be silent"
+    );
+    assert!(
+        ctx.metadata.contains_key("ai_tool_governor.enabled"),
+        "the observation must carry the plugin-enabled marker"
+    );
+    assert_ne!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("allow"),
+        "an unread shape must never be labelled as a policy allow"
+    );
+}
+
+/// The enforce path cuts the stream, and the operator must still be able to see
+/// WHY from the transaction summary rather than only from the cut itself.
+#[tokio::test]
+async fn streaming_unknown_shape_enforce_cut_still_records_observation() {
+    let plugin = Arc::new(make(provider_streaming_config("deny")));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("stream inspector");
+    let bytes = ANTHROPIC_UNREADABLE_FRAMES[0].as_bytes();
+    let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
+    assert!(terminated, "enforce must cut an unreadable shape");
+    drop(inspector);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(out.len() as u64))
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.uninspectable_reason")
+            .map(String::as_str),
+        Some("unrecognized_tool_call_shape"),
+        "a cut stream must still explain itself in the summary"
+    );
+}
