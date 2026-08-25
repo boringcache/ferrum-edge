@@ -93,15 +93,9 @@ impl ProxyHarness {
             k8s_mesh_overlay: Default::default(),
             gateway_trust_bundles: Vec::new(),
         };
-        let state = ProxyState::new(
-            config,
-            DnsCache::new(DnsConfig::default()),
-            env,
-            None,
-            None,
-        )
-        .expect("proxy state")
-        .0;
+        let state = ProxyState::new(config, DnsCache::new(DnsConfig::default()), env, None, None)
+            .expect("proxy state")
+            .0;
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
