@@ -779,6 +779,15 @@ UDP capture (`FERRUM_MESH_CAPTURE_UDP_ENABLED`, default off) is read by both the
 | `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS` | No | `60` | Maximum wall-clock seconds a WebSocket message may stay incomplete, measured from its first fragment and checked on every subsequent non-Close frame while the message is still incomplete — including the completing continuation and interleaved Ping/Pong (peer Close is exempt). Independent of the frame-count bound above, so a slow fragment drip that stays under the count ceiling is still terminated. A fully silent connection is covered by `FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS` instead. `0` disables the bound |
 | `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` | No | `10` | HTTP/1.1 header read timeout for proxy and admin listeners and for injector-mode (`FERRUM_MODE=injector`) admission-webhook connections; `0` disables it on all of them, leaving incomplete header blocks unbounded. On the **admin** listeners it additionally bounds two windows hyper's HTTP/1.1 timer cannot see: the HTTP/1.1-vs-HTTP/2 version sniff (a peer that connects and sends nothing never reaches the HTTP/1 timer), and HTTP/2 streams whose `HEADERS`/`CONTINUATION` block never completes. An admin connection that neither delivers a new request nor holds one in flight for a whole window is closed — so an idle keep-alive admin connection is closed after this long and the client reconnects, which is what the HTTP/1.1 timer already did |
 
+**Per-proxy WebSocket Origin (`allowed_ws_origins`).** Each proxy may set
+`allowed_ws_origins: ["https://app.example.com"]` to require a matching browser
+`Origin` on WebSocket upgrades (HTTP/1.1, H2 Extended CONNECT, H3 Extended CONNECT).
+The default empty list allows every origin. This gate is independent of the `cors`
+plugin, which does not run on WebSocket upgrades; operators with a strict CORS
+allowlist on the same route should mirror those origins in `allowed_ws_origins`. See
+[routing.md](routing.md#websocket-origin-admission) and
+[cors_plugin.md](cors_plugin.md#websocket-upgrades-and-cswsh).
+
 See [size_limits.md](size_limits.md) for detailed sizing guidance.
 
 **Route-scoped ceilings compose with these globals.** The `request_size_limiting`

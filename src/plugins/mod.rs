@@ -8759,6 +8759,12 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Whether this plugin instance carries a non-wildcard CORS origin policy.
+    /// Used by plugin-cache composition diagnostics for WebSocket Origin gaps.
+    fn cors_uses_strict_origin_policy(&self) -> bool {
+        false
+    }
+
     /// Authentication phase. Uses ConsumerIndex for O(1) credential lookups.
     async fn authenticate(
         &self,

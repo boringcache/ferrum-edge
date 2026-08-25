@@ -3767,6 +3767,11 @@ falling back to wildcard access. Multiple attached CORS instances compose
 origin/credential/exposure policy on actual requests and additionally
 intersect method/header/max-age policy on preflight.
 
+**WebSocket upgrades:** CORS does not govern WebSocket handshake `Origin` checks.
+Configure per-proxy `allowed_ws_origins` for Cross-Site WebSocket Hijacking (CSWSH)
+protection. See [cors_plugin.md](cors_plugin.md#websocket-upgrades-and-cswsh) and
+[routing.md](routing.md#websocket-origin-admission).
+
 See [cors_plugin.md](cors_plugin.md) for detailed configuration and troubleshooting.
 
 ### `bot_detection`
