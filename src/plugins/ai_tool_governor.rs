@@ -1492,16 +1492,17 @@ impl AiToolGovernor {
         // plugin cannot read. `allow` is the documented, loud opt-out: it still
         // records the `unrecognized_tool_call_shape` observation, so the traffic
         // is forwarded knowingly rather than silently.
-        let unknown_shape_action =
-            match optional_string(config, "unknown_shape_action")?.unwrap_or("deny") {
-                "deny" => UnknownShapeAction::Deny,
-                "allow" => UnknownShapeAction::Allow,
-                other => {
-                    return Err(format!(
-                        "ai_tool_governor: 'unknown_shape_action' must be one of 'deny' or 'allow', got {other:?}"
-                    ));
-                }
-            };
+        let unknown_shape_action = match optional_string(config, "unknown_shape_action")?
+            .unwrap_or("deny")
+        {
+            "deny" => UnknownShapeAction::Deny,
+            "allow" => UnknownShapeAction::Allow,
+            other => {
+                return Err(format!(
+                    "ai_tool_governor: 'unknown_shape_action' must be one of 'deny' or 'allow', got {other:?}"
+                ));
+            }
+        };
 
         let inspect = parse_inspect(config)?;
 
@@ -5519,7 +5520,11 @@ fn gemini_frame_has_tool_calls(frame: &Value) -> bool {
             .get("content")
             .and_then(|content| content.get("parts"))
             .and_then(Value::as_array)
-            .is_some_and(|parts| parts.iter().any(|part| gemini_function_call(part).is_some()))
+            .is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|part| gemini_function_call(part).is_some())
+            })
     })
 }
 
@@ -6125,7 +6130,9 @@ fn extract_request_tool_definitions(json: &Value) -> RequestToolDefinitionExtrac
     };
     collect_tool_definition_container(json.get("tools"), &mut extract);
     // Bedrock Converse nests the same definitions under `toolConfig`.
-    let bedrock = json.get("toolConfig").and_then(|config| config.get("tools"));
+    let bedrock = json
+        .get("toolConfig")
+        .and_then(|config| config.get("tools"));
     collect_tool_definition_container(bedrock, &mut extract);
     match json.get("functions") {
         None | Some(Value::Null) => {}

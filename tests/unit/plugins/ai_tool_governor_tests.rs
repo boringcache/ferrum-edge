@@ -11024,7 +11024,10 @@ async fn anthropic_streaming_tool_use_is_cut_in_enforce() {
         .expect("inspector");
     let body = anthropic_stream("kubectl.apply");
     let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
-    assert!(terminated, "a denied Anthropic tool_use must cut the stream");
+    assert!(
+        terminated,
+        "a denied Anthropic tool_use must cut the stream"
+    );
     let text = String::from_utf8_lossy(&out);
     assert!(
         !text.contains("kubectl.apply"),
@@ -11071,7 +11074,10 @@ async fn anthropic_streaming_reassembles_split_arguments() {
         "a blocked pattern that only matches after reassembly must cut the stream"
     );
     let text = String::from_utf8_lossy(&out);
-    assert!(!text.contains("NYC"), "reassembled arguments leaked: {text}");
+    assert!(
+        !text.contains("NYC"),
+        "reassembled arguments leaked: {text}"
+    );
 }
 
 /// Cohere v2 SSE: `tool-call-start` + `tool-call-delta`.
@@ -11099,7 +11105,10 @@ async fn cohere_streaming_tool_call_is_cut_in_enforce() {
     let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
     assert!(terminated, "a denied Cohere tool call must cut the stream");
     let text = String::from_utf8_lossy(&out);
-    assert!(!text.contains("kubectl.apply"), "held frames leaked: {text}");
+    assert!(
+        !text.contains("kubectl.apply"),
+        "held frames leaked: {text}"
+    );
 }
 
 #[tokio::test]
@@ -11135,9 +11144,15 @@ async fn gemini_streaming_function_call_is_cut_in_enforce() {
         .expect("inspector");
     let body = gemini_stream("kubectl.apply");
     let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
-    assert!(terminated, "a denied Google functionCall must cut the stream");
+    assert!(
+        terminated,
+        "a denied Google functionCall must cut the stream"
+    );
     let text = String::from_utf8_lossy(&out);
-    assert!(!text.contains("kubectl.apply"), "held frames leaked: {text}");
+    assert!(
+        !text.contains("kubectl.apply"),
+        "held frames leaked: {text}"
+    );
 }
 
 #[tokio::test]
@@ -11174,7 +11189,10 @@ async fn unknown_streaming_tool_shape_is_cut_in_enforce() {
         "an unreadable streaming tool-call shape must cut the stream in enforce"
     );
     let text = String::from_utf8_lossy(&out);
-    assert!(!text.contains("kubectl.apply"), "unread call leaked: {text}");
+    assert!(
+        !text.contains("kubectl.apply"),
+        "unread call leaked: {text}"
+    );
 }
 
 #[tokio::test]
