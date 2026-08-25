@@ -2936,6 +2936,17 @@ async fn handle_admin_request_inner(
                         serde_json::to_value(failures.snapshot()).unwrap_or_default(),
                     );
                 }
+                // Aggregate buffered-request pressure (issue #4153). Inserted
+                // into the DETAIL snapshot only: the coarse unauthenticated
+                // branch below reads `level` back out and discards everything
+                // else, so this never widens the unauthenticated surface.
+                obj.insert(
+                    "request_buffer".to_string(),
+                    serde_json::to_value(
+                        crate::proxy::response_buffer_budget::request_buffer_snapshot(),
+                    )
+                    .unwrap_or_default(),
+                );
             }
             if detailed {
                 return Ok(json_response(status, &snapshot_value));

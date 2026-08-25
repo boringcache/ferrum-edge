@@ -1,0 +1,267 @@
+//! Issue #4153 — fail-closed ceiling and aggregate budget for BUFFERED client
+//! request bodies.
+//!
+//! Two properties the request side did not have before, and which the response
+//! side already treats as a vulnerability class (GHSA-pwcm-6rh8-f2gh):
+//!
+//! * a configured request-body limit of `0` ("unlimited") used to take a raw
+//!   `body.collect()` on the buffered path, so one upload could grow a single
+//!   `Vec` for as long as it kept making progress — reachable
+//!   pre-authentication, because `waf` request-body inspection buffers in the
+//!   `authenticate` phase;
+//! * a finite per-request ceiling still multiplies by concurrency, so N
+//!   simultaneous buffered uploads had nothing capping them in aggregate.
+//!
+//! Every aggregate test runs against `RequestBufferBudgetProbe`, which is the
+//! production budget type with its own semaphore — same clamping, same
+//! non-blocking admission, same release-on-drop — so these cannot pass against
+//! a parallel implementation of the rules, and they do not race the
+//! process-global budget under a parallel test binary.
+
+use ferrum_edge::_test_support::{
+    DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES, DEFAULT_REQUEST_BUFFER_TOTAL_BYTES,
+    REQUEST_BUFFER_OVERLOAD_BODY, REQUEST_BUFFER_OVERLOAD_ERROR_CLASS,
+    REQUEST_BUFFER_OVERLOAD_GRPC_STATUS, REQUEST_BUFFER_OVERLOAD_STATUS,
+    RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT, RequestBufferBudgetProbe,
+    buffered_request_body_ceiling_for_test, effective_request_body_limit_for_test,
+    error_class_is_backend_failure_for_test, error_class_is_health_neutral_for_test,
+};
+use ferrum_edge::retry::ErrorClass;
+
+/// `total_blocks` blocks of budget with a one-block fallback ceiling, so the
+/// floor (`Budget::new` raises the total to at least the fallback) does not
+/// dominate the total under test.
+fn probe(total_blocks: usize) -> RequestBufferBudgetProbe {
+    RequestBufferBudgetProbe::new(UNIT, total_blocks * UNIT)
+}
+
+// ---------------------------------------------------------------------------
+// 1. A limit of 0 is not "unlimited" on the buffered path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_zero_limit_folds_to_the_finite_fallback_on_the_buffered_path() {
+    // The whole point of the issue: `0` used to reach a raw `collect()`.
+    assert_eq!(
+        buffered_request_body_ceiling_for_test(0),
+        DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES,
+        "a `0` request-body limit must not produce an unbounded retained buffer"
+    );
+    assert!(
+        DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES > 0,
+        "the fallback must be finite and non-zero or the fold is a no-op"
+    );
+}
+
+#[test]
+fn a_configured_limit_still_wins_over_the_fallback() {
+    // The fallback is a fail-closed floor for the `0` case only. An operator
+    // who configured a limit keeps exactly that limit — larger or smaller than
+    // the fallback.
+    assert_eq!(buffered_request_body_ceiling_for_test(1234), 1234);
+    assert_eq!(
+        buffered_request_body_ceiling_for_test(DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES * 4),
+        DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES * 4
+    );
+}
+
+#[test]
+fn a_route_ceiling_survives_an_unlimited_global_and_then_the_fold() {
+    // `effective_request_body_limit` folds global + plugin first; the buffered
+    // fold runs on the RESULT. A route ceiling under a `0` global therefore
+    // stays authoritative and never falls back.
+    let effective = effective_request_body_limit_for_test(0, Some(4096));
+    assert_eq!(effective, 4096);
+    assert_eq!(buffered_request_body_ceiling_for_test(effective), 4096);
+
+    // Only a proxy with no active route ceiling reaches the fallback.
+    assert_eq!(
+        buffered_request_body_ceiling_for_test(effective_request_body_limit_for_test(0, None)),
+        DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES
+    );
+}
+
+#[test]
+fn the_fallback_is_clamped_to_at_least_one_reservation_block() {
+    // A zero or sub-block fallback would not cover even one reservation block,
+    // which would refuse every buffered upload and take the proxy down.
+    let degenerate = RequestBufferBudgetProbe::new(0, 64 * UNIT);
+    assert_eq!(degenerate.buffered_request_body_ceiling(0), UNIT);
+
+    let short = RequestBufferBudgetProbe::new(UNIT / 4, 64 * UNIT);
+    assert_eq!(short.buffered_request_body_ceiling(0), UNIT);
+}
+
+#[test]
+fn the_probe_folds_zero_to_its_own_configured_fallback() {
+    let budget = RequestBufferBudgetProbe::new(3 * UNIT, 64 * UNIT);
+    assert_eq!(budget.buffered_request_body_ceiling(0), 3 * UNIT);
+    assert_eq!(budget.buffered_request_body_ceiling(7 * UNIT), 7 * UNIT);
+}
+
+// ---------------------------------------------------------------------------
+// 2. Aggregate: a finite per-request ceiling still multiplies by concurrency.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn concurrent_buffered_requests_are_capped_in_aggregate() {
+    // Four blocks of budget, one block per request: the fifth concurrent
+    // buffered request is refused rather than admitted alongside the others.
+    let budget = probe(4);
+    let mut admitted = Vec::new();
+    for i in 0..4 {
+        admitted.push(
+            budget
+                .try_reserve(UNIT)
+                .unwrap_or_else(|| panic!("request {i} must be admitted")),
+        );
+    }
+    assert_eq!(budget.available_bytes(), 0);
+    assert!(
+        budget.try_reserve(UNIT).is_none(),
+        "the Nth+1 concurrent buffered request must be refused, not admitted"
+    );
+
+    // Each admitted request really holds its block.
+    for permit in &admitted {
+        assert_eq!(permit.reserved_bytes(), UNIT);
+    }
+
+    // Releasing one readmits exactly one.
+    drop(admitted.pop());
+    assert_eq!(budget.available_bytes(), UNIT);
+    let readmitted = budget.try_reserve(UNIT);
+    assert!(
+        readmitted.is_some(),
+        "a released claim must return capacity to the next request"
+    );
+}
+
+#[test]
+fn a_claim_is_returned_by_drop_on_every_exit_path() {
+    // The RAII property is what makes success, 413, 499, timeout, deadline,
+    // authorization expiry, and cancellation identical: they are all drops.
+    let budget = probe(8);
+    let total = budget.available_bytes();
+
+    {
+        let _claim = budget.try_reserve(3 * UNIT).expect("admits");
+        assert_eq!(budget.available_bytes(), total - 3 * UNIT);
+        // Scope exit stands in for every early return on the buffered path.
+    }
+
+    assert_eq!(
+        budget.available_bytes(),
+        total,
+        "no exit path may leak the aggregate budget"
+    );
+}
+
+#[test]
+fn one_oversized_request_cannot_starve_the_whole_budget_silently() {
+    // A per-request ceiling above the aggregate budget is honored as a ceiling
+    // but is NOT admissible: the aggregate cap is not widened to fit one huge
+    // upload, because that would hand the memory bound back to the client.
+    let budget = probe(4);
+    assert_eq!(budget.buffered_request_body_ceiling(64 * UNIT), 64 * UNIT);
+    assert!(
+        budget.try_reserve(64 * UNIT).is_none(),
+        "an upload larger than the whole budget is refused, not silently admitted"
+    );
+    assert_eq!(
+        budget.available_bytes(),
+        4 * UNIT,
+        "a refused reservation must not consume capacity"
+    );
+}
+
+#[test]
+fn the_aggregate_budget_is_floored_at_the_fallback_ceiling() {
+    // A degenerate total would otherwise refuse every buffered upload. The
+    // floor guarantees one FALLBACK-sized upload is always admissible — and
+    // nothing beyond that.
+    let budget = RequestBufferBudgetProbe::new(4 * UNIT, 0);
+    assert_eq!(budget.available_bytes(), 4 * UNIT);
+    assert!(
+        budget.try_reserve(4 * UNIT).is_some(),
+        "one fallback-sized upload must always be admissible"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3. Streaming is unaffected.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_request_that_retains_nothing_takes_no_charge() {
+    // The structural reason a STREAMED request cannot be shed by this budget:
+    // it never reserves. Even against a fully exhausted budget, a zero-byte
+    // claim is admitted and consumes nothing, so adding this budget cannot
+    // convert streaming traffic into 503s.
+    let budget = probe(2);
+    let _exhaust = budget.try_reserve(2 * UNIT).expect("admits");
+    assert_eq!(budget.available_bytes(), 0);
+
+    let empty = budget
+        .try_reserve(0)
+        .expect("a request that retains nothing is always admitted");
+    assert_eq!(empty.reserved_bytes(), 0);
+    assert_eq!(budget.available_bytes(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// 4. Refusal shape.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn exhaustion_is_a_gateway_local_transient_capacity_terminal() {
+    // 503, not 4xx: the client's upload is well formed. Not 502: no backend was
+    // dialed.
+    assert_eq!(REQUEST_BUFFER_OVERLOAD_STATUS, 503);
+    // RESOURCE_EXHAUSTED is the gRPC capacity status. UNAVAILABLE would claim
+    // the backend is down; INVALID_ARGUMENT would blame a valid upload.
+    assert_eq!(REQUEST_BUFFER_OVERLOAD_GRPC_STATUS, 8);
+    // Fixed bytes: no route, header, credential, or body content.
+    assert_eq!(
+        REQUEST_BUFFER_OVERLOAD_BODY,
+        r#"{"error":"Request buffering capacity exceeded"}"#
+    );
+}
+
+#[test]
+fn exhaustion_is_backend_health_neutral_and_distinct_from_oversize() {
+    assert_eq!(
+        REQUEST_BUFFER_OVERLOAD_ERROR_CLASS,
+        ErrorClass::GatewayBufferCapacity
+    );
+
+    // Neutral: no circuit-breaker trip, no passive-health ding, no
+    // adaptive-concurrency shrink for a backend that was never contacted.
+    assert!(error_class_is_health_neutral_for_test(
+        REQUEST_BUFFER_OVERLOAD_ERROR_CLASS
+    ));
+    assert!(!error_class_is_backend_failure_for_test(
+        REQUEST_BUFFER_OVERLOAD_ERROR_CLASS
+    ));
+
+    // A genuine per-request overflow stays its own condition, so the two remain
+    // distinguishable in telemetry.
+    assert_ne!(
+        REQUEST_BUFFER_OVERLOAD_ERROR_CLASS,
+        ErrorClass::RequestBodyTooLarge
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5. Defaults.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn defaults_are_finite_and_the_total_exceeds_one_request() {
+    assert_eq!(DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES, 10 * 1024 * 1024);
+    assert_eq!(DEFAULT_REQUEST_BUFFER_TOTAL_BYTES, 256 * 1024 * 1024);
+    assert!(
+        DEFAULT_REQUEST_BUFFER_TOTAL_BYTES > DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES,
+        "the aggregate default must admit more than a single fallback-sized upload"
+    );
+}

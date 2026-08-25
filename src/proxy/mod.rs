@@ -3402,6 +3402,14 @@ struct BufferedClientRequestBody {
     headers: hyper::HeaderMap,
     body: Vec<u8>,
     trailers: Option<hyper::HeaderMap>,
+    /// The aggregate buffered-request charge that paid for `body`, held here so
+    /// it is returned by DROP rather than by any particular exit path (issue
+    /// #4153). Reserved before the collect started and sized to this request's
+    /// retained ceiling, so admission preceded the allocation.
+    ///
+    /// `None` only for the constructions that never went through a governed
+    /// collect (a body a plugin phase staged, and the unit tests below).
+    _budget: Option<response_buffer_budget::RequestBufferPermit>,
 }
 
 enum RequestBodyBufferError {
@@ -3409,6 +3417,13 @@ enum RequestBodyBufferError {
     ClientDisconnected(String),
     TimedOut,
     DeadlineExceeded,
+    /// The aggregate buffered-request budget could not admit this upload's
+    /// retained ceiling (issue #4153). A GATEWAY-LOCAL transient-capacity
+    /// condition: the client's request is well formed and no backend was
+    /// dialed, so it is surfaced as `503` / gRPC `RESOURCE_EXHAUSTED` with the
+    /// health-neutral [`response_buffer_budget::REQUEST_BUFFER_OVERLOAD_ERROR_CLASS`],
+    /// never as a `4xx` blaming the client.
+    BufferCapacityExceeded,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3765,47 +3780,55 @@ async fn buffer_request_body_for_before_proxy(
         return Ok(ClientRequestBody::Streaming(Box::new(request)));
     }
 
+    // Fail-closed retained ceiling (issue #4153). `0` on
+    // `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` stays "unlimited" for STREAMING —
+    // nothing is retained there — but a buffered collect is never run
+    // unbounded, so the `0` case folds to the configured fail-closed fallback
+    // instead of taking a raw `body.collect()`.
+    let ceiling =
+        response_buffer_budget::buffered_request_body_ceiling(max_request_body_size_bytes);
+
     // Parsed per comma-folded member so a repeated identical declaration is
     // compared against the ceiling rather than skipping this guard
-    // (`GHSA-xrfj-852f-645j`). An unusable declaration falls through to the
+    // (`GHSA-xrfj-852f-645j`). Compared against the RETAINED ceiling, not the
+    // raw limit, so a declared length over the fail-closed fallback is refused
+    // before a single byte is read rather than after the collector has drained
+    // a fallback's worth of it. An unusable declaration falls through to the
     // bounded collect below, which never trusts a declared length.
-    if declared_request_content_length_over_limit(headers, max_request_body_size_bytes) {
+    if declared_request_content_length_over_limit(headers, ceiling) {
         return Err(RequestBodyBufferError::TooLarge);
     }
 
     let (parts, body) = request.into_parts();
-    let collected = if max_request_body_size_bytes > 0 {
-        let limited = http_body_util::Limited::new(body, max_request_body_size_bytes);
-        let collected = collect_request_body_with_deadline(
-            limited.collect(),
-            grpc_deadline_at,
-            request_body_read_timeout_ms,
-        )
-        .await?;
-        collected.map_err(|e| {
-            // Limited::collect() returns either a LengthLimitError (the body
-            // actually exceeded the cap -> 413) or the underlying transport
-            // error (the client dropped the connection mid-upload -> 499).
-            // Distinguish them so a client disconnect is not misreported and
-            // logged as "Request body exceeds maximum size", mirroring the
-            // unlimited branch below.
-            if e.downcast_ref::<http_body_util::LengthLimitError>()
-                .is_some()
-            {
-                RequestBodyBufferError::TooLarge
-            } else {
-                RequestBodyBufferError::ClientDisconnected(e.to_string())
-            }
-        })?
-    } else {
-        let collected = collect_request_body_with_deadline(
-            body.collect(),
-            grpc_deadline_at,
-            request_body_read_timeout_ms,
-        )
-        .await?;
-        collected.map_err(|e| RequestBodyBufferError::ClientDisconnected(e.to_string()))?
-    };
+    // Aggregate admission BEFORE the buffer is allocated. Sized to the ceiling,
+    // because the ceiling is the most this collect can retain and admission has
+    // to precede the allocation rather than chase it. The permit travels into
+    // the returned `BufferedClientRequestBody`, so it is returned by drop on
+    // every exit path — success, `413`, `499`, timeout, deadline, and task
+    // cancellation alike.
+    let budget_permit = response_buffer_budget::RequestBufferPermit::reserve(ceiling)
+        .ok_or(RequestBodyBufferError::BufferCapacityExceeded)?;
+    let limited = http_body_util::Limited::new(body, ceiling);
+    let collected = collect_request_body_with_deadline(
+        limited.collect(),
+        grpc_deadline_at,
+        request_body_read_timeout_ms,
+    )
+    .await?;
+    // Limited::collect() returns either a LengthLimitError (the body actually
+    // exceeded the cap -> 413) or the underlying transport error (the client
+    // dropped the connection mid-upload -> 499). Distinguish them so a client
+    // disconnect is not misreported and logged as "Request body exceeds
+    // maximum size".
+    let collected = collected.map_err(|e| {
+        if e.downcast_ref::<http_body_util::LengthLimitError>()
+            .is_some()
+        {
+            RequestBodyBufferError::TooLarge
+        } else {
+            RequestBodyBufferError::ClientDisconnected(e.to_string())
+        }
+    })?;
     let trailers = collected.trailers().cloned();
     let body_bytes = collected.to_bytes().to_vec();
 
@@ -3815,6 +3838,7 @@ async fn buffer_request_body_for_before_proxy(
             headers: parts.headers,
             body: body_bytes,
             trailers,
+            _budget: Some(budget_permit),
         },
     )))
 }
@@ -3883,6 +3907,9 @@ async fn prepare_mesh_request_body(
             }
             RequestBodyBufferError::DeadlineExceeded => {
                 client_grpc_deadline_exceeded_response(resolved_ip.clone())
+            }
+            RequestBodyBufferError::BufferCapacityExceeded => {
+                request_buffer_capacity_backend_response(resolved_ip.clone())
             }
         })?,
         buffered => buffered,
@@ -29865,6 +29892,17 @@ async fn handle_proxy_request_inner(
                             r#"{"error":"Client disconnected"}"#,
                         ));
                     }
+                    Err(RequestBodyBufferError::BufferCapacityExceeded) => {
+                        let response = build_request_buffer_capacity_response(
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
+                        );
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
+                    }
                     Err(RequestBodyBufferError::TimedOut) => {
                         let response = build_request_body_timeout_response(
                             is_grpc_request,
@@ -30035,6 +30073,17 @@ async fn handle_proxy_request_inner(
                             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
                             r#"{"error":"Client disconnected"}"#,
                         ));
+                    }
+                    Err(RequestBodyBufferError::BufferCapacityExceeded) => {
+                        let response = build_request_buffer_capacity_response(
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
+                        );
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
                     }
                     Err(RequestBodyBufferError::TimedOut) => {
                         let response = build_request_body_timeout_response(
@@ -30253,6 +30302,17 @@ async fn handle_proxy_request_inner(
                             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
                             r#"{"error":"Client disconnected"}"#,
                         ));
+                    }
+                    Err(RequestBodyBufferError::BufferCapacityExceeded) => {
+                        let response = build_request_buffer_capacity_response(
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
+                        );
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
                     }
                     Err(RequestBodyBufferError::TimedOut) => {
                         let response = build_request_body_timeout_response(
@@ -31123,6 +31183,23 @@ async fn handle_proxy_request_inner(
                         )
                         .await);
                     }
+                    Err(RequestBodyBufferError::BufferCapacityExceeded) => {
+                        return Ok(finalize_terminal_request_body_read_rejection(
+                            &state,
+                            &plugins,
+                            &mut ctx,
+                            StatusCode::from_u16(
+                                response_buffer_budget::REQUEST_BUFFER_OVERLOAD_STATUS,
+                            )
+                            .unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+                            response_buffer_budget::REQUEST_BUFFER_OVERLOAD_BODY.as_bytes(),
+                            is_grpc_request,
+                            start_time,
+                            plugin_execution_ns,
+                            &original_request_path,
+                        )
+                        .await);
+                    }
                     Err(RequestBodyBufferError::TimedOut) => {
                         return Ok(finalize_terminal_request_body_read_rejection(
                             &state,
@@ -31568,6 +31645,24 @@ async fn handle_proxy_request_inner(
                             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
                             r#"{"error":"Client disconnected"}"#,
                         ));
+                    }
+                    Err(RequestBodyBufferError::BufferCapacityExceeded) => {
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            cb_is_half_open_probe,
+                        );
+                        drop(preacquired_backend_admission.take_if_acquired());
+                        let response = build_request_buffer_capacity_response(
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
+                        );
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
                     }
                     Err(RequestBodyBufferError::TimedOut) => {
                         release_circuit_breaker_probe_on_admission_reject(
@@ -43111,30 +43206,59 @@ async fn proxy_to_backend(
                     Some(request_ctx),
                     state.env_config.authenticated_stream_max_lifetime_seconds,
                 );
-                let body_bytes = if effective_max_request_body_size_bytes > 0 {
-                    let limited = http_body_util::Limited::new(
-                        (*original_req).into_body(),
-                        effective_max_request_body_size_bytes,
-                    );
-                    match collect_request_body_under_authorization(
-                        limited.collect(),
-                        request_ctx.grpc_deadline_at(),
-                        proxy.backend_read_timeout_ms,
-                        buffered_upload_auth_deadline.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(collected)) => collected.to_bytes().to_vec(),
-                        Ok(Err(_)) => {
+                // Fail-closed retained ceiling + aggregate admission taken
+                // BEFORE the buffer is allocated (issue #4153). `0` on
+                // `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` stays "unlimited" for
+                // STREAMING — nothing is retained there — but a buffered
+                // collect is never run unbounded.
+                let retained_ceiling = response_buffer_budget::buffered_request_body_ceiling(
+                    effective_max_request_body_size_bytes,
+                );
+                // Held for the rest of this dispatch arm, so it covers the
+                // collect and the construction of the backend request that
+                // carries the collected bytes, and is returned by DROP on every
+                // exit path below — 413, 499, timeout, deadline, authorization
+                // expiry, and task cancellation alike.
+                let _request_buffer_permit =
+                    match response_buffer_budget::RequestBufferPermit::reserve(retained_ceiling) {
+                        Some(permit) => permit,
+                        None => {
+                            return backend_dispatch_response(
+                                request_buffer_capacity_backend_response(resolved_ip.clone()),
+                                None,
+                                None,
+                            );
+                        }
+                    };
+                let limited =
+                    http_body_util::Limited::new((*original_req).into_body(), retained_ceiling);
+                let body_bytes = match collect_request_body_under_authorization(
+                    limited.collect(),
+                    request_ctx.grpc_deadline_at(),
+                    proxy.backend_read_timeout_ms,
+                    buffered_upload_auth_deadline.as_ref(),
+                )
+                .await
+                {
+                    Ok(Ok(collected)) => collected.to_bytes().to_vec(),
+                    // `Limited::collect()` yields either a `LengthLimitError`
+                    // (the body really exceeded the ceiling -> 413) or the
+                    // underlying transport error (the client dropped the
+                    // connection mid-upload -> 499). Distinguishing them keeps
+                    // a disconnect from being reported as an oversize body,
+                    // matching `buffer_request_body_for_before_proxy`.
+                    Ok(Err(e)) => {
+                        if e.downcast_ref::<http_body_util::LengthLimitError>()
+                            .is_some()
+                        {
                             return backend_dispatch_response(
                                 retry::BackendResponse {
                                     status_code: 413,
-                                    body:
-                                        ResponseBody::buffered(
-                                            r#"{"error":"Request body exceeds maximum size"}"#
-                                                .as_bytes()
-                                                .to_vec(),
-                                        ),
+                                    body: ResponseBody::buffered(
+                                        r#"{"error":"Request body exceeds maximum size"}"#
+                                            .as_bytes()
+                                            .to_vec(),
+                                    ),
                                     headers: HashMap::new(),
                                     connection_error: false,
                                     backend_resolved_ip: resolved_ip.clone(),
@@ -43144,90 +43268,52 @@ async fn proxy_to_backend(
                                 None,
                             );
                         }
-                        Err(AuthorizedUploadWaitError::Wait(
-                            RequestBodyWaitError::DeadlineExceeded,
-                        )) => {
-                            let response = client_grpc_deadline_exceeded_response_for_request(
-                                request_ctx,
-                                headers,
-                                resolved_ip.clone(),
-                            );
-                            return backend_dispatch_response(response, None, None);
-                        }
-                        Err(AuthorizedUploadWaitError::Wait(RequestBodyWaitError::TimedOut)) => {
-                            let response =
-                                request_body_timeout_backend_response(resolved_ip.clone());
-                            return backend_dispatch_response(response, None, None);
-                        }
-                        // Already latched and counted once. No backend was
-                        // dialed and nothing was committed downstream, so the
-                        // pre-commitment terminal in `handle_proxy_request_inner`
-                        // decides the client-visible shape.
-                        Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {
-                            return authorization_expired_backend_dispatch(
-                                resolved_ip.clone(),
-                                None,
-                                None,
-                            );
-                        }
+                        error!(
+                            proxy_id = %proxy.id,
+                            backend_url = %strip_query_params(backend_url),
+                            error_kind = "client_disconnect",
+                            error = %e,
+                            "Client disconnected while sending request body"
+                        );
+                        return backend_dispatch_response(
+                            retry::BackendResponse {
+                                status_code: 499,
+                                body: ResponseBody::buffered(
+                                    r#"{"error":"Client disconnected"}"#.as_bytes().to_vec(),
+                                ),
+                                headers: HashMap::new(),
+                                connection_error: false,
+                                backend_resolved_ip: resolved_ip.clone(),
+                                error_class: Some(retry::ErrorClass::ClientDisconnect),
+                            },
+                            None,
+                            None,
+                        );
                     }
-                } else {
-                    match collect_request_body_under_authorization(
-                        (*original_req).into_body().collect(),
-                        request_ctx.grpc_deadline_at(),
-                        proxy.backend_read_timeout_ms,
-                        buffered_upload_auth_deadline.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(collected)) => collected.to_bytes().to_vec(),
-                        Ok(Err(e)) => {
-                            error!(
-                                proxy_id = %proxy.id,
-                                backend_url = %strip_query_params(backend_url),
-                                error_kind = "client_disconnect",
-                                error = %e,
-                                "Client disconnected while sending request body"
-                            );
-                            return backend_dispatch_response(
-                                retry::BackendResponse {
-                                    status_code: 499,
-                                    body: ResponseBody::buffered(
-                                        r#"{"error":"Client disconnected"}"#.as_bytes().to_vec(),
-                                    ),
-                                    headers: HashMap::new(),
-                                    connection_error: false,
-                                    backend_resolved_ip: resolved_ip.clone(),
-                                    error_class: Some(retry::ErrorClass::ClientDisconnect),
-                                },
-                                None,
-                                None,
-                            );
-                        }
-                        Err(AuthorizedUploadWaitError::Wait(
-                            RequestBodyWaitError::DeadlineExceeded,
-                        )) => {
-                            let response = client_grpc_deadline_exceeded_response_for_request(
-                                request_ctx,
-                                headers,
-                                resolved_ip.clone(),
-                            );
-                            return backend_dispatch_response(response, None, None);
-                        }
-                        Err(AuthorizedUploadWaitError::Wait(RequestBodyWaitError::TimedOut)) => {
-                            let response =
-                                request_body_timeout_backend_response(resolved_ip.clone());
-                            return backend_dispatch_response(response, None, None);
-                        }
-                        // See the size-limited arm above: latched once, no
-                        // backend dialed, terminal decided pre-commitment.
-                        Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {
-                            return authorization_expired_backend_dispatch(
-                                resolved_ip.clone(),
-                                None,
-                                None,
-                            );
-                        }
+                    Err(AuthorizedUploadWaitError::Wait(
+                        RequestBodyWaitError::DeadlineExceeded,
+                    )) => {
+                        let response = client_grpc_deadline_exceeded_response_for_request(
+                            request_ctx,
+                            headers,
+                            resolved_ip.clone(),
+                        );
+                        return backend_dispatch_response(response, None, None);
+                    }
+                    Err(AuthorizedUploadWaitError::Wait(RequestBodyWaitError::TimedOut)) => {
+                        let response = request_body_timeout_backend_response(resolved_ip.clone());
+                        return backend_dispatch_response(response, None, None);
+                    }
+                    // Already latched and counted once. No backend was dialed
+                    // and nothing was committed downstream, so the
+                    // pre-commitment terminal in `handle_proxy_request_inner`
+                    // decides the client-visible shape.
+                    Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {
+                        return authorization_expired_backend_dispatch(
+                            resolved_ip.clone(),
+                            None,
+                            None,
+                        );
                     }
                 };
 
@@ -45155,6 +45241,60 @@ fn build_request_body_too_large_response(
         StatusCode::PAYLOAD_TOO_LARGE,
         r#"{"error":"Request body exceeds maximum size"}"#,
     )
+}
+
+/// Client-visible terminal for a buffered upload the aggregate request-buffer
+/// budget could not admit (issue #4153).
+///
+/// A GATEWAY-LOCAL transient-capacity refusal, so it mirrors the retained
+/// RESPONSE refusal exactly: `503` on HTTP, gRPC `RESOURCE_EXHAUSTED` on the
+/// native and gRPC-Web paths, and a fixed body that names no route, header,
+/// credential, or upload content.
+fn build_request_buffer_capacity_response(
+    is_grpc_request: bool,
+    grpc_web_response_content_type: Option<&str>,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> Response<ProxyBody> {
+    if let Some(content_type) = grpc_web_response_content_type {
+        return build_grpc_web_error_response(
+            content_type,
+            response_buffer_budget::REQUEST_BUFFER_OVERLOAD_GRPC_STATUS,
+            response_buffer_budget::REQUEST_BUFFER_OVERLOAD_GRPC_MESSAGE,
+            initial_response_header_policy_plugins,
+        );
+    }
+    if is_grpc_request {
+        return grpc_proxy::build_grpc_error_response_with_policy(
+            response_buffer_budget::REQUEST_BUFFER_OVERLOAD_GRPC_STATUS,
+            response_buffer_budget::REQUEST_BUFFER_OVERLOAD_GRPC_MESSAGE,
+            initial_response_header_policy_plugins,
+        );
+    }
+    build_response(
+        StatusCode::from_u16(response_buffer_budget::REQUEST_BUFFER_OVERLOAD_STATUS)
+            .unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+        response_buffer_budget::REQUEST_BUFFER_OVERLOAD_BODY,
+    )
+}
+
+/// The same refusal on the backend-dispatch seam, for the paths that return a
+/// [`retry::BackendResponse`] rather than a built response.
+fn request_buffer_capacity_backend_response(resolved_ip: Option<String>) -> retry::BackendResponse {
+    retry::BackendResponse {
+        status_code: response_buffer_budget::REQUEST_BUFFER_OVERLOAD_STATUS,
+        body: ResponseBody::buffered(
+            response_buffer_budget::REQUEST_BUFFER_OVERLOAD_BODY
+                .as_bytes()
+                .to_vec(),
+        ),
+        headers: HashMap::new(),
+        // No backend was dialed, so this carries no backend health signal and
+        // must never be retried: another upstream would meet the same
+        // process-global budget.
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(response_buffer_budget::REQUEST_BUFFER_OVERLOAD_ERROR_CLASS),
+    }
 }
 
 fn request_body_timeout_backend_response(resolved_ip: Option<String>) -> retry::BackendResponse {
@@ -51815,39 +51955,60 @@ async fn proxy_to_backend_http3(
         ClientRequestBody::Buffered(buffered) => buffered.body,
         ClientRequestBody::Streaming(original_req) => {
             let (_parts, body) = (*original_req).into_parts();
-            if effective_max_request_body_size_bytes > 0 {
-                if declared_request_content_length_over_limit(
-                    headers,
-                    effective_max_request_body_size_bytes,
-                ) {
-                    return (
-                        retry::BackendResponse {
-                            status_code: 413,
-                            body: ResponseBody::buffered(
-                                r#"{"error":"Request body exceeds maximum size"}"#
-                                    .as_bytes()
-                                    .to_vec(),
-                            ),
-                            headers: HashMap::new(),
-                            connection_error: false,
-                            backend_resolved_ip: resolved_ip,
-                            error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
-                        },
-                        None,
-                    );
-                }
-                let limited =
-                    http_body_util::Limited::new(body, effective_max_request_body_size_bytes);
-                match collect_request_body_under_authorization(
-                    limited.collect(),
-                    grpc_deadline_at,
-                    proxy.backend_read_timeout_ms,
-                    buffered_upload_auth_deadline.as_ref(),
-                )
-                .await
-                {
-                    Ok(Ok(collected)) => collected.to_bytes().to_vec(),
-                    Ok(Err(_)) => {
+            // Fail-closed retained ceiling + aggregate admission taken BEFORE
+            // the buffer is allocated (issue #4153). `0` on
+            // `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` stays "unlimited" for
+            // STREAMING — nothing is retained there — but this bridge arm
+            // buffers, so it is never collected unbounded.
+            let retained_ceiling = response_buffer_budget::buffered_request_body_ceiling(
+                effective_max_request_body_size_bytes,
+            );
+            if declared_request_content_length_over_limit(headers, retained_ceiling) {
+                return (
+                    retry::BackendResponse {
+                        status_code: 413,
+                        body: ResponseBody::buffered(
+                            r#"{"error":"Request body exceeds maximum size"}"#
+                                .as_bytes()
+                                .to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                    },
+                    None,
+                );
+            }
+            // Held for the rest of this bridge arm, so it covers the collect
+            // and the backend request built from the collected bytes, and is
+            // returned by DROP on every exit path below.
+            let _request_buffer_permit =
+                match response_buffer_budget::RequestBufferPermit::reserve(retained_ceiling) {
+                    Some(permit) => permit,
+                    None => {
+                        return (request_buffer_capacity_backend_response(resolved_ip), None);
+                    }
+                };
+            let limited = http_body_util::Limited::new(body, retained_ceiling);
+            match collect_request_body_under_authorization(
+                limited.collect(),
+                grpc_deadline_at,
+                proxy.backend_read_timeout_ms,
+                buffered_upload_auth_deadline.as_ref(),
+            )
+            .await
+            {
+                Ok(Ok(collected)) => collected.to_bytes().to_vec(),
+                // `Limited::collect()` yields either a `LengthLimitError` (the
+                // body really exceeded the ceiling -> 413) or the underlying
+                // transport error (the client dropped the stream mid-upload ->
+                // 499). Distinguishing them keeps a disconnect from being
+                // reported as an oversize body.
+                Ok(Err(e)) => {
+                    if e.downcast_ref::<http_body_util::LengthLimitError>()
+                        .is_some()
+                    {
                         return (
                             retry::BackendResponse {
                                 status_code: 413,
@@ -51864,84 +52025,44 @@ async fn proxy_to_backend_http3(
                             None,
                         );
                     }
-                    Err(AuthorizedUploadWaitError::Wait(RequestBodyWaitError::TimedOut)) => {
-                        return (request_body_timeout_backend_response(resolved_ip), None);
-                    }
-                    Err(AuthorizedUploadWaitError::Wait(
-                        RequestBodyWaitError::DeadlineExceeded,
-                    )) => {
-                        return (
-                            client_grpc_deadline_exceeded_response_for_optional_request(
-                                ctx.as_deref(),
-                                headers,
-                                resolved_ip,
+                    error!(
+                        proxy_id = %proxy.id,
+                        backend_url = %strip_query_params(backend_url),
+                        error_kind = "client_disconnect",
+                        error = %e,
+                        "Client disconnected while sending request body (HTTP/3)"
+                    );
+                    return (
+                        retry::BackendResponse {
+                            status_code: 499,
+                            body: ResponseBody::buffered(
+                                r#"{"error":"Client disconnected"}"#.as_bytes().to_vec(),
                             ),
-                            None,
-                        );
-                    }
-                    // Latched and counted once; no H3 backend was dialed and
-                    // nothing was committed downstream.
-                    Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {
-                        return (
-                            authorization_expired_dispatch_placeholder(resolved_ip),
-                            None,
-                        );
-                    }
+                            headers: HashMap::new(),
+                            connection_error: false,
+                            backend_resolved_ip: resolved_ip,
+                            error_class: Some(retry::ErrorClass::ClientDisconnect),
+                        },
+                        None,
+                    );
                 }
-            } else {
-                match collect_request_body_under_authorization(
-                    body.collect(),
-                    grpc_deadline_at,
-                    proxy.backend_read_timeout_ms,
-                    buffered_upload_auth_deadline.as_ref(),
-                )
-                .await
-                {
-                    Ok(Ok(collected)) => collected.to_bytes().to_vec(),
-                    Ok(Err(e)) => {
-                        error!(
-                            proxy_id = %proxy.id,
-                            backend_url = %strip_query_params(backend_url),
-                            error_kind = "client_disconnect",
-                            error = %e,
-                            "Client disconnected while sending request body (HTTP/3)"
-                        );
-                        return (
-                            retry::BackendResponse {
-                                status_code: 499,
-                                body: ResponseBody::buffered(
-                                    r#"{"error":"Client disconnected"}"#.as_bytes().to_vec(),
-                                ),
-                                headers: HashMap::new(),
-                                connection_error: false,
-                                backend_resolved_ip: resolved_ip,
-                                error_class: Some(retry::ErrorClass::ClientDisconnect),
-                            },
-                            None,
-                        );
-                    }
-                    Err(AuthorizedUploadWaitError::Wait(RequestBodyWaitError::TimedOut)) => {
-                        return (request_body_timeout_backend_response(resolved_ip), None);
-                    }
-                    Err(AuthorizedUploadWaitError::Wait(
-                        RequestBodyWaitError::DeadlineExceeded,
-                    )) => {
-                        return (
-                            client_grpc_deadline_exceeded_response_for_optional_request(
-                                ctx.as_deref(),
-                                headers,
-                                resolved_ip,
-                            ),
-                            None,
-                        );
-                    }
-                    // See the size-limited arm above.
-                    Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {
-                        return (
-                            authorization_expired_dispatch_placeholder(resolved_ip),
-                            None,
-                        );
-                    }
+                Err(AuthorizedUploadWaitError::Wait(RequestBodyWaitError::TimedOut)) => {
+                    return (request_body_timeout_backend_response(resolved_ip), None);
+                }
+                Err(AuthorizedUploadWaitError::Wait(RequestBodyWaitError::DeadlineExceeded)) => {
+                    return (
+                        client_grpc_deadline_exceeded_response_for_optional_request(
+                            ctx.as_deref(),
+                            headers,
+                            resolved_ip,
+                        ),
+                        None,
+                    );
+                }
+                // Latched and counted once; no H3 backend was dialed and
+                // nothing was committed downstream.
+                Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {
+                    return (authorization_expired_dispatch_placeholder(resolved_ip), None);
                 }
             }
         }
@@ -56478,6 +56599,7 @@ mod tests {
                 headers: hyper::HeaderMap::new(),
                 body: b"payload".to_vec(),
                 trailers: Some(trailers),
+                _budget: None,
             })),
             "POST",
             &headers,
@@ -56541,6 +56663,7 @@ mod tests {
                 headers: hyper::HeaderMap::new(),
                 body: b"payload".to_vec(),
                 trailers: Some(trailers),
+                _budget: None,
             })),
             "POST",
             &headers,
@@ -56594,6 +56717,7 @@ mod tests {
                 headers: hyper::HeaderMap::new(),
                 body: b"payload".to_vec(),
                 trailers: Some(hyper::HeaderMap::new()),
+                _budget: None,
             })),
             "POST",
             &HashMap::new(),
@@ -56927,6 +57051,7 @@ mod tests {
                 headers: hyper::HeaderMap::new(),
                 body: Vec::new(),
                 trailers: None,
+                _budget: None,
             })),
             None,
             &[],
@@ -56991,6 +57116,7 @@ mod tests {
                     headers: hyper::HeaderMap::new(),
                     body: Vec::new(),
                     trailers: None,
+                    _budget: None,
                 })),
                 None,
                 plugins,
@@ -57102,6 +57228,7 @@ mod tests {
                     headers: hyper::HeaderMap::new(),
                     body: Vec::new(),
                     trailers: None,
+                    _budget: None,
                 })),
                 None,
                 plugins,
@@ -57257,6 +57384,7 @@ mod tests {
                 headers: hyper::HeaderMap::new(),
                 body: Vec::new(),
                 trailers: None,
+                _budget: None,
             })),
             None,
             &plugins,
