@@ -14,7 +14,7 @@ use ferrum_edge::config::db_backend::{
     is_mtls_dns_identity_conflict, tcp_connection_throttle_attachment_conflict,
 };
 use ferrum_edge::config::db_loader::{
-    DatabaseStore, is_retryable_sql_transaction_conflict,
+    DatabaseStore, is_retryable_sql_transaction_conflict, sqlite_code_is_retryable_write_conflict,
     sqlstate_is_retryable_transaction_conflict,
 };
 use ferrum_edge::config::namespace_registry::NamespaceRegistryCorrupt;
@@ -2777,7 +2777,7 @@ fn delete_paths_set_postgres_snapshot_isolation_before_other_tx_statements() {
             .and_then(|rest| rest.split("pub async fn ").next())
             .unwrap_or_else(|| panic!("{fn_name} body"));
         let begin = body
-            .find("self.pool().begin()")
+            .find("self.begin_write_tx()")
             .unwrap_or_else(|| panic!("{fn_name} must begin a transaction"));
         let set_iso = body
             .find("use_delete_capture_snapshot_tx")
@@ -3667,7 +3667,7 @@ fn sql_namespace_registry_mutations_require_canonical_lease_set_before_begin() {
             .find("require_namespace_registry_admission_leases")
             .unwrap_or_else(|| panic!("{marker} must validate the canonical lease set:\n{body}"));
         let begin_at = body
-            .find("pool().begin()")
+            .find("begin_write_tx()")
             .unwrap_or_else(|| panic!("{marker} must open a transaction:\n{body}"));
         assert!(
             body.contains(names),
@@ -3697,6 +3697,122 @@ fn sql_namespace_registry_mutations_require_canonical_lease_set_before_begin() {
 }
 
 // ── Retryable serialization/deadlock classification (issue #3955 review) ─────
+
+/// SQLite's writer lock must be taken by `BEGIN`, not by the first write.
+///
+/// A deferred `BEGIN` pins a WAL read snapshot on its first `SELECT`; the
+/// upgrade to the writer lock then fails with `SQLITE_BUSY_SNAPSHOT` (extended
+/// code 517) the moment another connection committed in between, and
+/// `PRAGMA busy_timeout` deliberately does not wait that error out. Every
+/// read-then-write store path is exposed to it, and a background admission
+/// lease release on a second pooled connection is enough to trigger it.
+#[tokio::test]
+async fn sqlite_write_transactions_hold_the_writer_lock_from_begin() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("sqlite_write_tx.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    insert_namespace_row(&store, "writer-lock-seed").await;
+
+    // A deferred `BEGIN` reproduces the failure exactly.
+    let mut deferred = store.pool().begin().await.unwrap();
+    let _: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM namespaces")
+        .fetch_one(&mut *deferred)
+        .await
+        .unwrap();
+    insert_namespace_row(&store, "interleaved-commit").await;
+    let error = sqlx::query("UPDATE namespaces SET updated_at = ? WHERE name = ?")
+        .bind("2026-01-01T00:00:00Z")
+        .bind("writer-lock-seed")
+        .execute(&mut *deferred)
+        .await
+        .expect_err("a stale deferred snapshot cannot upgrade to the writer lock");
+    let wrapped = anyhow::Error::new(error).context("namespace registry transaction failed");
+    assert!(
+        is_retryable_sql_transaction_conflict(&wrapped),
+        "a SQLite busy/locked write conflict aborts before commit and must classify as \
+         retryable, not surface as a driver error: {wrapped:#}"
+    );
+    drop(deferred);
+
+    // `begin_write_tx()` takes the writer lock up front, so the same
+    // interleaving serializes instead of failing: the concurrent writer waits
+    // for this transaction's commit.
+    let mut immediate = store.begin_write_tx().await.unwrap();
+    let _: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM namespaces")
+        .fetch_one(&mut *immediate)
+        .await
+        .unwrap();
+    let concurrent_store = store.pool();
+    let concurrent = tokio::spawn(async move {
+        sqlx::query(
+            "INSERT INTO namespaces (name, description, created_at, updated_at) \
+             VALUES (?, NULL, ?, ?)",
+        )
+        .bind("waits-for-the-writer")
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&concurrent_store)
+        .await
+    });
+    sqlx::query("UPDATE namespaces SET updated_at = ? WHERE name = ?")
+        .bind("2026-01-02T00:00:00Z")
+        .bind("writer-lock-seed")
+        .execute(&mut *immediate)
+        .await
+        .expect("an immediate transaction already owns the writer lock");
+    immediate.commit().await.unwrap();
+    concurrent
+        .await
+        .unwrap()
+        .expect("the queued writer proceeds once the write transaction commits");
+}
+
+async fn insert_namespace_row(store: &DatabaseStore, name: &str) {
+    sqlx::query(
+        "INSERT INTO namespaces (name, description, created_at, updated_at) VALUES (?, NULL, ?, ?)",
+    )
+    .bind(name)
+    .bind("2026-01-01T00:00:00Z")
+    .bind("2026-01-01T00:00:00Z")
+    .execute(&store.pool())
+    .await
+    .unwrap();
+}
+
+#[test]
+fn sqlite_busy_and_locked_result_codes_are_the_retryable_write_conflicts() {
+    for code in [
+        "5",   // SQLITE_BUSY
+        "6",   // SQLITE_LOCKED
+        "517", // SQLITE_BUSY_SNAPSHOT — busy_timeout never waits this one out
+        "261", // SQLITE_BUSY_RECOVERY
+        "262", // SQLITE_LOCKED_SHAREDCACHE
+    ] {
+        assert!(
+            sqlite_code_is_retryable_write_conflict(code),
+            "SQLite {code} aborts the write before commit and is safe to retry"
+        );
+    }
+    for code in [
+        "1",    // SQLITE_ERROR
+        "8",    // SQLITE_READONLY
+        "19",   // SQLITE_CONSTRAINT — a real conflict a retry would only repeat
+        "1555", // SQLITE_CONSTRAINT_PRIMARYKEY
+        "787",  // SQLITE_CONSTRAINT_FOREIGNKEY
+        "14",   // SQLITE_CANTOPEN — connectivity, not a write conflict
+        "40001",
+        "",
+        "not-a-code",
+    ] {
+        assert!(
+            !sqlite_code_is_retryable_write_conflict(code),
+            "SQLite {code} must not be classified as a retryable write conflict"
+        );
+    }
+}
 
 #[test]
 fn retryable_transaction_conflict_sqlstates_are_exactly_serialization_and_deadlock() {

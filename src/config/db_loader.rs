@@ -161,9 +161,10 @@ pub fn sqlstate_is_retryable_transaction_conflict(code: &str) -> bool {
 /// Chain-aware, code-based classification of a database-aborted transaction.
 ///
 /// Persistence layers wrap driver errors with their own context, so the
-/// outermost message alone misses the abort. Only the SQLSTATE is inspected —
-/// the driver's message is never read, rendered, or logged, because it names
-/// the relation and the conflicting transaction.
+/// outermost message alone misses the abort. Only the SQLSTATE — or, on SQLite,
+/// the numeric result code — is inspected; the driver's message is never read,
+/// rendered, or logged, because it names the relation and the conflicting
+/// transaction.
 pub fn is_retryable_sql_transaction_conflict(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -176,8 +177,30 @@ fn sqlx_error_is_retryable_transaction_conflict(error: &sqlx::Error) -> bool {
     let sqlx::Error::Database(database_error) = error else {
         return false;
     };
+    // SQLite reports the same "I refused to serialize these two transactions"
+    // outcome as a busy/locked extended code instead of a SQLSTATE.
+    if database_error
+        .try_downcast_ref::<sqlx::sqlite::SqliteError>()
+        .is_some()
+    {
+        return DatabaseError::code(&**database_error)
+            .is_some_and(|code| sqlite_code_is_retryable_write_conflict(code.as_ref()));
+    }
     DatabaseError::code(&**database_error)
         .is_some_and(|code| sqlstate_is_retryable_transaction_conflict(code.as_ref()))
+}
+
+/// True when `code` is a SQLite result code that means "this write could not
+/// take the writer lock, so nothing from the transaction was applied".
+///
+/// `SQLITE_BUSY` (5) and `SQLITE_LOCKED` (6) — and every extended code built on
+/// them, notably `SQLITE_BUSY_SNAPSHOT` (517), which `PRAGMA busy_timeout`
+/// deliberately does *not* wait out — are raised **instead of** committing.
+/// They are the SQLite analogue of PostgreSQL's `40001`, so the caller gets the
+/// same typed retryable conflict rather than a 500 carrying driver text.
+pub fn sqlite_code_is_retryable_write_conflict(code: &str) -> bool {
+    code.parse::<i32>()
+        .is_ok_and(|code| matches!(code & 0xff, 5 | 6))
 }
 
 /// Replace a database-aborted registry mutation with the typed retryable
@@ -1434,7 +1457,7 @@ impl DatabaseStore {
         namespace: &str,
     ) -> Result<String, anyhow::Error> {
         let owner = Uuid::new_v4().to_string();
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
         let result = sqlx::query(&self.q(
             "UPDATE mtls_dns_admission_locks SET restore_owner = ?, updated_at = ? \
@@ -1457,7 +1480,7 @@ impl DatabaseStore {
         namespace: &str,
         owner: &str,
     ) -> Result<(), anyhow::Error> {
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, Some(owner))
             .await?;
         let result = sqlx::query(&self.q(
@@ -2796,7 +2819,7 @@ impl DatabaseStore {
         specs: &[crate::config::types::ApiSpec],
         mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         let mut admission_namespaces: Vec<&str> =
             specs.iter().map(|spec| spec.namespace.as_str()).collect();
         admission_namespaces.sort_unstable();
@@ -2838,7 +2861,7 @@ impl DatabaseStore {
         mode: &BatchConfigWriteMode,
     ) -> Result<(), anyhow::Error> {
         let start = Instant::now();
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         let mut namespaces: Vec<&str> = proxies
             .iter()
             .map(|p| p.namespace.as_str())
@@ -3251,7 +3274,7 @@ impl DatabaseStore {
         };
         let stream_match_json = serialize_stream_match(proxy)?;
 
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, &proxy.namespace)
             .await?;
         self.ensure_proxy_route_unique_tx(&mut tx, proxy, None)
@@ -3405,7 +3428,7 @@ impl DatabaseStore {
             ResponseBodyMode::Stream => "stream",
         };
 
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, &proxy.namespace)
             .await?;
         // Existence read inside the transaction is the not-found authority —
@@ -3544,7 +3567,7 @@ impl DatabaseStore {
         cleanup_orphaned_upstream: bool,
     ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
         let prior_mtls_dns_conflicts = self
             .mtls_dns_identity_conflicts_tx(&mut tx, namespace)
@@ -3883,7 +3906,7 @@ impl DatabaseStore {
         let start = Instant::now();
         let creds_json = serde_json::to_string(&consumer.credentials)?;
         let acl_groups_json = serde_json::to_string(&consumer.acl_groups)?;
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, &consumer.namespace)
             .await?;
         sqlx::query(
@@ -3932,7 +3955,7 @@ impl DatabaseStore {
         let start = Instant::now();
         let creds_json = serde_json::to_string(&consumer.credentials)?;
         let acl_groups_json = serde_json::to_string(&consumer.acl_groups)?;
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_for_owner_tx(&mut tx, &consumer.namespace, guard_owner)
             .await?;
         // Existence read inside the transaction is the not-found authority —
@@ -3995,7 +4018,7 @@ impl DatabaseStore {
 
     pub async fn delete_consumer(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
         let prior_mtls_dns_conflicts = self
             .mtls_dns_identity_conflicts_tx(&mut tx, namespace)
@@ -4080,7 +4103,7 @@ impl DatabaseStore {
             PluginScope::ProxyGroup => "proxy_group",
             PluginScope::Global => "global",
         };
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, &pc.namespace)
             .await?;
         sqlx::query(
@@ -4125,7 +4148,7 @@ impl DatabaseStore {
             PluginScope::ProxyGroup => "proxy_group",
             PluginScope::Global => "global",
         };
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, &pc.namespace)
             .await?;
         // Existence read inside the transaction is the not-found authority —
@@ -4187,7 +4210,7 @@ impl DatabaseStore {
         id: &str,
     ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
         let prior_mtls_dns_conflicts = self
             .mtls_dns_identity_conflicts_tx(&mut tx, namespace)
@@ -4712,7 +4735,7 @@ impl DatabaseStore {
         let start = Instant::now();
         let bundle_json = serde_json::to_string(&record.bundle)?;
 
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         // Written FIRST so the insert can carry the assigned revision. Both
         // statements are in one transaction, so a poller can still never see a
         // committed bundle with no change to detect, or the reverse.
@@ -4776,7 +4799,7 @@ impl DatabaseStore {
         let start = Instant::now();
         let bundle_json = serde_json::to_string(&record.bundle)?;
 
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         let select_sql = self.q(GATEWAY_TRUST_BUNDLE_SELECT_REVISION_SQL);
         let existing = sqlx::query(&select_sql)
             .bind(&record.namespace)
@@ -4899,7 +4922,7 @@ impl DatabaseStore {
         id: &str,
     ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         let delete_sql = self.q(GATEWAY_TRUST_BUNDLE_DELETE_SQL);
         let result = sqlx::query(&delete_sql)
             .bind(namespace)
@@ -5029,7 +5052,7 @@ impl DatabaseStore {
             .transpose()?;
         let backend_tls_san_allow_list_json = upstream_backend_tls_san_allow_list_json(upstream)?;
 
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, &upstream.namespace)
             .await?;
         sqlx::query(
@@ -5099,7 +5122,7 @@ impl DatabaseStore {
             .transpose()?;
         let backend_tls_san_allow_list_json = upstream_backend_tls_san_allow_list_json(upstream)?;
 
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, &upstream.namespace)
             .await?;
         // Existence read inside the transaction is the not-found authority —
@@ -5220,7 +5243,7 @@ impl DatabaseStore {
     /// check and the delete.
     pub async fn delete_upstream(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
         // Scope the existence check to the caller's namespace (issue #2122) so
         // a tenant cannot delete a same-id upstream in another namespace.
@@ -5287,7 +5310,7 @@ impl DatabaseStore {
         old_upstream_id: &str,
     ) -> Result<(), anyhow::Error> {
         let start = Instant::now();
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
 
         self.cleanup_orphaned_upstream_tx(&mut tx, namespace, old_upstream_id, true)
@@ -6495,7 +6518,7 @@ impl DatabaseStore {
         attach_plugins: bool,
         mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         let mut admission_namespaces: Vec<&str> = proxies
             .iter()
             .map(|proxy| proxy.namespace.as_str())
@@ -6697,7 +6720,7 @@ impl DatabaseStore {
         }
 
         for chunk in proxies.chunks(Self::BATCH_CHUNK_SIZE) {
-            let mut tx = self.pool().begin().await?;
+            let mut tx = self.begin_write_tx().await?;
             let mut admission_namespaces: Vec<&str> =
                 chunk.iter().map(|proxy| proxy.namespace.as_str()).collect();
             admission_namespaces.sort_unstable();
@@ -6806,7 +6829,7 @@ impl DatabaseStore {
         consumers: &[Consumer],
         mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         let mut admission_namespaces: Vec<&str> = consumers
             .iter()
             .map(|consumer| consumer.namespace.as_str())
@@ -6913,7 +6936,7 @@ impl DatabaseStore {
         configs: &[PluginConfig],
         mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         let mut admission_namespaces: Vec<&str> = configs
             .iter()
             .map(|config| config.namespace.as_str())
@@ -7026,7 +7049,7 @@ impl DatabaseStore {
         upstreams: &[Upstream],
         mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         let mut admission_namespaces: Vec<&str> = upstreams
             .iter()
             .map(|upstream| upstream.namespace.as_str())
@@ -7155,7 +7178,7 @@ impl DatabaseStore {
         let chunk_size = chunk_size.max(1);
         let admission_namespaces = graph.admission_namespaces();
 
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         for namespace in &admission_namespaces {
             self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                 .await?;
@@ -7306,7 +7329,7 @@ impl DatabaseStore {
         mode: &BatchConfigWriteMode,
     ) -> Result<(), anyhow::Error> {
         let start = Instant::now();
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         // PostgreSQL requires SET TRANSACTION before any other statement in the
         // transaction (including the mTLS DNS admission lock queries below).
         self.use_delete_capture_snapshot_tx(&mut tx).await?;
@@ -7426,6 +7449,33 @@ impl DatabaseStore {
     #[allow(dead_code)]
     pub fn db_type_str(&self) -> &str {
         &self.db_type
+    }
+
+    /// Begin a transaction that WILL write before it commits.
+    ///
+    /// SQLite's default `BEGIN` is *deferred*: the transaction takes a read
+    /// snapshot on its first `SELECT` and only tries to upgrade to the writer
+    /// lock at its first write. In WAL mode that upgrade fails immediately with
+    /// `SQLITE_BUSY_SNAPSHOT` (extended code 517, "database is locked") when
+    /// any other connection committed in between — and `PRAGMA busy_timeout`
+    /// does NOT retry that error, because the snapshot the transaction already
+    /// read from can never become writable. Every read-then-write path in this
+    /// module (a namespace delete that checks occupancy before taking the mTLS
+    /// DNS admission lock, for example) is exposed to it the moment a second
+    /// connection writes — an admission lease renewal or release is enough.
+    ///
+    /// `BEGIN IMMEDIATE` takes the writer lock up front, so contention becomes
+    /// an ordinary `SQLITE_BUSY` that `busy_timeout` waits out. PostgreSQL and
+    /// MySQL take row locks and report a retryable `40001`/`40P01` instead, so
+    /// they keep the plain `BEGIN`.
+    pub async fn begin_write_tx(
+        &self,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Any>, sqlx::Error> {
+        if self.db_type == "sqlite" {
+            self.pool().begin_with("BEGIN IMMEDIATE").await
+        } else {
+            self.pool().begin().await
+        }
     }
 
     /// Atomically replace the connection pool with a freshly connected one.
@@ -8344,7 +8394,7 @@ impl DatabaseStore {
         require_namespace_registry_admission_leases(&[&record.name], leases)
             .map_err(anyhow::Error::new)?;
         let fault = namespace_registry_fault(&record.name);
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         check_namespace_registry_fault(fault, RegistryPhase::Start)?;
         // Vacancy is decided HERE, inside the serialized transaction — an
         // earlier handler query could only improve the error message.
@@ -8403,7 +8453,7 @@ impl DatabaseStore {
         let start = Instant::now();
         let renaming = new_name != current_name;
         let fault = namespace_registry_fault(current_name);
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         // Postgres needs `SET TRANSACTION` before any other statement; a rename
         // deletes namespace-keyed rows after pre-scanning them for change-log
         // tombstones, so it needs the same repeatable-read capture the
@@ -8730,7 +8780,7 @@ impl DatabaseStore {
         require_namespace_registry_admission_leases(&[name], leases).map_err(anyhow::Error::new)?;
         let start = Instant::now();
         let fault = namespace_registry_fault(name);
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         // Postgres: must precede every other statement in the transaction.
         self.use_delete_capture_snapshot_tx(&mut tx).await?;
         check_namespace_registry_fault(fault, RegistryPhase::Start)?;
@@ -8888,7 +8938,7 @@ impl DatabaseStore {
             compensation_restore,
         )?;
 
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, &spec.namespace)
             .await?;
 
@@ -9236,7 +9286,7 @@ impl DatabaseStore {
         // tables are left untouched. Because this reads the live resources, direct
         // admin CRUD drift forces the full replace path even when the submitted
         // spec's resource_hash matches the stored metadata.
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, &spec.namespace)
             .await?;
 
@@ -10177,7 +10227,7 @@ impl DatabaseStore {
     /// proxy-scoped plugin_configs (via plugin_configs.proxy_id FK). Upstreams
     /// have no FK to proxies, so they are cleaned up manually by api_spec_id.
     pub async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.begin_write_tx().await?;
         // PostgreSQL requires SET TRANSACTION before any other statement in the
         // transaction (including the mTLS DNS admission lock queries below).
         self.use_delete_capture_snapshot_tx(&mut tx).await?;
