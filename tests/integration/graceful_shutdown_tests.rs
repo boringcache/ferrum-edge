@@ -699,12 +699,24 @@ async fn draining_makes_health_not_ready_while_live_stays_ok() {
     // `/status` is the same handler and must agree.
     let (status_code, status_body) = admin_get(&base, "/status").await;
     assert_eq!(status_code, 503, "{status_body}");
-    assert_eq!(status_body["ready"], serde_json::json!(false), "{status_body}");
-    assert_eq!(status_body["status"], serde_json::json!("draining"), "{status_body}");
+    assert_eq!(
+        status_body["ready"],
+        serde_json::json!(false),
+        "{status_body}"
+    );
+    assert_eq!(
+        status_body["status"],
+        serde_json::json!("draining"),
+        "{status_body}"
+    );
 
     // The unauthenticated tier still carries only the coarse contract.
     let object = body.as_object().expect("object body");
-    assert_eq!(object.len(), 2, "unauthenticated body must stay coarse: {body}");
+    assert_eq!(
+        object.len(),
+        2,
+        "unauthenticated body must stay coarse: {body}"
+    );
 
     // Liveness must not follow readiness down, or kubelet kills the pod
     // mid-drain.
