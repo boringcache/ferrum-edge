@@ -1754,11 +1754,7 @@ mod fallback_tests {
         .expect("fallback client request must not hang past outer bound");
         let elapsed = started.elapsed();
 
-        assert!(
-            result.is_err(),
-            "connect to non-routable TEST-NET-1 must fail"
-        );
-        let err = result.err().expect("connect failure");
+        let err = result.expect_err("connect to non-routable TEST-NET-1 must fail");
         assert!(
             err.is_timeout() || err.is_connect(),
             "expected timeout/connect error from fallback connect_timeout, got: {err:?}"
