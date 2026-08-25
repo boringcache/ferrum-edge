@@ -62198,7 +62198,10 @@ mod tests {
         // The pod's IPv6 address is only ours when the socket says so, and a
         // non-canonical spelling of it decides identically.
         assert_eq!(decide("fd00:10:244:1::4", 8080, Some(own_v6)), Ok(()));
-        assert_eq!(decide("[fd00:10:244:1:0:0:0:4]", 8080, Some(own_v6)), Ok(()));
+        assert_eq!(
+            decide("[fd00:10:244:1:0:0:0:4]", 8080, Some(own_v6)),
+            Ok(())
+        );
         // ...but a port this pod does not expose is refused...
         assert_eq!(
             decide("10.1.2.3", 9999, Some(own_ip)),

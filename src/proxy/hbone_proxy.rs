@@ -1997,9 +1997,15 @@ mod tests {
         };
 
         assert_eq!(decide(None, Some(own_ip)), Ok(()));
-        assert_eq!(decide(Some(&target("127.0.0.1", 8080)), Some(own_ip)), Ok(()));
+        assert_eq!(
+            decide(Some(&target("127.0.0.1", 8080)), Some(own_ip)),
+            Ok(())
+        );
         // The terminator's own pod address, reached on this socket.
-        assert_eq!(decide(Some(&target("10.1.2.3", 8080)), Some(own_ip)), Ok(()));
+        assert_eq!(
+            decide(Some(&target("10.1.2.3", 8080)), Some(own_ip)),
+            Ok(())
+        );
         assert_eq!(
             decide(Some(&target("203.0.113.10", 8080)), Some(own_ip)),
             Err(InboundRelayDenial::AddressNotTerminated)

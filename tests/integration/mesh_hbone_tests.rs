@@ -1653,11 +1653,20 @@ fn inbound_relay_admits_the_terminators_own_address() {
     let mesh = own_pod_terminator_mesh();
     let own = Some(ip("10.244.1.7"));
 
-    assert_eq!(mesh.inbound_relay_destination_decision("10.244.1.7", 8080, own), Ok(()));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, own),
+        Ok(())
+    );
     // Loopback resolves inside this pod's own network namespace, bounded to the
     // ports this pod declares.
-    assert_eq!(mesh.inbound_relay_destination_decision("127.0.0.1", 8080, own), Ok(()));
-    assert_eq!(mesh.inbound_relay_destination_decision("localhost", 8080, own), Ok(()));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("127.0.0.1", 8080, own),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("localhost", 8080, own),
+        Ok(())
+    );
     // A port this pod does not declare is still refused, so a stray local
     // listener is not reachable just because it shares the netns.
     assert_eq!(
@@ -1738,9 +1747,15 @@ fn inbound_relay_admits_only_the_waypoint_termination_inventory() {
     };
     let waypoint = Some(ip("10.244.4.4"));
 
-    assert_eq!(mesh.inbound_relay_destination_decision("10.244.2.9", 8080, waypoint), Ok(()));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.2.9", 8080, waypoint),
+        Ok(())
+    );
     // A record declaring no ports does not constrain its address.
-    assert_eq!(mesh.inbound_relay_destination_decision("10.244.2.10", 6379, waypoint), Ok(()));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.2.10", 6379, waypoint),
+        Ok(())
+    );
     assert_eq!(
         mesh.inbound_relay_destination_decision("10.244.2.9", 9999, waypoint),
         Err(InboundRelayDenial::PortNotDeclared)
