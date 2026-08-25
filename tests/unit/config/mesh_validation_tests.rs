@@ -2442,6 +2442,56 @@ fn mesh_config_validate_rejects_destination_rule_outlier_range_gaps() {
 }
 
 #[test]
+fn mesh_config_validate_rejects_destination_rule_tcp_idle_timeout_above_cap() {
+    let mesh = MeshConfig {
+        destination_rules: vec![MeshDestinationRule {
+            name: "dr".into(),
+            namespace: "default".into(),
+            host: "reviews.default.svc.cluster.local".into(),
+            traffic_policy: Some(MeshTrafficPolicy {
+                tcp_idle_timeout_seconds: Some(86_401),
+                ..MeshTrafficPolicy::default()
+            }),
+            port_level_settings: HashMap::new(),
+            subsets: Vec::new(),
+            export_to: vec!["*".to_string()],
+        }],
+        ..MeshConfig::default()
+    };
+    let errors = mesh.validate();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("idleTimeout") && e.contains("86400")),
+        "expected TCP idleTimeout cap rejection, got: {errors:?}"
+    );
+}
+
+#[test]
+fn mesh_config_validate_accepts_destination_rule_tcp_idle_timeout_zero() {
+    let mesh = MeshConfig {
+        destination_rules: vec![MeshDestinationRule {
+            name: "dr".into(),
+            namespace: "default".into(),
+            host: "reviews.default.svc.cluster.local".into(),
+            traffic_policy: Some(MeshTrafficPolicy {
+                tcp_idle_timeout_seconds: Some(0),
+                ..MeshTrafficPolicy::default()
+            }),
+            port_level_settings: HashMap::new(),
+            subsets: Vec::new(),
+            export_to: vec!["*".to_string()],
+        }],
+        ..MeshConfig::default()
+    };
+    let errors = mesh.validate();
+    assert!(
+        errors.iter().all(|e| !e.contains("idleTimeout")),
+        "0 must be accepted as disable, got: {errors:?}"
+    );
+}
+
+#[test]
 fn mesh_config_validate_accepts_zero_consecutive_errors_as_disabled() {
     // Istio treats `outlierDetection.consecutive5xxErrors: 0` as *disabling*
     // 5xx-based ejection rather than as a lower-bound violation, and the K8s

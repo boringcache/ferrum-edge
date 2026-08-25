@@ -670,6 +670,14 @@ pub struct UpstreamPortOverride {
     /// (HTTP-family dispatch is a follow-on PR).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_keepalive: Option<TcpKeepaliveCfg>,
+    /// Per-port bidirectional TCP idle bound, mapped from DestinationRule
+    /// `connectionPool.tcp.idleTimeout` (whole seconds). `Some(0)` disables
+    /// the idle watchdog for long-lived TCP (DB keepalives, SSH, IMAP).
+    /// Stream-family / mesh L4 relays consult this before the proxy field
+    /// and `FERRUM_TCP_IDLE_TIMEOUT_SECONDS`. Distinct from
+    /// `http_idle_timeout_ms` (HTTP pool idle; 0 is rejected).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_idle_timeout_seconds: Option<u64>,
     /// Legacy carrier for DestinationRule
     /// `connectionPool.http.maxRequestsPerConnection`.
     ///
@@ -818,6 +826,7 @@ pub struct ResolvedPortOverride {
     pub locality_lb_setting: Option<UpstreamLocalityLbSetting>,
     pub max_connections: Option<u32>,
     pub tcp_keepalive: Option<TcpKeepaliveCfg>,
+    pub tcp_idle_timeout_seconds: Option<u64>,
     pub http_max_requests_per_connection: Option<u32>,
     pub http_idle_timeout_ms: Option<u64>,
     /// Destination-wide active-request cap (`http2MaxRequests`).
@@ -859,6 +868,7 @@ impl ResolvedPortOverride {
             locality_lb_setting: value.locality_lb_setting.clone(),
             max_connections: value.max_connections,
             tcp_keepalive: value.tcp_keepalive.clone(),
+            tcp_idle_timeout_seconds: value.tcp_idle_timeout_seconds,
             http_max_requests_per_connection: value.http_max_requests_per_connection,
             http_idle_timeout_ms: value.http_idle_timeout_ms,
             http2_max_requests: value.http2_max_requests,
@@ -882,6 +892,7 @@ impl ResolvedPortOverride {
             && self.locality_lb_setting.is_none()
             && self.max_connections.is_none()
             && self.tcp_keepalive.is_none()
+            && self.tcp_idle_timeout_seconds.is_none()
             && self.http_max_requests_per_connection.is_none()
             && self.http_idle_timeout_ms.is_none()
             && self.http2_max_requests.is_none()
