@@ -4570,6 +4570,148 @@ pub struct MeshConfig {
     /// captured datapath trusts.
     #[serde(skip)]
     pub external_udp_egress_routes: Vec<MeshExternalUdpEgressRoute>,
+    /// Runtime-only inventory of the NON-LOCAL destinations this proxy's
+    /// authenticated inbound CONNECT terminator may relay to (issue #4150).
+    ///
+    /// The inbound HBONE/`:15006` terminator is only allowed to be the
+    /// ztunnel-equivalent for destinations it actually terminates FOR. Two
+    /// topologies legitimately terminate for a workload other than the pod the
+    /// proxy runs in, and only those two populate this vector:
+    ///
+    /// * `NodeWaypoint` — the CP-authorized pods enrolled on THIS node, taken
+    ///   from [`Self::node_waypoint_capture_destinations`].
+    /// * `ServiceWaypoint` — the backing workloads of the services bound to
+    ///   THIS waypoint, taken from the slice's already waypoint-narrowed
+    ///   workload view.
+    ///
+    /// `Sidecar` / `Ambient` terminate only for their own pod, which the
+    /// accepted connection's own local address proves without any inventory, so
+    /// they leave this EMPTY and set
+    /// [`Self::inbound_relay_admits_accepted_local_address`] instead.
+    /// `EastWestGateway` (SNI passthrough) and `EgressGateway` (external
+    /// ServiceEntry destinations, admitted by their own allowlists) leave both
+    /// unset.
+    ///
+    /// **Fail closed by construction.** Assigned UNCONDITIONALLY on every mesh
+    /// apply, so an empty vector admits no non-local destination and a withdrawn
+    /// enrollment cannot leave a stale admission behind. `serde(skip)`: never
+    /// operator-settable and never on the `config_json` wire — an
+    /// operator-supplied entry here would name a workload this node would then
+    /// relay into, bypassing that workload's own inbound policy.
+    #[serde(skip)]
+    pub inbound_relay_destinations: Vec<MeshInboundRelayDestination>,
+    /// Runtime-only marker for the OWN-POD inbound CONNECT terminators
+    /// (`Sidecar` / `Ambient`), set on every mesh apply (issue #4150).
+    ///
+    /// When true, the accepted connection's own local address is an admissible
+    /// relay destination: the peer provably reached the pod it named, on this
+    /// socket, so the destination IS this terminator. The port is still bounded
+    /// by the workload record(s) the slice declares FOR THAT ADDRESS, never by
+    /// some other workload's ports. False for every topology that runs outside
+    /// the destination pod's own network namespace.
+    #[serde(skip)]
+    pub inbound_relay_admits_accepted_local_address: bool,
+}
+
+/// One address the authenticated inbound CONNECT terminator may relay to, with
+/// the application ports the owning workload record declares (issue #4150).
+///
+/// An EMPTY `ports` mirrors the workload inventory's own rule: a record that
+/// declares no ports does not constrain the port for its address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshInboundRelayDestination {
+    /// Canonicalized destination address (IPv4-mapped IPv6 folded to IPv4), so
+    /// the two textual spellings of one address cannot diverge.
+    pub address: std::net::IpAddr,
+    /// Declared application ports, sorted and deduplicated. Empty ⇒ the owning
+    /// record declares none and does not constrain the port.
+    pub ports: Vec<u16>,
+}
+
+/// Why the authenticated inbound CONNECT terminator refused a destination
+/// (issue #4150). Carried into structured audit metadata so an operator can
+/// tell "this node does not terminate for that address at all" apart from "it
+/// does, but not on that port".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundRelayDenial {
+    /// No mesh slice is applied, so this proxy terminates for nothing.
+    NoSlice,
+    /// The authority is empty, portless, or not an IP literal / `localhost`.
+    /// A name would have to be resolved, and whatever it resolved to could not
+    /// be attributed to this terminator.
+    UnresolvableHost,
+    /// The address is not one this proxy terminates for. This is the
+    /// open-relay refusal: a slice-declared workload belonging to some OTHER
+    /// node lands here.
+    AddressNotTerminated,
+    /// The address IS one this proxy terminates for, but the owning workload
+    /// record does not declare the requested port.
+    PortNotDeclared,
+}
+
+impl InboundRelayDenial {
+    /// Stable, low-cardinality label for logs and transaction metadata.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoSlice => "no_mesh_slice",
+            Self::UnresolvableHost => "unresolvable_authority",
+            Self::AddressNotTerminated => "address_not_terminated_here",
+            Self::PortNotDeclared => "port_not_declared",
+        }
+    }
+}
+
+/// Collapse `workloads` into the compact address→declared-ports inventory the
+/// inbound CONNECT terminator's guard reads (issue #4150).
+///
+/// Cold path, run once per mesh apply. Addresses that are not IP literals are
+/// dropped: the guard compares parsed addresses, so an unparseable record could
+/// never match anyway and keeping it would only make the inventory look wider
+/// than it is.
+pub fn inbound_relay_destinations_from_workloads(
+    workloads: &[Workload],
+) -> Vec<MeshInboundRelayDestination> {
+    let mut destinations: Vec<MeshInboundRelayDestination> = Vec::new();
+    for workload in workloads {
+        for address in &workload.addresses {
+            let Ok(address) = address.parse::<std::net::IpAddr>() else {
+                continue;
+            };
+            let address = address.to_canonical();
+            let ports: Vec<u16> = workload.ports.iter().map(|port| port.port).collect();
+            // Index lookup, not `iter_mut().find()`: the mutable borrow would
+            // otherwise still be live in the insert arm.
+            let existing = destinations
+                .iter()
+                .position(|existing| existing.address == address);
+            let Some(index) = existing else {
+                destinations.push(MeshInboundRelayDestination { address, ports });
+                continue;
+            };
+            // Several records can back one pod (several Services on the same
+            // workload). Admit the UNION of their declared ports, and let a
+            // record that declares none leave the address unconstrained —
+            // exactly the rule a single record follows.
+            let existing = &mut destinations[index];
+            if existing.ports.is_empty() {
+                continue;
+            }
+            if ports.is_empty() {
+                existing.ports.clear();
+                continue;
+            }
+            for port in ports {
+                if !existing.ports.contains(&port) {
+                    existing.ports.push(port);
+                }
+            }
+        }
+    }
+    for destination in &mut destinations {
+        destination.ports.sort_unstable();
+    }
+    destinations.sort_by(|left, right| left.address.cmp(&right.address));
+    destinations
 }
 
 /// Canonical comparison form for a mesh host: IP literals fold IPv4-mapped
@@ -4618,6 +4760,121 @@ pub enum SidecarIngressConnectRelay {
 }
 
 impl MeshConfig {
+    /// Whether an authenticated inbound CONNECT to `host:port` may be
+    /// transparently relayed by THIS terminator (issue #4150), and why not when
+    /// it may not.
+    ///
+    /// The rule is ownership, not mesh membership: a destination is admissible
+    /// only when this proxy is the thing that terminates for it. Being declared
+    /// somewhere in the slice is NOT enough — relaying to another node's
+    /// workload would dial that pod in plaintext from this pod's IP, skipping
+    /// the destination's own `AuthorizationPolicy` set entirely.
+    ///
+    /// Admissible sources, in order:
+    ///
+    /// 1. **The accepted connection's own local address** (`Sidecar` /
+    ///    `Ambient`, gated on
+    ///    [`Self::inbound_relay_admits_accepted_local_address`]). The peer
+    ///    provably reached this pod at the address it named — a transport fact
+    ///    the peer cannot choose. The port is still bounded by the workload
+    ///    record(s) the slice declares FOR THAT ADDRESS.
+    /// 2. **Loopback** (`127.0.0.1` / `::1` / `localhost`), which resolves
+    ///    inside the terminator's OWN network namespace and is therefore
+    ///    admissible only for those same own-pod terminators, and only on a
+    ///    port this pod's own workload record declares. A `NodeWaypoint` runs
+    ///    in the host namespace and a `ServiceWaypoint` terminates for other
+    ///    pods, so neither may reach loopback at all.
+    /// 3. **[`Self::inbound_relay_destinations`]** — the deliberate, narrow
+    ///    multi-destination allowance for the two topologies that are MEANT to
+    ///    terminate for another workload (`NodeWaypoint` enrolled pods,
+    ///    `ServiceWaypoint` waypoint-bound backing workloads).
+    ///
+    /// Everything else fails closed, including a slice-declared workload owned
+    /// by a different node. Hot path: no allocation, no lock, and no scan of
+    /// the workload inventory except to bound the port of an address the
+    /// socket already proved is ours.
+    pub fn inbound_relay_destination_decision(
+        &self,
+        host: &str,
+        port: u16,
+        terminator_local_ip: Option<std::net::IpAddr>,
+    ) -> Result<(), InboundRelayDenial> {
+        if host.is_empty() || port == 0 {
+            return Err(InboundRelayDenial::UnresolvableHost);
+        }
+        // Only an own-pod terminator may treat its socket's local address as a
+        // relay destination; on every other topology the local address is the
+        // waypoint/node itself, not a workload it terminates for.
+        let own_address = terminator_local_ip
+            .filter(|_| self.inbound_relay_admits_accepted_local_address)
+            .map(|ip| ip.to_canonical());
+
+        if host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+        {
+            let Some(own_address) = own_address else {
+                return Err(InboundRelayDenial::AddressNotTerminated);
+            };
+            return if self.workload_declares_address_port(own_address, port) {
+                Ok(())
+            } else {
+                Err(InboundRelayDenial::PortNotDeclared)
+            };
+        }
+
+        let Ok(address) = host.parse::<std::net::IpAddr>() else {
+            return Err(InboundRelayDenial::UnresolvableHost);
+        };
+        // Canonicalize so `::ffff:10.1.2.3` and `10.1.2.3`, and the several
+        // textual spellings of one IPv6 address, resolve to the same decision
+        // instead of one form being admitted and the other refused.
+        let address = address.to_canonical();
+
+        if own_address == Some(address) {
+            return if self.workload_declares_address_port(address, port) {
+                Ok(())
+            } else {
+                Err(InboundRelayDenial::PortNotDeclared)
+            };
+        }
+
+        let mut terminates_for_address = false;
+        for destination in &self.inbound_relay_destinations {
+            if destination.address != address {
+                continue;
+            }
+            terminates_for_address = true;
+            if destination.ports.is_empty() || destination.ports.contains(&port) {
+                return Ok(());
+            }
+        }
+        if terminates_for_address {
+            Err(InboundRelayDenial::PortNotDeclared)
+        } else {
+            Err(InboundRelayDenial::AddressNotTerminated)
+        }
+    }
+
+    /// Whether the slice declares `port` for `address`.
+    ///
+    /// Only ever consulted for an address ALREADY proven to be this
+    /// terminator's own (the accepted connection's local address), so it can
+    /// never widen the admitted address set — it only bounds the port. Address
+    /// comparison is canonicalized on both sides, so a record spelled
+    /// `::ffff:10.1.2.3` still bounds `10.1.2.3`.
+    fn workload_declares_address_port(&self, address: std::net::IpAddr, port: u16) -> bool {
+        self.workloads.iter().any(|workload| {
+            workload.addresses.iter().any(|declared| {
+                declared
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.to_canonical() == address)
+            }) && (workload.ports.is_empty()
+                || workload.ports.iter().any(|declared| declared.port == port))
+        })
+    }
+
     /// Whether `host` belongs to the unambiguously resolved local service's
     /// workload set (see [`Self::local_workload_addresses`]). This membership
     /// check is not pod-unique; callers that need the exact replica must also
@@ -4861,6 +5118,8 @@ impl Default for MeshConfig {
             sidecar_ingress_bind_overrides: std::collections::BTreeMap::new(),
             egress_udp_destinations: Vec::new(),
             external_udp_egress_routes: Vec::new(),
+            inbound_relay_destinations: Vec::new(),
+            inbound_relay_admits_accepted_local_address: false,
         }
     }
 }

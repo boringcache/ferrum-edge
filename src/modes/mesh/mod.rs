@@ -1637,6 +1637,56 @@ fn prepare_normalized_gateway_config_for_mesh(
             local_addresses.dedup();
         }
         mesh.local_workload_addresses = local_addresses;
+        // Bound the authenticated inbound CONNECT terminator to the
+        // destinations THIS proxy actually terminates for (issue #4150).
+        //
+        // Assigned UNCONDITIONALLY on every apply, so a topology change, a
+        // withdrawn NodeWaypoint enrollment, or a service unbound from this
+        // waypoint immediately stops being an admissible relay destination
+        // instead of leaving a stale admission behind. Both fields default to
+        // "terminates for nothing", so an unrecognized or gateway topology
+        // refuses every transparent relay rather than falling back to the
+        // slice-wide workload view — which is what made this terminator an
+        // open relay into other nodes' pods.
+        let (inbound_relay_destinations, admits_accepted_local_address) = match runtime.topology {
+            // Own-pod terminators. The ONLY address they terminate for is the
+            // pod they run in, and the accepted connection's own local address
+            // proves that without needing the slice to resolve a local identity
+            // (which is `None` whenever no Sidecar narrowing applied). No
+            // inventory, so a sibling replica of the same service — a different
+            // pod, with its own policies — is not a relay destination either.
+            MeshTopology::Sidecar | MeshTopology::Ambient => (Vec::new(), true),
+            // Deliberate multi-destination allowance #1: a NodeWaypoint IS the
+            // inbound terminator for every pod enrolled on its node, so those
+            // pods' addresses are legitimately not its own. The inventory is the
+            // CP-authorized enrolled set (scope + bearer `ns` claim), never the
+            // subscription-namespace `workloads` view.
+            MeshTopology::NodeWaypoint => (
+                crate::modes::mesh::config::inbound_relay_destinations_from_workloads(
+                    &mesh_slice.node_waypoint_capture_destinations,
+                ),
+                false,
+            ),
+            // Deliberate multi-destination allowance #2: a GAMMA ServiceWaypoint
+            // IS the L7 terminator for the services bound to it, and the slice
+            // filter has already narrowed `workloads` to the workloads backing
+            // exactly those services. A workload outside that binding is still
+            // refused.
+            MeshTopology::ServiceWaypoint => (
+                crate::modes::mesh::config::inbound_relay_destinations_from_workloads(
+                    &mesh_slice.workloads,
+                ),
+                false,
+            ),
+            // EastWestGateway is SNI passthrough and terminates no HBONE at all.
+            // EgressGateway relays to EXTERNAL ServiceEntry destinations through
+            // its own admission lists (`egress_udp_destinations` for datagrams,
+            // materialized routes for byte streams), never to an in-mesh
+            // workload address, so it owns no transparent-relay destination.
+            MeshTopology::EastWestGateway | MeshTopology::EgressGateway => (Vec::new(), false),
+        };
+        mesh.inbound_relay_destinations = inbound_relay_destinations;
+        mesh.inbound_relay_admits_accepted_local_address = admits_accepted_local_address;
     }
     materialize_fault_runtime_overlay(&mut config, &mesh_slice.runtime_overlay);
     materialize_transformer_runtime_overlay(&mut config, &mesh_slice.runtime_overlay);
@@ -8656,11 +8706,13 @@ fn cross_cluster_hbone_synthetic_host(
 ///   endpoint.
 /// - Ambient: inner = HBONE CONNECT, the dest relay
 ///   (`build_inbound_hbone_relay_proxy`) dials the CONNECT `:authority` under the
-///   OPEN-RELAY GUARD (`inbound_hbone_relay_destination_allowed`) — the authority
-///   must be loopback OR a slice-declared workload addr+port; a service FQDN is
-///   REJECTED. The remote pod IP IS slice-declared on the dest side AND known to
-///   the client (merged remote endpoints). So Ambient cross-cluster targets are
-///   PER-REMOTE-POD, with the east-west gateway carried as a DIAL OVERRIDE.
+///   OPEN-RELAY GUARD (`inbound_hbone_relay_destination_decision`) — the authority
+///   must be loopback OR the DEST pod's own address on a declared port (issue
+///   #4150); a service FQDN is REJECTED. The remote pod IP is exactly the
+///   address the inner mTLS lands on at the dest pod (the east-west gateway is
+///   SNI passthrough), and it is known to the client from the merged remote
+///   endpoints. So Ambient cross-cluster targets are PER-REMOTE-POD, with the
+///   east-west gateway carried as a DIAL OVERRIDE.
 ///
 /// IDENTITY (overlapping-CIDR collision avoidance): `UpstreamTarget.host` is a
 /// SCOPED SYNTHETIC identity keyed by `(gateway dial endpoint, real pod addr)`
@@ -40014,6 +40066,108 @@ mod tests {
             Some(expected_pod_ip),
         );
         assert_eq!(stale, config::SidecarIngressConnectRelay::NotDeclared);
+    }
+
+    /// Issue #4150: the authenticated inbound CONNECT terminator's admitted
+    /// destinations are derived from the TOPOLOGY, not from the slice-wide
+    /// workload view. Own-pod terminators carry no inventory (the accepted
+    /// socket's local address is the proof); the two waypoint topologies carry
+    /// exactly their narrow inventory; the gateway topologies carry neither.
+    #[test]
+    fn inbound_relay_termination_scope_is_back_projected_per_topology() {
+        use crate::modes::mesh::config::InboundRelayDenial;
+
+        let mut peer = workload("reviews", "reviews");
+        peer.addresses = vec!["10.244.1.7".to_string()];
+        let mut enrolled = workload("ratings", "ratings");
+        enrolled.addresses = vec!["10.244.2.9".to_string()];
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![peer],
+            node_waypoint_capture_destinations: vec![enrolled],
+            ..MeshSlice::default()
+        };
+        let pod_ip = "10.244.1.7"
+            .parse::<std::net::IpAddr>()
+            .expect("test pod IP");
+        let enrolled_ip = "10.244.2.9"
+            .parse::<std::net::IpAddr>()
+            .expect("enrolled pod IP");
+
+        let prepared = |topology: MeshTopology| {
+            let runtime = MeshRuntimeConfig {
+                topology,
+                waypoint_name: matches!(topology, MeshTopology::ServiceWaypoint)
+                    .then(|| "reviews-waypoint".to_string()),
+                ..test_mesh_runtime_config()
+            };
+            let config = gateway_config_from_mesh_slice(&slice, &runtime, None, None)
+                .expect("slice → config");
+            *config.mesh.expect("prepared mesh")
+        };
+        let addresses = |mesh: &config::MeshConfig| {
+            mesh.inbound_relay_destinations
+                .iter()
+                .map(|destination| destination.address)
+                .collect::<Vec<_>>()
+        };
+        let decide = |mesh: &config::MeshConfig, host: &str, local: Option<std::net::IpAddr>| {
+            mesh.inbound_relay_destination_decision(host, 8080, local)
+        };
+
+        // Own-pod terminators: no inventory, and the accepted local address IS
+        // the admission. A slice-declared workload reached WITHOUT that proof
+        // is refused — the open-relay fix.
+        for topology in [MeshTopology::Sidecar, MeshTopology::Ambient] {
+            let mesh = prepared(topology);
+            assert!(
+                mesh.inbound_relay_admits_accepted_local_address,
+                "{topology:?} terminates for its own pod"
+            );
+            assert!(
+                mesh.inbound_relay_destinations.is_empty(),
+                "{topology:?} must carry no non-local termination inventory"
+            );
+            assert_eq!(decide(&mesh, "10.244.1.7", Some(pod_ip)), Ok(()));
+            assert_eq!(
+                decide(&mesh, "10.244.1.7", None),
+                Err(InboundRelayDenial::AddressNotTerminated)
+            );
+        }
+
+        // NodeWaypoint: the CP-authorized enrolled pods, never the
+        // subscription-namespace workload view, and never its own address.
+        let mesh = prepared(MeshTopology::NodeWaypoint);
+        assert!(!mesh.inbound_relay_admits_accepted_local_address);
+        assert_eq!(addresses(&mesh), vec![enrolled_ip]);
+        assert_eq!(decide(&mesh, "10.244.2.9", Some(pod_ip)), Ok(()));
+        assert_eq!(
+            decide(&mesh, "10.244.1.7", Some(pod_ip)),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
+
+        // ServiceWaypoint: the already waypoint-narrowed backing workloads.
+        let mesh = prepared(MeshTopology::ServiceWaypoint);
+        assert!(!mesh.inbound_relay_admits_accepted_local_address);
+        assert_eq!(addresses(&mesh), vec![pod_ip]);
+        assert_eq!(decide(&mesh, "10.244.1.7", None), Ok(()));
+        assert_eq!(
+            decide(&mesh, "10.244.2.9", None),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
+
+        // Gateway topologies terminate no in-mesh workload at all.
+        for topology in [MeshTopology::EastWestGateway, MeshTopology::EgressGateway] {
+            let mesh = prepared(topology);
+            assert!(!mesh.inbound_relay_admits_accepted_local_address);
+            assert!(mesh.inbound_relay_destinations.is_empty());
+            assert_eq!(
+                decide(&mesh, "10.244.1.7", Some(pod_ip)),
+                Err(InboundRelayDenial::AddressNotTerminated)
+            );
+        }
     }
 
     /// The `sidecar_ingress_declared` marker is SIDECAR-topology only, exactly

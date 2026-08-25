@@ -10085,7 +10085,7 @@ async fn sidecar_ingress_connect(
 /// The local `echo` workload plus its Service.
 ///
 /// Every port in `workload_ports` is declared as a WORKLOAD port, so the
-/// ordinary inbound open-relay guard (`inbound_hbone_relay_destination_allowed`)
+/// ordinary inbound open-relay guard (`inbound_hbone_relay_destination_decision`)
 /// would admit an authenticated CONNECT to any of them. That is what makes the
 /// ingress assertions non-vacuous: refusals below come from the DECLARED
 /// `ingress[]` surface replacing the ordinary one, not from a port the slice
