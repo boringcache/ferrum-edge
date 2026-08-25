@@ -4901,6 +4901,23 @@ pub mod _test_support {
         ))
     }
 
+    /// Whether the built Redis TLS address has `insecure = true`.
+    ///
+    /// Used to assert that a caller-supplied `#insecure` fragment cannot disable
+    /// verification unless `tls_no_verify` (`FERRUM_TLS_NO_VERIFY`) is set.
+    pub fn redis_client_tls_insecure(
+        config: RedisConfig,
+        url: &str,
+        tls_no_verify: bool,
+    ) -> Result<bool, String> {
+        let client = RedisRateLimitClient::new(config, None, tls_no_verify, None);
+        let redis_client = client.build_client(url).map_err(|e| e.to_string())?;
+        match &redis_client.get_connection_info().addr {
+            redis::ConnectionAddr::TcpTls { insecure, .. } => Ok(*insecure),
+            other => Err(format!("expected Redis TcpTls address, got {other:?}")),
+        }
+    }
+
     pub fn redis_rate_limit_client_for_test(config: RedisConfig) -> RedisRateLimitClient {
         RedisRateLimitClient::new(config, None, false, None)
     }
