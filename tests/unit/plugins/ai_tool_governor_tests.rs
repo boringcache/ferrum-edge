@@ -10560,3 +10560,652 @@ async fn buffered_sse_duplicate_member_frame_is_observed_in_dry_run() {
     assert_dry_run_ambiguity_observation(&ctx);
     assert_no_metadata_contains(&ctx, "danger");
 }
+
+// ---------------------------------------------------------------------------
+// Provider tool-call shapes (issue #4165)
+//
+// Before this coverage the governor read only the OpenAI wire format, so every
+// non-OpenAI-shaped tool call and tool definition extracted to zero calls,
+// reported `ungovernable == false`, and was forwarded with `decision: allow`
+// even under `mode: enforce` + `default_action: deny`.
+// ---------------------------------------------------------------------------
+
+/// `default_action: deny` with one allow-listed tool, buffered responses only.
+fn provider_config() -> Value {
+    json!({
+        "default_action": "deny",
+        "tools": { "get_weather": { "action": "allow" } },
+        "inspect": { "response_tool_calls": true }
+    })
+}
+
+/// Drive one buffered provider response body through the governor.
+async fn govern_buffered(plugin: &AiToolGovernor, body: Value) -> (PluginResult, RequestContext) {
+    let mut ctx = create_test_context();
+    let bytes = body.to_string().into_bytes();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &bytes)
+        .await;
+    (result, ctx)
+}
+
+/// Anthropic Messages: `content[]` blocks of `type: "tool_use"`.
+fn anthropic_response(name: &str) -> Value {
+    json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4",
+        "content": [
+            { "type": "text", "text": "on it" },
+            { "type": "tool_use", "id": "toolu_1", "name": name, "input": { "city": "NYC" } }
+        ],
+        "stop_reason": "tool_use"
+    })
+}
+
+#[tokio::test]
+async fn anthropic_buffered_tool_use_is_denied_in_enforce() {
+    let plugin = make(provider_config());
+    let (result, ctx) = govern_buffered(&plugin, anthropic_response("kubectl.apply")).await;
+    assert_reject(result, Some(403));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("deny")
+    );
+}
+
+#[tokio::test]
+async fn anthropic_buffered_tool_use_is_allowed_when_permitted() {
+    let plugin = make(provider_config());
+    let (result, ctx) = govern_buffered(&plugin, anthropic_response("get_weather")).await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("allow")
+    );
+}
+
+/// Google Gemini: `candidates[].content.parts[].functionCall`.
+fn gemini_response(name: &str) -> Value {
+    json!({
+        "candidates": [{
+            "content": {
+                "role": "model",
+                "parts": [{ "functionCall": { "name": name, "args": { "city": "NYC" } } }]
+            },
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": { "promptTokenCount": 3, "candidatesTokenCount": 4 }
+    })
+}
+
+#[tokio::test]
+async fn gemini_buffered_function_call_is_denied_in_enforce() {
+    let plugin = make(provider_config());
+    let (result, _ctx) = govern_buffered(&plugin, gemini_response("kubectl.apply")).await;
+    assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn gemini_buffered_function_call_is_allowed_when_permitted() {
+    let plugin = make(provider_config());
+    let (result, _ctx) = govern_buffered(&plugin, gemini_response("get_weather")).await;
+    assert_continue(result);
+}
+
+/// Cohere v2 `/v2/chat`: `message.tool_calls[].function`.
+fn cohere_response(name: &str) -> Value {
+    json!({
+        "id": "c1",
+        "finish_reason": "TOOL_CALL",
+        "message": {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "tc_1",
+                "type": "function",
+                "function": { "name": name, "arguments": "{\"city\":\"NYC\"}" }
+            }]
+        }
+    })
+}
+
+#[tokio::test]
+async fn cohere_buffered_tool_call_is_denied_in_enforce() {
+    let plugin = make(provider_config());
+    let (result, _ctx) = govern_buffered(&plugin, cohere_response("kubectl.apply")).await;
+    assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn cohere_buffered_tool_call_is_allowed_when_permitted() {
+    let plugin = make(provider_config());
+    let (result, _ctx) = govern_buffered(&plugin, cohere_response("get_weather")).await;
+    assert_continue(result);
+}
+
+/// Amazon Bedrock Converse: `output.message.content[].toolUse`.
+fn bedrock_response(name: &str) -> Value {
+    json!({
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "toolUse": { "toolUseId": "tu_1", "name": name, "input": { "city": "NYC" } }
+                }]
+            }
+        },
+        "stopReason": "tool_use",
+        "usage": { "inputTokens": 3, "outputTokens": 4 }
+    })
+}
+
+#[tokio::test]
+async fn bedrock_buffered_tool_use_is_denied_in_enforce() {
+    let plugin = make(provider_config());
+    let (result, _ctx) = govern_buffered(&plugin, bedrock_response("kubectl.apply")).await;
+    assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn bedrock_buffered_tool_use_is_allowed_when_permitted() {
+    let plugin = make(provider_config());
+    let (result, _ctx) = govern_buffered(&plugin, bedrock_response("get_weather")).await;
+    assert_continue(result);
+}
+
+/// OpenAI Responses API: `output[]` items of `type: "function_call"`.
+fn openai_responses_body(name: &str) -> Value {
+    json!({
+        "id": "resp_1",
+        "object": "response",
+        "model": "gpt-5",
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": name,
+            "arguments": "{\"city\":\"NYC\"}"
+        }]
+    })
+}
+
+#[tokio::test]
+async fn openai_responses_function_call_is_denied_in_enforce() {
+    let plugin = make(provider_config());
+    let (result, _ctx) = govern_buffered(&plugin, openai_responses_body("kubectl.apply")).await;
+    assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn openai_responses_function_call_is_allowed_when_permitted() {
+    let plugin = make(provider_config());
+    let (result, _ctx) = govern_buffered(&plugin, openai_responses_body("get_weather")).await;
+    assert_continue(result);
+}
+
+// ---------------------------------------------------------------------------
+// Unreadable tool-call shapes (`unknown_shape_action`)
+// ---------------------------------------------------------------------------
+
+/// A dialect the extractors do not read, but that plainly carries a tool call.
+fn unknown_shape_response() -> Value {
+    json!({
+        "model": "novel-model-1",
+        "usage": { "prompt_tokens": 1, "completion_tokens": 2 },
+        "result": {
+            "actions": [{ "toolCall": { "name": "kubectl.apply", "arguments": "{}" } }]
+        }
+    })
+}
+
+#[tokio::test]
+async fn unknown_tool_call_shape_fails_closed_in_enforce() {
+    let plugin = make(provider_config());
+    let (result, ctx) = govern_buffered(&plugin, unknown_shape_response()).await;
+    assert_reject(result, Some(502));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.uninspectable_reason")
+            .map(String::as_str),
+        Some("unrecognized_tool_call_shape")
+    );
+}
+
+#[tokio::test]
+async fn unknown_tool_call_shape_is_recorded_but_forwarded_in_dry_run() {
+    let mut config = provider_config();
+    config["mode"] = json!("dry_run");
+    let plugin = make(config);
+    let (result, ctx) = govern_buffered(&plugin, unknown_shape_response()).await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.uninspectable_reason")
+            .map(String::as_str),
+        Some("unrecognized_tool_call_shape"),
+        "observe mode must still count an unreadable shape"
+    );
+    assert_ne!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("allow"),
+        "an unread shape must never be labelled as a policy allow"
+    );
+}
+
+#[tokio::test]
+async fn unknown_tool_call_shape_opt_out_forwards_but_still_records() {
+    let mut config = provider_config();
+    config["unknown_shape_action"] = json!("allow");
+    let plugin = make(config);
+    let (result, ctx) = govern_buffered(&plugin, unknown_shape_response()).await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.uninspectable_reason")
+            .map(String::as_str),
+        Some("unrecognized_tool_call_shape"),
+        "the documented opt-out must not be silent"
+    );
+}
+
+#[tokio::test]
+async fn bodies_without_any_tool_surface_are_out_of_scope() {
+    let plugin = make(provider_config());
+    // Embeddings, moderations, and content-only completions carry no tool
+    // marker at all and must not be rejected by the fail-closed posture.
+    for body in [
+        json!({
+            "object": "list",
+            "model": "text-embedding-3-small",
+            "data": [{ "object": "embedding", "index": 0, "embedding": [0.1, 0.2] }],
+            "usage": { "prompt_tokens": 4, "total_tokens": 4 }
+        }),
+        json!({ "id": "r1", "model": "m", "results": [{ "flagged": false }] }),
+        json!({
+            "id": "chatcmpl-2",
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "hi", "tool_calls": null },
+                "finish_reason": "stop"
+            }]
+        }),
+        json!({ "ok": true, "items": [1, 2, 3] }),
+    ] {
+        let (result, ctx) = govern_buffered(&plugin, body).await;
+        assert_continue(result);
+        assert!(
+            !ctx.metadata
+                .contains_key("ai_tool_governor.uninspectable_reason"),
+            "a body with no tool surface must not be recorded as unreadable"
+        );
+    }
+}
+
+#[tokio::test]
+async fn empty_tool_call_container_is_not_an_unreadable_shape() {
+    let plugin = make(provider_config());
+    let body = json!({
+        "id": "chatcmpl-3",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "hi", "tool_calls": [] },
+            "finish_reason": "stop"
+        }]
+    });
+    let (result, _ctx) = govern_buffered(&plugin, body).await;
+    assert_continue(result);
+}
+
+#[test]
+fn rejects_invalid_unknown_shape_action() {
+    let err = try_make(json!({
+        "unknown_shape_action": "maybe",
+        "tools": { "x": { "action": "allow" } }
+    }))
+    .err()
+    .unwrap();
+    assert!(err.contains("unknown_shape_action"), "{err}");
+}
+
+#[test]
+fn accepts_documented_unknown_shape_action_values() {
+    for value in ["deny", "allow"] {
+        assert!(
+            try_make(json!({
+                "unknown_shape_action": value,
+                "tools": { "x": { "action": "allow" } }
+            }))
+            .is_ok(),
+            "{value} must be accepted"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Provider tool definitions on the request path
+// ---------------------------------------------------------------------------
+
+/// Drive one request body through `before_proxy` with definition inspection on.
+async fn govern_request_definitions(plugin: &AiToolGovernor, body: Value) -> PluginResult {
+    let mut ctx = json_post_ctx();
+    ctx.metadata
+        .insert("request_body".to_string(), body.to_string());
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await
+}
+
+fn definition_config() -> Value {
+    json!({
+        "default_action": "deny",
+        "tools": { "get_weather": { "action": "allow" } },
+        "inspect": { "request_tool_definitions": true, "response_tool_calls": false }
+    })
+}
+
+#[tokio::test]
+async fn anthropic_request_tool_definitions_are_governed() {
+    let plugin = make(definition_config());
+    let denied = json!({
+        "model": "claude-sonnet-4",
+        "tools": [{
+            "name": "kubectl.apply",
+            "description": "apply",
+            "input_schema": { "type": "object" }
+        }]
+    });
+    assert_reject(govern_request_definitions(&plugin, denied).await, Some(403));
+
+    let allowed = json!({
+        "model": "claude-sonnet-4",
+        "tools": [{
+            "name": "get_weather",
+            "description": "weather",
+            "input_schema": { "type": "object" }
+        }]
+    });
+    assert_continue(govern_request_definitions(&plugin, allowed).await);
+}
+
+#[tokio::test]
+async fn gemini_request_tool_definitions_are_governed() {
+    let plugin = make(definition_config());
+    let denied = json!({
+        "tools": [{ "functionDeclarations": [{ "name": "kubectl.apply" }] }]
+    });
+    assert_reject(govern_request_definitions(&plugin, denied).await, Some(403));
+
+    let allowed = json!({
+        "tools": [{ "functionDeclarations": [{ "name": "get_weather" }] }]
+    });
+    assert_continue(govern_request_definitions(&plugin, allowed).await);
+}
+
+#[tokio::test]
+async fn bedrock_request_tool_definitions_are_governed() {
+    let plugin = make(definition_config());
+    let denied = json!({
+        "toolConfig": { "tools": [{ "toolSpec": { "name": "kubectl.apply" } }] }
+    });
+    assert_reject(govern_request_definitions(&plugin, denied).await, Some(403));
+
+    let allowed = json!({
+        "toolConfig": { "tools": [{ "toolSpec": { "name": "get_weather" } }] }
+    });
+    assert_continue(govern_request_definitions(&plugin, allowed).await);
+}
+
+#[tokio::test]
+async fn unnameable_tool_definition_fails_closed_in_enforce() {
+    let plugin = make(definition_config());
+    // No `function.name`, no bare `name`, no declarations, no `type`: policy is
+    // keyed by name, so this entry was never checked and must not pass.
+    let body = json!({ "tools": [{ "description": "mystery tool" }] });
+    assert_reject(govern_request_definitions(&plugin, body).await, Some(502));
+}
+
+#[tokio::test]
+async fn provider_builtin_tool_definition_is_governed_under_its_type() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "code_interpreter": { "action": "deny" }, "web_search": { "action": "allow" } },
+        "inspect": { "request_tool_definitions": true, "response_tool_calls": false }
+    }));
+    let denied = json!({ "tools": [{ "type": "code_interpreter", "container": {} }] });
+    assert_reject(govern_request_definitions(&plugin, denied).await, Some(403));
+
+    let allowed = json!({ "tools": [{ "type": "web_search" }] });
+    assert_continue(govern_request_definitions(&plugin, allowed).await);
+}
+
+// ---------------------------------------------------------------------------
+// Provider streaming tool-call shapes
+// ---------------------------------------------------------------------------
+
+fn provider_streaming_config(default_action: &str) -> Value {
+    json!({
+        "default_action": default_action,
+        "tools": { "get_weather": { "action": "allow" } },
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    })
+}
+
+/// Anthropic SSE: `content_block_start` (`tool_use`) + `input_json_delta`.
+fn anthropic_stream(name: &str) -> String {
+    format!(
+        concat!(
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"m1\",\"model\":\"claude-sonnet-4\"}}}}\n\n",
+            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"{name}\",\"input\":{{}}}}}}\n\n",
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"city\\\":\"}}}}\n\n",
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"NYC\\\"}}\"}}}}\n\n",
+            "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+            "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}}}}\n\n",
+            "event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+        ),
+        name = name
+    )
+}
+
+#[tokio::test]
+async fn anthropic_streaming_tool_use_is_cut_in_enforce() {
+    let plugin = make(provider_streaming_config("deny"));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let body = anthropic_stream("kubectl.apply");
+    let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(terminated, "a denied Anthropic tool_use must cut the stream");
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        !text.contains("kubectl.apply"),
+        "held tool-call frames leaked: {text}"
+    );
+}
+
+#[tokio::test]
+async fn anthropic_streaming_tool_use_is_released_when_permitted() {
+    let plugin = make(provider_streaming_config("deny"));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let body = anthropic_stream("get_weather");
+    let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(!terminated, "an allowed tool call must not cut the stream");
+    assert_eq!(out, body.as_bytes());
+}
+
+/// Anthropic SSE argument fragments are reassembled before policy runs.
+#[tokio::test]
+async fn anthropic_streaming_reassembles_split_arguments() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": {
+            "get_weather": {
+                "action": "allow",
+                "blocked_arg_patterns": [{ "name": "city", "regex": "NYC" }]
+            }
+        },
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    }));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let body = anthropic_stream("get_weather");
+    let bytes = body.as_bytes();
+    let (first, second) = bytes.split_at(bytes.len() / 2);
+    let (out, terminated) = drive_stream(&mut inspector, &[first, second]).await;
+    assert!(
+        terminated,
+        "a blocked pattern that only matches after reassembly must cut the stream"
+    );
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("NYC"), "reassembled arguments leaked: {text}");
+}
+
+/// Cohere v2 SSE: `tool-call-start` + `tool-call-delta`.
+fn cohere_stream(name: &str) -> String {
+    format!(
+        concat!(
+            "data: {{\"type\":\"message-start\",\"id\":\"c1\"}}\n\n",
+            "data: {{\"type\":\"tool-call-start\",\"index\":0,\"delta\":{{\"message\":{{\"tool_calls\":{{\"id\":\"tc1\",\"type\":\"function\",\"function\":{{\"name\":\"{name}\",\"arguments\":\"\"}}}}}}}}}}\n\n",
+            "data: {{\"type\":\"tool-call-delta\",\"index\":0,\"delta\":{{\"message\":{{\"tool_calls\":{{\"function\":{{\"arguments\":\"{{\\\"city\\\":\\\"NYC\\\"}}\"}}}}}}}}}}\n\n",
+            "data: {{\"type\":\"tool-call-end\",\"index\":0}}\n\n",
+            "data: {{\"type\":\"message-end\",\"delta\":{{\"finish_reason\":\"TOOL_CALL\"}}}}\n\n"
+        ),
+        name = name
+    )
+}
+
+#[tokio::test]
+async fn cohere_streaming_tool_call_is_cut_in_enforce() {
+    let plugin = make(provider_streaming_config("deny"));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let body = cohere_stream("kubectl.apply");
+    let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(terminated, "a denied Cohere tool call must cut the stream");
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("kubectl.apply"), "held frames leaked: {text}");
+}
+
+#[tokio::test]
+async fn cohere_streaming_tool_call_is_released_when_permitted() {
+    let plugin = make(provider_streaming_config("deny"));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let body = cohere_stream("get_weather");
+    let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(!terminated, "an allowed tool call must not cut the stream");
+    assert_eq!(out, body.as_bytes());
+}
+
+/// Google SSE: each chunk carries a whole `functionCall`.
+fn gemini_stream(name: &str) -> String {
+    format!(
+        concat!(
+            "data: {{\"candidates\":[{{\"index\":0,\"content\":{{\"role\":\"model\",\"parts\":[{{\"text\":\"ok\"}}]}}}}]}}\n\n",
+            "data: {{\"candidates\":[{{\"index\":0,\"content\":{{\"role\":\"model\",\"parts\":[{{\"functionCall\":{{\"name\":\"{name}\",\"args\":{{\"city\":\"NYC\"}}}}}}]}},\"finishReason\":\"STOP\"}}]}}\n\n"
+        ),
+        name = name
+    )
+}
+
+#[tokio::test]
+async fn gemini_streaming_function_call_is_cut_in_enforce() {
+    let plugin = make(provider_streaming_config("deny"));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let body = gemini_stream("kubectl.apply");
+    let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(terminated, "a denied Google functionCall must cut the stream");
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("kubectl.apply"), "held frames leaked: {text}");
+}
+
+#[tokio::test]
+async fn gemini_streaming_function_call_is_released_when_permitted() {
+    let plugin = make(provider_streaming_config("deny"));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let body = gemini_stream("get_weather");
+    let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(!terminated, "an allowed tool call must not cut the stream");
+    assert_eq!(out, body.as_bytes());
+}
+
+/// An SSE frame carrying a tool-call marker no accumulator claims is an
+/// unreadable shape: cut in enforce, forwarded (and recorded) in dry-run.
+const UNKNOWN_SHAPE_STREAM: &str = concat!(
+    "data: {\"type\":\"novel-start\",\"model\":\"novel-1\"}\n\n",
+    "data: {\"type\":\"novel-tool\",\"payload\":{\"toolCall\":{\"name\":\"kubectl.apply\"}}}\n\n",
+    "data: [DONE]\n\n"
+);
+
+#[tokio::test]
+async fn unknown_streaming_tool_shape_is_cut_in_enforce() {
+    let plugin = make(provider_streaming_config("deny"));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[UNKNOWN_SHAPE_STREAM.as_bytes()]).await;
+    assert!(
+        terminated,
+        "an unreadable streaming tool-call shape must cut the stream in enforce"
+    );
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("kubectl.apply"), "unread call leaked: {text}");
+}
+
+#[tokio::test]
+async fn unknown_streaming_tool_shape_is_forwarded_in_dry_run() {
+    let mut config = provider_streaming_config("deny");
+    config["mode"] = json!("dry_run");
+    let plugin = make(config);
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[UNKNOWN_SHAPE_STREAM.as_bytes()]).await;
+    assert!(!terminated, "dry-run must never disrupt traffic");
+    assert_eq!(out, UNKNOWN_SHAPE_STREAM.as_bytes());
+}
+
+/// Buffered-SSE parity: the same Anthropic stream delivered on the buffered
+/// path is governed rather than forwarded uninspected.
+#[tokio::test]
+async fn buffered_sse_anthropic_tool_use_is_denied_in_enforce() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "get_weather": { "action": "allow" } },
+        "inspect": { "response_tool_calls": true, "streaming_response_tool_calls": true }
+    }));
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    let body = anthropic_stream("kubectl.apply");
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+        .await;
+    assert_reject(result, Some(403));
+}
