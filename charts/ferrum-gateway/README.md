@@ -127,12 +127,60 @@ migrations; use the explicit Job for `status`, dry-run, and operator-controlled
   `secretVolumeDefaultMode` and `podSecurityContext` are overridable for images
   with a different runtime identity.
 - **Graceful shutdown** wires `terminationGracePeriodSeconds` to the
-  `FERRUM_SHUTDOWN_DRAIN_SECONDS` drain window (grace must exceed drain + ~5s
-  cleanup, enforced at render). `shutdownDrainSeconds: 0` is a valid "skip
-  draining" value and is rendered explicitly; set it to `null` to omit the env
-  and fall back to the binary's 30s default. A `null` drain is still validated
-  against that 30s default, so a grace period below 35s fails render rather than
-  letting Kubernetes SIGKILL the pod mid-drain.
+  `FERRUM_SHUTDOWN_DRAIN_SECONDS` drain window (enforced at render).
+  `shutdownDrainSeconds: 0` is a valid "skip draining" value and is rendered
+  explicitly; set it to `null` to omit the env and fall back to the binary's
+  30s default. A `null` drain is still validated against that 30s default, so
+  too low a grace period fails render rather than letting Kubernetes SIGKILL
+  the pod mid-drain.
+- **Rolling upgrades do not refuse new connections.** See
+  [Termination and rolling upgrades](#termination-and-rolling-upgrades) below.
+
+## Termination and rolling upgrades
+
+Kubernetes removes a terminating pod from its Service endpoints *concurrently
+with* stopping it, and that removal has to propagate through the EndpointSlice
+controller to every node's kube-proxy. A gateway that closes its accept loops
+the instant SIGTERM lands therefore refuses new connections at a pod that is
+still a live Endpoint. The chart closes that window from both sides:
+
+1. `shutdownPreStopSeconds` (default `30`) renders a native
+   `lifecycle.preStop.sleep` (`SleepAction`). Kubernetes runs `preStop`
+   **before** SIGTERM, so the gateway keeps serving normally for the whole
+   window while endpoint removal propagates. `SleepAction` needs no shell, so
+   it works on the distroless image; it requires Kubernetes **1.29+** (GA in
+   1.30). Set it to `0` on older clusters to omit the hook.
+2. `shutdownPreDrainSeconds` (default `0`, `FERRUM_SHUTDOWN_PREDRAIN_SECONDS`)
+   keeps every listener — proxy **and** admin — accepting for a window *after*
+   SIGTERM while readiness already reports `ready:false` / 503 and `/live` still
+   returns 200. Redundant with `preStop` on 1.29+, so it is off by default;
+   raise it on clusters without `SleepAction` or when an external load balancer
+   polls `/health` directly.
+3. Readiness is drain-aware in the binary: as soon as termination begins,
+   `/health` and `/status` report `{"status":"draining","ready":false}` with
+   HTTP 503, while `/live` deliberately keeps returning 200 so kubelet does not
+   SIGKILL the pod mid-drain.
+4. `probes.readiness.failureThreshold` (default `3`) is rendered explicitly
+   rather than inherited, because `failureThreshold x periodSeconds` is the
+   probe-driven endpoint-removal latency the `preStop` default is derived from.
+
+### Grace-period arithmetic
+
+`terminationGracePeriodSeconds` is measured from pod deletion, so the `preStop`
+sleep is billed to it. The chart fails render unless:
+
+```
+terminationGracePeriodSeconds >= shutdownPreStopSeconds
+                               + shutdownPreDrainSeconds
+                               + post-SIGTERM shutdown budget
+```
+
+The post-SIGTERM budget is more than `shutdownDrainSeconds`: after the in-flight
+drain the binary still releases transport pools, joins background tasks, flushes
+the admin audit spool (`database`/`cp`), drains observability delivery, and
+finalizes plugin generations — roughly **78s** at the defaults. See
+[docs/graceful_shutdown.md](../../docs/graceful_shutdown.md). The chart default
+of `110` covers the full sequence plus the 30s `preStop` window.
 
 ## Probes
 

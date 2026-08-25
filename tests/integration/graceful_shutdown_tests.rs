@@ -563,3 +563,152 @@ fn create_test_proxy_state_with_env(
 fn _typecheck_dependencies() -> HashMap<String, ()> {
     HashMap::new()
 }
+
+// ── Draining readiness (issue #4154) ───────────────────────────────────────
+
+/// Admin state wired to a real `ProxyState` so the readiness verdict can
+/// observe that instance's drain flag. Mirrors the shape every serving mode
+/// builds; only `proxy_state` is load-bearing here.
+fn drain_admin_state(proxy_state: ProxyState) -> ferrum_edge::admin::AdminState {
+    ferrum_edge::admin::AdminState {
+        db: None,
+        jwt_manager: ferrum_edge::admin::jwt_auth::JwtManager::new(
+            ferrum_edge::admin::jwt_auth::JwtConfig {
+                secret: "graceful-shutdown-readiness-test-secret-000000".to_string(),
+                issuer: "ferrum-edge-graceful-shutdown-readiness-test".to_string(),
+                audience: None,
+                max_ttl_seconds: 3600,
+                algorithm: jsonwebtoken::Algorithm::HS256,
+            },
+        ),
+        metrics_auth: Arc::new(ferrum_edge::admin::MetricsAuthPolicy {
+            allowed_cidrs: ferrum_edge::proxy::client_ip::TrustedProxies::none(),
+            bearer_token: None,
+        }),
+        proxy_state: Some(proxy_state),
+        cached_config: None,
+        mode: "file".to_string(),
+        read_only: true,
+        admin_audit_enabled: false,
+        admin_audit_fallback_dir: Some(crate::common::isolated_audit_fallback_dir()),
+        admin_require_namespace_claim: false,
+        startup_ready: None,
+        serving_degraded: None,
+        serving_listener_failures: None,
+        gateway_listener_status: None,
+        gateway_listener_failure_fails_readiness: false,
+        db_available: None,
+        config_rejected: None,
+        admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::none()),
+        cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        db_health_refresh: Arc::new(tokio::sync::Mutex::new(())),
+        dp_registry: None,
+        mesh_registry: None,
+        cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
+        admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        external_ref_policy: Arc::new(
+            ferrum_edge::admin::api_specs::ExternalRefProcessPolicy::default(),
+        ),
+        external_ref_loader: Arc::new(
+            ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
+        ),
+        runtime_config_apply: None,
+    }
+}
+
+/// Serve the admin API on an ephemeral loopback port. The returned sender must
+/// stay alive for the listener's shutdown receiver to remain valid.
+async fn start_drain_admin(proxy_state: ProxyState) -> (String, tokio::sync::watch::Sender<bool>) {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind admin");
+    let addr = listener.local_addr().expect("admin addr");
+    let state = drain_admin_state(proxy_state);
+    tokio::spawn(async move {
+        let _ = ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await;
+    });
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    (format!("http://{addr}"), shutdown_tx)
+}
+
+async fn admin_get(base: &str, path: &str) -> (u16, serde_json::Value) {
+    let response = reqwest::Client::new()
+        .get(format!("{base}{path}"))
+        .send()
+        .await
+        .expect("admin request");
+    let status = response.status().as_u16();
+    let body: serde_json::Value = response.json().await.expect("json body");
+    (status, body)
+}
+
+/// Readiness must become drain-aware the moment the gateway is told to
+/// terminate, and `/live` must NOT follow it down (issue #4154).
+///
+/// Before this, `rg 'draining' src/admin/mod.rs` matched exactly one unrelated
+/// comment: a SIGTERMed pod kept reporting `ready: true` right up until its
+/// admin listener closed, so Kubernetes only removed it from the Service after
+/// `failureThreshold` consecutive *connection refusals*. Every new connection
+/// steered at it during that window was refused.
+///
+/// `/live` staying 200 is the other half of the contract: a liveness probe
+/// that failed here would have kubelet SIGKILL the pod mid-drain, which is
+/// strictly worse than the bug being fixed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draining_makes_health_not_ready_while_live_stays_ok() {
+    let proxy_state = create_test_proxy_state(vec![]);
+    let overload = proxy_state.overload.clone();
+    let (base, _shutdown_tx) = start_drain_admin(proxy_state).await;
+
+    let (code, body) = admin_get(&base, "/health").await;
+    assert_eq!(code, 200, "a healthy gateway is ready: {body}");
+    assert_eq!(body["ready"], serde_json::json!(true), "{body}");
+    assert_ne!(body["status"], serde_json::json!("draining"), "{body}");
+
+    let (live_code, live_body) = admin_get(&base, "/live").await;
+    assert_eq!(live_code, 200, "{live_body}");
+    assert_eq!(live_body["status"], serde_json::json!("ok"), "{live_body}");
+
+    // Exactly what every serving mode publishes when shutdown begins.
+    ferrum_edge::overload::begin_drain(&overload);
+
+    let (code, body) = admin_get(&base, "/health").await;
+    assert_eq!(code, 503, "a draining gateway must not be ready: {body}");
+    assert_eq!(body["ready"], serde_json::json!(false), "{body}");
+    assert_eq!(body["status"], serde_json::json!("draining"), "{body}");
+
+    // `/status` is the same handler and must agree.
+    let (status_code, status_body) = admin_get(&base, "/status").await;
+    assert_eq!(status_code, 503, "{status_body}");
+    assert_eq!(status_body["ready"], serde_json::json!(false), "{status_body}");
+    assert_eq!(status_body["status"], serde_json::json!("draining"), "{status_body}");
+
+    // The unauthenticated tier still carries only the coarse contract.
+    let object = body.as_object().expect("object body");
+    assert_eq!(object.len(), 2, "unauthenticated body must stay coarse: {body}");
+
+    // Liveness must not follow readiness down, or kubelet kills the pod
+    // mid-drain.
+    let (live_code, live_body) = admin_get(&base, "/live").await;
+    assert_eq!(live_code, 200, "{live_body}");
+    assert_eq!(live_body["status"], serde_json::json!("ok"), "{live_body}");
+}

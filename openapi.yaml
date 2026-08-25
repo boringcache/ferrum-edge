@@ -356,7 +356,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
         "503":
-          description: Gateway not ready (status `starting` during startup, or `unavailable` after a supervised serving-listener failure); `ready=false`
+          description: Gateway not ready (status `starting` during startup, `unavailable` after a supervised serving-listener failure, or `draining` while the process is terminating); `ready=false`
           content:
             application/json:
               schema:
@@ -388,7 +388,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
         "503":
-          description: Gateway not ready (status `starting` or `unavailable`, `ready=false`)
+          description: Gateway not ready (status `starting`, `unavailable`, or `draining`, `ready=false`)
           content:
             application/json:
               schema:
@@ -13430,7 +13430,7 @@ components:
       properties:
         status:
           type: string
-          enum: [ok, degraded, starting, unavailable]
+          enum: [ok, degraded, starting, unavailable, draining]
           description: |
             Aggregate gateway health.
             `ok` — fully ready and healthy (200). Also returned for
@@ -13473,6 +13473,15 @@ components:
             those policies have no local fallback, so every protected request on
             them is failing closed. It clears as soon as the backend recovers,
             with no restart and no config reload — see `replay_authority`.
+            `draining` — the process has received SIGTERM/SIGINT and is
+            terminating (returned with 503 and `ready: false`). It is published
+            the moment the signal is observed, ahead of the accept-loop close,
+            so an orchestrator can withdraw the replica from its endpoint set
+            before new connections are refused; `FERRUM_SHUTDOWN_PREDRAIN_SECONDS`
+            keeps the listeners accepting for that window. Terminal — it wins
+            over every other status and never clears. `/live` is deliberately
+            unaffected and keeps returning 200, so a liveness probe cannot
+            SIGKILL the pod mid-drain.
         ready:
           type: boolean
           description: |
@@ -13484,7 +13493,7 @@ components:
             no expired `withdraw` upstream still has stale targets installed
             because its withdrawal publication is retrying AND no live plugin
             generation's `shared` single-use replay authority is currently
-            unavailable. A recoverable
+            unavailable AND the process has not begun terminating. A recoverable
             dynamic Gateway API listener failure also sets `ready: false` when
             `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS=true`; it is ready
             by default. While `false`, the

@@ -2581,6 +2581,23 @@ async fn handle_admin_request_inner(
         let replay_authority_health =
             crate::plugins::utils::replay_authority::shared_health_snapshot();
         let replay_authority_unavailable = replay_authority_health.unavailable();
+        // Graceful-shutdown drain (issue #4154). A replica that has been told
+        // to terminate must stop being steered NEW traffic even while every
+        // dependency below is still healthy, otherwise Kubernetes keeps it in
+        // the Service endpoints until `failureThreshold` probe periods have
+        // elapsed and kube-proxy steers new connections at accept loops that
+        // are about to close. The process-wide latch is published the moment
+        // the signal is observed — ahead of the accept-loop close — and the
+        // per-instance flag covers a mode that drains without the signal path.
+        // Two `Acquire` loads: no allocation, no lock, no I/O, so an
+        // unauthenticated probe flood cannot drive work. `/live` above is
+        // deliberately untouched: failing liveness during the drain would have
+        // kubelet SIGKILL the pod mid-drain.
+        let instance_draining = state
+            .proxy_state
+            .as_ref()
+            .is_some_and(|proxy| proxy.overload.draining.load(Ordering::Acquire));
+        let draining = crate::overload::shutdown_drain_announced() || instance_draining;
         let ready = startup_ready
             && !serving_degraded
             && jwks_ready
@@ -2588,7 +2605,8 @@ async fn handle_admin_request_inner(
             && !dp_config_stale
             && !cp_trust_blocked
             && !replay_authority_unavailable
-            && !gateway_listeners_not_ready;
+            && !gateway_listeners_not_ready
+            && !draining;
         health_status["ready"] = json!(ready);
         if gateway_listeners_degraded {
             health_status["status"] = json!("degraded");
@@ -2882,7 +2900,13 @@ async fn handle_admin_request_inner(
                 || dp_config_stale
                 || cp_trust_blocked
                 || replay_authority_unavailable;
-            health_status["status"] = json!(if lost_authority {
+            // A terminating replica is neither "starting" nor a lost
+            // dependency: it is doing exactly what it was told to do, and the
+            // orchestrator only needs to know to stop steering traffic at it.
+            // Draining wins over every other label because it is terminal.
+            health_status["status"] = json!(if draining {
+                "draining"
+            } else if lost_authority {
                 "unavailable"
             } else if gateway_listeners_not_ready {
                 "degraded"

@@ -3468,6 +3468,21 @@ pub struct EnvConfig {
     /// to complete. Default: 30. Set to 0 to skip draining (immediate shutdown).
     pub shutdown_drain_seconds: u64,
 
+    /// Seconds to keep every listener (proxy AND admin) accepting after
+    /// SIGTERM/SIGINT before the shutdown signal closes the accept loops.
+    ///
+    /// The admin readiness verdict flips to `ready:false` (HTTP 503) as soon as
+    /// the signal is observed, while `/live` keeps returning 200, so an
+    /// orchestrator or load balancer can withdraw the replica from its endpoint
+    /// set before a single new connection is refused. Nothing else changes:
+    /// after the window the ordinary drain runs unmodified.
+    ///
+    /// Default: 0 (no pre-drain window; behavior identical to before). On
+    /// Kubernetes prefer the chart's `preStop` sleep, which delays SIGTERM
+    /// itself; this knob is for load balancers and clusters that cannot use
+    /// `lifecycle.preStop.sleep`. Only serving modes honor it.
+    pub shutdown_predrain_seconds: u64,
+
     // ── Admin status metrics ─────────────────────────────────────────────
     /// Window size in seconds for computing per-second rate metrics on the
     /// admin `/status` endpoint.  A background task snapshots cumulative
@@ -3983,6 +3998,7 @@ impl Default for EnvConfig {
             overload_loop_warn_us: 10_000,
             overload_loop_critical_us: 500_000,
             shutdown_drain_seconds: 30,
+            shutdown_predrain_seconds: 0,
             status_metrics_window_seconds: 30,
             tls_offload_threads: 0,
             tcp_fastopen_enabled: AutoBool::Auto,
@@ -4628,6 +4644,7 @@ impl EnvConfig {
             overload_loop_warn_us: u64 = "FERRUM_OVERLOAD_LOOP_WARN_US" => 10_000u64;
             overload_loop_critical_us: u64 = "FERRUM_OVERLOAD_LOOP_CRITICAL_US" => 500_000u64;
             shutdown_drain_seconds: u64 = "FERRUM_SHUTDOWN_DRAIN_SECONDS" => 30u64;
+            shutdown_predrain_seconds: u64 = "FERRUM_SHUTDOWN_PREDRAIN_SECONDS" => 0u64;
             status_metrics_window_seconds: u64 = "FERRUM_STATUS_METRICS_WINDOW_SECONDS" => 30u64, max(1u64);
             tls_offload_threads: usize = "FERRUM_TLS_OFFLOAD_THREADS" => 0usize;
             tcp_fastopen_queue_len: u16 = "FERRUM_TCP_FASTOPEN_QUEUE_LEN" => 256u16;
@@ -5374,6 +5391,7 @@ impl EnvConfig {
             overload_loop_warn_us,
             overload_loop_critical_us,
             shutdown_drain_seconds,
+            shutdown_predrain_seconds,
             status_metrics_window_seconds,
             tls_offload_threads,
             tcp_fastopen_enabled,
