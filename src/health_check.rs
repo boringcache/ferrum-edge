@@ -3054,7 +3054,9 @@ fn build_health_check_client_with_san_pinning(
     let client_auth = load_probe_rustls_client_auth(tls_config, global_identity)?;
     let builder = backend_client_config_builder(None)
         .map_err(|e| HealthCheckClientError::SanPinningUnavailable(e.to_string()))?;
-    let builder = builder.dangerous().with_custom_certificate_verifier(verifier);
+    let builder = builder
+        .dangerous()
+        .with_custom_certificate_verifier(verifier);
     let mut rustls_config = match client_auth {
         ProbeRustlsClientAuth::None => builder.with_no_client_auth(),
         ProbeRustlsClientAuth::Materialized { certs, key } => {
