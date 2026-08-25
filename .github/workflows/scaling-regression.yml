@@ -36,7 +36,15 @@ jobs:
   scaling-regression:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # 300, not 180: read-your-write live apply (#3960) made `POST /batch` block
+    # until the poll loop publishes a covering generation, so every one of the
+    # 30k test's ten batches now pays a synchronous convergence cost that used
+    # to be asynchronous. The MongoDB leg ran 138 min before that landed and
+    # exceeded 180 after (issue #4136), while reporting 100% success on every
+    # batch it completed — it ran out of wall clock, not correctness. This
+    # restores comparable headroom without shrinking the 30,000-proxy workload
+    # the gate exists to measure.
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
