@@ -1829,8 +1829,11 @@ pub struct EnvConfig {
     /// Maximum execution time (seconds) for any single SQL statement. Default:
     /// 30, max 3600 (1 hour). Values above 3600 are clamped at parse time with
     /// a warning. Set via `SET statement_timeout` (PostgreSQL) or `SET SESSION
-    /// max_execution_time` (MySQL) on every new connection. 0 = disabled.
-    /// Ignored for SQLite (not supported).
+    /// max_execution_time` (MySQL) on every new connection. On MySQL the same
+    /// budget is additionally applied as `SET SESSION
+    /// innodb_lock_wait_timeout`, because `max_execution_time` only bounds
+    /// read-only `SELECT`s (issue #4146). 0 = disabled. Ignored for SQLite
+    /// (not supported).
     pub db_pool_statement_timeout_seconds: u64,
 
     // MongoDB-specific settings (when FERRUM_DB_TYPE=mongodb).

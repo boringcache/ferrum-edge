@@ -753,6 +753,32 @@ pub(crate) fn effective_pool_connect_timeout_seconds(
     }
 }
 
+/// Build the `SET` SQL bounding how long a MySQL statement waits on a row
+/// lock, or `None` when disabled or not MySQL.
+///
+/// PostgreSQL's `statement_timeout` already covers lock waits — it bounds the
+/// whole statement, blocked or not. MySQL's `max_execution_time` does not: it
+/// applies to read-only `SELECT`s, so an `INSERT` or `UPDATE` queued behind
+/// another transaction's row or duplicate-key lock is unbounded there.
+///
+/// That is the pileup shape in issue #4146. When an admin client abandons a
+/// config mutation, the server-side statements keep their locks until they
+/// finish; the client's retry of the same all-or-nothing body then waits on
+/// the abandoned attempt's locks, and each retry adds another waiter. Bounding
+/// the wait with the same budget as the statement timeout makes an attempt
+/// that can no longer succeed give its locks back instead of accumulating.
+///
+/// `innodb_lock_wait_timeout` is expressed in **seconds**, unlike the
+/// millisecond `max_execution_time` above. The caller is responsible for
+/// clamping `timeout_seconds` before calling (enforced at `EnvConfig` parse
+/// time, 0..=3600), so the interpolation is always a plain integer literal.
+pub(crate) fn lock_wait_timeout_sql(timeout_seconds: u64, is_mysql: bool) -> Option<String> {
+    if timeout_seconds == 0 || !is_mysql {
+        return None;
+    }
+    Some(format!("SET SESSION innodb_lock_wait_timeout = {timeout_seconds}"))
+}
+
 /// Build the `SET` SQL for per-statement timeouts, or `None` when disabled.
 ///
 /// Returns:
@@ -1908,6 +1934,12 @@ impl DatabaseStore {
                     if let Some(sql) =
                         statement_timeout_sql(statement_timeout_seconds, is_postgres, is_mysql)
                     {
+                        conn.execute(sql.as_str()).await?;
+                    }
+                    // MySQL only: `max_execution_time` above does not bound a
+                    // write blocked on another transaction's row lock, which is
+                    // the zombie-lock pileup in issue #4146.
+                    if let Some(sql) = lock_wait_timeout_sql(statement_timeout_seconds, is_mysql) {
                         conn.execute(sql.as_str()).await?;
                     }
                     Ok(())
