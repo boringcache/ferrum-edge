@@ -10412,8 +10412,8 @@ impl DatabaseStore {
         sqlx::query(&self.q(&format!(
             "INSERT INTO audit_events \
              (id, ts, actor, action, resource_type, resource_id, namespace, \
-              source_address, request_id, outcome, diff) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?){on_conflict}"
+              namespace_at_event, source_address, request_id, outcome, diff) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?){on_conflict}"
         )))
         .bind(&event.id)
         .bind(audit_ts_string(&event.ts))
@@ -10422,6 +10422,7 @@ impl DatabaseStore {
         .bind(&event.resource_type)
         .bind(&event.resource_id)
         .bind(&event.namespace)
+        .bind(&event.namespace_at_event)
         .bind(&event.source_address)
         .bind(&event.request_id)
         .bind(&event.outcome)
@@ -10701,7 +10702,7 @@ impl DatabaseStore {
 
         let sql = self.q(&format!(
             "SELECT id, ts, actor, action, resource_type, resource_id, namespace, \
-             source_address, request_id, outcome, diff \
+             namespace_at_event, source_address, request_id, outcome, diff \
              FROM audit_events WHERE {where_clause} \
              ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?"
         ));
@@ -12553,6 +12554,7 @@ fn row_to_audit_event(row: &AnyRow) -> Result<crate::admin::audit::AuditEvent, a
         resource_type: row.try_get("resource_type")?,
         resource_id: row.try_get("resource_id")?,
         namespace: row.try_get("namespace")?,
+        namespace_at_event: row.try_get("namespace_at_event")?,
         source_address: row.try_get("source_address")?,
         request_id: row.try_get("request_id")?,
         outcome: row.try_get("outcome")?,
