@@ -2758,11 +2758,7 @@ fn append_family_generation_controls(
             ] {
                 if let Some(max_tokens) = body.get(field) {
                     start_key_part(key_input, has_part);
-                    let _ = write!(
-                        key_input,
-                        "{prefix}:{}",
-                        canonical_param_value(max_tokens)
-                    );
+                    let _ = write!(key_input, "{prefix}:{}", canonical_param_value(max_tokens));
                 }
             }
             if matches!(family, CacheRequestFamily::Messages) {
