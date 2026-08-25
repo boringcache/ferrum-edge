@@ -245,7 +245,12 @@ pub(crate) struct LeaseRenewalCounters {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LeaseRenewalReport {
+    // Read by the external lease-renewal tests through
+    // `run_namespace_config_admission_renewal_for_test`; the binary target
+    // never inspects the report, so both fields are dead there.
+    #[allow(dead_code)]
     pub(crate) outcome: LeaseRenewalOutcome,
+    #[allow(dead_code)]
     pub(crate) counters: LeaseRenewalCounters,
 }
 
@@ -988,6 +993,7 @@ async fn lock_namespace_config_admission_with_local(
 /// envelope exercises the identical arithmetic in milliseconds instead of
 /// minutes. Returns the renewer's report plus the guard-visible verdict
 /// [`NamespaceConfigAdmissionGuard::ensure_held`] would reach at that instant.
+#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
 pub(crate) async fn run_namespace_config_admission_renewal_for_test(
     db: Arc<dyn crate::config::db_backend::NamespaceConfigAdmissionLeaseBackend>,
     namespace: &str,
