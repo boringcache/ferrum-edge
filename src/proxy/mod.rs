@@ -41,6 +41,11 @@ pub mod body;
 pub mod client_ip;
 pub mod datagram_client_address;
 pub mod deferred_log;
+/// Pre-request admission bound for the data-plane HTTP frontend (issue #4152).
+/// Covers the H1-vs-H2 version sniff and HTTP/2 SETTINGS/header windows that
+/// hyper's HTTP/1 `header_read_timeout` cannot see, without closing idle
+/// keep-alive after the first request.
+pub(crate) mod frontend_admission;
 pub mod gateway_listener;
 pub mod gateway_listener_status;
 pub mod grpc_proxy;
@@ -13196,6 +13201,12 @@ async fn run_per_ip_cleanup_loop(
 /// connections. h2c (cleartext HTTP/2) is required for gRPC clients that
 /// connect without TLS.
 ///
+/// Pre-request admission (issue #4152) is bounded by
+/// `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS`, covering the version sniff and
+/// HTTP/2 SETTINGS/header windows that hyper's HTTP/1 timer cannot see. The
+/// bound starts after TCP accept (plaintext) or after the frontend TLS
+/// handshake (TLS). It does not close idle keep-alive after the first request.
+///
 /// On shutdown, calls `graceful_shutdown()` on the hyper connection so that
 /// HTTP/2 clients receive a GOAWAY frame and HTTP/1.1 keepalive connections
 /// stop accepting new requests. Without this, persistent H2/keepalive
@@ -13230,7 +13241,9 @@ async fn handle_connection(
         let mut http1 = builder.http1();
         http1.max_buf_size(http1_parser_max_buf_size(state.max_header_size_bytes));
         http1.writev(true);
-        // Slowloris protection: close connections that take too long to send headers.
+        // Slowloris protection: close HTTP/1.1 connections that take too long
+        // to send headers. The H1-vs-H2 version sniff and HTTP/2 pre-request
+        // window are bounded separately by `FrontendAdmission` below.
         if state.env_config.http_header_read_timeout_seconds > 0 {
             http1.timer(hyper_util::rt::TokioTimer::new());
             http1.header_read_timeout(std::time::Duration::from_secs(
@@ -13268,7 +13281,11 @@ async fn handle_connection(
     // reach this connection when the downstream refuses to drain the terminal.
     let authorization_closer = crate::proxy::auth_lifetime::AuthorizationConnectionCloser::new();
     let mut authorization_close_rx = authorization_closer.subscribe();
+    let header_read_timeout_seconds = state.env_config.http_header_read_timeout_seconds;
+    let admission = frontend_admission::FrontendAdmission::new();
+    let service_admission = Arc::clone(&admission);
     let svc = service_fn(move |req: Request<Incoming>| {
+        service_admission.mark();
         let state = Arc::clone(&state);
         let addr = remote_addr;
         let connection_metadata = RequestConnectionMetadata {
@@ -13309,6 +13326,19 @@ async fn handle_connection(
     let result = tokio::select! {
         biased;
         res = conn.as_mut() => res,
+        // Issue #4152: bound the version sniff and HTTP/2 pre-request window.
+        // Returning drops `conn` (hard close), matching the TLS handshake
+        // timeout. After the first request this future never fires, so idle
+        // HTTP/2 keep-alive is preserved.
+        () = admission.wait_pre_request_deadline(header_read_timeout_seconds) => {
+            debug!(
+                remote_addr = %remote_addr.ip(),
+                tls = false,
+                "Closing client connection: no request delivered within the \
+                 header-read timeout"
+            );
+            Ok(())
+        }
         _ = shutdown_rx.changed() => {
             // Send GOAWAY (H2) / signal end-of-keepalive (H1) and wait for
             // in-flight requests to complete on this connection. Continuing
@@ -20867,6 +20897,10 @@ async fn run_accept_loop(
 
 /// Handle TLS connections with HTTP/1.1 and HTTP/2 auto-negotiation via ALPN.
 ///
+/// Frontend TLS admission (`FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`)
+/// completes before the HTTP pre-request bound
+/// (`FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS`) starts; see [`handle_connection`].
+///
 /// On shutdown, calls `graceful_shutdown()` on the hyper connection so that
 /// HTTP/2 clients receive a GOAWAY frame and HTTP/1.1 keepalive connections
 /// stop accepting new requests. See [`handle_connection`] for rationale.
@@ -20975,7 +21009,9 @@ async fn handle_tls_connection(
         let mut http1 = builder.http1();
         http1.max_buf_size(http1_parser_max_buf_size(state.max_header_size_bytes));
         http1.writev(true);
-        // Slowloris protection: close connections that take too long to send headers.
+        // Slowloris protection: close HTTP/1.1 connections that take too long
+        // to send headers. The H1-vs-H2 version sniff and HTTP/2 pre-request
+        // window are bounded separately by `FrontendAdmission` below.
         if state.env_config.http_header_read_timeout_seconds > 0 {
             http1.timer(hyper_util::rt::TokioTimer::new());
             http1.header_read_timeout(std::time::Duration::from_secs(
@@ -21013,7 +21049,11 @@ async fn handle_tls_connection(
     // a downstream that will not drain an expired stream's terminal.
     let authorization_closer = crate::proxy::auth_lifetime::AuthorizationConnectionCloser::new();
     let mut authorization_close_rx = authorization_closer.subscribe();
+    let header_read_timeout_seconds = state.env_config.http_header_read_timeout_seconds;
+    let admission = frontend_admission::FrontendAdmission::new();
+    let service_admission = Arc::clone(&admission);
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        service_admission.mark();
         let state = Arc::clone(&state);
         let addr = remote_addr;
         let cert = client_cert_der.clone();
@@ -21056,6 +21096,19 @@ async fn handle_tls_connection(
     let result = tokio::select! {
         biased;
         res = conn.as_mut() => res,
+        // Issue #4152: same pre-request bound as the plaintext handler. Starts
+        // after `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` has already
+        // completed, so a peer cannot hold the slot by finishing TLS and then
+        // sending nothing. Idle keep-alive after the first request is preserved.
+        () = admission.wait_pre_request_deadline(header_read_timeout_seconds) => {
+            debug!(
+                remote_addr = %remote_addr.ip(),
+                tls = true,
+                "Closing client connection: no request delivered within the \
+                 header-read timeout"
+            );
+            Ok(())
+        }
         // Issue #3857: the operator withdrew this connection's client-certificate
         // trust decision. Reuse hyper's own graceful shutdown — H2 gets a GOAWAY
         // (no further stream is admitted) and H1 ends keep-alive after the

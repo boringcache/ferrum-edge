@@ -2655,9 +2655,14 @@ pub struct EnvConfig {
     pub websocket_max_incomplete_message_seconds: u64,
     /// Maximum number of credential entries per type per consumer (for zero-downtime rotation).
     pub max_credentials_per_type: usize,
-    /// HTTP/1.1 header read timeout in seconds. Protects against slowloris attacks
-    /// by closing connections that take too long to send complete request headers.
-    /// 0 = disabled (no timeout). Default: 10 seconds.
+    /// HTTP header-read / pre-request admission timeout in seconds.
+    ///
+    /// HTTP/1.1 uses hyper's `header_read_timeout` (re-armed per request head).
+    /// On data-plane auto-protocol listeners the same value also bounds the
+    /// HTTP/1.1-vs-HTTP/2 version sniff and an HTTP/2 connection that never
+    /// delivers a request to the service (issue #4152). Idle HTTP/2 keep-alive
+    /// after that first request is not closed. `0` disables the bound.
+    /// Default: 10 seconds.
     pub http_header_read_timeout_seconds: u64,
     /// Frontend TLS handshake timeout in seconds. Applies before HTTP header
     /// parsing, so slow TLS handshakes cannot hold connection slots forever.
