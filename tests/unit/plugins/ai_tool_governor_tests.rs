@@ -11227,3 +11227,486 @@ async fn buffered_sse_anthropic_tool_use_is_denied_in_enforce() {
         .await;
     assert_reject(result, Some(403));
 }
+
+// ---------------------------------------------------------------------------
+// Unreadable provider containers on the buffered response path
+//
+// Each body below carries a tool surface that is PRESENT but not checkable.
+// Policy is keyed by name, so extracting zero calls and reporting "no tool
+// call" would let the body past even `default_action: deny`. Enforce must fail
+// closed on the container itself.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn openai_chat_non_array_tool_calls_fails_closed() {
+    let plugin = make(provider_config());
+    let body = json!({
+        "id": "chatcmpl-4",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "tool_calls": { "0": { "function": { "name": "kubectl.apply" } } }
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    let (result, _ctx) = govern_buffered(&plugin, body).await;
+    assert_reject(result, Some(502));
+}
+
+#[tokio::test]
+async fn openai_responses_non_function_call_items_are_skipped() {
+    let plugin = make(provider_config());
+    // A Responses body mixes output item types; only `function_call` items are
+    // tool calls, and skipping the others must not skip the call beside them.
+    let body = json!({
+        "id": "resp_2",
+        "object": "response",
+        "model": "gpt-5",
+        "output": [
+            { "type": "message", "content": [{ "type": "output_text", "text": "ok" }] },
+            {
+                "type": "function_call",
+                "call_id": "call_2",
+                "name": "kubectl.apply",
+                "arguments": "{}"
+            }
+        ]
+    });
+    let (result, _ctx) = govern_buffered(&plugin, body).await;
+    assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn anthropic_non_array_content_fails_closed() {
+    let plugin = make(provider_config());
+    // An Anthropic envelope whose `content` is neither an array nor the
+    // plain-text string shape could be hiding a `tool_use` block.
+    let unreadable = json!({
+        "id": "msg_2",
+        "type": "message",
+        "role": "assistant",
+        "content": { "blocks": [] }
+    });
+    let (result, _ctx) = govern_buffered(&plugin, unreadable).await;
+    assert_reject(result, Some(502));
+
+    // The documented plain-text convenience shape carries no tool surface and
+    // must stay out of scope rather than be rejected.
+    let text_only = json!({
+        "id": "msg_3",
+        "type": "message",
+        "role": "assistant",
+        "content": "just prose"
+    });
+    let (result, _ctx) = govern_buffered(&plugin, text_only).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn bedrock_content_container_shapes_are_classified() {
+    let plugin = make(provider_config());
+    // No `content` at all: a real content-free Converse turn, not a failure.
+    let empty = json!({
+        "output": { "message": { "role": "assistant" } },
+        "stopReason": "end_turn"
+    });
+    let (result, _ctx) = govern_buffered(&plugin, empty).await;
+    assert_continue(result);
+
+    // `content` present but not an array: unreadable, so fail closed.
+    let unreadable = json!({
+        "output": { "message": { "role": "assistant", "content": { "0": {} } } },
+        "stopReason": "tool_use"
+    });
+    let (result, _ctx) = govern_buffered(&plugin, unreadable).await;
+    assert_reject(result, Some(502));
+}
+
+#[tokio::test]
+async fn gemini_skips_partless_candidates_and_non_call_parts() {
+    let plugin = make(provider_config());
+    // A candidate with no `content.parts` and a plain text part are ordinary
+    // skips; the `functionCall` beside them must still be governed.
+    let body = json!({
+        "candidates": [
+            { "index": 0, "finishReason": "SAFETY" },
+            {
+                "index": 1,
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        { "text": "ok" },
+                        { "functionCall": { "name": "kubectl.apply", "args": {} } }
+                    ]
+                }
+            }
+        ]
+    });
+    let (result, _ctx) = govern_buffered(&plugin, body).await;
+    assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn cohere_message_shapes_are_classified() {
+    let plugin = make(provider_config());
+    // A `message` object on an unrelated REST body is never claimed.
+    let unrelated = json!({ "message": { "text": "hello" }, "ok": true });
+    let (result, _ctx) = govern_buffered(&plugin, unrelated).await;
+    assert_continue(result);
+
+    // An assistant turn with an explicit null container carries no calls.
+    let no_calls = json!({
+        "id": "c2",
+        "message": { "role": "assistant", "content": "hi", "tool_calls": null }
+    });
+    let (result, _ctx) = govern_buffered(&plugin, no_calls).await;
+    assert_continue(result);
+
+    // A non-array container could hide a denied call: fail closed.
+    let unreadable = json!({
+        "id": "c3",
+        "message": { "role": "assistant", "tool_calls": { "0": {} } }
+    });
+    let (result, _ctx) = govern_buffered(&plugin, unreadable).await;
+    assert_reject(result, Some(502));
+}
+
+// ---------------------------------------------------------------------------
+// Marker-scan backstop
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tool_use_type_marker_without_extraction_fails_closed() {
+    let plugin = make(provider_config());
+    // A rewritten envelope: the block is plainly a tool call, but it sits under
+    // no container any extractor reads. The marker scan is what catches it.
+    let body = json!({
+        "model": "novel-model-2",
+        "result": {
+            "blocks": [{ "type": "tool_use", "name": "kubectl.apply", "input": {} }]
+        }
+    });
+    let (result, ctx) = govern_buffered(&plugin, body).await;
+    assert_reject(result, Some(502));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.uninspectable_reason")
+            .map(String::as_str),
+        Some("unrecognized_tool_call_shape")
+    );
+}
+
+#[tokio::test]
+async fn scalar_under_a_tool_call_key_is_a_live_marker() {
+    let plugin = make(provider_config());
+    // A scalar under a tool-call key is malformed rather than empty, so it must
+    // not be read as the documented "no calls" shape.
+    let body = json!({ "result": { "tool_calls": "kubectl.apply" } });
+    let (result, _ctx) = govern_buffered(&plugin, body).await;
+    assert_reject(result, Some(502));
+}
+
+#[tokio::test]
+async fn unknown_shape_fails_closed_even_with_metadata_emission_off() {
+    let mut config = provider_config();
+    config["observability"] = json!({ "emit_metadata": false });
+    let plugin = make(config);
+    // Turning observability off silences the record, never the enforcement.
+    let (result, ctx) = govern_buffered(&plugin, unknown_shape_response()).await;
+    assert_reject(result, Some(502));
+    assert!(
+        !ctx.metadata
+            .keys()
+            .any(|key| key.starts_with("ai_tool_governor.")),
+        "metadata emission is off but governor metadata was written"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Unreadable tool-definition containers on the request path
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn unnamed_openai_function_definition_fails_closed() {
+    let plugin = make(definition_config());
+    let body = json!({
+        "tools": [{ "type": "function", "function": { "description": "mystery" } }]
+    });
+    assert_reject(govern_request_definitions(&plugin, body).await, Some(502));
+}
+
+#[tokio::test]
+async fn legacy_openai_functions_definitions_are_governed() {
+    let plugin = make(definition_config());
+    let denied = json!({
+        "functions": [{ "name": "kubectl.apply", "parameters": { "type": "object" } }]
+    });
+    assert_reject(govern_request_definitions(&plugin, denied).await, Some(403));
+
+    let allowed = json!({ "functions": [{ "name": "get_weather" }] });
+    assert_continue(govern_request_definitions(&plugin, allowed).await);
+}
+
+#[tokio::test]
+async fn unreadable_tool_definition_containers_fail_closed() {
+    let plugin = make(definition_config());
+    // Each container below could hide a disallowed definition.
+    for body in [
+        json!({ "tools": "everything" }),
+        json!({ "functions": { "get_weather": {} } }),
+        json!({ "tools": [{ "functionDeclarations": { "name": "get_weather" } }] }),
+    ] {
+        assert_reject(govern_request_definitions(&plugin, body).await, Some(502));
+    }
+}
+
+#[tokio::test]
+async fn unnameable_tool_definition_is_recorded_but_forwarded_in_dry_run() {
+    let mut config = definition_config();
+    config["mode"] = json!("dry_run");
+    let plugin = make(config);
+    let mut ctx = json_post_ctx();
+    let body = json!({ "tools": [{ "description": "mystery tool" }] });
+    ctx.metadata
+        .insert("request_body".to_string(), body.to_string());
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.uninspectable_reason")
+            .map(String::as_str),
+        Some("unrecognized_tool_call_shape"),
+        "dry-run must record an unchecked definition rather than pass silently"
+    );
+    assert_ne!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("allow"),
+        "an unchecked definition must never be labelled a policy allow"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Unreadable shapes on the buffered-SSE path
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn buffered_sse_unknown_tool_shape_fails_closed() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "get_weather": { "action": "allow" } },
+        "inspect": { "response_tool_calls": true, "streaming_response_tool_calls": true }
+    }));
+    let mut ctx = create_test_context();
+    let body = UNKNOWN_SHAPE_STREAM.as_bytes();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body)
+        .await;
+    assert_reject(result, Some(502));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.uninspectable_reason")
+            .map(String::as_str),
+        Some("unrecognized_tool_call_shape")
+    );
+}
+
+#[tokio::test]
+async fn buffered_sse_unknown_tool_shape_opt_out_forwards_but_records() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "unknown_shape_action": "allow",
+        "tools": { "get_weather": { "action": "allow" } },
+        "inspect": { "response_tool_calls": true, "streaming_response_tool_calls": true }
+    }));
+    let mut ctx = create_test_context();
+    let body = UNKNOWN_SHAPE_STREAM.as_bytes();
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), body)
+        .await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.uninspectable_reason")
+            .map(String::as_str),
+        Some("unrecognized_tool_call_shape"),
+        "the documented opt-out must not be silent"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Streaming frames whose tool-call surface cannot be addressed
+//
+// Every frame below names an ALLOWED tool, so a cut can only come from the
+// frame being unreadable — never from the policy verdict.
+// ---------------------------------------------------------------------------
+
+/// Drive one SSE body through a fresh streaming inspector.
+async fn drive_provider_stream(plugin: &AiToolGovernor, body: &str) -> (Vec<u8>, bool) {
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    drive_stream(&mut inspector, &[body.as_bytes()]).await
+}
+
+const ANTHROPIC_UNREADABLE_FRAMES: &[&str] = &[
+    // A `tool_use` block with no index has no slot to accumulate against.
+    "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"get_weather\",\"input\":{}}}\n\n",
+    // A NON-empty `input` seed cannot be concatenated with the
+    // `input_json_delta` string fragments that follow it.
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"get_weather\",\"input\":{\"city\":\"NYC\"}}}\n\n",
+    // A non-string block id is an unusable call identity.
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":7,\"name\":\"get_weather\",\"input\":{}}}\n\n",
+    // An `input_json_delta` with no index has no slot to append to.
+    "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+];
+
+#[tokio::test]
+async fn anthropic_unreadable_streaming_frames_are_cut_in_enforce() {
+    let plugin = make(provider_streaming_config("deny"));
+    for frame in ANTHROPIC_UNREADABLE_FRAMES {
+        let (out, terminated) = drive_provider_stream(&plugin, frame).await;
+        assert!(terminated, "unreadable frame was not cut: {frame}");
+        assert!(out.is_empty(), "held bytes leaked: {out:?}");
+    }
+}
+
+const COHERE_UNREADABLE_FRAMES: &[&str] = &[
+    // No event index to accumulate against.
+    "data: {\"type\":\"tool-call-start\",\"delta\":{\"message\":{\"tool_calls\":{\"id\":\"t1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}}}}\n\n",
+    // No `delta.message.tool_calls` container at all.
+    "data: {\"type\":\"tool-call-start\",\"index\":0,\"delta\":{\"message\":{\"content\":{\"text\":\"hi\"}}}}\n\n",
+    // A non-string call id is an unusable call identity.
+    "data: {\"type\":\"tool-call-start\",\"index\":0,\"delta\":{\"message\":{\"tool_calls\":{\"id\":9,\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}}}}\n\n",
+];
+
+#[tokio::test]
+async fn cohere_unreadable_streaming_frames_are_cut_in_enforce() {
+    let plugin = make(provider_streaming_config("deny"));
+    for frame in COHERE_UNREADABLE_FRAMES {
+        let (out, terminated) = drive_provider_stream(&plugin, frame).await;
+        assert!(terminated, "unreadable frame was not cut: {frame}");
+        assert!(out.is_empty(), "held bytes leaked: {out:?}");
+    }
+}
+
+#[tokio::test]
+async fn gemini_streaming_function_call_without_a_name_is_cut() {
+    let plugin = make(provider_streaming_config("deny"));
+    // A part-less candidate and a text part are ordinary skips; the nameless
+    // `functionCall` in the same frame is the unreadable one.
+    let frame = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"finishReason\":\"SAFETY\"},",
+        "{\"index\":1,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"},",
+        "{\"functionCall\":{\"args\":{\"city\":\"NYC\"}}}]}}]}\n\n"
+    );
+    let (out, terminated) = drive_provider_stream(&plugin, frame).await;
+    assert!(terminated, "a nameless functionCall must cut the stream");
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("NYC"), "held frame leaked: {text}");
+}
+
+/// Gemini frames that also carry Anthropic event discriminators. Each provider
+/// arm is gated on its OWN shape, so the Anthropic arm must treat these as
+/// no-ops rather than misreading them into an ungovernable batch.
+const CROSS_DIALECT_FRAMES: &str = concat!(
+    "data: {\"type\":\"content_block_start\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{}}}]}}]}\n\n",
+    "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"text\",\"text\":\"hi\"},\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{}}}]}}]}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{}}}]}}]}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"},\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{}}}]}}]}\n\n",
+    "data: [DONE]\n\n"
+);
+
+#[tokio::test]
+async fn provider_arms_do_not_misread_each_others_frames() {
+    let plugin = make(provider_streaming_config("deny"));
+    let (out, terminated) = drive_provider_stream(&plugin, CROSS_DIALECT_FRAMES).await;
+    assert!(
+        !terminated,
+        "an allowed Gemini call must not be cut by the Anthropic arm"
+    );
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("get_weather"), "frames were not released");
+}
+
+// ---------------------------------------------------------------------------
+// JSON-shaped stream fallback: same postures as the buffered path
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn json_shaped_stream_unknown_tool_shape_is_cut_in_enforce() {
+    let plugin = Arc::new(make(provider_streaming_config("deny")));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("stream inspector");
+    let body = unknown_shape_response().to_string();
+    let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(terminated, "an unreadable JSON-shaped stream must be cut");
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("kubectl.apply"), "call leaked: {text}");
+}
+
+#[tokio::test]
+async fn json_shaped_stream_unknown_tool_shape_is_forwarded_in_dry_run() {
+    let mut config = provider_streaming_config("deny");
+    config["mode"] = json!("dry_run");
+    let plugin = Arc::new(make(config));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("stream inspector");
+    let body = unknown_shape_response().to_string();
+    let bytes = body.as_bytes();
+    let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
+    assert!(!terminated, "dry-run must never disrupt traffic");
+    assert_eq!(out, bytes, "dry-run must forward the held body unchanged");
+}
+
+/// A `function.arguments` JSON STRING carrying duplicate object member names is
+/// a second document the enclosing body screen cannot see into: enforce cuts
+/// the JSON-shaped stream, dry-run forwards and records the fixed observation.
+const JSON_STREAM_AMBIGUOUS_ARGS: &str = concat!(
+    r#"{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","#,
+    r#""tool_calls":[{"id":"c1","type":"function","function":{"name":"get_weather","#,
+    r#""arguments":"{\"city\":\"NYC\",\"city\":\"LA\"}"}}]},"finish_reason":"tool_calls"}]}"#
+);
+
+#[tokio::test]
+async fn json_shaped_stream_ambiguous_arguments_cut_the_stream_in_enforce() {
+    let plugin = make(provider_streaming_config("deny"));
+    let body = JSON_STREAM_AMBIGUOUS_ARGS;
+    let (out, terminated) = drive_provider_stream(&plugin, body).await;
+    assert!(terminated, "ambiguous arguments must cut the stream");
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("NYC"), "ambiguous bytes leaked: {text}");
+}
+
+#[tokio::test]
+async fn json_shaped_stream_ambiguous_arguments_are_observed_in_dry_run() {
+    let mut config = provider_streaming_config("deny");
+    config["mode"] = json!("dry_run");
+    let plugin = Arc::new(make(config));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("stream inspector");
+    let bytes = JSON_STREAM_AMBIGUOUS_ARGS.as_bytes();
+    let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
+    assert!(!terminated, "dry-run must never disrupt traffic");
+    assert_eq!(out, bytes, "dry-run must forward the held body unchanged");
+    drop(inspector);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(out.len() as u64))
+        .await;
+    assert_dry_run_ambiguity_observation(&ctx);
+}
