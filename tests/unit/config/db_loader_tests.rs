@@ -113,7 +113,10 @@ fn mysql_sequence_and_route_lock_helpers_skip_redundant_for_update() {
     let config_change = source
         .split("async fn lock_config_change_sequence_tx(")
         .nth(1)
-        .and_then(|rest| rest.split("async fn lock_config_change_sequences_tx(").next())
+        .and_then(|rest| {
+            rest.split("async fn lock_config_change_sequences_tx(")
+                .next()
+        })
         .expect("lock_config_change_sequence_tx body");
     assert!(
         config_change.contains("db_type != \"mysql\""),

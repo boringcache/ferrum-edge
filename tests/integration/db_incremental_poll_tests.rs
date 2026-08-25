@@ -666,12 +666,11 @@ async fn config_change_sequence_locks_are_per_namespace() {
         .await
         .expect("tenant-b write must succeed");
 
-    let lock_names: Vec<String> = sqlx::query_scalar(
-        "SELECT lock_name FROM config_change_locks ORDER BY lock_name",
-    )
-    .fetch_all(&store.pool())
-    .await
-    .expect("config_change_locks rows must load");
+    let lock_names: Vec<String> =
+        sqlx::query_scalar("SELECT lock_name FROM config_change_locks ORDER BY lock_name")
+            .fetch_all(&store.pool())
+            .await
+            .expect("config_change_locks rows must load");
     assert_eq!(
         lock_names,
         vec!["tenant-a".to_string(), "tenant-b".to_string()],

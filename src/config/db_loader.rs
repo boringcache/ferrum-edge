@@ -2789,7 +2789,8 @@ impl DatabaseStore {
             self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                 .await?;
         }
-        self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces).await?;
+        self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces)
+            .await?;
         for spec in specs {
             // Defense in depth: the owning proxy must already exist. Ownership
             // tags are stamped separately because ordinary batch inserts omit
@@ -5732,10 +5733,8 @@ impl DatabaseStore {
         // Same revision with different content. The sum of each namespace's
         // high-water mark is strictly monotonic when any namespace advances
         // and still includes deleted namespaces whose change-log rows remain.
-        let rows = sqlx::query(&self.q(
-            "SELECT COALESCE(MAX(sequence), 0) AS max_sequence \
-             FROM config_changes GROUP BY namespace",
-        ))
+        let rows = sqlx::query(&self.q("SELECT COALESCE(MAX(sequence), 0) AS max_sequence \
+             FROM config_changes GROUP BY namespace"))
         .fetch_all(&self.pool())
         .await?;
         let mut total: u64 = 0;
@@ -6507,7 +6506,8 @@ impl DatabaseStore {
             self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                 .await?;
         }
-        self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces).await?;
+        self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces)
+            .await?;
         let mut touched_namespaces = HashSet::new();
         self.insert_proxies_in_tx(&mut tx, proxies, attach_plugins, &mut touched_namespaces)
             .await?;
@@ -6708,7 +6708,8 @@ impl DatabaseStore {
                 self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                     .await?;
             }
-            self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces).await?;
+            self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces)
+                .await?;
             let mut touched_namespaces = HashSet::new();
             self.attach_proxy_plugins_in_tx(&mut tx, chunk, &mut touched_namespaces)
                 .await?;
@@ -6820,7 +6821,8 @@ impl DatabaseStore {
             self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                 .await?;
         }
-        self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces).await?;
+        self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces)
+            .await?;
         let mut touched_namespaces = HashSet::new();
         self.insert_consumers_in_tx(&mut tx, consumers, &mut touched_namespaces)
             .await?;
@@ -6928,7 +6930,8 @@ impl DatabaseStore {
             self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                 .await?;
         }
-        self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces).await?;
+        self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces)
+            .await?;
         let mut touched_namespaces = HashSet::new();
         self.insert_plugin_configs_in_tx(&mut tx, configs, &mut touched_namespaces)
             .await?;
@@ -7042,7 +7045,8 @@ impl DatabaseStore {
             self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                 .await?;
         }
-        self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces).await?;
+        self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces)
+            .await?;
         let mut touched_namespaces = HashSet::new();
         self.insert_upstreams_in_tx(&mut tx, upstreams, &mut touched_namespaces)
             .await?;
@@ -7166,7 +7170,8 @@ impl DatabaseStore {
             self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                 .await?;
         }
-        self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces).await?;
+        self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces)
+            .await?;
         let mut touched_namespaces = HashSet::new();
 
         Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Consumers, 0)?;

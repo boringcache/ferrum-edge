@@ -230,10 +230,7 @@ impl CpScope {
 
 /// Saturating sum of per-namespace durable change-log cursors.
 pub(crate) fn sum_namespace_change_sequences(sequences: &HashMap<String, u64>) -> u64 {
-    sequences
-        .values()
-        .copied()
-        .fold(0u64, u64::saturating_add)
+    sequences.values().copied().fold(0u64, u64::saturating_add)
 }
 
 /// Per-namespace broadcast channel set.
