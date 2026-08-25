@@ -46867,10 +46867,11 @@ fn install_response_authorization_deadline(
 /// The health-neutral dispatch outcome for a phase the gateway itself cancelled
 /// on an authorization expiry, built out of line (issues #3815 / #3764).
 ///
-/// `proxy_to_backend` reaches this from seven cold arms. Constructing the
+/// `proxy_to_backend` reaches this from six cold arms. Constructing the
 /// `retry::BackendResponse` inline at each of them charged that coroutine's
-/// `poll` frame seven fixed slots — for a plain unauthenticated request that can
-/// never take any of them. One `#[inline(never)]` leaf frame builds it instead.
+/// `poll` frame one fixed slot apiece — for a plain unauthenticated request that
+/// can never take any of them. One `#[inline(never)]` leaf frame builds it
+/// instead.
 /// The value is the same health-neutral placeholder wrapped in the same dispatch
 /// result; only where the temporaries live changes.
 #[inline(never)]

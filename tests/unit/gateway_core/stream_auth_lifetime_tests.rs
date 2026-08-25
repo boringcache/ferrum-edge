@@ -2043,13 +2043,17 @@ const PROXY_BODY_SOURCE: &str = include_str!("../../../src/proxy/body.rs");
 
 #[test]
 fn every_post_admission_buffered_upload_collect_carries_the_authorization_plan() {
-    // reqwest buffered (limited + unlimited) and the H3-backend bridge's
-    // buffered arms (limited + unlimited).
+    // The reqwest dispatcher's buffered arm and the H3-backend bridge's buffered
+    // arm. Issue #4153 gave both a fail-closed retained ceiling, which folded
+    // each one's former "unlimited" twin away: `0` on
+    // `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` no longer selects a raw
+    // `body.collect()`, it selects the configured fallback ceiling. Two arms
+    // where there were four, same two dispatchers.
     assert_eq!(
         PROXY_SOURCE
             .matches("collect_request_body_under_authorization(")
             .count(),
-        4,
+        2,
         "a post-admission buffered upload arm reverted to the unbounded collect"
     );
     // Both buffered native-gRPC collects.
@@ -2066,7 +2070,66 @@ fn every_post_admission_buffered_upload_collect_carries_the_authorization_plan()
         PROXY_SOURCE
             .matches("Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {")
             .count(),
-        4
+        2
+    );
+    // What the file-wide counts above cannot show once branches are unified: the
+    // survivor could keep the deadline-aware collector while a SECOND, raw
+    // collect is added beside it, or the bound could be dropped from whichever
+    // arm survived. So pin it per dispatcher as well — inside each
+    // post-admission buffered region every `.collect()` must be an argument of
+    // the authorized collector, the region must never fall back to the
+    // deadline-only entry point, and the collect must stay wrapped in a
+    // fail-closed `Limited`.
+    assert_buffered_upload_region_stays_bounded(
+        "reqwest",
+        "\nasync fn proxy_to_backend(",
+        "\nfn is_streaming_content_type(",
+    );
+    assert_buffered_upload_region_stays_bounded(
+        "http3",
+        "\nasync fn proxy_to_backend_http3(",
+        "\nasync fn proxy_to_backend_http3_retry(",
+    );
+}
+
+/// Every `.collect()` inside one post-admission buffered upload region is an
+/// argument of the authorized, deadline-aware collector, and the collect it
+/// feeds is bounded by the fail-closed retained ceiling (issues #3815 / #4153).
+#[track_caller]
+fn assert_buffered_upload_region_stays_bounded(dispatcher: &str, open: &str, close: &str) {
+    let region = PROXY_SOURCE
+        .split(open)
+        .nth(1)
+        .expect("post-admission buffered dispatcher must remain present")
+        .split(close)
+        .next()
+        .expect("post-admission buffered dispatcher must remain bounded");
+    let authorized = region
+        .matches("collect_request_body_under_authorization(")
+        .count();
+    assert_eq!(
+        authorized,
+        1,
+        "the {dispatcher} dispatcher must keep exactly one buffered upload collect site"
+    );
+    assert_eq!(
+        region.matches(".collect()").count(),
+        authorized,
+        "a {dispatcher} buffered upload collect bypassed the authorized collector"
+    );
+    assert!(
+        !region.contains("collect_request_body_with_deadline("),
+        "the {dispatcher} post-admission collect must keep the authorization \
+         bound, not only the client deadline"
+    );
+    assert!(
+        region.contains("buffered_request_body_ceiling("),
+        "the {dispatcher} buffered upload must size itself from the fail-closed \
+         retained ceiling"
+    );
+    assert!(
+        region.contains("http_body_util::Limited::new("),
+        "the {dispatcher} buffered upload must stay wrapped in `Limited`"
     );
 }
 
@@ -2257,27 +2320,57 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
         9,
         "an H1/H2 dispatch phase lost its authorization attribution"
     );
-    // Every one of those exits returns the health-neutral placeholder. Seventeen
+    // Every one of those exits returns the health-neutral placeholder. Sixteen
     // references name it directly: the definition, the out-of-line wrapper's own
-    // single use, the three `proxy_to_backend_retry` returns, and the twelve
+    // single use, the three `proxy_to_backend_retry` returns, and the eleven
     // tuple-returning exits across HBONE, Unix, mesh mTLS, direct-H2, and the
-    // native-H3 backend. The seven `proxy_to_backend` exits reach the same value
+    // native-H3 backend. The six `proxy_to_backend` exits reach the same value
     // through that wrapper.
+    //
+    // Issue #4153 retired one reference on each of these two counts, and only
+    // one: giving the buffered uploads a fail-closed retained ceiling folded the
+    // native-H3 bridge's "unlimited" arm and the reqwest dispatcher's
+    // "unlimited" arm into their bounded twins. Neither exit changed shape — two
+    // identical exits became one — which the structural backstop below is what
+    // actually proves.
     assert_eq!(
         PROXY_SOURCE
             .matches("authorization_expired_dispatch_placeholder(")
             .count(),
-        17,
+        16,
         "an H1/H2 authorization exit stopped being health-neutral"
     );
-    // The wrapper's definition plus its seven `proxy_to_backend` call sites.
+    // The wrapper's definition plus its six `proxy_to_backend` call sites.
     assert_eq!(
         PROXY_SOURCE
             .matches("authorization_expired_backend_dispatch(")
             .count(),
-        8,
+        7,
         "a reqwest-dispatch authorization exit stopped being health-neutral"
     );
+    // The counts above are a tripwire for a LOST exit; this is the check that
+    // survives a legitimate one being folded away. Whatever the count, every
+    // buffered-upload authorization arm still in the file must resolve to one of
+    // the two health-neutral helpers rather than building its own outcome, so an
+    // arm can never quietly settle an expiry as a backend fault.
+    // Asserted first so the loop below can never pass vacuously.
+    assert!(
+        PROXY_SOURCE.contains("Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {"),
+        "the buffered-upload authorization arms must remain present"
+    );
+    for arm in PROXY_SOURCE
+        .split("Err(AuthorizedUploadWaitError::AuthorizationExpired(_)) => {")
+        .skip(1)
+    {
+        // Bounded at the start of the next match arm; the helper call is the
+        // arm's first statement, so this window always contains it.
+        let branch = arm.split("=> {").next().unwrap_or(arm);
+        assert!(
+            branch.contains("authorization_expired_dispatch_placeholder(")
+                || branch.contains("authorization_expired_backend_dispatch("),
+            "a buffered-upload authorization expiry stopped being health-neutral: {branch}"
+        );
+    }
 }
 
 /// Every buffered RESPONSE collection goes through the shared composer, and
@@ -3936,16 +4029,21 @@ fn the_authorization_expired_rejection_future_is_built_out_of_line() {
 /// `opt-level = 0`, because every alloca is emitted on function entry whichever
 /// branch runs. Three of this contract's constructions are wide
 /// (`(status, HeaderMap, ResponseBody)` terminals, `ProxyBody` moves, and
-/// `retry::BackendResponse`), and inlining them across eleven cold sites
+/// `retry::BackendResponse`), and inlining them across the cold sites they cover
 /// overflowed a tokio worker stack on the coverage profile for a plain
 /// unauthenticated non-gRPC request that can reach none of them. Each must stay
 /// behind an `#[inline(never)]` frame that returns before anything is awaited.
 #[test]
 fn the_precommit_authorization_terminal_is_applied_out_of_line() {
+    // `authorization_expired_backend_dispatch` reaches six cold arms rather than
+    // seven since issue #4153: the reqwest dispatcher's "unlimited" buffered
+    // upload arm was folded into its bounded twin, taking a duplicate call site
+    // with it. One fewer cold site is one fewer frame slot, never an inlined
+    // one — which the region check below is what actually establishes.
     for (callee, expected_calls) in [
         ("apply_precommit_authorization_terminal(", 2),
         ("install_response_authorization_deadline(", 2),
-        ("authorization_expired_backend_dispatch(", 7),
+        ("authorization_expired_backend_dispatch(", 6),
     ] {
         let definition = format!("fn {callee}");
         let before_definition = PROXY_SOURCE
@@ -3967,6 +4065,29 @@ fn the_precommit_authorization_terminal_is_applied_out_of_line() {
              inline in a hot coroutine's frame again"
         );
     }
+
+    // The count is a tripwire for a lost call site; this is what the guard is
+    // really for, and it survives a duplicate arm being folded away. Whatever
+    // the count, `proxy_to_backend` itself must never NAME the placeholder: the
+    // moment one of its cold arms builds the `retry::BackendResponse` inline
+    // again, that coroutine's `poll` frame gets the fixed slot back — for a
+    // plain unauthenticated request that can reach none of those arms.
+    let reqwest_dispatch = PROXY_SOURCE
+        .split("\nasync fn proxy_to_backend(")
+        .nth(1)
+        .expect("the reqwest dispatcher must remain present")
+        .split("\nfn is_streaming_content_type(")
+        .next()
+        .expect("the reqwest dispatcher must remain bounded");
+    assert!(
+        !reqwest_dispatch.contains("authorization_expired_dispatch_placeholder("),
+        "a `proxy_to_backend` authorization exit builds its terminal inline again \
+         instead of through the `#[inline(never)]` wrapper"
+    );
+    assert!(
+        reqwest_dispatch.contains("authorization_expired_backend_dispatch("),
+        "the reqwest dispatcher must still reach the out-of-line wrapper"
+    );
 
     // Moving the work out of line must not move the security decision: the
     // shared latch is still consulted first, an unlatched-but-elapsed plan is
