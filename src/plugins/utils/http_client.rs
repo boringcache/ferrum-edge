@@ -1742,8 +1742,9 @@ mod fallback_tests {
         // connect_timeout the dial can hang for the OS SYN-retransmit budget
         // (~75s on Linux). The outer bound proves the fallback builder path
         // inherited the same 30s connect bound as the fully-configured client.
-        let client = build_dns_cached_fallback_client(None, &PluginTlsPosture::PlatformRoots, false)
-            .expect("fallback client builds");
+        let client =
+            build_dns_cached_fallback_client(None, &PluginTlsPosture::PlatformRoots, false)
+                .expect("fallback client builds");
         let started = std::time::Instant::now();
         let result = tokio::time::timeout(
             Duration::from_secs(40),
