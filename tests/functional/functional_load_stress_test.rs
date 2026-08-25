@@ -445,7 +445,16 @@ impl LoadTestHarness {
             )
             .env("FERRUM_DB_TYPE", db_type)
             .env("FERRUM_DB_URL", db_url)
-            .env("FERRUM_DB_POLL_INTERVAL", "2")
+            // Production default. The harness used 2s here for fast convergence,
+            // but with deferred provisioning (issue #4139) that cadence keeps
+            // the poller in continuous consumer-escalated FULL reloads during
+            // creation, and on PostgreSQL the resulting I/O starvation
+            // produced 170s COMMITs, sequence-lock pileups, and lease losses
+            // (run 32815095730: single-row INSERT 227s, chunk past the 5-min
+            // client budget). Wave-end convergence no longer depends on this
+            // interval: the blocking `GET /config/apply-status` cursor gate
+            // raises an immediate poll wake on demand.
+            .env("FERRUM_DB_POLL_INTERVAL", "30")
             .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
             .env("FERRUM_BASIC_AUTH_HMAC_SECRET", &basic_auth_hmac_secret)
