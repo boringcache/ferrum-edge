@@ -2700,15 +2700,15 @@ jobs:
           grep -Fq 'objectSelector:' "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-self-exclusion.yaml"
           grep -Fq 'app.kubernetes.io/name' "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-self-exclusion.yaml"
           grep -Fq 'ferrum-mesh-injector' "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-self-exclusion.yaml"
-          grep -A20 'namespaceSelector:' "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-self-exclusion.yaml" | grep -Fq '          - ferrum'
+          grep -A20 'namespaceSelector:' "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-self-exclusion.yaml" | grep -Eq '^ +- ferrum$'
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             --set injector.enabled=true \
             --set injector.tls.secretName=ferrum-mesh-injector-tls \
             --set-json 'injector.namespaceSelector={"matchExpressions":[{"key":"kubernetes.io/metadata.name","operator":"NotIn","values":["kube-system"]}]}' \
             --show-only templates/injector-deployment.yaml \
             > "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-ns-override.yaml"
-          grep -A20 'namespaceSelector:' "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-ns-override.yaml" | grep -Fq '          - ferrum'
-          grep -A20 'namespaceSelector:' "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-ns-override.yaml" | grep -Fq '          - kube-system'
+          grep -A20 'namespaceSelector:' "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-ns-override.yaml" | grep -Eq '^ +- ferrum$'
+          grep -A20 'namespaceSelector:' "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-ns-override.yaml" | grep -Eq '^ +- kube-system$'
           # Mesh workload probes (#2450): helm stays in this trusted workflow shell;
           # assertions live in .github/scripts/verify_mesh_workload_probes.py so the
           # trusted ARM64 build-policy gate does not freeze probe-shape edits here.
