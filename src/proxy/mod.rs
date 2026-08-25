@@ -62537,7 +62537,11 @@ mod tests {
 
         // Use a long interval so the test latency is dominated by the
         // shutdown branch of the `tokio::select!`, not by `timer.tick()`.
-        let handle = tokio::spawn(run_per_ip_cleanup_loop(vec![counts.clone()], 3600, Some(rx)));
+        let handle = tokio::spawn(run_per_ip_cleanup_loop(
+            vec![counts.clone()],
+            3600,
+            Some(rx),
+        ));
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(

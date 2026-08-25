@@ -301,7 +301,10 @@ async fn functional_websocket_per_ip_limit_rejects_h3_multiplexed() {
     assert_eq!(other.status, StatusCode::OK);
 
     first.send_close().await.expect("close first H3 websocket");
-    other.send_close().await.expect("close source-B H3 websocket");
+    other
+        .send_close()
+        .await
+        .expect("close source-B H3 websocket");
     gateway.shutdown();
     backend_task.abort();
 }
@@ -393,9 +396,9 @@ async fn wait_for_h1_reconnect(url: &str, xff: &str) {
             Err(_) if Instant::now() < deadline => {
                 sleep(Duration::from_millis(50)).await;
             }
-            Err(err) => panic!(
-                "per-source WebSocket slot was not released after disconnect: {err}"
-            ),
+            Err(err) => {
+                panic!("per-source WebSocket slot was not released after disconnect: {err}")
+            }
         }
     }
 }
