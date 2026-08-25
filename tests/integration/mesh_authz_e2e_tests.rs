@@ -38,6 +38,7 @@ use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::{
     JwtAuthAttributeValue, Plugin, PluginResult, RequestContext, StreamConnectionContext,
 };
+use ferrum_edge::policy_path::canonicalize_policy_path;
 use ferrum_edge::proxy::stream_match::{StreamMatchArm, StreamMatchCriteria, StreamMatchEvidence};
 use serde_json::json;
 use std::sync::Arc;
@@ -2539,4 +2540,342 @@ async fn condition_set_follows_policy_reload_update_and_delete() {
         deleted.authorize(&mut ctx).await,
         PluginResult::Continue
     ));
+}
+
+// ── Canonical request path (issues #1701 and #4149) ────────────────────────
+//
+// Istio `paths:` / `notPaths:` are matched LITERALLY, so an authorization
+// decision is only sound while the string the matcher reads is the string the
+// backend resolves. Two spellings break that on their own:
+//
+//   * an encoded separator — `/admin%2Fsecret` (issue #1701), and
+//   * a dot segment — `/public/../admin/secret` (issue #4149, recorded in
+//     #1701 as its remaining half).
+//
+// Either lets a DENY on `/admin/*` miss, or an ALLOW on `/public/*` match,
+// while a normalizing backend (nginx, Spring, Go's `http.ServeMux`, or the
+// `url` crate behind the gateway's own dispatch) still serves
+// `/admin/secret`.
+//
+// Ferrum closes both halves with ONE mechanism, in one place: every HTTP/1.1,
+// HTTP/2, and HTTP/3 request target is canonicalized at the frontend boundary,
+// and a target with more than one reading is REFUSED with a 400 rather than
+// rewritten. Removing `..` would itself be a second reading, so a backend that
+// does not remove it would still disagree with policy; refusing cannot
+// disagree with anything. `mesh_authz` then re-runs the same canonicalizer —
+// the identity, and allocation-free, on everything the boundary admits — so it
+// fails closed instead of matching raw even if some future entry point ever
+// built a context without passing the boundary.
+
+/// Exactly what `handle_proxy_request_inner` and the H3 handler do at the
+/// boundary: canonicalize the raw target, then build the request context on
+/// the canonical form.
+///
+/// `None` means the boundary refused the target — the client got a 400 and no
+/// authorization decision is ever taken for that spelling.
+fn boundary_ctx(method: &str, raw_path: &str, principal: Option<&str>) -> Option<RequestContext> {
+    let canonical = canonicalize_policy_path(raw_path).ok()?;
+    Some(ctx_with_principal(method, &canonical, principal))
+}
+
+/// The same, for a target the boundary is expected to admit.
+fn canonical_ctx(method: &str, raw_path: &str, principal: Option<&str>) -> RequestContext {
+    boundary_ctx(method, raw_path, principal).expect("target must be admitted at the boundary")
+}
+
+/// A policy with one rule carrying the supplied `to.operation` match.
+fn policy_with_request_match(name: &str, action: PolicyAction, to: RequestMatch) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: vec![to],
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action,
+        }],
+    }
+}
+
+/// ALLOW `GET` on everything EXCEPT `/admin/*`.
+///
+/// `methods` and `notPaths` live in ONE `RequestMatch`, which is Istio's
+/// conjunctive AND-block. The repo contract forbids splitting a negative match
+/// into a separate DENY policy, and these tests would not detect that
+/// regression if they did.
+fn allow_get_except_admin() -> MeshPolicy {
+    policy_with_request_match(
+        "allow-except-admin",
+        PolicyAction::Allow,
+        RequestMatch {
+            methods: vec!["GET".to_string()],
+            not_paths: vec!["/admin/*".to_string()],
+            ..RequestMatch::default()
+        },
+    )
+}
+
+/// A source-agnostic policy on the supplied `paths:` patterns.
+fn policy_on_paths(name: &str, action: PolicyAction, patterns: &[&str]) -> MeshPolicy {
+    policy_with_request_match(
+        name,
+        action,
+        RequestMatch {
+            paths: patterns.iter().map(|p| p.to_string()).collect(),
+            ..RequestMatch::default()
+        },
+    )
+}
+
+/// Every spelling of `/admin/secret` a client can put on the wire: plain,
+/// literal dot segments in each position, `%2e` / `%2E` escaped dot segments,
+/// a double-encoded dot segment, and the issue #1701 encoded-slash forms.
+const ADMIN_SPELLINGS: [&str; 12] = [
+    "/admin/secret",
+    "/public/../admin/secret",
+    "/x/../admin/secret",
+    "/./admin/secret",
+    "/admin/./secret",
+    "/admin/../admin/secret",
+    "/x/%2e%2e/admin/secret",
+    "/x/%2E%2E/admin/secret",
+    "/x/.%2e/admin/secret",
+    "/x/%252e%252e/admin/secret",
+    "/admin%2fsecret",
+    "/admin%252Fsecret",
+];
+
+#[test]
+fn every_ambiguous_spelling_of_a_protected_path_is_refused_at_the_boundary() {
+    // Each of these is a 400 before routing, before every plugin phase, and
+    // before backend dispatch, so `mesh_authz` never evaluates the target at
+    // all. The resolved spelling is the only one that survives.
+    for raw in ADMIN_SPELLINGS {
+        if raw == "/admin/secret" {
+            continue;
+        }
+        assert!(
+            canonicalize_policy_path(raw).is_err(),
+            "{raw:?} must be refused, not resolved to one of its readings"
+        );
+    }
+    // A trailing dot segment and a bare one are refused too.
+    for raw in ["/admin/secret/..", "/admin/secret/.", "/..", "/."] {
+        assert!(
+            canonicalize_policy_path(raw).is_err(),
+            "{raw:?} must be refused as a dot segment"
+        );
+    }
+    // Issue #1701's own half, spelled out so a regression there is named.
+    for raw in ["/admin%2fsecret", "/admin%2Fsecret", "/admin%252Fsecret"] {
+        assert!(
+            canonicalize_policy_path(raw).is_err(),
+            "{raw:?} (encoded separator) must stay refused"
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_spelling_of_a_protected_path_escapes_the_not_paths_negative_match() {
+    let plugin = build_mesh_authz_for_workload(&[], vec![allow_get_except_admin()]);
+
+    // The ALLOW grant works for what it actually names.
+    let mut granted = canonical_ctx("GET", "/api/items", Some(CLIENT_SPIFFE));
+    assert!(matches!(
+        plugin.authorize(&mut granted).await,
+        PluginResult::Continue
+    ));
+
+    // The path a normalizing backend actually serves is refused: `notPaths`
+    // fires, the ALLOW rule does not match, and the implicit-deny floor
+    // applies.
+    let mut resolved = canonical_ctx("GET", "/admin/secret", Some(CLIENT_SPIFFE));
+    assert!(matches!(
+        plugin.authorize(&mut resolved).await,
+        PluginResult::Reject { .. }
+    ));
+
+    // No other spelling of that same resource obtains a wider answer: each is
+    // either refused at the boundary, or reaches the same denial.
+    for raw in ADMIN_SPELLINGS {
+        let Some(mut ctx) = boundary_ctx("GET", raw, Some(CLIENT_SPIFFE)) else {
+            continue;
+        };
+        let canonical = ctx.path.clone();
+        let result = plugin.authorize(&mut ctx).await;
+        assert!(
+            matches!(result, PluginResult::Reject { .. }),
+            "{raw:?} canonicalized to {canonical:?} and was ALLOWED; a \
+             normalizing backend would serve /admin/secret"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_dot_segment_cannot_widen_an_allow_grant_onto_a_protected_path() {
+    // The issue's ALLOW-widening half. `paths: ["/public/*"]` matches
+    // `/public/../admin/secret` literally, which a normalizing backend then
+    // serves as `/admin/secret`.
+    let policy = policy_on_paths("allow-public", PolicyAction::Allow, &["/public/*"]);
+    let plugin = build_mesh_authz_for_workload(&[], vec![policy]);
+
+    assert!(
+        canonicalize_policy_path("/public/../admin/secret").is_err(),
+        "the widening spelling must never reach an authorization decision"
+    );
+
+    let mut raw = ctx_with_principal("GET", "/public/../admin/secret", Some(CLIENT_SPIFFE));
+    assert!(
+        matches!(plugin.authorize(&mut raw).await, PluginResult::Reject { .. }),
+        "handed the raw target directly, the grant must not widen onto /admin"
+    );
+
+    let mut inside = canonical_ctx("GET", "/public/index", Some(CLIENT_SPIFFE));
+    assert!(matches!(
+        plugin.authorize(&mut inside).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn authorize_fails_closed_on_a_raw_ambiguous_target() {
+    // Defense in depth behind the boundary. Before issue #4149 the plugin
+    // matched `ctx.path` literally after folding only `%2F`, so handed the raw
+    // `/public/../admin/secret` the negative match never saw `/admin/...`: the
+    // ALLOW rule fired and the request was permitted while a normalizing
+    // backend served the protected resource. It must now deny instead.
+    let plugin = build_mesh_authz_for_workload(&[], vec![allow_get_except_admin()]);
+
+    for raw in [
+        "/public/../admin/secret",
+        "/x/%2e%2e/admin/secret",
+        "/admin%2fsecret",
+    ] {
+        let mut ctx = ctx_with_principal("GET", raw, Some(CLIENT_SPIFFE));
+        let result = plugin.authorize(&mut ctx).await;
+        match result {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+            other => panic!("{raw:?} must fail closed, got {other:?}"),
+        }
+        let deny_policy = ctx.metadata.get("mesh_authz.deny_policy");
+        assert_eq!(
+            deny_policy.map(String::as_str),
+            Some("non_canonical_path"),
+            "{raw:?} must be attributed to the canonical-path gate, not a rule"
+        );
+        // The recorded reason is a compiled-in token and never echoes request
+        // bytes.
+        assert!(
+            ctx.metadata.contains_key("mesh_authz.non_canonical_path"),
+            "{raw:?} must record why the target was unjudgeable"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dots_inside_a_segment_name_are_reachable_and_matched_literally() {
+    // `/a..b` is NOT a dot segment: RFC 3986 `remove_dot_segments` leaves it
+    // alone, so it must clear the boundary byte-for-byte and still be matched
+    // literally by an operator's rule. Normalizing it away is the regression a
+    // naive "strip `..`" fix would introduce.
+    for raw in ["/a..b", "/..a", "/a..", "/...", "/x/..b/y", "/x/b../y"] {
+        let canonical = canonicalize_policy_path(raw)
+            .unwrap_or_else(|rejection| panic!("{raw:?} refused at boundary: {rejection:?}"));
+        assert_eq!(canonical, raw, "{raw:?} must survive the boundary unchanged");
+    }
+
+    let policy = policy_on_paths("deny-dots", PolicyAction::Deny, &["/a..b"]);
+    let plugin = build_mesh_authz_for_workload(&[], vec![policy]);
+
+    let mut denied = canonical_ctx("GET", "/a..b", Some(CLIENT_SPIFFE));
+    assert!(
+        matches!(
+            plugin.authorize(&mut denied).await,
+            PluginResult::Reject { .. }
+        ),
+        "the literal rule must still fire on a segment name that contains dots"
+    );
+
+    // The DENY is the only policy, so anything it does not match is admitted —
+    // no ALLOW rule exists to raise an implicit-deny floor.
+    let mut admitted = canonical_ctx("GET", "/ab", Some(CLIENT_SPIFFE));
+    assert!(matches!(
+        plugin.authorize(&mut admitted).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn prefix_suffix_and_exact_path_matcher_shapes_all_hold_on_the_canonical_path() {
+    // Istio's three `paths:` shapes. Each must fire on the resolved path, must
+    // not be reachable by an ambiguous spelling of it, and must not turn into
+    // a blanket DENY.
+    for pattern in ["/admin/*", "*/secret", "/admin/secret"] {
+        let policy = policy_on_paths("deny-shape", PolicyAction::Deny, &[pattern]);
+        let plugin = build_mesh_authz_for_workload(&[], vec![policy]);
+
+        let mut resolved = canonical_ctx("GET", "/admin/secret", Some(CLIENT_SPIFFE));
+        assert!(
+            matches!(
+                plugin.authorize(&mut resolved).await,
+                PluginResult::Reject { .. }
+            ),
+            "paths: [{pattern:?}] must deny the resolved /admin/secret"
+        );
+
+        for raw in ADMIN_SPELLINGS {
+            let Some(mut ctx) = boundary_ctx("GET", raw, Some(CLIENT_SPIFFE)) else {
+                continue;
+            };
+            let canonical = ctx.path.clone();
+            let result = plugin.authorize(&mut ctx).await;
+            assert!(
+                matches!(result, PluginResult::Reject { .. }),
+                "paths: [{pattern:?}] was evaded by {raw:?} (canonical {canonical:?})"
+            );
+        }
+
+        let mut other = canonical_ctx("GET", "/public/index", Some(CLIENT_SPIFFE));
+        assert!(
+            matches!(plugin.authorize(&mut other).await, PluginResult::Continue),
+            "paths: [{pattern:?}] must not deny an unrelated path"
+        );
+    }
+}
+
+#[tokio::test]
+async fn canonical_path_gate_does_not_disturb_the_allow_implicit_deny_floor() {
+    // The gate must be invisible to Istio's documented semantics: an ordinary
+    // canonical path that matches no rule is still denied by the ALLOW floor,
+    // and is still attributed to `implicit-deny` rather than to the gate.
+    let allow = policy_allow_principal(
+        "client-only",
+        DEFAULT_NAMESPACE,
+        PolicyScope::MeshWide,
+        CLIENT_SPIFFE,
+    );
+    let plugin = build_mesh_authz_for_workload(&[], vec![allow]);
+
+    let mut allowed = canonical_ctx("GET", "/public/index", Some(CLIENT_SPIFFE));
+    assert!(matches!(
+        plugin.authorize(&mut allowed).await,
+        PluginResult::Continue
+    ));
+
+    let mut floored = canonical_ctx("GET", "/public/index", Some(ROGUE_SPIFFE));
+    assert!(matches!(
+        plugin.authorize(&mut floored).await,
+        PluginResult::Reject { .. }
+    ));
+    let deny_policy = floored.metadata.get("mesh_authz.deny_policy");
+    assert_eq!(
+        deny_policy.map(String::as_str),
+        Some("implicit-deny"),
+        "an ordinary non-match must not be attributed to the canonical-path gate"
+    );
 }

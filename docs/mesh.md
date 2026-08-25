@@ -1882,6 +1882,50 @@ Each `MeshRule` checks the following dimensions (all must match — a conjunctio
 - **Request matching** (`to`): methods, paths (glob), hosts (normalized, case-insensitive), ports (exact + glob patterns), headers (case-insensitive keys, normalized at config load). The negative `to.operation` matchers (`notMethods`/`notPaths`/`notHosts`/`notPorts`) are conjunctive; `notPorts` accepts the same bounded Istio port grammar as positive `ports` (`"*"`, `"<digits>*"`, `"*<digits>"` that can match an ordinary decimal port in `1..=65535`, plus literal `1`-`65535`) and evaluates through pre-normalized `not_ports` / `not_port_patterns` without per-request allocation. ALLOW/AUDIT rules fail closed when the corresponding request attribute is absent (including an unresolved destination/listener port for `notPorts`); DENY rules follow Istio and treat missing HTTP-only operation attributes as matches, so port scoping is recommended for DENY rules that mention HTTP fields and can see TCP traffic.
 - **Condition matching** (`when`): attribute-based with `values` (the attribute must be present and equal one of the values) and `not_values` (the attribute must not equal any value; an absent attribute satisfies a `not_values`-only condition, matching Istio's compiled `not_rule` semantics). Values follow Istio's `StringMatcherWithPrefix` grammar for most keys: `*` is a presence check, a trailing `*` is a prefix match, a leading `*` is a suffix match, and anything else — including a mid-string `*` — is an exact match on the literal text. **Three keys have their own Istio grammar and do not use that matcher** — `source.ip` / `remote.ip` / `destination.ip` are CIDR blocks, `source.serviceAccount` is an exact namespace-relative match, and `source.namespace` accepts a `*` at any position (see [Value grammars](#value-grammars-per-key) below). **Ferrum represents the complete documented Istio condition-key set** (see [Condition keys](#condition-keys) below): `source.principal` (Istio form without the `spiffe://` scheme), `source.namespace`, `source.serviceAccount`, and `source.trustDomain` (all from the resolved peer SPIFFE ID), `source.ip`, `remote.ip`, `destination.ip`, `destination.port`, `connection.sni`, `request.auth.principal`, `request.auth.presenter` (JWT `azp`), `request.auth.audiences`, `request.auth.claims[<name>]` and nested `request.auth.claims[<name>][<nested>]` string or string-list leaf values (from the validated JWT via the mesh `RequestAuthentication` plugin), `request.headers[<name>]`, and `experimental.envoy.filters.<filter>[<key>]`. Dynamic header/claim keys follow Istio's loose `validateMapKey` framing: the first `[` and final `]` delimit a non-empty interior, without an extra HTTP-header-name parse at policy admission. Known HTTP pseudo-headers (`:authority`, `:method`, `:path`, `:scheme`) come from typed request facts; unusual admitted interiors that no request or validated claim can materialize remain absent. Keys outside the documented prefixes are **rejected** at translation/config validation time with a field-specific diagnostic, so a DENY condition on an unmodelled attribute cannot silently fail open. Only the attribute keys some loaded policy references are materialized per request, so a policy set with no `when:` conditions adds no hot-path cost.
 
+#### Request-path matching is done on the canonical path
+
+`paths:` / `notPaths:` (and the `request.headers[:path]` condition) are matched
+against the **canonical policy path**, not the raw request target. Ferrum
+canonicalizes every HTTP/1.1, HTTP/2, and HTTP/3 request target once at the
+frontend boundary — before routing, before any plugin phase, and before backend
+dispatch — so the string the policy matcher reads is the string the backend
+resolves. This is what stops a path-scoped DENY from being evaded, or a
+path-scoped ALLOW from being widened, by an alternative spelling of the same
+resource.
+
+A target that has more than one reading is **refused with `400`** rather than
+rewritten into one of them:
+
+| Target | Result | Reason token |
+| --- | --- | --- |
+| `/public/../admin/secret`, `/./admin`, `/admin/.` | `400` | `literal_dot_segment` |
+| `/x/%2e%2e/admin`, `/%2e/admin` | `400` | `ambiguous_dot_segment` |
+| `/admin%2Fsecret` | `400` | `encoded_separator` |
+| `/admin%252Fsecret`, any `%25` | `400` | `double_encoding` |
+| `/api%20name`, any escape of a non-`pchar` byte | `400` | `unrepresentable_escape` |
+| `/admin\secret`, `/admin%5Csecret` | `400` | `literal_backslash` / `encoded_backslash` |
+| `/%61dmin` | served as `/admin` | — (escape of a `pchar` byte is decoded) |
+| `/a..b`, `/...`, `/v1.0/x` | served unchanged | — (dots inside a segment NAME are not dot segments) |
+
+**Divergence from Istio, deliberate.** Istio/Envoy applies
+`meshConfig.pathNormalization: DEFAULT` (RFC 3986 `remove_dot_segments`) and
+*rewrites* `/public/../admin` to `/admin` before RBAC. Ferrum refuses it
+instead. Removing dot segments is itself a second reading of the target, so a
+backend that does not remove them would still resolve a different path than
+policy evaluated; refusing cannot disagree with any backend. Operators
+migrating a policy set that relied on Envoy's rewrite should expect such
+requests to fail with `400` rather than be silently normalized — no
+authorization decision is ever taken for them.
+
+`mesh_authz` re-runs the same canonicalizer before it evaluates a rule. On every
+target the boundary admits this is the identity and allocates nothing; a target
+that somehow reached authorization without passing the boundary is denied
+(`403`) and recorded with `mesh_authz.deny_policy = non_canonical_path`, never
+matched literally.
+
+Full contract, reason tokens, and the operational impact on the rest of the
+gateway: [docs/request_path_canonicalization.md](request_path_canonicalization.md).
+
 #### Condition keys
 
 Every key documented in Istio's [AuthorizationPolicy conditions](https://istio.io/latest/docs/reference/config/security/conditions/) reference is represented. The table below is the authoritative Ferrum support matrix; `MeshConditionKeyKind` in `src/modes/mesh/config.rs` is the typed classification behind it.
