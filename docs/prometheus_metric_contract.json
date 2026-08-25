@@ -1099,7 +1099,7 @@
     ],
     "subsystem": "configsync",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "alert",
     "emission": "conditional"
   },
   {
@@ -1452,7 +1452,7 @@
     ],
     "subsystem": "database_polling",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "alert",
     "emission": "conditional"
   },
   {
@@ -1584,7 +1584,7 @@
     ],
     "subsystem": "dp_config",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "alert",
     "emission": "conditional"
   },
   {
@@ -4193,7 +4193,7 @@
     ],
     "subsystem": "tls",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "alert",
     "emission": "conditional"
   },
   {

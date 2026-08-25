@@ -1,0 +1,57 @@
+{{- if and .Values.metrics.enabled .Values.metrics.serviceMonitor.enabled }}
+{{- $metrics := .Values.metrics | default dict -}}
+{{- $sm := $metrics.serviceMonitor | default dict -}}
+{{- $ports := .Values.ports | default dict -}}
+{{- $adminTls := (.Values.tls | default dict).admin | default dict -}}
+{{- $adminTlsSet := include "ferrum-gateway.serverTlsConfigured" (dict "root" . "surface" $adminTls "certSource" "FERRUM_ADMIN_TLS_CERT_SOURCE" "keySource" "FERRUM_ADMIN_TLS_KEY_SOURCE") -}}
+{{- $hasAdminHttp := and (hasKey $ports "adminHttp") (ne ($ports.adminHttp | toString) "0") -}}
+{{- $hasAdminHttps := and (hasKey $ports "adminHttps") (ne ($ports.adminHttps | toString) "0") $adminTlsSet -}}
+{{- if not (or $hasAdminHttp $hasAdminHttps) -}}
+{{- fail "metrics.serviceMonitor.enabled=true but no admin scrape port is available: enable a plaintext admin listener (ports.adminHttp>0) or admin HTTPS (ports.adminHttps>0 with tls.admin or complete FERRUM_ADMIN_TLS_{CERT,KEY}_SOURCE pair)." -}}
+{{- end -}}
+{{- $bearer := $metrics.bearerToken | default dict -}}
+{{- $bearerSecret := $bearer.existingSecret | default dict -}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "ferrum-gateway.suffixedName" (dict "base" (include "ferrum-gateway.fullname" .) "suffix" "-metrics") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferrum-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway-metrics
+    {{- with $sm.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $sm.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  jobLabel: app.kubernetes.io/name
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "ferrum-gateway.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: gateway-admin
+  endpoints:
+    - path: /metrics
+      interval: {{ $sm.interval | default "30s" | quote }}
+      scrapeTimeout: {{ $sm.scrapeTimeout | default "10s" | quote }}
+      {{- if $hasAdminHttp }}
+      port: admin-http
+      {{- else }}
+      port: admin-https
+      scheme: https
+      tlsConfig:
+        insecureSkipVerify: true
+      {{- end }}
+      {{- if $bearerSecret.name }}
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ $bearerSecret.name | quote }}
+          key: {{ default "metrics-bearer-token" $bearerSecret.key | quote }}
+      {{- end }}
+{{- end }}

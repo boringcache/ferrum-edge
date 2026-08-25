@@ -113,6 +113,32 @@ external-secret `_FILE` mount pattern). TLS and `_FILE` Secret projections
 default to group-readable `0440` with the distroless nonroot group supplied by
 the pod security context; both settings remain overridable.
 
+### Metrics and Prometheus (optional)
+
+The chart's `metrics` subtree is **off by default** (`metrics.enabled=false`).
+When enabled it can render `FERRUM_METRICS_BEARER_TOKEN` /
+`FERRUM_METRICS_ALLOWED_CIDRS`, an optional Prometheus Operator `ServiceMonitor`
+that scrapes `/metrics` on the admin Service, and a `PrometheusRule` with core
+gateway alerts. Enabling metrics does not change `admin.bindAddress` — expose
+admin explicitly (`admin.bindAddress` + `admin.service.enabled`) and restrict
+access with a `NetworkPolicy`. Scrapers must be authorized via metrics bearer
+token or allowed CIDR; see [`charts/ferrum-gateway/README.md`](../charts/ferrum-gateway/README.md#metrics-and-prometheus).
+
+`/metrics` also requires a globally scoped `prometheus_metrics` plugin in the
+gateway configuration; without it the endpoint returns an empty exposition:
+
+```yaml
+plugin_configs:
+  - id: prometheus
+    plugin_name: prometheus_metrics
+    scope: global
+    enabled: true
+    config: {}
+```
+
+In file mode add this under `file.inlineConfig`; in database/cp/dp modes add it
+through the admin API or your config-distribution workflow.
+
 ### Binary operating-mode Kubernetes contract
 
 Every `FERRUM_MODE` value maps to exactly one supported Kubernetes contract:

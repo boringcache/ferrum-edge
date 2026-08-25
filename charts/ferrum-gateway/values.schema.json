@@ -541,6 +541,58 @@
           ]
         }
       }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "allowedCidrs": { "type": "string" },
+        "bearerToken": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "value": { "type": "string" },
+            "existingSecret": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": { "type": "string" },
+                "key": { "type": "string" }
+              }
+            },
+            "valueFrom": { "type": "object" }
+          }
+        },
+        "serviceMonitor": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "interval": { "type": "string" },
+            "scrapeTimeout": { "type": "string" },
+            "labels": {
+              "type": "object",
+              "additionalProperties": { "type": ["string", "number", "integer", "boolean"] }
+            },
+            "annotations": {
+              "type": "object",
+              "additionalProperties": { "type": ["string", "number", "integer", "boolean"] }
+            }
+          }
+        },
+        "alerts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "high5xxRatePerSecond": { "type": "number", "minimum": 0 },
+            "p99LatencyMs": { "type": "number", "minimum": 0 },
+            "certExpiringSeconds": { "type": "integer", "minimum": 0 },
+            "databasePollStaleSeconds": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
     }
   },
   "definitions": {
