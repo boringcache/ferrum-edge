@@ -1,7 +1,11 @@
 //! Tests for circuit breaker module
 
 use ferrum_edge::circuit_breaker::{CircuitBreaker, CircuitBreakerCache, target_key};
-use ferrum_edge::config::types::CircuitBreakerConfig;
+use ferrum_edge::config::db_loader::IncrementalResult;
+use ferrum_edge::config::types::{
+    CircuitBreakerConfig, GatewayConfig, LoadBalancerAlgorithm, UpstreamTarget,
+};
+use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1097,20 +1101,46 @@ fn test_circuit_breaker_prune_stale_targets() {
     let cache = CircuitBreakerCache::new();
     let config = default_config();
 
-    // Create breakers for multiple targets
     cache.get_or_create("ferrum", "proxy1", Some("10.0.0.1:8080"), &config);
     cache.get_or_create("ferrum", "proxy1", Some("10.0.0.2:8080"), &config);
     cache.get_or_create("ferrum", "proxy1", Some("10.0.0.3:8080"), &config);
-    cache.get_or_create("ferrum", "proxy2", None, &config); // direct backend
+    // HTTP dispatch mints a target-scoped key for direct backends too.
+    cache.get_or_create("ferrum", "proxy-direct", Some("backend.example:443"), &config);
+    // UDP/DTLS direct backends still use the proxy-scoped key (no "::").
+    cache.get_or_create("ferrum", "proxy-udp-direct", None, &config);
 
-    // Only keep ferrum|proxy1::10.0.0.1:8080 — the rest are stale. Active keys
-    // are namespace-qualified exactly as dispatch composes them.
     let mut active = std::collections::HashSet::new();
     active.insert("ferrum|proxy1::10.0.0.1:8080".to_string());
+    active.insert("ferrum|proxy-direct::backend.example:443".to_string());
     cache.prune_stale_targets(&active);
 
-    // Direct backend key (ferrum|proxy2, no "::") should be preserved
-    assert_eq!(cache.len(), 2); // ferrum|proxy1::10.0.0.1:8080 + ferrum|proxy2
+    assert!(
+        cache
+            .peek("ferrum", "proxy1", Some("10.0.0.1:8080"))
+            .is_some()
+    );
+    assert!(
+        cache
+            .peek("ferrum", "proxy-direct", Some("backend.example:443"))
+            .is_some(),
+        "dispatch-shaped direct-backend keys must survive when present in active_keys"
+    );
+    assert!(
+        cache.peek("ferrum", "proxy-udp-direct", None).is_some(),
+        "proxy-scoped keys without '::' remain managed by prune(), not target prune"
+    );
+    assert!(
+        cache
+            .peek("ferrum", "proxy1", Some("10.0.0.2:8080"))
+            .is_none(),
+        "retired upstream targets must still be reclaimed"
+    );
+    assert!(
+        cache
+            .peek("ferrum", "proxy1", Some("10.0.0.3:8080"))
+            .is_none()
+    );
+    assert_eq!(cache.len(), 3);
 }
 
 #[test]
@@ -2160,5 +2190,210 @@ fn can_execute_with_admission_epoch_returns_the_admitted_generation() {
     assert_eq!(
         epoch, 1,
         "the probe captures the generation it is probing, not the pre-open value"
+    );
+}
+
+fn trip_open(cache: &CircuitBreakerCache, namespace: &str, proxy_id: &str, target: Option<&str>) {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        timeout_seconds: 60,
+        ..default_config()
+    };
+    let cb = cache.get_or_create(namespace, proxy_id, target, &config);
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+}
+
+fn assert_open(cache: &CircuitBreakerCache, namespace: &str, proxy_id: &str, target: Option<&str>) {
+    let cb = cache
+        .peek(namespace, proxy_id, target)
+        .unwrap_or_else(|| panic!("breaker {namespace}|{proxy_id} {target:?} must survive prune"));
+    assert_eq!(
+        cb.state_name(),
+        "open",
+        "breaker {namespace}|{proxy_id} {target:?} must remain open"
+    );
+}
+
+/// An unrelated config delta must not reclaim live breakers for (a) static
+/// upstream targets, (b) HTTP direct-backend host:port keys, or (c) live
+/// service-discovery IPs that are not in the authored `upstream.targets`.
+/// Retired targets still have to disappear (#4159).
+#[tokio::test]
+async fn apply_incremental_preserves_live_breaker_state_for_all_target_kinds() {
+    let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "plugin_configs": [],
+        "proxies": [
+            {
+                "id": "proxy-direct",
+                "listen_path": "/direct",
+                "backend_scheme": "http",
+                "backend_host": "payments.internal",
+                "backend_port": 8443,
+                "circuit_breaker": { "failure_threshold": 1, "timeout_seconds": 60 }
+            },
+            {
+                "id": "proxy-upstream",
+                "listen_path": "/upstream",
+                "backend_scheme": "http",
+                "backend_host": "unused.local",
+                "backend_port": 1,
+                "upstream_id": "static-up",
+                "circuit_breaker": { "failure_threshold": 1, "timeout_seconds": 60 }
+            },
+            {
+                "id": "proxy-sd",
+                "listen_path": "/sd",
+                "backend_scheme": "http",
+                "backend_host": "unused.local",
+                "backend_port": 1,
+                "upstream_id": "sd-up",
+                "circuit_breaker": { "failure_threshold": 1, "timeout_seconds": 60 }
+            },
+            {
+                "id": "proxy-unrelated",
+                "listen_path": "/other",
+                "backend_scheme": "http",
+                "backend_host": "other.internal",
+                "backend_port": 80
+            }
+        ],
+        "upstreams": [
+            {
+                "id": "static-up",
+                "targets": [{ "host": "10.0.0.1", "port": 8080 }]
+            },
+            {
+                "id": "sd-up",
+                "targets": [{ "host": "10.0.0.50", "port": 8080 }]
+            }
+        ]
+    }))
+    .expect("fixture config");
+    config.normalize_fields();
+
+    let dns_cache = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default());
+    let (state, _) = ProxyState::new(
+        config,
+        dns_cache,
+        ferrum_edge::config::env_config::EnvConfig::default(),
+        None,
+        None,
+    )
+    .expect("test proxy state should build");
+
+    let discovered: UpstreamTarget = serde_json::from_value(serde_json::json!({
+        "host": "10.9.9.9",
+        "port": 8080
+    }))
+    .expect("discovered target");
+    state.load_balancer_cache.update_targets(
+        "ferrum",
+        "sd-up",
+        vec![discovered],
+        LoadBalancerAlgorithm::default(),
+        None,
+    );
+    state
+        .request_epoch
+        .republish_from_runtime_parts_for_test(
+            (*state.config.load_full()).clone(),
+            &state.plugin_cache,
+            &state.consumer_index,
+            &state.load_balancer_cache,
+        )
+        .expect("publish live discovery targets into the request epoch");
+
+    let ns = "ferrum";
+    trip_open(
+        &state.circuit_breaker_cache,
+        ns,
+        "proxy-direct",
+        Some("payments.internal:8443"),
+    );
+    trip_open(
+        &state.circuit_breaker_cache,
+        ns,
+        "proxy-upstream",
+        Some("10.0.0.1:8080"),
+    );
+    trip_open(
+        &state.circuit_breaker_cache,
+        ns,
+        "proxy-sd",
+        Some("10.9.9.9:8080"),
+    );
+    trip_open(
+        &state.circuit_breaker_cache,
+        ns,
+        "proxy-sd",
+        Some("10.0.0.50:8080"),
+    );
+    trip_open(
+        &state.circuit_breaker_cache,
+        ns,
+        "proxy-upstream",
+        Some("10.0.0.99:8080"),
+    );
+
+    let mut unrelated = state
+        .config
+        .load_full()
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == "proxy-unrelated")
+        .cloned()
+        .expect("unrelated proxy");
+    unrelated.backend_host = "other-v2.internal".to_string();
+    unrelated.updated_at = unrelated.updated_at + chrono::Duration::seconds(1);
+
+    let outcome = state
+        .apply_incremental(IncrementalResult {
+            added_or_modified_proxies: vec![unrelated],
+            removed_proxy_ids: vec![],
+            added_or_modified_consumers: vec![],
+            removed_consumer_ids: vec![],
+            added_or_modified_plugin_configs: vec![],
+            removed_plugin_config_ids: vec![],
+            added_or_modified_upstreams: vec![],
+            removed_upstream_ids: vec![],
+            sequence_cursor: 0,
+            poll_timestamp: chrono::Utc::now(),
+        })
+        .await;
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+
+    assert_open(
+        &state.circuit_breaker_cache,
+        ns,
+        "proxy-direct",
+        Some("payments.internal:8443"),
+    );
+    assert_open(
+        &state.circuit_breaker_cache,
+        ns,
+        "proxy-upstream",
+        Some("10.0.0.1:8080"),
+    );
+    assert_open(
+        &state.circuit_breaker_cache,
+        ns,
+        "proxy-sd",
+        Some("10.9.9.9:8080"),
+    );
+    assert!(
+        state
+            .circuit_breaker_cache
+            .peek(ns, "proxy-sd", Some("10.0.0.50:8080"))
+            .is_none(),
+        "authored SD placeholder that is not in the live LB set must be reclaimed"
+    );
+    assert!(
+        state
+            .circuit_breaker_cache
+            .peek(ns, "proxy-upstream", Some("10.0.0.99:8080"))
+            .is_none(),
+        "retired upstream IPs must still be reclaimed on a config delta"
     );
 }
