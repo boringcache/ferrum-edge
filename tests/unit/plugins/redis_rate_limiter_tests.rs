@@ -1,7 +1,7 @@
 use ferrum_edge::_test_support::{
-    MAX_REDIS_POOL_SIZE, RedisConfig, RedisRateLimitClient, create_rate_limit_plugin_with_config_id,
-    redis_client_credentials, redis_client_tls_insecure, redis_config_url_with_ip,
-    redis_rate_limit_client_for_test,
+    MAX_REDIS_POOL_SIZE, RedisConfig, RedisRateLimitClient,
+    create_rate_limit_plugin_with_config_id, redis_client_credentials, redis_client_tls_insecure,
+    redis_config_url_with_ip, redis_rate_limit_client_for_test,
 };
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
