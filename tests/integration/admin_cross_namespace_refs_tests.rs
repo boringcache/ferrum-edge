@@ -793,7 +793,7 @@ async fn seed_store_upstream(store: &DatabaseStore, namespace: &str, id: &str, t
     .bind(format!("{id}-name"))
     .bind(ts)
     .bind(ts)
-    .execute(store.pool())
+    .execute(&store.pool())
     .await
     .expect("upstream insert must succeed");
 }
@@ -809,7 +809,7 @@ async fn seed_store_proxy(store: &DatabaseStore, namespace: &str, id: &str, ts: 
     .bind(format!("{id}-name"))
     .bind(ts)
     .bind(ts)
-    .execute(store.pool())
+    .execute(&store.pool())
     .await
     .expect("proxy insert must succeed");
 }
@@ -836,7 +836,7 @@ async fn seed_store_mesh_route_dispatch(
     .bind(proxy_id)
     .bind(ts)
     .bind(ts)
-    .execute(store.pool())
+    .execute(&store.pool())
     .await
     .expect("mesh_route_dispatch insert must succeed");
 }
@@ -845,7 +845,7 @@ async fn upstream_exists(store: &DatabaseStore, namespace: &str, id: &str) -> bo
     sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM upstreams WHERE id = ? AND namespace = ?")
         .bind(id)
         .bind(namespace)
-        .fetch_one(store.pool())
+        .fetch_one(&store.pool())
         .await
         .expect("upstream count must succeed")
         > 0
