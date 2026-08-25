@@ -138,7 +138,12 @@ async fn functional_header_read_timeout_closes_h2c_without_request() {
 
     let mut buf = Vec::new();
     let drain = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf));
-    drain
+    // The TIMEOUT is the assertion: the gateway must close the connection inside
+    // the window. Whether the drain then reports a clean EOF or a reset is
+    // immaterial — both mean closed — so the inner io result is discarded
+    // deliberately rather than unwrapped, which would make the test brittle
+    // against a RST.
+    let _ = drain
         .await
         .expect("an h2c connection that sends no request must be closed");
     assert_backend_hits(&backend_hits, 0).await;
