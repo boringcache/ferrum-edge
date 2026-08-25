@@ -353,11 +353,11 @@ explicit empty slice disables spread even at higher replica counts.
 {{- $replicas := .replicas | int -}}
 {{- if ge $replicas 2 -}}
 {{- if kindIs "slice" .constraints -}}
-{{- if gt (len .constraints) 0 -}}
+{{- if gt (len .constraints) 0 }}
       topologySpreadConstraints:
-{{ toYaml .constraints | nindent 8 }}
+{{- toYaml .constraints | nindent 8 }}
 {{- end -}}
-{{- else -}}
+{{- else }}
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
