@@ -2168,7 +2168,7 @@ impl SoapWsSecurity {
                     dns_cache,
                     tls_no_verify,
                     tls_ca_bundle_path,
-                )))
+                )?))
             }
             None => {
                 // Only a policy that can actually make process-local replay

@@ -70,7 +70,9 @@ fn redis_bucket_key(prefix: &str, rate_key: &str, suffix: &[&str]) -> String {
     )
     .expect("redis config parses")
     .expect("redis mode enabled");
-    RedisRateLimitClient::new(config, None, false, None).make_slot_key(rate_key, suffix)
+    RedisRateLimitClient::new(config, None, false, None)
+        .expect("construction without a CA path must succeed")
+        .make_slot_key(rate_key, suffix)
 }
 
 /// Every `KEYS` glob a plugin's records may live under for `prefix`.
@@ -2195,7 +2197,8 @@ async fn test_request_deduplication_redis_publication_is_ownership_fenced() {
     )
     .expect("redis config parses")
     .expect("redis mode enabled");
-    let client = RedisRateLimitClient::new(config, None, false, None);
+    let client = RedisRateLimitClient::new(config, None, false, None)
+        .expect("construction without a CA path must succeed");
 
     let key = client.make_key(&["fence"]);
     let owner_a = b"owner-a-inflight-record".to_vec();
@@ -3923,9 +3926,10 @@ async fn test_shared_replay_authority_live_redis_admits_exactly_one_winner() {
         .expect("redis mode enabled");
         // A separate client per authority: independent connection pools, exactly
         // as two gateway replicas have.
-        Arc::new(RedisRateLimitClient::for_replay_authority(
-            config, None, false, None,
-        ))
+        Arc::new(
+            RedisRateLimitClient::for_replay_authority(config, None, false, None)
+                .expect("construction without a CA path must succeed"),
+        )
     };
 
     let domain = ReplayDomain::new(
@@ -4038,12 +4042,15 @@ async fn test_shared_replay_authority_live_redis_admits_exactly_one_winner() {
     .expect("redis config parses")
     .expect("redis mode enabled");
     let unreachable_authority = ReplayAuthority::shared(
-        Arc::new(RedisRateLimitClient::for_replay_authority(
-            unreachable_config,
-            None,
-            false,
-            None,
-        )),
+        Arc::new(
+            RedisRateLimitClient::for_replay_authority(
+                unreachable_config,
+                None,
+                false,
+                None,
+            )
+            .expect("construction without a CA path must succeed"),
+        ),
         retention,
     );
     unreachable_authority.activate();

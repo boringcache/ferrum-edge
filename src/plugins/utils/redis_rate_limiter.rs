@@ -116,7 +116,19 @@
 //! # TLS
 //!
 //! Supports TLS via `rediss://` URL scheme (note the double-s). CA verification
-//! and skip-verify are inherited from the gateway-level TLS settings.
+//! and skip-verify are inherited from the gateway-level TLS settings
+//! (`FERRUM_TLS_CA_BUNDLE_PATH`, `FERRUM_TLS_NO_VERIFY`).
+//!
+//! A configured CA bundle is exclusive: it is the sole trust anchor, with no
+//! mixing of redis-rs default (system/public) roots. The bundle is loaded once
+//! at construction and stored for both the main connect path and the
+//! background health-check reconnect, so neither path can later open a
+//! downgraded client. If the path is set, verification is enabled, and the
+//! bundle cannot be loaded, construction returns an error rather than
+//! warning-and-continuing. An unset CA path still uses redis-rs default roots.
+//! `FERRUM_TLS_NO_VERIFY` is the sanctioned skip-verify path; the CA is unused
+//! there (Ferrum appends `#insecure` internally), so an unloadable bundle is
+//! not a construction error on that path.
 //!
 //! # Resilience
 //!
@@ -1737,8 +1749,14 @@ pub struct RedisRateLimitClient {
     health_checker_abort: Mutex<Option<AbortHandle>>,
     /// Gateway-level TLS no-verify setting (`FERRUM_TLS_NO_VERIFY`).
     tls_no_verify: bool,
-    /// Pre-read CA bundle PEM bytes from `FERRUM_TLS_CA_BUNDLE_PATH`.
-    /// Loaded once at construction to avoid filesystem reads on every connection.
+    /// Pre-read exclusive CA bundle PEM bytes from `FERRUM_TLS_CA_BUNDLE_PATH`.
+    ///
+    /// Loaded once at construction so the main connect path and the background
+    /// health-check reconnect share the same trust policy. `None` means no
+    /// exclusive CA was configured, or verification is skipped via
+    /// `FERRUM_TLS_NO_VERIFY`. A configured path that failed to load never
+    /// produces this client — construction fails closed instead of storing
+    /// `None` and falling back to default roots.
     tls_ca_bundle_pem: Option<Vec<u8>>,
     /// How this client publishes operational diagnostics.
     ///
@@ -1849,6 +1867,42 @@ impl SharedReplayRegistrationSample {
     }
 }
 
+/// Load the exclusive Redis TLS CA bundle, or `None` when the operator named
+/// no custom CA (or disabled verification).
+///
+/// `FERRUM_TLS_CA_BUNDLE_PATH` is exclusive: a client built after a failed
+/// load would verify against redis-rs's default (system/public) roots, which
+/// is a weaker trust policy than the one configured. Fail closed instead of
+/// warning-and-continuing. Both `build_client` and the background health-check
+/// reconnect consume the bytes stored on the client, so neither can reopen a
+/// downgraded connection later.
+///
+/// When `tls_no_verify` is set (`FERRUM_TLS_NO_VERIFY`), verification is
+/// already off by explicit operator choice. The CA is unused on that path
+/// (Ferrum appends `#insecure` internally), so an unloadable bundle is not a
+/// construction error — matching `PluginHttpClient`'s skip-verify posture.
+/// Do not load the file just to discard it, and do not change that sanctioned
+/// path's semantics.
+fn load_redis_tls_ca_bundle(
+    tls_no_verify: bool,
+    tls_ca_bundle_path: Option<&str>,
+) -> Result<Option<Vec<u8>>, String> {
+    if tls_no_verify {
+        return Ok(None);
+    }
+    let Some(path) = tls_ca_bundle_path else {
+        return Ok(None);
+    };
+    let source = CertSource::parse(path, MaterialKind::CaBundle);
+    match load_material_blocking(&source, MaterialKind::CaBundle) {
+        Ok(material) => Ok(Some(material.bytes.expose_secret().to_vec())),
+        Err(error) => Err(format!(
+            "redis rate limiter: failed to load exclusive CA bundle; \
+             refusing to fall back to default TLS roots: {error}"
+        )),
+    }
+}
+
 /// Interpret the semantic reply to the replay authority's `SET ... NX EX`.
 ///
 /// Redis returns exactly `OK` when it stored the marker and a nil reply when
@@ -1883,12 +1937,16 @@ impl RedisRateLimitClient {
     ///
     /// When `dns_cache` is provided, Redis hostnames are resolved through the
     /// gateway's shared DNS cache instead of the system resolver.
+    ///
+    /// Returns `Err` when a CA bundle path is configured, verification is
+    /// enabled, and the bundle cannot be loaded. That is fail-closed exclusive
+    /// trust: the client is never built against redis-rs default roots.
     pub fn new(
         config: RedisConfig,
         dns_cache: Option<DnsCache>,
         tls_no_verify: bool,
         tls_ca_bundle_path: Option<&str>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         Self::construct(
             config,
             dns_cache,
@@ -1912,12 +1970,14 @@ impl RedisRateLimitClient {
     /// already-redacted endpoint — never raw backend text, `INFO` payloads, key
     /// material, marker material, credentials, or the operator key prefix.
     /// Generic rate-limiter clients must keep [`Self::new`].
+    ///
+    /// Returns `Err` under the same exclusive-CA load failure as [`Self::new`].
     pub fn for_replay_authority(
         config: RedisConfig,
         dns_cache: Option<DnsCache>,
         tls_no_verify: bool,
         tls_ca_bundle_path: Option<&str>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         Self::construct(
             config,
             dns_cache,
@@ -1933,26 +1993,10 @@ impl RedisRateLimitClient {
         tls_no_verify: bool,
         tls_ca_bundle_path: Option<&str>,
         log_policy: RedisClientLogPolicy,
-    ) -> Self {
-        let tls_ca_bundle_pem = if !tls_no_verify {
-            tls_ca_bundle_path.and_then(|path| {
-                let source = CertSource::parse(path, MaterialKind::CaBundle);
-                match load_material_blocking(&source, MaterialKind::CaBundle) {
-                    Ok(material) => Some(material.bytes.expose_secret().to_vec()),
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            "Failed to load CA bundle for Redis TLS — using system root CAs"
-                        );
-                        None
-                    }
-                }
-            })
-        } else {
-            None
-        };
+    ) -> Result<Self, String> {
+        let tls_ca_bundle_pem = load_redis_tls_ca_bundle(tls_no_verify, tls_ca_bundle_path)?;
 
-        Self {
+        Ok(Self {
             pool: Arc::new(ConnectionPool::new(config.pool_size)),
             config,
             dns_cache,
@@ -1966,7 +2010,7 @@ impl RedisRateLimitClient {
             tls_ca_bundle_pem,
             log_policy,
             shared_replay_health: OnceLock::new(),
-        }
+        })
     }
 
     /// Count this distinct Redis client as one shared replay authority.
@@ -2193,6 +2237,15 @@ impl RedisRateLimitClient {
     #[allow(dead_code)] // public support used by the external unit-test target
     pub fn observer_sees_available_for_test(&self) -> bool {
         self.availability_signal().is_available()
+    }
+
+    /// Whether construction stored exclusive CA bundle bytes (test support).
+    ///
+    /// True only when verification is on and a configured bundle loaded. False
+    /// when no CA path was set or when `tls_no_verify` skipped the load.
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn uses_exclusive_ca_bundle_for_test(&self) -> bool {
+        self.tls_ca_bundle_pem.is_some()
     }
 
     /// Whether the background recovery checker has been started (test support).

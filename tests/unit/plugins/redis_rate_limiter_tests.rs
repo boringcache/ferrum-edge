@@ -1,6 +1,6 @@
 use ferrum_edge::_test_support::{
-    MAX_REDIS_POOL_SIZE, RedisConfig, RedisRateLimitClient, redis_client_credentials,
-    redis_config_url_with_ip, redis_rate_limit_client_for_test,
+    MAX_REDIS_POOL_SIZE, RedisConfig, RedisRateLimitClient, redis_build_client,
+    redis_client_credentials, redis_config_url_with_ip, redis_rate_limit_client_for_test,
 };
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -291,6 +291,99 @@ fn test_from_plugin_config_rejects_malformed_redis_urls() {
             "redis_url should fail validation: {redis_url}"
         );
     }
+}
+
+/// Issue #4173: a configured exclusive CA that cannot be loaded must not
+/// silently fall back to redis-rs default (system/public) roots.
+#[test]
+fn redis_tls_fails_closed_when_configured_ca_cannot_be_loaded() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("missing-redis-ca.pem");
+    let missing_path = missing.to_str().expect("utf8 path");
+    let config = make_config("rediss://cache.internal:6380/0", true);
+
+    let err = RedisRateLimitClient::new(config, None, false, Some(missing_path))
+        .expect_err("unloadable exclusive CA must refuse construction");
+    assert!(
+        err.contains("exclusive CA bundle") && err.contains("refusing to fall back"),
+        "diagnostic must name the fail-closed exclusive-CA decision: {err}"
+    );
+    assert!(
+        !err.contains("using system root"),
+        "must not advertise a default-root fallback: {err}"
+    );
+}
+
+#[test]
+fn redis_tls_constructs_when_no_ca_path_is_configured() {
+    let config = make_config("rediss://cache.internal:6380/0", true);
+    let client = RedisRateLimitClient::new(config, None, false, None)
+        .expect("construction without a CA path must succeed");
+    assert!(
+        !client.uses_exclusive_ca_bundle_for_test(),
+        "an unset CA path must keep redis-rs default roots"
+    );
+    redis_build_client(&client, "rediss://cache.internal:6380/0")
+        .expect("default-root Redis TLS client");
+}
+
+#[test]
+fn redis_tls_uses_exclusive_ca_when_the_bundle_loads() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bundle_path = dir.path().join("redis-ca.pem");
+    std::fs::write(&bundle_path, include_str!("../../certs/server.crt"))
+        .expect("write CA bundle");
+    let path = bundle_path.to_str().expect("utf8 path");
+    let config = make_config("rediss://cache.internal:6380/0", true);
+
+    let client = RedisRateLimitClient::new(config, None, false, Some(path))
+        .expect("a loadable exclusive CA must construct");
+    assert!(
+        client.uses_exclusive_ca_bundle_for_test(),
+        "a loaded CA must be the sole trust anchor, not default roots"
+    );
+    redis_build_client(&client, "rediss://cache.internal:6380/0")
+        .expect("exclusive-CA Redis TLS client");
+}
+
+#[test]
+fn redis_tls_no_verify_does_not_fail_construction_on_an_unloadable_ca() {
+    // FERRUM_TLS_NO_VERIFY is the sanctioned skip-verify path. Verification is
+    // already off, so an unloadable CA is not a trust-policy downgrade and
+    // must not change that path's construction semantics.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("missing-redis-ca-noverify.pem");
+    let missing_path = missing.to_str().expect("utf8 path");
+    let config = make_config("rediss://cache.internal:6380/0", true);
+
+    let client = RedisRateLimitClient::new(config, None, true, Some(missing_path))
+        .expect("tls_no_verify must not fail construction on an unloadable CA");
+    assert!(
+        !client.uses_exclusive_ca_bundle_for_test(),
+        "skip-verify must not store exclusive CA bytes it will not use"
+    );
+    redis_build_client(&client, "rediss://cache.internal:6380/0")
+        .expect("skip-verify Redis TLS client");
+}
+
+#[test]
+fn redis_exclusive_ca_load_is_the_shared_construction_gate() {
+    // PR #4194 routes connect + health-check reconnect through one client
+    // builder. Exclusive-CA fail-closed must stay on the load that feeds both
+    // paths, not inside a connect-only helper those reconnects could bypass.
+    let source = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
+    assert!(
+        source.contains("fn load_redis_tls_ca_bundle("),
+        "CA loading must live in one helper both connect paths inherit"
+    );
+    assert!(
+        !source.contains("using system root CAs"),
+        "an unloadable exclusive CA must not fall back to default roots"
+    );
+    assert!(
+        source.matches("tls_ca_bundle_pem").count() >= 3,
+        "stored exclusive CA bytes must be the input both connect paths use"
+    );
 }
 
 #[test]
@@ -1360,7 +1453,8 @@ async fn hostname_egress_denial_arms_the_recovery_checker() {
     });
     let mut config = make_config("redis://redis.denied.test:6379/0", false);
     config.health_check_interval_seconds = 3600;
-    let client = RedisRateLimitClient::new(config, Some(dns_cache), false, None);
+    let client = RedisRateLimitClient::new(config, Some(dns_cache), false, None)
+        .expect("construction without a CA path must succeed");
 
     assert!(
         !client.health_checker_started_for_test(),
@@ -1395,7 +1489,8 @@ async fn literal_ip_egress_denial_does_not_arm_the_recovery_checker() {
     });
     let mut config = make_config("redis://127.0.0.1:6379/0", false);
     config.health_check_interval_seconds = 3600;
-    let client = RedisRateLimitClient::new(config, Some(dns_cache), false, None);
+    let client = RedisRateLimitClient::new(config, Some(dns_cache), false, None)
+        .expect("construction without a CA path must succeed");
 
     assert!(!client.health_checker_started_for_test());
     assert!(

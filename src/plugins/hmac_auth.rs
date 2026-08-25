@@ -1089,7 +1089,7 @@ impl HmacAuth {
                     http_client.and_then(|client| client.dns_cache().cloned()),
                     http_client.is_some_and(|client| client.tls_no_verify()),
                     http_client.and_then(|client| client.tls_ca_bundle_path()),
-                ));
+                )?);
                 // Detached until `commit_background_tasks`: an invalid later
                 // plugin in the same candidate, or this instance if it is never
                 // installed, must not mark live readiness unavailable or dial

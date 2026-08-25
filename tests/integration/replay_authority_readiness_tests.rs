@@ -166,9 +166,10 @@ fn shared_client_for_url(
     )
     .expect("redis config parses")
     .expect("sync_mode redis yields a config");
-    Arc::new(RedisRateLimitClient::for_replay_authority(
-        config, None, false, None,
-    ))
+    Arc::new(
+        RedisRateLimitClient::for_replay_authority(config, None, false, None)
+            .expect("construction without a CA path must succeed"),
+    )
 }
 
 const INFO_CMD: &[u8] = b"$4\r\nINFO\r\n";

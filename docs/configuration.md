@@ -831,7 +831,7 @@ See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_TLS_CA_BUNDLE_PATH` | No | — | Path to PEM CA bundle for all outbound TLS verification |
+| `FERRUM_TLS_CA_BUNDLE_PATH` | No | — | Path to PEM CA bundle for all outbound TLS verification. When set, this bundle is the **sole** trust anchor (no webpki/system mixing). Redis-backed plugins fail construction if the bundle cannot be loaded while verification is enabled, rather than falling back to redis-rs default roots. Unused when `FERRUM_TLS_NO_VERIFY=true` |
 | `FERRUM_TLS_CA_BUNDLE_SOURCE` | No | — | Source override for `FERRUM_TLS_CA_BUNDLE_PATH`; accepts path, `file://`, inline PEM, or provider URI |
 | `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for backend mTLS |
 | `FERRUM_BACKEND_TLS_CLIENT_CERT_SOURCE` | No | — | Source override for `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH`; accepts path, `file://`, inline PEM, or provider URI |
@@ -1098,6 +1098,10 @@ Rather than leave an unenforced egress path, **`kafka_logging` fails closed**: i
 Bootstrap entries are still parsed with librdkafka's exact grammar (`[proto://]host[:port]`, URL-path truncation, bracketed-IPv6 port rules, empty host → `localhost`) and denied literal destinations are rejected — so a protocol-prefixed literal such as `PLAINTEXT://169.254.169.254:9092` cannot slip past screening. An entry whose protocol prefix disagrees with `security_protocol` is also rejected, because librdkafka would silently discard it and stop parsing the rest of the list.
 
 If you need Kafka log shipping under a restrictive egress policy, use a sink that dials through Ferrum's policy-aware path (`http_logging`, `tcp_logging`, `ws_logging`, `loki_logging`) and bridge to Kafka outside the gateway. Loosening the gateway-wide egress policy just to re-enable this sink weakens every other outbound path and is not recommended.
+
+### Redis TLS trust
+
+When `FERRUM_TLS_CA_BUNDLE_PATH` is set and `FERRUM_TLS_NO_VERIFY` is false, Redis TLS uses that bundle as the sole trust anchor. If the bundle cannot be loaded, Redis-backed plugin construction fails rather than falling back to system/public roots. With no CA path configured, redis-rs default roots are used. `FERRUM_TLS_NO_VERIFY=true` is the sanctioned skip-verify path and does not treat an unloadable CA as a construction error.
 
 ### Known limitation: `rediss://` (TLS) Redis hostnames
 
