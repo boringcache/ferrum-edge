@@ -2207,7 +2207,9 @@ fn cors_plugin_config(
 }
 
 fn gateway_with_cors_proxy(cors_origins: Value, allowed_ws_origins: Vec<String>) -> GatewayConfig {
-    let mut proxy = create_test_proxy("ws-api", "/api");
+    let mut proxy = create_test_proxy();
+    proxy.id = "ws-api".to_string();
+    proxy.listen_path = Some("/api".to_string());
     proxy.allowed_ws_origins = allowed_ws_origins;
     proxy.plugins = vec![PluginAssociation {
         plugin_config_id: "cors-strict".to_string(),
