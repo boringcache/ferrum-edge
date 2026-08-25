@@ -631,10 +631,14 @@ gateway trust bundles, API specs, `/batch`, `/restore` — not `/namespaces`):
   `503 sequence_unavailable` as the sync path).
 - The response is **`202 Accepted`** with the normal success body plus the
   cursor header. A 202 never claims the generation is live.
-- The write still raises a coalesced immediate poll wake, so background
-  convergence does not sit on `FERRUM_DB_POLL_INTERVAL`; a stream of deferred
-  writes produces back-to-back polls that each absorb everything committed
-  since the previous watermark.
+- Deferred writes deliberately do NOT raise per-write poll wakes: bulk
+  deferred churn with per-write wakes turns the poll loop into gapless
+  back-to-back reloads that saturate the database in exactly the scenario
+  this mode exists for. Background convergence rides the periodic
+  `FERRUM_DB_POLL_INTERVAL` tick and the change-stream backstop (the same
+  cadence external writers get), and a blocking `GET /config/apply-status`
+  probe raises an immediate poll wake the moment convergence is actually
+  demanded.
 - Request-level validation (400s) still happens synchronously; only
   graph-level poll rejections are deferred to the status endpoint. Deferred
   mode therefore trades per-write rejection attribution for throughput — a

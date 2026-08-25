@@ -766,3 +766,33 @@ fn harnesses_provision_deferred_and_gate_on_the_cursor() {
         "the cursor gate must use the documented status endpoint"
     );
 }
+
+/// The pre-persist admission-lease re-check refuses with NOTHING persisted, so
+/// its 503 must carry the documented retryable `rollback: not_needed` shape
+/// the harness (and any bulk client) retries under the bounded fence budget.
+/// Without it, a transient lease-renewal miss under heavy reload load aborts
+/// provisioning as fatal (observed on the 30k PostgreSQL leg, issue #4139).
+#[test]
+fn batch_pre_persist_lease_loss_is_the_documented_retryable_shape() {
+    let admin = include_str!("../../../src/admin/mod.rs");
+    let branch = admin
+        .split("batch_namespace_admission_before_persist")
+        .nth(1)
+        .map(|tail| &tail[..tail.len().min(1500)])
+        .expect("pre-persist ensure_held branch remains inspectable");
+    assert!(
+        branch.contains(r#""rollback": "not_needed""#),
+        "pre-persist lease loss must report rollback: not_needed"
+    );
+    assert!(
+        branch.contains("RETRY_AFTER"),
+        "pre-persist lease loss must carry Retry-After like the mid-transaction variant"
+    );
+    // And the harness classifier accepts exactly that shape as a bounded retry.
+    let body =
+        documented_batch_rollback_not_needed_body("Config admission unavailable").to_string();
+    assert!(matches!(
+        classify_admin_batch_response(503, Some("1"), &body),
+        BatchProvisionDecision::Retry { .. }
+    ));
+}

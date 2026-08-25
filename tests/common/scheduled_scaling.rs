@@ -453,14 +453,26 @@ where
 /// own 30s budget); larger values are rejected with `400`.
 pub const APPLY_STATUS_WAIT_MS: u64 = 30_000;
 
+/// Wall-clock bound on ONE wave's live-apply cursor gate.
+///
+/// Deliberately larger than [`CONFIG_CONVERGENCE_MAX_WAIT_SECS`]: deferred
+/// provisioning batches a whole wave's reload debt to this boundary, and a
+/// wave of 3,000 consumers always escalates the poll to a FULL reload
+/// (`IncrementalFullReloadRequired::for_consumer_changes`), so the gate must
+/// absorb up to two full reloads at 30k scale on a CI runner already loaded
+/// by the inserts (observed 186s at only 9k proxies on PostgreSQL). The
+/// data-plane probe gate that follows keeps its own tighter bound — by the
+/// time the cursor is applied, routability is one probe away.
+pub const LIVE_APPLY_CURSOR_MAX_WAIT_SECS: u64 = 15 * 60;
+
 /// Block until the poll loop has accepted a generation covering `cursor`, or
 /// fail with an explicit fail-closed diagnostic (issue #4139).
 ///
 /// This is the amortization that keeps 30k-scale provisioning inside the job
 /// budget: every `?apply=async` chunk answered `202` without paying a reload,
-/// and this ONE bounded wait (shared [`CONFIG_CONVERGENCE_MAX_WAIT_SECS`]
-/// budget) proves the whole wave live, because cursors are monotone and the
-/// caller kept the highest one it saw.
+/// and this ONE bounded wait ([`LIVE_APPLY_CURSOR_MAX_WAIT_SECS`]) proves the
+/// whole wave live, because cursors are monotone and the caller kept the
+/// highest one it saw.
 ///
 /// `rejected` and `unverifiable` abort loudly: the first means the runtime
 /// refused the candidate and the wave will never go live; the second means the
@@ -475,7 +487,7 @@ pub async fn wait_for_batch_apply_cursor(
     cursor: BatchApplyCursor,
     label: &str,
 ) -> Result<Duration, String> {
-    let budget = Duration::from_secs(CONFIG_CONVERGENCE_MAX_WAIT_SECS);
+    let budget = Duration::from_secs(LIVE_APPLY_CURSOR_MAX_WAIT_SECS);
     let started = Instant::now();
     let url = format!(
         "{admin_url}/config/apply-status?epoch={}&sequence={}&wait_ms={APPLY_STATUS_WAIT_MS}",
@@ -486,7 +498,7 @@ pub async fn wait_for_batch_apply_cursor(
         if started.elapsed() >= budget {
             return Err(format!(
                 "live apply never converged for {label}: cursor {}:{} still unresolved after \
-                 {elapsed:.1}s (bound {CONFIG_CONVERGENCE_MAX_WAIT_SECS}s); last outcome: \
+                 {elapsed:.1}s (bound {LIVE_APPLY_CURSOR_MAX_WAIT_SECS}s); last outcome: \
                  {last_outcome}. This is a configuration-publication failure, not a throughput \
                  regression.",
                 cursor.epoch,

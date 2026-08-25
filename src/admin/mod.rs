@@ -687,12 +687,19 @@ impl AdminState {
                 // Explicit `?apply=async` (issue #4139): the row is durable and
                 // the covering cursor was captured fail-closed under the pins,
                 // but the client chose not to pay the synchronous reload.
-                // Answer 202 — never a 2xx that claims live — and kick a
-                // coalesced immediate poll so background convergence does not
-                // sit on `FERRUM_DB_POLL_INTERVAL`.
-                if let Some(apply) = self.runtime_config_apply.as_ref() {
-                    apply.signal_deferred_mutation();
-                }
+                // Answer 202 — never a 2xx that claims live.
+                //
+                // Deliberately NO immediate poll wake here. A bulk stream of
+                // deferred writes with per-write wakes turns the poll loop
+                // into gapless back-to-back reloads that saturate the
+                // database in exactly the scenario this mode exists for
+                // (observed starving the namespace admission lease renewer on
+                // the 30k PostgreSQL scaling leg). Background convergence
+                // rides the periodic `FERRUM_DB_POLL_INTERVAL` tick and the
+                // change-stream backstop — the pre-#3987 external-writer
+                // cadence — and a blocking `GET /config/apply-status` probe
+                // raises the immediate wake the moment convergence is
+                // actually demanded.
                 let mut response = attach_config_cursor_header(response, cursor);
                 *response.status_mut() = StatusCode::ACCEPTED;
                 response
@@ -7917,10 +7924,25 @@ async fn handle_batch_create(
     // intervening writer may have invalidated.
     if let Err(_error) = namespace_config_admission_guard.ensure_held() {
         warn_persistence_failure_redacted("batch_namespace_admission_before_persist");
-        return Ok(json_response(
+        // This check runs BEFORE persist, so nothing from the request is
+        // durable — semantically identical to the mid-transaction lease-lost
+        // 503 below, which already carries the documented retryable
+        // `rollback: not_needed` shape. Issue #4139 follow-up: under heavy
+        // background reload load a lease renewal can miss its window and
+        // expire a healthy request's lease; without this shape a bulk client
+        // has to treat a transient, nothing-was-applied condition as fatal
+        // (observed aborting the 30k PostgreSQL scaling leg).
+        let mut response = json_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": CONFIG_ADMISSION_UNAVAILABLE_MESSAGE}),
-        ));
+            &json!({
+                "error": CONFIG_ADMISSION_UNAVAILABLE_MESSAGE,
+                "rollback": "not_needed",
+            }),
+        );
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        return Ok(response);
     }
     let graph = AtomicBatchGraph {
         namespace,
