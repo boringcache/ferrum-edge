@@ -2181,7 +2181,10 @@ mod tests {
 
         let mut meshed = host_network_pod(Value::Bool(true));
         meshed["spec"]["hostNetwork"] = Value::Bool(false);
-        assert_eq!(injection_decision(&meshed, &config), InjectionDecision::Inject);
+        assert_eq!(
+            injection_decision(&meshed, &config),
+            InjectionDecision::Inject
+        );
     }
 
     #[test]
