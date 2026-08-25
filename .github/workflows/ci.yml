@@ -1332,6 +1332,7 @@ jobs:
               functional_injector_serving_test
               functional_response_body_limits_test
               functional_request_body_limits_test
+              functional_request_buffer_budget_test
               functional_header_limits_test
               functional_early_data_test
               functional_ws_origin_test
