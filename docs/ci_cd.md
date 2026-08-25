@@ -923,8 +923,9 @@ the cipher from a gateway-side `tls12_crypto_info` layout error. See
 The excluded 30k scale variants (SQLite, PostgreSQL, and MongoDB) and the 10k
 PostgreSQL load-stress test run weekly and on manual dispatch in the
 `Scheduled Scaling Regression` workflow. Its matrix jobs have independent
-failure signals and a three-hour timeout for the large provisioning and load
-phases. A red matrix, or a latest main scaling-regression run that is not a
+failure signals and a five-hour timeout for the large provisioning and load
+phases (raised from three hours by issue #4136, after read-your-write live
+apply made every batch pay a synchronous convergence cost). A red matrix, or a latest main scaling-regression run that is not a
 completed success within eight days (the daily
 `Scheduled Scaling Gate Freshness` workflow), upserts a `severity:high`
 issue so the streak cannot stay silent. Weekly and daily publisher jobs

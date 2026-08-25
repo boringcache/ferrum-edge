@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Static contracts for Scheduled Scaling Regression (issue #3892).
 
-Pins the weekly 180-minute matrix, workflow-sized admin JWT policy in both
+Pins the weekly 300-minute matrix, workflow-sized admin JWT policy in both
 affected harnesses, documented all-or-nothing batch 503 retries, and the
 fail-closed scaling-gate signal / freshness notification. Does not execute
 tests or mint tokens.
