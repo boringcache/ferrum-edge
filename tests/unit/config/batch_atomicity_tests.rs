@@ -233,7 +233,7 @@ fn sql_atomic_batch_uses_a_single_transaction_for_every_phase() {
     let body = &SQL_STORE_SOURCE[start..end];
 
     assert_eq!(
-        body.matches("self.pool().begin()").count(),
+        body.matches("self.begin_write_tx()").count(),
         1,
         "the atomic batch graph write must open exactly one transaction"
     );

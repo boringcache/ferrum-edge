@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Static contracts for Scheduled Scaling Regression (issue #3892).
 
-Pins the weekly 180-minute matrix, workflow-sized admin JWT policy in both
+Pins the weekly 300-minute matrix, workflow-sized admin JWT policy in both
 affected harnesses, documented all-or-nothing batch 503 retries, and the
 fail-closed scaling-gate signal / freshness notification. Does not execute
 tests or mint tokens.
@@ -122,7 +122,11 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         "scaling workflow must not execute untrusted pull-request code",
         failures,
     )
-    require("timeout-minutes: 180" in text, "matrix jobs must keep the 180-minute timeout", failures)
+    require(
+        "timeout-minutes: 300" in text,
+        "matrix jobs must keep the 300-minute timeout (issue #4136)",
+        failures,
+    )
     require("permissions:" in text, "workflow must declare explicit permissions", failures)
     require("contents: read" in text, "workflow must use contents: read", failures)
     require(
@@ -458,7 +462,7 @@ permissions:
   contents: read
 jobs:
   scaling-regression:
-    timeout-minutes: 180
+    timeout-minutes: 300
     steps:
       - name: Verify workflow contract (static)
         run: python3 -I .github/scripts/verify_scaling_regression_workflow.py --self-test
