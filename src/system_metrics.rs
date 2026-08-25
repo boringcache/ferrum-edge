@@ -656,8 +656,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn parse_system_cpu_line_reads_aggregate_idle_and_total() {
-        let sample = super::parse_system_cpu_line("cpu  10 20 30 40 5 1 2 3")
-            .expect("aggregate cpu line");
+        let sample =
+            super::parse_system_cpu_line("cpu  10 20 30 40 5 1 2 3").expect("aggregate cpu line");
         assert_eq!(sample.idle, 45);
         assert_eq!(sample.total, 111);
         assert!(super::parse_system_cpu_line("cpu  1 2 3").is_none());

@@ -700,8 +700,7 @@ async fn overload_monitor_publishes_fd_current() {
         ..OverloadConfig::default()
     };
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let monitor =
-        ferrum_edge::overload::start_monitor(state.clone(), config, 1000, 0, shutdown_rx);
+    let monitor = ferrum_edge::overload::start_monitor(state.clone(), config, 1000, 0, shutdown_rx);
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
