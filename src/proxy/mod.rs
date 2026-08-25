@@ -62247,7 +62247,7 @@ mod tests {
 
     /// Issue #4150: the two topologies that legitimately terminate for OTHER
     /// workloads read a narrow slice-derived inventory, and nothing else — not
-    /// the slice-wide workload view, and not loopback.
+    /// the slice-wide workload view, and not an own-namespace loopback shortcut.
     #[test]
     fn inbound_hbone_relay_guard_admits_the_waypoint_termination_inventory_only() {
         use crate::modes::mesh::config::{
@@ -62281,14 +62281,43 @@ mod tests {
             Err(InboundRelayDenial::AddressNotTerminated)
         );
         // The waypoint/node runs outside the destination pods' network
-        // namespace, so its own address and loopback are not relay
-        // destinations: `inbound_relay_admits_accepted_local_address` is false.
+        // namespace, so its own address is not a relay destination and
+        // loopback gets no own-namespace shortcut when it is absent from
+        // the inventory.
         assert_eq!(
             decide("10.4.4.4", 8080),
             Err(InboundRelayDenial::AddressNotTerminated)
         );
         assert_eq!(
             decide("127.0.0.1", 8080),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
+
+        // Loopback listed IN the inventory is a real termination target —
+        // the functional waypoint suite declares `127.0.0.1` as the
+        // workload address. The own-namespace shortcut stays off.
+        let loopback_mesh = MeshConfig {
+            inbound_relay_destinations: inbound_relay_destinations_from_workloads(&[
+                relay_guard_workload("loopback-app", &["127.0.0.1"], &[8080]),
+            ]),
+            ..MeshConfig::default()
+        };
+        assert_eq!(
+            inbound_hbone_relay_destination_decision(
+                "127.0.0.1",
+                8080,
+                Some(&loopback_mesh),
+                Some(waypoint_ip),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            inbound_hbone_relay_destination_decision(
+                "localhost",
+                8080,
+                Some(&loopback_mesh),
+                Some(waypoint_ip),
+            ),
             Err(InboundRelayDenial::AddressNotTerminated)
         );
     }

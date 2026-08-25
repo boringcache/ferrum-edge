@@ -2005,9 +2005,9 @@ A CONNECT `:authority` of `host:port` is admitted only when `host` resolves to a
 
 | Topology | Admitted destinations | Loopback |
 | --- | --- | --- |
-| `Sidecar`, `Ambient` | The accepted connection's own local address — the pod IP the peer actually reached on this socket, resolved even behind a wildcard bind. The port must be one the slice declares **for that address**. | Admitted (`127.0.0.1` / `::1` / `localhost`) — it resolves inside this pod's own network namespace — on this pod's declared ports only. |
-| `NodeWaypoint` | The CP-authorized pods enrolled on **this node** (the same inventory the transparent capture listener resolves against). | Refused: a NodeWaypoint runs in the host network namespace, not the destination pods'. |
-| `ServiceWaypoint` | The workloads backing the services bound to **this waypoint**, from the slice's already waypoint-narrowed workload view. | Refused: a ServiceWaypoint terminates for other pods. |
+| `Sidecar`, `Ambient` | The accepted connection's own local address — the pod IP the peer actually reached on this socket, resolved even behind a wildcard bind. The port must be one the slice declares **for that address**. | Admitted (`127.0.0.1` / `::1` / `localhost`) as an own-namespace shortcut — it resolves inside this pod's own network namespace — on this pod's declared ports only. |
+| `NodeWaypoint` | The CP-authorized pods enrolled on **this node** (the same inventory the transparent capture listener resolves against). | No own-namespace shortcut (the waypoint runs in the host network namespace). Admitted only when loopback is itself in that inventory. |
+| `ServiceWaypoint` | The workloads backing the services bound to **this waypoint**, from the slice's already waypoint-narrowed workload view. | No own-namespace shortcut. Admitted only when loopback is itself in that inventory (the functional suite declares `127.0.0.1` as the workload address). |
 | `EastWestGateway`, `EgressGateway` | None. East-west is SNI passthrough; egress relays to external `ServiceEntry` destinations through its own admission lists. | Refused. |
 
 Rules that apply across all of them:

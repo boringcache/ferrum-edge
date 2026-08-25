@@ -4778,12 +4778,15 @@ impl MeshConfig {
     ///    provably reached this pod at the address it named — a transport fact
     ///    the peer cannot choose. The port is still bounded by the workload
     ///    record(s) the slice declares FOR THAT ADDRESS.
-    /// 2. **Loopback** (`127.0.0.1` / `::1` / `localhost`), which resolves
-    ///    inside the terminator's OWN network namespace and is therefore
-    ///    admissible only for those same own-pod terminators, and only on a
-    ///    port this pod's own workload record declares. A `NodeWaypoint` runs
-    ///    in the host namespace and a `ServiceWaypoint` terminates for other
-    ///    pods, so neither may reach loopback at all.
+    /// 2. **Loopback** (`127.0.0.1` / `::1` / `localhost`) as an
+    ///    own-namespace shortcut, admissible only for those same own-pod
+    ///    terminators and only on a port this pod's own workload record
+    ///    declares. A `NodeWaypoint` / `ServiceWaypoint` does not get that
+    ///    shortcut — they run outside the destination pods' network
+    ///    namespaces — but they MAY still relay to loopback when that
+    ///    address is itself in [`Self::inbound_relay_destinations`] (the
+    ///    functional waypoint suite declares `127.0.0.1` as the workload
+    ///    address).
     /// 3. **[`Self::inbound_relay_destinations`]** — the deliberate, narrow
     ///    multi-destination allowance for the two topologies that are MEANT to
     ///    terminate for another workload (`NodeWaypoint` enrolled pods,
@@ -4809,35 +4812,39 @@ impl MeshConfig {
             .filter(|_| self.inbound_relay_admits_accepted_local_address)
             .map(|ip| ip.to_canonical());
 
-        // The authority form brackets IPv6 and ONLY IPv6 (RFC 3986 section
-        // 3.2.2), and `IpAddr::from_str` rejects brackets outright — so the
-        // literal has to be unwrapped before parsing, and the bracketing has to
-        // agree with the address family or the two spellings of one address
-        // would disagree.
+        // `IpAddr::from_str` rejects brackets, so unwrap a `[...]` wrapper
+        // before parsing. RFC 3986 section 3.2.2 brackets IPv6 and only IPv6:
+        // a bracketed IPv4 literal (`[10.1.2.3]`) is not a resolvable host.
+        // Unbracketed IPv6 MUST still parse — the CONNECT boundary
+        // (`hbone_relay_authority_host_for_mesh`) already strips brackets, and
+        // this function's `host` argument is that already-split host, not a
+        // Host-header routing key.
         let (candidate, bracketed) = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']'))
         {
             Some(inner) => (inner, true),
             None => (host, false),
         };
         let parsed = candidate.parse::<std::net::IpAddr>().ok();
-        match parsed {
-            Some(ip) if bracketed != ip.is_ipv6() => {
-                return Err(InboundRelayDenial::UnresolvableHost);
-            }
-            None if bracketed => return Err(InboundRelayDenial::UnresolvableHost),
-            _ => {}
+        if bracketed && !parsed.is_some_and(|ip| ip.is_ipv6()) {
+            return Err(InboundRelayDenial::UnresolvableHost);
         }
 
         if candidate.eq_ignore_ascii_case("localhost") || parsed.is_some_and(|ip| ip.is_loopback())
         {
-            let Some(own_address) = own_address else {
+            if let Some(own_address) = own_address {
+                return if self.workload_declares_address_port(own_address, port) {
+                    Ok(())
+                } else {
+                    Err(InboundRelayDenial::PortNotDeclared)
+                };
+            }
+            if parsed.is_none() {
+                // `localhost` is not an IP literal; the inventory is
+                // addresses only, so a waypoint has nothing to match.
                 return Err(InboundRelayDenial::AddressNotTerminated);
-            };
-            return if self.workload_declares_address_port(own_address, port) {
-                Ok(())
-            } else {
-                Err(InboundRelayDenial::PortNotDeclared)
-            };
+            }
+            // Fall through: a waypoint/node may still terminate for
+            // 127.0.0.1 / ::1 when that address is in its inventory.
         }
 
         let Some(address) = parsed else {

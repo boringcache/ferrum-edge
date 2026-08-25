@@ -1732,8 +1732,8 @@ fn inbound_relay_folds_ipv4_mapped_ipv6_to_one_decision() {
 
 /// NodeWaypoint / ServiceWaypoint terminate for OTHER workloads by design, and
 /// only for the ones in their narrow inventory. They run outside those pods'
-/// network namespaces, so loopback and their own address are never relay
-/// destinations.
+/// network namespaces, so they get no own-namespace loopback shortcut and
+/// their own address is never a relay destination.
 #[test]
 fn inbound_relay_admits_only_the_waypoint_termination_inventory() {
     let mesh = MeshConfig {
@@ -1771,5 +1771,18 @@ fn inbound_relay_admits_only_the_waypoint_termination_inventory() {
     assert_eq!(
         mesh.inbound_relay_destination_decision("10.244.4.4", 8080, waypoint),
         Err(InboundRelayDenial::AddressNotTerminated)
+    );
+
+    // Loopback in the inventory itself is a real termination target (the
+    // functional waypoint suite declares `127.0.0.1`).
+    let loopback_mesh = MeshConfig {
+        inbound_relay_destinations: inbound_relay_destinations_from_workloads(&[
+            relay_guard_workload("loopback-app", &["127.0.0.1"], &[8080]),
+        ]),
+        ..MeshConfig::default()
+    };
+    assert_eq!(
+        loopback_mesh.inbound_relay_destination_decision("127.0.0.1", 8080, waypoint),
+        Ok(())
     );
 }
