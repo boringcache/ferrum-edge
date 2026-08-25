@@ -4912,7 +4912,7 @@ pub mod _test_support {
     ) -> Result<bool, String> {
         let client = RedisRateLimitClient::new(config, None, tls_no_verify, None);
         let redis_client = client.build_client(url).map_err(|e| e.to_string())?;
-        match &redis_client.get_connection_info().addr {
+        match redis_client.get_connection_info().addr() {
             redis::ConnectionAddr::TcpTls { insecure, .. } => Ok(*insecure),
             other => Err(format!("expected Redis TcpTls address, got {other:?}")),
         }
