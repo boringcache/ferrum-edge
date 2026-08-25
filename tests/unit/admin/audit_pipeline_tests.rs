@@ -1521,3 +1521,45 @@ async fn shutdown_with_no_worker_is_a_no_op() {
         "a second shutdown is idempotent and never detaches a task"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Mesh config-revision reset admission (issue #4177)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mesh_config_revision_reset_uses_admit_audited_operation_in_handler() {
+    let admin_source = include_str!("../../../src/admin/mod.rs");
+    let reset_handler = admin_source
+        .split("async fn handle_mesh_config_revision_reset")
+        .nth(1)
+        .and_then(|tail| tail.split("fn mesh_config_revision_reset_audit_diff").next())
+        .expect("mesh config-revision reset handler remains inspectable");
+    assert!(
+        reset_handler.contains("admit_audited_operation().await"),
+        "mesh reset must durably prepare audit evidence before lowering the gate"
+    );
+    assert!(
+        reset_handler.contains("parse_restore_confirm(query)"),
+        "mesh reset must require explicit operator confirmation"
+    );
+    assert!(
+        !reset_handler.contains("admit_write().await"),
+        "mesh reset must not pin config-database write topology"
+    );
+}
+
+#[test]
+fn mesh_config_revision_reset_fail_closed_prepare_contract_matches_admit_path() {
+    let dir = TempDir::new().expect("temp dir");
+    let mut cfg = config(Some(&dir));
+    cfg.policy = AuditUnavailablePolicy::FailClosed;
+    cfg.spool_max_records = 1;
+    let pipeline = pipeline(cfg);
+    pipeline
+        .prepare_intent(event())
+        .expect("first pre-mutation intent is durable");
+    let reason = pipeline
+        .prepare_intent(event())
+        .expect_err("second prepare is refused when the spool is saturated");
+    assert_eq!(reason, AuditUnavailableReason::SpoolSaturated);
+}

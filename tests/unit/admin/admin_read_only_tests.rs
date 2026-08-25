@@ -1326,3 +1326,22 @@ fn test_read_only_rejection_metric_renders_on_prometheus_scrape() {
         "counter must include namespace label and incremented value"
     );
 }
+
+#[test]
+fn mesh_config_revision_reset_bypasses_read_only_via_admit_audited_operation() {
+    let admin_source = include_str!("../../../src/admin/mod.rs");
+    let reset_handler = admin_source
+        .split("async fn handle_mesh_config_revision_reset")
+        .nth(1)
+        .and_then(|tail| tail.split("fn mesh_config_revision_reset_audit_diff").next())
+        .expect("mesh config-revision reset handler remains inspectable");
+    assert!(
+        reset_handler.contains("admit_audited_operation().await"),
+        "mesh reset must take the audited-operation admission path"
+    );
+    assert!(
+        !reset_handler.contains("admit_read_only_gate")
+            && !reset_handler.contains("admit_write().await"),
+        "mesh reset must not be blocked by read-only or config-db write topology gates"
+    );
+}
