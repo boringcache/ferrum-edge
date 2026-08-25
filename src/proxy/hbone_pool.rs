@@ -34,8 +34,8 @@ use crate::modes::mesh::hbone::{
     baggage_header_for_udp_source,
 };
 use crate::proxy::mesh_trust_registry::{
-    MESH_KEEPALIVE_FAILED_MESSAGE, MeshTransportGate, MeshTransportKind,
-    MeshTransportRegistration, MeshTrustRegistry,
+    MESH_KEEPALIVE_FAILED_MESSAGE, MeshTransportGate, MeshTransportKind, MeshTransportRegistration,
+    MeshTrustRegistry,
 };
 use crate::retry::{ErrorClass, error_class_log_kind};
 use crate::tls::backend::BackendSvidGeneration;

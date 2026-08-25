@@ -1138,8 +1138,7 @@ async fn hbone_keepalive_timeout_evicts_dead_pooled_transport_and_redials() {
         root_der.clone(),
     ));
     let server_slot = svid_slot(bundle_for(server_id, server_leaf, server_key, root_der));
-    let (server_addr, connection_count) =
-        start_hbone_blackhole_then_echo_server(server_slot).await;
+    let (server_addr, connection_count) = start_hbone_blackhole_then_echo_server(server_slot).await;
 
     let pool = HboneConnectionPool::new(
         PoolConfig::default(),
