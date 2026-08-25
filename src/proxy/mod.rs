@@ -7332,6 +7332,21 @@ impl ProxyState {
         );
     }
 
+    /// Reclaim per-endpoint H2/gRPC `rr_counters` and backend TLS config cache
+    /// entries whose endpoints (or TLS identities) are no longer in the
+    /// published config. Pod/EDS churn otherwise retains a counter and a
+    /// duplicate trust store per historical target IP for the process lifetime.
+    ///
+    /// Runs once per config publication that becomes current — including
+    /// out-of-band mesh/MMDB republications with no resource delta — never on
+    /// the request path. Live endpoints and TLS identities are retained.
+    fn reconcile_backend_pool_side_maps(&self, published: &RequestEpoch) {
+        self.http2_pool.retain_live_from_config(&published.config);
+        self.grpc_pool.retain_live_from_config(&published.config);
+        self.connection_pool
+            .retain_live_tls_configs_from_config(&published.config);
+    }
+
     /// Terminal drain of transport pools that own kernel objects the graceful
     /// shutdown must release deterministically (issue #3731).
     ///
@@ -11964,6 +11979,7 @@ impl ProxyState {
             // is now current, so it owns the generation advance like any other
             // publication (issue #3764).
             self.reconcile_unix_backend_pool(&published);
+            self.reconcile_backend_pool_side_maps(&published);
 
             // DNS warmup for all hostnames in the new config
             let mut hostnames: Vec<(String, Option<String>, Option<u64>)> = new_config
@@ -12246,6 +12262,7 @@ impl ProxyState {
         // idle map, and its check-in is fenced against the generation it was
         // leased under (issue #3764).
         self.reconcile_unix_backend_pool(&published);
+        self.reconcile_backend_pool_side_maps(&published);
 
         // Wake external config watchers (Gateway API listener lifecycle) on the
         // incremental path too — an add/update/delete of a port-scoped route
@@ -12907,6 +12924,7 @@ impl ProxyState {
         // (issue #3764). Before the no-delta early return below, for the same
         // reason as on the full path.
         self.reconcile_unix_backend_pool(&published);
+        self.reconcile_backend_pool_side_maps(&published);
 
         // Wake socket reconciliation here as well as in the full-snapshot path;
         // otherwise a newly added/removed listener waits for the slow
