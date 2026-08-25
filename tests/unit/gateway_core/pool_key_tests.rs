@@ -2327,14 +2327,10 @@ async fn grpc_rr_counters_and_tls_cache_reclaim_stale_endpoints() {
     stale_tls_proxy.resolved_tls.server_ca_cert_path = Some("/certs/stale-ca.pem".to_string());
     let stale_tls = GrpcConnectionPool::tls_config_cache_key_for_warmup(&stale_tls_proxy, None);
     cache
-        .get_or_try_build(live_tls.clone(), || {
-            Ok::<_, String>(test_client_config())
-        })
+        .get_or_try_build(live_tls.clone(), || Ok::<_, String>(test_client_config()))
         .expect("live tls");
     cache
-        .get_or_try_build(stale_tls.clone(), || {
-            Ok::<_, String>(test_client_config())
-        })
+        .get_or_try_build(stale_tls.clone(), || Ok::<_, String>(test_client_config()))
         .expect("stale tls");
     assert_eq!(cache.len(), 2);
 
@@ -2365,14 +2361,10 @@ async fn h2_tls_cache_retain_keeps_live_identity() {
     let live_key = tls_cache_key(&live);
     let stale_key = tls_cache_key(&stale);
     cache
-        .get_or_try_build(live_key.clone(), || {
-            Ok::<_, String>(test_client_config())
-        })
+        .get_or_try_build(live_key.clone(), || Ok::<_, String>(test_client_config()))
         .expect("live");
     cache
-        .get_or_try_build(stale_key.clone(), || {
-            Ok::<_, String>(test_client_config())
-        })
+        .get_or_try_build(stale_key.clone(), || Ok::<_, String>(test_client_config()))
         .expect("stale");
 
     pool.retain_live_from_config(&GatewayConfig {
@@ -2397,14 +2389,10 @@ async fn h3_tls_cache_retain_keeps_live_identity() {
     let live_key = pool.tls_config_cache_key_for_warmup(&live);
     let stale_key = pool.tls_config_cache_key_for_warmup(&stale);
     cache
-        .get_or_try_build(live_key.clone(), || {
-            Ok::<_, String>(test_client_config())
-        })
+        .get_or_try_build(live_key.clone(), || Ok::<_, String>(test_client_config()))
         .expect("live");
     cache
-        .get_or_try_build(stale_key.clone(), || {
-            Ok::<_, String>(test_client_config())
-        })
+        .get_or_try_build(stale_key.clone(), || Ok::<_, String>(test_client_config()))
         .expect("stale");
 
     pool.retain_live_tls_configs_from_config(&GatewayConfig {

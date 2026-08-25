@@ -454,9 +454,9 @@ impl ConnectionPool {
         proxy: &Proxy,
     ) -> Result<Arc<rustls::ClientConfig>, anyhow::Error> {
         let manager = self.pool.manager();
-        manager
-            .backend_h3_tls_configs
-            .get_or_try_build(manager.tls_config_cache_key_owned(proxy), || {
+        manager.backend_h3_tls_configs.get_or_try_build(
+            manager.tls_config_cache_key_owned(proxy),
+            || {
                 let crls = manager.crls.load_full();
                 let mut client_config = BackendTlsConfigBuilder {
                     proxy,
@@ -484,7 +484,8 @@ impl ConnectionPool {
 
                 client_config.alpn_protocols = vec![b"h3".to_vec()];
                 Ok(client_config)
-            })
+            },
+        )
     }
 
     /// Clear all pooled connections.
