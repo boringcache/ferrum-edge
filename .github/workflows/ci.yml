@@ -3065,12 +3065,21 @@ jobs:
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
           grep -Fq 'kind: PodDisruptionBudget' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
           grep -Fq 'minAvailable: 1' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
-          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+          # replicaCount=1 renders NO PodDisruptionBudget, and `--show-only` exits
+          # non-zero with "could not find template" when the selected template
+          # produces nothing — that IS the pass condition. Same shape as the
+          # single-replica control-plane case in the mesh chart above.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set replicaCount=1 \
             --show-only templates/pdb.yaml \
-            > "$RUNNER_TEMP/ferrum-gateway-helm-results/pdb-single-replica.yaml"
-          if grep -Fq 'kind: PodDisruptionBudget' "$RUNNER_TEMP/ferrum-gateway-helm-results/pdb-single-replica.yaml"; then
-            echo "::error title=Single-replica gateway PDB rendered::replicaCount=1 must not render a minAvailable PDB"
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/pdb-single-replica.yaml" 2>&1; then
+            if grep -Fq 'kind: PodDisruptionBudget' "$RUNNER_TEMP/ferrum-gateway-helm-results/pdb-single-replica.yaml"; then
+              echo "::error title=Single-replica gateway PDB rendered::replicaCount=1 must not render a minAvailable PDB"
+              exit 1
+            fi
+          elif ! grep -Fq 'could not find template' "$RUNNER_TEMP/ferrum-gateway-helm-results/pdb-single-replica.yaml"; then
+            echo "::error title=Unexpected helm failure rendering the single-replica gateway PDB::see the chart artifact"
+            cat "$RUNNER_TEMP/ferrum-gateway-helm-results/pdb-single-replica.yaml"
             exit 1
           fi
           grep -Fq 'name: FERRUM_FILE_CONFIG_PATH' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
