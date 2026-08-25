@@ -11573,7 +11573,13 @@ async fn anthropic_unreadable_streaming_frames_are_cut_in_enforce() {
     for frame in ANTHROPIC_UNREADABLE_FRAMES {
         let (out, terminated) = drive_provider_stream(&plugin, frame).await;
         assert!(terminated, "unreadable frame was not cut: {frame}");
-        assert!(out.is_empty(), "held bytes leaked: {out:?}");
+        // A cut still emits the terminal `event: error` frame, so the output is
+        // not empty — what must never survive is the held tool-call content.
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            !text.contains("get_weather"),
+            "held tool-call fragment leaked past the cut: {text}"
+        );
     }
 }
 
@@ -11592,7 +11598,13 @@ async fn cohere_unreadable_streaming_frames_are_cut_in_enforce() {
     for frame in COHERE_UNREADABLE_FRAMES {
         let (out, terminated) = drive_provider_stream(&plugin, frame).await;
         assert!(terminated, "unreadable frame was not cut: {frame}");
-        assert!(out.is_empty(), "held bytes leaked: {out:?}");
+        // A cut still emits the terminal `event: error` frame, so the output is
+        // not empty — what must never survive is the held tool-call content.
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            !text.contains("get_weather"),
+            "held tool-call fragment leaked past the cut: {text}"
+        );
     }
 }
 
