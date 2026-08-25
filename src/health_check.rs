@@ -173,15 +173,118 @@ fn load_probe_tls_root_store(
 /// Re-export the cap from types so runtime and validation share one value.
 use crate::config::types::MAX_RECENT_FAILURES_PER_TARGET;
 
+/// Bounded ring of recent failure timestamps for one target.
+///
+/// Replaces the previous `DashMap<u64, u64>` + per-failure `retain` / sort /
+/// eviction path. A circular buffer of at most
+/// [`MAX_RECENT_FAILURES_PER_TARGET`] epoch-ms timestamps gives:
+///
+/// - O(1) amortized record: each timestamp is written once and expired once
+/// - No heap allocation after the first failure (the slot `Vec` is sized to
+///   the cap once and reused)
+/// - Exact sliding-window counts, so the unhealthy-threshold decision matches
+///   the previous map. When the in-window count would exceed the cap this
+///   returns the capped count; `unhealthy_threshold` is validated `<=` the
+///   cap, so the boolean decision is identical
+///
+/// Stored behind a per-target [`Mutex`]. The critical section is a handful of
+/// integer ops and replaces a sharded DashMap `retain` over the whole window
+/// plus a 1000-entry sort on the request path. Concurrent reporters for the
+/// *same* target serialize here; different targets do not share a lock. This
+/// stays per-proxy isolated because each [`ProxyHealthState`] owns its own
+/// `TargetHealth` rows.
+struct RecentFailureRing {
+    /// Circular buffer. Empty until the first `record` so active-probe-only
+    /// `TargetHealth` rows do not pay the cap.
+    slots: Vec<u64>,
+    /// Index of the oldest stored timestamp.
+    head: usize,
+    /// Number of valid timestamps currently stored (`<= slots.len()`).
+    len: usize,
+}
+
+impl RecentFailureRing {
+    fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            head: 0,
+            len: 0,
+        }
+    }
+
+    fn ensure_slots(&mut self) {
+        if !self.slots.is_empty() {
+            return;
+        }
+        self.slots.resize(MAX_RECENT_FAILURES_PER_TARGET, 0);
+    }
+
+    /// Push `now_ms`, drop expired and over-cap oldest entries, return the
+    /// in-window count. O(1) amortized; no allocation after the first call.
+    fn record(&mut self, now_ms: u64, window_start: u64) -> usize {
+        self.ensure_slots();
+        self.expire_before(window_start);
+        if self.len == MAX_RECENT_FAILURES_PER_TARGET {
+            self.pop_front();
+        }
+        self.push_back(now_ms);
+        self.len
+    }
+
+    fn expire_before(&mut self, window_start: u64) {
+        while !self.is_empty() && self.front() < window_start {
+            self.pop_front();
+        }
+    }
+
+    fn front(&self) -> u64 {
+        self.slots[self.head]
+    }
+
+    fn pop_front(&mut self) {
+        let cap = self.slots.len();
+        self.head += 1;
+        if self.head == cap {
+            self.head = 0;
+        }
+        self.len -= 1;
+    }
+
+    fn push_back(&mut self, ts: u64) {
+        let cap = self.slots.len();
+        let mut idx = self.head + self.len;
+        if idx >= cap {
+            idx -= cap;
+        }
+        self.slots[idx] = ts;
+        self.len += 1;
+    }
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn slot_capacity(&self) -> usize {
+        self.slots.len()
+    }
+}
+
 /// Health state for a single target.
 struct TargetHealth {
     consecutive_successes: AtomicU32,
     consecutive_failures: AtomicU32,
     /// Recent failure timestamps (epoch ms) for passive windowed counting.
-    /// Key is a monotonic counter, value is the timestamp.
     /// Bounded to MAX_RECENT_FAILURES_PER_TARGET entries.
-    recent_failures: dashmap::DashMap<u64, u64>,
-    failure_counter: AtomicU64,
+    recent_failures: Mutex<RecentFailureRing>,
 }
 
 impl TargetHealth {
@@ -189,9 +292,137 @@ impl TargetHealth {
         Self {
             consecutive_successes: AtomicU32::new(0),
             consecutive_failures: AtomicU32::new(0),
-            recent_failures: DashMap::new(),
-            failure_counter: AtomicU64::new(0),
+            recent_failures: Mutex::new(RecentFailureRing::new()),
         }
+    }
+
+    fn lock_recent_failures(&self) -> std::sync::MutexGuard<'_, RecentFailureRing> {
+        self.recent_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod recent_failure_ring_tests {
+    //! Private ring-buffer accounting. External tests cannot see this type;
+    //! keep the reference comparison here rather than widening the runtime API.
+    use super::*;
+
+    /// Old DashMap semantics: keep timestamps `>= window_start` in insert
+    /// order, then drop the oldest until at most CAP remain.
+    fn reference_in_window(stamps: &[u64], window_start: u64) -> Vec<u64> {
+        let mut kept: Vec<u64> = stamps
+            .iter()
+            .copied()
+            .filter(|&ts| ts >= window_start)
+            .collect();
+        if kept.len() > MAX_RECENT_FAILURES_PER_TARGET {
+            let excess = kept.len() - MAX_RECENT_FAILURES_PER_TARGET;
+            kept.drain(..excess);
+        }
+        kept
+    }
+
+    fn record_all(ring: &mut RecentFailureRing, stamps: &[u64], window_ms: u64) -> Vec<usize> {
+        stamps
+            .iter()
+            .enumerate()
+            .map(|(i, &now_ms)| {
+                let window_start = now_ms.saturating_sub(window_ms);
+                let prefix = &stamps[..=i];
+                let expected = reference_in_window(prefix, window_start);
+                let got = ring.record(now_ms, window_start);
+                assert_eq!(
+                    got,
+                    expected.len(),
+                    "ring count diverged from retain+cap at i={i}"
+                );
+                assert_eq!(ring.len(), expected.len());
+                got
+            })
+            .collect()
+    }
+
+    #[test]
+    fn threshold_decision_matches_retain_and_cap_for_representative_sequences() {
+        let window_ms = 10_000;
+        let threshold = 3usize;
+
+        // Tight cluster: three in-window failures trip; two do not.
+        let cluster = [1_000u64, 1_100, 1_200];
+        let mut ring = RecentFailureRing::new();
+        let counts = record_all(&mut ring, &cluster, window_ms);
+        assert!(counts[0] < threshold);
+        assert!(counts[1] < threshold);
+        assert!(counts[2] >= threshold);
+
+        // Window expiry: two old failures must not combine with a later one.
+        let mut ring = RecentFailureRing::new();
+        let expired = [0u64, 1, 12_000];
+        let counts = record_all(&mut ring, &expired, window_ms);
+        assert!(counts[1] < threshold);
+        assert_eq!(counts[2], 1);
+        assert!(counts[2] < threshold);
+
+        // Mix of in-window and expired timestamps, then a wrap past the cap.
+        let mut stamps = vec![0u64; MAX_RECENT_FAILURES_PER_TARGET + 50];
+        for (i, slot) in stamps.iter_mut().enumerate() {
+            *slot = i as u64;
+        }
+        // Shift the tail far enough that the first CAP entries expire.
+        for slot in stamps.iter_mut().skip(MAX_RECENT_FAILURES_PER_TARGET) {
+            *slot += 20_000;
+        }
+        let mut ring = RecentFailureRing::new();
+        let counts = record_all(&mut ring, &stamps, window_ms);
+        let last = *counts.last().unwrap();
+        assert_eq!(last, 50);
+        assert!(last < MAX_RECENT_FAILURES_PER_TARGET);
+        assert_eq!(
+            ring.slot_capacity(),
+            MAX_RECENT_FAILURES_PER_TARGET,
+        );
+    }
+
+    #[test]
+    fn ring_stays_capped_and_does_not_grow_past_max() {
+        let mut ring = RecentFailureRing::new();
+        let window_start = 0;
+        for i in 0..(MAX_RECENT_FAILURES_PER_TARGET * 5) {
+            let count = ring.record(i as u64, window_start);
+            assert!(count <= MAX_RECENT_FAILURES_PER_TARGET);
+            assert_eq!(
+                ring.slot_capacity(),
+                MAX_RECENT_FAILURES_PER_TARGET,
+            );
+        }
+        assert_eq!(ring.len(), MAX_RECENT_FAILURES_PER_TARGET);
+    }
+
+    #[test]
+    fn clear_resets_len_but_keeps_the_capped_allocation() {
+        let mut ring = RecentFailureRing::new();
+        assert_eq!(ring.slot_capacity(), 0);
+        ring.record(1, 0);
+        assert_eq!(ring.len(), 1);
+        assert_eq!(
+            ring.slot_capacity(),
+            MAX_RECENT_FAILURES_PER_TARGET,
+        );
+        ring.clear();
+        assert_eq!(ring.len(), 0);
+        assert_eq!(
+            ring.slot_capacity(),
+            MAX_RECENT_FAILURES_PER_TARGET,
+        );
+        ring.record(2, 0);
+        assert_eq!(ring.len(), 1);
+        assert_eq!(
+            ring.slot_capacity(),
+            MAX_RECENT_FAILURES_PER_TARGET,
+        );
     }
 }
 
@@ -830,38 +1061,17 @@ impl HealthChecker {
                 state.consecutive_failures.fetch_add(1, Ordering::Relaxed);
 
                 let now_ms = now_epoch_ms();
-                let counter = state.failure_counter.fetch_add(1, Ordering::Relaxed);
-                state.recent_failures.insert(counter, now_ms);
-
-                // Clean old failures outside the window and read len() immediately
-                // after retain() to minimise the race window between the two
-                // DashMap operations. This is a best-effort snapshot: concurrent
-                // reporters, hard-cap evictions, or recovery clears can skew the
-                // count in either direction. Acceptable for health threshold
-                // decisions which self-correct on subsequent reports and recovery.
                 let window_start =
                     now_ms.saturating_sub(config.unhealthy_window_seconds * 1000);
-                state
-                    .recent_failures
-                    .retain(|_, &mut ts| ts >= window_start);
-                let failures_in_window = state.recent_failures.len();
+                // Per-target mutex: a handful of integer ops. Replaces the
+                // previous DashMap insert + full-window retain + cap-eviction
+                // sort on this path. Concurrent reporters for this same
+                // target serialize here so the in-window count is exact.
+                let failures_in_window = {
+                    let mut ring = state.lock_recent_failures();
+                    ring.record(now_ms, window_start)
+                } as u32;
 
-                // Hard cap: prevent unbounded memory growth. Snapshot len once
-                // to avoid a second racy read between the guard and the eviction.
-                if failures_in_window > MAX_RECENT_FAILURES_PER_TARGET {
-                    let excess = failures_in_window - MAX_RECENT_FAILURES_PER_TARGET;
-                    let mut to_remove: Vec<u64> = state
-                        .recent_failures
-                        .iter()
-                        .map(|entry| *entry.key())
-                        .collect();
-                    to_remove.sort_unstable();
-                    for key in to_remove.into_iter().take(excess) {
-                        state.recent_failures.remove(&key);
-                    }
-                }
-
-                let failures_in_window = failures_in_window as u32;
                 if failures_in_window >= config.unhealthy_threshold
                     && !proxy_state.unhealthy.contains_key(buf.as_str())
                 {
@@ -897,7 +1107,7 @@ impl HealthChecker {
                             buf.as_str(), proxy_id
                         );
                         if let Some((_, ejection)) = proxy_state.unhealthy.remove(buf.as_str()) {
-                            state.recent_failures.clear();
+                            state.lock_recent_failures().clear();
                             self.reset_latency_after_passive_recovery(
                                 namespace,
                                 &ejection.upstream_id,
@@ -1030,6 +1240,44 @@ impl HealthChecker {
     #[allow(dead_code)]
     pub fn has_active_target_state_for_test(&self, key: &str) -> bool {
         self.active_target_states.contains_key(key)
+    }
+
+    /// Test-only count of timestamps stored in the per-target passive
+    /// failure ring. Used to prove the hard cap holds after many failures.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn passive_recent_failure_len_for_test(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        host_port: &str,
+    ) -> usize {
+        let Some(proxy_state) = self.passive_state(namespace, proxy_id) else {
+            return 0;
+        };
+        let Some(state) = proxy_state.states.get(host_port) else {
+            return 0;
+        };
+        state.lock_recent_failures().len()
+    }
+
+    /// Test-only allocated slot count of the per-target passive failure ring.
+    /// Zero before the first failure; the cap after the ring is sized.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn passive_recent_failure_slot_cap_for_test(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        host_port: &str,
+    ) -> usize {
+        let Some(proxy_state) = self.passive_state(namespace, proxy_id) else {
+            return 0;
+        };
+        let Some(state) = proxy_state.states.get(host_port) else {
+            return 0;
+        };
+        state.lock_recent_failures().slot_capacity()
     }
 
     /// Run one passive-recovery pass: clear every auto-recoverable ejection
@@ -2779,7 +3027,7 @@ fn recover_due_passive_ejections_inner(
             if let Some(state) = proxy_state.states.get(hp) {
                 state.consecutive_failures.store(0, Ordering::Relaxed);
                 state.consecutive_successes.store(0, Ordering::Relaxed);
-                state.recent_failures.clear();
+                state.lock_recent_failures().clear();
             }
 
             // Seed least-latency sample count past warm-up so passive recovery
