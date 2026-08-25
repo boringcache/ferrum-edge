@@ -163,7 +163,7 @@ impl MeshH2Transport {
 /// the pool map (issue #4162). Identity is the gate `Arc`, so a newer entry
 /// under the same key is left alone.
 #[derive(Clone)]
-struct HboneKeepalivePoolHandle {
+pub(crate) struct HboneKeepalivePoolHandle {
     entries: Arc<DashMap<String, Vec<HbonePoolEntry>>>,
     key: String,
 }
