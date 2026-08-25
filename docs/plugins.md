@@ -3986,6 +3986,8 @@ The function should return JSON with optional `headers` and `metadata` fields:
 }
 ```
 
+The response body must be a JSON **object**. Invalid JSON, an empty body, or any non-object JSON value (`null`, a string, number, array, …) is treated as an invocation failure with the fixed `invalid_pre_proxy_response` error class and routed through `on_error` / `error_status_code` — it is never silently ignored. An empty object (`{}`) is valid and simply injects nothing.
+
 Headers are validated before injection; invalid and hop-by-hop/protocol-managed request headers are ignored. Metadata is stored under `serverless_function.<plugin-config-id>.metadata.<key>`, while invocation status and sanitized error class use the same instance namespace. Namespace segments percent-encode punctuation other than `-`/`_`. This keeps multiple instances independent and deterministic in transaction metadata.
 
 #### Function Response Format (terminate mode — native gRPC)

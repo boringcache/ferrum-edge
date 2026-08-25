@@ -5583,6 +5583,150 @@ async fn test_pre_proxy_succeeds_when_response_body_within_limit() {
     }
 }
 
+/// A 2xx `pre_proxy` body that is not a JSON object must fail closed under
+/// `on_error: reject` rather than silently continuing without injection.
+#[tokio::test]
+async fn test_pre_proxy_rejects_non_object_2xx_response_bodies() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let malformed_bodies: &[&[u8]] = &[
+        b"not json",
+        b"",
+        b"[]",
+        b"\"string\"",
+        b"42",
+        b"null",
+    ];
+
+    for body in malformed_bodies {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(*body))
+            .mount(&server)
+            .await;
+
+        let plugin = ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": format!("{}/func", server.uri()),
+                "mode": "pre_proxy",
+                "on_error": "reject",
+                "error_status_code": 502,
+                "timeout_ms": 5000
+            }),
+            default_client(),
+        )
+        .unwrap();
+
+        let mut ctx = create_test_context();
+        let mut headers = HashMap::new();
+
+        let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
+        match result {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 502);
+                assert!(body.contains("invalid_pre_proxy_response"));
+            }
+            other => panic!(
+                "expected Reject for malformed pre_proxy body {:?}, got {:?}",
+                body, other
+            ),
+        }
+        assert_eq!(
+            ctx.metadata
+                .get("serverless_function.standalone.error_class")
+                .map(String::as_str),
+            Some("invalid_pre_proxy_response")
+        );
+    }
+}
+
+/// Under `on_error: continue`, a non-object 2xx body still records the error
+/// class and continues without injecting headers.
+#[tokio::test]
+async fn test_pre_proxy_continue_on_non_object_2xx_response_body() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"[]"))
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "pre_proxy",
+            "on_error": "continue",
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::Continue => {
+            assert_eq!(
+                ctx.metadata
+                    .get("serverless_function.standalone.error_class")
+                    .map(String::as_str),
+                Some("invalid_pre_proxy_response")
+            );
+            assert!(headers.is_empty());
+        }
+        other => panic!("Expected Continue with metadata error, got {:?}", other),
+    }
+}
+
+/// An empty JSON object is a valid pre_proxy approval that injects nothing.
+#[tokio::test]
+async fn test_pre_proxy_empty_object_body_is_valid() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "pre_proxy",
+            "on_error": "reject",
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::Continue => {
+            assert!(headers.is_empty());
+            assert!(
+                !ctx.metadata
+                    .contains_key("serverless_function.standalone.error_class")
+            );
+        }
+        other => panic!("Expected Continue for empty object body, got {:?}", other),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
