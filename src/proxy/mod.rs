@@ -203,8 +203,8 @@ use crate::util::http_headers::{
 
 use self::backend_capabilities::{
     BackendCapabilityProbeTarget, BackendCapabilityRecord, BackendCapabilityRefreshOutcome,
-    BackendCapabilityRegistry, BackendCapabilitySnapshot, CapabilityCommitOutcome,
-    ProtocolSupport, RefreshCoalescer, SharedBackendCapabilityRegistry, SharedRefreshCoalescer,
+    BackendCapabilityRegistry, BackendCapabilitySnapshot, CapabilityCommitOutcome, ProtocolSupport,
+    RefreshCoalescer, SharedBackendCapabilityRegistry, SharedRefreshCoalescer,
 };
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{
@@ -10603,9 +10603,7 @@ impl ProxyState {
     /// Synchronously refresh backend capabilities through the shared
     /// [`RefreshCoalescer`], preserving the admin endpoint's post-refresh
     /// snapshot contract while collapsing concurrent callers onto one pass.
-    pub async fn refresh_backend_capabilities_coalesced(
-        &self,
-    ) -> BackendCapabilityRefreshOutcome {
+    pub async fn refresh_backend_capabilities_coalesced(&self) -> BackendCapabilityRefreshOutcome {
         if self.backend_capabilities_refresh.request() {
             self.run_backend_capability_refresh_loop().await;
             BackendCapabilityRefreshOutcome::Ran

@@ -136,7 +136,9 @@ fn admin_state_with_http_probe_proxy(jwt: JwtManager, backend_port: u16) -> Admi
         ProxyState::new(cfg, dns_cache, env_config, None, None).expect("proxy state");
 
     let key = capability_key_for_proxy_target(&proxy, None);
-    proxy_state.backend_capabilities.upsert(key, BackendCapabilityRecord::default());
+    proxy_state
+        .backend_capabilities
+        .upsert(key, BackendCapabilityRecord::default());
 
     admin_state_from_proxy_state(jwt, proxy_state)
 }

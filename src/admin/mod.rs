@@ -11044,10 +11044,7 @@ async fn handle_backend_capabilities_refresh(
         crate::proxy::backend_capabilities::BackendCapabilityRefreshOutcome::Ran => "refreshed",
         crate::proxy::backend_capabilities::BackendCapabilityRefreshOutcome::Joined => "joined",
     };
-    Ok(json_response(
-        StatusCode::OK,
-        &json!({"status": status}),
-    ))
+    Ok(json_response(StatusCode::OK, &json!({"status": status})))
 }
 
 fn protocol_support_label(
