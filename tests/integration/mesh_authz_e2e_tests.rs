@@ -2731,7 +2731,10 @@ async fn a_dot_segment_cannot_widen_an_allow_grant_onto_a_protected_path() {
 
     let mut raw = ctx_with_principal("GET", "/public/../admin/secret", Some(CLIENT_SPIFFE));
     assert!(
-        matches!(plugin.authorize(&mut raw).await, PluginResult::Reject { .. }),
+        matches!(
+            plugin.authorize(&mut raw).await,
+            PluginResult::Reject { .. }
+        ),
         "handed the raw target directly, the grant must not widen onto /admin"
     );
 
@@ -2786,7 +2789,10 @@ async fn dots_inside_a_segment_name_are_reachable_and_matched_literally() {
     for raw in ["/a..b", "/..a", "/a..", "/...", "/x/..b/y", "/x/b../y"] {
         let canonical = canonicalize_policy_path(raw)
             .unwrap_or_else(|rejection| panic!("{raw:?} refused at boundary: {rejection:?}"));
-        assert_eq!(canonical, raw, "{raw:?} must survive the boundary unchanged");
+        assert_eq!(
+            canonical, raw,
+            "{raw:?} must survive the boundary unchanged"
+        );
     }
 
     let policy = policy_on_paths("deny-dots", PolicyAction::Deny, &["/a..b"]);
