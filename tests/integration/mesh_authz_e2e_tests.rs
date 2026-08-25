@@ -1077,7 +1077,7 @@ async fn namespace_scoped_allow_does_not_implicit_deny_the_outbound_capture_leg(
         "a namespace-scoped inbound ALLOW must not deny egress, got {result:?}"
     );
     assert!(
-        outbound.metadata.get("mesh_authz.deny_policy").is_none(),
+        !outbound.metadata.contains_key("mesh_authz.deny_policy"),
         "the outbound leg must not record an authorization denial"
     );
 
