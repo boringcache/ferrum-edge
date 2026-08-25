@@ -167,7 +167,13 @@ mod tests {
         let labels = make_labels(&[("ferrum.io/mesh", "enabled")]);
         let annotations = HashMap::new();
         assert_eq!(
-            evaluate_enrollment(&labels, &annotations, "kube-system", &default_excluded(), false),
+            evaluate_enrollment(
+                &labels,
+                &annotations,
+                "kube-system",
+                &default_excluded(),
+                false
+            ),
             EnrollmentDecision::Skip
         );
     }
