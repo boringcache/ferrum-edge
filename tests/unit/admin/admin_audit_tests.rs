@@ -161,7 +161,6 @@ use ferrum_edge::modes::mesh::revision::MeshConfigRevision;
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use jsonwebtoken::{EncodingKey, Header, encode};
-use serde_json::json;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -282,6 +281,10 @@ async fn start_mesh_reset_admin(state: AdminState) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let actual_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
+        // Hold the sender for the server's lifetime: this helper returns only the
+        // address, so dropping it here would close the watch channel and the
+        // listener would stop before the test issued its first request.
+        let _shutdown_tx = shutdown_tx;
         let _ = serve_admin_on_listener(
             listener,
             state,
