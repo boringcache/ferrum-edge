@@ -51,7 +51,7 @@ migrations; use the explicit Job for `status`, dry-run, and operator-controlled
   binary hard-fails on a non-loopback **plaintext** admin bind unless you also
   set one of `admin.allowedCidrs`, admin TLS (`tls.admin` or a complete
   `FERRUM_ADMIN_TLS_{CERT,KEY}_SOURCE` pair, with `ports.adminHttp=0`), or
-  `admin.allowInsecureHttp=true`; TLS on 9443 does not protect a still-live
+  `admin.allowInsecureHttp=true` with `networkPolicy.enabled=true`; TLS on 9443 does not protect a still-live
   plaintext listener on 9000. Any allowlist that covers a whole address family
   is rejected as ineffective protection, including `/0`, mapped IPv6 `/96`
   spellings that canonicalize to IPv4 `/0`, and full-coverage CIDR unions.

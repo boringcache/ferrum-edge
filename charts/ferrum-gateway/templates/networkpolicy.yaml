@@ -1,0 +1,94 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $ports := .Values.ports | default dict -}}
+{{- $np := .Values.networkPolicy | default dict -}}
+{{- $nsSelectors := $np.allowedNamespaceSelectors | default list -}}
+{{- $podSelectors := $np.allowedPodSelectors | default list -}}
+{{- $adminTls := (.Values.tls | default dict).admin | default dict -}}
+{{- $adminTlsSet := include "ferrum-gateway.serverTlsConfigured" (dict "root" . "surface" $adminTls "certSource" "FERRUM_ADMIN_TLS_CERT_SOURCE" "keySource" "FERRUM_ADMIN_TLS_KEY_SOURCE") -}}
+{{- $hasProxyHttp := and (ne .Values.mode "cp") (hasKey $ports "proxyHttp") (ne ($ports.proxyHttp | toString) "0") -}}
+{{- $hasProxyHttps := and (ne .Values.mode "cp") (hasKey $ports "proxyHttps") (ne ($ports.proxyHttps | toString) "0") -}}
+{{- $hasHttp3 := and $hasProxyHttps (eq (include "ferrum-gateway.http3Enabled" .) "true") -}}
+{{- $hasAdminHttp := and (hasKey $ports "adminHttp") (ne ($ports.adminHttp | toString) "0") -}}
+{{- $hasAdminHttps := and (hasKey $ports "adminHttps") (ne ($ports.adminHttps | toString) "0") $adminTlsSet -}}
+{{- $hasCpGrpc := and (eq .Values.mode "cp") (ne (include "ferrum-gateway.cpGrpcPort" . | toString) "0") -}}
+{{- $hasRestricted := or $hasAdminHttp $hasAdminHttps $hasCpGrpc -}}
+{{- $hasStreamSvc := false -}}
+{{- range .Values.streamPorts -}}{{- if .service -}}{{- $hasStreamSvc = true -}}{{- end -}}{{- end -}}
+{{- $hasOpen := or $hasProxyHttp $hasProxyHttps $hasStreamSvc -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "ferrum-gateway.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferrum-gateway.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "ferrum-gateway.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    {{- if $hasOpen }}
+    - ports:
+        {{- if $hasProxyHttp }}
+        - protocol: TCP
+          port: {{ $ports.proxyHttp }}
+        {{- end }}
+        {{- if $hasProxyHttps }}
+        - protocol: TCP
+          port: {{ $ports.proxyHttps }}
+        {{- if $hasHttp3 }}
+        - protocol: UDP
+          port: {{ $ports.proxyHttps }}
+        {{- end }}
+        {{- end }}
+        {{- range .Values.streamPorts }}
+        {{- if .service }}
+        - protocol: {{ .protocol | default "TCP" }}
+          port: {{ .containerPort }}
+        {{- end }}
+        {{- end }}
+    {{- end }}
+    {{- if $hasRestricted }}
+    - {{- if and (eq (len $nsSelectors) 0) (eq (len $podSelectors) 0) }}
+      from: []
+      {{- else }}
+      from:
+        {{- if eq (len $nsSelectors) 0 }}
+        {{- range $podSelectors }}
+        - podSelector:
+            {{- toYaml . | nindent 12 }}
+        {{- end }}
+        {{- else if eq (len $podSelectors) 0 }}
+        {{- range $nsSelectors }}
+        - namespaceSelector:
+            {{- toYaml . | nindent 12 }}
+        {{- end }}
+        {{- else }}
+        {{- range $nsSelectors }}
+        {{- $ns := . }}
+        {{- range $podSelectors }}
+        - namespaceSelector:
+            {{- toYaml $ns | nindent 12 }}
+          podSelector:
+            {{- toYaml . | nindent 12 }}
+        {{- end }}
+        {{- end }}
+        {{- end }}
+      {{- end }}
+      ports:
+        {{- if $hasAdminHttp }}
+        - protocol: TCP
+          port: {{ $ports.adminHttp }}
+        {{- end }}
+        {{- if $hasAdminHttps }}
+        - protocol: TCP
+          port: {{ $ports.adminHttps }}
+        {{- end }}
+        {{- if $hasCpGrpc }}
+        - protocol: TCP
+          port: {{ include "ferrum-gateway.cpGrpcPort" . }}
+        {{- end }}
+    {{- end }}
+{{- end }}
