@@ -765,3 +765,175 @@ async fn batch_mesh_route_dispatch_destination_can_reference_batch_upstream() {
         body
     );
 }
+
+// ── store-level mesh_route_dispatch upstream-reference lookup ────────────────
+//
+// Admission rejects cross-namespace mesh_route_dispatch writes, but the store
+// delete path must still namespace-predicate its reference scan so a legacy or
+// direct DB row cannot block another tenant's upstream delete.
+
+async fn sqlite_store_for_store_level_tests() -> (DatabaseStore, tempfile::TempDir) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("cross_ns_store_refs.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("SQLite store creation must succeed");
+    (store, tmp)
+}
+
+async fn seed_store_upstream(store: &DatabaseStore, namespace: &str, id: &str, ts: &str) {
+    sqlx::query(
+        "INSERT INTO upstreams \
+         (id, namespace, name, targets, algorithm, created_at, updated_at) \
+         VALUES (?, ?, ?, '[{\"host\":\"127.0.0.1\",\"port\":8080,\"weight\":100}]', 'round_robin', ?, ?)",
+    )
+    .bind(id)
+    .bind(namespace)
+    .bind(format!("{id}-name"))
+    .bind(ts)
+    .bind(ts)
+    .execute(store.pool())
+    .await
+    .expect("upstream insert must succeed");
+}
+
+async fn seed_store_proxy(store: &DatabaseStore, namespace: &str, id: &str, ts: &str) {
+    sqlx::query(
+        "INSERT INTO proxies \
+         (id, namespace, name, hosts, listen_path, backend_scheme, backend_host, backend_port, created_at, updated_at) \
+         VALUES (?, ?, ?, '[]', '/route', 'http', '127.0.0.1', 8080, ?, ?)",
+    )
+    .bind(id)
+    .bind(namespace)
+    .bind(format!("{id}-name"))
+    .bind(ts)
+    .bind(ts)
+    .execute(store.pool())
+    .await
+    .expect("proxy insert must succeed");
+}
+
+async fn seed_store_mesh_route_dispatch(
+    store: &DatabaseStore,
+    namespace: &str,
+    plugin_id: &str,
+    proxy_id: &str,
+    upstream_id: &str,
+    ts: &str,
+) {
+    let config = format!(
+        r#"{{"rules":[{{"match":{{"methods":["GET"]}},"destination":{{"upstream_id":"{upstream_id}"}}}}]}}"#
+    );
+    sqlx::query(
+        "INSERT INTO plugin_configs \
+         (id, namespace, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) \
+         VALUES (?, ?, 'mesh_route_dispatch', ?, 'proxy', ?, 1, ?, ?)",
+    )
+    .bind(plugin_id)
+    .bind(namespace)
+    .bind(config)
+    .bind(proxy_id)
+    .bind(ts)
+    .bind(ts)
+    .execute(store.pool())
+    .await
+    .expect("mesh_route_dispatch insert must succeed");
+}
+
+async fn upstream_exists(store: &DatabaseStore, namespace: &str, id: &str) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM upstreams WHERE id = ? AND namespace = ?",
+    )
+    .bind(id)
+    .bind(namespace)
+    .fetch_one(store.pool())
+    .await
+    .expect("upstream count must succeed")
+        > 0
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_store_cross_namespace_ref_does_not_block_upstream_delete() {
+    let (store, _tmp) = sqlite_store_for_store_level_tests().await;
+    let ts = chrono::Utc::now().to_rfc3339();
+    let shared_upstream_id = "up-shared-store";
+
+    seed_store_upstream(&store, NAMESPACE_A, shared_upstream_id, &ts).await;
+    seed_store_proxy(&store, NAMESPACE_B, "p-b-store-route", &ts).await;
+    seed_store_mesh_route_dispatch(
+        &store,
+        NAMESPACE_B,
+        "pc-b-store-route",
+        "p-b-store-route",
+        shared_upstream_id,
+        &ts,
+    )
+    .await;
+
+    let deleted = store
+        .delete_upstream(NAMESPACE_A, shared_upstream_id)
+        .await
+        .expect("namespace A upstream delete must succeed despite cross-namespace plugin row");
+    assert!(deleted, "upstream in namespace A must be deleted");
+    assert!(
+        !upstream_exists(&store, NAMESPACE_A, shared_upstream_id).await,
+        "deleted upstream must not remain in namespace A"
+    );
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_store_same_namespace_ref_blocks_upstream_delete() {
+    let (store, _tmp) = sqlite_store_for_store_level_tests().await;
+    let ts = chrono::Utc::now().to_rfc3339();
+    let upstream_id = "up-a-store-route";
+
+    seed_store_upstream(&store, NAMESPACE_A, upstream_id, &ts).await;
+    seed_store_proxy(&store, NAMESPACE_A, "p-a-store-route", &ts).await;
+    seed_store_mesh_route_dispatch(
+        &store,
+        NAMESPACE_A,
+        "pc-a-store-route",
+        "p-a-store-route",
+        upstream_id,
+        &ts,
+    )
+    .await;
+
+    let err = store
+        .delete_upstream(NAMESPACE_A, upstream_id)
+        .await
+        .expect_err("same-namespace mesh_route_dispatch reference must block delete");
+    let message = err.to_string();
+    assert!(
+        message.contains("mesh_route_dispatch") && message.contains("pc-a-store-route"),
+        "delete error must name the referring plugin; got: {message}"
+    );
+    assert!(
+        upstream_exists(&store, NAMESPACE_A, upstream_id).await,
+        "blocked upstream must remain in namespace A"
+    );
+}
+
+#[test]
+fn mongo_mesh_route_dispatch_upstream_ref_lookup_filters_by_namespace() {
+    let source = include_str!("../../src/config/mongo_store.rs");
+    let find_start = source
+        .find("async fn find_mesh_route_dispatch_upstream_ref_opt_session(")
+        .expect("Mongo mesh_route_dispatch upstream lookup");
+    let find_body = &source[find_start..];
+    let next_fn = find_body
+        .find("async fn find_access_control_consumer_ref_opt_session(")
+        .expect("access_control lookup following mesh_route_dispatch lookup");
+    let find_body = &find_body[..next_fn];
+
+    assert!(
+        find_body.contains("\"namespace\": namespace,"),
+        "Mongo mesh_route_dispatch upstream-reference lookup must filter by namespace"
+    );
+    assert_eq!(
+        find_body.matches("\"namespace\": namespace,").count(),
+        2,
+        "Mongo lookup must namespace-predicate both session branches"
+    );
+}

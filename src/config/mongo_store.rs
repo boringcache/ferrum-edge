@@ -3831,12 +3831,17 @@ mod inner {
         async fn find_mesh_route_dispatch_upstream_ref_opt_session(
             &self,
             session: Option<&mut ClientSession>,
+            namespace: &str,
             upstream_id: &str,
         ) -> Result<Option<PluginConfig>, anyhow::Error> {
             if let Some(s) = session {
                 let plugin_configs = self.plugin_configs();
                 let mut cursor = plugin_configs
-                    .find(doc! { "plugin_name": "mesh_route_dispatch", "enabled": true })
+                    .find(doc! {
+                        "plugin_name": "mesh_route_dispatch",
+                        "namespace": namespace,
+                        "enabled": true,
+                    })
                     .session(&mut *s)
                     .await?;
                 while cursor.advance(&mut *s).await? {
@@ -3848,7 +3853,11 @@ mod inner {
             } else {
                 let plugin_configs = self.plugin_configs();
                 let mut cursor = plugin_configs
-                    .find(doc! { "plugin_name": "mesh_route_dispatch", "enabled": true })
+                    .find(doc! {
+                        "plugin_name": "mesh_route_dispatch",
+                        "namespace": namespace,
+                        "enabled": true,
+                    })
                     .await?;
                 while cursor.advance().await? {
                     let plugin = doc_to_plugin_config(cursor.deserialize_current()?)?;
@@ -8831,6 +8840,7 @@ mod inner {
                                             let dispatch_ref = if !still_referenced {
                                                 this.find_mesh_route_dispatch_upstream_ref_opt_session(
                                                     Some(&mut *s),
+                                                    namespace.as_str(),
                                                     uid,
                                                 )
                                                 .await
@@ -8999,8 +9009,12 @@ mod inner {
                             .await?
                             > 0;
                         let dispatch_ref = if !still_referenced {
-                            self.find_mesh_route_dispatch_upstream_ref_opt_session(None, uid)
-                                .await?
+                            self.find_mesh_route_dispatch_upstream_ref_opt_session(
+                                None,
+                                namespace,
+                                uid,
+                            )
+                            .await?
                         } else {
                             None
                         };
@@ -10399,6 +10413,7 @@ mod inner {
                                 if let Some(plugin) = this
                                     .find_mesh_route_dispatch_upstream_ref_opt_session(
                                         Some(&mut *s),
+                                        namespace.as_str(),
                                         id.as_str(),
                                     )
                                     .await
@@ -10473,7 +10488,7 @@ mod inner {
                     );
                 }
                 if let Some(plugin) = self
-                    .find_mesh_route_dispatch_upstream_ref_opt_session(None, id)
+                    .find_mesh_route_dispatch_upstream_ref_opt_session(None, namespace, id)
                     .await?
                 {
                     anyhow::bail!(
@@ -10574,6 +10589,7 @@ mod inner {
                                             let dispatch_ref = this
                                                 .find_mesh_route_dispatch_upstream_ref_opt_session(
                                                     Some(&mut *s),
+                                                    namespace.as_str(),
                                                     upstream_id,
                                                 )
                                                 .await
@@ -10617,6 +10633,7 @@ mod inner {
                         let dispatch_ref = if count == 0 {
                             self.find_mesh_route_dispatch_upstream_ref_opt_session(
                                 None,
+                                namespace,
                                 upstream_id,
                             )
                             .await?
@@ -17748,6 +17765,29 @@ mod inner {
         }
 
         #[test]
+        fn find_mesh_route_dispatch_upstream_ref_filters_by_namespace() {
+            let source = include_str!("mongo_store.rs");
+            let find_start = source
+                .find("async fn find_mesh_route_dispatch_upstream_ref_opt_session(")
+                .expect("find_mesh_route_dispatch_upstream_ref_opt_session function");
+            let find_body = &source[find_start..];
+            let access_control_start = find_body
+                .find("async fn find_access_control_consumer_ref_opt_session(")
+                .expect("find_access_control_consumer_ref_opt_session following mesh lookup");
+            let find_body = &find_body[..access_control_start];
+
+            assert!(
+                find_body.contains("\"namespace\": namespace,"),
+                "mesh_route_dispatch upstream-reference lookup must filter plugin_configs by namespace"
+            );
+            assert_eq!(
+                find_body.matches("\"namespace\": namespace,").count(),
+                2,
+                "both session and non-session mesh_route_dispatch lookups must filter by namespace"
+            );
+        }
+
+        #[test]
         fn delete_upstream_standalone_checks_namespaced_target_before_references() {
             let source = include_str!("mongo_store.rs");
             let delete_start = source
@@ -17765,7 +17805,9 @@ mod inner {
                 .find(".count_documents(doc! { \"upstream_id\": id })")
                 .expect("proxy reference check");
             let plugin_refs = standalone_path
-                .find(".find_mesh_route_dispatch_upstream_ref_opt_session(None, id)")
+                .find(
+                    ".find_mesh_route_dispatch_upstream_ref_opt_session(None, namespace, id)",
+                )
                 .expect("plugin reference check");
 
             assert!(
