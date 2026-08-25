@@ -9,7 +9,9 @@
 const ROOT_CARGO_TOML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
 
 fn profile_body<'a>(toml: &'a str, header: &str) -> &'a str {
-    let start = toml.find(header).unwrap_or_else(|| panic!("Cargo.toml must contain {header}"));
+    let start = toml
+        .find(header)
+        .unwrap_or_else(|| panic!("Cargo.toml must contain {header}"));
     let after_header = &toml[start + header.len()..];
     let end = after_header.find("\n[").unwrap_or(after_header.len());
     &after_header[..end]
