@@ -47,10 +47,12 @@ fn a_zero_limit_folds_to_the_finite_fallback_on_the_buffered_path() {
         DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES,
         "a `0` request-body limit must not produce an unbounded retained buffer"
     );
-    assert!(
-        DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES > 0,
-        "the fallback must be finite and non-zero or the fold is a no-op"
-    );
+    const {
+        assert!(
+            DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES > 0,
+            "the fallback must be finite and non-zero or the fold is a no-op"
+        )
+    };
 }
 
 #[test]
@@ -260,8 +262,10 @@ fn exhaustion_is_backend_health_neutral_and_distinct_from_oversize() {
 fn defaults_are_finite_and_the_total_exceeds_one_request() {
     assert_eq!(DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES, 10 * 1024 * 1024);
     assert_eq!(DEFAULT_REQUEST_BUFFER_TOTAL_BYTES, 256 * 1024 * 1024);
-    assert!(
-        DEFAULT_REQUEST_BUFFER_TOTAL_BYTES > DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES,
-        "the aggregate default must admit more than a single fallback-sized upload"
-    );
+    const {
+        assert!(
+            DEFAULT_REQUEST_BUFFER_TOTAL_BYTES > DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES,
+            "the aggregate default must admit more than a single fallback-sized upload"
+        )
+    };
 }
