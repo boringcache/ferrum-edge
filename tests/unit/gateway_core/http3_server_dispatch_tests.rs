@@ -1387,8 +1387,7 @@ fn buffered_http3_backend_upload_honors_client_grpc_deadline() {
         .matches("collect_request_body_under_authorization(")
         .count();
     assert_eq!(
-        deadline_aware,
-        1,
+        deadline_aware, 1,
         "HTTP/3 upload buffering must keep exactly one deadline-aware collect site"
     );
     assert_eq!(

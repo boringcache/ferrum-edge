@@ -2108,8 +2108,7 @@ fn assert_buffered_upload_region_stays_bounded(dispatcher: &str, open: &str, clo
         .matches("collect_request_body_under_authorization(")
         .count();
     assert_eq!(
-        authorized,
-        1,
+        authorized, 1,
         "the {dispatcher} dispatcher must keep exactly one buffered upload collect site"
     );
     assert_eq!(
