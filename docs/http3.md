@@ -782,7 +782,7 @@ This means every WebSocket plugin works on H3 sessions unchanged:
 - `prometheus_metrics` WebSocket session count/duration and directional
   byte/frame totals (the shared disconnect hook gives H1 Upgrade, H2 Extended
   CONNECT, and H3 Extended CONNECT identical completion accounting)
-- Connection-admission via `FERRUM_WEBSOCKET_MAX_CONNECTIONS` (shared with H1/H2)
+- Connection-admission via `FERRUM_WEBSOCKET_MAX_CONNECTIONS` and `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP` (shared with H1/H2)
 - All authentication, authorization, and `before_proxy` plugins (run BEFORE the bridge accepts the upgrade)
 - Sticky-session cookies on the 200 response (same as H1/H2)
 - All logging plugins (the `TransactionSummary` emitted at upgrade time carries `http_method = "CONNECT"`, mirroring the H2 Extended CONNECT path)

@@ -84,6 +84,16 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Cleanup mechanism:** A periodic background sweep removes entries where the counter has reached zero (client has no active requests). The RAII `Drop` guard on each request ensures counters are always decremented, even across early returns and error paths.
 
+### Per-IP WebSocket Session Counters
+
+**What it stores:** Active upgraded WebSocket session count per resolved client IP address. Only active when `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP > 0`. Independent of the per-IP request counters: the request guard is released at the upgrade boundary.
+
+**Default limit:** No hard entry cap -- bounded by the number of unique client IPs with active WebSocket sessions.
+
+**Env var:** `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP` (default `0` = disabled) and `FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS` (default 60s).
+
+**Cleanup mechanism:** The same periodic sweep that reclaims zero-count request entries also reclaims zero-count WebSocket session entries. The RAII `PerIpWebSocketGuard` is moved into the upgraded session so every disconnect path (relay exit, upgrade failure, cancellation) decrements the counter.
+
 ### Circuit Breaker Cache
 
 **What it stores:** Circuit breaker state (Closed/Open/Half-Open) per `proxy_id::host:port` combination. Tracks connection errors and status code failures independently.
@@ -275,6 +285,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 | `FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS` | `10` | Failed DNS retry interval (`0` = disabled) |
 | `FERRUM_STATUS_COUNTS_MAX_ENTRIES` | `200` | Maximum HTTP status code counter entries |
 | `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP` | `0` | Per-IP concurrent request limit (`0` = disabled) |
+| `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP` | `0` | Per-IP upgraded WebSocket session limit (`0` = disabled) |
 | `FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS` | `60` | Cleanup interval for per-IP zero-count entries |
 | `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES` | `10000` | Maximum circuit breaker state entries |
 | `FERRUM_POOL_CLEANUP_INTERVAL_SECONDS` | `30` | Connection pool cleanup sweep interval |

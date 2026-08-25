@@ -1860,6 +1860,7 @@ fn test_env_config_http3_defaults() {
             assert_eq!(config.server_http2_max_pending_accept_reset_streams, 64);
             assert_eq!(config.server_http2_max_local_error_reset_streams, 256);
             assert_eq!(config.websocket_max_connections, 20_000);
+            assert_eq!(config.websocket_max_connections_per_ip, 0);
         },
     );
 }
@@ -2387,12 +2388,29 @@ fn test_env_config_http2_reset_and_websocket_limits_custom() {
             ("FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS", "96"),
             ("FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS", "384"),
             ("FERRUM_WEBSOCKET_MAX_CONNECTIONS", "4000"),
+            ("FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP", "7"),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.server_http2_max_pending_accept_reset_streams, 96);
             assert_eq!(config.server_http2_max_local_error_reset_streams, 384);
             assert_eq!(config.websocket_max_connections, 4000);
+            assert_eq!(config.websocket_max_connections_per_ip, 7);
+        },
+    );
+}
+
+#[test]
+fn test_websocket_max_connections_per_ip_zero_disables() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.websocket_max_connections_per_ip, 0);
         },
     );
 }
