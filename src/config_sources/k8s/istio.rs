@@ -19513,7 +19513,8 @@ extensionProviders:
         )
         .expect_err("over-cap TCP idleTimeout must fail");
         assert!(
-            err.to_string().contains("exceeds the proxy idle-timeout cap"),
+            err.to_string()
+                .contains("exceeds the proxy idle-timeout cap"),
             "unexpected: {err}"
         );
     }
