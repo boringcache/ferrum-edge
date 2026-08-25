@@ -97,10 +97,14 @@ webhooks:
       - v1
     sideEffects: None
     failurePolicy: {{ .Values.injector.failurePolicy }}
-{{ with .Values.injector.namespaceSelector }}
     namespaceSelector:
-{{ toYaml . | nindent 6 }}
-{{ end }}
+{{ include "ferrum-mesh.renderInjectorWebhookNamespaceSelector" (dict "Release" .Release "namespaceSelector" .Values.injector.namespaceSelector) | nindent 6 }}
+    objectSelector:
+      matchExpressions:
+        - key: app.kubernetes.io/name
+          operator: NotIn
+          values:
+            - ferrum-mesh-injector
     clientConfig:
       service:
         name: ferrum-mesh-injector

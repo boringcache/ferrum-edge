@@ -329,6 +329,32 @@ Both DaemonSets include this SAME helper so the ambient preflight and the
 node-agent's registry-synchronization publication can never disagree about
 which era a proof belongs to.
 */}}
+{{/*
+Render the injector mutating webhook namespaceSelector. User-provided
+matchExpressions are preserved, but the release namespace is always appended so
+an override of injector.namespaceSelector cannot re-enable admission on the
+chart's own namespace (issue #4155 bootstrap deadlock).
+*/}}
+{{- define "ferrum-mesh.renderInjectorWebhookNamespaceSelector" -}}
+{{- $user := .namespaceSelector | default dict -}}
+{{- $releaseNs := .Release.Namespace -}}
+{{- $exprs := $user.matchExpressions | default list -}}
+{{- $hasReleaseExclusion := false -}}
+{{- range $exprs -}}
+{{- if and (eq .key "kubernetes.io/metadata.name") (eq .operator "NotIn") (has $releaseNs .values) -}}
+{{- $hasReleaseExclusion = true -}}
+{{- end -}}
+{{- end -}}
+{{- if not $hasReleaseExclusion -}}
+{{- $exprs = append $exprs (dict "key" "kubernetes.io/metadata.name" "operator" "NotIn" "values" (list $releaseNs)) -}}
+{{- end -}}
+{{- $selector := dict "matchExpressions" $exprs -}}
+{{- if $user.matchLabels -}}
+{{- $_ := set $selector "matchLabels" $user.matchLabels -}}
+{{- end -}}
+{{- $selector | toYaml -}}
+{{- end -}}
+
 {{- define "ferrum-mesh.ambientUdpNodeProofGeneration" -}}
 {{- $env := default dict .Values.ambient.env -}}
 {{- $topology := replace "-" "_" (lower (trim (toString (index $env "FERRUM_MESH_TOPOLOGY")))) -}}

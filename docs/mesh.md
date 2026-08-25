@@ -3455,6 +3455,13 @@ Keep all three nonzero on any injector reachable beyond the API server; a nonzer
 
 These complement the existing boundary checks: the body-size limit (returns `413`), reserved-container-name conflicts (`ferrum-edge` / `ferrum-edge-init`) refuse injection, and invalid port/CIDR annotations are rejected with a webhook error that names the offending annotation.
 
+**Self-exclusion (bootstrap deadlock).** A self-hosted mutating webhook with `failurePolicy: Fail` must not intercept its own replacement pods: when every injector replica is down, admission calls fail and pod `CREATE` in the release namespace is rejected until an operator deletes the `MutatingWebhookConfiguration`. The `charts/ferrum-mesh` chart therefore renders two guards on `sidecar-injector.ferrum.io`:
+
+1. **`namespaceSelector`** — user `injector.namespaceSelector` matchExpressions are preserved, but the chart **always** appends `kubernetes.io/metadata.name NotIn [<Helm release namespace>]` at render time so overrides cannot drop it. Pods in the release namespace (injector, control plane, mesh CA, east-west gateway) are never gated on the webhook.
+2. **`objectSelector`** — `app.kubernetes.io/name NotIn [ferrum-mesh-injector]` excludes injector pods by label regardless of namespace.
+
+Raising `injector.replicas` (see PR #4186) reduces the chance that all endpoints disappear at once; self-exclusion ensures a total outage still does not block injector recovery. Workloads in other namespaces continue to receive admission calls; opt-in/out semantics are unchanged.
+
 Register with Kubernetes:
 
 ```yaml
@@ -3464,6 +3471,19 @@ metadata:
   name: ferrum-edge-injector
 webhooks:
   - name: ferrum-inject.ferrum.io
+    failurePolicy: Fail
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - ferrum-system
+    objectSelector:
+      matchExpressions:
+        - key: app.kubernetes.io/name
+          operator: NotIn
+          values:
+            - ferrum-mesh-injector
     clientConfig:
       service:
         name: ferrum-edge-injector
