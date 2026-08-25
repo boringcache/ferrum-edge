@@ -4710,7 +4710,7 @@ pub fn inbound_relay_destinations_from_workloads(
     for destination in &mut destinations {
         destination.ports.sort_unstable();
     }
-    destinations.sort_by(|left, right| left.address.cmp(&right.address));
+    destinations.sort_by_key(|destination| destination.address);
     destinations
 }
 
@@ -4809,10 +4809,26 @@ impl MeshConfig {
             .filter(|_| self.inbound_relay_admits_accepted_local_address)
             .map(|ip| ip.to_canonical());
 
-        if host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
+        // The authority form brackets IPv6 and ONLY IPv6 (RFC 3986 section
+        // 3.2.2), and `IpAddr::from_str` rejects brackets outright — so the
+        // literal has to be unwrapped before parsing, and the bracketing has to
+        // agree with the address family or the two spellings of one address
+        // would disagree.
+        let (candidate, bracketed) = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']'))
+        {
+            Some(inner) => (inner, true),
+            None => (host, false),
+        };
+        let parsed = candidate.parse::<std::net::IpAddr>().ok();
+        match parsed {
+            Some(ip) if bracketed != ip.is_ipv6() => {
+                return Err(InboundRelayDenial::UnresolvableHost);
+            }
+            None if bracketed => return Err(InboundRelayDenial::UnresolvableHost),
+            _ => {}
+        }
+
+        if candidate.eq_ignore_ascii_case("localhost") || parsed.is_some_and(|ip| ip.is_loopback())
         {
             let Some(own_address) = own_address else {
                 return Err(InboundRelayDenial::AddressNotTerminated);
@@ -4824,7 +4840,7 @@ impl MeshConfig {
             };
         }
 
-        let Ok(address) = host.parse::<std::net::IpAddr>() else {
+        let Some(address) = parsed else {
             return Err(InboundRelayDenial::UnresolvableHost);
         };
         // Canonicalize so `::ffff:10.1.2.3` and `10.1.2.3`, and the several
