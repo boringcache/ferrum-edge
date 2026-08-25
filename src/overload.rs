@@ -529,19 +529,68 @@ impl Default for OverloadConfig {
 
 // ── Resource monitors ───────────────────────────────────────────────────
 
-/// Count open file descriptors for the current process.
+/// Count open file descriptors by inspecting `path` (normally `/proc/self/fd`).
+///
+/// Prefer the kernel aggregate in `stat(2).st_size` when `path` is procfs and
+/// the size is non-zero (Linux 6.2+ reports `bitmap_weight` of the open-fd
+/// bitmap there; older kernels report 0). Otherwise walk the directory.
+///
+/// Do not use `FDSize` from `/proc/self/status`: that is allocated fdtable
+/// capacity (typically a power of two), not the open count, and would inflate
+/// `fd_current` enough to trip critical shedding while well under the rlimit.
+///
+/// Fail closed: if neither source is readable (for example EMFILE under
+/// descriptor exhaustion), return `u64::MAX` so FD pressure is forced critical.
 #[cfg(target_os = "linux")]
 fn count_open_fds_linux(path: &str) -> u64 {
+    if let Some(count) = linux_fd_count_from_stat(path) {
+        return count;
+    }
+    linux_fd_count_from_walk(path)
+}
+
+/// Open-FD aggregate from `stat(path).st_size` when `path` is a procfs
+/// directory and the kernel fills in a non-zero size.
+#[cfg(target_os = "linux")]
+fn linux_fd_count_from_stat(path: &str) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_dir() {
+        return None;
+    }
+    let size = meta.len();
+    // Pre-6.2 procfs reports size 0. A regular directory's st_size is the
+    // on-disk length (often 4096) — never treat that as an FD count.
+    if size == 0 || !linux_path_is_procfs(path) {
+        return None;
+    }
+    Some(size)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_path_is_procfs(path: &str) -> bool {
+    let Ok(cpath) = std::ffi::CString::new(path) else {
+        return false;
+    };
+    let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let rc = unsafe { libc::statfs(cpath.as_ptr(), buf.as_mut_ptr()) };
+    if rc != 0 {
+        return false;
+    }
+    let buf = unsafe { buf.assume_init() };
+    // linux/magic.h PROC_SUPER_MAGIC. Unsuffixed so this matches both
+    // 32-bit and 64-bit `f_type` widths without an extra cast.
+    buf.f_type == 0x9fa0
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fd_count_from_walk(path: &str) -> u64 {
     std::fs::read_dir(path)
         .map(|d| d.count() as u64)
-        // Fail closed: if we cannot inspect /proc/self/fd (for example,
-        // EMFILE under descriptor exhaustion), force critical FD pressure.
         .unwrap_or(u64::MAX)
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) fn count_open_fds() -> u64 {
-    // On Linux, /proc/self/fd is the canonical way to count open FDs.
     count_open_fds_linux("/proc/self/fd")
 }
 
@@ -849,7 +898,12 @@ pub fn start_monitor(
             }
 
             // ── FD pressure ──
-            let fd_current = count_open_fds();
+            // count_open_fds() may stat or walk /proc. Run it on the blocking
+            // pool so a large fdtable cannot stall a tokio worker — worst
+            // exactly when FDs are the problem. Join failure is fail-closed.
+            let fd_current = tokio::task::spawn_blocking(count_open_fds)
+                .await
+                .unwrap_or(u64::MAX);
             state.fd_current.store(fd_current, Ordering::Relaxed);
 
             let fd_ratio = pressure_ratio(fd_current, fd_limit);
@@ -1176,6 +1230,49 @@ mod tests {
     fn fd_count_failures_are_fail_closed() {
         let count = count_open_fds_linux("/proc/self/fd/definitely-missing");
         assert_eq!(count, u64::MAX);
+        assert_eq!(linux_fd_count_from_walk("/no/such/fd-dir"), u64::MAX);
+    }
+
+    /// When the kernel publishes an open-FD aggregate on `/proc/self/fd`
+    /// (`stat.st_size` > 0 on procfs), the sampler must use that value rather
+    /// than walking the directory or reading `FDSize` (allocated slots).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fd_count_uses_procfs_stat_aggregate_when_available() {
+        let counted = count_open_fds();
+        assert!(counted > 0, "Process should have at least some open FDs");
+        assert_ne!(counted, u64::MAX, "live /proc/self/fd must be readable");
+        if let Some(from_stat) = linux_fd_count_from_stat("/proc/self/fd") {
+            assert_eq!(
+                counted, from_stat,
+                "count_open_fds must prefer the procfs st_size aggregate"
+            );
+        }
+    }
+
+    /// A non-procfs directory must take the walk fallback. Using `st_size`
+    /// here would report the directory's byte length (often 4096), not the
+    /// number of entries — which would both fail this test and, in
+    /// production, trip FD-critical shedding from a bogus count.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fd_count_falls_back_to_directory_walk_off_procfs() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("0"), b"").expect("fd 0");
+        std::fs::write(dir.path().join("1"), b"").expect("fd 1");
+        std::fs::write(dir.path().join("2"), b"").expect("fd 2");
+        let path = dir.path().to_str().expect("utf8 temp path");
+        let meta_len = std::fs::metadata(path).expect("stat temp dir").len();
+        assert!(
+            linux_fd_count_from_stat(path).is_none(),
+            "non-procfs directories must not use st_size as an FD count"
+        );
+        let counted = count_open_fds_linux(path);
+        assert_eq!(counted, 3, "fallback walk must count directory entries");
+        assert_ne!(
+            counted, meta_len,
+            "must not treat a regular directory's st_size ({meta_len}) as an FD count"
+        );
     }
 
     /// `raise_fd_limit` must never return a soft cap above the hard cap, must

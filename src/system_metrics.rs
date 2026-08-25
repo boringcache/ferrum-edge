@@ -131,11 +131,27 @@ pub fn start_sampler(
 ) -> tokio::task::JoinHandle<()> {
     let metrics = crate::runtime_metrics::global();
     tokio::spawn(async move {
-        let mut sampler = SystemSampler::new();
         let interval = Duration::from_millis(sample_interval_ms.max(100));
+        // Construction reads /proc (and cgroup files). Keep it off the worker.
+        let mut sampler = match tokio::task::spawn_blocking(SystemSampler::new).await {
+            Ok(sampler) => sampler,
+            Err(_) => return,
+        };
 
         loop {
-            let snapshot = sampler.sample(proxy_state.as_ref());
+            let proxy = proxy_state.clone();
+            let sample_result = tokio::task::spawn_blocking(move || {
+                let snapshot = sampler.sample(proxy.as_ref());
+                (sampler, snapshot)
+            })
+            .await;
+            let snapshot = match sample_result {
+                Ok((next_sampler, snapshot)) => {
+                    sampler = next_sampler;
+                    snapshot
+                }
+                Err(_) => return,
+            };
             metrics.system.store(std::sync::Arc::new(snapshot));
 
             tokio::select! {
@@ -309,19 +325,44 @@ struct SystemCpuSample {
 
 #[cfg(target_os = "linux")]
 fn system_cpu_sample() -> Option<SystemCpuSample> {
-    let contents = std::fs::read_to_string("/proc/stat").ok()?;
-    let line = contents.lines().next()?;
+    use std::io::BufRead;
+
+    let file = std::fs::File::open("/proc/stat").ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    parse_system_cpu_line(&line)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_system_cpu_line(line: &str) -> Option<SystemCpuSample> {
     let mut parts = line.split_whitespace();
     if parts.next()? != "cpu" {
         return None;
     }
-    let values: Vec<u64> = parts.filter_map(|p| p.parse::<u64>().ok()).collect();
-    if values.len() < 4 {
+    let mut idle = 0u64;
+    let mut iowait = 0u64;
+    let mut total = 0u64;
+    let mut n = 0usize;
+    for part in parts {
+        let Ok(value) = part.parse::<u64>() else {
+            continue;
+        };
+        total = total.saturating_add(value);
+        if n == 3 {
+            idle = value;
+        } else if n == 4 {
+            iowait = value;
+        }
+        n += 1;
+    }
+    if n < 4 {
         return None;
     }
-    let idle = values.get(3).copied().unwrap_or(0) + values.get(4).copied().unwrap_or(0);
-    let total = values.iter().copied().sum();
-    Some(SystemCpuSample { idle, total })
+    Some(SystemCpuSample {
+        idle: idle.saturating_add(iowait),
+        total,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -610,6 +651,18 @@ mod tests {
             super::parse_ephemeral_port_range("32768\t60999"),
             (Some(32768), Some(60999), Some(28232))
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_system_cpu_line_reads_aggregate_idle_and_total() {
+        let sample = super::parse_system_cpu_line("cpu  10 20 30 40 5 1 2 3")
+            .expect("aggregate cpu line");
+        assert_eq!(sample.idle, 45);
+        assert_eq!(sample.total, 111);
+        assert!(super::parse_system_cpu_line("cpu  1 2 3").is_none());
+        assert!(super::parse_system_cpu_line("intr 0").is_none());
+        assert!(super::parse_system_cpu_line("").is_none());
     }
 
     #[cfg(unix)]
