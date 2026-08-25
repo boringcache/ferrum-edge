@@ -52,7 +52,10 @@ fn per_ip_websocket_session_rejects_when_limit_is_exhausted() {
     );
 
     let second = try_acquire_per_ip_websocket_session(Some(&counts), "198.51.100.1", 1);
-    assert_eq!(second.unwrap_err(), PerIpWebSocketLimitExceeded);
+    assert!(
+        matches!(second, Err(PerIpWebSocketLimitExceeded)),
+        "a second session from the same source must be refused"
+    );
     assert_eq!(
         counts
             .get("198.51.100.1")
