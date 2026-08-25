@@ -611,6 +611,61 @@ namespace this process does not serve, and writes in CP/file/DP modes, do not
 wait. External writers still become live on the next poll interval or
 change-stream wake.
 
+Every database-mode config mutation that captures a covering cursor also
+returns it as `X-Ferrum-Config-Cursor: {topology_epoch}:{sequence}` — on
+synchronous 2xx (the proven-live generation), on deferred `202` (below), and
+on the committed-but-not-live `503` (so a caller can keep gating on
+`GET /config/apply-status` instead of guessing whether a durable commit
+converged). Cursors are monotone per topology epoch.
+
+### Deferred apply for bulk provisioning (`?apply=async`)
+
+The synchronous contract pays one poll-loop reload per mutation, and reload
+cost grows with total config size — the wrong shape for bulk provisioning or
+high-churn automation. `?apply=async` (issue #4139) is the explicit opt-out on
+config mutations (proxies, consumers, upstreams, plugin configs, credentials,
+gateway trust bundles, API specs, `/batch`, `/restore` — not `/namespaces`):
+
+- The mutation commits durably and the covering cursor is still captured
+  fail-closed under the write pins (a capture failure is the same truthful
+  `503 sequence_unavailable` as the sync path).
+- The response is **`202 Accepted`** with the normal success body plus the
+  cursor header. A 202 never claims the generation is live.
+- The write still raises a coalesced immediate poll wake, so background
+  convergence does not sit on `FERRUM_DB_POLL_INTERVAL`; a stream of deferred
+  writes produces back-to-back polls that each absorb everything committed
+  since the previous watermark.
+- Request-level validation (400s) still happens synchronously; only
+  graph-level poll rejections are deferred to the status endpoint. Deferred
+  mode therefore trades per-write rejection attribution for throughput — a
+  rejected poll fails the whole pending range coarsely.
+- In CP/file/DP modes, and for writes to a namespace this process does not
+  serve, `apply=async` is accepted and has no effect (those writes never
+  wait). Exactly one occurrence of `sync` or `async` is accepted; anything
+  else is `400`.
+
+### `GET /config/apply-status`
+
+Operator-gated (not namespace-scoped — cursors are process-topology values).
+Query: `epoch`, `sequence` (both required u64s), optional `wait_ms`
+(0–30000). Classifies the cursor without touching the database:
+
+- `applied` — an accepted generation covers the cursor; every write at or
+  below it is live on this process.
+- `pending` — not yet accepted or rejected. A blocking probe that elapses
+  also returns `pending`; retry harmlessly with the same cursor.
+- `rejected` — a completed poll attempted a covering sequence and the runtime
+  rejected the candidate. Fail-closed: durable but not live.
+- `unverifiable` — the cursor's topology was replaced
+  (failover/reconnect/restart) or was never issued by this process; observe
+  config directly instead.
+
+With `wait_ms`, the probe registers as a live-apply waiter and inherits the
+immediate poll nudge. The bulk recipe: POST every chunk with `apply=async`,
+keep the **last** cursor header, then issue one blocking
+`GET /config/apply-status?epoch=E&sequence=S&wait_ms=30000` — a single reload
+proves the whole batch live, instead of one reload per write.
+
 ## Consumers
 
 Consumer identity is one keyspace per namespace: `id`, `username`, and `custom_id` must all be mutually unique across every consumer in a namespace (a consumer whose own `custom_id` equals its own `id`/`username` is fine). Cross-field collisions — e.g. one consumer's `username` equalling another's `custom_id` — are rejected with `409 Conflict`, enforced both by the admission precheck and by a persistence-level unique constraint (`consumer_identity_index`), so concurrent writes cannot race a collision in. Consumer `id` values are scoped per namespace: the same id may exist in two namespaces.

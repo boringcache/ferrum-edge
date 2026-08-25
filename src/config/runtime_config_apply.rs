@@ -33,6 +33,52 @@ use crate::config::config_change_watch::ConfigChangeWakeSignal;
 /// to publish the committed generation. Cache rebuilds share this budget.
 pub const ADMIN_WRITE_LIVE_APPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How a database-mode admin mutation completes relative to the poll-loop
+/// apply (issue #4139).
+///
+/// `Sync` is the default read-your-write contract from issue #3926: 2xx only
+/// after the poll loop publishes a covering generation. `Deferred` is the
+/// explicit bulk-provisioning opt-in (`?apply=async`): the mutation commits
+/// durably, the covering cursor is still captured fail-closed under the write
+/// pins, but the handler answers `202 Accepted` with the cursor instead of
+/// waiting. The client proves convergence later through
+/// `GET /config/apply-status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LiveApplyMode {
+    #[default]
+    Sync,
+    Deferred,
+}
+
+/// Classification of a captured cursor against the coordinator's published
+/// snapshot (issue #4139). Closed static labels for the
+/// `GET /config/apply-status` JSON `state` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveApplyCursorState {
+    /// The poll loop accepted a generation covering the cursor.
+    Applied,
+    /// No covering generation has been accepted or rejected yet.
+    Pending,
+    /// A completed poll attempted a sequence covering the cursor and rejected
+    /// the candidate. Fail-closed: the write range is not live.
+    Rejected,
+    /// The cursor's topology was replaced (failover/reconnect/restart), so
+    /// liveness can no longer be proven from this process. Observe config
+    /// directly instead.
+    Unverifiable,
+}
+
+impl LiveApplyCursorState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Pending => "pending",
+            Self::Rejected => "rejected",
+            Self::Unverifiable => "unverifiable",
+        }
+    }
+}
+
 /// Why a committed mutation is not live. Closed static labels for OpenAPI /
 /// JSON `reason` — never a resource id, namespace, or driver error string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,6 +371,30 @@ impl RuntimeConfigApply {
         }
     }
 
+    /// Classify `cursor` against the published snapshot without waiting and
+    /// without registering a waiter (issue #4139). Never reads the database;
+    /// pair it with a process-topology check when the caller must distinguish
+    /// a genuinely pending cursor from one minted by a different process.
+    pub fn cursor_state(&self, cursor: LiveApplyCursor) -> LiveApplyCursorState {
+        match classify_snapshot(*self.snapshot.borrow(), cursor) {
+            Some(Ok(())) => LiveApplyCursorState::Applied,
+            Some(Err(LiveApplyFailure::ConfigRejected)) => LiveApplyCursorState::Rejected,
+            Some(Err(_)) => LiveApplyCursorState::Unverifiable,
+            None => LiveApplyCursorState::Pending,
+        }
+    }
+
+    /// Coalesced immediate poll wake for a deferred (`?apply=async`) mutation
+    /// (issue #4139). The writer does not register as a waiter — nothing
+    /// blocks on this write — but background convergence must not sit on
+    /// `FERRUM_DB_POLL_INTERVAL` either. Extra signals raised while a poll is
+    /// in flight coalesce onto the next wake, so a bulk stream of deferred
+    /// writes produces back-to-back polls that each absorb everything
+    /// committed since the previous watermark.
+    pub fn signal_deferred_mutation(&self) {
+        self.wake.signal_immediate();
+    }
+
     /// Wait until the poll loop has accepted a generation covering `sequence`
     /// or a truthful failure is known. `sequence` must already have been
     /// captured under the write-topology pin; this method never reads the
@@ -339,6 +409,19 @@ impl RuntimeConfigApply {
     pub async fn await_committed_cursor(
         &self,
         cursor: LiveApplyCursor,
+    ) -> Result<(), LiveApplyFailure> {
+        self.await_committed_cursor_with_timeout(cursor, self.timeout)
+            .await
+    }
+
+    /// [`Self::await_committed_cursor`] with an explicit wait budget, for
+    /// `GET /config/apply-status?wait_ms=` (issue #4139). Callers must clamp
+    /// `wait` to at most [`ADMIN_WRITE_LIVE_APPLY_TIMEOUT`]-scale budgets; the
+    /// coordinator does not re-clamp so tests can exercise short waits.
+    pub async fn await_committed_cursor_with_timeout(
+        &self,
+        cursor: LiveApplyCursor,
+        wait: Duration,
     ) -> Result<(), LiveApplyFailure> {
         if let Some(result) = classify_snapshot(*self.snapshot.borrow(), cursor) {
             return result;
@@ -360,7 +443,7 @@ impl RuntimeConfigApply {
         self.wake.signal_immediate();
 
         let mut rx = self.snapshot.subscribe();
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + wait;
         loop {
             {
                 let snap = *rx.borrow();

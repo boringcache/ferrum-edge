@@ -25,6 +25,7 @@ use crate::config::db_backend::{
 };
 use crate::config::db_loader::{is_proxy_plugin_association_load_error, is_row_decode_rejection};
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
+use crate::config::runtime_config_apply::LiveApplyMode;
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, validate_resource_id,
 };
@@ -2387,8 +2388,17 @@ pub(crate) async fn handle_create<R: AdminResource>(
     actor: &AuditActor,
     body: &[u8],
     namespace: &str,
+    apply_mode: LiveApplyMode,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    handle_write::<R>(state, actor, body, namespace, WriteAction::Create).await
+    handle_write::<R>(
+        state,
+        actor,
+        body,
+        namespace,
+        WriteAction::Create,
+        apply_mode,
+    )
+    .await
 }
 
 pub(crate) async fn handle_update<R: AdminResource>(
@@ -2397,8 +2407,17 @@ pub(crate) async fn handle_update<R: AdminResource>(
     id: &str,
     body: &[u8],
     namespace: &str,
+    apply_mode: LiveApplyMode,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    handle_write::<R>(state, actor, body, namespace, WriteAction::Update { id }).await
+    handle_write::<R>(
+        state,
+        actor,
+        body,
+        namespace,
+        WriteAction::Update { id },
+        apply_mode,
+    )
+    .await
 }
 
 /// Parse `cleanup_orphaned_upstream` from `DELETE /proxies/{id}`.
@@ -2441,6 +2460,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
     id: &str,
     namespace: &str,
     query: Option<&str>,
+    apply_mode: LiveApplyMode,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -2516,6 +2536,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
                         namespace,
                         _write_permit,
                         super::empty_response(StatusCode::NO_CONTENT),
+                        apply_mode,
                     )
                     .await),
                 Ok(false) => Ok(not_found_response::<R>()),
@@ -2582,6 +2603,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
                 namespace,
                 _write_permit,
                 super::empty_response(StatusCode::NO_CONTENT),
+                apply_mode,
             )
             .await),
         Ok(false) => Ok(not_found_response::<R>()),
@@ -4756,6 +4778,7 @@ async fn handle_write<R: AdminResource>(
     body: &[u8],
     namespace: &str,
     action: WriteAction<'_>,
+    apply_mode: LiveApplyMode,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -5052,6 +5075,7 @@ async fn handle_write<R: AdminResource>(
             namespace,
             _write_permit,
             super::json_response(status, &body),
+            apply_mode,
         )
         .await)
 }

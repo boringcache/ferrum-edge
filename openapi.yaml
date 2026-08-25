@@ -2084,6 +2084,76 @@ paths:
           $ref: "#/components/responses/Unauthorized"
 
   # ── Cluster Status ───────────────────────────────────────────────────
+  /config/apply-status:
+    get:
+      operationId: getConfigApplyStatus
+      summary: Classify a live-apply cursor (database mode)
+      description: |
+        Classifies a previously returned `X-Ferrum-Config-Cursor` against the
+        database-mode poll-loop coordinator (issue #4139): `applied`,
+        `pending`, `rejected`, or `unverifiable`. With `wait_ms`, blocks
+        (bounded) until the cursor resolves, registering as a live-apply
+        waiter so it inherits the immediate poll nudge — this is how a bulk
+        `?apply=async` client converges with one reload instead of one per
+        write. Never reads the database; discloses only sequence numbers and
+        topology epochs. Requires the `operator` role or above. Not
+        namespace-scoped: cursors are process-topology values, not
+        tenant-addressed resources.
+      tags: [System]
+      parameters:
+        - name: epoch
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: uint64
+          description: Topology epoch half of the cursor (`{epoch}:{sequence}`).
+        - name: sequence
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: uint64
+          description: Change-log sequence half of the cursor.
+        - name: wait_ms
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: uint64
+            minimum: 0
+            maximum: 30000
+          description: |
+            Bounded blocking wait in milliseconds. `0` or omitted classifies
+            without waiting. Values above 30000 (the synchronous mutation
+            path's own wait budget) are rejected with `400` so a status probe
+            can never out-wait a synchronous write. A wait that elapses
+            returns `200` with `state: pending` — retry harmlessly with the
+            same cursor.
+      responses:
+        "200":
+          description: Cursor classification
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApplyStatusResponse"
+        "400":
+          description: Missing/duplicate/non-integer `epoch` or `sequence`, or `wait_ms` above 30000
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: No poll-loop coordinator in this mode (CP/file/DP, or database mode without an active poll loop)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /cluster:
     get:
       operationId: getClusterStatus
@@ -4133,7 +4203,11 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/BatchCreateRequest"
+      parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "201":
           description: |
             All resources created successfully. In database mode the committed
@@ -4376,6 +4450,7 @@ paths:
         (generated via `GET /backup?resources=proxies`, etc.).
       tags: [Backup & Restore]
       parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
         - name: confirm
           in: query
           required: true
@@ -4401,6 +4476,8 @@ paths:
             schema:
               $ref: "#/components/schemas/RestoreRequest"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Configuration restored successfully
           content:
@@ -4597,7 +4674,11 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/ProxyCreate"
+      parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "201":
           description: |
             Proxy created. In database mode a covering `config_changes`
@@ -4669,7 +4750,11 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/ProxyCreate"
+      parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: |
             Proxy updated. In database mode a covering `config_changes`
@@ -4736,8 +4821,11 @@ paths:
         mutation; configure a replica set and retry.
       tags: [Proxies]
       parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
         - $ref: "#/components/parameters/CleanupOrphanedUpstream"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Proxy deleted
         "400":
@@ -4822,7 +4910,11 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/ConsumerCreate"
+      parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "201":
           description: Consumer created
           content:
@@ -4892,7 +4984,11 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/ConsumerUpdate"
+      parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Consumer updated
           content:
@@ -4928,7 +5024,11 @@ paths:
         policy. A consumer named only in `disallowed_consumers` can still be
         deleted.
       tags: [Consumers]
+      parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Consumer deleted
         "401":
@@ -4980,6 +5080,7 @@ paths:
           description: >-
             Built-in credential type to replace. Matches runtime
             `ALLOWED_CREDENTIAL_TYPES`; any other path segment returns `400`.
+        - $ref: "#/components/parameters/LiveApplyMode"
       requestBody:
         required: true
         content:
@@ -4996,6 +5097,8 @@ paths:
                 - password: s3cret
                 - key: my-api-key-value
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Credentials updated — returns full consumer object
           content:
@@ -5040,6 +5143,7 @@ paths:
           description: >-
             Built-in credential type to append to. Matches runtime
             `ALLOWED_CREDENTIAL_TYPES`; any other path segment returns `400`.
+        - $ref: "#/components/parameters/LiveApplyMode"
       requestBody:
         required: true
         content:
@@ -5047,6 +5151,8 @@ paths:
             schema:
               $ref: "#/components/schemas/ConsumerCredentialInput"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Credential appended — returns full consumer object
           content:
@@ -5097,7 +5203,10 @@ paths:
             whole-Consumer `PUT` preserves — is addressable here. `PUT` and
             `POST` on this path advertise only `BuiltInCredentialType`; this
             `DELETE` parameter stays the broader `CredentialTypeName`.
+        - $ref: "#/components/parameters/LiveApplyMode"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Credential removed
         "400":
@@ -5144,7 +5253,11 @@ paths:
         Removes a single credential entry at the given index. When the array
         becomes empty after removal, the credential type is removed.
       tags: [Consumers]
+      parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Credential entry removed — returns full consumer object
           content:
@@ -5322,7 +5435,11 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/PluginConfigCreate"
+      parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "201":
           description: Plugin configuration created
           content:
@@ -5380,7 +5497,11 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/PluginConfigCreate"
+      parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Plugin configuration updated
           content:
@@ -5406,7 +5527,11 @@ paths:
       operationId: deletePluginConfig
       summary: Delete a plugin configuration
       tags: [Plugins]
+      parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Plugin configuration deleted
         "400":
@@ -5475,7 +5600,11 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/UpstreamCreate"
+      parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "201":
           description: Created upstream
           content:
@@ -5531,7 +5660,11 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/UpstreamCreate"
+      parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Updated upstream
           content:
@@ -5565,7 +5698,11 @@ paths:
         opposite of `DELETE /proxies/{id}`, which orphan-cleans a last-referenced
         hand-owned upstream by default unless `cleanup_orphaned_upstream=false`.
       tags: [Upstreams]
+      parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Upstream deleted
         "401":
@@ -5653,7 +5790,11 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/GatewayTrustBundleCreate"
+      parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "201":
           description: Created gateway trust bundle
           content:
@@ -5732,7 +5873,11 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/GatewayTrustBundleCreate"
+      parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Updated gateway trust bundle
           content:
@@ -5767,7 +5912,11 @@ paths:
         from "no change" on the wire: subscribed data planes receive an explicit
         clear on the ConfigSync trust side channel and withdraw the roots.
       tags: [Gateway Trust]
+      parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Gateway trust bundle deleted
         "400":
@@ -6377,6 +6526,7 @@ paths:
         contract, worked examples, and curl recipes.
       tags: [API Specs]
       parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
         - name: X-Ferrum-Namespace
           in: header
           required: false
@@ -6422,6 +6572,8 @@ paths:
             schema:
               type: string
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "201":
           description: Spec accepted; proxy, upstream, and plugins created
           headers:
@@ -6626,6 +6778,7 @@ paths:
         This mutation requires the `admin` role.
       tags: [API Specs]
       parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
         - name: X-Ferrum-Namespace
           in: header
           required: false
@@ -6653,6 +6806,8 @@ paths:
             schema:
               type: string
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Spec replaced; spec-owned resources recreated
           content:
@@ -6759,6 +6914,7 @@ paths:
         This mutation requires the `admin` role.
       tags: [API Specs]
       parameters:
+        - $ref: "#/components/parameters/LiveApplyMode"
         - name: X-Ferrum-Namespace
           in: header
           required: false
@@ -6766,6 +6922,8 @@ paths:
             type: string
           description: Namespace to operate in.
       responses:
+        "202":
+          $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Spec and spec-owned resources deleted
         "401":
@@ -6982,6 +7140,34 @@ components:
         any proxy or `mesh_route_dispatch` plugin still references the
         upstream and never cascades.
 
+    LiveApplyMode:
+      name: apply
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: [sync, async]
+        default: sync
+      description: |
+        How this config-database mutation completes relative to the poll-loop
+        apply (issue #4139). `sync` (default) keeps the issue #3926
+        read-your-write contract: 2xx only after a covering `config_changes`
+        generation is live on this process. `async` is the explicit
+        bulk-provisioning opt-in: the mutation commits durably, the covering
+        cursor is still captured fail-closed under the write pins, and the
+        response is `202 Accepted` with an `X-Ferrum-Config-Cursor` header
+        instead of waiting — one blocking `GET /config/apply-status` on the
+        last cursor then proves every prior deferred write live with a single
+        reload. Request-level validation (`400`) still happens synchronously;
+        only graph-level poll rejections are deferred to the status endpoint.
+
+        Exactly one occurrence of the exact string `sync` or `async` is
+        accepted; any other value or a duplicate returns `400`, because this
+        flag decides whether 2xx still means live. In CP/file/DP modes, and
+        for writes to a namespace this process does not serve, the parameter
+        is accepted and has no effect (those writes never wait). Namespace
+        registry mutations (`/namespaces`) do not accept it.
+
     PaginationOffset:
       name: offset
       in: query
@@ -7028,6 +7214,22 @@ components:
       schema:
         type: string
         enum: [cached]
+
+    X-Ferrum-Config-Cursor:
+      description: |
+        Covering live-apply cursor of a config-database mutation, as
+        `{topology_epoch}:{sequence}` (issue #4139). Present on database-mode
+        mutation responses when this process serves the written namespace —
+        on synchronous 2xx (the proven-live generation), on deferred `202`
+        (the cursor to prove later), and on the committed-but-not-live `503`
+        (so the caller can keep gating on `GET /config/apply-status` instead
+        of guessing whether the durable commit converged). Cursors are
+        monotone per topology epoch, so a bulk client only needs to keep the
+        last one it saw.
+      required: false
+      schema:
+        type: string
+        pattern: '^[0-9]+:[0-9]+$'
 
   # ── Reusable responses ─────────────────────────────────────────────
   responses:
@@ -7190,6 +7392,20 @@ components:
               FERRUM_MONGO_REPLICA_SET (or a ?replicaSet= URL option) so
               namespace create/rename/delete can commit all-or-nothing with a
               commit-boundary admission check. Nothing was modified.
+    AcceptedDeferred:
+      description: |
+        The mutation was requested with `?apply=async` (issue #4139): the
+        write is durably committed and the covering live-apply cursor was
+        captured, but no reload was awaited, so this response deliberately
+        does NOT claim the generation is live. The response body is the same
+        as the synchronous success body. Prove convergence with
+        `GET /config/apply-status` using the `X-Ferrum-Config-Cursor` header.
+        Only returned in database mode when this process serves the written
+        namespace; otherwise `?apply=async` is a no-op and the synchronous
+        success status is returned.
+      headers:
+        X-Ferrum-Config-Cursor:
+          $ref: "#/components/headers/X-Ferrum-Config-Cursor"
     NotImplemented:
       description: Capability is not available in this build
       content:
@@ -7315,6 +7531,45 @@ components:
             - config_rejected
             - reload_timeout
             - sequence_unavailable
+
+    ApplyStatusResponse:
+      type: object
+      required:
+        [topology_epoch, sequence, state, accepted_topology_epoch, accepted_sequence]
+      properties:
+        topology_epoch:
+          type: integer
+          format: uint64
+          description: Echo of the queried cursor's topology epoch.
+        sequence:
+          type: integer
+          format: uint64
+          description: Echo of the queried cursor's change-log sequence.
+        state:
+          type: string
+          description: |
+            Fail-closed classification of the queried cursor against the
+            poll-loop coordinator (issue #4139). `applied`: an accepted
+            generation covers the cursor — every write at or below it is
+            live on this process. `pending`: not yet accepted or rejected.
+            `rejected`: a completed poll attempted a covering sequence and
+            the runtime rejected the candidate; the write range is durable
+            but not live. `unverifiable`: the cursor's topology was replaced
+            (failover/reconnect/restart) or was never issued by this
+            process — liveness can no longer be proven here; observe config
+            directly instead.
+          enum: [applied, pending, rejected, unverifiable]
+        accepted_topology_epoch:
+          type: integer
+          format: uint64
+          description: Topology epoch of the coordinator's accepted cursor.
+        accepted_sequence:
+          type: integer
+          format: uint64
+          description: |
+            Highest change-log sequence the poll loop has accepted in the
+            accepted topology epoch. Diagnostic: shows convergence progress
+            for pending cursors.
 
     AcmeCertificateRecordListResponse:
       type: object
