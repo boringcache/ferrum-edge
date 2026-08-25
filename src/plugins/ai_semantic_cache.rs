@@ -2756,9 +2756,13 @@ fn append_family_generation_controls(
                 ("max_output_tokens", "mot"),
                 ("max_new_tokens", "mnt"),
             ] {
-                if let Some(max_tokens) = body.get(field).and_then(|t| t.as_u64()) {
+                if let Some(max_tokens) = body.get(field) {
                     start_key_part(key_input, has_part);
-                    let _ = write!(key_input, "{prefix}:{max_tokens}");
+                    let _ = write!(
+                        key_input,
+                        "{prefix}:{}",
+                        canonical_param_value(max_tokens)
+                    );
                 }
             }
             if matches!(family, CacheRequestFamily::Messages) {
@@ -2822,10 +2826,12 @@ fn append_family_shape_fields(
 
     // `stream`: stream:true and stream:false produce different wire formats
     // (SSE vs single JSON), so cached non-stream responses must not be
-    // replayed to a stream:true caller (or vice versa).
-    if let Some(stream) = body.get("stream").and_then(|s| s.as_bool()) {
+    // replayed to a stream:true caller (or vice versa). Accept any JSON
+    // encoding (`true`, `1`, `"true"`) so non-bool forms cannot collapse with
+    // an absent `stream` field.
+    if let Some(stream) = body.get("stream") {
         start_key_part(key_input, has_part);
-        let _ = write!(key_input, "stream:{stream}");
+        let _ = write!(key_input, "stream:{}", canonical_json_for_key(stream));
     }
 }
 
@@ -2882,7 +2888,7 @@ fn append_family_conversation_state(
         CacheRequestFamily::Cohere => {
             key_input.push_str("cohere:");
             if let Some(history) = body.get("chat_history") {
-                append_object_array_state(history, &["message", "content"], key_input)?;
+                append_object_array_state(history, &["message"], key_input)?;
             } else {
                 key_input.push_str("no_history;");
             }
@@ -3103,11 +3109,11 @@ fn append_family_prompt_exact_key(
                     append_len_prefixed(key_input, role);
                     append_len_prefixed(
                         key_input,
-                        &canonical_json_for_key(
-                            msg.get("message")
-                                .or_else(|| msg.get("content"))
-                                .unwrap_or(&Value::Null),
-                        ),
+                        &canonical_json_for_key(msg.get("message").unwrap_or(&Value::Null)),
+                    );
+                    append_len_prefixed(
+                        key_input,
+                        &canonical_json_for_key(msg.get("content").unwrap_or(&Value::Null)),
                     );
                 }
             }
@@ -3445,18 +3451,30 @@ fn build_family_semantic_input(family: CacheRequestFamily, body: &Value) -> Opti
                     if role.eq_ignore_ascii_case("system") {
                         continue;
                     }
-                    let content = msg
+                    let message_text = msg
                         .get("message")
-                        .or_else(|| msg.get("content"))
                         .and_then(|c| c.as_str())
-                        .unwrap_or("");
-                    let normalized = normalize_text(content);
-                    if normalized.is_empty() {
+                        .map(normalize_text)
+                        .unwrap_or_default();
+                    let content_text = msg
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .map(normalize_text)
+                        .unwrap_or_default();
+                    if message_text.is_empty() && content_text.is_empty() {
                         continue;
                     }
                     push_ascii_lowercase(&mut input, role);
                     input.push_str(": ");
-                    input.push_str(&normalized);
+                    if !message_text.is_empty() {
+                        input.push_str(&message_text);
+                    }
+                    if !content_text.is_empty() {
+                        if !message_text.is_empty() {
+                            input.push('\x1e');
+                        }
+                        input.push_str(&content_text);
+                    }
                     input.push('\n');
                 }
             }
