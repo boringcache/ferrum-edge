@@ -2436,6 +2436,20 @@ LIVE_SUITE_RELEVANCE_CONTRACTS = {
         "ambient-host-udp",
         "ambient-host-udp",
     ),
+    "cni-lifecycle-live.yml": (
+        "changes",
+        "cni-lifecycle-live",
+        "CNI lifecycle trigger",
+        "cni-lifecycle",
+        "cni-lifecycle",
+    ),
+    "istio-status-cas-live.yml": (
+        "changes",
+        "istio-status-cas-live",
+        "Istio status CAS trigger",
+        "istio-status-cas",
+        "istio-status-cas",
+    ),
     "mesh-e2e-sidecar-live.yml": (
         "changes",
         "mesh-e2e-sidecar-live",

@@ -198,31 +198,6 @@ jobs:
           fi
           git cat-file blob "$entry_object" > "$trusted_filter"
 
-          # Bootstrap handshake for issue #3908. ONE-WAY and temporary: this
-          # workflow and the `istio-status-cas` entry in the classifier land in the
-          # same commit, so while the introducing pull request is open the
-          # TRUSTED copy extracted above still predates the suite name and
-          # rejects it with an argparse usage error. That is a hard failure
-          # rather than a skip, but it is indistinguishable from a broken
-          # classifier, so ask the trusted copy which suites it knows and force
-          # this one to RUN when it cannot classify it. The verdict is never
-          # taken from the pull request's own checkout, and every OTHER failure
-          # below still fails the job closed. Delete this block once the
-          # classifier suite is on the trusted base.
-          if ! trusted_suites="$(python3 -I "$trusted_filter" --list-suites)"; then
-            trusted_suites=""
-          fi
-          if ! printf '%s\n' "$trusted_suites" | grep -Fqx -- 'istio-status-cas'; then
-            echo "relevant=true" >> "$GITHUB_OUTPUT"
-            {
-              echo "## Istio status CAS trigger"
-              echo ""
-              echo "Trusted base ${trusted_sha} predates the \`istio-status-cas\` classifier"
-              echo "suite, so relevance cannot be decided there. Running the suite."
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
           if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
             git diff --name-only --no-renames "${trusted_sha}...HEAD" \
               | sort > "$changed_files"
