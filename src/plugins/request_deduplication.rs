@@ -1183,18 +1183,20 @@ impl RequestDeduplication {
 
         // Build optional Redis client
         let default_prefix = default_redis_key_prefix(http_client.namespace());
-        let redis_client =
-            RedisConfig::from_plugin_config(config, &default_prefix)?.map(|redis_config| {
+        let redis_client = match RedisConfig::from_plugin_config(config, &default_prefix)? {
+            Some(redis_config) => {
                 let dns_cache = http_client.dns_cache();
                 let tls_no_verify = http_client.tls_no_verify();
                 let tls_ca_bundle_path = http_client.tls_ca_bundle_path();
-                Arc::new(RedisRateLimitClient::new(
+                Some(Arc::new(RedisRateLimitClient::new(
                     redis_config,
                     dns_cache.cloned(),
                     tls_no_verify,
                     tls_ca_bundle_path,
-                ))
-            });
+                )?))
+            }
+            None => None,
+        };
 
         let compatibility = RequestDeduplicationCompatibility {
             header_name: header_name.clone(),

@@ -1170,18 +1170,20 @@ impl AiSemanticCache {
         // the root allowlist above; the shared parser does not close the object
         // so other Redis-backed plugins keep their own root keys.
         let default_redis_prefix = default_redis_key_prefix(http_client.namespace());
-        let redis_client =
-            RedisConfig::from_plugin_config(config, &default_redis_prefix)?.map(|redis_config| {
+        let redis_client = match RedisConfig::from_plugin_config(config, &default_redis_prefix)? {
+            Some(redis_config) => {
                 let dns_cache = http_client.dns_cache();
                 let tls_no_verify = http_client.tls_no_verify();
                 let tls_ca_bundle_path = http_client.tls_ca_bundle_path();
-                Arc::new(RedisRateLimitClient::new(
+                Some(Arc::new(RedisRateLimitClient::new(
                     redis_config,
                     dns_cache.cloned(),
                     tls_no_verify,
                     tls_ca_bundle_path,
-                ))
-            });
+                )?))
+            }
+            None => None,
+        };
 
         // Redis envelopes must be authenticated. Fail closed when Redis mode is
         // enabled without a narrowly scoped integrity secret; there is no

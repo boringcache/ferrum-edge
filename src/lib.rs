@@ -4958,7 +4958,9 @@ pub mod _test_support {
 
     /// Redis key a rate-limit window bucket would use, for hash-tag coverage.
     pub fn redis_slot_key(config: RedisConfig, rate_key: &str, suffix: &[&str]) -> String {
-        RedisRateLimitClient::new(config, None, false, None).make_slot_key(rate_key, suffix)
+        RedisRateLimitClient::new(config, None, false, None)
+            .expect("construction without a CA path must succeed")
+            .make_slot_key(rate_key, suffix)
     }
 
     pub fn redis_config_url_with_ip(config: &RedisConfig, ip: std::net::IpAddr) -> String {
@@ -4975,7 +4977,8 @@ pub mod _test_support {
         config: RedisConfig,
         url: &str,
     ) -> Result<(Option<String>, Option<String>), String> {
-        let client = RedisRateLimitClient::new(config, None, false, None);
+        let client = RedisRateLimitClient::new(config, None, false, None)
+            .expect("construction without a CA path must succeed");
         let redis_client = client.build_client(url).map_err(|e| e.to_string())?;
         let info = redis_client.get_connection_info();
         Ok((
@@ -4993,7 +4996,7 @@ pub mod _test_support {
         url: &str,
         tls_no_verify: bool,
     ) -> Result<bool, String> {
-        let client = RedisRateLimitClient::new(config, None, tls_no_verify, None);
+        let client = RedisRateLimitClient::new(config, None, tls_no_verify, None)?;
         let redis_client = client.build_client(url).map_err(|e| e.to_string())?;
         match redis_client.get_connection_info().addr() {
             redis::ConnectionAddr::TcpTls { insecure, .. } => Ok(*insecure),
@@ -5003,6 +5006,15 @@ pub mod _test_support {
 
     pub fn redis_rate_limit_client_for_test(config: RedisConfig) -> RedisRateLimitClient {
         RedisRateLimitClient::new(config, None, false, None)
+            .expect("construction without a CA path must succeed")
+    }
+
+    /// Build a redis-rs client from an already-constructed Ferrum wrapper.
+    pub fn redis_build_client(client: &RedisRateLimitClient, url: &str) -> Result<(), String> {
+        client
+            .build_client(url)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     /// Deterministic Redis sliding-window index + elapsed fraction for tests.
