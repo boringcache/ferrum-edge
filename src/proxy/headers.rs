@@ -15,7 +15,10 @@
 //! Secondary-request builders (`request_mirror`, `load_testing`) call the
 //! hot-path predicates below directly (via
 //! [`is_secondary_request_strip_header`]), so newly added strip arms are
-//! honored automatically. The `*_NAMES` consts are the same inventory as the
+//! honored automatically. That boundary also takes the request's
+//! immediate-peer trust verdict so client-asserted identity is refused on a
+//! mirror / synthetic target under exactly the rule the primary backend
+//! builders apply. The `*_NAMES` consts are the same inventory as the
 //! predicates — generated together — and exist for documentation and tests
 //! that enumerate the closed set, not as a second allowlist that must be kept
 //! in sync by hand.
@@ -174,6 +177,7 @@ pub enum SecondaryRequestHostPolicy {
 ///
 /// Applies the primary backend-request strip set, every proxy forwarding
 /// identity header (the `X-Forwarded-*` family and RFC 7239 `Forwarded`),
+/// an untrusted peer's `X-Real-IP` ([`is_untrusted_real_ip_header`]),
 /// RFC 9110 `Connection`-listed names (snapshot must be taken via
 /// [`parse_connection_listed_from_str_map`] before filtering), and the
 /// caller-selected [`SecondaryRequestHostPolicy`].
@@ -183,6 +187,16 @@ pub enum SecondaryRequestHostPolicy {
 /// `X-Forwarded-*`, so a client-supplied identity cannot reach a mirror or
 /// synthetic/fan-out target even when primary RFC 7239 generation is disabled.
 ///
+/// `peer_trusted` is the request's immediate-socket-peer trust verdict — the
+/// SAME value the four primary backend builders compute from
+/// `crate::proxy::forwarding_peer_is_trusted`, carried to plugin phases on
+/// [`crate::plugins::RequestContext::forwarding_peer_trusted`]. It exists so
+/// `X-Real-IP` cannot reach a mirror / synthetic target from an untrusted
+/// socket after the primary request already refused it: the secondary boundary
+/// enforces the same client-identity trust rule the primary boundary does. A
+/// trusted peer keeps the header, matching the primary path's deliberate
+/// overwrite-only-proxy support.
+///
 /// Comparison is ASCII case-insensitive so plugin-synthesised mixed-case keys
 /// cannot bypass the boundary.
 #[inline]
@@ -190,6 +204,7 @@ pub fn is_secondary_request_strip_header(
     name: &str,
     connection_listed: &[String],
     host_policy: SecondaryRequestHostPolicy,
+    peer_trusted: bool,
 ) -> bool {
     let name_lower = name.to_ascii_lowercase();
     if host_policy == SecondaryRequestHostPolicy::Strip && name_lower == "host" {
@@ -201,6 +216,7 @@ pub fn is_secondary_request_strip_header(
     is_backend_request_strip_header(&name_lower)
         || is_proxy_generated_forwarding_header(&name_lower)
         || name_lower == "forwarded"
+        || is_untrusted_real_ip_header(&name_lower, peer_trusted)
 }
 
 /// Filter a materialised request header map for a Ferrum-generated secondary
@@ -209,13 +225,18 @@ pub fn is_secondary_request_strip_header(
 ///
 /// `extra_exclude` removes additional plugin-control names (for example
 /// load-testing trigger/fan-out headers) after the canonical strip. `Host`
-/// handling is selected via [`SecondaryRequestHostPolicy`].
+/// handling is selected via [`SecondaryRequestHostPolicy`], and `peer_trusted`
+/// gates the untrusted-`X-Real-IP` strip exactly as on primary dispatch (see
+/// [`is_secondary_request_strip_header`]). Callers must pass the request's real
+/// trust verdict — [`crate::plugins::RequestContext::forwarding_peer_trusted`]
+/// — never a hard-coded `true`.
 ///
 /// Connection-listed names are snapshotted first so dynamic hop-by-hop tokens
 /// are removed even though `connection` itself is stripped by the static set.
 pub fn filter_secondary_request_headers(
     headers: &std::collections::HashMap<String, String>,
     host_policy: SecondaryRequestHostPolicy,
+    peer_trusted: bool,
     extra_exclude: &[&str],
 ) -> Vec<(String, String)> {
     let connection_listed = parse_connection_listed_from_str_map(headers);
@@ -228,7 +249,7 @@ pub fn filter_secondary_request_headers(
             {
                 return false;
             }
-            !is_secondary_request_strip_header(name, &connection_listed, host_policy)
+            !is_secondary_request_strip_header(name, &connection_listed, host_policy, peer_trusted)
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()

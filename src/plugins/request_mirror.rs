@@ -31,8 +31,13 @@
 //!
 //! Outbound mirror headers cross the same canonical secondary-request boundary
 //! as primary backend dispatch (Connection-listed hop-by-hop, Trailer, framing,
-//! Ferrum request-only markers, and proxy-owned `X-Forwarded-*`). Forwarding
-//! identity is stripped rather than regenerated. Off-mesh mirrors omit client
+//! Ferrum request-only markers, proxy-owned `X-Forwarded-*` / `Forwarded`, and
+//! — when the immediate socket peer is not in `FERRUM_TRUSTED_PROXIES` — the
+//! client's `X-Real-IP`). Forwarding identity is stripped rather than
+//! regenerated, so a shadow destination is never told a source address the
+//! primary backend request itself refused (issue #4164); a trusted peer's
+//! `X-Real-IP` still rides, matching the primary path's deliberate support for
+//! overwrite-only front proxies. Off-mesh mirrors omit client
 //! `Host` so authority comes from the mirror URL. When `mesh_route_dispatch`
 //! has already matched the request, the mirror instead applies Istio/Envoy
 //! shadow Host/:authority semantics: dial and validate the configured mirror
@@ -2007,6 +2012,11 @@ impl Plugin for RequestMirror {
         let mut mirror_headers = filter_secondary_request_headers(
             headers,
             SecondaryRequestHostPolicy::Strip,
+            // A mirror target must never be told a forged source address. The
+            // primary backend request already refuses an untrusted peer's
+            // `X-Real-IP`; pass the same verdict so the shadow destination sees
+            // the identical client-identity boundary (issue #4164).
+            ctx.forwarding_peer_trusted,
             &[HEADER_TRIGGER_KEY, HEADER_FANOUT],
         );
         apply_mirror_credential_policy(

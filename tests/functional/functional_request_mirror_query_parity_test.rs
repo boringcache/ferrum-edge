@@ -4,6 +4,13 @@
 //! the exact raw query bytes the primary backend receives (repeated pairs,
 //! order, flags, empty values, `+`, encoded delimiters, percent escapes, and
 //! non-ASCII encoded octets).
+//!
+//! Issue #4164: the same harness proves the client-identity boundary. A shadow
+//! target must never be told a source address or gateway assertion the client
+//! chose, so `X-Real-IP` from an untrusted peer (the default — this harness
+//! sets no `FERRUM_TRUSTED_PROXIES`) and the reserved `x-consumer-*` family
+//! must be absent from the mirrored request while ordinary application headers
+//! still ride.
 
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
@@ -57,9 +64,75 @@ async fn request_mirror_primary_and_mirror_request_targets_match_on_h1_h2_h3() {
     harness.shutdown();
 }
 
+/// Untrusted-peer client identity the shadow target must never observe
+/// (issue #4164). `10.0.0.7` is chosen so a leak is unmistakable in a diff:
+/// the harness dials the gateway from loopback.
+const SPOOFED_REAL_IP: &str = "10.0.0.7";
+/// Reserved gateway-assertion header the client is not allowed to author.
+const FORGED_CONSUMER: &str = "forged-admin";
+/// Ordinary application header that MUST still reach the shadow target — the
+/// fix is a targeted identity strip, not a blanket header drop.
+const APPLICATION_HEADER: &str = "x-app-correlation";
+
+#[ignore]
+#[tokio::test]
+async fn request_mirror_does_not_forward_client_asserted_identity_to_the_shadow_target() {
+    let mut harness = MirrorQueryParityHarness::spawn().await;
+    harness.reset_captures();
+
+    let client = reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("http1 client");
+    let status = client
+        .get(harness.gateway.proxy_url("/identity?probe=1"))
+        .header("x-real-ip", SPOOFED_REAL_IP)
+        .header("x-consumer-username", FORGED_CONSUMER)
+        .header("x-consumer-custom-id", FORGED_CONSUMER)
+        .header(APPLICATION_HEADER, "keep-me")
+        .send()
+        .await
+        .expect("identity probe request")
+        .status();
+    assert_eq!(status, StatusCode::OK, "identity probe request failed");
+
+    let primary_head = harness
+        .primary
+        .wait_for_target_prefix("/identity", Duration::from_secs(5))
+        .await
+        .expect("timed out waiting for the primary backend request");
+    let mirror_head = harness
+        .mirror
+        .wait_for_target_prefix("/identity", Duration::from_secs(5))
+        .await
+        .expect("timed out waiting for the mirror request");
+
+    for (label, head) in [("primary", &primary_head), ("mirror", &mirror_head)] {
+        let lower = head.to_ascii_lowercase();
+        assert!(
+            !lower.contains("x-real-ip:"),
+            "{label} backend received a client-asserted X-Real-IP:\n{head}"
+        );
+        assert!(
+            !lower.contains(FORGED_CONSUMER),
+            "{label} backend received a client-asserted consumer identity:\n{head}"
+        );
+        assert!(
+            lower.contains(APPLICATION_HEADER),
+            "{label} backend lost an ordinary application header:\n{head}"
+        );
+    }
+
+    harness.shutdown();
+}
+
 struct CapturingBackend {
     port: u16,
     targets: Arc<Mutex<Vec<String>>>,
+    /// Complete request head (request line + field lines) of every captured
+    /// request, in arrival order. Used by the #4164 identity-boundary test.
+    heads: Arc<Mutex<Vec<String>>>,
     notify: Arc<Notify>,
     handle: Option<JoinHandle<()>>,
 }
@@ -71,14 +144,17 @@ impl CapturingBackend {
             .expect("bind capture backend");
         let port = listener.local_addr().expect("local addr").port();
         let targets = Arc::new(Mutex::new(Vec::new()));
+        let heads = Arc::new(Mutex::new(Vec::new()));
         let notify = Arc::new(Notify::new());
         let targets_task = targets.clone();
+        let heads_task = heads.clone();
         let notify_task = notify.clone();
         let handle = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((mut stream, _)) => {
                         let targets = targets_task.clone();
+                        let heads = heads_task.clone();
                         let notify = notify_task.clone();
                         tokio::spawn(async move {
                             let mut buf = Vec::new();
@@ -103,6 +179,7 @@ impl CapturingBackend {
                                 .unwrap_or("")
                                 .to_string();
                             targets.lock().expect("targets lock").push(target);
+                            heads.lock().expect("heads lock").push(head.to_string());
                             notify.notify_waiters();
                             let _ = stream
                                 .write_all(
@@ -119,6 +196,7 @@ impl CapturingBackend {
         Self {
             port,
             targets,
+            heads,
             notify,
             handle: Some(handle),
         }
@@ -128,8 +206,42 @@ impl CapturingBackend {
         self.targets.lock().expect("targets lock").first().cloned()
     }
 
+    /// First captured head whose request-line target starts with `prefix`.
+    /// Scans every capture rather than only the first so an unrelated probe
+    /// cannot shadow the request under test.
+    fn head_for_target_prefix(&self, prefix: &str) -> Option<String> {
+        self.heads
+            .lock()
+            .expect("heads lock")
+            .iter()
+            .find(|head| {
+                head.lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .is_some_and(|target| target.starts_with(prefix))
+            })
+            .cloned()
+    }
+
+    async fn wait_for_target_prefix(&self, prefix: &str, timeout: Duration) -> Option<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(head) = self.head_for_target_prefix(prefix) {
+                return Some(head);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::select! {
+                _ = self.notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    }
+
     fn clear(&self) {
         self.targets.lock().expect("targets lock").clear();
+        self.heads.lock().expect("heads lock").clear();
     }
 
     fn abort(&mut self) {

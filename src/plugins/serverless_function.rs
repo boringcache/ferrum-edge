@@ -679,6 +679,20 @@ impl ServerlessFunction {
                 // had asserted it. `ctx.headers` is the pristine ingress map and
                 // is never the outbound view; on the no-clone path the handler
                 // has already moved it into `proxy_headers`.
+                // Issue #4164: the same client-identity rule the primary and
+                // secondary request boundaries apply. An untrusted peer's
+                // `X-Real-IP` never reaches the real backend, so it must not
+                // reach a function that may treat it as authoritative either —
+                // even when an operator listed it explicitly. The gateway's own
+                // resolved address is already in the payload as `client_ip`. A
+                // trusted peer's assertion still rides, matching primary
+                // dispatch.
+                if crate::proxy::headers::is_untrusted_real_ip_header(
+                    key,
+                    ctx.forwarding_peer_trusted,
+                ) {
+                    continue;
+                }
                 if let Some(val) = proxy_headers.get(key) {
                     headers_map.insert(key.clone(), Value::String(val.clone()));
                 }
