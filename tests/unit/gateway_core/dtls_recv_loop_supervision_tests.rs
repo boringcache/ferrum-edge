@@ -8,6 +8,8 @@
 //! `_test_support` wrapper with synthetic tasks (including deliberate panics
 //! and ordinary errors) so JoinError/error classification stays deterministic
 //! without a production fault seam.
+//!
+//! Panic-inducing tests are `panic = "unwind"` only (issue #4166).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -18,6 +20,7 @@ use ferrum_edge::_test_support::{
 };
 use tokio::sync::watch;
 
+#[cfg(panic = "unwind")]
 #[tokio::test]
 async fn supervise_observes_recv_loop_panic_while_accept_would_block() {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
