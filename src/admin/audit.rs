@@ -426,7 +426,14 @@ pub struct AuditEvent {
     pub action: String,
     pub resource_type: String,
     pub resource_id: String,
+    /// Authorization-scoping namespace. Rewritten on tenant rename so history
+    /// follows the tenant and a later reuse of the old name cannot disclose it.
     pub namespace: String,
+    /// Immutable namespace identity recorded when the event was written.
+    /// Never rewritten on tenant rename. Empty for events that predate this
+    /// field.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub namespace_at_event: String,
     /// Canonical peer/source address for the admin connection. Never derived
     /// from client-spoofable forwarding headers. Empty for legacy mutation
     /// events that predate request-context capture.
@@ -472,6 +479,7 @@ impl AuditEvent {
         namespace: impl Into<String>,
         diff: Value,
     ) -> Self {
+        let namespace = namespace.into();
         Self {
             id: Uuid::new_v4().to_string(),
             ts: Utc::now(),
@@ -479,7 +487,8 @@ impl AuditEvent {
             action: action.into(),
             resource_type: resource_type.into(),
             resource_id: resource_id.into(),
-            namespace: namespace.into(),
+            namespace: namespace.clone(),
+            namespace_at_event: namespace,
             source_address: String::new(),
             request_id: String::new(),
             outcome: String::new(),
@@ -2040,6 +2049,7 @@ fn build_intent_event(inner: &mut AuditRequestSlotInner) -> Option<Option<AuditE
         resource_type: AUDIT_INTENT_RESOURCE_TYPE.to_string(),
         resource_id: inner.path.clone(),
         namespace: inner.namespace.clone(),
+        namespace_at_event: inner.namespace.clone(),
         source_address: inner.source_address.clone(),
         request_id: inner.request_id.clone(),
         outcome: String::new(),
@@ -2142,7 +2152,8 @@ async fn finalize_unconsumed_intent_with_pipeline(
         action: prepared.action,
         resource_type: AUDIT_INTENT_RESOURCE_TYPE.to_string(),
         resource_id: prepared.resource_id,
-        namespace,
+        namespace: namespace.clone(),
+        namespace_at_event: namespace,
         source_address: slot
             .with(|inner| inner.source_address.clone())
             .unwrap_or_default(),

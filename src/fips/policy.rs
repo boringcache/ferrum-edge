@@ -781,6 +781,7 @@ pub fn check_gateway_config_enforced(config: &GatewayConfig) -> Result<(), Strin
         collect_jwt_algorithm_violations(plugin, &mut jwt_violations);
         collect_non_approved_algorithm_selections(plugin, &mut algorithm_violations);
         collect_unauthenticated_peer_keys(plugin, &mut peer_verification_violations);
+        collect_redis_url_verification_fragments(plugin, &mut peer_verification_violations);
     }
 
     // ── Per-upstream and per-proxy backend peer verification ────────────
@@ -1090,6 +1091,27 @@ fn collect_unauthenticated_peer_keys(plugin: &PluginConfig, out: &mut Vec<String
                 _ => {}
             }
         }
+    }
+}
+
+/// Collect `redis_url` values that carry a URL fragment.
+///
+/// redis-rs treats `#insecure` as `ConnectionAddr::TcpTls.insecure = true`,
+/// which is a verification opt-out that is not `FERRUM_TLS_NO_VERIFY`. Plugin
+/// construction already rejects any fragment; this is the FIPS-enforce
+/// backstop so a fragment-bearing spec cannot be admitted even if a future
+/// caller bypasses `RedisConfig::from_plugin_config`. The URL itself is never
+/// interpolated — it can carry Redis ACL credentials.
+fn collect_redis_url_verification_fragments(plugin: &PluginConfig, out: &mut Vec<String>) {
+    let Some(raw) = plugin
+        .config
+        .get("redis_url")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return;
+    };
+    if raw.contains('#') {
+        out.push(format!("{}.redis_url", plugin.plugin_name));
     }
 }
 

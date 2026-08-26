@@ -78,10 +78,11 @@ info:
     than a `500`. `GET /namespaces`
     remains the backward-compatible union of registry names and derived
     resource names; ordinary resource writes isolate data but do not insert
-    registry rows. Historical audit rows are never renamed or deleted, so a
-    namespace name is a durable audit identity: reusing a deleted or renamed
-    name resumes its prior `GET /audit` history for callers authorized for that
-    name. Assign unrelated tenants fresh, previously unused names. The one-time
+    registry rows. Historical audit rows are not deleted; on rename their
+    authorization-scoping `namespace` follows the tenant so a later reuse of
+    the old name cannot expose the renamed tenant's `GET /audit` history, while
+    immutable `namespace_at_event` keeps the namespace recorded when the event
+    occurred. The one-time
     connect/migrate compatibility backfill of pre-existing derived names takes
     that same global registry lease and commits as one transaction — on SQL the
     lease row is verified and locked (`FOR UPDATE`, or SQLite's writer lock)
@@ -4043,8 +4044,10 @@ paths:
         plus unconditional security-sensitive backup export and authenticated
         backup-attempt records. Requires an admin-role JWT. Each event
         includes actor, action, resource identity, timestamp, and a JSON diff.
-        Events may also include `source_address` (canonical socket peer), a
-        bounded `request_id`, and a fixed-cardinality `outcome`. Consumer
+        Events may also include `namespace_at_event` (the namespace in effect
+        when the event was written; never rewritten on tenant rename),
+        `source_address` (canonical socket peer), a bounded `request_id`, and a
+        fixed-cardinality `outcome`. Consumer
         credential data is redacted before it is written to the audit log.
         Sensitive plugin configuration is redacted as well, through the same
         schema-aware sensitivity contract used for non-admin plugin reads:
@@ -6139,13 +6142,14 @@ paths:
         the global namespace-registry admission lease plus the source and
         target namespace leases. Those lease identities are re-verified inside
         the committing transaction, so a lost lease aborts with nothing applied
-        (`503`). Historical `audit_events` rows are immutable evidence and are
-        not rewritten: they retain the namespace identity recorded when the
-        event occurred. Reusing the old name resumes that same `GET /audit`
-        history for callers authorized for the reused name; an unrelated tenant
-        must receive a fresh, previously unused name. The rename itself may emit
-        a new audit event under the new name with a before/after diff. Rename also holds both the source
-        and target mTLS DNS admission fences (sorted, de-duplicated) and fails
+        (`503`). Historical `audit_events` rows are retained and their
+        authorization-scoping `namespace` is rewritten so they follow the
+        tenant; a later reuse of the old name cannot expose the renamed
+        tenant's `GET /audit` history. Immutable `namespace_at_event` keeps
+        the namespace recorded when the event occurred and is never rewritten.
+        The rename itself may emit a new audit event under the new name with a
+        before/after diff. Rename also holds both the source and target mTLS
+        DNS admission fences (sorted, de-duplicated) and fails
         closed if either has a restore owner; a description-only update holds
         the current name's fence. A namespace that exists only because a
         resource was written under it (no registry row) is materialized by the
@@ -8347,7 +8351,17 @@ components:
           description: Mutated resource ID
         namespace:
           type: string
-          description: Namespace selected by `X-Ferrum-Namespace`
+          description: >-
+            Authorization-scoping namespace. Matches `X-Ferrum-Namespace` at
+            write time. On tenant rename this field follows the tenant so
+            `GET /audit` for the new name returns the history and a later reuse
+            of the old name cannot.
+        namespace_at_event:
+          type: string
+          description: >-
+            Immutable namespace identity recorded when the event was written.
+            Never rewritten on tenant rename. Omitted when empty (events that
+            predate this field).
         source_address:
           type: string
           description: >-
@@ -11405,7 +11419,9 @@ components:
             unsupported. Any RESP-compatible server works.
         redis_url:
           type: string
-          description: "Redis connection URL. Required when sync_mode is 'redis'."
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL. Required when sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY."
         redis_tls:
           type: boolean
           default: false
@@ -11505,7 +11521,9 @@ components:
           description: "Datagram/byte counter storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported."
         redis_url:
           type: string
-          description: "Redis connection URL. Required when sync_mode is 'redis'."
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL. Required when sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY."
         redis_tls:
           type: boolean
           default: false
@@ -19255,8 +19273,8 @@ components:
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
-          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Required when sync_mode is 'redis'."
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY. Required when sync_mode is 'redis'."
         redis_tls:
           type: boolean
           default: false
@@ -20023,8 +20041,8 @@ components:
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
-          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Required when sync_mode is 'redis'."
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY. Required when sync_mode is 'redis'."
         redis_tls:
           type: boolean
           default: false
@@ -21360,8 +21378,8 @@ components:
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
-          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Required when sync_mode is 'redis'."
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY. Required when sync_mode is 'redis'."
         redis_tls:
           type: boolean
           default: false
@@ -23228,7 +23246,9 @@ components:
           description: "Rate limit state storage: 'local' (in-memory per instance) or 'redis' (centralized across instances). Database-backed counters are unsupported. Any RESP-compatible server works (Redis, Valkey, DragonflyDB, KeyDB, Garnet)."
         redis_url:
           type: string
-          description: "Redis connection URL (e.g., redis://host:6379/0). Required when sync_mode is 'redis'."
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL (e.g., redis://host:6379/0). Required when sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY."
         redis_tls:
           type: boolean
           default: false
@@ -25621,8 +25641,8 @@ components:
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
-          description: "Redis connection URL. Required when sync_mode is 'redis'."
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL. Required when sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY."
         redis_tls:
           type: boolean
           default: false
@@ -25757,8 +25777,8 @@ components:
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
-          description: "Redis connection URL. Required when sync_mode is 'redis'."
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL. Required when sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY."
         redis_tls:
           type: boolean
           default: false
@@ -26893,12 +26913,15 @@ components:
           description: "Storage backend: 'local' (in-memory DashMap) or 'redis' (centralized Redis)"
         redis_url:
           type: string
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
           description: >-
-            Redis connection URL (required when sync_mode is redis). URL-embedded
-            userinfo is accepted but never disclosed: connection/health-check
-            logs and non-admin/audit projections keep only the scheme, host,
-            port, and database, replace the userinfo, and remove query/fragment
-            data. Full admin reads stay raw.
+            Redis connection URL (required when sync_mode is redis). Must not
+            carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY.
+            URL-embedded userinfo is accepted but never disclosed:
+            connection/health-check logs and non-admin/audit projections keep
+            only the scheme, host, port, and database, replace the userinfo, and
+            remove query/fragment data. Full admin reads stay raw.
         redis_tls:
           type: boolean
           default: false
@@ -27174,7 +27197,9 @@ components:
           description: "Token budget storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported. Any RESP-compatible server works."
         redis_url:
           type: string
-          description: "Redis connection URL. Required when sync_mode is 'redis'."
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL. Required when sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY."
         redis_tls:
           type: boolean
           default: false
@@ -29997,8 +30022,8 @@ components:
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
-          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Required when sync_mode is 'redis'."
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY. Required when sync_mode is 'redis'."
         redis_tls:
           type: boolean
           default: false

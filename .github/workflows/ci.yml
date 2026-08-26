@@ -1266,6 +1266,7 @@ jobs:
               functional_mesh_vs_traffic_mgmt_test
               functional_otel_ldap_test
               functional_opa_key_auth_redaction_test
+              functional_opa_protocol_coverage_test
               functional_plugin_extended_test
               functional_plugin_test
               functional_mcp_gateway_batch_test
@@ -3537,7 +3538,7 @@ jobs:
           # shutdownDrainSeconds=0 is a valid skip-draining value and must render.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=file --set shutdownDrainSeconds=0 \
-            --set terminationGracePeriodSeconds=10 \
+            --set terminationGracePeriodSeconds=25 \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/shutdown-zero.yaml"
           drain_block="$(grep -A1 'name: FERRUM_SHUTDOWN_DRAIN_SECONDS' "$RUNNER_TEMP/ferrum-gateway-helm-results/shutdown-zero.yaml")"
           if ! grep -q '"0"' <<<"$drain_block"; then
@@ -3571,6 +3572,65 @@ jobs:
             --show-only templates/service-admin.yaml \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-service-tls.yaml"
           grep -Fq 'admin-https' "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-service-tls.yaml"
+          # networkPolicy is default-off; enabling it renders a split ingress policy.
+          if grep -Fq 'kind: NetworkPolicy' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"; then
+            echo "::error title=Default NetworkPolicy rendered::networkPolicy.enabled defaults to false"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            --set admin.bindAddress=0.0.0.0 --set admin.allowInsecureHttp=true \
+            --set networkPolicy.enabled=true \
+            --set-string 'networkPolicy.allowedNamespaceSelectors[0].matchLabels.kubernetes\.io/metadata\.name'=monitoring \
+            --show-only templates/networkpolicy.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/networkpolicy-insecure-admin.yaml"
+          grep -Fq 'kind: NetworkPolicy' "$RUNNER_TEMP/ferrum-gateway-helm-results/networkpolicy-insecure-admin.yaml"
+          open_block="$(awk '/^  ingress:/{f=1;next} f&&/^    - from:/{exit} f' "$RUNNER_TEMP/ferrum-gateway-helm-results/networkpolicy-insecure-admin.yaml")"
+          if ! grep -Fq 'port: 8000' <<<"$open_block"; then
+            echo "::error title=Proxy port missing from open NetworkPolicy rule::proxy HTTP must stay reachable"
+            exit 1
+          fi
+          if grep -Fq 'port: 9000' <<<"$open_block"; then
+            echo "::error title=Admin port in unrestricted NetworkPolicy rule::admin HTTP must be selector-restricted"
+            exit 1
+          fi
+          restricted_block="$(awk '/^    - from:/{f=1} f{print} f&&/port: 9000/{exit}' "$RUNNER_TEMP/ferrum-gateway-helm-results/networkpolicy-insecure-admin.yaml")"
+          if ! grep -Fq 'namespaceSelector:' <<<"$restricted_block"; then
+            echo "::error title=Admin NetworkPolicy rule missing selector::restricted ingress must name allowed peers"
+            exit 1
+          fi
+          grep -Fq 'port: 9000' <<<"$restricted_block"
+          helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
+            -f ./charts/ferrum-gateway/examples/cp-values.yaml \
+            --set grpc.allowPlaintext=true \
+            --set networkPolicy.enabled=true \
+            --set-string 'networkPolicy.allowedNamespaceSelectors[0].matchLabels.kubernetes\.io/metadata\.name'=ferrum \
+            --show-only templates/networkpolicy.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/networkpolicy-cp-grpc.yaml"
+          if grep -Fq 'port: 8000' "$RUNNER_TEMP/ferrum-gateway-helm-results/networkpolicy-cp-grpc.yaml"; then
+            echo "::error title=CP NetworkPolicy published proxy ports::cp mode has no proxy listeners"
+            exit 1
+          fi
+          grep -Fq 'port: 50051' "$RUNNER_TEMP/ferrum-gateway-helm-results/networkpolicy-cp-grpc.yaml"
+          # Fail-closed with no peers: a NetworkPolicy ingress rule with an empty
+          # `from` matches ALL sources, so the restricted rule must be OMITTED
+          # rather than rendered as `from: []` — otherwise enabling the policy
+          # would publish admin cluster-wide while appearing to restrict it.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            --set admin.bindAddress=0.0.0.0 --set admin.allowInsecureHttp=true \
+            --set networkPolicy.enabled=true \
+            --show-only templates/networkpolicy.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/networkpolicy-no-selectors.yaml"
+          if grep -Fq 'from: []' "$RUNNER_TEMP/ferrum-gateway-helm-results/networkpolicy-no-selectors.yaml"; then
+            echo "::error title=NetworkPolicy renders an empty from::an empty from matches ALL sources; omit the restricted rule instead"
+            exit 1
+          fi
+          if grep -Fq 'port: 9000' "$RUNNER_TEMP/ferrum-gateway-helm-results/networkpolicy-no-selectors.yaml"; then
+            echo "::error title=Admin port published without selectors::admin must be denied when no NetworkPolicy peers are configured"
+            exit 1
+          fi
+          grep -Fq 'port: 8000' "$RUNNER_TEMP/ferrum-gateway-helm-results/networkpolicy-no-selectors.yaml"
           # dp mode publishes the HTTPS Service port on the port alone (CP-managed TLS).
           helm template ferrum-dp ./charts/ferrum-gateway --namespace ferrum \
             -f ./charts/ferrum-gateway/examples/dp-values.yaml \
@@ -3804,11 +3864,11 @@ jobs:
           grep -F 'accepts at most one source' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-admin-jwt-conflict.err"
           # A values file may use explicit nulls to omit shutdown drain and clear the
           # PDB minAvailable default (the schema must accept null for both). The grace
-          # period must still cover the binary's 30s default drain + 5s cleanup.
+          # period must still cover the binary's full 78s default shutdown budget.
           cat > "$RUNNER_TEMP/ferrum-gateway-helm-results/null-values.yaml" <<'NULLEOF'
           mode: file
           shutdownDrainSeconds: null
-          terminationGracePeriodSeconds: 40
+          terminationGracePeriodSeconds: 80
           podDisruptionBudget:
             enabled: true
             minAvailable: null
@@ -3822,11 +3882,11 @@ jobs:
             exit 1
           fi
           # A null shutdownDrainSeconds still drains for the binary's 30s default, so a
-          # grace period below 30+5 must fail render instead of being skipped.
+          # grace period below the full 78s budget must fail render instead of being skipped.
           cat > "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.yaml" <<'NULLGRACEEOF'
           mode: file
           shutdownDrainSeconds: null
-          terminationGracePeriodSeconds: 10
+          terminationGracePeriodSeconds: 40
           NULLGRACEEOF
           if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             -f "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.yaml" \
@@ -3836,6 +3896,7 @@ jobs:
             exit 1
           fi
           grep -F 'null shutdownDrainSeconds uses the binary' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.err"
+          grep -F 'must be at least 78' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.err"
           grep -Fq 'maxUnavailable: 1' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-rendered.yaml"
           if grep -Fq 'minAvailable:' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-rendered.yaml"; then
             echo "::error title=Null minAvailable still rendered::minAvailable: null must fall through to maxUnavailable"

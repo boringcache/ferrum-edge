@@ -158,6 +158,8 @@ The client IP resolution follows these security principles:
 
 6. **The trust list itself is strict**: `FERRUM_TRUSTED_PROXIES` must parse in full. Invalid configuration fails validation and startup rather than installing a partial trust boundary.
 
+7. **Secondary requests honor the same verdict**: the peer-trust decision is latched once per request at ingress and reused by every outbound boundary, primary and secondary alike. A client-supplied `X-Real-IP` from an untrusted peer is stripped from the primary backend request *and* from the requests `request_mirror` and `load_testing` build, so a shadow target or a synthetic replay can never be told a source address the real backend refused. A trusted peer's assertion still reaches both. The reserved gateway-assertion family (`x-consumer-username`, `x-consumer-custom-id`, `x-geo-country`, `x-path-param-*`) is never accepted from client input at all, on any boundary.
+
 ### Attack Scenarios Handled
 
 | Scenario | Behavior |
@@ -174,6 +176,8 @@ The client IP resolution follows these security principles:
 | Trusted proxy overwrites XFP with one `http` or `https` value | Value becomes the original request scheme |
 | Trusted proxies append aligned XFF `client, proxy` and XFP `http, https` | Original scheme resolves to `http` at the client boundary |
 | Appended XFP is malformed or does not align with XFF | Forwarded scheme ignored; accepted frontend transport scheme retained |
+| Untrusted client sends `X-Real-IP` on a proxy running `request_mirror` | Stripped from both the primary backend request and the mirrored shadow request |
+| `load_testing` trigger holder sends a spoofed `X-Real-IP` | Stripped from the synthetic/fan-out header snapshot, so loopback replays cannot re-assert it through a trusted peer |
 
 ## Deployment Examples
 

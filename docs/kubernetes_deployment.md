@@ -493,7 +493,7 @@ spec:
       labels:
         app: ferrum-edge
     spec:
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 80
       containers:
         - name: ferrum-edge
           image: ghcr.io/ferrum-edge/ferrum-edge:latest
@@ -673,6 +673,45 @@ For CP/DP mode, keep the Control Plane private and expose only the Data Plane pr
 > `FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true` + a `NetworkPolicy` — both shown below.
 > Omit the admin Service entirely if you only need in-pod (`kubectl exec`) admin
 > access; the gRPC Service (`50051`) is independent.
+
+With the Helm chart, set `networkPolicy.enabled=true` and configure
+`networkPolicy.allowedNamespaceSelectors` / `networkPolicy.allowedPodSelectors`
+to restrict admin and CP gRPC ingress while leaving proxy ports open. Example
+manifest (adjust selectors to your scrape/admin clients):
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ferrum-edge-cp
+spec:
+  podSelector:
+    matchLabels:
+      app: ferrum-edge-cp
+  policyTypes: ["Ingress"]
+  ingress:
+    # Data-plane proxy ports (omit in cp-only installs with no proxy listeners).
+    - ports:
+        - protocol: TCP
+          port: 8000
+        - protocol: TCP
+          port: 8443
+    # Admin + CP gRPC: only from trusted namespaces/pods.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ferrum
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 9000
+        - protocol: TCP
+          port: 9443
+        - protocol: TCP
+          port: 50051
+```
 
 ### Mesh config ordering across CP replicas
 

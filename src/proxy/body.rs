@@ -2038,6 +2038,51 @@ impl UploadAuthDeadline {
     }
 }
 
+// -- Request-trailer trust boundary -------------------------------------------
+
+/// Apply the canonical backend request-trailer filter to one client request
+/// body frame on the HTTP/1.1 and HTTP/2 dispatch paths.
+///
+/// Client request trailers are read AFTER the initial header block has been
+/// stripped and sanitized (`strip_backend_request_headers`,
+/// `strip_reserved_gateway_assertion_headers`), so a malicious client can
+/// smuggle hop-by-hop fields (`connection`, `te`, ...), credentials
+/// (`authorization`, `x-api-key`), forwarding identity (`x-forwarded-*`,
+/// `forwarded`), or reserved gateway assertions (`x-consumer-*`,
+/// `x-geo-country`, `x-ferrum-*`, `x-path-param-*`) here that the gateway
+/// removed from the header block. HTTP/3 has always sanitized this boundary
+/// (`http3::client`, `http3::server`, `http3::cross_protocol`); this is the
+/// H1/H2 counterpart, and it shares the SAME predicate
+/// ([`crate::proxy::headers::sanitize_backend_request_trailers`]) so the two
+/// families cannot drift.
+///
+/// Mirrors the response-direction wrapper
+/// ([`StripHopByHopTrailers`]): non-trailer frames are returned untouched
+/// after one `is_trailers()` discriminant test, and the `Frame::trailers`
+/// shape is preserved even when the filter empties the map, because hyper's
+/// HTTP/2 writer still needs the END_STREAM trailers signal and an empty
+/// trailer block is functionally equivalent to "no trailers" on the wire.
+///
+/// Hot-path cost: one enum-discriminant test per DATA frame and nothing else.
+/// A trailer frame that is already clean allocates nothing —
+/// `sanitize_backend_request_trailers` collects the removal list into a `Vec`
+/// that stays empty, and an empty `Vec` never allocates.
+#[inline]
+pub(crate) fn sanitize_backend_request_trailer_frame(frame: Frame<Bytes>) -> Frame<Bytes> {
+    if !frame.is_trailers() {
+        return frame;
+    }
+    match frame.into_trailers() {
+        Ok(mut trailers) => {
+            crate::proxy::headers::sanitize_backend_request_trailers(&mut trailers);
+            Frame::trailers(trailers)
+        }
+        // `is_trailers()` was true, so this arm is unreachable; return the
+        // frame unchanged rather than panicking on the proxy request path.
+        Err(other) => other,
+    }
+}
+
 // -- Gateway-owned upload source ----------------------------------------------
 
 /// Where a streaming client request-body adapter reads its frames from.
@@ -2085,13 +2130,26 @@ impl UploadSource {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
-        match self {
+        let polled = match self {
             UploadSource::Direct(incoming) => {
                 let frame = std::task::ready!(http_body::Body::poll_frame(Pin::new(incoming), cx));
                 Poll::Ready(frame.map(|result| result.map_err(|e| Box::new(e) as BoxError)))
             }
             UploadSource::Pumped(pump) => pump.poll_frame(cx),
             UploadSource::Exhausted => Poll::Ready(None),
+        };
+        // The single late request-trailer trust boundary for every H1/H2
+        // streaming dispatch: `SizeLimitedIncoming`, `CountingIncoming`, and
+        // `GrpcBody::Streaming` all read their frames here, so the reqwest
+        // pool, the direct-HTTP/2 pool, the native gRPC pool, the mesh-mTLS
+        // pool, and the Unix-socket pool inherit it without a per-path copy.
+        // Applying it at the SOURCE also covers the pumped arm, whose frames
+        // come from the same client body across a bounded bridge.
+        match polled {
+            Poll::Ready(Some(Ok(frame))) => {
+                Poll::Ready(Some(Ok(sanitize_backend_request_trailer_frame(frame))))
+            }
+            other => other,
         }
     }
 
@@ -2665,7 +2723,11 @@ impl http_body::Body for DirectH2RequestBody {
                         if let Some(data) = frame.data_ref() {
                             *seen = seen.saturating_add(data.len() as u64);
                         }
-                        Poll::Ready(Some(Ok(frame)))
+                        // The one direct-HTTP/2 arm that does NOT read through
+                        // `UploadSource` — it polls the client `Incoming` in
+                        // place — so the late request-trailer trust boundary
+                        // has to be applied here too.
+                        Poll::Ready(Some(Ok(sanitize_backend_request_trailer_frame(frame))))
                     }
                     Poll::Ready(Some(Err(e))) => {
                         publish_passthrough_request_bytes(observed, *seen, published, latch);

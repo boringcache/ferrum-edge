@@ -174,6 +174,10 @@ impl V001SqlBuilder {
         let columns = if self.is_mysql() {
             [
                 (
+                    "namespace_at_event",
+                    "VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''",
+                ),
+                (
                     "source_address",
                     "VARCHAR(128) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT ''",
                 ),
@@ -188,6 +192,7 @@ impl V001SqlBuilder {
             ]
         } else {
             [
+                ("namespace_at_event", "TEXT NOT NULL DEFAULT ''"),
                 ("source_address", "TEXT NOT NULL DEFAULT ''"),
                 ("request_id", "TEXT NOT NULL DEFAULT ''"),
                 ("outcome", "TEXT NOT NULL DEFAULT ''"),
@@ -1835,6 +1840,7 @@ impl V001SqlBuilder {
                 resource_type VARCHAR(128) COLLATE utf8mb4_0900_bin NOT NULL,
                 resource_id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
+                namespace_at_event VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '',
                 source_address VARCHAR(128) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '',
                 request_id VARCHAR(128) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '',
                 outcome VARCHAR(64) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '',
@@ -1851,6 +1857,7 @@ impl V001SqlBuilder {
                 resource_type TEXT NOT NULL,
                 resource_id TEXT NOT NULL,
                 namespace TEXT NOT NULL DEFAULT 'ferrum',
+                namespace_at_event TEXT NOT NULL DEFAULT '',
                 source_address TEXT NOT NULL DEFAULT '',
                 request_id TEXT NOT NULL DEFAULT '',
                 outcome TEXT NOT NULL DEFAULT '',

@@ -153,7 +153,7 @@ use tokio_tungstenite::{
 };
 use tracing::{debug, error, info, trace, warn};
 
-use crate::circuit_breaker::CircuitBreakerCache;
+use crate::circuit_breaker::{CircuitBreakerCache, scoped_cache_key};
 use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HttpFlavor,
@@ -11355,6 +11355,59 @@ impl ProxyState {
         }
     }
 
+    /// Keys HTTP dispatch currently mints for live circuit breakers.
+    ///
+    /// Direct-backend proxies contribute `namespace|id::backend_host:backend_port`.
+    /// Upstream-backed proxies contribute one key per target in the live
+    /// load-balancer set (static plus service-discovery), falling back to the
+    /// authored config only when the upstream is not yet in the LB cache.
+    /// Callers pass this set to [`CircuitBreakerCache::prune_stale_targets`] so
+    /// a config delta cannot reclaim still-routable breakers.
+    fn collect_active_circuit_breaker_target_keys(
+        &self,
+        config: &GatewayConfig,
+    ) -> HashSet<String> {
+        let mut active_keys = HashSet::new();
+        let lb_snapshot = self.load_balancer_cache.load();
+        for proxy in &config.proxies {
+            if let Some(ref upstream_id) = proxy.upstream_id {
+                if let Some(live_upstream) = LoadBalancerCache::get_upstream_from(
+                    &lb_snapshot,
+                    &proxy.namespace,
+                    upstream_id,
+                ) {
+                    for target in &live_upstream.targets {
+                        active_keys.insert(scoped_cache_key(
+                            &proxy.namespace,
+                            &proxy.id,
+                            &target.host,
+                            target.port,
+                        ));
+                    }
+                } else if let Some(upstream) = config.upstreams.iter().find(|upstream| {
+                    upstream.id == *upstream_id && upstream.namespace == proxy.namespace
+                }) {
+                    for target in &upstream.targets {
+                        active_keys.insert(scoped_cache_key(
+                            &proxy.namespace,
+                            &proxy.id,
+                            &target.host,
+                            target.port,
+                        ));
+                    }
+                }
+            } else if !proxy.backend_host.is_empty() && proxy.backend_port != 0 {
+                active_keys.insert(scoped_cache_key(
+                    &proxy.namespace,
+                    &proxy.id,
+                    &proxy.backend_host,
+                    proxy.backend_port,
+                ));
+            }
+        }
+        active_keys
+    }
+
     /// Timestamp-neutral proxy content comparison for route-table reuse.
     ///
     /// Serialized proxy content catches ordinary route/backend/policy edits while
@@ -12277,26 +12330,12 @@ impl ProxyState {
             self.circuit_breaker_cache.prune(&delta.removed_proxy_ids);
         }
 
-        // --- CircuitBreakerCache: prune stale upstream targets ---
-        // Removes breakers for host:port combos no longer in any upstream,
-        // preventing unbounded growth from target churn (e.g., K8s pod cycling).
+        // --- CircuitBreakerCache: prune stale targets ---
+        // Keep keys dispatch currently mints (direct-backend host:port, live
+        // upstream/SD targets) so a config delta cannot reclaim still-routable
+        // breakers, while still dropping retired pod IPs and removed hosts.
         {
-            let mut active_keys = std::collections::HashSet::new();
-            for proxy in &new_config.proxies {
-                if let Some(ref upstream_id) = proxy.upstream_id
-                    && let Some(upstream) = new_config
-                        .upstreams
-                        .iter()
-                        .find(|u| u.id == *upstream_id && u.namespace == proxy.namespace)
-                {
-                    for target in &upstream.targets {
-                        active_keys.insert(format!(
-                            "{}|{}::{}:{}",
-                            proxy.namespace, proxy.id, target.host, target.port
-                        ));
-                    }
-                }
-            }
+            let active_keys = self.collect_active_circuit_breaker_target_keys(&new_config);
             self.circuit_breaker_cache.prune_stale_targets(&active_keys);
         }
 
@@ -12923,24 +12962,11 @@ impl ProxyState {
             self.circuit_breaker_cache.prune(&delta.removed_proxy_ids);
         }
 
-        // Prune stale upstream targets from circuit breaker cache
+        // Keep keys dispatch currently mints (direct-backend host:port, live
+        // upstream/SD targets) so a config delta cannot reclaim still-routable
+        // breakers, while still dropping retired pod IPs and removed hosts.
         {
-            let mut active_keys = std::collections::HashSet::new();
-            for proxy in &new_config.proxies {
-                if let Some(ref upstream_id) = proxy.upstream_id
-                    && let Some(upstream) = new_config
-                        .upstreams
-                        .iter()
-                        .find(|u| u.id == *upstream_id && u.namespace == proxy.namespace)
-                {
-                    for target in &upstream.targets {
-                        active_keys.insert(format!(
-                            "{}|{}::{}:{}",
-                            proxy.namespace, proxy.id, target.host, target.port
-                        ));
-                    }
-                }
-            }
+            let active_keys = self.collect_active_circuit_breaker_target_keys(&new_config);
             self.circuit_breaker_cache.prune_stale_targets(&active_keys);
         }
 
@@ -28897,6 +28923,15 @@ async fn handle_proxy_request_inner(
     // lines, never a single `get()`, so duplicate lines cannot hide a competing
     // attacker-supplied value (advisory GHSA-fx4w-68hx-mj7r).
     if !state.trusted_proxies.is_empty() {
+        // Latch the immediate-peer trust verdict for the whole request, before
+        // any plugin phase runs. Plugin phases that build their own outbound
+        // request (`request_mirror`, `load_testing`) read it so the secondary
+        // boundary refuses a client-asserted `X-Real-IP` under exactly the rule
+        // the primary backend builders apply at dispatch (issue #4164). The
+        // default is `false`, so an empty trust list or an unparseable peer
+        // keeps the fail-closed verdict without extra work here.
+        ctx.forwarding_peer_trusted =
+            forwarding_peer_is_trusted(&socket_ip, &state.trusted_proxies);
         let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
         if let Some(ref addr) = socket_addr {
             if let Some(forwarded_scheme) =
