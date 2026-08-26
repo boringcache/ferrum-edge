@@ -3271,10 +3271,10 @@ config:
 
 ### `opa`
 
-Delegates HTTP request authorization to [Open Policy Agent](https://www.openpolicyagent.org/) by POSTing an `input` document to OPA's Data API during the `authorize` phase. It runs after local authentication, `access_control`, and `mesh_authz`, so OPA policies can use the authenticated Consumer or external identity without re-validating credentials.
+Delegates HTTP-family request authorization to [Open Policy Agent](https://www.openpolicyagent.org/) by POSTing an `input` document to OPA's Data API during the `authorize` phase. It runs after local authentication, `access_control`, and `mesh_authz`, so OPA policies can use the authenticated Consumer or external identity without re-validating credentials.
 
 **Priority:** 2080
-**Supported protocols:** HTTP only
+**Supported protocols:** HTTP, gRPC, WebSocket
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|

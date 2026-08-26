@@ -1953,7 +1953,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `access_control` | ✓ | ✓ | ✓ | ✓ | ✓ | Needs authenticated identity from an auth plugin; supports consumer username and ACL group allow/deny lists |
 | `tcp_connection_throttle` | | | | ✓ | | Tracks process-local active TCP/TCP+TLS connections per Consumer or canonical client IP; each replica enforces independently |
 | `mesh_authz` | ✓ | ✓ | ✓ | ✓ | ✓ | Applies Layer 2 mesh policy using SPIFFE or HBONE identities |
-| `opa` | ✓ | | | | | Delegates HTTP request authorization to an OPA Data API policy |
+| `opa` | ✓ | ✓ | ✓ | | | Delegates HTTP-family request authorization to an OPA Data API policy |
 | `adaptive_concurrency` | ✓ | ✓ | ✓ | | | Target-aware backend admission for HTTP-family upstream survival |
 | `request_deduplication` | ✓ | | | | | HTTP-only request deduplication and response replay |
 | `request_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy request body size limits |

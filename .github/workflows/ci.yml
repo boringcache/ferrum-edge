@@ -1266,6 +1266,7 @@ jobs:
               functional_mesh_vs_traffic_mgmt_test
               functional_otel_ldap_test
               functional_opa_key_auth_redaction_test
+              functional_opa_protocol_coverage_test
               functional_plugin_extended_test
               functional_plugin_test
               functional_mcp_gateway_batch_test
