@@ -775,7 +775,7 @@ Validation: fail render on missing/unsafe configuration.
 {{- $cpGrpcTls := $tlsAll.cpGrpc | default dict -}}
 {{- $cpGrpcTlsSet := include "ferrum-gateway.serverTlsConfigured" (dict "root" . "surface" $cpGrpcTls "certSource" "FERRUM_CP_GRPC_TLS_CERT_SOURCE" "keySource" "FERRUM_CP_GRPC_TLS_KEY_SOURCE") -}}
 {{- if and (ne ($cpGrpcPort | toString) "0") (not $cpLoopback) (not $cpGrpcTlsSet) (not $grpc.allowPlaintext) -}}
-{{- fail (printf "mode=cp hard-fails on a non-loopback PLAINTEXT gRPC bind (%s:%v). Set one of: gRPC TLS (tls.cpGrpc Secret or a complete FERRUM_CP_GRPC_TLS_{CERT,KEY}_SOURCE pair), a loopback cp.grpcBindAddress (127.0.0.1), or grpc.allowPlaintext=true to explicitly permit plaintext config sync (dev only; pair with a NetworkPolicy)." $cpBind $cpGrpcPort) -}}
+{{- fail (printf "mode=cp hard-fails on a non-loopback PLAINTEXT gRPC bind (%s:%v). Set one of: gRPC TLS (tls.cpGrpc Secret or a complete FERRUM_CP_GRPC_TLS_{CERT,KEY}_SOURCE pair), a loopback cp.grpcBindAddress (127.0.0.1), or grpc.allowPlaintext=true to explicitly permit plaintext config sync (dev only; pair with networkPolicy.enabled=true)." $cpBind $cpGrpcPort) -}}
 {{- end -}}
 {{/* A ClusterIP Service routes to the pod IP + targetPort, never the container's
      loopback, so a loopback-bound CP gRPC listener published through the Service
@@ -872,7 +872,7 @@ Validation: fail render on missing/unsafe configuration.
 {{- if $permitsAll -}}
 {{- fail "admin.allowedCidrs permits every address in an IP family (for example via /0, an IPv4-mapped /96, or a full-coverage CIDR union), which does not restrict a non-loopback plaintext admin listener. Use a narrower allowlist, TLS-only admin with ports.adminHttp=0, or admin.allowInsecureHttp=true for local development." -}}
 {{- end -}}
-{{- fail (printf "mode=%s hard-fails on a non-loopback plaintext admin bind. Set one of: admin.allowedCidrs, admin TLS (tls.admin Secret or complete FERRUM_ADMIN_TLS_{CERT,KEY}_SOURCE pair + ports.adminHttp=0), or admin.allowInsecureHttp=true with a NetworkPolicy" $mode) -}}
+{{- fail (printf "mode=%s hard-fails on a non-loopback plaintext admin bind. Set one of: admin.allowedCidrs, admin TLS (tls.admin Secret or complete FERRUM_ADMIN_TLS_{CERT,KEY}_SOURCE pair + ports.adminHttp=0), or admin.allowInsecureHttp=true with networkPolicy.enabled=true" $mode) -}}
 {{- end -}}
 {{- end -}}
 {{/* The admin accept loop applies allowedCidrs to in-pod probes like every other
