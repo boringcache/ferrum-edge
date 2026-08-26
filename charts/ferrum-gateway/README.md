@@ -51,7 +51,7 @@ migrations; use the explicit Job for `status`, dry-run, and operator-controlled
   binary hard-fails on a non-loopback **plaintext** admin bind unless you also
   set one of `admin.allowedCidrs`, admin TLS (`tls.admin` or a complete
   `FERRUM_ADMIN_TLS_{CERT,KEY}_SOURCE` pair, with `ports.adminHttp=0`), or
-  `admin.allowInsecureHttp=true`; TLS on 9443 does not protect a still-live
+  `admin.allowInsecureHttp=true` with `networkPolicy.enabled=true`; TLS on 9443 does not protect a still-live
   plaintext listener on 9000. Any allowlist that covers a whole address family
   is rejected as ineffective protection, including `/0`, mapped IPv6 `/96`
   spellings that canonicalize to IPv4 `/0`, and full-coverage CIDR unions.
@@ -126,13 +126,19 @@ migrations; use the explicit Job for `status`, dry-run, and operator-controlled
   `0440` with pod `fsGroup: 65532`, matching the distroless nonroot image. Both
   `secretVolumeDefaultMode` and `podSecurityContext` are overridable for images
   with a different runtime identity.
-- **Graceful shutdown** wires `terminationGracePeriodSeconds` to the
-  `FERRUM_SHUTDOWN_DRAIN_SECONDS` drain window (enforced at render).
+- **Graceful shutdown** wires `terminationGracePeriodSeconds` to the WHOLE
+  termination sequence (enforced at render): `preStop + preDrain + shutdown
+  budget`, where the shutdown budget sums in-flight drain, transport pool tail
+  (6s), background join (5s), audit flush `clamp(drain, 5, 60)` (database/cp),
+  observability delivery (2s default), and 5s finalizer slack. With default
+  `shutdownDrainSeconds: 30` that budget is `30 + 6 + 5 + 30 + 2 + 5 = 78s`,
+  and the default 30s `preStop` window brings the minimum grace to `108s`; the
+  chart defaults to `110s`. See `docs/graceful_shutdown.md`.
   `shutdownDrainSeconds: 0` is a valid "skip draining" value and is rendered
   explicitly; set it to `null` to omit the env and fall back to the binary's
   30s default. A `null` drain is still validated against that 30s default, so
-  too low a grace period fails render rather than letting Kubernetes SIGKILL
-  the pod mid-drain.
+  a grace period below the computed minimum fails render rather than letting
+  Kubernetes SIGKILL the pod mid-flush.
 - **Rolling upgrades do not refuse new connections.** See
   [Termination and rolling upgrades](#termination-and-rolling-upgrades) below.
 

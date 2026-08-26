@@ -278,6 +278,17 @@
 //! declared `nonce.replay_scope` — `process` (single-replica by declaration) or
 //! `shared` (atomic Redis `SET NX EX` across replicas). `OneTimeUse` needs no
 //! special case because every accepted assertion is claimed exactly once.
+//!
+//! ## One reading of every element value
+//!
+//! Every element value this module acts on is read through `element_text`,
+//! which rejects a comment (or any other markup) inside a value element and
+//! concatenates every text child of the ones it accepts. A comment is invisible
+//! to exclusive canonicalization but splits the DOM's character data, so a
+//! reader that returned only the first text child would act on a truncated
+//! prefix of a value the signature covered — the CVE-2017-11427 "SAML comment
+//! truncation" identity substitution. Two different readings of one element is
+//! the vulnerability; do not add a second one.
 
 use crate::fips::backend::digest;
 use crate::fips::backend::signature as ring_sig;
@@ -2260,7 +2271,7 @@ impl SoapWsSecurity {
         else {
             return Ok(None);
         };
-        let raw = element_text(node)
+        let raw = element_text(node)?
             .ok_or_else(|| format!("WS-Security: Timestamp {local_name} element is empty"))?;
         let parsed = parse_ws_datetime(&raw)
             .ok_or_else(|| format!("WS-Security: invalid {local_name} timestamp"))?;
@@ -2436,6 +2447,7 @@ impl SoapWsSecurity {
             .map_err(UsernameTokenError::Structural)?
             .ok_or_else(|| structural("WS-Security: UsernameToken missing Username element"))?;
         let username = element_text(username_node)
+            .map_err(UsernameTokenError::Structural)?
             .ok_or_else(|| structural("WS-Security: UsernameToken Username element is empty"))?;
 
         let password_element =
@@ -2444,6 +2456,7 @@ impl SoapWsSecurity {
                 .ok_or_else(|| structural("WS-Security: UsernameToken missing Password element"))?;
 
         let password_value = element_text(password_element)
+            .map_err(UsernameTokenError::Structural)?
             .ok_or_else(|| structural("WS-Security: Password element has no content"))?;
 
         // The verification mode is dictated solely by the operator-configured
@@ -2516,6 +2529,7 @@ impl SoapWsSecurity {
                             structural("WS-Security: PasswordDigest requires Nonce element")
                         })?;
                 let nonce_b64_raw = element_text(nonce_node)
+                    .map_err(UsernameTokenError::Structural)?
                     .ok_or_else(|| structural("WS-Security: Nonce element is empty"))?;
 
                 // One canonical form for both the digest input and the replay
@@ -2545,6 +2559,7 @@ impl SoapWsSecurity {
                             structural("WS-Security: PasswordDigest requires Created element")
                         })?;
                 let created = element_text(created_node)
+                    .map_err(UsernameTokenError::Structural)?
                     .ok_or_else(|| structural("WS-Security: Created element is empty"))?;
 
                 // Freshness + outer-Timestamp binding are structural: the
@@ -3235,8 +3250,7 @@ impl SoapWsSecurity {
             "WS-Security",
         )?
         .ok_or_else(|| "WS-Security: Signature missing SignatureValue".to_string())?;
-        let sig_value_b64 = sig_value_node
-            .text()
+        let sig_value_b64 = element_text(sig_value_node)?
             .ok_or_else(|| "WS-Security: SignatureValue is empty".to_string())?;
 
         let sig_bytes = BASE64
@@ -3382,8 +3396,7 @@ impl SoapWsSecurity {
                 "WS-Security",
             )?
             .ok_or_else(|| "WS-Security: Reference missing DigestValue".to_string())?;
-            let expected_b64 = digest_value
-                .text()
+            let expected_b64 = element_text(digest_value)?
                 .ok_or_else(|| "WS-Security: DigestValue is empty".to_string())?;
 
             let expected_bytes = BASE64
@@ -3535,7 +3548,7 @@ impl SoapWsSecurity {
             "BinarySecurityToken",
             "WS-Security",
         )? {
-            let cert_b64 = element_text(bst)
+            let cert_b64 = element_text(bst)?
                 .ok_or_else(|| "WS-Security: BinarySecurityToken has no content".to_string())?;
             return BASE64
                 .decode(cert_b64.replace(char::is_whitespace, "").as_bytes())
@@ -3627,7 +3640,7 @@ impl SoapWsSecurity {
             "WS-Security: SAML",
         )?
         .ok_or_else(|| "WS-Security: SAML Assertion missing Issuer element".to_string())?;
-        let issuer = element_text(issuer_node)
+        let issuer = element_text(issuer_node)?
             .ok_or_else(|| "WS-Security: SAML Issuer is empty".to_string())?;
 
         // The rejected issuer is credential material presented by the caller
@@ -3704,7 +3717,7 @@ impl SoapWsSecurity {
                 .children()
                 .filter(|node| node.has_tag_name((SAML2_ASSERTION_NS, "Audience")))
             {
-                if element_text(audience).as_deref() == Some(expected_audience) {
+                if element_text(audience)?.as_deref() == Some(expected_audience) {
                     restriction_matched = true;
                 }
             }
@@ -3747,7 +3760,11 @@ impl SoapWsSecurity {
         // that a semantic failure that consumes no replay state.
         let name_id_node =
             unique_ns_child(subject, SAML2_ASSERTION_NS, "NameID", "WS-Security: SAML")?;
-        let Some(name_id) = name_id_node.and_then(element_text) else {
+        let name_id_text = match name_id_node {
+            Some(node) => element_text(node)?,
+            None => None,
+        };
+        let Some(name_id) = name_id_text else {
             return Err("WS-Security: SAML Subject has no nonblank NameID".to_string());
         };
 
@@ -3956,8 +3973,7 @@ impl SoapWsSecurity {
             "WS-Security: SAML",
         )?
         .ok_or_else(|| "WS-Security: SAML Signature missing SignatureValue".to_string())?;
-        let sig_value_b64 = sig_value_node
-            .text()
+        let sig_value_b64 = element_text(sig_value_node)?
             .ok_or_else(|| "WS-Security: SAML SignatureValue is empty".to_string())?;
         let sig_bytes = BASE64
             .decode(sig_value_b64.replace(char::is_whitespace, "").as_bytes())
@@ -4084,8 +4100,7 @@ impl SoapWsSecurity {
             "WS-Security: SAML",
         )?
         .ok_or_else(|| "WS-Security: SAML Reference missing DigestValue".to_string())?;
-        let expected_b64 = digest_value
-            .text()
+        let expected_b64 = element_text(digest_value)?
             .ok_or_else(|| "WS-Security: SAML DigestValue is empty".to_string())?;
         let expected_bytes = BASE64
             .decode(expected_b64.replace(char::is_whitespace, "").as_bytes())
@@ -5383,10 +5398,72 @@ fn unique_ns_child<'a, 'input>(
     Ok(first)
 }
 
-/// Trimmed text of the single text child, or `None` when the element is empty.
-fn element_text(node: Node<'_, '_>) -> Option<String> {
-    let text = node.text()?.trim();
-    (!text.is_empty()).then(|| text.to_string())
+/// Rejection emitted when a comment splits (or precedes) an element's
+/// character data. Deliberately content-free: the elements this helper reads
+/// are credential material.
+const COMMENT_IN_VALUE_REJECTION: &str =
+    "WS-Security: an XML comment inside a security-relevant element is not permitted";
+
+/// Rejection emitted when an element that must carry character data also
+/// carries markup.
+const MIXED_CONTENT_REJECTION: &str =
+    "WS-Security: mixed content inside a security-relevant element is not permitted";
+
+/// Trimmed character data of `node`, or `None` when the element is empty.
+///
+/// # SAML comment truncation (CVE-2017-11427 class) — do NOT relax this
+///
+/// `roxmltree::Node::text()` returns only the FIRST child, and only when that
+/// child is a text node. The parser resets its text-accumulation flag on a
+/// comment, so `<NameID>admin<!---->@evil.example</NameID>` is parsed as
+/// `Text("admin"), Comment, Text("@evil.example")` and `text()` yields
+/// `"admin"` on its own.
+///
+/// Exclusive canonicalization — the transform that produces the bytes an XML
+/// signature actually digests — does the opposite: it drops comments and emits
+/// *both* text runs, so the signed bytes read `admin@evil.example`. Reading
+/// only the first run is therefore the Duo Labs "SAML comment truncation"
+/// identity substitution: the IdP signature verifies over one identity while
+/// the gateway acts on a shorter prefix of it, and a backend that re-parses the
+/// same assertion sees the longer one.
+///
+/// This helper closes that gap two independent ways, and BOTH must stay:
+///
+/// 1. Any comment, processing instruction, or child element inside an element
+///    that is supposed to carry a value is rejected outright (fail closed). A
+///    comment is invisible to exclusive c14n, so it can never be a legitimate
+///    part of a signature-covered value; a PI or child element is visible to
+///    c14n, so it is never legitimate character data either.
+/// 2. Whatever text does survive is read by concatenating EVERY text child in
+///    document order — the same order and content `canonicalize_node` emits —
+///    never just the first one.
+///
+/// Rule 2 alone would already agree with c14n; rule 1 alone would already
+/// reject the attack. Keeping both means a refactor that weakens either one on
+/// its own cannot silently reintroduce the CVE. Every element whose value the
+/// gateway acts on — `NameID`, `Issuer`, `Audience`, `Username`, `Password`,
+/// `Nonce`, `Created`, `SignatureValue`, `DigestValue`, and the certificate
+/// carriers — is read through here so there is exactly ONE reading of an
+/// element's value in this module. Two readings is the vulnerability.
+///
+/// Trimming is a normalization applied uniformly to the concatenated value; it
+/// never drops a text run.
+fn element_text(node: Node<'_, '_>) -> Result<Option<String>, String> {
+    let mut text = String::new();
+    for child in node.children() {
+        if child.is_text() {
+            if let Some(chunk) = child.text() {
+                text.push_str(chunk);
+            }
+            continue;
+        }
+        if child.is_comment() {
+            return Err(COMMENT_IN_VALUE_REJECTION.to_string());
+        }
+        return Err(MIXED_CONTENT_REJECTION.to_string());
+    }
+    let trimmed = text.trim();
+    Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
 }
 
 /// Bounded, single-pass index of every XML id-bearing attribute in the
@@ -5493,7 +5570,7 @@ fn xmldsig_key_info_certificate(
     else {
         return Ok(None);
     };
-    Ok(element_text(certificate))
+    element_text(certificate)
 }
 
 /// Aggregate canonicalization/scan work budget for one validated message.
@@ -6249,7 +6326,7 @@ fn extract_saml_signing_cert(signature: Node<'_, '_>) -> Result<Vec<u8>, String>
         "BinarySecurityToken",
         "WS-Security: SAML",
     )? {
-        let cert_b64 = element_text(bst)
+        let cert_b64 = element_text(bst)?
             .ok_or_else(|| "WS-Security: SAML BinarySecurityToken has no content".to_string())?;
         return BASE64
             .decode(cert_b64.replace(char::is_whitespace, "").as_bytes())

@@ -4901,6 +4901,23 @@ pub mod _test_support {
         ))
     }
 
+    /// Whether the built Redis TLS address has `insecure = true`.
+    ///
+    /// Used to assert that a caller-supplied `#insecure` fragment cannot disable
+    /// verification unless `tls_no_verify` (`FERRUM_TLS_NO_VERIFY`) is set.
+    pub fn redis_client_tls_insecure(
+        config: RedisConfig,
+        url: &str,
+        tls_no_verify: bool,
+    ) -> Result<bool, String> {
+        let client = RedisRateLimitClient::new(config, None, tls_no_verify, None);
+        let redis_client = client.build_client(url).map_err(|e| e.to_string())?;
+        match redis_client.get_connection_info().addr() {
+            redis::ConnectionAddr::TcpTls { insecure, .. } => Ok(*insecure),
+            other => Err(format!("expected Redis TcpTls address, got {other:?}")),
+        }
+    }
+
     pub fn redis_rate_limit_client_for_test(config: RedisConfig) -> RedisRateLimitClient {
         RedisRateLimitClient::new(config, None, false, None)
     }
@@ -10733,6 +10750,131 @@ pub mod _test_support {
             }
             crate::proxy::body::UploadCancelSignal::Idle => UploadCancelSignalForTest::Idle,
         }
+    }
+
+    /// A client request body that emits one DATA frame and then exactly one
+    /// TRAILERS frame — the wire shape an attacker uses to smuggle reserved
+    /// gateway assertions past the sanitized initial header block.
+    struct RequestTrailerProbeBody {
+        data: Option<bytes::Bytes>,
+        trailers: Option<http::HeaderMap>,
+    }
+
+    impl http_body::Body for RequestTrailerProbeBody {
+        type Data = bytes::Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<bytes::Bytes>, Self::Error>>> {
+            if let Some(data) = self.data.take() {
+                return std::task::Poll::Ready(Some(Ok(http_body::Frame::data(data))));
+            }
+            if let Some(trailers) = self.trailers.take() {
+                return std::task::Poll::Ready(Some(Ok(http_body::Frame::trailers(trailers))));
+            }
+            std::task::Poll::Ready(None)
+        }
+    }
+
+    fn request_trailer_probe_map(trailers: &[(&str, &str)]) -> http::HeaderMap {
+        let mut map = http::HeaderMap::with_capacity(trailers.len());
+        for (name, value) in trailers {
+            let name = http::HeaderName::from_bytes(name.as_bytes())
+                .unwrap_or_else(|e| panic!("probe trailer name {name:?} is invalid: {e}"));
+            let value = http::HeaderValue::from_str(value)
+                .unwrap_or_else(|e| panic!("probe trailer value {value:?} is invalid: {e}"));
+            map.append(name, value);
+        }
+        map
+    }
+
+    fn sorted_trailer_entries(map: &http::HeaderMap) -> Vec<(String, String)> {
+        let mut entries: Vec<(String, String)> = map
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    /// The trailer block the backend would observe after the shared late
+    /// request-trailer boundary runs, driven through the production applicator
+    /// `crate::proxy::body::sanitize_backend_request_trailer_frame` (issue
+    /// #4148).
+    ///
+    /// Sorted by `(name, value)` so assertions do not depend on `HeaderMap`
+    /// hash order.
+    pub fn sanitized_backend_request_trailer_frame(
+        trailers: &[(&str, &str)],
+    ) -> Vec<(String, String)> {
+        let frame = http_body::Frame::trailers(request_trailer_probe_map(trailers));
+        let sanitized = crate::proxy::body::sanitize_backend_request_trailer_frame(frame);
+        match sanitized.into_trailers() {
+            Ok(map) => sorted_trailer_entries(&map),
+            Err(_) => panic!("the sanitized frame must still be a trailers frame"),
+        }
+    }
+
+    /// A DATA frame must cross the late request-trailer boundary byte-for-byte:
+    /// the sanitizer is a trailer-only filter, never a body rewriter.
+    pub fn sanitize_backend_request_trailer_frame_preserves_data(payload: &'static [u8]) -> bool {
+        let frame = http_body::Frame::data(bytes::Bytes::from_static(payload));
+        crate::proxy::body::sanitize_backend_request_trailer_frame(frame)
+            .into_data()
+            .is_ok_and(|data| data.as_ref() == payload)
+    }
+
+    /// Drive the REAL H1/H2 streaming request-body seam
+    /// (`crate::proxy::body::UploadSource::poll_frame`) over a client body that
+    /// ends in a TRAILERS frame, and report `(forwarded_data, trailers)` exactly
+    /// as the backend transport would observe them (issue #4148).
+    ///
+    /// `SizeLimitedIncoming` (reqwest, direct HTTP/2 `Limited`, mesh-mTLS
+    /// `Streaming`, Unix H1), `CountingIncoming` (unlimited reqwest), and
+    /// `GrpcBody::Streaming` (the default native-gRPC fast path) all read their
+    /// frames through this one seam, so this exercises the wiring those paths
+    /// inherit rather than the predicate in isolation.
+    pub async fn h1_h2_upload_source_forwarded_frames(
+        payload: &'static [u8],
+        trailers: &[(&str, &str)],
+    ) -> (Vec<u8>, Vec<(String, String)>) {
+        let body = RequestTrailerProbeBody {
+            data: Some(bytes::Bytes::from_static(payload)),
+            trailers: Some(request_trailer_probe_map(trailers)),
+        };
+        // `plan = None` / `write_timeout_ms = 0`: no authorization deadline and
+        // no write watermark, so the pump is a plain bounded bridge and the only
+        // behaviour under test is the trailer boundary.
+        let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(body, None, 0);
+        let mut source = crate::proxy::body::UploadSource::Pumped(source);
+        let mut forwarded_data = Vec::new();
+        let mut forwarded_trailers = Vec::new();
+        loop {
+            let next = std::future::poll_fn(|cx| source.poll_frame(cx)).await;
+            match next {
+                Some(Ok(frame)) => match frame.into_data() {
+                    Ok(data) => forwarded_data.extend_from_slice(data.as_ref()),
+                    Err(frame) => match frame.into_trailers() {
+                        Ok(map) => forwarded_trailers.extend(sorted_trailer_entries(&map)),
+                        Err(_) => panic!("unexpected non-data non-trailer frame"),
+                    },
+                },
+                Some(Err(e)) => panic!("probe upload failed: {e}"),
+                None => break,
+            }
+        }
+        // Dropping the join disarms cancellation (a dropped sender is not a
+        // cancellation), so the pump is never torn down mid-relay.
+        drop(join);
+        forwarded_trailers.sort();
+        (forwarded_data, forwarded_trailers)
     }
 
     pub fn effective_request_body_limit_for_protocol_for_test(

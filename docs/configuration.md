@@ -989,7 +989,7 @@ See [client_ip_resolution.md](client_ip_resolution.md) for the security model an
 | `FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS` | No | `64` | Rapid-reset mitigation threshold for pending accept-reset streams |
 | `FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS` | No | `256` | Rapid-reset mitigation threshold for locally reset streams |
 | `FERRUM_WEBSOCKET_MAX_CONNECTIONS` | No | `20000` | Dedicated cap for upgraded WebSocket connections; `0` disables |
-| `FERRUM_SHUTDOWN_DRAIN_SECONDS` | No | `30` | Graceful shutdown drain period; `0` skips draining |
+| `FERRUM_SHUTDOWN_DRAIN_SECONDS` | No | `30` | In-flight connection drain wait at shutdown; `0` skips the wait. This is only one phase of a longer sequential shutdown (transport pool tail, background join, audit flush on database/cp, observability delivery, and plugin finalizers). Kubernetes `terminationGracePeriodSeconds` must cover the full budget — with defaults that is `30 + 6 + 5 + clamp(30,5,60) + 2 + 5 = 78s`, and the Helm chart adds its default 30s `preStop` window on top for a rendered minimum of 108s (see [graceful_shutdown.md](graceful_shutdown.md)) |
 | `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` | No | `0` | Seconds every listener (proxy **and** admin) keeps accepting after SIGTERM/SIGINT before the accept loops close. Readiness reports `ready:false` / 503 for the whole window while `/live` stays 200, so an orchestrator can withdraw the replica before a connection is refused. Serving modes only (`database`, `file`, `dp`, `mesh`); `0` keeps the pre-change behavior. On Kubernetes prefer the chart's `preStop` sleep — see [graceful_shutdown.md](graceful_shutdown.md) |
 | `FERRUM_STATUS_METRICS_WINDOW_SECONDS` | No | `30` | Rate window for admin `/status` metrics |
 

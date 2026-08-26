@@ -456,10 +456,17 @@ impl std::fmt::Display for PluginHttpClientBuildError {
     }
 }
 
+/// Connect timeout for every plugin HTTP client builder path (primary and fallback).
+const PLUGIN_HTTP_CONNECT_TIMEOUT_SECS: u64 = 30;
+/// Request timeout for every plugin HTTP client builder path (primary and fallback).
+const PLUGIN_HTTP_REQUEST_TIMEOUT_SECS: u64 = 60;
+
 fn plugin_client_no_proxy_no_redirect() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(PLUGIN_HTTP_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(PLUGIN_HTTP_REQUEST_TIMEOUT_SECS))
 }
 
 fn attach_plugin_client_dns(
@@ -590,7 +597,8 @@ fn build_fail_closed_plugin_client(
 /// retained on every attempt so fallback cannot bypass hostname egress policy.
 /// Terminal construction is a bounded `Result`: it never panics, never retries
 /// without a limit, and never restores ambient proxy, redirects, weakened TLS,
-/// system-DNS egress, or a downgraded HTTP/2 companion.
+/// system-DNS egress, connect/request timeouts, or a downgraded HTTP/2
+/// companion.
 fn build_dns_cached_fallback_client(
     dns_cache: Option<DnsCache>,
     tls_posture: &PluginTlsPosture,
@@ -651,8 +659,8 @@ fn build_configured_plugin_client(
         .no_proxy()
         .pool_max_idle_per_host(pool_config.max_idle_per_host)
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
-        .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(PLUGIN_HTTP_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(PLUGIN_HTTP_REQUEST_TIMEOUT_SECS))
         // Never auto-follow redirects on plugin outbound calls. A
         // compromised or spoofed upstream (e.g. an OIDC IdP whose JWKS or
         // discovery endpoint passes the first-hop same-host check in
@@ -716,9 +724,10 @@ fn build_configured_plugin_client(
                 error = %error,
                 "Failed to build fully-configured plugin HTTP client. Retrying a \
                  minimal builder that preserves the TLS trust posture (custom CA / \
-                 no-verify), DNS cache, and HTTP/2 preference, dropping only \
-                 pool/keepalive tuning — a custom CA configured for exclusivity must \
-                 not be silently widened to platform/webpki roots."
+                 no-verify), DNS cache, connect/request timeouts, and HTTP/2 \
+                 preference, dropping only pool/keepalive tuning — a custom CA \
+                 configured for exclusivity must not be silently widened to \
+                 platform/webpki roots."
             );
             build_dns_cached_fallback_client(dns_cache, tls_posture, http2_prior_knowledge)
         }
@@ -1725,6 +1734,36 @@ mod fallback_tests {
     fn tls_no_verify_takes_precedence_over_ca_bundle() {
         let posture = PluginTlsPosture::from_config(true, Some("/does/not/exist.pem"));
         assert!(matches!(posture, PluginTlsPosture::SkipVerification));
+    }
+
+    #[tokio::test]
+    async fn fallback_client_enforces_connect_timeout() {
+        // RFC 5737 TEST-NET-1 is non-routable. Without a client-level
+        // connect_timeout the dial can hang for the OS SYN-retransmit budget
+        // (~75s on Linux). The outer bound proves the fallback builder path
+        // inherited the same 30s connect bound as the fully-configured client.
+        let client =
+            build_dns_cached_fallback_client(None, &PluginTlsPosture::PlatformRoots, false)
+                .expect("fallback client builds");
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(40),
+            client.get("http://192.0.2.1:9999/").send(),
+        )
+        .await
+        .expect("fallback client request must not hang past outer bound");
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("connect to non-routable TEST-NET-1 must fail");
+        assert!(
+            err.is_timeout() || err.is_connect(),
+            "expected timeout/connect error from fallback connect_timeout, got: {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(35),
+            "fallback connect_timeout={PLUGIN_HTTP_CONNECT_TIMEOUT_SECS}s must apply at runtime, \
+             took {elapsed:?}"
+        );
     }
 
     #[tokio::test]

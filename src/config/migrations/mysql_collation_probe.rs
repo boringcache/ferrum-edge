@@ -304,6 +304,10 @@ pub fn identity_bearing_columns() -> &'static [IdentityBearingColumn] {
         },
         IdentityBearingColumn {
             table: "audit_events",
+            column: "namespace_at_event",
+        },
+        IdentityBearingColumn {
+            table: "audit_events",
             column: "source_address",
         },
         IdentityBearingColumn {

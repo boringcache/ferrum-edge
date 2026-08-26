@@ -2973,51 +2973,71 @@ impl Plugin for ServerlessFunction {
                     );
                 }
 
-                // Parse the response body as JSON to extract headers to inject
-                if let Ok(resp_json) = serde_json::from_slice::<Value>(&body) {
-                    // Inject headers from response: { "headers": { "X-Custom": "value" } }
-                    if let Some(header_map) = resp_json.get("headers").and_then(|h| h.as_object()) {
-                        let mut candidates = HashMap::new();
-                        for (key, val) in header_map {
-                            let Some(value) = val.as_str() else {
-                                continue;
-                            };
-                            let Ok(name) = HeaderName::from_bytes(key.as_bytes()) else {
-                                continue;
-                            };
-                            if HeaderValue::from_str(value).is_err() {
-                                continue;
-                            }
-                            candidates.insert(name.as_str().to_string(), value.to_string());
+                // A 2xx pre_proxy response must be a JSON object. Anything else —
+                // invalid JSON, an empty body, or a non-object value — is an
+                // unusable approval signal and must not silently continue.
+                let resp_json = match serde_json::from_slice::<Value>(&body) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return self.failure_result(
+                            ctx,
+                            InvocationFailure::new(
+                                "invalid_pre_proxy_response",
+                                "function response body is not valid JSON",
+                            ),
+                        );
+                    }
+                };
+                if !resp_json.is_object() {
+                    return self.failure_result(
+                        ctx,
+                        InvocationFailure::new(
+                            "invalid_pre_proxy_response",
+                            "function response body must be a JSON object",
+                        ),
+                    );
+                }
+
+                // Inject headers from response: { "headers": { "X-Custom": "value" } }
+                if let Some(header_map) = resp_json.get("headers").and_then(|h| h.as_object()) {
+                    let mut candidates = HashMap::new();
+                    for (key, val) in header_map {
+                        let Some(value) = val.as_str() else {
+                            continue;
+                        };
+                        let Ok(name) = HeaderName::from_bytes(key.as_bytes()) else {
+                            continue;
+                        };
+                        if HeaderValue::from_str(value).is_err() {
+                            continue;
                         }
-                        let connection_listed: HashSet<String> =
-                            crate::proxy::headers::parse_connection_listed_from_str_map(
-                                &candidates,
-                            )
+                        candidates.insert(name.as_str().to_string(), value.to_string());
+                    }
+                    let connection_listed: HashSet<String> =
+                        crate::proxy::headers::parse_connection_listed_from_str_map(&candidates)
                             .into_iter()
                             .collect();
-                        for (key, value) in candidates {
-                            if connection_listed.contains(&key)
-                                || crate::proxy::headers::is_backend_request_strip_header(&key)
-                            {
-                                continue;
-                            }
-                            // Published as an overlay rather than written into
-                            // the finalized snapshot: the representation this
-                            // function just decided on must stay exactly the one
-                            // policy accepted and the backend receives.
-                            backend_header_overlay.insert(key, value);
+                    for (key, value) in candidates {
+                        if connection_listed.contains(&key)
+                            || crate::proxy::headers::is_backend_request_strip_header(&key)
+                        {
+                            continue;
                         }
+                        // Published as an overlay rather than written into
+                        // the finalized snapshot: the representation this
+                        // function just decided on must stay exactly the one
+                        // policy accepted and the backend receives.
+                        backend_header_overlay.insert(key, value);
                     }
+                }
 
-                    // Store metadata from response: { "metadata": { "key": "value" } }
-                    if let Some(meta_map) = resp_json.get("metadata").and_then(|m| m.as_object()) {
-                        for (key, val) in meta_map {
-                            if let Some(value) = val.as_str() {
-                                let suffix = format!("metadata.{}", encode_metadata_segment(key));
-                                ctx.metadata
-                                    .insert(self.metadata_key(&suffix), value.to_string());
-                            }
+                // Store metadata from response: { "metadata": { "key": "value" } }
+                if let Some(meta_map) = resp_json.get("metadata").and_then(|m| m.as_object()) {
+                    for (key, val) in meta_map {
+                        if let Some(value) = val.as_str() {
+                            let suffix = format!("metadata.{}", encode_metadata_segment(key));
+                            ctx.metadata
+                                .insert(self.metadata_key(&suffix), value.to_string());
                         }
                     }
                 }

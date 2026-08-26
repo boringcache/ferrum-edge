@@ -544,6 +544,29 @@
           ]
         }
       }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "allowedNamespaceSelectors": {
+          "type": "array",
+          "description": "NetworkPolicy namespaceSelector peers for admin and CP gRPC ingress.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "allowedPodSelectors": {
+          "type": "array",
+          "description": "NetworkPolicy podSelector peers for admin and CP gRPC ingress.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      }
     }
   },
   "definitions": {

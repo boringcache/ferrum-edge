@@ -4,6 +4,8 @@ When the gateway receives SIGTERM or SIGINT, it performs a graceful shutdown tha
 
 ## Shutdown Sequence
 
+Serving modes (database, file, dp, mesh) run these phases **sequentially**, each with its own bounded budget. The worst-case total is the sum of every phase below, not just `FERRUM_SHUTDOWN_DRAIN_SECONDS`.
+
 1. **Signal received** — the process publishes its draining verdict *before* anything else: `/health` and `/status` immediately report `{"status": "draining", "ready": false}` with HTTP 503, while `/live` deliberately keeps returning 200 so a Kubernetes livenessProbe cannot SIGKILL the pod mid-drain
 2. **Pre-drain window (optional)** — for `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` (default `0`) every listener, proxy **and** admin, keeps accepting normally while readiness already reports not-ready. This is the window in which a load balancer or orchestrator can withdraw the replica from its endpoint set before a single new connection is refused. At the default `0` the shutdown broadcast fires immediately, exactly as before
 3. **Shutdown broadcast** — SIGTERM/SIGINT is broadcast to all components
@@ -14,8 +16,12 @@ When the gateway receives SIGTERM or SIGINT, it performs a graceful shutdown tha
    - The gateway waits up to `FERRUM_SHUTDOWN_DRAIN_SECONDS` for all in-flight connections to complete
 6. **Connection tracking** — every accepted connection creates a `ConnectionGuard` (RAII) that increments an atomic counter on accept and decrements on drop. The drain waiter monitors this counter
 7. **Drain timeout** — if connections remain after the drain period, they are force-closed and the gateway proceeds with shutdown
-8. **Background task cleanup** — DNS refresh, config polling, overload monitor, and other background tasks get 5 seconds to clean up
-9. **Process exit**
+8. **Transport pool drain** — sidecar-ingress Unix backend pools release held file descriptors under a bounded tail (5s driver drain + 1s reap; see `unix_backend_pool.rs`)
+9. **Background task cleanup** — DNS refresh, config polling, overload monitor, health checks, and other background tasks get 5 seconds to clean up
+10. **Audit flush** (database and cp modes) — accepted audit events drain for `clamp(FERRUM_SHUTDOWN_DRAIN_SECONDS, 5, 60)` seconds while the database handle is still alive
+11. **Observability delivery** — deferred logging/notification workers drain for `FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS` (default 2s)
+12. **Plugin finalizers** — chargeback snapshot and Kafka logging generations finalize (best-effort; allow headroom in the pod grace period)
+13. **Process exit**
 
 `FERRUM_SHUTDOWN_DRAIN_SECONDS=0` still disables the drain **wait**; the close hint and the request-admission rejection in step 5 are unconditional, and the pre-drain window in step 2 is independent of it.
 
@@ -30,7 +36,24 @@ FERRUM_SHUTDOWN_DRAIN_SECONDS=30
 # while readiness already reports ready:false / 503 (default: 0 = disabled).
 # Serving modes only (database, file, dp, mesh).
 FERRUM_SHUTDOWN_PREDRAIN_SECONDS=0
+
+# Shared observability shutdown budget in milliseconds (default: 2000)
+FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS=2000
 ```
+
+### Worst-case budget (defaults)
+
+With `FERRUM_SHUTDOWN_DRAIN_SECONDS=30` and the binary defaults above:
+
+| Phase | Budget |
+|---|---|
+| In-flight drain | 30s |
+| Transport pool tail | 6s |
+| Background tasks | 5s |
+| Audit flush (database/cp) | 30s (`clamp(30, 5, 60)`) |
+| Observability delivery | 2s |
+| Recommended finalizer slack | 5s |
+| **Total** | **78s** |
 
 ## Deployment Recommendations
 
@@ -38,7 +61,20 @@ FERRUM_SHUTDOWN_PREDRAIN_SECONDS=0
 
 Kubernetes removes a terminating pod from its Service endpoints *concurrently with* stopping it. The deletion has to reach the EndpointSlice controller and then every node's kube-proxy, so for a short period kube-proxy is still steering **new** connections at a pod that has already been told to stop. `terminationGracePeriodSeconds` does not delay the accept-loop close by a single millisecond — it only bounds how long the pod may take once SIGTERM has been sent.
 
-The mitigation is a `preStop` hook, which Kubernetes runs **before** SIGTERM. Kubernetes 1.29+ ships a native `SleepAction` (GA in 1.30) that needs no shell and therefore works on the distroless image:
+The mitigation is a `preStop` hook, which Kubernetes runs **before** SIGTERM. Kubernetes 1.29+ ships a native `SleepAction` (GA in 1.30) that needs no shell and therefore works on the distroless image.
+
+The grace period must cover the WHOLE sequence — `preStop` included, because Kubernetes starts that clock at pod deletion:
+
+```
+terminationGracePeriodSeconds >= preStop + preDrain + drain
+  + 6   # transport pool tail
+  + 5   # background tasks
+  + clamp(drain, 5, 60)   # audit flush (database/cp)
+  + 2   # observability delivery (default)
+  + 5   # finalizer slack
+```
+
+With the default 30s drain the post-SIGTERM budget is **78s**, and the chart's default 30s `preStop` brings the minimum to **108s**. The Ferrum gateway Helm chart defaults to **110s** and validates this at render time:
 
 ```yaml
 spec:
