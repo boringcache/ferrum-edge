@@ -1,0 +1,57 @@
+{{- $first := true -}}
+{{- if .Values.controlPlane.enabled }}
+{{- $doc := include "ferrum-mesh.renderPodDisruptionBudget" (dict
+  "root" .
+  "componentEnabled" true
+  "replicas" .Values.controlPlane.replicas
+  "name" "ferrum-mesh-control-plane"
+  "selectorName" "ferrum-mesh-control-plane") -}}
+{{- if $doc }}
+{{- $doc }}
+{{- $first = false -}}
+{{- end }}
+{{- end }}
+{{- if .Values.injector.enabled }}
+{{- $doc := include "ferrum-mesh.renderPodDisruptionBudget" (dict
+  "root" .
+  "componentEnabled" true
+  "replicas" .Values.injector.replicas
+  "name" "ferrum-mesh-injector"
+  "selectorName" "ferrum-mesh-injector") -}}
+{{- if $doc }}
+{{- if not $first }}
+---
+{{- end }}
+{{- $doc }}
+{{- $first = false -}}
+{{- end }}
+{{- end }}
+{{- if .Values.eastWest.enabled }}
+{{- $doc := include "ferrum-mesh.renderPodDisruptionBudget" (dict
+  "root" .
+  "componentEnabled" true
+  "replicas" .Values.eastWest.replicas
+  "name" "ferrum-mesh-east-west"
+  "selectorName" "ferrum-mesh-east-west") -}}
+{{- if $doc }}
+{{- if not $first }}
+---
+{{- end }}
+{{- $doc }}
+{{- $first = false -}}
+{{- end }}
+{{- end }}
+{{- if .Values.ca.enabled }}
+{{- $doc := include "ferrum-mesh.renderPodDisruptionBudget" (dict
+  "root" .
+  "componentEnabled" true
+  "replicas" 1
+  "name" "ferrum-mesh-ca"
+  "selectorName" "ferrum-mesh-ca") -}}
+{{- if $doc }}
+{{- if not $first }}
+---
+{{- end }}
+{{- $doc }}
+{{- end }}
+{{- end }}

@@ -36,8 +36,10 @@ image:
   # Names of imagePullSecrets to attach to the pod.
   pullSecrets: []
 
-# Number of gateway replicas. A proxy is horizontally scalable; the control
-# plane (cp) can also run multiple replicas behind its gRPC Service.
+# Number of gateway replicas. Defaults to 2 so a node drain or rolling upgrade
+# can evict one pod without dropping the front door to zero. Single-replica
+# installs are an explicit non-HA choice — the PDB is skipped when replicas < 2
+# so minAvailable: 1 cannot block voluntary evictions.
 replicaCount: 2
 
 # Logical Ferrum namespace selector (FERRUM_NAMESPACE). Optional; leave empty to
@@ -502,11 +504,15 @@ autoscaling:
   targetCPUUtilizationPercentage: 80
   targetMemoryUtilizationPercentage: null
 
-# Optional PodDisruptionBudget. Set exactly one of minAvailable / maxUnavailable
-# (a PDB rejects both). minAvailable ships as a default, so to use maxUnavailable
-# set minAvailable: null to clear it; a null/absent minAvailable falls through.
+# Optional PodDisruptionBudget. Enabled by default when replicas >= 2 (or
+# autoscaling.minReplicas >= 2) so kubectl drain cannot evict every gateway pod
+# at once. Skipped when fewer than two replicas are configured because
+# minAvailable: 1 would block all voluntary evictions. Set exactly one of
+# minAvailable / maxUnavailable (a PDB rejects both). minAvailable ships as a
+# default, so to use maxUnavailable set minAvailable: null to clear it; a null/
+# absent minAvailable falls through.
 podDisruptionBudget:
-  enabled: false
+  enabled: true
   minAvailable: 1
   # minAvailable: null
   # maxUnavailable: 1
