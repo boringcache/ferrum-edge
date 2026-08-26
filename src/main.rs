@@ -872,6 +872,17 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         env_config.request_decode_max_total_bytes,
     );
 
+    // Same rule for the aggregate budget that bounds buffered client REQUEST
+    // bodies (issue #4153). Published before the first listener binds, so the
+    // very first prebuffered upload — which `waf` request-body inspection
+    // reaches in the `authenticate` phase, before any principal is admitted —
+    // is already collected under a finite ceiling and charged against the
+    // aggregate budget.
+    crate::proxy::response_buffer_budget::init_request_buffer(
+        env_config.request_buffer_fallback_max_bytes,
+        env_config.request_buffer_max_total_bytes,
+    );
+
     // Initialize DTLS buffer config from resolved EnvConfig before any DTLS sessions.
     crate::dtls::init_dtls_buf_config(
         env_config.dtls_max_plaintext_bytes,

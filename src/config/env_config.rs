@@ -2557,6 +2557,31 @@ pub struct EnvConfig {
     /// aggregate cap to fit one huge response would hand the memory bound back
     /// to whoever picks the response. Default: 268435456 (256 MiB).
     pub response_buffer_max_total_bytes: usize,
+    /// Fail-closed per-request ceiling applied when the effective request-body
+    /// limit resolves to `0` ("unlimited") *and* the body is being RETAINED in
+    /// memory for a plugin, a protocol translation, or retry replay rather than
+    /// streamed. `0 = unlimited` remains a valid streaming policy; it is not a
+    /// valid buffering policy, because one client-chosen upload could then grow
+    /// without bound on a path `waf` request-body inspection reaches BEFORE
+    /// authentication (issue #4153). Runtime clamps this fallback to one 64 KiB
+    /// reservation block at minimum and `usize::MAX / 2` at maximum. Default:
+    /// 10485760 (10 MiB).
+    pub request_buffer_fallback_max_bytes: usize,
+    /// Aggregate ceiling (bytes) on everything concurrent buffered REQUEST
+    /// bodies are admitted to retain at once. A finite per-request ceiling
+    /// still multiplies by concurrency, so this is the bound that actually caps
+    /// gateway memory under a flood of buffered uploads. The claim is taken
+    /// before the collect starts, sized to the per-request retained ceiling,
+    /// and released by drop on every exit path. A request that cannot reserve
+    /// capacity is refused with `503` / gRPC `RESOURCE_EXHAUSTED` instead of
+    /// being collected.
+    ///
+    /// Clamped up to at least the FALLBACK per-request ceiling
+    /// ([`Self::request_buffer_fallback_max_bytes`]) and nothing else, for the
+    /// same reason as the response budget: one fallback-sized upload is always
+    /// admissible, but an arbitrarily larger configured per-request ceiling is
+    /// NOT. Default: 268435456 (256 MiB).
+    pub request_buffer_max_total_bytes: usize,
     /// Aggregate ceiling (bytes) on the working set retained while governed
     /// compressed requests are decoded for final request-body policy
     /// inspection. This is deliberately separate from the response-buffer
@@ -3801,6 +3826,10 @@ impl Default for EnvConfig {
                 crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_RESPONSE_FALLBACK_BYTES,
             response_buffer_max_total_bytes:
                 crate::proxy::response_buffer_budget::DEFAULT_RESPONSE_BUFFER_TOTAL_BYTES,
+            request_buffer_fallback_max_bytes:
+                crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES,
+            request_buffer_max_total_bytes:
+                crate::proxy::response_buffer_budget::DEFAULT_REQUEST_BUFFER_TOTAL_BYTES,
             request_decode_max_total_bytes:
                 crate::proxy::response_buffer_budget::DEFAULT_REQUEST_DECODE_TOTAL_BYTES,
             response_buffer_cutoff_bytes: 65_536,
@@ -4391,6 +4420,8 @@ impl EnvConfig {
             max_response_body_size_bytes: usize = "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES" => 10_485_760usize;
             response_buffer_fallback_max_bytes: usize = "FERRUM_RESPONSE_BUFFER_FALLBACK_MAX_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_RESPONSE_FALLBACK_BYTES;
             response_buffer_max_total_bytes: usize = "FERRUM_RESPONSE_BUFFER_MAX_TOTAL_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_RESPONSE_BUFFER_TOTAL_BYTES;
+            request_buffer_fallback_max_bytes: usize = "FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES;
+            request_buffer_max_total_bytes: usize = "FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_REQUEST_BUFFER_TOTAL_BYTES;
             request_decode_max_total_bytes: usize = "FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_REQUEST_DECODE_TOTAL_BYTES;
             response_buffer_cutoff_bytes: usize = "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES" => 65_536usize;
             h2_coalesce_target_bytes: usize = "FERRUM_H2_COALESCE_TARGET_BYTES" => 131_072usize, clamp(16_384usize, 1_048_576usize);
@@ -5201,6 +5232,8 @@ impl EnvConfig {
             max_response_body_size_bytes,
             response_buffer_fallback_max_bytes,
             response_buffer_max_total_bytes,
+            request_buffer_fallback_max_bytes,
+            request_buffer_max_total_bytes,
             request_decode_max_total_bytes,
             response_buffer_cutoff_bytes,
             h2_coalesce_target_bytes,

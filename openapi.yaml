@@ -1775,7 +1775,8 @@ paths:
         seeing resource internals. The **full** snapshot — resource pressure
         (file descriptors, connections, requests, event-loop latency), active
         counts, port-exhaustion events, load-shedding actions, stream-listener
-        diagnostics, and `listener_failures` — requires a valid admin JWT, a matching
+        diagnostics, `request_buffer` (aggregate buffered-request budget
+        pressure), and `listener_failures` — requires a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS`
         source IP.
 
@@ -15108,6 +15109,44 @@ components:
             reject_new_requests:
               type: boolean
               description: Whether new requests/streams are being rejected with 503
+        request_buffer:
+          type: object
+          description: |
+            Aggregate buffered-request budget pressure
+            (`FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES`). Present only in the
+            authenticated detail snapshot and only when the gateway has a
+            proxy state; the coarse unauthenticated response carries `level`
+            alone.
+          required: [total_bytes, available_bytes, reserved_bytes, reservation_unit_bytes, fallback_max_bytes, rejections]
+          properties:
+            total_bytes:
+              type: integer
+              format: uint64
+              description: Total aggregate capacity after startup clamping.
+            available_bytes:
+              type: integer
+              format: uint64
+              description: Capacity not currently claimed by an in-flight buffered request.
+            reserved_bytes:
+              type: integer
+              format: uint64
+              description: Capacity claimed by in-flight buffered requests right now.
+            reservation_unit_bytes:
+              type: integer
+              format: uint64
+              description: Granularity of one reservation block (64 KiB).
+            fallback_max_bytes:
+              type: integer
+              format: uint64
+              description: |
+                Per-request ceiling applied when the effective request-body
+                limit resolves to `0` (`FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES`).
+            rejections:
+              type: integer
+              format: uint64
+              description: |
+                Buffered requests refused for aggregate capacity since startup
+                (`503` / gRPC `RESOURCE_EXHAUSTED`). Alert when this increases.
         stream_listeners:
           type: object
           description: |

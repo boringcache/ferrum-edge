@@ -1,4 +1,12 @@
-//! Fail-closed bounds for response bodies the gateway retains in memory.
+//! Fail-closed bounds for bodies the gateway retains in memory.
+//!
+//! Named for the surface it was written for. It now hosts three sibling
+//! process-wide budgets built from the same primitives: the retained-RESPONSE
+//! budget documented below, the governed request-DECODE working set, and — see
+//! the "Buffered REQUEST bodies" section beside the constants — the buffered
+//! client-REQUEST budget (issue #4153). They are separate semaphores on
+//! purpose: they bound different allocations with different lifetimes, and an
+//! operator who tunes one must not silently starve another.
 //!
 //! Response-body buffering is entered whenever an active plugin needs the
 //! complete representation (`response_transformer` body rules,
@@ -327,6 +335,7 @@
 
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -378,6 +387,80 @@ pub(crate) const REQUEST_DECODE_OVERLOAD_BODY: &str =
 pub(crate) const REQUEST_DECODE_OVERLOAD_GRPC_MESSAGE: &str =
     "Request inspection capacity exceeded";
 
+// ---------------------------------------------------------------------------
+// Buffered REQUEST bodies (issue #4153)
+// ---------------------------------------------------------------------------
+//
+// The request side entered buffering with NEITHER of the two properties the
+// response side already has.
+//
+// * `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` documents `0` as "unlimited", and the
+//   buffered collectors branched on it: a `0` limit took a raw `body.collect()`
+//   with no size bound at all. `waf` declares `requires_request_body_buffering`
+//   whenever request-body inspection is on, and that buffering runs in the
+//   `authenticate` phase, so one UNAUTHENTICATED upload could grow a single
+//   `Vec` for as long as it kept making progress.
+// * Even at a finite per-request ceiling there was no aggregate bound, so N
+//   concurrent buffered uploads multiplied linearly — the same "a finite
+//   per-response ceiling still multiplies by concurrency" argument this module
+//   already makes for responses.
+//
+// Both are closed with the machinery above rather than a parallel one:
+// [`buffered_request_body_ceiling`] folds `0` to a finite fail-closed fallback
+// on the BUFFERED path only — streaming enforcement keeps `0 = unlimited`,
+// which stays defensible precisely because nothing is retained — and
+// [`RequestBufferPermit`] charges that ceiling against a process-wide semaphore
+// before the collect starts.
+//
+// The charge is taken BEFORE the collect and sized to the CEILING, not to the
+// collected length: the ceiling is the most the collect can retain, and
+// admission has to precede the allocation rather than chase it. It is returned
+// by `Drop`, so success, `413`, `499`, read timeout, RPC deadline,
+// authorization expiry, and task cancellation all release it identically and no
+// path can leak it.
+//
+// A third semaphore, not a share of the retained-response or request-decode
+// ones, for exactly the reason those two are already separate: they bound
+// different allocations with different lifetimes, and an operator who tunes one
+// should not silently starve another.
+
+/// Per-request ceiling applied when the effective request-body limit is `0`
+/// and the body is being retained rather than streamed.
+pub(crate) const DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES: usize = 10 * 1024 * 1024;
+
+/// Aggregate ceiling on bytes concurrent buffered REQUEST bodies are admitted
+/// to retain at once (`FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES`).
+pub(crate) const DEFAULT_REQUEST_BUFFER_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+
+/// Status returned when the aggregate request-buffer budget cannot admit
+/// another buffered upload. `503` for the same reason the two refusals above
+/// are `503`: the client's request is well formed and the backend is
+/// uninvolved, so this is transient GATEWAY capacity.
+pub(crate) const REQUEST_BUFFER_OVERLOAD_STATUS: u16 = 503;
+
+/// gRPC status for the same refusal. `RESOURCE_EXHAUSTED` is the resource /
+/// capacity status and is what the neighbouring buffered-body refusals already
+/// use; `UNAVAILABLE` would claim the backend is down and `INVALID_ARGUMENT`
+/// would blame a perfectly valid upload.
+pub(crate) const REQUEST_BUFFER_OVERLOAD_GRPC_STATUS: u32 =
+    crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED;
+
+/// Client-visible body for a request-buffering capacity refusal. Fixed bytes:
+/// it names no route, header, credential, or body content.
+pub(crate) const REQUEST_BUFFER_OVERLOAD_BODY: &str =
+    r#"{"error":"Request buffering capacity exceeded"}"#;
+
+/// Fixed `grpc-message` for the same refusal, redaction-safe for the same
+/// reason.
+pub(crate) const REQUEST_BUFFER_OVERLOAD_GRPC_MESSAGE: &str = "Request buffering capacity exceeded";
+
+/// Telemetry/retry class for the refusal. Gateway-local by construction, so it
+/// is neutral to the circuit breaker, passive health, and adaptive concurrency,
+/// and is never retried — another upstream would hit the same process-global
+/// budget.
+pub(crate) const REQUEST_BUFFER_OVERLOAD_ERROR_CLASS: ErrorClass =
+    ErrorClass::GatewayBufferCapacity;
+
 /// Status returned when the aggregate budget cannot admit another buffered
 /// response. `503` (not `502`) because the backend behaved correctly and the
 /// condition is transient gateway capacity.
@@ -417,12 +500,25 @@ fn blocks_for(retained_bytes: usize) -> u32 {
 
 struct Budget {
     fallback_per_response_bytes: usize,
+    /// Blocks the semaphore was constructed with. Diagnostics only — the live
+    /// permit count is the authority for admission.
+    total_blocks: usize,
     permits: Arc<Semaphore>,
 }
 
 static BUDGET: OnceLock<Budget> = OnceLock::new();
 
 static REQUEST_DECODE_BUDGET: OnceLock<Budget> = OnceLock::new();
+
+static REQUEST_BUFFER_BUDGET: OnceLock<Budget> = OnceLock::new();
+
+/// Refusals taken by the aggregate buffered-request budget since startup.
+///
+/// Deliberately NOT `CachePadded`: it is written only on a REFUSAL, which is a
+/// rare event by construction, and read at most once per `/overload` scrape.
+/// The padded treatment in `overload.rs` exists for read-mostly flags sharing a
+/// line with a hot `fetch_add`; this is neither.
+static REQUEST_BUFFER_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Which aggregate budget one charge is taken against.
 ///
@@ -438,6 +534,9 @@ enum BudgetTarget<'a> {
     /// The working set a governed REQUEST decode holds while the final
     /// request-body hooks inspect its plaintext.
     RequestDecode,
+    /// Bytes the gateway RETAINS while a buffered client REQUEST body is
+    /// collected for a plugin, a protocol translation, or retry replay.
+    RequestBuffer,
     /// A test-bound isolated semaphore.
     Bound(&'a Budget),
 }
@@ -456,11 +555,17 @@ impl<'a> BudgetRef<'a> {
         Self(BudgetTarget::RequestDecode)
     }
 
+    /// The process-global buffered-request budget.
+    pub(crate) const fn request_buffer() -> Self {
+        Self(BudgetTarget::RequestBuffer)
+    }
+
     fn resolve(self) -> &'a Budget {
         match self.0 {
             BudgetTarget::Bound(budget) => budget,
             BudgetTarget::RetainedResponse => budget(),
             BudgetTarget::RequestDecode => request_decode_budget(),
+            BudgetTarget::RequestBuffer => request_buffer_budget(),
         }
     }
 }
@@ -523,6 +628,140 @@ pub(crate) fn init_request_decode(total_bytes: usize) {
     }
 }
 
+fn request_buffer_budget() -> &'static Budget {
+    REQUEST_BUFFER_BUDGET.get_or_init(|| {
+        Budget::new(
+            DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES,
+            DEFAULT_REQUEST_BUFFER_TOTAL_BYTES,
+        )
+    })
+}
+
+/// Publish the operator-configured buffered-request bounds. Called once during
+/// startup, before any listener accepts traffic, with the same
+/// restart-to-change semantics as [`init`] and [`init_request_decode`].
+///
+/// `#[allow(dead_code)]`: the binary calls this from `main`, but the same
+/// module is separately compiled into the library crate where that binary-only
+/// call site is invisible.
+#[allow(dead_code)] // binary startup caller; dead in the separately compiled library unit
+pub(crate) fn init_request_buffer(fallback_per_request_bytes: usize, total_bytes: usize) {
+    if REQUEST_BUFFER_BUDGET
+        .set(Budget::new(fallback_per_request_bytes, total_bytes))
+        .is_err()
+    {
+        tracing::warn!(
+            requested_fallback_per_request_bytes = fallback_per_request_bytes,
+            requested_total_bytes = total_bytes,
+            "FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES / FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES \
+             startup configuration was ignored because the buffered-request budget was already \
+             initialized; the earlier buffered-request budget remains active"
+        );
+    }
+}
+
+/// The effective ceiling for a client request body the gateway is about to
+/// *retain*.
+///
+/// `effective_limit` is the already-folded strictest active limit (global +
+/// protocol + route/plugin). A configured value is honored verbatim. `0` —
+/// documented as "unlimited" for streaming — becomes the finite fallback here,
+/// because an unlimited retained upload buffer is not a policy the gateway can
+/// honor safely. Streaming enforcement is untouched and keeps `0 = unlimited`.
+///
+/// A configured ceiling larger than the aggregate budget is honored as a
+/// *ceiling* but is not thereby admissible: [`RequestBufferPermit::reserve`]
+/// still refuses what will not fit. See [`Budget::new`].
+pub(crate) fn buffered_request_body_ceiling(effective_limit: usize) -> usize {
+    request_buffer_budget().ceiling(effective_limit)
+}
+
+/// An RAII claim on the aggregate buffered-request budget.
+///
+/// Taken BEFORE the collect and sized to the per-request retained ceiling, so
+/// admission precedes the allocation instead of chasing it. Held for as long as
+/// the buffered bytes are being collected and dispatched, and returned by
+/// `Drop` — success, `413`, `499`, read timeout, RPC deadline, authorization
+/// expiry, and task cancellation are all just drops, so none of them can leak
+/// the budget and none of them can release early while the bytes are resident.
+#[must_use = "dropping the permit immediately returns the capacity it reserved"]
+pub(crate) struct RequestBufferPermit {
+    /// Read only by [`Self::reserved_bytes`], which is an external-test seam
+    /// and therefore dead in the separately compiled binary unit. The permit's
+    /// real job is its `Drop`, which returns the blocks to the semaphore.
+    #[allow(dead_code)]
+    reservation: ResponseBufferReservation,
+}
+
+impl RequestBufferPermit {
+    /// Charge `retained_bytes` against the process-global buffered-request
+    /// budget. `None` means the budget refused and the caller must surface
+    /// [`REQUEST_BUFFER_OVERLOAD_STATUS`] instead of collecting.
+    pub(crate) fn reserve(retained_bytes: usize) -> Option<Self> {
+        Self::reserve_in(BudgetRef::request_buffer(), retained_bytes)
+    }
+
+    /// The same admission against an explicitly chosen budget. Production
+    /// passes [`BudgetRef::request_buffer`]; external tests bind an
+    /// [`IsolatedBudget`] so a parallel test binary can observe admission and
+    /// release deterministically.
+    pub(crate) fn reserve_in(budget: BudgetRef<'_>, retained_bytes: usize) -> Option<Self> {
+        let mut reservation = ResponseBufferReservation::new();
+        if reservation.reserve_in(budget, retained_bytes) {
+            Some(Self { reservation })
+        } else {
+            REQUEST_BUFFER_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    /// Bytes currently reserved (whole blocks). Diagnostics and tests only.
+    #[allow(dead_code)] // external-test seam; dead in the separately compiled binary unit
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self.reservation.reserved_bytes()
+    }
+}
+
+/// Operator-facing pressure on the aggregate buffered-request budget.
+///
+/// Surfaced only to AUTHENTICATED `/overload` callers: the coarse
+/// unauthenticated `{level}` stays coarse, exactly like every other counter in
+/// that snapshot.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub(crate) struct RequestBufferBudgetSnapshot {
+    /// Total capacity the budget was constructed with, after clamping.
+    pub(crate) total_bytes: usize,
+    /// Capacity not currently claimed by an in-flight buffered request.
+    pub(crate) available_bytes: usize,
+    /// Capacity claimed by in-flight buffered requests right now.
+    pub(crate) reserved_bytes: usize,
+    /// Granularity of one reservation block.
+    pub(crate) reservation_unit_bytes: usize,
+    /// Per-request ceiling applied when the effective limit resolves to `0`.
+    pub(crate) fallback_max_bytes: usize,
+    /// Buffered requests refused for capacity since startup.
+    pub(crate) rejections: u64,
+}
+
+/// Snapshot the aggregate buffered-request budget. Cheap: two atomic loads and
+/// no allocation on the reading path.
+pub(crate) fn request_buffer_snapshot() -> RequestBufferBudgetSnapshot {
+    let budget = request_buffer_budget();
+    let total_bytes = budget.total_blocks.saturating_mul(RESERVATION_UNIT_BYTES);
+    let available_bytes = budget
+        .permits
+        .available_permits()
+        .saturating_mul(RESERVATION_UNIT_BYTES);
+    RequestBufferBudgetSnapshot {
+        total_bytes,
+        available_bytes,
+        reserved_bytes: total_bytes.saturating_sub(available_bytes),
+        reservation_unit_bytes: RESERVATION_UNIT_BYTES,
+        fallback_max_bytes: budget.fallback_per_response_bytes,
+        rejections: REQUEST_BUFFER_REJECTIONS.load(Ordering::Relaxed),
+    }
+}
+
 impl Budget {
     fn new(fallback_per_response_bytes: usize, total_bytes: usize) -> Self {
         // A zero/short fallback would not cover even one reservation block, and
@@ -544,10 +783,13 @@ impl Budget {
         let fallback_per_response_bytes =
             fallback_per_response_bytes.clamp(RESERVATION_UNIT_BYTES, usize::MAX / 2);
         let total_bytes = total_bytes.max(fallback_per_response_bytes);
-        let blocks = total_bytes.div_ceil(RESERVATION_UNIT_BYTES);
+        let blocks = total_bytes
+            .div_ceil(RESERVATION_UNIT_BYTES)
+            .min(Semaphore::MAX_PERMITS);
         Self {
             fallback_per_response_bytes,
-            permits: Arc::new(Semaphore::new(blocks.min(Semaphore::MAX_PERMITS))),
+            total_blocks: blocks,
+            permits: Arc::new(Semaphore::new(blocks)),
         }
     }
 
@@ -1443,6 +1685,19 @@ impl IsolatedBudget {
 
     pub(crate) fn buffered_response_body_ceiling(&self, effective_limit: usize) -> usize {
         self.0.ceiling(effective_limit)
+    }
+
+    /// The retained-path ceiling for a buffered REQUEST body under this bound
+    /// budget. Same folding rule as production, so a test cannot pass against a
+    /// parallel implementation of it.
+    pub(crate) fn buffered_request_body_ceiling(&self, effective_limit: usize) -> usize {
+        self.0.ceiling(effective_limit)
+    }
+
+    /// The PRODUCTION buffered-request admission, bound to this isolated
+    /// budget: reserve the ceiling before the collect, release on drop.
+    pub(crate) fn try_reserve_request_permit(&self, bytes: usize) -> Option<RequestBufferPermit> {
+        RequestBufferPermit::reserve_in(self.handle(), bytes)
     }
 
     /// Reserve `bytes` before allocating them, exactly as the H3 / gRPC
