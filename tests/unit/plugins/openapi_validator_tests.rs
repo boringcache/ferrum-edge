@@ -1454,6 +1454,145 @@ async fn xml_rejects_repeated_scalar_elements_fail_closed() {
 }
 
 #[tokio::test]
+async fn xml_comment_split_scalar_never_validates_as_prefix() {
+    // A comment inside a scalar element splits roxmltree's character data into
+    // separate text runs while a backend that drops comments concatenates them.
+    // Validation must not accept the prefix alone.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/orders",
+            "path_regex": "^/orders$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "order"},
+                        "required": ["quantity"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "quantity": {
+                                "type": "integer",
+                                "maximum": 9,
+                                "xml": {"name": "qty"}
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("application/xml");
+
+    let mut ctx = post_ctx("/orders");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<order><qty>1<!---->000</qty></order>"#,
+            )
+            .await,
+        Some(400),
+    );
+
+    let mut ctx = post_ctx("/orders");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<order><qty>3</qty></order>"#,
+            )
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn xml_comment_between_elements_still_accepted() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/orders",
+            "path_regex": "^/orders$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "order"},
+                        "required": ["quantity"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "quantity": {
+                                "type": "integer",
+                                "maximum": 9,
+                                "xml": {"name": "qty"}
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("application/xml");
+    let mut ctx = post_ctx("/orders");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<order><!-- routing hint --><qty>3</qty></order>"#,
+            )
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn xml_comment_split_mixed_content_text_never_validates_as_prefix() {
+    // generic_xml_node_to_value models inter-element text as "#text". A comment
+    // inside that text must not reduce validation to the prefix alone.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/payload",
+            "path_regex": "^/payload$",
+            "request_body": {
+                "content": {
+                    "application/xml": {
+                        "type": "object",
+                        "xml": {"name": "root"},
+                        "properties": {
+                            "known": {"type": "string"}
+                        },
+                        "additionalProperties": true
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("application/xml");
+
+    let mut ctx = post_ctx("/payload");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                br#"<root><known>ok</known><payload>pre<!---->fix<part>1</part></payload></root>"#,
+            )
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
 async fn xml_namespace_and_prefix_metadata_fail_closed() {
     // #3022: honor xml.namespace / xml.prefix via expanded-name matching.
     let plugin = OpenapiValidator::new(&json!({
