@@ -51,19 +51,11 @@ fn passive_unhealthy_count(checker: &HealthChecker) -> usize {
 }
 
 fn ring_len(checker: &HealthChecker, proxy_id: &str, host_port: &str) -> usize {
-    checker.passive_recent_failure_len_for_test(
-        DEFAULT_NAMESPACE,
-        proxy_id,
-        host_port,
-    )
+    checker.passive_recent_failure_len_for_test(DEFAULT_NAMESPACE, proxy_id, host_port)
 }
 
 fn ring_slot_cap(checker: &HealthChecker, proxy_id: &str, host_port: &str) -> usize {
-    checker.passive_recent_failure_slot_cap_for_test(
-        DEFAULT_NAMESPACE,
-        proxy_id,
-        host_port,
-    )
+    checker.passive_recent_failure_slot_cap_for_test(DEFAULT_NAMESPACE, proxy_id, host_port)
 }
 
 fn report_failures(
@@ -856,11 +848,7 @@ fn test_remove_stale_passive_targets_drops_failure_ring() {
     assert_eq!(ring_len(&checker, TEST_PROXY, "backend1:8080"), 4);
     assert_eq!(ring_len(&checker, TEST_PROXY, "backend2:8080"), 2);
 
-    checker.remove_stale_passive_targets_for_proxy(
-        DEFAULT_NAMESPACE,
-        TEST_PROXY,
-        &[kept],
-    );
+    checker.remove_stale_passive_targets_for_proxy(DEFAULT_NAMESPACE, TEST_PROXY, &[kept]);
     assert_eq!(
         ring_len(&checker, TEST_PROXY, "backend1:8080"),
         0,

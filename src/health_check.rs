@@ -380,10 +380,7 @@ mod recent_failure_ring_tests {
         let last = *counts.last().unwrap();
         assert_eq!(last, 50);
         assert!(last < MAX_RECENT_FAILURES_PER_TARGET);
-        assert_eq!(
-            ring.slot_capacity(),
-            MAX_RECENT_FAILURES_PER_TARGET,
-        );
+        assert_eq!(ring.slot_capacity(), MAX_RECENT_FAILURES_PER_TARGET,);
     }
 
     #[test]
@@ -393,10 +390,7 @@ mod recent_failure_ring_tests {
         for i in 0..(MAX_RECENT_FAILURES_PER_TARGET * 5) {
             let count = ring.record(i as u64, window_start);
             assert!(count <= MAX_RECENT_FAILURES_PER_TARGET);
-            assert_eq!(
-                ring.slot_capacity(),
-                MAX_RECENT_FAILURES_PER_TARGET,
-            );
+            assert_eq!(ring.slot_capacity(), MAX_RECENT_FAILURES_PER_TARGET,);
         }
         assert_eq!(ring.len(), MAX_RECENT_FAILURES_PER_TARGET);
     }
@@ -407,22 +401,13 @@ mod recent_failure_ring_tests {
         assert_eq!(ring.slot_capacity(), 0);
         ring.record(1, 0);
         assert_eq!(ring.len(), 1);
-        assert_eq!(
-            ring.slot_capacity(),
-            MAX_RECENT_FAILURES_PER_TARGET,
-        );
+        assert_eq!(ring.slot_capacity(), MAX_RECENT_FAILURES_PER_TARGET,);
         ring.clear();
         assert_eq!(ring.len(), 0);
-        assert_eq!(
-            ring.slot_capacity(),
-            MAX_RECENT_FAILURES_PER_TARGET,
-        );
+        assert_eq!(ring.slot_capacity(), MAX_RECENT_FAILURES_PER_TARGET,);
         ring.record(2, 0);
         assert_eq!(ring.len(), 1);
-        assert_eq!(
-            ring.slot_capacity(),
-            MAX_RECENT_FAILURES_PER_TARGET,
-        );
+        assert_eq!(ring.slot_capacity(), MAX_RECENT_FAILURES_PER_TARGET,);
     }
 }
 
