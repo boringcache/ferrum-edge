@@ -241,6 +241,10 @@ divergence this representation exists to eliminate.
 - `docs/routing.md` — route matching and `strip_listen_path`
 - `docs/plugins.md` — `waf`, `openapi_validator`, `request_termination`,
   `hmac_auth`
+- `docs/mesh.md` — Istio `AuthorizationPolicy` `paths:` / `notPaths:` matching,
+  which runs on this canonical path (issues #1701 and #4149). `mesh_authz`
+  re-runs the canonicalizer before it evaluates a rule and denies with `403`
+  rather than matching a target it cannot reduce to one reading.
 - `src/router_cache.rs` `normalize_encoded_slashes()` — the predecessor helper,
-  retained only as an unreachable defense-in-depth residual for callers that do
-  not enter through the frontend boundary
+  retained only for backend listen-path stripping, which needs the router's own
+  offset coordinate system

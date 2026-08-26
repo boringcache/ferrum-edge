@@ -48,6 +48,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -982,6 +983,11 @@ fn http_header_attribute(
         return Some(ctx.method.clone());
     }
     if name.eq_ignore_ascii_case(":path") {
+        // The canonical policy path, same as the `paths:` / `notPaths:`
+        // matcher reads. Every caller runs after `authorize`'s canonical-path
+        // gate has already proven `ctx.path` canonicalizes to itself, so a
+        // `when: request.headers[:path]` condition and a `to.operation.paths`
+        // entry can never be evaluated against two different spellings.
         return Some(ctx.path.clone());
     }
     if name.eq_ignore_ascii_case(":scheme") {
@@ -1132,8 +1138,70 @@ fn mesh_authz_destination_ip(
         .map(crate::util::client_identity::canonical_ip)
 }
 
-fn mesh_authz_authorization_path(path: &str) -> String {
-    crate::router_cache::normalize_encoded_slashes(path).into_owned()
+/// The request path mesh authorization evaluates, or the reason the target
+/// cannot be judged at all.
+///
+/// `paths:` / `notPaths:` matching is purely literal (`wildcard_match` in
+/// `src/modes/mesh/policy.rs`), so an authorization decision is only sound
+/// while the string it reads is the one the backend resolves. Two spellings
+/// break that on their own: an encoded separator (`/admin%2Fsecret`, issue
+/// #1701) and a dot segment (`/public/../admin/secret`, issue #4149). Either
+/// lets a DENY on `/admin/*` miss — or an ALLOW on `/public/*` match — while
+/// a normalizing backend still serves the protected resource.
+///
+/// Ferrum settles both halves with ONE mechanism, the canonical policy path
+/// ([`crate::policy_path`]), rather than with a second authz-local
+/// normalizer. Every HTTP/1.1, HTTP/2, and HTTP/3 request target is run
+/// through [`crate::policy_path::canonicalize_policy_path`] at the frontend
+/// boundary — before routing, before every plugin phase, and before backend
+/// dispatch — and an encoded separator or a dot segment is *refused* there
+/// rather than rewritten. Refusing is what removal cannot do: removing `..`
+/// is itself a second reading of the target, so a backend that does not
+/// remove it would still see a different path than policy read.
+///
+/// Re-running the canonicalizer here is therefore the identity on every path
+/// that can actually reach `authorize` — it borrows, and allocates nothing —
+/// and it converts "unreachable" into "proven": if a future entry point ever
+/// built a [`RequestContext`] without passing that boundary, authorization
+/// fails closed on the ambiguous target instead of matching it literally.
+///
+/// A segment that merely *contains* dots (`/a..b`, `/...`) is not a dot
+/// segment and is returned untouched.
+fn mesh_authz_authorization_path(
+    path: &str,
+) -> Result<Cow<'_, str>, crate::policy_path::PolicyPathRejection> {
+    crate::policy_path::canonicalize_policy_path(path)
+}
+
+/// Stable, fixed-cardinality rule name for a denial caused by a request
+/// target mesh authorization cannot reduce to one reading.
+pub(crate) const MESH_AUTHZ_NON_CANONICAL_PATH_DENY: &str = "non_canonical_path";
+
+/// Fail closed on a request target mesh authorization cannot canonicalize.
+///
+/// The reason token comes from
+/// [`crate::policy_path::PolicyPathRejection::reason`] and is a compiled-in
+/// literal, so the drilldown records *why* the target was unjudgeable without
+/// ever carrying attacker-controlled request bytes. The client body is the
+/// same fixed string every other mesh denial uses — a refused peer learns
+/// nothing about which policy or which spelling stopped it.
+fn non_canonical_authorization_path_reject(
+    ctx: &mut RequestContext,
+    rejection: crate::policy_path::PolicyPathRejection,
+) -> PluginResult {
+    ctx.metadata.insert(
+        "mesh_authz.non_canonical_path".to_string(),
+        rejection.reason().to_string(),
+    );
+    ctx.metadata.insert(
+        "mesh_authz.deny_policy".to_string(),
+        MESH_AUTHZ_NON_CANONICAL_PATH_DENY.to_string(),
+    );
+    PluginResult::Reject {
+        status_code: 403,
+        body: r#"{"error":"Mesh authorization denied"}"#.into(),
+        headers: HashMap::new(),
+    }
 }
 
 /// The authorization destination port for a materialized sidecar inbound route,
@@ -2046,7 +2114,19 @@ impl MeshAuthz {
                 check_headers.insert(name.as_str().to_string(), value);
             }
         }
-        let path = mesh_authz_authorization_path(&ctx.path);
+        // Same canonical-path contract the policy matcher was held to above:
+        // the provider is handed exactly the string `paths:` / `notPaths:`
+        // were evaluated against, never the raw target. `authorize` gates on
+        // this before it can select a CUSTOM delegation, so the error arm is
+        // unreachable in production — it exists so the provider can never be
+        // asked to judge a target the matcher itself refused to judge.
+        let path = mesh_authz_authorization_path(&ctx.path).map(Cow::into_owned);
+        let path = match path {
+            Ok(path) => path,
+            Err(rejection) => {
+                return Some(non_canonical_authorization_path_reject(ctx, rejection));
+            }
+        };
         let body = ctx.request_body_bytes.clone();
         // The ext-auth protocol carries the ORIGINAL request authority. This is
         // the same validated `Host` / `:authority` the policy matcher used, and
@@ -2515,6 +2595,32 @@ impl Plugin for MeshAuthz {
                 headers: HashMap::new(),
             };
         }
+        // Canonical-path gate (issues #1701 and #4149). `paths:` / `notPaths:`
+        // are matched literally, so a target this gateway cannot reduce to a
+        // single reading must not be judged at all — matching it raw is what
+        // lets `/public/../admin/secret` or `/admin%2Fsecret` walk past a DENY
+        // and satisfy an unrelated ALLOW. The frontend boundary already
+        // refuses every such spelling with a 400, so on every reachable path
+        // this borrows and returns unchanged; it is here so no future entry
+        // point can reintroduce the divergence silently.
+        //
+        // Placed ahead of header materialization and condition-attribute
+        // construction: an unjudgeable target should cost the workload
+        // nothing.
+        let authorization_path = mesh_authz_authorization_path(&ctx.path).map(Cow::into_owned);
+        let authorization_path = match authorization_path {
+            Ok(path) => path,
+            Err(rejection) => {
+                let reject = non_canonical_authorization_path_reject(ctx, rejection);
+                self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
+                if self.per_pod_policy_scoping && !asserted_identity_rejected {
+                    crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
+                        crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::AuthzDeny,
+                    );
+                }
+                return reject;
+            }
+        };
         let mut host = ctx
             .raw_header_get("host")
             .or_else(|| ctx.raw_header_get(":authority"))
@@ -2580,7 +2686,7 @@ impl Plugin for MeshAuthz {
             source_principal,
             request_principal,
             method: Some(ctx.method.clone()),
-            path: Some(mesh_authz_authorization_path(&ctx.path)),
+            path: Some(authorization_path),
             host,
             port,
             headers,
@@ -3018,12 +3124,21 @@ impl Plugin for MeshAuthz {
             .or_else(|| ctx.raw_header_get(":authority"))
             .map(str::to_string)
             .or_else(|| ctx.headers.get("host").cloned());
-        let path = mesh_authz_authorization_path(&ctx.path);
+        // The predicate must have no false negatives for a rule that will
+        // later match, so an unjudgeable target falls back to the raw bytes
+        // rather than skipping the scan. Such a target never reaches a
+        // provider anyway: `authorize` denies it before any check is
+        // dispatched.
+        let canonical = mesh_authz_authorization_path(&ctx.path);
+        let path: &str = match &canonical {
+            Ok(canonical) => canonical,
+            Err(_) => ctx.path.as_str(),
+        };
         self.body_inspecting_custom_rules.iter().any(|rule| {
             crate::modes::mesh::policy::mesh_rule_request_scope_may_apply(
                 rule,
                 &ctx.method,
-                &path,
+                path,
                 host.as_deref(),
             )
         })
@@ -3930,16 +4045,121 @@ mod tests {
         );
     }
 
+    /// An ordinary target is returned untouched AND borrowed: the mesh authz
+    /// hot path must not allocate to canonicalize a path that is already
+    /// canonical, which is every path the frontend boundary lets through.
     #[test]
-    fn mesh_authz_authorization_path_normalizes_encoded_slashes() {
+    fn mesh_authz_authorization_path_borrows_an_already_canonical_target() {
+        for path in ["/", "/admin/secret", "/a/b/c", "/v1.0/items"] {
+            let canonical = mesh_authz_authorization_path(path)
+                .unwrap_or_else(|rejection| panic!("{path:?} refused: {rejection:?}"));
+            assert_eq!(canonical, path);
+            assert!(
+                matches!(canonical, std::borrow::Cow::Borrowed(_)),
+                "{path:?} must canonicalize without allocating"
+            );
+        }
+    }
+
+    /// Dots INSIDE a segment name are ordinary path bytes, not dot segments.
+    /// RFC 3986 `remove_dot_segments` leaves them alone and so must this — a
+    /// resource legitimately named `/a..b` has to stay reachable and has to
+    /// keep matching an operator's literal `paths:` entry.
+    #[test]
+    fn mesh_authz_authorization_path_keeps_dots_inside_a_segment_name() {
+        for path in ["/a..b", "/..a", "/a..", "/...", "/a/..b/c", "/a/b../c"] {
+            let canonical = mesh_authz_authorization_path(path)
+                .unwrap_or_else(|rejection| panic!("{path:?} refused: {rejection:?}"));
+            assert_eq!(canonical, path, "{path:?} must not be rewritten");
+        }
+    }
+
+    /// Issue #4149 — the recorded remaining half of #1701. A dot segment is a
+    /// second reading of the target: policy would evaluate
+    /// `/public/../admin/secret` while a normalizing backend serves
+    /// `/admin/secret`. Refusing it is what keeps the two on one coordinate,
+    /// in every spelling (literal, `%2e`, `%2E`, and double-encoded).
+    #[test]
+    fn mesh_authz_authorization_path_refuses_dot_segments_in_every_spelling() {
+        use crate::policy_path::PolicyPathRejection;
+
+        for path in [
+            "/public/../admin/secret",
+            "/x/../admin/secret",
+            "/./admin/secret",
+            "/admin/./secret",
+            "/admin/../admin/secret",
+            "/admin/secret/..",
+            "/admin/secret/.",
+            "/..",
+            "/.",
+        ] {
+            assert_eq!(
+                mesh_authz_authorization_path(path).err(),
+                Some(PolicyPathRejection::LiteralDotSegment),
+                "{path:?} must be refused as a literal dot segment"
+            );
+        }
+
+        for path in [
+            "/x/%2e%2e/admin/secret",
+            "/x/%2E%2E/admin/secret",
+            "/x/.%2e/admin/secret",
+            "/%2e/admin/secret",
+        ] {
+            assert_eq!(
+                mesh_authz_authorization_path(path).err(),
+                Some(PolicyPathRejection::AmbiguousDotSegment),
+                "{path:?} must be refused as an escaped dot segment"
+            );
+        }
+
+        // A double encoding never gets as far as the dot-segment check: the
+        // encoded `%` is refused first, which is the same closure by a
+        // stricter rule.
         assert_eq!(
-            mesh_authz_authorization_path("/admin%2fsecret"),
-            "/admin/secret"
+            mesh_authz_authorization_path("/x/%252e%252e/admin/secret").err(),
+            Some(PolicyPathRejection::DoubleEncoding)
+        );
+    }
+
+    /// Issue #1701 (the encoded-slash half) must not regress. It is now closed
+    /// by refusal rather than by folding `%2F` to `/`: folding changes segment
+    /// structure, so a folded decision could still disagree with a backend
+    /// that does not decode. Refusal cannot.
+    #[test]
+    fn mesh_authz_authorization_path_refuses_encoded_separators() {
+        use crate::policy_path::PolicyPathRejection;
+
+        assert_eq!(
+            mesh_authz_authorization_path("/admin%2fsecret").err(),
+            Some(PolicyPathRejection::EncodedSeparator)
         );
         assert_eq!(
-            mesh_authz_authorization_path("/admin%252Fsecret"),
-            "/admin/secret"
+            mesh_authz_authorization_path("/admin%2Fsecret").err(),
+            Some(PolicyPathRejection::EncodedSeparator)
         );
-        assert_eq!(mesh_authz_authorization_path("/api%20name"), "/api%20name");
+        assert_eq!(
+            mesh_authz_authorization_path("/admin%252Fsecret").err(),
+            Some(PolicyPathRejection::DoubleEncoding)
+        );
+        // Never silently evaluated raw: the old normalizer passed this
+        // through unchanged, so policy read a spelling a decoding backend
+        // resolves differently.
+        assert_eq!(
+            mesh_authz_authorization_path("/api%20name").err(),
+            Some(PolicyPathRejection::UnrepresentableEscape)
+        );
+    }
+
+    /// An escape of a byte that is legal literally IS decoded, so an
+    /// operator's literal `paths: ["/admin"]` still matches `/%61dmin`
+    /// (advisory GHSA-69xf-42xm-4w4f). Mesh authz reads the same canonical
+    /// form every other policy surface does.
+    #[test]
+    fn mesh_authz_authorization_path_decodes_pchar_escapes() {
+        let canonical =
+            mesh_authz_authorization_path("/%61dmin").expect("pchar escape is decodable");
+        assert_eq!(canonical, "/admin");
     }
 }
