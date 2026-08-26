@@ -408,6 +408,9 @@ where
         match tokio::time::timeout_at(deadline, accept_fut).await {
             Ok(result) => result,
             Err(_) => {
+                crate::data_path_metrics::record_frontend_tls_handshake_failure(
+                    crate::data_path_metrics::FrontendTlsHandshakeFailure::Timeout,
+                );
                 if record_mesh_mtls_metric {
                     crate::plugins::mesh::prometheus_helpers::increment_mesh_mtls_handshake_failure(
                         "timeout",
@@ -443,6 +446,9 @@ where
             Ok(stream)
         }
         Err(e) => {
+            crate::data_path_metrics::record_frontend_tls_handshake_failure(
+                crate::data_path_metrics::FrontendTlsHandshakeFailure::Error,
+            );
             if record_mesh_mtls_metric {
                 crate::plugins::mesh::prometheus_helpers::increment_mesh_mtls_handshake_failure(
                     "error",

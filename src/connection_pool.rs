@@ -378,6 +378,16 @@ impl ConnectionPool {
         &self.pool.manager().global_config
     }
 
+    /// Resident pool entries and the configured per-host idle ceiling.
+    ///
+    /// Scrape-path counterpart to [`Self::get_stats`], which additionally
+    /// snapshots every pool key to build the per-host map. The `/metrics`
+    /// surface never labels by pool key, so it does not pay for that snapshot.
+    pub fn pool_gauges(&self) -> (usize, usize) {
+        let stats = self.pool.stats();
+        (stats.size, stats.max_idle_per_host)
+    }
+
     /// Get pool statistics for monitoring.
     pub fn get_stats(&self) -> PoolStats {
         let stats = self.pool.stats();

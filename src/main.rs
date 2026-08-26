@@ -29,6 +29,7 @@ mod connection_pool;
 mod consumer_index;
 #[path = "../custom_plugins/mod.rs"]
 mod custom_plugins;
+mod data_path_metrics;
 mod date_cache;
 mod dns;
 // Test-facing constructors/accessors (deterministic-clock variants) are used by

@@ -22,6 +22,7 @@ mod configsync_lifecycle_tests;
 mod consumer_index_tests;
 mod cp_listener_supervision_tests;
 mod cp_server_tests;
+mod data_path_metrics_tests;
 mod datagram_client_address_tests;
 mod date_cache_tests;
 mod db_poll_supervision_tests;
