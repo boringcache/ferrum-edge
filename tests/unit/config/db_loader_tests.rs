@@ -4,7 +4,7 @@ use ferrum_edge::_test_support::{
     database_store_set_reconnect_transition_hooks_for_test, db_code_is_transient, db_diff_removed,
     db_mongo_error_is_transient, db_mysql_error_number_is_transient,
     db_wrap_mysql_isolation_read_error, effective_pool_connect_timeout_seconds,
-    is_config_validation_rejection, mysql_config_change_lock_insert_sql,
+    is_config_validation_rejection, lock_wait_timeout_sql, mysql_config_change_lock_insert_sql,
     mysql_mtls_dns_admission_lock_insert_sql, mysql_proxy_route_lock_insert_sql, parse_auth_mode,
     parse_scheme, statement_timeout_sql, validate_tcp_connection_throttle_attachments,
 };
@@ -541,6 +541,23 @@ fn test_statement_timeout_sql_mysql() {
 fn test_statement_timeout_sql_sqlite_returns_none() {
     // SQLite does not support statement timeouts.
     assert_eq!(statement_timeout_sql(30, false, false), None);
+}
+
+#[test]
+fn test_lock_wait_timeout_sql_is_mysql_only_and_in_seconds() {
+    // MySQL's max_execution_time bounds read-only SELECTs, so a write queued
+    // behind an abandoned transaction's row lock is otherwise unbounded — the
+    // zombie-lock pileup in issue #4146. innodb_lock_wait_timeout is expressed
+    // in seconds, not milliseconds.
+    assert_eq!(
+        lock_wait_timeout_sql(30, true),
+        Some("SET SESSION innodb_lock_wait_timeout = 30".to_string())
+    );
+    // PostgreSQL's statement_timeout already bounds blocked statements, and
+    // SQLite uses PRAGMA busy_timeout.
+    assert_eq!(lock_wait_timeout_sql(30, false), None);
+    // 0 = disabled, same as the statement timeout.
+    assert_eq!(lock_wait_timeout_sql(0, true), None);
 }
 
 #[tokio::test]

@@ -2079,6 +2079,83 @@ pub mod _test_support {
         .await
     }
 
+    /// Lease backend a renewal test supplies to
+    /// [`run_namespace_config_admission_renewal_for_test`].
+    pub type TestLeaseBackend =
+        std::sync::Arc<dyn crate::config::db_backend::NamespaceConfigAdmissionLeaseBackend>;
+
+    /// Scaled timing envelope for
+    /// [`run_namespace_config_admission_renewal_for_test`].
+    ///
+    /// Production runs a 120s lease renewed every 30s with a 1s retry gap.
+    /// Tests keep the same ratios in milliseconds so the stall and expiry
+    /// boundaries can be crossed without waiting minutes.
+    #[derive(Clone, Copy, Debug)]
+    pub struct TestLeaseRenewalTiming {
+        pub lease_duration_ms: u64,
+        pub renew_interval_ms: u64,
+        pub retry_interval_ms: u64,
+    }
+
+    /// Terminal state of the renewer under test.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TestLeaseRenewalOutcome {
+        /// Stopped by the guard while the lease was still held.
+        Stopped,
+        /// Ownership provably changed hands.
+        Lost,
+        /// The window closed without a provable renewal; failed closed.
+        Expired,
+    }
+
+    /// What the renewer did, plus the guard-visible verdict at the end.
+    #[derive(Clone, Copy, Debug)]
+    pub struct TestLeaseRenewalObservation {
+        pub outcome: TestLeaseRenewalOutcome,
+        pub renewals: u32,
+        pub retries: u32,
+        pub reclaims: u32,
+        pub still_held: bool,
+    }
+
+    /// Drive the production namespace config admission renewer against a
+    /// caller-supplied lease backend (issue #4146).
+    ///
+    /// Every bound the renewer applies — the per-attempt budget, the retry
+    /// gap, and the hard window close — is derived from `timing`, so a scaled
+    /// envelope exercises the identical arithmetic production runs.
+    pub async fn run_namespace_config_admission_renewal_for_test(
+        backend: TestLeaseBackend,
+        namespace: &str,
+        owner: &str,
+        generation: u64,
+        timing: TestLeaseRenewalTiming,
+        run_for: std::time::Duration,
+    ) -> TestLeaseRenewalObservation {
+        let timing = crate::admin::crud::LeaseRenewalTiming {
+            lease_duration: std::time::Duration::from_millis(timing.lease_duration_ms),
+            renew_interval: std::time::Duration::from_millis(timing.renew_interval_ms),
+            retry_interval: std::time::Duration::from_millis(timing.retry_interval_ms),
+        };
+        let (report, still_held) =
+            crate::admin::crud::run_namespace_config_admission_renewal_for_test(
+                backend, namespace, owner, generation, timing, run_for,
+            )
+            .await;
+        let outcome = match report.outcome {
+            crate::admin::crud::LeaseRenewalOutcome::Stopped => TestLeaseRenewalOutcome::Stopped,
+            crate::admin::crud::LeaseRenewalOutcome::Lost => TestLeaseRenewalOutcome::Lost,
+            crate::admin::crud::LeaseRenewalOutcome::Expired => TestLeaseRenewalOutcome::Expired,
+        };
+        TestLeaseRenewalObservation {
+            outcome,
+            renewals: report.counters.renewals,
+            retries: report.counters.retries,
+            reclaims: report.counters.reclaims,
+            still_held,
+        }
+    }
+
     /// Acquire the durable namespace config admission lease (same primitive as
     /// admin mutations and api_specs-emitting backups) for external tests.
     pub async fn lock_namespace_config_admission_db_for_test(
@@ -5103,6 +5180,10 @@ pub mod _test_support {
 
     pub fn parse_auth_mode(s: &str) -> AuthMode {
         crate::config::db_loader::parse_auth_mode(s)
+    }
+
+    pub fn lock_wait_timeout_sql(timeout_seconds: u64, is_mysql: bool) -> Option<String> {
+        crate::config::db_loader::lock_wait_timeout_sql(timeout_seconds, is_mysql)
     }
 
     pub fn statement_timeout_sql(
