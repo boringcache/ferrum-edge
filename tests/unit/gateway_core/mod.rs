@@ -108,6 +108,7 @@ mod proxy_protocol_tests;
 mod proxy_tests;
 mod request_context_tests;
 mod request_representation_tests;
+mod request_trailer_boundary_tests;
 mod response_body_mode_tests;
 mod response_buffer_budget_tests;
 mod response_pipeline_ordering_tests;

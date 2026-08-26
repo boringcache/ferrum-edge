@@ -3006,6 +3006,91 @@ async fn test_stream_true_vs_false_no_cache_hit() {
 }
 
 #[tokio::test]
+async fn type_tolerant_max_tokens_stream_and_cohere_history_isolate_exact_keys() {
+    // #4183: max_tokens/stream must not be type-gated, and Cohere chat_history
+    // must bind both `message` and `content` when both are present.
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+
+    let low_tokens = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 50.0
+    });
+    let high_tokens = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 4096.0
+    });
+    let key_low = miss_cache_key(&plugin, &serde_json::to_string(&low_tokens).unwrap()).await;
+    let key_high = miss_cache_key(&plugin, &serde_json::to_string(&high_tokens).unwrap()).await;
+    assert_ne!(
+        key_low, key_high,
+        "float `max_tokens` values must not collapse to the same cache key"
+    );
+
+    let int_tokens = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 256
+    });
+    let key_int = miss_cache_key(&plugin, &serde_json::to_string(&int_tokens).unwrap()).await;
+    let key_int_repeat =
+        miss_cache_key(&plugin, &serde_json::to_string(&int_tokens).unwrap()).await;
+    assert_eq!(
+        key_int, key_int_repeat,
+        "byte-identical requests must produce the same cache key"
+    );
+    // The staged key is `KeyParts::finish`'s partition hash, not the readable
+    // key input, so bind the field by DIFFERENCE rather than by substring: a
+    // request that omits `max_tokens`, and one that sets a neighbouring integer,
+    // must both key differently from `max_tokens: 256`.
+    let no_tokens = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let key_absent = miss_cache_key(&plugin, &serde_json::to_string(&no_tokens).unwrap()).await;
+    assert_ne!(
+        key_int, key_absent,
+        "integer `max_tokens` must bind into the exact key"
+    );
+    let adjacent_tokens = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 257
+    });
+    let key_adjacent =
+        miss_cache_key(&plugin, &serde_json::to_string(&adjacent_tokens).unwrap()).await;
+    assert_ne!(
+        key_int, key_adjacent,
+        "adjacent integer `max_tokens` values must not collide"
+    );
+
+    let with_stream = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": 1
+    });
+    let no_stream = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    assert_exact_miss_for_variant(with_stream, no_stream, br#""ok""#).await;
+
+    let cohere_a = json!({
+        "model": "command-r",
+        "chat_history": [{"role": "USER", "message": "Hi", "content": "Hello"}],
+        "message": "What is 2 + 2?"
+    });
+    let cohere_b = json!({
+        "model": "command-r",
+        "chat_history": [{"role": "USER", "message": "Hi", "content": "Goodbye"}],
+        "message": "What is 2 + 2?"
+    });
+    assert_exact_miss_for_variant(cohere_a.clone(), cohere_b, br#""4""#).await;
+    assert_exact_hit_roundtrip(cohere_a, br#""4""#).await;
+}
+
+#[tokio::test]
 async fn test_different_tools_no_cache_hit() {
     // SECURITY: Two requests with identical messages but different tool
     // schemas should produce different responses (model may invoke a tool in

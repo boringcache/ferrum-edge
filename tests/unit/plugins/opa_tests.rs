@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::plugins::{
-    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, opa::Opa,
-    priority, validate_plugin_config,
+    HTTP_FAMILY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext,
+    opa::Opa, priority, validate_plugin_config,
 };
 use serde_json::{Value, json};
 use tracing_subscriber::fmt::MakeWriter;
@@ -192,7 +192,13 @@ fn opa_plugin_contract() {
 
     assert_eq!(plugin.name(), "opa");
     assert_eq!(plugin.priority(), priority::OPA);
-    assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+    assert_eq!(plugin.supported_protocols(), HTTP_FAMILY_PROTOCOLS);
+    assert!(plugin.supported_protocols().contains(&ProxyProtocol::Grpc));
+    assert!(
+        plugin
+            .supported_protocols()
+            .contains(&ProxyProtocol::WebSocket)
+    );
     assert!(!plugin.requires_request_body_buffering());
     assert!(!plugin.needs_request_body_bytes());
 
@@ -223,6 +229,78 @@ fn opa_plugin_contract() {
     )
     .unwrap();
     assert_eq!(bounded_body_plugin.request_body_buffer_limit(), Some(4096));
+}
+
+fn websocket_upgrade_ctx(method: &str, path: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        method.to_string(),
+        path.to_string(),
+    );
+    ctx.headers
+        .insert("connection".to_string(), "upgrade".to_string());
+    ctx.headers
+        .insert("upgrade".to_string(), "websocket".to_string());
+    ctx.headers.insert(
+        "sec-websocket-key".to_string(),
+        "dGhlIHNhbXBsZSBub25jZQ==".to_string(),
+    );
+    ctx.headers
+        .insert("sec-websocket-version".to_string(), "13".to_string());
+    ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    ctx
+}
+
+fn grpc_ctx(method: &str, path: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        method.to_string(),
+        path.to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    ctx
+}
+
+#[tokio::test]
+async fn opa_denies_websocket_upgrade_request_shape() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": false})).await;
+    let plugin = plugin(&server, json!({}));
+
+    let mut ctx = websocket_upgrade_ctx("POST", "/x");
+    assert_reject(plugin.authorize(&mut ctx).await, Some(403));
+}
+
+#[tokio::test]
+async fn opa_denies_native_grpc_request_shape() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": false})).await;
+    let plugin = plugin(&server, json!({}));
+
+    let mut ctx = grpc_ctx("POST", "/my.Service/Method");
+    assert_reject(plugin.authorize(&mut ctx).await, Some(403));
+}
+
+#[tokio::test]
+async fn opa_allows_websocket_upgrade_request_shape_when_policy_allows() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({}));
+
+    let mut ctx = websocket_upgrade_ctx("POST", "/x");
+    assert_continue(plugin.authorize(&mut ctx).await);
+}
+
+#[tokio::test]
+async fn opa_allows_native_grpc_request_shape_when_policy_allows() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({}));
+
+    let mut ctx = grpc_ctx("POST", "/my.Service/Method");
+    assert_continue(plugin.authorize(&mut ctx).await);
 }
 
 #[test]

@@ -11396,6 +11396,33 @@ fn test_opa_body_buffering_is_deferred_until_after_authentication() {
 }
 
 #[test]
+fn test_opa_is_cached_for_grpc_and_websocket_protocols() {
+    let plugin_config = make_plugin_config_with_json(
+        "ps1",
+        "opa",
+        json!({
+            "opa_host": "http://opa.internal:8181",
+            "policy_path": "ferrum/authz/allow",
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![plugin_config],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    for protocol in [ProxyProtocol::Grpc, ProxyProtocol::WebSocket] {
+        let plugins = cache.get_plugins_for_protocol("ferrum", "p1", protocol);
+        assert!(
+            plugins.iter().any(|plugin| plugin.name() == "opa"),
+            "OPA must run on {protocol:?} chains"
+        );
+    }
+}
+
+#[test]
 fn test_waf_sets_needs_final_request_body_context_capability() {
     // WAF returns true for `needs_final_request_body_context()` because it
     // annotates request metadata (`waf.rule_hits`, `waf.action`, etc.) from

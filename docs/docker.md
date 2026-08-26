@@ -497,7 +497,7 @@ docker stop --time=30 ferrum-edge
 > **Note**: The distroless images have no shell. Use a `httpGet` preStop hook or configure `terminationGracePeriodSeconds` instead of a shell-based sleep.
 
 ```yaml
-terminationGracePeriodSeconds: 30
+terminationGracePeriodSeconds: 80
 ```
 
 ### 7. Upgrade Strategy

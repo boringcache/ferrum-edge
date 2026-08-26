@@ -2163,6 +2163,10 @@ fn graphql_config_schema_matches_runtime_validation() {
     );
     assert_eq!(schema["properties"]["redis_pool_size"]["minimum"], 1);
     assert_eq!(
+        schema["properties"]["redis_url"]["pattern"],
+        json!("^rediss?://[^/?#\\s]+(?:/[^?#\\s]*)?(?:\\?[^\\s#]*)?$")
+    );
+    assert_eq!(
         schema["properties"]["redis_connect_timeout_seconds"]["minimum"],
         1
     );
@@ -2298,6 +2302,16 @@ fn graphql_config_schema_matches_runtime_validation() {
         json!({
             "max_depth": 5,
             "sync_mode": "redis",
+            "redis_url": "rediss://localhost:6380/0#insecure"
+        }),
+        json!({
+            "max_depth": 5,
+            "sync_mode": "local",
+            "redis_url": "rediss://localhost:6380/0#insecure"
+        }),
+        json!({
+            "max_depth": 5,
+            "sync_mode": "redis",
             "redis_url": "redis://localhost:6379",
             "redis_key_prefix": ""
         }),
@@ -2375,6 +2389,10 @@ fn request_deduplication_schema_matches_runtime_validation() {
         json!(1)
     );
     assert_eq!(schema["properties"]["redis_url"]["minLength"], json!(1));
+    assert_eq!(
+        schema["properties"]["redis_url"]["pattern"],
+        json!("^rediss?://[^/?#\\s]+(?:/[^?#\\s]*)?(?:\\?[^\\s#]*)?$")
+    );
     let redis_guard = schema["allOf"]
         .as_array()
         .expect("RequestDeduplicationConfig allOf")
@@ -2501,6 +2519,7 @@ fn request_deduplication_schema_matches_runtime_validation() {
         json!({"sync_mode": "redis"}),
         json!({"sync_mode": "redis", "redis_url": ""}),
         json!({"sync_mode": "redis", "redis_url": "https://example.invalid"}),
+        json!({"sync_mode": "redis", "redis_url": "rediss://cache.internal:6380/0#insecure"}),
         json!({"sync_mode": "redis", "redis_url": null}),
         json!({"sync_mode": "local", "redis_url": "https://example.invalid"}),
         json!({"sync_mode": "local", "redis_url": "redis://"}),
