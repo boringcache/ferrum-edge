@@ -4190,7 +4190,14 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            handle_mesh_config_revision_reset(&state, &auth).await
+            handle_mesh_config_revision_reset(
+                &state,
+                &auth,
+                query.as_deref(),
+                &namespace,
+                &audit_request_ctx,
+            )
+            .await
         }
 
         // F7.2: remote-cluster discovery introspection. Read-only operator
@@ -4523,6 +4530,9 @@ async fn handle_mesh_runtime_overlay_get(
 async fn handle_mesh_config_revision_reset(
     state: &AdminState,
     auth: &AuditActor,
+    query: Option<&str>,
+    namespace: &str,
+    request_ctx: &audit::AuditRequestContext,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let Some(mesh_runtime) = state.mesh_runtime_state.as_ref() else {
         return Ok(json_response(
@@ -4530,6 +4540,19 @@ async fn handle_mesh_config_revision_reset(
             &json!({"error": "No active mesh runtime state"}),
         ));
     };
+
+    if !parse_restore_confirm(query) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({
+                "error": "Clearing the mesh config-revision freshness gate is a privileged operation. Pass ?confirm=true to proceed."
+            }),
+        ));
+    }
+
+    if let Err(response) = state.admit_audited_operation().await {
+        return Ok(response);
+    }
 
     let cleared = mesh_runtime.reset_accepted_revision();
     warn!(
@@ -4542,6 +4565,25 @@ async fn handle_mesh_config_revision_reset(
         "Mesh config-revision freshness gate reset by operator; the next accepted slice \
          establishes a new ordering baseline"
     );
+
+    let diff = mesh_config_revision_reset_audit_diff(cleared.as_ref());
+    let resource_id = cleared
+        .as_ref()
+        .map(|revision| revision.authority.as_str())
+        .unwrap_or("none")
+        .to_string();
+    let event = audit::AuditEvent::new(
+        auth,
+        "reset",
+        "mesh_config_revision",
+        resource_id,
+        namespace,
+        diff,
+    )
+    .with_request_context(request_ctx)
+    .with_outcome(audit::outcome::SUCCESS);
+    record_operation_audit(state, event).await;
+
     Ok(json_response(
         StatusCode::OK,
         &json!({
@@ -4549,6 +4591,29 @@ async fn handle_mesh_config_revision_reset(
             "cleared_revision": cleared,
         }),
     ))
+}
+
+fn mesh_config_revision_reset_audit_diff(
+    cleared: Option<&crate::modes::mesh::revision::MeshConfigRevision>,
+) -> Value {
+    match cleared {
+        Some(revision) => json!({
+            "cleared_authority": revision.authority.as_str(),
+            "cleared_sequence": revision.sequence,
+        }),
+        None => json!({ "cleared_revision": null }),
+    }
+}
+
+async fn record_operation_audit(state: &AdminState, event: audit::AuditEvent) {
+    let result = if let Some(db) = state.db.as_ref() {
+        audit::record(state.admin_audit_enabled, db.clone(), event).await
+    } else {
+        audit::record_without_database(state.admin_audit_enabled, event).await
+    };
+    if let Err(error) = result {
+        log_audit_enqueue_failure(&error);
+    }
 }
 
 /// MESH-T6-C: per-DP config drift introspection.

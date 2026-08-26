@@ -3819,9 +3819,19 @@ paths:
         the calling token's subject and the cleared revision.
 
         Requires the `operator` role. Returns `404 Not Found` outside mesh mode.
+        Requires `?confirm=true` because clearing the freshness gate is a
+        privileged operation that lowers a fail-closed guard.
       tags: [Mesh Config Drift]
       security:
         - bearerAuth: []
+      parameters:
+        - name: confirm
+          in: query
+          required: true
+          description: Must be `true` to confirm the privileged reset operation
+          schema:
+            type: boolean
+            enum: [true]
       responses:
         "200":
           description: Accepted revision cleared
@@ -3863,6 +3873,12 @@ paths:
                     cleared_revision:
                       authority: db
                       sequence: 4821
+        "400":
+          description: Missing `?confirm=true` confirmation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -3876,6 +3892,8 @@ paths:
                 properties:
                   error:
                     type: string
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /mesh/policy-denies/recent:
     get:

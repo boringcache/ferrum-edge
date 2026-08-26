@@ -1812,7 +1812,7 @@ Returns `404 Not Found` outside mesh mode (no `mesh_runtime_state`). Returns `20
 
 ## Mesh Config Revision Reset (mesh mode)
 
-`POST /mesh/config-revision/reset` clears this DP's accepted authoritative config revision so the next mesh slice from **any** config authority is eligible again. Requires JWT authentication and the **`operator`** role (`403 Forbidden` without it). Returns `404 Not Found` outside mesh mode. On success returns `200 OK`:
+`POST /mesh/config-revision/reset` clears this DP's accepted authoritative config revision so the next mesh slice from **any** config authority is eligible again. Requires JWT authentication and the **`operator`** role (`403 Forbidden` without it). Returns `404 Not Found` outside mesh mode. This lowers a fail-closed freshness guard, so it requires explicit operator confirmation via `?confirm=true` (same pattern as destructive namespace and restore operations) and leaves a durable audit record when `FERRUM_ADMIN_AUDIT_ENABLED` is on. On success returns `200 OK`:
 
 ```json
 {
@@ -1829,7 +1829,7 @@ Returns `404 Not Found` outside mesh mode (no `mesh_runtime_state`). Returns `20
 Use this for the one case that is never auto-adopted: a sequence rewind **inside** one authority (for example a config store restored from backup without bumping `FERRUM_MESH_CONFIG_AUTHORITY_ID`). Foreign-authority adoption uses `FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS` instead; fleet-wide ordering-domain resets are preferably done by bumping `FERRUM_MESH_CONFIG_AUTHORITY_ID` or `FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID` so every DP adopts through the normal grace period without a per-DP call. The reset installs nothing itself — the next slice still has to pass subscription binding and update validation. Pair with `GET /mesh/config-drift` to confirm convergence after recovery.
 
 ```bash
-curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:9000/mesh/config-revision/reset
+curl -X POST -H "Authorization: Bearer $TOKEN" "http://localhost:9000/mesh/config-revision/reset?confirm=true"
 ```
 
 ## Mesh Slice Drift (CP mode)
