@@ -648,6 +648,71 @@ fn gateway_policy_ignores_a_disabled_non_approved_plugin() {
 }
 
 #[test]
+fn gateway_policy_rejects_a_redis_url_insecure_fragment() {
+    // Issue #4147: redis-rs `#insecure` is a verification opt-out that is not
+    // FERRUM_TLS_NO_VERIFY. FIPS enforce must refuse it on any plugin that
+    // carries redis_url, without echoing the URL (which may hold ACL secrets).
+    let secret = "redis-acl-secret";
+    let config = config_with(vec![plugin(
+        "rate_limiting",
+        json!({
+            "sync_mode": "redis",
+            "redis_url": format!("rediss://acl:{secret}@cache.internal:6380/0#insecure"),
+            "redis_tls": true,
+        }),
+    )]);
+    let err = policy::check_gateway_config_enforced(&config)
+        .expect_err("fragment-bearing redis_url must be refused");
+    assert!(err.contains("rate_limiting.redis_url"), "{err}");
+    assert!(
+        !err.contains(secret) && !err.contains("#insecure") && !err.contains("cache.internal"),
+        "FIPS diagnostic must not echo redis_url: {err}"
+    );
+
+    let clean = config_with(vec![plugin(
+        "rate_limiting",
+        json!({
+            "sync_mode": "redis",
+            "redis_url": "rediss://cache.internal:6380/0",
+            "redis_tls": true,
+        }),
+    )]);
+    policy::check_gateway_config_enforced(&clean)
+        .expect("a fragment-free redis_url is not a verification opt-out");
+}
+
+#[test]
+fn gateway_policy_rejects_redis_url_fragments_on_every_shared_client_plugin() {
+    // The shared Redis client backs more than the four rate limiters. A
+    // fragment on any of these is the same skip-verify affordance.
+    for name in [
+        "rate_limiting",
+        "ai_rate_limiter",
+        "ws_rate_limiting",
+        "udp_rate_limiting",
+        "jwks_auth",
+        "hmac_auth",
+        "soap_ws_security",
+        "request_deduplication",
+        "ai_semantic_cache",
+        "graphql",
+        "grpc_method_router",
+    ] {
+        let config = config_with(vec![plugin(
+            name,
+            json!({ "redis_url": "rediss://h:6380/0#insecure" }),
+        )]);
+        let err = policy::check_gateway_config_enforced(&config).expect_err(&format!(
+            "{name} fragment-bearing redis_url must be refused"
+        ));
+        assert!(
+            err.contains(&format!("{name}.redis_url")),
+            "{name} diagnostic must name redis_url: {err}"
+        );
+    }
+}
+
+#[test]
 fn gateway_policy_rejects_non_approved_jwt_algorithms() {
     // `ES512` is in this list deliberately. ECDSA over P-521 is an approved
     // FIPS 186-5 scheme, but the `jsonwebtoken/aws_lc_rs` backend this profile

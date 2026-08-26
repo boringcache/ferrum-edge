@@ -11419,7 +11419,9 @@ components:
             unsupported. Any RESP-compatible server works.
         redis_url:
           type: string
-          description: "Redis connection URL. Required when sync_mode is 'redis'."
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL. Required when sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY."
         redis_tls:
           type: boolean
           default: false
@@ -11519,7 +11521,9 @@ components:
           description: "Datagram/byte counter storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported."
         redis_url:
           type: string
-          description: "Redis connection URL. Required when sync_mode is 'redis'."
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL. Required when sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY."
         redis_tls:
           type: boolean
           default: false
@@ -19269,8 +19273,8 @@ components:
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
-          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Required when sync_mode is 'redis'."
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY. Required when sync_mode is 'redis'."
         redis_tls:
           type: boolean
           default: false
@@ -20037,8 +20041,8 @@ components:
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
-          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Required when sync_mode is 'redis'."
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY. Required when sync_mode is 'redis'."
         redis_tls:
           type: boolean
           default: false
@@ -21374,8 +21378,8 @@ components:
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
-          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Required when sync_mode is 'redis'."
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY. Required when sync_mode is 'redis'."
         redis_tls:
           type: boolean
           default: false
@@ -23242,7 +23246,9 @@ components:
           description: "Rate limit state storage: 'local' (in-memory per instance) or 'redis' (centralized across instances). Database-backed counters are unsupported. Any RESP-compatible server works (Redis, Valkey, DragonflyDB, KeyDB, Garnet)."
         redis_url:
           type: string
-          description: "Redis connection URL (e.g., redis://host:6379/0). Required when sync_mode is 'redis'."
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL (e.g., redis://host:6379/0). Required when sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY."
         redis_tls:
           type: boolean
           default: false
@@ -25635,8 +25641,8 @@ components:
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
-          description: "Redis connection URL. Required when sync_mode is 'redis'."
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL. Required when sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY."
         redis_tls:
           type: boolean
           default: false
@@ -25771,8 +25777,8 @@ components:
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
-          description: "Redis connection URL. Required when sync_mode is 'redis'."
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL. Required when sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY."
         redis_tls:
           type: boolean
           default: false
@@ -26907,12 +26913,15 @@ components:
           description: "Storage backend: 'local' (in-memory DashMap) or 'redis' (centralized Redis)"
         redis_url:
           type: string
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
           description: >-
-            Redis connection URL (required when sync_mode is redis). URL-embedded
-            userinfo is accepted but never disclosed: connection/health-check
-            logs and non-admin/audit projections keep only the scheme, host,
-            port, and database, replace the userinfo, and remove query/fragment
-            data. Full admin reads stay raw.
+            Redis connection URL (required when sync_mode is redis). Must not
+            carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY.
+            URL-embedded userinfo is accepted but never disclosed:
+            connection/health-check logs and non-admin/audit projections keep
+            only the scheme, host, port, and database, replace the userinfo, and
+            remove query/fragment data. Full admin reads stay raw.
         redis_tls:
           type: boolean
           default: false
@@ -27188,7 +27197,9 @@ components:
           description: "Token budget storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported. Any RESP-compatible server works."
         redis_url:
           type: string
-          description: "Redis connection URL. Required when sync_mode is 'redis'."
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL. Required when sync_mode is 'redis'. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY."
         redis_tls:
           type: boolean
           default: false
@@ -30011,8 +30022,8 @@ components:
         redis_url:
           type: string
           minLength: 1
-          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
-          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Required when sync_mode is 'redis'."
+          pattern: '^rediss?://[^/?#\s]+(?:/[^?#\s]*)?(?:\?[^\s#]*)?$'
+          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Must not carry a URL fragment; TLS skip-verify is only FERRUM_TLS_NO_VERIFY. Required when sync_mode is 'redis'."
         redis_tls:
           type: boolean
           default: false
