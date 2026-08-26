@@ -2678,7 +2678,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                             // Subsequent CP snapshots don't take this
                             // path — `update_config` already spawns a
                             // coalesced background refresh for them.
-                            proxy_state.refresh_backend_capabilities().await;
+                            proxy_state.refresh_backend_capabilities_coalesced().await;
                             if let Some(ref startup_ready) = startup_ready {
                                 startup_ready.store(true, Ordering::Release);
                                 // Wake a fallback subscription's primary-retry

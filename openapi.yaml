@@ -2324,9 +2324,15 @@ paths:
       description: |
         Synchronously re-probes every HTTP-family backend in the current
         gateway config and replaces each registry entry with the new
-        classification. Blocks until every probe completes, so callers
-        can issue `GET /backend-capabilities` immediately afterward to
+        classification. Blocks until the coalesced refresh pass completes, so
+        callers can issue `GET /backend-capabilities` immediately afterward to
         observe the post-refresh state.
+
+        Concurrent requests collapse onto the shared `RefreshCoalescer`: at
+        most one probe fan-out runs at a time, with additional callers waiting
+        for the in-flight pass. The response `status` reports whether this
+        request drove the pass (`refreshed`) or joined one already running
+        (`joined`).
 
         This operational recovery action does not persist configuration and is
         available in read-only file, DP, and mesh modes with standard JWT
@@ -2347,7 +2353,10 @@ paths:
         - bearerAuth: []
       responses:
         "200":
-          description: Refresh completed; registry now reflects the latest probe results
+          description: |
+            Refresh completed; registry now reflects the latest probe results.
+            `status=refreshed` when this request drove the coalesced pass;
+            `status=joined` when it waited for an in-flight pass.
           content:
             application/json:
               schema:
@@ -2356,9 +2365,16 @@ paths:
                 properties:
                   status:
                     type: string
-                    enum: [refreshed]
-              example:
-                status: refreshed
+                    enum: [refreshed, joined]
+              examples:
+                drove_pass:
+                  summary: This request drove the refresh pass
+                  value:
+                    status: refreshed
+                joined_pass:
+                  summary: Joined an in-flight refresh pass
+                  value:
+                    status: joined
         "401":
           $ref: "#/components/responses/Unauthorized"
         "503":

@@ -202,9 +202,9 @@ use crate::util::http_headers::{
 };
 
 use self::backend_capabilities::{
-    BackendCapabilityProbeTarget, BackendCapabilityRecord, BackendCapabilityRegistry,
-    BackendCapabilitySnapshot, CapabilityCommitOutcome, ProtocolSupport, RefreshCoalescer,
-    SharedBackendCapabilityRegistry, SharedRefreshCoalescer,
+    BackendCapabilityProbeTarget, BackendCapabilityRecord, BackendCapabilityRefreshOutcome,
+    BackendCapabilityRegistry, BackendCapabilitySnapshot, CapabilityCommitOutcome, ProtocolSupport,
+    RefreshCoalescer, SharedBackendCapabilityRegistry, SharedRefreshCoalescer,
 };
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{
@@ -10596,20 +10596,33 @@ impl ProxyState {
         }
         let state = self.clone();
         tokio::spawn(async move {
-            loop {
-                while state.backend_capabilities_refresh.take_pending() {
-                    state.refresh_backend_capabilities().await;
-                }
-                // Handoff-safe finish: if a caller set `pending` between
-                // our last `take_pending()` and `try_finish()`, we either
-                // re-acquire the runner role (return `false`, loop back to
-                // drain again) or observe that someone else has become the
-                // runner in the meantime (return `true`, exit).
-                if state.backend_capabilities_refresh.try_finish() {
-                    break;
-                }
-            }
+            state.run_backend_capability_refresh_loop().await;
         });
+    }
+
+    /// Synchronously refresh backend capabilities through the shared
+    /// [`RefreshCoalescer`], preserving the admin endpoint's post-refresh
+    /// snapshot contract while collapsing concurrent callers onto one pass.
+    pub async fn refresh_backend_capabilities_coalesced(&self) -> BackendCapabilityRefreshOutcome {
+        if self.backend_capabilities_refresh.request() {
+            self.run_backend_capability_refresh_loop().await;
+            BackendCapabilityRefreshOutcome::Ran
+        } else {
+            self.backend_capabilities_refresh.wait_until_idle().await;
+            BackendCapabilityRefreshOutcome::Joined
+        }
+    }
+
+    async fn run_backend_capability_refresh_loop(&self) {
+        loop {
+            while self.backend_capabilities_refresh.take_pending() {
+                self.refresh_backend_capabilities().await;
+            }
+            if self.backend_capabilities_refresh.try_finish() {
+                self.backend_capabilities_refresh.signal_idle();
+                break;
+            }
+        }
     }
 
     /// Start the periodic background refresh task.
