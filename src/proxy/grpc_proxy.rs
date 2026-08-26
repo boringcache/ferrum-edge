@@ -44,7 +44,7 @@ use crate::backend_conn_limit::{
     PooledConnectionAdmission, SharedBackendConnectionGuard, SharedBackendConnectionLimiter,
 };
 use crate::config::PoolConfig;
-use crate::config::types::{BackendScheme, Proxy};
+use crate::config::types::{BackendScheme, GatewayConfig, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::plugins::{BufferedInitialResponseHeaderPolicyState, Plugin};
 use crate::pool::{CoalescedCreateAttempt, GenericPool, PoolManager};
@@ -58,7 +58,8 @@ use crate::tls::backend::{
     BackendSvidGeneration, BackendTlsConfigBuilder, BackendTlsConfigCache, SvidGenerationMatcher,
     append_backend_tls_pool_key_fields, append_http2_max_concurrent_streams_pool_key,
     append_optional_pool_key_component, append_pool_key_component,
-    backend_svid_generation_for_client_cert,
+    backend_svid_generation_for_client_cert, backend_tls_config_cache_key,
+    pool_key_host_port_prefix, write_backend_host_port_prefix,
 };
 use crate::util::body_limit::is_length_limit_error;
 
@@ -743,6 +744,73 @@ impl GrpcConnectionPool {
         Self::pool_key_owned(proxy)
     }
 
+    /// TLS-config cache key (no host/port). Used by unit tests to prove two
+    /// endpoints sharing trust material reuse one `ClientConfig`.
+    #[allow(dead_code)] // exercised from unit tests
+    pub fn tls_config_cache_key_for_warmup(proxy: &Proxy, svid_generation: Option<u64>) -> String {
+        backend_tls_config_cache_key(
+            &proxy.resolved_tls,
+            proxy.resolved_tls.client_cert_path.as_deref(),
+            proxy.resolved_tls.client_key_path.as_deref(),
+            proxy.resolved_tls.verify_server_cert,
+            svid_generation,
+        )
+    }
+
+    /// Drop `rr_counters` for withdrawn endpoints and TLS configs whose
+    /// identity is no longer in `config`. Cold-path only (config publication);
+    /// live endpoints and TLS identities are retained.
+    pub fn retain_live_from_config(&self, config: &GatewayConfig) {
+        let mut live_prefixes = HashSet::new();
+        let mut live_tls_keys = HashSet::new();
+        let mut prefix_buf = String::with_capacity(64);
+
+        for proxy in &config.proxies {
+            write_backend_host_port_prefix(
+                &mut prefix_buf,
+                &proxy.backend_host,
+                proxy.backend_port,
+            );
+            live_prefixes.insert(prefix_buf.clone());
+            let svid = self.pool.manager().svid_generation_for_proxy(proxy);
+            live_tls_keys.insert(self.pool.manager().tls_config_cache_key_owned(proxy, svid));
+        }
+        for upstream in &config.upstreams {
+            for target in &upstream.targets {
+                write_backend_host_port_prefix(&mut prefix_buf, &target.host, target.port);
+                live_prefixes.insert(prefix_buf.clone());
+            }
+        }
+
+        self.rr_counters.retain(|key, _| {
+            pool_key_host_port_prefix(key)
+                .map(|prefix| live_prefixes.contains(prefix))
+                .unwrap_or(true)
+        });
+        self.pool.manager().tls_configs.retain_keys(&live_tls_keys);
+    }
+
+    #[allow(dead_code)] // exercised from unit tests
+    pub fn insert_rr_counter_for_tests(&self, key: impl Into<String>) {
+        self.rr_counters
+            .insert(key.into(), Arc::new(AtomicUsize::new(0)));
+    }
+
+    #[allow(dead_code)] // exercised from unit tests
+    pub fn rr_counter_len(&self) -> usize {
+        self.rr_counters.len()
+    }
+
+    #[allow(dead_code)] // exercised from unit tests
+    pub fn contains_rr_counter(&self, key: &str) -> bool {
+        self.rr_counters.contains_key(key)
+    }
+
+    #[allow(dead_code)] // exercised from unit tests
+    pub fn backend_tls_config_cache(&self) -> &BackendTlsConfigCache {
+        &self.pool.manager().tls_configs
+    }
+
     /// Append a shard suffix in-place by truncating to `base_len` first.
     /// Avoids clearing and rewriting the base key on every shard iteration.
     fn write_shard_key_inplace(buf: &mut String, base_len: usize, shard: usize) {
@@ -946,7 +1014,7 @@ impl GrpcPoolManager {
         proxy: &Proxy,
         svid_generation: Option<u64>,
     ) -> Result<Arc<rustls::ClientConfig>, GrpcProxyError> {
-        let cache_key = self.pool_key_owned(proxy, svid_generation);
+        let cache_key = self.tls_config_cache_key_owned(proxy, svid_generation);
         self.tls_configs.get_or_try_build(cache_key, || {
             let crls = self.crls.load_full();
             let mut tls_config = BackendTlsConfigBuilder {
@@ -1380,16 +1448,14 @@ impl GrpcPoolManager {
         );
     }
 
-    fn pool_key_owned(&self, proxy: &Proxy, svid_generation: Option<u64>) -> String {
-        let mut buf = String::with_capacity(128);
-        self.write_pool_key(
-            &mut buf,
-            &proxy.backend_host,
-            proxy.backend_port,
-            proxy,
+    fn tls_config_cache_key_owned(&self, proxy: &Proxy, svid_generation: Option<u64>) -> String {
+        backend_tls_config_cache_key(
+            &proxy.resolved_tls,
+            self.effective_client_cert_path(proxy),
+            self.effective_client_key_path(proxy),
+            proxy.resolved_tls.verify_server_cert,
             svid_generation,
-        );
-        buf
+        )
     }
 
     fn svid_generation_for_proxy(&self, proxy: &Proxy) -> Option<u64> {
