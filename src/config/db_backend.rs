@@ -1797,6 +1797,19 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         namespace: &str,
     ) -> Result<GatewayConfig, anyhow::Error>;
 
+    /// Load the namespace policy graph (proxies + plugin_configs) without
+    /// consumers or upstreams.
+    ///
+    /// Plugin-graph admission only needs those families. Callers that would
+    /// otherwise take [`Self::load_namespace_snapshot`] just to overlay a
+    /// Proxy or PluginConfig candidate must use this so a large Consumer
+    /// table cannot dominate admission (issue #4234). The namespace predicate
+    /// belongs in the query, not a post-filter.
+    async fn load_namespace_policy_graph(
+        &self,
+        namespace: &str,
+    ) -> Result<GatewayConfig, anyhow::Error>;
+
     /// Count namespace resources on the authoritative primary without
     /// deserializing rows/documents.
     async fn count_namespace_resources(

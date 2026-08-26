@@ -60,8 +60,8 @@ mod inner {
         TcpConnectionThrottleAttachmentConflict,
     };
     use crate::config::db_loader::{
-        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE, credential_value_hash, mark_row_decode_rejection,
-        proxy_route_key_hash,
+        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE, credential_value_hash,
+        format_consumer_identity_conflict, mark_row_decode_rejection, proxy_route_key_hash,
     };
     use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
     use crate::config::types::{
@@ -6668,6 +6668,43 @@ mod inner {
             .collect()
     }
 
+    async fn format_mongo_consumer_identity_conflict(
+        store: &MongoStore,
+        namespace: &str,
+        candidates: &[(&str, &str)],
+        identity_value: &str,
+        owner_id: &str,
+    ) -> Result<String, anyhow::Error> {
+        let existing = store.get_consumer(namespace, owner_id).await?;
+        let Some(existing) = existing else {
+            return Ok(format!(
+                "Consumer identity '{}' conflicts with consumer '{}'",
+                identity_value, owner_id
+            ));
+        };
+        let existing_fields = [
+            ("id", Some(existing.id.as_str())),
+            ("username", Some(existing.username.as_str())),
+            ("custom_id", existing.custom_id.as_deref()),
+        ];
+        for (candidate_field, candidate_value) in candidates {
+            for (existing_field, existing_value) in existing_fields {
+                if existing_value == Some(*candidate_value) {
+                    return Ok(format_consumer_identity_conflict(
+                        candidate_field,
+                        candidate_value,
+                        existing_field,
+                        owner_id,
+                    ));
+                }
+            }
+        }
+        Ok(format!(
+            "Consumer identity '{}' conflicts with consumer '{}'",
+            identity_value, owner_id
+        ))
+    }
+
     /// Extract a required string field from a `consumer_identity_index`
     /// reservation candidate or stored document, mapping a missing or mistyped
     /// field to a transaction error instead of panicking. Used by the
@@ -7873,6 +7910,13 @@ mod inner {
             // runtime-derived field that is never stored.
             config.normalize_fields();
             Ok(config)
+        }
+
+        async fn load_namespace_policy_graph(
+            &self,
+            namespace: &str,
+        ) -> Result<GatewayConfig, anyhow::Error> {
+            self.load_mtls_dns_policy_candidate(namespace).await
         }
 
         async fn count_namespace_resources(
@@ -11269,35 +11313,66 @@ mod inner {
             custom_id: Option<&str>,
             exclude_consumer_id: Option<&str>,
         ) -> Result<Option<String>, anyhow::Error> {
-            let mut candidates = vec![
-                Bson::String(consumer_id.to_string()),
-                Bson::String(username.to_string()),
-            ];
+            let mut values = vec![consumer_id, username];
             if let Some(custom_id) = custom_id {
-                candidates.push(Bson::String(custom_id.to_string()));
+                values.push(custom_id);
             }
-            // Consumer `_id` is the composite "{namespace}:{id}", so identity
-            // matching (and self-exclusion) must run against the plain `id`
-            // field that serde keeps in the document.
-            let mut filter = doc! {
-                "namespace": namespace,
-                "$or": [
-                    { "id": { "$in": candidates.clone() } },
-                    { "username": { "$in": candidates.clone() } },
-                    { "custom_id": { "$in": candidates } },
-                ],
-            };
-            if let Some(id) = exclude_consumer_id {
-                filter.insert("id", doc! { "$ne": id });
-            }
-            let result = self.consumers().find_one(filter).await?;
-            match result {
-                Some(doc) => {
-                    let conflict_id = doc.get_str("id").unwrap_or("unknown").to_string();
-                    Ok(Some(conflict_id))
+            values.sort_unstable();
+            values.dedup();
+
+            let candidates = {
+                let mut fields = vec![("id", consumer_id), ("username", username)];
+                if let Some(custom_id) = custom_id {
+                    fields.push(("custom_id", custom_id));
                 }
-                None => Ok(None),
+                fields
+            };
+
+            for value in values {
+                let doc = self
+                    .consumer_identity_index()
+                    .find_one(doc! {
+                        "_id": consumer_identity_doc_id(namespace, value),
+                    })
+                    .await?;
+                let Some(doc) = doc else {
+                    continue;
+                };
+                // Namespace is encoded in `_id`. Require the stored namespace
+                // field to match as well; a missing/mismatched field cannot
+                // be treated as unique (fail closed).
+                let doc_namespace = doc.get_str("namespace").unwrap_or("");
+                if doc_namespace != namespace {
+                    return Ok(Some(format!(
+                        "Consumer identity '{}' conflicts with consumer '{}'",
+                        value,
+                        doc.get_str("consumer_id").unwrap_or("unknown")
+                    )));
+                }
+                let owner_id = match doc.get_str("consumer_id") {
+                    Ok(id) => id.to_string(),
+                    Err(_) => {
+                        return Ok(Some(format!(
+                            "Consumer identity '{}' conflicts with an existing consumer",
+                            value
+                        )));
+                    }
+                };
+                if exclude_consumer_id == Some(owner_id.as_str()) {
+                    continue;
+                }
+                return Ok(Some(
+                    format_mongo_consumer_identity_conflict(
+                        self,
+                        namespace,
+                        &candidates,
+                        value,
+                        &owner_id,
+                    )
+                    .await?,
+                ));
             }
+            Ok(None)
         }
 
         async fn check_keyauth_key_unique(
@@ -11429,7 +11504,7 @@ mod inner {
             let mut mtls_leases = self
                 .acquire_mtls_dns_admission_leases_for_mode(lease_scope, mode)
                 .await?;
-            if mode.validates_mtls_dns() {
+            if mode.validates_mtls_dns() && graph.requires_post_write_policy_admission() {
                 for namespace in &admission_namespaces {
                     let namespace = *namespace;
                     self.validate_plugin_graph_admission_candidate(namespace, |candidate| {

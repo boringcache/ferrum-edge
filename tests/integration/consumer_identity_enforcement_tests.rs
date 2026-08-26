@@ -314,3 +314,43 @@ async fn phantom_update_returns_false_and_records_no_change() {
         "a phantom update must not emit a config-change record"
     );
 }
+
+#[tokio::test]
+async fn identity_uniqueness_does_not_cross_namespaces() {
+    let (store, _tmp) = sqlite_store().await;
+
+    store
+        .create_consumer(&consumer_in("ferrum", "c1", "alice", Some("alice-ext")))
+        .await
+        .expect("ferrum consumer must persist");
+
+    store
+        .create_consumer(&consumer_in("tenant-b", "c1", "alice", Some("alice-ext")))
+        .await
+        .expect("the same identity values must be reusable in another namespace");
+
+    assert!(
+        store
+            .check_consumer_identity_unique("ferrum", "other", "alice", None, None)
+            .await
+            .expect("ferrum identity probe")
+            .is_some(),
+        "alice remains taken inside ferrum"
+    );
+    assert!(
+        store
+            .check_consumer_identity_unique("tenant-b", "other", "alice", None, None)
+            .await
+            .expect("tenant-b identity probe")
+            .is_some(),
+        "alice is also taken inside tenant-b after the isolated insert"
+    );
+    assert!(
+        store
+            .check_consumer_identity_unique("tenant-c", "other", "alice", None, None)
+            .await
+            .expect("empty-namespace identity probe")
+            .is_none(),
+        "a third namespace must not see either tenant's identity rows"
+    );
+}

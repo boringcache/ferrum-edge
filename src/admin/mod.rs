@@ -7473,6 +7473,140 @@ async fn handle_metrics_runtime(state: &AdminState) -> Result<Response<Full<Byte
 
 // ---- Batch Create ----
 
+/// Point uniqueness checks against already-persisted resources.
+///
+/// Intra-batch collisions stay on `ValidationPipeline` (HTTP 400). Collisions
+/// with existing rows are the same typed 409s as single-resource admission.
+/// Every lookup carries the namespace predicate in the query (issue #4234).
+async fn batch_existing_resource_conflict(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    batch: &RestorePayload,
+) -> Result<Option<String>, anyhow::Error> {
+    for consumer in &batch.consumers {
+        if let Some(message) = db
+            .check_consumer_identity_unique(
+                namespace,
+                &consumer.id,
+                &consumer.username,
+                consumer.custom_id.as_deref(),
+                None,
+            )
+            .await?
+        {
+            return Ok(Some(message));
+        }
+        if let Some(message) =
+            crud::check_consumer_credential_uniqueness(db, namespace, consumer, None).await?
+        {
+            return Ok(Some(message));
+        }
+    }
+
+    for proxy in &batch.proxies {
+        if !proxy.dispatch_kind.is_stream() {
+            match db
+                .check_listen_path_unique(
+                    namespace,
+                    proxy.listen_path.as_deref(),
+                    &proxy.hosts,
+                    None,
+                )
+                .await?
+            {
+                true => {}
+                false => {
+                    return Ok(Some(PROXY_ROUTE_CONFLICT_ERROR.to_string()));
+                }
+            }
+        }
+        if let Some(name) = proxy.name.as_deref() {
+            match db.check_proxy_name_unique(namespace, name, None).await? {
+                true => {}
+                false => {
+                    return Ok(Some(format!("Proxy name '{}' already exists", name)));
+                }
+            }
+        }
+    }
+
+    for upstream in &batch.upstreams {
+        if let Some(name) = upstream.name.as_deref() {
+            match db.check_upstream_name_unique(namespace, name, None).await? {
+                true => {}
+                false => {
+                    return Ok(Some(format!("Upstream name '{}' already exists", name)));
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn batch_needs_consumer_snapshot(batch: &RestorePayload) -> bool {
+    batch.consumers.iter().any(|consumer| {
+        consumer.has_credential("mtls_auth") || !consumer.credential_entries("hmac_auth").is_empty()
+    })
+}
+
+fn batch_needs_mtls_plugin_compat(batch: &RestorePayload) -> bool {
+    batch
+        .plugin_configs
+        .iter()
+        .any(|plugin| plugin.plugin_name == "mtls_auth")
+        || batch
+            .proxies
+            .iter()
+            .any(|proxy| proxy.dispatch_kind.is_stream())
+}
+
+fn batch_submits_plugin_graph(batch: &RestorePayload) -> bool {
+    !batch.plugin_configs.is_empty() || batch.proxies.iter().any(|proxy| !proxy.plugins.is_empty())
+}
+
+fn overlay_batch_consumers(candidate: &mut GatewayConfig, consumers: &[Consumer]) {
+    for consumer in consumers {
+        if let Some(existing) = candidate
+            .consumers
+            .iter_mut()
+            .find(|item| item.id == consumer.id)
+        {
+            *existing = consumer.clone();
+        } else {
+            candidate.consumers.push(consumer.clone());
+        }
+    }
+}
+
+fn overlay_batch_proxies(candidate: &mut GatewayConfig, proxies: &[Proxy]) {
+    for proxy in proxies {
+        if let Some(existing) = candidate
+            .proxies
+            .iter_mut()
+            .find(|item| item.id == proxy.id)
+        {
+            *existing = proxy.clone();
+        } else {
+            candidate.proxies.push(proxy.clone());
+        }
+    }
+}
+
+fn overlay_batch_plugin_configs(candidate: &mut GatewayConfig, plugins: &[PluginConfig]) {
+    for plugin in plugins {
+        if let Some(existing) = candidate
+            .plugin_configs
+            .iter_mut()
+            .find(|item| item.id == plugin.id)
+        {
+            *existing = plugin.clone();
+        } else {
+            candidate.plugin_configs.push(plugin.clone());
+        }
+    }
+}
+
 /// Batch create endpoint for proxies, consumers, plugin configs, and upstreams.
 async fn handle_batch_create(
     state: &AdminState,
@@ -7686,67 +7820,54 @@ async fn handle_batch_create(
         ..Default::default()
     };
 
-    match db.load_namespace_snapshot(namespace).await {
-        Ok(mut candidate_config) => {
-            for consumer in &batch.consumers {
-                if let Some(existing) = candidate_config
+    if batch_needs_consumer_snapshot(&batch) {
+        match db.load_namespace_snapshot(namespace).await {
+            Ok(mut candidate_config) => {
+                overlay_batch_consumers(&mut candidate_config, &batch.consumers);
+                overlay_batch_proxies(&mut candidate_config, &batch.proxies);
+                overlay_batch_plugin_configs(&mut candidate_config, &batch.plugin_configs);
+                if let Err(errors) = candidate_config.validate_mtls_auth_compatibility() {
+                    validation_errors.extend(errors);
+                }
+                if let Err(errors) = candidate_config.validate_unique_mtls_credentials() {
+                    validation_errors.extend(errors);
+                }
+                // Match single-resource admission: legacy duplicates are
+                // already quarantined at load time and must not block
+                // unrelated batch writes. Re-evaluate the authoritative
+                // candidate only when this batch submits a Consumer that
+                // carries HMAC credentials.
+                if batch
                     .consumers
-                    .iter_mut()
-                    .find(|item| item.id == consumer.id)
+                    .iter()
+                    .any(|consumer| !consumer.credential_entries("hmac_auth").is_empty())
+                    && let Err(errors) = candidate_config.validate_unique_hmac_credentials()
                 {
-                    *existing = consumer.clone();
-                } else {
-                    candidate_config.consumers.push(consumer.clone());
+                    validation_errors.extend(errors);
                 }
             }
-            for proxy in &batch.proxies {
-                if let Some(existing) = candidate_config
-                    .proxies
-                    .iter_mut()
-                    .find(|item| item.id == proxy.id)
-                {
-                    *existing = proxy.clone();
-                } else {
-                    candidate_config.proxies.push(proxy.clone());
-                }
-            }
-            for plugin in &batch.plugin_configs {
-                if let Some(existing) = candidate_config
-                    .plugin_configs
-                    .iter_mut()
-                    .find(|item| item.id == plugin.id)
-                {
-                    *existing = plugin.clone();
-                } else {
-                    candidate_config.plugin_configs.push(plugin.clone());
-                }
-            }
-            if let Err(errors) = candidate_config.validate_mtls_auth_compatibility() {
-                validation_errors.extend(errors);
-            }
-            if let Err(errors) = candidate_config.validate_unique_mtls_credentials() {
-                validation_errors.extend(errors);
-            }
-            // Match single-resource admission: legacy duplicates are already
-            // quarantined at load time and must not block unrelated batch
-            // writes. Re-evaluate the authoritative candidate only when this
-            // batch submits a Consumer that carries HMAC credentials.
-            if batch
-                .consumers
-                .iter()
-                .any(|consumer| !consumer.credential_entries("hmac_auth").is_empty())
-                && let Err(errors) = candidate_config.validate_unique_hmac_credentials()
-            {
-                validation_errors.extend(errors);
-            }
+            Err(error) => validation_errors.push(format!(
+                "Failed to load namespace config for credential candidate validation: {}",
+                redacted_persistence_error_message("batch_credential_candidate_load", &error,)
+            )),
         }
-        Err(error) => validation_errors.push(format!(
-            "Failed to load namespace config for credential candidate validation: {}",
-            redacted_persistence_error_message("batch_credential_candidate_load", &error)
-        )),
+    } else if batch_needs_mtls_plugin_compat(&batch) {
+        match db.load_namespace_policy_graph(namespace).await {
+            Ok(mut candidate_config) => {
+                overlay_batch_proxies(&mut candidate_config, &batch.proxies);
+                overlay_batch_plugin_configs(&mut candidate_config, &batch.plugin_configs);
+                if let Err(errors) = candidate_config.validate_mtls_auth_compatibility() {
+                    validation_errors.extend(errors);
+                }
+            }
+            Err(error) => validation_errors.push(format!(
+                "Failed to load namespace config for mTLS compatibility validation: {}",
+                redacted_persistence_error_message("batch_mtls_compat_candidate_load", &error,)
+            )),
+        }
     }
 
-    if !batch.proxies.is_empty() || !batch.plugin_configs.is_empty() {
+    if batch_submits_plugin_graph(&batch) {
         match crud::validate_plugin_graph_candidates(
             db.as_ref(),
             state,
@@ -7979,6 +8100,22 @@ async fn handle_batch_create(
                 "validation_errors": validation_errors
             }),
         ));
+    }
+
+    match batch_existing_resource_conflict(db.as_ref(), namespace, &batch).await {
+        Ok(Some(message)) => {
+            return Ok(json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": message}),
+            ));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &db_error_response(&error),
+            ));
+        }
     }
 
     // One transaction covers every dependency phase and every chunk, so there
