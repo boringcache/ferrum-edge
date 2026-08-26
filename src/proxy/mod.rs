@@ -11625,6 +11625,7 @@ impl ProxyState {
             && a.locality_lb_setting == b.locality_lb_setting
             && a.max_connections == b.max_connections
             && a.tcp_keepalive == b.tcp_keepalive
+            && a.tcp_idle_timeout_seconds == b.tcp_idle_timeout_seconds
             && a.http_max_requests_per_connection == b.http_max_requests_per_connection
             && a.http_idle_timeout_ms == b.http_idle_timeout_ms
             && a.h2_max_concurrent_streams == b.h2_max_concurrent_streams

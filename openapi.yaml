@@ -12635,6 +12635,15 @@ components:
           oneOf:
             - $ref: "#/components/schemas/TcpKeepaliveCfg"
             - type: "null"
+        tcp_idle_timeout_seconds:
+          type: [integer, "null"]
+          format: uint64
+          minimum: 0
+          description: >-
+            Bidirectional TCP idle bound in seconds (DestinationRule
+            `connectionPool.tcp.idleTimeout`) for this port. `0` disables the
+            idle watchdog. Distinct from `http_idle_timeout_ms` (HTTP pool
+            idle).
         http_max_requests_per_connection:
           type: [integer, "null"]
           format: uint32
