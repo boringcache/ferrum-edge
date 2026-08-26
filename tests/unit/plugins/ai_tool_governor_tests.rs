@@ -11735,9 +11735,12 @@ async fn json_shaped_stream_ambiguous_arguments_are_observed_in_dry_run() {
 // path was unaffected because it writes `ctx.metadata` directly.
 // ---------------------------------------------------------------------------
 
-/// The documented `unknown_shape_action: "allow"` opt-out forwards the body, so
-/// the observation is the ONLY signal the operator gets. Losing it on the
-/// streaming path is the silent-forward this plugin exists to prevent.
+/// The true #4232 regression guard. The documented `unknown_shape_action:
+/// "allow"` opt-out forwards the body and records ONLY
+/// `write_unrecognized_shape_observation_into`, which deliberately sets no
+/// `ai_tool_governor.decision` — so before the fix `merge_stream_metadata`
+/// returned early and the observation never reached `ctx.metadata`. Forwarded
+/// AND silent is exactly the outcome this plugin exists to prevent.
 #[tokio::test]
 async fn streaming_unknown_shape_opt_out_records_observation_into_ctx_metadata() {
     let mut config = provider_streaming_config("deny");
@@ -11748,7 +11751,7 @@ async fn streaming_unknown_shape_opt_out_records_observation_into_ctx_metadata()
     let mut inspector =
         create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
             .expect("stream inspector");
-    let bytes = ANTHROPIC_UNREADABLE_FRAMES[0].as_bytes();
+    let bytes = UNKNOWN_SHAPE_STREAM.as_bytes();
     let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
     assert!(
         !terminated,
@@ -11778,8 +11781,12 @@ async fn streaming_unknown_shape_opt_out_records_observation_into_ctx_metadata()
     );
 }
 
-/// The enforce path cuts the stream, and the operator must still be able to see
-/// WHY from the transaction summary rather than only from the cut itself.
+/// Coverage (NOT a #4232 regression guard): the enforce cut also calls
+/// `record_uninspectable_metadata`, whose writer sets `decision=deny`, so this
+/// batch always carried a decision and `merge_stream_metadata` never dropped
+/// it — this case passed before the fix too. It is kept so the cut path's
+/// observation cannot regress independently of the opt-out path above, which
+/// is the case that was actually broken.
 #[tokio::test]
 async fn streaming_unknown_shape_enforce_cut_still_records_observation() {
     let plugin = Arc::new(make(provider_streaming_config("deny")));
@@ -11788,7 +11795,7 @@ async fn streaming_unknown_shape_enforce_cut_still_records_observation() {
     let mut inspector =
         create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
             .expect("stream inspector");
-    let bytes = ANTHROPIC_UNREADABLE_FRAMES[0].as_bytes();
+    let bytes = UNKNOWN_SHAPE_STREAM.as_bytes();
     let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
     assert!(terminated, "enforce must cut an unreadable shape");
     drop(inspector);
