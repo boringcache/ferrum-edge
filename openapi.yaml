@@ -27605,7 +27605,7 @@ components:
 
     AiToolGovernorConfig:
       type: object
-      description: "Plugin: ai_tool_governor — Deterministic allow/deny/approval policy for AI tool/function calls. Inspects request tool definitions (tools[].function.name / functions[].name), buffered response tool calls (choices[].message.tool_calls[] and legacy function_call), streaming SSE tool-call deltas (held until complete and cleared by policy/approval, then released — or the stream is cut with an SSE error event, never leaking the held call), and optionally MCP tools/call and A2A JSON-RPC methods. Complements ai_semantic_firewall (which catches intent): every decision here is a deterministic function of names, arguments, JSON Schema, regexes, identity, and an optional approval webhook. In enforce mode, governed bodies the plugin cannot inspect fail closed: Content-Encoding'd, oversized (>4 MiB), non-UTF-8, or unparseable JSON request bodies are rejected when request inspection is enabled, oversized JSON responses are rejected, and streaming holds past the 4 MiB cap cut the stream. Configuration is strict: unknown root, inspect, tool-policy, blocked-pattern, approval, response, and observability properties are rejected (with path-qualified diagnostics). The free-form `tools` name map and arbitrary per-tool `json_schema` document remain open. Does not execute tools or replace mcp_gateway/A2A routing. HTTP-family only."
+      description: "Plugin: ai_tool_governor — Deterministic allow/deny/approval policy for AI tool/function calls. Inspects request tool definitions across every provider shape (OpenAI tools[].function.name / functions[].name, Anthropic tools[].name, Google tools[].functionDeclarations[].name, Bedrock toolConfig.tools[].toolSpec.name), buffered response tool calls (OpenAI choices[].message.tool_calls[] and legacy function_call, OpenAI Responses output[] function_call items, Anthropic content[] tool_use blocks, Google candidates[].content.parts[].functionCall, Cohere v2 message.tool_calls[], Bedrock Converse output.message.content[].toolUse), streaming SSE tool-call deltas in the OpenAI, Anthropic (content_block_start / input_json_delta), Cohere v2 (tool-call-start / tool-call-delta), and Google shapes (held until complete and cleared by policy/approval, then released — or the stream is cut with an SSE error event, never leaking the held call), and optionally MCP tools/call and A2A JSON-RPC methods. A payload carrying a tool-call marker this plugin cannot read is ungovernable and fails closed in enforce mode by default (see unknown_shape_action). Complements ai_semantic_firewall (which catches intent): every decision here is a deterministic function of names, arguments, JSON Schema, regexes, identity, and an optional approval webhook. In enforce mode, governed bodies the plugin cannot inspect fail closed: Content-Encoding'd, oversized (>4 MiB), non-UTF-8, or unparseable JSON request bodies are rejected when request inspection is enabled, oversized JSON responses are rejected, and streaming holds past the 4 MiB cap cut the stream. Configuration is strict: unknown root, inspect, tool-policy, blocked-pattern, approval, response, and observability properties are rejected (with path-qualified diagnostics). The free-form `tools` name map and arbitrary per-tool `json_schema` document remain open. Does not execute tools or replace mcp_gateway/A2A routing. HTTP-family only."
       properties:
         enabled:
           type: boolean
@@ -27627,6 +27627,7 @@ components:
                 const: false
               mode: true
               default_action: true
+              unknown_shape_action: true
               inspect: true
               tools: true
               approval: true
@@ -27734,6 +27735,11 @@ components:
           enum: [allow, deny, require_approval]
           default: deny
           description: "Action for a tool with no explicit policy entry. tools may be empty only when default_action governs (deny/require_approval)."
+        unknown_shape_action:
+          type: string
+          enum: [deny, allow]
+          default: deny
+          description: "Posture for a governed payload that carries a live tool-call marker (tool_calls / toolCalls / tool_use / toolUse / function_call / functionCall member names, or a block tagged type: tool_use / function_call / tool-call) from which no call could be extracted — a provider tool-call shape this plugin cannot read. deny (default) treats it as ungovernable: enforce rejects the body or cuts the stream, dry_run forwards. allow forwards it as if no tool call were present. BOTH settings record the fixed ai_tool_governor.uninspectable_reason=unrecognized_tool_call_shape observation without claiming a decision, so an unreadable shape is never silently permitted. Payloads with no tool-call marker at all (ordinary REST JSON on a shared proxy, embeddings/moderations responses, content-only completions) are out of scope under both settings."
         inspect:
           type: object
           additionalProperties: false
