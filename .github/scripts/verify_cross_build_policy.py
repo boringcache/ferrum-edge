@@ -86,7 +86,7 @@ WORKFLOW_CONTRACTS = (
     (
         "CI workflow",
         "build-arm64-cross",
-        "9a1b2bb4914826b77e82ad4489f73b15ebbdc93cd0d925b91cbcdc21a5e148cc",
+        "62894a1ffaf66397d537ccea6667e67bf32785b7d4e03561441af495ba46f31f",
         "143872ebf5dd925529b785273f180671bcc3bbd612d74ef0b88e1b8dce86c774",
         # Pins the top-level `on:` mapping that schedules CI, including
         # unconditional `merge_group: checks_requested` alongside push,
@@ -96,7 +96,7 @@ WORKFLOW_CONTRACTS = (
     (
         "release workflow",
         "build-release-arm64-cross",
-        "338c9be78c5e354365990a9c27dafa36c21202f18cf517567ad44995cff03950",
+        "bae233bd3c7f3008950e49de8e4167223916924a54d5ee54d90ebe01cf5c7bc9",
         "1d5104bd955d0ef4c397cb7be08f37d2d829a822ff9efe43eb26bdac1133bc0a",
         "2a9e77c5946c27cbf1f055f20adf283e159ffd3735e2dcc90edded2c35563c3b",
     ),
@@ -153,7 +153,7 @@ DOCKER_PUBLISH_STEPS_MIDDLE = (
 DOCKER_PUBLISH_STEPS_TAIL = (
     "\n"
     "      - name: Set up Docker Buildx\n"
-    "        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4\n"
+    "        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4\n"
     "\n"
     "      - name: Log in to GitHub Container Registry\n"
     "        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4\n"
@@ -527,7 +527,7 @@ CI_DOCKER_MANIFEST_STEPS = r"""    steps:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -763,7 +763,7 @@ RELEASE_CREATE_RELEASE_STEPS = r"""    steps:
 
 RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -1149,7 +1149,7 @@ RELEASE_DOCKER_MANIFEST_STEPS = r"""    steps:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -1229,7 +1229,7 @@ RELEASE_DOCKER_EBPF_MANIFEST_STEPS = r"""    steps:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -1546,7 +1546,7 @@ RELEASE_DOCKER_EBPF_TOOLS_MANIFEST_STEPS = r"""    steps:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -1610,7 +1610,7 @@ RELEASE_DOCKER_EBPF_STEPS = r"""    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -2568,7 +2568,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       # GitHub Actions cache is a 10 GB repository quota with LRU eviction
       # across every ref. `type=gha,mode=max` exports multi-gigabyte BuildKit
