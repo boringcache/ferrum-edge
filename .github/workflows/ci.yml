@@ -3597,7 +3597,7 @@ jobs:
           grep -F 'preDrain 20s' "$RUNNER_TEMP/ferrum-gateway-helm-results/predrain-low-grace.err"
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=file --set shutdownPreDrainSeconds=20 \
-            --set terminationGracePeriodSeconds=120 \
+            --set terminationGracePeriodSeconds=130 \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/predrain-env.yaml"
           predrain_block="$(grep -A1 'name: FERRUM_SHUTDOWN_PREDRAIN_SECONDS' "$RUNNER_TEMP/ferrum-gateway-helm-results/predrain-env.yaml")"
           if ! grep -q '"20"' <<<"$predrain_block"; then
