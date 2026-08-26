@@ -399,14 +399,12 @@ impl JwksAuth {
         // so connection/auth/topology failures cannot emit backend text or the
         // operator key prefix.
         let shared_replay_client = match redis_config {
-            Some(redis_config) => Some(Arc::new(
-                RedisRateLimitClient::for_replay_authority(
-                    redis_config,
-                    http_client.dns_cache().cloned(),
-                    http_client.tls_no_verify(),
-                    http_client.tls_ca_bundle_path(),
-                )?,
-            )),
+            Some(redis_config) => Some(Arc::new(RedisRateLimitClient::for_replay_authority(
+                redis_config,
+                http_client.dns_cache().cloned(),
+                http_client.tls_no_verify(),
+                http_client.tls_ca_bundle_path(),
+            )?)),
             None => None,
         };
 

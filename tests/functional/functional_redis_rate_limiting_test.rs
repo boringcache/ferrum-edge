@@ -4043,13 +4043,8 @@ async fn test_shared_replay_authority_live_redis_admits_exactly_one_winner() {
     .expect("redis mode enabled");
     let unreachable_authority = ReplayAuthority::shared(
         Arc::new(
-            RedisRateLimitClient::for_replay_authority(
-                unreachable_config,
-                None,
-                false,
-                None,
-            )
-            .expect("construction without a CA path must succeed"),
+            RedisRateLimitClient::for_replay_authority(unreachable_config, None, false, None)
+                .expect("construction without a CA path must succeed"),
         ),
         retention,
     );

@@ -331,8 +331,7 @@ fn redis_tls_constructs_when_no_ca_path_is_configured() {
 fn redis_tls_uses_exclusive_ca_when_the_bundle_loads() {
     let dir = tempfile::tempdir().expect("tempdir");
     let bundle_path = dir.path().join("redis-ca.pem");
-    std::fs::write(&bundle_path, include_str!("../../certs/server.crt"))
-        .expect("write CA bundle");
+    std::fs::write(&bundle_path, include_str!("../../certs/server.crt")).expect("write CA bundle");
     let path = bundle_path.to_str().expect("utf8 path");
     let config = make_config("rediss://cache.internal:6380/0", true);
 
