@@ -27793,8 +27793,12 @@ pre_build = []
                 f"admitted fuzz-smoke generation {generation} does not carry the "
                 "bounded six-target libFuzzer budget exactly once"
             )
-    # The retired generation and the scheduled lane install no compiler cache
-    # at all, so both clear every wrapper input the root Cargo config sets.
+    # The scheduled lane installs no compiler cache at all, so it clears every
+    # wrapper input the root Cargo config sets. This assertion used to cover the
+    # retired generation too, because the #2461 shape it held also disabled
+    # caching. That generation is gone (#4238): the retired slot now holds
+    # #3902's shape, which deliberately DOES use the checksum-pinned sccache
+    # installer, so asserting the opposite of it here would be false.
     cargo_override_block = (
         '    env:\n'
         '      RUSTC_WRAPPER: ""\n'
@@ -27802,7 +27806,6 @@ pre_build = []
         '      RUSTFLAGS: ""\n'
     )
     for admitted_label, admitted_text in (
-        ("retired fuzz-smoke generation", CI_FUZZ_SMOKE_RETIRED_JOB),
         ("scheduled fuzz lane", FUZZ_WORKFLOW),
     ):
         if cargo_override_block not in admitted_text:
@@ -27842,11 +27845,21 @@ pre_build = []
             "the adopted fuzz-smoke generation lets an untrusted ref write the "
             "compiler cache the sanitizer build restores"
         )
-    if "        if: github.event_name != 'pull_request'\n" not in CI_FUZZ_SMOKE_JOB:
+    if (
+        "        if: github.event_name == 'push' "
+        "|| github.event_name == 'workflow_dispatch'\n"
+    ) not in CI_FUZZ_SMOKE_JOB:
         failures.append(
-            "the adopted fuzz-smoke generation no longer keeps the sanitizer "
-            "budget off the ordinary pull-request path"
+            "the adopted fuzz-smoke generation no longer restricts the "
+            "sanitizer budget to the push to `main` and manual dispatch"
         )
+    for barred_event in ("pull_request", "merge_group"):
+        if f"github.event_name != '{barred_event}'" in CI_FUZZ_SMOKE_JOB:
+            failures.append(
+                "the adopted fuzz-smoke generation gates the sanitizer budget "
+                f"by excluding {barred_event} rather than by naming the two "
+                "events that may run it; an allow-list is the contract (#4238)"
+            )
     for admitted_event in (
         "github.event_name == 'merge_group'",
         "(github.event_name == 'push' && github.ref == 'refs/heads/main')",
@@ -27855,7 +27868,7 @@ pre_build = []
         if admitted_event not in CI_FUZZ_SMOKE_JOB:
             failures.append(
                 "the adopted fuzz-smoke generation no longer reaches the "
-                f"sanitizer budget through {admitted_event}"
+                f"fuzz-smoke job through {admitted_event}"
             )
     if "needs.ci-plan.outputs.mode == 'full'" not in CI_FUZZ_SMOKE_JOB:
         failures.append(
@@ -28008,13 +28021,33 @@ pre_build = []
     # What issue #3902 added to the contract, and therefore what a later pull
     # request must not be able to take back out of it.
     fuzz_smoke_adopted_tampering: dict[str, tuple[str, str]] = {
+        # Removing the guard entirely restores the six-target sanitizer build
+        # to every full-mode pull request -- the ~39-minute compile #3902 took
+        # off that path. Still forbidden.
         "sanitizer budget restored to every pull request": (
-            "        if: github.event_name != 'pull_request'\n",
+            "        if: github.event_name == 'push' "
+            "|| github.event_name == 'workflow_dispatch'\n",
             "",
         ),
-        "sanitizer budget dropped from the merge queue": (
-            "        if: github.event_name != 'pull_request'\n",
+        # #4238 moved the budget off `merge_group` deliberately, so "dropped
+        # from the merge queue" is no longer a tamper -- it is the contract.
+        # What must still be impossible is dropping it from the push to `main`,
+        # because that is now the ONLY automatic route that runs it at all.
+        # Narrowing the guard to manual dispatch would leave the six targets
+        # unfuzzed on every merged change while the job kept reporting green.
+        "sanitizer budget dropped from the push to main": (
+            "        if: github.event_name == 'push' "
+            "|| github.event_name == 'workflow_dispatch'\n",
             "        if: github.event_name == 'workflow_dispatch'\n",
+        ),
+        # The mirror of the above: re-admitting merge_group is also a deviation
+        # from the frozen text, so the freeze must reject a change back to it
+        # just as firmly as it rejects a narrowing. A generation transition is
+        # the only sanctioned way to move this lane again.
+        "sanitizer budget re-added to the merge queue": (
+            "        if: github.event_name == 'push' "
+            "|| github.event_name == 'workflow_dispatch'\n",
+            "        if: github.event_name != 'pull_request'\n",
         ),
         "property gate dropped from pull requests": (
             "      - name: Run deterministic property smoke tests\n",
