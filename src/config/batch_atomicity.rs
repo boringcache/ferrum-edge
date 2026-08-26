@@ -198,8 +198,7 @@ impl AtomicBatchGraph<'_> {
             return true;
         }
         if self.plugin_configs.iter().any(|plugin| {
-            plugin.plugin_name == "mtls_auth"
-                || plugin.plugin_name == "tcp_connection_throttle"
+            plugin.plugin_name == "mtls_auth" || plugin.plugin_name == "tcp_connection_throttle"
         }) {
             return true;
         }

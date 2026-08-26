@@ -5462,10 +5462,7 @@ impl DatabaseStore {
     ) -> Result<Option<String>, anyhow::Error> {
         let start = Instant::now();
         let candidates = consumer_identity_probe_fields(consumer_id, username, custom_id);
-        let mut values: Vec<&str> = candidates
-            .iter()
-            .map(|(_, value)| *value)
-            .collect();
+        let mut values: Vec<&str> = candidates.iter().map(|(_, value)| *value).collect();
         values.sort_unstable();
         values.dedup();
 
@@ -5477,11 +5474,14 @@ impl DatabaseStore {
         } else {
             ""
         };
+        // One typed 409 is enough to reject the batch. LIMIT 1 keeps the
+        // datastore from returning identity rows the caller would discard.
         let sql = self.q(&format!(
             "SELECT identity_value, consumer_id \
              FROM consumer_identity_index \
              WHERE namespace = ? \
-             AND identity_value IN ({placeholders}){exclude_filter}"
+             AND identity_value IN ({placeholders}){exclude_filter} \
+             LIMIT 1"
         ));
         let mut query = sqlx::query(&sql).bind(namespace);
         for value in &values {
@@ -5491,8 +5491,7 @@ impl DatabaseStore {
             query = query.bind(exclude_id);
         }
 
-        let rows = query.fetch_all(&self.pool()).await?;
-        for row in rows {
+        if let Some(row) = query.fetch_optional(&self.pool()).await? {
             let identity_value: String = row.try_get("identity_value")?;
             let owner_id: String = row.try_get("consumer_id")?;
             let conflict = self
@@ -5518,14 +5517,13 @@ impl DatabaseStore {
         identity_value: &str,
         owner_id: &str,
     ) -> Result<String, anyhow::Error> {
-        let row: Option<AnyRow> = sqlx::query(&self.q(
-            "SELECT id, username, custom_id FROM consumers \
-             WHERE namespace = ? AND id = ?",
-        ))
-        .bind(namespace)
-        .bind(owner_id)
-        .fetch_optional(&self.pool())
-        .await?;
+        let row: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT id, username, custom_id FROM consumers \
+             WHERE namespace = ? AND id = ?"))
+            .bind(namespace)
+            .bind(owner_id)
+            .fetch_optional(&self.pool())
+            .await?;
         let Some(row) = row else {
             // Index claimed a collision but the owner row is gone. Fail
             // closed rather than treating an inconclusive index hit as unique.

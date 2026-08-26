@@ -4130,13 +4130,8 @@ fn sql_namespace_registry_backfill_does_not_nest_a_sqlite_begin() {
     );
 }
 
-fn http_route_proxy(
-    id: &str,
-    namespace: &str,
-    listen_path: Option<&str>,
-    hosts: &[&str],
-) -> Proxy {
-    let mut proxy = serde_json::from_value(json!({
+fn http_route_proxy(id: &str, namespace: &str, listen_path: Option<&str>, hosts: &[&str]) -> Proxy {
+    let mut proxy: Proxy = serde_json::from_value(json!({
         "id": id,
         "namespace": namespace,
         "hosts": hosts,
@@ -4259,6 +4254,10 @@ fn consumer_identity_uniqueness_queries_the_identity_index() {
     assert!(
         body.contains("WHERE namespace = ?"),
         "identity uniqueness must carry the namespace predicate in the query:\n{body}"
+    );
+    assert!(
+        body.contains("LIMIT 1"),
+        "identity uniqueness must stop at the first index hit:\n{body}"
     );
     assert!(
         !body.contains("id IN (")

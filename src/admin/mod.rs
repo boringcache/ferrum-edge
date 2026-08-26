@@ -7432,8 +7432,7 @@ async fn batch_existing_resource_conflict(
             return Ok(Some(message));
         }
         if let Some(message) =
-            crud::check_consumer_credential_uniqueness(db, namespace, consumer, None)
-                .await?
+            crud::check_consumer_credential_uniqueness(db, namespace, consumer, None).await?
         {
             return Ok(Some(message));
         }
@@ -7452,23 +7451,15 @@ async fn batch_existing_resource_conflict(
             {
                 true => {}
                 false => {
-                    return Ok(Some(
-                        PROXY_ROUTE_CONFLICT_ERROR.to_string(),
-                    ));
+                    return Ok(Some(PROXY_ROUTE_CONFLICT_ERROR.to_string()));
                 }
             }
         }
         if let Some(name) = proxy.name.as_deref() {
-            match db
-                .check_proxy_name_unique(namespace, name, None)
-                .await?
-            {
+            match db.check_proxy_name_unique(namespace, name, None).await? {
                 true => {}
                 false => {
-                    return Ok(Some(format!(
-                        "Proxy name '{}' already exists",
-                        name
-                    )));
+                    return Ok(Some(format!("Proxy name '{}' already exists", name)));
                 }
             }
         }
@@ -7476,16 +7467,10 @@ async fn batch_existing_resource_conflict(
 
     for upstream in &batch.upstreams {
         if let Some(name) = upstream.name.as_deref() {
-            match db
-                .check_upstream_name_unique(namespace, name, None)
-                .await?
-            {
+            match db.check_upstream_name_unique(namespace, name, None).await? {
                 true => {}
                 false => {
-                    return Ok(Some(format!(
-                        "Upstream name '{}' already exists",
-                        name
-                    )));
+                    return Ok(Some(format!("Upstream name '{}' already exists", name)));
                 }
             }
         }
@@ -7496,8 +7481,7 @@ async fn batch_existing_resource_conflict(
 
 fn batch_needs_consumer_snapshot(batch: &RestorePayload) -> bool {
     batch.consumers.iter().any(|consumer| {
-        consumer.has_credential("mtls_auth")
-            || !consumer.credential_entries("hmac_auth").is_empty()
+        consumer.has_credential("mtls_auth") || !consumer.credential_entries("hmac_auth").is_empty()
     })
 }
 
@@ -7513,11 +7497,7 @@ fn batch_needs_mtls_plugin_compat(batch: &RestorePayload) -> bool {
 }
 
 fn batch_submits_plugin_graph(batch: &RestorePayload) -> bool {
-    !batch.plugin_configs.is_empty()
-        || batch
-            .proxies
-            .iter()
-            .any(|proxy| !proxy.plugins.is_empty())
+    !batch.plugin_configs.is_empty() || batch.proxies.iter().any(|proxy| !proxy.plugins.is_empty())
 }
 
 fn overlay_batch_consumers(candidate: &mut GatewayConfig, consumers: &[Consumer]) {
@@ -7792,20 +7772,18 @@ async fn handle_batch_create(
                 // unrelated batch writes. Re-evaluate the authoritative
                 // candidate only when this batch submits a Consumer that
                 // carries HMAC credentials.
-                if batch.consumers.iter().any(|consumer| {
-                    !consumer.credential_entries("hmac_auth").is_empty()
-                }) && let Err(errors) =
-                    candidate_config.validate_unique_hmac_credentials()
+                if batch
+                    .consumers
+                    .iter()
+                    .any(|consumer| !consumer.credential_entries("hmac_auth").is_empty())
+                    && let Err(errors) = candidate_config.validate_unique_hmac_credentials()
                 {
                     validation_errors.extend(errors);
                 }
             }
             Err(error) => validation_errors.push(format!(
                 "Failed to load namespace config for credential candidate validation: {}",
-                redacted_persistence_error_message(
-                    "batch_credential_candidate_load",
-                    &error,
-                )
+                redacted_persistence_error_message("batch_credential_candidate_load", &error,)
             )),
         }
     } else if batch_needs_mtls_plugin_compat(&batch) {
@@ -7819,10 +7797,7 @@ async fn handle_batch_create(
             }
             Err(error) => validation_errors.push(format!(
                 "Failed to load namespace config for mTLS compatibility validation: {}",
-                redacted_persistence_error_message(
-                    "batch_mtls_compat_candidate_load",
-                    &error,
-                )
+                redacted_persistence_error_message("batch_mtls_compat_candidate_load", &error,)
             )),
         }
     }
@@ -8062,8 +8037,7 @@ async fn handle_batch_create(
         ));
     }
 
-    match batch_existing_resource_conflict(db.as_ref(), namespace, &batch).await
-    {
+    match batch_existing_resource_conflict(db.as_ref(), namespace, &batch).await {
         Ok(Some(message)) => {
             return Ok(json_response(
                 StatusCode::CONFLICT,

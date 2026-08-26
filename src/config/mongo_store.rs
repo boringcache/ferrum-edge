@@ -61,8 +61,7 @@ mod inner {
     };
     use crate::config::db_loader::{
         GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE, credential_value_hash,
-        format_consumer_identity_conflict, mark_row_decode_rejection,
-        proxy_route_key_hash,
+        format_consumer_identity_conflict, mark_row_decode_rejection, proxy_route_key_hash,
     };
     use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
     use crate::config::types::{
