@@ -541,6 +541,13 @@ fn every_plugin_owned_verification_opt_out_is_refused() {
             "ai_stream_router",
             json!({ "providers": [{ "allow_plaintext": true }] }),
         ),
+        (
+            "rate_limiting",
+            json!({
+                "sync_mode": "redis",
+                "redis_url": "rediss://cache.internal:6380/0#insecure",
+            }),
+        ),
     ];
 
     for (name, config) in cases {

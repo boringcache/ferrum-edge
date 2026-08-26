@@ -1,6 +1,7 @@
 use ferrum_edge::_test_support::{
-    MAX_REDIS_POOL_SIZE, RedisConfig, RedisRateLimitClient, redis_build_client,
-    redis_client_credentials, redis_config_url_with_ip, redis_rate_limit_client_for_test,
+    MAX_REDIS_POOL_SIZE, RedisConfig, RedisRateLimitClient,
+    create_rate_limit_plugin_with_config_id, redis_build_client, redis_client_credentials,
+    redis_client_tls_insecure, redis_config_url_with_ip, redis_rate_limit_client_for_test,
 };
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -281,6 +282,11 @@ fn test_from_plugin_config_rejects_malformed_redis_urls() {
         "http://cache.internal:6379/0",
         "redis:///0",
         "rediss:///0",
+        "rediss://cache.internal:6380/0#insecure",
+        "rediss://cache.internal:6380/0#anything",
+        "redis://cache.internal:6379/0#insecure",
+        "rediss://cache.internal:6380/0#%69nsecure",
+        "rediss://cache.internal:6380/0#",
     ] {
         let config = json!({
             "sync_mode": "redis",
@@ -382,6 +388,122 @@ fn redis_exclusive_ca_load_is_the_shared_construction_gate() {
     assert!(
         source.matches("tls_ca_bundle_pem").count() >= 3,
         "stored exclusive CA bytes must be the input both connect paths use"
+    );
+}
+
+#[test]
+fn test_from_plugin_config_rejects_insecure_fragment_without_echoing_the_url() {
+    // Issue #4147: a redis_url fragment is a TLS verification opt-out, not a
+    // destination. Admission must fail closed without echoing userinfo or the
+    // fragment itself.
+    let secret = "super-secret-redis-pw";
+    let config = json!({
+        "sync_mode": "redis",
+        "redis_url": format!("rediss://acl:{secret}@cache.internal:6380/0#insecure"),
+        "redis_tls": true,
+    });
+    let err = RedisConfig::from_plugin_config(&config, "ferrum:test")
+        .expect_err("fragment-bearing redis_url must be rejected at construction");
+    assert!(
+        err.contains("fragment"),
+        "diagnostic must name the rejected shape: {err}"
+    );
+    assert!(
+        !err.contains(secret) && !err.contains("#insecure") && !err.contains("cache.internal"),
+        "redis_url diagnostic must not echo secrets or the URL: {err}"
+    );
+}
+
+#[test]
+fn test_from_plugin_config_rejects_fragment_even_in_local_mode() {
+    // Latent Redis fields are validated even when sync_mode is local, so
+    // toggling to redis later cannot activate a skip-verify fragment.
+    let config = json!({
+        "sync_mode": "local",
+        "redis_url": "rediss://cache.internal:6380/0#insecure",
+    });
+    assert!(
+        RedisConfig::from_plugin_config(&config, "ferrum:test").is_err(),
+        "latent fragment-bearing redis_url must fail closed"
+    );
+}
+
+#[test]
+fn test_build_client_ignores_caller_insecure_fragment_unless_tls_no_verify() {
+    // Belt-and-braces: even a RedisConfig constructed without from_plugin_config
+    // must not honor a caller #insecure fragment. Skip-verify is only the
+    // gateway-wide FERRUM_TLS_NO_VERIFY flag.
+    let fragment_url = "rediss://cache.internal:6380/0#insecure";
+    let config = make_config(fragment_url, true);
+
+    let insecure = redis_client_tls_insecure(config.clone(), fragment_url, false)
+        .expect("build_client with stripped fragment");
+    assert!(
+        !insecure,
+        "caller #insecure fragment must not disable Redis TLS verification"
+    );
+
+    let sanctioned = redis_client_tls_insecure(
+        make_config("rediss://cache.internal:6380/0", true),
+        "rediss://cache.internal:6380/0",
+        true,
+    )
+    .expect("FERRUM_TLS_NO_VERIFY path");
+    assert!(
+        sanctioned,
+        "FERRUM_TLS_NO_VERIFY must still append #insecure internally"
+    );
+
+    // A caller fragment plus the sanctioned flag still skip-verifies, because
+    // Ferrum strips the caller fragment and re-appends its own. Construction
+    // remains the primary reject; this is the reconnect/health-check backstop.
+    let both = redis_client_tls_insecure(config, fragment_url, true)
+        .expect("tls_no_verify with stripped caller fragment");
+    assert!(
+        both,
+        "FERRUM_TLS_NO_VERIFY must win after stripping a caller fragment"
+    );
+}
+
+#[test]
+fn test_rate_limiting_plugin_rejects_insecure_redis_url_fragment() {
+    let config = json!({
+        "limits": [{ "scope": "default", "requests_per_minute": 10 }],
+        "sync_mode": "redis",
+        "redis_url": "rediss://cache.internal:6380/0#insecure",
+        "redis_tls": true,
+    });
+    let err = create_rate_limit_plugin_with_config_id("rate_limiting", &config, Some("rl-1"))
+        .expect_err("rate_limiting must fail construction on a fragment-bearing redis_url");
+    assert!(err.contains("fragment"), "got: {err}");
+    assert!(
+        !err.contains("cache.internal") && !err.contains("#insecure"),
+        "plugin construction must not echo redis_url: {err}"
+    );
+}
+
+#[test]
+fn redis_tls_skip_verify_is_applied_only_through_open_screened_redis_client() {
+    // The health-check reconnect path used to duplicate the `#insecure` append
+    // (and the `!url.contains('#')` guard that let a caller fragment through).
+    // Both paths must share open_screened_redis_client, which strips first.
+    let source = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
+    assert!(
+        source.contains("fn open_screened_redis_client("),
+        "Redis TLS client construction must go through one helper"
+    );
+    assert!(
+        source.contains("format!(\"{without_fragment}#insecure\")"),
+        "skip-verify must append #insecure only after stripping any caller fragment"
+    );
+    assert!(
+        !source.contains("&& !url.contains('#')"),
+        "the old contains('#') guard let a caller #insecure fragment through"
+    );
+    let helper_calls = source.matches("open_screened_redis_client(").count();
+    assert!(
+        helper_calls >= 3,
+        "build_client and the health-check reconnect must both call the helper; got {helper_calls}"
     );
 }
 

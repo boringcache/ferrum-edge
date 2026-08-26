@@ -400,6 +400,7 @@ walks through, so all of the following are refused:
 | `spec_expose` | `tls_no_verify: true` |
 | `load_testing` | `gateway_tls_no_verify` — refused when `gateway_tls` is on and it is not explicitly `false`, because it **defaults open** |
 | `udp_logging` | `dtls_no_verify: true` |
+| Any plugin `redis_url` | a URL fragment (`#insecure` or otherwise). redis-rs treats `#insecure` as skip-verify; Ferrum refuses the fragment at plugin construction and again here. Skip-verify is only `FERRUM_TLS_NO_VERIFY` |
 | `api_chargeback_sink` | `clickhouse.tls.insecure_skip_verify: true`, `clickhouse.tls.verify_hostname: false` |
 | `mesh_route_dispatch` | `rules[].destination.backend_tls.verify_server_cert: false` |
 | `ai_transcript_audit` | `sink.allow_insecure_loopback: true` |

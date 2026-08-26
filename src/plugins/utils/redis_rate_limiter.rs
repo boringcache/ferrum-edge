@@ -117,7 +117,12 @@
 //!
 //! Supports TLS via `rediss://` URL scheme (note the double-s). CA verification
 //! and skip-verify are inherited from the gateway-level TLS settings
-//! (`FERRUM_TLS_CA_BUNDLE_PATH`, `FERRUM_TLS_NO_VERIFY`).
+//! (`FERRUM_TLS_CA_BUNDLE_PATH`, `FERRUM_TLS_NO_VERIFY`). A `redis_url` fragment
+//! (`#insecure` or any other) is rejected at plugin construction: redis-rs
+//! treats `#insecure` as a verification opt-out, and Ferrum does not let that
+//! bypass the gateway-wide gates. The only sanctioned skip-verify path is
+//! `FERRUM_TLS_NO_VERIFY`, which Ferrum applies internally after the operator
+//! URL has been admitted.
 //!
 //! A configured CA bundle is exclusive: it is the sole trust anchor, with no
 //! mixing of redis-rs default (system/public) roots. The bundle is loaded once
@@ -127,8 +132,7 @@
 //! bundle cannot be loaded, construction returns an error rather than
 //! warning-and-continuing. An unset CA path still uses redis-rs default roots.
 //! `FERRUM_TLS_NO_VERIFY` is the sanctioned skip-verify path; the CA is unused
-//! there (Ferrum appends `#insecure` internally), so an unloadable bundle is
-//! not a construction error on that path.
+//! there, so an unloadable bundle is not a construction error on that path.
 //!
 //! # Resilience
 //!
@@ -255,6 +259,10 @@ pub const REDIS_PLUGIN_CONFIG_KEYS: &[&str] = &[
 #[derive(Clone)]
 pub struct RedisConfig {
     /// Redis connection URL (e.g., `redis://host:6379/0` or `rediss://host:6380/0` for TLS).
+    ///
+    /// Must not carry a URL fragment. redis-rs treats `#insecure` as a TLS
+    /// verification opt-out; Ferrum rejects any fragment at admission so that
+    /// skip-verify can only come from `FERRUM_TLS_NO_VERIFY`.
     pub url: String,
     /// Enable TLS for the Redis connection. When true and the URL uses `redis://`,
     /// it is automatically upgraded to `rediss://`.
@@ -597,6 +605,18 @@ fn validate_redis_url(raw_url: &str) -> Result<(), String> {
     if !has_non_empty_authority(raw_url) || normalized_url_hostname(&parsed).is_none() {
         return Err("redis rate limiter: 'redis_url' must include a hostname".to_string());
     }
+    // redis-rs treats `#insecure` as ConnectionAddr::TcpTls.insecure = true.
+    // That is a verification opt-out that is not FERRUM_TLS_NO_VERIFY, so it
+    // would escape production-mode, FIPS, and startup-warning gates. No
+    // legitimate redis_url needs a fragment: Ferrum appends `#insecure` itself
+    // on the sanctioned FERRUM_TLS_NO_VERIFY path after admission.
+    if parsed.fragment().is_some() {
+        return Err(
+            "redis rate limiter: 'redis_url' must not carry a URL fragment; TLS certificate \
+             verification cannot be disabled per URL"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -613,6 +633,55 @@ fn normalized_url_hostname(url: &Url) -> Option<String> {
         Host::Ipv4(host) => Some(host.to_string()),
         Host::Ipv6(host) => Some(host.to_string()),
         _ => None,
+    }
+}
+
+/// Build a redis-rs client with Ferrum's TLS verification policy applied.
+///
+/// redis-rs treats a `#insecure` URL fragment as
+/// `ConnectionAddr::TcpTls.insecure = true`. Caller-supplied fragments are
+/// stripped first; the fragment is re-appended only when `tls_no_verify` is
+/// set from `FERRUM_TLS_NO_VERIFY`. This is the single construction path for
+/// both the main client and the background health-check reconnect.
+fn open_screened_redis_client(
+    url: &str,
+    tls_no_verify: bool,
+    tls_ca_bundle_pem: Option<&[u8]>,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<redis::Client, redis::RedisError> {
+    use redis::IntoConnectionInfo;
+
+    let is_tls = url.starts_with("rediss://");
+    let without_fragment = url.split_once('#').map(|(base, _)| base).unwrap_or(url);
+    let conn_info_url = if is_tls && tls_no_verify {
+        format!("{without_fragment}#insecure")
+    } else {
+        without_fragment.to_string()
+    };
+
+    let mut conn_info = conn_info_url.as_str().into_connection_info()?;
+    if username.is_some() || password.is_some() {
+        let mut redis_settings = conn_info.redis_settings().clone();
+        if let Some(username) = username {
+            redis_settings = redis_settings.set_username(username);
+        }
+        if let Some(password) = password {
+            redis_settings = redis_settings.set_password(password);
+        }
+        conn_info = conn_info.set_redis_settings(redis_settings);
+    }
+
+    if is_tls && (tls_ca_bundle_pem.is_some() || tls_no_verify) {
+        redis::Client::build_with_tls(
+            conn_info,
+            redis::TlsCertificates {
+                client_tls: None,
+                root_cert: tls_ca_bundle_pem.map(|pem| pem.to_vec()),
+            },
+        )
+    } else {
+        redis::Client::open(conn_info)
     }
 }
 
@@ -2398,7 +2467,8 @@ impl RedisRateLimitClient {
     ///
     /// When TLS is enabled (`rediss://` URL), applies:
     /// - Custom CA bundle from `FERRUM_TLS_CA_BUNDLE_PATH` via `build_with_tls`
-    /// - Skip-verify from `FERRUM_TLS_NO_VERIFY` via `#insecure` URL fragment
+    /// - Skip-verify from `FERRUM_TLS_NO_VERIFY` via an internally appended
+    ///   `#insecure` fragment, never from a caller-supplied URL fragment
     ///
     /// ACL credentials from [`RedisConfig::username`] / [`RedisConfig::password`]
     /// are injected into the parsed [`redis::ConnectionInfo`] so that both the
@@ -2406,55 +2476,13 @@ impl RedisRateLimitClient {
     /// principal. When set, these fields override any user-info already encoded
     /// in [`RedisConfig::url`].
     pub(crate) fn build_client(&self, url: &str) -> Result<redis::Client, redis::RedisError> {
-        let is_tls = url.starts_with("rediss://");
-
-        // Parse the URL into ConnectionInfo so we can inject ACL credentials.
-        // The URL parser already handles user:pass@host, db numbers, and the
-        // #insecure fragment; we only override credentials when the operator
-        // configured `redis_username` / `redis_password` explicitly.
-        let conn_info_url = if is_tls && self.tls_no_verify && !url.contains('#') {
-            // Append #insecure so the URL parser sets ConnectionAddr::TcpTls.insecure = true
-            format!("{url}#insecure")
-        } else {
-            url.to_string()
-        };
-
-        let conn_info = self.build_connection_info(&conn_info_url)?;
-
-        if is_tls && (self.tls_ca_bundle_pem.is_some() || self.tls_no_verify) {
-            redis::Client::build_with_tls(
-                conn_info,
-                redis::TlsCertificates {
-                    client_tls: None,
-                    root_cert: self.tls_ca_bundle_pem.clone(),
-                },
-            )
-        } else {
-            redis::Client::open(conn_info)
-        }
-    }
-
-    /// Parse a Redis URL into a [`redis::ConnectionInfo`] with ACL credentials
-    /// from [`RedisConfig`] overriding any URL-embedded user-info.
-    fn build_connection_info(&self, url: &str) -> Result<redis::ConnectionInfo, redis::RedisError> {
-        use redis::IntoConnectionInfo;
-
-        let mut conn_info = url.into_connection_info()?;
-
-        if self.config.username.is_some() || self.config.password.is_some() {
-            // Clone the parsed redis settings (preserves db number, protocol, etc.)
-            // and override only the username/password before reinstalling them.
-            let mut redis_settings = conn_info.redis_settings().clone();
-            if let Some(username) = self.config.username.as_deref() {
-                redis_settings = redis_settings.set_username(username);
-            }
-            if let Some(password) = self.config.password.as_deref() {
-                redis_settings = redis_settings.set_password(password);
-            }
-            conn_info = conn_info.set_redis_settings(redis_settings);
-        }
-
-        Ok(conn_info)
+        open_screened_redis_client(
+            url,
+            self.tls_no_verify,
+            self.tls_ca_bundle_pem.as_deref(),
+            self.config.username.as_deref(),
+            self.config.password.as_deref(),
+        )
     }
 
     /// Duration used as the effective Redis connection-attempt timeout.
@@ -2994,35 +3022,13 @@ impl RedisRateLimitClient {
                 // dedicated paths (inner AsyncConnectionConfig + defensive outer
                 // bound). Gateway DNS screening above is outside that timeout.
                 let result: Result<(), redis::RedisError> = async {
-                    use redis::IntoConnectionInfo;
-                    let is_tls = url.starts_with("rediss://");
-                    let conn_info_url = if is_tls && tls_no_verify && !url.contains('#') {
-                        format!("{url}#insecure")
-                    } else {
-                        url.clone()
-                    };
-                    let mut conn_info = conn_info_url.as_str().into_connection_info()?;
-                    if config.username.is_some() || config.password.is_some() {
-                        let mut redis_settings = conn_info.redis_settings().clone();
-                        if let Some(u) = config.username.as_deref() {
-                            redis_settings = redis_settings.set_username(u);
-                        }
-                        if let Some(p) = config.password.as_deref() {
-                            redis_settings = redis_settings.set_password(p);
-                        }
-                        conn_info = conn_info.set_redis_settings(redis_settings);
-                    }
-                    let client = if is_tls && (tls_ca_bundle_pem.is_some() || tls_no_verify) {
-                        redis::Client::build_with_tls(
-                            conn_info,
-                            redis::TlsCertificates {
-                                client_tls: None,
-                                root_cert: tls_ca_bundle_pem.clone(),
-                            },
-                        )?
-                    } else {
-                        redis::Client::open(conn_info)?
-                    };
+                    let client = open_screened_redis_client(
+                        &url,
+                        tls_no_verify,
+                        tls_ca_bundle_pem.as_deref(),
+                        config.username.as_deref(),
+                        config.password.as_deref(),
+                    )?;
                     let async_config = recovery_async_connection_config(connect_timeout);
                     let mut conn = match tokio::time::timeout(
                         connect_timeout,

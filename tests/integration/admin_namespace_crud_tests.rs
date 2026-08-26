@@ -2,8 +2,9 @@
 //!
 //! Covers create/get/list, malformed update bodies, Unicode description
 //! bounds, rename (resources move, target collision, derived-only tenants,
-//! historical audit namespace retained), delete (empty, occupied, confirmed
-//! cascade over every occupancy and ancillary surface), protection of the
+//! historical audit history follows the tenant while namespace_at_event is
+//! retained), delete (empty, occupied, confirmed cascade over every occupancy
+//! and ancillary surface), protection of the
 //! effective configured namespace from both delete and rename-away, the
 //! last-remaining-namespace invariant under concurrent deletes, commit-boundary
 //! lease loss, late-step rollback, file-mode 403s, and the
@@ -1509,7 +1510,7 @@ async fn store_create_rename_delete_round_trip() {
 }
 
 #[tokio::test]
-async fn namespace_rename_retains_historical_audit_namespace() {
+async fn namespace_rename_moves_historical_audit_namespace() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(make_store(&dir).await);
     let db: Arc<dyn DatabaseBackend> = store.clone();
@@ -1539,6 +1540,7 @@ async fn namespace_rename_retains_historical_audit_namespace() {
             resource_type: "upstream".to_string(),
             resource_id: "up-hist".to_string(),
             namespace: "hist-a".to_string(),
+            namespace_at_event: "hist-a".to_string(),
             source_address: String::new(),
             request_id: String::new(),
             outcome: "success".to_string(),
@@ -1588,9 +1590,10 @@ async fn namespace_rename_retains_historical_audit_namespace() {
         )
         .await
         .unwrap();
-    assert_eq!(historical.total, 1, "prior audit rows stay under hist-a");
-    assert_eq!(historical.items[0].id, "hist-event-1");
-    assert_eq!(historical.items[0].namespace, "hist-a");
+    assert_eq!(
+        historical.total, 0,
+        "old namespace must not expose the renamed tenant's audit history"
+    );
 
     let renamed = store
         .list_audit_events(
@@ -1604,8 +1607,14 @@ async fn namespace_rename_retains_historical_audit_namespace() {
         .await
         .unwrap();
     assert_eq!(
-        renamed.total, 0,
-        "rename must not rewrite historical audit_events onto the new name"
+        renamed.total, 1,
+        "historical audit_events must follow the renamed tenant"
+    );
+    assert_eq!(renamed.items[0].id, "hist-event-1");
+    assert_eq!(renamed.items[0].namespace, "hist-b");
+    assert_eq!(
+        renamed.items[0].namespace_at_event, "hist-a",
+        "namespace_at_event must keep the namespace recorded when the event was written"
     );
 }
 
