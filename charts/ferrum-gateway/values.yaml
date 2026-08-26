@@ -46,17 +46,53 @@ replicaCount: 2
 # use the binary default.
 ferrumNamespace: ""
 
-# Graceful shutdown. terminationGracePeriodSeconds must cover the binary's full
-# sequential shutdown budget or the chart fails render:
+# Graceful shutdown. terminationGracePeriodSeconds must cover the WHOLE
+# termination sequence or the chart fails render:
+#   preStop + preDrain + shutdown budget, where the shutdown budget is
 #   drain + 6s transport pool + 5s background + clamp(drain,5,60)s audit
 #   + 2s observability + 5s finalizer slack
-# With the defaults below that is 30+6+5+30+2+5 = 78s (see docs/graceful_shutdown.md).
-# On SIGTERM the gateway stops accept loops, marks itself draining, adds
-# `Connection: close`, and waits up to FERRUM_SHUTDOWN_DRAIN_SECONDS for in-flight
-# work before exiting. A value of 0 is honored (skip draining) and rendered
-# explicitly; set to null to omit the env and take the binary's 30s default.
+# With the defaults below that is 30 + 0 + (30+6+5+30+2+5) = 108s, which is why
+# terminationGracePeriodSeconds defaults to 110 (see docs/graceful_shutdown.md).
 shutdownDrainSeconds: 30
-terminationGracePeriodSeconds: 80
+
+# Endpoint-removal lag mitigation (issue #4154). Kubernetes runs `preStop`
+# BEFORE it sends SIGTERM, so the gateway keeps accepting for this whole window
+# while the EndpointSlice update propagates to every node's kube-proxy. Without
+# it, a `helm upgrade` SIGTERMs a pod that is still a live Endpoint and every
+# new connection steered at it is refused until the readiness probe has failed
+# `probes.readiness.failureThreshold` times.
+#
+# Rendered as a native `lifecycle.preStop.sleep` (SleepAction), which needs no
+# shell and therefore works on the distroless image. Requires Kubernetes 1.29+
+# (GA in 1.30) — set to 0 on older clusters to omit the hook entirely. The
+# default matches probes.readiness.periodSeconds x failureThreshold (10 x 3) so
+# it also covers clusters where removal is probe-driven rather than
+# deletion-driven; most clusters converge in well under 10s.
+shutdownPreStopSeconds: 30
+
+# Optional post-SIGTERM window in which every listener (proxy AND admin) keeps
+# accepting while readiness already reports `ready:false` / 503 and `/live`
+# still returns 200 (FERRUM_SHUTDOWN_PREDRAIN_SECONDS). Redundant with
+# `shutdownPreStopSeconds` on Kubernetes 1.29+, which is why it defaults to 0;
+# raise it instead of the preStop hook on clusters without SleepAction, or when
+# an external load balancer polls /health directly. Set to null to omit the env
+# and take the binary's 0s default.
+shutdownPreDrainSeconds: 0
+
+# terminationGracePeriodSeconds must cover the WHOLE termination sequence,
+# because Kubernetes starts that clock at pod deletion — preStop included:
+#
+#   terminationGracePeriodSeconds >= shutdownPreStopSeconds
+#                                  + shutdownPreDrainSeconds
+#                                  + post-SIGTERM shutdown budget
+#
+# The chart fails render when it does not. The post-SIGTERM budget is more than
+# the drain wait alone: after the drain the binary still releases transport
+# pools, joins background tasks, flushes the admin audit spool (database/cp),
+# drains observability delivery, and finalizes plugin generations — roughly 78s
+# at the defaults (see docs/graceful_shutdown.md). The default below leaves
+# room for the full sequence plus the 30s preStop window.
+terminationGracePeriodSeconds: 110
 
 serviceAccount:
   create: true
@@ -434,6 +470,11 @@ probes:
     enabled: true
     initialDelaySeconds: 5
     periodSeconds: 10
+    # Rendered explicitly instead of inheriting the Kubernetes default of 3:
+    # failureThreshold x periodSeconds is how long a terminating pod stays in
+    # the Service endpoints when removal is probe-driven, and it is the
+    # arithmetic `shutdownPreStopSeconds` is derived from.
+    failureThreshold: 3
     # Replaces the computed readiness handler, e.g.:
     # override:
     #   httpGet:

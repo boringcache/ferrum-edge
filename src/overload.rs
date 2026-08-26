@@ -1038,6 +1038,45 @@ pub fn start_monitor(
     })
 }
 
+/// Process-wide shutdown announcement latch (issue #4154).
+///
+/// Every serving mode drives its drain from the same `watch` channel its
+/// listeners observe, so the per-instance [`OverloadState::draining`] flag can
+/// only be published *after* the accept loops have already exited. That is too
+/// late for an orchestrator: the admin listener is driven by the same channel,
+/// so the readiness probe stops answering by connection refusal rather than by
+/// a `ready:false` body, and Kubernetes still needs `failureThreshold`
+/// consecutive probe periods before the pod leaves the Service endpoints.
+///
+/// This latch is published the moment SIGTERM/SIGINT is observed, before the
+/// shutdown channel fires, so `/health` and `/status` report `ready:false`
+/// (503) while the listeners are still accepting. `/live` is deliberately not
+/// derived from it — a liveness probe that failed during the drain would have
+/// kubelet SIGKILL the pod mid-drain.
+///
+/// One-way: a process never un-drains. It is deliberately NOT set by
+/// [`begin_shutdown_drain`], for the same reason the fault-delay token is not
+/// set by [`begin_drain`]: ordinary tests call the drain helpers directly, and
+/// a process-global latch flipped there would make every later readiness
+/// assertion in the same test binary observe a draining gateway.
+static SHUTDOWN_DRAIN_ANNOUNCED: AtomicBool = AtomicBool::new(false);
+
+/// Publish the process-wide draining verdict. Idempotent and one-way.
+///
+/// Called from the signal handler only, before the shutdown watch channel is
+/// fired, so readiness flips ahead of the accept-loop close.
+pub fn announce_shutdown_drain() {
+    SHUTDOWN_DRAIN_ANNOUNCED.store(true, Ordering::Release);
+}
+
+/// Read the process-wide draining verdict.
+///
+/// One `Acquire` load of a process-global `AtomicBool` — no allocation, no
+/// lock, and no I/O, so the unauthenticated readiness probe stays flood-safe.
+pub fn shutdown_drain_announced() -> bool {
+    SHUTDOWN_DRAIN_ANNOUNCED.load(Ordering::Acquire)
+}
+
 /// Mark the overload state as draining and refuse new request admission.
 ///
 /// Sets both `draining` and `reject_new_requests` together so they are observed

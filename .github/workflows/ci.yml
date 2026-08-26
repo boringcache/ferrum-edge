@@ -3599,13 +3599,73 @@ jobs:
           fi
           grep -F 'extraEnv entry FERRUM_PROXY_HTTP_PORT is managed by first-class' "$RUNNER_TEMP/ferrum-gateway-helm-results/extraenv-reserved.err"
           # shutdownDrainSeconds=0 is a valid skip-draining value and must render.
+          # shutdownPreStopSeconds=0 opts out of the preStop window so this case
+          # keeps exercising the minimum grace period on its own.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
-            --set mode=file --set shutdownDrainSeconds=0 \
+            --set mode=file --set shutdownDrainSeconds=0 --set shutdownPreStopSeconds=0 \
             --set terminationGracePeriodSeconds=25 \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/shutdown-zero.yaml"
           drain_block="$(grep -A1 'name: FERRUM_SHUTDOWN_DRAIN_SECONDS' "$RUNNER_TEMP/ferrum-gateway-helm-results/shutdown-zero.yaml")"
           if ! grep -q '"0"' <<<"$drain_block"; then
             echo "::error title=Zero drain dropped::shutdownDrainSeconds=0 must render FERRUM_SHUTDOWN_DRAIN_SECONDS=0"
+            exit 1
+          fi
+          if grep -Fq 'preStop:' "$RUNNER_TEMP/ferrum-gateway-helm-results/shutdown-zero.yaml"; then
+            echo "::error title=preStop rendered at zero::shutdownPreStopSeconds=0 must omit lifecycle.preStop entirely"
+            exit 1
+          fi
+          # Issue #4154: the default deployment ships a native SleepAction preStop
+          # hook (no shell, so it works on distroless) plus an explicit readiness
+          # failureThreshold, and readiness is drain-aware in the binary.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-default.yaml"
+          if ! grep -Fq 'preStop:' "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-default.yaml"; then
+            echo "::error title=preStop missing::the chart must render lifecycle.preStop by default (issue #4154)"
+            exit 1
+          fi
+          prestop_block="$(grep -A3 'preStop:' "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-default.yaml")"
+          if ! grep -Fq 'sleep:' <<<"$prestop_block"; then
+            echo "::error title=preStop is not a SleepAction::distroless has no shell; preStop must use lifecycle.preStop.sleep"
+            exit 1
+          fi
+          if ! grep -Eq 'seconds: 30' <<<"$prestop_block"; then
+            echo "::error title=preStop seconds missing::preStop.sleep.seconds must render shutdownPreStopSeconds"
+            exit 1
+          fi
+          if ! grep -Eq 'failureThreshold: 3$' "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-default.yaml"; then
+            echo "::error title=Readiness failureThreshold implicit::render it explicitly; it is the endpoint-removal budget"
+            exit 1
+          fi
+          # The preStop window is billed to terminationGracePeriodSeconds, so the
+          # render-time guard must refuse a grace period that only covers the
+          # post-SIGTERM budget.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set shutdownPreStopSeconds=30 \
+            --set terminationGracePeriodSeconds=35 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-low-grace.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-low-grace.err"; then
+            echo "::error title=preStop escaped the grace guard::preStop seconds must be added to the minimum grace period"
+            exit 1
+          fi
+          grep -F 'preStop 30s' "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-low-grace.err"
+          # The post-SIGTERM pre-drain window is additive in exactly the same way.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set shutdownPreStopSeconds=0 --set shutdownPreDrainSeconds=20 \
+            --set terminationGracePeriodSeconds=35 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/predrain-low-grace.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/predrain-low-grace.err"; then
+            echo "::error title=preDrain escaped the grace guard::shutdownPreDrainSeconds must be added to the minimum grace period"
+            exit 1
+          fi
+          grep -F 'preDrain 20s' "$RUNNER_TEMP/ferrum-gateway-helm-results/predrain-low-grace.err"
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set shutdownPreDrainSeconds=20 \
+            --set terminationGracePeriodSeconds=130 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/predrain-env.yaml"
+          predrain_block="$(grep -A1 'name: FERRUM_SHUTDOWN_PREDRAIN_SECONDS' "$RUNNER_TEMP/ferrum-gateway-helm-results/predrain-env.yaml")"
+          if ! grep -q '"20"' <<<"$predrain_block"; then
+            echo "::error title=Pre-drain env missing::shutdownPreDrainSeconds must render FERRUM_SHUTDOWN_PREDRAIN_SECONDS"
             exit 1
           fi
           # Suffixed admin Service name also stays within the DNS label limit.
@@ -3927,11 +3987,13 @@ jobs:
           grep -F 'accepts at most one source' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-admin-jwt-conflict.err"
           # A values file may use explicit nulls to omit shutdown drain and clear the
           # PDB minAvailable default (the schema must accept null for both). The grace
-          # period must still cover the binary's full 78s default shutdown budget.
+          # period must still cover the binary's full 78s default shutdown budget
+          # (issue #4170) PLUS the chart's default 30s preStop window (issue #4154),
+          # i.e. 108s once both land.
           cat > "$RUNNER_TEMP/ferrum-gateway-helm-results/null-values.yaml" <<'NULLEOF'
           mode: file
           shutdownDrainSeconds: null
-          terminationGracePeriodSeconds: 80
+          terminationGracePeriodSeconds: 110
           podDisruptionBudget:
             enabled: true
             minAvailable: null
@@ -3945,7 +4007,7 @@ jobs:
             exit 1
           fi
           # A null shutdownDrainSeconds still drains for the binary's 30s default, so a
-          # grace period below the full 78s budget must fail render instead of being skipped.
+          # grace period below the unified 108s minimum must fail render instead of being skipped.
           cat > "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.yaml" <<'NULLGRACEEOF'
           mode: file
           shutdownDrainSeconds: null
@@ -3959,7 +4021,7 @@ jobs:
             exit 1
           fi
           grep -F 'null shutdownDrainSeconds uses the binary' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.err"
-          grep -F 'must be at least 78' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.err"
+          grep -F 'must be at least 108' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.err"
           grep -Fq 'maxUnavailable: 1' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-rendered.yaml"
           if grep -Fq 'minAvailable:' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-rendered.yaml"; then
             echo "::error title=Null minAvailable still rendered::minAvailable: null must fall through to maxUnavailable"

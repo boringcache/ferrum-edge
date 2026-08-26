@@ -494,10 +494,14 @@ docker stop --time=30 ferrum-edge
 
 **In orchestration** (Kubernetes):
 
-> **Note**: The distroless images have no shell. Use a `httpGet` preStop hook or configure `terminationGracePeriodSeconds` instead of a shell-based sleep.
+> **Note**: The distroless images have no shell, so a shell-based `preStop` sleep is not an option. Kubernetes 1.29+ ships a native `SleepAction` that needs no shell and works on distroless; it delays SIGTERM so Service endpoint removal can propagate before the accept loops close. `terminationGracePeriodSeconds` is measured from pod deletion and must cover the `preStop` sleep *plus* the full post-SIGTERM shutdown budget — see [graceful_shutdown.md](graceful_shutdown.md).
 
 ```yaml
-terminationGracePeriodSeconds: 80
+terminationGracePeriodSeconds: 110
+lifecycle:
+  preStop:
+    sleep:
+      seconds: 30
 ```
 
 ### 7. Upgrade Strategy
