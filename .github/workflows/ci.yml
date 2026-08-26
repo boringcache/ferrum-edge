@@ -4556,12 +4556,19 @@ jobs:
     # request cannot widen the budget, change the target list, add a step, or
     # redirect this job at a repository-supplied script.
     #
-    # Lane split (#3902): the deterministic property smoke stays the required
-    # full-mode pull-request gate. The six-target, sanitizer-instrumented
-    # libFuzzer build spent roughly 39 minutes compiling to buy roughly 48
-    # seconds of fuzzing on every pull request, so it now runs on merge_group,
-    # on the push to `main`, and on manual dispatch instead. Every route a
-    # change takes to `main` still executes it at byte-identical bounds.
+    # Lane split (#3902, narrowed by #4238): the deterministic property smoke
+    # stays the required gate and runs on pull_request AND merge_group. The
+    # six-target, sanitizer-instrumented libFuzzer build spends roughly 39
+    # minutes compiling to buy roughly 48 seconds of fuzzing, so it runs only
+    # on the push to `main` and on manual dispatch.
+    #
+    # #3902 took it off the pull-request path for cost. #4238 takes it off the
+    # merge_group path for blast radius: a hosted-runner reclamation (exit 143)
+    # anywhere in that ~38-minute window ejected the queue entry and cascaded a
+    # rebuild of every entry behind it, and it did so without a defect in the
+    # ejected change. Discovery coverage is unchanged -- every merged change is
+    # still fuzzed at byte-identical bounds by the push to `main` that follows
+    # it, which is also the only event permitted to populate this lane's cache.
     name: Fuzz Smoke
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
@@ -4628,10 +4635,14 @@ jobs:
           echo "Fuzz property smoke seconds: $((SECONDS - property_started))"
 
       - name: Run bounded libFuzzer smoke budget
-        # Issue #3902: off the ordinary pull-request path. Every route to
-        # `main` (merge_group, the push to `main` itself, and manual dispatch)
-        # still executes the whole six-target budget below.
-        if: github.event_name != 'pull_request'
+        # Issue #4238: the push to `main` and manual dispatch only. This step
+        # is a probabilistic DISCOVERY run, not a verdict on one diff, so it
+        # must not be able to eject a merge-queue entry: its bounds buy about
+        # 48 seconds of fuzzing behind roughly 39 minutes of sanitizer compile,
+        # and a runner reclamation in that window costs the whole queue.
+        # Every merged change still reaches this budget through the push to
+        # `main`, at byte-identical bounds, seconds later.
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         working-directory: fuzz
         run: |
           set -euo pipefail
@@ -4661,10 +4672,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-            echo "Fuzz lane shape: deterministic property gate only"
-          else
+          if [ "$GITHUB_EVENT_NAME" = "push" ] || [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             echo "Fuzz lane shape: property gate plus the six-target sanitizer budget"
+          else
+            echo "Fuzz lane shape: deterministic property gate only"
           fi
 
           sccache_bin="${RUSTC_WRAPPER:-}"

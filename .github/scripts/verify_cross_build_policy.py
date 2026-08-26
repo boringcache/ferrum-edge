@@ -2849,18 +2849,34 @@ LIVE_SUITE_JOB_BINDING = {
 #   * a repository that has not adopted the job may omit it, but once the
 #     trusted base carries it a pull request cannot remove it.
 #
-# Issue #3902 changes what the job runs where, which a whole-job freeze cannot
+# Changing what the job runs where is not something a whole-job freeze can
 # express as an edit. It is therefore admitted the same way `release.yml` admits
 # a new image family: as two byte-frozen GENERATIONS with a one-way transition
 # between them (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first).
 #
-#   * `CI_FUZZ_SMOKE_RETIRED_JOB` is the shape issue #2461 landed: one job that
-#     compiled and ran the six sanitizer-instrumented libFuzzer targets on every
-#     full-mode pull request, with compiler caching explicitly disabled.
-#   * `CI_FUZZ_SMOKE_JOB` is the adopted shape: the deterministic property smoke
-#     is still the required pull-request gate, the six-target bounded budget
-#     runs on merge_group / push to `main` / manual dispatch, and the lane uses
-#     the repository's checksum-pinned sccache installer.
+# The pair now carries issue #4238. Issue #3902's own transition is spent: its
+# adopted generation reached `main`, and the rule is to retire a generation once
+# that is true, so the #2461 shape it retired is gone from this file.
+#
+#   * `CI_FUZZ_SMOKE_RETIRED_JOB` is #3902's adopted shape: the deterministic
+#     property smoke as the required pull-request gate, and the six-target
+#     bounded budget on merge_group / push to `main` / manual dispatch.
+#   * `CI_FUZZ_SMOKE_JOB` is the adopted shape: identical except that the
+#     bounded budget no longer runs on `merge_group`.
+#
+#     #3902 took the budget off the pull-request path for COST -- roughly 39
+#     minutes of sanitizer compile to buy roughly 48 seconds of fuzzing. #4238
+#     takes it off the merge_group path for BLAST RADIUS. It is a probabilistic
+#     discovery run, not a verdict on one diff, but on `merge_group` a failure
+#     ejects the queue entry and cascades a rebuild of every entry behind it. A
+#     hosted-runner reclamation (`exit 143`) inside that ~38-minute window did
+#     exactly that, with no defect in the ejected change.
+#
+#     Coverage is not reduced. `merge_group` still runs the job and its
+#     deterministic property gate; the six-target budget still runs at
+#     byte-identical bounds on the push to `main` that follows every merge --
+#     which is also the only event permitted to populate this lane's cache, so
+#     it was always the placement that paid the compile cost usefully.
 #
 # Both generations are admitted so the trusted base stays valid while the
 # transition lands, and so the destination revision validates against a policy
@@ -2876,71 +2892,6 @@ LIVE_SUITE_JOB_BINDING = {
 # / `-rss_limit_mb` bounds cannot drift while a generation is added.
 CI_FUZZ_SMOKE_JOB_NAME = "fuzz-smoke"
 CI_FUZZ_SMOKE_RETIRED_JOB = r"""  fuzz-smoke:
-    # Byte-frozen by the trusted Cross build policy
-    # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
-    # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
-    # this is its entire permitted shape. Every command, action pin, toolchain
-    # pin, tool version, target name, and libFuzzer bound below is part of the
-    # contract, so a pull request cannot widen the budget, change the target
-    # list, add a step, or redirect this job at a repository-supplied script.
-    name: Fuzz Smoke
-    needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    # The repository-root Cargo config selects sccache and host linker flags,
-    # but this isolated fuzz job installs neither sccache nor mold. Disable both
-    # Cargo wrapper inputs and inherited rustflags explicitly.
-    env:
-      RUSTC_WRAPPER: ""
-      CARGO_BUILD_RUSTC_WRAPPER: ""
-      RUSTFLAGS: ""
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-        with:
-          persist-credentials: false
-
-      - name: Install required build dependency
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
-
-      - name: Install pinned nightly toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
-        with:
-          toolchain: nightly-2025-07-01
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          workspaces: fuzz -> target
-          shared-key: fuzz-smoke
-
-      - name: Install pinned cargo-fuzz
-        run: cargo install cargo-fuzz --locked --version 0.13.1
-
-      - name: Run deterministic property smoke tests
-        working-directory: fuzz
-        run: cargo test --locked
-
-      - name: Run bounded libFuzzer smoke budget
-        working-directory: fuzz
-        run: |
-          set -euo pipefail
-
-          for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
-            echo "Fuzz smoke target: ${fuzz_target}"
-            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \
-              -runs=512 \
-              -max_total_time=8 \
-              -max_len=4096 \
-              -timeout=2 \
-              -rss_limit_mb=1024
-          done
-"""
-CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     # Byte-frozen by the trusted Cross build policy
     # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
     # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
@@ -3059,6 +3010,147 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
             echo "Fuzz lane shape: deterministic property gate only"
           else
             echo "Fuzz lane shape: property gate plus the six-target sanitizer budget"
+          fi
+
+          sccache_bin="${RUSTC_WRAPPER:-}"
+          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+            echo "Fuzz lane sccache statistics after this run:"
+            "$sccache_bin" --show-stats
+            du -sh "${GITHUB_WORKSPACE}/.cache/sccache" || true
+          else
+            echo "::warning::sccache was unavailable; this fuzz run compiled without a compiler cache"
+          fi
+"""
+CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
+    # Byte-frozen by the trusted Cross build policy
+    # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
+    # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
+    # issue #3902 decides where each half of it runs. This is its entire
+    # permitted shape. Every command, action pin, toolchain pin, tool version,
+    # target name, and libFuzzer bound below is part of the contract, so a pull
+    # request cannot widen the budget, change the target list, add a step, or
+    # redirect this job at a repository-supplied script.
+    #
+    # Lane split (#3902, narrowed by #4238): the deterministic property smoke
+    # stays the required gate and runs on pull_request AND merge_group. The
+    # six-target, sanitizer-instrumented libFuzzer build spends roughly 39
+    # minutes compiling to buy roughly 48 seconds of fuzzing, so it runs only
+    # on the push to `main` and on manual dispatch.
+    #
+    # #3902 took it off the pull-request path for cost. #4238 takes it off the
+    # merge_group path for blast radius: a hosted-runner reclamation (exit 143)
+    # anywhere in that ~38-minute window ejected the queue entry and cascaded a
+    # rebuild of every entry behind it, and it did so without a defect in the
+    # ejected change. Discovery coverage is unchanged -- every merged change is
+    # still fuzzed at byte-identical bounds by the push to `main` that follows
+    # it, which is also the only event permitted to populate this lane's cache.
+    name: Fuzz Smoke
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    # The repository-root Cargo config also selects the mold linker through
+    # per-target rustflags, and this isolated lane installs no fast linker, so
+    # the inherited rustflags are cleared explicitly. The rustc wrapper is
+    # deliberately NOT pinned here: `setup-sccache` below publishes either the
+    # checksum-verified sccache path or an empty value through `GITHUB_ENV`,
+    # and a job-level `env` entry of the same name would override that
+    # fail-closed decision.
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install required build dependency
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly-2025-07-01
+
+      # The repository's own checksum-pinned sccache installer, and the only
+      # local action this contract admits. It never enables the
+      # credential-bearing sccache GHA backend, never persists
+      # ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL into later steps, asserts
+      # those credentials are absent before any build runs, and fails closed to
+      # no wrapper at all. It must run BEFORE the cache restore below so the
+      # lazily started sccache server indexes the restored entries.
+      - uses: ./.github/actions/setup-sccache
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz-smoke
+          cache-directories: ${{ github.workspace }}/.cache/sccache
+          # Only a push to `main` may write this lane's cache. GitHub already
+          # scopes a pull request's cache writes to its own ref; writing
+          # nothing at all from an untrusted ref is the stronger statement,
+          # and it keeps every compiler artifact the sanitizer build reuses
+          # attributable to code that has already merged.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.1
+
+      - name: Run deterministic property smoke tests
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+
+          property_started=$SECONDS
+          cargo test --locked
+          echo "Fuzz property smoke seconds: $((SECONDS - property_started))"
+
+      - name: Run bounded libFuzzer smoke budget
+        # Issue #4238: the push to `main` and manual dispatch only. This step
+        # is a probabilistic DISCOVERY run, not a verdict on one diff, so it
+        # must not be able to eject a merge-queue entry: its bounds buy about
+        # 48 seconds of fuzzing behind roughly 39 minutes of sanitizer compile,
+        # and a runner reclamation in that window costs the whole queue.
+        # Every merged change still reaches this budget through the push to
+        # `main`, at byte-identical bounds, seconds later.
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+
+          sanitizer_started=$SECONDS
+          sccache_bin="${RUSTC_WRAPPER:-}"
+          echo "Fuzz sanitizer lane sccache statistics before the sanitizer build:"
+          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+            "$sccache_bin" --show-stats
+          else
+            echo "sccache is unavailable; this sanitizer build cannot reuse compiler output"
+          fi
+
+          for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
+            echo "Fuzz smoke target: ${fuzz_target}"
+            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \
+              -runs=512 \
+              -max_total_time=8 \
+              -max_len=4096 \
+              -timeout=2 \
+              -rss_limit_mb=1024
+          done
+          echo "Fuzz sanitizer lane seconds: $((SECONDS - sanitizer_started))"
+
+      - name: Report fuzz lane compiler-cache telemetry
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_EVENT_NAME" = "push" ] || [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Fuzz lane shape: property gate plus the six-target sanitizer budget"
+          else
+            echo "Fuzz lane shape: deterministic property gate only"
           fi
 
           sccache_bin="${RUSTC_WRAPPER:-}"
