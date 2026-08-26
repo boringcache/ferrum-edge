@@ -12116,18 +12116,15 @@ CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
 WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS: tuple[
     tuple[str, str, str, str], ...
 ] = (
-    # `coverage.yml` `coverage-merge` on the trusted base → PR #3917
-    # (issue #3907): shard-scoped coverage planning re-shapes the merge
-    # aggregate (planned-shard artifact selection, plugin gate, planned-shard
-    # outcome enforcement), pinned against its latest-main-merged branch
-    # grok/issue-3907-coverage-shards-r1. Both generations include the current
-    # checksum-pinned taiki-e/install-action update.
-    (
-        "coverage.yml",
-        "coverage-merge",
-        "5acba780094766b03f72059b8ac229c7bcc4a722ce0130060da7ed0d1ba5850f",
-        "28c3ff517027c36ba2ca7ce8a80adc43d2e8475e46c4d5cb0106819dd3f1c152",
-    ),
+    # Empty: no workflow-directory job transition is currently admitted.
+    #
+    # The `coverage.yml` `coverage-merge` pair for PR #3917 (issue #3907) was
+    # retired here. Both are closed -- #3917 merged 2026-08-18 and its
+    # destination digest was main's live value -- so the tuple was already
+    # spent, and the action-pin bump in #4243 moved the job off that digest
+    # entirely. A spent tuple admits a transition between two states main is
+    # not in, so it is dead weight that only widens what a pull request may
+    # claim. Retiring it restores the default, stricter scan for that job.
 )
 
 # Local composite actions are compared by whole-file digest once Cross-sensitive.
