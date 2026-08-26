@@ -2130,6 +2130,7 @@ fn install_merged_targets(
     }
 
     health_checker.remove_stale_targets(upstream_namespace, upstream_id, merged);
+    health_checker.restart_upstream_probes_for_discovered(upstream_namespace, upstream_id, merged);
     if let Some(epoch_store) = request_epoch {
         let epoch = epoch_store.load();
         for proxy in epoch.config.proxies.iter().filter(|proxy| {
