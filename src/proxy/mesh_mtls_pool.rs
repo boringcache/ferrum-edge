@@ -1082,6 +1082,7 @@ impl MeshMtlsConnectionPool {
             conn_admission.as_ref(),
             self.trust_registry(),
             MeshTransportKind::MeshMtls,
+            None,
         )
         .await?;
         tokio::time::timeout(
@@ -1192,6 +1193,7 @@ impl MeshMtlsConnectionPool {
             conn_admission.as_ref(),
             self.trust_registry(),
             MeshTransportKind::MeshMtls,
+            None,
         )
         .await?;
         tokio::time::timeout(
@@ -1311,6 +1313,7 @@ impl MeshMtlsConnectionPool {
             None,
             self.trust_registry(),
             MeshTransportKind::MeshMtls,
+            None,
         )
         .await?;
         tokio::time::timeout(

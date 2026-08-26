@@ -14,6 +14,9 @@ use ferrum_edge::proxy::hbone_pool::{
     H2ConnectTunnel, HBONE_TARGET_TAG, HboneConnectionPool, HbonePoolError,
 };
 use ferrum_edge::proxy::mesh_mtls_pool::MeshMtlsSender;
+use ferrum_edge::proxy::mesh_trust_registry::{
+    MESH_KEEPALIVE_FAILED_MESSAGE, MESH_TRUST_WITHDRAWN_MESSAGE, MeshTransportGate,
+};
 use ferrum_edge::proxy::{GatewayTrustCommit, ProxyState};
 use ferrum_edge::tls::spiffe::build_spiffe_inbound_config;
 use http::{Response, StatusCode};
@@ -1011,4 +1014,308 @@ async fn a_commit_that_withdraws_no_root_never_clears_a_pooled_mesh_entry() {
     );
     assert_eq!(state.mesh_mtls_pool.pool_size(), 1);
     assert_eq!(backend_security_generation(&state), before);
+}
+
+/// First accepted TCP is held open after the TLS+H2 handshake without reading
+/// or writing, so client PINGs time out instead of seeing FIN/RST. Later
+/// accepts are a normal CONNECT echo so a redial can succeed (issue #4162).
+async fn start_hbone_blackhole_then_echo_server(
+    server_slot: SharedSvidBundle,
+) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind hbone blackhole server");
+    let addr = listener.local_addr().expect("listener addr");
+    let connection_count = Arc::new(AtomicUsize::new(0));
+    let count_for_task = connection_count.clone();
+
+    tokio::spawn(async move {
+        let inbound = build_spiffe_inbound_config(server_slot, true, Arc::new(Vec::new()))
+            .expect("server config");
+        let acceptor = TlsAcceptor::from(inbound);
+        let mut first = true;
+        loop {
+            let (tcp, _) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(_) => return,
+            };
+            count_for_task.fetch_add(1, Ordering::SeqCst);
+            let acceptor = acceptor.clone();
+            let blackhole = first;
+            first = false;
+            tokio::spawn(async move {
+                let tls = match acceptor.accept(tcp).await {
+                    Ok(tls) => tls,
+                    Err(_) => return,
+                };
+                let h2 = match h2::server::handshake(tls).await {
+                    Ok(h2) => h2,
+                    Err(_) => return,
+                };
+                if blackhole {
+                    // Hold the accepted socket open without reading or writing
+                    // so client PINGs time out rather than seeing FIN/RST.
+                    std::future::pending::<()>().await;
+                }
+                let mut h2 = h2;
+                while let Some(next) = h2.accept().await {
+                    let (request, mut respond) = match next {
+                        Ok(stream) => stream,
+                        Err(_) => break,
+                    };
+                    if request.method() != http::Method::CONNECT {
+                        continue;
+                    }
+                    tokio::spawn(async move {
+                        let mut recv = request.into_body();
+                        let response = Response::builder()
+                            .status(StatusCode::OK)
+                            .body(())
+                            .expect("connect response");
+                        let mut send = match respond.send_response(response, false) {
+                            Ok(send) => send,
+                            Err(_) => return,
+                        };
+                        while let Some(chunk) = recv.data().await {
+                            let chunk = match chunk {
+                                Ok(chunk) => chunk,
+                                Err(_) => return,
+                            };
+                            let _ = recv.flow_control().release_capacity(chunk.len());
+                            if send.send_data(chunk, false).is_err() {
+                                return;
+                            }
+                        }
+                        let _ = send.send_data(Bytes::new(), true);
+                    });
+                }
+            });
+        }
+    });
+
+    (addr, connection_count)
+}
+
+fn keepalive_proxy() -> Proxy {
+    let mut proxy = proxy_for_test();
+    proxy.pool_enable_http2 = Some(true);
+    proxy.pool_http2_keep_alive_interval_seconds = Some(1);
+    proxy.pool_http2_keep_alive_timeout_seconds = Some(1);
+    proxy.backend_connect_timeout_ms = 8_000;
+    proxy
+}
+
+async fn wait_for_hbone_pool_size(pool: &HboneConnectionPool, expected: usize, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if pool.pool_size() == expected {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "HBONE pool_size stayed at {} (wanted {expected}) after {timeout:?}",
+                pool.pool_size()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hbone_keepalive_timeout_evicts_dead_pooled_transport_and_redials() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let td = TrustDomain::new("cluster.local").unwrap();
+    let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
+    let gateway_id = SpiffeId::from_parts(&td, "ns/edge/sa/gateway").unwrap();
+    let server_id = SpiffeId::from_parts(&td, "ns/default/sa/orders").unwrap();
+    let (gateway_leaf, gateway_key) = issue_svid(&gateway_id, &root_pem, &root_key_pem);
+    let (server_leaf, server_key) = issue_svid(&server_id, &root_pem, &root_key_pem);
+
+    let gateway_slot = svid_slot(bundle_for(
+        gateway_id,
+        gateway_leaf,
+        gateway_key,
+        root_der.clone(),
+    ));
+    let server_slot = svid_slot(bundle_for(server_id, server_leaf, server_key, root_der));
+    let (server_addr, connection_count) = start_hbone_blackhole_then_echo_server(server_slot).await;
+
+    let pool = HboneConnectionPool::new(
+        PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        gateway_slot,
+        4,
+    );
+    let proxy = keepalive_proxy();
+
+    let first = tokio::time::timeout(
+        Duration::from_secs(12),
+        pool.get_tunnel_via(
+            &proxy,
+            "127.0.0.1",
+            "127.0.0.1",
+            8080,
+            8080,
+            server_addr.port(),
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("timely first hbone attempt");
+    match first {
+        Ok(_) => {}
+        Err(HbonePoolError::ConnectStream { message, .. }) => {
+            assert!(
+                !message.contains("timed out after"),
+                "keepalive must tear the dead transport down instead of leaving \
+                 CONNECT hung until connect_timeout: {message}"
+            );
+        }
+        Err(other) => panic!("unexpected first-dial error: {other:?}"),
+    }
+
+    wait_for_hbone_pool_size(&pool, 0, Duration::from_secs(8)).await;
+    assert_eq!(
+        connection_count.load(Ordering::SeqCst),
+        1,
+        "the black-holed peer must still be the only dial before redial"
+    );
+
+    let mut tunnel = tokio::time::timeout(
+        Duration::from_secs(15),
+        pool.get_tunnel_via(
+            &proxy,
+            "127.0.0.1",
+            "127.0.0.1",
+            8080,
+            8080,
+            server_addr.port(),
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("timely redial")
+    .expect("redial must open a fresh HBONE tunnel instead of reusing the dead pooled transport");
+
+    tunnel.write_all(b"keepalive-redial").await.expect("write");
+    let mut echoed = [0_u8; 16];
+    tokio::time::timeout(Duration::from_secs(5), tunnel.read_exact(&mut echoed))
+        .await
+        .expect("timely echo")
+        .expect("read echo");
+    assert_eq!(&echoed, b"keepalive-redial");
+    assert!(
+        connection_count.load(Ordering::SeqCst) >= 2,
+        "next checkout after keepalive eviction must redial, not reuse the dead peer"
+    );
+    assert_eq!(
+        pool.pool_size(),
+        1,
+        "the replacement transport must stay pooled and not be evicted as if it were the dead one"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hbone_keepalive_does_not_tear_down_a_healthy_pooled_transport() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let td = TrustDomain::new("cluster.local").unwrap();
+    let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
+    let gateway_id = SpiffeId::from_parts(&td, "ns/edge/sa/gateway").unwrap();
+    let server_id = SpiffeId::from_parts(&td, "ns/default/sa/orders").unwrap();
+    let (gateway_leaf, gateway_key) = issue_svid(&gateway_id, &root_pem, &root_key_pem);
+    let (server_leaf, server_key) = issue_svid(&server_id, &root_pem, &root_key_pem);
+
+    let gateway_slot = svid_slot(bundle_for(
+        gateway_id,
+        gateway_leaf,
+        gateway_key,
+        root_der.clone(),
+    ));
+    let server_slot = svid_slot(bundle_for(server_id, server_leaf, server_key, root_der));
+    let (server_addr, connection_count) = start_hbone_counting_echo_server(server_slot).await;
+
+    let pool = HboneConnectionPool::new(
+        PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        gateway_slot,
+        4,
+    );
+    let proxy = keepalive_proxy();
+
+    let mut tunnel = tokio::time::timeout(
+        Duration::from_secs(15),
+        pool.get_tunnel_via(
+            &proxy,
+            "127.0.0.1",
+            "127.0.0.1",
+            8080,
+            8080,
+            server_addr.port(),
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("timely hbone tunnel open")
+    .expect("open hbone tunnel");
+    tunnel.write_all(b"still-alive").await.expect("write");
+    let mut echoed = [0_u8; 11];
+    tokio::time::timeout(Duration::from_secs(5), tunnel.read_exact(&mut echoed))
+        .await
+        .expect("timely echo")
+        .expect("read echo");
+    assert_eq!(&echoed, b"still-alive");
+    drop(tunnel);
+
+    assert_eq!(pool.pool_size(), 1);
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    assert_eq!(
+        pool.pool_size(),
+        1,
+        "a healthy peer that answers PINGs must not be torn down by keepalive"
+    );
+    assert_eq!(
+        connection_count.load(Ordering::SeqCst),
+        1,
+        "keepalive must not force a redial against a live peer"
+    );
+}
+
+#[test]
+fn hbone_keepalive_abort_is_distinct_from_trust_withdrawal() {
+    let trust = MeshTransportGate::new();
+    assert!(trust.retire());
+    assert!(trust.is_retired());
+    assert!(!trust.keepalive_failed());
+    assert!(
+        trust
+            .retired_io_error()
+            .to_string()
+            .contains(MESH_TRUST_WITHDRAWN_MESSAGE)
+    );
+
+    let keepalive = MeshTransportGate::new();
+    assert!(keepalive.abort_keepalive());
+    assert!(keepalive.keepalive_failed());
+    assert!(
+        !keepalive.is_retired(),
+        "keepalive failure must not set the trust-withdrawal flag"
+    );
+    assert!(
+        keepalive
+            .keepalive_io_error()
+            .to_string()
+            .contains(MESH_KEEPALIVE_FAILED_MESSAGE)
+    );
+    assert_ne!(MESH_KEEPALIVE_FAILED_MESSAGE, MESH_TRUST_WITHDRAWN_MESSAGE);
+    assert!(!keepalive.abort_keepalive(), "abort is one-shot");
+    assert!(!trust.retire(), "retire is one-shot");
 }
