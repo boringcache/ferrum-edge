@@ -15,8 +15,8 @@ use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 use ferrum_edge::plugins::request_transformer::RequestTransformer;
 use ferrum_edge::plugins::{
-    Plugin, PluginFailurePolicy, PluginResult, RequestContext, StreamConnectionContext,
-    available_plugins, create_plugin, plugin_failure_policy,
+    Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult, RequestContext,
+    StreamConnectionContext, available_plugins, create_plugin, plugin_failure_policy,
 };
 use serde_json::json;
 
@@ -6634,5 +6634,255 @@ async fn mesh_authz_stream_remote_ip_uses_forwarded_address_not_socket_peer() {
             PluginResult::Continue
         ),
         "remote.ip when-condition must NOT match the direct socket peer (direct_client_ip)"
+    );
+}
+
+// ── Outbound capture leg is not judged (issue #4158) ──────────────────────
+//
+// Istio `AuthorizationPolicy` is a DESTINATION-side contract: a policy without
+// `targetRefs` authorizes traffic arriving AT the workloads it selects, and an
+// Envoy sidecar carries no RBAC filter on its outbound listeners. Ferrum
+// injects `__mesh_authz` as a GLOBAL plugin, so the same inbound policy set
+// also ran on the Sidecar/Ambient plaintext outbound capture listener — where
+// the peer is the co-located application over loopback and no source principal
+// can ever exist. Because the implicit-deny floor is raised by policy
+// PRESENCE, one namespace-scoped ALLOW took a whole namespace's egress offline.
+//
+// `mesh_authz_skips_outbound_capture_leg` gates three call sites — `authorize`,
+// `on_stream_connect`, and `should_buffer_request_body`. The tests below pin
+// each one on BOTH legs, so the gate can be neither widened into the inbound
+// path nor narrowed back out of the outbound one, and pin the NodeWaypoint
+// (`per_pod_policy_scoping`) carve-out that keeps enforcing on the source side
+// because its branch resolves DESTINATION workload scopes.
+
+/// The Sidecar/Ambient plaintext outbound capture port.
+const OUTBOUND_CAPTURE_PORT: u16 = 15001;
+
+/// A generation whose CUSTOM provider inspects the request body, so
+/// `should_buffer_request_body` has a rule to speak for. Mirrors the injected
+/// shape: the provider rides the slice and the policy delegates `/admin/*`.
+fn body_inspecting_mesh_authz(per_pod_policy_scoping: bool) -> MeshAuthz {
+    MeshAuthz::new_with_http_client(
+        &json!({
+            "mesh_slice": {
+                "node_id": "node-a",
+                "namespace": "default",
+                "version": "test",
+                "mesh_policies": [{
+                    "name": "delegate-admin",
+                    "namespace": "default",
+                    "scope": {"kind": "mesh_wide"},
+                    "rules": [{
+                        "to": [{"paths": ["/admin/*"]}],
+                        "action": {"custom": {"provider": "sample-ext-authz"}}
+                    }]
+                }],
+                "ext_authz_providers": [{
+                    "name": "sample-ext-authz",
+                    "service": "127.0.0.1",
+                    "port": 9000,
+                    "timeout_ms": 500,
+                    "status_on_error": 403,
+                    "include_request_body_in_check": {"max_request_bytes": 64}
+                }]
+            },
+            "per_pod_policy_scoping": per_pod_policy_scoping
+        }),
+        Some(PluginHttpClient::default()),
+    )
+    .expect("body-inspecting mesh_authz generation builds")
+}
+
+/// A request the body-inspecting CUSTOM rule can reach, on the leg `direction`
+/// names.
+fn admin_request_context(direction: Option<MeshTrafficDirection>) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/admin/reports".to_string(),
+    );
+    ctx.headers
+        .insert("host".to_string(), "api.example.com".to_string());
+    ctx.mesh_direction = direction;
+    ctx
+}
+
+/// A raw-TCP connection accepted by the plaintext outbound capture listener.
+fn outbound_capture_stream_context() -> StreamConnectionContext {
+    let mut ctx = StreamConnectionContext::new(
+        "127.0.0.1".to_string(),
+        "127.0.0.1".to_string(),
+        "__mesh-outbound-capture".to_string(),
+        Some("mesh raw-tcp egress".to_string()),
+        OUTBOUND_CAPTURE_PORT,
+        BackendScheme::Tcp,
+        Arc::new(ConsumerIndex::new(&[])),
+    );
+    ctx.mesh_direction = Some(MeshTrafficDirection::Outbound);
+    ctx
+}
+
+/// A mesh-wide DENY keyed on the connection SNI, used as the L4 control.
+fn deny_admin_sni_config(per_pod_policy_scoping: bool) -> serde_json::Value {
+    json!({
+        "mesh_policies": [{
+            "name": "deny-admin-sni",
+            "namespace": "default",
+            "scope": {"kind": "mesh_wide"},
+            "rules": [{
+                "when": [{
+                    "key": "connection.sni",
+                    "values": ["admin.mesh.internal"]
+                }],
+                "action": "deny"
+            }]
+        }],
+        "per_pod_policy_scoping": per_pod_policy_scoping
+    })
+}
+
+#[test]
+fn mesh_authz_does_not_buffer_a_request_body_on_the_outbound_capture_leg() {
+    // A request `authorize` will not judge cannot reach a CUSTOM check, so it
+    // must not buffer its body — nor inherit the shared `maxRequestBytes`
+    // ceiling, which the proxy enforces as a 413 BEFORE `authorize` runs and
+    // would otherwise cap egress bodies for a check that never executes.
+    let plugin = body_inspecting_mesh_authz(false);
+
+    let outbound = admin_request_context(Some(MeshTrafficDirection::Outbound));
+    assert!(
+        !plugin.should_buffer_request_body(&outbound),
+        "the outbound capture leg must not prebuffer for a check that never runs"
+    );
+
+    // Controls. The gate is about the LEG, not about disabling body
+    // inspection: the same request still buffers wherever it is judged.
+    let inbound = admin_request_context(Some(MeshTrafficDirection::Inbound));
+    assert!(
+        plugin.should_buffer_request_body(&inbound),
+        "the inbound leg still reaches the CUSTOM check and must prebuffer"
+    );
+    let unstamped = admin_request_context(None);
+    assert!(
+        plugin.should_buffer_request_body(&unstamped),
+        "a non-mesh listener carries no direction stamp and keeps buffering"
+    );
+}
+
+#[test]
+fn mesh_authz_node_waypoint_still_buffers_on_its_source_side_leg() {
+    // NodeWaypoint is the deliberate exception. One proxy serves every enrolled
+    // pod on the node and its in-netns capture backend IS stamped `Outbound`,
+    // but that branch resolves the DESTINATION Service's backing-workload
+    // scopes — so a CUSTOM rule genuinely can run there and its body must
+    // still be prebuffered.
+    let plugin = body_inspecting_mesh_authz(true);
+
+    let outbound = admin_request_context(Some(MeshTrafficDirection::Outbound));
+    assert!(
+        plugin.should_buffer_request_body(&outbound),
+        "per_pod_policy_scoping keeps destination-scoped enforcement on this leg"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_authorize_skips_the_outbound_capture_leg_and_still_enforces_inbound() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)]
+    }))
+    .expect("plugin config");
+
+    // The issue #4158 reproduction: on the capture leg the peer is the local
+    // application over plaintext loopback, so a `from.principals` ALLOW can
+    // never match — and `saw_allow` is raised by the policy's presence.
+    let mut outbound = request_context(None);
+    outbound.mesh_direction = Some(MeshTrafficDirection::Outbound);
+    let result = plugin.authorize(&mut outbound).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "an inbound ALLOW must not implicit-deny egress, got {result:?}"
+    );
+    assert!(
+        !outbound.metadata.contains_key("mesh_authz.deny_policy"),
+        "the skipped leg must not write an authorization decision"
+    );
+
+    // Controls: the implicit-deny floor still stands on the leg that is judged,
+    // and the admitted principal still gets through it.
+    let mut denied = request_context(Some("spiffe://cluster.local/ns/default/sa/other"));
+    denied.mesh_direction = Some(MeshTrafficDirection::Inbound);
+    assert!(
+        matches!(
+            plugin.authorize(&mut denied).await,
+            PluginResult::Reject { .. }
+        ),
+        "inbound implicit-deny must still refuse an unadmitted peer"
+    );
+    assert_eq!(
+        denied
+            .metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("implicit-deny")
+    );
+    let mut admitted = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    admitted.mesh_direction = Some(MeshTrafficDirection::Inbound);
+    assert!(matches!(
+        plugin.authorize(&mut admitted).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn mesh_authz_stream_connect_skips_the_outbound_capture_leg_and_still_enforces_inbound() {
+    // The L4 path is gated by the same shared predicate so the two legs cannot
+    // drift. No stream listener that runs this chain stamps `Outbound` today —
+    // captured raw-TCP egress is relayed over HBONE outside the plugin chain —
+    // so this pins the contract and stops a future outbound stream listener
+    // from reintroducing the implicit-deny floor on egress.
+    let plugin = MeshAuthz::new(&deny_admin_sni_config(false)).expect("plugin config");
+
+    let mut inbound = stream_context();
+    inbound.mesh_direction = Some(MeshTrafficDirection::Inbound);
+    inbound.sni_hostname = Some("admin.mesh.internal".to_string());
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut inbound).await,
+            PluginResult::Reject { .. }
+        ),
+        "the inbound leg must still enforce the destination-side DENY"
+    );
+
+    let mut outbound = outbound_capture_stream_context();
+    outbound.sni_hostname = Some("admin.mesh.internal".to_string());
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut outbound).await,
+            PluginResult::Continue
+        ),
+        "an inbound DENY must not be applied to a captured outbound stream"
+    );
+    assert!(
+        outbound.metadata.is_none(),
+        "the skipped leg is gated before the metadata clone and allocates nothing"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_node_waypoint_stream_still_enforces_on_its_source_side_leg() {
+    // The L4 half of the NodeWaypoint carve-out, alongside
+    // `mesh_authz_node_waypoint_source_side_hbone_still_requires_source_scope`
+    // on the HTTP path: one listener serves every enrolled pod, so an
+    // `Outbound` stamp there must not stand the authorizer down.
+    let plugin = MeshAuthz::new(&deny_admin_sni_config(true)).expect("plugin config");
+
+    let mut outbound = outbound_capture_stream_context();
+    outbound.sni_hostname = Some("admin.mesh.internal".to_string());
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut outbound).await,
+            PluginResult::Reject { .. }
+        ),
+        "per_pod_policy_scoping is exempt from the outbound-capture gate"
     );
 }

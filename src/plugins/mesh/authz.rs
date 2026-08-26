@@ -1095,6 +1095,58 @@ fn mesh_ingress_authz_port_missing(
         && ingress_listener_authz_port.is_none()
 }
 
+/// Whether inbound `AuthorizationPolicy` semantics must NOT be applied to this
+/// request or connection because it arrived on a mesh **outbound capture** leg
+/// (issue #4158).
+///
+/// Istio `AuthorizationPolicy` is a DESTINATION-side contract: a policy without
+/// `targetRefs` authorizes traffic arriving AT the workloads it selects, and an
+/// Envoy sidecar carries no RBAC filter on its outbound listeners. Ferrum
+/// injects `__mesh_authz` as a GLOBAL plugin and the plugin cache starts every
+/// proxy's chain from the full global list, so before this gate the same
+/// inbound policy set also ran on the Sidecar/Ambient outbound capture listener
+/// (`:15001`), where the peer is the co-located application over plaintext
+/// loopback and no source principal can ever exist. The implicit-deny floor is
+/// raised by policy PRESENCE (`saw_allow`), not by a match, so ONE
+/// namespace-scoped ALLOW — a `from.principals` rule, a `to.operation.paths`
+/// rule, or Istio's "ALLOW with no rules" allow-nothing sentinel, which
+/// translates to a never-matching rule — denied EVERY egress request from every
+/// workload in the namespace.
+///
+/// The discriminator is the LISTENER that accepted the connection, stamped onto
+/// the context by the mesh listener-spawn path from
+/// `MeshRuntimeConfig::listener_plan` — never inferred from a port number at
+/// request time. Only the Sidecar and Ambient plaintext capture listeners (and
+/// the NodeWaypoint in-netns capture backend) are stamped `Outbound`;
+/// EastWestGateway (`:15443`), EgressGateway (`:15090`), Node/ServiceWaypoint
+/// HBONE (`:15008`), sidecar mTLS (`:15006`), and the NodeWaypoint transparent
+/// inbound capture are all `Inbound` and keep full enforcement. A non-mesh
+/// gateway running an operator-configured `mesh_authz` has no direction stamp
+/// at all (`None`) and is likewise unaffected.
+///
+/// `per_pod_policy_scoping` (NodeWaypoint) is the deliberate exception. One
+/// proxy instance serves every enrolled pod on the node, its in-netns capture
+/// backend IS stamped `Outbound`, and that branch resolves the DESTINATION
+/// Service's backing-workload scopes (`destination_scope_match_for_proxy` /
+/// `policy_applies_for_destination`) rather than the local workload's inbound
+/// policy set — destination-scoped enforcement reached from a source-side leg,
+/// which is Istio-consistent and stays on, including its missing-scope
+/// fail-closed gate.
+///
+/// Egress is NOT left unauthorized by this gate. `outboundTrafficPolicy:
+/// REGISTRY_ONLY` is enforced on the same leg by `mesh_outbound_registry`
+/// (HTTP-family) and `MeshOutboundEnforcement` (stream-family), unresolvable
+/// destinations have no materialized outbound route at all, and traffic leaving
+/// through an egress gateway is authorized by that gateway's own `Inbound` leg.
+#[inline]
+fn mesh_authz_skips_outbound_capture_leg(
+    per_pod_policy_scoping: bool,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+) -> bool {
+    !per_pod_policy_scoping
+        && mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Outbound)
+}
+
 /// Destination port for stream authorization and stream metric attribution.
 ///
 /// Transparent stream listeners bind a fixed interception port while the
@@ -2481,6 +2533,16 @@ impl Plugin for MeshAuthz {
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
+        // Istio parity: `AuthorizationPolicy` is an INBOUND contract, so the
+        // outbound capture leg is not judged at all (issue #4158). This is the
+        // first statement in the phase deliberately — the leg then pays nothing:
+        // no source-principal resolution, no header materialization, no
+        // condition-attribute construction, no path canonicalization, and no
+        // metadata write. See `mesh_authz_skips_outbound_capture_leg` for how
+        // the leg is decided and what still enforces egress.
+        if mesh_authz_skips_outbound_capture_leg(self.per_pod_policy_scoping, ctx.mesh_direction) {
+            return PluginResult::Continue;
+        }
         let inbound_hbone_relay_request = ctx.mesh_direction
             == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
             && ctx.matched_proxy.as_ref().is_some_and(|proxy| {
@@ -3116,6 +3178,14 @@ impl Plugin for MeshAuthz {
     /// false negatives for a rule that will later match — see
     /// [`crate::modes::mesh::policy::mesh_rule_request_scope_may_apply`].
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        // A request `authorize` will not judge cannot reach a CUSTOM check
+        // (issue #4158), so the outbound capture leg must not buffer its body
+        // or inherit the shared `maxRequestBytes` ceiling — which the proxy
+        // enforces as a `413` BEFORE `authorize` runs and would otherwise cap
+        // egress request bodies for a check that never executes.
+        if mesh_authz_skips_outbound_capture_leg(self.per_pod_policy_scoping, ctx.mesh_direction) {
+            return false;
+        }
         if self.body_inspecting_custom_rules.is_empty() {
             return false;
         }
@@ -3174,6 +3244,21 @@ impl Plugin for MeshAuthz {
     }
 
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
+        // Same inbound-only contract as the HTTP path (issue #4158), applied
+        // with the same shared predicate so the two legs cannot drift. Today no
+        // stream listener that runs this chain stamps `Outbound` — captured
+        // raw-TCP egress is relayed over HBONE outside the plugin chain and
+        // captured UDP egress goes through the mesh UDP capture path, both of
+        // which invoke only `workload_metrics` — so this is a fail-safe gate
+        // rather than a live behavior change on the L4 leg. It is here because
+        // the HTTP defect existed exactly because a global plugin ran on a leg
+        // nobody had gated, and a future outbound stream listener that stamps
+        // direction must not reintroduce the implicit-deny floor on egress.
+        // Placed before the metadata clone below, so the gated leg allocates
+        // nothing.
+        if mesh_authz_skips_outbound_capture_leg(self.per_pod_policy_scoping, ctx.mesh_direction) {
+            return PluginResult::Continue;
+        }
         let mut metadata = ctx.metadata.clone().unwrap_or_default();
         let source_principal = metadata
             .get("peer_spiffe_id")

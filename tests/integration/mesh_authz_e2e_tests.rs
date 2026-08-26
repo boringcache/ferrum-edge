@@ -86,6 +86,22 @@ fn build_mesh_authz_for_workload(
         runtime.workload_labels.insert(k.to_string(), v.to_string());
     }
     let mesh = mesh_config_with(Vec::new(), Vec::new(), policies);
+    let authz_config = prepared_mesh_plugin_configs(&runtime, mesh)
+        .into_iter()
+        .find(|p| p.id == MESH_AUTHZ_PLUGIN_ID)
+        .expect("mesh_authz plugin injected")
+        .config;
+    MeshAuthz::new(&authz_config).expect("authz plugin builds from injected config")
+}
+
+/// Run the production mesh-preparation pipeline and return the plugin configs
+/// it injected. Shared by the `mesh_authz` builder above and by the tests that
+/// need a SECOND mesh-managed plugin from the same generation (the outbound
+/// registry), so both always read the same injection path.
+fn prepared_mesh_plugin_configs(
+    runtime: &ferrum_edge::modes::mesh::MeshRuntimeConfig,
+    mesh: MeshConfig,
+) -> Vec<ferrum_edge::config::types::PluginConfig> {
     let config = ferrum_edge::config::types::GatewayConfig {
         version: "test".to_string(),
         proxies: Vec::new(),
@@ -107,15 +123,9 @@ fn build_mesh_authz_for_workload(
         k8s_mesh_overlay: Default::default(),
         gateway_trust_bundles: Vec::new(),
     };
-    let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh-prepared");
-    let authz_config = prepared
+    prepare_gateway_config_for_mesh(config, runtime)
+        .expect("mesh-prepared")
         .plugin_configs
-        .iter()
-        .find(|p| p.id == MESH_AUTHZ_PLUGIN_ID)
-        .expect("mesh_authz plugin injected")
-        .config
-        .clone();
-    MeshAuthz::new(&authz_config).expect("authz plugin builds from injected config")
 }
 
 #[tokio::test]
@@ -992,6 +1002,369 @@ async fn deny_without_rules_is_a_no_op() {
         plugin.authorize(&mut ctx).await,
         PluginResult::Continue
     ));
+}
+
+// ── Inbound-only enforcement (issue #4158) ────────────────────────────────
+//
+// Istio `AuthorizationPolicy` is a DESTINATION-side contract: a policy without
+// `targetRefs` authorizes traffic arriving AT the workloads it selects, and an
+// Envoy sidecar carries no RBAC filter on its outbound listeners. Ferrum
+// injects `__mesh_authz` as a GLOBAL plugin and the plugin cache starts every
+// proxy's chain from the full global list, so the same inbound policy set also
+// ran on the Sidecar/Ambient plaintext OUTBOUND capture listener (`:15001`) —
+// where the peer is the co-located application over loopback and no source
+// principal can ever exist.
+//
+// The implicit-deny floor is raised by policy PRESENCE, not by a match, so a
+// single namespace-scoped ALLOW took the whole namespace's egress offline. The
+// tests below pin the fix and, just as importantly, pin that every inbound
+// contract it could have weakened still holds.
+//
+// The discriminator is the LISTENER that accepted the connection, stamped onto
+// the context by the mesh listener-spawn path from
+// `MeshRuntimeConfig::listener_plan`, never inferred from a port number at
+// request time. What still enforces egress after the change is exercised by
+// `registry_only_still_refuses_unknown_destinations_on_the_outbound_leg`.
+
+/// The Sidecar/Ambient plaintext outbound capture port.
+const OUTBOUND_CAPTURE_PORT: u16 = 15001;
+
+/// A request captured on the OUTBOUND leg: the accepting listener stamped
+/// `MeshTrafficDirection::Outbound`, and — because the peer is the local
+/// application over plaintext loopback — there is no peer SPIFFE identity.
+fn outbound_capture_ctx(method: &str, path: &str, host: &str) -> RequestContext {
+    let mut ctx = ctx_with_principal(method, path, None);
+    ctx.mesh_direction = Some(MeshTrafficDirection::Outbound);
+    ctx.frontend_listen_port = Some(OUTBOUND_CAPTURE_PORT);
+    ctx.headers.insert("host".to_string(), host.to_string());
+    ctx
+}
+
+/// The same request shape on the INBOUND leg, where mTLS supplies the peer
+/// identity. Used as the control in every test below: the outbound assertion
+/// only means something next to proof that the policy still enforces inbound.
+fn inbound_leg_ctx(method: &str, path: &str, principal: Option<&str>) -> RequestContext {
+    let mut ctx = ctx_with_principal(method, path, principal);
+    ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+    ctx
+}
+
+/// The canonical Istio recipe from the issue: an `AuthorizationPolicy` in
+/// `default` with no selector, admitting one service account.
+fn namespace_allow_from_client() -> MeshPolicy {
+    policy_allow_principal(
+        "allow-from-client",
+        DEFAULT_NAMESPACE,
+        PolicyScope::Namespace {
+            namespace: DEFAULT_NAMESPACE.to_string(),
+        },
+        CLIENT_SPIFFE,
+    )
+}
+
+#[tokio::test]
+async fn namespace_scoped_allow_does_not_implicit_deny_the_outbound_capture_leg() {
+    // The reproduction from issue #4158. A namespace-scoped ALLOW keyed on
+    // `from.principals` can never match on the capture leg — the peer is the
+    // local app over loopback — and `saw_allow` is set by the policy's
+    // presence, so before the fix every egress request in the namespace was
+    // rejected with `mesh_authz.deny_policy = implicit-deny`.
+    let plugin = build_mesh_authz_for_workload(&[], vec![namespace_allow_from_client()]);
+
+    let mut outbound = outbound_capture_ctx("GET", "/api/items", "payments.default.svc:8080");
+    let result = plugin.authorize(&mut outbound).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a namespace-scoped inbound ALLOW must not deny egress, got {result:?}"
+    );
+    assert!(
+        !outbound.metadata.contains_key("mesh_authz.deny_policy"),
+        "the outbound leg must not record an authorization denial"
+    );
+
+    // Control: the SAME policy still implicit-denies the unauthenticated
+    // request on the inbound leg. The fix is about the leg, not about
+    // weakening the floor.
+    let mut inbound = inbound_leg_ctx("GET", "/api/items", None);
+    assert!(
+        matches!(
+            plugin.authorize(&mut inbound).await,
+            PluginResult::Reject { .. }
+        ),
+        "inbound implicit-deny must still hold for an unauthenticated request"
+    );
+
+    // And the admitted principal still gets through inbound.
+    let mut admitted = inbound_leg_ctx("GET", "/api/items", Some(CLIENT_SPIFFE));
+    assert!(matches!(
+        plugin.authorize(&mut admitted).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn path_scoped_allow_does_not_implicit_deny_unrelated_outbound_requests() {
+    // The amplifying case: the trigger is broader than `from.principals`. An
+    // ALLOW scoped by `to.operation.paths` raises the same floor, so before the
+    // fix every egress request to any OTHER path was denied — even from a
+    // workload the policy admits.
+    let allow_api = MeshPolicy {
+        name: "allow-api-paths".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::Namespace {
+            namespace: DEFAULT_NAMESPACE.to_string(),
+        },
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: vec![RequestMatch {
+                paths: vec!["/api/*".to_string()],
+                ..RequestMatch::default()
+            }],
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Allow,
+        }],
+    };
+    let plugin = build_mesh_authz_for_workload(&[], vec![allow_api]);
+
+    let mut outbound = outbound_capture_ctx("GET", "/metrics", "vendor.example.com");
+    assert!(
+        matches!(
+            plugin.authorize(&mut outbound).await,
+            PluginResult::Continue
+        ),
+        "a path-scoped inbound ALLOW must not blackhole egress to other paths"
+    );
+
+    // Control: inbound, the non-matching path still falls to implicit deny and
+    // the matching path is still admitted.
+    let mut inbound_other = inbound_leg_ctx("GET", "/metrics", Some(CLIENT_SPIFFE));
+    assert!(matches!(
+        plugin.authorize(&mut inbound_other).await,
+        PluginResult::Reject { .. }
+    ));
+    let mut inbound_api = inbound_leg_ctx("GET", "/api/items", Some(CLIENT_SPIFFE));
+    assert!(matches!(
+        plugin.authorize(&mut inbound_api).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn istio_allow_without_rules_still_leaves_egress_working() {
+    // `AuthorizationPolicy{action: ALLOW, rules: []}` is Istio's
+    // "allow-nothing" sentinel, translated to a never-matching ALLOW rule so
+    // the implicit-deny floor applies. That is correct INBOUND — pinned by
+    // `istio_allow_without_rules_means_allow_nothing` — and it was the worst
+    // outbound case, because the rule cannot match anything by construction.
+    let allow_nothing = MeshPolicy {
+        name: "allow-nothing".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::Namespace {
+            namespace: DEFAULT_NAMESPACE.to_string(),
+        },
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: Vec::new(),
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: true,
+            action: PolicyAction::Allow,
+        }],
+    };
+    let plugin = build_mesh_authz_for_workload(&[], vec![allow_nothing]);
+
+    let mut outbound = outbound_capture_ctx("POST", "/v1/charge", "vendor.example.com");
+    assert!(
+        matches!(
+            plugin.authorize(&mut outbound).await,
+            PluginResult::Continue
+        ),
+        "allow-nothing is a destination-side sentinel; it must not close egress"
+    );
+
+    let mut inbound = inbound_leg_ctx("POST", "/v1/charge", Some(CLIENT_SPIFFE));
+    assert!(
+        matches!(
+            plugin.authorize(&mut inbound).await,
+            PluginResult::Reject { .. }
+        ),
+        "allow-nothing must still allow nothing inbound"
+    );
+}
+
+#[tokio::test]
+async fn deny_first_ordering_is_unchanged_on_the_inbound_leg() {
+    // The invariant most at risk from a direction gate: DENY rules evaluate
+    // first and the first match wins. Pinned here with the direction stamped
+    // explicitly, so the gate cannot silently reorder or skip the DENY tier on
+    // the leg that still enforces.
+    let allow = policy_allow_principal(
+        "client-allow",
+        DEFAULT_NAMESPACE,
+        PolicyScope::MeshWide,
+        CLIENT_SPIFFE,
+    );
+    let deny = policy_deny_principal(
+        "client-deny",
+        DEFAULT_NAMESPACE,
+        PolicyScope::MeshWide,
+        CLIENT_SPIFFE,
+    );
+    let plugin = build_mesh_authz_for_workload(&[], vec![allow, deny]);
+
+    let mut inbound = inbound_leg_ctx("GET", "/api/items", Some(CLIENT_SPIFFE));
+    assert!(
+        matches!(
+            plugin.authorize(&mut inbound).await,
+            PluginResult::Reject { .. }
+        ),
+        "DENY must still win over a matching ALLOW on the inbound leg"
+    );
+
+    // Istio parity, stated as a test rather than left implicit: an inbound
+    // DENY is a destination-side rule and is NOT enforced on the source's
+    // capture leg. The destination's own inbound leg refuses the request, so
+    // the DENY is still enforced end to end — on one leg, not two.
+    let mut outbound = outbound_capture_ctx("GET", "/api/items", "payments.default.svc:8080");
+    assert!(matches!(
+        plugin.authorize(&mut outbound).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn stream_authorization_is_inbound_only_too() {
+    // The L4 path has the same shape as the HTTP path and is gated by the same
+    // shared predicate. No stream listener that runs this chain stamps
+    // `Outbound` today — captured raw-TCP egress is relayed over HBONE outside
+    // the plugin chain — so this pins the contract rather than a live
+    // behaviour change, and stops a future outbound stream listener from
+    // reintroducing the implicit-deny floor on egress.
+    let deny = deny_principal_on_port("deny-redis", CLIENT_SPIFFE, 6379);
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny]);
+
+    let mut inbound = inbound_stream_ctx(6379, CLIENT_SPIFFE);
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut inbound).await,
+            PluginResult::Reject { .. }
+        ),
+        "the port-scoped DENY must still refuse the inbound raw-TCP stream"
+    );
+
+    // Same principal, same destination port — only the accepting leg differs.
+    let mut outbound = StreamConnectionContext::new(
+        "10.0.0.7".to_string(),
+        "10.0.0.7".to_string(),
+        "__mesh-outbound-capture".to_string(),
+        Some("mesh raw-tcp egress".to_string()),
+        OUTBOUND_CAPTURE_PORT,
+        BackendScheme::Tcp,
+        Arc::new(ConsumerIndex::new(&[] as &[Consumer])),
+    );
+    outbound.mesh_direction = Some(MeshTrafficDirection::Outbound);
+    outbound.destination_port = Some(6379);
+    outbound.insert_metadata("peer_spiffe_id".to_string(), CLIENT_SPIFFE.to_string());
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut outbound).await,
+            PluginResult::Continue
+        ),
+        "an inbound DENY must not be applied to a captured outbound stream"
+    );
+}
+
+#[tokio::test]
+async fn registry_only_still_refuses_unknown_destinations_on_the_outbound_leg() {
+    // What remains enforced on egress after `mesh_authz` stands down. Istio's
+    // `outboundTrafficPolicy: REGISTRY_ONLY` is the egress-scoping surface, and
+    // it is enforced on the SAME capture leg by `mesh_outbound_registry` for
+    // HTTP-family traffic (`MeshOutboundEnforcement` covers the stream family).
+    // Neither is touched by the direction gate, so a namespace-scoped ALLOW no
+    // longer denies egress while an unregistered destination still cannot be
+    // reached.
+    let mut runtime = default_mesh_runtime();
+    let capture_addr = format!("127.0.0.1:{OUTBOUND_CAPTURE_PORT}");
+    runtime.outbound_listen_addr = capture_addr.parse().expect("outbound capture addr");
+    runtime.outbound_traffic_policy =
+        ferrum_edge::modes::mesh::config::OutboundTrafficPolicy::RegistryOnly;
+
+    let workload = super::mesh_test_support::workload_for(
+        "payments",
+        DEFAULT_NAMESPACE,
+        [("app", "payments")],
+        ["10.0.0.5"],
+    );
+    let service =
+        super::mesh_test_support::service_for("payments", DEFAULT_NAMESPACE, &[&workload]);
+    let policies = vec![namespace_allow_from_client()];
+    let mesh = mesh_config_with(vec![workload], vec![service], policies);
+    let plugin_configs = prepared_mesh_plugin_configs(&runtime, mesh);
+
+    let authz_config = plugin_configs
+        .iter()
+        .find(|p| p.id == MESH_AUTHZ_PLUGIN_ID)
+        .expect("mesh_authz plugin injected")
+        .config
+        .clone();
+    let authz = MeshAuthz::new(&authz_config).expect("authz plugin builds from injected config");
+    let registry_config = plugin_configs
+        .iter()
+        .find(|p| p.id == ferrum_edge::modes::mesh::MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+        .expect("REGISTRY_ONLY injects the outbound registry plugin")
+        .config
+        .clone();
+    let built_registry =
+        ferrum_edge::plugins::mesh::outbound_registry::OutboundRegistry::new(&registry_config);
+    let registry = built_registry.expect("outbound registry builds from injected config");
+
+    // Drive the admit case with a destination the injected registry actually
+    // carries, so the test asserts reachability instead of re-deriving the
+    // mesh's own naming rules. Finding no entry at all is itself a failure.
+    let registered_host = registry_config
+        .get("registry")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|entries| {
+            entries
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .find(|entry| entry.starts_with("payments.") && entry.ends_with(":8080"))
+        })
+        .expect("the mesh service must be in the injected REGISTRY_ONLY registry")
+        .to_string();
+
+    // A registered in-mesh destination: admitted by both surfaces.
+    let mut known = outbound_capture_ctx("GET", "/api/items", &registered_host);
+    assert!(matches!(
+        authz.authorize(&mut known).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        matches!(
+            registry.on_request_received(&mut known).await,
+            PluginResult::Continue
+        ),
+        "a registered mesh destination must still be reachable"
+    );
+
+    // An unregistered external destination: `mesh_authz` no longer speaks for
+    // it, and REGISTRY_ONLY still refuses it.
+    let mut unknown = outbound_capture_ctx("GET", "/", "not-in-registry.example.com");
+    assert!(matches!(
+        authz.authorize(&mut unknown).await,
+        PluginResult::Continue
+    ));
+    let result = registry.on_request_received(&mut unknown).await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "REGISTRY_ONLY must still refuse an unregistered egress destination, got {result:?}"
+    );
 }
 
 #[tokio::test]

@@ -1526,7 +1526,36 @@ The slice builder:
 
 ## Authorization
 
-Mesh authorization is evaluated by the auto-injected `mesh_authz` plugin (priority 2075) on every request. In sidecar, ambient, east-west, and egress-gateway topologies, the plugin pre-filters applicable policies at construction time (cold path) so the request hot path evaluates only the relevant subset. In `NodeWaypoint` topology, one proxy instance serves many pods, so policy scope is resolved per pod on the request path from the node-waypoint identity resolver; a pod whose scope is absent (its workload left the live slice generation) **fails closed** when namespace/selector-scoped policies are configured, and falls through to mesh-wide-only when the mesh has only mesh-wide policies.
+Mesh authorization is evaluated by the auto-injected `mesh_authz` plugin (priority 2075) on every request that arrives on an **inbound** leg — see [Which leg enforces which policy family](#which-leg-enforces-which-policy-family-issue-4158) immediately below. In sidecar, ambient, east-west, and egress-gateway topologies, the plugin pre-filters applicable policies at construction time (cold path) so the request hot path evaluates only the relevant subset. In `NodeWaypoint` topology, one proxy instance serves many pods, so policy scope is resolved per pod on the request path from the node-waypoint identity resolver; a pod whose scope is absent (its workload left the live slice generation) **fails closed** when namespace/selector-scoped policies are configured, and falls through to mesh-wide-only when the mesh has only mesh-wide policies.
+
+### Which leg enforces which policy family (issue #4158)
+
+Istio `AuthorizationPolicy` is a **destination-side** contract: a policy without `targetRefs` authorizes traffic arriving *at* the workloads it selects, and an Envoy sidecar carries no RBAC filter on its outbound listeners. Ferrum follows that split exactly. `mesh_authz` is injected as a **global** plugin, so it is reached from every materialized route, but it evaluates policy only on legs whose accepting listener is `Inbound`:
+
+| Leg | Listener | Direction | `AuthorizationPolicy` (`mesh_authz`) | Egress scoping |
+|---|---|---|---|---|
+| Sidecar inbound | mTLS `:15006` | `Inbound` | Enforced (DENY-first, then ALLOW, then implicit deny) | — |
+| Ambient / waypoint inbound | HBONE `:15008` | `Inbound` | Enforced | — |
+| NodeWaypoint transparent inbound capture | `FERRUM_MESH_INBOUND_LISTEN_ADDR` | `Inbound` | Enforced, per-pod scoped | — |
+| East-west gateway | SNI passthrough `:15443` | `Inbound` | Enforced | — |
+| Egress gateway | mTLS `:15090` | `Inbound` | Enforced — this is where mesh-external traffic is authorized | ServiceEntry (`location: mesh_external`) backends |
+| Sidecar / Ambient outbound capture | plaintext `:15001` (+ UDP capture) | `Outbound` | **Not enforced** | `mesh_outbound_registry` (HTTP-family) / `MeshOutboundEnforcement` (stream-family) |
+| NodeWaypoint in-netns pod capture | per-pod loopback capture | `Outbound` | Enforced, resolving the **destination** Service's backing-workload scopes | as above |
+
+The discriminator is the listener that accepted the connection (`MeshRuntimeConfig::listener_plan` → `RequestContext::mesh_direction` / `StreamConnectionContext::mesh_direction`), not a port number inspected at request time.
+
+**Why the outbound capture leg is excluded.** On `:15001` the peer is the co-located application over plaintext loopback, so no source principal can ever exist. The implicit-deny floor is raised by policy *presence* (any applicable ALLOW rule), not by a match, so before this change a single ordinary namespace-scoped ALLOW — a `from.principals` rule, a `to.operation.paths` rule, or Istio's "ALLOW with no rules" allow-nothing sentinel (translated to a never-matching rule) — rejected **every** outbound request from **every** workload in the namespace with `mesh_authz.deny_policy = implicit-deny`. Applying a standard Istio `AuthorizationPolicy` must not take a namespace's egress offline.
+
+**What still authorizes egress.** Excluding the capture leg does not make egress unauthorized:
+
+- `outboundTrafficPolicy: REGISTRY_ONLY` (mesh-wide `MeshConfig`, an applicable `Sidecar`, or `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY`) is enforced **on the same capture leg** — by the auto-injected `mesh_outbound_registry` plugin for HTTP-family traffic and by `MeshOutboundEnforcement` at connect / first-datagram time for the stream family. An unregistered destination is refused there.
+- A destination that is not in the slice has no materialized outbound route at all, so it is not reachable through the capture listener to begin with.
+- Traffic leaving through an **egress gateway** is authorized by that gateway's own inbound (`:15090`) leg, where `AuthorizationPolicy` is fully enforced.
+- Every in-mesh destination still enforces its own inbound policy set. A DENY is therefore enforced end to end — on one leg, not two.
+
+**Operational consequence.** `AUDIT` policies no longer record outbound-leg evaluations, and a DENY written with the intention of blocking a *source* workload's egress is enforced at the destination rather than at the source. Use `outboundTrafficPolicy: REGISTRY_ONLY` plus `ServiceEntry` scoping, or an egress gateway, to constrain what a workload may reach.
+
+`NodeWaypoint` is the deliberate exception in the table: one proxy instance serves every enrolled pod on the node and its in-netns capture backend is stamped `Outbound`, but that branch evaluates the **destination** Service's backing-workload scopes (`policy_applies_for_destination`) rather than the local workload's inbound policy set. That is destination-scoped enforcement reached from a source-side leg, so it stays on — including its missing-scope fail-closed gate.
 
 ### PolicyScope Filtering
 
