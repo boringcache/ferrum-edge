@@ -9068,6 +9068,10 @@ components:
             one of these values (case-insensitive comparison). Empty array (default) means
             no origin check. Protects against Cross-Site WebSocket Hijacking (CSWSH).
 
+            Independent of the `cors` plugin, which does not run on WebSocket upgrades.
+            Operators with a strict CORS allowlist on the same proxy should mirror those
+            origins here. See docs/routing.md#websocket-origin-admission.
+
             WebSocket over HTTP/1.1 (`Upgrade: websocket`), HTTP/2
             (RFC 8441 Extended CONNECT), and HTTP/3 (RFC 9220 Extended
             CONNECT) are all supported and use the same Origin check.

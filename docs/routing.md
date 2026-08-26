@@ -276,3 +276,45 @@ Two protocol-level filters run **before** route match and also return 405:
 | Non-WebSocket `CONNECT` | No tunnel is established that would bypass proxy routing. On HTTP/3 this is plain CONNECT with no `:protocol`, or a registered `:protocol` this gateway does not implement (for example `webtransport`). RFC 9298 CONNECT-UDP is a separate profile (501 when disabled). |
 
 Those 405s carry a static `Allow: GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS`. TRACE and CONNECT are omitted because the same filter rejected them. There is no matched proxy yet, so `allowed_methods` cannot supply the list.
+
+## WebSocket Origin admission
+
+Browsers do not apply the CORS protocol to WebSocket upgrade handshakes. The `cors`
+plugin runs only on HTTP and gRPC (including gRPC-Web) request-policy chains, so a
+strict `cors.allowed_origins` list does **not** automatically protect WebSocket
+upgrades on the same proxy.
+
+Cross-Site WebSocket Hijacking (CSWSH) is enforced separately through the per-proxy
+`allowed_ws_origins` field (RFC 6455 §10.2). When `allowed_ws_origins` is **non-empty**,
+every WebSocket upgrade — HTTP/1.1 `Upgrade: websocket`, HTTP/2 Extended CONNECT, and
+HTTP/3 Extended CONNECT — must carry an `Origin` header that matches one of the listed
+values (case-insensitive; default ports normalized). Missing or disallowed origins
+receive **403 Forbidden** with body `{"error":"WebSocket Origin not allowed"}` before
+backend dispatch. When `allowed_ws_origins` is **empty** (the default), no Origin check
+runs and any browser origin may upgrade.
+
+Operators who configure a strict `cors` allowlist on a proxy that also serves WebSocket
+traffic should set `allowed_ws_origins` to the same origin set. The gateway logs a
+composition warning at config load when a proxy has strict CORS but an empty
+`allowed_ws_origins` list. See [cors_plugin.md](cors_plugin.md#websocket-upgrades-and-cswsh).
+
+Example:
+
+```yaml
+proxies:
+  - id: api
+    listen_path: /api
+    backend_scheme: https
+    backend_host: backend.internal
+    allowed_ws_origins:
+      - https://app.example.com
+plugin_configs:
+  - id: cors-prod
+    plugin_name: cors
+    config:
+      allowed_origins:
+        - https://app.example.com
+      allow_credentials: true
+    scope: global
+    enabled: true
+```
