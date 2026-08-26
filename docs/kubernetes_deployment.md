@@ -467,7 +467,7 @@ spec:
       labels:
         app: ferrum-edge
     spec:
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 80
       containers:
         - name: ferrum-edge
           image: ghcr.io/ferrum-edge/ferrum-edge:latest

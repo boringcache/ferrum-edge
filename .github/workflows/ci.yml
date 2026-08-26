@@ -3537,7 +3537,7 @@ jobs:
           # shutdownDrainSeconds=0 is a valid skip-draining value and must render.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=file --set shutdownDrainSeconds=0 \
-            --set terminationGracePeriodSeconds=10 \
+            --set terminationGracePeriodSeconds=25 \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/shutdown-zero.yaml"
           drain_block="$(grep -A1 'name: FERRUM_SHUTDOWN_DRAIN_SECONDS' "$RUNNER_TEMP/ferrum-gateway-helm-results/shutdown-zero.yaml")"
           if ! grep -q '"0"' <<<"$drain_block"; then
@@ -3863,11 +3863,11 @@ jobs:
           grep -F 'accepts at most one source' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-admin-jwt-conflict.err"
           # A values file may use explicit nulls to omit shutdown drain and clear the
           # PDB minAvailable default (the schema must accept null for both). The grace
-          # period must still cover the binary's 30s default drain + 5s cleanup.
+          # period must still cover the binary's full 78s default shutdown budget.
           cat > "$RUNNER_TEMP/ferrum-gateway-helm-results/null-values.yaml" <<'NULLEOF'
           mode: file
           shutdownDrainSeconds: null
-          terminationGracePeriodSeconds: 40
+          terminationGracePeriodSeconds: 80
           podDisruptionBudget:
             enabled: true
             minAvailable: null
@@ -3881,11 +3881,11 @@ jobs:
             exit 1
           fi
           # A null shutdownDrainSeconds still drains for the binary's 30s default, so a
-          # grace period below 30+5 must fail render instead of being skipped.
+          # grace period below the full 78s budget must fail render instead of being skipped.
           cat > "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.yaml" <<'NULLGRACEEOF'
           mode: file
           shutdownDrainSeconds: null
-          terminationGracePeriodSeconds: 10
+          terminationGracePeriodSeconds: 40
           NULLGRACEEOF
           if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             -f "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.yaml" \
@@ -3895,6 +3895,7 @@ jobs:
             exit 1
           fi
           grep -F 'null shutdownDrainSeconds uses the binary' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.err"
+          grep -F 'must be at least 78' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.err"
           grep -Fq 'maxUnavailable: 1' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-rendered.yaml"
           if grep -Fq 'minAvailable:' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-rendered.yaml"; then
             echo "::error title=Null minAvailable still rendered::minAvailable: null must fall through to maxUnavailable"
