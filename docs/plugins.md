@@ -2926,6 +2926,35 @@ Assertion claims are retained for the same fixed **93 601-second** horizon as Pa
 
 Rejections never echo the issuer, audience, recipient, subject, assertion id, or any assertion text node; every SAML rejection logs the fixed failure class `saml` with no assertion content. Client bodies do name the *reason* for the rejection, and for the unsupported-algorithm / unsupported-transform / unbound-prefix classes that reason includes the rejected algorithm URI, element name, or namespace prefix taken from the caller's own signature block — attacker-supplied structural labels, never credential-adjacent values.
 
+#### One reading of every element value
+
+An XML comment splits an element's character data into two text nodes, while
+exclusive canonicalization — the transform that produces the bytes an XML
+signature actually digests — drops comments and emits both runs. A reader that
+returned only the first run would therefore act on a truncated prefix of a value
+the IdP legitimately signed: `<NameID>admin<!---->@evil.example</NameID>` digests
+(and so verifies) as `admin@evil.example` while resolving to `admin`. That is the
+CVE-2017-11427 / "SAML comment truncation" identity substitution, and the same
+shape reaches issuer trust (`Issuer`), audience binding (`Audience`), and the
+non-SAML `Username` / `Password` path, where the differential is between the
+gateway's principal and a backend that re-parses the same envelope.
+
+Ferrum reads every element value through one helper, so there is exactly one
+reading of an element in this plugin:
+
+- **Any comment inside a value element is rejected** with HTTP `401`. A comment
+  is invisible to exclusive c14n, so it can never be a legitimate part of a
+  signature-covered value. Processing instructions and child elements inside a
+  value element are rejected the same way.
+- Whatever text does survive is read by concatenating **every** text child in
+  document order — the same order and content canonicalization emits.
+
+This applies to `NameID`, `Issuer`, `Audience`, `Username`, `Password`, `Nonce`,
+`Created`, `Expires`, `SignatureValue`, `DigestValue`, `BinarySecurityToken`, and
+`X509Certificate`. Comments **between** elements are ordinary markup and are
+still accepted — only comments *inside* a value are refused. The rejection body
+names the reason and never echoes the element's content.
+
 #### UsernameToken — PasswordDigest
 
 The PasswordDigest mode computes `Base64(SHA-1(nonce + created + password))` per the WS-Security UsernameToken Profile 1.0 specification. The SOAP request must include `wsse:Nonce` and `wsu:Created` elements alongside the password. Each nonce is tracked for replay protection within the scope declared by `nonce.replay_scope`.
