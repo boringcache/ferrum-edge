@@ -328,7 +328,7 @@
         },
         "namespaceSelector": {
           "type": "object",
-          "description": "Free-form Kubernetes LabelSelector for the mutating webhook.",
+          "description": "Additional Kubernetes LabelSelector matchExpressions for the mutating webhook. The chart always appends a NotIn rule for the Helm release namespace at render time; see charts/ferrum-mesh/README.md.",
           "additionalProperties": true
         },
         "podSecurityContext": {

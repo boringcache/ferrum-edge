@@ -2690,6 +2690,27 @@ jobs:
             echo "::error title=Development example still uses cluster-wide CP without trust binding::development-values.yaml must stay single-namespace or mount a trust bundle (GHSA-3f2j-wwqw-grmg)"
             exit 1
           fi
+          # Injector webhook self-exclusion (#4155): release namespace and injector
+          # pods must never be gated on the mutating webhook, even when
+          # injector.namespaceSelector is overridden.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set injector.enabled=true \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            --show-only templates/injector-deployment.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-self-exclusion.yaml"
+          grep -Fq 'kind: MutatingWebhookConfiguration' "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-self-exclusion.yaml"
+          grep -Fq 'objectSelector:' "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-self-exclusion.yaml"
+          grep -Fq 'app.kubernetes.io/name' "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-self-exclusion.yaml"
+          grep -Fq 'ferrum-mesh-injector' "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-self-exclusion.yaml"
+          grep -A20 'namespaceSelector:' "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-self-exclusion.yaml" | grep -Eq '^ +- ferrum$'
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set injector.enabled=true \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            --set-json 'injector.namespaceSelector={"matchExpressions":[{"key":"kubernetes.io/metadata.name","operator":"NotIn","values":["kube-system"]}]}' \
+            --show-only templates/injector-deployment.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-ns-override.yaml"
+          grep -A20 'namespaceSelector:' "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-ns-override.yaml" | grep -Eq '^ +- ferrum$'
+          grep -A20 'namespaceSelector:' "$RUNNER_TEMP/ferrum-helm-results/injector-webhook-ns-override.yaml" | grep -Eq '^ +- kube-system$'
           # PodDisruptionBudget: data-path workloads with replicas >= 2 get
           # minAvailable protection; single-replica workloads skip PDB so drains
           # are not deadlocked.

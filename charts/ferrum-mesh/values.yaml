@@ -171,6 +171,10 @@ injector:
   requireAnnotation: true
   failurePolicy: Fail
   caBundle: ""
+  # Additional namespaceSelector matchExpressions for the mutating webhook. The
+  # chart always appends a NotIn rule for .Release.Namespace at render time so
+  # injector/CP/CA pods in the release namespace are never gated on the webhook
+  # itself (issue #4155). objectSelector also excludes ferrum-mesh-injector pods.
   namespaceSelector:
     matchExpressions:
       - key: kubernetes.io/metadata.name
