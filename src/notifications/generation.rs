@@ -516,15 +516,11 @@ impl DeliveryTaskSettlement {
 pub(crate) fn invoke_delivery_callback(
     callback: &DeliveryCallback,
     outcome: DispatchSettle,
-    channel_type: &'static str,
+    _channel_type: &'static str,
 ) {
-    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(outcome))).is_err() {
-        tracing::warn!(
-            channel_type,
-            ?outcome,
-            "notification delivery settle callback panicked; state rollback may be incomplete"
-        );
-    }
+    // Shipping profiles set `panic = "abort"` (issue #4166): a panicking
+    // settle callback terminates the process. There is no unwind boundary.
+    callback(outcome);
 }
 
 /// Ensures a cancelled/aborted dispatch task still decrements in-flight,

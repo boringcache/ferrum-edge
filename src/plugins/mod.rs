@@ -2129,6 +2129,19 @@ pub struct RequestContext {
     /// resolution. Mesh authz uses this for Istio `source.ip` so forwarded
     /// `remote.ip` cannot masquerade as the direct peer.
     pub direct_client_ip: String,
+    /// Whether the immediate downstream socket peer is in
+    /// `FERRUM_TRUSTED_PROXIES`, latched once by the HTTP frontends before any
+    /// plugin phase runs. This is the SAME verdict
+    /// `crate::proxy::forwarding_peer_is_trusted` produces for the primary
+    /// backend builders at dispatch; carrying it lets plugin phases that build
+    /// their own outbound request (`request_mirror`, `load_testing`) apply the
+    /// identical client-identity strip through
+    /// [`crate::proxy::headers::filter_secondary_request_headers`].
+    ///
+    /// Fails closed: `false` unless a frontend proved the peer is trusted, so
+    /// the default empty trust list, an unparseable peer address, and every
+    /// non-HTTP or synthetic context all treat the client as untrusted.
+    pub forwarding_peer_trusted: bool,
     canonical_client_ip: CanonicalClientIpCache,
     pub method: String,
     /// Canonical policy path (`crate::policy_path`). Every security decision —
@@ -3325,6 +3338,10 @@ impl RequestContext {
         Self {
             direct_client_ip: client_ip.clone(),
             client_ip,
+            // Fail closed. A frontend latches the real verdict after
+            // trusted-proxy resolution; anything that never does keeps every
+            // client-supplied forwarding identity out of secondary requests.
+            forwarding_peer_trusted: false,
             canonical_client_ip: CanonicalClientIpCache::default(),
             method,
             path,
@@ -4498,6 +4515,7 @@ impl RequestContext {
         Self {
             client_ip: self.client_ip.clone(),
             direct_client_ip: self.direct_client_ip.clone(),
+            forwarding_peer_trusted: self.forwarding_peer_trusted,
             canonical_client_ip: self.canonical_client_ip.clone(),
             method: self.method.clone(),
             path: self.path.clone(),
@@ -8776,6 +8794,12 @@ pub trait Plugin: Send + Sync {
     /// Identifies the cache-internal wrapper used to defer a composed CORS
     /// chain. This prevents incremental cache rebuilds from nesting wrappers.
     fn is_deferred_cors_wrapper(&self) -> bool {
+        false
+    }
+
+    /// Whether this plugin instance carries a non-wildcard CORS origin policy.
+    /// Used by plugin-cache composition diagnostics for WebSocket Origin gaps.
+    fn cors_uses_strict_origin_policy(&self) -> bool {
         false
     }
 

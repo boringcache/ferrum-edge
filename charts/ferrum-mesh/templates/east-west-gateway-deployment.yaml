@@ -25,6 +25,11 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       serviceAccountName: ferrum-mesh
+{{- include "ferrum-mesh.renderTopologySpreadConstraints" (dict
+  "Release" .Release
+  "replicas" .Values.eastWest.replicas
+  "selectorName" "ferrum-mesh-east-west"
+  "constraints" .Values.eastWest.topologySpreadConstraints) }}
       containers:
         - name: ferrum-edge
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

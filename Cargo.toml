@@ -434,14 +434,21 @@ incremental = true      # incremental compilation for faster rebuilds
 # Split debuginfo to speed up linking (macOS/Linux)
 split-debuginfo = "unpacked"
 
-# Release: optimise for runtime performance
+# Release: optimise for runtime performance.
+#
+# `panic = "abort"` is a deliberate availability tradeoff (issue #4166): no
+# unwind tables (smaller binary, faster error paths), and a panic anywhere —
+# including a background poller or accept loop — terminates the process.
+# Background-task supervisors still handle non-panic unexpected exits.
+# Operators must run a process supervisor (systemd, Kubernetes). See
+# PRODUCTION_READINESS.md ("Deliberate decisions") and docs/ci_cd.md.
 [profile.release]
 opt-level = 3
 lto = "fat"             # fat LTO: full cross-crate inlining for maximum hot-path perf
 codegen-units = 1       # single codegen unit for best LLVM optimization
 strip = true            # strip symbols — smaller binary
 incremental = false     # disable incremental for deterministic release builds
-panic = "abort"         # no unwind tables — smaller binary, faster error paths
+panic = "abort"         # fail-fast: no unwind tables; a panic kills the process
 
 # CI-specific: fast release builds for testing (not shipping)
 [profile.ci-release]
@@ -471,7 +478,7 @@ codegen-units = 256
 inherits = "release"
 lto = "fat"             # full inter-module LTO (cross-crate inlining, DCE)
 codegen-units = 1       # single codegen unit for maximum optimiser visibility
-panic = "abort"         # skip unwind tables — smaller binary, faster panics
+panic = "abort"         # inherit release fail-fast; no unwind tables
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"

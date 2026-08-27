@@ -9,6 +9,7 @@ Ferrum Edge includes comprehensive CI/CD pipelines for automated testing, buildi
 - [CI Pipeline (ci.yml)](#ci-pipeline-ciyml)
 - [CI runtime caching (production images and FIPS)](#ci-runtime-caching-production-images-and-fips)
 - [Release Pipeline (release.yml)](#release-pipeline-releaseyml)
+- [Process supervision](#process-supervision)
 - [How Releases Work](#how-releases-work)
 - [Creating a New Release](#creating-a-new-release)
 - [Binaries and Downloads](#binaries-and-downloads)
@@ -2757,6 +2758,25 @@ chmod +x ferrum-edge-linux-x86_64
 FERRUM_MODE=file FERRUM_FILE_CONFIG_PATH=config.yaml ./ferrum-edge-linux-x86_64 run
 ```
 ````
+
+## Process supervision
+
+Shipping profiles (`release`, `ci-release`, and `max-perf`) set
+`panic = "abort"` (issue #4166). A panic anywhere in the process — including a
+background poller, accept loop, or notification callback — terminates the
+gateway immediately. There is no in-process panic recovery in shipping
+binaries.
+
+Run `ferrum-edge` under a process supervisor (systemd, Kubernetes
+`restartPolicy`, or equivalent) so the host restarts the process. Background-task
+supervisors still restart on non-panic unexpected exits (I/O errors, unexpected
+completion, cancellation) and keep serving last-known-good config where that
+policy already exists.
+
+Dev, test, and `pr-build` keep `panic = "unwind"` so the suite can observe
+`JoinError::is_panic()`. Those panic-recovery tests do not represent shipping
+behavior. See PRODUCTION_READINESS.md (*Deliberate decisions*) and
+`tests/unit/gateway_core/build_profile_panic_strategy_tests.rs`.
 
 ## How Releases Work
 

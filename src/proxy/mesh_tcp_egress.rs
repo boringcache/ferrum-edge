@@ -403,7 +403,11 @@ pub(crate) async fn handle_mesh_tcp_egress(
     let result = tcp_proxy::bidirectional_copy_for_relay(
         client_stream,
         tunnel,
-        super::hbone_proxy::proxy_idle_timeout(proxy, &state.env_config),
+        super::hbone_proxy::proxy_idle_timeout_for_policy_port(
+            proxy,
+            &state.env_config,
+            Some(target.dispatch_policy_port()),
+        ),
         super::hbone_proxy::proxy_half_close_cap(&state.env_config),
         super::hbone_proxy::backend_read_timeout(proxy),
         super::hbone_proxy::backend_write_timeout(proxy),
@@ -547,6 +551,12 @@ listen_port: 15001
             &keepalive_only,
             5432
         ));
+
+        let idle_only = proxy_with_override(crate::config::types::ResolvedPortOverride {
+            tcp_idle_timeout_seconds: Some(0),
+            ..Default::default()
+        });
+        assert!(!stream_port_override_affects_selection(&idle_only, 5432));
 
         let locality = proxy_with_override(crate::config::types::ResolvedPortOverride {
             locality_lb_setting: Some(crate::config::types::UpstreamLocalityLbSetting::default()),

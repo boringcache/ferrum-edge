@@ -775,7 +775,7 @@ Validation: fail render on missing/unsafe configuration.
 {{- $cpGrpcTls := $tlsAll.cpGrpc | default dict -}}
 {{- $cpGrpcTlsSet := include "ferrum-gateway.serverTlsConfigured" (dict "root" . "surface" $cpGrpcTls "certSource" "FERRUM_CP_GRPC_TLS_CERT_SOURCE" "keySource" "FERRUM_CP_GRPC_TLS_KEY_SOURCE") -}}
 {{- if and (ne ($cpGrpcPort | toString) "0") (not $cpLoopback) (not $cpGrpcTlsSet) (not $grpc.allowPlaintext) -}}
-{{- fail (printf "mode=cp hard-fails on a non-loopback PLAINTEXT gRPC bind (%s:%v). Set one of: gRPC TLS (tls.cpGrpc Secret or a complete FERRUM_CP_GRPC_TLS_{CERT,KEY}_SOURCE pair), a loopback cp.grpcBindAddress (127.0.0.1), or grpc.allowPlaintext=true to explicitly permit plaintext config sync (dev only; pair with a NetworkPolicy)." $cpBind $cpGrpcPort) -}}
+{{- fail (printf "mode=cp hard-fails on a non-loopback PLAINTEXT gRPC bind (%s:%v). Set one of: gRPC TLS (tls.cpGrpc Secret or a complete FERRUM_CP_GRPC_TLS_{CERT,KEY}_SOURCE pair), a loopback cp.grpcBindAddress (127.0.0.1), or grpc.allowPlaintext=true to explicitly permit plaintext config sync (dev only; pair with networkPolicy.enabled=true)." $cpBind $cpGrpcPort) -}}
 {{- end -}}
 {{/* A ClusterIP Service routes to the pod IP + targetPort, never the container's
      loopback, so a loopback-bound CP gRPC listener published through the Service
@@ -872,7 +872,7 @@ Validation: fail render on missing/unsafe configuration.
 {{- if $permitsAll -}}
 {{- fail "admin.allowedCidrs permits every address in an IP family (for example via /0, an IPv4-mapped /96, or a full-coverage CIDR union), which does not restrict a non-loopback plaintext admin listener. Use a narrower allowlist, TLS-only admin with ports.adminHttp=0, or admin.allowInsecureHttp=true for local development." -}}
 {{- end -}}
-{{- fail (printf "mode=%s hard-fails on a non-loopback plaintext admin bind. Set one of: admin.allowedCidrs, admin TLS (tls.admin Secret or complete FERRUM_ADMIN_TLS_{CERT,KEY}_SOURCE pair + ports.adminHttp=0), or admin.allowInsecureHttp=true with a NetworkPolicy" $mode) -}}
+{{- fail (printf "mode=%s hard-fails on a non-loopback plaintext admin bind. Set one of: admin.allowedCidrs, admin TLS (tls.admin Secret or complete FERRUM_ADMIN_TLS_{CERT,KEY}_SOURCE pair + ports.adminHttp=0), or admin.allowInsecureHttp=true with networkPolicy.enabled=true" $mode) -}}
 {{- end -}}
 {{- end -}}
 {{/* The admin accept loop applies allowedCidrs to in-pod probes like every other
@@ -922,20 +922,41 @@ Validation: fail render on missing/unsafe configuration.
 {{- fail (printf "admin.allowedCidrs must include %s (or bare %s) while the default exec probes are enabled; the computed exec probes dial admin host %s from source %s and the admin TCP allowlist otherwise drops the in-pod health checks. Add the exact probe source (or a covering CIDR) or override/disable every computed probe handler." $probeCidr $probeSource $probeHost $probeSource) -}}
 {{- end -}}
 {{- end -}}
-{{/* Graceful shutdown: give the pod time to drain plus the ~5s cleanup window.
-     Use presence (not truthiness) checks so an intentional drain of 0 (skip
-     draining, per docs/configuration.md) is honored instead of dropped. A null
-     shutdownDrainSeconds omits FERRUM_SHUTDOWN_DRAIN_SECONDS, so the binary
-     falls back to its 30s default (shutdown_drain_seconds default in
-     src/config/env_config.rs); validate the grace period against that default
-     rather than skipping the guard, or a lowered grace SIGKILLs the pod
-     mid-drain. */}}
+{{/* Graceful shutdown budget (database/cp proxy path, src/modes/database.rs):
+     FERRUM_SHUTDOWN_DRAIN_SECONDS wait (default 30; 0 skips the wait)
+     + unix transport-pool tail (DRIVER_DRAIN 5s + REAP 1s in unix_backend_pool.rs)
+     + background task join (5s)
+     + audit flush (clamp(drain, 5, 60)s; database/cp only)
+     + observability delivery (FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS default 2s)
+     + 5s slack for plugin finalizers (chargeback/kafka)
+     Default total: 30+6+5+30+2+5 = 78s. Use presence (not truthiness) checks so
+     an intentional drain of 0 is honored. A null shutdownDrainSeconds omits
+     FERRUM_SHUTDOWN_DRAIN_SECONDS, so the binary falls back to its 30s default
+     (shutdown_drain_seconds in src/config/env_config.rs). */}}
 {{- $drain := .Values.shutdownDrainSeconds -}}
 {{- $effectiveDrain := 30 -}}
 {{- if not (kindIs "invalid" $drain) -}}{{- $effectiveDrain = int $drain -}}{{- end -}}
+{{/* Post-SIGTERM budget the binary consumes before the process can exit. Issue
+     #4170 expands this term with the transport-pool tail, background join,
+     audit flush, observability delivery, and finalizer slack; issue #4154 only
+     adds the two pre-SIGTERM/pre-close terms below on top of whatever it
+     computes, so the two changes compose instead of contradicting. */}}
+{{- $auditBudget := $effectiveDrain -}}
+{{- if lt $auditBudget 5 -}}{{- $auditBudget = 5 -}}{{- end -}}
+{{- if gt $auditBudget 60 -}}{{- $auditBudget = 60 -}}{{- end -}}
+{{- $shutdownBudget := add $effectiveDrain (add 6 (add 5 (add $auditBudget (add 2 5)))) -}}
+{{/* preStop runs BEFORE SIGTERM but is billed to the SAME
+     terminationGracePeriodSeconds clock, so it is additive, not free
+     (Kubernetes starts the grace clock at deletion). preDrain then holds the
+     accept loops open AFTER SIGTERM and before the drain, so it is additive
+     too. Both default the pod's grace period upward rather than silently
+     truncating the shutdown. */}}
+{{- $preStop := int (.Values.shutdownPreStopSeconds | default 0) -}}
+{{- $preDrain := int (.Values.shutdownPreDrainSeconds | default 0) -}}
+{{- $minGrace := add $preStop (add $preDrain $shutdownBudget) -}}
 {{- $grace := .Values.terminationGracePeriodSeconds -}}
-{{- if and (not (kindIs "invalid" $grace)) (lt (int $grace) (add $effectiveDrain 5)) -}}
-{{- fail (printf "terminationGracePeriodSeconds (%d) must be at least the effective shutdownDrainSeconds + 5s cleanup (%d); a null shutdownDrainSeconds uses the binary's 30s default" (int $grace) (add $effectiveDrain 5)) -}}
+{{- if and (not (kindIs "invalid" $grace)) (lt (int $grace) $minGrace) -}}
+{{- fail (printf "terminationGracePeriodSeconds (%d) must be at least %d (preStop %ds + preDrain %ds + shutdown budget %ds, where the shutdown budget is drain %ds + transport pool 6s + background 5s + audit %ds + observability 2s + finalizer slack 5s); a null shutdownDrainSeconds uses the binary's 30s default" (int $grace) $minGrace $preStop $preDrain $shutdownBudget $effectiveDrain $auditBudget) -}}
 {{- end -}}
 {{- end -}}
 
@@ -947,7 +968,7 @@ Env assembly.
      probes, Services, ports, or Secret wiring from the running process, so both
      env passthroughs reject them. Keep this list the single source of truth. */}}
 {{- define "ferrum-gateway.reservedEnv" -}}
-FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GRPC_JWT_SECRET FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT FERRUM_DP_CP_GRPC_URLS FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS FERRUM_CP_GRPC_LISTEN_ADDR FERRUM_CP_NAMESPACES FERRUM_CP_REQUIRE_NAMESPACE_CLAIM FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH FERRUM_CP_DP_GRPC_JWT_KEY_ID FERRUM_DP_CP_GRPC_TOKEN_FILE FERRUM_FILE_CONFIG_PATH FERRUM_PROXY_HTTP_PORT FERRUM_PROXY_HTTPS_PORT FERRUM_ADMIN_HTTP_PORT FERRUM_ADMIN_HTTPS_PORT FERRUM_ADMIN_BIND_ADDRESS FERRUM_ADMIN_ALLOWED_CIDRS FERRUM_ALLOW_INSECURE_ADMIN_HTTP FERRUM_SHUTDOWN_DRAIN_SECONDS FERRUM_FRONTEND_TLS_CERT_PATH FERRUM_FRONTEND_TLS_KEY_PATH FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_ADMIN_TLS_CERT_PATH FERRUM_ADMIN_TLS_KEY_PATH FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_BACKEND_TLS_CLIENT_CERT_PATH FERRUM_BACKEND_TLS_CLIENT_KEY_PATH FERRUM_CP_GRPC_TLS_CERT_PATH FERRUM_CP_GRPC_TLS_KEY_PATH FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH FERRUM_DP_GRPC_TLS_CA_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
+FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GRPC_JWT_SECRET FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT FERRUM_DP_CP_GRPC_URLS FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS FERRUM_CP_GRPC_LISTEN_ADDR FERRUM_CP_NAMESPACES FERRUM_CP_REQUIRE_NAMESPACE_CLAIM FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH FERRUM_CP_DP_GRPC_JWT_KEY_ID FERRUM_DP_CP_GRPC_TOKEN_FILE FERRUM_FILE_CONFIG_PATH FERRUM_PROXY_HTTP_PORT FERRUM_PROXY_HTTPS_PORT FERRUM_ADMIN_HTTP_PORT FERRUM_ADMIN_HTTPS_PORT FERRUM_ADMIN_BIND_ADDRESS FERRUM_ADMIN_ALLOWED_CIDRS FERRUM_ALLOW_INSECURE_ADMIN_HTTP FERRUM_SHUTDOWN_DRAIN_SECONDS FERRUM_SHUTDOWN_PREDRAIN_SECONDS FERRUM_FRONTEND_TLS_CERT_PATH FERRUM_FRONTEND_TLS_KEY_PATH FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_ADMIN_TLS_CERT_PATH FERRUM_ADMIN_TLS_KEY_PATH FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_BACKEND_TLS_CLIENT_CERT_PATH FERRUM_BACKEND_TLS_CLIENT_KEY_PATH FERRUM_CP_GRPC_TLS_CERT_PATH FERRUM_CP_GRPC_TLS_KEY_PATH FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH FERRUM_DP_GRPC_TLS_CA_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
 {{- end -}}
 
 {{- define "ferrum-gateway.modeEnv" -}}
@@ -1078,6 +1099,10 @@ FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRE
 {{- if not (kindIs "invalid" .Values.shutdownDrainSeconds) }}
 - name: FERRUM_SHUTDOWN_DRAIN_SECONDS
   value: {{ .Values.shutdownDrainSeconds | quote }}
+{{- end }}
+{{- if not (kindIs "invalid" .Values.shutdownPreDrainSeconds) }}
+- name: FERRUM_SHUTDOWN_PREDRAIN_SECONDS
+  value: {{ .Values.shutdownPreDrainSeconds | quote }}
 {{- end }}
 {{- end -}}
 

@@ -706,6 +706,7 @@ fn mesh_traffic_policy_with_tls_none_omits_tls_key_from_json() {
         max_connections: None,
         tcp_keepalive: None,
         connection_pool_http: None,
+        tcp_idle_timeout_seconds: None,
     };
 
     let json = serde_json::to_value(&policy).expect("serialize");
@@ -727,6 +728,11 @@ fn mesh_traffic_policy_with_tls_none_omits_tls_key_from_json() {
     assert!(
         !object.contains_key("tcp_keepalive"),
         "tcp_keepalive=None must NOT appear in serialized JSON \
+         (wire compatibility): {json}"
+    );
+    assert!(
+        !object.contains_key("tcp_idle_timeout_seconds"),
+        "tcp_idle_timeout_seconds=None must NOT appear in serialized JSON \
          (wire compatibility): {json}"
     );
     assert!(

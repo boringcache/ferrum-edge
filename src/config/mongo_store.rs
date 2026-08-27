@@ -60,8 +60,8 @@ mod inner {
         TcpConnectionThrottleAttachmentConflict,
     };
     use crate::config::db_loader::{
-        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE, credential_value_hash, mark_row_decode_rejection,
-        proxy_route_key_hash,
+        GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE, credential_value_hash,
+        format_consumer_identity_conflict, mark_row_decode_rejection, proxy_route_key_hash,
     };
     use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
     use crate::config::types::{
@@ -3831,12 +3831,17 @@ mod inner {
         async fn find_mesh_route_dispatch_upstream_ref_opt_session(
             &self,
             session: Option<&mut ClientSession>,
+            namespace: &str,
             upstream_id: &str,
         ) -> Result<Option<PluginConfig>, anyhow::Error> {
             if let Some(s) = session {
                 let plugin_configs = self.plugin_configs();
                 let mut cursor = plugin_configs
-                    .find(doc! { "plugin_name": "mesh_route_dispatch", "enabled": true })
+                    .find(doc! {
+                        "plugin_name": "mesh_route_dispatch",
+                        "namespace": namespace,
+                        "enabled": true,
+                    })
                     .session(&mut *s)
                     .await?;
                 while cursor.advance(&mut *s).await? {
@@ -3848,7 +3853,11 @@ mod inner {
             } else {
                 let plugin_configs = self.plugin_configs();
                 let mut cursor = plugin_configs
-                    .find(doc! { "plugin_name": "mesh_route_dispatch", "enabled": true })
+                    .find(doc! {
+                        "plugin_name": "mesh_route_dispatch",
+                        "namespace": namespace,
+                        "enabled": true,
+                    })
                     .await?;
                 while cursor.advance().await? {
                     let plugin = doc_to_plugin_config(cursor.deserialize_current()?)?;
@@ -6162,10 +6171,7 @@ mod inner {
                 .await?;
 
             // Collections whose `_id` is independent of the namespace: rewrite
-            // the field in place. Historical `audit_events` are immutable
-            // evidence and are deliberately excluded: they retain the namespace
-            // recorded when the event occurred. The rename mutation may still
-            // enqueue a new audit event under the new name after commit.
+            // the field in place.
             for collection in ["proxies", "plugin_configs", "upstreams", "api_specs"] {
                 self.collection(collection)
                     .update_many(
@@ -6175,6 +6181,17 @@ mod inner {
                     .session(&mut *session)
                     .await?;
             }
+            // Audit history follows the tenant so it cannot be disclosed to a
+            // caller authorized for a later reuse of the old namespace name.
+            // `namespace_at_event` is not in this $set: it preserves the
+            // namespace identity recorded when the event occurred.
+            self.audit_events()
+                .update_many(
+                    doc! { "namespace": current_name },
+                    doc! { "$set": { "namespace": new_name } },
+                )
+                .session(&mut *session)
+                .await?;
 
             // Composite `_id` = "{namespace}:{suffix}", plus a `namespace`
             // field: the document must be reinserted under a new `_id`.
@@ -6658,6 +6675,43 @@ mod inner {
             .iter()
             .map(|value| consumer_identity_index_doc(namespace, value, consumer_id))
             .collect()
+    }
+
+    async fn format_mongo_consumer_identity_conflict(
+        store: &MongoStore,
+        namespace: &str,
+        candidates: &[(&str, &str)],
+        identity_value: &str,
+        owner_id: &str,
+    ) -> Result<String, anyhow::Error> {
+        let existing = store.get_consumer(namespace, owner_id).await?;
+        let Some(existing) = existing else {
+            return Ok(format!(
+                "Consumer identity '{}' conflicts with consumer '{}'",
+                identity_value, owner_id
+            ));
+        };
+        let existing_fields = [
+            ("id", Some(existing.id.as_str())),
+            ("username", Some(existing.username.as_str())),
+            ("custom_id", existing.custom_id.as_deref()),
+        ];
+        for (candidate_field, candidate_value) in candidates {
+            for (existing_field, existing_value) in existing_fields {
+                if existing_value == Some(*candidate_value) {
+                    return Ok(format_consumer_identity_conflict(
+                        candidate_field,
+                        candidate_value,
+                        existing_field,
+                        owner_id,
+                    ));
+                }
+            }
+        }
+        Ok(format!(
+            "Consumer identity '{}' conflicts with consumer '{}'",
+            identity_value, owner_id
+        ))
     }
 
     /// Extract a required string field from a `consumer_identity_index`
@@ -7867,6 +7921,13 @@ mod inner {
             Ok(config)
         }
 
+        async fn load_namespace_policy_graph(
+            &self,
+            namespace: &str,
+        ) -> Result<GatewayConfig, anyhow::Error> {
+            self.load_mtls_dns_policy_candidate(namespace).await
+        }
+
         async fn count_namespace_resources(
             &self,
             namespace: &str,
@@ -8831,6 +8892,7 @@ mod inner {
                                             let dispatch_ref = if !still_referenced {
                                                 this.find_mesh_route_dispatch_upstream_ref_opt_session(
                                                     Some(&mut *s),
+                                                    namespace.as_str(),
                                                     uid,
                                                 )
                                                 .await
@@ -8999,8 +9061,12 @@ mod inner {
                             .await?
                             > 0;
                         let dispatch_ref = if !still_referenced {
-                            self.find_mesh_route_dispatch_upstream_ref_opt_session(None, uid)
-                                .await?
+                            self.find_mesh_route_dispatch_upstream_ref_opt_session(
+                                None,
+                                namespace,
+                                uid,
+                            )
+                            .await?
                         } else {
                             None
                         };
@@ -10399,6 +10465,7 @@ mod inner {
                                 if let Some(plugin) = this
                                     .find_mesh_route_dispatch_upstream_ref_opt_session(
                                         Some(&mut *s),
+                                        namespace.as_str(),
                                         id.as_str(),
                                     )
                                     .await
@@ -10473,7 +10540,7 @@ mod inner {
                     );
                 }
                 if let Some(plugin) = self
-                    .find_mesh_route_dispatch_upstream_ref_opt_session(None, id)
+                    .find_mesh_route_dispatch_upstream_ref_opt_session(None, namespace, id)
                     .await?
                 {
                     anyhow::bail!(
@@ -10574,6 +10641,7 @@ mod inner {
                                             let dispatch_ref = this
                                                 .find_mesh_route_dispatch_upstream_ref_opt_session(
                                                     Some(&mut *s),
+                                                    namespace.as_str(),
                                                     upstream_id,
                                                 )
                                                 .await
@@ -10617,6 +10685,7 @@ mod inner {
                         let dispatch_ref = if count == 0 {
                             self.find_mesh_route_dispatch_upstream_ref_opt_session(
                                 None,
+                                namespace,
                                 upstream_id,
                             )
                             .await?
@@ -11261,35 +11330,66 @@ mod inner {
             custom_id: Option<&str>,
             exclude_consumer_id: Option<&str>,
         ) -> Result<Option<String>, anyhow::Error> {
-            let mut candidates = vec![
-                Bson::String(consumer_id.to_string()),
-                Bson::String(username.to_string()),
-            ];
+            let mut values = vec![consumer_id, username];
             if let Some(custom_id) = custom_id {
-                candidates.push(Bson::String(custom_id.to_string()));
+                values.push(custom_id);
             }
-            // Consumer `_id` is the composite "{namespace}:{id}", so identity
-            // matching (and self-exclusion) must run against the plain `id`
-            // field that serde keeps in the document.
-            let mut filter = doc! {
-                "namespace": namespace,
-                "$or": [
-                    { "id": { "$in": candidates.clone() } },
-                    { "username": { "$in": candidates.clone() } },
-                    { "custom_id": { "$in": candidates } },
-                ],
-            };
-            if let Some(id) = exclude_consumer_id {
-                filter.insert("id", doc! { "$ne": id });
-            }
-            let result = self.consumers().find_one(filter).await?;
-            match result {
-                Some(doc) => {
-                    let conflict_id = doc.get_str("id").unwrap_or("unknown").to_string();
-                    Ok(Some(conflict_id))
+            values.sort_unstable();
+            values.dedup();
+
+            let candidates = {
+                let mut fields = vec![("id", consumer_id), ("username", username)];
+                if let Some(custom_id) = custom_id {
+                    fields.push(("custom_id", custom_id));
                 }
-                None => Ok(None),
+                fields
+            };
+
+            for value in values {
+                let doc = self
+                    .consumer_identity_index()
+                    .find_one(doc! {
+                        "_id": consumer_identity_doc_id(namespace, value),
+                    })
+                    .await?;
+                let Some(doc) = doc else {
+                    continue;
+                };
+                // Namespace is encoded in `_id`. Require the stored namespace
+                // field to match as well; a missing/mismatched field cannot
+                // be treated as unique (fail closed).
+                let doc_namespace = doc.get_str("namespace").unwrap_or("");
+                if doc_namespace != namespace {
+                    return Ok(Some(format!(
+                        "Consumer identity '{}' conflicts with consumer '{}'",
+                        value,
+                        doc.get_str("consumer_id").unwrap_or("unknown")
+                    )));
+                }
+                let owner_id = match doc.get_str("consumer_id") {
+                    Ok(id) => id.to_string(),
+                    Err(_) => {
+                        return Ok(Some(format!(
+                            "Consumer identity '{}' conflicts with an existing consumer",
+                            value
+                        )));
+                    }
+                };
+                if exclude_consumer_id == Some(owner_id.as_str()) {
+                    continue;
+                }
+                return Ok(Some(
+                    format_mongo_consumer_identity_conflict(
+                        self,
+                        namespace,
+                        &candidates,
+                        value,
+                        &owner_id,
+                    )
+                    .await?,
+                ));
             }
+            Ok(None)
         }
 
         async fn check_keyauth_key_unique(
@@ -11421,7 +11521,7 @@ mod inner {
             let mut mtls_leases = self
                 .acquire_mtls_dns_admission_leases_for_mode(lease_scope, mode)
                 .await?;
-            if mode.validates_mtls_dns() {
+            if mode.validates_mtls_dns() && graph.requires_post_write_policy_admission() {
                 for namespace in &admission_namespaces {
                     let namespace = *namespace;
                     self.validate_plugin_graph_admission_candidate(namespace, |candidate| {
@@ -16199,6 +16299,7 @@ mod inner {
                 resource_type: "proxy".to_string(),
                 resource_id: "proxy-1".to_string(),
                 namespace: "ferrum".to_string(),
+                namespace_at_event: "ferrum".to_string(),
                 source_address: String::new(),
                 request_id: String::new(),
                 outcome: String::new(),
@@ -17748,6 +17849,29 @@ mod inner {
         }
 
         #[test]
+        fn find_mesh_route_dispatch_upstream_ref_filters_by_namespace() {
+            let source = include_str!("mongo_store.rs");
+            let find_start = source
+                .find("async fn find_mesh_route_dispatch_upstream_ref_opt_session(")
+                .expect("find_mesh_route_dispatch_upstream_ref_opt_session function");
+            let find_body = &source[find_start..];
+            let access_control_start = find_body
+                .find("async fn find_access_control_consumer_ref_opt_session(")
+                .expect("find_access_control_consumer_ref_opt_session following mesh lookup");
+            let find_body = &find_body[..access_control_start];
+
+            assert!(
+                find_body.contains("\"namespace\": namespace,"),
+                "mesh_route_dispatch upstream-reference lookup must filter plugin_configs by namespace"
+            );
+            assert_eq!(
+                find_body.matches("\"namespace\": namespace,").count(),
+                2,
+                "both session and non-session mesh_route_dispatch lookups must filter by namespace"
+            );
+        }
+
+        #[test]
         fn delete_upstream_standalone_checks_namespaced_target_before_references() {
             let source = include_str!("mongo_store.rs");
             let delete_start = source
@@ -17765,7 +17889,7 @@ mod inner {
                 .find(".count_documents(doc! { \"upstream_id\": id })")
                 .expect("proxy reference check");
             let plugin_refs = standalone_path
-                .find(".find_mesh_route_dispatch_upstream_ref_opt_session(None, id)")
+                .find(".find_mesh_route_dispatch_upstream_ref_opt_session(None, namespace, id)")
                 .expect("plugin reference check");
 
             assert!(

@@ -81,10 +81,18 @@ pub const NAMESPACE_FENCE_MAX_BACKOFF_SECS: u64 = 30;
 ///
 /// The scale harness's general HTTP client uses a 60-second timeout for data
 /// plane probes. Growing SQL-backed configuration sets can legitimately need
-/// longer than that to commit one admin batch. Give the mutation a bounded
-/// five-minute budget instead of retrying an ambiguous transport timeout: the
-/// server may have committed even when the client did not receive a response.
-pub const ADMIN_BATCH_REQUEST_TIMEOUT_SECS: u64 = 5 * 60;
+/// longer than that to commit one admin batch: each chunk's admission runs
+/// per-resource uniqueness prechecks against the whole namespace snapshot, so
+/// chunk latency grows with total config size, and on a saturated CI runner
+/// the 30k PostgreSQL leg showed healthy chunks taking ~300s at wave 8
+/// (194s `proxy_route_locks` insert + 108s full consumer scan, run
+/// 32832589798). A timeout that fires on a slow-but-progressing chunk is the
+/// WORST outcome — the server may still commit after the client gave up, and
+/// an all-or-nothing body can never be safely re-posted after an ambiguous
+/// transport error — so the budget must sit well above the observed late-wave
+/// worst case. Ten minutes doubles that headroom while staying bounded; the
+/// contract test pins it against the fence-retry budget and the job timeout.
+pub const ADMIN_BATCH_REQUEST_TIMEOUT_SECS: u64 = 10 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchProvisionDecision {

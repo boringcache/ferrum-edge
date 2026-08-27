@@ -6480,14 +6480,25 @@ async fn test_codec_offload_allows_unrelated_async_progress() {
         progressed_flag.store(true, AtomicOrdering::SeqCst);
     });
 
-    while !progressed.load(AtomicOrdering::SeqCst) && !encode.is_finished() {
-        tokio::task::yield_now().await;
-    }
+    // Awaiting the observer resolves only after the runtime has actually
+    // scheduled and run it, which is precisely the claim under test.
+    //
+    // The previous spin loop also exited when `encode` finished first, so a
+    // codec job that completed before the observer was ever scheduled left
+    // `progressed` false and failed the assertion. That is a race, not a
+    // regression: this is a 64 KiB gzip on the blocking pool, which on a
+    // loaded CI runner routinely finishes before an unrelated task's first
+    // poll. It ejected PR #4198 from the merge queue on an unrelated diff.
+    //
+    // If the runtime genuinely could not schedule unrelated work while a
+    // bounded codec job occupies a blocking-pool worker, this await never
+    // resolves and the test fails on the harness timeout — a real failure
+    // rather than one decided by scheduling luck.
+    observer.await.expect("observer task");
     assert!(
         progressed.load(AtomicOrdering::SeqCst),
         "Tokio must schedule unrelated work while bounded codec jobs run on spawn_blocking"
     );
-    observer.await.expect("observer task");
     let compressed = encode
         .await
         .expect("encode task join")

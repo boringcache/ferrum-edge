@@ -1,4 +1,7 @@
 //! Issue #2986: DB/CP config poll-task exit classification and supervision.
+//!
+//! Panic classification and panic-inducing tests are `panic = "unwind"` only
+//! (issue #4166): shipping profiles abort the process before a JoinError.
 
 use ferrum_edge::modes::database::DatabaseDeltaPollMetrics;
 use ferrum_edge::modes::db_poll_supervision::{
@@ -41,6 +44,7 @@ async fn classify_abort_without_shutdown_is_unexpected() {
     );
 }
 
+#[cfg(panic = "unwind")]
 #[tokio::test]
 async fn classify_panic_without_shutdown_is_unexpected() {
     let handle = tokio::spawn(async {
@@ -330,6 +334,7 @@ enum SimulatedPollExit {
     HandledRejectionContinue,
     HandledErrorContinue,
     MidAttemptAbort,
+    #[cfg(panic = "unwind")]
     MidAttemptPanic,
     MidAttemptDrop,
 }
@@ -348,6 +353,7 @@ async fn run_simulated_poll_attempt(metrics: &DatabaseDeltaPollMetrics, exit: Si
             // In-flight work never reaches record_poll_completed.
             std::future::pending::<()>().await;
         }
+        #[cfg(panic = "unwind")]
         SimulatedPollExit::MidAttemptPanic => {
             panic!("intentional mid-poll panic for freshness test");
         }
@@ -405,6 +411,7 @@ async fn mid_poll_abort_does_not_advance_freshness() {
     );
 }
 
+#[cfg(panic = "unwind")]
 #[tokio::test]
 async fn mid_poll_panic_does_not_advance_freshness() {
     let metrics = Arc::new(DatabaseDeltaPollMetrics::default());

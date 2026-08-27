@@ -36,9 +36,9 @@ Each is toggled independently under `inspect`; at least one must be enabled.
 
 | Surface | Default | What it governs |
 | --- | --- | --- |
-| `request_tool_definitions` | `false` | Tool definitions the client exposes to the model (`tools[].function.name`, `functions[].name`). A disallowed definition is rejected/dry-run. |
-| `response_tool_calls` | `true` | Buffered response tool calls (`choices[].message.tool_calls[]` and legacy `choices[].message.function_call`). |
-| `streaming_response_tool_calls` | `false` | OpenAI SSE `choices[].delta.tool_calls` deltas and legacy `choices[].delta.function_call` (`functions` API) deltas, reassembled across frames. |
+| `request_tool_definitions` | `false` | Tool definitions the client exposes to the model, in every provider shape: OpenAI `tools[].function.name` and legacy `functions[].name`, Anthropic `tools[].name`, Google `tools[].functionDeclarations[].name`, Bedrock `toolConfig.tools[].toolSpec.name`. A provider built-in that carries a `type` but no name of its own (`{"type": "code_interpreter"}`) is governed under its `type`. A disallowed definition is rejected/dry-run; an entry no shape can name is ungovernable. |
+| `response_tool_calls` | `true` | Buffered response tool calls in every provider shape: OpenAI `choices[].message.tool_calls[]` and legacy `choices[].message.function_call`, OpenAI Responses `output[]` items of `type: "function_call"`, Anthropic `content[]` blocks of `type: "tool_use"`, Google `candidates[].content.parts[].functionCall`, Cohere v2 `message.tool_calls[]`, Bedrock Converse `output.message.content[].toolUse`. |
+| `streaming_response_tool_calls` | `false` | SSE tool-call deltas, reassembled across frames, in every provider shape: OpenAI `choices[].delta.tool_calls` and legacy `choices[].delta.function_call`, Anthropic `content_block_start` (`content_block.type: "tool_use"`) plus `content_block_delta` (`delta.type: "input_json_delta"`), Cohere v2 `tool-call-start` / `tool-call-delta`, Google `candidates[].content.parts[].functionCall`. Batch boundaries are OpenAI `finish_reason`, Google `finishReason`, Anthropic `message_delta` (`delta.stop_reason`) / `message_stop`, and Cohere `message-end`. |
 | `mcp_tool_calls` | `false` | MCP JSON-RPC `tools/call` request bodies (`params.name` + `params.arguments`), including calls inside JSON-RPC **batch arrays**. Omitted `params.arguments` normalizes to `{}` before evaluation (MCP zero-argument calls); provider response `function.arguments` omissions are not normalized. |
 | `a2a_methods` | `false` | A2A JSON-RPC method names (governed against the `tools` map), including batch arrays. |
 
@@ -136,6 +136,50 @@ disabled, SSE stays buffered and is governed by buffered-SSE governance (or
 the JSON-shape fallback if the label was lying). Operators should expect
 mislabeled, unlabeled, or compressed SSE responses on governed routes to be
 delivered buffered rather than streamed.
+
+## Modes
+
+| `mode` | Rejects? | What it does |
+| --- | --- | --- |
+| `enforce` (default) | yes | Blocks denied calls, cuts blocked streams, and **fails closed** on every body it cannot policy-check. |
+| `dry_run` | never | Evaluates, records `ai_tool_governor.decision=dry_run` and the observation labels below, and forwards. The safe rollout / observe posture. Never calls the approval webhook. |
+
+`dry_run` still **counts and logs** everything `enforce` would have refused,
+including bodies it could not read — it just does not disrupt traffic, and it
+never records `decision=deny` for something it did not block.
+
+## Unreadable tool-call shapes (`unknown_shape_action`)
+
+A response can carry a tool call in a provider dialect the extractors above do
+not read. Reporting "no tool calls" for such a body would be an **extraction
+failure reported as an allow** — the exact fail-open the `FailClosed` policy
+exists to prevent.
+
+The plugin therefore scans every governed payload for a live **tool-call
+marker**: an object member named `tool_calls`, `toolCalls`, `tool_call`,
+`toolCall`, `tool_use`, `toolUse`, `function_call`, `functionCall`,
+`function_calls`, or `functionCalls` whose value is non-`null` and non-empty,
+or a block tagged `"type": "tool_use"` / `"function_call"` / `"tool-call"`.
+A payload that carries such a marker but from which **no call could be
+extracted** is ungovernable.
+
+| `unknown_shape_action` | Default | Behavior |
+| --- | --- | --- |
+| `deny` | yes | Ungovernable: `enforce` rejects the buffered body with `502` / cuts the stream; `dry_run` forwards. |
+| `allow` | — | Documented opt-out: forwards the payload as if it carried no tool calls. |
+
+Both settings record the fixed
+`ai_tool_governor.uninspectable_reason = unrecognized_tool_call_shape`
+observation and never set `decision` — the bytes were not evaluated against
+policy, so neither `allow` nor `deny` would be a truthful label. The case is
+therefore never *silent* under either setting.
+
+Scoping the posture to a positive marker is deliberate: payloads with **no**
+tool surface at all — ordinary REST JSON on a shared proxy, embeddings /
+moderations / image responses, content-only completions — stay out of scope
+under both settings and are never rejected. Empty and `null` containers
+(`"tool_calls": []`, `"tool_calls": null`) are the documented provider "no
+calls" shapes and are not markers.
 
 ## Fail-closed handling of uninspectable bodies
 
@@ -372,7 +416,10 @@ When `observability.emit_metadata` is on (default), the plugin writes
 `tool_names`, `risk` (max), `policy_ids`, `approval_id`, `arguments_hashes`
 (SHA-256, when `hash_arguments` is on), `redacted_tools`, and — when global
 `mode: dry_run` observes duplicate-key ambiguity without blocking —
-`uninspectable_reason` (`ambiguous_json` only; never raw body bytes).
+`uninspectable_reason` (`ambiguous_json`, or `unrecognized_tool_call_shape`
+when a payload carried an unreadable tool-call shape; never raw body bytes).
+`unrecognized_tool_call_shape` is recorded in **both** modes and under **both**
+`unknown_shape_action` settings, and never sets `decision`.
 
 Raw arguments are **never** placed in metadata and never logged unless
 `observability.max_argument_log_bytes > 0` (then a bounded excerpt of a blocked
@@ -402,6 +449,14 @@ so disabling metadata/hash observability cannot be bypassed by lifecycle state.
   *deterministic* tool/action policy on the concrete call. Run both: the
   firewall (2968) evaluates the prompt/response text; the governor (2978)
   gates the specific tool name and arguments.
+- **`ai_stream_router`** — composition is a **stage** relationship, not a
+  priority one. Response-stream inspectors are sorted by
+  `ResponseStreamInspectorStage`, and every `ai_stream_router` normalizer
+  declares `Normalize`, which sorts before this plugin's default `Inspect`. So
+  with a router present the governor inspects the **normalized** OpenAI chunks
+  the client will receive, and without one it reads the provider-native frames
+  directly. The request-side priorities (`2978` vs `2984`) do not order these
+  inspectors.
 - **`mcp_gateway`** — MCP routing, aggregation, and session mediation remain in
   `mcp_gateway`. Enable `inspect.mcp_tool_calls` on `ai_tool_governor` to add
   deterministic approval/argument policy over selected MCP `tools/call` traffic;
@@ -434,6 +489,24 @@ so disabling metadata/hash observability cannot be bypassed by lifecycle state.
 - A JSON-labelled **response** body that fails to parse is forwarded (only
   oversized responses fail closed) — rejecting every unparseable JSON response
   on a shared proxy would break unrelated routes.
+- **Provider scope is explicit, not universal.** Tool calls and definitions are
+  read in the OpenAI (Chat Completions and Responses), Anthropic Messages,
+  Google Gemini, Cohere v2, and Amazon Bedrock Converse shapes. A dialect
+  outside that set is not silently allowed: if the payload carries a tool-call
+  marker the plugin cannot resolve into a call, `unknown_shape_action` (default
+  `deny`) fails closed and the fixed `unrecognized_tool_call_shape` observation
+  is recorded either way. A dialect that names its tool calls with none of the
+  documented marker members and none of the marker `type` values would still
+  read as call-free; open an issue with the wire shape so it can be added.
+- **Bedrock streaming is buffered-only.** Bedrock
+  `InvokeModelWithResponseStream` uses the binary
+  `application/vnd.amazon.eventstream` framing rather than SSE text, so it is
+  never parsed as a stream; a Bedrock Converse response delivered as a buffered
+  JSON body is governed normally.
+- The unknown-shape posture is scoped to a positive tool-call marker. It does
+  not attempt to decide whether an arbitrary body "is an AI response", so a
+  provider dialect with no recognizable marker is out of scope in both
+  settings.
 - The plugin governs tool calls; it does not execute tools, manage MCP sessions,
   or replace `mcp_gateway`/A2A routing.
 - Streaming inspection is transport-independent across reqwest, direct HTTP/2,

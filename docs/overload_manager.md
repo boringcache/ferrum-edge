@@ -4,7 +4,7 @@ The overload manager monitors system resource pressure and progressively sheds l
 
 ## How It Works
 
-A single background task polls four resource signals at a configurable interval (default: 1 second):
+A single background task polls four resource signals at a configurable interval (default: 1 second). File-descriptor probing runs on Tokio's blocking pool so a large fdtable cannot stall a worker thread:
 
 | Signal | Source | Why It Matters |
 |--------|--------|----------------|
@@ -203,7 +203,7 @@ resource that starts serving on a later reconcile clears its entry.
 
 | Platform | FD Monitoring | FD Limit |
 |----------|--------------|----------|
-| Linux | `/proc/self/fd` count | `getrlimit(RLIMIT_NOFILE)` |
+| Linux | Kernel open-FD aggregate from `stat(/proc/self/fd).st_size` (Linux 6.2+); directory walk of `/proc/self/fd` on older kernels | `getrlimit(RLIMIT_NOFILE)` |
 | macOS | `proc_pidinfo(PROC_PIDLISTFDS)` | `getrlimit(RLIMIT_NOFILE)` |
 | Windows | Not available (ratios are 0.0) | Not available |
 

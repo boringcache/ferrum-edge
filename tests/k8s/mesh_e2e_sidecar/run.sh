@@ -1116,6 +1116,26 @@ $drsvc_workloads_yaml
       workloads:
         - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/slowsvc
 $drsvc_service_yaml
+  # Issue #4158: an ordinary namespace-scoped Istio AuthorizationPolicy riding
+  # the CLIENT slice. AuthorizationPolicy is a destination-side contract, so it
+  # must NOT be enforced on the outbound capture leg (:15001) — where the peer
+  # is this pod's own curl container over plaintext loopback and no source
+  # principal can ever exist. The implicit-deny floor is raised by policy
+  # PRESENCE, not by a match, so before the fix this one policy 403'd EVERY
+  # probe in this suite that leaves the client pod. It is deliberately left
+  # here with no assertion of its own: every existing client egress assertion
+  # below is the regression guard, and each of them fails if source-side
+  # enforcement ever comes back.
+  mesh_policies:
+    - name: client-ns-allow
+      namespace: $NS
+      scope:
+        kind: namespace
+        namespace: $NS
+      rules:
+        - action: allow
+          from:
+            - spiffe_id_pattern: spiffe://$TRUST_DOMAIN/ns/$NS/sa/svc
   # VirtualService-derived CORS (issue #1973): Istio applies VS policy on the
   # CLIENT sidecar, so the policy rides the client slice and the sidecar
   # synthesizes a cors plugin onto its materialized svc outbound route. The

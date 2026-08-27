@@ -4,7 +4,7 @@ use ferrum_edge::_test_support::{
     database_store_set_reconnect_transition_hooks_for_test, db_code_is_transient, db_diff_removed,
     db_mongo_error_is_transient, db_mysql_error_number_is_transient,
     db_wrap_mysql_isolation_read_error, effective_pool_connect_timeout_seconds,
-    is_config_validation_rejection, mysql_config_change_lock_insert_sql,
+    is_config_validation_rejection, lock_wait_timeout_sql, mysql_config_change_lock_insert_sql,
     mysql_mtls_dns_admission_lock_insert_sql, mysql_proxy_route_lock_insert_sql, parse_auth_mode,
     parse_scheme, statement_timeout_sql, validate_tcp_connection_throttle_attachments,
 };
@@ -17,7 +17,9 @@ use ferrum_edge::config::db_loader::{
     DatabaseStore, is_retryable_sql_transaction_conflict, sqlite_code_is_retryable_write_conflict,
     sqlstate_is_retryable_transaction_conflict,
 };
-use ferrum_edge::config::namespace_registry::NamespaceRegistryCorrupt;
+use ferrum_edge::config::namespace_registry::{
+    NAMESPACE_RENAME_SIMPLE_TABLES, NamespaceRegistryCorrupt,
+};
 use ferrum_edge::config::plugin_trigger::PluginTrigger;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, PluginAssociation, PluginConfig,
@@ -539,6 +541,23 @@ fn test_statement_timeout_sql_mysql() {
 fn test_statement_timeout_sql_sqlite_returns_none() {
     // SQLite does not support statement timeouts.
     assert_eq!(statement_timeout_sql(30, false, false), None);
+}
+
+#[test]
+fn test_lock_wait_timeout_sql_is_mysql_only_and_in_seconds() {
+    // MySQL's max_execution_time bounds read-only SELECTs, so a write queued
+    // behind an abandoned transaction's row lock is otherwise unbounded — the
+    // zombie-lock pileup in issue #4146. innodb_lock_wait_timeout is expressed
+    // in seconds, not milliseconds.
+    assert_eq!(
+        lock_wait_timeout_sql(30, true),
+        Some("SET SESSION innodb_lock_wait_timeout = 30".to_string())
+    );
+    // PostgreSQL's statement_timeout already bounds blocked statements, and
+    // SQLite uses PRAGMA busy_timeout.
+    assert_eq!(lock_wait_timeout_sql(30, false), None);
+    // 0 = disabled, same as the statement timeout.
+    assert_eq!(lock_wait_timeout_sql(0, true), None);
 }
 
 #[tokio::test]
@@ -3535,7 +3554,7 @@ fn last_remaining_sql_is_registry_row_authority_not_the_get_union() {
 }
 
 #[test]
-fn sql_namespace_rename_does_not_rewrite_historical_audit_events() {
+fn sql_namespace_rename_rewrites_historical_audit_events() {
     let source = include_str!("../../../src/config/db_loader.rs");
     let start = source
         .find("async fn rename_namespace_in_tx(")
@@ -3549,10 +3568,12 @@ fn sql_namespace_rename_does_not_rewrite_historical_audit_events() {
         "in-place SQL rename must still walk the live resource table plan:\n{body}"
     );
     assert!(
-        !body.contains("UPDATE audit_events")
-            && !body.contains("\"audit_events\"")
-            && !body.contains("'audit_events'"),
-        "historical audit_events must retain the namespace recorded at event time:\n{body}"
+        NAMESPACE_RENAME_SIMPLE_TABLES.contains(&"audit_events"),
+        "historical audit_events must follow the renamed tenant:\n{body}"
+    );
+    assert!(
+        !body.contains("namespace_at_event"),
+        "namespace_at_event is immutable evidence and must not be rewritten on rename:\n{body}"
     );
     for table in ["proxies", "plugin_configs", "upstreams", "api_specs"] {
         assert!(
@@ -4127,5 +4148,142 @@ fn sql_namespace_registry_backfill_does_not_nest_a_sqlite_begin() {
             && !rollback.contains("connection.begin()"),
         "savepoint rollback must not COMMIT or ROLLBACK the outer migration transaction:\n\
          {rollback}"
+    );
+}
+
+fn http_route_proxy(id: &str, namespace: &str, listen_path: Option<&str>, hosts: &[&str]) -> Proxy {
+    let mut proxy: Proxy = serde_json::from_value(json!({
+        "id": id,
+        "namespace": namespace,
+        "hosts": hosts,
+        "listen_path": listen_path,
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 8080
+    }))
+    .unwrap();
+    proxy.normalize_fields();
+    proxy
+}
+
+async fn sqlite_uniqueness_store() -> (DatabaseStore, tempfile::TempDir) {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("admission_point_lookups.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    (store, temp_dir)
+}
+
+#[tokio::test]
+async fn check_listen_path_unique_rejects_catch_all_and_isolates_namespaces() {
+    let (store, _tmp) = sqlite_uniqueness_store().await;
+
+    let catch_all = http_route_proxy("p-catch", "ferrum", Some("/svc/1"), &[]);
+    store.create_proxy(&catch_all).await.unwrap();
+
+    let same_path_other_hosts =
+        http_route_proxy("p-overlap", "ferrum", Some("/svc/1"), &["api.example.com"]);
+    assert!(
+        !store
+            .check_listen_path_unique(
+                "ferrum",
+                same_path_other_hosts.listen_path.as_deref(),
+                &same_path_other_hosts.hosts,
+                None,
+            )
+            .await
+            .unwrap(),
+        "empty hosts is a catch-all that overlaps every host on the same listen_path"
+    );
+
+    let other_namespace = http_route_proxy("p-other-ns", "tenant-b", Some("/svc/1"), &[]);
+    assert!(
+        store
+            .check_listen_path_unique(
+                "tenant-b",
+                other_namespace.listen_path.as_deref(),
+                &other_namespace.hosts,
+                None,
+            )
+            .await
+            .unwrap(),
+        "the same listen_path in another namespace must not collide"
+    );
+
+    let host_only = http_route_proxy("p-host-only", "ferrum", None, &["api.example.com"]);
+    store.create_proxy(&host_only).await.unwrap();
+    let path_carrying =
+        http_route_proxy("p-path", "ferrum", Some("/svc/path"), &["api.example.com"]);
+    assert!(
+        store
+            .check_listen_path_unique(
+                "ferrum",
+                path_carrying.listen_path.as_deref(),
+                &path_carrying.hosts,
+                None,
+            )
+            .await
+            .unwrap(),
+        "host-only and path-carrying proxies on the same host occupy different match tiers"
+    );
+}
+
+#[tokio::test]
+async fn check_consumer_identity_unique_is_namespace_isolated() {
+    let (store, _tmp) = sqlite_uniqueness_store().await;
+
+    let mut alice = make_consumer("c-alice", "alice");
+    alice.namespace = "ferrum".to_string();
+    store.create_consumer(&alice).await.unwrap();
+
+    let conflict = store
+        .check_consumer_identity_unique("ferrum", "c-other", "alice", None, None)
+        .await
+        .unwrap();
+    assert!(
+        conflict.is_some(),
+        "the same username in the same namespace must collide: {conflict:?}"
+    );
+
+    let isolated = store
+        .check_consumer_identity_unique("tenant-b", "c-other", "alice", None, None)
+        .await
+        .unwrap();
+    assert!(
+        isolated.is_none(),
+        "the same username in another namespace must be unique: {isolated:?}"
+    );
+}
+
+#[test]
+fn consumer_identity_uniqueness_queries_the_identity_index() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+    let start = source
+        .find("    pub async fn check_consumer_identity_unique(")
+        .expect("SQL identity uniqueness check");
+    let end = source[start..]
+        .find("\n    pub async fn check_keyauth_key_unique(")
+        .expect("keyauth uniqueness follows identity uniqueness")
+        + start;
+    let body = &source[start..end];
+    assert!(
+        body.contains("FROM consumer_identity_index"),
+        "identity uniqueness must probe the identity index, not scan consumers:\n{body}"
+    );
+    assert!(
+        body.contains("WHERE namespace = ?"),
+        "identity uniqueness must carry the namespace predicate in the query:\n{body}"
+    );
+    assert!(
+        body.contains("LIMIT 1"),
+        "identity uniqueness must stop at the first index hit:\n{body}"
+    );
+    assert!(
+        !body.contains("id IN (")
+            && !body.contains("username IN (")
+            && !body.contains("custom_id IN ("),
+        "identity uniqueness must not scan the consumers table:\n{body}"
     );
 }

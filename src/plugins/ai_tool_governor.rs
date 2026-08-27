@@ -13,14 +13,24 @@
 //! out-of-band approval webhook.
 //!
 //! Inspection surfaces (each independently toggled under `inspect`):
-//! - **request tool definitions**: `tools[].function.name` / `functions[].name`
-//!   the client exposes to the model (reject/dry-run disallowed tools).
-//! - **buffered response tool calls**: `choices[].message.tool_calls[]` and the
-//!   legacy `choices[].message.function_call` on non-streaming responses.
+//! - **request tool definitions**: the tool definitions the client exposes to
+//!   the model — OpenAI `tools[].function.name` / `functions[].name`, Anthropic
+//!   `tools[].name`, Google `tools[].functionDeclarations[].name`, and Bedrock
+//!   `toolConfig.tools[].toolSpec.name` (reject/dry-run disallowed tools). A
+//!   definition entry no known shape can name is ungovernable.
+//! - **buffered response tool calls**: OpenAI `choices[].message.tool_calls[]`
+//!   and the legacy `choices[].message.function_call`, OpenAI Responses
+//!   `output[]` `function_call` items, Anthropic `content[]` `tool_use` blocks,
+//!   Google `candidates[].content.parts[].functionCall`, Cohere v2
+//!   `message.tool_calls[]`, and Bedrock Converse
+//!   `output.message.content[].toolUse` on non-streaming responses.
 //! - **streaming response tool calls**: OpenAI SSE `choices[].delta.tool_calls`
 //!   and legacy `choices[].delta.function_call` (the `functions` API's one
-//!   implicit call per choice) deltas, accumulated across split frames;
-//!   tool-call frames are HELD until
+//!   implicit call per choice) deltas, Anthropic `content_block_start` /
+//!   `content_block_delta` (`input_json_delta`) blocks, Cohere v2
+//!   `tool-call-start` / `tool-call-delta` events, and Google
+//!   `candidates[].content.parts[].functionCall` chunks, accumulated across
+//!   split frames; tool-call frames are HELD until
 //!   the call is complete and policy/approval clears it, then released — or the
 //!   stream is terminated with an SSE error event, never leaking the held call.
 //!   Duplicate indexes in one frame or conflicting call ids for one slot are
@@ -40,6 +50,19 @@
 //! (> [`MAX_PARSE_BYTES`]), non-UTF-8, or unparseable JSON request bodies when
 //! request inspection is on; oversized JSON response bodies; and streaming
 //! holds past [`MAX_STREAM_HOLD_BYTES`].
+//!
+//! A buffered response body that yields NO extractable call while still
+//! carrying a live tool-call marker (see [`body_carries_tool_call_marker`]) is
+//! treated as ungovernable: the shape was present but unreadable, so
+//! `calls.is_empty()` is an extraction failure and not proof the body carries
+//! no tool call. `enforce` fails closed and `dry_run` records the fixed
+//! `unrecognized_tool_call_shape` observation. That is the
+//! `unknown_shape_action: "deny"` default; the documented opt-out
+//! `unknown_shape_action: "allow"` forwards instead and STILL records the
+//! observation, so an unreadable tool-call shape is never silently permitted.
+//! Bodies with no tool surface at all (ordinary REST JSON on a shared proxy,
+//! embeddings/moderations payloads, content-only completions) are out of scope
+//! in both settings.
 //!
 //! Request and response policy is evaluated in `before_proxy` / `on_response_body`
 //! and then re-evaluated on the FINAL backend-/client-visible body in
@@ -118,6 +141,7 @@ pub const AI_TOOL_GOVERNOR_CONFIG_KEYS: &[&str] = &[
     "enabled",
     "mode",
     "default_action",
+    "unknown_shape_action",
     "inspect",
     "tools",
     "approval",
@@ -236,6 +260,14 @@ const AMBIGUOUS_TOOL_ARGUMENTS: &str =
 /// global `mode: dry_run`. Never echoes body, key, argument, tool, or
 /// backend-controlled bytes; repeated ambiguous events reuse this same value.
 const AMBIGUITY_OBSERVATION_REASON: &str = "ambiguous_json";
+/// Fixed reason for a body that carries a live tool-call marker but yielded no
+/// extractable call. The governor cannot prove the body carries no tool call,
+/// so it is ungovernable rather than an allow.
+const UNRECOGNIZED_RESPONSE_SHAPE: &str =
+    "response body carries a tool-call shape this plugin cannot read and cannot be policy-checked";
+/// Fixed-cardinality transaction-log label for [`UNRECOGNIZED_RESPONSE_SHAPE`].
+/// Never echoes body, provider, model, tool, or backend-controlled bytes.
+const UNRECOGNIZED_SHAPE_OBSERVATION: &str = "unrecognized_tool_call_shape";
 /// Metadata key for [`AMBIGUITY_OBSERVATION_REASON`]. Kept separate from
 /// `decision` so dry-run can record the observation as `decision=dry_run`
 /// without claiming enforcement via `decision=deny`.
@@ -294,6 +326,27 @@ impl Mode {
             Mode::DryRun => "dry_run",
         }
     }
+}
+
+/// What to do with a buffered response body that carries a live tool-call
+/// marker (see [`body_carries_tool_call_marker`]) from which no call could be
+/// extracted — a provider tool-call shape this plugin cannot read.
+///
+/// This is deliberately NOT applied to arbitrary JSON: a plain REST body on a
+/// shared proxy carries no tool surface at all and is forwarded under both
+/// settings (the same scoping the "unparseable JSON response is forwarded"
+/// limitation already uses). It applies only where the gateway can positively
+/// see a tool call it could not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnknownShapeAction {
+    /// Fail closed (default): treat the body as ungovernable, so `enforce`
+    /// rejects it and `dry_run` records
+    /// [`UNRECOGNIZED_SHAPE_OBSERVATION`] and forwards.
+    Deny,
+    /// Documented opt-out: forward the body as if it carried no tool calls.
+    /// The observation is STILL recorded in both modes, so an unrecognized
+    /// provider shape is never silently permitted.
+    Allow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -447,6 +500,10 @@ struct ObservabilityConfig {
 struct GovernorEngine {
     mode: Mode,
     default_action: DefaultAction,
+    /// Posture for an AI completion body whose tool-call envelope this plugin
+    /// does not recognize. Lives on the engine (not the plugin) because the
+    /// streaming inspector holds only an `Arc<GovernorEngine>`.
+    unknown_shape_action: UnknownShapeAction,
     tools: HashMap<String, ToolPolicy>,
     approval: Option<ApprovalConfig>,
     response: ResponseConfig,
@@ -1373,6 +1430,7 @@ impl AiToolGovernor {
             let engine = GovernorEngine {
                 mode: Mode::Enforce,
                 default_action: DefaultAction::Allow,
+                unknown_shape_action: UnknownShapeAction::Deny,
                 tools: HashMap::new(),
                 approval: None,
                 response: ResponseConfig {
@@ -1426,6 +1484,22 @@ impl AiToolGovernor {
             other => {
                 return Err(format!(
                     "ai_tool_governor: 'default_action' must be one of 'allow', 'deny', or 'require_approval', got {other:?}"
+                ));
+            }
+        };
+
+        // Fail closed by default on an AI completion whose tool-call shape this
+        // plugin cannot read. `allow` is the documented, loud opt-out: it still
+        // records the `unrecognized_tool_call_shape` observation, so the traffic
+        // is forwarded knowingly rather than silently.
+        let unknown_shape_action = match optional_string(config, "unknown_shape_action")?
+            .unwrap_or("deny")
+        {
+            "deny" => UnknownShapeAction::Deny,
+            "allow" => UnknownShapeAction::Allow,
+            other => {
+                return Err(format!(
+                    "ai_tool_governor: 'unknown_shape_action' must be one of 'deny' or 'allow', got {other:?}"
                 ));
             }
         };
@@ -1517,6 +1591,7 @@ impl AiToolGovernor {
         let engine = GovernorEngine {
             mode,
             default_action,
+            unknown_shape_action,
             tools,
             approval,
             response,
@@ -1819,6 +1894,78 @@ impl AiToolGovernor {
             .or_insert_with(|| AMBIGUITY_OBSERVATION_REASON.to_string());
     }
 
+    /// Record that a governed payload carried a provider tool-call shape this
+    /// plugin cannot read.
+    ///
+    /// Written in BOTH postures — the `unknown_shape_action: "deny"` dry-run
+    /// forward and the `"allow"` opt-out — so an unrecognized shape is never
+    /// silently permitted. Deliberately does NOT touch `decision`: the bytes
+    /// were not evaluated against policy, so neither `allow` nor `deny` would
+    /// be a truthful label. The reason label is fixed-cardinality and never
+    /// echoes body, provider, model, tool, or backend-controlled bytes.
+    fn write_unrecognized_shape_observation_into(
+        engine: &GovernorEngine,
+        metadata: &mut HashMap<String, String>,
+    ) {
+        if !engine.observability.emit_metadata {
+            return;
+        }
+        metadata.insert("ai_tool_governor.enabled".to_string(), "true".to_string());
+        metadata.insert(
+            "ai_tool_governor.mode".to_string(),
+            engine.mode.as_str().to_string(),
+        );
+        // Sticky single label: repeated unrecognized bodies on one request must
+        // not grow metadata cardinality.
+        metadata
+            .entry(UNINSPECTABLE_REASON_KEY.to_string())
+            .or_insert_with(|| UNRECOGNIZED_SHAPE_OBSERVATION.to_string());
+    }
+
+    /// Screen a buffered response extraction before governance runs.
+    ///
+    /// Returns `Some(result)` when the body was never governable, keeping the
+    /// two causes distinct:
+    /// - a tool call was FOUND but cannot be policy-checked (always
+    ///   ungovernable, exactly as before);
+    /// - NO call was extracted although the body carries a live tool-call
+    ///   marker ([`body_carries_tool_call_marker`]), so `calls.is_empty()` is
+    ///   an EXTRACTION FAILURE — a provider shape this plugin cannot read —
+    ///   rather than proof the response carries no tool call.
+    ///
+    /// `None` means "parsed, and governance may proceed" — the ONLY path on
+    /// which policy gets to allow. The unrecognized case records its sanitized
+    /// observation before returning under either posture, so the
+    /// `unknown_shape_action: "allow"` opt-out forwards knowingly instead of
+    /// silently.
+    fn screen_response_extract(
+        &self,
+        ctx: &mut RequestContext,
+        json: &Value,
+        extract: &ResponseToolCallExtract,
+    ) -> Option<PluginResult> {
+        if extract.ungovernable {
+            let reason = if extract.args_ambiguous() {
+                AMBIGUOUS_TOOL_ARGUMENTS
+            } else {
+                "response contains a tool call that cannot be policy-checked (missing or non-string name, or ambiguous arguments)"
+            };
+            return Some(self.uninspectable_governed_response(ctx, reason));
+        }
+        // A body with no tool surface at all (ordinary REST JSON on a shared
+        // proxy, an embeddings/moderations payload, a content-only completion)
+        // stays out of scope in both postures — the same scoping the documented
+        // "unparseable JSON response is forwarded" limitation uses.
+        if !extract.calls.is_empty() || !body_carries_tool_call_marker(json) {
+            return None;
+        }
+        Self::write_unrecognized_shape_observation_into(&self.engine, &mut ctx.metadata);
+        if self.engine.unknown_shape_action == UnknownShapeAction::Allow {
+            return None;
+        }
+        Some(self.uninspectable_governed_response(ctx, UNRECOGNIZED_RESPONSE_SHAPE))
+    }
+
     /// True when `reason` is one of the fixed duplicate-key ambiguity strings
     /// (not a generic uninspectable cause such as encoding or size).
     fn is_ambiguity_reason(reason: &str) -> bool {
@@ -1831,9 +1978,16 @@ impl AiToolGovernor {
         target: &mut HashMap<String, String>,
         source: &HashMap<String, String>,
     ) {
-        let Some(label) = source.get("ai_tool_governor.decision") else {
-            return;
-        };
+        // Observation keys are merged BEFORE the decision gate (issue #4232).
+        // `write_unrecognized_shape_observation_into` deliberately records
+        // `enabled` + `uninspectable_reason` and sets NO `decision`, so an
+        // early return on a missing decision dropped the unknown-shape
+        // observation on the streaming path — it never reached `ctx.metadata`,
+        // the transaction summary, or any logging sink. That made the
+        // documented "an uninspectable payload is never silent" guarantee
+        // false for exactly the `unknown_shape_action: "allow"` case that
+        // forwards the body. The buffered path was unaffected because it
+        // writes into `ctx.metadata` directly.
         if let Some(enabled) = source.get("ai_tool_governor.enabled") {
             target.insert("ai_tool_governor.enabled".to_string(), enabled.clone());
         }
@@ -1847,6 +2001,12 @@ impl AiToolGovernor {
                 .entry(UNINSPECTABLE_REASON_KEY.to_string())
                 .or_insert_with(|| reason.clone());
         }
+
+        // An observation-only batch carries no decision and must not fabricate
+        // one: the remaining merge below is decision-scoped.
+        let Some(label) = source.get("ai_tool_governor.decision") else {
+            return;
+        };
 
         let previous_rank = target
             .get("ai_tool_governor.decision")
@@ -2000,9 +2160,24 @@ impl AiToolGovernor {
 
         // 1. Client tool definitions exposed to the model.
         if self.inspect.request_tool_definitions {
+            let definitions = extract_request_tool_definitions(json);
+            // A definition entry no known provider shape can name is not a
+            // silent no-op: policy is keyed by name, so the entry was never
+            // checked. Fail closed in enforce, record and forward in dry-run —
+            // the same posture the response and streaming surfaces take.
+            if definitions.ungovernable {
+                if self.engine.mode == Mode::Enforce {
+                    return self.reject_uninspectable(
+                        ctx,
+                        "request body",
+                        "request exposes a tool definition whose name cannot be policy-checked",
+                    );
+                }
+                Self::write_unrecognized_shape_observation_into(&self.engine, &mut ctx.metadata);
+            }
             let mut denied = Vec::new();
             let mut dry_run = Vec::new();
-            for name in extract_request_tool_definitions(json) {
+            for name in definitions.names {
                 match self.engine.definition_outcome(&name) {
                     DefinitionOutcome::Deny(risk) => denied.push((name, risk)),
                     DefinitionOutcome::DryRun(risk) => dry_run.push((name, risk)),
@@ -2249,18 +2424,16 @@ impl AiToolGovernor {
     /// is not available here — the redaction transform already ran — so a
     /// `redact_args` match fails closed (`redaction_unavailable = true`).
     async fn govern_final_response(&self, ctx: &mut RequestContext, json: &Value) -> PluginResult {
-        let (calls, ungovernable) = extract_response_tool_calls(json);
+        let extract = extract_response_tool_calls(json);
         // Parity with the streaming finalizer and the buffered-SSE path: an
         // entry the extractor cannot policy-check (a missing or non-string
-        // name) fails closed in enforce mode and forwards in dry-run.
-        if ungovernable {
-            let reason = if calls.iter().any(|call| call.args_ambiguous) {
-                AMBIGUOUS_TOOL_ARGUMENTS
-            } else {
-                "response contains a tool call that cannot be policy-checked (missing or non-string name, or ambiguous arguments)"
-            };
-            return self.uninspectable_governed_response(ctx, reason);
+        // name), or an AI completion whose provider tool-call shape is not
+        // recognized at all, fails closed in enforce mode and forwards in
+        // dry-run.
+        if let Some(result) = self.screen_response_extract(ctx, json, &extract) {
+            return result;
         }
+        let calls = extract.calls;
         if calls.is_empty() {
             return PluginResult::Continue;
         }
@@ -2369,6 +2542,18 @@ impl AiToolGovernor {
                 "streamed response body contains an ungovernable tool call"
             };
             return self.uninspectable_governed_response(ctx, reason);
+        }
+        // A frame carried a live tool-call marker no provider accumulator
+        // claimed: the shape was present but unreadable, so this body was
+        // never proven call-free. Record in BOTH postures (never silent), then
+        // fail closed under the default `unknown_shape_action: deny` or
+        // forward under the documented opt-out. Screened BEFORE the skip hash
+        // for the same reason the ungovernable screen is.
+        if extracted.unreadable_shape {
+            Self::write_unrecognized_shape_observation_into(&self.engine, &mut ctx.metadata);
+            if self.engine.unknown_shape_action == UnknownShapeAction::Deny {
+                return self.uninspectable_governed_response(ctx, UNRECOGNIZED_RESPONSE_SHAPE);
+            }
         }
         // Record the hash of the SSE body governed here so the post-transform
         // `on_final_response_body` re-check (which routes SSE-labeled/shaped
@@ -3130,20 +3315,18 @@ impl Plugin for AiToolGovernor {
         // per-instance `ai_tool_governor_response_hashes` map, off `ctx.metadata`.
         self.set_response_hash(ctx, sha256_hex_bytes(body));
 
-        let (calls, ungovernable) = extract_response_tool_calls(&json);
-        // Streaming parity: an ungovernable `tool_calls[]` entry (a missing
-        // or non-string `function.name`) must not slide past policy
-        // because the extractor dropped it — with all entries unnamed,
-        // `calls.is_empty()` would Continue even under `default_action: deny`.
-        // Fail closed in enforce mode, forward in dry-run.
-        if ungovernable {
-            let reason = if calls.iter().any(|call| call.args_ambiguous) {
-                AMBIGUOUS_TOOL_ARGUMENTS
-            } else {
-                "response contains a tool call that cannot be policy-checked (missing or non-string name, or ambiguous arguments)"
-            };
-            return self.uninspectable_governed_response(ctx, reason);
+        let extract = extract_response_tool_calls(&json);
+        // Streaming parity: an ungovernable tool-call entry (a missing or
+        // non-string name) must not slide past policy because the extractor
+        // dropped it — with all entries unnamed, `calls.is_empty()` would
+        // Continue even under `default_action: deny`. The same holds for an AI
+        // completion whose provider tool-call envelope this plugin cannot read
+        // at all: it was never proven call-free. Fail closed in enforce mode,
+        // forward (with a recorded observation) in dry-run.
+        if let Some(result) = self.screen_response_extract(ctx, &json, &extract) {
+            return result;
         }
+        let calls = extract.calls;
         if calls.is_empty() {
             return PluginResult::Continue;
         }
@@ -3315,7 +3498,7 @@ impl Plugin for AiToolGovernor {
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 let corr = self.correlation(ctx, model, provider.as_deref());
-                self.record_governed_calls(ctx, &corr, &extract_response_tool_calls(&json).0);
+                self.record_governed_calls(ctx, &corr, &extract_response_tool_calls(&json).calls);
                 Some(rewritten)
             }
             RedactTransform::AmplificationFailed => {
@@ -3627,18 +3810,23 @@ impl Plugin for AiToolGovernor {
                 || ctx.metadata.get(STREAM_REQUESTED_KEY).map(String::as_str) == Some("true"))
     }
 
-    /// The streaming inspector accumulates OpenAI-shaped SSE
-    /// `choices[].delta.tool_calls`. LIMITATION: `ai_stream_router` (2984)
-    /// normalizes provider-native streaming (e.g. Anthropic `tool_use` /
-    /// `input_json_delta`) into OpenAI chunks in a stream inspector that runs
-    /// AFTER this one (2978 < 2984), so on those routes the governor sees only
-    /// raw provider frames it does not recognize as tool calls. Deterministic
-    /// mid-stream tool governance therefore covers OpenAI-native SSE; buffered
-    /// (non-streaming) responses are governed for every provider, and
-    /// provider-native streaming governance is tracked as a follow-up (it would
-    /// require the governor to understand each provider's native tool events or
-    /// to run after normalization). Reordering is not an option here: 2978 is
-    /// deliberately before semantic cache/federation on the request path.
+    /// The streaming inspector accumulates every provider tool-call shape this
+    /// plugin understands: OpenAI `choices[].delta.tool_calls` (and the legacy
+    /// `delta.function_call`), Anthropic `content_block_start` /
+    /// `content_block_delta` (`input_json_delta`), Cohere v2 `tool-call-start`
+    /// / `tool-call-delta`, and Google `candidates[].content.parts[]
+    /// .functionCall`. A frame that carries a live tool-call marker none of
+    /// those claim is an unreadable shape and takes the
+    /// `unknown_shape_action` posture (default: cut the stream in enforce).
+    ///
+    /// Composition with `ai_stream_router` is a STAGE relationship, not a
+    /// priority one: response-stream inspectors are sorted by
+    /// `ResponseStreamInspectorStage` in `chain_response_stream_inspectors`,
+    /// and every `ai_stream_router` normalizer declares `Normalize`, which
+    /// sorts before this plugin's default `Inspect`. So when a router is
+    /// present the governor sees NORMALIZED OpenAI chunks, and when it is
+    /// absent the governor reads the provider-native frames directly. The
+    /// request-side priorities (2978 vs 2984) do not order these inspectors.
     ///
     /// The proxy drives this inspector on reqwest, direct-H2, and native-H3
     /// streaming responses. Request-body transforms are finalized before the
@@ -3773,6 +3961,18 @@ impl AiToolGovernor {
 enum ToolSlot {
     Indexed(usize),
     LegacyFunctionCall,
+    /// Anthropic `content_block_start` / `content_block_delta` tool_use block
+    /// at this content-block index. A distinct variant so an Anthropic block
+    /// index can never merge with an OpenAI `tool_calls[].index` slot on a
+    /// mixed or hostile frame.
+    AnthropicBlock(usize),
+    /// Cohere v2 `tool-call-start` / `tool-call-delta` event at this index.
+    CohereIndex(usize),
+    /// A provider-COMPLETE call that arrives whole in one frame (Google
+    /// `functionCall`). Each occurrence is allocated a fresh ordinal, so two
+    /// identical parts in successive chunks are two calls rather than one
+    /// concatenated `safedanger`.
+    Complete(usize),
 }
 
 /// Accumulates OpenAI streaming tool-call deltas — modern
@@ -3783,11 +3983,17 @@ enum ToolSlot {
 struct StreamingToolCallAccumulator {
     calls: Vec<((usize, ToolSlot), StreamingCall)>,
     positions: HashMap<(usize, ToolSlot), usize>,
-    /// A frame carried a MALFORMED `tool_calls` container (present but not a
-    /// JSON array): its entries cannot be accumulated, so the batch is
-    /// ungovernable — the SSE mirror of the buffered `extract_response_tool_calls`
-    /// non-array case (round 10). Enforce cuts the stream; dry-run releases.
+    /// A frame carried a MALFORMED tool-call container (an OpenAI `tool_calls`
+    /// present but not a JSON array, an Anthropic/Cohere tool event with no
+    /// usable block index, an Anthropic `tool_use` block that seeds a
+    /// non-empty `input` the `input_json_delta` fragments cannot be appended
+    /// to, or a Google `functionCall` with no name): its entries cannot be
+    /// accumulated, so the batch is ungovernable — the SSE mirror of the
+    /// buffered `extract_response_tool_calls` non-array case (round 10).
+    /// Enforce cuts the stream; dry-run releases.
     malformed: bool,
+    /// Monotonic ordinal for [`ToolSlot::Complete`] allocation.
+    next_complete_slot: usize,
 }
 
 #[derive(Default)]
@@ -3811,7 +4017,20 @@ struct StreamingCall {
 }
 
 impl StreamingToolCallAccumulator {
+    /// Accumulate every provider streaming tool-call shape this plugin
+    /// understands from one frame. Each provider arm is independently gated on
+    /// its own discriminator, so a frame that is not that provider's is a
+    /// no-op rather than a misread.
     fn push_frame(&mut self, frame: &Value) {
+        self.push_openai_frame(frame);
+        self.push_anthropic_frame(frame);
+        self.push_cohere_frame(frame);
+        self.push_gemini_frame(frame);
+    }
+
+    /// OpenAI (and every OpenAI-compatible backend): `choices[].delta.tool_calls`
+    /// plus the legacy `choices[].delta.function_call`.
+    fn push_openai_frame(&mut self, frame: &Value) {
         let Some(choices) = frame.get("choices").and_then(Value::as_array) else {
             return;
         };
@@ -3897,6 +4116,171 @@ impl StreamingToolCallAccumulator {
                     fc.get("name"),
                     fc.get("arguments"),
                 );
+            }
+        }
+    }
+
+    /// Anthropic Messages streaming: a `content_block_start` whose
+    /// `content_block.type == "tool_use"` opens the call (name + stable id) at
+    /// the frame's content-block `index`, and each `content_block_delta` whose
+    /// `delta.type == "input_json_delta"` appends `delta.partial_json` bytes to
+    /// that same block.
+    ///
+    /// Text blocks (`text_delta`) are untouched, so ordinary prose still
+    /// streams live. An `input_json_delta` at an index that never opened a
+    /// `tool_use` block creates a never-named slot, which `finalize_checked`
+    /// reports as ungovernable — the fail-closed outcome, not a silent drop.
+    fn push_anthropic_frame(&mut self, frame: &Value) {
+        let Some(kind) = frame.get("type").and_then(Value::as_str) else {
+            return;
+        };
+        match kind {
+            "content_block_start" => {
+                let Some(block) = frame.get("content_block") else {
+                    return;
+                };
+                if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                    return;
+                }
+                let Some(index) = block_index(frame) else {
+                    self.malformed = true;
+                    return;
+                };
+                // Anthropic opens a tool_use block with an EMPTY `input` object
+                // and streams the argument bytes as `input_json_delta`
+                // fragments. A NON-empty seed object cannot be concatenated
+                // with those string fragments, so it is ungovernable rather
+                // than merged into a synthetic argument document.
+                if block
+                    .get("input")
+                    .is_some_and(|input| !input.as_object().is_some_and(|o| o.is_empty()))
+                {
+                    self.malformed = true;
+                }
+                let call_id = match block.get("id") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(id)) if !id.is_empty() => Some(id.as_str()),
+                    Some(_) => {
+                        self.malformed = true;
+                        None
+                    }
+                };
+                self.push_delta(
+                    0,
+                    ToolSlot::AnthropicBlock(index),
+                    call_id,
+                    block.get("name"),
+                    None,
+                );
+            }
+            "content_block_delta" => {
+                let Some(delta) = frame.get("delta") else {
+                    return;
+                };
+                if delta.get("type").and_then(Value::as_str) != Some("input_json_delta") {
+                    return;
+                }
+                let Some(index) = block_index(frame) else {
+                    self.malformed = true;
+                    return;
+                };
+                self.push_delta(
+                    0,
+                    ToolSlot::AnthropicBlock(index),
+                    None,
+                    None,
+                    delta.get("partial_json"),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// Cohere v2 streaming: `tool-call-start` carries
+    /// `delta.message.tool_calls.function.name` (plus the call id) and each
+    /// `tool-call-delta` appends `delta.message.tool_calls.function.arguments`
+    /// for the same event `index`.
+    fn push_cohere_frame(&mut self, frame: &Value) {
+        let Some(kind) = frame.get("type").and_then(Value::as_str) else {
+            return;
+        };
+        if kind != "tool-call-start" && kind != "tool-call-delta" {
+            return;
+        }
+        let Some(index) = block_index(frame) else {
+            self.malformed = true;
+            return;
+        };
+        let Some(tool_call) = frame
+            .get("delta")
+            .and_then(|delta| delta.get("message"))
+            .and_then(|message| message.get("tool_calls"))
+        else {
+            self.malformed = true;
+            return;
+        };
+        let function = tool_call.get("function");
+        let call_id = match tool_call.get("id") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) if !id.is_empty() => Some(id.as_str()),
+            Some(_) => {
+                self.malformed = true;
+                None
+            }
+        };
+        self.push_delta(
+            0,
+            ToolSlot::CohereIndex(index),
+            call_id,
+            function.and_then(|f| f.get("name")),
+            function.and_then(|f| f.get("arguments")),
+        );
+    }
+
+    /// Google Gemini streaming: each chunk carries WHOLE
+    /// `candidates[].content.parts[].functionCall` objects rather than
+    /// fragments, so every occurrence takes a fresh [`ToolSlot::Complete`]
+    /// ordinal and its `args` object is recorded once. A `functionCall`
+    /// without a usable name is ungovernable.
+    fn push_gemini_frame(&mut self, frame: &Value) {
+        let Some(candidates) = frame.get("candidates").and_then(Value::as_array) else {
+            return;
+        };
+        for (cpos, candidate) in candidates.iter().enumerate() {
+            let cidx = candidate
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(cpos);
+            let Some(parts) = candidate
+                .get("content")
+                .and_then(|content| content.get("parts"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for part in parts {
+                let Some(call) = gemini_function_call(part) else {
+                    continue;
+                };
+                let Some(name) = call
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                else {
+                    self.malformed = true;
+                    continue;
+                };
+                // `args` arrives as a JSON OBJECT, not the string fragments the
+                // delta providers stream. Serializing the already-parsed value
+                // is exact and cannot reintroduce duplicate members.
+                let arguments = call.get("args").map(Value::to_string).unwrap_or_default();
+                let slot = ToolSlot::Complete(self.next_complete_slot);
+                self.next_complete_slot = self.next_complete_slot.saturating_add(1);
+                let entry = self.entry(cidx, slot);
+                entry.name.push_str(name);
+                entry.arguments.push_str(&arguments);
+                entry.saw_fragment = true;
             }
         }
     }
@@ -4274,6 +4658,29 @@ impl ToolCallStreamInspector {
         }
     }
 
+    /// Stream-side mirror of
+    /// [`AiToolGovernor::write_unrecognized_shape_observation_into`].
+    fn record_unrecognized_shape_observation(&self) {
+        let Some(slot) = &self.stream_metadata else {
+            return;
+        };
+        match slot.lock() {
+            Ok(mut metadata) => {
+                AiToolGovernor::write_unrecognized_shape_observation_into(
+                    &self.engine,
+                    &mut metadata,
+                );
+            }
+            Err(poisoned) => {
+                let mut metadata = poisoned.into_inner();
+                AiToolGovernor::write_unrecognized_shape_observation_into(
+                    &self.engine,
+                    &mut metadata,
+                );
+            }
+        }
+    }
+
     /// Evaluate the accumulated tool calls at a completion boundary. On
     /// release, appends the held raw bytes to `out` and resets batch state.
     async fn finalize(&mut self, out: &mut Vec<u8>) -> Finalize {
@@ -4444,8 +4851,8 @@ impl ToolCallStreamInspector {
         let Ok(json) = serde_json::from_slice::<Value>(strip_json_bom(&body)) else {
             return ResponseStreamAction::Forward(Bytes::from(body));
         };
-        let (calls, ungovernable) = extract_response_tool_calls(&json);
-        if ungovernable {
+        let extract = extract_response_tool_calls(&json);
+        if extract.ungovernable {
             if self.engine.mode == Mode::Enforce {
                 self.record_uninspectable_metadata();
                 warn!(
@@ -4454,11 +4861,31 @@ impl ToolCallStreamInspector {
                 );
                 return self.terminate(Vec::new());
             }
-            if calls.iter().any(|call| call.args_ambiguous) {
+            if extract.args_ambiguous() {
                 self.record_ambiguity_observation();
             }
             return ResponseStreamAction::Forward(Bytes::from(body));
         }
+        // A held JSON-shaped stream that carries a live tool-call marker but
+        // yielded no extractable call was never proven call-free. Record the
+        // sanitized observation in BOTH postures, then cut in enforce (default
+        // `unknown_shape_action: deny`) or release under the documented
+        // `allow` opt-out.
+        if extract.calls.is_empty() && body_carries_tool_call_marker(&json) {
+            self.record_unrecognized_shape_observation();
+            if self.engine.unknown_shape_action == UnknownShapeAction::Deny
+                && self.engine.mode == Mode::Enforce
+            {
+                self.record_uninspectable_metadata();
+                warn!(
+                    target: "ai_tool_governor",
+                    "JSON-shaped stream carries a tool-call shape this plugin cannot read; cutting stream"
+                );
+                return self.terminate(Vec::new());
+            }
+            return ResponseStreamAction::Forward(Bytes::from(body));
+        }
+        let calls = extract.calls;
         if calls.is_empty() {
             return ResponseStreamAction::Forward(Bytes::from(body));
         }
@@ -4541,6 +4968,27 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                     if frame_has_tool_calls(&frame) {
                         self.saw_tool_calls = true;
                         self.accumulator.push_frame(&frame);
+                    } else if body_carries_tool_call_marker(&frame) {
+                        // The frame carries a live tool-call marker that none
+                        // of the provider accumulators claimed: a shape this
+                        // plugin cannot read, so forwarding it would deliver
+                        // an ungoverned call. Same posture as the ambiguous
+                        // frame — record, then cut in enforce (default
+                        // `unknown_shape_action: deny`) before any held byte
+                        // is released; release under the documented opt-out
+                        // or in dry-run.
+                        self.record_unrecognized_shape_observation();
+                        if self.engine.unknown_shape_action == UnknownShapeAction::Deny
+                            && self.engine.mode == Mode::Enforce
+                        {
+                            self.record_uninspectable_metadata();
+                            warn!(
+                                target: "ai_tool_governor",
+                                "SSE frame carries a tool-call shape this plugin cannot read; cutting stream"
+                            );
+                            self.held.clear();
+                            return self.terminate(out);
+                        }
                     }
                     // Once a governed batch is pending, hold EVERY subsequent
                     // event (not just tool-call frames) in arrival order: with
@@ -4692,6 +5140,27 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                     self.saw_tool_calls = true;
                     self.accumulator.push_frame(&frame);
                     self.held.extend_from_slice(&event);
+                }
+                // Trailing mirror of the mid-stream unreadable-shape cut: a
+                // tool-call marker no accumulator claimed must not be flushed
+                // to the client in enforce mode.
+                SseEvent::Frame(frame)
+                    if body_carries_tool_call_marker(&frame)
+                        && self.engine.unknown_shape_action == UnknownShapeAction::Deny
+                        && self.engine.mode == Mode::Enforce =>
+                {
+                    self.record_unrecognized_shape_observation();
+                    self.record_uninspectable_metadata();
+                    warn!(
+                        target: "ai_tool_governor",
+                        "trailing SSE frame carries a tool-call shape this plugin cannot read; cutting stream"
+                    );
+                    self.held.clear();
+                    return self.terminate(Vec::new());
+                }
+                SseEvent::Frame(frame) if body_carries_tool_call_marker(&frame) => {
+                    self.record_unrecognized_shape_observation();
+                    trailing = event;
                 }
                 // Same posture as the mid-stream ambiguous frame: an
                 // uninspectable trailing event must not be flushed to the
@@ -4888,22 +5357,68 @@ fn collect_finished_choices(
     acc: &StreamingToolCallAccumulator,
     finished: &mut std::collections::HashSet<usize>,
 ) {
-    let Some(choices) = frame.get("choices").and_then(Value::as_array) else {
-        return;
-    };
-    for (cpos, choice) in choices.iter().enumerate() {
-        if choice.get("finish_reason").is_none_or(|r| r.is_null()) {
-            continue;
-        }
-        let cidx = choice
-            .get("index")
-            .and_then(Value::as_u64)
-            .and_then(|v| usize::try_from(v).ok())
-            .unwrap_or(cpos);
-        if acc.has_choice(cidx) {
-            finished.insert(cidx);
+    if let Some(choices) = frame.get("choices").and_then(Value::as_array) {
+        for (cpos, choice) in choices.iter().enumerate() {
+            if choice.get("finish_reason").is_none_or(|r| r.is_null()) {
+                continue;
+            }
+            let cidx = choice
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(cpos);
+            if acc.has_choice(cidx) {
+                finished.insert(cidx);
+            }
         }
     }
+    // Google streams a per-candidate `finishReason` on the terminal chunk.
+    if let Some(candidates) = frame.get("candidates").and_then(Value::as_array) {
+        for (cpos, candidate) in candidates.iter().enumerate() {
+            let finish = candidate
+                .get("finishReason")
+                .or_else(|| candidate.get("finish_reason"));
+            if finish.is_none_or(|reason| reason.is_null()) {
+                continue;
+            }
+            let cidx = candidate
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(cpos);
+            if acc.has_choice(cidx) {
+                finished.insert(cidx);
+            }
+        }
+    }
+    // Anthropic and Cohere v2 accumulate every tool block under choice 0, and
+    // close the message with a single terminal event: Anthropic `message_stop`
+    // (or `message_delta` once `delta.stop_reason` is set), Cohere
+    // `message-end`. `content_block_stop` / `tool-call-end` are deliberately
+    // NOT boundaries — a later block in the same message would open a second
+    // batch and, with `require_approval`, a second webhook round for one turn.
+    let is_message_terminal = match frame.get("type").and_then(Value::as_str) {
+        Some("message_stop") | Some("message-end") => true,
+        Some("message_delta") => frame
+            .get("delta")
+            .and_then(|delta| delta.get("stop_reason"))
+            .is_some_and(|reason| !reason.is_null()),
+        _ => false,
+    };
+    if is_message_terminal && acc.has_choice(0) {
+        finished.insert(0);
+    }
+}
+
+/// The content-block / tool-event `index` an Anthropic or Cohere v2 streaming
+/// frame addresses. `None` when it is absent or not a usable index — callers
+/// treat that as malformed rather than guessing a slot, so two independently
+/// addressed calls can never merge into one synthetic identity.
+fn block_index(frame: &Value) -> Option<usize> {
+    frame
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
 }
 
 /// Classify a `tool_calls` container Value the ONE way this plugin decides
@@ -4953,12 +5468,20 @@ fn delta_has_tool_calls(delta: Option<&Value>) -> bool {
         .is_some_and(|fc| !fc.is_null())
 }
 
-/// Whether a streaming frame carries governed call deltas (or a malformed
-/// tool-call container that must be held and flagged ungovernable): modern
-/// `choices[].delta.tool_calls`, or the legacy `functions`-API
-/// `choices[].delta.function_call`. Frames matching this are HELD until the
-/// accumulated call clears policy.
+/// Whether a streaming frame carries governed call deltas, in ANY provider
+/// shape this plugin accumulates (or a malformed container that must be held
+/// and flagged ungovernable). Frames matching this are HELD until the
+/// accumulated call clears policy; everything else streams live.
 fn frame_has_tool_calls(frame: &Value) -> bool {
+    openai_frame_has_tool_calls(frame)
+        || anthropic_frame_has_tool_calls(frame)
+        || cohere_frame_has_tool_calls(frame)
+        || gemini_frame_has_tool_calls(frame)
+}
+
+/// OpenAI-family frame: modern `choices[].delta.tool_calls`, or the legacy
+/// `functions`-API `choices[].delta.function_call`.
+fn openai_frame_has_tool_calls(frame: &Value) -> bool {
     frame
         .get("choices")
         .and_then(Value::as_array)
@@ -4967,6 +5490,55 @@ fn frame_has_tool_calls(frame: &Value) -> bool {
                 .iter()
                 .any(|choice| delta_has_tool_calls(choice.get("delta")))
         })
+}
+
+/// Anthropic frame: a `content_block_start` opening a `tool_use` block, or a
+/// `content_block_delta` carrying an `input_json_delta`. Text blocks and
+/// `text_delta` frames are NOT held, so prose still streams live.
+fn anthropic_frame_has_tool_calls(frame: &Value) -> bool {
+    match frame.get("type").and_then(Value::as_str) {
+        Some("content_block_start") => {
+            frame
+                .get("content_block")
+                .and_then(|block| block.get("type"))
+                .and_then(Value::as_str)
+                == Some("tool_use")
+        }
+        Some("content_block_delta") => {
+            frame
+                .get("delta")
+                .and_then(|delta| delta.get("type"))
+                .and_then(Value::as_str)
+                == Some("input_json_delta")
+        }
+        _ => false,
+    }
+}
+
+/// Cohere v2 frame: a `tool-call-start` or `tool-call-delta` event.
+fn cohere_frame_has_tool_calls(frame: &Value) -> bool {
+    matches!(
+        frame.get("type").and_then(Value::as_str),
+        Some("tool-call-start") | Some("tool-call-delta")
+    )
+}
+
+/// Google frame: any `candidates[].content.parts[].functionCall` part.
+fn gemini_frame_has_tool_calls(frame: &Value) -> bool {
+    let Some(candidates) = frame.get("candidates").and_then(Value::as_array) else {
+        return false;
+    };
+    candidates.iter().any(|candidate| {
+        candidate
+            .get("content")
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|part| gemini_function_call(part).is_some())
+            })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -4986,6 +5558,11 @@ struct BufferedSseExtract {
     /// dry-run can record the fixed observation without treating generic
     /// ungovernable traffic the same way.
     ambiguous: bool,
+    /// A frame carried a live tool-call marker no provider accumulator
+    /// claimed — a tool-call shape this plugin cannot read. Distinct from
+    /// `ungovernable` so the operator-tunable `unknown_shape_action` posture
+    /// applies to it and only to it.
+    unreadable_shape: bool,
     /// First `model` a data frame reported, mirroring the live inspector's
     /// `record_frame_context` — approval webhook/cache keys must carry the
     /// served model even when request metadata is absent.
@@ -5019,6 +5596,7 @@ impl BufferedSseBatches {
                 calls: Vec::new(),
                 ungovernable: false,
                 ambiguous: false,
+                unreadable_shape: false,
                 model: None,
                 provider: None,
             },
@@ -5063,6 +5641,11 @@ impl BufferedSseBatches {
                 if frame_has_tool_calls(&frame) {
                     self.saw_tool_calls = true;
                     self.acc.push_frame(&frame);
+                } else if body_carries_tool_call_marker(&frame) {
+                    // Buffered mirror of the live inspector's
+                    // unreadable-shape cut: a tool-call marker no provider
+                    // accumulator claimed cannot be extracted from.
+                    self.extract.unreadable_shape = true;
                 }
                 collect_finished_choices(&frame, &self.acc, &mut self.finished);
                 // Every choice holding tool-call deltas has finished: the
@@ -5150,28 +5733,186 @@ fn tool_call_from(name: &str, args: Option<&Value>) -> ToolCall {
     }
 }
 
-/// Extract `choices[].message.tool_calls[]` and legacy
-/// `choices[].message.function_call` from a buffered response.
+/// Tool calls extracted from a buffered provider response, plus the
+/// governability signal every caller needs.
+struct ResponseToolCallExtract {
+    calls: Vec<ToolCall>,
+    /// A tool call was present that cannot be policy-checked (missing or
+    /// non-string name, a malformed container, or duplicate-member argument
+    /// bytes). Callers fail closed in enforce mode and forward in dry-run.
+    ungovernable: bool,
+}
+
+impl ResponseToolCallExtract {
+    fn empty() -> Self {
+        Self {
+            calls: Vec::new(),
+            ungovernable: false,
+        }
+    }
+
+    /// Record one governable call, or mark the batch ungovernable when the
+    /// provider entry carries no checkable name. Policy is keyed by name, so a
+    /// nameless entry must be SURFACED rather than silently dropped — the one
+    /// choke point every provider arm below goes through, so none of them can
+    /// drift back into dropping calls.
+    fn push_named(&mut self, name: Option<&str>, args: Option<&Value>) {
+        match name.filter(|name| !name.is_empty()) {
+            Some(name) => self.calls.push(tool_call_from(name, args)),
+            None => self.ungovernable = true,
+        }
+    }
+
+    /// Whether any extracted call carried duplicate-member argument bytes, so
+    /// callers can pick the ambiguity-specific fixed reason.
+    fn args_ambiguous(&self) -> bool {
+        self.calls.iter().any(|call| call.args_ambiguous)
+    }
+}
+
+/// JSON member names that name a tool/function call in every provider dialect
+/// this gateway proxies, in both the snake_case and camelCase spellings the
+/// various JSON mappings emit.
+const TOOL_CALL_MARKER_KEYS: &[&str] = &[
+    "tool_calls",
+    "toolCalls",
+    "tool_call",
+    "toolCall",
+    "tool_use",
+    "toolUse",
+    "function_call",
+    "functionCall",
+    "function_calls",
+    "functionCalls",
+];
+
+/// `"type"` discriminator values that tag a block as a tool/function call.
+/// Matched exactly, so OpenAI's `function_call_output` input item (and other
+/// prefixed relatives) are not claimed.
+const TOOL_CALL_MARKER_TYPES: &[&str] = &["tool_use", "toolUse", "function_call", "tool-call"];
+
+/// Node budget for [`body_carries_tool_call_marker`]. The body is already
+/// bounded by [`MAX_PARSE_BYTES`], so a real provider response never
+/// approaches this; exhausting it means the scan could not prove the body
+/// carries no tool call, which is an ungovernable outcome rather than an
+/// allow.
+const TOOL_MARKER_SCAN_MAX_NODES: u32 = 250_000;
+
+/// Whether `json` carries a live tool-call marker ANYWHERE in the document.
 ///
-/// Returns `(calls, ungovernable)`, bringing the buffered path to parity with
-/// [`extract_sse_tool_calls`] / the streaming accumulator: an entry that
-/// cannot be policy-checked — a missing or non-string `function.name` (or a
-/// `tool_calls` container that is not an array) — must be SURFACED rather
-/// than silently dropped, or an all-unnamed `tool_calls[]` would yield
-/// `calls.is_empty()` and slide past even `default_action: deny`. Callers
-/// fail closed in enforce mode and forward in dry-run, exactly like the
-/// streaming finalizer. Two deliberate divergences from streaming:
-/// - Non-string `function.arguments` are GOVERNABLE here: the buffered value
-///   is fully available, so `tool_call_from` evaluates (and the redaction
+/// This is the fail-closed backstop for provider shapes the extractors below
+/// do not read: paired with "and no call was extracted", a marker means the
+/// tool surface was present but unreadable, so `calls.is_empty()` is an
+/// extraction FAILURE rather than proof the response carries no tool call.
+/// Scoping the unknown-shape posture to a positive marker (instead of "any AI
+/// response whose envelope is unfamiliar") is what keeps embeddings,
+/// moderations, image, and plain-text completion responses — which have no
+/// tool surface at all — out of enforce-mode rejection.
+///
+/// Empty and `null` containers (`"tool_calls": []`, `"tool_calls": null`) are
+/// the documented "no calls" shapes and are NOT markers. The walk is iterative
+/// with an explicit stack (no recursion on backend-controlled nesting) and
+/// bounded by [`TOOL_MARKER_SCAN_MAX_NODES`].
+fn body_carries_tool_call_marker(json: &Value) -> bool {
+    let mut stack: Vec<&Value> = vec![json];
+    let mut budget = TOOL_MARKER_SCAN_MAX_NODES;
+    while let Some(value) = stack.pop() {
+        if budget == 0 {
+            // Could not finish the scan: cannot prove the absence of a tool
+            // call, so report one (fail closed) rather than allow.
+            return true;
+        }
+        budget -= 1;
+        match value {
+            Value::Object(map) => {
+                let tagged = map
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| TOOL_CALL_MARKER_TYPES.contains(&kind));
+                if tagged {
+                    return true;
+                }
+                for (key, child) in map {
+                    let named = TOOL_CALL_MARKER_KEYS.contains(&key.as_str());
+                    if named && tool_call_marker_is_live(child) {
+                        return true;
+                    }
+                    stack.push(child);
+                }
+            }
+            Value::Array(items) => stack.extend(items.iter()),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether a tool-call marker member actually carries a call. `null`, an empty
+/// array, and an empty object are the provider "no calls" shapes.
+fn tool_call_marker_is_live(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+        // A scalar under a tool-call key is malformed rather than empty; the
+        // per-provider extractors already classify it, and reporting a marker
+        // here keeps the two from disagreeing.
+        _ => true,
+    }
+}
+
+/// Extract every buffered provider tool-call shape this plugin understands.
+///
+/// Supported envelopes (all screened in one pass, because a response
+/// transformer can leave more than one of them in a single body):
+/// - **OpenAI Chat Completions** — `choices[].message.tool_calls[]` and the
+///   legacy `choices[].message.function_call`.
+/// - **OpenAI Responses** — `output[]` items of `type: "function_call"`.
+/// - **Anthropic Messages** — `content[]` blocks of `type: "tool_use"`.
+/// - **Amazon Bedrock Converse** — `output.message.content[].toolUse`.
+/// - **Google Gemini** — `candidates[].content.parts[].functionCall`.
+/// - **Cohere v2 chat** — `message.tool_calls[].function`.
+///
+/// Returns [`ResponseToolCallExtract`], bringing every provider path to the
+/// same parity the OpenAI path already had with [`extract_sse_tool_calls`] /
+/// the streaming accumulator: an entry that cannot be policy-checked — a
+/// missing or non-string name, or a container that is not an array — must be
+/// SURFACED rather than silently dropped, or an all-unnamed batch would yield
+/// `calls.is_empty()` and slide past even `default_action: deny`. Callers fail
+/// closed in enforce mode and forward in dry-run, exactly like the streaming
+/// finalizer. Two deliberate divergences from streaming:
+/// - Non-string argument payloads are GOVERNABLE here: the buffered value is
+///   fully available, so `tool_call_from` evaluates (and the redaction
 ///   transform rewrites) the concrete JSON — unlike streaming, where
 ///   non-string argument deltas are never accumulated and thus uncheckable.
-/// - A `null` `tool_calls` / `function_call` is the documented "no calls"
-///   shape (OpenAI emits it on content-only responses), NOT ungovernable.
-fn extract_response_tool_calls(json: &Value) -> (Vec<ToolCall>, bool) {
-    let mut out = Vec::new();
-    let mut ungovernable = false;
+///   This is also why Anthropic `input` / Gemini `args` / Bedrock `input`
+///   objects are governable without normalization.
+/// - A `null` `tool_calls` / `function_call` / `content` is the documented
+///   "no calls" shape (OpenAI emits it on content-only responses), NOT
+///   ungovernable.
+fn extract_response_tool_calls(json: &Value) -> ResponseToolCallExtract {
+    let mut extract = ResponseToolCallExtract::empty();
+    extract_openai_chat_tool_calls(json, &mut extract);
+    extract_openai_responses_tool_calls(json, &mut extract);
+    extract_anthropic_tool_calls(json, &mut extract);
+    extract_bedrock_tool_calls(json, &mut extract);
+    extract_gemini_tool_calls(json, &mut extract);
+    extract_cohere_tool_calls(json, &mut extract);
+    // A `function.arguments` JSON STRING whose content carries duplicate object
+    // member names is a second document the enclosing body screen could not see
+    // into. It is checkable in form but not in meaning, so it joins the
+    // ungovernable class rather than being evaluated on a last-wins collapse
+    // the client's parser may not share (advisory `GHSA-c78j-5w9p-cpq6`).
+    extract.ungovernable |= extract.args_ambiguous();
+    extract
+}
+
+/// OpenAI Chat Completions: `choices[].message.tool_calls[]` plus the legacy
+/// `choices[].message.function_call`. Mistral and every OpenAI-compatible
+/// backend use this shape.
+fn extract_openai_chat_tool_calls(json: &Value, extract: &mut ResponseToolCallExtract) {
     let Some(choices) = json.get("choices").and_then(Value::as_array) else {
-        return (out, false);
+        return;
     };
     for choice in choices {
         let Some(message) = choice.get("message") else {
@@ -5181,67 +5922,303 @@ fn extract_response_tool_calls(json: &Value) -> (Vec<ToolCall>, bool) {
         match classify_tool_calls_container(message.get("tool_calls")) {
             ToolCallsContainer::Array(tool_calls) => {
                 for tc in tool_calls {
-                    let function = tc.get("function");
-                    match function.and_then(|f| f.get("name")).and_then(Value::as_str) {
-                        Some(name) if !name.is_empty() => {
-                            out.push(tool_call_from(
-                                name,
-                                function.and_then(|f| f.get("arguments")),
-                            ));
-                        }
-                        // Arguments/id without a checkable `function.name`:
-                        // policy is keyed by name, so this call cannot be
-                        // evaluated and must not vanish from the batch.
-                        Some(_) | None => ungovernable = true,
-                    }
+                    extract_openai_function_entry(tc.get("function"), extract);
                 }
             }
             // Absent or explicitly-null: no tool calls for this choice.
             ToolCallsContainer::None => {}
             // `tool_calls` present but not an array: not a checkable shape.
-            ToolCallsContainer::Malformed => ungovernable = true,
+            ToolCallsContainer::Malformed => extract.ungovernable = true,
         }
         match message.get("function_call") {
             Some(Value::Null) | None => {}
-            Some(function_call) => match function_call.get("name").and_then(Value::as_str) {
-                Some(name) if !name.is_empty() => {
-                    out.push(tool_call_from(name, function_call.get("arguments")));
-                }
-                Some(_) | None => ungovernable = true,
-            },
+            Some(function_call) => {
+                let name = function_call.get("name").and_then(Value::as_str);
+                extract.push_named(name, function_call.get("arguments"));
+            }
         }
     }
-    // A `function.arguments` JSON STRING whose content carries duplicate object
-    // member names is a second document the enclosing body screen could not see
-    // into. It is checkable in form but not in meaning, so it joins the
-    // ungovernable class rather than being evaluated on a last-wins collapse
-    // the client's parser may not share (advisory `GHSA-c78j-5w9p-cpq6`).
-    ungovernable |= out.iter().any(|call| call.args_ambiguous);
-    (out, ungovernable)
 }
 
-/// Extract tool definition names from a request's `tools[]` / `functions[]`.
-fn extract_request_tool_definitions(json: &Value) -> Vec<String> {
-    let mut names = Vec::new();
-    if let Some(tools) = json.get("tools").and_then(Value::as_array) {
-        for tool in tools {
-            if let Some(name) = tool
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
-            {
-                names.push(name.to_string());
+/// One `{"function": {"name": …, "arguments": …}}` entry, shared by the OpenAI
+/// and Cohere v2 buffered containers. A missing `function` object is itself an
+/// unnamed entry and therefore ungovernable, not a skip.
+fn extract_openai_function_entry(function: Option<&Value>, extract: &mut ResponseToolCallExtract) {
+    let name = function.and_then(|f| f.get("name")).and_then(Value::as_str);
+    extract.push_named(name, function.and_then(|f| f.get("arguments")));
+}
+
+/// OpenAI Responses API: `output[]` items of `type: "function_call"` carrying
+/// `name` plus an `arguments` JSON string. Bedrock Converse also uses a
+/// top-level `output`, but as an OBJECT — the array check keeps the two apart.
+fn extract_openai_responses_tool_calls(json: &Value, extract: &mut ResponseToolCallExtract) {
+    let Some(output) = json.get("output").and_then(Value::as_array) else {
+        return;
+    };
+    for item in output {
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            continue;
+        }
+        let name = item.get("name").and_then(Value::as_str);
+        extract.push_named(name, item.get("arguments"));
+    }
+}
+
+/// Anthropic Messages: `content[]` blocks of `type: "tool_use"` carrying `name`
+/// plus an `input` OBJECT (not a JSON string).
+///
+/// Claimed when the body carries the `type: "message"` / `role: "assistant"`
+/// envelope discriminators Anthropic always sends, OR when the `content` array
+/// itself holds a `tool_use` block. The second condition matters: without it a
+/// `tool_use` block under a rewritten envelope would extract nothing and only
+/// reach the fail-closed marker backstop, when it can simply be governed. An
+/// unrelated REST body whose `content` array holds no `tool_use` block is
+/// never claimed.
+fn extract_anthropic_tool_calls(json: &Value, extract: &mut ResponseToolCallExtract) {
+    let envelope = json.get("type").and_then(Value::as_str) == Some("message")
+        || json.get("role").and_then(Value::as_str) == Some("assistant");
+    match json.get("content") {
+        Some(Value::Array(blocks)) => {
+            let holds_tool_use = blocks
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
+            if envelope || holds_tool_use {
+                extract_tool_use_blocks(blocks, "tool_use", "input", extract);
             }
         }
+        // Present, non-null, and not an array under an Anthropic envelope: an
+        // unreadable container that could hide a `tool_use` block. A `content`
+        // STRING is Anthropic's plain-text convenience shape and carries none.
+        Some(value) if envelope && !value.is_null() && !value.is_string() => {
+            extract.ungovernable = true;
+        }
+        _ => {}
     }
-    if let Some(functions) = json.get("functions").and_then(Value::as_array) {
-        for function in functions {
-            if let Some(name) = function.get("name").and_then(Value::as_str) {
-                names.push(name.to_string());
-            }
+}
+
+/// Amazon Bedrock Converse: `output.message.content[]` blocks carrying a
+/// `toolUse` object (`{toolUseId, name, input}`).
+fn extract_bedrock_tool_calls(json: &Value, extract: &mut ResponseToolCallExtract) {
+    let Some(message) = json
+        .get("output")
+        .filter(|output| output.is_object())
+        .and_then(|output| output.get("message"))
+    else {
+        return;
+    };
+    match message.get("content") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(blocks)) => extract_tool_use_blocks(blocks, "toolUse", "input", extract),
+        // Present, non-null, and not an array: an unreadable container that
+        // could hide a `toolUse` block.
+        Some(_) => extract.ungovernable = true,
+    }
+}
+
+/// Shared block walker for the two `content[]`-of-blocks providers.
+///
+/// `marker` selects the block discriminator: Anthropic tags the block itself
+/// with `{"type": "tool_use", "name": …}` while Bedrock nests the call under a
+/// `{"toolUse": {"name": …}}` key. `args_key` names the argument object inside
+/// the resolved block.
+fn extract_tool_use_blocks(
+    blocks: &[Value],
+    marker: &str,
+    args_key: &str,
+    extract: &mut ResponseToolCallExtract,
+) {
+    for block in blocks {
+        let call = if block.get("type").and_then(Value::as_str) == Some(marker) {
+            block
+        } else if let Some(nested) = block.get(marker) {
+            nested
+        } else {
+            continue;
+        };
+        let name = call.get("name").and_then(Value::as_str);
+        extract.push_named(name, call.get(args_key));
+    }
+}
+
+/// Google Gemini / Vertex: `candidates[].content.parts[].functionCall`
+/// (`{name, args}`). The `function_call` spelling is accepted alongside the
+/// canonical camelCase one because the protobuf-JSON mapping emits both.
+fn extract_gemini_tool_calls(json: &Value, extract: &mut ResponseToolCallExtract) {
+    let Some(candidates) = json.get("candidates").and_then(Value::as_array) else {
+        return;
+    };
+    for candidate in candidates {
+        let Some(parts) = candidate
+            .get("content")
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for part in parts {
+            let Some(call) = gemini_function_call(part) else {
+                continue;
+            };
+            let name = call.get("name").and_then(Value::as_str);
+            extract.push_named(name, call.get("args"));
         }
     }
-    names
+}
+
+/// The `functionCall` object of a Gemini content part, under either JSON
+/// spelling. Shared by the buffered extractor and the streaming accumulator.
+fn gemini_function_call(part: &Value) -> Option<&Value> {
+    part.get("functionCall")
+        .or_else(|| part.get("function_call"))
+        .filter(|call| call.is_object())
+}
+
+/// Cohere v2 `/v2/chat`: a top-level `message` object carrying
+/// `tool_calls[].function.{name, arguments}` (arguments is a JSON string, as
+/// in the OpenAI shape).
+fn extract_cohere_tool_calls(json: &Value, extract: &mut ResponseToolCallExtract) {
+    let Some(message) = json.get("message").filter(|message| message.is_object()) else {
+        return;
+    };
+    // Only an assistant message envelope — never an arbitrary `message` object
+    // on an unrelated REST body.
+    let assistant = message.get("role").and_then(Value::as_str).is_some()
+        || message.get("tool_calls").is_some();
+    if !assistant {
+        return;
+    }
+    match classify_tool_calls_container(message.get("tool_calls")) {
+        ToolCallsContainer::Array(tool_calls) => {
+            for tc in tool_calls {
+                extract_openai_function_entry(tc.get("function"), extract);
+            }
+        }
+        ToolCallsContainer::None => {}
+        ToolCallsContainer::Malformed => extract.ungovernable = true,
+    }
+}
+
+/// Tool definition names extracted from a request body, plus the ungovernable
+/// channel the response extractor already had.
+struct RequestToolDefinitionExtract {
+    names: Vec<String>,
+    /// A definition entry was present that no known provider shape can name,
+    /// so it cannot be checked against the `tools` policy map. Enforce mode
+    /// fails closed; dry-run records and forwards.
+    ungovernable: bool,
+}
+
+impl RequestToolDefinitionExtract {
+    /// Record one definition name, or mark the request ungovernable when the
+    /// entry carries no checkable name.
+    fn push_named(&mut self, name: Option<&str>) {
+        match name.filter(|name| !name.is_empty()) {
+            Some(name) => self.names.push(name.to_string()),
+            None => self.ungovernable = true,
+        }
+    }
+}
+
+/// Extract tool definition names a request exposes to the model, across every
+/// provider shape this gateway proxies:
+/// - **OpenAI / Mistral / Cohere v2** — `tools[].function.name`, and the legacy
+///   `functions[].name`.
+/// - **Anthropic** — `tools[].name` (alongside `input_schema`), including the
+///   server-tool entries that carry both `type` and `name`.
+/// - **Google Gemini** — `tools[].functionDeclarations[].name` (the
+///   `function_declarations` spelling is accepted too).
+/// - **Amazon Bedrock Converse** — `toolConfig.tools[].toolSpec.name`, and a
+///   bare `tools[].toolSpec.name`.
+///
+/// A provider BUILT-IN entry that carries a `type` but no name of its own
+/// (OpenAI Responses `{"type": "code_interpreter"}` and friends) is governed
+/// under its `type` rather than treated as unreadable: those are real
+/// capabilities an operator wants in the `tools` policy map, and refusing them
+/// outright would reject legitimate traffic. Only an entry that yields no name
+/// under ANY of these rules is ungovernable.
+fn extract_request_tool_definitions(json: &Value) -> RequestToolDefinitionExtract {
+    let mut extract = RequestToolDefinitionExtract {
+        names: Vec::new(),
+        ungovernable: false,
+    };
+    collect_tool_definition_container(json.get("tools"), &mut extract);
+    // Bedrock Converse nests the same definitions under `toolConfig`.
+    let bedrock = json
+        .get("toolConfig")
+        .and_then(|config| config.get("tools"));
+    collect_tool_definition_container(bedrock, &mut extract);
+    match json.get("functions") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(functions)) => {
+            for function in functions {
+                extract.push_named(function.get("name").and_then(Value::as_str));
+            }
+        }
+        // Present but not an array: an unreadable container that could hide a
+        // disallowed definition.
+        Some(_) => extract.ungovernable = true,
+    }
+    extract
+}
+
+/// Walk one `tools[]`-shaped container, preserving the absent / empty /
+/// unreadable distinction.
+fn collect_tool_definition_container(
+    container: Option<&Value>,
+    extract: &mut RequestToolDefinitionExtract,
+) {
+    match container {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(tools)) => {
+            for tool in tools {
+                collect_tool_definition_names(tool, extract);
+            }
+        }
+        Some(_) => extract.ungovernable = true,
+    }
+}
+
+/// Resolve one `tools[]` entry to the policy name(s) it exposes, across the
+/// provider shapes documented on [`extract_request_tool_definitions`].
+fn collect_tool_definition_names(tool: &Value, extract: &mut RequestToolDefinitionExtract) {
+    // OpenAI / Mistral / Cohere: `{"type": "function", "function": {"name": …}}`.
+    if let Some(function) = tool.get("function") {
+        extract.push_named(function.get("name").and_then(Value::as_str));
+        return;
+    }
+    // Bedrock Converse: `{"toolSpec": {"name": …, "inputSchema": …}}`.
+    if let Some(spec) = tool.get("toolSpec") {
+        extract.push_named(spec.get("name").and_then(Value::as_str));
+        return;
+    }
+    // Google Gemini: `{"functionDeclarations": [{"name": …}, …]}`.
+    if let Some(declarations) = tool
+        .get("functionDeclarations")
+        .or_else(|| tool.get("function_declarations"))
+    {
+        match declarations.as_array() {
+            Some(declarations) => {
+                for declaration in declarations {
+                    extract.push_named(declaration.get("name").and_then(Value::as_str));
+                }
+            }
+            None => extract.ungovernable = true,
+        }
+        return;
+    }
+    // Anthropic client tools and server tools: a bare `name`.
+    if tool.get("name").is_some() {
+        extract.push_named(tool.get("name").and_then(Value::as_str));
+        return;
+    }
+    // Provider built-in with no name of its own: govern it under its `type`.
+    // `type: "function"` is excluded — that shape MUST carry `function.name`,
+    // and reaching here means the name was missing.
+    let kind = tool.get("type").and_then(Value::as_str);
+    match kind.filter(|kind| !kind.is_empty() && *kind != "function") {
+        Some(kind) => extract.names.push(kind.to_string()),
+        None => extract.ungovernable = true,
+    }
 }
 
 enum McpToolCallExtraction {

@@ -129,10 +129,17 @@
 //! folded `%2F`/`%252F` into `/` for route lookup. Folding *changes* structure,
 //! so the router and a non-decoding backend could still disagree; this module
 //! rejects those targets instead and runs strictly earlier. The router helper
-//! is retained as an unreachable defense-in-depth residual for callers that do
-//! not come through the frontend boundary (mesh authz normalization, backend
-//! listen-path stripping). It is not a competing model: after canonicalization
-//! it is always the identity function.
+//! is retained only for backend listen-path stripping, which needs the router's
+//! own offset coordinate system. It is not a competing model: after
+//! canonicalization it is always the identity function.
+//!
+//! Mesh authorization (`src/plugins/mesh/authz.rs`) used to fold through the
+//! router helper before evaluating Istio `paths:` / `notPaths:`. Folding closed
+//! only the encoded-slash half of issue #1701 and left `.`/`..` untouched
+//! (issue #4149), so it now re-runs [`canonicalize_policy_path`] instead:
+//! identity — and allocation-free — on every target the boundary admits, and a
+//! fail-closed `403` on anything that somehow reaches `authorize` without
+//! having passed it.
 
 use std::borrow::Cow;
 
