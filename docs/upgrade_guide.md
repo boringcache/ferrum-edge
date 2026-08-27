@@ -99,6 +99,7 @@ forms that older builds could tolerate:
 - HTTP/2 or HTTP/3 requests whose `Host` header disagrees with `:authority`
 - unbracketed IPv6 literals in `Host` or `:authority`; use `[2001:db8::1]` form
 - TLS or DTLS clients that do not complete the frontend handshake within `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` (default 10s)
+- HTTP/1.1-or-HTTP/2 clients that complete TCP accept (or the frontend TLS handshake) and then never deliver a request head within `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` (default 10s). This covers the version sniff and an HTTP/2 SETTINGS/header exchange that never reaches the service. Idle HTTP/2 keep-alive *after* the first request is unchanged.
 
 During staged validation, scan access/error logs for unexpected 400s or frontend
 TLS/DTLS handshake timeout warnings. Legacy clients that emit these malformed
