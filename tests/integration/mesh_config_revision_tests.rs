@@ -1359,12 +1359,15 @@ fn whitespace_only_envelope_authority_is_malformed_not_absent() {
     .expect("raw-empty envelope with absent slice remains unrevisioned");
 }
 
-/// Full-load revision stamping is scope-domained (issue #2473):
-/// - Explicit Single/Set: max of scoped namespace cursors (same domain incremental
-///   polling advances). An unrelated namespace's global sequence must not make a
-///   restarted replica jump ahead of its identical running peer.
-/// - All: store-global high-water mark so a deleted namespace cannot rewind a
-///   restarted CP. In-process floor is preserved for both.
+/// Full-load revision stamping is scope-domained (issue #2473 / #4130):
+/// - Explicit Single/Set: saturating sum of scoped namespace cursors (same
+///   domain incremental polling advances). An unrelated namespace's global
+///   sequence must not make a restarted replica jump ahead of its identical
+///   running peer. Sum (not max) stays strictly monotonic when any scoped
+///   namespace advances under per-namespace sequence locks.
+/// - All: store-wide sum of per-namespace high-water marks so a deleted
+///   namespace cannot rewind a restarted CP. In-process floor is preserved
+///   for both.
 #[test]
 fn explicit_scope_full_load_sequence_ignores_unrelated_global_high_water() {
     use ferrum_edge::grpc::cp_server::CpScope;
@@ -1388,8 +1391,8 @@ fn explicit_scope_full_load_sequence_ignores_unrelated_global_high_water() {
     set_scoped.insert("beta".to_string(), 12);
     assert_eq!(
         set.mesh_full_load_sequence(&set_scoped, store_global, 0),
-        12,
-        "Set-scope full load uses max of explicit namespace cursors only"
+        22,
+        "Set-scope full load uses the sum of explicit namespace cursors only"
     );
 
     // All-scope retains the store-global watermark when discovery shrinks.

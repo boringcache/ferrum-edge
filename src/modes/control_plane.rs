@@ -1125,12 +1125,14 @@ async fn load_full_config_multi_with_sequence(
     // only boundaries whose corresponding snapshots actually refreshed.
     sequences.retain(|namespace, _| outcome.refreshed_namespaces.contains(namespace));
 
-    // Sequence domain is scope-dependent (issue #2473):
-    // - Explicit Single/Set: max of the same per-namespace durable cursors
-    //   incremental polling advances from, so an unrelated namespace cannot make
-    //   a restarted replica jump ahead of its identical running peer.
-    // - All: store-global high-water mark, so a namespace that disappears after
-    //   its last resource is deleted cannot rewind a restarted CP.
+    // Sequence domain is scope-dependent (issue #2473 / #4130):
+    // - Explicit Single/Set: saturating sum of the same per-namespace durable
+    //   cursors incremental polling advances from, so an unrelated namespace
+    //   cannot make a restarted replica jump ahead of its identical running peer.
+    // - All: store-wide sum of per-namespace high-water marks, so a namespace
+    //   that disappears after its last resource is deleted cannot rewind a
+    //   restarted CP, and a write in one namespace still advances the stamp
+    //   when another namespace already holds a higher auto-increment id.
     // The in-process floor is applied only after those safe captures and acts
     // solely as a monotonic lower bound while the process is alive.
     let mesh_sequence = if mesh_authority.is_some() {
@@ -1296,6 +1298,7 @@ pub(crate) struct PartitionComposeOutcome {
 pub(crate) fn cas_publish_incremental_partitions(
     config_arc: &ArcSwap<GatewayConfig>,
     partitions: &HashMap<String, IncrementalResult>,
+    last_change_sequences: &HashMap<String, u64>,
 ) -> PartitionComposeOutcome {
     let mut old_config = config_arc.load();
     loop {
@@ -1309,19 +1312,25 @@ pub(crate) fn cas_publish_incremental_partitions(
         // a rejected far-future partition must not advance the published
         // watermark past content the CP never accepted.
         //
+        // Issue #4130: per-namespace sequence locks mean a newly committed
+        // cursor in one namespace can be lower than another namespace's
+        // already-published id. Replace that namespace's previous contribution
+        // in the published sum rather than taking max of the accepted cursors.
+        //
         // Issue #3611: `advance_change_log_sequence` refuses a Kubernetes-domain
         // revision. A K8s-controller CP's mesh block comes wholly from the K8s
         // overlay, so a database change cursor describes none of it and must
         // never move its sequence — in either direction.
         if let Some(current_revision) = old_config.mesh_revision.as_ref() {
             let mut revision = current_revision.clone();
-            let accepted_sequence = outcome
-                .accepted
-                .values()
-                .map(|delta| delta.sequence_cursor)
-                .max()
-                .unwrap_or(0);
-            revision.advance_change_log_sequence(accepted_sequence);
+            let mut mesh_sequence = current_revision.sequence;
+            for (namespace, delta) in &outcome.accepted {
+                let previous = last_change_sequences.get(namespace).copied().unwrap_or(0);
+                mesh_sequence = mesh_sequence
+                    .saturating_sub(previous)
+                    .saturating_add(delta.sequence_cursor);
+            }
+            revision.advance_change_log_sequence(mesh_sequence);
             outcome.config.mesh_revision = Some(revision);
         }
         let new_config = Arc::new(outcome.config.clone());
@@ -1573,9 +1582,11 @@ pub(crate) fn publish_cp_incremental(
     cp_scope: &CpScope,
     mesh_update_tx: &tokio::sync::broadcast::Sender<crate::grpc::mesh_server::MeshConfigBroadcast>,
     mesh_registry: &crate::grpc::mesh_registry::MeshNodeRegistry,
+    last_change_sequences: &HashMap<String, u64>,
 ) -> PartitionComposeOutcome {
     publication_gate.publish(|| {
-        let outcome = cas_publish_incremental_partitions(config_arc, partitions);
+        let outcome =
+            cas_publish_incremental_partitions(config_arc, partitions, last_change_sequences);
         if outcome.accepted.is_empty() {
             return outcome;
         }
@@ -3368,6 +3379,7 @@ pub async fn run(
                                     &poll_scope,
                                     &mesh_update_tx,
                                     &mesh_registry_poll,
+                                    &last_change_sequences,
                                 );
 
                                 // Warn-only validators (same set as

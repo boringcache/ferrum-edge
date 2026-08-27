@@ -1,8 +1,9 @@
-//! Functional coverage for the HTTP/1 header-read timeout.
+//! Functional coverage for the HTTP header-read / pre-request admission timeout.
 //!
 //! `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` protects the HTTP proxy listener
-//! from clients that open a connection and then drip-feed request headers.
-//! Setting it to `0` intentionally disables the guard.
+//! from clients that open a connection and then drip-feed request headers, and
+//! (issue #4152) from peers that never leave the H1-vs-H2 version sniff or an
+//! HTTP/2 SETTINGS exchange. Setting it to `0` intentionally disables the guard.
 
 use crate::common::{TestGateway, TestGatewayBuilder};
 
@@ -69,6 +70,83 @@ async fn functional_header_read_timeout_zero_allows_delayed_http1_headers() {
         "backend response body should be delivered; response={response:?}"
     );
     assert_backend_hits(&backend_hits, 1).await;
+
+    gateway.shutdown();
+    backend_task.abort();
+}
+
+/// A peer that completes TCP accept and sends nothing must be closed. Hyper's
+/// HTTP/1 timer never starts because the connection has not been classified.
+#[ignore]
+#[tokio::test]
+async fn functional_header_read_timeout_closes_silent_tcp_connection() {
+    let (backend_port, backend_hits, backend_task) = spawn_header_backend().await;
+    let mut gateway = timeout_gateway_builder(backend_port, "1")
+        .spawn()
+        .await
+        .expect("start silent-connection gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(5))
+        .await
+        .expect("proxy port ready");
+
+    let mut stream = TcpStream::connect(("127.0.0.1", gateway.proxy_port))
+        .await
+        .expect("connect proxy");
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
+    match read {
+        Ok(Ok(0)) => {}
+        Ok(Err(e))
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            ) => {}
+        other => panic!("silent TCP peer must be closed within the deadline, got {other:?}"),
+    }
+    assert_backend_hits(&backend_hits, 0).await;
+
+    gateway.shutdown();
+    backend_task.abort();
+}
+
+/// h2c preface + SETTINGS with no request: the HTTP/2 window HTTP/1
+/// `header_read_timeout` cannot see.
+#[ignore]
+#[tokio::test]
+async fn functional_header_read_timeout_closes_h2c_without_request() {
+    let (backend_port, backend_hits, backend_task) = spawn_header_backend().await;
+    let mut gateway = timeout_gateway_builder(backend_port, "1")
+        .spawn()
+        .await
+        .expect("start h2c-admission gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(5))
+        .await
+        .expect("proxy port ready");
+
+    let mut stream = TcpStream::connect(("127.0.0.1", gateway.proxy_port))
+        .await
+        .expect("connect proxy");
+    // Client connection preface plus an empty SETTINGS frame.
+    let mut opening = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    opening.extend_from_slice(&[0, 0, 0, 0x4, 0, 0, 0, 0, 0]);
+    stream.write_all(&opening).await.expect("write h2c preface");
+    let _ = stream.flush().await;
+
+    let mut buf = Vec::new();
+    let drain = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf));
+    // The TIMEOUT is the assertion: the gateway must close the connection inside
+    // the window. Whether the drain then reports a clean EOF or a reset is
+    // immaterial — both mean closed — so the inner io result is discarded
+    // deliberately rather than unwrapped, which would make the test brittle
+    // against a RST.
+    let _ = drain
+        .await
+        .expect("an h2c connection that sends no request must be closed");
+    assert_backend_hits(&backend_hits, 0).await;
 
     gateway.shutdown();
     backend_task.abort();
