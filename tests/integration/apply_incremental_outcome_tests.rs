@@ -33,6 +33,8 @@ use ferrum_edge::plugins::{PluginResult, ProxyProtocol, REQUEST_ID_METADATA_KEY,
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 use tempfile::TempDir;
 
+use crate::scaffolding::ports::{BIND_DROP_SPAWN_ATTEMPTS, reserve_port};
+
 const COUNTRY_MMDB_B64: &str = include_str!("../fixtures/maxmind/GeoIP2-Country-Test.mmdb.b64");
 
 fn country_mmdb_bytes() -> Vec<u8> {
@@ -2651,6 +2653,76 @@ async fn relay_round_trip(proxy_port: u16) -> Vec<u8> {
     buf
 }
 
+/// Start a TCP+TLS stream proxy, re-reserving a **fresh** frontend port and
+/// rebuilding `Proxy` / `GatewayConfig` / `ProxyState` on every attempt.
+///
+/// `drop_and_take_port` cannot stay held: `initial_reconcile_stream_listeners`
+/// binds its own socket. Reusing a stolen number loses the same race. Returns
+/// the port that actually bound so later `relay_round_trip` dials it.
+async fn start_tls_stream_proxy_with_retry(
+    backend_port: u16,
+    ca_a_path: &std::path::Path,
+) -> (ProxyState, Upstream, u16) {
+    let mut last_port = 0u16;
+    let mut last_error = String::from("no stream listener error recorded");
+    for attempt in 1..=BIND_DROP_SPAWN_ATTEMPTS {
+        let frontend = reserve_port().await.expect("reserve frontend port");
+        let proxy_port = frontend.drop_and_take_port();
+        last_port = proxy_port;
+
+        let mut upstream = test_upstream("u-tls", "127.0.0.1", backend_port);
+        upstream.backend_tls_verify_server_cert = true;
+        upstream.backend_tls_server_ca_cert_path =
+            Some(ca_a_path.to_str().expect("utf-8 temp path").to_string());
+
+        let mut proxy = test_proxy("p-tcp-tls", "/unused");
+        proxy.listen_path = None;
+        proxy.listen_port = Some(proxy_port);
+        proxy.backend_scheme = Some(BackendScheme::Tcps);
+        proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcps);
+        proxy.upstream_id = Some("u-tls".to_string());
+
+        let mut config = GatewayConfig {
+            proxies: vec![proxy],
+            upstreams: vec![upstream.clone()],
+            loaded_at: Utc::now(),
+            ..GatewayConfig::default()
+        };
+        config.normalize_fields();
+        let state = proxy_state_with_config(config);
+
+        match state.initial_reconcile_stream_listeners().await {
+            Ok(()) => {
+                if let Err(error) = state
+                    .stream_listener_manager
+                    .wait_until_started(std::time::Duration::from_secs(5))
+                    .await
+                {
+                    last_error = format!(
+                        "attempt {attempt}/{BIND_DROP_SPAWN_ATTEMPTS} on {proxy_port}: \
+                         stream listener did not start: {error}"
+                    );
+                    eprintln!("{last_error}");
+                    state.stream_listener_manager.shutdown_all().await;
+                    continue;
+                }
+                return (state, upstream, proxy_port);
+            }
+            Err(error) => {
+                last_error = format!(
+                    "attempt {attempt}/{BIND_DROP_SPAWN_ATTEMPTS} on {proxy_port}: {error}"
+                );
+                eprintln!("{last_error}");
+                state.stream_listener_manager.shutdown_all().await;
+            }
+        }
+    }
+    panic!(
+        "initial stream listener reconcile failed after {BIND_DROP_SPAWN_ATTEMPTS} \
+         fresh-port attempts; last port {last_port}: {last_error}"
+    );
+}
+
 /// Regression test: an UPSTREAM-only TLS change must trigger stream listener
 /// reconcile through `apply_incremental`.
 ///
@@ -2688,43 +2760,13 @@ async fn apply_incremental_upstream_only_tls_change_reconciles_stream_listeners(
         .port();
     let _echo = spawn_tls_echo_server(backend_listener, &leaf_cert_pem, &leaf_key_pem);
 
-    // Frontend: ephemeral port for the stream proxy.
-    let front = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("probe frontend port");
-    let proxy_port = front.local_addr().expect("frontend local addr").port();
-    drop(front);
-
-    let mut upstream = test_upstream("u-tls", "127.0.0.1", backend_port);
-    upstream.backend_tls_verify_server_cert = true;
-    upstream.backend_tls_server_ca_cert_path =
-        Some(ca_a_path.to_str().expect("utf-8 temp path").to_string());
-
-    let mut proxy = test_proxy("p-tcp-tls", "/unused");
-    proxy.listen_path = None;
-    proxy.listen_port = Some(proxy_port);
-    proxy.backend_scheme = Some(BackendScheme::Tcps);
-    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcps);
-    proxy.upstream_id = Some("u-tls".to_string());
-
-    let mut config = GatewayConfig {
-        proxies: vec![proxy],
-        upstreams: vec![upstream.clone()],
-        loaded_at: Utc::now(),
-        ..GatewayConfig::default()
-    };
-    config.normalize_fields();
-    let state = proxy_state_with_config(config);
-
-    state
-        .initial_reconcile_stream_listeners()
-        .await
-        .expect("initial stream listener reconcile");
-    state
-        .stream_listener_manager
-        .wait_until_started(std::time::Duration::from_secs(5))
-        .await
-        .expect("stream listener should bind");
+    // Frontend: `drop_and_take_port` cannot stay held —
+    // `initial_reconcile_stream_listeners` binds its own socket. Retry with a
+    // fresh port so a parallel steal does not panic on the first collision.
+    // The helper returns the port that actually bound; `relay_round_trip`
+    // must dial that number, not the stolen reservation.
+    let (state, upstream, proxy_port) =
+        start_tls_stream_proxy_with_retry(backend_port, &ca_a_path).await;
 
     // With trust pinned to CA-A, the backend handshake (CA-B cert) fails and
     // the relay closes without echoing.
