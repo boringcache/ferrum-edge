@@ -972,6 +972,13 @@ fn insert_node_source_ip(ips: &mut NodeSourceIps, var_name: &str, raw: &str) -> 
     }
 }
 
+fn pod_uses_host_network(pod: &Pod) -> bool {
+    pod.spec
+        .as_ref()
+        .and_then(|spec| spec.host_network)
+        .unwrap_or(false)
+}
+
 fn pod_probe_ports_from_spec(spec: Option<&PodSpec>) -> Vec<u16> {
     let Some(spec) = spec else {
         return Vec::new();
@@ -3651,6 +3658,7 @@ fn apply_cni_add_from_pod(
         inbound_redirect_ports,
         pod_pid: None,
         veth_iface_override: None,
+        host_network: pod_uses_host_network(pod),
     };
     handle_pod_added(backend, pod_states, config, metrics, &event);
     // Surface the UID that was actually inserted into `pod_states` (the
@@ -4483,6 +4491,7 @@ fn handle_kube_pod_applied(
         inbound_redirect_ports,
         pod_pid: None,
         veth_iface_override: None,
+        host_network: pod_uses_host_network(pod),
     };
     handle_pod_added(backend, pod_states, config, metrics, &event);
     Some(pod_uid)
@@ -4519,6 +4528,9 @@ pub struct PodEvent<'a> {
     /// considered enrolled, without needing a real pod PID or a Linux kernel
     /// under test.
     pub veth_iface_override: Option<&'a str>,
+    /// Kubernetes `spec.hostNetwork`. Host-network pods share the node's netns
+    /// and are never enrolled for cgroup-keyed capture.
+    pub host_network: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4562,6 +4574,7 @@ struct RetryablePodEnrollment {
     node_probe_ports: Vec<u16>,
     inbound_redirect_ports: Vec<u16>,
     pod_pid: Option<u32>,
+    host_network: bool,
 }
 
 impl RetryablePodEnrollment {
@@ -4578,6 +4591,7 @@ impl RetryablePodEnrollment {
             node_probe_ports: event.node_probe_ports.clone(),
             inbound_redirect_ports: event.inbound_redirect_ports.clone(),
             pod_pid: event.pod_pid,
+            host_network: event.host_network,
         }
     }
 
@@ -4599,6 +4613,7 @@ impl RetryablePodEnrollment {
             pod_pid: self.pod_pid,
             // Production always re-resolves the veth on retry (see struct docs).
             veth_iface_override: None,
+            host_network: self.host_network,
         }
     }
 }
@@ -7235,16 +7250,32 @@ fn handle_pod_added_inner(
         event.annotations,
         namespace,
         &config.excluded_namespaces,
+        event.host_network,
     );
     if decision != EnrollmentDecision::Enroll {
         // Leaving the mesh is a removal transition even while the pod/netns is
         // still live. Route tracked and failed-untracked enrollments through
         // the same evidence-based cleanup and durable close handoff.
         handle_pod_removed(backend, pod_states, config, metrics, pod_uid);
-        debug!(
-            pod_uid,
-            pod_name, namespace, "Pod does not meet enrollment criteria"
-        );
+        match decision {
+            EnrollmentDecision::SkipHostNetwork => {
+                warn!(
+                    pod_uid,
+                    pod_name,
+                    namespace,
+                    "Node-agent skipping enrollment for pod with spec.hostNetwork=true: \
+                     the pod shares the node's network namespace, so cgroup-keyed capture \
+                     and per-pod veth tc attachment cannot be scoped safely; leaving the \
+                     pod uncaptured"
+                );
+            }
+            _ => {
+                debug!(
+                    pod_uid,
+                    pod_name, namespace, "Pod does not meet enrollment criteria"
+                );
+            }
+        }
         return;
     }
 
@@ -10708,6 +10739,7 @@ mod tests {
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
+            host_network: false,
         }
     }
 
@@ -11381,6 +11413,7 @@ mod tests {
                 inbound_redirect_ports: ports,
                 pod_pid: None,
                 veth_iface_override: Some("veth-mock"),
+                host_network: false,
             };
             handle_pod_added(backend, &pod_states, &config, &metrics, &event);
         };
@@ -11465,6 +11498,7 @@ mod tests {
                 inbound_redirect_ports: ports,
                 pod_pid: None,
                 veth_iface_override: Some("veth-mock"),
+                host_network: false,
             };
             handle_pod_added(backend, &pod_states, &config, &metrics, &event);
         };
@@ -11516,6 +11550,7 @@ mod tests {
                 inbound_redirect_ports: ports,
                 pod_pid: None,
                 veth_iface_override: Some("veth-mock"),
+                host_network: false,
             };
             handle_pod_added(backend, &pod_states, &config, &metrics, &event);
         };
@@ -12593,6 +12628,7 @@ mod tests {
                 node_probe_ports: Vec::new(),
                 inbound_redirect_ports: Vec::new(),
                 pod_pid: None,
+                host_network: false,
             },
             &failed_cleanup_state,
         );
@@ -12714,6 +12750,7 @@ mod tests {
                 node_probe_ports: Vec::new(),
                 inbound_redirect_ports: Vec::new(),
                 pod_pid: None,
+                host_network: false,
             },
             &failed_cleanup_state,
         );
@@ -12951,6 +12988,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-test"),
+            host_network: false,
         };
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
         assert!(pod_states.contains_key(pod_uid));
@@ -13092,6 +13130,7 @@ mod tests {
                 node_probe_ports: Vec::new(),
                 inbound_redirect_ports: Vec::new(),
                 pod_pid: None,
+                host_network: false,
             },
         );
 
@@ -13596,6 +13635,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -14147,6 +14187,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -14211,6 +14252,7 @@ mod tests {
                 inbound_redirect_ports: Vec::new(),
                 pod_pid: None,
                 veth_iface_override: Some("veth-udp"),
+                host_network: false,
             };
 
             handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -14276,6 +14318,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-udp"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -14325,6 +14368,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -14401,6 +14445,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -14462,6 +14507,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -14551,6 +14597,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(
@@ -14630,6 +14677,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some(veth),
+            host_network: false,
         };
         let connect4_count = |b: &MockEbpfBackend| {
             b.cgroup_attachments
@@ -14768,6 +14816,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -14842,6 +14891,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         // Initial enrollment writes the pod inode + container1's leaf inode.
@@ -14918,6 +14968,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -15001,6 +15052,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -15078,6 +15130,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         // Enrollment: the pod-root write fails, the container write succeeds.
@@ -15131,6 +15184,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -15171,6 +15225,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -15211,6 +15266,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: Some(4242),
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         let snapshot = RetryablePodEnrollment::from_event(&event);
@@ -15283,6 +15339,7 @@ mod tests {
             // None mirrors production and the retry snapshot; veth resolves via
             // the override guard above.
             veth_iface_override: None,
+            host_network: false,
         };
 
         // First enrollment fails transiently at attach_tc.
@@ -15425,6 +15482,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-new"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -15486,6 +15544,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -15548,6 +15607,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -15621,6 +15681,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -15691,6 +15752,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -15770,6 +15832,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -16032,6 +16095,7 @@ mod tests {
                 inbound_redirect_ports: Vec::new(),
                 pod_pid: None,
                 veth_iface_override: None,
+                host_network: false,
             };
             handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
         };
@@ -16143,6 +16207,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: None,
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -16189,6 +16254,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -16244,6 +16310,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -16306,6 +16373,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-test"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -16345,6 +16413,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -18578,6 +18647,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -18651,6 +18721,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-new"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -18742,6 +18813,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -18812,6 +18884,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -19432,6 +19505,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-a"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -19901,6 +19975,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -19969,6 +20044,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -20039,6 +20115,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         // Initial enrollment: only the pod inode is present.
@@ -20107,6 +20184,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -20162,6 +20240,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -20216,6 +20295,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -20265,6 +20345,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         };
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
@@ -20331,6 +20412,7 @@ mod tests {
             inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
+            host_network: false,
         }
     }
 

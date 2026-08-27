@@ -67,6 +67,29 @@ Watcher-loop exit is classified deliberately: an operator-requested shutdown sti
 | Subsequent `Apply` for an already-tracked pod | Pod metadata, label, or annotation update; status/condition change; container restart | Re-evaluate enrollment criteria (opt-in/opt-out labels and annotations), reconcile pod IP, **diff the parsed `includeOutboundPorts` policy** against the stashed baseline. Identical policy is a structural no-op (no BPF syscalls). A changed policy re-programs `FERRUM_INCLUDE_PORTS` for that pod's cgroup id; removed annotation drops the entry. Opt-in→opt-out flip triggers un-enrollment, opt-out→opt-in triggers enrollment. |
 | `Delete` | Pod deletion | Detach BPF programs, remove `FERRUM_POD_IPS` / `FERRUM_POD_IPS6` and `FERRUM_INCLUDE_PORTS` entries. Counts toward `ferrum_node_agent_pods_unenrolled_total`. |
 
+### Host-Network Pods Are Never Enrolled
+
+A pod with `spec.hostNetwork: true` shares the **node's** network namespace. The node-agent therefore **skips enrollment unconditionally**, matching the injector's host-networking refusal ([docs/mesh.md](mesh.md#host-network-pods-are-never-injected)):
+
+- Capture is cgroup-keyed and attaches tc classifiers on each enrolled pod's **host-side veth**. A host-network pod has no pod-scoped network namespace and no distinct veth to scope rules against.
+- Such pods skip CNI ADD entirely (same as the node-agent DaemonSet itself), so the enrollment path cannot rely on a sandbox netns or veth discovery.
+- The Ambient UDP producer already refuses to install pod UDP rules when the resolved netns is the host/proxy namespace; skipping at enrollment avoids retry churn on a target that can never succeed.
+
+The skip is evaluated **before** the opt-in gate, so neither `ferrum.io/inject: "true"` nor `ferrum.io/mesh: enabled` can enroll a host-network pod. (An explicit opt-out is still honored first; it reaches the same skip.)
+
+Because the skip is invisible from the workload's point of view, it is logged. Each skipped pod emits one structured `WARN` naming the pod UID, name, and namespace:
+
+```
+WARN Node-agent skipping enrollment for pod with spec.hostNetwork=true: the pod shares
+     the node's network namespace, so cgroup-keyed capture and per-pod veth tc
+     attachment cannot be scoped safely; leaving the pod uncaptured
+     pod_uid=… pod_name=kube-proxy-abcde namespace=payments
+```
+
+Ordinary opt-out / not-selected skips stay at `debug!` — they are the steady-state outcome for most pods the watcher sees. Only the node-safety skip is logged at `WARN`.
+
+To mesh a workload that currently requests `hostNetwork`, move it to a pod network namespace; there is no annotation that overrides this guard.
+
 Mid-life update guarantees:
 
 - **Diff-skip:** comparison is against the parsed, sorted, deduplicated `IncludePortsPolicy`, not the raw annotation string. Reordering ports in the annotation is a no-op. Modified events from unrelated pod activity (image pulls, status updates) cost only the diff compare.

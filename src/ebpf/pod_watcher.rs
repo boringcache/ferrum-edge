@@ -16,7 +16,11 @@ use crate::util::mesh_enrollment::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnrollmentDecision {
     Enroll,
+    /// Ordinary steady-state skip (opt-out, excluded namespace, no opt-in, …).
     Skip,
+    /// `spec.hostNetwork: true` — shares the node's network namespace, so
+    /// per-pod capture cannot be scoped safely. Logged at the call site.
+    SkipHostNetwork,
 }
 
 /// Default namespaces excluded from enrollment.
@@ -30,11 +34,13 @@ pub const DEFAULT_EXCLUDED_NAMESPACES: &[&str] = &["kube-system", "kube-public",
 ///   The value is checked explicitly so `ferrum.io/injected: "false"` does not
 ///   skip an otherwise eligible pod.
 /// - Not in excluded namespaces
+/// - Does NOT have `spec.hostNetwork: true` (shares the node's netns)
 pub fn evaluate_enrollment(
     labels: &std::collections::HashMap<String, String>,
     annotations: &std::collections::HashMap<String, String>,
     namespace: &str,
     excluded_namespaces: &HashSet<String>,
+    host_network: bool,
 ) -> EnrollmentDecision {
     if excluded_namespaces.contains(namespace) {
         return EnrollmentDecision::Skip;
@@ -56,6 +62,16 @@ pub fn evaluate_enrollment(
         .is_some_and(|v| v == "true")
     {
         return EnrollmentDecision::Skip;
+    }
+
+    // Evaluated before the opt-in gate so neither `ferrum.io/inject: "true"`
+    // nor `ferrum.io/mesh: enabled` can enroll a host-network pod. Capture is
+    // cgroup-keyed and attaches tc on the pod's host-side veth; a host-network
+    // pod has no pod-scoped netns or veth, and the Ambient UDP producer already
+    // refuses the host netns at runtime — skip here rather than retry until veth
+    // discovery fails.
+    if host_network {
+        return EnrollmentDecision::SkipHostNetwork;
     }
 
     let has_mesh_label = mesh_label_opts_in(labels.get("ferrum.io/mesh").map(String::as_str));
@@ -108,7 +124,7 @@ mod tests {
         let labels = make_labels(&[("ferrum.io/mesh", "enabled")]);
         let annotations = HashMap::new();
         assert_eq!(
-            evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+            evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
             EnrollmentDecision::Enroll
         );
     }
@@ -118,7 +134,7 @@ mod tests {
         let labels = HashMap::new();
         let annotations = make_labels(&[("ferrum.io/inject", "true")]);
         assert_eq!(
-            evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+            evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
             EnrollmentDecision::Enroll
         );
     }
@@ -128,7 +144,7 @@ mod tests {
         let labels = make_labels(&[("ferrum.io/mesh", "enabled")]);
         let annotations = make_labels(&[("ferrum.io/injected", "true")]);
         assert_eq!(
-            evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+            evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
             EnrollmentDecision::Skip
         );
     }
@@ -141,7 +157,7 @@ mod tests {
         let labels = make_labels(&[("ferrum.io/mesh", "enabled")]);
         let annotations = make_labels(&[("ferrum.io/injected", "false")]);
         assert_eq!(
-            evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+            evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
             EnrollmentDecision::Enroll
         );
     }
@@ -151,7 +167,13 @@ mod tests {
         let labels = make_labels(&[("ferrum.io/mesh", "enabled")]);
         let annotations = HashMap::new();
         assert_eq!(
-            evaluate_enrollment(&labels, &annotations, "kube-system", &default_excluded()),
+            evaluate_enrollment(
+                &labels,
+                &annotations,
+                "kube-system",
+                &default_excluded(),
+                false
+            ),
             EnrollmentDecision::Skip
         );
     }
@@ -161,7 +183,7 @@ mod tests {
         let labels = make_labels(&[("ferrum.io/mesh", "disabled")]);
         let annotations = HashMap::new();
         assert_eq!(
-            evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+            evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
             EnrollmentDecision::Skip
         );
     }
@@ -171,7 +193,7 @@ mod tests {
         let labels = HashMap::new();
         let annotations = make_labels(&[("ferrum.io/inject", "false")]);
         assert_eq!(
-            evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+            evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
             EnrollmentDecision::Skip
         );
     }
@@ -182,7 +204,7 @@ mod tests {
             let labels = HashMap::new();
             let annotations = make_labels(&[("ferrum.io/inject", value)]);
             assert_eq!(
-                evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+                evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
                 EnrollmentDecision::Skip,
                 "ferrum.io/inject={value:?} must skip enrollment"
             );
@@ -195,7 +217,7 @@ mod tests {
             let labels = HashMap::new();
             let annotations = make_labels(&[("ferrum.io/inject", value)]);
             assert_eq!(
-                evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+                evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
                 EnrollmentDecision::Enroll,
                 "ferrum.io/inject={value:?} must enroll"
             );
@@ -208,7 +230,7 @@ mod tests {
             let labels = make_labels(&[("ferrum.io/mesh", value)]);
             let annotations = HashMap::new();
             assert_eq!(
-                evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+                evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
                 EnrollmentDecision::Skip,
                 "ferrum.io/mesh={value:?} must skip enrollment"
             );
@@ -221,7 +243,7 @@ mod tests {
             let labels = make_labels(&[("ferrum.io/mesh", value)]);
             let annotations = HashMap::new();
             assert_eq!(
-                evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+                evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
                 EnrollmentDecision::Enroll,
                 "ferrum.io/mesh={value:?} must enroll"
             );
@@ -233,7 +255,7 @@ mod tests {
         let labels = make_labels(&[("ferrum.io/mesh", "maybe")]);
         let annotations = HashMap::new();
         assert_eq!(
-            evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+            evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
             EnrollmentDecision::Skip
         );
     }
@@ -243,7 +265,7 @@ mod tests {
         let labels = HashMap::new();
         let annotations = make_labels(&[("ferrum.io/inject", "disabled")]);
         assert_eq!(
-            evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+            evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
             EnrollmentDecision::Skip
         );
     }
@@ -253,8 +275,38 @@ mod tests {
         let labels = HashMap::new();
         let annotations = HashMap::new();
         assert_eq!(
-            evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+            evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
             EnrollmentDecision::Skip
+        );
+    }
+
+    #[test]
+    fn skip_host_network_pod_even_with_mesh_label() {
+        let labels = make_labels(&[("ferrum.io/mesh", "enabled")]);
+        let annotations = HashMap::new();
+        assert_eq!(
+            evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), true),
+            EnrollmentDecision::SkipHostNetwork
+        );
+    }
+
+    #[test]
+    fn skip_host_network_pod_even_with_inject_annotation() {
+        let labels = HashMap::new();
+        let annotations = make_labels(&[("ferrum.io/inject", "true")]);
+        assert_eq!(
+            evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), true),
+            EnrollmentDecision::SkipHostNetwork
+        );
+    }
+
+    #[test]
+    fn enroll_pod_without_host_network() {
+        let labels = make_labels(&[("ferrum.io/mesh", "enabled")]);
+        let annotations = HashMap::new();
+        assert_eq!(
+            evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
+            EnrollmentDecision::Enroll
         );
     }
 

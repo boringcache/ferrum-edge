@@ -891,6 +891,13 @@ pub fn pod_event_from_request<'a>(
         // declared ports moments later. Fail-closed by construction: an
         // unscoped pod is never flagged for redirect.
         inbound_redirect_ports: Vec::new(),
+        // Not a guess: kubelet does not invoke the CNI plugin for a
+        // `hostNetwork: true` pod, because there is no pod network namespace to
+        // configure. Receiving an ADD therefore implies the pod has its own
+        // netns. The production path re-derives this from the real pod spec
+        // (`pod_uses_host_network`) once the kube-rs watcher reconciles, so a
+        // host-network pod that somehow reached here is skipped there.
+        host_network: false,
         pod_pid: None,
         veth_iface_override: None,
     }
