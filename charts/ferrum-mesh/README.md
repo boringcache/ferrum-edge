@@ -3,7 +3,17 @@
 Deploys Ferrum Edge service-mesh components: control plane, sidecar injector,
 east-west gateway, mesh CA, ambient/node-agent DaemonSets, and optional
 observability assets. Core gateway modes (`database`, `file`, `cp`, `dp`) belong
-in the sibling [`ferrum-gateway`](../ferrum-gateway) chart.
+in the sibling [`ferrum-gateway`](../ferrum-gateway) chart — the two charts share
+naming, labelling, secret, and validation conventions.
+
+| Component | Values key | Default | Notes |
+|-----------|------------|---------|-------|
+| Control plane | `controlPlane.enabled` | `false` | Requires DB + JWT secrets |
+| Injector webhook | `injector.enabled` | `false` | Requires TLS Secret |
+| East-west gateway | `eastWest.enabled` | `false` | Cross-cluster SNI passthrough |
+| Mesh CA | `ca.enabled` | `false` | Fixed one replica in template |
+| Ambient proxy | `ambient.enabled` | `false` | Requires `nodeAgent.enabled` |
+| Node agent | `nodeAgent.enabled` | `false` | eBPF capture manager |
 
 Example value overlays live under [`examples/`](examples/).
 
@@ -37,19 +47,6 @@ Workloads in other namespaces still receive admission calls; opt-in/out behavior
 is unchanged (`requireAnnotation`, pod annotations, and `ferrum.io/injection`
 labels). Extend `injector.namespaceSelector` for platform namespaces such as
 `gke-managed-system` or `openshift-*` before enabling broader injection.
-in the sibling [`ferrum-gateway`](../ferrum-gateway) chart — the two charts share
-naming, labelling, secret, and validation conventions.
-
-| Component | Values key | Default | Notes |
-|-----------|------------|---------|-------|
-| Control plane | `controlPlane.enabled` | `false` | Requires DB + JWT secrets |
-| Injector webhook | `injector.enabled` | `false` | Requires TLS Secret |
-| East-west gateway | `eastWest.enabled` | `false` | Cross-cluster SNI passthrough |
-| Mesh CA | `ca.enabled` | `false` | Fixed one replica in template |
-| Ambient proxy | `ambient.enabled` | `false` | Requires `nodeAgent.enabled` |
-| Node agent | `nodeAgent.enabled` | `false` | eBPF capture manager |
-
-Example value overlays live under [`examples/`](examples/).
 
 ## High availability and disruption
 
