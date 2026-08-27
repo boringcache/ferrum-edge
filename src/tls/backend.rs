@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,7 +44,13 @@ pub enum TlsError {
     Rustls(String),
 }
 
-/// Shared cache for backend rustls client configs keyed by connection identity.
+/// Shared cache for backend rustls client configs keyed by TLS identity.
+///
+/// Keys carry CA, client cert/key, SNI, SAN digest, verify flag, and SVID
+/// generation — not `backend_host` / `backend_port`. The built `ClientConfig`
+/// does not depend on the dial target (SNI is supplied at connect time), so
+/// keying by endpoint would retain a duplicate trust store per pod IP under
+/// EDS/mesh churn.
 ///
 /// Reusing the same `Arc<ClientConfig>` lets protocol pools share rustls'
 /// in-memory session resumption state across new backend connections instead
@@ -86,6 +93,30 @@ impl BackendTlsConfigCache {
 
     pub fn clear(&self) {
         self.configs.clear();
+    }
+
+    /// Keep only configs whose keys are in `live`.
+    ///
+    /// Called from config publication (cold path) so withdrawn TLS identities
+    /// cannot accumulate for the process lifetime. Live identities are
+    /// retained; the request path never scans this map.
+    pub fn retain_keys(&self, live: &HashSet<String>) {
+        self.configs.retain(|key, _| live.contains(key));
+    }
+
+    #[allow(dead_code)] // exercised from unit tests
+    pub fn len(&self) -> usize {
+        self.configs.len()
+    }
+
+    #[allow(dead_code)] // exercised from unit tests
+    pub fn is_empty(&self) -> bool {
+        self.configs.is_empty()
+    }
+
+    #[allow(dead_code)] // exercised from unit tests
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.configs.contains_key(key)
     }
 
     /// Build or retrieve a cached `ClientConfig` for `key`. Callers MUST have
@@ -301,6 +332,48 @@ pub fn append_backend_tls_pool_key_fields(
     buf.push('|');
     buf.push(if verify_server_cert { '1' } else { '0' });
     append_backend_svid_generation_key_field(buf, svid_generation);
+}
+
+/// Cache key for a reusable backend rustls `ClientConfig`.
+///
+/// Unlike connection-pool keys, this excludes `backend_host`, `backend_port`,
+/// `dns_override`, subset, and H2 stream caps: `build_rustls` reads only
+/// trust/client material, SNI, SAN allow-list, and the verify flag.
+pub fn backend_tls_config_cache_key(
+    tls: &BackendTlsConfig,
+    client_cert_path: Option<&str>,
+    client_key_path: Option<&str>,
+    verify_server_cert: bool,
+    svid_generation: Option<u64>,
+) -> String {
+    let mut buf = String::with_capacity(64);
+    append_backend_tls_pool_key_fields(
+        &mut buf,
+        tls,
+        client_cert_path,
+        client_key_path,
+        verify_server_cert,
+        svid_generation,
+    );
+    buf
+}
+
+/// Write the `host|port|` prefix used to reclaim per-endpoint pool side maps.
+pub fn write_backend_host_port_prefix(buf: &mut String, host: &str, port: u16) {
+    use std::fmt::Write;
+    buf.clear();
+    append_pool_key_component(buf, host);
+    let _ = write!(buf, "|{port}|");
+}
+
+/// `host|port|` prefix of a connection-pool key.
+///
+/// Used on the config-reload cold path to drop `rr_counters` for withdrawn
+/// endpoints without reconstructing every TLS/subset field of the full key.
+pub fn pool_key_host_port_prefix(key: &str) -> Option<&str> {
+    let first = key.find('|')?;
+    let second_rel = key[first + 1..].find('|')?;
+    Some(&key[..first + 1 + second_rel + 1])
 }
 
 /// Return the TLS server name used for backend handshakes.

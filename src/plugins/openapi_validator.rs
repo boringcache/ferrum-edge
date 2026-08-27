@@ -81,6 +81,8 @@ const XML_ATTRIBUTE_ELEMENT_CONFLICT_DETAIL: &str =
     "XML attribute and element sharing a local name cannot be represented unambiguously";
 const XML_NAMESPACE_CONFLICT_DETAIL: &str =
     "XML elements sharing a local name across namespaces cannot be represented unambiguously";
+const XML_COMMENT_IN_VALUE_DETAIL: &str =
+    "XML element contains a comment inside its character data";
 /// Fixed-cardinality multipart / scalar conversion diagnostics. Neither the
 /// rejected value nor the payload-chosen part name is interpolated.
 const MULTIPART_DISPOSITION_TYPE_DETAIL: &str =
@@ -2725,15 +2727,13 @@ fn xml_node_to_value(
                 }
             }
         }
-        if node.children().any(|child| {
-            child.is_text() && child.text().is_some_and(|text| !text.trim().is_empty())
-        }) {
+        if xml_mixed_content_text(node)?.is_some() {
             return Err("XML object contains unmodeled text content".to_string());
         }
         return Ok(Value::Object(out));
     }
-    let text = node.text().unwrap_or("").trim();
-    scalar_to_schema_value(text, schema, conversion)
+    let text = xml_scalar_element_text(node)?;
+    scalar_to_schema_value(&text, schema, conversion)
 }
 
 fn xml_array_values(
@@ -2827,6 +2827,52 @@ fn xml_array_item_name<'a>(
     )
 }
 
+/// Concatenate every direct text child of `node` in document order.
+///
+/// `roxmltree::Node::text()` returns only the first text run, and only when the
+/// first child IS text; an XML comment splits character data into separate runs
+/// while a backend that drops comments concatenates them. Both spellings are
+/// dangerous — `<qty>1<!--x-->000</qty>` reads as `1`, and
+/// `<qty><!--x-->1000</qty>` reads as nothing at all — so an element carrying a
+/// comment ALONGSIDE character data is refused rather than validated on a value
+/// the backend would not read.
+///
+/// A comment that merely sits BETWEEN child elements
+/// (`<order><!-- hint --><qty>3</qty></order>`) splits no character data and is
+/// accepted: rejecting it would refuse ordinary annotated documents. Only
+/// non-whitespace character data makes a comment dangerous, so the incidental
+/// whitespace around a pretty-printed comment is not itself a rejection.
+fn xml_direct_text_children(node: roxmltree::Node<'_, '_>) -> Result<String, String> {
+    let mut text = String::new();
+    let mut saw_comment = false;
+    for child in node.children() {
+        if child.is_text() {
+            if let Some(chunk) = child.text() {
+                text.push_str(chunk);
+            }
+            continue;
+        }
+        if child.is_comment() {
+            saw_comment = true;
+        }
+    }
+    if saw_comment && !text.trim().is_empty() {
+        return Err(XML_COMMENT_IN_VALUE_DETAIL.to_string());
+    }
+    Ok(text)
+}
+
+/// Trimmed character data of a pure-scalar XML element (no child elements).
+fn xml_scalar_element_text(node: roxmltree::Node<'_, '_>) -> Result<String, String> {
+    Ok(xml_direct_text_children(node)?.trim().to_string())
+}
+
+/// Trimmed `#text` for mixed-content elements that also carry child elements.
+fn xml_mixed_content_text(node: roxmltree::Node<'_, '_>) -> Result<Option<String>, String> {
+    let trimmed = xml_direct_text_children(node)?.trim().to_string();
+    Ok((!trimmed.is_empty()).then_some(trimmed))
+}
+
 fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>) -> Result<Value, String> {
     let mut out = serde_json::Map::new();
     let mut attribute_locals = HashSet::new();
@@ -2847,7 +2893,7 @@ fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>) -> Result<Value, Str
         .filter(roxmltree::Node::is_element)
         .collect();
     if children.is_empty() {
-        let text = node.text().unwrap_or("").trim().to_string();
+        let text = xml_scalar_element_text(node)?;
         if out.is_empty() {
             return Ok(Value::String(text));
         }
@@ -2882,10 +2928,8 @@ fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>) -> Result<Value, Str
             }
         }
     }
-    if let Some(text) = node.text().map(str::trim)
-        && !text.is_empty()
-    {
-        out.insert("#text".to_string(), Value::String(text.to_string()));
+    if let Some(text) = xml_mixed_content_text(node)? {
+        out.insert("#text".to_string(), Value::String(text));
     }
     Ok(Value::Object(out))
 }

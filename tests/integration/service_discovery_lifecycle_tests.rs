@@ -184,6 +184,7 @@ impl ScriptedDiscoverer {
         }
     }
 
+    #[cfg(panic = "unwind")]
     fn panicking(panic_until_call: u64) -> Self {
         Self {
             panic_until_call,
@@ -192,6 +193,7 @@ impl ScriptedDiscoverer {
     }
 
     /// Always panics, but only after `panic_delay`.
+    #[cfg(panic = "unwind")]
     fn panicking_slowly(panic_delay: std::time::Duration) -> Self {
         Self {
             panic_until_call: u64::MAX,
@@ -363,8 +365,9 @@ async fn reconcile_stops_only_the_removed_upstream() {
     manager.stop();
 }
 
-// ── #3721: supervision ────────────────────────────────────────────────
+// ── #3721: supervision (unwind-only panic recovery; issue #4166) ──────
 
+#[cfg(panic = "unwind")]
 #[tokio::test]
 async fn a_panicking_poller_is_restarted_and_recovers() {
     let _guard = isolated().await;
@@ -475,6 +478,7 @@ async fn a_clean_cancel_is_not_counted_as_a_crash() {
     );
 }
 
+#[cfg(panic = "unwind")]
 #[tokio::test]
 async fn a_superseded_generation_neither_restarts_nor_publishes() {
     let _guard = isolated().await;
@@ -1791,6 +1795,7 @@ async fn wait_for_deadline_action(
     wait_for_progress(predicate).await
 }
 
+#[cfg(panic = "unwind")]
 #[tokio::test]
 async fn a_crash_looping_poller_still_expires_and_withdraws_during_restart_backoff() {
     let _guard = isolated().await;

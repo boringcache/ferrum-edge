@@ -462,16 +462,24 @@ fn schema_compat_marker_cannot_collide_with_tenant_namespaces() {
 }
 
 #[test]
-fn namespace_rename_simple_tables_cover_live_resources_and_exclude_audit_history() {
-    // In-place SQL rename rewrites live resource rows. Historical audit
-    // evidence is immutable and must keep the namespace recorded at event time.
+fn namespace_rename_simple_tables_move_audit_history_with_tenant() {
+    // In-place SQL rename rewrites live resource rows and the authorization-
+    // scoping audit_events.namespace column so an old namespace name cannot
+    // expose the renamed tenant's events. namespace_at_event is a different
+    // column and is not part of this rewrite.
     assert_eq!(
         NAMESPACE_RENAME_SIMPLE_TABLES,
-        &["proxies", "plugin_configs", "upstreams", "api_specs"]
+        &[
+            "proxies",
+            "plugin_configs",
+            "upstreams",
+            "api_specs",
+            "audit_events",
+        ]
     );
     assert!(
-        !NAMESPACE_RENAME_SIMPLE_TABLES.contains(&"audit_events"),
-        "audit_events must not be rewritten on rename"
+        NAMESPACE_RENAME_SIMPLE_TABLES.contains(&"audit_events"),
+        "audit_events must follow a renamed tenant"
     );
     for live in ["proxies", "plugin_configs", "upstreams", "api_specs"] {
         assert!(

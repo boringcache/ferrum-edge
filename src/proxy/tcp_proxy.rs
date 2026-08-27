@@ -2004,6 +2004,7 @@ fn classify_tcp_accept_peer_exit(
                 ))
             }
         }
+        #[cfg(panic = "unwind")]
         Err(join_err) if join_err.is_panic() => TcpAcceptPeerExit::Failed(anyhow::anyhow!(
             "TCP accept loop {class} panicked: {join_err}"
         )),
@@ -3668,12 +3669,11 @@ async fn handle_tcp_connection_inner(
             is_half_open_probe: false,
         };
 
-        // Honor DestinationRule per-port `connect_timeout_ms` overrides on the
-        // L4/TCP path. The override is keyed by destination port and lives on
-        // the proxy's pre-computed `dispatch_port_overrides` map — single
-        // field read, no DashMap/ArcSwap traversal. Pre-port DR
-        // connectTimeouts for TCP services (e.g. MySQL on 3306 with a
-        // tighter budget than the proxy default) now flow into the relay.
+        // Honor DestinationRule per-port `connect_timeout_ms` and
+        // `tcp_idle_timeout_seconds` overrides on the L4/TCP path. The override
+        // is keyed by destination policy port and lives on the proxy's
+        // pre-computed `dispatch_port_overrides` map — single field read, no
+        // DashMap/ArcSwap traversal. `Some(0)` idle is an explicit disable.
         let port_override = proxy
             .dispatch_port_overrides
             .as_ref()
@@ -3691,8 +3691,9 @@ async fn handle_tcp_connection_inner(
             backend_connect_timeout_ms: effective_backend_connect_timeout_ms,
             backend_read_timeout_ms: proxy.backend_read_timeout_ms,
             backend_write_timeout_ms: proxy.backend_write_timeout_ms,
-            tcp_idle_timeout_seconds: proxy
-                .tcp_idle_timeout_seconds
+            tcp_idle_timeout_seconds: port_override
+                .and_then(|override_config| override_config.tcp_idle_timeout_seconds)
+                .or(proxy.tcp_idle_timeout_seconds)
                 .unwrap_or(global_tcp_idle_timeout),
             tcp_half_close_max_wait_seconds,
             retry: proxy.retry.clone(),

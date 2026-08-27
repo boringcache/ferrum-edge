@@ -822,6 +822,38 @@ plugin_configs:
         .expect("Failed to write config");
 }
 
+/// Write a YAML config with strict global CORS but no WebSocket Origin gate.
+fn write_ws_cors_without_origin_gate_config(config_path: &std::path::Path, backend_port: u16) {
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "ws-cors-proxy"
+    listen_path: "/ws-cors"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {}
+    strip_listen_path: true
+
+consumers: []
+plugin_configs:
+  - id: "plugin-cors-ws-gap"
+    plugin_name: "cors"
+    config:
+      allowed_origins:
+        - "https://app.example.com"
+      allow_credentials: true
+    scope: global
+    enabled: true
+"#,
+        backend_port
+    );
+
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
 /// Write a YAML config with a WebSocket proxy protected by key_auth.
 fn write_ws_auth_config(config_path: &std::path::Path, backend_port: u16) {
     let config = format!(
@@ -1758,6 +1790,56 @@ async fn test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1() {
     let _ = gateway.wait();
     echo_handle.abort();
     println!("test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1 PASSED");
+}
+
+/// Issue #4168 regression anchor: strict CORS does not govern WebSocket upgrade
+/// Origin checks until `allowed_ws_origins` is configured separately.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_upgrade_ignores_cors_without_allowed_ws_origins() {
+    let backend_port = free_port().await;
+
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_cors_without_origin_gate_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), None, None, None).await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-cors", gateway_port);
+    let mut cross_origin = url
+        .as_str()
+        .into_client_request()
+        .expect("valid WebSocket request");
+    cross_origin
+        .headers_mut()
+        .insert("origin", "https://evil.example.com".parse().unwrap());
+    let (mut ws, response) = tokio_tungstenite::connect_async(cross_origin)
+        .await
+        .expect("CORS-only proxy must still accept cross-origin WebSocket today");
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    ws.send(Message::Text("cors gap".into()))
+        .await
+        .expect("Failed to send text");
+    let reply = ws
+        .next()
+        .await
+        .expect("No reply")
+        .expect("Error reading reply");
+    assert_eq!(reply, Message::Text("Echo: cors gap".into()));
+
+    ws.send(Message::Close(None))
+        .await
+        .expect("Failed to send close");
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
 }
 
 /// The global WebSocket frame-size env limit is enforced by the shared

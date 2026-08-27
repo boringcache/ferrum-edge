@@ -83,6 +83,13 @@ use crate::identity::TrustBundleSet;
 pub const MESH_TRUST_WITHDRAWN_MESSAGE: &str =
     "gateway-to-mesh transport retired: gateway trust authority withdrawn";
 
+/// Client-visible reason a pooled HBONE HTTP/2 transport reports when keepalive
+/// PING failure tears it down (issue #4162). Distinct from
+/// [`MESH_TRUST_WITHDRAWN_MESSAGE`] so a dead peer is never labeled as a trust
+/// withdrawal.
+pub const MESH_KEEPALIVE_FAILED_MESSAGE: &str =
+    "gateway-to-mesh transport closed: HTTP/2 keepalive ping failed";
+
 /// Transport classes registered here. Closed set — it is a metric label.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshTransportKind {
@@ -229,10 +236,18 @@ pub fn trust_withdrawal_reason(
 /// lock and no allocation, so a byte relay can check it on every poll.
 pub struct MeshTransportGateInner {
     retired: AtomicBool,
+    /// Set when HTTP/2 keepalive PING fails or times out (issue #4162). Kept
+    /// separate from `retired` so a dead peer is never labeled as a trust
+    /// withdrawal.
+    keepalive_failed: AtomicBool,
     /// Wakes the connection driver exactly once. `notify_one` stores a permit
     /// when no waiter is parked, so a retirement that lands before the driver
     /// first polls is not lost.
     driver_cancel: Notify,
+    /// Wakes the connection driver on keepalive failure. Separate from
+    /// `driver_cancel` so a keepalive abort cannot be consumed by a waiter
+    /// parked on trust withdrawal, and vice versa.
+    keepalive_cancel: Notify,
 }
 
 #[derive(Clone)]
@@ -242,7 +257,9 @@ impl MeshTransportGate {
     pub fn new() -> Self {
         Self(Arc::new(MeshTransportGateInner {
             retired: AtomicBool::new(false),
+            keepalive_failed: AtomicBool::new(false),
             driver_cancel: Notify::new(),
+            keepalive_cancel: Notify::new(),
         }))
     }
 
@@ -290,6 +307,55 @@ impl MeshTransportGate {
             std::io::ErrorKind::ConnectionAborted,
             MESH_TRUST_WITHDRAWN_MESSAGE,
         )
+    }
+
+    /// True after [`Self::abort_keepalive`]. One relaxed load, same cost as
+    /// [`Self::is_retired`].
+    #[inline]
+    pub fn keepalive_failed(&self) -> bool {
+        self.0.keepalive_failed.load(Ordering::Relaxed)
+    }
+
+    /// Mark this transport dead because HTTP/2 keepalive PING failed or timed
+    /// out (issue #4162). Returns `true` exactly once. Does not set
+    /// [`Self::is_retired`], so trust-withdrawal accounting and error strings
+    /// stay distinct.
+    pub fn abort_keepalive(&self) -> bool {
+        if self.0.keepalive_failed.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        self.0.keepalive_cancel.notify_one();
+        true
+    }
+
+    /// Awaited by the connection driver. Resolves immediately when keepalive
+    /// has already failed.
+    pub async fn keepalive_cancelled(&self) {
+        loop {
+            if self.keepalive_failed() {
+                return;
+            }
+            let notified = self.0.keepalive_cancel.notified();
+            if self.keepalive_failed() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Material-free I/O error for a keepalive-aborted transport. Same
+    /// `ConnectionAborted` kind as trust withdrawal, different message.
+    pub fn keepalive_io_error(&self) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            MESH_KEEPALIVE_FAILED_MESSAGE,
+        )
+    }
+
+    /// Identity of this gate, used so pool eviction removes *this* transport
+    /// and not a newer replacement stored under the same pool key.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 

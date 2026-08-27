@@ -4168,6 +4168,7 @@ fn classify_cp_listener_exit(
             error!("CP listener task '{name}' failed: {err:#}");
             Some(err.context(format!("{name} failed")))
         }
+        #[cfg(panic = "unwind")]
         Err(err) if err.is_panic() => {
             error!("CP listener task '{name}' failed: {err}");
             Some(anyhow::anyhow!("{name} panicked: {err}"))

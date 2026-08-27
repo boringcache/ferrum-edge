@@ -4,8 +4,10 @@
 //! buffered/streamed normalize as one lifecycle, without spawning the binary.
 
 use ferrum_edge::plugins::ai_stream_router::AiStreamRouter;
+use ferrum_edge::plugins::ai_tool_governor::AiToolGovernor;
 use ferrum_edge::plugins::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, ResponseStreamAction,
+    ResponseStreamInspector, ResponseStreamInspectorStage, chain_response_stream_inspectors,
 };
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -441,4 +443,149 @@ async fn premature_eof_buffered_path_surfaces_upstream_error() {
     assert!(text.contains("upstream_error"));
     assert!(text.contains("before message_stop"));
     assert_eq!(text.matches("data: [DONE]").count(), 1);
+}
+
+/// Anthropic tool-use SSE with the argument bytes split across
+/// `input_json_delta` fragments.
+const ANTHROPIC_TOOL_SSE: &str = concat!(
+    "event: message_start\n",
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_t\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+    "event: content_block_start\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"kubectl.apply\",\"input\":{}}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"ns\\\":\"}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"prod\\\"}\"}}\n\n",
+    "event: content_block_stop\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "event: message_delta\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n",
+    "event: message_stop\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+fn tool_governor() -> AiToolGovernor {
+    AiToolGovernor::new(
+        &json!({
+            "default_action": "deny",
+            "tools": { "safe_tool": { "action": "allow" } },
+            "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+        }),
+        PluginHttpClient::default(),
+    )
+    .expect("valid config")
+}
+
+async fn drive(inspector: &mut Box<dyn ResponseStreamInspector>, body: &[u8]) -> (Vec<u8>, bool) {
+    let mut out = Vec::new();
+    let mut terminated = false;
+    match inspector.on_chunk(body).await {
+        ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),
+        ResponseStreamAction::Terminate(bytes) => {
+            if let Some(bytes) = bytes {
+                out.extend_from_slice(&bytes);
+            }
+            terminated = true;
+        }
+    }
+    if !terminated {
+        match inspector.on_end().await {
+            ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),
+            ResponseStreamAction::Terminate(bytes) => {
+                if let Some(bytes) = bytes {
+                    out.extend_from_slice(&bytes);
+                }
+                terminated = true;
+            }
+        }
+    }
+    (out, terminated)
+}
+
+/// Pins the stage-ordering guarantee the governor's scope comment relies on:
+/// `ai_stream_router` normalizers declare `Normalize`, which sorts BEFORE the
+/// governor's default `Inspect`, regardless of the two plugins' request-side
+/// priorities (2984 vs 2978). If this ever inverts, the governor would inspect
+/// raw provider frames while the client receives normalized ones.
+#[tokio::test]
+async fn stream_router_normalizer_sorts_before_the_tool_governor() {
+    let router = plugin();
+    let (ctx, _) = claim(&router).await;
+    let router_inspector = router
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("router inspector");
+    let governor = tool_governor();
+    let governor_inspector = governor
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("governor inspector");
+
+    assert_eq!(
+        router_inspector.stage(),
+        ResponseStreamInspectorStage::Normalize
+    );
+    assert_eq!(
+        governor_inspector.stage(),
+        ResponseStreamInspectorStage::Inspect
+    );
+    assert!(
+        ResponseStreamInspectorStage::Normalize < ResponseStreamInspectorStage::Inspect,
+        "normalizers must sort before policy inspectors"
+    );
+}
+
+/// Composition case: with `ai_stream_router` present the governor inspects the
+/// NORMALIZED OpenAI chunks, so a denied Anthropic `tool_use` is cut and never
+/// reaches the client.
+#[tokio::test]
+async fn tool_governor_denies_normalized_anthropic_tool_use() {
+    let router = plugin();
+    let (ctx, _) = claim(&router).await;
+    let governor = tool_governor();
+
+    // Deliberately register the governor FIRST so the chain's own stage sort —
+    // not the caller's ordering — is what puts the normalizer in front.
+    let chained = chain_response_stream_inspectors(vec![
+        governor
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("governor inspector"),
+        router
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("router inspector"),
+    ]);
+    let mut chained = chained.expect("chained inspector");
+
+    let (out, terminated) = drive(&mut chained, ANTHROPIC_TOOL_SSE.as_bytes()).await;
+    assert!(
+        terminated,
+        "a denied tool call must cut the normalized stream"
+    );
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        !text.contains("kubectl.apply"),
+        "the denied tool call leaked to the client: {text}"
+    );
+}
+
+/// The same stream WITHOUT a normalizer: the governor reads Anthropic-native
+/// frames directly, so the denied call is still cut. Before issue #4165 this
+/// path forwarded every `tool_use` block with `decision: allow`.
+#[tokio::test]
+async fn tool_governor_denies_native_anthropic_tool_use_without_a_normalizer() {
+    let router = plugin();
+    let (ctx, _) = claim(&router).await;
+    let governor = tool_governor();
+    let mut inspector = governor
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("governor inspector");
+
+    let (out, terminated) = drive(&mut inspector, ANTHROPIC_TOOL_SSE.as_bytes()).await;
+    assert!(
+        terminated,
+        "a denied provider-native tool_use must cut the stream"
+    );
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        !text.contains("kubectl.apply"),
+        "the denied tool call leaked to the client: {text}"
+    );
 }

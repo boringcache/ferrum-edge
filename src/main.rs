@@ -29,6 +29,7 @@ mod connection_pool;
 mod consumer_index;
 #[path = "../custom_plugins/mod.rs"]
 mod custom_plugins;
+mod data_path_metrics;
 mod date_cache;
 mod dns;
 // Test-facing constructors/accessors (deterministic-clock variants) are used by
@@ -871,6 +872,17 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         env_config.request_decode_max_total_bytes,
     );
 
+    // Same rule for the aggregate budget that bounds buffered client REQUEST
+    // bodies (issue #4153). Published before the first listener binds, so the
+    // very first prebuffered upload — which `waf` request-body inspection
+    // reaches in the `authenticate` phase, before any principal is admitted —
+    // is already collected under a finite ceiling and charged against the
+    // aggregate budget.
+    crate::proxy::response_buffer_budget::init_request_buffer(
+        env_config.request_buffer_fallback_max_bytes,
+        env_config.request_buffer_max_total_bytes,
+    );
+
     // Initialize DTLS buffer config from resolved EnvConfig before any DTLS sessions.
     crate::dtls::init_dtls_buf_config(
         env_config.dtls_max_plaintext_bytes,
@@ -1015,6 +1027,20 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     );
     let observability_delivery_timeout =
         std::time::Duration::from_millis(env_config.log_shutdown_drain_timeout_ms);
+    // Pre-drain window (issue #4154). Serving modes only: the knob exists so a
+    // replica can report `ready:false` while it is still accepting, which only
+    // means anything where there are listeners and a readiness consumer.
+    let predrain_seconds = match env_config.mode {
+        OperatingMode::Database
+        | OperatingMode::File
+        | OperatingMode::DataPlane
+        | OperatingMode::Mesh => env_config.shutdown_predrain_seconds,
+        OperatingMode::ControlPlane
+        | OperatingMode::Injector
+        | OperatingMode::NodeAgent
+        | OperatingMode::Migrate => 0,
+    };
+    let shutdown_predrain = std::time::Duration::from_secs(predrain_seconds);
     let gateway_exit_code: i32 = rt.block_on(async {
         // Shutdown signal
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1050,6 +1076,20 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                 info!("Ctrl+C received, initiating graceful shutdown...");
             }
 
+            // Publish the draining verdict BEFORE the shutdown channel closes
+            // the accept loops. `/health` and `/status` report `ready:false`
+            // (503) from here on while `/live` stays 200, so an orchestrator
+            // can withdraw the replica from its endpoint set without kubelet
+            // killing the pod mid-drain. With the default 0s window the accept
+            // loops still close immediately, exactly as before.
+            overload::announce_shutdown_drain();
+            if !shutdown_predrain.is_zero() {
+                info!(
+                    predrain_seconds = shutdown_predrain.as_secs(),
+                    "Pre-drain: reporting not-ready while listeners keep accepting"
+                );
+                tokio::time::sleep(shutdown_predrain).await;
+            }
             let _ = shutdown_tx_signal.send(true);
         });
 

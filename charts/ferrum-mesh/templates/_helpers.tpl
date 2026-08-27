@@ -369,3 +369,60 @@ chart's own namespace (issue #4155 bootstrap deadlock).
 {{- end -}}
 {{- $result -}}
 {{- end -}}
+
+{{/*
+Render hostname spread constraints for HA Deployments (replicas >= 2). When
+topologySpreadConstraints is unset, apply a chart default across nodes. An
+explicit empty slice disables spread even at higher replica counts.
+*/}}
+{{- define "ferrum-mesh.renderTopologySpreadConstraints" -}}
+{{- $replicas := .replicas | int -}}
+{{- if ge $replicas 2 -}}
+{{- if kindIs "slice" .constraints -}}
+{{- if gt (len .constraints) 0 }}
+      topologySpreadConstraints:
+{{- toYaml .constraints | nindent 8 }}
+{{- end -}}
+{{- else }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ .selectorName }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Render a PodDisruptionBudget when the workload is enabled, podDisruptionBudget
+is enabled globally, and replicas >= 2. Single-replica workloads skip PDB so
+minAvailable: 1 cannot block voluntary evictions during node drains.
+*/}}
+{{- define "ferrum-mesh.renderPodDisruptionBudget" -}}
+{{- $root := .root -}}
+{{- $pdb := $root.Values.podDisruptionBudget | default dict -}}
+{{- $replicas := .replicas | int -}}
+{{- if and .componentEnabled ($pdb.enabled | default false) (ge $replicas 2) -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .name }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .selectorName }}
+    app.kubernetes.io/instance: {{ $root.Release.Name }}
+spec:
+  {{- if not (kindIs "invalid" $pdb.minAvailable) }}
+  minAvailable: {{ $pdb.minAvailable }}
+  {{- else if not (kindIs "invalid" $pdb.maxUnavailable) }}
+  maxUnavailable: {{ $pdb.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .selectorName }}
+      app.kubernetes.io/instance: {{ $root.Release.Name }}
+{{- end -}}
+{{- end -}}

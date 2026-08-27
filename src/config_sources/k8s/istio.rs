@@ -1655,6 +1655,11 @@ fn translate_traffic_policy(
         .transpose()?
         .filter(|cfg| !cfg.is_empty());
 
+    let tcp_idle_timeout_seconds = match tcp.and_then(|tcp| string_field(tcp, "idleTimeout")) {
+        Some(raw) => Some(parse_tcp_idle_timeout_seconds(object, raw)?),
+        None => None,
+    };
+
     let connection_pool_http = value
         .get("connectionPool")
         .and_then(|cp| cp.get("http"))
@@ -1700,6 +1705,7 @@ fn translate_traffic_policy(
         locality_lb_setting,
         max_connections,
         tcp_keepalive,
+        tcp_idle_timeout_seconds,
         connection_pool_http,
     })
 }
@@ -2084,6 +2090,47 @@ fn parse_http_idle_timeout_ms(object: &K8sObject, raw: &str) -> Result<u64, K8sT
         ));
     }
     Ok(ms)
+}
+
+/// Parse `connectionPool.tcp.idleTimeout` into whole seconds.
+///
+/// Unlike HTTP `idleTimeout` (a pool idle bound that rejects 0), TCP idle is
+/// a bidirectional inactivity watermark on the byte relay: `0s` / `0ms` means
+/// disabled, matching `Proxy.tcp_idle_timeout_seconds`. Sub-second values
+/// other than 0 are rejected because the proxy field is whole-second
+/// granular. Values above `MAX_TCP_IDLE_TIMEOUT` (24h) are rejected so the
+/// K8s surface stays consistent with the admin admit-path validator.
+fn parse_tcp_idle_timeout_seconds(object: &K8sObject, raw: &str) -> Result<u64, K8sTranslateError> {
+    let ms = parse_istio_duration_ms(raw).ok_or_else(|| {
+        invalid_resource(
+            object,
+            format!(
+                "trafficPolicy.connectionPool.tcp.idleTimeout '{raw}' is not a valid Istio duration"
+            ),
+        )
+    })?;
+    if ms == 0 {
+        return Ok(0);
+    }
+    if ms % 1000 != 0 {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "trafficPolicy.connectionPool.tcp.idleTimeout '{raw}' must be a whole number of seconds (sub-second precision is not supported by the proxy idle-timeout field)"
+            ),
+        ));
+    }
+    let seconds = ms / 1000;
+    if seconds > crate::config::types::MAX_TCP_IDLE_TIMEOUT {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "trafficPolicy.connectionPool.tcp.idleTimeout '{raw}' exceeds the proxy idle-timeout cap of {}s",
+                crate::config::types::MAX_TCP_IDLE_TIMEOUT
+            ),
+        ));
+    }
+    Ok(seconds)
 }
 
 fn translate_locality_lb_setting(
@@ -19371,6 +19418,105 @@ extensionProviders:
         assert_eq!(keepalive.time_seconds, Some(300));
         assert_eq!(keepalive.interval_seconds, Some(30));
         assert_eq!(keepalive.probes, Some(3));
+    }
+
+    #[test]
+    fn destination_rule_translates_top_level_tcp_idle_timeout() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {
+                            "tcp": {
+                                "idleTimeout": "1h"
+                            }
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let dr = &mesh.destination_rules[0];
+        let tp = dr.traffic_policy.as_ref().expect("traffic policy");
+        assert_eq!(tp.tcp_idle_timeout_seconds, Some(3600));
+    }
+
+    #[test]
+    fn destination_rule_translates_tcp_idle_timeout_zero_as_disabled() {
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {
+                            "tcp": {
+                                "idleTimeout": "0s"
+                            }
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let dr = &mesh.destination_rules[0];
+        let tp = dr.traffic_policy.as_ref().expect("traffic policy");
+        assert_eq!(tp.tcp_idle_timeout_seconds, Some(0));
+    }
+
+    #[test]
+    fn destination_rule_rejects_sub_second_tcp_idle_timeout() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {
+                            "tcp": {"idleTimeout": "500ms"}
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("sub-second TCP idleTimeout must fail");
+        assert!(
+            err.to_string().contains("whole number of seconds"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn destination_rule_rejects_tcp_idle_timeout_above_cap() {
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {
+                            "tcp": {"idleTimeout": "25h"}
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("over-cap TCP idleTimeout must fail");
+        assert!(
+            err.to_string()
+                .contains("exceeds the proxy idle-timeout cap"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]

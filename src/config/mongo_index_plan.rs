@@ -92,6 +92,13 @@ pub fn required_mongo_indexes() -> Vec<RequiredMongoIndex> {
         doc! { "namespace": 1, "updated_at": 1 },
     ));
     plan.push(keys_only("proxies", doc! { "namespace": 1, "_id": 1 }));
+    // Non-unique (namespace, listen_path) covers check_listen_path_unique
+    // candidate filters. Uniqueness stays application-enforced because
+    // conflict is host-overlap, not path equality (issue #4234).
+    plan.push(keys_only(
+        "proxies",
+        doc! { "namespace": 1, "listen_path": 1 },
+    ));
 
     // consumers — `_id` is already `{namespace}:{id}`; username/custom_id/
     // credential uniqueness are secondary guards.

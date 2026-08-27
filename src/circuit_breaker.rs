@@ -564,10 +564,11 @@ impl CircuitBreaker {
 /// Build the cache key for a circuit breaker.
 ///
 /// Keys are namespace-qualified (`namespace|proxy_id`) so the same proxy id in
-/// two tenants cannot share or leak breaker state. When an upstream target is
-/// provided, the breaker is scoped to that specific target
-/// (`namespace|proxy_id::host:port`) so each target tracks failures independently.
-/// Without a target, the key is `namespace|proxy_id` (direct backend proxies).
+/// two tenants cannot share or leak breaker state. When a concrete target is
+/// provided, the breaker is scoped to that host:port
+/// (`namespace|proxy_id::host:port`). HTTP dispatch always supplies a target,
+/// including direct-backend proxies (`backend_host:backend_port`). UDP/DTLS
+/// direct-backend sessions still omit the target, producing `namespace|proxy_id`.
 fn circuit_breaker_key(namespace: &str, proxy_id: &str, target_key: Option<&str>) -> String {
     match target_key {
         Some(tk) => format!("{namespace}|{proxy_id}::{tk}"),
@@ -578,6 +579,15 @@ fn circuit_breaker_key(namespace: &str, proxy_id: &str, target_key: Option<&str>
 /// Build a target key string from host and port (e.g. `"10.0.0.1:8080"`).
 pub fn target_key(host: &str, port: u16) -> String {
     format!("{host}:{port}")
+}
+
+/// Cache key HTTP dispatch mints for a concrete `host:port` target.
+///
+/// Direct-backend proxies use `backend_host:backend_port`; upstream and
+/// service-discovery targets use the selected target's host and port. The
+/// result is `namespace|proxy_id::host:port`.
+pub fn scoped_cache_key(namespace: &str, proxy_id: &str, host: &str, port: u16) -> String {
+    circuit_breaker_key(namespace, proxy_id, Some(&target_key(host, port)))
 }
 
 /// Cache of circuit breakers, keyed per namespace-qualified proxy unless dispatch
@@ -802,12 +812,17 @@ impl CircuitBreakerCache {
         });
     }
 
-    /// Remove circuit breakers for upstream targets that no longer exist.
-    /// This prevents unbounded growth from target churn (e.g., Kubernetes
-    /// pod cycling where old pod IPs accumulate as stale breaker entries).
+    /// Remove circuit breakers for targets that are no longer live.
+    ///
+    /// `active_target_keys` must be the keys dispatch currently mints:
+    /// per-proxy `namespace|id::host:port` for every live upstream or
+    /// service-discovery target and every direct-backend
+    /// `backend_host:backend_port`. Keys without `::` are the proxy-scoped
+    /// form used by UDP/DTLS direct backends and are reclaimed by
+    /// [`Self::prune`] when the proxy itself is removed.
     pub fn prune_stale_targets(&self, active_target_keys: &std::collections::HashSet<String>) {
         self.breakers.retain(|key, _| {
-            // Direct-backend keys (no "::") are managed by prune() via proxy removal
+            // Proxy-scoped keys (no "::") are managed by prune() via proxy removal.
             if !key.contains("::") {
                 return true;
             }
@@ -817,6 +832,15 @@ impl CircuitBreakerCache {
             }
             keep
         });
+    }
+
+    /// Configured admission ceiling for distinct breaker keys.
+    ///
+    /// Exported as `ferrum_circuit_breaker_cache_max_entries` so operators can
+    /// alert on the cache approaching the ceiling at which new proxy/target
+    /// breakers stop being admitted.
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
     }
 
     /// Current number of entries in the cache.

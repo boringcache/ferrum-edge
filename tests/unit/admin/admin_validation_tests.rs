@@ -81,6 +81,68 @@ fn test_batch_writes_run_plugin_graph_candidate_validation() {
     );
     assert!(source.contains("&batch.proxies,"));
     assert!(source.contains("&batch.plugin_configs,"));
+    assert!(
+        source.contains("if batch_submits_plugin_graph(&batch)"),
+        "HTTP-only proxy chunks with empty associations must skip the plugin-graph snapshot"
+    );
+}
+
+#[test]
+fn batch_create_admission_uses_point_uniqueness_instead_of_namespace_snapshot() {
+    let source = include_str!("../../../src/admin/mod.rs");
+    let handler_start = source
+        .find("// ---- Batch Create ----")
+        .expect("batch create section");
+    let handler_end = source[handler_start..]
+        .find("\n// ---- Backup & Restore ----")
+        .expect("backup section follows batch")
+        + handler_start;
+    let handler = &source[handler_start..handler_end];
+
+    assert!(
+        handler.contains("if batch_needs_consumer_snapshot(&batch)"),
+        "full consumer snapshot is only for mTLS/HMAC credential candidates"
+    );
+    let snapshot = handler
+        .find("load_namespace_snapshot(namespace)")
+        .expect("gated snapshot load remains for mTLS/HMAC candidates");
+    let gate = handler
+        .find("if batch_needs_consumer_snapshot(&batch)")
+        .expect("consumer snapshot gate");
+    assert!(
+        gate < snapshot,
+        "load_namespace_snapshot must stay behind the credential-snapshot gate"
+    );
+    assert!(
+        handler.contains("batch_existing_resource_conflict("),
+        "existing-resource uniqueness must run as point lookups"
+    );
+    assert!(
+        handler.contains("check_listen_path_unique("),
+        "HTTP route uniqueness must use the host-overlap point query"
+    );
+    assert!(
+        handler.contains("check_consumer_identity_unique("),
+        "consumer identity uniqueness must use the identity-index point query"
+    );
+
+    let crud = include_str!("../../../src/admin/crud.rs");
+    let plugin_graph = crud
+        .split("pub(crate) async fn validate_plugin_graph_candidates(")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("pub(crate) async fn validate_plugin_graph_proxy_deletion_candidate(")
+                .next()
+        })
+        .expect("plugin-graph candidate helper");
+    assert!(
+        plugin_graph.contains("load_namespace_policy_graph(namespace)"),
+        "plugin-graph admission must not decode every Consumer row"
+    );
+    assert!(
+        !plugin_graph.contains("load_namespace_snapshot(namespace)"),
+        "plugin-graph admission must not load the full namespace snapshot"
+    );
 }
 
 #[test]

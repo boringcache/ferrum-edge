@@ -1,4 +1,10 @@
 //! End-to-end replay fidelity for `load_testing` across H1 and H3 ingress.
+//!
+//! Issue #4164: replays are dialed at `127.0.0.1`, which operators routinely
+//! list in `FERRUM_TRUSTED_PROXIES`, so a client-supplied `X-Real-IP` carried
+//! into the synthetic header snapshot would be honored by
+//! `client_ip::resolve_client_ip` on backend-bound traffic. Every trigger below
+//! therefore sends a spoofed `X-Real-IP` that must appear in NO capture.
 
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
@@ -16,6 +22,10 @@ use tokio::task::JoinHandle;
 const TRIGGER_KEY: &str = "functional-load-key-0123456789abcdef";
 const RAW_QUERY: &str = "tag=red&tag=blue&q=a+b&prefix=a%2Fb&flag&empty=";
 const MAX_REQUEST_BYTES: usize = 128 * 1024;
+/// Client-asserted source address the gateway must refuse on both the original
+/// request and every synthetic replay (issue #4164). The harness dials from
+/// loopback, so this value can only have come from the trigger's header.
+const SPOOFED_REAL_IP: &str = "10.0.0.7";
 
 #[derive(Debug)]
 struct CapturedRequest {
@@ -192,6 +202,7 @@ async fn functional_load_testing_replays_exact_body_query_and_framing_from_h1_an
     let h3_options = GetOptions::default()
         .method(Method::POST)
         .header("x-loadtesting-key", TRIGGER_KEY)
+        .header("x-real-ip", SPOOFED_REAL_IP)
         .body(h3_body.clone());
     let deadline = Instant::now() + Duration::from_secs(10);
     let h3_response = loop {
@@ -232,12 +243,18 @@ fn assert_replay_captures(captures: &[CapturedRequest], expected_body: &[u8]) {
         assert!(!capture.headers.contains_key("transfer-encoding"));
         assert!(!capture.headers.contains_key("x-loadtesting-key"));
         assert!(!capture.headers.contains_key("x-loadtesting-fanout"));
+        // Issue #4164: neither the original request nor the synthetic replay
+        // may carry the untrusted peer's client-asserted source address.
+        assert!(
+            !capture.headers.contains_key("x-real-ip"),
+            "client-asserted X-Real-IP survived into a load-test capture: {capture:?}"
+        );
     }
 }
 
 async fn send_raw_h1_trigger(port: u16, target: &str, body: &[u8]) {
     let request_head = format!(
-        "POST {target} HTTP/1.1\r\nHost: localhost\r\nX-Loadtesting-Key: {TRIGGER_KEY}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {target} HTTP/1.1\r\nHost: localhost\r\nX-Loadtesting-Key: {TRIGGER_KEY}\r\nX-Real-IP: {SPOOFED_REAL_IP}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let response = tokio::time::timeout(Duration::from_secs(10), async {

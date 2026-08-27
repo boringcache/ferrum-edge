@@ -393,6 +393,84 @@ fn destination_rule_top_level_max_connections_fans_out_to_all_target_ports() {
 }
 
 #[test]
+fn destination_rule_tcp_idle_timeout_fans_out_and_applies_to_proxy() {
+    let config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    tcp_idle_timeout_seconds: Some(3600),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    let mut config = config;
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let upstream_override = prepared.upstreams[0]
+        .port_overrides
+        .get(&8080)
+        .expect("top-level idleTimeout fan-out must populate port 8080");
+    assert_eq!(upstream_override.tcp_idle_timeout_seconds, Some(3600));
+
+    let dispatch = prepared.proxies[0]
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|map| map.get(&8080))
+        .expect("dispatch port override projected");
+    assert_eq!(dispatch.tcp_idle_timeout_seconds, Some(3600));
+    assert_eq!(prepared.proxies[0].tcp_idle_timeout_seconds, Some(3600));
+}
+
+#[test]
+fn destination_rule_tcp_idle_timeout_zero_disables_and_is_not_unset() {
+    let config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    tcp_idle_timeout_seconds: Some(0),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    let mut config = config;
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    assert_eq!(
+        prepared.upstreams[0]
+            .port_overrides
+            .get(&8080)
+            .and_then(|slot| slot.tcp_idle_timeout_seconds),
+        Some(0),
+        "0 must land as explicit disable, not inherit"
+    );
+    assert_eq!(prepared.proxies[0].tcp_idle_timeout_seconds, Some(0));
+}
+
+#[test]
 fn destination_rule_port_level_max_connections_overrides_top_level() {
     // Per-port `connectionPool.tcp.maxConnections` overrides the top-level
     // fan-out for that specific port; ports not enumerated in

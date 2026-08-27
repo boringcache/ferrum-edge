@@ -8,7 +8,10 @@
 //!
 //! * **Ordinary shutdown** — the shared shutdown watch is already set (or becomes
 //!   set while joining). Expected; no respawn and no serving degradation.
-//! * **Panic** — `JoinError::is_panic()`. Unexpected.
+//! * **Panic** — `JoinError::is_panic()`. Constructed only in `panic = "unwind"`
+//!   builds (dev/test/`pr-build`). Shipping profiles set `panic = "abort"`
+//!   (issue #4166), so a panicking task terminates the process before a
+//!   `JoinError` exists.
 //! * **Abort** — task cancelled without shutdown requested. Unexpected.
 //! * **Unexpected completion** — task returned `Ok(())` without shutdown.
 //!   Defensive; today's loops only return on shutdown.
@@ -17,9 +20,12 @@
 //!
 //! * **database** — error-log and respawn a new poll generation after a bounded,
 //!   shutdown-aware delay (keep serving last-known-good config). The delay
-//!   prevents a tight spawn/panic/log loop under deterministic regressions.
+//!   prevents a tight spawn/exit/log loop under deterministic regressions. A
+//!   Rust panic in a shipping build is process-fatal; this respawn path covers
+//!   abort and unexpected completion.
 //! * **cp** — sticky `serving_degraded` (mirrors listener-failure handling) so
-//!   `/health` becomes not-ready; do not respawn.
+//!   `/health` becomes not-ready; do not respawn. A shipping-profile panic
+//!   never reaches this signal: the process is already gone.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,7 +36,7 @@ use tokio::task::{JoinError, JoinHandle};
 use tracing::error;
 
 /// Fixed delay before respawning a database-mode poll generation after an
-/// unexpected exit. Caps spawn/panic churn; interruptible by shutdown so drain
+/// unexpected exit. Caps spawn/exit churn; interruptible by shutdown so drain
 /// stays prompt. Normal operation (healthy generations) is not delayed — the
 /// wait runs only after an unexpected exit, before the next `spawn_poll`.
 pub const DATABASE_POLL_RESPAWN_DELAY: Duration = Duration::from_secs(1);
@@ -41,6 +47,10 @@ pub enum DbPollTaskExitKind {
     /// Shutdown was already requested; exit is expected.
     OrdinaryShutdown,
     /// Task panicked.
+    ///
+    /// Only constructed when the binary is built with `panic = "unwind"`.
+    /// Shipping profiles abort the process before `JoinError::is_panic()`.
+    #[cfg(panic = "unwind")]
     Panic,
     /// Task was aborted/cancelled without shutdown requested.
     Abort,
@@ -52,6 +62,7 @@ impl DbPollTaskExitKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::OrdinaryShutdown => "ordinary_shutdown",
+            #[cfg(panic = "unwind")]
             Self::Panic => "panic",
             Self::Abort => "abort",
             Self::UnexpectedCompletion => "unexpected_completion",
@@ -66,9 +77,10 @@ impl DbPollTaskExitKind {
 /// Classify a poll-task join result against the shutdown watch.
 ///
 /// When `shutdown_requested` is true, every join outcome is
-/// [`DbPollTaskExitKind::OrdinaryShutdown`] — including panic/abort during
-/// drain — so shutdown ownership stays bounded and operator-initiated stop is
-/// never mistaken for a liveness failure.
+/// [`DbPollTaskExitKind::OrdinaryShutdown`] — including abort during drain —
+/// so shutdown ownership stays bounded and operator-initiated stop is never
+/// mistaken for a liveness failure. A shipping-profile panic never reaches
+/// this classifier: `panic = "abort"` terminates the process first.
 pub fn classify_db_poll_task_exit(
     join_result: Result<(), JoinError>,
     shutdown_requested: bool,
@@ -78,6 +90,7 @@ pub fn classify_db_poll_task_exit(
     }
     match join_result {
         Ok(()) => DbPollTaskExitKind::UnexpectedCompletion,
+        #[cfg(panic = "unwind")]
         Err(err) if err.is_panic() => DbPollTaskExitKind::Panic,
         Err(_) => DbPollTaskExitKind::Abort,
     }

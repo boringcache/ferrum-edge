@@ -25,6 +25,11 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       serviceAccountName: ferrum-mesh
+{{- include "ferrum-mesh.renderTopologySpreadConstraints" (dict
+  "Release" .Release
+  "replicas" .Values.injector.replicas
+  "selectorName" "ferrum-mesh-injector"
+  "constraints" .Values.injector.topologySpreadConstraints) }}
 {{ with .Values.injector.podSecurityContext }}
       securityContext:
 {{ toYaml . | nindent 8 }}

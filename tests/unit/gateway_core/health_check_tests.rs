@@ -2,8 +2,9 @@
 
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    ActiveHealthCheck, DEFAULT_NAMESPACE, GatewayConfig, HealthCheckConfig, HealthProbeType,
-    LoadBalancerAlgorithm, PassiveHealthCheck, Upstream, UpstreamTarget, default_namespace,
+    ActiveHealthCheck, BackendTlsConfig, DEFAULT_NAMESPACE, GatewayConfig, HealthCheckConfig,
+    HealthProbeType, LoadBalancerAlgorithm, PassiveHealthCheck, Upstream, UpstreamTarget,
+    default_namespace,
 };
 use ferrum_edge::health_check::HealthChecker;
 use std::collections::HashMap;
@@ -48,6 +49,34 @@ fn passive_unhealthy_count(checker: &HealthChecker) -> usize {
         .iter()
         .map(|entry| entry.value().unhealthy.len())
         .sum()
+}
+
+fn ring_len(checker: &HealthChecker, proxy_id: &str, host_port: &str) -> usize {
+    checker.passive_recent_failure_len_for_test(DEFAULT_NAMESPACE, proxy_id, host_port)
+}
+
+fn ring_slot_cap(checker: &HealthChecker, proxy_id: &str, host_port: &str) -> usize {
+    checker.passive_recent_failure_slot_cap_for_test(DEFAULT_NAMESPACE, proxy_id, host_port)
+}
+
+fn report_failures(
+    checker: &HealthChecker,
+    proxy_id: &str,
+    target: &UpstreamTarget,
+    config: &PassiveHealthCheck,
+    n: usize,
+) {
+    for _ in 0..n {
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            proxy_id,
+            "test-upstream",
+            target,
+            500,
+            false,
+            Some(config),
+        );
+    }
 }
 
 #[test]
@@ -650,6 +679,211 @@ fn test_passive_window_failures_within_window_accumulate() {
     assert!(
         is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
         "Should be unhealthy after 3 failures within window"
+    );
+}
+
+#[test]
+fn test_passive_failure_ring_matches_threshold_sequences() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 3,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+        max_ejection_percent: None,
+        gateway_error_codes: None,
+        split_external_local_origin_errors: None,
+    };
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 1);
+    assert_eq!(ring_len(&checker, TEST_PROXY, "backend1:8080"), 1);
+    assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 1);
+    assert_eq!(ring_len(&checker, TEST_PROXY, "backend1:8080"), 2);
+    assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 1);
+    assert_eq!(ring_len(&checker, TEST_PROXY, "backend1:8080"), 3);
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "third in-window failure must trip the same threshold as before"
+    );
+}
+
+#[test]
+fn test_passive_failure_ring_stays_capped_past_max() {
+    use ferrum_edge::config::types::MAX_RECENT_FAILURES_PER_TARGET;
+
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 3,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+        max_ejection_percent: None,
+        gateway_error_codes: None,
+        split_external_local_origin_errors: None,
+    };
+
+    report_failures(
+        &checker,
+        TEST_PROXY,
+        &target,
+        &config,
+        MAX_RECENT_FAILURES_PER_TARGET * 5,
+    );
+    assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+    assert_eq!(
+        ring_len(&checker, TEST_PROXY, "backend1:8080"),
+        MAX_RECENT_FAILURES_PER_TARGET,
+    );
+    assert_eq!(
+        ring_slot_cap(&checker, TEST_PROXY, "backend1:8080"),
+        MAX_RECENT_FAILURES_PER_TARGET,
+    );
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 1);
+    assert_eq!(
+        ring_len(&checker, TEST_PROXY, "backend1:8080"),
+        MAX_RECENT_FAILURES_PER_TARGET,
+        "further failures must overwrite, not grow"
+    );
+}
+
+#[test]
+fn test_passive_failure_ring_is_isolated_per_proxy() {
+    use ferrum_edge::config::types::MAX_RECENT_FAILURES_PER_TARGET;
+
+    let checker = HealthChecker::new();
+    let target = make_target("shared-backend", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 3,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+        max_ejection_percent: None,
+        gateway_error_codes: None,
+        split_external_local_origin_errors: None,
+    };
+
+    report_failures(
+        &checker,
+        "proxy-a",
+        &target,
+        &config,
+        MAX_RECENT_FAILURES_PER_TARGET + 25,
+    );
+    report_failures(&checker, "proxy-b", &target, &config, 1);
+
+    assert!(is_passive_unhealthy(
+        &checker,
+        "proxy-a",
+        "shared-backend:8080",
+    ));
+    assert!(
+        !is_passive_unhealthy(&checker, "proxy-b", "shared-backend:8080"),
+        "proxy-b must not inherit proxy-a's failure ring"
+    );
+    assert_eq!(
+        ring_len(&checker, "proxy-a", "shared-backend:8080"),
+        MAX_RECENT_FAILURES_PER_TARGET,
+    );
+    assert_eq!(ring_len(&checker, "proxy-b", "shared-backend:8080"), 1);
+}
+
+#[test]
+fn test_passive_failure_ring_clears_on_success_recovery() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 2,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+        max_ejection_percent: None,
+        gateway_error_codes: None,
+        split_external_local_origin_errors: None,
+    };
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 5);
+    assert_eq!(ring_len(&checker, TEST_PROXY, "backend1:8080"), 5);
+    assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+
+    checker.report_response(
+        DEFAULT_NAMESPACE,
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        200,
+        false,
+        Some(&config),
+    );
+    assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+    assert_eq!(
+        ring_len(&checker, TEST_PROXY, "backend1:8080"),
+        0,
+        "success recovery must clear the ring so stale failures cannot re-trip"
+    );
+}
+
+#[test]
+fn test_remove_stale_passive_targets_drops_failure_ring() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let kept = make_target("backend2", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 2,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+        max_ejection_percent: None,
+        gateway_error_codes: None,
+        split_external_local_origin_errors: None,
+    };
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 4);
+    report_failures(&checker, TEST_PROXY, &kept, &config, 2);
+    assert_eq!(ring_len(&checker, TEST_PROXY, "backend1:8080"), 4);
+    assert_eq!(ring_len(&checker, TEST_PROXY, "backend2:8080"), 2);
+
+    checker.remove_stale_passive_targets_for_proxy(DEFAULT_NAMESPACE, TEST_PROXY, &[kept]);
+    assert_eq!(
+        ring_len(&checker, TEST_PROXY, "backend1:8080"),
+        0,
+        "removed target must drop its ring with the TargetHealth row"
+    );
+    assert_eq!(ring_len(&checker, TEST_PROXY, "backend2:8080"), 2);
+}
+
+#[test]
+fn test_passive_failure_ring_clears_on_timer_recovery() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 1,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+        max_ejection_percent: None,
+        gateway_error_codes: None,
+        split_external_local_origin_errors: None,
+    };
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 4);
+    assert_eq!(ring_len(&checker, TEST_PROXY, "backend1:8080"), 4);
+    {
+        let ps = checker.passive_health.get(&rk(TEST_PROXY)).unwrap();
+        ps.unhealthy.get_mut("backend1:8080").unwrap().recover_at_ms = 1;
+    }
+    checker.recover_due_passive_ejections();
+    assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+    assert_eq!(
+        ring_len(&checker, TEST_PROXY, "backend1:8080"),
+        0,
+        "timer recovery must clear the ring with the ejection"
     );
 }
 
@@ -1854,4 +2088,96 @@ async fn passive_recovery_scanner_replaces_taken_generation_on_reload() {
         1,
         "current generation scanner must remain registered"
     );
+}
+
+#[tokio::test]
+async fn active_probes_do_not_start_for_empty_static_targets() {
+    let checker = HealthChecker::new();
+    let upstream = make_upstream_with_active_probe("sd-empty", vec![], 60);
+    checker.start(&config_with_upstreams(vec![upstream]));
+    assert_eq!(
+        checker.active_task_count(),
+        0,
+        "SD-only upstreams have no static targets to probe at start"
+    );
+    assert!(!checker.has_running_active_probes(DEFAULT_NAMESPACE, "sd-empty"));
+}
+
+#[tokio::test]
+async fn restart_upstream_probes_starts_and_shrinks_discovered_targets() {
+    let checker = HealthChecker::new();
+    let upstream = make_upstream_with_active_probe("sd-up", vec![], 60);
+    checker.start(&config_with_upstreams(vec![upstream.clone()]));
+    assert_eq!(checker.active_task_count(), 0);
+
+    let active = upstream
+        .health_checks
+        .as_ref()
+        .and_then(|hc| hc.active.clone())
+        .expect("active health check");
+    let tls = BackendTlsConfig::from_upstream(&upstream);
+
+    checker.restart_upstream_probes(
+        DEFAULT_NAMESPACE,
+        "sd-up",
+        &[make_target("10.0.0.1", 8080), make_target("10.0.0.2", 8080)],
+        active.clone(),
+        tls.clone(),
+    );
+    assert_eq!(checker.active_task_count(), 2);
+    assert!(checker.has_running_active_probes(DEFAULT_NAMESPACE, "sd-up"));
+
+    checker.restart_upstream_probes(
+        DEFAULT_NAMESPACE,
+        "sd-up",
+        &[make_target("10.0.0.1", 8080), make_target("10.0.0.2", 8080)],
+        active.clone(),
+        tls.clone(),
+    );
+    assert_eq!(
+        checker.active_task_count(),
+        2,
+        "unchanged discovered set must not respawn probes"
+    );
+
+    checker.restart_upstream_probes(
+        DEFAULT_NAMESPACE,
+        "sd-up",
+        &[make_target("10.0.0.1", 8080)],
+        active.clone(),
+        tls.clone(),
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(checker.active_task_count(), 1);
+
+    checker.restart_upstream_probes(DEFAULT_NAMESPACE, "sd-up", &[], active, tls);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(checker.active_task_count(), 0);
+    assert!(!checker.has_running_active_probes(DEFAULT_NAMESPACE, "sd-up"));
+}
+
+#[tokio::test]
+async fn restart_upstream_probes_does_not_cancel_other_upstreams() {
+    let checker = HealthChecker::new();
+    let up_a = make_upstream_with_active_probe("up-a", vec![make_target("a.local", 9001)], 60);
+    let up_b = make_upstream_with_active_probe("up-b", vec![make_target("b.local", 9002)], 60);
+    checker.start(&config_with_upstreams(vec![up_a.clone(), up_b.clone()]));
+    assert_eq!(checker.active_task_count(), 2);
+
+    let active = up_a
+        .health_checks
+        .as_ref()
+        .and_then(|hc| hc.active.clone())
+        .expect("active health check");
+    let tls = BackendTlsConfig::from_upstream(&up_a);
+    checker.restart_upstream_probes(
+        DEFAULT_NAMESPACE,
+        "up-a",
+        &[make_target("a1.local", 9001), make_target("a2.local", 9002)],
+        active,
+        tls,
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(checker.active_task_count(), 3);
+    assert!(checker.has_running_active_probes(DEFAULT_NAMESPACE, "up-b"));
 }

@@ -5,12 +5,25 @@ image:
 
 namespace: ferrum
 
+# Optional PodDisruptionBudget for mesh Deployments with replicas >= 2. Skipped
+# when a workload runs fewer than two replicas so minAvailable: 1 cannot block
+# node drains. Set minAvailable: null and maxUnavailable: 1 to allow full
+# voluntary eviction on two-replica workloads during maintenance.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+  # minAvailable: null
+  # maxUnavailable: 1
+
 controlPlane:
   # Disabled by default because CP mode requires an explicit database URL plus
   # operator-provided JWT secrets. Use examples/development-values.yaml for a
   # single-node SQLite lab, or examples/production-existing-secrets-values.yaml
   # for a Secret-backed install shape.
   enabled: false
+  # Defaults to 1 for single-node lab installs (development-values.yaml). Raise
+  # to >= 2 for HA before enabling production control planes; the PDB renders
+  # only when replicas >= 2.
   replicas: 1
   grpcPort: 50051
   rbac:
@@ -145,7 +158,9 @@ injector:
   # Disabled by default: the webhook requires a serving-cert Secret and should
   # be enabled only after that Secret and namespace policy are ready.
   enabled: false
-  replicas: 1
+  # Defaults to 2 so a node drain cannot take the mutating webhook to zero
+  # replicas. Set to 1 only as an explicit non-HA lab choice (PDB skipped).
+  replicas: 2
   listenPort: 9443
   requireAnnotation: true
   failurePolicy: Fail
@@ -333,7 +348,9 @@ ambient:
 
 eastWest:
   enabled: false
-  replicas: 1
+  # Defaults to 2 so a node drain cannot take cross-cluster east-west traffic
+  # to zero replicas. Set to 1 only as an explicit non-HA lab choice (PDB skipped).
+  replicas: 2
   listenPort: 15443
   env:
     FERRUM_MODE: mesh
@@ -360,7 +377,9 @@ eastWest:
 
 ca:
   # Disabled by default. This Deployment runs the Ferrum binary in CP mode, so
-  # it shares the controlPlane database/JWT contract when enabled.
+  # it shares the controlPlane database/JWT contract when enabled. Replicas are
+  # fixed at 1 in the template — an explicit non-HA choice; scale via separate
+  # releases or out-of-band if you need CA redundancy.
   enabled: false
   env:
     FERRUM_MESH_PRODUCTION_MODE: "true"

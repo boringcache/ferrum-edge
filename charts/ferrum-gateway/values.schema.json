@@ -43,6 +43,8 @@
       "description": "Logical Ferrum namespace selector (FERRUM_NAMESPACE)."
     },
     "shutdownDrainSeconds": { "type": ["integer", "null"], "minimum": 0 },
+    "shutdownPreStopSeconds": { "type": ["integer", "null"], "minimum": 0, "description": "Seconds of native lifecycle.preStop.sleep before SIGTERM, covering Service endpoint-removal lag. Requires Kubernetes 1.29+; 0 omits the hook. Counts against terminationGracePeriodSeconds." },
+    "shutdownPreDrainSeconds": { "type": ["integer", "null"], "minimum": 0, "description": "FERRUM_SHUTDOWN_PREDRAIN_SECONDS: seconds every listener keeps accepting after SIGTERM while readiness already reports ready:false. Counts against terminationGracePeriodSeconds." },
     "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
     "serviceAccount": {
       "type": "object",
@@ -401,6 +403,7 @@
             "enabled": { "type": "boolean" },
             "initialDelaySeconds": { "type": "integer", "minimum": 0 },
             "periodSeconds": { "type": "integer", "minimum": 1 },
+            "failureThreshold": { "type": "integer", "minimum": 1 },
             "override": {
               "type": "object",
               "description": "Free-form custom readiness handler (exec/httpGet/tcpSocket) replacing the computed /health check.",
@@ -539,6 +542,29 @@
             { "type": "string", "pattern": "^[0-9]+%$" },
             { "type": "null" }
           ]
+        }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "allowedNamespaceSelectors": {
+          "type": "array",
+          "description": "NetworkPolicy namespaceSelector peers for admin and CP gRPC ingress.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "allowedPodSelectors": {
+          "type": "array",
+          "description": "NetworkPolicy podSelector peers for admin and CP gRPC ingress.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
         }
       }
     }

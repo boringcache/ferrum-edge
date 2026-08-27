@@ -515,7 +515,10 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
 /// * `redis_url` credentials — Redis ACL credentials are documented as
 ///   encodable in the URL (`redis://user:pass@host`). Userinfo is replaced and
 ///   query/fragment data is removed; scheme/host/port/database stay visible as
-///   bounded diagnostics.
+///   bounded diagnostics. A URL *fragment* can no longer reach storage at all
+///   (issue #4147: redis-rs reads `#insecure` as a TLS-verification opt-out, so
+///   admission refuses any fragment), but the projection still strips fragments
+///   because configs written before that guard can still hold one.
 ///
 /// Full-Admin reads stay raw so rotation via read-modify-write keeps working.
 #[tokio::test]
@@ -532,7 +535,7 @@ async fn redis_backed_plugin_secrets_are_redacted_for_non_admins_and_audit() {
     let redis_query_secret = "query-secret-0123456789";
     let redis_fragment_secret = "fragment-secret-0123456789";
     let redis_url = format!(
-        "redis://cacheuser:{redis_password}@cache.internal:6379/3?token={redis_query_secret}#{redis_fragment_secret}"
+        "redis://cacheuser:{redis_password}@cache.internal:6379/3?token={redis_query_secret}"
     );
     let plugin = json!({
         "id": "redis-cache-secret",
@@ -545,6 +548,22 @@ async fn redis_backed_plugin_secrets_are_redacted_for_non_admins_and_audit() {
             "ttl_seconds": 60
         }
     });
+
+    // A fragment is refused at admission rather than redacted after the fact:
+    // redis-rs treats `#insecure` as a TLS-verification opt-out, so it must never
+    // reach storage (issue #4147).
+    let mut fragment_plugin = plugin.clone();
+    fragment_plugin["config"]["redis_url"] =
+        serde_json::Value::String(format!("{redis_url}#{redis_fragment_secret}"));
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &fragment_plugin).await;
+    assert_eq!(
+        status, 400,
+        "fragment-bearing redis_url must be refused: {body:?}"
+    );
+    assert!(
+        !body.to_string().contains(redis_fragment_secret),
+        "rejection echoed the fragment secret: {body:?}"
+    );
 
     let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
     assert_eq!(status, 201, "plugin create failed: {body:?}");
