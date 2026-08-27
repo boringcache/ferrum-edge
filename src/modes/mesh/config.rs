@@ -4589,21 +4589,28 @@ pub struct MeshConfig {
     /// authenticated inbound CONNECT terminator may relay to (issue #4150).
     ///
     /// The inbound HBONE/`:15006` terminator is only allowed to be the
-    /// ztunnel-equivalent for destinations it actually terminates FOR. Two
+    /// ztunnel-equivalent for destinations it actually terminates FOR. Three
     /// topologies legitimately terminate for a workload other than the pod the
-    /// proxy runs in, and only those two populate this vector:
+    /// proxy runs in, and only those three populate this vector:
     ///
+    /// * `Sidecar` / `Ambient` — the slice workload record(s) carrying THIS
+    ///   proxy's own workload identity (`FERRUM_MESH_WORKLOAD_SPIFFE_ID`).
+    ///   Ambient is a ztunnel-style proxy that runs OUTSIDE the workload pods'
+    ///   network namespaces and terminates inbound for the pods the node-agent
+    ///   enrolls (`docs/mesh.md` → "Enrolled Ambient destination pod UDP
+    ///   relay"), so the accepted socket's local address alone cannot name
+    ///   every legitimate destination. A blank/absent identity leaves this
+    ///   EMPTY — fail closed, own-local-address only.
     /// * `NodeWaypoint` — the CP-authorized pods enrolled on THIS node, taken
     ///   from [`Self::node_waypoint_capture_destinations`].
     /// * `ServiceWaypoint` — the backing workloads of the services bound to
     ///   THIS waypoint, taken from the slice's already waypoint-narrowed
     ///   workload view.
     ///
-    /// `Sidecar` / `Ambient` terminate only for their own pod, which the
-    /// accepted connection's own local address proves without any inventory, so
-    /// they leave this EMPTY and set
-    /// [`Self::inbound_relay_admits_accepted_local_address`] instead.
-    /// `EastWestGateway` (SNI passthrough) and `EgressGateway` (external
+    /// `Sidecar` / `Ambient` ALSO set
+    /// [`Self::inbound_relay_admits_accepted_local_address`], because the pod
+    /// IP the peer actually reached is a transport fact no inventory is needed
+    /// for. `EastWestGateway` (SNI passthrough) and `EgressGateway` (external
     /// ServiceEntry destinations, admitted by their own allowlists) leave both
     /// unset.
     ///
@@ -4615,8 +4622,9 @@ pub struct MeshConfig {
     /// relay into, bypassing that workload's own inbound policy.
     #[serde(skip)]
     pub inbound_relay_destinations: Vec<MeshInboundRelayDestination>,
-    /// Runtime-only marker for the OWN-POD inbound CONNECT terminators
-    /// (`Sidecar` / `Ambient`), set on every mesh apply (issue #4150).
+    /// Runtime-only marker for the inbound CONNECT terminators that serve their
+    /// own workload identity (`Sidecar` / `Ambient`), set on every mesh apply
+    /// (issue #4150).
     ///
     /// When true, the accepted connection's own local address is an admissible
     /// relay destination: the peer provably reached the pod it named, on this
@@ -4628,19 +4636,40 @@ pub struct MeshConfig {
     pub inbound_relay_admits_accepted_local_address: bool,
 }
 
-/// One address the authenticated inbound CONNECT terminator may relay to, with
-/// the application ports the owning workload record declares (issue #4150).
+/// One destination the authenticated inbound CONNECT terminator may relay to,
+/// with the application ports the owning workload record declares (issue
+/// #4150).
 ///
 /// An EMPTY `ports` mirrors the workload inventory's own rule: a record that
 /// declares no ports does not constrain the port for its address.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MeshInboundRelayDestination {
-    /// Canonicalized destination address (IPv4-mapped IPv6 folded to IPv4), so
-    /// the two textual spellings of one address cannot diverge.
-    pub address: std::net::IpAddr,
+    /// The destination exactly as the owning workload record declares it.
+    pub host: MeshInboundRelayHost,
     /// Declared application ports, sorted and deduplicated. Empty ⇒ the owning
     /// record declares none and does not constrain the port.
     pub ports: Vec<u16>,
+}
+
+/// A workload address in the termination inventory, in comparison form
+/// (issue #4150).
+///
+/// `Workload.addresses` are normally pod IP literals, but the mesh data model
+/// has always allowed a DECLARED NAME (a `ServiceEntry`/`WorkloadEntry` host, a
+/// VM address, a functional fixture's DNS name) and the pre-#4150 guard matched
+/// those by string. Both forms are kept so that behaviour survives, bounded to
+/// the terminator's OWN inventory: a name is compared verbatim and is NEVER
+/// resolved here, so nothing is admitted that this proxy's inventory does not
+/// already name. Resolution stays where it belongs — after admission, on the
+/// dial path.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MeshInboundRelayHost {
+    /// Canonicalized IP literal (IPv4-mapped IPv6 folded to IPv4), so the two
+    /// textual spellings of one address cannot diverge.
+    Ip(std::net::IpAddr),
+    /// ASCII-lowercased declared name, compared case-insensitively against the
+    /// CONNECT authority host.
+    Name(String),
 }
 
 /// Why the authenticated inbound CONNECT terminator refused a destination
@@ -4651,9 +4680,9 @@ pub struct MeshInboundRelayDestination {
 pub enum InboundRelayDenial {
     /// No mesh slice is applied, so this proxy terminates for nothing.
     NoSlice,
-    /// The authority is empty, portless, or not an IP literal / `localhost`.
-    /// A name would have to be resolved, and whatever it resolved to could not
-    /// be attributed to this terminator.
+    /// The authority is empty, portless, or a name this terminator's own
+    /// inventory does not declare. Anything else would have to be resolved,
+    /// and whatever it resolved to could not be attributed to this terminator.
     UnresolvableHost,
     /// The address is not one this proxy terminates for. This is the
     /// open-relay refusal: a slice-declared workload belonging to some OTHER
@@ -4676,31 +4705,38 @@ impl InboundRelayDenial {
     }
 }
 
-/// Collapse `workloads` into the compact address→declared-ports inventory the
+/// Collapse `workloads` into the compact host→declared-ports inventory the
 /// inbound CONNECT terminator's guard reads (issue #4150).
 ///
-/// Cold path, run once per mesh apply. Addresses that are not IP literals are
-/// dropped: the guard compares parsed addresses, so an unparseable record could
-/// never match anyway and keeping it would only make the inventory look wider
-/// than it is.
-pub fn inbound_relay_destinations_from_workloads(
-    workloads: &[Workload],
+/// Cold path, run once per mesh apply. Every declared address is carried: IP
+/// literals canonicalized, anything else kept verbatim (ASCII-lowercased) as a
+/// [`MeshInboundRelayHost::Name`] the guard matches without resolving. Blank
+/// addresses are dropped — they would match an empty authority the caller has
+/// already refused.
+pub fn inbound_relay_destinations_from_workloads<'a>(
+    workloads: impl IntoIterator<Item = &'a Workload>,
 ) -> Vec<MeshInboundRelayDestination> {
     let mut destinations: Vec<MeshInboundRelayDestination> = Vec::new();
     for workload in workloads {
         for address in &workload.addresses {
-            let Ok(address) = address.parse::<std::net::IpAddr>() else {
-                continue;
+            let host = match address.parse::<std::net::IpAddr>() {
+                Ok(address) => MeshInboundRelayHost::Ip(address.to_canonical()),
+                Err(_) => {
+                    let name = address.trim();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    MeshInboundRelayHost::Name(name.to_ascii_lowercase())
+                }
             };
-            let address = address.to_canonical();
             let ports: Vec<u16> = workload.ports.iter().map(|port| port.port).collect();
             // Index lookup, not `iter_mut().find()`: the mutable borrow would
             // otherwise still be live in the insert arm.
             let existing = destinations
                 .iter()
-                .position(|existing| existing.address == address);
+                .position(|existing| existing.host == host);
             let Some(index) = existing else {
-                destinations.push(MeshInboundRelayDestination { address, ports });
+                destinations.push(MeshInboundRelayDestination { host, ports });
                 continue;
             };
             // Several records can back one pod (several Services on the same
@@ -4725,7 +4761,7 @@ pub fn inbound_relay_destinations_from_workloads(
     for destination in &mut destinations {
         destination.ports.sort_unstable();
     }
-    destinations.sort_by_key(|destination| destination.address);
+    destinations.sort();
     destinations
 }
 
@@ -4803,9 +4839,14 @@ impl MeshConfig {
     ///    functional waypoint suite declares `127.0.0.1` as the workload
     ///    address).
     /// 3. **[`Self::inbound_relay_destinations`]** — the deliberate, narrow
-    ///    multi-destination allowance for the two topologies that are MEANT to
-    ///    terminate for another workload (`NodeWaypoint` enrolled pods,
-    ///    `ServiceWaypoint` waypoint-bound backing workloads).
+    ///    multi-destination allowance for the topologies that are MEANT to
+    ///    terminate for a workload other than the pod the proxy runs in
+    ///    (`Sidecar` / `Ambient` own-identity workload records, `NodeWaypoint`
+    ///    enrolled pods, `ServiceWaypoint` waypoint-bound backing workloads).
+    ///    An entry is matched by IP when the authority is an IP literal and by
+    ///    verbatim (case-insensitive) name when it is not; a name is never
+    ///    resolved here, so this cannot reach anything the inventory does not
+    ///    itself declare.
     ///
     /// Everything else fails closed, including a slice-declared workload owned
     /// by a different node. Hot path: no allocation, no lock, and no scan of
@@ -4854,23 +4895,23 @@ impl MeshConfig {
                 };
             }
             if parsed.is_none() {
-                // `localhost` is not an IP literal; the inventory is
-                // addresses only, so a waypoint has nothing to match.
+                // `localhost` is a resolver alias, never a declared workload
+                // address, so a terminator without the own-namespace shortcut
+                // has nothing to match it against.
                 return Err(InboundRelayDenial::AddressNotTerminated);
             }
             // Fall through: a waypoint/node may still terminate for
             // 127.0.0.1 / ::1 when that address is in its inventory.
         }
 
-        let Some(address) = parsed else {
-            return Err(InboundRelayDenial::UnresolvableHost);
-        };
         // Canonicalize so `::ffff:10.1.2.3` and `10.1.2.3`, and the several
         // textual spellings of one IPv6 address, resolve to the same decision
         // instead of one form being admitted and the other refused.
-        let address = address.to_canonical();
+        let address = parsed.map(|address| address.to_canonical());
 
-        if own_address == Some(address) {
+        if let Some(address) = address
+            && own_address == Some(address)
+        {
             return if self.workload_declares_address_port(address, port) {
                 Ok(())
             } else {
@@ -4878,20 +4919,48 @@ impl MeshConfig {
             };
         }
 
-        let mut terminates_for_address = false;
+        self.inbound_relay_inventory_decision(candidate, address, port)
+    }
+
+    /// Match `host` (already bracket-stripped; `address` is its canonical IP
+    /// form when it is an IP literal) against this terminator's own
+    /// [`Self::inbound_relay_destinations`] inventory (issue #4150).
+    ///
+    /// An IP authority matches only `Ip` entries and a name authority matches
+    /// only `Name` entries: the inventory is never resolved, so a declared name
+    /// can never stand in for an address or vice versa. Hot path — comparison
+    /// only, no allocation.
+    fn inbound_relay_inventory_decision(
+        &self,
+        host: &str,
+        address: Option<std::net::IpAddr>,
+        port: u16,
+    ) -> Result<(), InboundRelayDenial> {
+        let mut terminates_for_host = false;
         for destination in &self.inbound_relay_destinations {
-            if destination.address != address {
+            let matches = match &destination.host {
+                MeshInboundRelayHost::Ip(declared) => address == Some(*declared),
+                MeshInboundRelayHost::Name(declared) => {
+                    address.is_none() && declared.eq_ignore_ascii_case(host)
+                }
+            };
+            if !matches {
                 continue;
             }
-            terminates_for_address = true;
+            terminates_for_host = true;
             if destination.ports.is_empty() || destination.ports.contains(&port) {
                 return Ok(());
             }
         }
-        if terminates_for_address {
+        if terminates_for_host {
             Err(InboundRelayDenial::PortNotDeclared)
-        } else {
+        } else if address.is_some() {
             Err(InboundRelayDenial::AddressNotTerminated)
+        } else {
+            // A name nothing in this terminator's inventory declares. Admitting
+            // it would mean resolving it, and whatever it resolved to could not
+            // be attributed to this terminator.
+            Err(InboundRelayDenial::UnresolvableHost)
         }
     }
 

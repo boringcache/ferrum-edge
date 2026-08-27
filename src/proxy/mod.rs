@@ -2355,9 +2355,10 @@ pub fn is_udp_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig)
 ///
 /// The admitted set is the destinations THIS terminator actually terminates
 /// for — its own pod (proved by `terminator_local_ip`, the accepted
-/// connection's own local address) plus, for the two topologies that are meant
-/// to terminate for other workloads, a narrow slice-derived inventory
-/// (`NodeWaypoint` enrolled pods / `ServiceWaypoint` waypoint-bound backing
+/// connection's own local address) plus a narrow slice-derived inventory for
+/// the topologies that legitimately terminate for a workload other than the
+/// pod the proxy runs in (`Sidecar` / `Ambient` own-identity workload records,
+/// `NodeWaypoint` enrolled pods, `ServiceWaypoint` waypoint-bound backing
 /// workloads). Being declared ANYWHERE in the slice is deliberately not
 /// enough: relaying to another node's workload would dial that pod in
 /// plaintext from this pod's IP, skipping the destination's own
@@ -29430,9 +29431,11 @@ async fn handle_proxy_request_inner(
             // 404ing. The synthesized proxy is built only on the inbound
             // listener (`mesh_direction == Inbound`) and only for this
             // terminator's own pod (proved by the accepted connection's local
-            // address, loopback included) or — on NodeWaypoint /
-            // ServiceWaypoint — a workload in its narrow slice-derived
-            // termination inventory (issue #4150); `handle_hbone_request` /
+            // address, loopback included) or a workload in its narrow
+            // slice-derived termination inventory — own-identity records on
+            // Sidecar/Ambient, enrolled pods on NodeWaypoint, waypoint-bound
+            // backing workloads on ServiceWaypoint (issue #4150);
+            // `handle_hbone_request` /
             // `handle_hbone_udp_request` re-checks the authenticated-peer gate
             // before dialing. A datagram-over-HBONE CONNECT (`is_udp_hbone_connect`)
             // takes the SAME transparent-relay synthesis — the open-relay guard
@@ -62422,8 +62425,9 @@ mod tests {
             decide("[fd00:10:244:1::99]", 8080, Some(own_ip)),
             Err(InboundRelayDenial::AddressNotTerminated)
         );
-        // A bracketed IPv4 literal is not a valid authority host, and a name is
-        // never resolvable to a destination this node terminates for.
+        // A bracketed IPv4 literal is not a valid authority host, and a name
+        // this terminator's own inventory does not declare is never resolved
+        // into a destination it terminates for.
         assert_eq!(
             decide("[10.1.2.3]", 8080, Some(own_ip)),
             Err(InboundRelayDenial::UnresolvableHost)
