@@ -36,7 +36,7 @@ use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{GetOptions, Http2Client, Http3Client};
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::{
-    reserve_colocated_tcp_udp, reserve_port, reserve_refused_tcp_port,
+    BIND_DROP_SPAWN_ATTEMPTS, reserve_colocated_tcp_udp, reserve_port, reserve_refused_tcp_port,
 };
 use crate::scaffolding::to_file_mode_yaml;
 use bytes::Bytes;
@@ -304,15 +304,39 @@ async fn spawn_h3_harness_with_explicit_https_port_and_config(
     pool_warmup_enabled: bool,
     refresh_interval_secs: Option<u64>,
 ) -> (GatewayHarness, String, u16) {
-    const STARTUP_ATTEMPTS: u32 = 3;
+    spawn_h3_harness_with_explicit_https_port_config_and_env(
+        yaml,
+        pool_warmup_enabled,
+        refresh_interval_secs,
+        &[],
+    )
+    .await
+}
+
+/// Spawn an H3-enabled binary harness with a freshly reserved
+/// `FERRUM_PROXY_HTTPS_PORT` on every attempt.
+///
+/// The reservation cannot stay open: the gateway subprocess binds its own
+/// TCP+UDP sockets, so the test must drop before spawn. Reusing a stolen
+/// number loses the same race; inner `max_attempts(1)` avoids wasting
+/// `TestGateway`'s default 3 retries on a port that cannot change.
+/// Budget is [`BIND_DROP_SPAWN_ATTEMPTS`] (3), not the 10 used for the
+/// cheap `127.0.0.1:0` reservation bind.
+async fn spawn_h3_harness_with_explicit_https_port_config_and_env(
+    yaml: String,
+    pool_warmup_enabled: bool,
+    refresh_interval_secs: Option<u64>,
+    extra_env: &[(&str, &str)],
+) -> (GatewayHarness, String, u16) {
     let mut last_error = None;
-    for attempt in 1..=STARTUP_ATTEMPTS {
+    let mut last_port = 0u16;
+    for attempt in 1..=BIND_DROP_SPAWN_ATTEMPTS {
         // A fixed env-pinned HTTPS/QUIC port cannot be reused after a failed
         // startup. Retry the complete harness with a fresh port and scratch
         // directory, matching the chunked-harness stabilization in PR #2065.
         let reservation = reserve_port().await.expect("reserve https port");
-        let https_port = reservation.port;
-        drop(reservation);
+        let https_port = reservation.drop_and_take_port();
+        last_port = https_port;
 
         let scratch = tempfile::tempdir().expect("scratch");
         let (ca_pem, cert_path, key_path) = write_frontend_certs(scratch.path(), "h3-gw-ca");
@@ -336,6 +360,9 @@ async fn spawn_h3_harness_with_explicit_https_port_and_config(
                 secs.to_string(),
             );
         }
+        for (k, v) in extra_env {
+            builder = builder.env(*k, *v);
+        }
 
         match builder.spawn().await {
             Ok(harness) => {
@@ -346,17 +373,16 @@ async fn spawn_h3_harness_with_explicit_https_port_and_config(
             }
             Err(error) => {
                 eprintln!(
-                    "H3 harness startup attempt {attempt}/{STARTUP_ATTEMPTS} failed: {error}"
+                    "H3 harness startup attempt {attempt}/{BIND_DROP_SPAWN_ATTEMPTS} \
+                     failed (https_port={https_port}): {error}"
                 );
                 last_error = Some(error.to_string());
-                if attempt < STARTUP_ATTEMPTS {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
             }
         }
     }
     panic!(
-        "H3 harness failed after {STARTUP_ATTEMPTS} fresh-port attempts: {}",
+        "H3 harness failed after {BIND_DROP_SPAWN_ATTEMPTS} fresh-port attempts; \
+         last https port {last_port}: {}",
         last_error.unwrap_or_else(|| "no startup error recorded".to_string())
     );
 }
@@ -987,11 +1013,6 @@ async fn h3_pool_key_separates_by_dns_override() {
             .spawn()
             .expect("spawn h3");
 
-    // Frontend certs.
-    let scratch = tempfile::tempdir().expect("scratch");
-    let (_ca_pem, cert_path, key_path) = write_frontend_certs(scratch.path(), "h3-gw-ca");
-    Box::leak(Box::new(scratch));
-
     // Two proxies with the same backend host + port but different dns_override.
     let config = json!({
         "version": "1",
@@ -1024,24 +1045,8 @@ async fn h3_pool_key_separates_by_dns_override() {
         "plugin_configs": [],
     });
     let yaml = serde_yaml::to_string(&config).expect("yaml");
-
-    let reservation = reserve_port().await.expect("https port");
-    let https_port = reservation.port;
-    drop(reservation);
-
-    let harness = GatewayHarness::builder()
-        .file_config(yaml)
-        .log_level("info")
-        .capture_output()
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
-        .env("FERRUM_TLS_NO_VERIFY", "true")
-        .env("FERRUM_POOL_WARMUP_ENABLED", "true")
-        .spawn()
-        .await
-        .expect("spawn");
+    let (harness, _ca_pem, _https_port) =
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, true, None).await;
 
     // Poll until the registry has both entries.
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -1132,27 +1137,8 @@ async fn h3_client_without_host_header_synthesizes_from_authority_preserve_false
     // Default proxy → preserve_host_header is `false`: the backend Host
     // should be the upstream target host, NOT the client's `:authority`.
     let yaml = file_mode_yaml_for_h3(backend_port);
-    let reservation = reserve_port().await.expect("reserve https port");
-    let https_port = reservation.port;
-    drop(reservation);
-
-    let scratch = tempfile::tempdir().expect("scratch");
-    let (_ca_pem, cert_path, key_path) = write_frontend_certs(scratch.path(), "h3-gw-host1");
-    Box::leak(Box::new(scratch));
-
-    let _harness = GatewayHarness::builder()
-        .file_config(yaml)
-        .log_level("info")
-        .capture_output()
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
-        .env("FERRUM_TLS_NO_VERIFY", "true")
-        .env("FERRUM_POOL_WARMUP_ENABLED", "true")
-        .spawn()
-        .await
-        .expect("spawn gateway");
+    let (_harness, _ca_pem, https_port) =
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, true, None).await;
 
     // Drive the H3 frontend with the canonical "no explicit Host" wire
     // shape. The bug-fixed gateway must still emit a Host to the backend.
@@ -1266,26 +1252,8 @@ async fn h3_client_without_host_header_synthesizes_from_authority_preserve_true(
         "plugin_configs": [],
     });
     let yaml = serde_yaml::to_string(&config).expect("yaml");
-    let reservation = reserve_port().await.expect("reserve https port");
-    let https_port = reservation.port;
-    drop(reservation);
-    let scratch = tempfile::tempdir().expect("scratch");
-    let (_ca_pem, cert_path, key_path) = write_frontend_certs(scratch.path(), "h3-gw-host2");
-    Box::leak(Box::new(scratch));
-
-    let _harness = GatewayHarness::builder()
-        .file_config(yaml)
-        .log_level("info")
-        .capture_output()
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
-        .env("FERRUM_TLS_NO_VERIFY", "true")
-        .env("FERRUM_POOL_WARMUP_ENABLED", "true")
-        .spawn()
-        .await
-        .expect("spawn gateway");
+    let (_harness, _ca_pem, https_port) =
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, true, None).await;
 
     let client = Http3Client::insecure().expect("h3 client");
     let url = format!("https://127.0.0.1:{https_port}/api/x");
@@ -1361,26 +1329,8 @@ async fn h3_client_explicit_host_matches_authority_preserved() {
         "plugin_configs": [],
     });
     let yaml = serde_yaml::to_string(&config).expect("yaml");
-    let reservation = reserve_port().await.expect("reserve https port");
-    let https_port = reservation.port;
-    drop(reservation);
-    let scratch = tempfile::tempdir().expect("scratch");
-    let (_ca_pem, cert_path, key_path) = write_frontend_certs(scratch.path(), "h3-gw-host3");
-    Box::leak(Box::new(scratch));
-
-    let _harness = GatewayHarness::builder()
-        .file_config(yaml)
-        .log_level("info")
-        .capture_output()
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
-        .env("FERRUM_TLS_NO_VERIFY", "true")
-        .env("FERRUM_POOL_WARMUP_ENABLED", "true")
-        .spawn()
-        .await
-        .expect("spawn gateway");
+    let (_harness, _ca_pem, https_port) =
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, true, None).await;
 
     let client = Http3Client::insecure().expect("h3 client");
     let url = format!("https://127.0.0.1:{https_port}/api/x");
@@ -1518,28 +1468,8 @@ async fn h3_native_pool_synthesizes_host_from_upstream_target_not_proxy_backend_
         "plugin_configs": [],
     });
     let yaml = serde_yaml::to_string(&config).expect("yaml");
-
-    let reservation = reserve_port().await.expect("reserve https port");
-    let https_port = reservation.port;
-    drop(reservation);
-
-    let scratch = tempfile::tempdir().expect("scratch");
-    let (_ca_pem, cert_path, key_path) = write_frontend_certs(scratch.path(), "h3-gw-codex-p1");
-    Box::leak(Box::new(scratch));
-
-    let harness = GatewayHarness::builder()
-        .file_config(yaml)
-        .log_level("info")
-        .capture_output()
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
-        .env("FERRUM_TLS_NO_VERIFY", "true")
-        .env("FERRUM_POOL_WARMUP_ENABLED", "true")
-        .spawn()
-        .await
-        .expect("spawn gateway");
+    let (harness, _ca_pem, https_port) =
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, true, None).await;
 
     // Wait for capability classification — gateway must see h3=supported
     // before it'll route via the native H3 pool.
@@ -2621,29 +2551,13 @@ async fn spawn_h3_frontend_refined_buffering_harness(
         .spawn()
         .expect("spawn h3 backend");
 
-    let reservation = reserve_port().await.expect("reserve https port");
-    let https_port = reservation.port;
-    drop(reservation);
-
-    let scratch = tempfile::tempdir().expect("scratch");
-    let (_ca_pem, cert_path, key_path) =
-        write_frontend_certs(scratch.path(), "h3-gw-refined-buffering");
-    Box::leak(Box::new(scratch));
-
-    let mut builder = GatewayHarness::builder()
-        .file_config(file_mode_yaml_for_h3_with_compression(backend_port))
-        .log_level("info")
-        .capture_output()
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
-        .env("FERRUM_TLS_NO_VERIFY", "true")
-        .env("FERRUM_POOL_WARMUP_ENABLED", "true");
-    for (k, v) in extra_env {
-        builder = builder.env(*k, *v);
-    }
-    let harness = builder.spawn().await.expect("spawn gateway");
+    let (harness, _ca_pem, https_port) = spawn_h3_harness_with_explicit_https_port_config_and_env(
+        file_mode_yaml_for_h3_with_compression(backend_port),
+        true,
+        None,
+        extra_env,
+    )
+    .await;
 
     let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
         .await

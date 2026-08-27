@@ -60,7 +60,10 @@ const UDP_DENY_NAMESPACE: &str = "t5b-stream-tests-udp-deny";
 const PROXY_ID: &str = "t5b-stream-proxy";
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 const PER_ATTEMPT_STARTED_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_GATEWAY_ATTEMPTS: u32 = 3;
+/// Whole-listener spawn budget. Matches
+/// [`crate::scaffolding::ports::BIND_DROP_SPAWN_ATTEMPTS`] / `TestGateway`'s
+/// default 3 — not the 10 used for the cheap `127.0.0.1:0` reservation bind.
+const MAX_GATEWAY_ATTEMPTS: u32 = crate::scaffolding::ports::BIND_DROP_SPAWN_ATTEMPTS;
 
 // ── Shared fixtures ───────────────────────────────────────────────────────
 
@@ -211,18 +214,21 @@ async fn spawn_udp_echo_backend(
 // ── TCP enforcement ───────────────────────────────────────────────────────
 
 /// Try once to spawn a TCP listener on `listen_port` with the supplied
-/// enforcement slot. Returns `Some(...)` on successful bind, `None` on
+/// enforcement slot. Returns `Ok(...)` on successful bind, `Err` on
 /// bind-drop-rebind race or timeout (retried by the outer loop).
 async fn try_spawn_tcp_listener(
     listen_port: u16,
     backend_port: u16,
     enforcement: SharedMeshOutboundEnforcement,
-) -> Option<(
-    u16,
-    watch::Sender<bool>,
-    tokio::task::JoinHandle<()>,
-    Arc<TcpProxyMetrics>,
-)> {
+) -> Result<
+    (
+        u16,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+        Arc<TcpProxyMetrics>,
+    ),
+    String,
+> {
     let proxy = tcp_proxy(listen_port, backend_port);
     let gateway_config = GatewayConfig {
         version: "1".to_string(),
@@ -301,55 +307,81 @@ async fn try_spawn_tcp_listener(
         stream_gateway_ref: None,
         trusted_proxies: Arc::new(TrustedProxies::none()),
     };
-    let join = tokio::spawn(async move {
-        let _ = start_tcp_listener(cfg).await;
-    });
+    let join = tokio::spawn(async move { start_tcp_listener(cfg).await });
 
     let deadline = std::time::Instant::now() + PER_ATTEMPT_STARTED_TIMEOUT;
     loop {
         if started.load(Ordering::Acquire) {
-            return Some((listen_port, shutdown_tx, join, metrics));
+            return Ok((listen_port, shutdown_tx, join, metrics));
         }
         if join.is_finished() {
-            let _ = join.await;
-            return None;
+            return Err(format_listener_exit("tcp", listen_port, join.await));
         }
         if std::time::Instant::now() > deadline {
             let _ = shutdown_tx.send(true);
             join.abort();
-            let _ = join.await;
-            return None;
+            return Err(format_listener_exit("tcp", listen_port, join.await));
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
+fn format_listener_exit(
+    kind: &str,
+    listen_port: u16,
+    outcome: Result<Result<(), anyhow::Error>, tokio::task::JoinError>,
+) -> String {
+    match outcome {
+        Ok(Ok(())) => {
+            format!("{kind} listener on {listen_port} exited without setting started=true")
+        }
+        Ok(Err(error)) => format!("{kind} listener on {listen_port}: {error}"),
+        Err(error) => format!("{kind} listener on {listen_port} join error: {error}"),
+    }
+}
+
+/// Spawn a TCP listener, re-reserving a **fresh** frontend port and rebuilding
+/// capture-port enforcement on every attempt.
+///
+/// `drop_and_take_port` cannot stay held: `start_tcp_listener` binds its own
+/// socket. Reusing a stolen number, or cloning enforcement built for a
+/// previous port, loses the same race.
 async fn spawn_tcp_listener_with_retry(
     backend_port: u16,
-    enforcement: SharedMeshOutboundEnforcement,
+    enforcement_for_port: impl Fn(u16) -> SharedMeshOutboundEnforcement,
 ) -> (
     u16,
     watch::Sender<bool>,
-    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<Result<(), anyhow::Error>>,
     Arc<TcpProxyMetrics>,
 ) {
+    let mut last_port = 0u16;
+    let mut last_error = String::from("no listener error recorded");
     for attempt in 1..=MAX_GATEWAY_ATTEMPTS {
         let frontend = reserve_port().await.expect("reserve frontend port");
         let frontend_port = frontend.drop_and_take_port();
-        if let Some(handles) =
-            try_spawn_tcp_listener(frontend_port, backend_port, enforcement.clone()).await
+        last_port = frontend_port;
+        match try_spawn_tcp_listener(
+            frontend_port,
+            backend_port,
+            enforcement_for_port(frontend_port),
+        )
+        .await
         {
-            return handles;
-        }
-        eprintln!(
-            "tcp listener spawn attempt {attempt}/{MAX_GATEWAY_ATTEMPTS} on \
-             {frontend_port} failed — retrying"
-        );
-        if attempt < MAX_GATEWAY_ATTEMPTS {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(handles) => return handles,
+            Err(error) => {
+                eprintln!(
+                    "tcp listener spawn attempt {attempt}/{MAX_GATEWAY_ATTEMPTS} \
+                     on {frontend_port} failed: {error}"
+                );
+                last_error = error;
+            }
         }
     }
-    panic!("tcp listener never reported started=true after {MAX_GATEWAY_ATTEMPTS} attempts");
+    panic!(
+        "tcp listener never reported started=true after {MAX_GATEWAY_ATTEMPTS} \
+         attempts; last port {last_port}: {last_error}"
+    );
 }
 
 #[tokio::test]
@@ -363,22 +395,20 @@ async fn tcp_admitted_destination_passes_through_to_backend() {
     let accept_counter = Arc::new(AtomicU64::new(0));
     let _backend = spawn_tcp_echo_backend(backend_listener, accept_counter.clone()).await;
 
-    // Build enforcement: gateway will bind on a fresh port (set by retry),
-    // and we mark that port as a mesh outbound capture port. The registry
-    // admits the backend.
-    let frontend = reserve_port().await.expect("reserve port for enforcement");
-    let frontend_port = frontend.drop_and_take_port();
+    // Build enforcement per attempt: gateway binds a fresh port, and that
+    // port is marked as a mesh outbound capture port. The registry admits
+    // the backend. Reusing a stolen number (or enforcement built for it)
+    // would lose the same bind-drop-rebind race.
     let registry_entry = format!("127.0.0.1:{}", backend_addr.port());
-    let enforcement = make_enforcement(
-        PASSTHROUGH_NAMESPACE,
-        &[&registry_entry],
-        vec![frontend_port],
-    );
-
     let (listen_port, shutdown_tx, join, _metrics) =
-        try_spawn_tcp_listener(frontend_port, backend_addr.port(), enforcement)
-            .await
-            .expect("gateway listener bound");
+        spawn_tcp_listener_with_retry(backend_addr.port(), |frontend_port| {
+            make_enforcement(
+                PASSTHROUGH_NAMESPACE,
+                &[registry_entry.as_str()],
+                vec![frontend_port],
+            )
+        })
+        .await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
 
     let mut stream = TcpStream::connect(gateway_addr)
@@ -415,18 +445,15 @@ async fn tcp_unadmitted_destination_is_dropped_before_backend_dial() {
     let _backend = spawn_tcp_echo_backend(backend_listener, accept_counter.clone()).await;
 
     // Registry admits a different host:port; backend is unadmitted.
-    let frontend = reserve_port().await.expect("reserve port for enforcement");
-    let frontend_port = frontend.drop_and_take_port();
-    let enforcement = make_enforcement(
-        TCP_DENY_NAMESPACE,
-        &["mongo.allowed.io:27017"],
-        vec![frontend_port],
-    );
-
     let (listen_port, shutdown_tx, join, _metrics) =
-        try_spawn_tcp_listener(frontend_port, backend_addr.port(), enforcement)
-            .await
-            .expect("gateway listener bound");
+        spawn_tcp_listener_with_retry(backend_addr.port(), |frontend_port| {
+            make_enforcement(
+                TCP_DENY_NAMESPACE,
+                &["mongo.allowed.io:27017"],
+                vec![frontend_port],
+            )
+        })
+        .await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
 
     // Snapshot the prometheus deny counter before the attempt so we
@@ -492,14 +519,15 @@ async fn tcp_skips_enforcement_when_listener_not_in_capture_ports() {
 
     // Enforcement points at a DIFFERENT port (15006 — conventional inbound).
     // The gateway will bind on a fresh port → Skip applies.
-    let enforcement = make_enforcement(
-        PASSTHROUGH_NAMESPACE,
-        &["mongo.allowed.io:27017"],
-        vec![15006],
-    );
-
     let (listen_port, shutdown_tx, join, _metrics) =
-        spawn_tcp_listener_with_retry(backend_addr.port(), enforcement).await;
+        spawn_tcp_listener_with_retry(backend_addr.port(), |_| {
+            make_enforcement(
+                PASSTHROUGH_NAMESPACE,
+                &["mongo.allowed.io:27017"],
+                vec![15006],
+            )
+        })
+        .await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
 
     let mut stream = TcpStream::connect(gateway_addr)
@@ -528,7 +556,14 @@ async fn try_spawn_udp_listener(
     listen_port: u16,
     backend_port: u16,
     enforcement: SharedMeshOutboundEnforcement,
-) -> Option<(u16, watch::Sender<bool>, tokio::task::JoinHandle<()>)> {
+) -> Result<
+    (
+        u16,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    ),
+    String,
+> {
     let proxy = udp_proxy(listen_port, backend_port);
     let gateway_config = GatewayConfig {
         version: "1".to_string(),
@@ -604,50 +639,63 @@ async fn try_spawn_udp_listener(
         node_waypoint_udp_destinations: None,
         datagram_client_address: None,
     };
-    let join = tokio::spawn(async move {
-        let _ = start_udp_listener(cfg).await;
-    });
+    let join = tokio::spawn(async move { start_udp_listener(cfg).await });
 
     let deadline = std::time::Instant::now() + PER_ATTEMPT_STARTED_TIMEOUT;
     loop {
         if started.load(Ordering::Acquire) {
-            return Some((listen_port, shutdown_tx, join));
+            return Ok((listen_port, shutdown_tx, join));
         }
         if join.is_finished() {
-            let _ = join.await;
-            return None;
+            return Err(format_listener_exit("udp", listen_port, join.await));
         }
         if std::time::Instant::now() > deadline {
             let _ = shutdown_tx.send(true);
             join.abort();
-            let _ = join.await;
-            return None;
+            return Err(format_listener_exit("udp", listen_port, join.await));
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
+/// Spawn a UDP listener, re-reserving a **fresh** frontend port and rebuilding
+/// capture-port enforcement on every attempt. Same bind-drop-rebind caveat
+/// as [`spawn_tcp_listener_with_retry`].
 async fn spawn_udp_listener_with_retry(
     backend_port: u16,
-    enforcement: SharedMeshOutboundEnforcement,
-) -> (u16, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+    enforcement_for_port: impl Fn(u16) -> SharedMeshOutboundEnforcement,
+) -> (
+    u16,
+    watch::Sender<bool>,
+    tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+) {
+    let mut last_port = 0u16;
+    let mut last_error = String::from("no listener error recorded");
     for attempt in 1..=MAX_GATEWAY_ATTEMPTS {
         let frontend = reserve_port().await.expect("reserve frontend port");
         let frontend_port = frontend.drop_and_take_port();
-        if let Some(handles) =
-            try_spawn_udp_listener(frontend_port, backend_port, enforcement.clone()).await
+        last_port = frontend_port;
+        match try_spawn_udp_listener(
+            frontend_port,
+            backend_port,
+            enforcement_for_port(frontend_port),
+        )
+        .await
         {
-            return handles;
-        }
-        eprintln!(
-            "udp listener spawn attempt {attempt}/{MAX_GATEWAY_ATTEMPTS} on \
-             {frontend_port} failed — retrying"
-        );
-        if attempt < MAX_GATEWAY_ATTEMPTS {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(handles) => return handles,
+            Err(error) => {
+                eprintln!(
+                    "udp listener spawn attempt {attempt}/{MAX_GATEWAY_ATTEMPTS} \
+                     on {frontend_port} failed: {error}"
+                );
+                last_error = error;
+            }
         }
     }
-    panic!("udp listener never reported started=true after {MAX_GATEWAY_ATTEMPTS} attempts");
+    panic!(
+        "udp listener never reported started=true after {MAX_GATEWAY_ATTEMPTS} \
+         attempts; last port {last_port}: {last_error}"
+    );
 }
 
 #[tokio::test]
@@ -657,19 +705,16 @@ async fn udp_admitted_destination_passes_through_to_backend() {
     let backend_bytes = Arc::new(AtomicU64::new(0));
     let _backend = spawn_udp_echo_backend(backend_socket, backend_bytes.clone()).await;
 
-    let frontend = reserve_port().await.expect("reserve frontend port");
-    let frontend_port = frontend.drop_and_take_port();
     let registry_entry = format!("127.0.0.1:{}", backend_addr.port());
-    let enforcement = make_enforcement(
-        PASSTHROUGH_NAMESPACE,
-        &[&registry_entry],
-        vec![frontend_port],
-    );
-
     let (listen_port, shutdown_tx, join) =
-        try_spawn_udp_listener(frontend_port, backend_addr.port(), enforcement)
-            .await
-            .expect("udp listener bound");
+        spawn_udp_listener_with_retry(backend_addr.port(), |frontend_port| {
+            make_enforcement(
+                PASSTHROUGH_NAMESPACE,
+                &[registry_entry.as_str()],
+                vec![frontend_port],
+            )
+        })
+        .await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
 
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
@@ -698,18 +743,15 @@ async fn udp_unadmitted_destination_is_silently_dropped() {
     let backend_bytes = Arc::new(AtomicU64::new(0));
     let _backend = spawn_udp_echo_backend(backend_socket, backend_bytes.clone()).await;
 
-    let frontend = reserve_port().await.expect("reserve frontend port");
-    let frontend_port = frontend.drop_and_take_port();
-    let enforcement = make_enforcement(
-        UDP_DENY_NAMESPACE,
-        &["redis.allowed.io:6379"],
-        vec![frontend_port],
-    );
-
     let (listen_port, shutdown_tx, join) =
-        try_spawn_udp_listener(frontend_port, backend_addr.port(), enforcement)
-            .await
-            .expect("udp listener bound");
+        spawn_udp_listener_with_retry(backend_addr.port(), |frontend_port| {
+            make_enforcement(
+                UDP_DENY_NAMESPACE,
+                &["redis.allowed.io:6379"],
+                vec![frontend_port],
+            )
+        })
+        .await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
 
     let deny_before = stream_deny_count(UDP_DENY_NAMESPACE, "udp");
@@ -757,14 +799,15 @@ async fn udp_skips_enforcement_when_listener_not_in_capture_ports() {
 
     // Enforcement points at a DIFFERENT port; gateway port is not in
     // the capture set → Skip → traffic flows through.
-    let enforcement = make_enforcement(
-        PASSTHROUGH_NAMESPACE,
-        &["redis.allowed.io:6379"],
-        vec![15006],
-    );
-
     let (listen_port, shutdown_tx, join) =
-        spawn_udp_listener_with_retry(backend_addr.port(), enforcement).await;
+        spawn_udp_listener_with_retry(backend_addr.port(), |_| {
+            make_enforcement(
+                PASSTHROUGH_NAMESPACE,
+                &["redis.allowed.io:6379"],
+                vec![15006],
+            )
+        })
+        .await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
 
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");

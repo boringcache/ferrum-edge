@@ -156,7 +156,7 @@ fn tls_client_hello(hostname: &str) -> Vec<u8> {
     record
 }
 
-/// Allocate an ephemeral port by binding and immediately dropping.
+/// Allocate an ephemeral TCP port by binding and immediately dropping.
 async fn ephemeral_port() -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -164,8 +164,26 @@ async fn ephemeral_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-/// Start a TCP stream-listener fixture on a fresh port, retrying only the
-/// demonstrated bind-and-release race from `ephemeral_port()`.
+/// Allocate an ephemeral UDP port by binding and immediately dropping.
+///
+/// TCP and UDP port spaces are independent: a number free in TCP may already
+/// be bound in UDP. UDP fixtures must reserve from UDP space.
+async fn ephemeral_udp_port() -> u16 {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind ephemeral UDP port");
+    socket.local_addr().unwrap().port()
+}
+
+#[derive(Clone, Copy)]
+enum FreshPortFamily {
+    Tcp,
+    Udp,
+}
+
+/// Start a stream-listener fixture on a fresh port, retrying only the
+/// demonstrated bind-and-release race from `ephemeral_port()` /
+/// `ephemeral_udp_port()`.
 ///
 /// The production manager owns its listener bind, so the test cannot hand it a
 /// reservation. Another parallel test can therefore claim the released port
@@ -173,24 +191,44 @@ async fn ephemeral_port() -> u16 {
 /// when every reported failure is the expected `Port ... is already in use`
 /// error for that exact port; configuration, TLS, and lifecycle failures remain
 /// immediate test failures. Each attempt uses a new kernel-assigned port.
-async fn start_manager_on_fresh_tcp_port<F>(mut build_config: F) -> (StreamListenerManager, u16)
+///
+/// `make_runtime` builds the manager (plain, request-epoch, or datagram-secret
+/// fixtures). When `shutdown_rx` is `Some`, it is installed before `reconcile`
+/// so the spawned accept loop observes the global SIGTERM channel.
+async fn start_runtime_on_fresh_port<F, M>(
+    family: FreshPortFamily,
+    mut build_config: F,
+    mut make_runtime: M,
+    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) -> (StreamManagerRuntime, Arc<ArcSwap<GatewayConfig>>, u16)
 where
     F: FnMut(u16) -> GatewayConfig,
+    M: FnMut(Arc<ArcSwap<GatewayConfig>>, &GatewayConfig) -> StreamManagerRuntime,
 {
     const MAX_BIND_ATTEMPTS: usize = 8;
 
     let mut bind_races = Vec::new();
     for attempt in 1..=MAX_BIND_ATTEMPTS {
-        let port = ephemeral_port().await;
+        let port = match family {
+            FreshPortFamily::Tcp => ephemeral_port().await,
+            FreshPortFamily::Udp => ephemeral_udp_port().await,
+        };
         let config = build_config(port);
         assert!(config.validate_stream_proxies().is_ok());
 
-        let manager = create_manager(config);
-        let failures = manager.reconcile().await;
+        let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
+        let runtime = make_runtime(config_arc.clone(), &config);
+        if let Some(rx) = &shutdown_rx {
+            runtime.manager.set_global_shutdown_rx(rx.clone());
+        }
+        let failures = runtime.manager.reconcile().await;
         if failures.is_empty() {
-            let started = manager.wait_until_started(Duration::from_secs(5)).await;
+            let started = runtime
+                .manager
+                .wait_until_started(Duration::from_secs(5))
+                .await;
             if started.is_ok() {
-                return (manager, port);
+                return (runtime, config_arc, port);
             }
 
             // Reconcile first probes the port, then the listener task performs
@@ -198,14 +236,14 @@ where
             // narrower interval. Retry only when the manager's structured
             // snapshot proves that exact EADDRINUSE class; a generic startup
             // timeout or any other degradation remains a hard assertion.
-            let async_failures = manager.stream_bind_failures();
+            let async_failures = runtime.manager.stream_bind_failures();
             let only_async_port_collision = !async_failures.is_empty()
                 && async_failures.iter().all(|failure| {
                     failure.listen_port == port
                         && matches!(failure.kind, StreamListenerDegradation::BindFailed)
                         && failure.error.contains("already in use")
                 });
-            manager.shutdown_all().await;
+            runtime.manager.shutdown_all().await;
             assert!(
                 only_async_port_collision,
                 "stream listener on fresh port {port} did not start: {started:?}; \
@@ -221,7 +259,7 @@ where
         let only_released_port_collision = failures.iter().all(|(_, failed_port, message)| {
             *failed_port == port && message.starts_with(&expected_prefix)
         });
-        manager.shutdown_all().await;
+        runtime.manager.shutdown_all().await;
         assert!(
             only_released_port_collision,
             "stream-listener setup failed for a reason other than the released-port race: {failures:?}"
@@ -234,6 +272,127 @@ where
     panic!(
         "could not acquire a frontend port after {MAX_BIND_ATTEMPTS} fresh, narrowly classified attempts: {bind_races:?}"
     );
+}
+
+async fn start_manager_with_config_arc_on_fresh_port<F>(
+    family: FreshPortFamily,
+    build_config: F,
+) -> (StreamListenerManager, Arc<ArcSwap<GatewayConfig>>, u16)
+where
+    F: FnMut(u16) -> GatewayConfig,
+{
+    let (runtime, config_arc, port) =
+        start_runtime_on_fresh_port(family, build_config, create_manager_runtime, None).await;
+    (runtime.manager, config_arc, port)
+}
+
+/// Start a TCP stream-listener fixture on a fresh port, retrying only the
+/// demonstrated bind-and-release race from `ephemeral_port()`.
+async fn start_manager_on_fresh_tcp_port<F>(build_config: F) -> (StreamListenerManager, u16)
+where
+    F: FnMut(u16) -> GatewayConfig,
+{
+    let (manager, _config_arc, port) =
+        start_manager_with_config_arc_on_fresh_port(FreshPortFamily::Tcp, build_config).await;
+    (manager, port)
+}
+
+/// Like [`start_manager_on_fresh_tcp_port`], but keeps the config `ArcSwap` so
+/// tests that reload listener identity can store a replacement `GatewayConfig`.
+async fn start_manager_with_config_arc_on_fresh_tcp_port<F>(
+    build_config: F,
+) -> (StreamListenerManager, Arc<ArcSwap<GatewayConfig>>, u16)
+where
+    F: FnMut(u16) -> GatewayConfig,
+{
+    start_manager_with_config_arc_on_fresh_port(FreshPortFamily::Tcp, build_config).await
+}
+
+/// UDP analogue of [`start_manager_on_fresh_tcp_port`]. Allocates from UDP
+/// space so a free TCP number that is already bound in UDP cannot steal the
+/// first attempt (see `test_reconcile_defers_udp_without_dtls_config`).
+async fn start_manager_on_fresh_udp_port<F>(build_config: F) -> (StreamListenerManager, u16)
+where
+    F: FnMut(u16) -> GatewayConfig,
+{
+    let (manager, _config_arc, port) =
+        start_manager_with_config_arc_on_fresh_port(FreshPortFamily::Udp, build_config).await;
+    (manager, port)
+}
+
+/// Like [`start_manager_with_config_arc_on_fresh_tcp_port`], but keeps the
+/// [`StreamManagerRuntime`] so reload tests can republish the request epoch
+/// together with the config ArcSwap.
+async fn start_manager_runtime_on_fresh_tcp_port<F>(
+    build_config: F,
+) -> (StreamManagerRuntime, Arc<ArcSwap<GatewayConfig>>, u16)
+where
+    F: FnMut(u16) -> GatewayConfig,
+{
+    start_runtime_on_fresh_port(
+        FreshPortFamily::Tcp,
+        build_config,
+        create_manager_runtime,
+        None,
+    )
+    .await
+}
+
+/// UDP start helper that installs the datagram client-address secret before
+/// reconcile. `start_manager_on_fresh_udp_port` cannot serve these tests: it
+/// drops the runtime (needed to republish the request epoch on reload) and
+/// never calls `set_datagram_client_address_secret`.
+async fn start_datagram_reload_manager_on_fresh_udp_port<F>(
+    build_config: F,
+) -> (StreamManagerRuntime, Arc<ArcSwap<GatewayConfig>>, u16)
+where
+    F: FnMut(u16) -> GatewayConfig,
+{
+    start_runtime_on_fresh_port(
+        FreshPortFamily::Udp,
+        build_config,
+        create_datagram_reload_manager_runtime,
+        None,
+    )
+    .await
+}
+
+/// TCP start helper that wires `set_global_shutdown_rx` before reconcile so
+/// the spawned accept loop observes the channel. A post-start install would
+/// miss the already-spawned listener.
+async fn start_manager_with_shutdown_rx_on_fresh_tcp_port<F>(
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    build_config: F,
+) -> (StreamListenerManager, u16)
+where
+    F: FnMut(u16) -> GatewayConfig,
+{
+    let (runtime, _config_arc, port) = start_runtime_on_fresh_port(
+        FreshPortFamily::Tcp,
+        build_config,
+        create_manager_runtime,
+        Some(shutdown_rx),
+    )
+    .await;
+    (runtime.manager, port)
+}
+
+/// UDP analogue of [`start_manager_with_shutdown_rx_on_fresh_tcp_port`].
+async fn start_manager_with_shutdown_rx_on_fresh_udp_port<F>(
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    build_config: F,
+) -> (StreamListenerManager, u16)
+where
+    F: FnMut(u16) -> GatewayConfig,
+{
+    let (runtime, _config_arc, port) = start_runtime_on_fresh_port(
+        FreshPortFamily::Udp,
+        build_config,
+        create_manager_runtime,
+        Some(shutdown_rx),
+    )
+    .await;
+    (runtime.manager, port)
 }
 
 fn create_manager(config: GatewayConfig) -> StreamListenerManager {
@@ -578,20 +737,11 @@ async fn test_reconcile_with_empty_config_returns_no_failures() {
 
 #[tokio::test]
 async fn test_reconcile_starts_tcp_listener() {
-    let port = ephemeral_port().await;
-    let config = GatewayConfig {
+    let (manager, port) = start_manager_on_fresh_tcp_port(|port| GatewayConfig {
         proxies: vec![create_stream_proxy("tcp1", BackendScheme::Tcp, port)],
         ..empty_config()
-    };
-
-    let manager = create_manager(config);
-
-    let failures = manager.reconcile().await;
-    assert!(
-        failures.is_empty(),
-        "TCP listener should start without failures: {:?}",
-        failures
-    );
+    })
+    .await;
 
     // Verify the port is now bound by trying to bind again (should fail)
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -608,23 +758,16 @@ async fn test_reconcile_starts_tcp_listener() {
 
 #[tokio::test]
 async fn test_reconcile_starts_single_hosted_passthrough_as_sni_listener() {
-    let port = ephemeral_port().await;
-    let mut proxy = create_stream_proxy("tcp-sni", BackendScheme::Tcp, port);
-    proxy.passthrough = true;
-    proxy.hosts = vec!["secure.example.com".to_string()];
-    let config = GatewayConfig {
-        proxies: vec![proxy],
-        ..empty_config()
-    };
-
-    let manager = create_manager(config);
-
-    let failures = manager.reconcile().await;
-    assert!(
-        failures.is_empty(),
-        "SNI passthrough listener should start without failures: {:?}",
-        failures
-    );
+    let (manager, _port) = start_manager_on_fresh_tcp_port(|port| {
+        let mut proxy = create_stream_proxy("tcp-sni", BackendScheme::Tcp, port);
+        proxy.passthrough = true;
+        proxy.hosts = vec!["secure.example.com".to_string()];
+        GatewayConfig {
+            proxies: vec![proxy],
+            ..empty_config()
+        }
+    })
+    .await;
     manager
         .wait_until_started(Duration::from_secs(5))
         .await
@@ -970,72 +1113,11 @@ async fn opaque_tcp_sni_group_rebuilds_on_reload_and_delete() {
         }
     };
 
-    // `ephemeral_port()` binds and releases, so a parallel test can claim the
-    // port before the manager performs its own bind. Retry the acquisition the
-    // way `start_manager_on_fresh_tcp_port` does. This fixture cannot call that
-    // helper: it needs `create_manager_runtime` so the request epoch is
-    // mirrored into the shared ArcSwap. Only the EADDRINUSE class for this
-    // exact port is retryable; every other failure stays a hard failure.
-    const MAX_BIND_ATTEMPTS: usize = 8;
-    let mut bind_races: Vec<String> = Vec::new();
-    let mut acquired = None;
-    for attempt in 1..=MAX_BIND_ATTEMPTS {
-        let frontend_port = ephemeral_port().await;
-        let initial = build(frontend_port, first_port, true);
-        assert!(initial.validate_stream_proxies().is_ok());
-        let config_arc = Arc::new(ArcSwap::from_pointee(initial.clone()));
-        let runtime = create_manager_runtime(config_arc.clone(), &initial);
-
-        let failures = runtime.manager.reconcile().await;
-        if !failures.is_empty() {
-            let only_port_collision = failures.iter().all(|(_, failed_port, error)| {
-                *failed_port == frontend_port && error.contains("already in use")
-            });
-            runtime.manager.shutdown_all().await;
-            assert!(
-                only_port_collision,
-                "initial reconcile failed: {failures:?}"
-            );
-            bind_races.push(format!(
-                "attempt {attempt}, port {frontend_port}, reconcile: {failures:?}"
-            ));
-            continue;
-        }
-
-        let started = runtime
-            .manager
-            .wait_until_started(Duration::from_secs(5))
-            .await;
-        if started.is_ok() {
-            acquired = Some((runtime, config_arc, frontend_port));
-            break;
-        }
-
-        // Reconcile probes the port, then the listener task performs the owning
-        // bind. A competing test can win that second, narrower interval.
-        let async_failures = runtime.manager.stream_bind_failures();
-        let only_async_port_collision = !async_failures.is_empty()
-            && async_failures.iter().all(|failure| {
-                failure.listen_port == frontend_port
-                    && matches!(failure.kind, StreamListenerDegradation::BindFailed)
-                    && failure.error.contains("already in use")
-            });
-        runtime.manager.shutdown_all().await;
-        assert!(
-            only_async_port_collision,
-            "SNI group listener on fresh port {frontend_port} did not start: \
-             {started:?}; failures={async_failures:?}"
-        );
-        bind_races.push(format!(
-            "attempt {attempt}, port {frontend_port}, async failures: {async_failures:?}"
-        ));
-    }
-    let (runtime, config_arc, frontend_port) = acquired.unwrap_or_else(|| {
-        panic!(
-            "could not bind a fresh SNI-group frontend port in \
-             {MAX_BIND_ATTEMPTS} attempts: {bind_races:?}"
-        )
-    });
+    let (runtime, config_arc, frontend_port) =
+        start_manager_runtime_on_fresh_tcp_port(|frontend_port| {
+            build(frontend_port, first_port, true)
+        })
+        .await;
     let manager = &runtime.manager;
 
     let mut client = tokio::net::TcpStream::connect(("127.0.0.1", frontend_port))
@@ -1110,20 +1192,11 @@ async fn opaque_tcp_sni_group_rebuilds_on_reload_and_delete() {
 
 #[tokio::test]
 async fn test_reconcile_starts_udp_listener() {
-    let port = ephemeral_port().await;
-    let config = GatewayConfig {
+    let (manager, port) = start_manager_on_fresh_udp_port(|port| GatewayConfig {
         proxies: vec![create_stream_proxy("udp1", BackendScheme::Udp, port)],
         ..empty_config()
-    };
-
-    let manager = create_manager(config);
-
-    let failures = manager.reconcile().await;
-    assert!(
-        failures.is_empty(),
-        "UDP listener should start without failures: {:?}",
-        failures
-    );
+    })
+    .await;
 
     // Verify the UDP port is bound
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1302,6 +1375,10 @@ async fn test_shared_sni_bind_failure_reports_every_proxy() {
 /// used to show `bind_failures_total == 0`.
 #[tokio::test]
 async fn test_config_skip_surfaced_in_overload_snapshot() {
+    // Does not bind: `frontend_tls` with no ServerConfig takes the
+    // FrontendTlsDeferred `continue` in `reconcile` before the port probe, so
+    // a stolen ephemeral number cannot produce the EADDRINUSE class that
+    // flaked #4217. Retrying would not be meaningful and is not used.
     let port = ephemeral_port().await;
     let mut proxy = create_stream_proxy("tcp-tls-deferred", BackendScheme::Tcp, port);
     // frontend_tls with no ServerConfig loaded on the manager (created with
@@ -1345,27 +1422,14 @@ async fn test_config_skip_surfaced_in_overload_snapshot() {
 
 #[tokio::test]
 async fn test_reconcile_restarts_changed_tcp_listener_without_bind_failure() {
-    let port = ephemeral_port().await;
-    let proxy = create_stream_proxy("tcp-restart", BackendScheme::Tcp, port);
-    let config = GatewayConfig {
-        proxies: vec![proxy.clone()],
-        ..empty_config()
-    };
-    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
-    let manager = create_manager_with_config_arc(config_arc.clone(), &config);
+    let (manager, config_arc, port) =
+        start_manager_with_config_arc_on_fresh_tcp_port(|port| GatewayConfig {
+            proxies: vec![create_stream_proxy("tcp-restart", BackendScheme::Tcp, port)],
+            ..empty_config()
+        })
+        .await;
 
-    let failures = manager.reconcile().await;
-    assert!(
-        failures.is_empty(),
-        "initial TCP listener should start without failures: {:?}",
-        failures
-    );
-    manager
-        .wait_until_started(Duration::from_secs(5))
-        .await
-        .expect("initial TCP listener should bind");
-
-    let mut restarted_proxy = proxy;
+    let mut restarted_proxy = create_stream_proxy("tcp-restart", BackendScheme::Tcp, port);
     restarted_proxy.backend_scheme = Some(BackendScheme::Tcps);
     restarted_proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcps);
     restarted_proxy.backend_tls_verify_server_cert = false;
@@ -1391,6 +1455,10 @@ async fn test_reconcile_restarts_changed_tcp_listener_without_bind_failure() {
 
 #[tokio::test]
 async fn test_reconcile_skips_tcp_tls_listener_when_backend_tls_material_unreadable() {
+    // Backend TLS validation fails and `continue`s before the bind probe, so
+    // reconcile cannot return the EADDRINUSE class. The occupancy probe below
+    // cannot be retried: a dead listener occupying the port (the regression)
+    // is indistinguishable from a competitor bind.
     let port = ephemeral_port().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let missing_ca_path = dir.path().join("missing-ca.pem");
@@ -1454,36 +1522,25 @@ fn generate_test_ca_pem(common_name: &str) -> String {
 #[tokio::test]
 async fn test_in_place_backend_tls_rotation_to_invalid_keeps_old_listener_serving() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let port = ephemeral_port().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let ca_path = dir.path().join("ca.pem");
     std::fs::write(&ca_path, generate_test_ca_pem("Rotation CA A")).expect("write initial ca");
+    let ca_path_str = ca_path
+        .to_str()
+        .expect("test temp path must be utf-8 for proxy config")
+        .to_string();
 
-    let mut proxy = create_stream_proxy("tcp-tls-rotate", BackendScheme::Tcps, port);
-    proxy.backend_tls_verify_server_cert = true;
-    proxy.backend_tls_server_ca_cert_path = Some(
-        ca_path
-            .to_str()
-            .expect("test temp path must be utf-8 for proxy config")
-            .to_string(),
-    );
-    proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
-    let config = GatewayConfig {
-        proxies: vec![proxy],
-        ..empty_config()
-    };
-    let manager = create_manager(config);
-
-    let failures = manager.reconcile().await;
-    assert!(
-        failures.is_empty(),
-        "initial TCP TLS listener should start with valid CA material: {:?}",
-        failures
-    );
-    manager
-        .wait_until_started(Duration::from_secs(5))
-        .await
-        .expect("initial TCP TLS listener should bind");
+    let (manager, port) = start_manager_on_fresh_tcp_port(|port| {
+        let mut proxy = create_stream_proxy("tcp-tls-rotate", BackendScheme::Tcps, port);
+        proxy.backend_tls_verify_server_cert = true;
+        proxy.backend_tls_server_ca_cert_path = Some(ca_path_str.clone());
+        proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
+        GatewayConfig {
+            proxies: vec![proxy],
+            ..empty_config()
+        }
+    })
+    .await;
 
     // Rotate the CA file IN PLACE to unparseable garbage. The content
     // fingerprint changes the reload key, but the replacement TLS config
@@ -1548,44 +1605,35 @@ async fn test_in_place_backend_tls_rotation_to_invalid_keeps_old_listener_servin
 #[tokio::test]
 async fn test_mixed_routing_change_and_invalid_tls_rotation_tears_down_listener() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let port = ephemeral_port().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let ca_path = dir.path().join("ca.pem");
     std::fs::write(&ca_path, generate_test_ca_pem("Mixed Update CA")).expect("write initial ca");
+    let ca_path_str = ca_path
+        .to_str()
+        .expect("test temp path must be utf-8 for proxy config")
+        .to_string();
 
-    let mut proxy = create_stream_proxy("tcp-tls-mixed", BackendScheme::Tcps, port);
-    proxy.backend_tls_verify_server_cert = true;
-    proxy.backend_tls_server_ca_cert_path = Some(
-        ca_path
-            .to_str()
-            .expect("test temp path must be utf-8 for proxy config")
-            .to_string(),
-    );
-    proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
-    let config = GatewayConfig {
-        proxies: vec![proxy.clone()],
-        ..empty_config()
-    };
-    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
-    let manager = create_manager_with_config_arc(config_arc.clone(), &config);
-
-    let failures = manager.reconcile().await;
-    assert!(
-        failures.is_empty(),
-        "initial TCP TLS listener should start cleanly: {:?}",
-        failures
-    );
-    manager
-        .wait_until_started(Duration::from_secs(5))
-        .await
-        .expect("initial TCP TLS listener should bind");
+    let (manager, config_arc, port) = start_manager_with_config_arc_on_fresh_tcp_port(|port| {
+        let mut proxy = create_stream_proxy("tcp-tls-mixed", BackendScheme::Tcps, port);
+        proxy.backend_tls_verify_server_cert = true;
+        proxy.backend_tls_server_ca_cert_path = Some(ca_path_str.clone());
+        proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
+        GatewayConfig {
+            proxies: vec![proxy],
+            ..empty_config()
+        }
+    })
+    .await;
 
     // Single update: same-path rotation to garbage AND a backend routing
     // change. Listener identity (port/scheme/frontend_tls/passthrough) is
     // unchanged, so without the routing gate this would hit the
     // keep-old-listener path.
     std::fs::write(&ca_path, b"not-a-pem-certificate").expect("rotate ca to garbage");
-    let mut updated = proxy;
+    let mut updated = create_stream_proxy("tcp-tls-mixed", BackendScheme::Tcps, port);
+    updated.backend_tls_verify_server_cert = true;
+    updated.backend_tls_server_ca_cert_path = Some(ca_path_str);
+    updated.resolved_tls = BackendTlsConfig::from_proxy(&updated);
     updated.backend_port = 19999;
     let updated_config = GatewayConfig {
         proxies: vec![updated],
@@ -1628,49 +1676,37 @@ async fn test_mixed_routing_change_and_invalid_tls_rotation_tears_down_listener(
 #[tokio::test]
 async fn test_tls_source_change_to_invalid_material_tears_down_listener() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let port = ephemeral_port().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let ca_a_path = dir.path().join("ca-a.pem");
     std::fs::write(&ca_a_path, generate_test_ca_pem("Source Change CA A")).expect("write ca a");
+    let ca_a_path_str = ca_a_path
+        .to_str()
+        .expect("test temp path must be utf-8 for proxy config")
+        .to_string();
     let ca_b_path = dir.path().join("ca-b-missing.pem");
+    let ca_b_path_str = ca_b_path
+        .to_str()
+        .expect("test temp path must be utf-8 for proxy config")
+        .to_string();
 
-    let mut proxy = create_stream_proxy("tcp-tls-source-change", BackendScheme::Tcps, port);
-    proxy.backend_tls_verify_server_cert = true;
-    proxy.backend_tls_server_ca_cert_path = Some(
-        ca_a_path
-            .to_str()
-            .expect("test temp path must be utf-8 for proxy config")
-            .to_string(),
-    );
-    proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
-    let config = GatewayConfig {
-        proxies: vec![proxy.clone()],
-        ..empty_config()
-    };
-    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
-    let manager = create_manager_with_config_arc(config_arc.clone(), &config);
-
-    let failures = manager.reconcile().await;
-    assert!(
-        failures.is_empty(),
-        "initial TCP TLS listener should start cleanly: {:?}",
-        failures
-    );
-    manager
-        .wait_until_started(Duration::from_secs(5))
-        .await
-        .expect("initial TCP TLS listener should bind");
+    let (manager, config_arc, port) = start_manager_with_config_arc_on_fresh_tcp_port(|port| {
+        let mut proxy = create_stream_proxy("tcp-tls-source-change", BackendScheme::Tcps, port);
+        proxy.backend_tls_verify_server_cert = true;
+        proxy.backend_tls_server_ca_cert_path = Some(ca_a_path_str.clone());
+        proxy.resolved_tls = BackendTlsConfig::from_proxy(&proxy);
+        GatewayConfig {
+            proxies: vec![proxy],
+            ..empty_config()
+        }
+    })
+    .await;
 
     // Operator points the proxy at a DIFFERENT CA source that is unreadable.
     // Routing is unchanged, but the source identity changed, so this is not
     // an in-place rotation and must not take the keep-old path.
-    let mut updated = proxy;
-    updated.backend_tls_server_ca_cert_path = Some(
-        ca_b_path
-            .to_str()
-            .expect("test temp path must be utf-8 for proxy config")
-            .to_string(),
-    );
+    let mut updated = create_stream_proxy("tcp-tls-source-change", BackendScheme::Tcps, port);
+    updated.backend_tls_verify_server_cert = true;
+    updated.backend_tls_server_ca_cert_path = Some(ca_b_path_str);
     updated.resolved_tls = BackendTlsConfig::from_proxy(&updated);
     let updated_config = GatewayConfig {
         proxies: vec![updated],
@@ -1713,54 +1749,44 @@ async fn test_tls_source_change_to_invalid_material_tears_down_listener() {
 #[tokio::test]
 async fn test_reconcile_detects_upstream_resolved_tls_change() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let port = ephemeral_port().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let ca_a_path = dir.path().join("upstream-ca-a.pem");
     let ca_b_path = dir.path().join("upstream-ca-b.pem");
     std::fs::write(&ca_a_path, generate_test_ca_pem("Upstream CA A")).expect("write ca a");
     std::fs::write(&ca_b_path, b"garbage-rotated-by-upstream").expect("write ca b");
+    let ca_a_path_str = ca_a_path
+        .to_str()
+        .expect("test temp path must be utf-8 for proxy config")
+        .to_string();
+    let ca_b_path_str = ca_b_path
+        .to_str()
+        .expect("test temp path must be utf-8 for proxy config")
+        .to_string();
 
     // Proxy's own backend_tls_* fields stay empty; TLS arrives via
     // resolved_tls, exactly as resolve_upstream_tls() projects from a
     // referenced upstream.
-    let mut proxy = create_stream_proxy("tcp-tls-upstream", BackendScheme::Tcps, port);
-    proxy.resolved_tls = BackendTlsConfig {
-        server_ca_cert_path: Some(
-            ca_a_path
-                .to_str()
-                .expect("test temp path must be utf-8 for proxy config")
-                .to_string(),
-        ),
+    let (manager, config_arc, port) = start_manager_with_config_arc_on_fresh_tcp_port(|port| {
+        let mut proxy = create_stream_proxy("tcp-tls-upstream", BackendScheme::Tcps, port);
+        proxy.resolved_tls = BackendTlsConfig {
+            server_ca_cert_path: Some(ca_a_path_str.clone()),
+            verify_server_cert: true,
+            ..BackendTlsConfig::default_verify()
+        };
+        GatewayConfig {
+            proxies: vec![proxy],
+            ..empty_config()
+        }
+    })
+    .await;
+
+    // Upstream-only TLS change: identical proxy fields, new resolved_tls.
+    let mut rotated_proxy = create_stream_proxy("tcp-tls-upstream", BackendScheme::Tcps, port);
+    rotated_proxy.resolved_tls = BackendTlsConfig {
+        server_ca_cert_path: Some(ca_b_path_str),
         verify_server_cert: true,
         ..BackendTlsConfig::default_verify()
     };
-    let mut rotated_proxy = proxy.clone();
-    rotated_proxy.resolved_tls.server_ca_cert_path = Some(
-        ca_b_path
-            .to_str()
-            .expect("test temp path must be utf-8 for proxy config")
-            .to_string(),
-    );
-
-    let config = GatewayConfig {
-        proxies: vec![proxy],
-        ..empty_config()
-    };
-    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
-    let manager = create_manager_with_config_arc(config_arc.clone(), &config);
-
-    let failures = manager.reconcile().await;
-    assert!(
-        failures.is_empty(),
-        "initial upstream-resolved TLS should start cleanly: {:?}",
-        failures
-    );
-    manager
-        .wait_until_started(Duration::from_secs(5))
-        .await
-        .expect("initial TCP TLS listener should bind");
-
-    // Upstream-only TLS change: identical proxy fields, new resolved_tls.
     let rotated_config = GatewayConfig {
         proxies: vec![rotated_proxy],
         ..empty_config()
@@ -1797,6 +1823,10 @@ async fn test_reconcile_detects_upstream_resolved_tls_change() {
 
 #[tokio::test]
 async fn test_reconcile_defers_tcp_without_tls_config() {
+    // Does not bind: `frontend_tls` with no ServerConfig takes the
+    // FrontendTlsDeferred `continue` in `reconcile` before the port probe.
+    // The occupancy probe below cannot be retried: a listener that wrongly
+    // bound (the regression) is indistinguishable from a competitor bind.
     let port = ephemeral_port().await;
     let mut proxy = create_stream_proxy("tcp-tls", BackendScheme::Tcps, port);
     proxy.frontend_tls = true;
@@ -1868,31 +1898,15 @@ async fn test_reconcile_defers_udp_without_dtls_config() {
 
 #[tokio::test]
 async fn test_shutdown_all_releases_ports() {
-    let mut last_failures = Vec::new();
-    let mut started = None;
-    for _ in 0..3 {
-        let port = ephemeral_port().await;
-        let config = GatewayConfig {
-            proxies: vec![create_stream_proxy(
-                "tcp-shutdown",
-                BackendScheme::Tcp,
-                port,
-            )],
-            ..empty_config()
-        };
-
-        let manager = create_manager(config);
-        let failures = manager.reconcile().await;
-        if failures.is_empty() {
-            started = Some((manager, port));
-            break;
-        }
-        last_failures = failures;
-        manager.shutdown_all().await;
-    }
-    let (manager, port) = started.unwrap_or_else(|| {
-        panic!("TCP listener did not start after 3 fresh-port attempts: {last_failures:?}")
-    });
+    let (manager, port) = start_manager_on_fresh_tcp_port(|port| GatewayConfig {
+        proxies: vec![create_stream_proxy(
+            "tcp-shutdown",
+            BackendScheme::Tcp,
+            port,
+        )],
+        ..empty_config()
+    })
+    .await;
 
     // Wait for listener to start
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1928,16 +1942,11 @@ async fn test_wait_until_started_with_empty_config() {
 
 #[tokio::test]
 async fn test_wait_until_started_succeeds_for_tcp() {
-    let port = ephemeral_port().await;
-    let config = GatewayConfig {
+    let (manager, _port) = start_manager_on_fresh_tcp_port(|port| GatewayConfig {
         proxies: vec![create_stream_proxy("tcp-wait", BackendScheme::Tcp, port)],
         ..empty_config()
-    };
-
-    let manager = create_manager(config);
-
-    let failures = manager.reconcile().await;
-    assert!(failures.is_empty());
+    })
+    .await;
 
     let result = manager.wait_until_started(Duration::from_secs(5)).await;
     assert!(
@@ -1962,77 +1971,13 @@ async fn test_wait_until_started_succeeds_for_tcp() {
 /// `shutdown_tx` is never fired.
 #[tokio::test]
 async fn test_global_shutdown_stops_tcp_accept_loop() {
-    let port = ephemeral_port().await;
-    let config = GatewayConfig {
-        proxies: vec![create_stream_proxy("tcp-sigterm", BackendScheme::Tcp, port)],
-        ..empty_config()
-    };
-
-    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
-    let dns_cache = DnsCache::new(DnsConfig::default());
-    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
-    let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
-    let plugin_cache = Arc::new(PluginCache::new(&config).expect("PluginCache::new failed"));
-    let request_epoch = Arc::new(RequestEpochStore::from_runtime_parts(
-        config.clone(),
-        &plugin_cache,
-        &consumer_index,
-        &lb_cache,
-    ));
-    let cb_cache = Arc::new(CircuitBreakerCache::new());
-
-    let manager = StreamListenerManager::new(
-        "127.0.0.1".parse::<IpAddr>().unwrap(),
-        config_arc,
-        dns_cache,
-        request_epoch,
-        cb_cache,
-        None,
-        false,
-        None,
-        300,
-        300,
-        10,
-        10_000,
-        10,
-        None,
-        Arc::new(Vec::new()),
-        Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
-            true, true, 300, 8192, 262_144, 65_536, 6000,
-        )),
-        64,
-        true,
-        2048,
-        1,
-        256,
-        Arc::new(ferrum_edge::overload::OverloadState::new()),
-        false,
-        false,
-        false,
-        0,
-        false,
-        false,
-        false,
-        Arc::new(TrustedProxies::none()),
-    );
-
-    // Inject the global shutdown receiver BEFORE reconcile so the spawned
-    // listener picks it up. This mirrors the wiring in each mode's startup.
     let (global_tx, global_rx) = tokio::sync::watch::channel(false);
-    manager.set_global_shutdown_rx(global_rx);
-
-    let failures = manager.reconcile().await;
-    assert!(
-        failures.is_empty(),
-        "TCP listener bind failed: {:?}",
-        failures
-    );
-
-    // Wait for the listener to be fully started.
-    manager
-        .wait_until_started(Duration::from_secs(5))
-        .await
-        .expect("TCP listener should start within timeout");
+    let (manager, port) =
+        start_manager_with_shutdown_rx_on_fresh_tcp_port(global_rx, |port| GatewayConfig {
+            proxies: vec![create_stream_proxy("tcp-sigterm", BackendScheme::Tcp, port)],
+            ..empty_config()
+        })
+        .await;
 
     // Verify the port is bound (a fresh bind on the same port must fail).
     let probe = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await;
@@ -2062,6 +2007,8 @@ async fn test_global_shutdown_stops_tcp_accept_loop() {
         "Port {} should be released after global shutdown signal",
         port
     );
+    // Held so Drop cannot stop the accept loop before the global channel is observed.
+    drop(manager);
 }
 
 /// Same as [`test_global_shutdown_stops_tcp_accept_loop`] but for UDP
@@ -2071,74 +2018,13 @@ async fn test_global_shutdown_stops_tcp_accept_loop() {
 /// fires correctly.
 #[tokio::test]
 async fn test_global_shutdown_stops_udp_recv_loop() {
-    let port = ephemeral_port().await;
-    let config = GatewayConfig {
-        proxies: vec![create_stream_proxy("udp-sigterm", BackendScheme::Udp, port)],
-        ..empty_config()
-    };
-
-    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
-    let dns_cache = DnsCache::new(DnsConfig::default());
-    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
-    let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
-    let plugin_cache = Arc::new(PluginCache::new(&config).expect("PluginCache::new failed"));
-    let request_epoch = Arc::new(RequestEpochStore::from_runtime_parts(
-        config.clone(),
-        &plugin_cache,
-        &consumer_index,
-        &lb_cache,
-    ));
-    let cb_cache = Arc::new(CircuitBreakerCache::new());
-
-    let manager = StreamListenerManager::new(
-        "127.0.0.1".parse::<IpAddr>().unwrap(),
-        config_arc,
-        dns_cache,
-        request_epoch,
-        cb_cache,
-        None,
-        false,
-        None,
-        300,
-        300,
-        10,
-        10_000,
-        10,
-        None,
-        Arc::new(Vec::new()),
-        Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
-            true, true, 300, 8192, 262_144, 65_536, 6000,
-        )),
-        64,
-        true,
-        2048,
-        1,
-        256,
-        Arc::new(ferrum_edge::overload::OverloadState::new()),
-        false,
-        false,
-        false,
-        0,
-        false,
-        false,
-        false,
-        Arc::new(TrustedProxies::none()),
-    );
-
     let (global_tx, global_rx) = tokio::sync::watch::channel(false);
-    manager.set_global_shutdown_rx(global_rx);
-
-    let failures = manager.reconcile().await;
-    assert!(
-        failures.is_empty(),
-        "UDP listener bind failed: {:?}",
-        failures
-    );
-
-    manager
-        .wait_until_started(Duration::from_secs(5))
-        .await
-        .expect("UDP listener should start within timeout");
+    let (manager, port) =
+        start_manager_with_shutdown_rx_on_fresh_udp_port(global_rx, |port| GatewayConfig {
+            proxies: vec![create_stream_proxy("udp-sigterm", BackendScheme::Udp, port)],
+            ..empty_config()
+        })
+        .await;
 
     // Verify the port is bound — a fresh UDP bind on the same port must fail.
     let probe = tokio::net::UdpSocket::bind(format!("127.0.0.1:{}", port)).await;
@@ -2163,6 +2049,8 @@ async fn test_global_shutdown_stops_udp_recv_loop() {
         "UDP port {} should be released after global shutdown signal",
         port
     );
+    // Held so Drop cannot stop the recv loop before the global channel is observed.
+    drop(manager);
 }
 
 // ============================================================================
@@ -2183,27 +2071,17 @@ async fn test_global_shutdown_stops_udp_recv_loop() {
 /// reconcile loop.
 #[tokio::test]
 async fn test_reconcile_restarts_listener_whose_task_exited() {
-    let port = ephemeral_port().await;
-    let config = GatewayConfig {
-        proxies: vec![create_stream_proxy(
-            "tcp-dead-task",
-            BackendScheme::Tcp,
-            port,
-        )],
-        ..empty_config()
-    };
-    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
-    let manager = create_manager_with_config_arc(config_arc, &config);
-
     let (first_tx, first_rx) = tokio::sync::watch::channel(false);
-    manager.set_global_shutdown_rx(first_rx);
-
-    let failures = manager.reconcile().await;
-    assert!(failures.is_empty(), "initial bind failed: {:?}", failures);
-    manager
-        .wait_until_started(Duration::from_secs(5))
-        .await
-        .expect("TCP listener should start");
+    let (manager, port) =
+        start_manager_with_shutdown_rx_on_fresh_tcp_port(first_rx, |port| GatewayConfig {
+            proxies: vec![create_stream_proxy(
+                "tcp-dead-task",
+                BackendScheme::Tcp,
+                port,
+            )],
+            ..empty_config()
+        })
+        .await;
 
     // Kill the listener task out from under the manager. The handle stays in
     // the map with keys that still match the desired config.
@@ -2711,23 +2589,13 @@ fn config_with_sidecar_bind(proxy: Proxy, port: u16, bind: IpAddr) -> GatewayCon
 /// drift and rebind — port/scheme alone are not enough restart identity.
 #[tokio::test]
 async fn test_reconcile_restarts_on_dedicated_bind_address_change() {
-    let port = ephemeral_port().await;
     let first: IpAddr = "127.0.0.1".parse().expect("ip");
     let second: IpAddr = "127.0.0.2".parse().expect("ip");
-    let proxy = create_stream_proxy("tcp-bind-rebind", BackendScheme::Tcp, port);
-    let config = config_with_sidecar_bind(proxy.clone(), port, first);
-    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
-    let manager = create_manager_with_config_arc(config_arc.clone(), &config);
-
-    let failures = manager.reconcile().await;
-    assert!(
-        failures.is_empty(),
-        "initial dedicated-bind listener should start: {failures:?}"
-    );
-    manager
-        .wait_until_started(Duration::from_secs(5))
-        .await
-        .expect("initial dedicated-bind listener should bind");
+    let (manager, config_arc, port) = start_manager_with_config_arc_on_fresh_tcp_port(|port| {
+        let proxy = create_stream_proxy("tcp-bind-rebind", BackendScheme::Tcp, port);
+        config_with_sidecar_bind(proxy, port, first)
+    })
+    .await;
     assert_eq!(
         manager.active_binds().await,
         vec![(
@@ -2744,7 +2612,11 @@ async fn test_reconcile_restarts_on_dedicated_bind_address_change() {
         .await
         .expect("pre-rebind connect to first bind must succeed");
 
-    config_arc.store(Arc::new(config_with_sidecar_bind(proxy, port, second)));
+    config_arc.store(Arc::new(config_with_sidecar_bind(
+        create_stream_proxy("tcp-bind-rebind", BackendScheme::Tcp, port),
+        port,
+        second,
+    )));
     let failures = manager.reconcile().await;
     assert!(
         failures.is_empty(),
@@ -3641,32 +3513,18 @@ async fn udp_stream_proxy_protocol_reload_restarts_listener_and_toggles_gate() {
     let backend_port = backend.local_addr().expect("backend addr").port();
     spawn_udp_echo_backend(Arc::clone(&backend)).await;
 
-    let frontend_port = ephemeral_port().await;
+    let (runtime, config_arc, frontend_port) =
+        start_datagram_reload_manager_on_fresh_udp_port(|frontend_port| GatewayConfig {
+            proxies: vec![udp_proxy_for_datagram_reload(
+                frontend_port,
+                backend_port,
+                None,
+            )],
+            ..empty_config()
+        })
+        .await;
     let gateway_addr = SocketAddr::from(([127, 0, 0, 1], frontend_port));
-
-    let initial = GatewayConfig {
-        proxies: vec![udp_proxy_for_datagram_reload(
-            frontend_port,
-            backend_port,
-            None,
-        )],
-        ..empty_config()
-    };
-    assert!(initial.validate_stream_proxies().is_ok());
-
-    let config_arc = Arc::new(ArcSwap::from_pointee(initial.clone()));
-    let runtime = create_datagram_reload_manager_runtime(config_arc.clone(), &initial);
     let manager = &runtime.manager;
-
-    let failures = manager.reconcile().await;
-    assert!(
-        failures.is_empty(),
-        "initial UDP listener should start: {failures:?}"
-    );
-    manager
-        .wait_until_started(Duration::from_secs(5))
-        .await
-        .expect("initial UDP listener should bind");
 
     let client = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
@@ -3799,28 +3657,18 @@ async fn udp_amplification_policy_reload_retires_sessions_with_stale_budget() {
     let amplified_response = b"amplified";
     spawn_udp_fixed_response_backend(Arc::clone(&backend), amplified_response).await;
 
-    let frontend_port = ephemeral_port().await;
+    let (runtime, config_arc, frontend_port) =
+        start_datagram_reload_manager_on_fresh_udp_port(|frontend_port| {
+            let mut unlimited = udp_proxy_for_datagram_reload(frontend_port, backend_port, None);
+            unlimited.udp_max_response_amplification_factor = None;
+            GatewayConfig {
+                proxies: vec![unlimited],
+                ..empty_config()
+            }
+        })
+        .await;
     let gateway_addr = SocketAddr::from(([127, 0, 0, 1], frontend_port));
-    let mut unlimited = udp_proxy_for_datagram_reload(frontend_port, backend_port, None);
-    unlimited.udp_max_response_amplification_factor = None;
-    let initial = GatewayConfig {
-        proxies: vec![unlimited],
-        ..empty_config()
-    };
-    assert!(initial.validate_stream_proxies().is_ok());
-
-    let config_arc = Arc::new(ArcSwap::from_pointee(initial.clone()));
-    let runtime = create_datagram_reload_manager_runtime(config_arc.clone(), &initial);
     let manager = &runtime.manager;
-    let failures = manager.reconcile().await;
-    assert!(
-        failures.is_empty(),
-        "initial unlimited UDP listener should start: {failures:?}"
-    );
-    manager
-        .wait_until_started(Duration::from_secs(5))
-        .await
-        .expect("initial unlimited UDP listener should bind");
 
     let client = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
