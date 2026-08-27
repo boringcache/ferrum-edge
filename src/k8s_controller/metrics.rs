@@ -1,4 +1,6 @@
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use tracing::info;
 
 pub struct ControllerMetrics {
     pub reconciliations: AtomicU64,
@@ -22,6 +24,16 @@ pub struct ControllerMetrics {
     /// this counter measures relist *rate*, not error rate. What is diagnostic
     /// is a scope that relists while the cluster is known to be changing.
     pub watch_idle_relists: AtomicU64,
+    /// Successful Gateway API route parent-status patches.
+    pub route_status_publications: AtomicU64,
+    /// Milliseconds from the patched route's Kubernetes `creationTimestamp` to
+    /// the successful Ferrum parent-status write. Zero until the first
+    /// successful publication that carried a parseable creation timestamp.
+    ///
+    /// This is the wait the Gateway API conformance suite observes (object
+    /// exists → parent status appears). kube-rs does not expose a watch-event
+    /// timestamp, so this is not a reflector-observation clock.
+    pub last_route_status_publish_latency_ms: AtomicU64,
     /// Istio status JSON Merge Patch 409s observed while applying Ferrum-owned
     /// conditions. Unlabeled: object identity and API error strings stay out.
     pub istio_status_conflicts: AtomicU64,
@@ -63,6 +75,8 @@ impl ControllerMetrics {
             last_reconcile_duration_ms: AtomicU64::new(0),
             gateway_api_status_plan_cursor: AtomicU64::new(0),
             watch_idle_relists: AtomicU64::new(0),
+            route_status_publications: AtomicU64::new(0),
+            last_route_status_publish_latency_ms: AtomicU64::new(0),
             istio_status_conflicts: AtomicU64::new(0),
             istio_status_retries: AtomicU64::new(0),
             istio_status_retry_exhausted: AtomicU64::new(0),
@@ -75,38 +89,22 @@ impl ControllerMetrics {
 
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
-            reconciliations: self
-                .reconciliations
-                .load(std::sync::atomic::Ordering::Relaxed),
-            full_syncs: self.full_syncs.load(std::sync::atomic::Ordering::Relaxed),
-            errors: self.errors.load(std::sync::atomic::Ordering::Relaxed),
-            last_reconcile_duration_ms: self
-                .last_reconcile_duration_ms
-                .load(std::sync::atomic::Ordering::Relaxed),
-            watch_idle_relists: self
-                .watch_idle_relists
-                .load(std::sync::atomic::Ordering::Relaxed),
-            istio_status_conflicts: self
-                .istio_status_conflicts
-                .load(std::sync::atomic::Ordering::Relaxed),
-            istio_status_retries: self
-                .istio_status_retries
-                .load(std::sync::atomic::Ordering::Relaxed),
-            istio_status_retry_exhausted: self
-                .istio_status_retry_exhausted
-                .load(std::sync::atomic::Ordering::Relaxed),
-            istio_status_recreated: self
-                .istio_status_recreated
-                .load(std::sync::atomic::Ordering::Relaxed),
-            istio_status_not_found: self
-                .istio_status_not_found
-                .load(std::sync::atomic::Ordering::Relaxed),
-            istio_status_unsupported: self
-                .istio_status_unsupported
-                .load(std::sync::atomic::Ordering::Relaxed),
-            istio_status_missing_uid: self
-                .istio_status_missing_uid
-                .load(std::sync::atomic::Ordering::Relaxed),
+            reconciliations: self.reconciliations.load(Ordering::Relaxed),
+            full_syncs: self.full_syncs.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+            last_reconcile_duration_ms: self.last_reconcile_duration_ms.load(Ordering::Relaxed),
+            watch_idle_relists: self.watch_idle_relists.load(Ordering::Relaxed),
+            route_status_publications: self.route_status_publications.load(Ordering::Relaxed),
+            last_route_status_publish_latency_ms: self
+                .last_route_status_publish_latency_ms
+                .load(Ordering::Relaxed),
+            istio_status_conflicts: self.istio_status_conflicts.load(Ordering::Relaxed),
+            istio_status_retries: self.istio_status_retries.load(Ordering::Relaxed),
+            istio_status_retry_exhausted: self.istio_status_retry_exhausted.load(Ordering::Relaxed),
+            istio_status_recreated: self.istio_status_recreated.load(Ordering::Relaxed),
+            istio_status_not_found: self.istio_status_not_found.load(Ordering::Relaxed),
+            istio_status_unsupported: self.istio_status_unsupported.load(Ordering::Relaxed),
+            istio_status_missing_uid: self.istio_status_missing_uid.load(Ordering::Relaxed),
         }
     }
 }
@@ -118,6 +116,8 @@ pub struct MetricsSnapshot {
     pub errors: u64,
     pub last_reconcile_duration_ms: u64,
     pub watch_idle_relists: u64,
+    pub route_status_publications: u64,
+    pub last_route_status_publish_latency_ms: u64,
     pub istio_status_conflicts: u64,
     pub istio_status_retries: u64,
     pub istio_status_retry_exhausted: u64,
@@ -125,4 +125,64 @@ pub struct MetricsSnapshot {
     pub istio_status_not_found: u64,
     pub istio_status_unsupported: u64,
     pub istio_status_missing_uid: u64,
+}
+
+/// Milliseconds from `creation_rfc3339` to `published_unix_ms`.
+///
+/// `None` when the creation timestamp is missing or not RFC 3339. A publish
+/// instant earlier than creation (clock skew) saturates at zero rather than
+/// wrapping.
+pub fn route_status_publish_latency_ms(
+    creation_rfc3339: Option<&str>,
+    published_unix_ms: u64,
+) -> Option<u64> {
+    let created = chrono::DateTime::parse_from_rfc3339(creation_rfc3339?).ok()?;
+    let created_ms = u64::try_from(created.timestamp_millis()).ok()?;
+    Some(published_unix_ms.saturating_sub(created_ms))
+}
+
+pub fn unix_now_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+}
+
+/// Record a successful Gateway API route parent-status patch.
+///
+/// Non-route kinds (Gateway, GatewayClass, policies) are ignored so the
+/// latency gauge stays a route-status signal.
+pub fn record_route_status_publication(
+    metrics: &ControllerMetrics,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+    creation_rfc3339: Option<&str>,
+    published_unix_ms: u64,
+) {
+    if !matches!(
+        kind,
+        "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" | "UDPRoute"
+    ) {
+        return;
+    }
+    metrics
+        .route_status_publications
+        .fetch_add(1, Ordering::Relaxed);
+    let Some(latency_ms) = route_status_publish_latency_ms(
+        creation_rfc3339,
+        published_unix_ms,
+    ) else {
+        return;
+    };
+    metrics
+        .last_route_status_publish_latency_ms
+        .store(latency_ms, Ordering::Relaxed);
+    info!(
+        kind,
+        namespace,
+        name,
+        latency_ms,
+        "Gateway API route parent status published"
+    );
 }

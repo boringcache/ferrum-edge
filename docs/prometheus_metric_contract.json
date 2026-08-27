@@ -2027,6 +2027,26 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_k8s_controller_errors_total",
+    "type": "counter",
+    "help": "Kubernetes translation skips and hard translation failures observed during reconcile.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_full_syncs_total",
+    "type": "counter",
+    "help": "Periodic Kubernetes controller full-sync reconcile passes.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_k8s_controller_istio_status_conflicts_total",
     "type": "counter",
     "help": "Istio status JSON Merge Patch 409 conflicts observed while applying Ferrum-owned conditions.",
@@ -2090,6 +2110,56 @@
     "name": "ferrum_k8s_controller_istio_status_unsupported_total",
     "type": "counter",
     "help": "Istio status writes aborted because the API server does not serve the Istio resource or its status subresource.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_last_reconcile_duration_milliseconds",
+    "type": "gauge",
+    "help": "Wall-clock duration of the most recently completed Kubernetes controller reconcile, in milliseconds.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_last_route_status_publish_latency_milliseconds",
+    "type": "gauge",
+    "help": "Milliseconds from the route object's Kubernetes creationTimestamp to a successful Ferrum parent-status patch. Zero until the first successful publication.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_reconciliations_total",
+    "type": "counter",
+    "help": "Kubernetes controller reconcile passes started, including periodic full-syncs and watch-driven reconciles.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_route_status_publications_total",
+    "type": "counter",
+    "help": "Successful Gateway API route parent-status patches (HTTPRoute, GRPCRoute, TCPRoute, TLSRoute, UDPRoute).",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_watch_idle_relists_total",
+    "type": "counter",
+    "help": "Watch-scope reflector rebuilds triggered because a scope delivered no event for the configured idle window, or because a replacement generation never finished its initial list.",
     "labels": [],
     "subsystem": "k8s_controller",
     "export_surface": "/metrics",

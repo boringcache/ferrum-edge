@@ -164,6 +164,22 @@ Emitted after `FERRUM_K8S_CONTROLLER_ENABLED=true` starts the Kubernetes control
 
 **Suggested alert:** `increase(ferrum_k8s_controller_istio_status_retry_exhausted_total[15m]) > 0`. Confirm a competing status writer and that Ferrum still merges only `Ferrum*` conditions. See [Istio CRD Status](mesh.md#istio-crd-status).
 
+### Kubernetes controller reconcile and route status
+
+Emitted with the Istio status CAS families after `FERRUM_K8S_CONTROLLER_ENABLED=true` registers the shared `ControllerMetrics` `Arc`. No labels. These answer whether Gateway API parent status is slow because reconcile is busy, because a watch scope went idle long enough to relist, or because route status writes themselves are delayed.
+
+| Family | Type | Labels | Guidance |
+|--------|------|--------|----------|
+| `ferrum_k8s_controller_reconciliations_total` | counter | — | Every reconcile pass, including the 15s lab full-sync. If this is frozen while HTTPRoutes exist without Ferrum parents, the reconciler is not running. |
+| `ferrum_k8s_controller_full_syncs_total` | counter | — | Periodic re-reconciles of the current reflector store. These cannot recover objects a stalled watch never delivered. |
+| `ferrum_k8s_controller_errors_total` | counter | — | Translation skips plus hard translation failures. |
+| `ferrum_k8s_controller_last_reconcile_duration_milliseconds` | gauge | — | Wall-clock length of the last completed reconcile, including status-patch I/O. Sustained values near the 60s Gateway API wait mean the controller is not keeping up. |
+| `ferrum_k8s_controller_watch_idle_relists_total` | counter | — | Relist *rate*, not error rate: a healthy quiet scope also relists on every `FERRUM_K8S_WATCH_IDLE_RELIST_SECS` window (default 300s). A rising count while the cluster is changing is the stall-recovery signal. |
+| `ferrum_k8s_controller_route_status_publications_total` | counter | — | Successful HTTPRoute/GRPCRoute/TCPRoute/TLSRoute/UDPRoute parent-status patches. Zero during a conformance parent-status timeout means Ferrum never published. |
+| `ferrum_k8s_controller_last_route_status_publish_latency_milliseconds` | gauge | — | Age of the route (`creationTimestamp` → successful patch). This is the wait the conformance suite observes. kube-rs does not expose a watch-event timestamp. Zero until the first parseable publication. |
+
+**Suggested investigation:** on a Gateway API parent-status timeout, scrape these together. High last-reconcile duration with climbing reconciliations points at CPU/API contention. Frozen reconciliations point at a wedged reconciler. `watch_idle_relists` still zero inside one idle window is expected and does not by itself prove a dead watch.
+
 ### Data-path load shedding, upstream health, and pool saturation
 
 Sampled on the authenticated `/metrics` scrape from state the gateway already maintains — the `OverloadState` atomics, the two-layer `HealthChecker` maps, the shared circuit-breaker cache, and each pool's own resident count. Nothing is added to the proxy hot path to publish them, and no series is keyed by a resolved endpoint address, peer IP, SNI, or certificate field.
@@ -391,6 +407,8 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_jwks_refresh_failures_total` | counter | `class` | `jwks` | `documented_only` | `always` | Remote JWKS refresh failures by fixed failure class. |
 | `ferrum_jwks_trust_age_seconds` | gauge | `state` | `jwks` | `documented_only` | `always` | Maximum age of the last validated non-empty JWKS among active remote stores in each trust state. |
 | `ferrum_jwks_trust_stores` | gauge | `state` | `jwks` | `documented_only` | `always` | Active remote JWKS stores by bounded trust state. |
+| `ferrum_k8s_controller_errors_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Kubernetes translation skips and hard translation failures observed during reconcile. |
+| `ferrum_k8s_controller_full_syncs_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Periodic Kubernetes controller full-sync reconcile passes. |
 | `ferrum_k8s_controller_istio_status_conflicts_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status JSON Merge Patch 409 conflicts observed while applying Ferrum-owned conditions. |
 | `ferrum_k8s_controller_istio_status_missing_uid_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status writes refused because the planned watch-snapshot UID was missing. |
 | `ferrum_k8s_controller_istio_status_not_found_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status writes aborted because the status read or write returned HTTP 404. |
@@ -398,6 +416,11 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_k8s_controller_istio_status_retries_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status writes that succeeded after at least one resourceVersion conflict retry. |
 | `ferrum_k8s_controller_istio_status_retry_exhausted_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status writes that exhausted the bounded conflict retry budget without an unversioned fallback. |
 | `ferrum_k8s_controller_istio_status_unsupported_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Istio status writes aborted because the API server does not serve the Istio resource or its status subresource. |
+| `ferrum_k8s_controller_last_reconcile_duration_milliseconds` | gauge | — | `k8s_controller` | `documented_only` | `conditional` | Wall-clock duration of the most recently completed Kubernetes controller reconcile, in milliseconds. |
+| `ferrum_k8s_controller_last_route_status_publish_latency_milliseconds` | gauge | — | `k8s_controller` | `documented_only` | `conditional` | Milliseconds from the route object's Kubernetes creationTimestamp to a successful Ferrum parent-status patch. Zero until the first successful publication. |
+| `ferrum_k8s_controller_reconciliations_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Kubernetes controller reconcile passes started, including periodic full-syncs and watch-driven reconciles. |
+| `ferrum_k8s_controller_route_status_publications_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Successful Gateway API route parent-status patches (HTTPRoute, GRPCRoute, TCPRoute, TLSRoute, UDPRoute). |
+| `ferrum_k8s_controller_watch_idle_relists_total` | counter | — | `k8s_controller` | `documented_only` | `conditional` | Watch-scope reflector rebuilds triggered because a scope delivered no event for the configured idle window, or because a replacement generation never finished its initial list. |
 | `ferrum_kafka_logging_accepting` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Whether the Kafka logging generation still admits new records. |
 | `ferrum_kafka_logging_healthy` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Whether the Kafka logging generation recovered from its latest failure. |
 | `ferrum_kafka_logging_in_flight` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Records waiting in librdkafka for terminal delivery. |

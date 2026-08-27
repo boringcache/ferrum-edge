@@ -240,6 +240,15 @@ jobs:
           GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
         run: bash scripts/gateway_api_gatewayclass_authority_conformance.sh blackbox
 
+      - name: Capture controller failure evidence
+        if: failure()
+        continue-on-error: true
+        env:
+          GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
+          GATEWAY_API_PROFILE: ${{ steps.inputs.outputs.conformance_profile }}
+          GATEWAY_API_SUPPORTED_FEATURES: ${{ steps.inputs.outputs.supported_features }}
+        run: bash scripts/gateway_api_data_plane_conformance.sh failure-evidence
+
       - name: Collect diagnostics
         if: always()
         env:
@@ -270,6 +279,15 @@ jobs:
         with:
           name: gateway-api-conformance-${{ steps.inputs.outputs.gateway_api_version }}
           path: conformance-results/
+          retention-days: 90
+
+      - name: Upload failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: gateway-api-conformance-failure-evidence-${{ steps.inputs.outputs.gateway_api_version }}
+          path: conformance-results/failure-evidence/
+          if-no-files-found: ignore
           retention-days: 90
 
   gate:

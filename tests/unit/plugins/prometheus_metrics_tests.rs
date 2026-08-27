@@ -691,6 +691,19 @@ async fn test_registry_renders_k8s_controller_istio_status_counters() {
     metrics.istio_status_not_found.store(5, Ordering::Relaxed);
     metrics.istio_status_unsupported.store(6, Ordering::Relaxed);
     metrics.istio_status_missing_uid.store(7, Ordering::Relaxed);
+    metrics.reconciliations.store(11, Ordering::Relaxed);
+    metrics.full_syncs.store(12, Ordering::Relaxed);
+    metrics.errors.store(13, Ordering::Relaxed);
+    metrics
+        .last_reconcile_duration_ms
+        .store(14, Ordering::Relaxed);
+    metrics.watch_idle_relists.store(15, Ordering::Relaxed);
+    metrics
+        .route_status_publications
+        .store(16, Ordering::Relaxed);
+    metrics
+        .last_route_status_publish_latency_ms
+        .store(60_020, Ordering::Relaxed);
     registry.set_k8s_controller_metrics(Arc::clone(&metrics));
     drop(metrics);
 
@@ -699,7 +712,9 @@ async fn test_registry_renders_k8s_controller_istio_status_counters() {
         "# HELP ferrum_k8s_controller_istio_status_conflicts_total Istio status JSON Merge Patch 409 conflicts observed while applying Ferrum-owned conditions."
     ));
     assert!(output.contains("# TYPE ferrum_k8s_controller_istio_status_conflicts_total counter"));
-    let istio_status_families = [
+    let k8s_controller_families = [
+        ("ferrum_k8s_controller_errors_total", "13"),
+        ("ferrum_k8s_controller_full_syncs_total", "12"),
         ("ferrum_k8s_controller_istio_status_conflicts_total", "2"),
         ("ferrum_k8s_controller_istio_status_missing_uid_total", "7"),
         ("ferrum_k8s_controller_istio_status_not_found_total", "5"),
@@ -710,22 +725,32 @@ async fn test_registry_renders_k8s_controller_istio_status_counters() {
             "3",
         ),
         ("ferrum_k8s_controller_istio_status_unsupported_total", "6"),
+        (
+            "ferrum_k8s_controller_last_reconcile_duration_milliseconds",
+            "14",
+        ),
+        (
+            "ferrum_k8s_controller_last_route_status_publish_latency_milliseconds",
+            "60020",
+        ),
+        ("ferrum_k8s_controller_reconciliations_total", "11"),
+        ("ferrum_k8s_controller_route_status_publications_total", "16"),
+        ("ferrum_k8s_controller_watch_idle_relists_total", "15"),
     ];
-    for (family, value) in istio_status_families {
+    for (family, value) in k8s_controller_families {
         assert!(
-            output.contains(&format!("# HELP {family} Istio status"))
-                || output.contains(&format!("# HELP {family}")),
+            output.contains(&format!("# HELP {family}")),
             "missing HELP for {family}"
         );
         assert!(
             output.contains(&format!("{family} {value}")),
-            "Istio status CAS family must render unlabeled even with a process namespace configured:\n{output}"
+            "K8s controller family must render unlabeled even with a process namespace configured:\n{output}"
         );
         for line in output.lines() {
             if line.starts_with(family) {
                 assert!(
                     !line.contains('{'),
-                    "Istio status CAS family must not carry labels:\n{line}"
+                    "K8s controller family must not carry labels:\n{line}"
                 );
             }
         }

@@ -21,6 +21,10 @@ BACKEND_NAMESPACE="${BACKEND_NAMESPACE:-gateway-conformance-web-backend}"
 APP_BACKEND_NAMESPACE="${APP_BACKEND_NAMESPACE:-gateway-conformance-app-backend}"
 JWT_SECRET="${JWT_SECRET:-ferrum-edge-gateway-api-conformance-grpc-secret}"
 ADMIN_SECRET="${ADMIN_SECRET:-ferrum-edge-gateway-api-conformance-admin-secret}"
+# Dedicated scrape credential so a failure-only diagnostics step can read
+# authenticated /metrics without minting an admin JWT. Must match the CP env.
+METRICS_TOKEN="${METRICS_TOKEN:-ferrum-edge-gateway-api-conformance-metrics-token}"
+ADMIN_HTTP_PORT="${ADMIN_HTTP_PORT:-9000}"
 
 mkdir -p "$RESULTS_DIR"
 
@@ -133,6 +137,7 @@ deploy_control_plane() {
     --set controlPlane.env.FERRUM_K8S_POD_DISCOVERY_ENABLED=true \
     --set controlPlane.env.FERRUM_K8S_FULL_SYNC_INTERVAL_SECS=15 \
     --set controlPlane.env.FERRUM_K8S_WATCH_IDLE_RELIST_SECS=20 \
+    --set-string "controlPlane.env.FERRUM_METRICS_BEARER_TOKEN=$METRICS_TOKEN" \
     --set controlPlane.env.FERRUM_GATEWAY_API_DATA_PLANE_SERVICE_NAMESPACE="$CP_NAMESPACE" \
     --set controlPlane.env.FERRUM_GATEWAY_API_DATA_PLANE_SERVICE_NAME="$DP_SERVICE_NAME" \
     --set controlPlane.env.FERRUM_GATEWAY_API_STATUS_ADDRESS="$GATEWAY_API_STATUS_ADDRESS" \
@@ -1005,7 +1010,155 @@ Artifacts:
 - ferrum-control-plane-previous.log
 - ferrum-data-plane.log
 - blackbox-*.log
+- failure-evidence/ (only on a failing job; see that directory's README)
 EOF
+}
+
+# Failure-only capture for issue #4239: distinguish slow reconcile under
+# contention from a watch that stopped delivering. Green runs skip this.
+# Output is files under $RESULTS_DIR/failure-evidence/ (capped); do not echo
+# large YAML into the job log.
+collect_failure_evidence() {
+  set +e
+  set +o pipefail
+  local dest="$RESULTS_DIR/failure-evidence"
+  mkdir -p "$dest"
+  echo "Collecting Gateway API failure evidence into $dest"
+
+  cat > "$dest/README.md" <<'EOF'
+# Gateway API conformance failure evidence
+
+Captured only when a conformance step fails. Use it to tell (a) slow
+reconciliation under contention from (b) a watch that stopped delivering.
+
+- `controller.log` / `controller-previous.log`: Ferrum control-plane logs.
+  Route parent-status publications log `latency_ms`. "Reconciliation complete"
+  is emitted only on an actual config change.
+- `controller-metrics-k8s.txt`: `ferrum_k8s_controller_*` families from
+  authenticated `/metrics` (reconciliations, full_syncs, errors, last
+  reconcile duration, watch_idle_relists, route-status publication latency).
+- `httproutes-status.txt`: compact parent-status digest. Empty Ferrum
+  `parents[]` with a live HTTPRoute is the suite's 60s wait.
+- `httproutes.yaml` / `gateways.describe.txt`: cluster objects at failure.
+- `top-nodes.txt` / `top-pods.txt` / `nodes.describe.txt`: resource pressure.
+  `kubectl top` needs metrics-server; kind labs usually fall back to describe.
+EOF
+
+  kubectl -n "$CP_NAMESPACE" logs deployment/ferrum-mesh-control-plane \
+    --all-containers --tail=4000 > "$dest/controller.log" 2>&1
+  kubectl -n "$CP_NAMESPACE" logs deployment/ferrum-mesh-control-plane \
+    --all-containers --previous --tail=2000 > "$dest/controller-previous.log" 2>&1
+
+  kubectl get httproutes.gateway.networking.k8s.io -A -o json \
+    2>"$dest/httproutes.err" | head -c 1048576 > "$dest/httproutes.json"
+  python3 - "$dest/httproutes.json" "$dest/httproutes-status.txt" <<'PY'
+import json
+import sys
+
+src, dest = sys.argv[1], sys.argv[2]
+try:
+    with open(src, encoding="utf-8") as handle:
+        doc = json.load(handle)
+except Exception as exc:
+    with open(dest, "w", encoding="utf-8") as handle:
+        handle.write(f"failed to parse HTTPRoute list: {exc}\n")
+    sys.exit(0)
+
+items = doc.get("items") or []
+lines = [f"httproutes={len(items)}"]
+for item in items:
+    md = item.get("metadata") or {}
+    st = item.get("status") or {}
+    parents = st.get("parents") or []
+    ns = md.get("namespace") or ""
+    name = md.get("name") or ""
+    lines.append(
+        f"{ns}/{name} generation={md.get('generation')} "
+        f"resourceVersion={md.get('resourceVersion')} parents={len(parents)}"
+    )
+    for parent in parents:
+        pref = parent.get("parentRef") or {}
+        conds = ",".join(
+            f"{c.get('type')}={c.get('status')}/{c.get('reason')}"
+            for c in (parent.get("conditions") or [])
+        )
+        lines.append(
+            f"  controller={parent.get('controllerName')} "
+            f"parent={pref.get('namespace')}/{pref.get('name')} {conds}"
+        )
+with open(dest, "w", encoding="utf-8") as handle:
+    handle.write("\n".join(lines) + "\n")
+PY
+  rm -f "$dest/httproutes.json"
+  kubectl get httproutes.gateway.networking.k8s.io -A -o yaml 2>/dev/null \
+    | head -c 1048576 > "$dest/httproutes.yaml"
+
+  : > "$dest/gateways.describe.txt"
+  while read -r ns name; do
+    [ -n "$name" ] || continue
+    kubectl -n "$ns" describe "gateway.gateway.networking.k8s.io/$name"
+  done < <(
+    kubectl get gateways.gateway.networking.k8s.io -A \
+      --no-headers -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name 2>/dev/null
+  ) 2>&1 | head -c 524288 >> "$dest/gateways.describe.txt"
+
+  if kubectl top nodes > "$dest/top-nodes.txt" 2>&1; then
+    kubectl top pods -A --sort-by=cpu > "$dest/top-pods.txt" 2>&1
+  else
+    echo "kubectl top unavailable; see nodes.describe.txt" >> "$dest/top-pods.txt"
+  fi
+  kubectl describe nodes 2>&1 | head -c 524288 > "$dest/nodes.describe.txt"
+
+  scrape_controller_metrics "$dest"
+
+  echo "Failure evidence written under $dest"
+}
+
+scrape_controller_metrics() {
+  local dest="$1"
+  local local_port=18090
+  local pf_log="$dest/port-forward.log"
+  local metrics_raw="$dest/controller-metrics.prom"
+  local metrics_tmp="$dest/controller-metrics.prom.tmp"
+  local pf_pid=""
+
+  kubectl -n "$CP_NAMESPACE" port-forward \
+    deploy/ferrum-mesh-control-plane \
+    "${local_port}:${ADMIN_HTTP_PORT}" \
+    >"$pf_log" 2>&1 &
+  pf_pid=$!
+
+  local scraped=""
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    sleep 1
+    if curl -fsS -m 5 \
+      -H "Authorization: Bearer ${METRICS_TOKEN}" \
+      -o "$metrics_tmp" \
+      "http://127.0.0.1:${local_port}/metrics" \
+      2>"$dest/controller-metrics.err"
+    then
+      scraped=1
+      break
+    fi
+  done
+
+  if [ -n "$scraped" ]; then
+    head -c 262144 "$metrics_tmp" > "$metrics_raw"
+    grep -E '^(# (HELP|TYPE) )?ferrum_k8s_controller' "$metrics_raw" \
+      > "$dest/controller-metrics-k8s.txt" 2>/dev/null \
+      || echo "no ferrum_k8s_controller families in scrape" \
+        > "$dest/controller-metrics-k8s.txt"
+  else
+    echo "controller /metrics scrape failed after ${attempt} attempts; see controller-metrics.err and port-forward.log" \
+      > "$dest/controller-metrics-k8s.txt"
+  fi
+  rm -f "$metrics_tmp"
+
+  if [ -n "$pf_pid" ]; then
+    kill "$pf_pid" >/dev/null 2>&1
+    wait "$pf_pid" >/dev/null 2>&1
+  fi
 }
 
 case "${1:-}" in
@@ -1013,8 +1166,9 @@ case "${1:-}" in
   upstream) run_upstream_conformance ;;
   blackbox) run_blackbox_tests ;;
   diagnostics) collect_diagnostics ;;
+  failure-evidence) collect_failure_evidence ;;
   *)
-    echo "usage: $0 {setup|upstream|blackbox|diagnostics}" >&2
+    echo "usage: $0 {setup|upstream|blackbox|diagnostics|failure-evidence}" >&2
     exit 2
     ;;
 esac
