@@ -728,11 +728,13 @@ impl RequestBufferPermit {
     /// Publish `data` as cheaply cloneable [`Bytes`] whose charge is released
     /// when the last clone drops — not when the collector's stack frame ends.
     ///
-    /// This is the in-dispatch analogue of the pre-auth path storing the permit
-    /// on `BufferedClientRequestBody`: the owner of the bytes owns the charge.
-    /// `O(1)`: the `Vec` is moved, never copied. Every cheap clone (backend
-    /// write, retry replay, protocol-NACK replay) shares that owner, so the
-    /// allocation is charged exactly once for as long as any handle exists.
+    /// This is the publication seam for every governed request-buffer collect:
+    /// in-dispatch collectors call it after they finish collecting, and the
+    /// pre-auth path stores the permit on `BufferedClientRequestBody` until
+    /// dispatch extracts the `Vec` and calls this. `O(1)`: the `Vec` is moved,
+    /// never copied. Every cheap clone (backend write, retry replay,
+    /// protocol-NACK replay) shares that owner, so the allocation is charged
+    /// exactly once for as long as any handle exists.
     ///
     /// Empty `data` returns [`Bytes::new()`] and drops the charge immediately,
     /// because nothing is retained. A surviving allocation smaller than the

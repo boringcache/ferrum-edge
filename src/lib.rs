@@ -11125,8 +11125,8 @@ pub mod _test_support {
         }
 
         /// Move this claim onto a cheaply cloneable [`bytes::Bytes`] view of
-        /// `data`, exactly as the in-dispatch collectors do after they finish
-        /// collecting. The charge is released when the last clone drops
+        /// `data`, exactly as dispatch does after a governed collect (in-dispatch
+        /// or pre-auth). The charge is released when the last clone drops
         /// (issue #4231).
         pub fn into_charged_bytes(self, data: Vec<u8>) -> bytes::Bytes {
             self.0.into_charged_bytes(data)

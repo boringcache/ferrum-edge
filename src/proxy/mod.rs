@@ -3407,14 +3407,16 @@ struct BufferedClientRequestBody {
     headers: hyper::HeaderMap,
     body: Vec<u8>,
     trailers: Option<hyper::HeaderMap>,
-    /// The aggregate buffered-request charge that paid for `body`, held here so
-    /// it is returned by DROP rather than by any particular exit path (issue
-    /// #4153). Reserved before the collect started and sized to this request's
-    /// retained ceiling, so admission preceded the allocation.
+    /// The aggregate buffered-request charge that paid for `body`. Held here
+    /// through pre-auth and plugin phases so early exits return it by DROP
+    /// (issue #4153). Dispatch publishes it through
+    /// [`response_buffer_budget::RequestBufferPermit::into_charged_bytes`] onto
+    /// the `Bytes` that stay resident for the backend write and retry replay
+    /// (issue #4231). `None` publishes a plain `Bytes::from(Vec)`.
     ///
     /// `None` only for the constructions that never went through a governed
     /// collect (a body a plugin phase staged, and the unit tests below).
-    _budget: Option<response_buffer_budget::RequestBufferPermit>,
+    budget: Option<response_buffer_budget::RequestBufferPermit>,
 }
 
 enum RequestBodyBufferError {
@@ -3843,7 +3845,7 @@ async fn buffer_request_body_for_before_proxy(
             headers: parts.headers,
             body: body_bytes,
             trailers,
-            _budget: Some(budget_permit),
+            budget: Some(budget_permit),
         },
     )))
 }
@@ -43201,11 +43203,16 @@ async fn proxy_to_backend(
                     &request_ctx.grpc_request_messages_observed,
                     &body_bytes,
                 );
+                // Publish a pre-auth permit onto the bytes that stay resident
+                // for the backend write and retry replay (issue #4231). `None`
+                // is a plugin-staged or unit-test body that never reserved.
+                // Empty data returns `Bytes::new()` and drops the charge
+                // immediately, matching the in-dispatch collector below.
+                let body_bytes = match buffered.budget {
+                    Some(permit) => permit.into_charged_bytes(body_bytes),
+                    None => Bytes::from(body_bytes),
+                };
                 if !body_bytes.is_empty() {
-                    // `Bytes::from(Vec<u8>)` is zero-cost (transfers ownership of
-                    // the Vec without copying). The optional clone below is then
-                    // a refcount bump, not a deep copy.
-                    let body_bytes = Bytes::from(body_bytes);
                     if retain_request_body {
                         retained_body = Some(body_bytes.clone());
                     }
@@ -52076,12 +52083,13 @@ async fn proxy_to_backend_http3(
         response_decision_ctx.or(ctx.as_deref()),
         state.env_config.authenticated_stream_max_lifetime_seconds,
     );
-    // In-dispatch collect (issue #4231): the permit must outlive this match so
-    // it can be published onto the `Bytes` that stay resident for the H3 send
-    // and retry replay. Pre-auth `Buffered` bodies already carry their permit
-    // on `BufferedClientRequestBody` until this match extracts the `Vec`.
-    let (request_body, in_dispatch_request_buffer_permit) = match client_request_body {
-        ClientRequestBody::Buffered(buffered) => (buffered.body, None),
+    // Permit from either origin (issue #4231): in-dispatch collect, or the
+    // pre-auth permit carried on `BufferedClientRequestBody`. Must outlive
+    // this match so it can be published onto the `Bytes` that stay resident
+    // for the H3 send and retry replay. `None` is a plugin-staged or unit-test
+    // body that never reserved.
+    let (request_body, request_buffer_permit) = match client_request_body {
+        ClientRequestBody::Buffered(buffered) => (buffered.body, buffered.budget),
         ClientRequestBody::Streaming(original_req) => {
             let (_parts, body) = (*original_req).into_parts();
             // Fail-closed retained ceiling + aggregate admission taken BEFORE
@@ -52272,10 +52280,10 @@ async fn proxy_to_backend_http3(
 
     // `Bytes::from(Vec<u8>)` transfers ownership without copying. Convert
     // before the optional retain-clone so retain becomes a refcount bump
-    // rather than a Vec deep copy on every retry-enabled request. When this
-    // body was collected in-dispatch, the permit travels with the `Bytes` so
-    // send and retry replay stay charged (issue #4231).
-    let body_bytes: bytes::Bytes = match in_dispatch_request_buffer_permit {
+    // rather than a Vec deep copy on every retry-enabled request. When a
+    // permit is present (in-dispatch or pre-auth), it travels with the
+    // `Bytes` so send and retry replay stay charged (issue #4231).
+    let body_bytes: bytes::Bytes = match request_buffer_permit {
         Some(permit) => permit.into_charged_bytes(request_body),
         None => request_body.into(),
     };
@@ -56735,7 +56743,7 @@ mod tests {
                 headers: hyper::HeaderMap::new(),
                 body: b"payload".to_vec(),
                 trailers: Some(trailers),
-                _budget: None,
+                budget: None,
             })),
             "POST",
             &headers,
@@ -56799,7 +56807,7 @@ mod tests {
                 headers: hyper::HeaderMap::new(),
                 body: b"payload".to_vec(),
                 trailers: Some(trailers),
-                _budget: None,
+                budget: None,
             })),
             "POST",
             &headers,
@@ -56853,7 +56861,7 @@ mod tests {
                 headers: hyper::HeaderMap::new(),
                 body: b"payload".to_vec(),
                 trailers: Some(hyper::HeaderMap::new()),
-                _budget: None,
+                budget: None,
             })),
             "POST",
             &HashMap::new(),
@@ -57187,7 +57195,7 @@ mod tests {
                 headers: hyper::HeaderMap::new(),
                 body: Vec::new(),
                 trailers: None,
-                _budget: None,
+                budget: None,
             })),
             None,
             &[],
@@ -57252,7 +57260,7 @@ mod tests {
                     headers: hyper::HeaderMap::new(),
                     body: Vec::new(),
                     trailers: None,
-                    _budget: None,
+                    budget: None,
                 })),
                 None,
                 plugins,
@@ -57364,7 +57372,7 @@ mod tests {
                     headers: hyper::HeaderMap::new(),
                     body: Vec::new(),
                     trailers: None,
-                    _budget: None,
+                    budget: None,
                 })),
                 None,
                 plugins,
@@ -57520,7 +57528,7 @@ mod tests {
                 headers: hyper::HeaderMap::new(),
                 body: Vec::new(),
                 trailers: None,
-                _budget: None,
+                budget: None,
             })),
             None,
             &plugins,

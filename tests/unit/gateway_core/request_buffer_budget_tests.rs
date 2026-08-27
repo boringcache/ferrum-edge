@@ -327,6 +327,46 @@ fn a_cloned_dispatch_body_keeps_the_charge_until_the_last_handle_drops() {
 }
 
 #[test]
+fn a_pre_auth_permit_stays_charged_through_dispatch_publication_and_retry_clone() {
+    // Pre-auth collect stores the permit on BufferedClientRequestBody for as
+    // long as that struct owns the Vec. Dispatch then extracts the Vec and
+    // MUST publish through into_charged_bytes — the same seam the in-dispatch
+    // collectors use — or the charge drops at extraction while the bytes go
+    // on to send and retry replay (issue #4231).
+    let budget = probe(1);
+    // Phase 1: the pre-auth struct still owns the Vec (permit is a live local).
+    let permit = budget.try_reserve(UNIT).expect("pre-auth collect admits");
+    let body = vec![0u8; UNIT];
+    assert_eq!(budget.available_bytes(), 0);
+    assert!(
+        budget.try_reserve(UNIT).is_none(),
+        "capacity must stay charged while the pre-auth body still owns the Vec"
+    );
+
+    // Phase 2: dispatch conversion, including a retry clone.
+    let published = permit.into_charged_bytes(body);
+    let retry_replay = published.clone();
+    assert_eq!(budget.available_bytes(), 0);
+    assert!(
+        budget.try_reserve(UNIT).is_none(),
+        "a pre-auth body published onto Bytes must keep the charge while those \
+         bytes (and their retry clone) are resident"
+    );
+
+    drop(published);
+    assert!(
+        budget.try_reserve(UNIT).is_none(),
+        "retry replay must keep the pre-auth charge after the dispatch handle drops"
+    );
+
+    drop(retry_replay);
+    assert!(
+        budget.try_reserve(UNIT).is_some(),
+        "the pre-auth charge returns when the last clone of the resident body drops"
+    );
+}
+
+#[test]
 fn publishing_an_empty_body_releases_the_charge() {
     let budget = probe(1);
     let empty = budget
@@ -385,6 +425,29 @@ fn in_dispatch_collectors_publish_the_permit_onto_the_resident_bytes() {
          Bytes that stay resident for send and retry replay"
     );
 
+    let reqwest_buffered = reqwest
+        .split("ClientRequestBody::Buffered(buffered) => {")
+        .nth(1)
+        .expect("reqwest buffered arm")
+        .split(
+            "ClientRequestBody::Streaming(original_req) if stream_request_body",
+        )
+        .next()
+        .expect("bounded reqwest buffered arm");
+    assert!(
+        reqwest_buffered.contains("buffered.budget"),
+        "the reqwest Buffered arm must carry the pre-auth permit to publication"
+    );
+    assert!(
+        reqwest_buffered.contains("permit.into_charged_bytes(body_bytes)"),
+        "the reqwest Buffered arm must publish the pre-auth permit onto the \
+         Bytes that stay resident for send and retry replay"
+    );
+    assert!(
+        reqwest_buffered.contains("None => Bytes::from(body_bytes)"),
+        "a plugin-staged Buffered body with no permit must publish plain Bytes"
+    );
+
     let h3 = proxy
         .split("async fn proxy_to_backend_http3(")
         .nth(1)
@@ -401,5 +464,13 @@ fn in_dispatch_collectors_publish_the_permit_onto_the_resident_bytes() {
         h3.contains("(body, Some(request_buffer_permit))"),
         "the H3 collect match must hoist the permit out of the Streaming arm \
          so plugin transforms and the backend send stay charged"
+    );
+    assert!(
+        h3.contains("(buffered.body, buffered.budget)"),
+        "the H3 Buffered arm must return the pre-auth permit, not discard it"
+    );
+    assert!(
+        !h3.contains("(buffered.body, None)"),
+        "the H3 Buffered arm must not drop the pre-auth permit at Vec extraction"
     );
 }
