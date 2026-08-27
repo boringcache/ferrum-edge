@@ -342,8 +342,8 @@ def validate_signal_text(text: str, failures: list[str]) -> None:
 
 def validate_helper_text(text: str, failures: list[str]) -> None:
     require(
-        "SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS: i64 = 4 * 60 * 60" in text,
-        "helper must pin the 4-hour admin JWT TTL",
+        "SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS: i64 = 6 * 60 * 60" in text,
+        "helper must pin the 6-hour admin JWT TTL",
         failures,
     )
     require(
