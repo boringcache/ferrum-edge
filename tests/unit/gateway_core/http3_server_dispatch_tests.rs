@@ -1371,7 +1371,11 @@ fn buffered_http3_backend_upload_honors_client_grpc_deadline() {
         .next()
         .expect("HTTP/3 backend dispatcher must remain bounded");
     let buffering = http3
-        .split("let request_body = match client_request_body")
+        // Issue #4231 rebound this match to also yield the request-buffer
+        // permit, so the anchor is the match on `client_request_body` itself
+        // rather than the binding pattern in front of it. Anchoring on the
+        // binding made this guard fail closed on a legitimate rebind.
+        .split(") = match client_request_body")
         .nth(1)
         .expect("HTTP/3 backend request buffering must remain present")
         .split("// Prepared buffers have already contributed")
