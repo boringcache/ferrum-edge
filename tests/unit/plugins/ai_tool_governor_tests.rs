@@ -10753,8 +10753,19 @@ async fn buffered_provider_tool_calls_redact_arguments_in_place() {
             "content": [{ "type": "tool_use", "name": "get_weather", "input": { "token": secret } }]
         }),
         json!({
+            "type": "message", "role": "assistant",
+            "content": [{
+                "tool_use": { "name": "get_weather", "input": { "token": secret } }
+            }]
+        }),
+        json!({
             "output": { "message": { "content": [{
                 "toolUse": { "name": "get_weather", "input": { "token": secret } }
+            }] } }
+        }),
+        json!({
+            "output": { "message": { "content": [{
+                "type": "toolUse", "name": "get_weather", "input": { "token": secret }
             }] } }
         }),
         json!({
@@ -10791,19 +10802,83 @@ async fn buffered_provider_tool_calls_redact_arguments_in_place() {
                 &json_headers(),
             )
             .await
-            .expect("provider tool-call arguments must be rewritten");
+            .expect(
+                "walker miss would leave RedactTransform::Unchanged and hash-skip the raw body",
+            );
         let rewritten_text = String::from_utf8(rewritten.clone()).unwrap();
         assert!(
             !rewritten_text.contains(secret),
             "secret leaked: {rewritten_text}"
         );
         assert!(rewritten_text.contains("[REDACTED_TOOL_ARG:token]"));
+        // Unredacted bytes must not hash-skip: a missed shape leaves the raw
+        // hash in place and this re-check would Continue while the secret is
+        // still on the wire. After a rewrite the skip hash is the redacted
+        // body, so the original is re-governed with redaction unavailable.
+        assert_reject(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &json_headers(), &original)
+                .await,
+            Some(502),
+        );
         assert_continue(
             plugin
                 .on_final_response_body(&mut ctx, 200, &json_headers(), &rewritten)
                 .await,
         );
     }
+}
+
+/// A redaction whose replacement is valid JSON but not an object must fail
+/// closed: do not install the mismatched value, and do not hash-skip the
+/// still-unredacted body on the final re-check.
+#[tokio::test]
+async fn buffered_object_arg_redaction_fails_closed_on_non_object_replacement() {
+    let plugin = make(json!({
+        "tools": {
+            "get_weather": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "token", "regex": ".+" }]
+            }
+        },
+        "response": { "redaction_placeholder": "[]" }
+    }));
+    let secret = "sk-KINDFAILSECRET123";
+    let original = json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{
+            "type": "tool_use",
+            "name": "get_weather",
+            "input": { "token": secret }
+        }]
+    })
+    .to_string()
+    .into_bytes();
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &original)
+            .await,
+    );
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &original,
+                Some("application/json"),
+                &json_headers(),
+            )
+            .await
+            .is_none(),
+        "a non-object redaction replacement must not be installed"
+    );
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &original)
+            .await,
+        Some(502),
+    );
 }
 
 #[tokio::test]

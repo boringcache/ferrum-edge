@@ -2379,35 +2379,48 @@ impl AiToolGovernor {
             }
         }
 
-        if let Some(content) = json.get_mut("content").and_then(Value::as_array_mut) {
-            for block in content
-                .iter_mut()
-                .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
-            {
-                match self.redact_named_arguments(
-                    Some(block),
-                    "input",
-                    &mut redacted_argument_bytes,
-                    redaction_memos,
-                ) {
-                    RedactTransform::Changed => modified = true,
-                    RedactTransform::AmplificationFailed => {
-                        return RedactTransform::AmplificationFailed;
+        // Same claim as `extract_anthropic_tool_calls`: envelope or a typed
+        // `tool_use` block. Nested-only `content[].tool_use` without that claim
+        // is not governed and must not be rewritten here.
+        let anthropic_envelope = json.get("type").and_then(Value::as_str) == Some("message")
+            || json.get("role").and_then(Value::as_str) == Some("assistant");
+        let anthropic_holds_tool_use = json
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+            });
+        if anthropic_envelope || anthropic_holds_tool_use {
+            if let Some(content) = json.get_mut("content").and_then(Value::as_array_mut) {
+                for block in content {
+                    match self.redact_named_arguments(
+                        tool_use_block_call_mut(block, "tool_use"),
+                        "input",
+                        &mut redacted_argument_bytes,
+                        redaction_memos,
+                    ) {
+                        RedactTransform::Changed => modified = true,
+                        RedactTransform::AmplificationFailed => {
+                            return RedactTransform::AmplificationFailed;
+                        }
+                        RedactTransform::Unchanged => {}
                     }
-                    RedactTransform::Unchanged => {}
                 }
             }
         }
 
         if let Some(content) = json
             .get_mut("output")
+            .filter(|output| output.is_object())
             .and_then(|output| output.get_mut("message"))
             .and_then(|message| message.get_mut("content"))
             .and_then(Value::as_array_mut)
         {
             for block in content {
                 match self.redact_named_arguments(
-                    block.get_mut("toolUse"),
+                    tool_use_block_call_mut(block, "toolUse"),
                     "input",
                     &mut redacted_argument_bytes,
                     redaction_memos,
@@ -2429,11 +2442,15 @@ impl AiToolGovernor {
                 .filter_map(Value::as_array_mut)
                 .flatten()
             {
-                let call = if part.get("functionCall").is_some() {
+                // Immutable probe first (same preference as `gemini_function_call`)
+                // so the subsequent `&mut` borrow is unique.
+                let camel = part.get("functionCall").is_some();
+                let call = if camel {
                     part.get_mut("functionCall")
                 } else {
                     part.get_mut("function_call")
                 };
+                let call = call.filter(|call| call.is_object());
                 match self.redact_named_arguments(
                     call,
                     "args",
@@ -2491,7 +2508,9 @@ impl AiToolGovernor {
     }
 
     /// Redact an extracted provider call while retaining the provider's native
-    /// string-versus-object argument representation.
+    /// string-versus-object argument representation. A non-string replacement
+    /// must parse as JSON of the same kind as the original value (an object
+    /// stays an object); otherwise this fails closed.
     fn redact_named_arguments(
         &self,
         function: Option<&mut Value>,
@@ -2514,6 +2533,10 @@ impl AiToolGovernor {
         let Some(args_value) = function.get(arguments_key) else {
             return RedactTransform::Unchanged;
         };
+        // Capture kind before the `Cow` borrow so the later `&mut function`
+        // assignment does not overlap the immutable probe.
+        let args_is_string = args_value.is_string();
+        let args_kind = std::mem::discriminant(args_value);
         let args = match args_value {
             Value::String(s) => Cow::Borrowed(s.as_str()),
             value => Cow::Owned(value.to_string()),
@@ -2541,13 +2564,16 @@ impl AiToolGovernor {
                 return RedactTransform::AmplificationFailed;
             }
             *redacted_argument_bytes = next_total;
-            let replacement = if args_value.is_string() {
+            let replacement = if args_is_string {
                 Value::String(redacted)
             } else {
-                let Ok(value) = serde_json::from_str(&redacted) else {
+                let Ok(parsed) = serde_json::from_str(&redacted) else {
                     return RedactTransform::AmplificationFailed;
                 };
-                value
+                if std::mem::discriminant(&parsed) != args_kind {
+                    return RedactTransform::AmplificationFailed;
+                }
+                parsed
             };
             function[arguments_key] = replacement;
             RedactTransform::Changed
@@ -6173,6 +6199,23 @@ fn extract_tool_use_blocks(
         };
         let name = call.get("name").and_then(Value::as_str);
         extract.push_named(name, call.get(args_key));
+    }
+}
+
+/// Mutable analogue of [`extract_tool_use_blocks`]'s per-block resolution.
+///
+/// Probe the typed vs nested form immutably first so the returned `&mut Value`
+/// is a single unique borrow: either the block itself (`{"type": marker, …}`)
+/// or the nested object (`{marker: {…}}`). Both providers accept both spellings.
+fn tool_use_block_call_mut(block: &mut Value, marker: &str) -> Option<&mut Value> {
+    let typed = block.get("type").and_then(Value::as_str) == Some(marker);
+    let nested = !typed && block.get(marker).is_some();
+    if typed {
+        Some(block)
+    } else if nested {
+        block.get_mut(marker)
+    } else {
+        None
     }
 }
 
