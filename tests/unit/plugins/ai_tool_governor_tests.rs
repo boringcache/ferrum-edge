@@ -10733,6 +10733,154 @@ fn openai_responses_body(name: &str) -> Value {
     })
 }
 
+/// Every buffered provider shape accepted by extraction must also be rewritten
+/// by `redact_args`; otherwise the unchanged governed-body hash skips the final
+/// fail-closed check and exposes the original argument.
+#[tokio::test]
+async fn buffered_provider_tool_calls_redact_arguments_in_place() {
+    let plugin = make(json!({
+        "tools": {
+            "get_weather": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "token", "regex": "sk-[A-Za-z0-9]+" }]
+            }
+        }
+    }));
+    let secret = "sk-PROVIDERSECRET123";
+    let bodies = [
+        json!({
+            "type": "message", "role": "assistant",
+            "content": [{ "type": "tool_use", "name": "get_weather", "input": { "token": secret } }]
+        }),
+        json!({
+            "type": "message", "role": "assistant",
+            "content": [{
+                "tool_use": { "name": "get_weather", "input": { "token": secret } }
+            }]
+        }),
+        json!({
+            "output": { "message": { "content": [{
+                "toolUse": { "name": "get_weather", "input": { "token": secret } }
+            }] } }
+        }),
+        json!({
+            "output": { "message": { "content": [{
+                "type": "toolUse", "name": "get_weather", "input": { "token": secret }
+            }] } }
+        }),
+        json!({
+            "candidates": [{ "content": { "parts": [{
+                "functionCall": { "name": "get_weather", "args": { "token": secret } }
+            }] } }]
+        }),
+        json!({
+            "message": { "role": "assistant", "tool_calls": [{
+                "function": { "name": "get_weather", "arguments": format!(r#"{{"token":"{secret}"}}"#) }
+            }] }
+        }),
+        json!({
+            "output": [{
+                "type": "function_call", "name": "get_weather",
+                "arguments": format!(r#"{{"token":"{secret}"}}"#)
+            }]
+        }),
+    ];
+
+    for body in bodies {
+        let original = body.to_string().into_bytes();
+        let mut ctx = create_test_context();
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &original)
+                .await,
+        );
+        let rewritten = plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &original,
+                Some("application/json"),
+                &json_headers(),
+            )
+            .await
+            .expect(
+                "walker miss would leave RedactTransform::Unchanged and hash-skip the raw body",
+            );
+        let rewritten_text = String::from_utf8(rewritten.clone()).unwrap();
+        assert!(
+            !rewritten_text.contains(secret),
+            "secret leaked: {rewritten_text}"
+        );
+        assert!(rewritten_text.contains("[REDACTED_TOOL_ARG:token]"));
+        // Unredacted bytes must not hash-skip: a missed shape leaves the raw
+        // hash in place and this re-check would Continue while the secret is
+        // still on the wire. After a rewrite the skip hash is the redacted
+        // body, so the original is re-governed with redaction unavailable.
+        assert_reject(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &json_headers(), &original)
+                .await,
+            Some(502),
+        );
+        assert_continue(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &json_headers(), &rewritten)
+                .await,
+        );
+    }
+}
+
+/// A redaction whose replacement is valid JSON but not an object must fail
+/// closed: do not install the mismatched value, and do not hash-skip the
+/// still-unredacted body on the final re-check.
+#[tokio::test]
+async fn buffered_object_arg_redaction_fails_closed_on_non_object_replacement() {
+    let plugin = make(json!({
+        "tools": {
+            "get_weather": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "token", "regex": ".+" }]
+            }
+        },
+        "response": { "redaction_placeholder": "[]" }
+    }));
+    let secret = "sk-KINDFAILSECRET123";
+    let original = json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{
+            "type": "tool_use",
+            "name": "get_weather",
+            "input": { "token": secret }
+        }]
+    })
+    .to_string()
+    .into_bytes();
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &original)
+            .await,
+    );
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &original,
+                Some("application/json"),
+                &json_headers(),
+            )
+            .await
+            .is_none(),
+        "a non-object redaction replacement must not be installed"
+    );
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &original)
+            .await,
+        Some(502),
+    );
+}
+
 #[tokio::test]
 async fn openai_responses_function_call_is_denied_in_enforce() {
     let plugin = make(provider_config());
