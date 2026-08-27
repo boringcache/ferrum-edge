@@ -429,9 +429,7 @@ fn in_dispatch_collectors_publish_the_permit_onto_the_resident_bytes() {
         .split("ClientRequestBody::Buffered(buffered) => {")
         .nth(1)
         .expect("reqwest buffered arm")
-        .split(
-            "ClientRequestBody::Streaming(original_req) if stream_request_body",
-        )
+        .split("ClientRequestBody::Streaming(original_req) if stream_request_body")
         .next()
         .expect("bounded reqwest buffered arm");
     assert!(
