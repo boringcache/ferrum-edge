@@ -734,7 +734,10 @@ async fn test_registry_renders_k8s_controller_istio_status_counters() {
             "60020",
         ),
         ("ferrum_k8s_controller_reconciliations_total", "11"),
-        ("ferrum_k8s_controller_route_status_publications_total", "16"),
+        (
+            "ferrum_k8s_controller_route_status_publications_total",
+            "16",
+        ),
         ("ferrum_k8s_controller_watch_idle_relists_total", "15"),
     ];
     for (family, value) in k8s_controller_families {

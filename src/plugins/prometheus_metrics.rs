@@ -2881,14 +2881,12 @@ impl MetricsRegistry {
         output.push_str(
             "# HELP ferrum_k8s_controller_last_reconcile_duration_milliseconds Wall-clock duration of the most recently completed Kubernetes controller reconcile, in milliseconds.\n",
         );
-        output.push_str(
-            "# TYPE ferrum_k8s_controller_last_reconcile_duration_milliseconds gauge\n",
-        );
+        output
+            .push_str("# TYPE ferrum_k8s_controller_last_reconcile_duration_milliseconds gauge\n");
         render_process_gauge(
             output,
             "ferrum_k8s_controller_last_reconcile_duration_milliseconds",
-            i64::try_from(snapshot.last_reconcile_duration_ms)
-                .unwrap_or(i64::MAX),
+            i64::try_from(snapshot.last_reconcile_duration_ms).unwrap_or(i64::MAX),
             "",
         );
         output.push_str(
@@ -2900,8 +2898,7 @@ impl MetricsRegistry {
         render_process_gauge(
             output,
             "ferrum_k8s_controller_last_route_status_publish_latency_milliseconds",
-            i64::try_from(snapshot.last_route_status_publish_latency_ms)
-                .unwrap_or(i64::MAX),
+            i64::try_from(snapshot.last_route_status_publish_latency_ms).unwrap_or(i64::MAX),
             "",
         );
         output.push_str(

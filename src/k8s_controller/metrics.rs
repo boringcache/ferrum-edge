@@ -169,10 +169,8 @@ pub fn record_route_status_publication(
     metrics
         .route_status_publications
         .fetch_add(1, Ordering::Relaxed);
-    let Some(latency_ms) = route_status_publish_latency_ms(
-        creation_rfc3339,
-        published_unix_ms,
-    ) else {
+    let Some(latency_ms) = route_status_publish_latency_ms(creation_rfc3339, published_unix_ms)
+    else {
         return;
     };
     metrics
@@ -180,9 +178,6 @@ pub fn record_route_status_publication(
         .store(latency_ms, Ordering::Relaxed);
     info!(
         kind,
-        namespace,
-        name,
-        latency_ms,
-        "Gateway API route parent status published"
+        namespace, name, latency_ms, "Gateway API route parent status published"
     );
 }

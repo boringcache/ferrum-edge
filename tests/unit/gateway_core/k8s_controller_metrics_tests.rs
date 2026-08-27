@@ -48,10 +48,7 @@ fn record_route_status_publication_ignores_non_route_kinds() {
         Some("1970-01-01T00:00:00Z"),
         60_020,
     );
-    assert_eq!(
-        metrics.route_status_publications.load(Ordering::Relaxed),
-        0
-    );
+    assert_eq!(metrics.route_status_publications.load(Ordering::Relaxed), 0);
     assert_eq!(
         metrics
             .last_route_status_publish_latency_ms
@@ -80,10 +77,7 @@ fn record_route_status_publication_stores_latency_and_counts() {
 fn record_route_status_publication_counts_even_without_creation_timestamp() {
     let metrics = ControllerMetrics::new();
     record_route_status_publication(&metrics, "TCPRoute", "ns", "echo", None, 1);
-    assert_eq!(
-        metrics.route_status_publications.load(Ordering::Relaxed),
-        1
-    );
+    assert_eq!(metrics.route_status_publications.load(Ordering::Relaxed), 1);
     assert_eq!(
         metrics
             .last_route_status_publish_latency_ms
