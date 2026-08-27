@@ -20,7 +20,7 @@ use tracing::{debug, error, warn};
 use super::{
     ClientRequestBody, LoadBalancerConnectionGuard, ProxyBody, ProxyState, backend_dispatch,
     build_response, build_response_from_normalized_reject,
-    finalize_reject_response_with_after_proxy_hooks, inbound_hbone_relay_destination_allowed,
+    finalize_reject_response_with_after_proxy_hooks, inbound_hbone_relay_destination_decision,
     log_rejected_request, mesh_egress_udp_destination_allowed, record_request, tcp_proxy,
 };
 use crate::config::EnvConfig;
@@ -55,6 +55,20 @@ struct HboneUdpSocketOpenError {
     body: &'static [u8],
     message: String,
 }
+
+/// Audit metadata key naming WHY the inbound CONNECT relay guard refused a
+/// destination (issue #4150). One of
+/// [`crate::modes::mesh::config::InboundRelayDenial::as_str`], or
+/// `ingress_endpoint_mapping_mismatch` for a Sidecar `ingress[]` remap.
+pub(super) const MESH_RELAY_DENIAL_REASON_METADATA_KEY: &str = "mesh.relay.denial_reason";
+/// Audit metadata key carrying the EFFECTIVE `host:port` the refused CONNECT
+/// would have dialled — post route-override, so it names what would actually
+/// have been opened rather than what the peer originally asked for.
+pub(super) const MESH_RELAY_DENIAL_DESTINATION_METADATA_KEY: &str = "mesh.relay.denied_destination";
+/// Audit metadata key carrying the accepted connection's own local address —
+/// the address this proxy terminates for. Present only when the accept path
+/// resolved one; its ABSENCE is itself the diagnosis for an own-pod topology.
+pub(super) const MESH_RELAY_TERMINATOR_IP_METADATA_KEY: &str = "mesh.relay.terminator_ip";
 
 pub(super) fn tag_request_metadata(ctx: &mut RequestContext) {
     ctx.metadata
@@ -430,19 +444,28 @@ fn try_reserve_mesh_egress_udp_session(
     true
 }
 
-fn inbound_hbone_relay_effective_destination_allowed(
+/// Post-plugin re-check of the ordinary transparent relay's EFFECTIVE
+/// destination against the terminator-ownership guard (issue #4150).
+///
+/// `terminator_local_ip` is the accepted connection's own local address, the
+/// only proof that an authority naming this pod really is this pod. It must be
+/// the same transport fact the synthesis-time guard used — passing `None` here
+/// would silently drop the own-pod arm and refuse every legitimate Sidecar /
+/// Ambient relay.
+fn inbound_hbone_relay_effective_destination_decision(
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
     mesh: Option<&crate::modes::mesh::config::MeshConfig>,
-) -> bool {
+    terminator_local_ip: Option<std::net::IpAddr>,
+) -> Result<(), crate::modes::mesh::config::InboundRelayDenial> {
     let (app_host, app_port) = effective_hbone_backend_target(proxy, upstream_target);
-    inbound_hbone_relay_destination_allowed(app_host, app_port, mesh)
+    inbound_hbone_relay_destination_decision(app_host, app_port, mesh, terminator_local_ip)
 }
 
 /// Post-plugin re-check for a Sidecar `ingress[]` CONNECT remap (issue #3260).
 ///
 /// The remapped relay is NOT covered by
-/// [`inbound_hbone_relay_effective_destination_allowed`]: its destination is the
+/// [`inbound_hbone_relay_effective_destination_decision`]: its destination is the
 /// listener's `defaultEndpoint`, which need not be a declared workload port at
 /// all (that is the whole point of `defaultEndpoint`). Instead the effective
 /// destination must still be EXACTLY the mapping the declared listener resolves
@@ -595,38 +618,67 @@ pub(super) async fn handle_hbone_request(
         .await;
     }
 
-    let relay_destination_denied = if proxy.id == MESH_INBOUND_HBONE_RELAY_PROXY_ID {
-        !inbound_hbone_relay_effective_destination_allowed(
+    // `Some(reason)` denies. The ordinary relay reports WHY through the
+    // ownership guard's typed denial; the Sidecar ingress remap has its own
+    // exact-mapping check with a single failure mode.
+    let relay_destination_denial = if proxy.id == MESH_INBOUND_HBONE_RELAY_PROXY_ID {
+        let decision = inbound_hbone_relay_effective_destination_decision(
             proxy,
             upstream_target.as_deref(),
             epoch.config.mesh.as_deref(),
-        )
+            ctx.mesh_inbound_terminator_ip,
+        );
+        match decision {
+            Ok(()) => None,
+            Err(reason) => Some(reason.as_str()),
+        }
     } else if proxy.id == MESH_INGRESS_HBONE_RELAY_PROXY_ID {
-        !inbound_ingress_relay_effective_destination_allowed(
+        let ingress_mapping_intact = inbound_ingress_relay_effective_destination_allowed(
             proxy,
             upstream_target.as_deref(),
             epoch.config.mesh.as_deref(),
             ctx.mesh_inbound_listener_authz_port,
-        )
+        );
+        (!ingress_mapping_intact).then_some("ingress_endpoint_mapping_mismatch")
     } else {
-        false
+        None
     };
-    if relay_destination_denied {
+    if let Some(denial) = relay_destination_denial {
         let (app_host, app_port) =
             effective_hbone_backend_target(proxy, upstream_target.as_deref());
         warn!(
             proxy_id = %proxy.id,
             app_host,
             app_port,
+            denial,
+            terminator_local_ip = ?ctx.mesh_inbound_terminator_ip,
             listener_authz_port = ?ctx.mesh_inbound_listener_authz_port,
-            "Rejected inbound CONNECT whose effective destination is outside the relay guard \
-             (open-relay allowlist, or — for a Sidecar ingress[] remap — the exact declared \
-             listener → defaultEndpoint mapping)"
+            "Rejected inbound CONNECT whose effective destination is not one this proxy \
+             terminates for (own pod / NodeWaypoint-enrolled / ServiceWaypoint-bound, or — \
+             for a Sidecar ingress[] remap — the exact declared listener → defaultEndpoint \
+             mapping)"
         );
         ctx.metadata.insert(
             "mesh_authz.deny_policy".to_string(),
             "hbone_relay_destination_denied".to_string(),
         );
+        // Structured audit trail for the refusal (issue #4150). Transport facts
+        // only — the destination the peer named and why this node does not own
+        // it. Never request bytes, headers, or credential material.
+        ctx.metadata.insert(
+            MESH_RELAY_DENIAL_REASON_METADATA_KEY.to_string(),
+            denial.to_string(),
+        );
+        ctx.metadata.insert(
+            MESH_RELAY_DENIAL_DESTINATION_METADATA_KEY.to_string(),
+            format!("{app_host}:{app_port}"),
+        );
+        if let Some(terminator_ip) = ctx.mesh_inbound_terminator_ip {
+            ctx.metadata.insert(
+                MESH_RELAY_TERMINATOR_IP_METADATA_KEY.to_string(),
+                terminator_ip.to_string(),
+            );
+        }
         crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
             crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundConnect,
             false,
@@ -1128,15 +1180,15 @@ pub(super) async fn handle_hbone_udp_request(
 
     // Re-run the open-relay guard on the EFFECTIVE (post-override) destination
     // (codex r6 P2). `build_inbound_hbone_relay_proxy` ran
-    // `inbound_hbone_relay_destination_allowed` on the ORIGINAL CONNECT authority
+    // `inbound_hbone_relay_destination_decision` on the ORIGINAL CONNECT authority
     // when it synthesized the relay proxy, but a `before_proxy` route-override
     // plugin (e.g. a global `mesh_route_dispatch` — the synthesized relay proxy
     // has an unknown id, so it inherits the global plugin chain) can rewrite
     // `app_host`/`app_port` above via `apply_route_overrides_with_upstreams` +
     // `select_upstream_target`. Without re-checking, an authenticated peer could
-    // ride a route override to open a local `UdpSocket` to a host/port outside
-    // the loopback / slice-declared-workload allowlist. The un-overridden relay
-    // destination was already guarded at build time, so this is a no-op for it.
+    // ride a route override to open a local `UdpSocket` to a destination this
+    // proxy does not terminate for. The un-overridden relay destination was
+    // already guarded at build time, so this is a no-op for it.
     //
     // The EgressGateway external-UDP allowlist (issue #3263) is the SECOND
     // admissible source and is checked with the same post-override rigor, but
@@ -1146,21 +1198,45 @@ pub(super) async fn handle_hbone_udp_request(
     // STATIC endpoint-IP dial targets remain usable because they are themselves
     // dial endpoints. Anything a route override rewrote off that set is refused.
     let mesh_config = epoch.config.mesh.as_deref();
-    let local_relay_allowed =
-        inbound_hbone_relay_destination_allowed(app_host, app_port, mesh_config);
-    let external_egress_allowed = !local_relay_allowed
+    let local_relay_decision = inbound_hbone_relay_destination_decision(
+        app_host,
+        app_port,
+        mesh_config,
+        ctx.mesh_inbound_terminator_ip,
+    );
+    let local_relay_denial = local_relay_decision.err();
+    let external_egress_allowed = local_relay_denial.is_some()
         && mesh_egress_udp_destination_allowed(app_host, app_port, mesh_config);
-    if !local_relay_allowed && !external_egress_allowed {
+    if let Some(denial) = local_relay_denial.filter(|_| !external_egress_allowed) {
         warn!(
             proxy_id = %proxy.id,
             app_host,
             app_port,
-            "Rejected datagram-over-HBONE CONNECT whose effective destination is outside the open-relay guard"
+            denial = denial.as_str(),
+            terminator_local_ip = ?ctx.mesh_inbound_terminator_ip,
+            "Rejected datagram-over-HBONE CONNECT whose effective destination is not one this \
+             proxy terminates for and is not an admitted external UDP egress endpoint"
         );
         ctx.metadata.insert(
             "mesh_authz.deny_policy".to_string(),
             "hbone_udp_relay_destination_denied".to_string(),
         );
+        // Structured audit trail for the refusal (issue #4150). Transport facts
+        // only — never request bytes, headers, or credential material.
+        ctx.metadata.insert(
+            MESH_RELAY_DENIAL_REASON_METADATA_KEY.to_string(),
+            denial.as_str().to_string(),
+        );
+        ctx.metadata.insert(
+            MESH_RELAY_DENIAL_DESTINATION_METADATA_KEY.to_string(),
+            format!("{app_host}:{app_port}"),
+        );
+        if let Some(terminator_ip) = ctx.mesh_inbound_terminator_ip {
+            ctx.metadata.insert(
+                MESH_RELAY_TERMINATOR_IP_METADATA_KEY.to_string(),
+                terminator_ip.to_string(),
+            );
+        }
         let reject = finalize_reject_response_with_after_proxy_hooks(
             plugins,
             ctx,
@@ -1194,9 +1270,9 @@ pub(super) async fn handle_hbone_udp_request(
     // early-return path below (socket open failure, missing upgrade handle),
     // because it simply drops out of scope.
     //
-    // Local (loopback / slice-known workload) relays are deliberately NOT
-    // metered here: they predate this cap and their destination set is already
-    // bounded by the slice.
+    // Local (own-pod / terminator-owned) relays are deliberately NOT metered
+    // here: they predate this cap and their destination set is already bounded
+    // by what this proxy terminates for.
     let egress_session_slot = if external_egress_allowed {
         match reserve_mesh_egress_udp_session(state.env_config.udp_max_sessions) {
             Some(slot) => Some(slot),
@@ -1831,7 +1907,7 @@ async fn hbone_udp_internal_error(
 mod tests {
     use super::{
         build_hbone_relay_summary, hbone_relay_body_outcome,
-        inbound_hbone_relay_effective_destination_allowed,
+        inbound_hbone_relay_effective_destination_decision,
         inbound_ingress_relay_effective_destination_allowed,
         registered_pod_target_for_udp_destination, try_reserve_mesh_egress_udp_session,
     };
@@ -1840,7 +1916,8 @@ mod tests {
     use crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID;
     use crate::modes::mesh::MESH_INGRESS_HBONE_RELAY_PROXY_ID;
     use crate::modes::mesh::config::{
-        AppProtocol, MeshConfig, ResolvedIngressListener, Workload, WorkloadPort, WorkloadSelector,
+        AppProtocol, InboundRelayDenial, MeshConfig, ResolvedIngressListener, Workload,
+        WorkloadPort, WorkloadSelector,
     };
     use crate::plugins::{Direction, RequestContext};
     use crate::proxy::tcp_proxy::{StreamFirstFailure, StreamIoSide};
@@ -1887,8 +1964,14 @@ mod tests {
         assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
+    /// Slice shaped like an own-pod terminator (`Sidecar` / `Ambient`): the
+    /// pod's own workload record, and the marker the apply path sets for those
+    /// topologies so the accepted local address counts as a destination.
     fn mesh_with_workload_port(port: u16) -> MeshConfig {
-        let mut mesh = MeshConfig::default();
+        let mut mesh = MeshConfig {
+            inbound_relay_admits_accepted_local_address: true,
+            ..MeshConfig::default()
+        };
         mesh.workloads.push(Workload {
             spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap(),
             selector: WorkloadSelector::default(),
@@ -1914,34 +1997,52 @@ mod tests {
         mesh
     }
 
+    /// Issue #4150: the post-plugin re-check enforces the SAME
+    /// terminator-ownership rule the synthesis-time guard applied, including the
+    /// own-pod arm — so a route override cannot move the dial onto a workload
+    /// this proxy does not terminate for, and a legitimate own-pod relay is not
+    /// refused because the re-check lost the accepted local address.
     #[test]
     fn inbound_relay_effective_destination_guard_checks_route_override_target() {
         let mesh = mesh_with_workload_port(8080);
+        let own_ip: std::net::IpAddr = "10.1.2.3".parse().expect("own pod IP");
         let mut proxy = minimal_proxy();
         proxy.id = MESH_INBOUND_HBONE_RELAY_PROXY_ID.to_string();
         proxy.backend_host = "127.0.0.1".to_string();
         proxy.backend_port = 8080;
+        let decide = |override_target: Option<&UpstreamTarget>, local: Option<std::net::IpAddr>| {
+            inbound_hbone_relay_effective_destination_decision(
+                &proxy,
+                override_target,
+                Some(&mesh),
+                local,
+            )
+        };
 
-        assert!(inbound_hbone_relay_effective_destination_allowed(
-            &proxy,
-            None,
-            Some(&mesh)
-        ));
-        assert!(inbound_hbone_relay_effective_destination_allowed(
-            &proxy,
-            Some(&target("127.0.0.1", 8080)),
-            Some(&mesh)
-        ));
-        assert!(!inbound_hbone_relay_effective_destination_allowed(
-            &proxy,
-            Some(&target("203.0.113.10", 8080)),
-            Some(&mesh)
-        ));
-        assert!(!inbound_hbone_relay_effective_destination_allowed(
-            &proxy,
-            Some(&target("127.0.0.1", 9999)),
-            Some(&mesh)
-        ));
+        assert_eq!(decide(None, Some(own_ip)), Ok(()));
+        assert_eq!(
+            decide(Some(&target("127.0.0.1", 8080)), Some(own_ip)),
+            Ok(())
+        );
+        // The terminator's own pod address, reached on this socket.
+        assert_eq!(
+            decide(Some(&target("10.1.2.3", 8080)), Some(own_ip)),
+            Ok(())
+        );
+        assert_eq!(
+            decide(Some(&target("203.0.113.10", 8080)), Some(own_ip)),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
+        assert_eq!(
+            decide(Some(&target("127.0.0.1", 9999)), Some(own_ip)),
+            Err(InboundRelayDenial::PortNotDeclared)
+        );
+        // Without the accepted local address there is no own-pod proof, so even
+        // loopback on a declared port fails closed.
+        assert_eq!(
+            decide(Some(&target("127.0.0.1", 8080)), None),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
     }
 
     /// Issue #3260: the Sidecar ingress CONNECT remap dials a `defaultEndpoint`

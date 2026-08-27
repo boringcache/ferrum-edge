@@ -16,9 +16,12 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::identity::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::MeshTrafficDirection;
 use ferrum_edge::modes::mesh::config::{
-    MeshConfig, MeshEgressUdpDestination, MeshEgressUdpDialEndpoint,
+    AppProtocol, InboundRelayDenial, MeshConfig, MeshEgressUdpDestination,
+    MeshEgressUdpDialEndpoint, Workload, WorkloadPort, WorkloadSelector,
+    inbound_relay_destinations_from_workloads,
 };
 use ferrum_edge::proxy::{
     ProxyState, start_proxy_listener_with_bound_listener,
@@ -759,11 +762,12 @@ async fn hbone_connect_closes_idle_tunnel() {
 /// Mesh config for an EgressGateway that admits exactly one external UDP
 /// destination.
 ///
-/// `workloads` is deliberately EMPTY so the byte-stream open-relay guard
-/// (`inbound_hbone_relay_destination_allowed`) denies every authority — a
-/// loopback authority is admitted only when some workload declares that port.
-/// Whatever the relay admits here therefore came from the external UDP
-/// allowlist and nothing else.
+/// `workloads` is deliberately EMPTY and the terminator-ownership markers are
+/// unset, so the byte-stream open-relay guard
+/// (`inbound_hbone_relay_destination_decision`) denies every authority — an
+/// EgressGateway terminates for no in-mesh workload (issue #4150). Whatever the
+/// relay admits here therefore came from the external UDP allowlist and nothing
+/// else.
 fn egress_udp_mesh_config(host: &str, port: u16, dial_port: u16) -> MeshConfig {
     egress_udp_mesh_config_with_endpoints(host, port, &[("127.0.0.1", dial_port)])
 }
@@ -1591,4 +1595,194 @@ async fn egress_udp_static_authority_relays_to_endpoint_without_resolving_the_ho
     shutdown_tx.send(true).expect("shutdown gateway");
     external_handle.abort();
     conn_task.abort();
+}
+
+// ── Inbound CONNECT terminator ownership guard (issue #4150) ──────────────
+
+/// Workload record for the terminator-ownership tests.
+fn relay_guard_workload(service: &str, addresses: &[&str], ports: &[u16]) -> Workload {
+    Workload {
+        spiffe_id: SpiffeId::new(format!("spiffe://cluster.local/ns/default/sa/{service}"))
+            .expect("test SPIFFE id"),
+        selector: WorkloadSelector::default(),
+        service_name: service.to_string(),
+        service_namespace: None,
+        addresses: addresses.iter().map(|addr| addr.to_string()).collect(),
+        ports: ports
+            .iter()
+            .map(|port| WorkloadPort {
+                port: *port,
+                protocol: AppProtocol::Http,
+                name: None,
+            })
+            .collect(),
+        trust_domain: TrustDomain::new("cluster.local").expect("test trust domain"),
+        namespace: "default".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: None,
+        pod_uid: None,
+        node_waypoint: None,
+        remote_provenance: false,
+    }
+}
+
+/// Slice shaped like an own-pod terminator (`Sidecar` / `Ambient`) that runs at
+/// `10.244.1.7` in a namespace where `10.244.9.9` is another pod entirely.
+fn own_pod_terminator_mesh() -> MeshConfig {
+    MeshConfig {
+        workloads: vec![
+            relay_guard_workload("app", &["10.244.1.7", "fd00:10:244:1::7"], &[8080]),
+            relay_guard_workload("neighbour", &["10.244.9.9"], &[8080]),
+        ],
+        inbound_relay_admits_accepted_local_address: true,
+        ..MeshConfig::default()
+    }
+}
+
+fn ip(literal: &str) -> std::net::IpAddr {
+    literal.parse().expect("test IP literal")
+}
+
+/// A CONNECT naming the address the peer actually reached on this socket is the
+/// terminator's own workload, so the transparent relay serves it.
+#[test]
+fn inbound_relay_admits_the_terminators_own_address() {
+    let mesh = own_pod_terminator_mesh();
+    let own = Some(ip("10.244.1.7"));
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, own),
+        Ok(())
+    );
+    // Loopback resolves inside this pod's own network namespace, bounded to the
+    // ports this pod declares.
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("127.0.0.1", 8080, own),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("localhost", 8080, own),
+        Ok(())
+    );
+    // A port this pod does not declare is still refused, so a stray local
+    // listener is not reachable just because it shares the netns.
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("127.0.0.1", 15021, own),
+        Err(InboundRelayDenial::PortNotDeclared)
+    );
+}
+
+/// The issue #4150 fix: another workload the SLICE declares is not a
+/// destination this proxy terminates for. Relaying there would dial that pod in
+/// plaintext from this pod's IP and skip its own AuthorizationPolicy set.
+#[test]
+fn inbound_relay_refuses_a_different_slice_declared_workload() {
+    let mesh = own_pod_terminator_mesh();
+    let own = Some(ip("10.244.1.7"));
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.9.9", 8080, own),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+    // Not even when the peer omits/loses the socket proof entirely.
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.9.9", 8080, None),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+    // And an address nothing declares stays refused, as before.
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("203.0.113.10", 8080, own),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+}
+
+/// IPv4 / IPv6 equivalence is decided on the CANONICAL address, so the two
+/// spellings of one address never disagree — an IPv4-mapped authority is the
+/// same destination as its IPv4 form, while a genuinely different IPv6 address
+/// is a different destination.
+#[test]
+fn inbound_relay_folds_ipv4_mapped_ipv6_to_one_decision() {
+    let mesh = own_pod_terminator_mesh();
+    let own_v4 = Some(ip("10.244.1.7"));
+    let own_mapped = Some(ip("::ffff:10.244.1.7"));
+    let own_v6 = Some(ip("fd00:10:244:1::7"));
+
+    let mapped_authority =
+        mesh.inbound_relay_destination_decision("[::ffff:10.244.1.7]", 8080, own_v4);
+    assert_eq!(mapped_authority, Ok(()));
+    let mapped_socket = mesh.inbound_relay_destination_decision("10.244.1.7", 8080, own_mapped);
+    assert_eq!(mapped_socket, Ok(()));
+    // The pod's IPv6 address is admitted on an IPv6 socket, in any spelling.
+    let expanded = mesh.inbound_relay_destination_decision("[fd00:10:244:1:0:0:0:7]", 8080, own_v6);
+    assert_eq!(expanded, Ok(()));
+    // A distinct IPv6 address is a distinct destination, not an alias.
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("[fd00:10:244:1::99]", 8080, own_v6),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+    // A bracketed IPv4 literal is not a valid authority host at all.
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("[10.244.1.7]", 8080, own_v4),
+        Err(InboundRelayDenial::UnresolvableHost)
+    );
+}
+
+/// NodeWaypoint / ServiceWaypoint terminate for OTHER workloads by design, and
+/// only for the ones in their narrow inventory. They run outside those pods'
+/// network namespaces, so they get no own-namespace loopback shortcut and
+/// their own address is never a relay destination.
+#[test]
+fn inbound_relay_admits_only_the_waypoint_termination_inventory() {
+    let mesh = MeshConfig {
+        // A workload the slice knows but this waypoint does NOT terminate for.
+        workloads: vec![relay_guard_workload("elsewhere", &["10.244.9.9"], &[8080])],
+        inbound_relay_destinations: inbound_relay_destinations_from_workloads(&[
+            relay_guard_workload("enrolled", &["10.244.2.9"], &[8080]),
+            relay_guard_workload("portless", &["10.244.2.10"], &[]),
+        ]),
+        ..MeshConfig::default()
+    };
+    let waypoint = Some(ip("10.244.4.4"));
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.2.9", 8080, waypoint),
+        Ok(())
+    );
+    // A record declaring no ports does not constrain its address.
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.2.10", 6379, waypoint),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.2.9", 9999, waypoint),
+        Err(InboundRelayDenial::PortNotDeclared)
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.9.9", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("127.0.0.1", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.4.4", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+
+    // Loopback in the inventory itself is a real termination target (the
+    // functional waypoint suite declares `127.0.0.1`).
+    let loopback_mesh = MeshConfig {
+        inbound_relay_destinations: inbound_relay_destinations_from_workloads(&[
+            relay_guard_workload("loopback-app", &["127.0.0.1"], &[8080]),
+        ]),
+        ..MeshConfig::default()
+    };
+    assert_eq!(
+        loopback_mesh.inbound_relay_destination_decision("127.0.0.1", 8080, waypoint),
+        Ok(())
+    );
 }

@@ -7357,7 +7357,9 @@ fn cross_cluster_ambient_dest_slice(
             service_name: "svc-c".to_string(),
             service_namespace: None,
             // Loopback + the backend port — the inner CONNECT authority the relay
-            // dials. Loopback passes the open-relay guard as long as a workload
+            // dials. Loopback passes the relay guard only for the port this
+            // proxy's OWN accepted local address declares (issue #4150); before
+            // that it passed as long as any workload
             // declares the port; dialing it reaches the echo backend.
             addresses: vec!["127.0.0.1".to_string()],
             ports: vec![WorkloadPort {
@@ -10085,7 +10087,7 @@ async fn sidecar_ingress_connect(
 /// The local `echo` workload plus its Service.
 ///
 /// Every port in `workload_ports` is declared as a WORKLOAD port, so the
-/// ordinary inbound open-relay guard (`inbound_hbone_relay_destination_allowed`)
+/// ordinary inbound open-relay guard (`inbound_hbone_relay_destination_decision`)
 /// would admit an authenticated CONNECT to any of them. That is what makes the
 /// ingress assertions non-vacuous: refusals below come from the DECLARED
 /// `ingress[]` surface replacing the ordinary one, not from a port the slice

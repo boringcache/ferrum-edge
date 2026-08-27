@@ -3287,6 +3287,24 @@ pub struct RequestContext {
     /// inbound routes (which authorize on the container/backend port, matching
     /// Istio inbound authz) and outside ingress/HBONE-relay synthesis.
     pub mesh_inbound_listener_authz_port: Option<u16>,
+    /// Concrete local (destination) address of the accepted mesh INBOUND
+    /// connection — the pod IP the peer actually reached, resolved even behind
+    /// a wildcard bind (issue #4150).
+    ///
+    /// This is the own-pod proof the authenticated inbound CONNECT relay guard
+    /// uses: on a `Sidecar` / `Ambient` terminator, an authority equal to this
+    /// address is provably THIS proxy's own workload, so relaying to it does
+    /// not hand the peer another pod's inbound surface. It is a transport fact
+    /// only — never derived from `Host`, `:authority`, `X-Forwarded-*`, or any
+    /// other client-settable input, because a peer that could choose it could
+    /// choose which pod this node relays into.
+    ///
+    /// Kept SEPARATE from [`Self::destination_ip`], which prefers a captured
+    /// pre-NAT `orig_dst` and is shaped for `mesh_authz`'s `destination.ip`
+    /// attribute. `None` outside mesh inbound listeners and whenever the accept
+    /// path could not resolve one; the guard then admits no own-pod
+    /// destination and falls back to the termination inventory alone.
+    pub mesh_inbound_terminator_ip: Option<std::net::IpAddr>,
     /// Set exactly once by `run_finalized_request_egress_hooks` when the
     /// finalized-request-egress phase has run for this request. The phase is
     /// reachable from several dispatch ladders (H1/H2 terminal preparation,
@@ -3494,6 +3512,7 @@ impl RequestContext {
             destination_ip: None,
             mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
+            mesh_inbound_terminator_ip: None,
             finalized_request_egress_dispatched: false,
         }
     }
@@ -4772,6 +4791,7 @@ impl RequestContext {
             destination_ip: self.destination_ip,
             mesh_outbound_destination_authz_port: self.mesh_outbound_destination_authz_port,
             mesh_inbound_listener_authz_port: self.mesh_inbound_listener_authz_port,
+            mesh_inbound_terminator_ip: self.mesh_inbound_terminator_ip,
             // The finalized-request-egress phase always runs against the REAL
             // request context (mirror admission leases, mirror result
             // receivers, and serverless terminate provenance all live there and

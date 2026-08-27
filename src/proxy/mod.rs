@@ -2356,42 +2356,35 @@ pub fn is_udp_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig)
 }
 
 /// Whether an authenticated inbound HBONE CONNECT to `host:port` may be
-/// transparently relayed. SAFE local targets only: a loopback address on an
-/// application port declared by the slice, or an in-mesh workload address+port
-/// the slice already declares. This bounds the terminator to mesh-known
-/// destinations, so an authenticated peer can never use the HBONE listener as
-/// an open proxy to arbitrary internal hosts or undeclared loopback listeners.
-/// (`handle_hbone_request` separately requires the peer to be an authenticated,
-/// trust-domain-verified mesh identity before dialing.)
-fn inbound_hbone_relay_destination_allowed(
+/// transparently relayed, and why not when it may not (issue #4150).
+///
+/// The admitted set is the destinations THIS terminator actually terminates
+/// for — its own pod (proved by `terminator_local_ip`, the accepted
+/// connection's own local address) plus a narrow slice-derived inventory for
+/// the topologies that legitimately terminate for a workload other than the
+/// pod the proxy runs in (`Sidecar` / `Ambient` own-identity workload records,
+/// `NodeWaypoint` enrolled pods, `ServiceWaypoint` waypoint-bound backing
+/// workloads). Being declared ANYWHERE in the slice is deliberately not
+/// enough: relaying to another node's workload would dial that pod in
+/// plaintext from this pod's IP, skipping the destination's own
+/// `AuthorizationPolicy` set and arriving as a trusted-looking unauthenticated
+/// source under a PERMISSIVE posture.
+///
+/// See [`crate::modes::mesh::config::MeshConfig::inbound_relay_destination_decision`]
+/// for the full rule set. (`handle_hbone_request` separately requires the peer
+/// to be an authenticated, trust-domain-verified mesh identity before dialing;
+/// this guard bounds WHERE that authenticated peer may be relayed.)
+fn inbound_hbone_relay_destination_decision(
     host: &str,
     port: u16,
     mesh: Option<&crate::modes::mesh::config::MeshConfig>,
-) -> bool {
+    terminator_local_ip: Option<std::net::IpAddr>,
+) -> Result<(), crate::modes::mesh::config::InboundRelayDenial> {
     let Some(mesh) = mesh else {
-        return false;
+        return Err(crate::modes::mesh::config::InboundRelayDenial::NoSlice);
     };
     let host = hbone_relay_authority_host_for_mesh(host);
-
-    if host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
-    {
-        return mesh
-            .workloads
-            .iter()
-            .flat_map(|workload| &workload.ports)
-            .any(|workload_port| workload_port.port == port);
-    }
-
-    // Otherwise the destination must be an in-mesh workload address+port the
-    // slice declares — never an arbitrary host. A workload that declares no
-    // ports admits any port for its address (the slice does not constrain it).
-    mesh.workloads.iter().any(|workload| {
-        workload.addresses.iter().any(|addr| addr == host)
-            && (workload.ports.is_empty() || workload.ports.iter().any(|wp| wp.port == port))
-    })
+    mesh.inbound_relay_destination_decision(host, port, terminator_local_ip)
 }
 
 /// Round-robin cursor over an admitted external UDP destination's precomputed
@@ -2423,10 +2416,10 @@ static MESH_EGRESS_UDP_ENDPOINT_CURSOR: std::sync::atomic::AtomicU64 =
 /// is precomputed and bounded at materialization; selection is a modulo index
 /// over it.
 ///
-/// This deliberately does NOT widen [`inbound_hbone_relay_destination_allowed`]:
-/// the byte-stream HBONE relay stays bounded to loopback / slice-known workload
-/// targets. Only the datagram handler consults this second, egress-specific
-/// allowlist.
+/// This deliberately does NOT widen [`inbound_hbone_relay_destination_decision`]:
+/// the byte-stream HBONE relay stays bounded to the destinations this
+/// terminator owns. Only the datagram handler consults this second,
+/// egress-specific allowlist.
 fn mesh_egress_udp_destination_dial_endpoint(
     host: &str,
     port: u16,
@@ -2530,11 +2523,13 @@ pub(crate) struct InboundConnectRelay {
 ///    invalid port the operator replaced.
 /// 2. **Ordinary transparent relay** (Ambient / Waypoint terminators, which
 ///    materialize NO inbound routes): dial the CONNECT `:authority` itself, the
-///    original destination the peer asked for. Unchanged, and unreachable for a
-///    declared ingress listener port so this can never widen it.
+///    original destination the peer asked for — but only when that authority is
+///    a destination THIS proxy terminates for. Unreachable for a declared
+///    ingress listener port so this can never widen it.
 ///
 /// Returns `None` (caller 404s) when the authority is missing/portless or is not
-/// a safe local relay target per [`inbound_hbone_relay_destination_allowed`].
+/// a destination this terminator owns per
+/// [`inbound_hbone_relay_destination_decision`].
 ///
 /// `is_udp_connect` is true for a datagram-over-CONNECT
 /// (`connect-udp`) request: `ingress[]` stream listeners are TCP, the UDP relay
@@ -2585,7 +2580,9 @@ fn build_inbound_hbone_relay_proxy(
         }
     }
 
-    if !inbound_hbone_relay_destination_allowed(host, port, mesh) {
+    if let Err(denial) =
+        inbound_hbone_relay_destination_decision(host, port, mesh, accepted_local_ip)
+    {
         if is_udp_connect
             && let Some((dial_host, dial_port)) =
                 mesh_egress_udp_destination_dial_endpoint(host, port, mesh)
@@ -2597,6 +2594,17 @@ fn build_inbound_hbone_relay_proxy(
                 ingress_listener_authz_port: Some(port),
             });
         }
+        // Synthesis-time refusal: the caller 404s and no request context exists
+        // yet, so the diagnosis rides a structured log. Authority host/port are
+        // transport facts — never request bytes or credentials.
+        debug!(
+            authority_host = host,
+            authority_port = port,
+            denial = denial.as_str(),
+            terminator_local_ip = ?accepted_local_ip,
+            "Refusing authenticated inbound CONNECT: the destination is not one this proxy \
+             terminates for"
+        );
         return None;
     }
     let relay = crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port);
@@ -2705,13 +2713,15 @@ pub(crate) fn resolve_node_waypoint_capture_destination(
     // claim) and keyed on the trusted `Workload.node_waypoint.spiffe_id`, so it
     // is both wider where it must be and strictly narrower everywhere else.
     //
-    // This also subsumes the `inbound_hbone_relay_destination_allowed` open-relay
-    // guard the HBONE relay uses, and is strictly stronger: that guard admits any
-    // slice-declared workload address (and loopback), whereas here the address
-    // must belong to a workload THIS NodeWaypoint is enrolled for, and the port
-    // must be one that workload declares. An EMPTY inventory therefore matches
-    // nothing and fails closed — the caller refuses the connection — rather than
-    // resolving a workload with no policy and defaulting PERMISSIVE.
+    // The HBONE relay's own guard (`inbound_hbone_relay_destination_decision`)
+    // reads the SAME inventory under NodeWaypoint topology (issue #4150), so the
+    // authenticated and the direct-plaintext inbound surfaces admit the same
+    // enrolled destinations. This resolution is still strictly stronger: it also
+    // requires exactly ONE non-divergent owning record, so there is always a
+    // definite PeerAuthentication posture and policy scope. An EMPTY inventory
+    // therefore matches nothing and fails closed — the caller refuses the
+    // connection — rather than resolving a workload with no policy and
+    // defaulting PERMISSIVE.
     //
     // A workload that declares ports admits only those ports; one that declares
     // none does not constrain its address (the same rule the HBONE open-relay
@@ -6579,15 +6589,18 @@ struct RequestConnectionMetadata {
     frontend_listen_port: Option<u16>,
     /// Concrete local address of the accepted TCP connection. Unlike the
     /// listener's wildcard bind address, this identifies the pod IP the peer
-    /// actually reached and binds a Sidecar ingress CONNECT to this replica.
+    /// actually reached — it binds a Sidecar ingress CONNECT to this replica
+    /// (issue #3260) and is the own-pod proof the transparent inbound relay
+    /// guard requires before dialing an authority (issue #4150).
     ///
     /// Populated only on the INBOUND mesh listener
-    /// (`mesh_direction == Some(Inbound)`, the only direction its consumer
-    /// `build_inbound_hbone_relay_proxy` runs on), and only after the accept
-    /// loop's overload / connection-permit fast-reject arms — the `getsockname`
-    /// must not be charged to every non-mesh or captured-egress accept, or to a
-    /// flood of connections the gateway is about to RST. `None` everywhere
-    /// else; its one consumer fails closed without it.
+    /// (`mesh_direction == Some(Inbound)`, the only direction its consumers
+    /// `build_inbound_hbone_relay_proxy` and the post-plugin effective-
+    /// destination re-check run on), and only after the accept loop's overload
+    /// / connection-permit fast-reject arms — the `getsockname` must not be
+    /// charged to every non-mesh or captured-egress accept, or to a flood of
+    /// connections the gateway is about to RST. `None` everywhere else; every
+    /// consumer fails closed without it.
     accepted_local_addr: Option<SocketAddr>,
     frontend_sni_hostname: Option<String>,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
@@ -28852,6 +28865,10 @@ async fn handle_proxy_request_inner(
     ctx.mesh_direction = connection_metadata.mesh_direction;
     ctx.orig_dst = connection_metadata.orig_dst;
     ctx.destination_ip = connection_metadata.destination_ip;
+    // Own-pod proof for the authenticated inbound CONNECT relay guard (issue
+    // #4150). The accept path resolves this ONLY for the mesh inbound
+    // direction, so it is `None` everywhere the guard does not run.
+    ctx.mesh_inbound_terminator_ip = accepted_local_ip;
     let mesh_inbound_pre_handshake_app_port =
         connection_metadata.mesh_inbound_pre_handshake_app_port;
     ctx.tls_client_cert_der = tls_client_cert_der;
@@ -29536,10 +29553,10 @@ async fn handle_proxy_request_inner(
     // dials a local `UdpSocket` straight at the route's backend addr+port, so a
     // `udp`-marked CONNECT whose `:authority` happens to match a materialized
     // HTTP/TCP route would open a socket to that route's destination WITHOUT the
-    // open-relay destination guard (`inbound_hbone_relay_destination_allowed`)
+    // open-relay destination guard (`inbound_hbone_relay_destination_decision`)
     // that `build_inbound_hbone_relay_proxy` applies. Forcing a route miss here
     // funnels every UDP CONNECT through that guard (which bounds the authority to
-    // a loopback / slice-known workload addr+port) or a fail-closed 404 — the
+    // a destination this proxy terminates for) or a fail-closed 404 — the
     // same destination check the byte-stream relay's synthesis path enforces
     // (codex r5 P2). The byte-stream HBONE relay deliberately keeps matched-route
     // dispatch (VirtualService `mesh_route_dispatch` overrides ride it), so this
@@ -29602,18 +29619,22 @@ async fn handle_proxy_request_inner(
             // Ambient / Waypoint inbound HBONE terminators materialize NO
             // inbound routes — the relay is transparent: it dials the CONNECT
             // `:authority`, the original destination the mesh peer asked for.
-            // An authenticated CONNECT to a safe local target therefore relays
-            // through a synthesized proxy instead of 404ing. The synthesized
-            // proxy is built only on the inbound listener (`mesh_direction ==
-            // Inbound`) and only for a loopback / slice-known workload
-            // destination, with loopback ports constrained to the slice's
-            // declared workload application ports; `handle_hbone_request` /
+            // An authenticated CONNECT to a destination THIS proxy terminates
+            // for therefore relays through a synthesized proxy instead of
+            // 404ing. The synthesized proxy is built only on the inbound
+            // listener (`mesh_direction == Inbound`) and only for this
+            // terminator's own pod (proved by the accepted connection's local
+            // address, loopback included) or a workload in its narrow
+            // slice-derived termination inventory — own-identity records on
+            // Sidecar/Ambient, enrolled pods on NodeWaypoint, waypoint-bound
+            // backing workloads on ServiceWaypoint (issue #4150);
+            // `handle_hbone_request` /
             // `handle_hbone_udp_request` re-checks the authenticated-peer gate
             // before dialing. A datagram-over-HBONE CONNECT (`is_udp_hbone_connect`)
             // takes the SAME transparent-relay synthesis — the open-relay guard
-            // (`inbound_hbone_relay_destination_allowed`) bounds the authority to
-            // a loopback / slice-known workload addr+port the same way — and is
-            // then routed to the UDP unframing handler at the dispatch branch.
+            // (`inbound_hbone_relay_destination_decision`) bounds the authority
+            // the same way — and is then routed to the UDP unframing handler at
+            // the dispatch branch.
             //
             // The SAME boundary also remaps an authenticated byte-stream CONNECT
             // that names a DECLARED Sidecar `ingress[]` stream listener onto that
@@ -62478,44 +62499,31 @@ mod tests {
         assert!(!ctx.metadata.contains_key("mesh.gateway.transport"));
     }
 
-    #[test]
-    fn inbound_hbone_relay_guard_allows_only_local_destinations() {
+    /// Build a workload record for the guard tests.
+    fn relay_guard_workload(
+        service: &str,
+        addresses: &[&str],
+        ports: &[u16],
+    ) -> crate::modes::mesh::config::Workload {
         use crate::identity::spiffe::{SpiffeId, TrustDomain};
-        use crate::modes::mesh::config::{MeshConfig, Workload, WorkloadPort, WorkloadSelector};
+        use crate::modes::mesh::config::{Workload, WorkloadPort, WorkloadSelector};
 
-        // With no slice context, even loopback is refused: the relay must not
-        // become a localhost open proxy to arbitrary gateway-host ports.
-        assert!(!inbound_hbone_relay_destination_allowed(
-            "127.0.0.1",
-            8080,
-            None
-        ));
-        assert!(!inbound_hbone_relay_destination_allowed("::1", 8080, None));
-        assert!(!inbound_hbone_relay_destination_allowed(
-            "localhost",
-            8080,
-            None
-        ));
-
-        // A non-loopback host is REFUSED when it is not a slice-known workload —
-        // an authenticated peer must not be able to relay to arbitrary hosts.
-        assert!(!inbound_hbone_relay_destination_allowed(
-            "10.1.2.3", 8080, None
-        ));
-
-        let mut mesh = MeshConfig::default();
-        mesh.workloads.push(Workload {
-            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap(),
+        Workload {
+            spiffe_id: SpiffeId::new(format!("spiffe://cluster.local/ns/default/sa/{service}"))
+                .expect("test SPIFFE id"),
             selector: WorkloadSelector::default(),
-            service_name: "app".to_string(),
+            service_name: service.to_string(),
             service_namespace: None,
-            addresses: vec!["10.1.2.3".to_string(), "fd00:10:244:1::4".to_string()],
-            ports: vec![WorkloadPort {
-                port: 8080,
-                protocol: crate::modes::mesh::config::AppProtocol::Http,
-                name: None,
-            }],
-            trust_domain: TrustDomain::new("cluster.local").unwrap(),
+            addresses: addresses.iter().map(|addr| addr.to_string()).collect(),
+            ports: ports
+                .iter()
+                .map(|port| WorkloadPort {
+                    port: *port,
+                    protocol: crate::modes::mesh::config::AppProtocol::Http,
+                    name: None,
+                })
+                .collect(),
+            trust_domain: TrustDomain::new("cluster.local").expect("test trust domain"),
             namespace: "default".to_string(),
             network: None,
             cluster: None,
@@ -62525,112 +62533,206 @@ mod tests {
             pod_uid: None,
             node_waypoint: None,
             remote_provenance: false,
-        });
-        // Now the workload's declared application port is allowed on loopback...
-        assert!(inbound_hbone_relay_destination_allowed(
-            "127.0.0.1",
-            8080,
-            Some(&mesh)
-        ));
-        assert!(inbound_hbone_relay_destination_allowed(
-            "::1",
-            8080,
-            Some(&mesh)
-        ));
-        assert!(inbound_hbone_relay_destination_allowed(
-            "localhost",
-            8080,
-            Some(&mesh)
-        ));
-        // ...but undeclared loopback ports remain refused.
-        assert!(!inbound_hbone_relay_destination_allowed(
-            "127.0.0.1",
-            9999,
-            Some(&mesh)
-        ));
-        assert!(!inbound_hbone_relay_destination_allowed(
-            "localhost",
-            9999,
-            Some(&mesh)
-        ));
+        }
+    }
 
-        // The workload's exact non-loopback address+port is allowed...
-        assert!(inbound_hbone_relay_destination_allowed(
-            "10.1.2.3",
-            8080,
-            Some(&mesh)
-        ));
-        assert!(inbound_hbone_relay_destination_allowed(
-            "fd00:10:244:1::4",
-            8080,
-            Some(&mesh)
-        ));
-        assert!(inbound_hbone_relay_destination_allowed(
-            "[fd00:10:244:1::4]",
-            8080,
-            Some(&mesh)
-        ));
-        // ...but a port the workload does not expose is refused...
-        assert!(!inbound_hbone_relay_destination_allowed(
-            "10.1.2.3",
-            9999,
-            Some(&mesh)
-        ));
-        assert!(!inbound_hbone_relay_destination_allowed(
-            "[fd00:10:244:1::4]",
-            9999,
-            Some(&mesh)
-        ));
-        // ...and an address the slice does not declare is refused.
-        assert!(!inbound_hbone_relay_destination_allowed(
-            "10.9.9.9",
-            8080,
-            Some(&mesh)
-        ));
-        assert!(!inbound_hbone_relay_destination_allowed(
-            "[fd00:10:244:1::99]",
-            8080,
-            Some(&mesh)
-        ));
-        assert!(!inbound_hbone_relay_destination_allowed(
-            "[10.1.2.3]",
-            8080,
-            Some(&mesh)
-        ));
+    /// Issue #4150: the guard admits the destinations THIS proxy terminates for,
+    /// not every workload the slice happens to declare.
+    #[test]
+    fn inbound_hbone_relay_guard_allows_only_the_terminators_own_destinations() {
+        use crate::modes::mesh::config::{InboundRelayDenial, MeshConfig};
+
+        let own_ip: std::net::IpAddr = "10.1.2.3".parse().expect("own pod IP");
+        let own_v6: std::net::IpAddr = "fd00:10:244:1::4".parse().expect("own pod IPv6");
+
+        // With no slice context, even loopback is refused: the relay must not
+        // become a localhost open proxy to arbitrary gateway-host ports.
+        let no_slice =
+            |host: &str| inbound_hbone_relay_destination_decision(host, 8080, None, Some(own_ip));
+        assert_eq!(no_slice("127.0.0.1"), Err(InboundRelayDenial::NoSlice));
+        assert_eq!(no_slice("::1"), Err(InboundRelayDenial::NoSlice));
+        assert_eq!(no_slice("localhost"), Err(InboundRelayDenial::NoSlice));
+        assert_eq!(no_slice("10.1.2.3"), Err(InboundRelayDenial::NoSlice));
+
+        // An own-pod terminator (Sidecar / Ambient): this pod plus a SIBLING pod
+        // the slice also declares. Only the first is a destination we terminate
+        // for.
+        let mesh = MeshConfig {
+            workloads: vec![
+                relay_guard_workload("app", &["10.1.2.3", "fd00:10:244:1::4"], &[8080]),
+                relay_guard_workload("peer", &["10.9.9.9"], &[8080]),
+            ],
+            inbound_relay_admits_accepted_local_address: true,
+            ..MeshConfig::default()
+        };
+        let decide = |host: &str, port: u16, local: Option<std::net::IpAddr>| {
+            inbound_hbone_relay_destination_decision(host, port, Some(&mesh), local)
+        };
+
+        // Loopback resolves in THIS pod's netns, on a port this pod declares.
+        assert_eq!(decide("127.0.0.1", 8080, Some(own_ip)), Ok(()));
+        assert_eq!(decide("::1", 8080, Some(own_ip)), Ok(()));
+        assert_eq!(decide("localhost", 8080, Some(own_ip)), Ok(()));
+        // ...but undeclared loopback ports remain refused.
+        assert_eq!(
+            decide("127.0.0.1", 9999, Some(own_ip)),
+            Err(InboundRelayDenial::PortNotDeclared)
+        );
+        assert_eq!(
+            decide("localhost", 9999, Some(own_ip)),
+            Err(InboundRelayDenial::PortNotDeclared)
+        );
+
+        // This pod's own address+port is allowed. IPv4-mapped IPv6 is the same
+        // address, so it decides the same way on either side of the comparison.
+        assert_eq!(decide("10.1.2.3", 8080, Some(own_ip)), Ok(()));
+        assert_eq!(decide("[::ffff:10.1.2.3]", 8080, Some(own_ip)), Ok(()));
+        let mapped_local = "::ffff:10.1.2.3".parse().expect("mapped own pod IP");
+        assert_eq!(decide("10.1.2.3", 8080, Some(mapped_local)), Ok(()));
+        // The pod's IPv6 address is only ours when the socket says so, and a
+        // non-canonical spelling of it decides identically.
+        assert_eq!(decide("fd00:10:244:1::4", 8080, Some(own_v6)), Ok(()));
+        assert_eq!(
+            decide("[fd00:10:244:1:0:0:0:4]", 8080, Some(own_v6)),
+            Ok(())
+        );
+        // ...but a port this pod does not expose is refused...
+        assert_eq!(
+            decide("10.1.2.3", 9999, Some(own_ip)),
+            Err(InboundRelayDenial::PortNotDeclared)
+        );
+        assert_eq!(
+            decide("[fd00:10:244:1::4]", 9999, Some(own_v6)),
+            Err(InboundRelayDenial::PortNotDeclared)
+        );
+
+        // ...and — the issue #4150 fix — a DIFFERENT workload the slice declares
+        // is refused, even on a port that workload really does expose. Relaying
+        // there would skip that pod's own AuthorizationPolicy set.
+        assert_eq!(
+            decide("10.9.9.9", 8080, Some(own_ip)),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
+        // An address nothing declares stays refused.
+        assert_eq!(
+            decide("[fd00:10:244:1::99]", 8080, Some(own_ip)),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
+        // A bracketed IPv4 literal is not a valid authority host, and a name
+        // this terminator's own inventory does not declare is never resolved
+        // into a destination it terminates for.
+        assert_eq!(
+            decide("[10.1.2.3]", 8080, Some(own_ip)),
+            Err(InboundRelayDenial::UnresolvableHost)
+        );
+        assert_eq!(
+            decide("app.default.svc.cluster.local", 8080, Some(own_ip)),
+            Err(InboundRelayDenial::UnresolvableHost)
+        );
+        // Without the accepted local address there is no own-pod proof at all.
+        assert_eq!(
+            decide("10.1.2.3", 8080, None),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
+        assert_eq!(
+            decide("127.0.0.1", 8080, None),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
+    }
+
+    /// Issue #4150: the two topologies that legitimately terminate for OTHER
+    /// workloads read a narrow slice-derived inventory, and nothing else — not
+    /// the slice-wide workload view, and not an own-namespace loopback shortcut.
+    #[test]
+    fn inbound_hbone_relay_guard_admits_the_waypoint_termination_inventory_only() {
+        use crate::modes::mesh::config::{
+            InboundRelayDenial, MeshConfig, inbound_relay_destinations_from_workloads,
+        };
+
+        let waypoint_ip: std::net::IpAddr = "10.4.4.4".parse().expect("waypoint IP");
+        let mesh = MeshConfig {
+            // A slice-declared workload this waypoint does NOT terminate for.
+            workloads: vec![relay_guard_workload("elsewhere", &["10.9.9.9"], &[8080])],
+            // ...and the ones it does.
+            inbound_relay_destinations: inbound_relay_destinations_from_workloads(&[
+                relay_guard_workload("enrolled", &["10.1.2.3"], &[8080]),
+                relay_guard_workload("portless", &["10.1.2.9"], &[]),
+            ]),
+            ..MeshConfig::default()
+        };
+        let decide = |host: &str, port: u16| {
+            inbound_hbone_relay_destination_decision(host, port, Some(&mesh), Some(waypoint_ip))
+        };
+
+        assert_eq!(decide("10.1.2.3", 8080), Ok(()));
+        // A record declaring no ports does not constrain its address.
+        assert_eq!(decide("10.1.2.9", 6379), Ok(()));
+        assert_eq!(
+            decide("10.1.2.3", 9999),
+            Err(InboundRelayDenial::PortNotDeclared)
+        );
+        assert_eq!(
+            decide("10.9.9.9", 8080),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
+        // The waypoint/node runs outside the destination pods' network
+        // namespace, so its own address is not a relay destination and
+        // loopback gets no own-namespace shortcut when it is absent from
+        // the inventory.
+        assert_eq!(
+            decide("10.4.4.4", 8080),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
+        assert_eq!(
+            decide("127.0.0.1", 8080),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
+
+        // Loopback listed IN the inventory is a real termination target —
+        // the functional waypoint suite declares `127.0.0.1` as the
+        // workload address. The own-namespace shortcut stays off.
+        let loopback_mesh = MeshConfig {
+            inbound_relay_destinations: inbound_relay_destinations_from_workloads(&[
+                relay_guard_workload("loopback-app", &["127.0.0.1"], &[8080]),
+            ]),
+            ..MeshConfig::default()
+        };
+        assert_eq!(
+            inbound_hbone_relay_destination_decision(
+                "127.0.0.1",
+                8080,
+                Some(&loopback_mesh),
+                Some(waypoint_ip),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            inbound_hbone_relay_destination_decision(
+                "localhost",
+                8080,
+                Some(&loopback_mesh),
+                Some(waypoint_ip),
+            ),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
     }
 
     #[test]
     fn inbound_hbone_relay_proxy_normalizes_bracketed_ipv6_authority() {
-        use crate::identity::spiffe::{SpiffeId, TrustDomain};
-        use crate::modes::mesh::config::{MeshConfig, Workload, WorkloadPort, WorkloadSelector};
+        use crate::modes::mesh::config::MeshConfig;
 
-        let mut mesh = MeshConfig::default();
-        mesh.workloads.push(Workload {
-            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap(),
-            selector: WorkloadSelector::default(),
-            service_name: "app".to_string(),
-            service_namespace: None,
-            addresses: vec!["fd00:10:244:1::4".to_string()],
-            ports: vec![WorkloadPort {
-                port: 8080,
-                protocol: crate::modes::mesh::config::AppProtocol::Http,
-                name: None,
-            }],
-            trust_domain: TrustDomain::new("cluster.local").unwrap(),
-            namespace: "default".to_string(),
-            network: None,
-            cluster: None,
-            weight: None,
-            locality: None,
-            service_account: None,
-            pod_uid: None,
-            node_waypoint: None,
-            remote_provenance: false,
-        });
+        let mesh = MeshConfig {
+            workloads: vec![relay_guard_workload("app", &["fd00:10:244:1::4"], &[8080])],
+            inbound_relay_admits_accepted_local_address: true,
+            ..MeshConfig::default()
+        };
         let authority: http::uri::Authority = "[fd00:10:244:1::4]:8080".parse().unwrap();
-
-        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), false, None)
-            .expect("bracketed IPv6 authority should build relay");
+        // The pod IP the peer reached on this socket — the own-pod proof the
+        // ownership guard requires (issue #4150).
+        let local_ip: std::net::IpAddr = "fd00:10:244:1::4".parse().unwrap();
+        let built =
+            build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), false, Some(local_ip));
+        let relay = built.expect("bracketed IPv6 authority should build relay");
 
         assert_eq!(relay.proxy.backend_host, "fd00:10:244:1::4");
         assert_eq!(relay.proxy.backend_port, 8080);

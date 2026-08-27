@@ -28,6 +28,7 @@ Concepts map directly to the Istio service mesh model: `Workload` corresponds to
   - [Rule Matching](#rule-matching)
   - [SPIFFE Identity](#spiffe-identity)
   - [HBONE Protocol](#hbone-protocol)
+  - [Inbound Relay Destination Guard](#inbound-relay-destination-guard)
   - [Trust Domain Aliasing](#trust-domain-aliasing)
   - [Trusted HBONE Assertors](#trusted-hbone-assertors)
 - [RequestAuthentication](#requestauthentication)
@@ -2060,6 +2061,8 @@ Wire-shape detection by `is_hbone_connect()`:
 
 Shape detection alone does **not** authorize the relay. Before the transparent TCP relay is established, the HBONE handler requires an authenticated, trust-domain-verified peer SPIFFE identity (`ctx.peer_spiffe_id.is_some()`, captured by `is_authenticated_hbone_connect()`). The inbound mTLS/HBONE listener populates `peer_spiffe_id` from the verified peer certificate (via the `spiffe_identity` plugin, or the node-agent/eBPF identity on the NodeWaypoint listener), so a present identity means a verified mesh peer terminated mTLS on this listener. A bare (marker-less) HTTP/2 CONNECT with no authenticated peer — and equally a CONNECT that merely asserts an `x-*-protocol: hbone` marker without a verified peer — is rejected with `403 Forbidden` and never relayed or dialed to a backend; the rejection stamps `mesh_authz.deny_policy=hbone_unauthenticated_peer`. Legitimate Istio ztunnel/waypoint HBONE always presents an authenticated mTLS peer, so interop is unaffected. This is independent of the trust-bundle peer verification performed at TLS time — it ensures the relay itself never opens a tunnel for an unauthenticated peer.
 
+Authentication is necessary but not sufficient: an authenticated peer still may not use this proxy as a relay into destinations it does not own. See [Inbound Relay Destination Guard](#inbound-relay-destination-guard) below.
+
 Identity extraction from W3C Baggage headers:
 - Source principal keys (with fallback aliases): `source.principal`, `source_principal`, `source.identity`, `source_identity`, `src.identity`, `src_identity`.
 - Values are percent-decoded per the Baggage spec.
@@ -2069,6 +2072,30 @@ Gateway DPs can also originate HBONE when they have a gateway SVID loaded and an
 Gateways with a loaded SVID auto-enable source identity labels for the `workload_metrics` plugin. The runtime injects an internal global `workload_metrics` plugin when none exists, or augments an existing global plugin with `workload_spiffe_id` when the operator has not set one explicitly. Successful HBONE-dispatched transactions are labeled with `mesh.connection_security_policy=mutual_tls` and `mesh.gateway.transport=hbone`; mesh-aware upstream target tags such as `mesh.spiffe_id`, `mesh.namespace`, `mesh.service`, and `mesh.trust_domain` are copied to destination metadata.
 
 Inbound HBONE CONNECT requests run the standard `before_proxy` plugin chain on the outer CONNECT request before the transparent TCP relay is established. This means `mesh_route_dispatch` (and any other `before_proxy` plugin that writes `RequestContext::route_override_*`) can match on the CONNECT request's method, headers, and query parameters, and override the backend `upstream_id`, `backend_host`/`backend_port`, resolved backend TLS materials, backend read timeout, and retry policy on a per-rule basis. The overrides flow into HBONE backend selection through `apply_route_overrides_with_upstreams`, so per-rule `timeout_ms` / `timeout_disabled` and `retry` from a translated `VirtualService` reach the HBONE relay's `backend_read_timeout` / `backend_write_timeout` / circuit-breaker decisions just as they reach the H1/H2/H3 dispatch paths. The relay itself stays a transparent byte-copy after the upgrade — `before_proxy` does not see inner H2 frames, so route decisions are made once per outer CONNECT, mirroring the post-upgrade pinning behavior of WebSocket dispatch.
+
+### Inbound Relay Destination Guard
+
+The authenticated inbound CONNECT terminator (HBONE `:15008`, and the bare HTTP/2 CONNECT a Sidecar accepts on `:15006`) admits **only the destinations this proxy actually terminates for**. Being declared somewhere in the mesh slice is deliberately *not* enough: relaying to another node's workload would dial that pod in plaintext from this pod's IP, skipping the destination's own `AuthorizationPolicy` set and arriving as a trusted-looking unauthenticated source under a PERMISSIVE `PeerAuthentication` posture.
+
+A CONNECT `:authority` of `host:port` is admitted only when `host` matches a destination in one of these sets — everything else is refused. The guard never resolves DNS; it compares what the peer named against what this proxy declares:
+
+| Topology | Admitted destinations | Loopback |
+| --- | --- | --- |
+| `Sidecar`, `Ambient` | Two sources. (1) The accepted connection's own local address — the pod IP the peer actually reached on this socket, resolved even behind a wildcard bind; the port must be one the slice declares **for that address**. (2) The slice `Workload` record(s) whose SPIFFE identity equals this proxy's own `FERRUM_MESH_WORKLOAD_SPIFFE_ID`, on the ports those records declare. Source (2) exists because `Ambient` is ztunnel-style: it runs outside the workload pods' network namespaces and terminates inbound for the pods the node-agent enrols on its node, so the destination address is legitimately not the accepted socket's own (see the "Enrolled Ambient destination pod UDP relay" note in the protocol support matrix). A blank or absent workload identity leaves source (2) EMPTY, so only source (1) applies. | Admitted (`127.0.0.1` / `::1` / `localhost`) as an own-namespace shortcut — it resolves inside this pod's own network namespace — on this pod's declared ports only. |
+| `NodeWaypoint` | The CP-authorized pods enrolled on **this node** (the same inventory the transparent capture listener resolves against). | No own-namespace shortcut (the waypoint runs in the host network namespace). Admitted only when loopback is itself in that inventory. |
+| `ServiceWaypoint` | The workloads visible in **this waypoint's namespaces** — its own namespace plus the namespaces of its bound services. This is a namespace-level narrowing, not a per-binding one: a workload in those namespaces that backs no bound service is still in the inventory. | No own-namespace shortcut. Admitted only when loopback is itself in that inventory (the functional suite declares `127.0.0.1` as the workload address). |
+| `EastWestGateway`, `EgressGateway` | None. East-west is SNI passthrough; egress relays to external `ServiceEntry` destinations through its own admission lists. | Refused. |
+
+Rules that apply across all of them:
+
+- **Ownership is a transport fact.** The own-pod arm compares the authority against the accepted socket's local address, never against `Host`, `:authority` routing hints, or `X-Forwarded-*`. A peer that could choose it could choose which pod this node relays into.
+- **Addresses are canonicalized.** IPv4-mapped IPv6 folds to its IPv4 form and IPv6 spellings are normalized before comparison, so the two textual forms of one address always decide identically. A bracketed IPv4 literal is not a valid authority host and is refused.
+- **Names are matched, never resolved.** A `Workload` record may declare a non-IP address (a `ServiceEntry`/`WorkloadEntry` host, a VM address). Such a record admits an authority that matches that name verbatim, ASCII-case-insensitively, on the record's declared ports. The gateway does **not** resolve the name inside the guard — whatever a name resolved to could not be attributed to this terminator — so nothing is admitted that the terminator's own inventory does not already declare by name. An authority naming an IP never matches a name entry, and vice versa. A name no entry declares is refused as `unresolvable_authority`.
+- **Ports come from the owning record.** A workload record that declares ports admits only those ports; one that declares none does not constrain its address. A port declared by some *other* workload never admits a destination.
+- **Fail closed.** No slice, an unresolvable authority, an empty inventory, or a missing accepted local address all refuse. The refusal is a `403` carrying `mesh_authz.deny_policy=hbone_relay_destination_denied` (or `hbone_udp_relay_destination_denied`) plus structured audit metadata: `mesh.relay.denial_reason` (`no_mesh_slice`, `unresolvable_authority`, `address_not_terminated_here`, `port_not_declared`, or `ingress_endpoint_mapping_mismatch`), `mesh.relay.denied_destination` (the effective `host:port`), and `mesh.relay.terminator_ip` when one was resolved.
+- **Re-checked after plugins.** The guard runs at relay synthesis on the original authority, and again on the *effective* destination after the `before_proxy` chain, so a `mesh_route_dispatch` route override cannot move the dial off the admitted set.
+
+Two narrower boundaries sit beside this guard and are unaffected by it: a declared Sidecar `ingress[]` block replaces the ordinary surface with an exact `listener port → defaultEndpoint` mapping (see [Sidecar Ingress Listeners](#sidecar-ingress-listeners)), and an `EgressGateway` admits external UDP `ServiceEntry` destinations from its own precomputed dial-endpoint allowlist.
 
 ### Trust Domain Aliasing
 
