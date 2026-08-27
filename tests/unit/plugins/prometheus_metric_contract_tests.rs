@@ -24,6 +24,11 @@ const PROMETHEUS_METRIC_CONTRACT_JSON: &str =
 const PROMETHEUS_METRICS_REFERENCE_MD: &str = include_str!("../../../docs/prometheus_metrics.md");
 const BUNDLED_PROMETHEUS_RULE_TEMPLATE: &str =
     include_str!("../../../charts/ferrum-mesh/templates/alerts-prometheusrule.yaml");
+/// The gateway chart ships its own alert set, so a family alerted on THERE is
+/// just as "referenced by a bundled chart" as one alerted on in the mesh chart.
+/// Scanning only the mesh file made every gateway-only alert look unreferenced.
+const BUNDLED_GATEWAY_PROMETHEUS_RULE_TEMPLATE: &str =
+    include_str!("../../../charts/ferrum-gateway/templates/metrics-prometheusrule.yaml");
 const BUNDLED_EXTERNAL_METRIC_ALLOWLIST: &[&str] = &["apiserver_admission_webhook_rejection_count"];
 const SAMPLE_SUFFIXES: &[&str] = &["_bucket", "_sum", "_count"];
 
@@ -1124,7 +1129,11 @@ fn representative_metrics_exposition_matches_contract() {
 fn bundled_prometheus_rule_metric_refs_are_inventoried_or_allowlisted() {
     let contract = load_contract();
     let allow: BTreeSet<&str> = BUNDLED_EXTERNAL_METRIC_ALLOWLIST.iter().copied().collect();
-    let names = ferrum_metric_names_in_text(BUNDLED_PROMETHEUS_RULE_TEMPLATE, &contract);
+    let mut names = ferrum_metric_names_in_text(BUNDLED_PROMETHEUS_RULE_TEMPLATE, &contract);
+    names.extend(ferrum_metric_names_in_text(
+        BUNDLED_GATEWAY_PROMETHEUS_RULE_TEMPLATE,
+        &contract,
+    ));
     let mut unknown = Vec::new();
     for name in &names {
         if allow.contains(name.as_str()) {
@@ -1188,6 +1197,10 @@ fn bundled_grafana_dashboard_metric_refs_are_inventoried() {
 fn bundled_classification_matches_chart_references() {
     let contract = load_contract();
     let mut referenced = ferrum_metric_names_in_text(BUNDLED_PROMETHEUS_RULE_TEMPLATE, &contract);
+    referenced.extend(ferrum_metric_names_in_text(
+        BUNDLED_GATEWAY_PROMETHEUS_RULE_TEMPLATE,
+        &contract,
+    ));
     for dash in [
         include_str!("../../../charts/ferrum-mesh/dashboards/certificate-posture.json"),
         include_str!("../../../charts/ferrum-mesh/dashboards/egress-scope.json"),

@@ -558,6 +558,65 @@ podDisruptionBudget:
   # minAvailable: null
   # maxUnavailable: 1
 
+# -----------------------------------------------------------------------------
+# Metrics / observability (optional). Default `enabled: false` so existing
+# installs do not render a ServiceMonitor, PrometheusRule, or metrics env vars.
+# `/metrics` is served on the admin listener and requires authentication unless
+# the scraper originates from `metrics.allowedCidrs` or presents
+# `metrics.bearerToken`. Enabling the ServiceMonitor does NOT change
+# `admin.bindAddress`; pair it with `admin.service.enabled=true` and a
+# non-loopback admin bind plus a NetworkPolicy. Also enable the globally scoped
+# `prometheus_metrics` plugin in your gateway config or the scrape returns an
+# empty exposition. See charts/ferrum-gateway/README.md#metrics-and-prometheus.
+# -----------------------------------------------------------------------------
+metrics:
+  enabled: false
+  # Comma-separated CIDRs/IPs allowed to scrape `/metrics` (and see detailed
+  # `/health` / `/overload`) without a credential (FERRUM_METRICS_ALLOWED_CIDRS).
+  allowedCidrs: ""
+  bearerToken:
+    # value: "change-me-to-a-long-random-metrics-token"
+    existingSecret:
+      name: ""
+      key: metrics-bearer-token
+    valueFrom: {}
+  serviceMonitor:
+    # When `metrics.enabled` is true, render a Prometheus Operator ServiceMonitor
+    # that scrapes `/metrics` on the admin Service (`app.kubernetes.io/component:
+    # gateway-admin`). Requires `admin.service.enabled=true`, a non-loopback
+    # `admin.bindAddress`, and either `metrics.allowedCidrs` (scrape source IP
+    # allowlist) or `metrics.bearerToken.existingSecret` (Bearer authorization
+    # on the scrape). Inline `bearerToken.value` wires the pod env only; create
+    # the Secret out-of-band for ServiceMonitor authorization.
+    enabled: true
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+    annotations: {}
+    # Required when the scrape falls through to admin HTTPS (no plaintext admin
+    # port): rendered verbatim as the endpoint's tlsConfig. The HTTPS scrape
+    # carries the metrics bearer token, so the chart refuses to render an
+    # unverified endpoint implicitly — either point at the CA, e.g.
+    #   tlsConfig:
+    #     ca:
+    #       secret:
+    #         name: ferrum-admin-tls
+    #         key: ca.crt
+    #     serverName: ferrum-gateway-admin.ferrum.svc
+    # or accept an unverified endpoint deliberately with
+    #   tlsConfig:
+    #     insecureSkipVerify: true
+    tlsConfig: {}
+  alerts:
+    # When `metrics.enabled` is true, render a PrometheusRule with core gateway
+    # alerts (5xx rate, P99 latency, TLS cert expiry, config poll freshness,
+    # DP config staleness, ConfigSync divergence).
+    enabled: true
+    high5xxRatePerSecond: 1
+    p99LatencyMs: 2000
+    certExpiringSeconds: 604800
+    databasePollStaleSeconds: 300
+
 # Optional NetworkPolicy. Default off. When enabled, proxy and stream listener
 # ports stay reachable from any source while admin HTTP/HTTPS and CP gRPC ingress
 # are limited to the configured selectors — pair with admin.allowInsecureHttp or

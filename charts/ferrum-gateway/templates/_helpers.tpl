@@ -958,6 +958,7 @@ Validation: fail render on missing/unsafe configuration.
 {{- if and (not (kindIs "invalid" $grace)) (lt (int $grace) $minGrace) -}}
 {{- fail (printf "terminationGracePeriodSeconds (%d) must be at least %d (preStop %ds + preDrain %ds + shutdown budget %ds, where the shutdown budget is drain %ds + transport pool 6s + background 5s + audit %ds + observability 2s + finalizer slack 5s); a null shutdownDrainSeconds uses the binary's 30s default" (int $grace) $minGrace $preStop $preDrain $shutdownBudget $effectiveDrain $auditBudget) -}}
 {{- end -}}
+{{- include "ferrum-gateway.validateMetrics" . -}}
 {{- end -}}
 
 {{/* ---------------------------------------------------------------------------
@@ -968,7 +969,7 @@ Env assembly.
      probes, Services, ports, or Secret wiring from the running process, so both
      env passthroughs reject them. Keep this list the single source of truth. */}}
 {{- define "ferrum-gateway.reservedEnv" -}}
-FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GRPC_JWT_SECRET FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT FERRUM_DP_CP_GRPC_URLS FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS FERRUM_CP_GRPC_LISTEN_ADDR FERRUM_CP_NAMESPACES FERRUM_CP_REQUIRE_NAMESPACE_CLAIM FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH FERRUM_CP_DP_GRPC_JWT_KEY_ID FERRUM_DP_CP_GRPC_TOKEN_FILE FERRUM_FILE_CONFIG_PATH FERRUM_PROXY_HTTP_PORT FERRUM_PROXY_HTTPS_PORT FERRUM_ADMIN_HTTP_PORT FERRUM_ADMIN_HTTPS_PORT FERRUM_ADMIN_BIND_ADDRESS FERRUM_ADMIN_ALLOWED_CIDRS FERRUM_ALLOW_INSECURE_ADMIN_HTTP FERRUM_SHUTDOWN_DRAIN_SECONDS FERRUM_SHUTDOWN_PREDRAIN_SECONDS FERRUM_FRONTEND_TLS_CERT_PATH FERRUM_FRONTEND_TLS_KEY_PATH FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_ADMIN_TLS_CERT_PATH FERRUM_ADMIN_TLS_KEY_PATH FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_BACKEND_TLS_CLIENT_CERT_PATH FERRUM_BACKEND_TLS_CLIENT_KEY_PATH FERRUM_CP_GRPC_TLS_CERT_PATH FERRUM_CP_GRPC_TLS_KEY_PATH FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH FERRUM_DP_GRPC_TLS_CA_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
+FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GRPC_JWT_SECRET FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT FERRUM_DP_CP_GRPC_URLS FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS FERRUM_CP_GRPC_LISTEN_ADDR FERRUM_CP_NAMESPACES FERRUM_CP_REQUIRE_NAMESPACE_CLAIM FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH FERRUM_CP_DP_GRPC_JWT_KEY_ID FERRUM_DP_CP_GRPC_TOKEN_FILE FERRUM_FILE_CONFIG_PATH FERRUM_PROXY_HTTP_PORT FERRUM_PROXY_HTTPS_PORT FERRUM_ADMIN_HTTP_PORT FERRUM_ADMIN_HTTPS_PORT FERRUM_ADMIN_BIND_ADDRESS FERRUM_ADMIN_ALLOWED_CIDRS FERRUM_ALLOW_INSECURE_ADMIN_HTTP FERRUM_METRICS_BEARER_TOKEN FERRUM_METRICS_ALLOWED_CIDRS FERRUM_SHUTDOWN_DRAIN_SECONDS FERRUM_SHUTDOWN_PREDRAIN_SECONDS FERRUM_FRONTEND_TLS_CERT_PATH FERRUM_FRONTEND_TLS_KEY_PATH FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_ADMIN_TLS_CERT_PATH FERRUM_ADMIN_TLS_KEY_PATH FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_BACKEND_TLS_CLIENT_CERT_PATH FERRUM_BACKEND_TLS_CLIENT_KEY_PATH FERRUM_CP_GRPC_TLS_CERT_PATH FERRUM_CP_GRPC_TLS_KEY_PATH FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH FERRUM_DP_GRPC_TLS_CA_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
 {{- end -}}
 
 {{- define "ferrum-gateway.modeEnv" -}}
@@ -1104,6 +1105,64 @@ FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRE
 - name: FERRUM_SHUTDOWN_PREDRAIN_SECONDS
   value: {{ .Values.shutdownPreDrainSeconds | quote }}
 {{- end }}
+{{- end -}}
+
+{{/* Metrics auth env (FERRUM_METRICS_*). Only rendered when metrics.enabled. */}}
+{{- define "ferrum-gateway.metricsEnv" -}}
+{{- if .Values.metrics.enabled }}
+{{- $metrics := .Values.metrics | default dict -}}
+{{- if $metrics.allowedCidrs }}
+- name: FERRUM_METRICS_ALLOWED_CIDRS
+  value: {{ $metrics.allowedCidrs | quote }}
+{{- end }}
+{{- if include "ferrum-gateway.sourceConfigured" ($metrics.bearerToken | default dict) }}
+{{ include "ferrum-gateway.renderSecretEnv" (dict "name" "FERRUM_METRICS_BEARER_TOKEN" "source" ($metrics.bearerToken | default dict) "defaultKey" "metrics-bearer-token") }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/* Validate optional metrics subtree. */}}
+{{- define "ferrum-gateway.validateMetrics" -}}
+{{- if .Values.metrics.enabled -}}
+{{- $metrics := .Values.metrics | default dict -}}
+{{- $allowedCidrs := trim ($metrics.allowedCidrs | default "") -}}
+{{- if $allowedCidrs -}}
+{{- range $raw := splitList "," $allowedCidrs -}}
+{{- $entry := trim $raw -}}
+{{- if or (contains "[" $entry) (contains "]" $entry) -}}
+{{- fail (printf "metrics.allowedCidrs entry %q uses bracketed IPv6 syntax, but the runtime requires bare IPv6 addresses/CIDRs (for example fd00::/8 or ::1/128)" $entry) -}}
+{{- end -}}
+{{- if not (include "ferrum-gateway.validAdminCidrEntry" $entry) -}}
+{{- $display := $entry | default "<empty>" -}}
+{{- fail (printf "metrics.allowedCidrs entry %q is not a valid IP address or CIDR; expected forms such as 10.0.0.0/8, 192.168.1.1, ::1, or fd00::/8" $display) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $bearer := $metrics.bearerToken | default dict -}}
+{{- include "ferrum-gateway.validateOneSource" (dict "label" "metrics.bearerToken" "source" $bearer "optional" true "root" . "envName" "FERRUM_METRICS_BEARER_TOKEN") -}}
+{{- $hasBearer := include "ferrum-gateway.sourceConfigured" $bearer -}}
+{{- if and (not $allowedCidrs) (not $hasBearer) -}}
+{{- fail "metrics.enabled requires metrics.bearerToken (value, existingSecret.name, or valueFrom) or a non-empty metrics.allowedCidrs so /metrics scrapes can be authorized" -}}
+{{- end -}}
+{{- $sm := $metrics.serviceMonitor | default dict -}}
+{{- if $sm.enabled -}}
+{{- $admin := .Values.admin | default dict -}}
+{{- $bind := $admin.bindAddress | default "" -}}
+{{- $normalizedBind := $bind | trimPrefix "[" | trimSuffix "]" -}}
+{{- $loopback := or (eq $normalizedBind "") (eq $normalizedBind "::1") (regexMatch "^127\\." $normalizedBind) -}}
+{{- $adminSvc := $admin.service | default dict -}}
+{{- if not $adminSvc.enabled -}}
+{{- fail "metrics.serviceMonitor.enabled=true requires admin.service.enabled=true so Prometheus can reach /metrics through the admin ClusterIP Service; the chart does not auto-expose admin on the pod IP" -}}
+{{- end -}}
+{{- if $loopback -}}
+{{- fail "metrics.serviceMonitor.enabled=true requires a non-loopback admin.bindAddress (e.g. 0.0.0.0 or ::); loopback-bound admin is not reachable through a Service" -}}
+{{- end -}}
+{{- $bearerSecret := ($bearer.existingSecret | default dict).name | default "" -}}
+{{- if and (not $allowedCidrs) (not $bearerSecret) -}}
+{{- fail "metrics.serviceMonitor.enabled=true without metrics.allowedCidrs requires metrics.bearerToken.existingSecret.name so the ServiceMonitor can attach Bearer authorization (inline bearerToken.value wires the pod env only — create the Secret out-of-band)" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 
 {{/* TLS path env for each enabled surface. */}}

@@ -319,7 +319,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_compression_response_buffer_admitted_total` | counter | `namespace` | `compression` | `documented_only` | `always` | Response-compression buffer admissions granted (bounds bodies collected for compression). |
 | `ferrum_compression_response_buffer_saturated_total` | counter | `namespace` | `compression` | `documented_only` | `always` | Response-compression buffer admission refusals; the response streams identity (or 406) instead. |
 | `ferrum_configsync_delta_rejections_total` | counter | `namespace` | `configsync` | `documented_only` | `conditional` | Non-empty ConfigSync deltas rejected by the DP, forcing an authoritative FULL_SNAPSHOT resync. |
-| `ferrum_configsync_diverged` | gauge | `namespace` | `configsync` | `documented_only` | `conditional` | Whether the DP is currently sticky-diverged after a rejected ConfigSync delta (1) or converged (0). |
+| `ferrum_configsync_diverged` | gauge | `namespace` | `configsync` | `alert` | `conditional` | Whether the DP is currently sticky-diverged after a rejected ConfigSync delta (1) or converged (0). |
 | `ferrum_configsync_divergence_recoveries_total` | counter | `namespace` | `configsync` | `documented_only` | `conditional` | ConfigSync divergence recoveries after an accepted authoritative FULL_SNAPSHOT. |
 | `ferrum_configsync_fenced_full_snapshots_total` | counter | `namespace` | `configsync` | `documented_only` | `conditional` | ConfigSync FULL_SNAPSHOTs the DP fenced without applying (stale/older, unorderable/inconsistent, or an implausibly-future CP clock stamp); last-known-good config keeps serving. |
 | `ferrum_connection_pool_entries` | gauge | `pool`, `namespace` | `connection_pool` | `documented_only` | `conditional` | Resident entries per gateway backend pool: cached reqwest clients for http, live multiplexed connections for the others. |
@@ -350,7 +350,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_database_delta_forced_full_reloads_total` | counter | `namespace` | `database_polling` | `documented_only` | `conditional` | Authoritative full reload attempts triggered by repeated rejected database deltas. |
 | `ferrum_database_delta_recoveries_total` | counter | `namespace` | `database_polling` | `documented_only` | `conditional` | Rejected database delta recovery events after an accepted incremental apply or full reload. |
 | `ferrum_database_delta_rejections_total` | counter | `resource_category`, `namespace` | `database_polling` | `documented_only` | `conditional` | Database incremental deltas rejected by validation, bucketed by bounded resource category. |
-| `ferrum_database_poll_last_completed_timestamp_seconds` | gauge | `namespace` | `database_polling` | `documented_only` | `conditional` | Unix timestamp of the most recently completed database/CP config poll attempt (including empty success). |
+| `ferrum_database_poll_last_completed_timestamp_seconds` | gauge | `namespace` | `database_polling` | `alert` | `conditional` | Unix timestamp of the most recently completed database/CP config poll attempt (including empty success). |
 | `ferrum_destination_active_requests` | gauge | `gateway_namespace` | `destination_breaker` | `documented_only` | `always` | Active upstream requests currently holding a DestinationRule http2MaxRequests permit. |
 | `ferrum_destination_active_requests_admitted_total` | counter | `gateway_namespace` | `destination_breaker` | `documented_only` | `always` | Upstream requests admitted through the DestinationRule http2MaxRequests breaker. |
 | `ferrum_destination_active_requests_rejected_total` | counter | `gateway_namespace` | `destination_breaker` | `documented_only` | `always` | Upstream requests shed because their destination was at its http2MaxRequests ceiling. |
@@ -361,7 +361,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_dp_config_snapshot_apply_failures_total` | counter | `namespace` | `dp_config` | `documented_only` | `conditional` | CP snapshots that were admitted and then failed to apply since process start. |
 | `ferrum_dp_config_snapshots_applied_total` | counter | `namespace` | `dp_config` | `documented_only` | `conditional` | CP snapshots/deltas validated and successfully applied since process start. |
 | `ferrum_dp_config_snapshots_rejected_total` | counter | `namespace` | `dp_config` | `documented_only` | `conditional` | CP payloads refused before apply since process start. |
-| `ferrum_dp_config_stale` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Whether the DP's applied configuration is past its bound with no authoritative CP (1) or not (0). |
+| `ferrum_dp_config_stale` | gauge | `namespace` | `dp_config` | `alert` | `conditional` | Whether the DP's applied configuration is past its bound with no authoritative CP (1) or not (0). |
 | `ferrum_dp_config_stale_transitions_total` | counter | `namespace` | `dp_config` | `documented_only` | `conditional` | Transitions into the stale state since process start. |
 | `ferrum_edge_overhead_ms` | histogram | `proxy_id`, `le`, `namespace` | `prometheus_metrics` | `dashboard` | `always` | Gateway overhead (excluding backend and plugins) in milliseconds. |
 | `ferrum_frontend_client_trust_fenced_total` | counter | `scope`, `namespace` | `tls` | `documented_only` | `conditional` | Requests or streams refused before routing because the transport's client-certificate trust was withdrawn. |
@@ -573,7 +573,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_stream_connections_total` | counter | `proxy_id`, `protocol`, `namespace` | `stream` | `dashboard` | `conditional` | Total stream connections (TCP/UDP). |
 | `ferrum_stream_disconnects_total` | counter | `proxy_id`, `protocol`, `cause`, `direction`, `namespace` | `stream` | `dashboard` | `conditional` | Stream disconnects (TCP/UDP) by cause and direction. |
 | `ferrum_stream_duration_ms` | histogram | `proxy_id`, `le`, `namespace` | `stream` | `documented_only` | `conditional` | Stream connection duration in milliseconds. |
-| `ferrum_tls_cert_expiry_seconds` | gauge | `cert_id`, `surface`, `source_kind`, `namespace` | `tls` | `documented_only` | `conditional` | Seconds until the certificate leaf not_after timestamp. Negative means expired. |
+| `ferrum_tls_cert_expiry_seconds` | gauge | `cert_id`, `surface`, `source_kind`, `namespace` | `tls` | `alert` | `conditional` | Seconds until the certificate leaf not_after timestamp. Negative means expired. |
 | `ferrum_tls_cert_not_before_seconds` | gauge | `cert_id`, `surface`, `source_kind`, `namespace` | `tls` | `documented_only` | `conditional` | Certificate leaf not_before timestamp as Unix seconds. |
 | `ferrum_tls_cert_rotations_total` | counter | `cert_id`, `reason`, `outcome`, `namespace` | `tls` | `documented_only` | `conditional` | TLS certificate rotation outcomes by cert ID, reason, and outcome. |
 | `ferrum_tls_inventory_snapshot_max_age_seconds` | gauge | `namespace` | `tls` | `documented_only` | `conditional` | Configured maximum snapshot age (FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS) before a scrape schedules a background refresh. |
@@ -606,6 +606,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 ## Bundled observability surfaces
 
 - PrometheusRule: `charts/ferrum-mesh/templates/alerts-prometheusrule.yaml`
+- PrometheusRule (core gateway): `charts/ferrum-gateway/templates/metrics-prometheusrule.yaml`
 - Grafana dashboards: `charts/ferrum-mesh/dashboards/*.json`
 - Families with `bundled: documented_only` are intentionally exported without a chart alert/dashboard yet; adding a query requires updating both the chart artifact and this inventory classification.
 

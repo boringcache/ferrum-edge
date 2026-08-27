@@ -132,6 +132,7 @@ spec:
             {{- include "ferrum-gateway.portEnv" . | nindent 12 }}
             {{- include "ferrum-gateway.shutdownEnv" . | nindent 12 }}
             {{- include "ferrum-gateway.tlsEnv" . | nindent 12 }}
+            {{- include "ferrum-gateway.metricsEnv" . | nindent 12 }}
             {{- include "ferrum-gateway.secretFileEnv" . | nindent 12 }}
             {{- include "ferrum-gateway.userEnv" . | nindent 12 }}
             {{- with .Values.extraEnv }}

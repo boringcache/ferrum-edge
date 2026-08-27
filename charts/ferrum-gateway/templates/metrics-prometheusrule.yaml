@@ -1,0 +1,68 @@
+{{- if and .Values.metrics.enabled .Values.metrics.alerts.enabled }}
+{{- $alerts := .Values.metrics.alerts | default dict -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "ferrum-gateway.suffixedName" (dict "base" (include "ferrum-gateway.fullname" .) "suffix" "-alerts") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferrum-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway-metrics
+    prometheus: ferrum-gateway
+spec:
+  groups:
+    - name: ferrum.gateway.traffic
+      rules:
+        - alert: FerrumGatewayHigh5xxRate
+          expr: sum(rate(ferrum_requests_total{status_code=~"5.."}[5m])) > {{ $alerts.high5xxRatePerSecond | default 1 }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ferrum gateway 5xx response rate is elevated
+            description: "Gateway 5xx responses are above the configured threshold ({{ "{{ $value }}" }} req/s)."
+        - alert: FerrumGatewayHighP99Latency
+          expr: histogram_quantile(0.99, sum(rate(ferrum_request_duration_ms_bucket[5m])) by (le)) > {{ $alerts.p99LatencyMs | default 2000 }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ferrum gateway P99 latency is elevated
+            description: "Gateway P99 request latency is {{ "{{ $value }}" }} ms (threshold {{ $alerts.p99LatencyMs | default 2000 }} ms)."
+    - name: ferrum.gateway.tls
+      rules:
+        - alert: FerrumGatewayTlsCertExpiringSoon
+          expr: min by (cert_id, surface, namespace) (ferrum_tls_cert_expiry_seconds) < {{ $alerts.certExpiringSeconds | default 604800 }}
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ferrum gateway TLS certificate is expiring soon
+            description: "Certificate {{ "{{ $labels.cert_id }}" }} on surface {{ "{{ $labels.surface }}" }} expires in {{ "{{ $value }}" }} seconds."
+    - name: ferrum.gateway.config
+      rules:
+        - alert: FerrumGatewayDatabasePollStale
+          expr: (time() - ferrum_database_poll_last_completed_timestamp_seconds > {{ $alerts.databasePollStaleSeconds | default 300 }}) or absent(ferrum_database_poll_last_completed_timestamp_seconds)
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ferrum gateway database config poll is stale
+            description: "No successful database/CP config poll completed within the freshness window for namespace {{ "{{ $labels.namespace }}" }}."
+        - alert: FerrumGatewayDpConfigStale
+          expr: max by (namespace) (ferrum_dp_config_stale) == 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            description: "Data plane namespace {{ "{{ $labels.namespace }}" }} is serving with stale CP configuration."
+            summary: Ferrum gateway data plane configuration is stale
+        - alert: FerrumGatewayConfigSyncDiverged
+          expr: max by (namespace) (ferrum_configsync_diverged) == 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ferrum gateway ConfigSync is diverged
+            description: "Data plane namespace {{ "{{ $labels.namespace }}" }} is sticky-diverged after a rejected ConfigSync delta."
+{{- end }}

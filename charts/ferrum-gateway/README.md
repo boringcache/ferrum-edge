@@ -376,3 +376,52 @@ are matched by base name, for example `name: FERRUM_ADMIN_JWT_SECRET` renders
 See [`values.yaml`](values.yaml) for the fully commented value surface and
 [`docs/kubernetes_deployment.md`](../../docs/kubernetes_deployment.md) for the
 deployment guide.
+
+## Metrics and Prometheus
+
+`/metrics` is served on the **admin** listener and is **gated by default** — a
+scraper must present a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`,
+or originate from `FERRUM_METRICS_ALLOWED_CIDRS`. The chart's optional `metrics`
+subtree (`metrics.enabled`, default `false`) wires those env vars and can render
+a Prometheus Operator `ServiceMonitor` plus a `PrometheusRule` with core gateway
+alerts. Enabling metrics does **not** change `admin.bindAddress`; you must
+explicitly expose admin for cluster scraping:
+
+```yaml
+metrics:
+  enabled: true
+  allowedCidrs: "10.0.0.0/8"   # Prometheus subnet, OR:
+  bearerToken:
+    existingSecret:
+      name: ferrum-metrics
+      key: metrics-bearer-token
+  serviceMonitor:
+    enabled: true
+admin:
+  bindAddress: "0.0.0.0"
+  service:
+    enabled: true
+  allowedCidrs: "10.0.0.0/8,127.0.0.0/8"   # database/cp: required for plaintext admin
+```
+
+Pair a non-loopback admin bind with a `NetworkPolicy` restricting who can reach
+the admin port. `metrics.bearerToken.value` wires the pod env for development;
+`metrics.bearerToken.existingSecret` is required for ServiceMonitor Bearer
+authorization when `metrics.allowedCidrs` is empty.
+
+`/metrics` also requires a globally scoped `prometheus_metrics` plugin instance or
+the scrape succeeds with an empty exposition. Add it to your gateway config
+(`file.inlineConfig`, database `plugin_configs`, or CP-pushed config):
+
+```yaml
+plugin_configs:
+  - id: prometheus
+    plugin_name: prometheus_metrics
+    scope: global
+    enabled: true
+    config: {}
+```
+
+See [`docs/admin_metrics.md`](../../docs/admin_metrics.md) and
+[`docs/prometheus_metrics.md`](../../docs/prometheus_metrics.md) for the metric
+families and bundled alert expressions.
