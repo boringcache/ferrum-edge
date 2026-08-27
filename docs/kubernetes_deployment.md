@@ -286,6 +286,18 @@ Managed clusters may expose additional platform namespaces such as
 `injector.namespaceSelector` or label them `ferrum.io/injection=disabled` before
 enabling broader injection.
 
+Pods with `spec.hostNetwork: true` are **never** injected, regardless of
+namespace selection, `injector.requireAnnotation`, or a per-pod opt-in
+annotation. Such a pod shares the node's network namespace, so the iptables
+init container would install the mesh capture rules in the node's own nat table
+(blackholing kubelet, CNI, DNS, and every other host-network pod, with no
+cleanup after the pod is deleted) and the sidecar's `15001`/`15006`/`15008`
+listeners would bind node-wide. The pod is admitted unmodified — not denied —
+and the webhook logs one `WARN` per skipped pod naming the pod, namespace, and
+capture mode. `hostPID` / `hostIPC` are not skip conditions: they share no
+namespace that an injected surface writes to. See
+[docs/mesh.md](mesh.md#host-network-pods-are-never-injected).
+
 The chart mounts the injector serving certificate through a Secret volume when
 the injector is enabled; the injector process does not read Kubernetes Secrets
 through the API, so the default service account does not need Secret RBAC for

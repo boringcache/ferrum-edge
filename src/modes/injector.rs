@@ -960,8 +960,24 @@ fn build_sidecar_patch_for_namespace(
     config: &InjectorConfig,
     admission_namespace: Option<&str>,
 ) -> Result<Vec<JsonPatchOperation>, String> {
-    if !should_inject(pod, config) {
-        return Ok(Vec::new());
+    match injection_decision(pod, config) {
+        InjectionDecision::Inject => {}
+        // A node-scoped skip is the one skip an operator must be able to see:
+        // it is silent from the workload's point of view (the pod is admitted
+        // unchanged) but it is also the difference between a meshed pod and a
+        // blackholed node. Log it with enough identity to act on. The ordinary
+        // opt-out / not-selected skips stay quiet -- they are the steady-state
+        // outcome for most pods the webhook ever sees.
+        InjectionDecision::SkipHostNetwork => {
+            warn!(
+                pod = %pod_display_name(pod),
+                namespace = %pod_namespace(pod, admission_namespace, config),
+                capture_mode = ?config.capture_mode,
+                "Injector skipping pod with spec.hostNetwork=true: the pod shares the node's network namespace, so capture rules and sidecar listeners would apply node-wide; admitting the pod unmodified"
+            );
+            return Ok(Vec::new());
+        }
+        InjectionDecision::SkipNotSelected => return Ok(Vec::new()),
     }
 
     if injected_shape_matches(pod, config, admission_namespace)? {
@@ -1027,7 +1043,22 @@ fn injected_shape_matches(
     Ok(init == &init_container(config, pod)?)
 }
 
-fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
+/// Why the injector did or did not patch a pod.
+///
+/// The admission path needs more than a bool: a `hostNetwork` skip is a
+/// node-safety refusal that has to be logged, while an opt-out or a
+/// missing opt-in is the ordinary steady-state outcome and must stay silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectionDecision {
+    /// Inject the sidecar (and, in `CaptureMode::Iptables`, the init container).
+    Inject,
+    /// `spec.hostNetwork: true` -- the pod shares the node's network namespace.
+    SkipHostNetwork,
+    /// Explicitly opted out, or never opted in under `require_annotation`.
+    SkipNotSelected,
+}
+
+fn injection_decision(pod: &Value, config: &InjectorConfig) -> InjectionDecision {
     let annotations = pod
         .pointer("/metadata/annotations")
         .and_then(Value::as_object);
@@ -1039,7 +1070,7 @@ fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
             .and_then(Value::as_str),
     ) {
         log_unrecognized_inject_annotation(annotations, "sidecar.istio.io/inject");
-        return false;
+        return InjectionDecision::SkipNotSelected;
     }
     if inject_annotation_blocks_injection(
         annotations
@@ -1047,7 +1078,7 @@ fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
             .and_then(Value::as_str),
     ) {
         log_unrecognized_inject_annotation(annotations, "ferrum.io/inject");
-        return false;
+        return InjectionDecision::SkipNotSelected;
     }
     if mesh_label_blocks_injection(
         labels
@@ -1055,14 +1086,37 @@ fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
             .and_then(Value::as_str),
     ) {
         log_unrecognized_mesh_label(labels);
-        return false;
+        return InjectionDecision::SkipNotSelected;
+    }
+
+    // A `hostNetwork: true` pod shares the NODE's network namespace, so every
+    // pod-scoped mesh surface becomes node-scoped:
+    //
+    // * The `CaptureMode::Iptables` init container runs `IptablesPlan` with
+    //   `NET_ADMIN`+`NET_RAW` and appends `nat/PREROUTING` + `nat/OUTPUT` jumps
+    //   into what is really the node's own nat table, redirecting all node TCP
+    //   at `127.0.0.1:15001`/`:15006`. That hijacks kubelet, CNI, DNS, every
+    //   other host-network workload, and the node's egress -- and the init
+    //   container installs no cleanup trap, so the outage outlives the pod.
+    // * Even with capture off (`Ebpf`/`Explicit`), the sidecar's own listeners
+    //   (15001/15006, and 15008 for HBONE) would bind on the NODE, colliding
+    //   with host ports and exposing a mesh inbound listener node-wide, while
+    //   having nothing captured to proxy.
+    //
+    // So skip the whole injection, not merely the capture half -- this matches
+    // Istio's `injectRequired()` host-networking skip. Evaluated BEFORE the
+    // opt-in gate so no opt-in spelling #4213 now accepts -- nor
+    // `require_annotation=false` -- can re-enable it. (Opt-OUT is honored first
+    // above only because it reaches the same skip outcome.)
+    if pod_uses_host_network(pod) {
+        return InjectionDecision::SkipHostNetwork;
     }
 
     if !config.require_annotation {
-        return true;
+        return InjectionDecision::Inject;
     }
 
-    inject_annotation_opts_in(
+    let opted_in = inject_annotation_opts_in(
         annotations
             .and_then(|m| m.get("ferrum.io/inject"))
             .and_then(Value::as_str),
@@ -1074,7 +1128,42 @@ fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
         labels
             .and_then(|m| m.get("ferrum.io/mesh"))
             .and_then(Value::as_str),
-    )
+    );
+
+    if opted_in {
+        InjectionDecision::Inject
+    } else {
+        InjectionDecision::SkipNotSelected
+    }
+}
+
+/// Whether the pod requests the node's network namespace.
+///
+/// The apiserver serializes `spec.hostNetwork` as a JSON boolean, but this
+/// guard protects a node-wide outage, so the stringly-typed spelling is
+/// accepted too: a hand-rolled or proxied AdmissionReview that sends
+/// `"hostNetwork": "true"` must not slip past into the iptables path.
+fn pod_uses_host_network(pod: &Value) -> bool {
+    match pod.pointer("/spec/hostNetwork") {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::String(value)) => value.eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+/// Best-effort pod identity for skip logs. Controller-created pods reach a
+/// CREATE admission with only `generateName` set, so fall back to it before
+/// giving up.
+fn pod_display_name(pod: &Value) -> &str {
+    pod.pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            pod.pointer("/metadata/generateName")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or("<unnamed>")
 }
 
 fn reject_reserved_name_conflicts(pod: &Value, config: &InjectorConfig) -> Result<(), String> {
@@ -2088,6 +2177,181 @@ mod tests {
         assert!(
             patch.is_empty(),
             "Ferrum-native disabled label remains opt-out"
+        );
+    }
+
+    fn host_network_pod(host_network: Value) -> Value {
+        json!({
+            "metadata": {
+                "name": "kube-proxy-abcde",
+                "namespace": "payments",
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {"ferrum.io/inject": "true"}
+            },
+            "spec": {
+                "hostNetwork": host_network,
+                "serviceAccountName": "api",
+                "containers": [{"name": "app", "image": "app:test"}]
+            }
+        })
+    }
+
+    #[test]
+    fn host_network_pod_is_not_injected_even_with_explicit_opt_in() {
+        // A `hostNetwork` pod shares the node's netns, so the iptables init
+        // container would REDIRECT the NODE's TCP into a proxy that is not
+        // listening. Explicit opt-in must not be able to buy that.
+        let pod = host_network_pod(Value::Bool(true));
+        let patch = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(true, CaptureMode::Iptables),
+            Some("payments"),
+        )
+        .expect("host-network pod is admitted, not rejected");
+
+        assert!(
+            patch.is_empty(),
+            "hostNetwork pod must receive neither a sidecar nor an init container, got {patch:?}"
+        );
+    }
+
+    #[test]
+    fn host_network_pod_is_not_injected_when_annotation_is_not_required() {
+        // The reachable-by-default shape: a namespace running
+        // `require_annotation=false` injects every pod it sees, including the
+        // host-network ones.
+        let mut pod = host_network_pod(Value::Bool(true));
+        pod["metadata"]["labels"] = json!({});
+        pod["metadata"]["annotations"] = json!({});
+        let patch = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(false, CaptureMode::Iptables),
+            Some("payments"),
+        )
+        .expect("host-network pod is admitted, not rejected");
+
+        assert!(
+            patch.is_empty(),
+            "hostNetwork skip must hold with require_annotation=false, got {patch:?}"
+        );
+    }
+
+    #[test]
+    fn host_network_skip_covers_capture_modes_without_an_init_container() {
+        // Even with no capture producer, the sidecar's 15001/15006 listeners
+        // would bind on the NODE, so the skip is not iptables-specific.
+        for mode in [CaptureMode::Ebpf, CaptureMode::Explicit] {
+            let config = test_config(true, mode);
+            let pod = host_network_pod(Value::Bool(true));
+            let patch = build_sidecar_patch_for_namespace(&pod, &config, Some("payments"))
+                .expect("host-network pod is admitted, not rejected");
+            assert!(
+                patch.is_empty(),
+                "hostNetwork pod must not be injected in {mode:?} mode, got {patch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_network_skip_accepts_the_stringly_typed_spelling() {
+        let pod = host_network_pod(Value::String("True".to_string()));
+        let patch = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(true, CaptureMode::Iptables),
+            Some("payments"),
+        )
+        .expect("host-network pod is admitted, not rejected");
+
+        assert!(
+            patch.is_empty(),
+            "a non-apiserver AdmissionReview spelling hostNetwork as a string must not slip past"
+        );
+    }
+
+    #[test]
+    fn pod_without_host_network_is_still_injected() {
+        // Control for the skip: identical metadata, pod-scoped netns.
+        for host_network in [Value::Bool(false), Value::Null] {
+            let mut pod = host_network_pod(Value::Bool(true));
+            pod["spec"]["hostNetwork"] = host_network.clone();
+            let patch = build_sidecar_patch_for_namespace(
+                &pod,
+                &test_config(true, CaptureMode::Iptables),
+                Some("payments"),
+            )
+            .expect("patch");
+
+            assert!(
+                patch.iter().any(|op| op.path == "/spec/containers/-"),
+                "expected sidecar container for hostNetwork={host_network:?}"
+            );
+            assert!(
+                patch.iter().any(|op| op.path == "/spec/initContainers/-"),
+                "expected iptables init container for hostNetwork={host_network:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn injection_decision_distinguishes_host_network_from_an_ordinary_skip() {
+        // The reason is what makes the skip loggable; a bool would flatten the
+        // node-safety refusal into the steady-state not-selected outcome.
+        let config = test_config(true, CaptureMode::Iptables);
+        assert_eq!(
+            injection_decision(&host_network_pod(Value::Bool(true)), &config),
+            InjectionDecision::SkipHostNetwork
+        );
+
+        let mut opted_out = host_network_pod(Value::Bool(true));
+        opted_out["metadata"]["annotations"] = json!({"ferrum.io/inject": "false"});
+        assert_eq!(
+            injection_decision(&opted_out, &config),
+            InjectionDecision::SkipNotSelected,
+            "an explicit opt-out reaches the same skip and stays quiet"
+        );
+
+        let mut meshed = host_network_pod(Value::Bool(true));
+        meshed["spec"]["hostNetwork"] = Value::Bool(false);
+        assert_eq!(
+            injection_decision(&meshed, &config),
+            InjectionDecision::Inject
+        );
+    }
+
+    #[test]
+    fn admission_response_admits_host_network_pod_without_a_patch() {
+        // The API server rejects a `patchType` with no `patch` (and an empty
+        // patch document is pointless churn), so the skip path must emit
+        // neither -- while still admitting the pod.
+        let review = json!({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "request": {
+                "uid": "host-net-1",
+                "namespace": "payments",
+                "kind": {"group": "", "version": "v1", "kind": "Pod"},
+                "resource": {"group": "", "version": "v1", "resource": "pods"},
+                "object": host_network_pod(Value::Bool(true))
+            }
+        });
+        let response = admission_response(
+            review.to_string().as_bytes(),
+            &test_config(false, CaptureMode::Iptables),
+        )
+        .expect("admission response");
+
+        assert_eq!(
+            response.pointer("/response/allowed"),
+            Some(&Value::Bool(true)),
+            "a hostNetwork pod is admitted, never denied: denying would break \
+             creation of host-network system pods in a meshed namespace"
+        );
+        assert_eq!(response.pointer("/response/patch"), None);
+        assert_eq!(response.pointer("/response/patchType"), None);
+        assert_eq!(response.pointer("/response/status"), None);
+        assert_eq!(
+            response.pointer("/response/uid"),
+            Some(&Value::String("host-net-1".to_string()))
         );
     }
 
