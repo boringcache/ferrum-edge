@@ -1,5 +1,5 @@
 //! Live MySQL contracts for custom-plugin migration recovery,
-//! cross-namespace config-change lock serialization, and byte-exact
+//! cross-namespace config-change lock concurrency, and byte-exact
 //! identity uniqueness under `utf8mb4_0900_bin` (#2994).
 
 use std::sync::Arc;
@@ -383,10 +383,11 @@ async fn mysql_example_audit_partial_ddl_recovers_and_accepts_text_bindings() {
     assert!(runner.run_plugin_pending(&list).await.unwrap().is_empty());
 }
 
-/// Cross-namespace admin writers share `config_change_locks.lock_name='global'`.
-/// The historical MySQL shape (`INSERT IGNORE` + `SELECT ... FOR UPDATE`)
-/// deadlocked on the S->X upgrade under concurrent distinct namespaces. This
-/// races two bounded write loops and asserts zero ER_LOCK_DEADLOCK 1213.
+/// Cross-namespace admin writers each take `config_change_locks.lock_name`
+/// equal to their namespace (issue #4130). The historical MySQL shape
+/// (`INSERT IGNORE` + `SELECT ... FOR UPDATE`) deadlocked on the S->X upgrade
+/// under concurrent distinct namespaces. This races two bounded write loops
+/// and asserts zero ER_LOCK_DEADLOCK 1213.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mysql_cross_namespace_config_change_lock_avoids_deadlock() {
     let fixture = match start_mysql().await {
@@ -402,7 +403,7 @@ async fn mysql_cross_namespace_config_change_lock_avoids_deadlock() {
     };
 
     // Two concurrent writers each need a connection; keep the pool small and
-    // deterministic so the race stays on the shared lock row rather than pool
+    // deterministic so the race stays on lock-row acquisition rather than pool
     // exhaustion.
     let pool_config = DbPoolConfig {
         max_connections: 4,
@@ -472,6 +473,67 @@ async fn mysql_cross_namespace_config_change_lock_avoids_deadlock() {
         ITERATIONS * 2,
         "every raced create_upstream must commit a config_changes row"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_distinct_namespaces_do_not_share_the_config_change_lock() {
+    let fixture = match start_mysql().await {
+        Ok(fixture) => fixture,
+        Err(error) => {
+            fail_in_ci_else_skip(
+                "mysql_distinct_namespaces_do_not_share_the_config_change_lock",
+                "MySQL 8.4",
+                &error,
+            );
+            return;
+        }
+    };
+
+    let pool_config = DbPoolConfig {
+        max_connections: 4,
+        min_connections: 2,
+        acquire_timeout_seconds: 10,
+        statement_timeout_seconds: 0,
+        ..DbPoolConfig::default()
+    };
+    let store = Arc::new(
+        DatabaseStore::connect_with_pool_config("mysql", &fixture.url, pool_config)
+            .await
+            .expect("connect DatabaseStore to hosted MySQL"),
+    );
+
+    // Seed both lock rows first so the hold is a record lock. A first-insert
+    // of `ns-hold` would take an insert-intention gap lock that can serialize
+    // an adjacent new primary key even after sequence locks are per-namespace.
+    store
+        .create_upstream(&make_namespace_upstream("ns-hold", "u-seed-hold"))
+        .await
+        .expect("seed ns-hold lock row");
+    store
+        .create_upstream(&make_namespace_upstream("ns-free", "u-seed-free"))
+        .await
+        .expect("seed ns-free lock row");
+
+    let mut hold = store.pool().begin().await.expect("begin hold transaction");
+    sqlx::query(ferrum_edge::_test_support::mysql_config_change_lock_insert_sql())
+        .bind("ns-hold")
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&mut *hold)
+        .await
+        .expect("take the ns-hold sequence lock");
+
+    let store_for_write = store.clone();
+    let write = tokio::spawn(async move {
+        store_for_write
+            .create_upstream(&make_namespace_upstream("ns-free", "u-free-2"))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), write)
+        .await
+        .expect("a write in ns-free must not wait on ns-hold's sequence lock")
+        .expect("ns-free writer task must join")
+        .expect("ns-free create_upstream must succeed while ns-hold is held");
+    hold.commit().await.expect("release ns-hold sequence lock");
 }
 
 /// NFC/NFD forms and trailing-space variants must remain distinct consumer
