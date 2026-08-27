@@ -8009,22 +8009,31 @@ mod inner {
         }
 
         async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error> {
-            let doc = self
+            let mut cursor = self
                 .config_changes()
-                .find_one(doc! {})
-                .sort(doc! { "sequence": -1 })
+                .aggregate(vec![doc! {
+                    "$group": {
+                        "_id": "$namespace",
+                        "max_sequence": { "$max": "$sequence" },
+                    }
+                }])
                 .await?;
-            let Some(doc) = doc else {
-                return Ok(0);
-            };
-            match doc.get("sequence") {
-                Some(Bson::Int64(value)) if *value >= 0 => Ok(*value as u64),
-                Some(Bson::Int32(value)) if *value >= 0 => Ok(*value as u64),
-                other => anyhow::bail!(
-                    "MongoDB config_changes row has invalid sequence: {:?}",
-                    other
-                ),
+            let mut total: u64 = 0;
+            while cursor.advance().await? {
+                let doc = cursor.deserialize_current()?;
+                let ns_max = match doc.get("max_sequence") {
+                    Some(Bson::Int64(value)) if *value >= 0 => *value as u64,
+                    Some(Bson::Int32(value)) if *value >= 0 => *value as u64,
+                    other => anyhow::bail!(
+                        "MongoDB config_changes row has invalid sequence: {:?}",
+                        other
+                    ),
+                };
+                total = total.checked_add(ns_max).ok_or_else(|| {
+                    anyhow::anyhow!("all-scope config-change sequence overflowed u64")
+                })?;
             }
+            Ok(total)
         }
 
         async fn load_incremental_config(

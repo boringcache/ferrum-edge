@@ -649,3 +649,132 @@ async fn saturated_change_log_batch_forces_full_reload_fallback() {
         "saturated batch error should explain the full-reload fallback, got: {message}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn config_change_sequence_locks_are_per_namespace() {
+    let (store, _temp_dir) = sqlite_store().await;
+    let mut tenant_a = test_upstream("lock-a", "127.0.0.1", 8080);
+    tenant_a.namespace = "tenant-a".to_string();
+    let mut tenant_b = test_upstream("lock-b", "127.0.0.1", 8081);
+    tenant_b.namespace = "tenant-b".to_string();
+    store
+        .create_upstream(&tenant_a)
+        .await
+        .expect("tenant-a write must succeed");
+    store
+        .create_upstream(&tenant_b)
+        .await
+        .expect("tenant-b write must succeed");
+
+    let lock_names: Vec<String> =
+        sqlx::query_scalar("SELECT lock_name FROM config_change_locks ORDER BY lock_name")
+            .fetch_all(&store.pool())
+            .await
+            .expect("config_change_locks rows must load");
+    assert_eq!(
+        lock_names,
+        vec!["tenant-a".to_string(), "tenant-b".to_string()],
+        "each namespace must own its own sequence lock row, not a shared 'global' row"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn all_scope_sequence_is_the_sum_of_per_namespace_high_waters() {
+    let (store, _temp_dir) = sqlite_store().await;
+    let mut tenant_a = test_upstream("sum-a", "127.0.0.1", 8080);
+    tenant_a.namespace = "tenant-a".to_string();
+    store
+        .create_upstream(&tenant_a)
+        .await
+        .expect("tenant-a write must succeed");
+    let a_sequence = store
+        .latest_change_sequence("tenant-a")
+        .await
+        .expect("tenant-a sequence must load");
+
+    let mut tenant_b = test_upstream("sum-b", "127.0.0.1", 8081);
+    tenant_b.namespace = "tenant-b".to_string();
+    store
+        .create_upstream(&tenant_b)
+        .await
+        .expect("tenant-b write must succeed");
+    let b_sequence = store
+        .latest_change_sequence("tenant-b")
+        .await
+        .expect("tenant-b sequence must load");
+
+    let all_scope = store
+        .latest_global_change_sequence()
+        .await
+        .expect("all-scope sequence must load");
+    assert_eq!(
+        all_scope,
+        a_sequence.saturating_add(b_sequence),
+        "All-scope mesh stamp must sum per-namespace high-waters, not take MAX(sequence)"
+    );
+    assert!(
+        all_scope > a_sequence && all_scope > b_sequence,
+        "the store-wide sum must exceed either namespace's own cursor"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn per_namespace_poller_ordering_stays_strict_across_interleaved_writes() {
+    let (store, _temp_dir) = sqlite_store().await;
+    let mut first = test_upstream("ordered-a1", "127.0.0.1", 8080);
+    first.namespace = "tenant-a".to_string();
+    store
+        .create_upstream(&first)
+        .await
+        .expect("first tenant-a write must succeed");
+    let after_first = store
+        .latest_change_sequence("tenant-a")
+        .await
+        .expect("first tenant-a sequence must load");
+
+    let mut other = test_upstream("ordered-b1", "127.0.0.1", 8081);
+    other.namespace = "tenant-b".to_string();
+    store
+        .create_upstream(&other)
+        .await
+        .expect("interleaved tenant-b write must succeed");
+
+    let mut second = test_upstream("ordered-a2", "127.0.0.1", 8082);
+    second.namespace = "tenant-a".to_string();
+    store
+        .create_upstream(&second)
+        .await
+        .expect("second tenant-a write must succeed");
+    let after_second = store
+        .latest_change_sequence("tenant-a")
+        .await
+        .expect("second tenant-a sequence must load");
+    assert!(
+        after_second > after_first,
+        "the second same-namespace write must receive a strictly later sequence"
+    );
+
+    let delta = store
+        .load_incremental_config("tenant-a", after_first)
+        .await
+        .expect("per-namespace incremental poll must succeed");
+    assert_eq!(delta.sequence_cursor, after_second);
+    assert_eq!(delta.added_or_modified_upstreams.len(), 1);
+    assert_eq!(delta.added_or_modified_upstreams[0].id, "ordered-a2");
+
+    let from_origin = store
+        .load_incremental_config("tenant-a", 0)
+        .await
+        .expect("origin incremental poll must succeed");
+    let mut ids: Vec<String> = from_origin
+        .added_or_modified_upstreams
+        .iter()
+        .map(|upstream| upstream.id.clone())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["ordered-a1".to_string(), "ordered-a2".to_string()],
+        "the tenant-a poller must observe both writes in that namespace"
+    );
+}

@@ -41,6 +41,11 @@ pub mod body;
 pub mod client_ip;
 pub mod datagram_client_address;
 pub mod deferred_log;
+/// Pre-request admission bound for the data-plane HTTP frontend (issue #4152).
+/// Covers the H1-vs-H2 version sniff and HTTP/2 SETTINGS/header windows that
+/// hyper's HTTP/1 `header_read_timeout` cannot see, without closing idle
+/// keep-alive after the first request.
+pub(crate) mod frontend_admission;
 pub mod gateway_listener;
 pub mod gateway_listener_status;
 pub mod grpc_proxy;
@@ -4726,6 +4731,31 @@ impl Drop for PerIpRequestGuard {
     }
 }
 
+/// RAII guard that decrements the per-source WebSocket session counter on drop.
+///
+/// Created after the global `FERRUM_WEBSOCKET_MAX_CONNECTIONS` permit is taken
+/// and moved into the upgraded session task so every disconnect path (relay
+/// exit, upgrade failure, cancellation, panic) releases the slot. Independent
+/// of [`PerIpRequestGuard`], which is deliberately dropped at the upgrade
+/// boundary so a long-lived session does not block ordinary HTTP requests.
+pub struct PerIpWebSocketGuard {
+    pub ip: String,
+    pub counts: Arc<dashmap::DashMap<String, AtomicU64>>,
+}
+
+impl Drop for PerIpWebSocketGuard {
+    fn drop(&mut self) {
+        if let Some(entry) = self.counts.get(&self.ip) {
+            entry.value().fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Sentinel returned when a resolved client IP already holds
+/// `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP` upgraded sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PerIpWebSocketLimitExceeded;
+
 /// RAII guard for load-balancer connection accounting on upgraded sessions.
 ///
 /// WebSocket proxying runs in a spawned task after the HTTP handler returns.
@@ -6222,6 +6252,14 @@ pub struct ProxyState {
     pub per_ip_request_counts: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
     /// Maximum concurrent requests per resolved client IP. 0 = disabled.
     pub max_concurrent_requests_per_ip: u64,
+    /// Per-IP concurrently upgraded WebSocket session counters. Each resolved
+    /// client IP gets an AtomicU64 tracking active sessions. `None` when
+    /// `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP=0` (disabled).
+    pub per_ip_websocket_sessions: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
+    /// Maximum concurrent upgraded WebSocket sessions per resolved client IP.
+    /// 0 = disabled. Keyed on the same trusted-proxy-resolved `client_ip` as
+    /// [`Self::per_ip_request_counts`].
+    pub websocket_max_connections_per_ip: u64,
     /// Manages TCP/UDP stream proxy listeners (dedicated port per proxy).
     pub stream_listener_manager: Arc<stream_listener::StreamListenerManager>,
     /// Monotonic counter bumped once per successful config publication.
@@ -8820,6 +8858,7 @@ impl ProxyState {
         let websocket_write_buffer_size = env_config.websocket_write_buffer_size;
         let websocket_tunnel_mode = env_config.websocket_tunnel_mode;
         let max_concurrent_requests_per_ip = env_config.max_concurrent_requests_per_ip;
+        let websocket_max_connections_per_ip = env_config.websocket_max_connections_per_ip;
         let mesh_egress_strip_baggage_keys =
             Arc::new(env_config.mesh_egress_strip_baggage_keys.clone());
         let pool_shard_amount =
@@ -9370,6 +9409,14 @@ impl ProxyState {
                 None
             },
             max_concurrent_requests_per_ip,
+            per_ip_websocket_sessions: if websocket_max_connections_per_ip > 0 {
+                Some(Arc::new(dashmap::DashMap::with_shard_amount(
+                    pool_shard_amount,
+                )))
+            } else {
+                None
+            },
+            websocket_max_connections_per_ip,
             stream_listener_manager,
             config_revision: ConfigRevisionNotifier::new(),
             started_at: Instant::now(),
@@ -9450,14 +9497,16 @@ impl ProxyState {
     }
 
     /// Start a background task that periodically removes stale zero-count
-    /// entries from `per_ip_request_counts`. Normally entries are cleaned via
-    /// the `PerIpRequestGuard` RAII drop, but this sweep catches edge cases
-    /// (e.g., task cancellation without guard drop).
+    /// entries from `per_ip_request_counts` and `per_ip_websocket_sessions`.
+    /// Normally entries are cleaned via the RAII drop of
+    /// [`PerIpRequestGuard`] / [`PerIpWebSocketGuard`], but this sweep catches
+    /// edge cases (e.g., task cancellation without guard drop).
     ///
-    /// Returns `Some(JoinHandle)` when per-IP tracking is enabled so the
+    /// Returns `Some(JoinHandle)` when either per-IP map is enabled so the
     /// caller can join the task during the background-task drain phase of
-    /// graceful shutdown. Returns `None` when
-    /// `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP=0` (no tracking, no task to
+    /// graceful shutdown. Returns `None` when both
+    /// `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP=0` and
+    /// `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP=0` (no tracking, no task to
     /// spawn). The task exits cleanly on `shutdown_rx` change so it doesn't
     /// wedge shutdown — consistent with `start_backend_capability_refresh_task`,
     /// `dns_cache.start_background_refresh_with_shutdown`, and the overload /
@@ -9466,10 +9515,19 @@ impl ProxyState {
         &self,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        let counts = self.per_ip_request_counts.as_ref()?.clone();
+        let mut maps = Vec::new();
+        if let Some(counts) = self.per_ip_request_counts.as_ref() {
+            maps.push(counts.clone());
+        }
+        if let Some(counts) = self.per_ip_websocket_sessions.as_ref() {
+            maps.push(counts.clone());
+        }
+        if maps.is_empty() {
+            return None;
+        }
         let interval_secs = self.env_config.per_ip_cleanup_interval_seconds.max(1);
         Some(tokio::spawn(run_per_ip_cleanup_loop(
-            counts,
+            maps,
             interval_secs,
             shutdown_rx,
         )))
@@ -13251,16 +13309,21 @@ impl ProxyState {
 /// exits cleanly on watch-channel change so the spawned task can be drained
 /// during graceful shutdown alongside DNS / overload / metrics handles.
 async fn run_per_ip_cleanup_loop(
-    counts: Arc<dashmap::DashMap<String, AtomicU64>>,
+    maps: Vec<Arc<dashmap::DashMap<String, AtomicU64>>>,
     interval_secs: u64,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
 ) {
+    let sweep = || {
+        for counts in &maps {
+            counts.retain(|_, count| count.load(Ordering::Relaxed) > 0);
+        }
+    };
     let mut timer = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
     match shutdown_rx {
         Some(mut shutdown_rx) => loop {
             tokio::select! {
                 _ = timer.tick() => {
-                    counts.retain(|_, count| count.load(Ordering::Relaxed) > 0);
+                    sweep();
                 }
                 _ = shutdown_rx.changed() => {
                     info!("Per-IP cleanup task shutting down");
@@ -13270,7 +13333,7 @@ async fn run_per_ip_cleanup_loop(
         },
         None => loop {
             timer.tick().await;
-            counts.retain(|_, count| count.load(Ordering::Relaxed) > 0);
+            sweep();
         },
     }
 }
@@ -13280,6 +13343,12 @@ async fn run_per_ip_cleanup_loop(
 /// Uses hyper-util's auto builder which accepts both HTTP/1.1 and HTTP/2
 /// connections. h2c (cleartext HTTP/2) is required for gRPC clients that
 /// connect without TLS.
+///
+/// Pre-request admission (issue #4152) is bounded by
+/// `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS`, covering the version sniff and
+/// HTTP/2 SETTINGS/header windows that hyper's HTTP/1 timer cannot see. The
+/// bound starts after TCP accept (plaintext) or after the frontend TLS
+/// handshake (TLS). It does not close idle keep-alive after the first request.
 ///
 /// On shutdown, calls `graceful_shutdown()` on the hyper connection so that
 /// HTTP/2 clients receive a GOAWAY frame and HTTP/1.1 keepalive connections
@@ -13315,7 +13384,9 @@ async fn handle_connection(
         let mut http1 = builder.http1();
         http1.max_buf_size(http1_parser_max_buf_size(state.max_header_size_bytes));
         http1.writev(true);
-        // Slowloris protection: close connections that take too long to send headers.
+        // Slowloris protection: close HTTP/1.1 connections that take too long
+        // to send headers. The H1-vs-H2 version sniff and HTTP/2 pre-request
+        // window are bounded separately by `FrontendAdmission` below.
         if state.env_config.http_header_read_timeout_seconds > 0 {
             http1.timer(hyper_util::rt::TokioTimer::new());
             http1.header_read_timeout(std::time::Duration::from_secs(
@@ -13353,7 +13424,11 @@ async fn handle_connection(
     // reach this connection when the downstream refuses to drain the terminal.
     let authorization_closer = crate::proxy::auth_lifetime::AuthorizationConnectionCloser::new();
     let mut authorization_close_rx = authorization_closer.subscribe();
+    let header_read_timeout_seconds = state.env_config.http_header_read_timeout_seconds;
+    let admission = frontend_admission::FrontendAdmission::new();
+    let service_admission = Arc::clone(&admission);
     let svc = service_fn(move |req: Request<Incoming>| {
+        service_admission.mark();
         let state = Arc::clone(&state);
         let addr = remote_addr;
         let connection_metadata = RequestConnectionMetadata {
@@ -13394,6 +13469,19 @@ async fn handle_connection(
     let result = tokio::select! {
         biased;
         res = conn.as_mut() => res,
+        // Issue #4152: bound the version sniff and HTTP/2 pre-request window.
+        // Returning drops `conn` (hard close), matching the TLS handshake
+        // timeout. After the first request this future never fires, so idle
+        // HTTP/2 keep-alive is preserved.
+        () = admission.wait_pre_request_deadline(header_read_timeout_seconds) => {
+            debug!(
+                remote_addr = %remote_addr.ip(),
+                tls = false,
+                "Closing client connection: no request delivered within the \
+                 header-read timeout"
+            );
+            Ok(())
+        }
         _ = shutdown_rx.changed() => {
             // Send GOAWAY (H2) / signal end-of-keepalive (H1) and wait for
             // in-flight requests to complete on this connection. Continuing
@@ -13510,6 +13598,43 @@ pub fn try_acquire_websocket_connection_permit(
     match limit {
         Some(limit) => limit.clone().try_acquire_owned().map(Some),
         None => Ok(None),
+    }
+}
+
+/// Try to admit one upgraded WebSocket session for `ip` against the per-source
+/// session budget.
+///
+/// `counts == None` or `max == 0` means the dimension is disabled (`Ok(None)`).
+/// The returned guard must be moved into the session task so the slot is
+/// released on every disconnect path. Source identity is the caller's
+/// resolved `client_ip` — forwarding headers must already have been accepted
+/// only from a trusted peer.
+pub fn try_acquire_per_ip_websocket_session(
+    counts: Option<&Arc<dashmap::DashMap<String, AtomicU64>>>,
+    ip: &str,
+    max: u64,
+) -> Result<Option<PerIpWebSocketGuard>, PerIpWebSocketLimitExceeded> {
+    let Some(counts) = counts else {
+        return Ok(None);
+    };
+    if max == 0 {
+        return Ok(None);
+    }
+    let current = {
+        let count = counts
+            .entry(ip.to_string())
+            .or_insert_with(|| AtomicU64::new(0));
+        count.value().fetch_add(1, Ordering::Relaxed) + 1
+    };
+    let guard = PerIpWebSocketGuard {
+        ip: ip.to_string(),
+        counts: counts.clone(),
+    };
+    if current > max {
+        drop(guard);
+        Err(PerIpWebSocketLimitExceeded)
+    } else {
+        Ok(Some(guard))
     }
 }
 
@@ -13809,6 +13934,48 @@ async fn handle_websocket_request_authenticated(
                 ));
             }
         };
+
+    // Per-source session bound. Independent of the per-IP *request* guard,
+    // which is released at the upgrade boundary so a long-lived session does
+    // not block ordinary HTTP from the same IP. Keyed on `ctx.client_ip`
+    // (socket peer, or forwarding headers only from a trusted proxy).
+    let per_ip_ws_guard = match try_acquire_per_ip_websocket_session(
+        state.per_ip_websocket_sessions.as_ref(),
+        &ctx.client_ip,
+        state.websocket_max_connections_per_ip,
+    ) {
+        Ok(guard) => guard,
+        Err(_) => {
+            warn!(
+                proxy_id = %proxy.id,
+                client_ip = %ctx.client_ip,
+                websocket_per_ip_limit = state.websocket_max_connections_per_ip,
+                "Rejecting WebSocket upgrade: per-source connection limit reached"
+            );
+            log_rejected_request_with_path(
+                &plugins,
+                &ctx,
+                503,
+                start_time,
+                "websocket_per_ip_connection_limit",
+                plugin_execution_ns,
+                Some(&original_request_path),
+            )
+            .await;
+            record_request(&state, 503);
+            release_circuit_breaker_probe_on_admission_reject(
+                &state,
+                &proxy,
+                current_cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+            );
+            return Ok(build_websocket_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"WebSocket connection limit exceeded"}"#,
+                &initial_response_header_policy_plugins,
+            ));
+        }
+    };
 
     // Inject authenticated identity headers for WebSocket connections.
     if let Some(username) = ctx.backend_consumer_username() {
@@ -14937,6 +15104,9 @@ async fn handle_websocket_request_authenticated(
         // every exit path (upgrade failure, run_websocket_proxy completion or
         // error), decrementing `active_connections` exactly once.
         let _ws_session_guard = ws_session_guard;
+        // Hold the per-source WebSocket session slot for the same lifetime so
+        // a disconnect, upgrade failure, or task cancel releases it.
+        let _per_ip_ws_guard = per_ip_ws_guard;
         // Hold the per-destination backend-connection slot (DestinationRule
         // `maxConnections`) for the same session lifetime. `Option`: `None`
         // when no cap is configured for the destination port. Dropping it on
@@ -20952,6 +21122,10 @@ async fn run_accept_loop(
 
 /// Handle TLS connections with HTTP/1.1 and HTTP/2 auto-negotiation via ALPN.
 ///
+/// Frontend TLS admission (`FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`)
+/// completes before the HTTP pre-request bound
+/// (`FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS`) starts; see [`handle_connection`].
+///
 /// On shutdown, calls `graceful_shutdown()` on the hyper connection so that
 /// HTTP/2 clients receive a GOAWAY frame and HTTP/1.1 keepalive connections
 /// stop accepting new requests. See [`handle_connection`] for rationale.
@@ -21060,7 +21234,9 @@ async fn handle_tls_connection(
         let mut http1 = builder.http1();
         http1.max_buf_size(http1_parser_max_buf_size(state.max_header_size_bytes));
         http1.writev(true);
-        // Slowloris protection: close connections that take too long to send headers.
+        // Slowloris protection: close HTTP/1.1 connections that take too long
+        // to send headers. The H1-vs-H2 version sniff and HTTP/2 pre-request
+        // window are bounded separately by `FrontendAdmission` below.
         if state.env_config.http_header_read_timeout_seconds > 0 {
             http1.timer(hyper_util::rt::TokioTimer::new());
             http1.header_read_timeout(std::time::Duration::from_secs(
@@ -21098,7 +21274,11 @@ async fn handle_tls_connection(
     // a downstream that will not drain an expired stream's terminal.
     let authorization_closer = crate::proxy::auth_lifetime::AuthorizationConnectionCloser::new();
     let mut authorization_close_rx = authorization_closer.subscribe();
+    let header_read_timeout_seconds = state.env_config.http_header_read_timeout_seconds;
+    let admission = frontend_admission::FrontendAdmission::new();
+    let service_admission = Arc::clone(&admission);
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        service_admission.mark();
         let state = Arc::clone(&state);
         let addr = remote_addr;
         let cert = client_cert_der.clone();
@@ -21141,6 +21321,19 @@ async fn handle_tls_connection(
     let result = tokio::select! {
         biased;
         res = conn.as_mut() => res,
+        // Issue #4152: same pre-request bound as the plaintext handler. Starts
+        // after `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` has already
+        // completed, so a peer cannot hold the slot by finishing TLS and then
+        // sending nothing. Idle keep-alive after the first request is preserved.
+        () = admission.wait_pre_request_deadline(header_read_timeout_seconds) => {
+            debug!(
+                remote_addr = %remote_addr.ip(),
+                tls = true,
+                "Closing client connection: no request delivered within the \
+                 header-read timeout"
+            );
+            Ok(())
+        }
         // Issue #3857: the operator withdrew this connection's client-certificate
         // trust decision. Reuse hyper's own graceful shutdown — H2 gets a GOAWAY
         // (no further stream is admitted) and H1 ends keep-alive after the
@@ -62595,7 +62788,11 @@ mod tests {
 
         // Use a long interval so the test latency is dominated by the
         // shutdown branch of the `tokio::select!`, not by `timer.tick()`.
-        let handle = tokio::spawn(run_per_ip_cleanup_loop(counts.clone(), 3600, Some(rx)));
+        let handle = tokio::spawn(run_per_ip_cleanup_loop(
+            vec![counts.clone()],
+            3600,
+            Some(rx),
+        ));
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
@@ -62616,7 +62813,7 @@ mod tests {
     #[tokio::test]
     async fn per_ip_cleanup_loop_runs_without_shutdown_receiver() {
         let counts: Arc<dashmap::DashMap<String, AtomicU64>> = Arc::new(dashmap::DashMap::new());
-        let handle = tokio::spawn(run_per_ip_cleanup_loop(counts, 3600, None));
+        let handle = tokio::spawn(run_per_ip_cleanup_loop(vec![counts], 3600, None));
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(

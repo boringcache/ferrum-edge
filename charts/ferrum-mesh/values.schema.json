@@ -313,7 +313,8 @@
           "maximum": 65535
         },
         "requireAnnotation": {
-          "type": "boolean"
+          "type": "boolean",
+          "description": "Require a per-pod opt-in annotation/label before injecting. Independent of this gate, pods with spec.hostNetwork: true are never injected -- they share the node's network namespace, so capture rules would rewrite the node's own iptables and sidecar listeners would bind node-wide; such pods are admitted unmodified and logged."
         },
         "failurePolicy": {
           "type": "string",
