@@ -2134,52 +2134,67 @@ triggers and onto the same posture:
   `production-dockerfile-plan` job reading `ci_runtime_plan.py` — so it did not
   get a second one. Two relevance jobs gating one live job is precisely the
   "either gate bypasses the other" hazard; the existing planner stayed the sole
-  authority and only the trigger and the aggregate changed. The classifier is
-  trusted, but the workflow's live-job `needs`/`if` binding and aggregate are
-  still supplied by the pull request until the direct-to-`main` policy
-  follow-up protects their exact contract.
+  authority and only the trigger and the aggregate changed. Its planner,
+  bindings, and aggregates are now frozen by `NODE_WAYPOINT_RELEVANCE_CONTRACT`
+  (see below).
 - `istio-status-cas-live.yml` and `cni-lifecycle-live.yml` gained a `changes`
-  job that currently matches the `LIVE_SUITE_RELEVANCE_JOB_TEMPLATE` text
-  above, apart from the display name, slug, `--suite` selector, and one
-  temporary bootstrap block described below. That text match is **not** a
-  freeze: the jobs are not in `LIVE_SUITE_RELEVANCE_CONTRACTS` yet.
+  job matching the `LIVE_SUITE_RELEVANCE_JOB_TEMPLATE` text above apart from
+  the display name, slug, and `--suite` selector. Both are now entries in
+  `LIVE_SUITE_RELEVANCE_CONTRACTS`, so that text match is a freeze.
 
 These three aggregates (`NodeWaypoint eBPF Live`, `Istio Status CAS Live`,
 `CNI Lifecycle Live`) are **not** branch-protection-required and must not be
 added to `REQUIRED_MERGE_GROUP_WORKFLOWS` or `DEDICATED_REQUIRED_CHECKS`;
 `verify_required_ci.py` asserts that, and asserts each keeps the canonical
 input-less `pull_request`, `merge_group` with exactly `checks_requested`,
-and `push: branches: [main]` trigger shape.
+and `push: branches: [main]` trigger shape. Freezing the *shape* of an optional
+gate is not the same as making it required, and neither contract below makes
+one required.
 
-Because they are not in `LIVE_SUITE_RELEVANCE_CONTRACTS`, the trusted policy
-does not yet freeze the two new relevance jobs. It also does not yet freeze the
-NodeWaypoint live-job binding or aggregate; the candidate-side verifier is a
-drift diagnostic, not a trusted-base tamper barrier. Adding the CNI/Istio
-contracts and a dedicated NodeWaypoint binding/aggregate contract requires editing
-`.github/scripts/verify_cross_build_policy.py`, which no pull request may
-change (`Trusted Cross Build Policy` rejects it outright), so that step is a
-separate trusted-base change that lands directly on `main` after this one.
-Until that follow-up lands, issue #3908 is **not durably complete** against
-future PR tampering: a later pull request can still rewrite either new
-`changes` job or the NodeWaypoint binding/aggregate because trusted policy does
-not freeze those surfaces. The current workflows do compute their verdicts
-from base-branch classifiers, but the complete planner-to-live-to-aggregate
-posture is not protected until that policy adoption.
+###### NodeWaypoint relevance contract
 
-###### Bootstrap handshake for a newly named suite
+`node-waypoint-ebpf-live.yml` cannot be carried by
+`LIVE_SUITE_RELEVANCE_CONTRACTS`: its relevance job is
+`production-dockerfile-plan` rather than `changes`, it runs `ci_runtime_plan.py`
+rather than `live_suite_path_filter.py`, one trusted read emits **two** verdicts
+(`relevant` for the production-image smoke and `node_waypoint_relevant` for the
+live datapath), and its live job binds fail-closed as
+`always() && … != 'false'` rather than `== 'true'`. Widening the shared
+mechanism to absorb those four differences would put the branch-protection-
+required live gates behind a more permissive, more parameterised template for
+the sake of one gate that is deliberately not required.
 
-A relevance job runs the **trusted** classifier, but a new suite name arrives in
-the same commit as the workflow that uses it. The trusted copy therefore does
-not know the name yet and rejects `--suite <new-name>` with an argparse usage
-error — a hard failure, and one indistinguishable from a genuinely broken
-classifier. The two new relevance jobs carry one extra block for exactly that
-window: they ask the trusted copy `--list-suites`, and if the flag is refused
-(an older classifier) or the suite is absent from the answer, they emit
-`relevant=true` and say why in the step summary. Every other failure still
-fails the job closed, and the verdict still never comes from the pull request's
-own checkout. The block is one-way and temporary: once the classifier suite is
-on `main` it is inert, and it is deleted by the same trusted-base change that
-adds the two `LIVE_SUITE_RELEVANCE_CONTRACTS` entries.
+Trusted policy therefore carries a second, additive contract —
+`NODE_WAYPOINT_RELEVANCE_CONTRACT` plus `NODE_WAYPOINT_FROZEN_JOBS`, enforced by
+`node_waypoint_relevance_errors` from both `validate_workflow_collection` and
+`compare_pr_workflow_collection`, absolute in exact and pull-request mode alike:
+
+| Job | Frozen |
+|---|---|
+| `production-dockerfile-plan` | whole job |
+| `production-dockerfile-smoke` | whole job (aggregate) |
+| `node-waypoint-ebpf-live-gate` | whole job (aggregate) |
+| `production-dockerfile-smoke-default` | `needs` + `if` only |
+| `production-dockerfile-smoke-ebpf` | `needs` + `if` only |
+| `node-waypoint-ebpf-live` | `needs` + `if` only |
+
+The planner is frozen whole because its base-ref charset/shape validation,
+single object-id pin, blob type/mode/size checks, `python3 -I` isolation,
+`true|false` verdict guard, and both `emit_suite_verdict` calls are one
+fail-closed unit. The two aggregates are frozen whole because their condition
+chains are the entire difference between "skipped because the trusted base
+proved irrelevance" and "green because the live job never ran". The three
+consumer jobs keep only their binding frozen, because their bodies are ordinary
+build and live-test recipes that must stay editable. Deleting the workflow is
+rejected too: a contract a `git rm` retires is the same weaker-than-it-looks
+coverage issue #3908 was filed for.
+
+With both contracts in place, issue #3908 is durably complete: neither new
+`changes` job nor the NodeWaypoint planner-to-live-to-aggregate posture can be
+rewritten by a pull request. The temporary `--list-suites` bootstrap handshake
+that carried the CNI and Istio suite names through their adoption window is
+deleted from `live_suite_path_filter.py`; both names are on `main` and the
+frozen relevance template never invoked the flag.
 
 ##### Admitted fuzz/property lane
 

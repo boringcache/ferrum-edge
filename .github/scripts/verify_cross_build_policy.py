@@ -2829,6 +2829,364 @@ LIVE_SUITE_JOB_BINDING = {
     "if": "    if: needs.changes.outputs.relevant == 'true'\n",
 }
 
+
+# ---------------------------------------------------------------------------
+# NodeWaypoint eBPF live relevance contract (issue #3908)
+# ---------------------------------------------------------------------------
+# `node-waypoint-ebpf-live.yml` decides relevance from a trusted-base
+# classifier read by object id off the base branch, exactly like the governed
+# suites above, but it cannot be carried by `LIVE_SUITE_RELEVANCE_CONTRACTS`:
+#
+#   * its relevance job is `production-dockerfile-plan`, not `changes`;
+#   * it runs `.github/scripts/ci_runtime_plan.py`, not
+#     `live_suite_path_filter.py`, so `live_suite_relevance_job()` cannot
+#     render it;
+#   * one trusted read emits TWO verdicts -- `relevant` for the production
+#     image smoke and `node_waypoint_relevant` for the live datapath;
+#   * the live job binds fail-closed as
+#     `always() && ... != 'false'` rather than `== 'true'`, which
+#     `LIVE_SUITE_JOB_BINDING` cannot express, and two further jobs bind to the
+#     other output.
+#
+# Widening the shared mechanism to absorb all four differences would put the
+# branch-protection-required live gates behind a more permissive, more
+# parameterised template for the sake of one gate that is deliberately NOT
+# required. This contract is therefore additive: the shared path is untouched
+# and NodeWaypoint is frozen on its own terms, in the same idiom the Ambient
+# host-UDP execution contract already uses.
+#
+# What is frozen, and why each piece:
+#
+#   * `production-dockerfile-plan` -- WHOLE job. It is the relevance decider.
+#     The base-ref charset/shape validation, the single object-id pin, the blob
+#     type/mode/size checks, `python3 -I`, the `true|false` verdict guard, and
+#     both `emit_suite_verdict` calls are one fail-closed unit; a pull request
+#     that rewrote any of it could declare itself irrelevant using its own
+#     code, which is the exact attack the relevance-job pattern closes.
+#   * `production-dockerfile-smoke` and `node-waypoint-ebpf-live-gate` --
+#     WHOLE jobs. These are the always-reporting aggregates. Their condition
+#     chains are the entire difference between "skipped because the trusted
+#     base proved irrelevance" and "green because the live job never ran", so
+#     a predicate about them is not enough.
+#   * `production-dockerfile-smoke-default`, `production-dockerfile-smoke-ebpf`
+#     and `node-waypoint-ebpf-live` -- `needs`/`if` ONLY. Their bodies are
+#     ordinary build and live-test recipes that must stay editable; only the
+#     binding from the trusted verdict to the job is contractual.
+#
+# `NodeWaypoint eBPF Live` stays OUT of REQUIRED_MERGE_GROUP_WORKFLOWS and
+# DEDICATED_REQUIRED_CHECKS (verify_required_ci.py asserts this). Freezing the
+# shape of an optional gate is not the same as making it required, and this
+# contract deliberately does not make it one.
+NODE_WAYPOINT_LIVE_WORKFLOW = "node-waypoint-ebpf-live.yml"
+
+NODE_WAYPOINT_PLAN_JOB = r"""  production-dockerfile-plan:
+    name: Production Dockerfile smoke trigger
+    runs-on: ubuntu-latest
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+      node_waypoint_relevant: ${{ steps.filter.outputs.node_waypoint_relevant }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check for production Dockerfile smoke changes
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+
+          filter_path=.github/scripts/ci_runtime_plan.py
+          changed_files="$RUNNER_TEMP/production-dockerfile-smoke-changed-files.txt"
+          trusted_filter="$RUNNER_TEMP/production-dockerfile-smoke-trusted-filter.py"
+          rm -f -- "$changed_files" "$trusted_filter"
+          : > "$changed_files"
+
+          filter_args=(--changed-files "$changed_files")
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if ! printf '%s' "$BASE_REF" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$'; then
+              echo "::error::refusing to resolve an unsafe base ref" >&2
+              exit 1
+            fi
+            case "$BASE_REF" in
+              *..*|*//*|*/|*.lock|*/.*)
+                echo "::error::refusing to resolve an unsafe base ref" >&2
+                exit 1
+                ;;
+            esac
+            fetched=false
+            for attempt in 1 2 3; do
+              if git fetch --no-tags --no-recurse-submodules origin \
+                "+refs/heads/${BASE_REF}:refs/ferrum/trusted-base"; then
+                fetched=true
+                break
+              fi
+              echo "git fetch of ${BASE_REF} failed (attempt ${attempt}/3); retrying" >&2
+              sleep $(( attempt * 10 ))
+            done
+            if [ "$fetched" != true ]; then
+              echo "::error::git fetch of ${BASE_REF} failed after 3 attempts" >&2
+              exit 1
+            fi
+            trusted_sha="$(git rev-parse --verify --quiet refs/ferrum/trusted-base^{commit} || true)"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::merge_group base_sha missing or malformed" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
+              fetched=false
+              for attempt in 1 2 3; do
+                if git fetch --no-tags --no-recurse-submodules origin \
+                  "${MERGE_BASE_SHA}"; then
+                  fetched=true
+                  break
+                fi
+                echo "git fetch of merge_group base failed (attempt ${attempt}/3); retrying" >&2
+                sleep $(( attempt * 10 ))
+              done
+              if [ "$fetched" != true ]; then
+                echo "::error::git fetch of merge_group base_sha failed after 3 attempts" >&2
+                exit 1
+              fi
+            fi
+            trusted_sha="$MERGE_BASE_SHA"
+          else
+            trusted_sha="$(git rev-parse --verify --quiet 'HEAD^{commit}' || true)"
+            filter_args+=(--force-run)
+          fi
+
+          if ! printf '%s' "$trusted_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::trusted base did not resolve to a full commit id" >&2
+            exit 1
+          fi
+
+          if ! git cat-file -e "${trusted_sha}:${filter_path}" 2>/dev/null; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "node_waypoint_relevant=true" >> "$GITHUB_OUTPUT"
+            echo "trusted base has not adopted ${filter_path}; running the full gate." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          entry="$(git ls-tree --full-tree "$trusted_sha" -- "$filter_path")"
+          if [ "$(printf '%s\n' "$entry" | grep -c . || true)" != "1" ]; then
+            echo "::error::${filter_path} is not a single tree entry at ${trusted_sha}" >&2
+            exit 1
+          fi
+          entry_mode="$(printf '%s\n' "$entry" | awk '{print $1}')"
+          entry_type="$(printf '%s\n' "$entry" | awk '{print $2}')"
+          entry_object="$(printf '%s\n' "$entry" | awk '{print $3}')"
+          entry_path="$(printf '%s\n' "$entry" | awk -F'\t' '{print $2}')"
+          if [ "$entry_type" != "blob" ] || [ "$entry_path" != "$filter_path" ]; then
+            echo "::error::${filter_path} is not a blob at ${trusted_sha}" >&2
+            exit 1
+          fi
+          case "$entry_mode" in
+            100644|100755) ;;
+            *)
+              echo "::error::${filter_path} has non-regular mode ${entry_mode}" >&2
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$entry_object" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::${filter_path} did not resolve to an object id" >&2
+            exit 1
+          fi
+          if [ "$(git cat-file -s "$entry_object")" -gt 262144 ]; then
+            echo "::error::${filter_path} exceeds the 256 KiB trusted-filter ceiling" >&2
+            exit 1
+          fi
+          git cat-file blob "$entry_object" > "$trusted_filter"
+
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
+            git diff --name-only --no-renames -z "${trusted_sha}...HEAD" \
+              > "$changed_files"
+          fi
+
+          python3 -I "$trusted_filter" --self-test
+
+          emit_suite_verdict() {
+            local suite="$1"
+            local output_key="$2"
+            local plan relevant
+            plan="$(python3 -I "$trusted_filter" --suite "$suite" "${filter_args[@]}")"
+            relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
+            case "$relevant" in
+              true|false) ;;
+              *)
+                echo "::error::trusted ${suite} relevance filter produced no usable verdict" >&2
+                exit 1
+                ;;
+            esac
+            echo "${output_key}=$relevant" >> "$GITHUB_OUTPUT"
+            echo "Relevance (${suite}) decided by trusted base ${trusted_sha}." >> "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          emit_suite_verdict production-dockerfile-smoke relevant
+          emit_suite_verdict node-waypoint-ebpf-live node_waypoint_relevant
+"""
+
+NODE_WAYPOINT_IMAGE_GATE_JOB = r"""  production-dockerfile-smoke:
+    name: Production Dockerfile eBPF image smoke
+    runs-on: ubuntu-latest
+    needs:
+      - production-dockerfile-plan
+      - production-dockerfile-smoke-default
+      - production-dockerfile-smoke-ebpf
+    if: always()
+    steps:
+      - name: Fail when production-image planning fails
+        if: needs.production-dockerfile-plan.result != 'success'
+        run: exit 1
+
+      - name: Fail when production-image planner output is unusable
+        if: needs.production-dockerfile-plan.result == 'success' && needs.production-dockerfile-plan.outputs.relevant != 'true' && needs.production-dockerfile-plan.outputs.relevant != 'false'
+        run: exit 1
+
+      - name: Skip production-image smoke for unrelated changes
+        if: needs.production-dockerfile-plan.outputs.relevant == 'false'
+        run: |
+          {
+            echo "## Production Dockerfile eBPF image smoke"
+            echo ""
+            echo "No Dockerfile/runtime-sensitive paths changed. Image smoke skipped."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail when the ordinary production image did not succeed
+        if: needs.production-dockerfile-plan.outputs.relevant == 'true' && needs.production-dockerfile-smoke-default.result != 'success'
+        run: exit 1
+
+      - name: Fail when the eBPF production image did not succeed
+        if: needs.production-dockerfile-plan.outputs.relevant == 'true' && needs.production-dockerfile-smoke-ebpf.result != 'success'
+        run: exit 1
+
+      - name: Report production-image smoke
+        if: needs.production-dockerfile-plan.outputs.relevant == 'true'
+        run: |
+          {
+            echo "## Production Dockerfile eBPF image smoke"
+            echo ""
+            echo "Ordinary \`runtime\` and distroless \`runtime-ebpf\` images built in parallel"
+            echo "through BuildKit. Trusted exact \`${{ github.sha }}\` hits restore a scoped"
+            echo "local BuildKit cache and do not export or save. Trusted partial matches"
+            echo "and misses export \`mode=max\` and save the new exact key via pinned"
+            echo "\`actions/cache/restore\` and \`actions/cache/save\`; fork pull"
+            echo "requests restore that cache and do not save. Distroless inventories passed."
+            echo ""
+            echo "Warm PR target: <=30 minutes, p95 <=45 minutes, measured on hosted runs."
+          } >> "$GITHUB_STEP_SUMMARY"
+"""
+
+NODE_WAYPOINT_LIVE_GATE_JOB = r"""  node-waypoint-ebpf-live-gate:
+    name: NodeWaypoint eBPF Live
+    runs-on: ubuntu-latest
+    needs:
+      - production-dockerfile-plan
+      - node-waypoint-ebpf-live
+    if: always()
+    steps:
+      # `NodeWaypoint eBPF Live` is deliberately NOT branch-protection-required
+      # (.claude/rules/testing.md); verify_required_ci.py asserts it stays out
+      # of REQUIRED_MERGE_GROUP_WORKFLOWS and DEDICATED_REQUIRED_CHECKS. It is
+      # an always-reporting aggregate so that a skipped-for-irrelevance run is
+      # visibly green rather than absent, and so a planner failure cannot look
+      # like a pass.
+      #
+      # The live job's own binding is `always() && ... != 'false'`, so the only
+      # outcome that legitimately skips it is an exact `false` verdict from the
+      # trusted-base planner. Every other shape reaches the live job, and this
+      # aggregate then reports whatever the live job did.
+      - name: Fail when NodeWaypoint relevance planning fails
+        if: needs.production-dockerfile-plan.result != 'success'
+        run: |
+          {
+            echo "## NodeWaypoint eBPF Live"
+            echo ""
+            echo "Failed before trusted-base relevance planning completed."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Skip NodeWaypoint eBPF live datapath for unrelated changes
+        if: needs.production-dockerfile-plan.outputs.node_waypoint_relevant == 'false'
+        run: |
+          {
+            echo "## NodeWaypoint eBPF Live"
+            echo ""
+            echo "Skipped the Kind/eBPF live datapath: the trusted-base classifier"
+            echo "proved no NodeWaypoint eBPF, chart, image, harness, or"
+            echo "documentation surface changed. The production-image contract is"
+            echo "reported separately by \`Production Dockerfile eBPF image smoke\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail when the NodeWaypoint eBPF live datapath did not succeed
+        if: needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false' && needs.node-waypoint-ebpf-live.result != 'success'
+        run: |
+          {
+            echo "## NodeWaypoint eBPF Live"
+            echo ""
+            echo "Live datapath validation failed or did not complete: ${{ needs.node-waypoint-ebpf-live.result }}."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Report NodeWaypoint eBPF live datapath
+        if: needs.production-dockerfile-plan.outputs.node_waypoint_relevant != 'false' && needs.node-waypoint-ebpf-live.result == 'success'
+        run: |
+          {
+            echo "## NodeWaypoint eBPF Live"
+            echo ""
+            echo "Live datapath validation passed."
+          } >> "$GITHUB_STEP_SUMMARY"
+"""
+
+# Job name -> complete frozen job text. Extracted with
+# `extract_job_contract_block`, so a comment that introduces the following job
+# is not carried into the contract; every byte from the job key through its
+# last field is.
+NODE_WAYPOINT_FROZEN_JOBS = (
+    ("production-dockerfile-plan", NODE_WAYPOINT_PLAN_JOB),
+    ("production-dockerfile-smoke", NODE_WAYPOINT_IMAGE_GATE_JOB),
+    ("node-waypoint-ebpf-live-gate", NODE_WAYPOINT_LIVE_GATE_JOB),
+)
+
+# Job name -> the exact `needs`/`if` binding to the trusted planner's outputs.
+# Freezing the planner alone is not sufficient: a pull request that left the
+# planner untouched but rewrote a consumer's `needs`/`if` would skip the
+# expensive job just as effectively.
+NODE_WAYPOINT_RELEVANCE_CONTRACT = {
+    "node-waypoint-ebpf-live": {
+        "needs": "    needs: production-dockerfile-plan\n",
+        # Fail-closed on purpose: only an exact `false` from the trusted-base
+        # planner skips the live datapath. `always() &&` keeps the live job
+        # reachable when the planner itself failed, so the aggregate reports a
+        # failure rather than an absence.
+        "if": (
+            "    if: always() && "
+            "needs.production-dockerfile-plan.outputs.node_waypoint_relevant"
+            " != 'false'\n"
+        ),
+    },
+    "production-dockerfile-smoke-default": {
+        "needs": "    needs: production-dockerfile-plan\n",
+        "if": (
+            "    if: needs.production-dockerfile-plan.outputs.relevant"
+            " == 'true'\n"
+        ),
+    },
+    "production-dockerfile-smoke-ebpf": {
+        "needs": "    needs: production-dockerfile-plan\n",
+        "if": (
+            "    if: needs.production-dockerfile-plan.outputs.relevant"
+            " == 'true'\n"
+        ),
+    },
+}
+
 # ---------------------------------------------------------------------------
 # Admitted fuzz/property lane (issue #2461)
 # ---------------------------------------------------------------------------
@@ -11577,6 +11935,105 @@ def live_suite_relevance_errors(
     return errors
 
 
+def node_waypoint_relevance_workflow() -> str:
+    """Render a minimal conforming NodeWaypoint workflow for the self-test.
+
+    Built from the frozen constants themselves, so the fixture proves the
+    contract is internally consistent and can be mutated to prove each
+    rejection. It cannot prove the constants still match the real workflow --
+    only running the verifier against `.github/workflows` does that, which is
+    what the candidate-policy lane and the trusted gate both do.
+    """
+
+    bound_jobs = ""
+    for job_name, binding in sorted(NODE_WAYPOINT_RELEVANCE_CONTRACT.items()):
+        bound_jobs += f"  {job_name}:\n"
+        bound_jobs += f"    name: {job_name} stub\n"
+        bound_jobs += binding["needs"]
+        bound_jobs += binding["if"]
+        bound_jobs += "    runs-on: ubuntu-latest\n"
+        bound_jobs += "    steps:\n"
+        bound_jobs += "      - run: echo stub\n"
+    return (
+        "name: Self-test NodeWaypoint live suite\n"
+        "on:\n"
+        "  pull_request:\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        + NODE_WAYPOINT_PLAN_JOB
+        + "\n"
+        + bound_jobs
+        + NODE_WAYPOINT_IMAGE_GATE_JOB
+        + "\n"
+        + NODE_WAYPOINT_LIVE_GATE_JOB
+    )
+
+
+def node_waypoint_relevance_errors(
+    workflows: dict[str, str],
+    source: str,
+) -> list[str]:
+    """Hold the NodeWaypoint live gate to its trusted-base relevance contract.
+
+    Like `live_suite_relevance_errors` this is ABSOLUTE in both exact and
+    pull-request mode rather than a comparison against the trusted base: the
+    accepted shape is the one written in this file and nothing else, so a
+    pull request cannot reach a weaker shape by first landing it on the base.
+
+    Deleting the workflow is rejected too. `NodeWaypoint eBPF Live` is not
+    branch-protection-required, so a deletion cannot forge a green required
+    check -- but issue #3908 exists because the effective coverage of this
+    suite was weaker than it looked, and a contract that a `git rm` retires is
+    exactly that failure again.
+    """
+
+    errors: list[str] = []
+    contents = workflows.get(NODE_WAYPOINT_LIVE_WORKFLOW)
+    if contents is None:
+        return [
+            f"{source} is missing {NODE_WAYPOINT_LIVE_WORKFLOW}; its live gate "
+            "must keep deciding relevance from the trusted base"
+        ]
+    located = f"{source}/{NODE_WAYPOINT_LIVE_WORKFLOW}"
+
+    for job_name, expected_job in NODE_WAYPOINT_FROZEN_JOBS:
+        actual_job, job_failures = extract_job_contract_block(
+            contents,
+            located,
+            job_name,
+            required=True,
+        )
+        errors.extend(job_failures)
+        if not job_failures and actual_job != expected_job:
+            errors.append(
+                f"{located} must keep complete job {job_name!r} exactly frozen; "
+                "the trusted-base relevance decision and the always-reporting "
+                "aggregates are one closed contract"
+            )
+
+    for job_name, binding in sorted(NODE_WAYPOINT_RELEVANCE_CONTRACT.items()):
+        for field, expected_field in sorted(binding.items()):
+            actual, field_failures = extract_job_field_block(
+                contents,
+                located,
+                job_name,
+                field,
+                required=True,
+            )
+            errors.extend(field_failures)
+            if field_failures:
+                continue
+            if actual != expected_field:
+                errors.append(
+                    f"{located} job {job_name!r} must keep {field!r} bound to the "
+                    "trusted planner output; rewriting it skips the job just as "
+                    "effectively as tampering with the relevance decision"
+                )
+
+    return errors
+
+
 def admitted_fuzz_smoke_generation(block: str | None) -> int | None:
     """Return which admitted generation this `fuzz-smoke` job text is.
 
@@ -11966,6 +12423,7 @@ def validate_workflow_collection(
 
     return [
         *live_suite_relevance_errors(workflows, source),
+        *node_waypoint_relevance_errors(workflows, source),
         *required_check_name_ownership_errors(workflows, source),
         *scan_workflow_collection_cross_surfaces(workflows, source),
     ]
@@ -12536,6 +12994,7 @@ def compare_pr_workflow_collection(
 
     return [
         *live_suite_relevance_errors(proposed_workflows, f"proposed {source}"),
+        *node_waypoint_relevance_errors(proposed_workflows, f"proposed {source}"),
         *required_check_name_ownership_errors(
             proposed_workflows,
             f"proposed {source}",
@@ -27317,7 +27776,10 @@ pre_build = []
         isolated_fixture,
         relevance_selftest_source,
     )
-    for contract_name in sorted(LIVE_SUITE_RELEVANCE_CONTRACTS):
+    for contract_name in (
+        *sorted(LIVE_SUITE_RELEVANCE_CONTRACTS),
+        NODE_WAYPOINT_LIVE_WORKFLOW,
+    ):
         if not any(contract_name in error for error in incomplete_validation):
             failures.append(
                 "full workflow-collection validation no longer requires "
@@ -27329,11 +27791,173 @@ pre_build = []
                 f"{contract_name}"
             )
 
+    # ------------------------------------------------------------------
+    # NodeWaypoint eBPF live relevance contract (issue #3908)
+    # ------------------------------------------------------------------
+    node_waypoint_fixture = {
+        NODE_WAYPOINT_LIVE_WORKFLOW: node_waypoint_relevance_workflow()
+    }
+    if node_waypoint_relevance_errors(
+        node_waypoint_fixture,
+        relevance_selftest_source,
+    ):
+        failures.append("the NodeWaypoint relevance contract was rejected")
+    if not node_waypoint_relevance_errors({}, relevance_selftest_source):
+        failures.append("a deleted NodeWaypoint live-gate workflow was not rejected")
+
+    # Every distinct fail-closed property of the frozen planner. Losing any one
+    # of them silently restores a relevance decision the pull request controls.
+    for required_token in (
+        'filter_path=.github/scripts/ci_runtime_plan.py',
+        'git ls-tree --full-tree "$trusted_sha" -- "$filter_path"',
+        'git cat-file blob "$entry_object" > "$trusted_filter"',
+        "^[0-9a-f]{40}$",
+        "100644|100755",
+        'python3 -I "$trusted_filter" --self-test',
+        "+refs/heads/${BASE_REF}:refs/ferrum/trusted-base",
+        "^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$",
+        'elif [ "$EVENT_NAME" = "merge_group" ]; then',
+        "MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}",
+        "merge_group base_sha missing or malformed",
+        "              true|false) ;;",
+        "emit_suite_verdict production-dockerfile-smoke relevant",
+        "emit_suite_verdict node-waypoint-ebpf-live node_waypoint_relevant",
+    ):
+        if required_token not in NODE_WAYPOINT_PLAN_JOB:
+            failures.append(
+                "the frozen NodeWaypoint planner no longer contains "
+                f"{required_token!r}"
+            )
+    if "python3 .github/scripts/ci_runtime_plan.py --self-test" in (
+        NODE_WAYPOINT_PLAN_JOB
+    ):
+        failures.append(
+            "the frozen NodeWaypoint planner executes the pull request's own filter"
+        )
+    # The live job binds fail-closed; only an exact `false` may skip it.
+    if "!= 'false'" not in NODE_WAYPOINT_RELEVANCE_CONTRACT[
+        "node-waypoint-ebpf-live"
+    ]["if"]:
+        failures.append(
+            "the NodeWaypoint live binding no longer fails closed on a "
+            "non-boolean planner verdict"
+        )
+
+    node_waypoint_mutations: dict[str, tuple[str, str]] = {
+        # Item A of issue #3908: the binding a pull request could previously
+        # rewrite at will, because nothing in trusted policy pinned it.
+        "severed live binding": (
+            "    if: always() && needs.production-dockerfile-plan.outputs."
+            "node_waypoint_relevant != 'false'\n",
+            "    if: false\n",
+        ),
+        "inverted live binding": (
+            "    if: always() && needs.production-dockerfile-plan.outputs."
+            "node_waypoint_relevant != 'false'\n",
+            "    if: needs.production-dockerfile-plan.outputs."
+            "node_waypoint_relevant == 'true'\n",
+        ),
+        "unbound live job": (
+            "  node-waypoint-ebpf-live:\n"
+            "    name: node-waypoint-ebpf-live stub\n"
+            "    needs: production-dockerfile-plan\n",
+            "  node-waypoint-ebpf-live:\n"
+            "    name: node-waypoint-ebpf-live stub\n"
+            "    needs: []\n",
+        ),
+        "severed image-smoke binding": (
+            "    if: needs.production-dockerfile-plan.outputs.relevant == 'true'\n",
+            "    if: false\n",
+        ),
+        "pull-request-supplied planner filter": (
+            'python3 -I "$trusted_filter" --self-test',
+            "python3 .github/scripts/ci_runtime_plan.py --self-test",
+        ),
+        "re-resolved planner base ref": (
+            'git cat-file blob "$entry_object" > "$trusted_filter"',
+            'git show "origin/${BASE_REF}:$filter_path" > "$trusted_filter"',
+        ),
+        "dropped planner blob mode check": (
+            "            100644|100755) ;;\n",
+            "            *) ;;\n",
+        ),
+        "unvalidated planner base ref": (
+            "^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$",
+            ".*",
+        ),
+        "fail-open planner verdict": (
+            "              true|false) ;;\n",
+            "              *) ;;\n",
+        ),
+        "dropped NodeWaypoint verdict": (
+            "          emit_suite_verdict node-waypoint-ebpf-live "
+            "node_waypoint_relevant\n",
+            "",
+        ),
+        "unpinned planner checkout": (
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6",
+            "actions/checkout@v6",
+        ),
+        "renamed planner job": (
+            "  production-dockerfile-plan:\n",
+            "  production-dockerfile-planner:\n",
+        ),
+        "silenced live aggregate": (
+            "      - name: Fail when the NodeWaypoint eBPF live datapath did "
+            "not succeed\n",
+            "      - name: Fail when the NodeWaypoint eBPF live datapath did "
+            "not succeed\n        if: false\n",
+        ),
+        "silenced planner-failure aggregate": (
+            "      - name: Fail when NodeWaypoint relevance planning fails\n",
+            "      - name: Never fail when NodeWaypoint relevance planning "
+            "fails\n",
+        ),
+        "silenced image-smoke aggregate": (
+            "      - name: Fail when production-image planning fails\n",
+            "      - name: Report production-image planning\n",
+        ),
+    }
+    for mutation_name, (original, replacement) in node_waypoint_mutations.items():
+        mutated = {
+            key: value.replace(original, replacement)
+            for key, value in node_waypoint_fixture.items()
+        }
+        if mutated == node_waypoint_fixture:
+            failures.append(
+                f"the {mutation_name} NodeWaypoint self-test mutation is stale"
+            )
+            continue
+        if not node_waypoint_relevance_errors(mutated, relevance_selftest_source):
+            failures.append(f"a {mutation_name} NodeWaypoint workflow was not rejected")
+
+    for deleted_job, marker in (
+        ("node-waypoint-ebpf-live-gate", NODE_WAYPOINT_LIVE_GATE_JOB),
+        ("production-dockerfile-smoke", NODE_WAYPOINT_IMAGE_GATE_JOB),
+    ):
+        pruned = {
+            key: value.replace(marker, "", 1)
+            for key, value in node_waypoint_fixture.items()
+        }
+        if pruned == node_waypoint_fixture:
+            failures.append(
+                f"the deleted {deleted_job} NodeWaypoint self-test mutation is stale"
+            )
+            continue
+        if not node_waypoint_relevance_errors(pruned, relevance_selftest_source):
+            failures.append(
+                f"a deleted NodeWaypoint {deleted_job} aggregate was not rejected"
+            )
+
     # A conforming complete collection must reach exactly the Cross verdict:
     # the enforcing wrapper may add nothing of its own to a collection that
     # already satisfies the contract, or the repair would have traded a false
     # failure for a permanent one.
-    complete_collection = {**relevance_workflows, **isolated_fixture}
+    complete_collection = {
+        **relevance_workflows,
+        **node_waypoint_fixture,
+        **isolated_fixture,
+    }
     ownership_prose_collection = {
         **complete_collection,
         "required-name-prose.yml": (

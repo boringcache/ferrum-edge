@@ -1631,23 +1631,18 @@ def main() -> int:
     parser.add_argument("--changed-files", type=Path)
     parser.add_argument("--force-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
-    # Capability handshake for a live suite whose workflow lands before this
-    # classifier reaches the trusted base. A relevance job runs the TRUSTED
-    # copy, and an older trusted copy rejects an unknown `--suite` with a
-    # usage error, which is indistinguishable from a broken classifier. It
-    # also rejects this flag, so "the flag was refused" is itself the answer:
-    # the workflow reads that as "this base cannot classify me" and runs the
-    # suite. Printing the names it does know keeps the negative provable
-    # rather than inferred from an error string.
-    parser.add_argument("--list-suites", action="store_true")
+    # The `--list-suites` capability handshake that carried the CNI lifecycle
+    # and Istio status-CAS suites through their adoption window (issue #3908)
+    # is gone. It existed only while those suite names were newer than the
+    # trusted copy of this classifier; both names are on `main`, both
+    # workflows now carry the byte-frozen LIVE_SUITE_RELEVANCE_JOB_TEMPLATE,
+    # which never invokes the flag, and no workflow, script, or policy calls
+    # it. A no-longer-reachable bootstrap is a shape a later relevance job
+    # could be written against, so it is deleted rather than left inert.
     args = parser.parse_args()
 
     if args.self_test:
         return self_test()
-    if args.list_suites:
-        for suite in sorted(SUITE_PATTERNS):
-            print(suite)
-        return 0
     if not args.suite or not args.changed_files:
         parser.error("--suite and --changed-files are required unless --self-test is used")
 

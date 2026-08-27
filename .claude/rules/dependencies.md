@@ -56,17 +56,27 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   other two), and report through an `if: always()` aggregate. Their aggregates
   (`NodeWaypoint eBPF Live`, `Istio Status CAS Live`, `CNI Lifecycle Live`) are
   NOT branch-protection-required and must not be added to
-  `REQUIRED_MERGE_GROUP_WORKFLOWS` or `DEDICATED_REQUIRED_CHECKS`. The two new
-  `changes` jobs are not yet in `LIVE_SUITE_RELEVANCE_CONTRACTS`, and the
-  NodeWaypoint workflow's live-job binding and aggregate are not yet frozen by
-  trusted policy even though its classifier is trusted-base. Issue #3908 is
-  therefore not durably complete against future PR tampering until the
-  follow-up direct-to-`main` policy change adds the CNI/Istio contracts,
-  protects the NodeWaypoint `needs`/`if` plus aggregate contract, and deletes
-  the temporary `--list-suites` bootstrap blocks. The classifier refuses to classify
+  `REQUIRED_MERGE_GROUP_WORKFLOWS` or `DEDICATED_REQUIRED_CHECKS` — freezing an
+  optional gate's shape is not the same as making it required. Issue #3908 is
+  now durably complete on all three: `cni-lifecycle-live.yml` and
+  `istio-status-cas-live.yml` are entries in `LIVE_SUITE_RELEVANCE_CONTRACTS`,
+  and NodeWaypoint has its own additive contract
+  (`NODE_WAYPOINT_RELEVANCE_CONTRACT` + `NODE_WAYPOINT_FROZEN_JOBS`, enforced by
+  `node_waypoint_relevance_errors` from both `validate_workflow_collection` and
+  `compare_pr_workflow_collection`) because its planner job is
+  `production-dockerfile-plan`, runs `ci_runtime_plan.py`, emits two verdicts,
+  and binds fail-closed as `always() && … != 'false'` — none of which the shared
+  template can express. That contract freezes `production-dockerfile-plan`,
+  `production-dockerfile-smoke`, and `node-waypoint-ebpf-live-gate` whole, and
+  freezes `needs`/`if` only on `production-dockerfile-smoke-default`,
+  `production-dockerfile-smoke-ebpf`, and `node-waypoint-ebpf-live`; deleting
+  the workflow is rejected. Editing any of this is a direct-to-`main` change:
+  no pull request may modify `verify_cross_build_policy.py`. The temporary
+  `--list-suites` bootstrap handshake is deleted from
+  `live_suite_path_filter.py`. The classifier refuses to classify
   any change-set record that is not a normal repository-relative pathname and
   forces the suite to run instead. See `docs/ci_cd.md` → "Trusted-base
-  relevance for required live gates".
+  relevance for required live gates" and "NodeWaypoint relevance contract".
 - The fuzz/property lane is admitted only as two byte-frozen shapes:
   `CI_FUZZ_SMOKE_JOB` (the whole `fuzz-smoke` job in `ci.yml`) and
   `FUZZ_WORKFLOW` (the whole of `.github/workflows/fuzz.yml`). Either may be
