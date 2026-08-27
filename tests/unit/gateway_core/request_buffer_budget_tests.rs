@@ -269,3 +269,206 @@ fn defaults_are_finite_and_the_total_exceeds_one_request() {
         )
     };
 }
+
+// ---------------------------------------------------------------------------
+// 6. Residency: the charge outlives the collector (issue #4231).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sequential_in_dispatch_collections_cannot_exceed_the_aggregate_while_the_first_body_is_alive() {
+    // The production in-dispatch collectors publish through
+    // `RequestBufferPermit::into_charged_bytes` so the charge travels with the
+    // `Bytes` that stay resident for the backend write and retry replay. Two
+    // sequential collections against a one-block budget: the second is refused
+    // while the first published body is still alive, and admitted after it drops.
+    let budget = probe(1);
+    let first_body = budget
+        .try_reserve(UNIT)
+        .expect("first collection admits")
+        .into_charged_bytes(vec![0u8; UNIT]);
+    assert_eq!(budget.available_bytes(), 0);
+    assert!(
+        budget.try_reserve(UNIT).is_none(),
+        "a second in-dispatch collection must be refused while the first body's \
+         bytes are still resident"
+    );
+
+    drop(first_body);
+    assert!(
+        budget.try_reserve(UNIT).is_some(),
+        "releasing the resident body must return capacity to the next collection"
+    );
+}
+
+#[test]
+fn a_cloned_dispatch_body_keeps_the_charge_until_the_last_handle_drops() {
+    // Retry replay and protocol-NACK replay are refcount bumps on the same
+    // owner. They must not mint a second permit, and dropping the original
+    // handle must not release while a clone is still resident.
+    let budget = probe(1);
+    let first = budget
+        .try_reserve(UNIT)
+        .expect("admits")
+        .into_charged_bytes(vec![0u8; UNIT]);
+    let retry_replay = first.clone();
+    assert_eq!(budget.available_bytes(), 0);
+
+    drop(first);
+    assert!(
+        budget.try_reserve(UNIT).is_none(),
+        "retry replay must keep the charge after the dispatch-arm handle drops"
+    );
+
+    drop(retry_replay);
+    assert!(
+        budget.try_reserve(UNIT).is_some(),
+        "the charge returns when the last clone of the resident body drops"
+    );
+}
+
+#[test]
+fn a_pre_auth_permit_stays_charged_through_dispatch_publication_and_retry_clone() {
+    // Pre-auth collect stores the permit on BufferedClientRequestBody for as
+    // long as that struct owns the Vec. Dispatch then extracts the Vec and
+    // MUST publish through into_charged_bytes — the same seam the in-dispatch
+    // collectors use — or the charge drops at extraction while the bytes go
+    // on to send and retry replay (issue #4231).
+    let budget = probe(1);
+    // Phase 1: the pre-auth struct still owns the Vec (permit is a live local).
+    let permit = budget.try_reserve(UNIT).expect("pre-auth collect admits");
+    let body = vec![0u8; UNIT];
+    assert_eq!(budget.available_bytes(), 0);
+    assert!(
+        budget.try_reserve(UNIT).is_none(),
+        "capacity must stay charged while the pre-auth body still owns the Vec"
+    );
+
+    // Phase 2: dispatch conversion, including a retry clone.
+    let published = permit.into_charged_bytes(body);
+    let retry_replay = published.clone();
+    assert_eq!(budget.available_bytes(), 0);
+    assert!(
+        budget.try_reserve(UNIT).is_none(),
+        "a pre-auth body published onto Bytes must keep the charge while those \
+         bytes (and their retry clone) are resident"
+    );
+
+    drop(published);
+    assert!(
+        budget.try_reserve(UNIT).is_none(),
+        "retry replay must keep the pre-auth charge after the dispatch handle drops"
+    );
+
+    drop(retry_replay);
+    assert!(
+        budget.try_reserve(UNIT).is_some(),
+        "the pre-auth charge returns when the last clone of the resident body drops"
+    );
+}
+
+#[test]
+fn publishing_an_empty_body_releases_the_charge() {
+    let budget = probe(1);
+    let empty = budget
+        .try_reserve(UNIT)
+        .expect("admits")
+        .into_charged_bytes(Vec::new());
+    assert!(empty.is_empty());
+    assert_eq!(
+        budget.available_bytes(),
+        UNIT,
+        "nothing is retained, so the pre-collect ceiling must not stay charged"
+    );
+}
+
+#[test]
+fn publishing_a_body_smaller_than_the_ceiling_releases_surplus() {
+    // The permit is reserved at the collect ceiling. Holding that ceiling for
+    // the whole backend/retry lifetime of a much smaller body would over-hold
+    // the aggregate. Publication narrows to the surviving allocation.
+    let budget = probe(4);
+    let body = budget
+        .try_reserve(4 * UNIT)
+        .expect("admits the ceiling")
+        .into_charged_bytes(vec![0u8; UNIT]);
+    assert_eq!(
+        budget.available_bytes(),
+        3 * UNIT,
+        "residency must charge the surviving allocation, not the pre-collect ceiling"
+    );
+    assert!(
+        budget.try_reserve(3 * UNIT).is_some(),
+        "surplus from a small published body must be available to other collections"
+    );
+    drop(body);
+}
+
+#[test]
+fn in_dispatch_collectors_publish_the_permit_onto_the_resident_bytes() {
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    assert!(
+        !proxy.contains("let _request_buffer_permit"),
+        "in-dispatch collectors must not hold the permit as a match-arm local \
+         that drops before the collected bytes stop being resident (issue #4231)"
+    );
+
+    let reqwest = proxy
+        .split("async fn proxy_to_backend(")
+        .nth(1)
+        .expect("reqwest dispatcher")
+        .split("\nfn is_streaming_content_type(")
+        .next()
+        .expect("bounded reqwest dispatcher");
+    assert!(
+        reqwest.contains("request_buffer_permit.into_charged_bytes(body_bytes)"),
+        "the reqwest in-dispatch collector must publish the permit onto the \
+         Bytes that stay resident for send and retry replay"
+    );
+
+    let reqwest_buffered = reqwest
+        .split("ClientRequestBody::Buffered(buffered) => {")
+        .nth(1)
+        .expect("reqwest buffered arm")
+        .split("ClientRequestBody::Streaming(original_req) if stream_request_body")
+        .next()
+        .expect("bounded reqwest buffered arm");
+    assert!(
+        reqwest_buffered.contains("buffered.budget"),
+        "the reqwest Buffered arm must carry the pre-auth permit to publication"
+    );
+    assert!(
+        reqwest_buffered.contains("permit.into_charged_bytes(body_bytes)"),
+        "the reqwest Buffered arm must publish the pre-auth permit onto the \
+         Bytes that stay resident for send and retry replay"
+    );
+    assert!(
+        reqwest_buffered.contains("None => Bytes::from(body_bytes)"),
+        "a plugin-staged Buffered body with no permit must publish plain Bytes"
+    );
+
+    let h3 = proxy
+        .split("async fn proxy_to_backend_http3(")
+        .nth(1)
+        .expect("h3 dispatcher")
+        .split("\nfn h3_streaming_backend_response(")
+        .next()
+        .expect("bounded h3 dispatcher");
+    assert!(
+        h3.contains("permit.into_charged_bytes(request_body)"),
+        "the H3 in-dispatch collector must publish the permit onto the Bytes \
+         that stay resident for send and retry replay"
+    );
+    assert!(
+        h3.contains("(body, Some(request_buffer_permit))"),
+        "the H3 collect match must hoist the permit out of the Streaming arm \
+         so plugin transforms and the backend send stay charged"
+    );
+    assert!(
+        h3.contains("(buffered.body, buffered.budget)"),
+        "the H3 Buffered arm must return the pre-auth permit, not discard it"
+    );
+    assert!(
+        !h3.contains("(buffered.body, None)"),
+        "the H3 Buffered arm must not drop the pre-auth permit at Vec extraction"
+    );
+}

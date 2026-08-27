@@ -414,10 +414,12 @@ pub(crate) const REQUEST_DECODE_OVERLOAD_GRPC_MESSAGE: &str =
 //
 // The charge is taken BEFORE the collect and sized to the CEILING, not to the
 // collected length: the ceiling is the most the collect can retain, and
-// admission has to precede the allocation rather than chase it. It is returned
-// by `Drop`, so success, `413`, `499`, read timeout, RPC deadline,
-// authorization expiry, and task cancellation all release it identically and no
-// path can leak it.
+// admission has to precede the allocation rather than chase it. Early exits
+// (`413`, `499`, read timeout, RPC deadline, authorization expiry, task
+// cancellation, panic) return it by `Drop`. On the success path
+// [`RequestBufferPermit::into_charged_bytes`] moves the charge onto the
+// published `Bytes`, so the backend write and retry replay stay charged until
+// the last clone drops (issue #4231) and no path can leak it.
 //
 // A third semaphore, not a share of the retained-response or request-decode
 // ones, for exactly the reason those two are already separate: they bound
@@ -679,17 +681,19 @@ pub(crate) fn buffered_request_body_ceiling(effective_limit: usize) -> usize {
 /// An RAII claim on the aggregate buffered-request budget.
 ///
 /// Taken BEFORE the collect and sized to the per-request retained ceiling, so
-/// admission precedes the allocation instead of chasing it. Held for as long as
-/// the buffered bytes are being collected and dispatched, and returned by
-/// `Drop` — success, `413`, `499`, read timeout, RPC deadline, authorization
-/// expiry, and task cancellation are all just drops, so none of them can leak
-/// the budget and none of them can release early while the bytes are resident.
+/// admission precedes the allocation instead of chasing it. Early exits return
+/// it by `Drop`. On the success path [`Self::into_charged_bytes`] moves it onto
+/// the published `Bytes` so the charge is released when the last clone of those
+/// bytes drops — not when the collector's stack frame ends (issue #4231).
+/// Success, `413`, `499`, read timeout, RPC deadline, authorization expiry, and
+/// task cancellation are all just drops, so none of them can leak the budget
+/// and none of them can release early while the bytes are resident.
 #[must_use = "dropping the permit immediately returns the capacity it reserved"]
 pub(crate) struct RequestBufferPermit {
-    /// Read only by [`Self::reserved_bytes`], which is an external-test seam
-    /// and therefore dead in the separately compiled binary unit. The permit's
-    /// real job is its `Drop`, which returns the blocks to the semaphore.
-    #[allow(dead_code)]
+    /// Moved into the published `Bytes` by [`Self::into_charged_bytes`], or
+    /// returned to the semaphore when this permit drops on an early exit.
+    /// [`Self::reserved_bytes`] is an external-test seam and therefore dead in
+    /// the separately compiled binary unit.
     reservation: ResponseBufferReservation,
 }
 
@@ -719,6 +723,39 @@ impl RequestBufferPermit {
     #[allow(dead_code)] // external-test seam; dead in the separately compiled binary unit
     pub(crate) fn reserved_bytes(&self) -> usize {
         self.reservation.reserved_bytes()
+    }
+
+    /// Publish `data` as cheaply cloneable [`Bytes`] whose charge is released
+    /// when the last clone drops — not when the collector's stack frame ends.
+    ///
+    /// This is the publication seam for every governed request-buffer collect:
+    /// in-dispatch collectors call it after they finish collecting, and the
+    /// pre-auth path stores the permit on `BufferedClientRequestBody` until
+    /// dispatch extracts the `Vec` and calls this. `O(1)`: the `Vec` is moved,
+    /// never copied. Every cheap clone (backend write, retry replay,
+    /// protocol-NACK replay) shares that owner, so the allocation is charged
+    /// exactly once for as long as any handle exists.
+    ///
+    /// Empty `data` returns [`Bytes::new()`] and drops the charge immediately,
+    /// because nothing is retained. A surviving allocation smaller than the
+    /// pre-collect ceiling releases surplus blocks so a small body does not
+    /// keep a ceiling-sized claim for the whole backend/retry lifetime. A
+    /// plugin transform that grew past that ceiling keeps the original charge
+    /// rather than refusing to publish — transform growth is outside this
+    /// budget's collect bound, and dropping the bytes here would be a new
+    /// failure mode on a path that already forwarded them.
+    pub(crate) fn into_charged_bytes(mut self, data: Vec<u8>) -> Bytes {
+        if data.is_empty() {
+            return Bytes::new();
+        }
+        // Narrowing only releases. `false` means a plugin transform grew past
+        // the pre-collect ceiling: keep that original charge and still publish,
+        // rather than dropping bytes a path that already accepted them.
+        let _: bool = self.reservation.narrow_to_covered(data.capacity());
+        Bytes::from_owner(ChargedBuffer {
+            data,
+            _permit: self.reservation.into_permit(),
+        })
     }
 }
 
