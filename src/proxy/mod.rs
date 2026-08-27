@@ -4002,7 +4002,15 @@ async fn prepare_mesh_request_body(
             }
         }
     };
-    let body = Bytes::from(body);
+    // Pre-auth collectors attach the aggregate charge to the buffered body
+    // (issue #4231). Publish it onto the `Bytes` the mesh transport and its
+    // replay clones hold, so the budget is released when the last handle
+    // drops rather than when this frame ends. `None` is a body a plugin phase
+    // staged, which never took a charge.
+    let body = match buffered.budget {
+        Some(permit) => permit.into_charged_bytes(body),
+        None => Bytes::from(body),
+    };
     // Authoritative gRPC request messages are counted from the backend-visible
     // body: `apply_request_body_plugins_with_context` above is where gRPC-Web
     // text base64 is decoded and the terminal trailer frame is split off. A
@@ -32669,7 +32677,10 @@ async fn handle_proxy_request_inner(
                     (
                         buffered.method,
                         buffered.headers,
-                        Bytes::from(buffered.body),
+                        match buffered.budget {
+                            Some(permit) => permit.into_charged_bytes(buffered.body),
+                            None => Bytes::from(buffered.body),
+                        },
                     )
                 }
             };
@@ -33120,7 +33131,10 @@ async fn handle_proxy_request_inner(
                             Ok((
                                 buffered.method,
                                 buffered.headers,
-                                Bytes::from(buffered.body),
+                                match buffered.budget {
+                                    Some(permit) => permit.into_charged_bytes(buffered.body),
+                                    None => Bytes::from(buffered.body),
+                                },
                             ))
                         }
                     }
