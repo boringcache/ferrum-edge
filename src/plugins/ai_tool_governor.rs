@@ -6207,7 +6207,7 @@ fn extract_tool_use_blocks(
 /// Probe the typed vs nested form immutably first so the returned `&mut Value`
 /// is a single unique borrow: either the block itself (`{"type": marker, …}`)
 /// or the nested object (`{marker: {…}}`). Both providers accept both spellings.
-fn tool_use_block_call_mut(block: &mut Value, marker: &str) -> Option<&mut Value> {
+fn tool_use_block_call_mut<'a>(block: &'a mut Value, marker: &str) -> Option<&'a mut Value> {
     let typed = block.get("type").and_then(Value::as_str) == Some(marker);
     let nested = !typed && block.get(marker).is_some();
     if typed {
