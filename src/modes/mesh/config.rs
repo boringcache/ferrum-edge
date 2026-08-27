@@ -4604,8 +4604,9 @@ pub struct MeshConfig {
     /// * `NodeWaypoint` — the CP-authorized pods enrolled on THIS node, taken
     ///   from [`Self::node_waypoint_capture_destinations`].
     /// * `ServiceWaypoint` — the backing workloads of the services bound to
-    ///   THIS waypoint, taken from the slice's already waypoint-narrowed
-    ///   workload view.
+    ///   THIS waypoint, taken from the slice's waypoint-narrowed workload view.
+    ///   That narrowing is NAMESPACE-level (the waypoint's namespace plus its
+    ///   bound services' namespaces), not per-binding.
     ///
     /// `Sidecar` / `Ambient` ALSO set
     /// [`Self::inbound_relay_admits_accepted_local_address`], because the pod
@@ -4842,7 +4843,7 @@ impl MeshConfig {
     ///    multi-destination allowance for the topologies that are MEANT to
     ///    terminate for a workload other than the pod the proxy runs in
     ///    (`Sidecar` / `Ambient` own-identity workload records, `NodeWaypoint`
-    ///    enrolled pods, `ServiceWaypoint` waypoint-bound backing workloads).
+    ///    enrolled pods, `ServiceWaypoint` workloads visible in its namespaces).
     ///    An entry is matched by IP when the authority is an IP literal and by
     ///    verbatim (case-insensitive) name when it is not; a name is never
     ///    resolved here, so this cannot reach anything the inventory does not
