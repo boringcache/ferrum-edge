@@ -81,7 +81,10 @@ fn auth_header() -> String {
 }
 
 /// Bind an ephemeral port then drop the listener. Vulnerable to races — only
-/// used where callers tolerate them (retry loops or pre-binding).
+/// used where the gateway subprocess must bind the port itself. Ownership is
+/// proven afterwards by [`prove_child_owns_admin`], not by holding a
+/// reservation: a `BoundTcpPortReservation` (or any live socket) would block
+/// the child's own bind of `FERRUM_ADMIN_HTTP_PORT` / `FERRUM_PROXY_HTTP_PORT`.
 async fn ephemeral_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let p = listener.local_addr().unwrap().port();
@@ -150,20 +153,42 @@ async fn start_tcp_echo_server_on(listener: TcpListener) -> tokio::task::JoinHan
     })
 }
 
-async fn wait_for_health(admin_port: u16) -> bool {
-    let url = format!("http://127.0.0.1:{}/health", admin_port);
-    let deadline = SystemTime::now() + Duration::from_secs(30);
-    loop {
-        if SystemTime::now() >= deadline {
-            return false;
-        }
-        if let Ok(r) = reqwest::get(&url).await
-            && r.status().is_success()
-        {
-            return true;
-        }
-        sleep(Duration::from_millis(250)).await;
+/// Prove the process that answered on `admin_port` is `child`.
+///
+/// Unauthenticated `/health` is only liveness: a parallel test can steal the
+/// bind-drop port, our child exits on `EADDRINUSE` (silently, with
+/// `Stdio::null()`), and `/health` still returns 200 from the thief. Polling
+/// `Child::try_wait` fails that attempt immediately so the outer retry can
+/// pick a fresh port. The authenticated `/health` detail tier (this child's
+/// `FERRUM_METRICS_BEARER_TOKEN`) rejects a live foreign gateway. When
+/// `admin_auth` is set, `GET /proxies` must also accept our JWT so a thief
+/// with a different `FERRUM_ADMIN_JWT_SECRET` cannot attach as a 401
+/// `InvalidSignature` on the first assertion (issue #4253).
+async fn prove_child_owns_admin(
+    child: &mut Child,
+    admin_port: u16,
+    observability_token: &str,
+    admin_auth: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    crate::common::wait_for_owned_gateway_identity(
+        child,
+        admin_port,
+        observability_token,
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    if let Some(auth) = admin_auth {
+        crate::common::wait_for_admin_jwt(admin_port, auth, Duration::from_secs(30))
+        .await
+        .map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+
+fn kill_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// True iff something is currently accepting TCP connections on 127.0.0.1:port.
@@ -221,16 +246,18 @@ impl DbHarness {
 
         let admin_port = ephemeral_port().await;
         let proxy_port = ephemeral_port().await;
+        let observability_token = crate::common::mint_observability_token("stream-listener-db");
 
         let db_url = format!(
             "sqlite:{}?mode=rwc",
             temp_dir.path().join("test.db").to_string_lossy()
         );
 
-        let child = Command::new(gateway_binary_path())
+        let mut child = Command::new(gateway_binary_path())
             .env("FERRUM_MODE", "database")
             .env("FERRUM_ADMIN_JWT_SECRET", JWT_SECRET)
             .env("FERRUM_ADMIN_JWT_ISSUER", JWT_ISSUER)
+            .env("FERRUM_METRICS_BEARER_TOKEN", &observability_token)
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", &db_url)
             .env("FERRUM_DB_POLL_INTERVAL", "2")
@@ -242,23 +269,26 @@ impl DbHarness {
             .stderr(Stdio::null())
             .spawn()?;
 
-        let mut h = Self {
+        let auth = auth_header();
+        if let Err(e) = prove_child_owns_admin(
+            &mut child,
+            admin_port,
+            &observability_token,
+            Some(&auth),
+        )
+        .await
+        {
+            kill_child(&mut child);
+            return Err(e);
+        }
+
+        Ok(Self {
             _temp_dir: temp_dir,
             gateway_process: Some(child),
             admin_base_url: format!("http://127.0.0.1:{}", admin_port),
             admin_port,
             _proxy_port: proxy_port,
-        };
-
-        if wait_for_health(admin_port).await {
-            Ok(h)
-        } else {
-            if let Some(mut c) = h.gateway_process.take() {
-                let _ = c.kill();
-                let _ = c.wait();
-            }
-            Err("Gateway did not become healthy within 30s".into())
-        }
+        })
     }
 }
 
@@ -468,10 +498,12 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
     for attempt in 1..=SEED_ATTEMPTS {
         admin_port_seed = ephemeral_port().await;
         let proxy_port_seed = ephemeral_port().await;
+        let observability_token = crate::common::mint_observability_token("stream-listener-seed");
         let mut child = Command::new(gateway_binary_path())
             .env("FERRUM_MODE", "database")
             .env("FERRUM_ADMIN_JWT_SECRET", JWT_SECRET)
             .env("FERRUM_ADMIN_JWT_ISSUER", JWT_ISSUER)
+            .env("FERRUM_METRICS_BEARER_TOKEN", &observability_token)
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", &db_url)
             .env("FERRUM_DB_POLL_INTERVAL", "2")
@@ -483,12 +515,20 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn seed gateway");
-        if wait_for_health(admin_port_seed).await {
+        let auth = auth_header();
+        if prove_child_owns_admin(
+            &mut child,
+            admin_port_seed,
+            &observability_token,
+            Some(&auth),
+        )
+        .await
+        .is_ok()
+        {
             seed_gw = Some(child);
             break;
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_child(&mut child);
         if attempt == SEED_ATTEMPTS {
             panic!("Seed gateway failed to become healthy");
         }
@@ -665,11 +705,13 @@ plugin_configs: []
         f.write_all(initial.as_bytes()).unwrap();
         drop(f);
 
-        let child = Command::new(gateway_binary_path())
+        let observability_token = crate::common::mint_observability_token("stream-listener-file");
+        let mut child = Command::new(gateway_binary_path())
             .env("FERRUM_MODE", "file")
             .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
             .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
+            .env("FERRUM_METRICS_BEARER_TOKEN", &observability_token)
             .env("FERRUM_LOG_LEVEL", "warn")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -677,7 +719,15 @@ plugin_configs: []
             .spawn()
             .expect("spawn gateway");
 
-        if wait_for_health(admin_port).await {
+        if prove_child_owns_admin(
+            &mut child,
+            admin_port,
+            &observability_token,
+            None,
+        )
+        .await
+        .is_ok()
+        {
             started = Some((child, stream_port_a, stream_port_b, admin_port, dir));
             stream_b_reservation = Some(reserved_b);
             break;
@@ -688,9 +738,7 @@ plugin_configs: []
             attempt, MAX_ATTEMPTS
         );
         last_err = format!("attempt {} failed", attempt);
-        let mut c = child;
-        let _ = c.kill();
-        let _ = c.wait();
+        kill_child(&mut child);
         if attempt < MAX_ATTEMPTS {
             sleep(Duration::from_secs(1)).await;
         }

@@ -233,20 +233,22 @@ fn start_gateway_with_extra_env(
     Ok(cmd.spawn()?)
 }
 
-/// Wait for the gateway health endpoint to respond.
-/// Returns true if healthy, false if timed out.
-async fn wait_for_health(admin_port: u16) -> bool {
-    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
-    let deadline = std::time::SystemTime::now() + Duration::from_secs(30);
-    loop {
-        if std::time::SystemTime::now() >= deadline {
-            return false;
-        }
-        match reqwest::get(&health_url).await {
-            Ok(r) if r.status().is_success() => return true,
-            _ => sleep(Duration::from_millis(500)).await,
-        }
-    }
+/// Wait until `child` owns `admin_port`. Unauthenticated `/health` is not
+/// identity: a parallel test can steal the bind-drop port and answer 200
+/// after this child has already exited.
+async fn wait_for_owned_gateway(
+    child: &mut std::process::Child,
+    admin_port: u16,
+    observability_token: &str,
+) -> bool {
+    crate::common::wait_for_owned_gateway_identity(
+        child,
+        admin_port,
+        observability_token,
+        Duration::from_secs(30),
+    )
+    .await
+    .is_ok()
 }
 
 async fn tagged_round_trip(
@@ -330,13 +332,17 @@ where
         let config_content = make_config(proxy_listen_port);
         std::fs::write(&config_path, &config_content).unwrap();
 
+        let observability_token = crate::common::mint_observability_token("tcp-proxy");
+        let mut owned_env: Vec<(&str, &str)> = extra_env.to_vec();
+        owned_env.push(("FERRUM_METRICS_BEARER_TOKEN", observability_token.as_str()));
+
         let mut child = match start_gateway_with_extra_env(
             config_path.to_str().unwrap(),
             http_port,
             admin_port,
             tls_cert_path,
             tls_key_path,
-            extra_env,
+            &owned_env,
         ) {
             Ok(c) => c,
             Err(e) => {
@@ -351,7 +357,9 @@ where
             }
         };
 
-        if wait_for_health(admin_port).await {
+        if wait_for_owned_gateway(&mut child, admin_port, &observability_token)
+            .await
+        {
             return (child, proxy_listen_port, admin_port, dir);
         }
 

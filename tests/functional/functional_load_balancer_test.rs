@@ -203,6 +203,7 @@ fn start_gateway_in_file_mode(
     config_path: &str,
     http_port: u16,
     admin_port: u16,
+    observability_token: &str,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     // Build (or verify the prebuilt artifact) via the shared helper so this
     // file shares the `OnceLock` memoization and `FERRUM_SKIP_GATEWAY_BUILD=1`
@@ -222,6 +223,7 @@ fn start_gateway_in_file_mode(
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
+        .env("FERRUM_METRICS_BEARER_TOKEN", observability_token)
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -231,27 +233,30 @@ fn start_gateway_in_file_mode(
     Ok(child)
 }
 
-/// Poll the admin /health endpoint and proxy listener until the gateway is ready.
-async fn wait_for_gateway(admin_port: u16, proxy_port: u16) -> bool {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap();
-
+/// Poll until this child owns admin `/health` and the proxy listener accepts.
+/// Unauthenticated `/health` is not identity (issue #4253).
+async fn wait_for_owned_gateway(
+    child: &mut std::process::Child,
+    admin_port: u16,
+    proxy_port: u16,
+    observability_token: &str,
+) -> bool {
+    if crate::common::wait_for_owned_gateway_identity(
+        child,
+        admin_port,
+        observability_token,
+        Duration::from_secs(15),
+    )
+    .await
+    .is_err()
+    {
+        return false;
+    }
     for _ in 0..30 {
-        let admin_ready = if let Ok(resp) = client
-            .get(format!("http://127.0.0.1:{}/health", admin_port))
-            .send()
-            .await
-        {
-            resp.status().is_success()
-        } else {
-            false
-        };
-
-        let proxy_ready = TcpStream::connect(("127.0.0.1", proxy_port)).await.is_ok();
-
-        if admin_ready && proxy_ready {
+        if child.try_wait().ok().flatten().is_some() {
+            return false;
+        }
+        if TcpStream::connect(("127.0.0.1", proxy_port)).await.is_ok() {
             return true;
         }
         sleep(Duration::from_millis(200)).await;
@@ -274,9 +279,22 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
 
-        match start_gateway_in_file_mode(config_path, proxy_port, admin_port) {
+        let observability_token = crate::common::mint_observability_token("load-balancer");
+        match start_gateway_in_file_mode(
+            config_path,
+            proxy_port,
+            admin_port,
+            &observability_token,
+        ) {
             Ok(mut child) => {
-                if wait_for_gateway(admin_port, proxy_port).await {
+                if wait_for_owned_gateway(
+                    &mut child,
+                    admin_port,
+                    proxy_port,
+                    &observability_token,
+                )
+                .await
+                {
                     return (child, proxy_port, admin_port);
                 }
                 eprintln!(

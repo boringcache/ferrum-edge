@@ -99,6 +99,7 @@ fn start_gateway(
     http_port: u16,
     admin_port: u16,
     drain_seconds: u64,
+    observability_token: &str,
 ) -> std::process::Child {
     let binary_path = gateway_binary_path();
 
@@ -110,6 +111,7 @@ fn start_gateway(
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_ADMIN_HTTPS_PORT", "0")
         .env("FERRUM_SHUTDOWN_DRAIN_SECONDS", drain_seconds.to_string())
+        .env("FERRUM_METRICS_BEARER_TOKEN", observability_token)
         .env("FERRUM_LOG_LEVEL", "error")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -118,18 +120,19 @@ fn start_gateway(
         .expect("Failed to start gateway binary")
 }
 
-async fn wait_for_gateway(admin_port: u16) -> bool {
-    let client = reqwest::Client::new();
-    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
-    for _ in 0..60 {
-        if let Ok(resp) = client.get(&health_url).send().await
-            && resp.status().is_success()
-        {
-            return true;
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
-    false
+async fn wait_for_owned_gateway(
+    child: &mut std::process::Child,
+    admin_port: u16,
+    observability_token: &str,
+) -> bool {
+    crate::common::wait_for_owned_gateway_identity(
+        child,
+        admin_port,
+        observability_token,
+        Duration::from_secs(15),
+    )
+    .await
+    .is_ok()
 }
 
 async fn ephemeral_port() -> u16 {
@@ -149,9 +152,18 @@ async fn start_gateway_with_retry(
         let proxy_port = ephemeral_port().await;
         let admin_port = ephemeral_port().await;
 
-        let mut child = start_gateway(config_path, proxy_port, admin_port, drain_seconds);
+        let observability_token = crate::common::mint_observability_token("graceful-shutdown");
+        let mut child = start_gateway(
+            config_path,
+            proxy_port,
+            admin_port,
+            drain_seconds,
+            &observability_token,
+        );
 
-        if wait_for_gateway(admin_port).await {
+        if wait_for_owned_gateway(&mut child, admin_port, &observability_token)
+            .await
+        {
             return (child, proxy_port, admin_port);
         }
 
@@ -765,14 +777,19 @@ where
         let admin_port = ephemeral_port().await;
         let config_path = write_config(&dir, stream_port);
 
+        let observability_token =
+            crate::common::mint_observability_token("graceful-shutdown-stream");
         let mut child = start_gateway(
             config_path.to_str().unwrap(),
             proxy_port,
             admin_port,
             drain_seconds,
+            &observability_token,
         );
 
-        if wait_for_gateway(admin_port).await {
+        if wait_for_owned_gateway(&mut child, admin_port, &observability_token)
+            .await
+        {
             return Some((child, proxy_port, admin_port, dir));
         }
 

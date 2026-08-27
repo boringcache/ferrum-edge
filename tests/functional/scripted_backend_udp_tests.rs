@@ -100,29 +100,6 @@ fn spawn_gateway(
     cmd.spawn()
 }
 
-/// Poll `/health` until 2xx or the deadline elapses. Returns true on
-/// success.
-async fn wait_for_health(admin_port: u16, deadline: Duration) -> bool {
-    let end = tokio::time::Instant::now() + deadline;
-    let url = format!("http://127.0.0.1:{admin_port}/health");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(1))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    while tokio::time::Instant::now() < end {
-        if let Ok(r) = client.get(&url).send().await
-            && r.status().is_success()
-        {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    false
-}
-
 /// Wrapper that combines "reserve UDP listen port" + "reserve HTTP +
 /// admin ports" + "write config + spawn gateway + wait for health".
 /// Retries up to 3× to absorb the bind-drop-rebind race.
@@ -168,14 +145,15 @@ where
             None
         };
 
-        let child = match spawn_gateway(
+        let observability_token = crate::common::mint_observability_token("scripted-udp");
+        let mut env = extra_env.clone();
+        env.push(("FERRUM_METRICS_BEARER_TOKEN", observability_token.clone()));
+
+        let mut child = match spawn_gateway(
             config_path.to_str().unwrap(),
             proxy_http_port,
             admin_port,
-            &extra_env
-                .iter()
-                .map(|(k, v)| (*k, v.clone()))
-                .collect::<Vec<_>>(),
+            &env,
             capture_paths
                 .as_ref()
                 .map(|(o, e)| (o.as_path(), e.as_path())),
@@ -184,7 +162,15 @@ where
             Err(_) => continue,
         };
 
-        if wait_for_health(admin_port, Duration::from_secs(20)).await {
+        if crate::common::wait_for_owned_gateway_identity(
+            &mut child,
+            admin_port,
+            &observability_token,
+            Duration::from_secs(20),
+        )
+        .await
+        .is_ok()
+        {
             return GatewayFixture {
                 child: Some(child),
                 udp_port,

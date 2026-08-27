@@ -208,6 +208,7 @@ fn start_gateway(
     config_path: &str,
     http_port: u16,
     admin_port: u16,
+    observability_token: &str,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let child = std::process::Command::new(gateway_binary_path())
         .env("FERRUM_MODE", "file")
@@ -215,6 +216,7 @@ fn start_gateway(
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .env("FERRUM_METRICS_BEARER_TOKEN", observability_token)
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -223,24 +225,33 @@ fn start_gateway(
     Ok(child)
 }
 
-async fn wait_for_gateway(
+async fn wait_for_owned_gateway(
+    child: &mut std::process::Child,
     admin_port: u16,
     gateway_port: u16,
+    observability_token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
-    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
-    for _ in 0..60 {
-        if let Ok(resp) = client.get(&health_url).send().await
-            && resp.status().is_success()
-            && tokio::net::TcpStream::connect(("127.0.0.1", gateway_port))
-                .await
-                .is_ok()
+    crate::common::wait_for_owned_gateway_identity(
+        child,
+        admin_port,
+        observability_token,
+        Duration::from_secs(15),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    for _ in 0..20 {
+        if child.try_wait().ok().flatten().is_some() {
+            return Err("gateway exited after proving admin ownership".into());
+        }
+        if tokio::net::TcpStream::connect(("127.0.0.1", gateway_port))
+            .await
+            .is_ok()
         {
             return Ok(());
         }
         sleep(Duration::from_millis(250)).await;
     }
-    Err("Gateway did not become healthy within 15 seconds".into())
+    Err("Gateway proxy port did not accept TCP connections".into())
 }
 
 async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
@@ -248,7 +259,13 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_port = free_port().await;
         let admin_port = free_port().await;
-        let mut child = match start_gateway(config_path, gateway_port, admin_port) {
+        let observability_token = crate::common::mint_observability_token("ai-response-guard-grpc");
+        let mut child = match start_gateway(
+            config_path,
+            gateway_port,
+            admin_port,
+            &observability_token,
+        ) {
             Ok(child) => child,
             Err(e) => {
                 eprintln!(
@@ -261,7 +278,14 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
                 continue;
             }
         };
-        match wait_for_gateway(admin_port, gateway_port).await {
+        match wait_for_owned_gateway(
+            &mut child,
+            admin_port,
+            gateway_port,
+            &observability_token,
+        )
+        .await
+        {
             Ok(()) => return (child, gateway_port, admin_port),
             Err(e) => {
                 eprintln!(

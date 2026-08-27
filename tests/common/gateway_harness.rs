@@ -1613,6 +1613,43 @@ pub async fn probe_gateway_identity(
     wait_for_gateway_identity(admin_port, observability_token, timeout, None).await
 }
 
+/// Fail-fast ownership barrier for a spawned child: `Child::try_wait` around
+/// every authenticated `/health` probe so a dead process cannot look ready
+/// just because something else answered on the released admin port.
+///
+/// Bespoke `Stdio::null()` harnesses should call this instead of polling
+/// unauthenticated `/health`. The `observability_token` must be this child's
+/// `FERRUM_METRICS_BEARER_TOKEN` or a JWT minted from its
+/// `FERRUM_ADMIN_JWT_SECRET`.
+pub async fn wait_for_owned_gateway_identity(
+    child: &mut Child,
+    admin_port: u16,
+    observability_token: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    wait_for_gateway_identity(admin_port, observability_token, timeout, Some(child)).await
+}
+
+/// Poll `GET /proxies` until this instance's admin JWT is accepted.
+///
+/// Complements [`wait_for_owned_gateway_identity`]: a foreign gateway with a
+/// different `FERRUM_ADMIN_JWT_SECRET` answers `/health` as live but rejects
+/// the JWT with `401 InvalidSignature`. Requiring a non-401 here fails the
+/// attach attempt so the outer spawn retry can pick a fresh port.
+pub async fn wait_for_admin_jwt(
+    admin_port: u16,
+    auth_header: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    wait_for_admin_auth_inner(admin_port, auth_header, timeout).await
+}
+
+/// Per-spawn `FERRUM_METRICS_BEARER_TOKEN` for bespoke file-mode harnesses
+/// that do not go through [`TestGateway`].
+pub fn mint_observability_token(label: &str) -> String {
+    format!("{label}-{}", Uuid::new_v4().simple())
+}
+
 async fn wait_for_admin_auth_inner(
     admin_port: u16,
     auth_header: &str,

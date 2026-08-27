@@ -71,6 +71,7 @@ fn start_gateway_with_cache_cap(
     http_port: u16,
     admin_port: u16,
     cache_cap: usize,
+    observability_token: &str,
 ) -> std::process::Child {
     let binary_path = gateway_binary_path();
     std::process::Command::new(binary_path)
@@ -79,6 +80,7 @@ fn start_gateway_with_cache_cap(
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_ROUTER_CACHE_MAX_ENTRIES", cache_cap.to_string())
+        .env("FERRUM_METRICS_BEARER_TOKEN", observability_token)
         .env("FERRUM_LOG_LEVEL", "warn")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -95,23 +97,21 @@ async fn ephemeral_port() -> u16 {
     port
 }
 
-/// Wait for the gateway admin health endpoint to respond.
-/// 500 proxies means startup may take a while, so allow up to ~30 seconds.
-async fn wait_for_gateway(admin_port: u16) -> bool {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
-    for _ in 0..120 {
-        if let Ok(resp) = client.get(&health_url).send().await
-            && resp.status().is_success()
-        {
-            return true;
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
-    false
+/// Wait until `child` owns `admin_port`. Unauthenticated `/health` is not
+/// identity (issue #4253). 500 proxies means startup may take a while.
+async fn wait_for_owned_gateway(
+    child: &mut std::process::Child,
+    admin_port: u16,
+    observability_token: &str,
+) -> bool {
+    crate::common::wait_for_owned_gateway_identity(
+        child,
+        admin_port,
+        observability_token,
+        Duration::from_secs(30),
+    )
+    .await
+    .is_ok()
 }
 
 /// Wait until a proxy route itself is serving traffic.
@@ -148,10 +148,18 @@ async fn start_gateway_with_retry(
         let proxy_port = ephemeral_port().await;
         let admin_port = ephemeral_port().await;
 
-        let mut child =
-            start_gateway_with_cache_cap(config_path, proxy_port, admin_port, cache_cap);
+        let observability_token = crate::common::mint_observability_token("router-cache");
+        let mut child = start_gateway_with_cache_cap(
+            config_path,
+            proxy_port,
+            admin_port,
+            cache_cap,
+            &observability_token,
+        );
 
-        if wait_for_gateway(admin_port).await {
+        if wait_for_owned_gateway(&mut child, admin_port, &observability_token)
+            .await
+        {
             return (child, proxy_port, admin_port);
         }
 

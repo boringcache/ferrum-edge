@@ -519,18 +519,31 @@ impl LoadTestHarness {
         }
     }
 
-    async fn wait_for_health(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let health_url = format!("{}/health", self.admin_base_url);
-        let deadline = SystemTime::now() + Duration::from_secs(30);
-        loop {
-            if SystemTime::now() >= deadline {
-                return Err("Gateway did not start within 30 seconds".into());
-            }
-            match reqwest::get(&health_url).await {
-                Ok(r) if r.status().is_success() => return Ok(()),
-                _ => tokio::time::sleep(Duration::from_millis(500)).await,
-            }
-        }
+    async fn wait_for_health(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let admin_port: u16 = self
+            .admin_base_url
+            .rsplit(':')
+            .next()
+            .ok_or("admin_base_url missing port")?
+            .parse()?;
+        let token = self.generate_admin_token()?;
+        let auth = format!("Bearer {token}");
+        let child = self
+            .gateway_process
+            .as_mut()
+            .ok_or("gateway process missing")?;
+        crate::common::wait_for_owned_gateway_identity(
+            child,
+            admin_port,
+            &token,
+            Duration::from_secs(30),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        crate::common::wait_for_admin_jwt(admin_port, &auth, Duration::from_secs(30))
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     fn generate_admin_token(&self) -> Result<String, Box<dyn std::error::Error>> {

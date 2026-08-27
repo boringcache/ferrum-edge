@@ -39,7 +39,7 @@ use serde_json::json;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// Default MongoDB connection for local development / CI.
@@ -453,31 +453,26 @@ impl MongoTestHarness {
         Ok(())
     }
 
-    async fn wait_for_health(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let health_url = format!("{}/health", self.admin_base_url);
-        let deadline = SystemTime::now() + Duration::from_secs(30);
-        // Finite per-request timeout so a dead/hung admin socket cannot wedge
-        // the SystemTime loop (a loop deadline does not bound `.send()`).
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .connect_timeout(Duration::from_secs(1))
-            .build()?;
-
-        loop {
-            if SystemTime::now() >= deadline {
-                return Err("Gateway (mongodb) did not start within 30 seconds".into());
-            }
-
-            match client.get(&health_url).send().await {
-                Ok(response) if response.status().is_success() => {
-                    println!("  Gateway (mongodb) is ready!");
-                    return Ok(());
-                }
-                _ => {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-            }
-        }
+    async fn wait_for_health(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let token = self.generate_token()?;
+        let auth = format!("Bearer {token}");
+        let child = self
+            .gateway_process
+            .as_mut()
+            .ok_or("gateway process missing")?;
+        crate::common::wait_for_owned_gateway_identity(
+            child,
+            self.admin_port,
+            &token,
+            Duration::from_secs(30),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        crate::common::wait_for_admin_jwt(self.admin_port, &auth, Duration::from_secs(30))
+        .await
+        .map_err(|e| e.to_string())?;
+        println!("  Gateway (mongodb) is ready!");
+        Ok(())
     }
 
     fn generate_token(&self) -> Result<String, Box<dyn std::error::Error>> {

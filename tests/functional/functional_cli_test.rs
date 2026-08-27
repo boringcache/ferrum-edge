@@ -43,21 +43,21 @@ async fn ephemeral_port() -> u16 {
     port
 }
 
-async fn wait_for_health(admin_port: u16) -> bool {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap();
-    let url = format!("http://127.0.0.1:{}/health", admin_port);
-    for _ in 0..60 {
-        if let Ok(resp) = client.get(&url).send().await
-            && resp.status().is_success()
-        {
-            return true;
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
-    false
+/// Wait until `child` owns `admin_port`. Unauthenticated `/health` is not
+/// identity (issue #4253).
+async fn wait_for_owned_health(
+    child: &mut std::process::Child,
+    admin_port: u16,
+    observability_token: &str,
+) -> bool {
+    crate::common::wait_for_owned_gateway_identity(
+        child,
+        admin_port,
+        observability_token,
+        Duration::from_secs(15),
+    )
+    .await
+    .is_ok()
 }
 
 fn kill_child(mut child: std::process::Child) {
@@ -1998,9 +1998,11 @@ plugin_configs: []
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let child = cmd.spawn().expect("Failed to spawn ferrum-edge");
+        let observability_token = crate::common::mint_observability_token("cli-smart-path");
+        cmd.env("FERRUM_METRICS_BEARER_TOKEN", &observability_token);
+        let mut child = cmd.spawn().expect("Failed to spawn ferrum-edge");
 
-        let health_ok = wait_for_health(admin_port).await;
+        let health_ok = wait_for_owned_health(&mut child, admin_port, &observability_token).await;
         let mut route_ok = false;
         if health_ok {
             let client = reqwest::Client::builder()
@@ -2109,9 +2111,11 @@ plugin_configs: []
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        let observability_token = crate::common::mint_observability_token("cli-spec-infer");
+        cmd.env("FERRUM_METRICS_BEARER_TOKEN", &observability_token);
         let mut child = cmd.spawn().expect("Failed to spawn ferrum-edge");
 
-        if wait_for_health(admin_port).await {
+        if wait_for_owned_health(&mut child, admin_port, &observability_token).await {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(3))
                 .build()
@@ -2215,9 +2219,11 @@ plugin_configs: []
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        let observability_token = crate::common::mint_observability_token("cli-flag-wins");
+        cmd.env("FERRUM_METRICS_BEARER_TOKEN", &observability_token);
         let mut child = cmd.spawn().expect("Failed to spawn ferrum-edge");
 
-        if wait_for_health(admin_port).await {
+        if wait_for_owned_health(&mut child, admin_port, &observability_token).await {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(3))
                 .build()
@@ -2311,9 +2317,11 @@ async fn functional_cli_precedence_env_beats_conf_file() {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        let observability_token = crate::common::mint_observability_token("cli-env-wins");
+        cmd.env("FERRUM_METRICS_BEARER_TOKEN", &observability_token);
         let mut child = cmd.spawn().expect("Failed to spawn ferrum-edge");
 
-        if wait_for_health(env_admin_port).await {
+        if wait_for_owned_health(&mut child, env_admin_port, &observability_token).await {
             // The gateway started and its admin health is reachable on the
             // env-var port. Because the conf-file decoy ports are held by
             // our listeners, the gateway would have fatally failed to start
