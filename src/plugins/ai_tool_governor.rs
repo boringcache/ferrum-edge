@@ -2384,14 +2384,14 @@ impl AiToolGovernor {
         // is not governed and must not be rewritten here.
         let anthropic_envelope = json.get("type").and_then(Value::as_str) == Some("message")
             || json.get("role").and_then(Value::as_str) == Some("assistant");
-        let anthropic_holds_tool_use = json
-            .get("content")
-            .and_then(Value::as_array)
-            .is_some_and(|blocks| {
-                blocks
-                    .iter()
-                    .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
-            });
+        let anthropic_holds_tool_use =
+            json.get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+                });
         if anthropic_envelope || anthropic_holds_tool_use {
             if let Some(content) = json.get_mut("content").and_then(Value::as_array_mut) {
                 for block in content {
