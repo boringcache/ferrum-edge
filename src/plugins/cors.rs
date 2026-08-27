@@ -398,6 +398,12 @@ impl CorsPlugin {
         })
     }
 
+    /// Whether this instance restricts origins to an explicit allow-list rather
+    /// than wildcard `*`. Used by plugin-cache composition diagnostics.
+    pub fn uses_strict_origin_policy(&self) -> bool {
+        !matches!(self.allowed_origins, AllowedOrigins::Wildcard)
+    }
+
     /// Parse the `allowed_origins` config field.
     ///
     /// Supports plain-string forms:
@@ -673,9 +679,15 @@ impl Plugin for CorsPlugin {
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        // gRPC-Web is selected through the gRPC request-policy chain even
-        // though browsers still require ordinary Origin/ACAO enforcement.
+        // HTTP and gRPC (including gRPC-Web) only. WebSocket upgrades are
+        // classified as `HttpFlavor::WebSocket` and do not run this plugin;
+        // Cross-Site WebSocket Hijacking (CSWSH) is enforced separately via the
+        // per-proxy `allowed_ws_origins` gate in `src/proxy/mod.rs`.
         super::HTTP_GRPC_PROTOCOLS
+    }
+
+    fn cors_uses_strict_origin_policy(&self) -> bool {
+        self.uses_strict_origin_policy()
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {

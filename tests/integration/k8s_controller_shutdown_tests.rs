@@ -15,6 +15,8 @@
 //! early-exit classification under the real control-plane ordering, dynamic
 //! (reprobe-style) registration, and refusal once shutdown closed the registry.
 //!
+//! Panic-inducing tests are `panic = "unwind"` only (issue #4166).
+//!
 //! Every test runs on the default `#[tokio::test]` current-thread runtime, so
 //! task interleaving is deterministic instead of depending on a multi-thread
 //! scheduler happening to poll in a particular order.
@@ -83,7 +85,8 @@ async fn shutdown_awaits_task_that_exits_after_a_delay() {
 }
 
 /// A panicking controller task must be reported, not silently discarded the way
-/// the old `let _ = handle.await` did.
+/// the old `let _ = handle.await` did. Unwind-only (issue #4166).
+#[cfg(panic = "unwind")]
 #[tokio::test]
 async fn shutdown_surfaces_a_panicked_controller_task() {
     let (shutdown_tx, _keep_open) = watch::channel(false);

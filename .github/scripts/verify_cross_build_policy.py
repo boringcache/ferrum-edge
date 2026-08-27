@@ -86,7 +86,7 @@ WORKFLOW_CONTRACTS = (
     (
         "CI workflow",
         "build-arm64-cross",
-        "9a1b2bb4914826b77e82ad4489f73b15ebbdc93cd0d925b91cbcdc21a5e148cc",
+        "62894a1ffaf66397d537ccea6667e67bf32785b7d4e03561441af495ba46f31f",
         "143872ebf5dd925529b785273f180671bcc3bbd612d74ef0b88e1b8dce86c774",
         # Pins the top-level `on:` mapping that schedules CI, including
         # unconditional `merge_group: checks_requested` alongside push,
@@ -96,7 +96,7 @@ WORKFLOW_CONTRACTS = (
     (
         "release workflow",
         "build-release-arm64-cross",
-        "338c9be78c5e354365990a9c27dafa36c21202f18cf517567ad44995cff03950",
+        "bae233bd3c7f3008950e49de8e4167223916924a54d5ee54d90ebe01cf5c7bc9",
         "1d5104bd955d0ef4c397cb7be08f37d2d829a822ff9efe43eb26bdac1133bc0a",
         "2a9e77c5946c27cbf1f055f20adf283e159ffd3735e2dcc90edded2c35563c3b",
     ),
@@ -153,7 +153,7 @@ DOCKER_PUBLISH_STEPS_MIDDLE = (
 DOCKER_PUBLISH_STEPS_TAIL = (
     "\n"
     "      - name: Set up Docker Buildx\n"
-    "        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4\n"
+    "        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4\n"
     "\n"
     "      - name: Log in to GitHub Container Registry\n"
     "        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4\n"
@@ -527,7 +527,7 @@ CI_DOCKER_MANIFEST_STEPS = r"""    steps:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -763,7 +763,7 @@ RELEASE_CREATE_RELEASE_STEPS = r"""    steps:
 
 RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -1149,7 +1149,7 @@ RELEASE_DOCKER_MANIFEST_STEPS = r"""    steps:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -1229,7 +1229,7 @@ RELEASE_DOCKER_EBPF_MANIFEST_STEPS = r"""    steps:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -1546,7 +1546,7 @@ RELEASE_DOCKER_EBPF_TOOLS_MANIFEST_STEPS = r"""    steps:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -1610,7 +1610,7 @@ RELEASE_DOCKER_EBPF_STEPS = r"""    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -2436,6 +2436,20 @@ LIVE_SUITE_RELEVANCE_CONTRACTS = {
         "ambient-host-udp",
         "ambient-host-udp",
     ),
+    "cni-lifecycle-live.yml": (
+        "changes",
+        "cni-lifecycle-live",
+        "CNI lifecycle trigger",
+        "cni-lifecycle",
+        "cni-lifecycle",
+    ),
+    "istio-status-cas-live.yml": (
+        "changes",
+        "istio-status-cas-live",
+        "Istio status CAS trigger",
+        "istio-status-cas",
+        "istio-status-cas",
+    ),
     "mesh-e2e-sidecar-live.yml": (
         "changes",
         "mesh-e2e-sidecar-live",
@@ -2568,7 +2582,7 @@ AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       # GitHub Actions cache is a 10 GB repository quota with LRU eviction
       # across every ref. `type=gha,mode=max` exports multi-gigabyte BuildKit
@@ -2835,18 +2849,34 @@ LIVE_SUITE_JOB_BINDING = {
 #   * a repository that has not adopted the job may omit it, but once the
 #     trusted base carries it a pull request cannot remove it.
 #
-# Issue #3902 changes what the job runs where, which a whole-job freeze cannot
+# Changing what the job runs where is not something a whole-job freeze can
 # express as an edit. It is therefore admitted the same way `release.yml` admits
 # a new image family: as two byte-frozen GENERATIONS with a one-way transition
 # between them (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first).
 #
-#   * `CI_FUZZ_SMOKE_RETIRED_JOB` is the shape issue #2461 landed: one job that
-#     compiled and ran the six sanitizer-instrumented libFuzzer targets on every
-#     full-mode pull request, with compiler caching explicitly disabled.
-#   * `CI_FUZZ_SMOKE_JOB` is the adopted shape: the deterministic property smoke
-#     is still the required pull-request gate, the six-target bounded budget
-#     runs on merge_group / push to `main` / manual dispatch, and the lane uses
-#     the repository's checksum-pinned sccache installer.
+# The pair now carries issue #4238. Issue #3902's own transition is spent: its
+# adopted generation reached `main`, and the rule is to retire a generation once
+# that is true, so the #2461 shape it retired is gone from this file.
+#
+#   * `CI_FUZZ_SMOKE_RETIRED_JOB` is #3902's adopted shape: the deterministic
+#     property smoke as the required pull-request gate, and the six-target
+#     bounded budget on merge_group / push to `main` / manual dispatch.
+#   * `CI_FUZZ_SMOKE_JOB` is the adopted shape: identical except that the
+#     bounded budget no longer runs on `merge_group`.
+#
+#     #3902 took the budget off the pull-request path for COST -- roughly 39
+#     minutes of sanitizer compile to buy roughly 48 seconds of fuzzing. #4238
+#     takes it off the merge_group path for BLAST RADIUS. It is a probabilistic
+#     discovery run, not a verdict on one diff, but on `merge_group` a failure
+#     ejects the queue entry and cascades a rebuild of every entry behind it. A
+#     hosted-runner reclamation (`exit 143`) inside that ~38-minute window did
+#     exactly that, with no defect in the ejected change.
+#
+#     Coverage is not reduced. `merge_group` still runs the job and its
+#     deterministic property gate; the six-target budget still runs at
+#     byte-identical bounds on the push to `main` that follows every merge --
+#     which is also the only event permitted to populate this lane's cache, so
+#     it was always the placement that paid the compile cost usefully.
 #
 # Both generations are admitted so the trusted base stays valid while the
 # transition lands, and so the destination revision validates against a policy
@@ -2862,71 +2892,6 @@ LIVE_SUITE_JOB_BINDING = {
 # / `-rss_limit_mb` bounds cannot drift while a generation is added.
 CI_FUZZ_SMOKE_JOB_NAME = "fuzz-smoke"
 CI_FUZZ_SMOKE_RETIRED_JOB = r"""  fuzz-smoke:
-    # Byte-frozen by the trusted Cross build policy
-    # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
-    # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
-    # this is its entire permitted shape. Every command, action pin, toolchain
-    # pin, tool version, target name, and libFuzzer bound below is part of the
-    # contract, so a pull request cannot widen the budget, change the target
-    # list, add a step, or redirect this job at a repository-supplied script.
-    name: Fuzz Smoke
-    needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    # The repository-root Cargo config selects sccache and host linker flags,
-    # but this isolated fuzz job installs neither sccache nor mold. Disable both
-    # Cargo wrapper inputs and inherited rustflags explicitly.
-    env:
-      RUSTC_WRAPPER: ""
-      CARGO_BUILD_RUSTC_WRAPPER: ""
-      RUSTFLAGS: ""
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-        with:
-          persist-credentials: false
-
-      - name: Install required build dependency
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
-
-      - name: Install pinned nightly toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
-        with:
-          toolchain: nightly-2025-07-01
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          workspaces: fuzz -> target
-          shared-key: fuzz-smoke
-
-      - name: Install pinned cargo-fuzz
-        run: cargo install cargo-fuzz --locked --version 0.13.1
-
-      - name: Run deterministic property smoke tests
-        working-directory: fuzz
-        run: cargo test --locked
-
-      - name: Run bounded libFuzzer smoke budget
-        working-directory: fuzz
-        run: |
-          set -euo pipefail
-
-          for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
-            echo "Fuzz smoke target: ${fuzz_target}"
-            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \
-              -runs=512 \
-              -max_total_time=8 \
-              -max_len=4096 \
-              -timeout=2 \
-              -rss_limit_mb=1024
-          done
-"""
-CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     # Byte-frozen by the trusted Cross build policy
     # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
     # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
@@ -3045,6 +3010,147 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
             echo "Fuzz lane shape: deterministic property gate only"
           else
             echo "Fuzz lane shape: property gate plus the six-target sanitizer budget"
+          fi
+
+          sccache_bin="${RUSTC_WRAPPER:-}"
+          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+            echo "Fuzz lane sccache statistics after this run:"
+            "$sccache_bin" --show-stats
+            du -sh "${GITHUB_WORKSPACE}/.cache/sccache" || true
+          else
+            echo "::warning::sccache was unavailable; this fuzz run compiled without a compiler cache"
+          fi
+"""
+CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
+    # Byte-frozen by the trusted Cross build policy
+    # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
+    # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
+    # issue #3902 decides where each half of it runs. This is its entire
+    # permitted shape. Every command, action pin, toolchain pin, tool version,
+    # target name, and libFuzzer bound below is part of the contract, so a pull
+    # request cannot widen the budget, change the target list, add a step, or
+    # redirect this job at a repository-supplied script.
+    #
+    # Lane split (#3902, narrowed by #4238): the deterministic property smoke
+    # stays the required gate and runs on pull_request AND merge_group. The
+    # six-target, sanitizer-instrumented libFuzzer build spends roughly 39
+    # minutes compiling to buy roughly 48 seconds of fuzzing, so it runs only
+    # on the push to `main` and on manual dispatch.
+    #
+    # #3902 took it off the pull-request path for cost. #4238 takes it off the
+    # merge_group path for blast radius: a hosted-runner reclamation (exit 143)
+    # anywhere in that ~38-minute window ejected the queue entry and cascaded a
+    # rebuild of every entry behind it, and it did so without a defect in the
+    # ejected change. Discovery coverage is unchanged -- every merged change is
+    # still fuzzed at byte-identical bounds by the push to `main` that follows
+    # it, which is also the only event permitted to populate this lane's cache.
+    name: Fuzz Smoke
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    # The repository-root Cargo config also selects the mold linker through
+    # per-target rustflags, and this isolated lane installs no fast linker, so
+    # the inherited rustflags are cleared explicitly. The rustc wrapper is
+    # deliberately NOT pinned here: `setup-sccache` below publishes either the
+    # checksum-verified sccache path or an empty value through `GITHUB_ENV`,
+    # and a job-level `env` entry of the same name would override that
+    # fail-closed decision.
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install required build dependency
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly-2025-07-01
+
+      # The repository's own checksum-pinned sccache installer, and the only
+      # local action this contract admits. It never enables the
+      # credential-bearing sccache GHA backend, never persists
+      # ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL into later steps, asserts
+      # those credentials are absent before any build runs, and fails closed to
+      # no wrapper at all. It must run BEFORE the cache restore below so the
+      # lazily started sccache server indexes the restored entries.
+      - uses: ./.github/actions/setup-sccache
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz-smoke
+          cache-directories: ${{ github.workspace }}/.cache/sccache
+          # Only a push to `main` may write this lane's cache. GitHub already
+          # scopes a pull request's cache writes to its own ref; writing
+          # nothing at all from an untrusted ref is the stronger statement,
+          # and it keeps every compiler artifact the sanitizer build reuses
+          # attributable to code that has already merged.
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.1
+
+      - name: Run deterministic property smoke tests
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+
+          property_started=$SECONDS
+          cargo test --locked
+          echo "Fuzz property smoke seconds: $((SECONDS - property_started))"
+
+      - name: Run bounded libFuzzer smoke budget
+        # Issue #4238: the push to `main` and manual dispatch only. This step
+        # is a probabilistic DISCOVERY run, not a verdict on one diff, so it
+        # must not be able to eject a merge-queue entry: its bounds buy about
+        # 48 seconds of fuzzing behind roughly 39 minutes of sanitizer compile,
+        # and a runner reclamation in that window costs the whole queue.
+        # Every merged change still reaches this budget through the push to
+        # `main`, at byte-identical bounds, seconds later.
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+
+          sanitizer_started=$SECONDS
+          sccache_bin="${RUSTC_WRAPPER:-}"
+          echo "Fuzz sanitizer lane sccache statistics before the sanitizer build:"
+          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
+            "$sccache_bin" --show-stats
+          else
+            echo "sccache is unavailable; this sanitizer build cannot reuse compiler output"
+          fi
+
+          for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
+            echo "Fuzz smoke target: ${fuzz_target}"
+            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \
+              -runs=512 \
+              -max_total_time=8 \
+              -max_len=4096 \
+              -timeout=2 \
+              -rss_limit_mb=1024
+          done
+          echo "Fuzz sanitizer lane seconds: $((SECONDS - sanitizer_started))"
+
+      - name: Report fuzz lane compiler-cache telemetry
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_EVENT_NAME" = "push" ] || [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Fuzz lane shape: property gate plus the six-target sanitizer budget"
+          else
+            echo "Fuzz lane shape: deterministic property gate only"
           fi
 
           sccache_bin="${RUSTC_WRAPPER:-}"
@@ -12102,18 +12208,15 @@ CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
 WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS: tuple[
     tuple[str, str, str, str], ...
 ] = (
-    # `coverage.yml` `coverage-merge` on the trusted base → PR #3917
-    # (issue #3907): shard-scoped coverage planning re-shapes the merge
-    # aggregate (planned-shard artifact selection, plugin gate, planned-shard
-    # outcome enforcement), pinned against its latest-main-merged branch
-    # grok/issue-3907-coverage-shards-r1. Both generations include the current
-    # checksum-pinned taiki-e/install-action update.
-    (
-        "coverage.yml",
-        "coverage-merge",
-        "5acba780094766b03f72059b8ac229c7bcc4a722ce0130060da7ed0d1ba5850f",
-        "28c3ff517027c36ba2ca7ce8a80adc43d2e8475e46c4d5cb0106819dd3f1c152",
-    ),
+    # Empty: no workflow-directory job transition is currently admitted.
+    #
+    # The `coverage.yml` `coverage-merge` pair for PR #3917 (issue #3907) was
+    # retired here. Both are closed -- #3917 merged 2026-08-18 and its
+    # destination digest was main's live value -- so the tuple was already
+    # spent, and the action-pin bump in #4243 moved the job off that digest
+    # entirely. A spent tuple admits a transition between two states main is
+    # not in, so it is dead weight that only widens what a pull request may
+    # claim. Retiring it restores the default, stricter scan for that job.
 )
 
 # Local composite actions are compared by whole-file digest once Cross-sensitive.
@@ -27690,8 +27793,12 @@ pre_build = []
                 f"admitted fuzz-smoke generation {generation} does not carry the "
                 "bounded six-target libFuzzer budget exactly once"
             )
-    # The retired generation and the scheduled lane install no compiler cache
-    # at all, so both clear every wrapper input the root Cargo config sets.
+    # The scheduled lane installs no compiler cache at all, so it clears every
+    # wrapper input the root Cargo config sets. This assertion used to cover the
+    # retired generation too, because the #2461 shape it held also disabled
+    # caching. That generation is gone (#4238): the retired slot now holds
+    # #3902's shape, which deliberately DOES use the checksum-pinned sccache
+    # installer, so asserting the opposite of it here would be false.
     cargo_override_block = (
         '    env:\n'
         '      RUSTC_WRAPPER: ""\n'
@@ -27699,7 +27806,6 @@ pre_build = []
         '      RUSTFLAGS: ""\n'
     )
     for admitted_label, admitted_text in (
-        ("retired fuzz-smoke generation", CI_FUZZ_SMOKE_RETIRED_JOB),
         ("scheduled fuzz lane", FUZZ_WORKFLOW),
     ):
         if cargo_override_block not in admitted_text:
@@ -27739,11 +27845,21 @@ pre_build = []
             "the adopted fuzz-smoke generation lets an untrusted ref write the "
             "compiler cache the sanitizer build restores"
         )
-    if "        if: github.event_name != 'pull_request'\n" not in CI_FUZZ_SMOKE_JOB:
+    if (
+        "        if: github.event_name == 'push' "
+        "|| github.event_name == 'workflow_dispatch'\n"
+    ) not in CI_FUZZ_SMOKE_JOB:
         failures.append(
-            "the adopted fuzz-smoke generation no longer keeps the sanitizer "
-            "budget off the ordinary pull-request path"
+            "the adopted fuzz-smoke generation no longer restricts the "
+            "sanitizer budget to the push to `main` and manual dispatch"
         )
+    for barred_event in ("pull_request", "merge_group"):
+        if f"github.event_name != '{barred_event}'" in CI_FUZZ_SMOKE_JOB:
+            failures.append(
+                "the adopted fuzz-smoke generation gates the sanitizer budget "
+                f"by excluding {barred_event} rather than by naming the two "
+                "events that may run it; an allow-list is the contract (#4238)"
+            )
     for admitted_event in (
         "github.event_name == 'merge_group'",
         "(github.event_name == 'push' && github.ref == 'refs/heads/main')",
@@ -27752,7 +27868,7 @@ pre_build = []
         if admitted_event not in CI_FUZZ_SMOKE_JOB:
             failures.append(
                 "the adopted fuzz-smoke generation no longer reaches the "
-                f"sanitizer budget through {admitted_event}"
+                f"fuzz-smoke job through {admitted_event}"
             )
     if "needs.ci-plan.outputs.mode == 'full'" not in CI_FUZZ_SMOKE_JOB:
         failures.append(
@@ -27905,13 +28021,33 @@ pre_build = []
     # What issue #3902 added to the contract, and therefore what a later pull
     # request must not be able to take back out of it.
     fuzz_smoke_adopted_tampering: dict[str, tuple[str, str]] = {
+        # Removing the guard entirely restores the six-target sanitizer build
+        # to every full-mode pull request -- the ~39-minute compile #3902 took
+        # off that path. Still forbidden.
         "sanitizer budget restored to every pull request": (
-            "        if: github.event_name != 'pull_request'\n",
+            "        if: github.event_name == 'push' "
+            "|| github.event_name == 'workflow_dispatch'\n",
             "",
         ),
-        "sanitizer budget dropped from the merge queue": (
-            "        if: github.event_name != 'pull_request'\n",
+        # #4238 moved the budget off `merge_group` deliberately, so "dropped
+        # from the merge queue" is no longer a tamper -- it is the contract.
+        # What must still be impossible is dropping it from the push to `main`,
+        # because that is now the ONLY automatic route that runs it at all.
+        # Narrowing the guard to manual dispatch would leave the six targets
+        # unfuzzed on every merged change while the job kept reporting green.
+        "sanitizer budget dropped from the push to main": (
+            "        if: github.event_name == 'push' "
+            "|| github.event_name == 'workflow_dispatch'\n",
             "        if: github.event_name == 'workflow_dispatch'\n",
+        ),
+        # The mirror of the above: re-admitting merge_group is also a deviation
+        # from the frozen text, so the freeze must reject a change back to it
+        # just as firmly as it rejects a narrowing. A generation transition is
+        # the only sanctioned way to move this lane again.
+        "sanitizer budget re-added to the merge queue": (
+            "        if: github.event_name == 'push' "
+            "|| github.event_name == 'workflow_dispatch'\n",
+            "        if: github.event_name != 'pull_request'\n",
         ),
         "property gate dropped from pull requests": (
             "      - name: Run deterministic property smoke tests\n",

@@ -1504,6 +1504,11 @@ pub fn has_effective_http_retries(config: Option<&RetryConfig>, method: &str) ->
 /// herd effects when multiple clients retry against the same failing backend.
 /// The jitter range is [delay * 0.5, delay * 1.5] capped at max_ms.
 pub fn retry_delay(config: &RetryConfig, attempt: u32) -> Duration {
+    // Single choke point for `ferrum_backend_retry_attempts_total`: every
+    // retrying transport (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, raw TCP)
+    // evaluates this immediately before replaying an attempt, and only then.
+    // One relaxed increment on an already-failed request.
+    crate::data_path_metrics::record_backend_retry_attempt();
     match &config.backoff {
         BackoffStrategy::Fixed { delay_ms } => Duration::from_millis(*delay_ms),
         BackoffStrategy::Exponential { base_ms, max_ms } => {

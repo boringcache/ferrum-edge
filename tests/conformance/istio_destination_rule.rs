@@ -201,6 +201,40 @@ fn dr_connection_pool_tcp_keepalive() {
     assert_eq!(keepalive.interval_seconds, Some(10));
 }
 
+/// `trafficPolicy.connectionPool.tcp.idleTimeout` — bidirectional TCP idle
+/// bound on stream-family / mesh L4 relays. `0s` disables.
+#[test]
+fn dr_connection_pool_tcp_idle_timeout() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "trafficPolicy.connectionPool.tcp.idleTimeout",
+        status = Status::Supported,
+        notes = "Mapped to tcp_idle_timeout_seconds (0 disables). Distinct from HTTP idleTimeout. Sub-second values other than 0s rejected.",
+    );
+    let dr = translated(json!({
+        "host": "echo.default.svc.cluster.local",
+        "trafficPolicy": {
+            "connectionPool": {"tcp": {"idleTimeout": "1h"}}
+        }
+    }));
+    let policy = dr.traffic_policy.expect("traffic policy emitted");
+    assert_eq!(policy.tcp_idle_timeout_seconds, Some(3600));
+
+    let disabled = translated(json!({
+        "host": "echo.default.svc.cluster.local",
+        "trafficPolicy": {
+            "connectionPool": {"tcp": {"idleTimeout": "0s"}}
+        }
+    }));
+    assert_eq!(
+        disabled
+            .traffic_policy
+            .expect("traffic policy emitted")
+            .tcp_idle_timeout_seconds,
+        Some(0)
+    );
+}
+
 /// `trafficPolicy.connectionPool.http.maxRequestsPerConnection` is parsed and
 /// validated, but deferred because Ferrum does not enforce close-after-N
 /// backend requests.

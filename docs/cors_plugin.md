@@ -40,6 +40,23 @@ write `allowed_origins: ["*"]` when allow-all is intended.
 
 Per the CORS specification, `Access-Control-Allow-Origin: *` cannot be combined with `Access-Control-Allow-Credentials: true`. If you configure `allow_credentials: true` with wildcard origins, the plugin logs a warning and automatically disables credentials. To use credentials, specify explicit origins.
 
+## WebSocket upgrades and CSWSH
+
+Browsers do not apply CORS to the WebSocket handshake. The `cors` plugin's
+`supported_protocols()` is HTTP and gRPC only, so upgrade requests classified as
+`HttpFlavor::WebSocket` never enter the CORS plugin chain. Cross-Site WebSocket
+Hijacking (CSWSH) is enforced separately by the per-proxy `allowed_ws_origins` gate in
+the proxy core (see [routing.md](routing.md#websocket-origin-admission)).
+
+| Mechanism | Applies to | Default when unset |
+|-----------|------------|--------------------|
+| `cors.allowed_origins` | Cross-origin HTTP, preflight `OPTIONS`, and gRPC-Web | Must be configured explicitly (no implicit wildcard) |
+| `allowed_ws_origins` | WebSocket upgrade `Origin` on H1/H2/H3 | Empty list = allow every origin |
+
+These fields are independent: a strict CORS allowlist does **not** restrict WebSocket
+upgrades until `allowed_ws_origins` is populated. At config load the gateway warns when
+a proxy has non-wildcard CORS but an empty `allowed_ws_origins` list.
+
 ## Usage Examples
 
 ### Example 1: Global Wildcard CORS (Development)

@@ -25,6 +25,7 @@ pub mod connection_pool;
 pub mod consumer_index;
 #[path = "../custom_plugins/mod.rs"]
 pub mod custom_plugins;
+pub mod data_path_metrics;
 pub mod date_cache;
 pub mod dns;
 pub mod dp_config_freshness;
@@ -2079,6 +2080,83 @@ pub mod _test_support {
         .await
     }
 
+    /// Lease backend a renewal test supplies to
+    /// [`run_namespace_config_admission_renewal_for_test`].
+    pub type TestLeaseBackend =
+        std::sync::Arc<dyn crate::config::db_backend::NamespaceConfigAdmissionLeaseBackend>;
+
+    /// Scaled timing envelope for
+    /// [`run_namespace_config_admission_renewal_for_test`].
+    ///
+    /// Production runs a 120s lease renewed every 30s with a 1s retry gap.
+    /// Tests keep the same ratios in milliseconds so the stall and expiry
+    /// boundaries can be crossed without waiting minutes.
+    #[derive(Clone, Copy, Debug)]
+    pub struct TestLeaseRenewalTiming {
+        pub lease_duration_ms: u64,
+        pub renew_interval_ms: u64,
+        pub retry_interval_ms: u64,
+    }
+
+    /// Terminal state of the renewer under test.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TestLeaseRenewalOutcome {
+        /// Stopped by the guard while the lease was still held.
+        Stopped,
+        /// Ownership provably changed hands.
+        Lost,
+        /// The window closed without a provable renewal; failed closed.
+        Expired,
+    }
+
+    /// What the renewer did, plus the guard-visible verdict at the end.
+    #[derive(Clone, Copy, Debug)]
+    pub struct TestLeaseRenewalObservation {
+        pub outcome: TestLeaseRenewalOutcome,
+        pub renewals: u32,
+        pub retries: u32,
+        pub reclaims: u32,
+        pub still_held: bool,
+    }
+
+    /// Drive the production namespace config admission renewer against a
+    /// caller-supplied lease backend (issue #4146).
+    ///
+    /// Every bound the renewer applies — the per-attempt budget, the retry
+    /// gap, and the hard window close — is derived from `timing`, so a scaled
+    /// envelope exercises the identical arithmetic production runs.
+    pub async fn run_namespace_config_admission_renewal_for_test(
+        backend: TestLeaseBackend,
+        namespace: &str,
+        owner: &str,
+        generation: u64,
+        timing: TestLeaseRenewalTiming,
+        run_for: std::time::Duration,
+    ) -> TestLeaseRenewalObservation {
+        let timing = crate::admin::crud::LeaseRenewalTiming {
+            lease_duration: std::time::Duration::from_millis(timing.lease_duration_ms),
+            renew_interval: std::time::Duration::from_millis(timing.renew_interval_ms),
+            retry_interval: std::time::Duration::from_millis(timing.retry_interval_ms),
+        };
+        let (report, still_held) =
+            crate::admin::crud::run_namespace_config_admission_renewal_for_test(
+                backend, namespace, owner, generation, timing, run_for,
+            )
+            .await;
+        let outcome = match report.outcome {
+            crate::admin::crud::LeaseRenewalOutcome::Stopped => TestLeaseRenewalOutcome::Stopped,
+            crate::admin::crud::LeaseRenewalOutcome::Lost => TestLeaseRenewalOutcome::Lost,
+            crate::admin::crud::LeaseRenewalOutcome::Expired => TestLeaseRenewalOutcome::Expired,
+        };
+        TestLeaseRenewalObservation {
+            outcome,
+            renewals: report.counters.renewals,
+            retries: report.counters.retries,
+            reclaims: report.counters.reclaims,
+            still_held,
+        }
+    }
+
     /// Acquire the durable namespace config admission lease (same primitive as
     /// admin mutations and api_specs-emitting backups) for external tests.
     pub async fn lock_namespace_config_admission_db_for_test(
@@ -2484,6 +2562,12 @@ pub mod _test_support {
         plugin: &crate::plugins::request_deduplication::RequestDeduplication,
     ) -> (usize, usize) {
         plugin.completed_size_snapshot_for_tests()
+    }
+
+    pub fn request_deduplication_inflight_count_snapshot_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+    ) -> usize {
+        plugin.inflight_count_snapshot_for_tests()
     }
 
     pub fn request_deduplication_request_identity_for_test(
@@ -4875,7 +4959,9 @@ pub mod _test_support {
 
     /// Redis key a rate-limit window bucket would use, for hash-tag coverage.
     pub fn redis_slot_key(config: RedisConfig, rate_key: &str, suffix: &[&str]) -> String {
-        RedisRateLimitClient::new(config, None, false, None).make_slot_key(rate_key, suffix)
+        RedisRateLimitClient::new(config, None, false, None)
+            .expect("construction without a CA path must succeed")
+            .make_slot_key(rate_key, suffix)
     }
 
     pub fn redis_config_url_with_ip(config: &RedisConfig, ip: std::net::IpAddr) -> String {
@@ -4892,7 +4978,8 @@ pub mod _test_support {
         config: RedisConfig,
         url: &str,
     ) -> Result<(Option<String>, Option<String>), String> {
-        let client = RedisRateLimitClient::new(config, None, false, None);
+        let client = RedisRateLimitClient::new(config, None, false, None)
+            .expect("construction without a CA path must succeed");
         let redis_client = client.build_client(url).map_err(|e| e.to_string())?;
         let info = redis_client.get_connection_info();
         Ok((
@@ -4910,7 +4997,7 @@ pub mod _test_support {
         url: &str,
         tls_no_verify: bool,
     ) -> Result<bool, String> {
-        let client = RedisRateLimitClient::new(config, None, tls_no_verify, None);
+        let client = RedisRateLimitClient::new(config, None, tls_no_verify, None)?;
         let redis_client = client.build_client(url).map_err(|e| e.to_string())?;
         match redis_client.get_connection_info().addr() {
             redis::ConnectionAddr::TcpTls { insecure, .. } => Ok(*insecure),
@@ -4920,6 +5007,15 @@ pub mod _test_support {
 
     pub fn redis_rate_limit_client_for_test(config: RedisConfig) -> RedisRateLimitClient {
         RedisRateLimitClient::new(config, None, false, None)
+            .expect("construction without a CA path must succeed")
+    }
+
+    /// Build a redis-rs client from an already-constructed Ferrum wrapper.
+    pub fn redis_build_client(client: &RedisRateLimitClient, url: &str) -> Result<(), String> {
+        client
+            .build_client(url)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     /// Deterministic Redis sliding-window index + elapsed fraction for tests.
@@ -5097,6 +5193,10 @@ pub mod _test_support {
 
     pub fn parse_auth_mode(s: &str) -> AuthMode {
         crate::config::db_loader::parse_auth_mode(s)
+    }
+
+    pub fn lock_wait_timeout_sql(timeout_seconds: u64, is_mysql: bool) -> Option<String> {
+        crate::config::db_loader::lock_wait_timeout_sql(timeout_seconds, is_mysql)
     }
 
     pub fn statement_timeout_sql(
@@ -10971,6 +11071,86 @@ pub mod _test_support {
     /// Telemetry/retry class every transport uses for the same refusal.
     pub const RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS: crate::retry::ErrorClass =
         crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS;
+
+    /// Ceiling a *retained* (buffered) REQUEST body is collected under. A
+    /// legacy `0` ("unlimited") folds to the fail-closed fallback rather than
+    /// producing an unbounded upload buffer (issue #4153).
+    pub fn buffered_request_body_ceiling_for_test(effective_limit: usize) -> usize {
+        crate::proxy::response_buffer_budget::buffered_request_body_ceiling(effective_limit)
+    }
+
+    /// Default fail-closed per-request ceiling for a `0` ("unlimited") limit.
+    pub const DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES: usize =
+        crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES;
+
+    /// Default aggregate ceiling on concurrently buffered request bodies.
+    pub const DEFAULT_REQUEST_BUFFER_TOTAL_BYTES: usize =
+        crate::proxy::response_buffer_budget::DEFAULT_REQUEST_BUFFER_TOTAL_BYTES;
+
+    /// Client-visible HTTP status for a buffered-REQUEST capacity refusal.
+    pub const REQUEST_BUFFER_OVERLOAD_STATUS: u16 =
+        crate::proxy::response_buffer_budget::REQUEST_BUFFER_OVERLOAD_STATUS;
+
+    /// gRPC status for the same refusal.
+    pub const REQUEST_BUFFER_OVERLOAD_GRPC_STATUS: u32 =
+        crate::proxy::response_buffer_budget::REQUEST_BUFFER_OVERLOAD_GRPC_STATUS;
+
+    /// Fixed, redaction-safe client body for the same refusal.
+    pub const REQUEST_BUFFER_OVERLOAD_BODY: &str =
+        crate::proxy::response_buffer_budget::REQUEST_BUFFER_OVERLOAD_BODY;
+
+    /// Telemetry/retry class every request path uses for the same refusal.
+    pub const REQUEST_BUFFER_OVERLOAD_ERROR_CLASS: crate::retry::ErrorClass =
+        crate::proxy::response_buffer_budget::REQUEST_BUFFER_OVERLOAD_ERROR_CLASS;
+
+    /// An isolated aggregate buffered-REQUEST budget built from the SAME
+    /// [`crate::proxy::response_buffer_budget`] code the process-global one
+    /// uses — same clamping, same non-blocking admission, same release-on-drop
+    /// — but with its own semaphore, so external tests can observe admission
+    /// and release deterministically under a parallel test binary (issue
+    /// #4153).
+    pub struct RequestBufferBudgetProbe(crate::proxy::response_buffer_budget::IsolatedBudget);
+
+    /// An RAII claim on a [`RequestBufferBudgetProbe`], mirroring exactly what
+    /// a buffered request path holds while it collects an upload. Dropping it
+    /// returns the capacity.
+    pub struct RequestBufferPermitProbe(crate::proxy::response_buffer_budget::RequestBufferPermit);
+
+    impl RequestBufferPermitProbe {
+        /// Capacity this claim currently holds, in whole reservation blocks.
+        pub fn reserved_bytes(&self) -> usize {
+            self.0.reserved_bytes()
+        }
+    }
+
+    impl RequestBufferBudgetProbe {
+        pub fn new(fallback_per_request_bytes: usize, total_bytes: usize) -> Self {
+            Self(crate::proxy::response_buffer_budget::IsolatedBudget::new(
+                fallback_per_request_bytes,
+                total_bytes,
+            ))
+        }
+
+        /// Currently unreserved capacity, in bytes.
+        pub fn available_bytes(&self) -> usize {
+            self.0.available_bytes()
+        }
+
+        /// Retained-path ceiling for an effective per-request limit (`0` folds
+        /// to the fail-closed fallback).
+        pub fn buffered_request_body_ceiling(&self, effective_limit: usize) -> usize {
+            self.0.buffered_request_body_ceiling(effective_limit)
+        }
+
+        /// The PRODUCTION admission a buffered request path takes before it
+        /// allocates. `None` when the aggregate budget refuses, which is what
+        /// makes the refusal happen BEFORE the collect rather than after it.
+        pub fn try_reserve(&self, bytes: usize) -> Option<RequestBufferPermitProbe> {
+            self.0
+                .try_reserve_request_permit(bytes)
+                .map(RequestBufferPermitProbe)
+        }
+    }
 
     /// Whether an error class is neutral to circuit-breaker, passive-health, and
     /// adaptive-concurrency accounting.

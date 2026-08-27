@@ -159,6 +159,27 @@ spec:
             {{- toYaml $readyHandler | nindent 12 }}
             initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            {{- /* Rendered explicitly rather than inherited from the Kubernetes
+                   default: endpoint-removal latency on a terminating pod is
+                   failureThreshold x periodSeconds, so it must be visible in
+                   the manifest next to the preStop arithmetic it pairs with. */}}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- end }}
+          {{- if gt (int (.Values.shutdownPreStopSeconds | default 0)) 0 }}
+          {{- /* Endpoint-removal lag mitigation (issue #4154). Kubernetes runs
+                 preStop BEFORE SIGTERM, so the gateway keeps accepting for this
+                 whole window while the EndpointSlice / kube-proxy update
+                 propagates; without it a rolling upgrade refuses new
+                 connections at a pod that is still a live Endpoint.
+                 `sleep` is a native SleepAction (Kubernetes 1.29+, GA 1.30) and
+                 needs no shell, so it works on the distroless image. Set
+                 shutdownPreStopSeconds: 0 on older clusters. The window is
+                 billed to terminationGracePeriodSeconds, which the chart
+                 validates at render time. */}}
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ int (.Values.shutdownPreStopSeconds | default 0) }}
           {{- end }}
           {{- with .Values.resources }}
           resources:

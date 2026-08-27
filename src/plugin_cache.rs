@@ -25,7 +25,7 @@ use crate::config::db_backend::{
 };
 use crate::config::types::{
     BackendScheme, CountryMmdbLoadSession, CountryMmdbSnapshot, GatewayConfig,
-    MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES, PluginScope,
+    MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES, PluginScope, Proxy,
 };
 use tracing::{error, warn};
 
@@ -324,6 +324,10 @@ impl Plugin for DeferredCorsPlugin {
         true
     }
 
+    fn cors_uses_strict_origin_policy(&self) -> bool {
+        self.inner.cors_uses_strict_origin_policy()
+    }
+
     async fn after_proxy(
         &self,
         _ctx: &mut RequestContext,
@@ -341,6 +345,28 @@ impl Plugin for DeferredCorsPlugin {
 const MESH_ROUTE_DISPATCH_NAME: &str = "mesh_route_dispatch";
 const MESH_ROUTE_DISPATCH_FINALIZER_NAME: &str = "__mesh_route_dispatch_finalizer";
 const CORS_NAME: &str = "cors";
+
+/// Warn when a proxy expresses a strict HTTP/gRPC CORS origin policy but leaves
+/// WebSocket Origin admission at the default allow-all setting.
+fn warn_if_cors_ws_origin_policy_gap(proxy: &Proxy, merged: &[Arc<dyn Plugin>]) {
+    if !proxy.allowed_ws_origins.is_empty() {
+        return;
+    }
+    let has_strict_cors = merged
+        .iter()
+        .any(|plugin| plugin.name() == CORS_NAME && plugin.cors_uses_strict_origin_policy());
+    if !has_strict_cors {
+        return;
+    }
+    warn!(
+        proxy = %proxy.id,
+        namespace = %proxy.namespace,
+        "Proxy has a strict CORS allowed_origins policy but allowed_ws_origins is empty; \
+         the cors plugin does not run on WebSocket upgrades — configure allowed_ws_origins on \
+         this proxy to enforce the same origin policy against Cross-Site WebSocket Hijacking \
+         (CSWSH). See docs/cors_plugin.md and docs/routing.md."
+    );
+}
 
 /// Cache-internal sentinel placed immediately after the last route-dispatch
 /// instance. Individual instances stage fail-closed misses on `RequestContext`;
@@ -4250,6 +4276,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
         {
             errors.push(format!("proxy={}/{}: {error}", proxy.namespace, proxy.id));
         }
+        warn_if_cors_ws_origin_policy_gap(proxy, &merged);
     }
 
     // Keep the gateway-wide global chain behind the same slice-shaped
@@ -7172,6 +7199,7 @@ impl PluginCache {
             {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
+            warn_if_cors_ws_origin_policy_gap(proxy, &merged);
             plugin_errors.extend(exclusive_effective_instance_errors(&merged, &proxy.id));
             if let Err(e) =
                 crate::plugins::mesh::workload_metrics::validate_effective_metric_tag_override_plan_budget(
@@ -7939,6 +7967,7 @@ impl PluginCache {
             {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
+            warn_if_cors_ws_origin_policy_gap(proxy, &merged);
             plugin_errors.extend(exclusive_effective_instance_errors(&merged, &proxy.id));
             if let Err(e) =
                 crate::plugins::mesh::workload_metrics::validate_effective_metric_tag_override_plan_budget(

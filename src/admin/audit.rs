@@ -2894,6 +2894,46 @@ pub async fn record(
     .unwrap_or_else(|error| Err(anyhow!("admin audit durable handoff task failed: {error}")))
 }
 
+/// Record a mutation audit event when no configuration-database backend is
+/// available (for example mesh data-plane operational actions). Finalizes
+/// through the durable spool pipeline — the same path [`record`] uses when no
+/// delivery worker is registered for the backend.
+pub async fn record_without_database(
+    enabled: bool,
+    mut event: AuditEvent,
+) -> Result<(), anyhow::Error> {
+    if !enabled {
+        return Ok(());
+    }
+    adopt_prepared_intent(&mut event);
+    if event.outcome.is_empty() {
+        event.outcome = AuditOutcome::Success.as_str().to_string();
+    }
+
+    let pipeline = pipeline();
+    let event_id = event.id.clone();
+    tokio::task::spawn_blocking(move || {
+        let record = pipeline.finalize_event(event).map_err(|reason| {
+            anyhow!(
+                "admin audit durable handoff failed ({}) for audit event {}",
+                reason.as_str(),
+                event_id
+            )
+        })?;
+        if pipeline.spool.is_some() {
+            Ok(())
+        } else {
+            pipeline.note_shutdown_memory_loss(&record);
+            Err(anyhow!(
+                "admin audit event {} could not be retained after delivery admission closed",
+                event_id
+            ))
+        }
+    })
+    .await
+    .unwrap_or_else(|error| Err(anyhow!("admin audit durable handoff task failed: {error}")))
+}
+
 /// Drain every registered audit worker within `timeout`.
 ///
 /// Called from each serving mode's shutdown path **before** the database Arc is

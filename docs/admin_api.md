@@ -93,6 +93,8 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/health
 
 Service-discovery task lifecycle and bounded staleness (issues #3717/#3721/#3722) drive the same coarse fields: a restarting, crash-looping, stale, or withdrawn upstream sets `status: "degraded"` while staying ready after a configured `withdraw` has published successfully. An expired upstream configured with `fail_readiness`, or a default `withdraw` upstream whose fail-closed withdrawal publication is still retrying, flips `ready: false` with `status: "unavailable"` and HTTP 503. Background task transitions precompute this fixed-cardinality coarse projection, so the unauthenticated probe remains an O(1), lock-free snapshot load rather than walking configured upstreams. The authenticated tier adds a `service_discovery` object with process aggregates plus per-upstream detail (provider, task state, stale/withdrawn flags, effective policy and window, last-success age, restart and consecutive-failure counts, and a closed-set `last_error` token) — never a registry URL, Consul/Kubernetes token, or response payload. `/metrics` carries only the fixed-cardinality `ferrum_service_discovery_*` aggregates; the namespaced upstream id is deliberately never a Prometheus label.
 
+A terminating process reports `status: "draining"`, `ready: false`, and HTTP 503 (issue #4154). The verdict is published the moment SIGTERM/SIGINT is observed — ahead of the accept-loop close — so an orchestrator or load balancer can withdraw the replica from its endpoint set before a new connection is refused; `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` keeps every listener (proxy and admin) accepting for that window. `draining` is terminal and wins over every other status. `/live` is deliberately unaffected and keeps returning 200: a liveness probe pointed at a draining pod must not trigger a SIGKILL mid-drain. See [graceful_shutdown.md](graceful_shutdown.md).
+
 Unauthenticated callers receive only `status` and `ready` (enough for a readiness probe) with the correct status code — 503 `"starting"` until the gateway is ready, 200 otherwise. Active remote JWKS trust still drives those coarse fields without leaking detail: grace keeps `ready: true` with `status: "degraded"`; expiry flips `ready: false` with `status: "unavailable"` and HTTP 503; with no active remote JWKS the coarse shape stays neutral. The probe path is an O(1) ArcSwap load plus monotonic deadline comparison — it never walks attacker-sized cache state. The detailed diagnostics (DB type/pool stats, optional `database.failover_topology`, cached-config proxy/consumer counts, `database_polling` degradation, `config_rejected`, mesh state, sanitized listener failures, fixed-cardinality `jwks_trust` fresh/grace/expired counts with per-state max ages — never URLs, kids, tokens, claims, or key material — and the `service_discovery` block described below) require an admin JWT, `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS` source IP. In database mode the authenticated response includes `database_polling`; repeated rejected incremental deltas set `status: "degraded"` (also visible unauthenticated) while the gateway keeps serving the last known-good config. Both **database** and **cp** modes expose `database_polling.last_poll_completed_at` (updated on every normally completed poll outcome — empty success, rejection, or handled error — not on panic/abort/cancel) so operators can alert when the supervised poll task stops advancing. In **cp** mode, unexpected poll-task exit (panic/abort/unexpected completion — not ordinary shutdown) flips sticky `serving_degraded`, so `/health` returns 503 with `status: "unavailable"` and `ready: false`. In **database** mode the poll task is respawned after an unexpected exit while last-known-good config continues to serve. When the optional MongoDB change-stream watcher is enabled (`FERRUM_MONGO_CHANGE_STREAM_ENABLED`, replica sets only), `database_polling.change_stream` reports its bounded connected/degraded/reconnect state; it is a reload-latency signal only and never forces `status: "degraded"`, because periodic polling stays authoritative. See [mongodb.md](mongodb.md#change-stream-triggered-reloads).
 
 In mesh mode, authenticated health detail includes
@@ -152,7 +154,7 @@ In database **and control-plane** mode, if a **full** config load is rejected by
 
 In **file** mode, if a SIGHUP reload candidate fails read, parse, validation, or apply, the gateway likewise keeps serving the last known-good config and raises the same `config_rejected` signal: authenticated `/health` reports `config_rejected: true` with `status: "degraded"` (boolean detail authenticated-only; coarse `degraded` also visible unauthenticated). File-mode admin stays read-only; operators repair by fixing the config file and reloading. The flag clears on the next Applied or Unchanged reload.
 
-In **CP, DP, and mesh modes**, if a supervised serving-listener task exits with an error *after* the gateway became ready (the CP gRPC server; a DP proxy/admin HTTP/HTTPS/H3 listener; or a mesh traffic/admin listener), `/health` returns 503 with `status: "unavailable"` and `ready: false`. The same sticky path applies in **CP mode** when the database config poll task exits unexpectedly (panic/abort/unexpected completion — not ordinary shutdown). This is a **sticky** signal: it is set once and never cleared, so it survives a later readiness restore. Mesh authenticated `/health`/`/status` and `/overload` responses include `listener_failures` with `failures_total` and per-listener `listener`, `listen_port`, `kind`, and a deliberately sanitized `error`; raw error strings are not retained. Unauthenticated health/status responses remain exactly `status` plus `ready`, and unauthenticated overload remains `{level}`.
+In **CP, DP, and mesh modes**, if a supervised serving-listener task exits with an error *after* the gateway became ready (the CP gRPC server; a DP proxy/admin HTTP/HTTPS/H3 listener; or a mesh traffic/admin listener), `/health` returns 503 with `status: "unavailable"` and `ready: false`. The same sticky path applies in **CP mode** when the database config poll task exits unexpectedly (abort/unexpected completion — not ordinary shutdown). A Rust panic in a shipping build (`panic = "abort"`, issue #4166) terminates the process before this signal can be set; operators restart via a process supervisor. This is a **sticky** signal: it is set once and never cleared, so it survives a later readiness restore. Mesh authenticated `/health`/`/status` and `/overload` responses include `listener_failures` with `failures_total` and per-listener `listener`, `listen_port`, `kind`, and a deliberately sanitized `error`; raw error strings are not retained. Unauthenticated health/status responses remain exactly `status` plus `ready`, and unauthenticated overload remains `{level}`.
 
 A **shared single-use replay authority** outage is a readiness failure, not a coarse degradation (issues #3834 / #3837). `hmac_auth` with `replay_scope: "shared"` and `jwks_auth` providers with `dpop_replay_scope: "shared"` claim every proof against Redis and have **no local fallback** by design, so while that backend is unavailable every protected request on those policies fails closed. `/health` and `/status` therefore return 503 with `ready: false` and `status: "unavailable"`, and authenticated callers additionally receive `replay_authority` — exactly two fixed-cardinality counters, `shared_authorities` and `shared_authorities_unavailable`, read from the same precomputed lock-free snapshot `/metrics/runtime` uses. Never an endpoint, host, namespace, plugin id, provider, key prefix, credential, marker, or backend error string; unauthenticated `/health` still carries only `status` and `ready`. The block is present only when at least one committed live plugin generation has `shared` scope; construction and validation of a candidate do not register that dependency, start recovery, or dial Redis. A retired plugin generation drops out of it immediately, so a rebuilt plugin cache can neither hold readiness down nor inflate the aggregate. Recovery is automatic: the Redis client's background recovery checker republishes availability and the next probe is ready again, with no restart and no config reload. `/live` is unaffected.
 
@@ -1656,7 +1658,7 @@ Use cases:
 
 ### `POST /backend-capabilities/refresh`
 
-Force an immediate, synchronous classification pass over every HTTP-family backend in the current config. Blocks until every probe completes (bounded by `FERRUM_POOL_WARMUP_CONCURRENCY` parallelism + per-probe timeout).
+Force an immediate, synchronous classification pass over every HTTP-family backend in the current config. Blocks until the coalesced refresh pass completes (bounded by `FERRUM_POOL_WARMUP_CONCURRENCY` parallelism + per-probe timeout). Concurrent requests collapse onto the shared `RefreshCoalescer`, so at most one probe fan-out runs at a time; additional callers wait for the in-flight pass instead of spawning duplicate work.
 
 This operational recovery endpoint is available in every proxy-serving mode,
 including read-only file, DP, and mesh admin states. It does not persist a
@@ -1666,11 +1668,19 @@ configuration or database mutation and still requires a valid admin JWT.
 curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:9000/backend-capabilities/refresh
 ```
 
-Response:
+Response when this request drove the pass:
 
 ```json
 {
   "status": "refreshed"
+}
+```
+
+Response when a refresh was already in flight and this request joined it:
+
+```json
+{
+  "status": "joined"
 }
 ```
 
@@ -1804,7 +1814,7 @@ Returns `404 Not Found` outside mesh mode (no `mesh_runtime_state`). Returns `20
 
 ## Mesh Config Revision Reset (mesh mode)
 
-`POST /mesh/config-revision/reset` clears this DP's accepted authoritative config revision so the next mesh slice from **any** config authority is eligible again. Requires JWT authentication and the **`operator`** role (`403 Forbidden` without it). Returns `404 Not Found` outside mesh mode. On success returns `200 OK`:
+`POST /mesh/config-revision/reset` clears this DP's accepted authoritative config revision so the next mesh slice from **any** config authority is eligible again. Requires JWT authentication and the **`operator`** role (`403 Forbidden` without it). Returns `404 Not Found` outside mesh mode. This lowers a fail-closed freshness guard, so it requires explicit operator confirmation via `?confirm=true` (same pattern as destructive namespace and restore operations) and leaves a durable audit record when `FERRUM_ADMIN_AUDIT_ENABLED` is on. On success returns `200 OK`:
 
 ```json
 {
@@ -1821,7 +1831,7 @@ Returns `404 Not Found` outside mesh mode (no `mesh_runtime_state`). Returns `20
 Use this for the one case that is never auto-adopted: a sequence rewind **inside** one authority (for example a config store restored from backup without bumping `FERRUM_MESH_CONFIG_AUTHORITY_ID`). Foreign-authority adoption uses `FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS` instead; fleet-wide ordering-domain resets are preferably done by bumping `FERRUM_MESH_CONFIG_AUTHORITY_ID` or `FERRUM_MESH_CONFIG_K8S_AUTHORITY_ID` so every DP adopts through the normal grace period without a per-DP call. The reset installs nothing itself — the next slice still has to pass subscription binding and update validation. Pair with `GET /mesh/config-drift` to confirm convergence after recovery.
 
 ```bash
-curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:9000/mesh/config-revision/reset
+curl -X POST -H "Authorization: Bearer $TOKEN" "http://localhost:9000/mesh/config-revision/reset?confirm=true"
 ```
 
 ## Mesh Slice Drift (CP mode)

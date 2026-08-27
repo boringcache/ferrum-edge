@@ -652,3 +652,73 @@ fn snapshot_includes_node_waypoint_drop_counters() {
     assert_eq!(snap.node_waypoint_drops.missing_workload_hash, 2);
     assert_eq!(snap.node_waypoint_drops.hash_mismatch, 0);
 }
+
+#[test]
+fn overload_fd_sample_runs_on_blocking_pool() {
+    let src = include_str!("../../../src/overload.rs");
+    assert!(
+        src.contains("tokio::task::spawn_blocking(count_open_fds)"),
+        "FD sampling must leave the tokio worker via spawn_blocking"
+    );
+    assert!(
+        src.contains("linux_fd_count_from_stat"),
+        "Linux must prefer the kernel open-FD aggregate when procfs reports it"
+    );
+    assert!(
+        src.contains("linux_fd_count_from_walk"),
+        "Linux must keep a directory-walk fallback when the aggregate is unavailable"
+    );
+}
+
+#[test]
+fn system_sampler_runs_on_blocking_pool() {
+    let src = include_str!("../../../src/system_metrics.rs");
+    assert!(
+        src.contains("tokio::task::spawn_blocking(SystemSampler::new)"),
+        "system sampler construction must not block a worker"
+    );
+    assert!(
+        src.contains("tokio::task::spawn_blocking(move ||"),
+        "system sampler ticks must not block a worker"
+    );
+    assert!(
+        src.contains("read_line"),
+        "/proc/stat must be consumed by read_line, not a full-file read_to_string"
+    );
+    assert!(
+        !src.contains("read_to_string(\"/proc/stat\")"),
+        "must not slurp all of /proc/stat just to parse the first line"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn overload_monitor_publishes_fd_current() {
+    let state = Arc::new(OverloadState::new());
+    let config = OverloadConfig {
+        check_interval_ms: 1,
+        ..OverloadConfig::default()
+    };
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let monitor = ferrum_edge::overload::start_monitor(state.clone(), config, 1000, 0, shutdown_rx);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let fd_current = state.fd_current.load(Ordering::Relaxed);
+            if fd_current > 0 && fd_current < u64::MAX {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("overload monitor did not publish a live fd_current");
+
+    shutdown_tx
+        .send(true)
+        .expect("monitor shutdown receiver should still be alive");
+    tokio::time::timeout(Duration::from_secs(1), monitor)
+        .await
+        .expect("overload monitor did not stop")
+        .expect("overload monitor task panicked");
+}

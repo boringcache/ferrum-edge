@@ -8,8 +8,8 @@
 use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy, ResolvedPortOverride,
-    ResponseBodyMode, UpstreamTarget,
+    AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
+    Proxy, ResolvedPortOverride, ResponseBodyMode, Upstream, UpstreamTarget,
 };
 use ferrum_edge::connection_pool::ConnectionPool;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -19,10 +19,12 @@ use ferrum_edge::proxy::backend_capabilities::{
 };
 use ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool;
 use ferrum_edge::proxy::http2_pool::Http2ConnectionPool;
+use ferrum_edge::tls::backend::pool_key_host_port_prefix;
 use ferrum_edge::tls::source::SYSTEM_TRUST_ROOTS_SOURCE;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::Once;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Build a minimal `Proxy` with sensible defaults for pool key testing.
 fn minimal_proxy() -> Proxy {
@@ -1999,4 +2001,406 @@ fn h2_and_grpc_pool_keys_partition_configured_versus_default_h2_cap() {
         grpc_configured.contains("|64|") && grpc_default.contains("|none|"),
         "configured/default gRPC keys must use decimal/`none` sentinels: {grpc_configured} / {grpc_default}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// TLS-config cache keys are TLS identity, not per-endpoint pool keys
+// ---------------------------------------------------------------------------
+
+fn tls_cache_key(proxy: &Proxy) -> String {
+    Http2ConnectionPool::tls_config_cache_key_for_warmup(proxy, None)
+}
+
+#[test]
+fn tls_config_cache_key_ignores_host_port_dns_override_and_subset() {
+    let mut host_a = minimal_proxy();
+    host_a.backend_host = "10.0.0.1".to_string();
+    host_a.backend_port = 8080;
+    let mut host_b = host_a.clone();
+    host_b.backend_host = "10.0.0.2".to_string();
+    host_b.backend_port = 9090;
+
+    assert_eq!(
+        tls_cache_key(&host_a),
+        tls_cache_key(&host_b),
+        "TLS cache key must not partition on backend_host/backend_port"
+    );
+    assert_ne!(
+        Http2ConnectionPool::pool_key_for_warmup(&host_a),
+        Http2ConnectionPool::pool_key_for_warmup(&host_b),
+        "connection pool keys must still partition on host/port"
+    );
+    assert_ne!(
+        GrpcConnectionPool::pool_key_for_warmup(&host_a),
+        GrpcConnectionPool::pool_key_for_warmup(&host_b),
+        "gRPC connection pool keys must still partition on host/port"
+    );
+
+    let mut dns = host_a.clone();
+    dns.dns_override = Some("192.0.2.10".to_string());
+    assert_eq!(
+        tls_cache_key(&host_a),
+        tls_cache_key(&dns),
+        "TLS cache key must not partition on dns_override"
+    );
+    assert_ne!(
+        Http2ConnectionPool::pool_key_for_warmup(&host_a),
+        Http2ConnectionPool::pool_key_for_warmup(&dns),
+        "connection pool keys must still partition on dns_override"
+    );
+
+    let mut subset = host_a.clone();
+    subset.upstream_subset = Some("v2".to_string());
+    assert_eq!(
+        tls_cache_key(&host_a),
+        tls_cache_key(&subset),
+        "TLS cache key must not partition on upstream_subset"
+    );
+    assert_ne!(
+        Http2ConnectionPool::pool_key_for_warmup(&host_a),
+        Http2ConnectionPool::pool_key_for_warmup(&subset),
+        "connection pool keys must still partition on subset"
+    );
+
+    assert_eq!(
+        GrpcConnectionPool::tls_config_cache_key_for_warmup(&host_a, None),
+        GrpcConnectionPool::tls_config_cache_key_for_warmup(&host_b, None),
+        "gRPC TLS cache key must match H2: host/port are not TLS identity"
+    );
+}
+
+#[test]
+fn tls_config_cache_key_partitions_on_resolved_tls_and_svid_generation() {
+    let mut base = minimal_proxy();
+    base.resolved_tls.server_ca_cert_path = Some("/certs/ca.pem".to_string());
+    let mut other_ca = base.clone();
+    other_ca.resolved_tls.server_ca_cert_path = Some("/certs/other-ca.pem".to_string());
+
+    assert_ne!(
+        tls_cache_key(&base),
+        tls_cache_key(&other_ca),
+        "distinct CA paths must partition the TLS cache"
+    );
+
+    let mut no_verify = base.clone();
+    no_verify.resolved_tls.verify_server_cert = false;
+    assert_ne!(
+        tls_cache_key(&base),
+        tls_cache_key(&no_verify),
+        "verify flag must partition the TLS cache"
+    );
+
+    assert_ne!(
+        Http2ConnectionPool::tls_config_cache_key_for_warmup(&base, Some(1)),
+        Http2ConnectionPool::tls_config_cache_key_for_warmup(&base, Some(2)),
+        "SVID generation must partition the TLS cache"
+    );
+    assert_eq!(
+        Http2ConnectionPool::tls_config_cache_key_for_warmup(&base, Some(1)),
+        GrpcConnectionPool::tls_config_cache_key_for_warmup(&base, Some(1)),
+        "H2 and gRPC TLS cache keys must agree for the same trust identity"
+    );
+}
+
+#[tokio::test]
+async fn reqwest_tls_config_cache_key_ignores_host_when_direct_backend() {
+    let pool = pool_with_defaults();
+    let mut host_a = minimal_proxy();
+    host_a.backend_scheme = Some(BackendScheme::Https);
+    host_a.backend_host = "10.0.0.1".to_string();
+    let mut host_b = host_a.clone();
+    host_b.backend_host = "10.0.0.2".to_string();
+
+    assert_eq!(
+        pool.tls_config_cache_key_for_warmup(&host_a),
+        pool.tls_config_cache_key_for_warmup(&host_b),
+        "H3/reqwest TLS cache key must not partition on backend_host"
+    );
+    assert_ne!(
+        pool.pool_key_for_warmup(&host_a),
+        pool.pool_key_for_warmup(&host_b),
+        "direct reqwest pool keys must still partition on host"
+    );
+}
+
+#[test]
+fn pool_key_host_port_prefix_reads_first_two_fields() {
+    let key = Http2ConnectionPool::pool_key_for_warmup(&minimal_proxy());
+    assert_eq!(
+        pool_key_host_port_prefix(&key),
+        Some("backend.example.com|8080|"),
+        "prefix must be escaped_host|port|: {key}"
+    );
+    assert_eq!(pool_key_host_port_prefix("no-delimiter"), None);
+}
+
+// ---------------------------------------------------------------------------
+// Config-reload reclaim: endpoint churn must not grow side maps unbounded
+// ---------------------------------------------------------------------------
+
+static INIT_CRYPTO: Once = Once::new();
+
+fn ensure_crypto_provider() {
+    INIT_CRYPTO.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+fn test_client_config() -> rustls::ClientConfig {
+    let provider = Arc::new(ferrum_edge::fips::base_crypto_provider());
+    rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("default protocol versions")
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth()
+}
+
+fn make_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
+    let now = Utc::now();
+    Upstream {
+        id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        name: None,
+        targets,
+        algorithm: LoadBalancerAlgorithm::RoundRobin,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        subsets: None,
+        port_overrides: HashMap::new(),
+        source_locality: None,
+        source_labels: HashMap::new(),
+        locality_lb_strict: false,
+        locality_lb_setting: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
+        resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+        k8s_service_uid: None,
+        pending_limit_scope: None,
+    }
+}
+
+fn make_target(host: &str, port: u16) -> UpstreamTarget {
+    UpstreamTarget {
+        host: host.to_string(),
+        port,
+        service_port_policy_key: None,
+        weight: 1,
+        tags: HashMap::new(),
+        locality: None,
+        path: None,
+    }
+}
+
+fn proxy_at(host: &str, port: u16) -> Proxy {
+    let mut proxy = minimal_proxy();
+    proxy.backend_host = host.to_string();
+    proxy.backend_port = port;
+    proxy
+}
+
+#[tokio::test]
+async fn backend_tls_config_cache_shares_arc_across_hosts() {
+    ensure_crypto_provider();
+    let pool = Http2ConnectionPool::default();
+    let cache = pool.backend_tls_config_cache();
+    let builds = AtomicUsize::new(0);
+
+    let mut first_arc = None;
+    for i in 0..16 {
+        let proxy = proxy_at(&format!("10.0.0.{i}"), 8080);
+        let key = tls_cache_key(&proxy);
+        let config = cache
+            .get_or_try_build(key, || {
+                builds.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, String>(test_client_config())
+            })
+            .expect("tls config");
+        first_arc.get_or_insert(config);
+    }
+
+    assert_eq!(
+        builds.load(Ordering::Relaxed),
+        1,
+        "identical trust configs must not rebuild per pod IP"
+    );
+    assert_eq!(cache.len(), 1);
+    let first = first_arc.expect("inserted");
+    let shared = cache
+        .get_or_try_build(tls_cache_key(&proxy_at("10.0.0.99", 8080)), || {
+            Ok::<_, String>(test_client_config())
+        })
+        .expect("shared lookup");
+    assert!(Arc::ptr_eq(&first, &shared));
+}
+
+#[tokio::test]
+async fn rr_counters_do_not_grow_unbounded_under_endpoint_churn() {
+    let pool = Http2ConnectionPool::default();
+    let live = proxy_at("10.0.0.1", 8080);
+    let live_key = Http2ConnectionPool::pool_key_for_warmup(&live);
+
+    for i in 1..=32 {
+        pool.insert_rr_counter_for_tests(Http2ConnectionPool::pool_key_for_warmup(&proxy_at(
+            &format!("10.0.0.{i}"),
+            8080,
+        )));
+    }
+    assert_eq!(pool.rr_counter_len(), 32);
+
+    pool.retain_live_from_config(&GatewayConfig {
+        proxies: vec![live.clone()],
+        ..GatewayConfig::default()
+    });
+
+    assert_eq!(
+        pool.rr_counter_len(),
+        1,
+        "withdrawn pod IPs must not retain rr_counters"
+    );
+    assert!(
+        pool.contains_rr_counter(&live_key),
+        "the still-configured endpoint must keep its rr_counter"
+    );
+}
+
+#[tokio::test]
+async fn rr_counters_keep_live_upstream_target_and_drop_churned_pods() {
+    let pool = Http2ConnectionPool::default();
+    let mut proxy = proxy_at("reviews.default.svc", 8080);
+    proxy.upstream_id = Some("reviews".to_string());
+
+    let live_target_key = Http2ConnectionPool::pool_key_for_warmup(&proxy_at("10.0.0.7", 8080));
+    let stale_target_key = Http2ConnectionPool::pool_key_for_warmup(&proxy_at("10.0.0.8", 8080));
+    let service_key = Http2ConnectionPool::pool_key_for_warmup(&proxy);
+
+    pool.insert_rr_counter_for_tests(live_target_key.clone());
+    pool.insert_rr_counter_for_tests(stale_target_key.clone());
+    pool.insert_rr_counter_for_tests(service_key.clone());
+
+    pool.retain_live_from_config(&GatewayConfig {
+        proxies: vec![proxy],
+        upstreams: vec![make_upstream(
+            "reviews",
+            vec![make_target("10.0.0.7", 8080)],
+        )],
+        ..GatewayConfig::default()
+    });
+
+    assert!(pool.contains_rr_counter(&live_target_key));
+    assert!(pool.contains_rr_counter(&service_key));
+    assert!(
+        !pool.contains_rr_counter(&stale_target_key),
+        "a withdrawn pod IP must lose its rr_counter"
+    );
+    assert_eq!(pool.rr_counter_len(), 2);
+}
+
+#[tokio::test]
+async fn grpc_rr_counters_and_tls_cache_reclaim_stale_endpoints() {
+    ensure_crypto_provider();
+    let pool = GrpcConnectionPool::default();
+    let live = proxy_at("10.0.0.1", 8080);
+    let live_key = GrpcConnectionPool::pool_key_for_warmup(&live);
+
+    for i in 1..=8 {
+        pool.insert_rr_counter_for_tests(GrpcConnectionPool::pool_key_for_warmup(&proxy_at(
+            &format!("10.1.0.{i}"),
+            8080,
+        )));
+    }
+    pool.insert_rr_counter_for_tests(live_key.clone());
+    assert_eq!(pool.rr_counter_len(), 9);
+
+    let cache = pool.backend_tls_config_cache();
+    let live_tls = GrpcConnectionPool::tls_config_cache_key_for_warmup(&live, None);
+    let mut stale_tls_proxy = live.clone();
+    stale_tls_proxy.resolved_tls.server_ca_cert_path = Some("/certs/stale-ca.pem".to_string());
+    let stale_tls = GrpcConnectionPool::tls_config_cache_key_for_warmup(&stale_tls_proxy, None);
+    cache
+        .get_or_try_build(live_tls.clone(), || Ok::<_, String>(test_client_config()))
+        .expect("live tls");
+    cache
+        .get_or_try_build(stale_tls.clone(), || Ok::<_, String>(test_client_config()))
+        .expect("stale tls");
+    assert_eq!(cache.len(), 2);
+
+    pool.retain_live_from_config(&GatewayConfig {
+        proxies: vec![live],
+        ..GatewayConfig::default()
+    });
+
+    assert_eq!(pool.rr_counter_len(), 1);
+    assert!(pool.contains_rr_counter(&live_key));
+    assert!(cache.contains_key(&live_tls));
+    assert!(
+        !cache.contains_key(&stale_tls),
+        "withdrawn TLS identity must not stay cached"
+    );
+}
+
+#[tokio::test]
+async fn h2_tls_cache_retain_keeps_live_identity() {
+    ensure_crypto_provider();
+    let pool = Http2ConnectionPool::default();
+    let live = minimal_proxy();
+    let mut stale = live.clone();
+    stale.resolved_tls.client_cert_path = Some("/certs/client.pem".to_string());
+    stale.resolved_tls.client_key_path = Some("/certs/client.key".to_string());
+
+    let cache = pool.backend_tls_config_cache();
+    let live_key = tls_cache_key(&live);
+    let stale_key = tls_cache_key(&stale);
+    cache
+        .get_or_try_build(live_key.clone(), || Ok::<_, String>(test_client_config()))
+        .expect("live");
+    cache
+        .get_or_try_build(stale_key.clone(), || Ok::<_, String>(test_client_config()))
+        .expect("stale");
+
+    pool.retain_live_from_config(&GatewayConfig {
+        proxies: vec![live],
+        ..GatewayConfig::default()
+    });
+
+    assert!(cache.contains_key(&live_key));
+    assert!(!cache.contains_key(&stale_key));
+    assert_eq!(cache.len(), 1);
+}
+
+#[tokio::test]
+async fn h3_tls_cache_retain_keeps_live_identity() {
+    ensure_crypto_provider();
+    let pool = pool_with_defaults();
+    let live = minimal_proxy();
+    let mut stale = live.clone();
+    stale.resolved_tls.server_ca_cert_path = Some("/certs/stale-ca.pem".to_string());
+
+    let cache = pool.backend_tls_config_cache();
+    let live_key = pool.tls_config_cache_key_for_warmup(&live);
+    let stale_key = pool.tls_config_cache_key_for_warmup(&stale);
+    cache
+        .get_or_try_build(live_key.clone(), || Ok::<_, String>(test_client_config()))
+        .expect("live");
+    cache
+        .get_or_try_build(stale_key.clone(), || Ok::<_, String>(test_client_config()))
+        .expect("stale");
+
+    pool.retain_live_tls_configs_from_config(&GatewayConfig {
+        proxies: vec![live],
+        ..GatewayConfig::default()
+    });
+
+    assert!(cache.contains_key(&live_key));
+    assert!(!cache.contains_key(&stale_key));
+    assert_eq!(cache.len(), 1);
 }

@@ -3876,8 +3876,8 @@ fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy
         strip_listen_path: false,
         preserve_host_header: false,
         backend_connect_timeout_ms: 30_000,
-        backend_read_timeout_ms: 30_000,
-        backend_write_timeout_ms: 30_000,
+        backend_read_timeout_ms: MESH_L4_RELAY_BACKEND_IO_TIMEOUT_MS,
+        backend_write_timeout_ms: MESH_L4_RELAY_BACKEND_IO_TIMEOUT_MS,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
@@ -4446,8 +4446,8 @@ fn east_west_service_proxy(
         strip_listen_path: false,
         preserve_host_header: false,
         backend_connect_timeout_ms: 30_000,
-        backend_read_timeout_ms: 30_000,
-        backend_write_timeout_ms: 30_000,
+        backend_read_timeout_ms: MESH_L4_RELAY_BACKEND_IO_TIMEOUT_MS,
+        backend_write_timeout_ms: MESH_L4_RELAY_BACKEND_IO_TIMEOUT_MS,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: false,
@@ -6494,6 +6494,17 @@ fn mesh_inbound_loopback_proxy_to(
     }
 }
 
+/// Synthesized mesh L4 relays disable per-direction inactivity watermarks.
+/// `backend_read_timeout_ms` / `backend_write_timeout_ms` are per-direction
+/// watermarks (not HTTP response timeouts): the b2c watermark starts armed
+/// and refreshes only on backend reads, so a 30s default killed idle DB
+/// pools and one-way uploads (issue #4161). `0` disables. Bound the session
+/// with bidirectional `tcp_idle_timeout_seconds` (inherits
+/// `FERRUM_TCP_IDLE_TIMEOUT_SECONDS`; DestinationRule
+/// `connectionPool.tcp.idleTimeout` overlays via `dispatch_port_overrides`;
+/// `0` disables).
+const MESH_L4_RELAY_BACKEND_IO_TIMEOUT_MS: u64 = 0;
+
 /// Reserved id prefix for synthesized local raw-TCP inbound relay proxies.
 /// These proxies never enter `config.proxies`; they provide a stable proxy
 /// identity and timeout config for the accept-loop relay from captured
@@ -6521,8 +6532,8 @@ pub(crate) fn mesh_inbound_tcp_relay_proxy(route: &MeshInboundTcpRoute) -> Proxy
         strip_listen_path: false,
         preserve_host_header: false,
         backend_connect_timeout_ms: 5_000,
-        backend_read_timeout_ms: 30_000,
-        backend_write_timeout_ms: 30_000,
+        backend_read_timeout_ms: MESH_L4_RELAY_BACKEND_IO_TIMEOUT_MS,
+        backend_write_timeout_ms: MESH_L4_RELAY_BACKEND_IO_TIMEOUT_MS,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: false,
@@ -6567,7 +6578,8 @@ pub(crate) fn mesh_inbound_tcp_relay_proxy(route: &MeshInboundTcpRoute) -> Proxy
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        tcp_idle_timeout_seconds: Some(300),
+        // Inherit `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` (0 disables).
+        tcp_idle_timeout_seconds: None,
         websocket_idle_timeout_seconds: None,
         allowed_methods: None,
         allowed_ws_origins: Vec::new(),
@@ -6649,8 +6661,8 @@ fn mesh_inbound_connect_relay_proxy(id: &str, host: &str, port: u16) -> Proxy {
         strip_listen_path: false,
         preserve_host_header: true,
         backend_connect_timeout_ms: 5_000,
-        backend_read_timeout_ms: 30_000,
-        backend_write_timeout_ms: 30_000,
+        backend_read_timeout_ms: MESH_L4_RELAY_BACKEND_IO_TIMEOUT_MS,
+        backend_write_timeout_ms: MESH_L4_RELAY_BACKEND_IO_TIMEOUT_MS,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: false,
@@ -6695,7 +6707,8 @@ fn mesh_inbound_connect_relay_proxy(id: &str, host: &str, port: u16) -> Proxy {
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        tcp_idle_timeout_seconds: Some(300),
+        // Inherit `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` (0 disables).
+        tcp_idle_timeout_seconds: None,
         websocket_idle_timeout_seconds: None,
         allowed_methods: None,
         allowed_ws_origins: Vec::new(),
@@ -7842,8 +7855,8 @@ fn mesh_outbound_tcp_relay_proxy_with_id(
         strip_listen_path: false,
         preserve_host_header: false,
         backend_connect_timeout_ms: 5_000,
-        backend_read_timeout_ms: 30_000,
-        backend_write_timeout_ms: 30_000,
+        backend_read_timeout_ms: MESH_L4_RELAY_BACKEND_IO_TIMEOUT_MS,
+        backend_write_timeout_ms: MESH_L4_RELAY_BACKEND_IO_TIMEOUT_MS,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: false,
@@ -7888,9 +7901,9 @@ fn mesh_outbound_tcp_relay_proxy_with_id(
         backend_proxy_protocol: None,
         stream_match: None,
         compiled_stream_match: None,
-        // Matches the repo's stream-proxy idle default; long-lived idle DB
-        // connections past this are closed by the relay's idle watchdog.
-        tcp_idle_timeout_seconds: Some(300),
+        // Inherit `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` (0 disables). DestinationRule
+        // `connectionPool.tcp.idleTimeout` overlays via `dispatch_port_overrides`.
+        tcp_idle_timeout_seconds: None,
         websocket_idle_timeout_seconds: None,
         allowed_methods: None,
         allowed_ws_origins: Vec::new(),
@@ -9805,15 +9818,17 @@ fn apply_destination_rules(
             let has_service_discovery = upstream.service_discovery.is_some();
             let mesh_sd_selected_port = mesh_sd_selected_service_port(upstream, mesh_slice);
 
-            // Top-level `connectionPool.tcp.{maxConnections,tcpKeepalive}` fan
-            // out to every port served by this upstream. Per-port
-            // `portLevelSettings` may overwrite either field below. We only
+            // Top-level `connectionPool.tcp.{maxConnections,tcpKeepalive,idleTimeout}`
+            // fan out to every port served by this upstream. Per-port
+            // `portLevelSettings` may overwrite any field below. We only
             // expand when there is at least one target port; service-discovery
             // upstreams skip the fan-out because their target ports aren't
             // known at apply time (the per-port loop still applies if the
             // operator explicitly listed `portLevelSettings`).
             if let Some(ref tp) = dr.traffic_policy
-                && (tp.max_connections.is_some() || tp.tcp_keepalive.is_some())
+                && (tp.max_connections.is_some()
+                    || tp.tcp_keepalive.is_some()
+                    || tp.tcp_idle_timeout_seconds.is_some())
                 && !has_service_discovery
             {
                 for port in &upstream_policy_ports {
@@ -9823,6 +9838,9 @@ fn apply_destination_rules(
                     }
                     if let Some(ref keepalive) = tp.tcp_keepalive {
                         override_slot.tcp_keepalive = Some(keepalive.clone());
+                    }
+                    if let Some(idle) = tp.tcp_idle_timeout_seconds {
+                        override_slot.tcp_idle_timeout_seconds = Some(idle);
                     }
                 }
             }
@@ -10183,6 +10201,62 @@ fn apply_destination_rules(
                     }
                 }
             }
+
+            // Top-level / per-subset `connectionPool.tcp.idleTimeout` for
+            // proxies that live in `config.proxies` (east-west service,
+            // stream egress). Synthesized mesh L4 relays are NOT in
+            // `config.proxies`; they pick the same value up from
+            // `dispatch_port_overrides` (the fan-out above). `Some(0)` is an
+            // explicit disable, distinct from unset (`None` = inherit env).
+            let tcp_idle_timeout_seconds = dr
+                .traffic_policy
+                .as_ref()
+                .and_then(|tp| tp.tcp_idle_timeout_seconds);
+            let subset_tcp_idles: Vec<(String, u64)> = dr
+                .subsets
+                .iter()
+                .filter_map(|s| {
+                    s.traffic_policy
+                        .as_ref()
+                        .and_then(|tp| tp.tcp_idle_timeout_seconds)
+                        .map(|secs| (s.name.clone(), secs))
+                })
+                .collect();
+            if tcp_idle_timeout_seconds.is_some() || !subset_tcp_idles.is_empty() {
+                let upstream_id = upstream.id.clone();
+                let upstream_namespace = upstream.namespace.clone();
+                for proxy in &mut config.proxies {
+                    if proxy.upstream_id.as_deref() != Some(upstream_id.as_str())
+                        || proxy.namespace != upstream_namespace
+                    {
+                        continue;
+                    }
+                    let effective_idle = proxy
+                        .upstream_subset
+                        .as_deref()
+                        .and_then(|name| {
+                            subset_tcp_idles
+                                .iter()
+                                .find(|(n, _)| n == name)
+                                .map(|(_, secs)| *secs)
+                        })
+                        .or(tcp_idle_timeout_seconds);
+                    if let Some(idle) = effective_idle
+                        && proxy.tcp_idle_timeout_seconds != Some(idle)
+                    {
+                        debug!(
+                            proxy = %proxy.id,
+                            upstream = %upstream_id,
+                            subset = proxy.upstream_subset.as_deref().unwrap_or(""),
+                            previous = ?proxy.tcp_idle_timeout_seconds,
+                            new_seconds = idle,
+                            rule = %dr.name,
+                            "DestinationRule overriding proxy tcp_idle_timeout_seconds"
+                        );
+                        proxy.tcp_idle_timeout_seconds = Some(idle);
+                    }
+                }
+            }
         }
     }
 
@@ -10332,15 +10406,18 @@ fn apply_traffic_policy_to_port_override(
         .locality_lb_setting
         .as_ref()
         .map(into_upstream_locality);
-    // Per-port `connectionPool.tcp.{maxConnections,tcpKeepalive}`. Ferrum's
-    // documented port-level connectionPool contract is field-level merge:
-    // per-port fields win when set, while omitted fields keep any top-level
-    // fan-out value already present on the slot.
+    // Per-port `connectionPool.tcp.{maxConnections,tcpKeepalive,idleTimeout}`.
+    // Ferrum's documented port-level connectionPool contract is field-level
+    // merge: per-port fields win when set, while omitted fields keep any
+    // top-level fan-out value already present on the slot.
     if let Some(max_conn) = policy.max_connections {
         slot.max_connections = Some(max_conn);
     }
     if let Some(ref keepalive) = policy.tcp_keepalive {
         slot.tcp_keepalive = Some(keepalive.clone());
+    }
+    if let Some(idle) = policy.tcp_idle_timeout_seconds {
+        slot.tcp_idle_timeout_seconds = Some(idle);
     }
     // Per-port `connectionPool.http.*` follows the same field-level merge
     // contract as the TCP fields above.
@@ -12069,8 +12146,8 @@ fn stream_egress_gateway_proxy(
         strip_listen_path: false,
         preserve_host_header: false,
         backend_connect_timeout_ms: 30_000,
-        backend_read_timeout_ms: 30_000,
-        backend_write_timeout_ms: 30_000,
+        backend_read_timeout_ms: MESH_L4_RELAY_BACKEND_IO_TIMEOUT_MS,
+        backend_write_timeout_ms: MESH_L4_RELAY_BACKEND_IO_TIMEOUT_MS,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
@@ -22655,6 +22732,7 @@ mod tests {
                     6379u16,
                     MeshTrafficPolicy {
                         connect_timeout_ms: Some(4321),
+                        tcp_idle_timeout_seconds: Some(0),
                         ..MeshTrafficPolicy::default()
                     },
                 )]),
@@ -22679,6 +22757,14 @@ mod tests {
                 .and_then(|slot| slot.connect_timeout_ms),
             Some(4321),
             "TCP-port portLevelSettings must land on the service policy port"
+        );
+        assert_eq!(
+            upstream
+                .port_overrides
+                .get(&6379)
+                .and_then(|slot| slot.tcp_idle_timeout_seconds),
+            Some(0),
+            "TCP idleTimeout must land on the service policy port (0 disables)"
         );
         assert!(
             !upstream.port_overrides.contains_key(&6380),
@@ -23212,6 +23298,90 @@ mod tests {
         assert_eq!(tcp.dispatch_kind, DispatchKind::TcpRaw);
         assert_eq!(udp.backend_scheme, Some(BackendScheme::Udp));
         assert_eq!(udp.dispatch_kind, DispatchKind::UdpRaw);
+    }
+
+    fn assert_mesh_l4_relay_disables_per_direction_timeouts(proxy: &Proxy) {
+        assert_eq!(
+            proxy.backend_read_timeout_ms, 0,
+            "L4 relays must disable per-direction read inactivity ({})",
+            proxy.id
+        );
+        assert_eq!(
+            proxy.backend_write_timeout_ms, 0,
+            "L4 relays must disable per-direction write inactivity ({})",
+            proxy.id
+        );
+        assert_eq!(
+            proxy.tcp_idle_timeout_seconds, None,
+            "L4 relays inherit FERRUM_TCP_IDLE_TIMEOUT_SECONDS ({})",
+            proxy.id
+        );
+    }
+
+    #[test]
+    fn mesh_l4_relay_constructors_disable_per_direction_inactivity_timeouts() {
+        let inbound = mesh_inbound_tcp_relay_proxy(&MeshInboundTcpRoute {
+            match_port: 6379,
+            backend_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 6379)),
+            namespace: "default".to_string(),
+            service_name: "redis".to_string(),
+            service_fqdn: "redis.default.svc.cluster.local".to_string(),
+            tls_inspect: false,
+            first_bytes_inspect: false,
+        });
+        let inbound_hbone = mesh_inbound_hbone_relay_proxy("127.0.0.1", 6379);
+        let outbound = mesh_outbound_tcp_relay_proxy("default", "redis", 6379, "tcp-upstream");
+        let outbound_udp = mesh_outbound_udp_relay_proxy("default", "dns", 53, "udp-upstream");
+        let east_west = east_west_gateway_proxy(
+            &EastWestGateway {
+                name: "ew".to_string(),
+                namespace: "istio-system".to_string(),
+                host: "remote.example".to_string(),
+                port: 15443,
+                sni_hosts: vec!["*.example".to_string()],
+                trust_domain: None,
+                network: None,
+            },
+            15443,
+        );
+        let east_west_svc = east_west_service_proxy(
+            "ew-svc",
+            "reviews.default.svc.cluster.local",
+            "default",
+            "reviews-u",
+            15443,
+            chrono::Utc::now(),
+        );
+        let stream_egress = stream_egress_gateway_proxy(
+            "stream-egress",
+            "mongo.external",
+            "default",
+            BackendScheme::Tcp,
+            27017,
+            AppProtocol::Mongo,
+            "mongo-u",
+            false,
+            chrono::Utc::now(),
+        );
+
+        assert_mesh_l4_relay_disables_per_direction_timeouts(&inbound);
+        assert_mesh_l4_relay_disables_per_direction_timeouts(&inbound_hbone);
+        assert_mesh_l4_relay_disables_per_direction_timeouts(&outbound);
+        assert_mesh_l4_relay_disables_per_direction_timeouts(&outbound_udp);
+        assert_mesh_l4_relay_disables_per_direction_timeouts(&east_west);
+        assert_mesh_l4_relay_disables_per_direction_timeouts(&east_west_svc);
+        assert_mesh_l4_relay_disables_per_direction_timeouts(&stream_egress);
+
+        let http_inbound = mesh_inbound_loopback_proxy_to(
+            "reviews-in",
+            vec!["reviews.default.svc.cluster.local".to_string()],
+            "default",
+            "127.0.0.1",
+            8080,
+            chrono::Utc::now(),
+        );
+        assert_eq!(http_inbound.backend_read_timeout_ms, 30_000);
+        assert_eq!(http_inbound.backend_write_timeout_ms, 30_000);
     }
 
     #[test]

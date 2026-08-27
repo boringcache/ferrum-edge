@@ -6,6 +6,7 @@ use ferrum_edge::_test_support::{
     request_deduplication_expire_completed_entries_for_test,
     request_deduplication_expire_execution_barriers_for_test,
     request_deduplication_expire_inflight_entries_for_test,
+    request_deduplication_inflight_count_snapshot_for_test,
     request_deduplication_logical_keys_from_context_for_test,
     request_deduplication_redis_cached_response_payload_is_valid,
     request_deduplication_redis_payload_for_test,
@@ -4837,7 +4838,7 @@ async fn test_total_retained_bytes_cap_skips_new_completion() {
 }
 
 #[tokio::test]
-async fn test_redis_total_cap_publish_failure_keeps_local_inflight() {
+async fn test_unowned_redis_total_cap_skip_clears_inflight() {
     let plugin = make_plugin(json!({
         "sync_mode": "redis",
         "redis_url": "redis://127.0.0.1:1/0",
@@ -4874,7 +4875,12 @@ async fn test_redis_total_cap_publish_failure_keeps_local_inflight() {
     complete_response_with_body(&plugin, &mut ctx2, &body).await;
 
     assert_eq!(assert_completed_size_exact(&plugin), first_size);
-    assert_eq!(plugin.tracked_keys_count(), Some(2));
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert_eq!(
+        request_deduplication_inflight_count_snapshot_for_test(&plugin),
+        0,
+        "unowned total-cap skip must clear the in-flight marker and counter"
+    );
 
     let mut retry_ctx = new_ctx("POST", "/api");
     let mut retry_headers = HashMap::new();
@@ -4885,12 +4891,51 @@ async fn test_redis_total_cap_publish_failure_keeps_local_inflight() {
     let result = plugin
         .before_proxy(&mut retry_ctx, &mut retry_headers)
         .await;
-    match result {
-        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 409),
-        other => {
-            panic!("Expected Redis publish failure to preserve local in-flight lock, got {other:?}")
-        }
-    }
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "completed request must not wedge its own idempotency key when Redis is configured but unowned"
+    );
+}
+
+#[tokio::test]
+async fn test_unowned_redis_entry_too_large_skip_clears_inflight() {
+    let plugin = make_plugin(json!({
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:1/0",
+        "redis_connect_timeout_seconds": 1,
+        "on_redis_unavailable": "local_only",
+        "max_entry_size_bytes": 1,
+        "max_total_size_bytes": 8192
+    }));
+
+    let mut ctx1 = new_ctx("POST", "/api");
+    let mut headers1 = HashMap::new();
+    headers1.insert(
+        "idempotency-key".to_string(),
+        "redis-entry-too-large".to_string(),
+    );
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+    complete_response_with_body(&plugin, &mut ctx1, b"too large").await;
+
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
+    assert_eq!(assert_completed_size_exact(&plugin), 0);
+    assert_eq!(
+        request_deduplication_inflight_count_snapshot_for_test(&plugin),
+        0
+    );
+
+    let mut ctx2 = new_ctx("POST", "/api");
+    let mut headers2 = HashMap::new();
+    headers2.insert(
+        "idempotency-key".to_string(),
+        "redis-entry-too-large".to_string(),
+    );
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "entry-too-large completion must clear in-flight state even when Redis is configured but unowned"
+    );
 }
 
 #[tokio::test]

@@ -1057,6 +1057,19 @@ impl MetricsRegistry {
         self.render_cache.store(Arc::new(None));
     }
 
+    /// Current `,namespace="…"` label fragment, empty until [`Self::configure`]
+    /// publishes the gateway namespace.
+    ///
+    /// Exposed so renderers outside this registry (the data-path families in
+    /// [`crate::data_path_metrics`]) label their series identically instead of
+    /// re-deriving the namespace from environment config.
+    pub fn namespace_label_fragment(&self) -> String {
+        self.namespace_label
+            .read()
+            .map(|label| label.clone())
+            .unwrap_or_default()
+    }
+
     pub fn record_stream(&self, summary: &StreamTransactionSummary) {
         let proxy_id: Arc<str> = Arc::from(summary.proxy_id.as_str());
 

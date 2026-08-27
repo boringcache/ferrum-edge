@@ -4686,6 +4686,7 @@ pub(crate) fn classify_dtls_recv_loop_exit(
         Err(join_err) if join_err.is_cancelled() => {
             anyhow::anyhow!("DTLS server recv loop was cancelled unexpectedly")
         }
+        #[cfg(panic = "unwind")]
         Err(join_err) if join_err.is_panic() => {
             anyhow::anyhow!("DTLS server recv loop panicked: {join_err}")
         }

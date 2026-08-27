@@ -1108,13 +1108,16 @@ pub async fn run(
 }
 
 /// Await DP serving-listener handles concurrently and trigger shared shutdown
-/// on the first panic so siblings can exit.
+/// on the first unexpected join so siblings can exit.
 ///
 /// Mirrors mesh / file-mode listener supervision: empty handle sets wait on
-/// the shutdown watch channel (stream-only deployments), and panics propagate
-/// as `Err` after draining remaining listeners. Long-lived bridge tasks must
-/// not be passed here — keep them on the background drain path so a pending
-/// earlier handle cannot mask a later listener panic (issue #2368).
+/// the shutdown watch channel (stream-only deployments), and panics (in
+/// `panic = "unwind"` builds) propagate as `Err` after draining remaining
+/// listeners. Shipping profiles set `panic = "abort"` (issue #4166), so a
+/// listener panic terminates the process before this helper can join it.
+/// Long-lived bridge tasks must not be passed here — keep them on the
+/// background drain path so a pending earlier handle cannot mask a later
+/// listener failure (issue #2368).
 pub(crate) async fn await_dp_listener_handles(
     listener_handles: Vec<JoinHandle<()>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,

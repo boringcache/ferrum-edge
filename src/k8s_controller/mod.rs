@@ -490,12 +490,13 @@ async fn await_controller_tasks(
                     // The task was aborted by *this* path, so a cancellation
                     // JoinError is the expected terminal state and must not be
                     // double-counted as a separate failure. A panic racing the
-                    // abort is logged but keeps the `timed_out` classification
-                    // for the same reason.
-                    let name = names.get(index).cloned().unwrap_or_default();
+                    // abort can only be observed in `panic = "unwind"` builds;
+                    // shipping profiles abort the process first (issue #4166).
+                    #[cfg(panic = "unwind")]
                     if let Err(err) = &joined
                         && err.is_panic()
                     {
+                        let name = names.get(index).cloned().unwrap_or_default();
                         error!(
                             task = %name,
                             error = %err,
@@ -503,6 +504,8 @@ async fn await_controller_tasks(
                              grace deadline"
                         );
                     }
+                    #[cfg(panic = "abort")]
+                    let _ = joined;
                     confirmed.insert(index);
                 }
                 Ok(None) => break,
@@ -553,7 +556,9 @@ fn classify_completion(
         Ok(_) => TaskDisposition::ExitedBeforeShutdown,
         // A panic inside the task unwinds through the lifecycle wrapper, so it
         // never records a completion; the same arm also covers a cancellation
-        // from outside this shutdown path.
+        // from outside this shutdown path. `panicked` is true only in
+        // `panic = "unwind"` builds; shipping profiles abort the process
+        // before a JoinError exists (issue #4166).
         Err(err) => TaskDisposition::Failed(K8sControllerTaskFailure {
             task: name,
             panicked: err.is_panic(),

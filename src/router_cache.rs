@@ -3735,10 +3735,13 @@ fn make_cache_key(
 /// Folding changes a path's segment structure, so a folded route decision
 /// could still disagree with a backend that does not decode; rejecting cannot.
 /// This function is therefore the identity on any request path the router now
-/// sees, and is retained only as a defense-in-depth residual for callers that
-/// do not enter through that boundary (mesh authz normalization, listen-path
-/// stripping in the backend-URL builders). It is not a second normalization
-/// model — do not extend it, extend `src/policy_path.rs`.
+/// sees, and is retained only as a defense-in-depth residual for the
+/// listen-path stripping in the backend-URL builders, which re-derives an
+/// offset in the same coordinate system the router measured it in. It is not a
+/// second normalization model — do not extend it, extend `src/policy_path.rs`.
+/// Mesh authorization used to be the other residual caller; since issue #4149
+/// it canonicalizes through `src/policy_path.rs` like every other policy
+/// surface, because folding cannot close the dot-segment half of issue #1701.
 ///
 /// Configured `listen_path` values are admitted by
 /// `non_canonical_listen_path_reason` in `src/config/types.rs`, which

@@ -164,6 +164,58 @@ Emitted after `FERRUM_K8S_CONTROLLER_ENABLED=true` starts the Kubernetes control
 
 **Suggested alert:** `increase(ferrum_k8s_controller_istio_status_retry_exhausted_total[15m]) > 0`. Confirm a competing status writer and that Ferrum still merges only `Ferrum*` conditions. See [Istio CRD Status](mesh.md#istio-crd-status).
 
+### Data-path load shedding, upstream health, and pool saturation
+
+Sampled on the authenticated `/metrics` scrape from state the gateway already maintains — the `OverloadState` atomics, the two-layer `HealthChecker` maps, the shared circuit-breaker cache, and each pool's own resident count. Nothing is added to the proxy hot path to publish them, and no series is keyed by a resolved endpoint address, peer IP, SNI, or certificate field.
+
+Everything except `ferrum_backend_retry_attempts_total` and `ferrum_frontend_tls_handshake_failures_total` requires a running data path, so `cp` and `node_agent` scrapes stay silent rather than reporting zeros for listeners they never bind.
+
+#### Load shedding
+
+| Family | Type | Labels | Guidance |
+|--------|------|--------|----------|
+| `ferrum_overload_level` | gauge | `namespace` | `0` normal, `1` pressure (keepalive shedding), `2` critical (rejecting new connections or requests). The single series to graph next to 5xx rate. |
+| `ferrum_overload_shedding_active` | gauge | `action`, `namespace` | One series per progressive action (`disable_keepalive`, `reject_new_connections`, `reject_new_requests`), `1` while engaged. All three are emitted every scrape so recovery is a value change, not a vanishing series. |
+| `ferrum_overload_red_drop_probability_ratio` | gauge | `namespace` | RED probabilistic keepalive shedding between the pressure and critical thresholds, as a ratio in `[0,1]`. A sustained non-zero value means the gateway is already shedding before any hard reject. |
+| `ferrum_overload_resource_current` / `ferrum_overload_resource_limit` | gauge | `resource`, `namespace` | The overload monitor's own view of `fd`, `connections`, and `requests`. Alert on `current / limit`, which is exactly what drives the 80/85/95% thresholds. |
+| `ferrum_overload_active_connections` / `ferrum_overload_active_requests` | gauge | `namespace` | Live RAII-guard counters, updated per connection/stream rather than per monitor tick. Use these for sub-tick resolution; use `resource_current` to reason about the thresholds. |
+| `ferrum_overload_port_exhaustion_events_total` | counter | `namespace` | Ephemeral-port exhaustion (`EADDRNOTAVAIL`). Any sustained increase means backend dials are failing before reaching the network. |
+| `ferrum_overload_draining` | gauge | `namespace` | `1` between SIGTERM and process exit. Expected to be `1` during a rolling restart; unexpected elsewhere. |
+| `ferrum_overload_event_loop_latency_seconds` | gauge | `namespace` | Most recent tokio scheduling delay. The 500ms critical threshold trips connection rejection. |
+
+**Suggested alert:** `max by (namespace) (ferrum_overload_level) >= 2` for 2m, or `ferrum_overload_resource_current / ferrum_overload_resource_limit > 0.85` for 5m. Both answer "why are requests being shed?" without polling a JWT-gated JSON endpoint.
+
+#### Upstream health and circuit breakers
+
+| Family | Type | Labels | Guidance |
+|--------|------|--------|----------|
+| `ferrum_upstream_targets` | gauge | `upstream_id`, `upstream_namespace`, `namespace` | Targets configured on the upstream, including service-discovery resolved endpoints. The denominator for the ejection ratio. |
+| `ferrum_upstream_unhealthy_targets` | gauge | `upstream_id`, `upstream_namespace`, `namespace` | Targets an **active** probe has ejected. Active ejection is upstream-scoped and shared by every proxy using that upstream. |
+| `ferrum_proxy_passive_unhealthy_targets` | gauge | `proxy_id`, `proxy_namespace`, `namespace` | Targets this proxy has ejected from **passive** (traffic-based) health checking. Passive state is per proxy by design: proxy A's failures never eject targets for proxy B, even on a shared upstream. |
+| `ferrum_circuit_breakers` | gauge | `proxy_id`, `proxy_namespace`, `state`, `namespace` | Breakers resident for the proxy, counted per state (`closed`, `open`, `half_open`). Per-target breakers are aggregated into this count deliberately — see cardinality below. |
+| `ferrum_circuit_breaker_cache_entries` / `ferrum_circuit_breaker_cache_max_entries` | gauge | `namespace` | Shared breaker-cache occupancy against its admission ceiling. At the ceiling, new proxy/target breakers stop being admitted. |
+
+**Suggested alert:** `ferrum_upstream_unhealthy_targets / ferrum_upstream_targets > 0.5` for 5m (an upstream is more than half ejected), and `max by (proxy_id) (ferrum_circuit_breakers{state="open"}) > 0` for 5m. To identify *which* target, read authenticated `GET /admin/metrics` — `health_check.unhealthy_targets[]` and `circuit_breakers[]` carry the `host:port` that the metric surface deliberately omits.
+
+#### Backend retries, pools, and frontend TLS admission
+
+| Family | Type | Labels | Guidance |
+|--------|------|--------|----------|
+| `ferrum_backend_retry_attempts_total` | counter | `namespace` | Retries scheduled by the retry policy across every dispatch transport (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, raw TCP). Compare against `ferrum_requests_total` to measure retry amplification. |
+| `ferrum_connection_pool_entries` | gauge | `pool`, `namespace` | Resident entries per backend pool. `pool="http"` counts cached reqwest clients (one per distinct pool key); `grpc`, `http2`, `http3`, `hbone`, and `mesh_mtls` count live multiplexed connections. |
+| `ferrum_connection_pool_max_idle_per_host` | gauge | `namespace` | Configured idle ceiling per backend host for the reqwest pool. |
+| `ferrum_frontend_tls_handshake_failures_total` | counter | `reason`, `namespace` | Frontend TLS handshakes refused before any HTTP work, `reason` in `{timeout, error}`. Covers every rustls-terminating listener that routes through the shared frontend admission helper: HTTPS/H2 proxy, TCP+TLS stream proxies, admin TLS, CP gRPC TLS, and the injector webhook. HTTP/3 (QUIC) and DTLS use their own handshake machinery and are **not** counted here. |
+
+**Suggested alert:** `increase(ferrum_frontend_tls_handshake_failures_total{reason="error"}[10m]) > 0` after a client-CA or CRL rollout — TLS material is static per process, so a rotation that went wrong shows up here and nowhere in `ferrum_requests_total`.
+
+#### Cardinality
+
+Label sets are bounded by *configuration*, never by traffic or endpoint churn:
+
+- `action`, `resource`, `state`, `pool`, and `reason` are closed compiled-in sets.
+- `upstream_id` and `proxy_id` are configured resource identities — the same cardinality tier `ferrum_requests_total` already uses.
+- Per-target health and per-target breaker state are reduced to a **count** per upstream / per proxy. A resolved endpoint address is never a label, so pod churn cannot grow the series count. Per-target detail stays on authenticated `GET /admin/metrics`.
+
 ## Complete family inventory
 
 Sorted by family name. Optional namespace labels are listed when the emitter supports them.
@@ -255,6 +307,10 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_api_stream_connection_charges_total` | counter | `consumer`, `proxy_id`, `proxy_name`, `currency`, `namespace` | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Total per-connection charges for stream sessions. |
 | `ferrum_api_stream_connections_total` | counter | `consumer`, `proxy_id`, `proxy_name`, `currency`, `namespace` | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Total stream sessions (TCP/UDP/DTLS) per consumer. |
 | `ferrum_backend_duration_ms` | histogram | `proxy_id`, `le`, `namespace` | `prometheus_metrics` | `dashboard` | `always` | Backend response time in milliseconds. |
+| `ferrum_backend_retry_attempts_total` | counter | `namespace` | `backend_retry` | `documented_only` | `always` | Backend request retries scheduled by the retry policy across every dispatch transport. |
+| `ferrum_circuit_breaker_cache_entries` | gauge | `namespace` | `circuit_breaker` | `documented_only` | `conditional` | Circuit breakers resident in the shared breaker cache. |
+| `ferrum_circuit_breaker_cache_max_entries` | gauge | `namespace` | `circuit_breaker` | `documented_only` | `conditional` | Admission ceiling for the shared breaker cache; new keys are refused at this count. |
+| `ferrum_circuit_breakers` | gauge | `proxy_id`, `proxy_namespace`, `state`, `namespace` | `circuit_breaker` | `documented_only` | `when_series_present` | Upstream circuit breakers resident for this proxy, counted by breaker state. |
 | `ferrum_client_disconnects_total` | counter | `proxy_id`, `namespace` | `prometheus_metrics` | `dashboard` | `conditional` | Requests where the client disconnected before receiving the full response. |
 | `ferrum_compression_codec_admitted_total` | counter | `namespace` | `compression` | `documented_only` | `always` | Compression codec jobs admitted to the bounded spawn_blocking pool. |
 | `ferrum_compression_codec_join_failures_total` | counter | `namespace` | `compression` | `documented_only` | `always` | Compression codec spawn_blocking tasks that failed to join. |
@@ -266,6 +322,8 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_configsync_diverged` | gauge | `namespace` | `configsync` | `alert` | `conditional` | Whether the DP is currently sticky-diverged after a rejected ConfigSync delta (1) or converged (0). |
 | `ferrum_configsync_divergence_recoveries_total` | counter | `namespace` | `configsync` | `documented_only` | `conditional` | ConfigSync divergence recoveries after an accepted authoritative FULL_SNAPSHOT. |
 | `ferrum_configsync_fenced_full_snapshots_total` | counter | `namespace` | `configsync` | `documented_only` | `conditional` | ConfigSync FULL_SNAPSHOTs the DP fenced without applying (stale/older, unorderable/inconsistent, or an implausibly-future CP clock stamp); last-known-good config keeps serving. |
+| `ferrum_connection_pool_entries` | gauge | `pool`, `namespace` | `connection_pool` | `documented_only` | `conditional` | Resident entries per gateway backend pool: cached reqwest clients for http, live multiplexed connections for the others. |
+| `ferrum_connection_pool_max_idle_per_host` | gauge | `namespace` | `connection_pool` | `documented_only` | `conditional` | Configured idle-connection ceiling per backend host for the HTTP/1.1 and HTTP/2 reqwest pool. |
 | `ferrum_cp_dp_trust_degraded` | gauge | `namespace` | `cp_dp_trust` | `documented_only` | `conditional` | Whether the CP is authorizing with a trust generation it could not revalidate, or the reload worker is stalled or failed (1) or not (0). |
 | `ferrum_cp_dp_trust_last_acceptance_age_seconds` | gauge | `namespace` | `cp_dp_trust` | `documented_only` | `conditional` | Seconds since the CP last accepted (replaced or confirmed) its trust source, on a monotonic clock. |
 | `ferrum_cp_dp_trust_max_stale_seconds` | gauge | `namespace` | `cp_dp_trust` | `documented_only` | `conditional` | Configured maximum unrevalidated trust-generation age before admission fails closed (0 = unbounded, explicit opt-in). |
@@ -313,6 +371,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_frontend_client_trust_retired_connections_total` | counter | `scope`, `reason`, `namespace` | `tls` | `documented_only` | `conditional` | Established frontend transports retired because their client-certificate trust decision was withdrawn. |
 | `ferrum_frontend_client_trust_tracked_connections` | gauge | `scope`, `namespace` | `tls` | `documented_only` | `conditional` | Established client-certificate-authenticated frontend transports currently tracked for retirement. |
 | `ferrum_frontend_client_trust_withdrawal_generation` | gauge | `scope`, `namespace` | `tls` | `documented_only` | `conditional` | Generation at which frontend client-certificate authority was last narrowed for a listener scope (0 = never). |
+| `ferrum_frontend_tls_handshake_failures_total` | counter | `reason`, `namespace` | `tls` | `documented_only` | `always` | Frontend TLS handshakes refused before any HTTP work, by bounded reason. |
 | `ferrum_gateway_listener_failed_ports` | gauge | `namespace` | `gateway_listener` | `documented_only` | `when_process_initialized` | Distinct dynamic Gateway API listener ports with at least one active failure. |
 | `ferrum_gateway_listener_failures_active` | gauge | `protocol`, `reason`, `namespace` | `gateway_listener` | `documented_only` | `when_process_initialized` | Dynamic Gateway API listener halves currently failing, by protocol half and bounded reason. |
 | `ferrum_gateway_listener_failures_total` | counter | `protocol`, `reason`, `namespace` | `gateway_listener` | `documented_only` | `when_process_initialized` | Dynamic Gateway API listener failures observed since process start, by protocol half and bounded reason. |
@@ -462,6 +521,17 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_observability_process_ceiling_rejections_total` | counter | — | `observability_delivery` | `documented_only` | `always` | Sink admissions refused specifically by the process-wide retained-byte ceiling rather than a per-instance budget. |
 | `ferrum_observability_retained_bytes` | gauge | — | `observability_delivery` | `documented_only` | `always` | Bytes currently retained across every observability sink instance in this process. |
 | `ferrum_observability_retained_bytes_high_water` | gauge | — | `observability_delivery` | `documented_only` | `always` | Peak process-wide observability retention observed since startup. |
+| `ferrum_overload_active_connections` | gauge | `namespace` | `overload` | `documented_only` | `conditional` | Live in-flight connections tracked by the accept-path RAII guard. |
+| `ferrum_overload_active_requests` | gauge | `namespace` | `overload` | `documented_only` | `conditional` | Live in-flight requests and multiplexed streams tracked by the request RAII guard. |
+| `ferrum_overload_draining` | gauge | `namespace` | `overload` | `documented_only` | `conditional` | Whether the gateway is draining for shutdown (1) or serving normally (0). |
+| `ferrum_overload_event_loop_latency_seconds` | gauge | `namespace` | `overload` | `documented_only` | `conditional` | Most recent tokio event-loop scheduling delay sampled by the overload monitor. |
+| `ferrum_overload_level` | gauge | `namespace` | `overload` | `documented_only` | `conditional` | Current overload pressure level: 0 normal, 1 pressure, 2 critical. |
+| `ferrum_overload_port_exhaustion_events_total` | counter | `namespace` | `overload` | `documented_only` | `conditional` | Ephemeral port exhaustion (EADDRNOTAVAIL) events observed since process start. |
+| `ferrum_overload_red_drop_probability_ratio` | gauge | `namespace` | `overload` | `documented_only` | `conditional` | RED probabilistic keepalive-shedding probability between the pressure and critical thresholds, as a ratio in [0,1]. |
+| `ferrum_overload_resource_current` | gauge | `resource`, `namespace` | `overload` | `documented_only` | `conditional` | Most recent overload-monitor sample of a tracked resource. |
+| `ferrum_overload_resource_limit` | gauge | `resource`, `namespace` | `overload` | `documented_only` | `conditional` | Ceiling the overload monitor compares each tracked resource against. |
+| `ferrum_overload_shedding_active` | gauge | `action`, `namespace` | `overload` | `documented_only` | `conditional` | Whether a progressive load-shedding action is currently engaged (1) or not (0). |
+| `ferrum_proxy_passive_unhealthy_targets` | gauge | `proxy_id`, `proxy_namespace`, `namespace` | `upstream_health` | `documented_only` | `when_series_present` | Targets this proxy has ejected from traffic-based passive health checking. |
 | `ferrum_rate_limit_exceeded_total` | counter | `namespace` | `prometheus_metrics` | `dashboard` | `always` | Total rate limit rejections. |
 | `ferrum_request_duration_ms` | histogram | `proxy_id`, `le`, `namespace` | `prometheus_metrics` | `dashboard` | `always` | Request duration in milliseconds. |
 | `ferrum_request_mirror_budget_drops_total` | counter | `namespace` | `request_mirror` | `documented_only` | `always` | request_mirror attempts dropped because max_retained_request_body_bytes was exhausted. |
@@ -520,6 +590,8 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_udp_amplification_responses_allowed_total` | counter | `namespace` | `udp` | `documented_only` | `always` | UDP backend responses admitted by the per-request amplification budget. |
 | `ferrum_udp_amplification_responses_dropped_total` | counter | `namespace` | `udp` | `documented_only` | `always` | UDP backend responses dropped for exceeding the per-request amplification budget. |
 | `ferrum_udp_amplification_unlimited_total` | counter | `namespace` | `udp` | `documented_only` | `always` | UDP/DTLS sessions admitted without a response-amplification limit. |
+| `ferrum_upstream_targets` | gauge | `upstream_id`, `upstream_namespace`, `namespace` | `upstream_health` | `documented_only` | `when_series_present` | Targets configured on an upstream, including service-discovery resolved endpoints. |
+| `ferrum_upstream_unhealthy_targets` | gauge | `upstream_id`, `upstream_namespace`, `namespace` | `upstream_health` | `documented_only` | `when_series_present` | Targets an active health probe has ejected for this upstream; shared across every proxy using it. |
 | `ferrum_websocket_bytes_total` | counter | `proxy_id`, `direction`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket payload bytes relayed by direction. |
 | `ferrum_websocket_frames_total` | counter | `proxy_id`, `direction`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket frames relayed by direction. |
 | `ferrum_websocket_session_duration_ms` | histogram | `proxy_id`, `result`, `direction`, `io_side`, `error_class`, `termination_reason`, `le`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket session duration in milliseconds. |

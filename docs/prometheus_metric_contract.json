@@ -994,6 +994,57 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_backend_retry_attempts_total",
+    "type": "counter",
+    "help": "Backend request retries scheduled by the retry policy across every dispatch transport.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "backend_retry",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_circuit_breaker_cache_entries",
+    "type": "gauge",
+    "help": "Circuit breakers resident in the shared breaker cache.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "circuit_breaker",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_circuit_breaker_cache_max_entries",
+    "type": "gauge",
+    "help": "Admission ceiling for the shared breaker cache; new keys are refused at this count.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "circuit_breaker",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_circuit_breakers",
+    "type": "gauge",
+    "help": "Upstream circuit breakers resident for this proxy, counted by breaker state.",
+    "labels": [
+      "proxy_id",
+      "proxy_namespace",
+      "state",
+      "namespace"
+    ],
+    "subsystem": "circuit_breaker",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_series_present"
+  },
+  {
     "name": "ferrum_client_disconnects_total",
     "type": "counter",
     "help": "Requests where the client disconnected before receiving the full response.",
@@ -1122,6 +1173,31 @@
       "namespace"
     ],
     "subsystem": "configsync",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_connection_pool_entries",
+    "type": "gauge",
+    "help": "Resident entries per gateway backend pool: cached reqwest clients for http, live multiplexed connections for the others.",
+    "labels": [
+      "pool",
+      "namespace"
+    ],
+    "subsystem": "connection_pool",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_connection_pool_max_idle_per_host",
+    "type": "gauge",
+    "help": "Configured idle-connection ceiling per backend host for the HTTP/1.1 and HTTP/2 reqwest pool.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "connection_pool",
     "export_surface": "/metrics",
     "bundled": "documented_only",
     "emission": "conditional"
@@ -1705,6 +1781,19 @@
     "export_surface": "/metrics",
     "bundled": "documented_only",
     "emission": "conditional"
+  },
+  {
+    "name": "ferrum_frontend_tls_handshake_failures_total",
+    "type": "counter",
+    "help": "Frontend TLS handshakes refused before any HTTP work, by bounded reason.",
+    "labels": [
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
   },
   {
     "name": "ferrum_gateway_listener_failed_ports",
@@ -3676,6 +3765,143 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_overload_active_connections",
+    "type": "gauge",
+    "help": "Live in-flight connections tracked by the accept-path RAII guard.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "overload",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_overload_active_requests",
+    "type": "gauge",
+    "help": "Live in-flight requests and multiplexed streams tracked by the request RAII guard.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "overload",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_overload_draining",
+    "type": "gauge",
+    "help": "Whether the gateway is draining for shutdown (1) or serving normally (0).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "overload",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_overload_event_loop_latency_seconds",
+    "type": "gauge",
+    "help": "Most recent tokio event-loop scheduling delay sampled by the overload monitor.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "overload",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_overload_level",
+    "type": "gauge",
+    "help": "Current overload pressure level: 0 normal, 1 pressure, 2 critical.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "overload",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_overload_port_exhaustion_events_total",
+    "type": "counter",
+    "help": "Ephemeral port exhaustion (EADDRNOTAVAIL) events observed since process start.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "overload",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_overload_red_drop_probability_ratio",
+    "type": "gauge",
+    "help": "RED probabilistic keepalive-shedding probability between the pressure and critical thresholds, as a ratio in [0,1].",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "overload",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_overload_resource_current",
+    "type": "gauge",
+    "help": "Most recent overload-monitor sample of a tracked resource.",
+    "labels": [
+      "resource",
+      "namespace"
+    ],
+    "subsystem": "overload",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_overload_resource_limit",
+    "type": "gauge",
+    "help": "Ceiling the overload monitor compares each tracked resource against.",
+    "labels": [
+      "resource",
+      "namespace"
+    ],
+    "subsystem": "overload",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_overload_shedding_active",
+    "type": "gauge",
+    "help": "Whether a progressive load-shedding action is currently engaged (1) or not (0).",
+    "labels": [
+      "action",
+      "namespace"
+    ],
+    "subsystem": "overload",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_proxy_passive_unhealthy_targets",
+    "type": "gauge",
+    "help": "Targets this proxy has ejected from traffic-based passive health checking.",
+    "labels": [
+      "proxy_id",
+      "proxy_namespace",
+      "namespace"
+    ],
+    "subsystem": "upstream_health",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_series_present"
+  },
+  {
     "name": "ferrum_rate_limit_exceeded_total",
     "type": "counter",
     "help": "Total rate limit rejections.",
@@ -4409,6 +4635,34 @@
     "export_surface": "/metrics",
     "bundled": "documented_only",
     "emission": "always"
+  },
+  {
+    "name": "ferrum_upstream_targets",
+    "type": "gauge",
+    "help": "Targets configured on an upstream, including service-discovery resolved endpoints.",
+    "labels": [
+      "upstream_id",
+      "upstream_namespace",
+      "namespace"
+    ],
+    "subsystem": "upstream_health",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_series_present"
+  },
+  {
+    "name": "ferrum_upstream_unhealthy_targets",
+    "type": "gauge",
+    "help": "Targets an active health probe has ejected for this upstream; shared across every proxy using it.",
+    "labels": [
+      "upstream_id",
+      "upstream_namespace",
+      "namespace"
+    ],
+    "subsystem": "upstream_health",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_series_present"
   },
   {
     "name": "ferrum_websocket_bytes_total",
