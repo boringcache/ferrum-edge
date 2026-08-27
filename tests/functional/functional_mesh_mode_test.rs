@@ -982,6 +982,7 @@ const CHILD_BOUND_READINESS_FIXTURES: &[&str] = &[
     "drive_sidecar_ingress_connect_relay",
     "functional_mesh_sidecar_ingress_stream_reload_withdraws_declared_listener",
     "drive_waypoint_target_refs",
+    "drive_inbound_relay_third_workload_refusal",
 ];
 
 /// Drivers that must void an attempt whose gateway died mid-run.
@@ -999,6 +1000,7 @@ const DEAD_GATEWAY_VOIDING_DRIVERS: &[&str] = &[
     "drive_sidecar_ingress_connect_relay",
     "functional_mesh_sidecar_ingress_stream_reload_withdraws_declared_listener",
     "drive_waypoint_target_refs",
+    "drive_inbound_relay_third_workload_refusal",
 ];
 
 /// Extract one top-level `async fn <name>` body from [`MESH_MODE_TEST_SOURCE`].
@@ -1086,6 +1088,7 @@ fn fixture_servers_bind_through_the_mesh_port_aware_helper() {
         "start_websocket_path_echo_backend",
         "start_tagged_tcp_backend",
         "start_loopback_tcp_echo",
+        "start_counting_tcp_echo_on",
     ] {
         let body = mesh_test_fn_body(name);
         assert!(
@@ -4397,6 +4400,11 @@ async fn functional_mesh_ambient_egress_routes_a_to_b_over_hbone() {
         "the response must carry point B's backend body: {body:?}\n{logs}"
     );
 }
+
+// The #4150 / #4252 negative of this keystone — an authenticated peer CONNECTs
+// to B naming a slice-declared third workload B does not terminate for — is
+// `functional_mesh_ambient_hbone_refuses_third_workload_{byte_stream,datagram}`
+// next to the UDP-dest CONNECT helpers it reuses.
 
 /// Egress keystone (Sidecar): a captured plaintext request at gateway A reaches
 /// the echo backend behind gateway B over **plain SVID-mTLS HTTP/2** to B's
@@ -9861,6 +9869,434 @@ async fn functional_mesh_udp_dest_untrusted_peer_fails_closed() {
             );
         }
     }
+}
+
+// ===================================================================
+// Issue #4252 — inbound relay refuses a third, slice-declared workload
+// ===================================================================
+//
+// The unit tests pin `MeshConfig::inbound_relay_destination_decision`. They do
+// not prove the guard is still *wired* into `handle_hbone_request` /
+// `handle_hbone_udp_request`. This is the end-to-end negative #4150 asked for
+// beside `functional_mesh_ambient_egress_routes_a_to_b_over_hbone`: an
+// authenticated peer CONNECTs to B naming a workload B does not terminate for.
+//
+// A Sidecar/Ambient terminator admits its accepted local address plus slice
+// records carrying its own `FERRUM_MESH_WORKLOAD_SPIFFE_ID` (and not marked
+// `remote_provenance`). Workload C is slice-declared under a different SPIFFE,
+// so the CONNECT must be refused — and C's backend must record zero dials. A
+// guard that refuses after dialling would still pass a status-only assertion.
+//
+// C listens on 127.0.0.2, not 127.0.0.1: the own-address loopback shortcut
+// would admit a sibling port declared on the terminator's own IP. 127.0.0.2 is
+// still loopback, so the live decision is `PortNotDeclared` rather than the
+// unit-test `AddressNotTerminated` (10.244.9.9) arm; either way a regression
+// that admits any slice-declared address would dial this backend.
+
+/// Loopback alias used as workload C's address. Distinct from B's accepted
+/// local address (`127.0.0.1`) so the own-pod shortcut cannot stand in for C.
+const THIRD_WORKLOAD_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(127, 0, 0, 2);
+
+/// CONNECT flavor under test. Each flavor takes a different handler with its
+/// own post-plugin re-check (`handle_hbone_request` vs
+/// `handle_hbone_udp_request`).
+#[derive(Clone, Copy)]
+enum ThirdWorkloadConnectFlavor {
+    ByteStream,
+    Datagram,
+}
+
+/// Counting TCP echo bound on `ip`. `accept()` is the destination-side "a
+/// backend dial occurred" signal for the byte-stream relay.
+async fn start_counting_tcp_echo_on(
+    ip: std::net::IpAddr,
+) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = bind_fixture_listener(SocketAddr::new(ip, 0))
+        .await
+        .expect("bind third-workload TCP echo on 127.0.0.2 — 127.0.0.0/8 must be loopback");
+    let addr = listener.local_addr().expect("third-workload TCP echo addr");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                loop {
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    if stream.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.flush().await;
+                }
+            });
+        }
+    });
+    (addr, accepted, task)
+}
+
+/// Counting UDP echo bound on `ip`. `recv_from` is the destination-side "a
+/// datagram was delivered" signal for the datagram-over-CONNECT relay.
+async fn start_counting_udp_echo_on(
+    ip: std::net::IpAddr,
+) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    // Re-roll past ports already promised to a mesh gateway subprocess — the
+    // UDP counterpart of [`bind_fixture_listener`] (issue #2132). Rejected
+    // sockets are held so the kernel cannot re-offer the same port.
+    let mut rejected = Vec::new();
+    let mut chosen = None;
+    for _ in 0..FIXTURE_BIND_ATTEMPTS {
+        let candidate = tokio::net::UdpSocket::bind(SocketAddr::new(ip, 0))
+            .await
+            .expect("bind third-workload UDP echo on 127.0.0.2 — 127.0.0.0/8 must be loopback");
+        let port = candidate.local_addr().expect("udp echo addr").port();
+        if !mesh_port_is_reserved(port) {
+            chosen = Some(candidate);
+            break;
+        }
+        rejected.push(candidate);
+    }
+    let socket =
+        chosen.expect("no acceptable ephemeral UDP port for a third-workload fixture socket");
+    drop(rejected);
+    let addr = socket.local_addr().expect("third-workload UDP echo addr");
+    let received = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&received);
+    let task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        while let Ok((n, src)) = socket.recv_from(&mut buf).await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let _ = socket.send_to(&buf[..n], src).await;
+        }
+    });
+    (addr, received, task)
+}
+
+/// Slice consumed by terminator B: B's own-identity record at 127.0.0.1 plus
+/// workload C — a different SPIFFE, a different address — whose addr+port is
+/// what the authenticated peer will name in the CONNECT.
+fn third_workload_refusal_slice(
+    node_id: &str,
+    b_spiffe: &str,
+    c_spiffe: &str,
+    b_local_port: u16,
+    c_port: u16,
+    protocol: AppProtocol,
+) -> MeshSlice {
+    let b_id = SpiffeId::new(b_spiffe).expect("b SPIFFE id");
+    let c_id = SpiffeId::new(c_spiffe).expect("c SPIFFE id");
+    let trust_domain = TrustDomain::new("cluster.local").expect("trust domain");
+    let proto_name = match protocol {
+        AppProtocol::Udp => "udp",
+        _ => "tcp",
+    };
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: "ferrum".to_string(),
+        version: Utc::now().to_rfc3339(),
+        workloads: vec![
+            Workload {
+                spiffe_id: b_id.clone(),
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "svc-b".to_string())]),
+                    namespace: Some("ferrum".to_string()),
+                },
+                service_name: "svc-b".to_string(),
+                service_namespace: None,
+                addresses: vec!["127.0.0.1".to_string()],
+                ports: vec![WorkloadPort {
+                    port: b_local_port,
+                    protocol,
+                    name: Some(proto_name.to_string()),
+                }],
+                trust_domain: trust_domain.clone(),
+                namespace: "ferrum".to_string(),
+                network: None,
+                cluster: None,
+                weight: None,
+                locality: None,
+                service_account: Some("svc-b".to_string()),
+                pod_uid: None,
+                node_waypoint: None,
+                remote_provenance: false,
+            },
+            Workload {
+                spiffe_id: c_id.clone(),
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "svc-c".to_string())]),
+                    namespace: Some("ferrum".to_string()),
+                },
+                service_name: "svc-c".to_string(),
+                service_namespace: None,
+                addresses: vec![THIRD_WORKLOAD_IP.to_string()],
+                ports: vec![WorkloadPort {
+                    port: c_port,
+                    protocol,
+                    name: Some(proto_name.to_string()),
+                }],
+                trust_domain,
+                namespace: "ferrum".to_string(),
+                network: None,
+                cluster: None,
+                weight: None,
+                locality: None,
+                service_account: Some("svc-c".to_string()),
+                pod_uid: None,
+                node_waypoint: None,
+                remote_provenance: false,
+            },
+        ],
+        services: vec![
+            MeshService {
+                cluster_ips: Vec::new(),
+                name: "svc-b".to_string(),
+                namespace: "ferrum".to_string(),
+                ports: vec![ServicePort {
+                    port: b_local_port,
+                    protocol,
+                    name: Some(proto_name.to_string()),
+                    target_port: None,
+                }],
+                workloads: vec![WorkloadRef { spiffe_id: b_id }],
+                protocol_overrides: HashMap::new(),
+                uid: None,
+            },
+            MeshService {
+                cluster_ips: Vec::new(),
+                name: "svc-c".to_string(),
+                namespace: "ferrum".to_string(),
+                ports: vec![ServicePort {
+                    port: c_port,
+                    protocol,
+                    name: Some(proto_name.to_string()),
+                    target_port: None,
+                }],
+                workloads: vec![WorkloadRef { spiffe_id: c_id }],
+                protocol_overrides: HashMap::new(),
+                uid: None,
+            },
+        ],
+        peer_authentications: vec![PeerAuthentication {
+            name: "mesh-strict".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::Strict,
+            port_overrides: HashMap::new(),
+        }],
+        ..MeshSlice::default()
+    }
+}
+
+/// CONNECT status plus how many times C's backend was actually reached.
+struct ThirdWorkloadRefusalOutcome {
+    status: u16,
+    backend_hits: usize,
+    logs: String,
+}
+
+/// Spawn Ambient terminator B over a slice that also declares workload C, then
+/// drive one authenticated CONNECT at B's HBONE port naming C's address.
+/// Setup failures retry; the CONNECT observation is made exactly once against
+/// a live child.
+async fn drive_inbound_relay_third_workload_refusal(
+    flavor: ThirdWorkloadConnectFlavor,
+) -> Result<ThirdWorkloadRefusalOutcome, String> {
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+    let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/client-app";
+    let b_spiffe = "spiffe://cluster.local/ns/ferrum/sa/svc-b";
+    let c_spiffe = "spiffe://cluster.local/ns/ferrum/sa/svc-c";
+    let flavor_label = match flavor {
+        ThirdWorkloadConnectFlavor::ByteStream => "byte-stream",
+        ThirdWorkloadConnectFlavor::Datagram => "datagram",
+    };
+    let protocol = match flavor {
+        ThirdWorkloadConnectFlavor::ByteStream => AppProtocol::Tcp,
+        ThirdWorkloadConnectFlavor::Datagram => AppProtocol::Udp,
+    };
+    let third_ip = std::net::IpAddr::V4(THIRD_WORKLOAD_IP);
+    let third_ip_str = THIRD_WORKLOAD_IP.to_string();
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_b = format!("functional-mesh-third-workload-{flavor_label}-b-{attempt}");
+        let temp_b = TempDir::new().map_err(|e| format!("temp dir b: {e}"))?;
+        let svids = generate_two_gateway_svids(temp_b.path(), a_spiffe, b_spiffe);
+
+        let (c_addr, hits, echo) = match flavor {
+            ThirdWorkloadConnectFlavor::ByteStream => {
+                start_counting_tcp_echo_on(third_ip).await
+            }
+            ThirdWorkloadConnectFlavor::Datagram => {
+                start_counting_udp_echo_on(third_ip).await
+            }
+        };
+        let c_port = c_addr.port();
+        // B's own-identity record must declare a port, otherwise the loopback
+        // arm treats the own address as unconstrained and would admit C's port
+        // (and then dial 127.0.0.2). Keep it distinct from C's ephemeral port.
+        let b_local_port = if c_port == 18080 { 18081 } else { 18080 };
+
+        let cp_b = start_static_mesh_cp(third_workload_refusal_slice(
+            &node_b,
+            b_spiffe,
+            c_spiffe,
+            b_local_port,
+            c_port,
+            protocol,
+        ))
+        .await;
+        let ports_b = reserve_mesh_ports().await;
+        let hbone_port = ports_b.hbone;
+
+        let mut child_b = spawn_mesh_gateway(
+            &temp_b,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp_b.addr,
+                ports: ports_b,
+                node_id: &node_b,
+                config_protocol: "native",
+                topology: "ambient",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", b_spiffe.to_string()),
+                    ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.b.cert_path.clone()),
+                    ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.b.key_path.clone()),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        svids.b.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+
+        let readiness = wait_for_gateway_listener(&mut child_b, hbone_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
+            last_failure = format!(
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("gateway B HBONE listener", hbone_port),
+                captured_output(&temp_b)
+            );
+            kill_child(&mut child_b);
+            cp_b.shutdown().await;
+            echo.abort();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let authority = format!("{third_ip_str}:{c_port}");
+        let connect = match flavor {
+            ThirdWorkloadConnectFlavor::ByteStream => {
+                drive_one_waypoint_byte_connect(
+                    hbone_port,
+                    &authority,
+                    &svids.a,
+                    b"third-workload-must-not-be-dialed",
+                )
+                .await
+                .map(|(status, _)| status)
+            }
+            ThirdWorkloadConnectFlavor::Datagram => {
+                drive_one_udp_connect(hbone_port, &authority, &svids.a)
+                    .await
+                    .map(|(status, _)| status)
+            }
+        };
+
+        let died = exited_gateway_diagnostic(&mut [("gateway B", &mut child_b)]);
+        let logs = captured_output(&temp_b);
+        let backend_hits = hits.load(Ordering::SeqCst);
+        kill_child(&mut child_b);
+        cp_b.shutdown().await;
+        echo.abort();
+
+        if let Some(diagnostic) = died {
+            last_failure = format!("attempt {attempt}: {diagnostic}\n{logs}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        return match connect {
+            Ok(status) => Ok(ThirdWorkloadRefusalOutcome {
+                status,
+                backend_hits,
+                logs,
+            }),
+            Err(e) => Err(format!(
+                "trusted CONNECT naming workload C failed against a healthy \
+                 terminator: {e}\n--- gateway B ---\n{logs}"
+            )),
+        };
+    }
+
+    Err(format!(
+        "third-workload refusal gateway never bound after {RETRY_ATTEMPTS} \
+         attempts\n{last_failure}"
+    ))
+}
+
+fn assert_third_workload_connect_refused(outcome: ThirdWorkloadRefusalOutcome, flavor: &str) {
+    assert_ne!(
+        outcome.status, 200,
+        "{flavor}: authenticated CONNECT naming a third workload must be refused\n{}",
+        outcome.logs
+    );
+    assert!(
+        matches!(outcome.status, 403 | 404),
+        "{flavor}: refusal is 403 (handler re-check) or 404 (synthesis-time \
+         guard), got {}\n{}",
+        outcome.status,
+        outcome.logs
+    );
+    assert_eq!(
+        outcome.backend_hits, 0,
+        "{flavor}: workload C's backend must see zero accepts/datagrams — a \
+         guard that refuses after dialling would still pass a status-only \
+         assertion\n{}",
+        outcome.logs
+    );
+}
+
+/// Issue #4252 (byte-stream): an authenticated HBONE CONNECT to terminator B
+/// naming slice-declared workload C is refused, and C's TCP echo records zero
+/// accepts — proving `handle_hbone_request`'s relay guard is still on the
+/// request path before `connect_backend`.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_ambient_hbone_refuses_third_workload_byte_stream() {
+    let outcome = drive_inbound_relay_third_workload_refusal(
+        ThirdWorkloadConnectFlavor::ByteStream,
+    )
+    .await
+    .expect("third-workload byte-stream setup");
+    assert_third_workload_connect_refused(outcome, "byte-stream HBONE CONNECT");
+}
+
+/// Issue #4252 (datagram-over-CONNECT): the same third-workload CONNECT over
+/// the UDP-marked flavor, asserting C's UDP echo records zero datagrams —
+/// proving `handle_hbone_udp_request`'s independently placed re-check is still
+/// wired before `resolve_local_udp_dest`.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_ambient_hbone_refuses_third_workload_datagram() {
+    let outcome = drive_inbound_relay_third_workload_refusal(
+        ThirdWorkloadConnectFlavor::Datagram,
+    )
+    .await
+    .expect("third-workload datagram setup");
+    assert_third_workload_connect_refused(outcome, "datagram-over-CONNECT HBONE CONNECT");
 }
 
 // ===================================================================
