@@ -10,6 +10,10 @@ use tokio::sync::watch;
 
 use crate::common::{empty_digest_header, generate_hmac_signature};
 
+use super::mesh_test_support::{
+    DEFAULT_NAMESPACE, DEFAULT_TRUST_DOMAIN, default_mesh_runtime, service_for, workload_for,
+};
+
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, PluginAssociation,
     PluginConfig, PluginScope, Proxy,
@@ -17,11 +21,14 @@ use ferrum_edge::config::types::{
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
-use ferrum_edge::modes::mesh::MeshTrafficDirection;
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, InboundRelayDenial, MeshConfig, MeshEgressUdpDestination,
-    MeshEgressUdpDialEndpoint, Workload, WorkloadPort, WorkloadSelector,
+    MeshEgressUdpDialEndpoint, MultiClusterConfig, Workload, WorkloadPort, WorkloadSelector,
     inbound_relay_destinations_from_workloads,
+};
+use ferrum_edge::modes::mesh::slice::MeshSlice;
+use ferrum_edge::modes::mesh::{
+    MeshRuntimeConfig, MeshTopology, MeshTrafficDirection, prepare_gateway_config_from_mesh_slice,
 };
 use ferrum_edge::proxy::{
     ProxyState, start_proxy_listener_with_bound_listener,
@@ -1784,5 +1791,252 @@ fn inbound_relay_admits_only_the_waypoint_termination_inventory() {
     assert_eq!(
         loopback_mesh.inbound_relay_destination_decision("127.0.0.1", 8080, waypoint),
         Ok(())
+    );
+}
+
+// ── Termination inventory is per-OWNER, not per-identity (issues #4249/#4251) ─
+
+/// Prepare a serving snapshot from `slice` and hand back its mesh block.
+fn prepared_mesh(slice: &MeshSlice, runtime: &MeshRuntimeConfig) -> Box<MeshConfig> {
+    prepare_gateway_config_from_mesh_slice(slice, runtime)
+        .expect("slice → config")
+        .mesh
+        .expect("prepared mesh")
+}
+
+/// Issue #4249: a shared SPIFFE id is a service-account identity, not
+/// ownership. The `Sidecar` / `Ambient` termination inventory is built with the
+/// same LOCAL-workload predicate the slice builder uses, so a same-identity
+/// record the slice places in another CLUSTER — or one carrying labels this
+/// workload does not have, i.e. a sibling replica on another node — is not a
+/// destination this proxy terminates for.
+#[test]
+fn inbound_relay_own_identity_inventory_requires_cluster_and_label_locality() {
+    let own_spiffe = format!("spiffe://{DEFAULT_TRUST_DOMAIN}/ns/{DEFAULT_NAMESPACE}/sa/reviews");
+
+    let mut own = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.244.5.5"],
+    );
+    own.cluster = Some("cluster-a".to_string());
+    // Same SPIFFE, remote cluster: `tag_remote_workloads` preserves a remote
+    // endpoint's identity, so an identity-only filter admits it and would dial
+    // it in plaintext, bypassing the east-west gateway's inner mTLS.
+    let mut remote_replica = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.244.7.7"],
+    );
+    remote_replica.cluster = Some("cluster-b".to_string());
+    // Same SPIFFE and cluster, labels this workload does not carry.
+    let mut label_mismatch = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews"), ("version", "canary")],
+        ["10.244.8.8"],
+    );
+    label_mismatch.cluster = Some("cluster-a".to_string());
+
+    let slice = MeshSlice {
+        node_id: "mesh-test-node".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        version: "test".to_string(),
+        workloads: vec![own, remote_replica, label_mismatch],
+        multi_cluster: Some(MultiClusterConfig {
+            local_cluster: Some("cluster-a".to_string()),
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshSlice::default()
+    };
+    let runtime = MeshRuntimeConfig {
+        topology: MeshTopology::Ambient,
+        workload_spiffe_id: Some(own_spiffe),
+        workload_labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+        ..default_mesh_runtime()
+    };
+
+    let mesh = prepared_mesh(&slice, &runtime);
+    // A ztunnel-style proxy's socket address is the node, not a workload, so
+    // nothing below rides in on the own-address arm.
+    let node = Some(ip("10.244.0.1"));
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(()),
+        "this proxy's own local workload record stays a termination destination"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.7.7", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a same-identity record in another cluster must not be an own-pod destination"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.8.8", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a same-identity sibling whose labels this workload does not carry must be refused"
+    );
+}
+
+/// Issue #4249: several workload records can legitimately declare ONE address —
+/// `hostNetwork` pods all declare the node IP — so the own-address arm and the
+/// own-namespace loopback shortcut take their port bound from the records this
+/// terminator OWNS. A co-located pod's app port must not become reachable
+/// through this proxy just because it shares the address.
+#[test]
+fn inbound_relay_own_address_port_bound_excludes_co_located_workloads() {
+    let own_spiffe = format!("spiffe://{DEFAULT_TRUST_DOMAIN}/ns/{DEFAULT_NAMESPACE}/sa/reviews");
+
+    // Both records declare the shared (host-network) address; only the first is
+    // this terminator's own, and it serves 8080 only.
+    let own = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.244.5.5"],
+    );
+    let mut co_located = workload_for(
+        "ratings",
+        DEFAULT_NAMESPACE,
+        [("app", "ratings")],
+        ["10.244.5.5"],
+    );
+    co_located.ports = vec![WorkloadPort {
+        port: 9443,
+        protocol: AppProtocol::Http,
+        name: Some("admin".to_string()),
+    }];
+
+    let slice = MeshSlice {
+        node_id: "mesh-test-node".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        version: "test".to_string(),
+        workloads: vec![own, co_located],
+        ..MeshSlice::default()
+    };
+    let runtime = MeshRuntimeConfig {
+        topology: MeshTopology::Sidecar,
+        workload_spiffe_id: Some(own_spiffe),
+        ..default_mesh_runtime()
+    };
+
+    let mesh = prepared_mesh(&slice, &runtime);
+    // The peer reached this pod at the shared address on this socket.
+    let own_ip = Some(ip("10.244.5.5"));
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, own_ip),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "a co-located workload's port must not widen the own-address bound"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("127.0.0.1", 8080, own_ip),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("localhost", 9443, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "the own-namespace loopback shortcut is bounded by the same owned records"
+    );
+}
+
+/// Issue #4251: a `ServiceWaypoint` is the L7 terminator for the services bound
+/// to it. The slice's own workload narrowing is only NAMESPACE-level (the
+/// waypoint's namespace plus its bound services' namespaces), so a workload
+/// sitting in a bound service's namespace that backs NO bound service must be
+/// refused `AddressNotTerminated` rather than relayed to in plaintext.
+#[test]
+fn inbound_relay_service_waypoint_admits_only_bound_service_backends() {
+    let backing = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.244.1.7"],
+    );
+    let unbound = workload_for(
+        "ratings",
+        DEFAULT_NAMESPACE,
+        [("app", "ratings")],
+        ["10.244.2.9"],
+    );
+    // Only `reviews` is bound to this waypoint, so only its Service survives
+    // the slice's service narrowing; `ratings` is namespace-visible only.
+    let bound_service = service_for("reviews", DEFAULT_NAMESPACE, &[&backing]);
+
+    let slice = MeshSlice {
+        node_id: "mesh-test-node".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        version: "test".to_string(),
+        workloads: vec![backing, unbound],
+        services: vec![bound_service],
+        ..MeshSlice::default()
+    };
+    let runtime = MeshRuntimeConfig {
+        topology: MeshTopology::ServiceWaypoint,
+        waypoint_name: Some("reviews-waypoint".to_string()),
+        ..default_mesh_runtime()
+    };
+
+    let mesh = prepared_mesh(&slice, &runtime);
+    // A waypoint runs outside the destination pods' netns; its own address is
+    // never a relay destination.
+    let waypoint = Some(ip("10.244.4.4"));
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, waypoint),
+        Ok(()),
+        "a bound service's backing workload is a destination this waypoint terminates for"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.2.9", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a workload visible in the bound service's namespace that backs no bound \
+         service is not a destination this waypoint terminates for"
+    );
+}
+
+/// Issue #4251, fail-closed side: bound services that list no backing workload
+/// leave the inventory EMPTY rather than falling back to the namespace-visible
+/// workload view.
+#[test]
+fn inbound_relay_service_waypoint_without_backing_refs_terminates_for_nothing() {
+    let visible = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.244.1.7"],
+    );
+    // A Service shell with no `workloads[]` authorization list.
+    let bound_service = service_for("reviews", DEFAULT_NAMESPACE, &[]);
+
+    let slice = MeshSlice {
+        node_id: "mesh-test-node".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        version: "test".to_string(),
+        workloads: vec![visible],
+        services: vec![bound_service],
+        ..MeshSlice::default()
+    };
+    let runtime = MeshRuntimeConfig {
+        topology: MeshTopology::ServiceWaypoint,
+        waypoint_name: Some("reviews-waypoint".to_string()),
+        ..default_mesh_runtime()
+    };
+
+    let mesh = prepared_mesh(&slice, &runtime);
+
+    assert!(
+        mesh.inbound_relay_destinations.is_empty(),
+        "no authorized backing workload must leave the inventory empty"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, Some(ip("10.244.4.4"))),
+        Err(InboundRelayDenial::AddressNotTerminated)
     );
 }

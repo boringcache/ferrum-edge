@@ -4593,20 +4593,27 @@ pub struct MeshConfig {
     /// topologies legitimately terminate for a workload other than the pod the
     /// proxy runs in, and only those three populate this vector:
     ///
-    /// * `Sidecar` / `Ambient` — the slice workload record(s) carrying THIS
-    ///   proxy's own workload identity (`FERRUM_MESH_WORKLOAD_SPIFFE_ID`).
-    ///   Ambient is a ztunnel-style proxy that runs OUTSIDE the workload pods'
-    ///   network namespaces and terminates inbound for the pods the node-agent
-    ///   enrolls (`docs/mesh.md` → "Enrolled Ambient destination pod UDP
-    ///   relay"), so the accepted socket's local address alone cannot name
-    ///   every legitimate destination. A blank/absent identity leaves this
-    ///   EMPTY — fail closed, own-local-address only.
+    /// * `Sidecar` / `Ambient` — the slice workload record(s) this proxy's own
+    ///   workload identity (`FERRUM_MESH_WORKLOAD_SPIFFE_ID`) resolves to under
+    ///   the shared LOCAL-workload predicate
+    ///   (`crate::modes::mesh::slice::workload_is_local`): same SPIFFE, same
+    ///   cluster, and a non-vacuous match against
+    ///   `FERRUM_MESH_WORKLOAD_LABELS` when those are configured (issue #4249).
+    ///   Remote-provenance records are excluded outright. Ambient is a
+    ///   ztunnel-style proxy that runs OUTSIDE the workload pods' network
+    ///   namespaces and terminates inbound for the pods the node-agent enrolls
+    ///   (`docs/mesh.md` → "Enrolled Ambient destination pod UDP relay"), so
+    ///   the accepted socket's local address alone cannot name every legitimate
+    ///   destination. A blank/absent identity leaves this EMPTY — fail closed,
+    ///   own-local-address only.
     /// * `NodeWaypoint` — the CP-authorized pods enrolled on THIS node, taken
     ///   from [`Self::node_waypoint_capture_destinations`].
-    /// * `ServiceWaypoint` — the backing workloads of the services bound to
-    ///   THIS waypoint, taken from the slice's waypoint-narrowed workload view.
-    ///   That narrowing is NAMESPACE-level (the waypoint's namespace plus its
-    ///   bound services' namespaces), not per-binding.
+    /// * `ServiceWaypoint` — the workloads that actually BACK one of the
+    ///   services bound to THIS waypoint (issue #4251): the workload's attached
+    ///   Service identity is one the slice carries, and that Service's
+    ///   `workloads[]` list authorizes the workload's SPIFFE. A workload merely
+    ///   VISIBLE in the waypoint's namespaces — the slice's namespace-level
+    ///   narrowing — is no longer admitted.
     ///
     /// `Sidecar` / `Ambient` ALSO set
     /// [`Self::inbound_relay_admits_accepted_local_address`], because the pod
@@ -4630,11 +4637,39 @@ pub struct MeshConfig {
     /// When true, the accepted connection's own local address is an admissible
     /// relay destination: the peer provably reached the pod it named, on this
     /// socket, so the destination IS this terminator. The port is still bounded
-    /// by the workload record(s) the slice declares FOR THAT ADDRESS, never by
-    /// some other workload's ports. False for every topology that runs outside
-    /// the destination pod's own network namespace.
+    /// by the workload record(s) this terminator OWNS at that address (see
+    /// [`Self::inbound_relay_own_address_ports`]), never by some other
+    /// workload's ports. False for every topology that runs outside the
+    /// destination pod's own network namespace.
     #[serde(skip)]
     pub inbound_relay_admits_accepted_local_address: bool,
+    /// Runtime-only port bound for the two OWN-address admission arms — the
+    /// accepted connection's local address and the own-namespace loopback
+    /// shortcut (issue #4249).
+    ///
+    /// `Some` is AUTHORITATIVE and is exactly the inventory built from the
+    /// records this proxy's own workload identity resolves to. Several
+    /// workloads can legitimately declare ONE address (`hostNetwork` pods all
+    /// declare the node IP; see `matched_workloads_are_same_pod` in
+    /// `crate::modes::mesh::slice`), so bounding the port from the whole
+    /// declared workload view would admit the UNION of every co-located pod's
+    /// ports on that address. An address absent from this inventory is not
+    /// port-declared and the own-address / loopback arms refuse it.
+    ///
+    /// `None` means this generation resolved NO ownership evidence at all — no
+    /// workload identity is configured, so no record can be attributed to this
+    /// terminator and there is nothing narrower than the declared workload view
+    /// to bound with. The bound then falls back to that view, exactly as before
+    /// issue #4249. Non-own-address topologies also leave it `None`; they never
+    /// consult it, because
+    /// [`Self::inbound_relay_admits_accepted_local_address`] gates both arms.
+    ///
+    /// It can only ever NARROW the port: both arms are reached solely for an
+    /// address the accepted socket already proved is this terminator's own, so
+    /// this never widens the admitted address set. `serde(skip)` for the same
+    /// reason as [`Self::inbound_relay_destinations`].
+    #[serde(skip)]
+    pub inbound_relay_own_address_ports: Option<Vec<MeshInboundRelayDestination>>,
 }
 
 /// One destination the authenticated inbound CONNECT terminator may relay to,
@@ -4828,8 +4863,10 @@ impl MeshConfig {
     ///    `Ambient`, gated on
     ///    [`Self::inbound_relay_admits_accepted_local_address`]). The peer
     ///    provably reached this pod at the address it named — a transport fact
-    ///    the peer cannot choose. The port is still bounded by the workload
-    ///    record(s) the slice declares FOR THAT ADDRESS.
+    ///    the peer cannot choose. The port is still bounded by the record(s)
+    ///    this terminator OWNS at that address
+    ///    ([`Self::inbound_relay_own_address_ports`]), never by a co-located
+    ///    pod that happens to declare the same address.
     /// 2. **Loopback** (`127.0.0.1` / `::1` / `localhost`) as an
     ///    own-namespace shortcut, admissible only for those same own-pod
     ///    terminators and only on a port this pod's own workload record
@@ -4842,8 +4879,9 @@ impl MeshConfig {
     /// 3. **[`Self::inbound_relay_destinations`]** — the deliberate, narrow
     ///    multi-destination allowance for the topologies that are MEANT to
     ///    terminate for a workload other than the pod the proxy runs in
-    ///    (`Sidecar` / `Ambient` own-identity workload records, `NodeWaypoint`
-    ///    enrolled pods, `ServiceWaypoint` workloads visible in its namespaces).
+    ///    (`Sidecar` / `Ambient` LOCAL workload records, `NodeWaypoint`
+    ///    enrolled pods, `ServiceWaypoint` workloads backing its bound
+    ///    services).
     ///    An entry is matched by IP when the authority is an IP literal and by
     ///    verbatim (case-insensitive) name when it is not; a name is never
     ///    resolved here, so this cannot reach anything the inventory does not
@@ -4965,14 +5003,36 @@ impl MeshConfig {
         }
     }
 
-    /// Whether the slice declares `port` for `address`.
+    /// Whether the record(s) this terminator OWNS at `address` declare `port`.
     ///
     /// Only ever consulted for an address ALREADY proven to be this
-    /// terminator's own (the accepted connection's local address), so it can
-    /// never widen the admitted address set — it only bounds the port. Address
-    /// comparison is canonicalized on both sides, so a record spelled
-    /// `::ffff:10.1.2.3` still bounds `10.1.2.3`.
+    /// terminator's own (the accepted connection's local address, and the
+    /// loopback shortcut that stands in for it), so it can never widen the
+    /// admitted address set — it only bounds the port. Address comparison is
+    /// canonicalized on both sides, so a record spelled `::ffff:10.1.2.3` still
+    /// bounds `10.1.2.3`.
+    ///
+    /// Issue #4249: prefer [`Self::inbound_relay_own_address_ports`] when this
+    /// generation resolved ownership evidence. Scanning the whole declared
+    /// workload view instead admits the UNION of every record that happens to
+    /// declare the address — and several pods legitimately share one
+    /// (`hostNetwork` pods all declare the node IP), so a co-located pod's app
+    /// port would become reachable through this terminator. `None` means no
+    /// identity was configured, so nothing narrower than the declared view
+    /// exists; fall back to it rather than refusing the own-address arm that
+    /// has no inventory to begin with.
     fn workload_declares_address_port(&self, address: std::net::IpAddr, port: u16) -> bool {
+        if let Some(owned) = self.inbound_relay_own_address_ports.as_deref() {
+            return owned.iter().any(|destination| {
+                let MeshInboundRelayHost::Ip(declared) = &destination.host else {
+                    // A declared NAME is never resolved, so it can never stand
+                    // in for the accepted socket's literal local address.
+                    return false;
+                };
+                *declared == address
+                    && (destination.ports.is_empty() || destination.ports.contains(&port))
+            });
+        }
         self.workloads.iter().any(|workload| {
             workload.addresses.iter().any(|declared| {
                 declared
@@ -5228,6 +5288,7 @@ impl Default for MeshConfig {
             external_udp_egress_routes: Vec::new(),
             inbound_relay_destinations: Vec::new(),
             inbound_relay_admits_accepted_local_address: false,
+            inbound_relay_own_address_ports: None,
         }
     }
 }

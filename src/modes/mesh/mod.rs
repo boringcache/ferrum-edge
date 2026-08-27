@@ -1648,6 +1648,15 @@ fn prepare_normalized_gateway_config_for_mesh(
         // refuses every transparent relay rather than falling back to the
         // slice-wide workload view — which is what made this terminator an
         // open relay into other nodes' pods.
+        //
+        // Resolved once, ahead of the match: the own-identity arm filters on
+        // it, and the own-ADDRESS port bound below is authoritative only when
+        // it resolved (issue #4249).
+        let own_workload_identity = runtime
+            .workload_spiffe_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|identity| !identity.is_empty());
         let (inbound_relay_destinations, admits_accepted_local_address) = match runtime.topology {
             // Own-IDENTITY terminators. Two admission sources, both narrow:
             //
@@ -1655,8 +1664,10 @@ fn prepare_normalized_gateway_config_for_mesh(
             //    peer actually reached on this socket. A transport fact, so it
             //    needs no inventory and works even when the slice resolved no
             //    local identity.
-            // 2. The slice workload record(s) carrying THIS proxy's configured
-            //    workload identity (`FERRUM_MESH_WORKLOAD_SPIFFE_ID`). Ambient
+            // 2. The slice workload record(s) that ARE this proxy's own local
+            //    workload — its configured identity
+            //    (`FERRUM_MESH_WORKLOAD_SPIFFE_ID`) plus cluster and label
+            //    locality, via the shared `workload_is_local`. Ambient
             //    is ztunnel-style: it runs OUTSIDE the workload pods' network
             //    namespaces and terminates inbound HBONE for the pods the
             //    node-agent enrolls on its node, dialing the destination pod's
@@ -1667,19 +1678,35 @@ fn prepare_normalized_gateway_config_for_mesh(
             //    datapath. A Sidecar reaches the same records through its own
             //    pod address, so this is a no-op there in practice.
             //
-            // The identity is the narrowing: a workload the slice declares
-            // under a DIFFERENT SPIFFE — another service, or another node's pod
-            // of another service — is still refused, which is the issue #4150
-            // property. A blank/absent identity yields an EMPTY inventory
-            // (fail closed), leaving only the accepted local address.
+            // The LOCAL-workload predicate is the narrowing: a workload the
+            // slice declares under a DIFFERENT SPIFFE — another service, or
+            // another node's pod of another service — is still refused, which
+            // is the issue #4150 property. Issue #4249 additionally requires
+            // the cluster and the configured workload labels to match, so a
+            // same-identity SIBLING REPLICA on another node no longer rides in
+            // on the SPIFFE alone. A blank/absent identity yields an EMPTY
+            // inventory (fail closed), leaving only the accepted local address.
             MeshTopology::Sidecar | MeshTopology::Ambient => {
-                let own_identity = runtime
-                    .workload_spiffe_id
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|identity| !identity.is_empty());
-                let destinations = match own_identity {
+                let destinations = match own_workload_identity {
                     Some(identity) => {
+                        // Same inputs the slice builder feeds
+                        // `resolve_local_workloads`, so the CP-side local view
+                        // and this DP-side inventory cannot drift: the cluster
+                        // this slice calls local, and the operator's own
+                        // `FERRUM_MESH_WORKLOAD_LABELS`. The env labels are
+                        // preferred over `mesh_slice.labels` deliberately —
+                        // the slice's copy can be an INFERRED intersection
+                        // (`MeshSlice::labels_ambiguous`) supplied by the
+                        // carrier, and this is a security guard.
+                        let local_cluster = mesh_slice
+                            .multi_cluster
+                            .as_ref()
+                            .and_then(|multi| multi.local_cluster.as_deref());
+                        let workload_labels: BTreeMap<String, String> = runtime
+                            .workload_labels
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect();
                         crate::modes::mesh::config::inbound_relay_destinations_from_workloads(
                             mesh_slice.workloads.iter().filter(|workload| {
                                 // `mesh_slice` here is the MULTICLUSTER-MERGED
@@ -1694,9 +1721,17 @@ fn prepare_normalized_gateway_config_for_mesh(
                                 // `remote_provenance` is the reserved
                                 // `serde(skip)` marker stamped DP-side at
                                 // remote-poll ingestion, so it cannot be forged
-                                // by a remote CP or an operator file.
+                                // by a remote CP or an operator file. It is
+                                // kept ALONGSIDE the cluster check because a
+                                // remote record whose `cluster` the merge left
+                                // unset would otherwise pass the cluster arm.
                                 !workload.remote_provenance
-                                    && workload.spiffe_id.as_str() == identity
+                                    && crate::modes::mesh::slice::workload_is_local(
+                                        workload,
+                                        identity,
+                                        &workload_labels,
+                                        local_cluster,
+                                    )
                             }),
                         )
                     }
@@ -1716,17 +1751,16 @@ fn prepare_normalized_gateway_config_for_mesh(
                 false,
             ),
             // Deliberate multi-destination allowance #2: a GAMMA ServiceWaypoint
-            // IS the L7 terminator for the services bound to it. NOTE the slice
-            // filter is NAMESPACE-level, not service-level:
-            // `service_waypoint_resource_namespaces` yields the waypoint's own
-            // namespace plus the namespaces of its bound services, so this
-            // inventory is every workload VISIBLE in those namespaces — not only
-            // the ones backing the bound services. That still refuses every
-            // workload outside those namespaces, but do not read it as a
-            // per-binding narrowing.
+            // IS the L7 terminator for the services bound to it — and for
+            // nothing else. The slice's own workload filter is NAMESPACE-level
+            // (`service_waypoint_resource_namespaces` yields the waypoint's own
+            // namespace plus the namespaces of its bound services), so reading
+            // `mesh_slice.workloads` directly admitted every workload VISIBLE
+            // in those namespaces, backing a bound service or not (issue
+            // #4251). Re-derive the backing set here instead.
             MeshTopology::ServiceWaypoint => (
                 crate::modes::mesh::config::inbound_relay_destinations_from_workloads(
-                    &mesh_slice.workloads,
+                    service_waypoint_backing_workloads(mesh_slice),
                 ),
                 false,
             ),
@@ -1737,8 +1771,20 @@ fn prepare_normalized_gateway_config_for_mesh(
             // workload address, so it owns no transparent-relay destination.
             MeshTopology::EastWestGateway | MeshTopology::EgressGateway => (Vec::new(), false),
         };
+        // Issue #4249: the own-address and own-namespace-loopback arms bound
+        // their port from the records this terminator OWNS, not from every
+        // record that happens to declare the address — `hostNetwork` pods all
+        // declare the node IP, so the whole-view scan admitted the union of
+        // their ports. `None` (no resolved identity, or a topology that never
+        // consults it) keeps the pre-#4249 fallback: there is no ownership
+        // evidence to narrow with, and this arm has no inventory either way.
+        // Assigned UNCONDITIONALLY, like the two fields below it.
+        let own_address_ports = own_workload_identity
+            .filter(|_| admits_accepted_local_address)
+            .map(|_| inbound_relay_destinations.clone());
         mesh.inbound_relay_destinations = inbound_relay_destinations;
         mesh.inbound_relay_admits_accepted_local_address = admits_accepted_local_address;
+        mesh.inbound_relay_own_address_ports = own_address_ports;
     }
     materialize_fault_runtime_overlay(&mut config, &mesh_slice.runtime_overlay);
     materialize_transformer_runtime_overlay(&mut config, &mesh_slice.runtime_overlay);
@@ -1746,6 +1792,67 @@ fn prepare_normalized_gateway_config_for_mesh(
     config.resolve_upstream_tls();
 
     Ok(config)
+}
+
+/// The slice workloads that actually BACK one of the services bound to this
+/// `ServiceWaypoint` (issue #4251).
+///
+/// A `ServiceWaypoint` is the L7 terminator for the services bound to it and
+/// for nothing else, but the slice's workload filter is NAMESPACE-level:
+/// `service_waypoint_resource_namespaces` admits every workload visible in the
+/// waypoint's own namespace plus the namespaces of its bound services. A
+/// `ratings` pod sitting in the same namespace as a bound `reviews` Service
+/// therefore rode into the relay inventory on visibility alone.
+///
+/// `mesh_slice.services` is the already waypoint-narrowed Service view, so the
+/// per-binding set is exactly the workloads those Services authorize: the
+/// workload's ATTACHED Service identity must be one the slice carries, and that
+/// Service's `workloads[]` list must name the workload's SPIFFE — the same
+/// authorization `validate_mesh_config_internal` enforces for a
+/// cross-namespace attachment, so a bare `service_namespace` stamp cannot spoof
+/// membership.
+///
+/// Fail closed: no bound Service, or bound Services that list no backing
+/// workload, yields an EMPTY inventory rather than falling back to the visible
+/// view. Cold path — one index build per mesh apply, then a hash-free ordered
+/// lookup per workload; the guard itself never runs this.
+fn service_waypoint_backing_workloads(
+    mesh_slice: &MeshSlice,
+) -> Vec<&crate::modes::mesh::config::Workload> {
+    let mut backed: BTreeSet<(&str, &str, &str)> = BTreeSet::new();
+    for service in &mesh_slice.services {
+        for reference in &service.workloads {
+            backed.insert((
+                service.namespace.as_str(),
+                service.name.as_str(),
+                reference.spiffe_id.as_str(),
+            ));
+        }
+    }
+    let mut backing: Vec<&crate::modes::mesh::config::Workload> = Vec::new();
+    if backed.is_empty() {
+        return backing;
+    }
+    for workload in &mesh_slice.workloads {
+        // A remote cluster's backing pod keeps its SPIFFE and its Service
+        // attachment through `tag_remote_workloads`, so it satisfies the
+        // membership test below. Relaying to it would dial across clusters in
+        // plaintext from this waypoint, bypassing the east-west gateway and its
+        // inner mTLS — the same reason the own-identity arm excludes remote
+        // provenance.
+        if workload.remote_provenance {
+            continue;
+        }
+        let attachment = (
+            workload.attached_service_namespace(),
+            workload.service_name.as_str(),
+            workload.spiffe_id.as_str(),
+        );
+        if backed.contains(&attachment) {
+            backing.push(workload);
+        }
+    }
+    backing
 }
 
 /// Env switch that opts a NodeWaypoint into materializing UDP/DTLS service
@@ -40299,19 +40406,31 @@ mod tests {
     /// socket's local address alone when no workload identity is configured;
     /// the two waypoint topologies carry exactly their narrow inventory; the
     /// gateway topologies carry neither.
+    ///
+    /// Issue #4251 sharpens the `ServiceWaypoint` arm: `unbound` below is
+    /// VISIBLE in the same namespace as the bound `reviews` Service but backs
+    /// no bound Service, so it must not be a destination the waypoint
+    /// terminates for.
     #[test]
     fn inbound_relay_termination_scope_is_back_projected_per_topology() {
         use crate::modes::mesh::config::{InboundRelayDenial, MeshInboundRelayHost};
+
+        const REVIEWS_SPIFFE: &str = "spiffe://cluster.local/ns/default/sa/reviews";
 
         let mut peer = workload("reviews", "reviews");
         peer.addresses = vec!["10.244.1.7".to_string()];
         let mut enrolled = workload("ratings", "ratings");
         enrolled.addresses = vec!["10.244.2.9".to_string()];
+        let mut unbound = workload("payments", "payments");
+        unbound.addresses = vec!["10.244.3.3".to_string()];
         let slice = MeshSlice {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
             version: "test".to_string(),
-            workloads: vec![peer],
+            workloads: vec![peer, unbound],
+            // Only `reviews` is bound to the waypoint, so only its Service
+            // rides the narrowed slice; `payments` is namespace-visible only.
+            services: vec![http_mesh_service("reviews", 80, REVIEWS_SPIFFE)],
             node_waypoint_capture_destinations: vec![enrolled],
             ..MeshSlice::default()
         };
@@ -40375,7 +40494,8 @@ mod tests {
             Err(InboundRelayDenial::AddressNotTerminated)
         );
 
-        // ServiceWaypoint: the already waypoint-narrowed backing workloads.
+        // ServiceWaypoint: the workloads BACKING its bound services, and only
+        // those (issue #4251).
         let mesh = prepared(MeshTopology::ServiceWaypoint);
         assert!(!mesh.inbound_relay_admits_accepted_local_address);
         assert_eq!(hosts(&mesh), vec![MeshInboundRelayHost::Ip(pod_ip)]);
@@ -40383,6 +40503,12 @@ mod tests {
         assert_eq!(
             decide(&mesh, "10.244.2.9", None),
             Err(InboundRelayDenial::AddressNotTerminated)
+        );
+        assert_eq!(
+            decide(&mesh, "10.244.3.3", None),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "a workload merely VISIBLE in a bound service's namespace, backing \
+             no bound service, is not a destination this waypoint terminates for"
         );
 
         // Gateway topologies terminate no in-mesh workload at all.
@@ -40418,18 +40544,49 @@ mod tests {
 
         let mut own = workload("reviews", "reviews");
         own.addresses = vec!["10.244.5.5".to_string(), OWN_NAME.to_string()];
+        own.cluster = Some("cluster-a".to_string());
         let mut other = workload("ratings", "ratings");
         other.addresses = vec!["10.244.6.6".to_string()];
+        // Issue #4249: the SAME SPIFFE in another CLUSTER. `tag_remote_workloads`
+        // preserves a remote endpoint's identity, so identity alone admits it.
+        let mut remote_replica = workload("reviews", "reviews");
+        remote_replica.addresses = vec!["10.244.7.7".to_string()];
+        remote_replica.cluster = Some("cluster-b".to_string());
+        // Issue #4249: the same SPIFFE and cluster, but labels this workload
+        // does not carry — a sibling replica of another revision, on some other
+        // node.
+        let mut label_mismatch = workload("reviews", "reviews");
+        label_mismatch.addresses = vec!["10.244.8.8".to_string()];
+        label_mismatch.cluster = Some("cluster-a".to_string());
+        label_mismatch
+            .selector
+            .labels
+            .insert("version".to_string(), "canary".to_string());
+        // Issue #4249: a CO-LOCATED pod declaring the SAME ADDRESS on a port
+        // this workload does not serve. `hostNetwork` pods all declare the node
+        // IP, so the own-address port bound must not union their ports in.
+        let mut co_located = workload("ratings", "ratings");
+        co_located.addresses = vec!["10.244.5.5".to_string()];
+        co_located.ports = vec![WorkloadPort {
+            port: 9443,
+            protocol: AppProtocol::Http,
+            name: Some("admin".to_string()),
+        }];
         let slice = MeshSlice {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
             version: "test".to_string(),
-            workloads: vec![own, other],
+            workloads: vec![own, other, remote_replica, label_mismatch, co_located],
+            multi_cluster: Some(MultiClusterConfig {
+                local_cluster: Some("cluster-a".to_string()),
+                ..MultiClusterConfig::default()
+            }),
             ..MeshSlice::default()
         };
         let runtime = MeshRuntimeConfig {
             topology: MeshTopology::Ambient,
             workload_spiffe_id: Some(OWN_SPIFFE.to_string()),
+            workload_labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
             ..test_mesh_runtime_config()
         };
         let config = gateway_config_from_mesh_slice(&slice, &runtime, None, None);
@@ -40479,6 +40636,20 @@ mod tests {
             decide("ratings.default.svc.cluster.local", 8080),
             Err(InboundRelayDenial::UnresolvableHost)
         );
+        // Issue #4249: the same SPIFFE is not ownership. A record the slice
+        // places in another cluster, and one carrying labels this workload does
+        // not have, are both refused — the inventory adopts the shared
+        // LOCAL-workload predicate, not a bare identity compare.
+        assert_eq!(
+            decide("10.244.7.7", 8080),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "a same-identity record in another cluster must not be an own-pod destination"
+        );
+        assert_eq!(
+            decide("10.244.8.8", 8080),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "a same-identity sibling whose labels this workload does not carry must be refused"
+        );
         // The accepted socket's own local address is admissible in principle
         // (this arm serves a Sidecar reached at its pod IP), but on a
         // node-shared Ambient proxy no workload record declares the node
@@ -40486,6 +40657,27 @@ mod tests {
         assert_eq!(
             decide("10.244.0.1", 8080),
             Err(InboundRelayDenial::PortNotDeclared)
+        );
+
+        // Issue #4249, own-ADDRESS arm: reached at the address the co-located
+        // pod also declares, the port bound comes from the records THIS
+        // terminator owns. `co_located`'s 9443 is not unioned in, and neither
+        // is it reachable through the own-namespace loopback shortcut.
+        let own_ip = "10.244.5.5".parse::<std::net::IpAddr>().expect("own IP");
+        let decide_own = |host: &str, port: u16| {
+            mesh.inbound_relay_destination_decision(host, port, Some(own_ip))
+        };
+        assert_eq!(decide_own("10.244.5.5", 8080), Ok(()));
+        assert_eq!(
+            decide_own("10.244.5.5", 9443),
+            Err(InboundRelayDenial::PortNotDeclared),
+            "a co-located pod's port must not widen the own-address bound"
+        );
+        assert_eq!(decide_own("127.0.0.1", 8080), Ok(()));
+        assert_eq!(
+            decide_own("localhost", 9443),
+            Err(InboundRelayDenial::PortNotDeclared),
+            "the own-namespace loopback shortcut is bounded by the same owned records"
         );
     }
 
