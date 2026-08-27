@@ -43334,12 +43334,12 @@ async fn proxy_to_backend(
                 let retained_ceiling = response_buffer_budget::buffered_request_body_ceiling(
                     effective_max_request_body_size_bytes,
                 );
-                // Held for the rest of this dispatch arm, so it covers the
-                // collect and the construction of the backend request that
-                // carries the collected bytes, and is returned by DROP on every
-                // exit path below — 413, 499, timeout, deadline, authorization
-                // expiry, and task cancellation alike.
-                let _request_buffer_permit =
+                // Held through collect + plugin transforms below; early exits
+                // (413, 499, timeout, deadline, authorization expiry, plugin
+                // reject, cancellation) return it by DROP. On the success path
+                // it is published onto the `Bytes` that stay resident for the
+                // backend write and retry replay (issue #4231).
+                let request_buffer_permit =
                     match response_buffer_budget::RequestBufferPermit::reserve(retained_ceiling) {
                         Some(permit) => permit,
                         None => {
@@ -43482,8 +43482,11 @@ async fn proxy_to_backend(
                     }
                 }
 
+                // Publish the charge onto the bytes that stay resident for the
+                // backend write and retry replay. An empty body retains nothing,
+                // so this returns `Bytes::new()` and drops the permit immediately.
+                let body_bytes = request_buffer_permit.into_charged_bytes(body_bytes);
                 if !body_bytes.is_empty() {
-                    let body_bytes = Bytes::from(body_bytes);
                     if retain_request_body {
                         retained_body = Some(body_bytes.clone());
                     }
@@ -52073,8 +52076,12 @@ async fn proxy_to_backend_http3(
         response_decision_ctx.or(ctx.as_deref()),
         state.env_config.authenticated_stream_max_lifetime_seconds,
     );
-    let request_body = match client_request_body {
-        ClientRequestBody::Buffered(buffered) => buffered.body,
+    // In-dispatch collect (issue #4231): the permit must outlive this match so
+    // it can be published onto the `Bytes` that stay resident for the H3 send
+    // and retry replay. Pre-auth `Buffered` bodies already carry their permit
+    // on `BufferedClientRequestBody` until this match extracts the `Vec`.
+    let (request_body, in_dispatch_request_buffer_permit) = match client_request_body {
+        ClientRequestBody::Buffered(buffered) => (buffered.body, None),
         ClientRequestBody::Streaming(original_req) => {
             let (_parts, body) = (*original_req).into_parts();
             // Fail-closed retained ceiling + aggregate admission taken BEFORE
@@ -52100,10 +52107,10 @@ async fn proxy_to_backend_http3(
                     None,
                 );
             }
-            // Held for the rest of this bridge arm, so it covers the collect
-            // and the backend request built from the collected bytes, and is
-            // returned by DROP on every exit path below.
-            let _request_buffer_permit =
+            // Held through collect below; early exits return it by DROP. On
+            // the success path it is published onto the resident `Bytes`
+            // after plugin transforms (issue #4231).
+            let request_buffer_permit =
                 match response_buffer_budget::RequestBufferPermit::reserve(retained_ceiling) {
                     Some(permit) => permit,
                     None => {
@@ -52111,7 +52118,7 @@ async fn proxy_to_backend_http3(
                     }
                 };
             let limited = http_body_util::Limited::new(body, retained_ceiling);
-            match collect_request_body_under_authorization(
+            let body = match collect_request_body_under_authorization(
                 limited.collect(),
                 grpc_deadline_at,
                 proxy.backend_read_timeout_ms,
@@ -52187,7 +52194,8 @@ async fn proxy_to_backend_http3(
                         None,
                     );
                 }
-            }
+            };
+            (body, Some(request_buffer_permit))
         }
     };
 
@@ -52264,8 +52272,13 @@ async fn proxy_to_backend_http3(
 
     // `Bytes::from(Vec<u8>)` transfers ownership without copying. Convert
     // before the optional retain-clone so retain becomes a refcount bump
-    // rather than a Vec deep copy on every retry-enabled request.
-    let body_bytes: bytes::Bytes = request_body.into();
+    // rather than a Vec deep copy on every retry-enabled request. When this
+    // body was collected in-dispatch, the permit travels with the `Bytes` so
+    // send and retry replay stay charged (issue #4231).
+    let body_bytes: bytes::Bytes = match in_dispatch_request_buffer_permit {
+        Some(permit) => permit.into_charged_bytes(request_body),
+        None => request_body.into(),
+    };
     let retained_body = if retain_request_body && !body_bytes.is_empty() {
         Some(body_bytes.clone())
     } else {

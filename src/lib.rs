@@ -11113,13 +11113,23 @@ pub mod _test_support {
 
     /// An RAII claim on a [`RequestBufferBudgetProbe`], mirroring exactly what
     /// a buffered request path holds while it collects an upload. Dropping it
-    /// returns the capacity.
+    /// returns the capacity. Publishing the collected bytes through
+    /// [`Self::into_charged_bytes`] moves the charge onto those bytes so it is
+    /// released when the last clone drops (issue #4231).
     pub struct RequestBufferPermitProbe(crate::proxy::response_buffer_budget::RequestBufferPermit);
 
     impl RequestBufferPermitProbe {
         /// Capacity this claim currently holds, in whole reservation blocks.
         pub fn reserved_bytes(&self) -> usize {
             self.0.reserved_bytes()
+        }
+
+        /// Move this claim onto a cheaply cloneable [`bytes::Bytes`] view of
+        /// `data`, exactly as the in-dispatch collectors do after they finish
+        /// collecting. The charge is released when the last clone drops
+        /// (issue #4231).
+        pub fn into_charged_bytes(self, data: Vec<u8>) -> bytes::Bytes {
+            self.0.into_charged_bytes(data)
         }
     }
 
