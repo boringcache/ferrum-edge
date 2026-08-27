@@ -7943,3 +7943,528 @@ mod saml_name_id_is_required {
         );
     }
 }
+
+// ── SAML / WS-Security comment truncation (CVE-2017-11427 class) ────────────
+//
+// An XML comment inside a signed value splits the DOM's character data into two
+// text nodes while exclusive canonicalization — the transform that produces the
+// bytes the signature actually digests — drops the comment and emits both runs.
+// A reader that returns only the first run therefore acts on a truncated prefix
+// of an identity the IdP legitimately signed. These tests pin the fix on every
+// element whose value this plugin reads.
+
+/// The premise of the whole class, proved directly against Ferrum's own
+/// exclusive c14n: the comment is invisible to the digest, so the IdP signature
+/// covers the FULL string. Anything the gateway trusts must agree with this.
+#[test]
+fn test_saml_comment_is_invisible_to_exclusive_canonicalization() {
+    let benign = format!(
+        r#"<saml:Assertion xmlns:saml="{ns}" ID="_c14n-benign"><saml:Subject><saml:NameID>admin@evil.example</saml:NameID></saml:Subject></saml:Assertion>"#,
+        ns = saml_fixtures::SAML_NS,
+    );
+    let split = format!(
+        r#"<saml:Assertion xmlns:saml="{ns}" ID="_c14n-benign"><saml:Subject><saml:NameID>admin<!--truncate-->@evil.example</saml:NameID></saml:Subject></saml:Assertion>"#,
+        ns = saml_fixtures::SAML_NS,
+    );
+
+    let benign_c14n = soap_exclusive_canonicalize_element_for_test(&benign, "Assertion", "")
+        .expect("benign assertion must canonicalize");
+    let split_c14n = soap_exclusive_canonicalize_element_for_test(&split, "Assertion", "")
+        .expect("comment-split assertion must canonicalize");
+
+    assert_eq!(
+        benign_c14n, split_c14n,
+        "exclusive c14n must drop the comment and emit both text runs — that is \
+         why the signature keeps verifying"
+    );
+    assert!(
+        benign_c14n.contains("admin@evil.example"),
+        "the signed bytes name the full identity: {benign_c14n}"
+    );
+}
+
+/// The attack itself: a validly-signed assertion whose NameID is split by a
+/// comment must never resolve to the truncated prefix.
+#[tokio::test]
+async fn test_saml_name_id_comment_truncation_rejected() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-comment-nameid",
+        "https://idp.example.com/metadata",
+        "admin@evil.example",
+    );
+    // The comment is present when the fixture signs, and c14n drops it, so this
+    // assertion carries a genuinely valid IdP signature over
+    // `admin@evil.example`.
+    builder.name_id_fragment =
+        Some("<saml:NameID>admin<!---->@evil.example</saml:NameID>".to_string());
+    let assertion = builder.build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+
+    assert!(
+        is_reject(&result),
+        "a comment-split NameID must not authenticate the truncated prefix: {result:?}"
+    );
+    assert_eq!(reject_status(&result), 401);
+    assert!(
+        reject_body(&result).contains("comment"),
+        "expected the comment rejection, got: {}",
+        reject_body(&result)
+    );
+    assert_ne!(
+        ctx.metadata.get("soap_ws_saml_subject").map(String::as_str),
+        Some("admin"),
+        "the truncated prefix must never become the request principal"
+    );
+    assert_ne!(ctx.authenticated_identity.as_deref(), Some("admin"));
+}
+
+/// A comment before the value makes `Node::text()` return `None` outright; the
+/// rejection must still be the explicit comment refusal, not an "empty NameID"
+/// accident that a later refactor could turn back into a truncation.
+#[tokio::test]
+async fn test_saml_name_id_leading_comment_rejected() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-leading-comment-nameid",
+        "https://idp.example.com/metadata",
+        "admin@evil.example",
+    );
+    builder.name_id_fragment =
+        Some("<saml:NameID><!---->admin@evil.example</saml:NameID>".to_string());
+    let assertion = builder.build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+
+    assert!(is_reject(&result), "got {result:?}");
+    assert!(
+        reject_body(&result).contains("comment"),
+        "expected the comment rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+/// Several comments, including one that splits the local part, must not be
+/// stitched back into a shorter principal either.
+#[tokio::test]
+async fn test_saml_name_id_multiple_comments_rejected() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-multi-comment-nameid",
+        "https://idp.example.com/metadata",
+        "admin@evil.example",
+    );
+    builder.name_id_fragment =
+        Some("<saml:NameID>ad<!--a-->min<!--b-->@evil.example</saml:NameID>".to_string());
+    let assertion = builder.build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+
+    assert!(is_reject(&result), "got {result:?}");
+    assert!(
+        reject_body(&result).contains("comment"),
+        "expected the comment rejection, got: {}",
+        reject_body(&result)
+    );
+    for truncation in ["ad", "admin", "admin@evil.example"] {
+        assert_ne!(
+            ctx.metadata.get("soap_ws_saml_subject").map(String::as_str),
+            Some(truncation),
+            "a rejected assertion must publish no principal"
+        );
+    }
+}
+
+/// The paired control: the very same identity, without the comment, still
+/// authenticates and resolves to exactly the string the signature covers.
+#[tokio::test]
+async fn test_saml_comment_free_name_id_still_accepted() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let assertion = saml_fixtures::AssertionBuilder::new(
+        "_assertion-comment-free-nameid",
+        "https://idp.example.com/metadata",
+        "admin@evil.example",
+    )
+    .build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "the benign assertion must still validate: {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata.get("soap_ws_saml_subject").map(String::as_str),
+        Some("admin@evil.example"),
+        "the resolved principal must be the string the signature covered"
+    );
+}
+
+/// A comment that is NOT inside a value element is ordinary markup: c14n drops
+/// it and nothing reads it, so the assertion must still validate. This is what
+/// keeps the fix from degenerating into "reject every comment".
+#[tokio::test]
+async fn test_saml_comment_outside_value_elements_still_accepted() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-benign-comment",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    );
+    builder.name_id_fragment =
+        Some("<!--idp--><saml:NameID>alice@example.com</saml:NameID>".to_string());
+    let assertion = builder.build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a comment between elements is not a truncation: {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata.get("soap_ws_saml_subject").map(String::as_str),
+        Some("alice@example.com")
+    );
+}
+
+/// Issuer trust confusion: the truncated prefix is a trusted issuer, the signed
+/// value is not.
+#[tokio::test]
+async fn test_saml_issuer_comment_truncation_rejected() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let assertion = saml_fixtures::AssertionBuilder::new(
+        "_assertion-comment-issuer",
+        "https://idp.example.com/metadata<!---->.evil.example",
+        "alice@example.com",
+    )
+    .build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+
+    assert!(
+        is_reject(&result),
+        "a comment-split Issuer must not resolve to the trusted prefix: {result:?}"
+    );
+    assert!(
+        reject_body(&result).contains("comment"),
+        "expected the comment rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+/// Audience-binding bypass: the truncated prefix is this service, the signed
+/// value names another one.
+#[tokio::test]
+async fn test_saml_audience_comment_truncation_rejected() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-comment-audience",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    );
+    builder.audience = Some(format!(
+        "{}<!---->.evil.example",
+        saml_fixtures::TEST_AUDIENCE
+    ));
+    let assertion = builder.build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+
+    assert!(
+        is_reject(&result),
+        "a comment-split Audience must not admit this service on its prefix: {result:?}"
+    );
+    assert!(
+        reject_body(&result).contains("comment"),
+        "expected the comment rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+/// Insert `<!---->` a few characters into the first `open_tag` element's value,
+/// so its character data is split rather than merely prefixed.
+fn split_element_value_with_comment(xml: &str, open_tag: &str) -> String {
+    let open = xml.find(open_tag).expect("fixture must contain the tag");
+    let mut out = xml.to_string();
+    // Every value this helper is used on is base64 (ASCII), so a fixed byte
+    // offset is a char boundary.
+    out.insert_str(open + open_tag.len() + 4, "<!---->");
+    out
+}
+
+/// The signature carriers are read through the same helper, so a comment there
+/// is a named refusal instead of a base64/verification accident — there is only
+/// ever ONE reading of an element's value in this module.
+#[tokio::test]
+async fn test_saml_signature_value_comment_rejected() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let assertion = saml_fixtures::AssertionBuilder::new(
+        "_assertion-comment-sigvalue",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    )
+    .build();
+    let assertion = split_element_value_with_comment(&assertion, "<ds:SignatureValue>");
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+
+    assert!(is_reject(&result), "got {result:?}");
+    assert!(
+        reject_body(&result).contains("comment"),
+        "expected the comment rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn test_saml_digest_value_comment_rejected() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let assertion = saml_fixtures::AssertionBuilder::new(
+        "_assertion-comment-digestvalue",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    )
+    .build();
+    let assertion = split_element_value_with_comment(&assertion, "<ds:DigestValue>");
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+
+    assert!(is_reject(&result), "got {result:?}");
+    assert!(
+        reject_body(&result).contains("comment"),
+        "expected the comment rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn test_saml_x509_certificate_comment_rejected() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let assertion = saml_fixtures::AssertionBuilder::new(
+        "_assertion-comment-x509",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    )
+    .build();
+    let assertion = split_element_value_with_comment(&assertion, "<ds:X509Certificate>");
+
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+
+    assert!(is_reject(&result), "got {result:?}");
+    assert!(
+        reject_body(&result).contains("comment"),
+        "expected the comment rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+/// The same shape on the non-SAML path. Nothing signs a plain UsernameToken,
+/// but the gateway/backend identity differential is identical: Ferrum would
+/// authenticate `alice` while a backend re-parsing the envelope sees
+/// `alice@evil.example`.
+#[tokio::test]
+async fn test_username_token_username_comment_truncation_rejected() {
+    let plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
+    let ut = r#"<wsse:UsernameToken>
+        <wsse:Username>alice<!---->@evil.example</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">secret123</wsse:Password>
+    </wsse:UsernameToken>"#;
+    let body = wrap_soap(ut);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+
+    assert!(
+        is_reject(&result),
+        "a comment-split Username must not authenticate the truncated prefix: {result:?}"
+    );
+    assert!(
+        reject_body(&result).contains("comment"),
+        "expected the comment rejection, got: {}",
+        reject_body(&result)
+    );
+    assert_ne!(
+        ctx.metadata.get("soap_ws_username").map(String::as_str),
+        Some("alice"),
+        "the truncated prefix must never become the request principal"
+    );
+}
+
+#[tokio::test]
+async fn test_username_token_password_comment_truncation_rejected() {
+    let plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
+    let ut = r#"<wsse:UsernameToken>
+        <wsse:Username>alice</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">secret123<!---->trailing</wsse:Password>
+    </wsse:UsernameToken>"#;
+    let body = wrap_soap(ut);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+
+    assert!(is_reject(&result), "got {result:?}");
+    assert!(
+        reject_body(&result).contains("comment"),
+        "expected the comment rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+/// Control for the non-SAML path: a comment between the token's child elements
+/// is ordinary markup and must still validate.
+#[tokio::test]
+async fn test_username_token_comment_outside_value_elements_still_accepted() {
+    let plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
+    let ut = r#"<wsse:UsernameToken>
+        <!-- issued by the test client -->
+        <wsse:Username>alice</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">secret123</wsse:Password>
+    </wsse:UsernameToken>"#;
+    let body = wrap_soap(ut);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a comment between elements is not a truncation: {result:?}"
+    );
+    assert_eq!(ctx.metadata.get("soap_ws_username").unwrap(), "alice");
+}
+
+/// `wsu:Created` feeds the PasswordDigest input and the replay-cache key; a
+/// split there must not produce a digest input the client did not present.
+#[tokio::test]
+async fn test_username_token_created_comment_truncation_rejected() {
+    let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+    let created = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let ut = format!(
+        r#"<wsse:UsernameToken>
+        <wsse:Username>alice</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">ZGlnZXN0</wsse:Password>
+        <wsse:Nonce>bm9uY2UtdmFsdWU=</wsse:Nonce>
+        <wsu:Created>{}<!----></wsu:Created>
+    </wsse:UsernameToken>"#,
+        created
+    );
+    let body = wrap_soap(&ut);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+
+    assert!(is_reject(&result), "got {result:?}");
+    assert!(
+        reject_body(&result).contains("comment"),
+        "expected the comment rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+/// `wsse:Nonce` is both the digest input and the replay-cache key; a split
+/// there must be refused, not silently keyed on the prefix.
+#[tokio::test]
+async fn test_username_token_nonce_comment_truncation_rejected() {
+    let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+    let created = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let ut = format!(
+        r#"<wsse:UsernameToken>
+        <wsse:Username>alice</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">ZGlnZXN0</wsse:Password>
+        <wsse:Nonce>bm9uY2Ut<!---->dmFsdWU=</wsse:Nonce>
+        <wsu:Created>{}</wsu:Created>
+    </wsse:UsernameToken>"#,
+        created
+    );
+    let body = wrap_soap(&ut);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+
+    assert!(is_reject(&result), "got {result:?}");
+    assert!(
+        reject_body(&result).contains("comment"),
+        "expected the comment rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+/// `wsu:Timestamp` bounds message freshness; a split `Created` must not be
+/// read as a shorter, differently-parsed instant.
+#[tokio::test]
+async fn test_timestamp_created_comment_truncation_rejected() {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    let now = chrono::Utc::now();
+    let created = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let expires = (now + chrono::Duration::minutes(5))
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    let ts = format!(
+        r#"<wsu:Timestamp wsu:Id="TS-1">
+        <wsu:Created>{}<!----></wsu:Created>
+        <wsu:Expires>{}</wsu:Expires>
+      </wsu:Timestamp>"#,
+        created, expires
+    );
+    let body = wrap_soap(&ts);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+
+    assert!(is_reject(&result), "got {result:?}");
+    assert!(
+        reject_body(&result).contains("comment"),
+        "expected the comment rejection, got: {}",
+        reject_body(&result)
+    );
+}

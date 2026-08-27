@@ -11,6 +11,7 @@
 //! lives in the integration test suite, not the functional one.
 
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
@@ -23,10 +24,18 @@ use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::proxy::backend_capabilities::{
     BackendCapabilityRecord, ProtocolSupport, capability_key_for_proxy_target,
 };
+use http_body_util::Full;
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper::{Request, Response};
+use hyper_util::rt::TokioIo;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use tokio::net::TcpListener;
 
 /// JWT config for tests. The admin handlers are JWT-gated regardless of
 /// any env flag, so this exercises the only auth path operators use.
@@ -106,6 +115,35 @@ fn admin_state_with_capability_registry(jwt: JwtManager) -> AdminState {
     record.last_probe_error = Some("seeded by test".to_string());
     proxy_state.backend_capabilities.upsert(key, record);
 
+    admin_state_from_proxy_state(jwt, proxy_state)
+}
+
+fn admin_state_with_http_probe_proxy(jwt: JwtManager, backend_port: u16) -> AdminState {
+    let proxy = make_http_probe_proxy("probe-proxy", backend_port);
+    let cfg = GatewayConfig {
+        version: "1".to_string(),
+        proxies: vec![proxy.clone()],
+        consumers: vec![],
+        plugin_configs: vec![],
+        upstreams: vec![],
+        loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
+        ..Default::default()
+    };
+    let env_config = ferrum_edge::config::env_config::EnvConfig::default();
+    let dns_cache = DnsCache::new(DnsConfig::default());
+    let (proxy_state, _health_check_handles) =
+        ProxyState::new(cfg, dns_cache, env_config, None, None).expect("proxy state");
+
+    let key = capability_key_for_proxy_target(&proxy, None);
+    proxy_state
+        .backend_capabilities
+        .upsert(key, BackendCapabilityRecord::default());
+
+    admin_state_from_proxy_state(jwt, proxy_state)
+}
+
+fn admin_state_from_proxy_state(jwt: JwtManager, proxy_state: ProxyState) -> AdminState {
     AdminState {
         db: None,
         jwt_manager: jwt,
@@ -147,6 +185,48 @@ fn admin_state_with_capability_registry(jwt: JwtManager) -> AdminState {
         ),
         runtime_config_apply: None,
     }
+}
+
+fn make_http_probe_proxy(id: &str, backend_port: u16) -> ferrum_edge::config::types::Proxy {
+    use ferrum_edge::config::types::{BackendScheme, DispatchKind};
+    let mut proxy = make_minimal_proxy(id);
+    proxy.backend_scheme = Some(BackendScheme::Http);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Http);
+    proxy.backend_host = "127.0.0.1".to_string();
+    proxy.backend_port = backend_port;
+    proxy
+}
+
+async fn start_slow_counting_http_backend(
+    response_delay: Duration,
+) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind counting backend");
+    let addr = listener.local_addr().expect("backend addr");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_for_task = accepted.clone();
+
+    let handle = tokio::spawn(async move {
+        while let Ok((socket, _peer)) = listener.accept().await {
+            accepted_for_task.fetch_add(1, Ordering::SeqCst);
+            let delay = response_delay;
+            tokio::spawn(async move {
+                let service = service_fn(move |_req: Request<Incoming>| async move {
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .keep_alive(true)
+                    .serve_connection(TokioIo::new(socket), service)
+                    .await;
+            });
+        }
+    });
+
+    (addr, accepted, handle)
 }
 
 fn make_minimal_proxy(id: &str) -> ferrum_edge::config::types::Proxy {
@@ -455,4 +535,63 @@ async fn get_backend_capabilities_rejects_invalid_token() {
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn concurrent_backend_capabilities_refresh_coalesces_probe_fanout() {
+    let tc = TestConfig::default();
+    let jwt = create_test_jwt_manager(&tc);
+    let (backend_addr, accepted, _backend_task) =
+        start_slow_counting_http_backend(Duration::from_millis(250)).await;
+    let state = admin_state_with_http_probe_proxy(jwt, backend_addr.port());
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    const CONCURRENT_REFRESHES: usize = 10;
+    let mut tasks = Vec::with_capacity(CONCURRENT_REFRESHES);
+    for _ in 0..CONCURRENT_REFRESHES {
+        let base_url = base_url.clone();
+        let token = token.clone();
+        tasks.push(tokio::spawn(async move {
+            admin_request_with_token(
+                reqwest::Method::POST,
+                &base_url,
+                "/backend-capabilities/refresh",
+                &token,
+            )
+            .await
+        }));
+    }
+
+    let mut refreshed = 0usize;
+    let mut joined = 0usize;
+    for task in tasks {
+        let (status, body) = task.await.expect("refresh task");
+        assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+        match body["status"].as_str() {
+            Some("refreshed") => refreshed += 1,
+            Some("joined") => joined += 1,
+            other => panic!("unexpected refresh status: {other:?}; body: {body}"),
+        }
+    }
+
+    assert_eq!(
+        refreshed, 1,
+        "exactly one caller should drive the coalesced pass"
+    );
+    assert_eq!(
+        joined,
+        CONCURRENT_REFRESHES - 1,
+        "remaining callers should join the in-flight pass"
+    );
+
+    let accepts = accepted.load(Ordering::SeqCst);
+    assert!(
+        accepts >= 1,
+        "expected at least one backend accept from the coalesced pass; got {accepts}"
+    );
+    assert!(
+        accepts <= 2,
+        "uncoalesced refreshes would multiply probe fan-out; got {accepts} accepts"
+    );
 }

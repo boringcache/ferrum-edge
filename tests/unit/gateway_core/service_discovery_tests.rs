@@ -6025,3 +6025,85 @@ async fn consul_normal_parsing_still_works_under_bounded_collector() {
     assert_eq!(snapshot.targets().len(), 1);
     assert_eq!(snapshot.pending_cursor_index(), Some(5));
 }
+
+#[tokio::test]
+async fn discovered_snapshot_starts_active_probes_for_sd_only_upstream() {
+    let mut upstream = make_upstream(
+        "sd-hc",
+        Vec::new(),
+        Some(ServiceDiscoveryConfig {
+            provider: SdProvider::DnsSd,
+            dns_sd: Some(DnsSdConfig {
+                service_name: "_http._tcp.svc.local".to_string(),
+                poll_interval_seconds: 30,
+            }),
+            kubernetes: None,
+            consul: None,
+            mesh: None,
+            default_weight: 1,
+            max_stale_seconds: None,
+            stale_policy: None,
+        }),
+    );
+    upstream.health_checks = Some(HealthCheckConfig {
+        active: Some(ActiveHealthCheck {
+            http_path: "/health".to_string(),
+            interval_seconds: 60,
+            timeout_ms: 100,
+            healthy_threshold: 2,
+            unhealthy_threshold: 2,
+            healthy_status_codes: vec![200],
+            use_tls: false,
+            probe_type: HealthProbeType::Tcp,
+            udp_probe_payload: None,
+            grpc_service_name: None,
+        }),
+        passive: None,
+    });
+    let config = make_config_with_upstreams(vec![upstream]);
+    let lb_cache = LoadBalancerCache::new(&config);
+    let health_checker = ferrum_edge::health_check::HealthChecker::new();
+    health_checker.start(&config);
+    assert_eq!(
+        health_checker.active_task_count(),
+        0,
+        "empty static targets must not spawn probes until discovery publishes"
+    );
+
+    let dns_cache = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default());
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let mut state = ferrum_edge::_test_support::DiscoveryLoopStateForTest::new();
+    let snapshot =
+        ferrum_edge::service_discovery::DiscoverySnapshot::from_targets(vec![make_target(
+            "10.0.0.9", 8080,
+        )]);
+    let outcome = ferrum_edge::_test_support::apply_service_discovery_snapshot_for_test(
+        "ferrum",
+        "sd-hc",
+        "dns_sd",
+        snapshot,
+        &mut state,
+        &lb_cache,
+        &None,
+        &[],
+        LoadBalancerAlgorithm::RoundRobin,
+        &None,
+        &cancel_rx,
+        &None,
+        &dns_cache,
+        &health_checker,
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            ferrum_edge::_test_support::DiscoveryApplyControlForTest::Continue
+        ),
+        "discovered snapshot should publish, got {outcome:?}"
+    );
+    assert!(
+        health_checker.active_task_count() >= 1,
+        "publishing discovered targets must start active probes"
+    );
+    assert!(health_checker.has_running_active_probes("ferrum", "sd-hc"));
+}

@@ -841,6 +841,45 @@ operation — declare the provenance or define an equivalent completion contract
 
 The absolute gRPC response-deadline wrapper sits outside the response-inspector chain. Its partial-DATA decision therefore counts only bytes emitted by the final inspected body, not backend chunks an inspector consumed and buffered. If an inspector has emitted zero bytes when the deadline fires, the client still receives the clean status-4 terminal representation.
 
+## Backend Request Trailers
+
+Every boundary above operates on the **initial header block**. A client may also
+send an HTTP/1.1 chunked trailer section or an HTTP/2 / HTTP/3 `TRAILERS` frame
+*after* that block has already been authenticated, routed, stripped, and
+re-stamped with gateway assertions — so trailers are their own, later trust
+boundary rather than a continuation of the header one.
+
+Client request trailers are filtered by a single canonical predicate
+(`is_forbidden_backend_request_trailer_name`) applied on every protocol family
+before the trailer section reaches a backend:
+
+- **HTTP/1.1 and HTTP/2** — at the streaming client-body source shared by the
+  reqwest pool, the direct-HTTP/2 pool, the native gRPC pool, the mesh-mTLS
+  pool, and the Unix-socket pool, plus the direct-HTTP/2 passthrough arm.
+- **HTTP/3** — at the native H3 relay and the H3-to-H2 cross-protocol bridge.
+- **gRPC-Web** — a `0x80` body trailer frame is validated against the same
+  predicate when it is staged, and re-validated when a dispatch path reads it
+  back; anything unprovable fails closed and no trailer block is sent.
+
+Removed from the trailer section: RFC 9110 §7.6.1 request-direction hop-by-hop
+and framing fields (`connection`, `keep-alive`, `proxy-authorization`,
+`proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`,
+`content-length`); reserved gateway assertions (`x-consumer-username`,
+`x-consumer-custom-id`, `x-geo-country`); Ferrum-owned names (`x-ferrum-*`,
+`x-path-param-*`); credentials (`authorization`, `cookie`, `x-api-key`);
+forwarding identity the gateway regenerates (`x-forwarded-*`, `forwarded`);
+initial-only gRPC call parameters (`grpc-*`); the gateway-owned `early-data`
+marker; the initial-section-only `via` intermediary chain; and header-section
+fields that are never legitimate as trailers (`host`, `user-agent`,
+`content-type`, `content-encoding`, `proxy-authenticate`, `x-grpc-web`).
+
+Ordinary application metadata — request checksums, tenant tags, tracing
+annotations — is unaffected and still reaches the backend. Requests dispatched
+through reqwest drop the inbound trailer section entirely, as they always have.
+A backend that needs to identify the caller must keep reading the gateway's
+`X-Consumer-Username` / `X-Consumer-Custom-Id` **headers**; those names are
+never accepted from a client in either section.
+
 ## Stream Proxy Lifecycle (TCP/UDP)
 
 TCP and UDP stream proxies use a separate two-phase lifecycle. Since there is no HTTP request/response structure, only protocol-agnostic plugins (those declaring `ALL_PROTOCOLS`) and protocol-specific plugins (e.g., `tcp_connection_throttle` for TCP, `udp_rate_limiting` for UDP) participate.
@@ -884,7 +923,7 @@ Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream 
 | `spiffe_identity` | ✓ | | Extracts peer SPIFFE IDs from TLS/DTLS client certificates |
 | `mtls_auth` | ✓ | | Maps the client certificate to a Consumer on TCP+TLS or UDP+DTLS |
 | `access_control` | ✓ | | Applies consumer and group allow/deny rules once a stream Consumer exists |
-| `mesh_authz` | ✓ | | Applies Layer 2 mesh authorization policies from SPIFFE/HBONE identity. An Istio `AuthorizationPolicy` with `action: CUSTOM` performs its bounded external-authorization check **in this phase** — before `before_proxy`, route dispatch, and every transformer — and fails closed on timeout/transport/oversize/malformed outcomes unless the provider sets `failOpen` (see [mesh.md](mesh.md#authorizationpolicy-action-custom-issue-3235)) |
+| `mesh_authz` | ✓ | | Applies Layer 2 mesh authorization policies from SPIFFE/HBONE identity. Istio `AuthorizationPolicy` is a destination-side contract, so the plugin evaluates policy only on **inbound** mesh legs; the Sidecar/Ambient outbound capture leg is not judged and egress scoping is enforced there by `mesh_outbound_registry` instead (see [mesh.md](mesh.md#which-leg-enforces-which-policy-family-issue-4158)). An Istio `AuthorizationPolicy` with `action: CUSTOM` performs its bounded external-authorization check **in this phase** — before `before_proxy`, route dispatch, and every transformer — and fails closed on timeout/transport/oversize/malformed outcomes unless the provider sets `failOpen` (see [mesh.md](mesh.md#authorizationpolicy-action-custom-issue-3235)) |
 | `tcp_connection_throttle` | ✓ | | Owns an opaque permit that caps process-local active TCP/TCP+TLS connections per Consumer, else canonical client IP; UDP/DTLS attachment is rejected |
 | `geo_restriction` | ✓ | | Rejects connections from denied countries |
 | `rate_limiting` | ✓ | | Consumer-aware rate limiting when a stream identity exists, else IP-based |
@@ -1914,7 +1953,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `access_control` | ✓ | ✓ | ✓ | ✓ | ✓ | Needs authenticated identity from an auth plugin; supports consumer username and ACL group allow/deny lists |
 | `tcp_connection_throttle` | | | | ✓ | | Tracks process-local active TCP/TCP+TLS connections per Consumer or canonical client IP; each replica enforces independently |
 | `mesh_authz` | ✓ | ✓ | ✓ | ✓ | ✓ | Applies Layer 2 mesh policy using SPIFFE or HBONE identities |
-| `opa` | ✓ | | | | | Delegates HTTP request authorization to an OPA Data API policy |
+| `opa` | ✓ | ✓ | ✓ | | | Delegates HTTP-family request authorization to an OPA Data API policy |
 | `adaptive_concurrency` | ✓ | ✓ | ✓ | | | Target-aware backend admission for HTTP-family upstream survival |
 | `request_deduplication` | ✓ | | | | | HTTP-only request deduplication and response replay |
 | `request_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy request body size limits |

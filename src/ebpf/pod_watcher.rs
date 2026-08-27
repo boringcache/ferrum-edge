@@ -7,6 +7,11 @@
 
 use std::collections::HashSet;
 
+use crate::util::mesh_enrollment::{
+    inject_annotation_blocks_injection, inject_annotation_opts_in, mesh_label_blocks_injection,
+    mesh_label_opts_in,
+};
+
 /// Criteria result for whether a pod should be enrolled for eBPF capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnrollmentDecision {
@@ -41,12 +46,8 @@ pub fn evaluate_enrollment(
         return EnrollmentDecision::Skip;
     }
 
-    if annotations
-        .get("ferrum.io/inject")
-        .is_some_and(|v| v == "false")
-        || labels
-            .get("ferrum.io/mesh")
-            .is_some_and(|v| v == "disabled" || v == "false")
+    if inject_annotation_blocks_injection(annotations.get("ferrum.io/inject").map(String::as_str))
+        || mesh_label_blocks_injection(labels.get("ferrum.io/mesh").map(String::as_str))
     {
         return EnrollmentDecision::Skip;
     }
@@ -73,10 +74,9 @@ pub fn evaluate_enrollment(
         return EnrollmentDecision::SkipHostNetwork;
     }
 
-    let has_mesh_label = labels.get("ferrum.io/mesh").is_some_and(|v| v == "enabled");
-    let has_inject_annotation = annotations
-        .get("ferrum.io/inject")
-        .is_some_and(|v| v == "true");
+    let has_mesh_label = mesh_label_opts_in(labels.get("ferrum.io/mesh").map(String::as_str));
+    let has_inject_annotation =
+        inject_annotation_opts_in(annotations.get("ferrum.io/inject").map(String::as_str));
 
     if has_mesh_label || has_inject_annotation {
         EnrollmentDecision::Enroll
@@ -194,6 +194,78 @@ mod tests {
         let annotations = make_labels(&[("ferrum.io/inject", "false")]);
         assert_eq!(
             evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
+            EnrollmentDecision::Skip
+        );
+    }
+
+    #[test]
+    fn skip_false_inject_annotation_spellings() {
+        for value in ["false", "False", "FALSE", "0", "f", "F"] {
+            let labels = HashMap::new();
+            let annotations = make_labels(&[("ferrum.io/inject", value)]);
+            assert_eq!(
+                evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+                EnrollmentDecision::Skip,
+                "ferrum.io/inject={value:?} must skip enrollment"
+            );
+        }
+    }
+
+    #[test]
+    fn enroll_true_inject_annotation_spellings() {
+        for value in ["true", "True", "TRUE", "1", "t", "T"] {
+            let labels = HashMap::new();
+            let annotations = make_labels(&[("ferrum.io/inject", value)]);
+            assert_eq!(
+                evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+                EnrollmentDecision::Enroll,
+                "ferrum.io/inject={value:?} must enroll"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_mesh_label_false_and_disabled_spellings() {
+        for value in ["false", "False", "FALSE", "0", "disabled", "Disabled"] {
+            let labels = make_labels(&[("ferrum.io/mesh", value)]);
+            let annotations = HashMap::new();
+            assert_eq!(
+                evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+                EnrollmentDecision::Skip,
+                "ferrum.io/mesh={value:?} must skip enrollment"
+            );
+        }
+    }
+
+    #[test]
+    fn enroll_mesh_enabled_label_spellings() {
+        for value in ["enabled", "Enabled", "ENABLED"] {
+            let labels = make_labels(&[("ferrum.io/mesh", value)]);
+            let annotations = HashMap::new();
+            assert_eq!(
+                evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+                EnrollmentDecision::Enroll,
+                "ferrum.io/mesh={value:?} must enroll"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_unrecognized_mesh_label_value() {
+        let labels = make_labels(&[("ferrum.io/mesh", "maybe")]);
+        let annotations = HashMap::new();
+        assert_eq!(
+            evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+            EnrollmentDecision::Skip
+        );
+    }
+
+    #[test]
+    fn skip_unrecognized_inject_annotation_value() {
+        let labels = HashMap::new();
+        let annotations = make_labels(&[("ferrum.io/inject", "disabled")]);
+        assert_eq!(
+            evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
             EnrollmentDecision::Skip
         );
     }

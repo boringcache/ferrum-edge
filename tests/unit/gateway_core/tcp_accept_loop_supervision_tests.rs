@@ -8,6 +8,8 @@
 //! `_test_support` wrapper with synthetic peer tasks (including deliberate
 //! non-primary panics and ordinary errors) so JoinError/error classification
 //! and sibling cancellation stay deterministic without a production fault seam.
+//!
+//! Panic-inducing tests are `panic = "unwind"` only (issue #4166).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -16,6 +18,7 @@ use std::time::{Duration, Instant};
 use ferrum_edge::_test_support::{TcpAcceptLoopClass, supervise_tcp_accept_loop_peers_for_test};
 use tokio::sync::watch;
 
+#[cfg(panic = "unwind")]
 #[tokio::test]
 async fn supervise_observes_non_primary_panic_while_primary_still_pending() {
     let (cancel_tx, _) = watch::channel(false);

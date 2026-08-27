@@ -3793,6 +3793,21 @@ pub struct MeshTrafficPolicy {
     /// the serde default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_keepalive: Option<crate::config::types::TcpKeepaliveCfg>,
+    /// Bidirectional TCP idle bound mapped from Istio
+    /// `connectionPool.tcp.idleTimeout`, stored as whole seconds.
+    ///
+    /// Distinct from HTTP `connectionPool.http.idleTimeout` (a pool idle
+    /// bound that rejects 0). This is the session-level inactivity watermark
+    /// on stream-family / mesh L4 relays: either direction refreshes it, and
+    /// `Some(0)` disables it for long-lived workloads (DB keepalives, SSH,
+    /// IMAP). Lands on `Upstream.port_overrides[port].tcp_idle_timeout_seconds`
+    /// via the same top-level fan-out + per-port overlay as `maxConnections`
+    /// / `tcpKeepalive`, then `Proxy.dispatch_port_overrides`. Sub-second
+    /// durations other than `0s` are rejected at translate time; values above
+    /// `MAX_TCP_IDLE_TIMEOUT` (24h) are rejected. Old DPs reading new slices
+    /// see this as a no-op via the serde default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_idle_timeout_seconds: Option<u64>,
     /// Optional `DestinationRule.trafficPolicy.connectionPool.http` block.
     /// When present, the K8s translator has parsed at least one supported HTTP
     /// connection-pool knob (`idleTimeout`, `http2MaxRequests`,
@@ -6819,6 +6834,14 @@ fn validate_dr_connection_pool(
     if policy.max_connections == Some(0) {
         errors.push(format!(
             "{context}.connectionPool.tcp.maxConnections must be positive (0 would refuse every backend connection)"
+        ));
+    }
+    if let Some(idle) = policy.tcp_idle_timeout_seconds
+        && idle > crate::config::types::MAX_TCP_IDLE_TIMEOUT
+    {
+        errors.push(format!(
+            "{context}.connectionPool.tcp.idleTimeout must be between 0 and {} seconds (got {idle})",
+            crate::config::types::MAX_TCP_IDLE_TIMEOUT
         ));
     }
     let Some(http) = policy.connection_pool_http.as_ref() else {

@@ -315,12 +315,19 @@ pub const NAMESPACE_OCCUPANCY_TABLES: &[&str] = &[
 /// namespace converge, and those tombstones need the old name's history and
 /// retention floor to stay where they are.
 ///
-/// `audit_events` is also absent: historical audit rows are immutable evidence
-/// and must retain the namespace identity recorded when the event occurred. The
-/// rename mutation may still enqueue a new audit event under the new name with
-/// a before/after diff; prior rows stay put.
-pub const NAMESPACE_RENAME_SIMPLE_TABLES: &[&str] =
-    &["proxies", "plugin_configs", "upstreams", "api_specs"];
+/// `audit_events` is included so the authorization-scoping `namespace` column
+/// follows the renamed tenant. Leaving those rows under the old name would
+/// disclose the previous tenant's history to a later occupant of that name
+/// (rename removes the source `namespaces` row and frees the name). The
+/// immutable `namespace_at_event` column is not part of this rewrite: it
+/// preserves the namespace identity recorded when the event occurred.
+pub const NAMESPACE_RENAME_SIMPLE_TABLES: &[&str] = &[
+    "proxies",
+    "plugin_configs",
+    "upstreams",
+    "api_specs",
+    "audit_events",
+];
 
 /// One canonical trim/length rule for `description`, shared by create and
 /// update. Trims surrounding whitespace, maps empty to absent, and rejects

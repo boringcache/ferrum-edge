@@ -1,10 +1,15 @@
 //! Tests for the CORS plugin
 
+use chrono::Utc;
+use ferrum_edge::PluginCache;
+use ferrum_edge::config::types::{GatewayConfig, PluginAssociation, PluginConfig, PluginScope};
 use ferrum_edge::plugins::cors::CorsPlugin;
 use ferrum_edge::plugins::response_mock::ResponseMock;
 use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+
+use super::plugin_utils::{capture_logs, create_test_proxy};
 
 fn make_ctx() -> RequestContext {
     RequestContext::new(
@@ -2175,4 +2180,100 @@ async fn test_credentialed_literal_exact_preflight_reflects_the_source_origin() 
             ..
         }
     ));
+}
+
+// ── CORS / WebSocket Origin composition diagnostic ───────────────────
+
+fn cors_plugin_config(
+    id: &str,
+    origins: Value,
+    scope: PluginScope,
+    proxy_id: Option<&str>,
+) -> PluginConfig {
+    PluginConfig {
+        id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "cors".to_string(),
+        config: json!({"allowed_origins": origins}),
+        scope,
+        proxy_id: proxy_id.map(str::to_string),
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn gateway_with_cors_proxy(cors_origins: Value, allowed_ws_origins: Vec<String>) -> GatewayConfig {
+    let mut proxy = create_test_proxy();
+    proxy.id = "ws-api".to_string();
+    proxy.listen_path = Some("/api".to_string());
+    proxy.allowed_ws_origins = allowed_ws_origins;
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "cors-strict".to_string(),
+    }];
+    GatewayConfig {
+        version: "1".to_string(),
+        proxies: vec![proxy],
+        consumers: vec![],
+        plugin_configs: vec![cors_plugin_config(
+            "cors-strict",
+            cors_origins,
+            PluginScope::Proxy,
+            Some("ws-api"),
+        )],
+        upstreams: vec![],
+        loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn cors_strict_origin_without_ws_allowlist_logs_composition_warning() {
+    let config = gateway_with_cors_proxy(json!(["https://app.example.com"]), vec![]);
+    let (logs, _guard) = capture_logs();
+    PluginCache::new(&config).expect("strict cors cache");
+    let output = logs.contents();
+    assert!(
+        output.contains("allowed_ws_origins is empty"),
+        "expected CORS/WebSocket composition warning, got: {output}"
+    );
+    assert!(output.contains("ws-api"));
+}
+
+#[test]
+fn cors_wildcard_origin_without_ws_allowlist_is_silent() {
+    let config = gateway_with_cors_proxy(json!(["*"]), vec![]);
+    let (logs, _guard) = capture_logs();
+    PluginCache::new(&config).expect("wildcard cors cache");
+    assert!(
+        !logs.contents().contains("allowed_ws_origins is empty"),
+        "wildcard CORS must not emit the WebSocket Origin gap warning"
+    );
+}
+
+#[test]
+fn cors_strict_origin_with_ws_allowlist_is_silent() {
+    let config = gateway_with_cors_proxy(
+        json!(["https://app.example.com"]),
+        vec!["https://app.example.com".to_string()],
+    );
+    let (logs, _guard) = capture_logs();
+    PluginCache::new(&config).expect("configured ws origins cache");
+    assert!(
+        !logs.contents().contains("allowed_ws_origins is empty"),
+        "configured allowed_ws_origins must suppress the composition warning"
+    );
+}
+
+#[test]
+fn cors_uses_strict_origin_policy_detects_non_wildcard() {
+    let strict = CorsPlugin::new(&json!({"allowed_origins": ["https://app.example.com"]}))
+        .expect("strict cors");
+    assert!(strict.uses_strict_origin_policy());
+    let wildcard = CorsPlugin::new(&json!({"allowed_origins": ["*"]})).expect("wildcard cors");
+    assert!(!wildcard.uses_strict_origin_policy());
 }

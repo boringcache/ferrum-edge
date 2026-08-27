@@ -35,6 +35,11 @@ use crate::config::conf_file::resolve_ferrum_var;
 use crate::identity::spiffe::TrustDomain;
 use crate::tls::{self, TlsPolicy};
 use crate::util::body_limit::is_length_limit_error;
+use crate::util::mesh_enrollment::{
+    inject_annotation_blocks_injection, inject_annotation_is_unrecognized,
+    inject_annotation_opts_in, mesh_label_blocks_injection, mesh_label_is_unrecognized,
+    mesh_label_opts_in,
+};
 
 const DEFAULT_INJECTOR_LISTEN_ADDR: &str = "0.0.0.0:9443";
 const DEFAULT_INJECTOR_ADMISSION_REVIEW_MAX_BODY_SIZE_MIB: usize = 4;
@@ -1028,10 +1033,28 @@ fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
         .and_then(Value::as_object);
     let labels = pod.pointer("/metadata/labels").and_then(Value::as_object);
 
-    if value_is_false(annotations.and_then(|m| m.get("sidecar.istio.io/inject")))
-        || value_is_false(annotations.and_then(|m| m.get("ferrum.io/inject")))
-        || mesh_label_opts_out(labels.and_then(|m| m.get("ferrum.io/mesh")))
-    {
+    if inject_annotation_blocks_injection(
+        annotations
+            .and_then(|m| m.get("sidecar.istio.io/inject"))
+            .and_then(Value::as_str),
+    ) {
+        log_unrecognized_inject_annotation(annotations, "sidecar.istio.io/inject");
+        return false;
+    }
+    if inject_annotation_blocks_injection(
+        annotations
+            .and_then(|m| m.get("ferrum.io/inject"))
+            .and_then(Value::as_str),
+    ) {
+        log_unrecognized_inject_annotation(annotations, "ferrum.io/inject");
+        return false;
+    }
+    if mesh_label_blocks_injection(
+        labels
+            .and_then(|m| m.get("ferrum.io/mesh"))
+            .and_then(Value::as_str),
+    ) {
+        log_unrecognized_mesh_label(labels);
         return false;
     }
 
@@ -1039,12 +1062,19 @@ fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
         return true;
     }
 
-    value_is_true(annotations.and_then(|m| m.get("ferrum.io/inject")))
-        || value_is_true(annotations.and_then(|m| m.get("sidecar.istio.io/inject")))
-        || labels
+    inject_annotation_opts_in(
+        annotations
+            .and_then(|m| m.get("ferrum.io/inject"))
+            .and_then(Value::as_str),
+    ) || inject_annotation_opts_in(
+        annotations
+            .and_then(|m| m.get("sidecar.istio.io/inject"))
+            .and_then(Value::as_str),
+    ) || mesh_label_opts_in(
+        labels
             .and_then(|m| m.get("ferrum.io/mesh"))
-            .and_then(Value::as_str)
-            .is_some_and(|value| value == "enabled")
+            .and_then(Value::as_str),
+    )
 }
 
 fn reject_reserved_name_conflicts(pod: &Value, config: &InjectorConfig) -> Result<(), String> {
@@ -1067,22 +1097,33 @@ fn reject_reserved_name_conflicts(pod: &Value, config: &InjectorConfig) -> Resul
     Ok(())
 }
 
-fn value_is_true(value: Option<&Value>) -> bool {
-    value
-        .and_then(Value::as_str)
-        .is_some_and(|value| value == "true")
+fn log_unrecognized_inject_annotation(
+    annotations: Option<&serde_json::Map<String, Value>>,
+    key: &str,
+) {
+    let raw = annotations.and_then(|m| m.get(key)).and_then(Value::as_str);
+    if !inject_annotation_is_unrecognized(raw) {
+        return;
+    }
+    warn!(
+        annotation = key,
+        value = raw,
+        "Unrecognized inject annotation bool; refusing injection (fail closed)"
+    );
 }
 
-fn value_is_false(value: Option<&Value>) -> bool {
-    value
-        .and_then(Value::as_str)
-        .is_some_and(|value| value == "false")
-}
-
-fn mesh_label_opts_out(value: Option<&Value>) -> bool {
-    value
-        .and_then(Value::as_str)
-        .is_some_and(|value| matches!(value, "false" | "disabled"))
+fn log_unrecognized_mesh_label(labels: Option<&serde_json::Map<String, Value>>) {
+    let raw = labels
+        .and_then(|m| m.get("ferrum.io/mesh"))
+        .and_then(Value::as_str);
+    if !mesh_label_is_unrecognized(raw) {
+        return;
+    }
+    warn!(
+        label = "ferrum.io/mesh",
+        value = raw,
+        "Unrecognized mesh label; refusing injection (fail closed)"
+    );
 }
 
 fn ensure_metadata_annotations(pod: &Value, patch: &mut Vec<JsonPatchOperation>) {
@@ -1921,7 +1962,7 @@ mod tests {
     }
 
     #[test]
-    fn istio_disabled_inject_annotation_does_not_opt_out() {
+    fn istio_disabled_inject_annotation_fails_closed() {
         let pod = json!({
             "metadata": {
                 "annotations": {"sidecar.istio.io/inject": "disabled"}
@@ -1936,9 +1977,99 @@ mod tests {
         .expect("patch");
 
         assert!(
-            patch.iter().any(|op| op.path == "/spec/containers/-"),
-            "Istio compatibility only treats sidecar.istio.io/inject=\"false\" as opt-out"
+            patch.is_empty(),
+            "Unrecognized sidecar.istio.io/inject values must fail closed rather than inject"
         );
+    }
+
+    #[test]
+    fn istio_false_inject_annotation_spellings_opt_out() {
+        for value in ["false", "False", "FALSE", "0", "f", "F"] {
+            let pod = json!({
+                "metadata": {
+                    "labels": {"ferrum.io/mesh": "enabled"},
+                    "annotations": {"sidecar.istio.io/inject": value}
+                },
+                "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+            });
+            let patch = build_sidecar_patch_for_namespace(
+                &pod,
+                &test_config(true, CaptureMode::Explicit),
+                None,
+            )
+            .expect("patch");
+            assert!(
+                patch.is_empty(),
+                "sidecar.istio.io/inject={value:?} must opt out"
+            );
+        }
+    }
+
+    #[test]
+    fn inject_annotation_true_spellings_opt_in() {
+        for value in ["true", "True", "TRUE", "1", "t", "T"] {
+            let pod = json!({
+                "metadata": {
+                    "annotations": {"ferrum.io/inject": value}
+                },
+                "spec": {
+                    "serviceAccountName": "api",
+                    "containers": [{"name": "app", "image": "app:test"}]
+                }
+            });
+            let patch = build_sidecar_patch_for_namespace(
+                &pod,
+                &test_config(true, CaptureMode::Iptables),
+                None,
+            )
+            .expect("patch");
+            assert!(
+                patch.iter().any(|op| op.path == "/spec/containers/-"),
+                "ferrum.io/inject={value:?} must opt in"
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_label_false_spellings_opt_out() {
+        for value in [
+            "false", "False", "FALSE", "0", "f", "F", "disabled", "Disabled",
+        ] {
+            let pod = json!({
+                "metadata": {"labels": {"ferrum.io/mesh": value}},
+                "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+            });
+            let patch = build_sidecar_patch_for_namespace(
+                &pod,
+                &test_config(false, CaptureMode::Explicit),
+                None,
+            )
+            .expect("patch");
+            assert!(patch.is_empty(), "ferrum.io/mesh={value:?} must opt out");
+        }
+    }
+
+    #[test]
+    fn mesh_label_enabled_spellings_opt_in() {
+        for value in ["enabled", "Enabled", "ENABLED"] {
+            let pod = json!({
+                "metadata": {"labels": {"ferrum.io/mesh": value}},
+                "spec": {
+                    "serviceAccountName": "api",
+                    "containers": [{"name": "app", "image": "app:test"}]
+                }
+            });
+            let patch = build_sidecar_patch_for_namespace(
+                &pod,
+                &test_config(true, CaptureMode::Iptables),
+                None,
+            )
+            .expect("patch");
+            assert!(
+                patch.iter().any(|op| op.path == "/spec/containers/-"),
+                "ferrum.io/mesh={value:?} must opt in"
+            );
+        }
     }
 
     #[test]

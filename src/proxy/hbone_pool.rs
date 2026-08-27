@@ -34,7 +34,8 @@ use crate::modes::mesh::hbone::{
     baggage_header_for_udp_source,
 };
 use crate::proxy::mesh_trust_registry::{
-    MeshTransportGate, MeshTransportKind, MeshTransportRegistration, MeshTrustRegistry,
+    MESH_KEEPALIVE_FAILED_MESSAGE, MeshTransportGate, MeshTransportKind, MeshTransportRegistration,
+    MeshTrustRegistry,
 };
 use crate::retry::{ErrorClass, error_class_log_kind};
 use crate::tls::backend::BackendSvidGeneration;
@@ -133,6 +134,7 @@ impl std::fmt::Debug for MeshH2Transport {
         formatter
             .debug_struct("MeshH2Transport")
             .field("retired", &self.is_retired())
+            .field("keepalive_failed", &self.keepalive_failed())
             .finish_non_exhaustive()
     }
 }
@@ -150,6 +152,25 @@ impl MeshH2Transport {
 
     fn is_retired(&self) -> bool {
         self.gate.is_retired()
+    }
+
+    fn keepalive_failed(&self) -> bool {
+        self.gate.keepalive_failed()
+    }
+}
+
+/// Handle the HBONE pool's keepalive task uses to evict *this* transport from
+/// the pool map (issue #4162). Identity is the gate `Arc`, so a newer entry
+/// under the same key is left alone.
+#[derive(Clone)]
+pub(crate) struct HboneKeepalivePoolHandle {
+    entries: Arc<DashMap<String, Vec<HbonePoolEntry>>>,
+    key: String,
+}
+
+impl HboneKeepalivePoolHandle {
+    fn evict(&self, gate: &MeshTransportGate) {
+        evict_hbone_entry_for_gate(&self.entries, &self.key, gate);
     }
 }
 
@@ -559,7 +580,7 @@ const MAX_RETIRED_SVID_GENERATIONS: usize = 16;
 const MAX_RETIRED_FINGERPRINTS_PER_GENERATION: usize = 8;
 
 pub struct HboneConnectionPool {
-    entries: DashMap<String, Vec<HbonePoolEntry>>,
+    entries: Arc<DashMap<String, Vec<HbonePoolEntry>>>,
     creation_locks: DashMap<String, Arc<Mutex<()>>>,
     gateway_svid: SharedSvidBundle,
     crls: crate::tls::SharedCrlList,
@@ -674,7 +695,7 @@ impl HboneConnectionPool {
         backend_svid_generation: BackendSvidGeneration,
     ) -> Self {
         Self {
-            entries: DashMap::with_shard_amount(shard_amount),
+            entries: Arc::new(DashMap::with_shard_amount(shard_amount)),
             creation_locks: DashMap::with_shard_amount(shard_amount),
             gateway_svid,
             crls,
@@ -1222,6 +1243,7 @@ impl HboneConnectionPool {
                 None,
                 self.trust_registry(),
                 MeshTransportKind::Hbone,
+                None,
             )
             .await?;
             let baggage = baggage_header_for_source(hbone_source_identity);
@@ -1331,6 +1353,7 @@ impl HboneConnectionPool {
             udp_conn_admission.as_ref(),
             self.trust_registry(),
             MeshTransportKind::Hbone,
+            None,
         )
         .await?;
         let baggage = asserted_source.map_or_else(
@@ -1428,7 +1451,7 @@ impl HboneConnectionPool {
                 match tokio::time::timeout(connect_timeout, sender.ready()).await {
                     Ok(Ok(sender)) => {
                         let transport = MeshH2Transport { sender, gate };
-                        if !transport.is_retired() {
+                        if !transport.is_retired() && !transport.keepalive_failed() {
                             return Ok(transport);
                         }
                         debug!(
@@ -1436,7 +1459,7 @@ impl HboneConnectionPool {
                             app_host,
                             app_port,
                             hbone_port,
-                            "Cached HBONE HTTP/2 transport retired by gateway trust withdrawal while waiting for readiness; creating a replacement"
+                            "Cached HBONE HTTP/2 transport became unusable while waiting for readiness; creating a replacement"
                         );
                     }
                     Ok(Err(err)) => {
@@ -1499,7 +1522,7 @@ impl HboneConnectionPool {
                 match tokio::time::timeout(remaining, sender.ready()).await {
                     Ok(Ok(sender)) => {
                         let transport = MeshH2Transport { sender, gate };
-                        if !transport.is_retired() {
+                        if !transport.is_retired() && !transport.keepalive_failed() {
                             return Ok(transport);
                         }
                         debug!(
@@ -1507,7 +1530,7 @@ impl HboneConnectionPool {
                             app_host,
                             app_port,
                             hbone_port,
-                            "Coalesced HBONE HTTP/2 transport retired by gateway trust withdrawal; creating a replacement"
+                            "Coalesced HBONE HTTP/2 transport became unusable; creating a replacement"
                         );
                     }
                     Ok(Err(err)) => {
@@ -1579,6 +1602,7 @@ impl HboneConnectionPool {
                 Some(remaining),
                 crls_before_dial.clone(),
                 pooled_conn_admission.as_ref(),
+                key,
             ),
         )
         .await
@@ -1633,6 +1657,11 @@ impl HboneConnectionPool {
         if transport.is_retired() {
             return Err(HbonePoolError::TrustWithdrawn);
         }
+        if transport.keepalive_failed() {
+            // Keepalive already tore this dial down; serve without pooling so
+            // the next request redials (issue #4162).
+            return Ok(transport);
+        }
         if !svid_slot_unchanged || !crls_unchanged || !key_fingerprint_is_current {
             debug!(
                 dial_host,
@@ -1666,6 +1695,12 @@ impl HboneConnectionPool {
                     idle_timeout_seconds: pool_config.idle_timeout_seconds,
                 }]
             });
+        // Keepalive may have failed between the check above and insert, or
+        // between insert and this recheck. Evict by gate identity so a newer
+        // replacement under the same key is not removed (issue #4162).
+        if transport.keepalive_failed() {
+            evict_hbone_entry_for_gate(&self.entries, key, &transport.gate);
+        }
         debug!(
             dial_host,
             app_host, app_port, hbone_port, "Created gateway HBONE HTTP/2 connection"
@@ -1681,9 +1716,10 @@ impl HboneConnectionPool {
         let mut idx = 0;
         while idx < entries.len() {
             let entry = &mut entries[idx];
-            // A retired transport is never handed out again, even before its
-            // socket has finished closing (issue #3859). One relaxed load.
-            if entry.transport.is_retired() {
+            // A retired or keepalive-failed transport is never handed out
+            // again, even before its socket has finished closing. One relaxed
+            // load each (issues #3859 / #4162).
+            if entry.transport.is_retired() || entry.transport.keepalive_failed() {
                 entries.remove(idx);
                 record_hbone_evictions(1);
                 continue;
@@ -1737,9 +1773,9 @@ impl HboneConnectionPool {
             if entry_idle_expired(last_used, entry.idle_timeout_seconds, now) {
                 continue;
             }
-            // Retired transports are skipped here and removed by the write path
-            // (this path holds only a shared lock). One relaxed load.
-            if entry.transport.is_retired() {
+            // Retired or keepalive-failed transports are skipped here and
+            // removed by the write path (this path holds only a shared lock).
+            if entry.transport.is_retired() || entry.transport.keepalive_failed() {
                 continue;
             }
             let transport = entry.transport.clone();
@@ -1808,6 +1844,7 @@ impl HboneConnectionPool {
         connect_timeout_override: Option<Duration>,
         crls: crate::tls::CrlList,
         conn_admission: Option<&crate::backend_conn_limit::PooledConnectionAdmission<'_>>,
+        pool_key: &str,
     ) -> Result<MeshH2Transport, HbonePoolError> {
         // The raw-`h2` dial over SVID-mTLS is the transport primitive shared
         // with the Sidecar mesh-mTLS raw-TCP egress path; only the dial port
@@ -1830,6 +1867,10 @@ impl HboneConnectionPool {
             conn_admission,
             self.trust_registry(),
             MeshTransportKind::Hbone,
+            Some(HboneKeepalivePoolHandle {
+                entries: Arc::clone(&self.entries),
+                key: pool_key.to_string(),
+            }),
         )
         .await
     }
@@ -1892,6 +1933,9 @@ impl AsyncRead for H2ConnectTunnel {
         if self.gate.is_retired() {
             return Poll::Ready(Err(self.gate.retired_io_error()));
         }
+        if self.gate.keepalive_failed() {
+            return Poll::Ready(Err(self.gate.keepalive_io_error()));
+        }
         if dst.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
@@ -1938,6 +1982,9 @@ impl AsyncWrite for H2ConnectTunnel {
     ) -> Poll<std::io::Result<usize>> {
         if self.gate.is_retired() {
             return Poll::Ready(Err(self.gate.retired_io_error()));
+        }
+        if self.gate.keepalive_failed() {
+            return Poll::Ready(Err(self.gate.keepalive_io_error()));
         }
         if self.write_closed {
             return Poll::Ready(Err(std::io::Error::new(
@@ -1989,6 +2036,10 @@ impl AsyncWrite for H2ConnectTunnel {
         // END_STREAM onto a stream whose connection is closing. Dropping the
         // tunnel afterwards resets the stream through h2's own teardown.
         if self.gate.is_retired() {
+            self.write_closed = true;
+            return Poll::Ready(Ok(()));
+        }
+        if self.gate.keepalive_failed() {
             self.write_closed = true;
             return Poll::Ready(Ok(()));
         }
@@ -2072,6 +2123,10 @@ pub(crate) async fn dial_h2_connect_sender(
     // closed transport class the retirement metrics label by.
     trust_registry: Option<&Arc<MeshTrustRegistry>>,
     kind: MeshTransportKind,
+    // Pooled HBONE only (issue #4162): identity-safe eviction handle so a
+    // keepalive failure removes *this* transport and not a newer replacement
+    // under the same key. `None` for 1:1 WS/datagram and mesh-mTLS CONNECT.
+    keepalive_pool: Option<HboneKeepalivePoolHandle>,
 ) -> Result<MeshH2Transport, HbonePoolError> {
     // Stamp the accepted trust generation BEFORE dialing. If a withdrawal
     // publishes a new generation while this dial is in flight, registration
@@ -2144,6 +2199,7 @@ pub(crate) async fn dial_h2_connect_sender(
         // clone, so only an established tunnel keeps the slot.
         let conn_slot = conn_slot.clone();
         let trust_registry = trust_registry.clone();
+        let keepalive_pool = keepalive_pool.clone();
         async move {
             let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
                 .await
@@ -2197,6 +2253,12 @@ pub(crate) async fn dial_h2_connect_sender(
                         message: e.to_string(),
                     })?;
 
+            // Admit the established transport under the generation it was
+            // dialed with. A withdrawal that landed mid-dial refuses it here,
+            // BEFORE the driver is spawned and before the sender can be pooled
+            // or served, so an old-generation connection can neither escape
+            // retirement nor repopulate the pool.
+            let gate = MeshTransportGate::new();
             if pool_config.enable_http2
                 && let Some(ping_pong) = connection.ping_pong()
             {
@@ -2204,15 +2266,11 @@ pub(crate) async fn dial_h2_connect_sender(
                     ping_pong,
                     pool_config.http2_keep_alive_interval_seconds,
                     pool_config.http2_keep_alive_timeout_seconds,
+                    gate.clone(),
+                    keepalive_pool,
                 );
             }
 
-            // Admit the established transport under the generation it was
-            // dialed with. A withdrawal that landed mid-dial refuses it here,
-            // BEFORE the driver is spawned and before the sender can be pooled
-            // or served, so an old-generation connection can neither escape
-            // retirement nor repopulate the pool.
-            let gate = MeshTransportGate::new();
             let registration: Option<Arc<MeshTransportRegistration>> =
                 match (trust_registry.as_ref(), admission_ticket) {
                     (Some(registry), Some(ticket)) => Some(
@@ -2243,6 +2301,15 @@ pub(crate) async fn dial_h2_connect_sender(
                     () = driver_gate.cancelled() => {
                         debug!(
                             "mesh h2 connect pool: HTTP/2 connection retired after gateway trust withdrawal"
+                        );
+                    }
+                    // Keepalive PING failure (issue #4162). Distinct from trust
+                    // withdrawal so a dead peer is never labeled as a withdrawn
+                    // authority. Dropping the connection here makes the pooled
+                    // SendRequest unusable for the next checkout.
+                    () = driver_gate.keepalive_cancelled() => {
+                        debug!(
+                            "mesh h2 connect pool: HTTP/2 connection closed after keepalive failure"
                         );
                     }
                     result = &mut connection => {
@@ -2288,6 +2355,12 @@ pub(crate) async fn open_h2_connect_stream(
     if transport.is_retired() {
         return Err(HbonePoolError::TrustWithdrawn);
     }
+    if transport.keepalive_failed() {
+        return Err(HbonePoolError::ConnectStream {
+            authority: authority.clone(),
+            message: MESH_KEEPALIVE_FAILED_MESSAGE.to_string(),
+        });
+    }
     let MeshH2Transport { sender, gate } = transport;
 
     let mut request = Request::builder()
@@ -2330,6 +2403,12 @@ pub(crate) async fn open_h2_connect_stream(
     // CONNECT stream during that interval.
     if gate.is_retired() {
         return Err(HbonePoolError::TrustWithdrawn);
+    }
+    if gate.keepalive_failed() {
+        return Err(HbonePoolError::ConnectStream {
+            authority: authority.clone(),
+            message: MESH_KEEPALIVE_FAILED_MESSAGE.to_string(),
+        });
     }
     let (response_fut, send_stream) =
         sender
@@ -2417,6 +2496,12 @@ pub(crate) async fn open_h2_ws_connect_stream(
     // and Extended CONNECT may not open a new stream.
     if transport.is_retired() {
         return Err(HbonePoolError::TrustWithdrawn);
+    }
+    if transport.keepalive_failed() {
+        return Err(HbonePoolError::ConnectStream {
+            authority: authority.to_string(),
+            message: MESH_KEEPALIVE_FAILED_MESSAGE.to_string(),
+        });
     }
     let MeshH2Transport { sender, gate } = transport;
     // Owned copy for the error variants (which carry a `String`).
@@ -2509,6 +2594,12 @@ pub(crate) async fn open_h2_ws_connect_stream(
     // new Extended CONNECT stream on the retired TLS session.
     if gate.is_retired() {
         return Err(HbonePoolError::TrustWithdrawn);
+    }
+    if gate.keepalive_failed() {
+        return Err(HbonePoolError::ConnectStream {
+            authority: authority.clone(),
+            message: MESH_KEEPALIVE_FAILED_MESSAGE.to_string(),
+        });
     }
     let (response_fut, send_stream) =
         sender
@@ -2840,8 +2931,9 @@ fn prune_pool_entries(entries: &mut Vec<HbonePoolEntry>) -> usize {
     let now = unix_secs();
     entries.retain(|entry| {
         // Retired by a gateway trust withdrawal: evict without consulting the
-        // socket at all (issue #3859).
-        if entry.transport.is_retired() {
+        // socket at all (issue #3859). Keepalive-failed transports are evicted
+        // the same way so a black-holed peer cannot stay "healthy" (issue #4162).
+        if entry.transport.is_retired() || entry.transport.keepalive_failed() {
             return false;
         }
         let sender = entry.transport.sender.clone();
@@ -2860,6 +2952,28 @@ fn prune_pool_entries(entries: &mut Vec<HbonePoolEntry>) -> usize {
 fn record_hbone_evictions(count: usize) {
     crate::runtime_metrics::global_ref()
         .record_pool_evictions(crate::runtime_metrics::PoolKind::Hbone, count as u64);
+}
+
+/// Remove the pool entry whose gate is `gate`. Identity match (not key-only)
+/// so a concurrent checkout that replaced this transport under the same key
+/// is not evicted (issue #4162). Mirrors `DashMap::remove_if` + `Arc::ptr_eq`
+/// used by `GenericPool` pending-creation cleanup and the HTTP/3 / HTTP/2
+/// pool invalidation pattern.
+fn evict_hbone_entry_for_gate(
+    entries: &DashMap<String, Vec<HbonePoolEntry>>,
+    key: &str,
+    gate: &MeshTransportGate,
+) {
+    let mut removed = 0;
+    {
+        if let Some(mut shard) = entries.get_mut(key) {
+            let before = shard.len();
+            shard.retain(|entry| !entry.transport.gate.ptr_eq(gate));
+            removed = before.saturating_sub(shard.len());
+        }
+    }
+    entries.remove_if(key, |_, remaining| remaining.is_empty());
+    record_hbone_evictions(removed);
 }
 
 // `last_used_secs`/`now_secs` are wall-clock `unix_secs()`, matching the
@@ -3028,30 +3142,44 @@ pub(crate) fn write_pool_config_key(buf: &mut String, pool_config: &PoolConfig) 
     }
 }
 
-fn spawn_h2_keepalive(mut ping_pong: h2::PingPong, interval_seconds: u64, timeout_seconds: u64) {
+fn spawn_h2_keepalive(
+    mut ping_pong: h2::PingPong,
+    interval_seconds: u64,
+    timeout_seconds: u64,
+    gate: MeshTransportGate,
+    keepalive_pool: Option<HboneKeepalivePoolHandle>,
+) {
     let interval_seconds = interval_seconds.max(1);
     let timeout_seconds = timeout_seconds.max(1);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_seconds));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await;
+        let mut keepalive_pool = keepalive_pool;
         loop {
             ticker.tick().await;
-            match tokio::time::timeout(
+            let ping_failed = match tokio::time::timeout(
                 Duration::from_secs(timeout_seconds),
                 ping_pong.ping(h2::Ping::opaque()),
             )
             .await
             {
-                Ok(Ok(_)) => {}
+                Ok(Ok(_)) => false,
                 Ok(Err(e)) => {
                     debug!("hbone_pool: HTTP/2 keepalive ping failed: {}", e);
-                    break;
+                    true
                 }
                 Err(_) => {
                     debug!("hbone_pool: HTTP/2 keepalive ping timed out");
-                    break;
+                    true
                 }
+            };
+            if ping_failed {
+                let _ = gate.abort_keepalive();
+                if let Some(handle) = keepalive_pool.take() {
+                    handle.evict(&gate);
+                }
+                break;
             }
         }
     });

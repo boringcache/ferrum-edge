@@ -795,6 +795,88 @@ fn representative_exposition() -> String {
             .render_prometheus_uncached()
             .expect("chargeback prometheus render"),
     );
+    // Data-path families (issue #4156). Rendered through the same public
+    // sub-renderers the `/metrics` handler uses, seeded with one upstream, one
+    // active ejection, one passive ejection, and one breaker so every label key
+    // the inventory declares is actually exercised by a sample line.
+    let data_ns_label = ",namespace=\"contract-ns\"";
+    let mut data_path = String::new();
+    ferrum_edge::data_path_metrics::render_process_families(&mut data_path, data_ns_label);
+
+    let overload = ferrum_edge::overload::OverloadState::new();
+    overload
+        .disable_keepalive
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    overload
+        .port_exhaustion_events
+        .store(3, std::sync::atomic::Ordering::Relaxed);
+    ferrum_edge::data_path_metrics::render_overload(&mut data_path, &overload, data_ns_label);
+
+    let upstream_json = serde_json::json!({
+        "id": "contract-upstream",
+        "namespace": "contract-ns",
+        "targets": [
+            {"host": "backend-a.internal", "port": 8080},
+            {"host": "backend-b.internal", "port": 8080}
+        ]
+    });
+    let mut data_config = ferrum_edge::config::types::GatewayConfig::default();
+    data_config
+        .upstreams
+        .push(serde_json::from_value(upstream_json).expect("contract fixture upstream"));
+
+    let health = ferrum_edge::health_check::HealthChecker::new();
+    let active_key = "contract-ns|contract-upstream::backend-b.internal:8080".to_string();
+    health.active_unhealthy_targets.insert(active_key, 1);
+    let passive_json = serde_json::json!({"unhealthy_threshold": 1});
+    let passive: ferrum_edge::config::types::PassiveHealthCheck =
+        serde_json::from_value(passive_json).expect("contract fixture passive policy");
+    let target_json = serde_json::json!({"host": "backend-a.internal", "port": 8080});
+    let passive_target: ferrum_edge::config::types::UpstreamTarget =
+        serde_json::from_value(target_json).expect("contract fixture target");
+    health.report_response(
+        "contract-ns",
+        "contract-proxy",
+        "contract-upstream",
+        &passive_target,
+        503,
+        false,
+        Some(&passive),
+    );
+    ferrum_edge::data_path_metrics::render_upstream_health(
+        &mut data_path,
+        &data_config,
+        &health,
+        data_ns_label,
+    );
+
+    let breakers = ferrum_edge::circuit_breaker::CircuitBreakerCache::with_max_entries(64);
+    breakers.get_or_create(
+        "contract-ns",
+        "contract-proxy",
+        Some("backend-a.internal:8080"),
+        &ferrum_edge::config::types::CircuitBreakerConfig::default(),
+    );
+    ferrum_edge::data_path_metrics::render_circuit_breakers(
+        &mut data_path,
+        &breakers,
+        data_ns_label,
+    );
+
+    ferrum_edge::data_path_metrics::render_connection_pools(
+        &mut data_path,
+        &[
+            ("http", 2),
+            ("grpc", 1),
+            ("http2", 1),
+            ("http3", 0),
+            ("hbone", 0),
+            ("mesh_mtls", 0),
+        ],
+        32,
+        data_ns_label,
+    );
+    output.push_str(&data_path);
     output
 }
 

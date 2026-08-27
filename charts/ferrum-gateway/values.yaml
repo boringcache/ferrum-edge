@@ -36,22 +36,63 @@ image:
   # Names of imagePullSecrets to attach to the pod.
   pullSecrets: []
 
-# Number of gateway replicas. A proxy is horizontally scalable; the control
-# plane (cp) can also run multiple replicas behind its gRPC Service.
+# Number of gateway replicas. Defaults to 2 so a node drain or rolling upgrade
+# can evict one pod without dropping the front door to zero. Single-replica
+# installs are an explicit non-HA choice — the PDB is skipped when replicas < 2
+# so minAvailable: 1 cannot block voluntary evictions.
 replicaCount: 2
 
 # Logical Ferrum namespace selector (FERRUM_NAMESPACE). Optional; leave empty to
 # use the binary default.
 ferrumNamespace: ""
 
-# Graceful shutdown. terminationGracePeriodSeconds must be >= shutdownDrainSeconds
-# + ~5s cleanup or the chart fails render. On SIGTERM the gateway stops accept
-# loops, marks itself draining, adds `Connection: close`, and waits up to
-# FERRUM_SHUTDOWN_DRAIN_SECONDS for in-flight work before exiting. A value of 0
-# is honored (skip draining) and rendered explicitly; set to null to omit the
-# env and take the binary's 30s default.
+# Graceful shutdown. terminationGracePeriodSeconds must cover the WHOLE
+# termination sequence or the chart fails render:
+#   preStop + preDrain + shutdown budget, where the shutdown budget is
+#   drain + 6s transport pool + 5s background + clamp(drain,5,60)s audit
+#   + 2s observability + 5s finalizer slack
+# With the defaults below that is 30 + 0 + (30+6+5+30+2+5) = 108s, which is why
+# terminationGracePeriodSeconds defaults to 110 (see docs/graceful_shutdown.md).
 shutdownDrainSeconds: 30
-terminationGracePeriodSeconds: 40
+
+# Endpoint-removal lag mitigation (issue #4154). Kubernetes runs `preStop`
+# BEFORE it sends SIGTERM, so the gateway keeps accepting for this whole window
+# while the EndpointSlice update propagates to every node's kube-proxy. Without
+# it, a `helm upgrade` SIGTERMs a pod that is still a live Endpoint and every
+# new connection steered at it is refused until the readiness probe has failed
+# `probes.readiness.failureThreshold` times.
+#
+# Rendered as a native `lifecycle.preStop.sleep` (SleepAction), which needs no
+# shell and therefore works on the distroless image. Requires Kubernetes 1.29+
+# (GA in 1.30) — set to 0 on older clusters to omit the hook entirely. The
+# default matches probes.readiness.periodSeconds x failureThreshold (10 x 3) so
+# it also covers clusters where removal is probe-driven rather than
+# deletion-driven; most clusters converge in well under 10s.
+shutdownPreStopSeconds: 30
+
+# Optional post-SIGTERM window in which every listener (proxy AND admin) keeps
+# accepting while readiness already reports `ready:false` / 503 and `/live`
+# still returns 200 (FERRUM_SHUTDOWN_PREDRAIN_SECONDS). Redundant with
+# `shutdownPreStopSeconds` on Kubernetes 1.29+, which is why it defaults to 0;
+# raise it instead of the preStop hook on clusters without SleepAction, or when
+# an external load balancer polls /health directly. Set to null to omit the env
+# and take the binary's 0s default.
+shutdownPreDrainSeconds: 0
+
+# terminationGracePeriodSeconds must cover the WHOLE termination sequence,
+# because Kubernetes starts that clock at pod deletion — preStop included:
+#
+#   terminationGracePeriodSeconds >= shutdownPreStopSeconds
+#                                  + shutdownPreDrainSeconds
+#                                  + post-SIGTERM shutdown budget
+#
+# The chart fails render when it does not. The post-SIGTERM budget is more than
+# the drain wait alone: after the drain the binary still releases transport
+# pools, joins background tasks, flushes the admin audit spool (database/cp),
+# drains observability delivery, and finalizes plugin generations — roughly 78s
+# at the defaults (see docs/graceful_shutdown.md). The default below leaves
+# room for the full sequence plus the 30s preStop window.
+terminationGracePeriodSeconds: 110
 
 serviceAccount:
   create: true
@@ -96,7 +137,7 @@ streamPorts: []
 #   - admin.allowedCidrs (an IP allowlist)
 #   - admin TLS (tls.admin Secret or complete cert/key SOURCE pair) with
 #     ports.adminHttp=0 (drop plaintext)
-#   - admin.allowInsecureHttp=true (local/dev; always pair with a NetworkPolicy)
+#   - admin.allowInsecureHttp=true (local/dev; always pair with networkPolicy.enabled=true)
 # The chart mirrors this and fails render early instead of shipping a pod that
 # crash-loops. Every comma-separated allowlist entry is strictly validated; a
 # typo or empty segment fails render. Any list that covers a whole address family
@@ -135,7 +176,8 @@ admin:
       key: admin-jwt-secret
     valueFrom: {}
   # Cluster-internal admin Service (ClusterIP). Only enable together with a
-  # non-loopback admin.bindAddress and a NetworkPolicy restricting access. The
+  # non-loopback admin.bindAddress and networkPolicy.enabled=true (or another
+  # access control). The
   # admin-https is published when tls.admin is enabled with a Secret or a complete
   # FERRUM_ADMIN_TLS_CERT_SOURCE / FERRUM_ADMIN_TLS_KEY_SOURCE pair is supplied.
   # If neither a plaintext admin port (ports.adminHttp>0) nor usable admin HTTPS
@@ -168,7 +210,7 @@ grpc:
   # production configure tls.cpGrpc (CP), or a complete
   # FERRUM_CP_GRPC_TLS_CERT_SOURCE / FERRUM_CP_GRPC_TLS_KEY_SOURCE pair, plus
   # tls.dpGrpc trust on the DP instead of enabling this. Pair any plaintext use
-  # with a NetworkPolicy.
+  # with networkPolicy.enabled=true.
   allowPlaintext: false
 
 # -----------------------------------------------------------------------------
@@ -428,6 +470,11 @@ probes:
     enabled: true
     initialDelaySeconds: 5
     periodSeconds: 10
+    # Rendered explicitly instead of inheriting the Kubernetes default of 3:
+    # failureThreshold x periodSeconds is how long a terminating pod stays in
+    # the Service endpoints when removal is probe-driven, and it is the
+    # arithmetic `shutdownPreStopSeconds` is derived from.
+    failureThreshold: 3
     # Replaces the computed readiness handler, e.g.:
     # override:
     #   httpGet:
@@ -498,11 +545,47 @@ autoscaling:
   targetCPUUtilizationPercentage: 80
   targetMemoryUtilizationPercentage: null
 
-# Optional PodDisruptionBudget. Set exactly one of minAvailable / maxUnavailable
-# (a PDB rejects both). minAvailable ships as a default, so to use maxUnavailable
-# set minAvailable: null to clear it; a null/absent minAvailable falls through.
+# Optional PodDisruptionBudget. Enabled by default when replicas >= 2 (or
+# autoscaling.minReplicas >= 2) so kubectl drain cannot evict every gateway pod
+# at once. Skipped when fewer than two replicas are configured because
+# minAvailable: 1 would block all voluntary evictions. Set exactly one of
+# minAvailable / maxUnavailable (a PDB rejects both). minAvailable ships as a
+# default, so to use maxUnavailable set minAvailable: null to clear it; a null/
+# absent minAvailable falls through.
 podDisruptionBudget:
-  enabled: false
+  enabled: true
   minAvailable: 1
   # minAvailable: null
   # maxUnavailable: 1
+
+# Optional NetworkPolicy. Default off. When enabled, proxy and stream listener
+# ports stay reachable from any source while admin HTTP/HTTPS and CP gRPC ingress
+# are limited to the configured selectors — pair with admin.allowInsecureHttp or
+# grpc.allowPlaintext when using non-loopback plaintext binds.
+networkPolicy:
+  # Renders an Ingress-only NetworkPolicy selecting this release's pods. Proxy and
+  # stream ports stay open to all sources; the admin ports and CP gRPC are
+  # reachable only from the peers named below.
+  #
+  # FAIL-CLOSED: if BOTH selector lists are empty, no restricted ingress rule is
+  # emitted at all, so the admin ports and CP gRPC are denied to every in-cluster
+  # peer. This is deliberate — a NetworkPolicy ingress rule with an empty `from`
+  # matches ALL sources, so emitting one here would publish admin cluster-wide
+  # while appearing to restrict it. Configure at least one selector before
+  # relying on networkPolicy.enabled=true to reach admin or (in cp mode) to let
+  # data planes dial gRPC.
+  enabled: false
+  # Each entry is a NetworkPolicy namespaceSelector (matchLabels and/or
+  # matchExpressions). When allowedPodSelectors is non-empty, every namespace
+  # selector is paired with every pod selector; otherwise each entry is a peer on
+  # its own.
+  allowedNamespaceSelectors: []
+  # Pod selector peers. Used alone when allowedNamespaceSelectors is empty, or
+  # cartesian-combined with each namespace selector otherwise.
+  #   allowedNamespaceSelectors:
+  #     - matchLabels:
+  #         kubernetes.io/metadata.name: monitoring
+  #   allowedPodSelectors:
+  #     - matchLabels:
+  #         app: prometheus
+  allowedPodSelectors: []

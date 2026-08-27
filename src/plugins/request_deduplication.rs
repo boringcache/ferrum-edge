@@ -761,6 +761,10 @@ struct LocalCompletionCandidate<'a> {
     body: &'a [u8],
     publish_execution_barrier_on_skip: bool,
     retain_barrier_on_eviction: bool,
+    /// This request holds a distributed Redis in-flight lock acquired during
+    /// admission. Retention on a size-cap skip is gated on ownership, not on
+    /// merely having a Redis client configured.
+    redis_owned: bool,
     /// See [`CachedResponse::retention`].
     retention: Duration,
     response_policy: ResponsePolicyProvenance,
@@ -1179,18 +1183,20 @@ impl RequestDeduplication {
 
         // Build optional Redis client
         let default_prefix = default_redis_key_prefix(http_client.namespace());
-        let redis_client =
-            RedisConfig::from_plugin_config(config, &default_prefix)?.map(|redis_config| {
+        let redis_client = match RedisConfig::from_plugin_config(config, &default_prefix)? {
+            Some(redis_config) => {
                 let dns_cache = http_client.dns_cache();
                 let tls_no_verify = http_client.tls_no_verify();
                 let tls_ca_bundle_path = http_client.tls_ca_bundle_path();
-                Arc::new(RedisRateLimitClient::new(
+                Some(Arc::new(RedisRateLimitClient::new(
                     redis_config,
                     dns_cache.cloned(),
                     tls_no_verify,
                     tls_ca_bundle_path,
-                ))
-            });
+                )?))
+            }
+            None => None,
+        };
 
         let compatibility = RequestDeduplicationCompatibility {
             header_name: header_name.clone(),
@@ -1345,6 +1351,11 @@ impl RequestDeduplication {
             self.local.completed_size_bytes.load(Ordering::Relaxed),
             self.actual_completed_size_locked(),
         )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn inflight_count_snapshot_for_tests(&self) -> usize {
+        self.local.inflight_count.load(Ordering::Relaxed)
     }
 
     #[allow(dead_code)]
@@ -2338,6 +2349,7 @@ impl RequestDeduplication {
             body,
             publish_execution_barrier_on_skip,
             retain_barrier_on_eviction,
+            redis_owned,
             retention,
             response_policy,
         } = candidate;
@@ -2408,7 +2420,7 @@ impl RequestDeduplication {
                     );
                 }
             }
-            let redis_candidate = if self.redis_client.is_some() {
+            let redis_candidate = if redis_owned {
                 Some(CachedResponse {
                     status_code,
                     headers,
@@ -3955,6 +3967,7 @@ impl Plugin for RequestDeduplication {
                 publish_execution_barrier_on_skip: requires_execution_barrier,
                 retain_barrier_on_eviction: requires_execution_barrier
                     || redis_lock_token.is_some(),
+                redis_owned: redis_lock_token.is_some(),
                 retention,
                 response_policy,
             },
