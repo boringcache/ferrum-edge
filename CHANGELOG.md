@@ -208,6 +208,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Security — client-asserted `X-Real-IP` no longer reaches mirror or
+  load-test targets** (issue #4164). The primary backend builders drop an
+  untrusted peer's `X-Real-IP`, but the shared secondary-request boundary took
+  no trust argument, so `request_mirror` and `load_testing` forwarded it
+  verbatim. On the default `FERRUM_TRUSTED_PROXIES=""` a direct client could
+  hand a shadow destination any source address it liked; with loopback trusted
+  and `FERRUM_REAL_IP_HEADER=x-real-ip`, a `load_testing` trigger-key holder
+  could get the spoofed value honored on every synthetic replay (each replay
+  re-enters the gateway at `127.0.0.1`, a trusted peer), steering
+  `ip_restriction`, `geo_restriction`, and IP-keyed rate limits. The
+  per-request peer-trust verdict is now latched at ingress on
+  `RequestContext::forwarding_peer_trusted` and threaded into
+  `filter_secondary_request_headers`, which applies the same
+  `is_untrusted_real_ip_header` rule the primary builders use — one chokepoint,
+  no forked header list. A **trusted** peer's `X-Real-IP` still reaches both
+  targets, unchanged, so overwrite-only front proxies are unaffected. The
+  reserved gateway-assertion family (`x-consumer-*`, `x-geo-country`,
+  `x-path-param-*`) was already refused from client input at request
+  admission and is unchanged. `serverless_function` gets the same rule: an
+  `x-real-ip` entry in its `forward_headers` allowlist is skipped for an
+  untrusted peer, since the invocation payload already carries the
+  gateway-resolved `client_ip`. **Operator action**: none, unless a shadow
+  consumer or function was relying on an untrusted client's `X-Real-IP` —
+  source the address from the primary path's `X-Forwarded-For`, the payload's
+  `client_ip`, or the transaction summary instead.
+
 - HTTP backend error classification now labels three previously misleading
   failure modes correctly. An HTTPS backend whose origin answers plaintext
   (TLS handshake after TCP connect) is `tls_error`, not `connection_refused`.

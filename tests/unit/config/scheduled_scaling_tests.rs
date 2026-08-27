@@ -239,7 +239,12 @@ fn namespace_fence_retries_are_bounded_by_wall_clock_not_attempt_count() {
 
 #[test]
 fn atomic_admin_batches_have_a_bounded_timeout_without_transport_retries() {
-    assert_eq!(ADMIN_BATCH_REQUEST_TIMEOUT_SECS, 5 * 60);
+    // 10 minutes: comfortably above the ~300s slow-but-healthy late-wave
+    // chunks observed on the 30k PostgreSQL leg (run 32832589798), because a
+    // client timeout on an in-flight all-or-nothing body is an ambiguous
+    // outcome that can never be safely retried. Still bounded and pinned
+    // against the fence budget + job timeout below.
+    assert_eq!(ADMIN_BATCH_REQUEST_TIMEOUT_SECS, 10 * 60);
     let helper = include_str!("../../common/scheduled_scaling.rs");
     assert!(
         helper.contains(".timeout(Duration::from_secs(ADMIN_BATCH_REQUEST_TIMEOUT_SECS))"),

@@ -1716,7 +1716,9 @@ mod tests {
     // pre-refactor `run()` used `handle.await?`, so a panicked listener
     // task would terminate the binary. Codex flagged the silent drop —
     // verify `await_listener_handles` surfaces panics as `Err` so `run()`
-    // can exit non-zero and the operator's supervisor restarts.
+    // can exit non-zero and the operator's supervisor restarts. Unwind-only
+    // (issue #4166): shipping profiles abort before JoinError exists.
+    #[cfg(panic = "unwind")]
     #[tokio::test]
     async fn await_listener_handles_returns_err_when_a_listener_panics() {
         let healthy = tokio::spawn(async {});
@@ -1763,7 +1765,8 @@ mod tests {
     // trigger: the first panic fires `shutdown_on_panic`, which the
     // remaining listeners observe via the watch channel and exit
     // promptly. This test models that with two listeners that wait on a
-    // shutdown channel and a third that panics.
+    // shutdown channel and a third that panics. Unwind-only (issue #4166).
+    #[cfg(panic = "unwind")]
     #[tokio::test]
     async fn await_listener_handles_signals_shutdown_so_remaining_listeners_can_exit() {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);

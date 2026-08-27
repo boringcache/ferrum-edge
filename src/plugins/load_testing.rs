@@ -989,7 +989,7 @@ impl Plugin for LoadTesting {
         let raw_query = ctx.raw_query_string().map(str::to_owned);
         let method = ctx.method.clone();
 
-        let synthetic_headers = filter_outbound_headers(headers);
+        let synthetic_headers = filter_outbound_headers(headers, ctx.forwarding_peer_trusted);
         // Fan-out starts from the same fully sanitized snapshot and appends one
         // canonical key/marker pair below. Never preserve a transformed alias
         // of either reserved control header.
@@ -1400,14 +1400,27 @@ fn fanout_ack_result() -> PluginResult {
     }
 }
 
-fn filter_outbound_headers(headers: &HashMap<String, String>) -> Vec<(String, String)> {
+fn filter_outbound_headers(
+    headers: &HashMap<String, String>,
+    peer_trusted: bool,
+) -> Vec<(String, String)> {
     // Same canonical secondary-request boundary as primary backend dispatch and
     // request_mirror. Preserve Host for host-based routing on synthetic/fan-out
     // re-entry; drop the reserved load-testing controls from the shared snapshot
     // (fan-out re-attaches the canonical key/marker pair explicitly).
+    //
+    // `peer_trusted` is the TRIGGERING request's verdict, not the replay's.
+    // Synthetic replays are dialed at `127.0.0.1`, which an operator running a
+    // local sidecar routinely lists in `FERRUM_TRUSTED_PROXIES`, so every
+    // replay re-enters the gateway from a trusted peer. Carrying the original
+    // client's `X-Real-IP` into that snapshot would let a trigger-key holder
+    // hand `client_ip::resolve_client_ip` an attacker-chosen address on
+    // backend-bound traffic and steer `ip_restriction` / `geo_restriction` /
+    // IP-keyed rate limits with it (issue #4164).
     filter_secondary_request_headers(
         headers,
         SecondaryRequestHostPolicy::Preserve,
+        peer_trusted,
         &[HEADER_TRIGGER_KEY, HEADER_FANOUT],
     )
 }

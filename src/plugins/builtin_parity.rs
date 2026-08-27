@@ -301,8 +301,8 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         classification: BuiltinPluginClassification::Public,
         priority: 2080,
         active_phases: "authorize",
-        matrix_protocols: HTTP_ONLY_PROTOCOLS,
-        protocol_rationale: "Delegates HTTP request authorization to an OPA Data API policy",
+        matrix_protocols: HTTP_FAMILY_PROTOCOLS,
+        protocol_rationale: "Delegates HTTP-family request authorization to an OPA Data API policy",
     },
     BuiltinPluginParityMeta {
         name: "adaptive_concurrency",

@@ -1,6 +1,6 @@
 //! Open Policy Agent (OPA) authorization plugin.
 //!
-//! Delegates HTTP request authorization to OPA's Data API by POSTing an
+//! Delegates HTTP-family request authorization to OPA's Data API by POSTing an
 //! `input` document to `/v1/data/{policy_path}` during the `authorize` phase.
 //! The plugin fails closed by default, bounds policy responses, and redacts
 //! sensitive client headers and query credentials before forwarding request
@@ -24,7 +24,7 @@ use super::utils::query::{CanonicalQuery, canonical_query_for_policy};
 use super::utils::response_body::{
     BoundedReadError, parse_max_response_body_bytes, read_response_body_bounded,
 };
-use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+use super::{HTTP_FAMILY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const DEFAULT_TIMEOUT_MS: u64 = 1000;
 const MAX_TIMEOUT_MS: u64 = 30_000;
@@ -514,6 +514,10 @@ impl Plugin for Opa {
 
     fn priority(&self) -> u16 {
         super::priority::OPA
+    }
+
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        HTTP_FAMILY_PROTOCOLS
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {

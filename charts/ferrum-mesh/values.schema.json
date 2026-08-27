@@ -30,6 +30,46 @@
       "type": "string",
       "description": "Documented default release namespace hint. Templates render into .Release.Namespace; install with --namespace to select the target namespace."
     },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "minAvailable": {
+          "description": "Set to null to clear the default and select maxUnavailable instead.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "string",
+              "pattern": "^[0-9]+%$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "maxUnavailable": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "string",
+              "pattern": "^[0-9]+%$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
     "gatewayClass": {
       "type": "object",
       "description": "Cluster-scoped GatewayClass Ferrum owns. Create is the install-time authority object; Ferrum never infers ownership from the class name spelling. Independent releases in one cluster must use unique names; Helm will not import another release's GatewayClass.",
@@ -244,6 +284,14 @@
             "type": "object",
             "additionalProperties": true
           }
+        },
+        "topologySpreadConstraints": {
+          "type": "array",
+          "description": "Optional Kubernetes TopologySpreadConstraint list. When unset and replicas >= 2, the chart spreads pods across kubernetes.io/hostname. An explicit empty list disables the default.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
         }
       }
     },
@@ -327,6 +375,14 @@
         },
         "probes": {
           "$ref": "#/definitions/workloadProbes"
+        },
+        "topologySpreadConstraints": {
+          "type": "array",
+          "description": "Optional Kubernetes TopologySpreadConstraint list. When unset and replicas >= 2, the chart spreads pods across kubernetes.io/hostname. An explicit empty list disables the default.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
         }
       }
     },
@@ -454,6 +510,14 @@
         },
         "probes": {
           "$ref": "#/definitions/workloadProbes"
+        },
+        "topologySpreadConstraints": {
+          "type": "array",
+          "description": "Optional Kubernetes TopologySpreadConstraint list. When unset and replicas >= 2, the chart spreads pods across kubernetes.io/hostname. An explicit empty list disables the default.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
         }
       }
     },

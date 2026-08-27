@@ -1377,32 +1377,53 @@ fn buffered_http3_backend_upload_honors_client_grpc_deadline() {
         .split("// Prepared buffers have already contributed")
         .next()
         .expect("HTTP/3 backend request buffering must remain bounded");
+    // Issue #4153 folded the former "unlimited" branch into the bounded one, so
+    // there is a single buffering path here instead of two. The invariant is
+    // unchanged and is pinned harder than the old pair of counts: EVERY collect
+    // in this region has to be an argument of the deadline-aware collector, so a
+    // re-added raw `body.collect()` fails here even though it would not move the
+    // deadline-aware count on its own.
+    let deadline_aware = buffering
+        .matches("collect_request_body_under_authorization(")
+        .count();
     assert_eq!(
-        buffering
-            .matches("collect_request_body_under_authorization(")
-            .count(),
-        2,
-        "limited and unlimited HTTP/3 upload buffering must share the deadline-aware collector"
+        deadline_aware, 1,
+        "HTTP/3 upload buffering must keep exactly one deadline-aware collect site"
     );
+    assert_eq!(
+        buffering.matches(".collect()").count(),
+        deadline_aware,
+        "an HTTP/3 upload buffering collect bypassed the deadline-aware collector"
+    );
+    assert!(
+        !buffering.contains("collect_request_body_with_deadline("),
+        "the post-admission HTTP/3 collect must keep the admitted stream's \
+         authorization bound, not only the client deadline"
+    );
+    // And the surviving branch is never run unbounded: the retained ceiling is
+    // fail-closed and the collect is wrapped in `Limited`.
+    assert!(buffering.contains("buffered_request_body_ceiling("));
+    assert!(buffering.contains("http_body_util::Limited::new("));
+    // Each terminal the deadline-aware collect can yield, once per collect site.
     assert_eq!(
         buffering
             .matches("RequestBodyWaitError::DeadlineExceeded")
             .count(),
-        2
+        deadline_aware
     );
     assert_eq!(
         buffering
             .matches("AuthorizedUploadWaitError::AuthorizationExpired(")
             .count(),
-        2,
-        "both buffering branches must also carry the admitted stream's authorization bound"
+        deadline_aware,
+        "the buffering branch must also carry the admitted stream's authorization bound"
     );
     assert_eq!(
         buffering
             .matches("client_grpc_deadline_exceeded_response_for_optional_request(")
             .count(),
-        2,
-        "both buffering branches must preserve native gRPC versus gRPC-Web wire flavor"
+        deadline_aware,
+        "the buffering branch must preserve native gRPC versus gRPC-Web wire flavor"
     );
 }
 

@@ -2424,6 +2424,12 @@ async fn handle_h3_request(
     // read as ALL of its field lines so duplicate lines cannot hide a competing
     // attacker-supplied value (advisory GHSA-fx4w-68hx-mj7r).
     if !state.trusted_proxies.is_empty() {
+        // Latch the immediate-peer trust verdict for the whole request, before
+        // any plugin phase runs — same contract as the H1/H2 frontend. Computed
+        // from the canonical `socket_ip` string so it is byte-for-byte the
+        // verdict the H3 backend builders recompute at dispatch (issue #4164).
+        ctx.forwarding_peer_trusted =
+            crate::proxy::forwarding_peer_is_trusted(socket_ip, &state.trusted_proxies);
         let socket_addr: std::net::IpAddr = remote_addr.ip();
         if let Some(forwarded_scheme) = crate::proxy::apply_trusted_forwarded_request_scheme(
             &mut ctx,

@@ -109,10 +109,11 @@ struct TaskEntry {
 
 /// Aborts a spawned task when the owning future is dropped.
 ///
-/// The supervisor spawns its poller so a panic surfaces as a `JoinError`
-/// instead of killing the supervisor. Dropping a `JoinHandle` only detaches, so
-/// aborting a supervisor (graceful-stop timeout) would otherwise leak the
-/// poller it was awaiting.
+/// The supervisor spawns its poller so an unexpected exit is observable as a
+/// `JoinError` instead of killing the supervisor. Dropping a `JoinHandle` only
+/// detaches, so aborting a supervisor (graceful-stop timeout) would otherwise
+/// leak the poller it was awaiting. Shipping profiles abort the process on
+/// panic, so isolation of a panicking poller is unwind-only (issue #4166).
 struct AbortOnDrop(tokio::task::AbortHandle);
 
 impl Drop for AbortOnDrop {
@@ -862,12 +863,16 @@ pub(crate) struct DiscoveryTaskContext {
 
 /// Supervise one upstream's poller for the lifetime of its generation.
 ///
-/// The poller runs in its own spawned task so a panic is observable as a
+/// The supervisor spawns its poller so an unexpected exit is observable as a
 /// `JoinError` instead of tearing down the supervisor with it (issue #3721).
-/// Clean cancel/shutdown ends supervision; an unexpected exit is restarted with
-/// bounded, jittered exponential backoff. Every restart is fenced on the
-/// generation: once the manager registers a replacement, the superseded
-/// supervisor exits instead of restarting or publishing.
+/// Clean cancel/shutdown ends supervision; an unexpected non-panic exit is
+/// restarted with bounded, jittered exponential backoff. Every restart is
+/// fenced on the generation: once the manager registers a replacement, the
+/// superseded supervisor exits instead of restarting or publishing.
+///
+/// Shipping profiles set `panic = "abort"` (issue #4166): a panicking poller
+/// terminates the process rather than producing a `JoinError`. The in-process
+/// panic-restart path is compiled only for `panic = "unwind"` (dev/test).
 async fn supervise_discovery_task(
     ctx: Arc<DiscoveryTaskContext>,
     discoverer: Arc<dyn ServiceDiscoverer>,
@@ -928,6 +933,12 @@ async fn supervise_discovery_task(
                 return;
             }
             Err(_) => {
+                // Unwind-only in practice (issue #4166): shipping profiles
+                // set `panic = "abort"`, so a panicking poller terminates the
+                // process before a JoinError exists. This arm stays compiled
+                // so the supervisor loop remains well-formed; operators must
+                // not treat `ferrum_service_discovery_task_panics_total` as a
+                // shipping-profile signal.
                 registry.record_service_discovery_task_panic();
                 warn!(
                     upstream = %ctx.upstream_id,
@@ -1051,7 +1062,8 @@ pub struct SupervisedTaskForTest {
 /// Only provider construction is substituted: supervision, generation fencing,
 /// restart backoff, publication, and staleness expiry all run exactly as they
 /// do under [`ServiceDiscoveryManager::start`], so external coverage of
-/// panic/restart/withdraw behavior cannot drift from production.
+/// restart/withdraw behavior cannot drift from production. Panic-restart
+/// coverage is unwind-only (issue #4166).
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn spawn_supervised_discovery_task_for_test(
@@ -1296,8 +1308,11 @@ fn report_task_join(
             );
         }
         Ok(Err(_)) => {
-            // Panic. Never reported as graceful: the poller for this upstream
-            // stopped without publishing, and the supervisor itself is gone.
+            // JoinError after cancellation is handled above. Remaining
+            // JoinErrors are panics, and only reach this arm in
+            // `panic = "unwind"` builds (issue #4166). Never reported as
+            // graceful: the poller stopped without publishing, and the
+            // supervisor itself is gone.
             health::remove_task(upstream_id, generation);
             crate::plugins::prometheus_metrics::global_registry()
                 .record_service_discovery_task_panic();
@@ -2130,6 +2145,7 @@ fn install_merged_targets(
     }
 
     health_checker.remove_stale_targets(upstream_namespace, upstream_id, merged);
+    health_checker.restart_upstream_probes_for_discovered(upstream_namespace, upstream_id, merged);
     if let Some(epoch_store) = request_epoch {
         let epoch = epoch_store.load();
         for proxy in epoch.config.proxies.iter().filter(|proxy| {

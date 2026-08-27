@@ -1647,7 +1647,7 @@ fn namespace_prefixed_id_rewrite_requires_suffix_field_and_embedded_namespace() 
 }
 
 #[test]
-fn mongo_namespace_rename_does_not_rewrite_historical_audit_events() {
+fn mongo_namespace_rename_rewrites_historical_audit_events() {
     let rename = mongo_method("rename_namespace_documents_in_session(");
     for collection in ["proxies", "plugin_configs", "upstreams", "api_specs"] {
         assert!(
@@ -1656,9 +1656,21 @@ fn mongo_namespace_rename_does_not_rewrite_historical_audit_events() {
         );
     }
     assert!(
-        !rename.contains("self.audit_events()"),
-        "historical audit_events must retain the namespace recorded at event time; \
-         the rename may still enqueue a new event under the new name after commit:\n{rename}"
+        rename.contains("self.audit_events()"),
+        "historical audit_events must follow the renamed tenant:\n{rename}"
+    );
+    let audit_at = rename
+        .find("self.audit_events()")
+        .expect("audit_events rewrite");
+    let audit_end = (audit_at + 500).min(rename.len());
+    let audit_update = &rename[audit_at..audit_end];
+    assert!(
+        audit_update.contains("\"namespace\": new_name"),
+        "audit rename must rewrite the authorization-scoping namespace field:\n{audit_update}"
+    );
+    assert!(
+        !audit_update.contains("namespace_at_event"),
+        "namespace_at_event must not be rewritten on rename:\n{audit_update}"
     );
 }
 

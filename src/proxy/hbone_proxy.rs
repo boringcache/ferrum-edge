@@ -155,11 +155,28 @@ fn relay_timeout_millis(milliseconds: u64) -> Option<Duration> {
 // (`proxy::mesh_tcp_egress`), which derives its copy-loop bounds from the
 // same proxy/env fields as the HBONE relay.
 pub(crate) fn proxy_idle_timeout(proxy: &Proxy, env_config: &EnvConfig) -> Option<Duration> {
-    relay_timeout(
-        proxy
-            .tcp_idle_timeout_seconds
-            .unwrap_or(env_config.tcp_idle_timeout_seconds),
-    )
+    proxy_idle_timeout_for_policy_port(proxy, env_config, None)
+}
+
+/// Bidirectional TCP idle bound for a mesh L4 relay. Per-port DestinationRule
+/// `connectionPool.tcp.idleTimeout` wins when set (`Some(0)` disables);
+/// otherwise the proxy field, then `FERRUM_TCP_IDLE_TIMEOUT_SECONDS`.
+pub(crate) fn proxy_idle_timeout_for_policy_port(
+    proxy: &Proxy,
+    env_config: &EnvConfig,
+    policy_port: Option<u16>,
+) -> Option<Duration> {
+    let seconds = policy_port
+        .and_then(|port| {
+            proxy
+                .dispatch_port_overrides
+                .as_ref()
+                .and_then(|m| m.get(&port))
+                .and_then(|override_config| override_config.tcp_idle_timeout_seconds)
+        })
+        .or(proxy.tcp_idle_timeout_seconds)
+        .unwrap_or(env_config.tcp_idle_timeout_seconds);
+    relay_timeout(seconds)
 }
 
 pub(crate) fn proxy_half_close_cap(env_config: &EnvConfig) -> Option<Duration> {
@@ -834,7 +851,13 @@ pub(super) async fn handle_hbone_request(
     let relay_plugin_execution_ns = plugin_execution_ns;
     let adaptive_buffer = Arc::clone(&state.adaptive_buffer);
     let relay_buffer_size = adaptive_buffer.get_buffer_size(&proxy.namespace, &proxy.id);
-    let relay_idle_timeout = proxy_idle_timeout(proxy, &state.env_config);
+    let relay_idle_timeout = proxy_idle_timeout_for_policy_port(
+        proxy,
+        &state.env_config,
+        upstream_target
+            .as_deref()
+            .map(UpstreamTarget::dispatch_policy_port),
+    );
     let relay_half_close_cap = proxy_half_close_cap(&state.env_config);
     let relay_read_timeout = backend_read_timeout(proxy);
     let relay_write_timeout = backend_write_timeout(proxy);

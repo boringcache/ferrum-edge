@@ -153,6 +153,22 @@ async fn wait_for_mirror_streams(
     })
 }
 
+/// Look a mirrored stream up by `:path` instead of by arrival index.
+///
+/// Mirror dispatch is fire-and-forget, so three RPCs the client issues
+/// sequentially can still be accepted by the mirror backend in any order.
+/// Indexing `observed` positionally therefore failed whenever the bidi mirror
+/// landed ahead of the server-stream mirror — CI saw
+/// `/helloworld.Greeter/RouteChat` where `/helloworld.Greeter/ListFeatures`
+/// was expected, on a PR that does not touch mirroring at all. Every
+/// per-stream assertion is unchanged; only the selection is.
+fn mirror_stream_for_path<'a>(observed: &'a [ReceivedStream], path: &str) -> &'a ReceivedStream {
+    observed.iter().find(|s| s.path == path).unwrap_or_else(|| {
+        let seen: Vec<&str> = observed.iter().map(|s| s.path.as_str()).collect();
+        panic!("no mirrored stream for {path}; observed paths: {seen:?}")
+    })
+}
+
 fn assert_mirror_grpc_headers(observed: &ReceivedStream, expected_path: &str) {
     assert_eq!(observed.path, expected_path);
     assert_eq!(
@@ -539,10 +555,13 @@ async fn request_mirror_grpc_h2c_streaming_shapes_and_multiframe_body() {
     assert_eq!(bidi.grpc_status(), Some(0), "response={bidi:?}");
 
     let observed = wait_for_mirror_streams(&mirror, 3).await;
-    assert_mirror_grpc_headers(&observed[0], CLIENT_STREAM_PATH);
-    assert!(observed[0].body.is_empty());
-    assert_mirror_grpc_headers(&observed[1], SERVER_STREAM_PATH);
-    assert_mirror_grpc_headers(&observed[2], BIDI_PATH);
+    let client_stream = mirror_stream_for_path(&observed, CLIENT_STREAM_PATH);
+    let server_stream = mirror_stream_for_path(&observed, SERVER_STREAM_PATH);
+    let bidi_stream = mirror_stream_for_path(&observed, BIDI_PATH);
+    assert_mirror_grpc_headers(client_stream, CLIENT_STREAM_PATH);
+    assert!(client_stream.body.is_empty());
+    assert_mirror_grpc_headers(server_stream, SERVER_STREAM_PATH);
+    assert_mirror_grpc_headers(bidi_stream, BIDI_PATH);
     assert!(
         mirror.handshakes_completed() >= 1,
         "streaming-shape mirrors must complete an h2c handshake"
@@ -666,10 +685,13 @@ async fn request_mirror_grpc_tls_streaming_shapes_and_multiframe_body() {
     assert_eq!(bidi.grpc_status(), Some(0), "response={bidi:?}");
 
     let observed = wait_for_mirror_streams(&mirror, 3).await;
-    assert_mirror_grpc_headers(&observed[0], CLIENT_STREAM_PATH);
-    assert!(observed[0].body.is_empty());
-    assert_mirror_grpc_headers(&observed[1], SERVER_STREAM_PATH);
-    assert_mirror_grpc_headers(&observed[2], BIDI_PATH);
+    let client_stream = mirror_stream_for_path(&observed, CLIENT_STREAM_PATH);
+    let server_stream = mirror_stream_for_path(&observed, SERVER_STREAM_PATH);
+    let bidi_stream = mirror_stream_for_path(&observed, BIDI_PATH);
+    assert_mirror_grpc_headers(client_stream, CLIENT_STREAM_PATH);
+    assert!(client_stream.body.is_empty());
+    assert_mirror_grpc_headers(server_stream, SERVER_STREAM_PATH);
+    assert_mirror_grpc_headers(bidi_stream, BIDI_PATH);
     assert!(
         mirror.handshakes_completed() >= 1,
         "TLS streaming-shape mirrors must complete an ALPN h2 handshake"

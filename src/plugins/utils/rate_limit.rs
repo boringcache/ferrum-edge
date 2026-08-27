@@ -582,13 +582,14 @@ impl<A: RateLimitAlgorithm> RedisLimiter<A> {
         let health_check_interval = Duration::from_secs(cfg.health_check_interval_seconds.max(1));
         let key_prefix = cfg.key_prefix.clone();
 
+        let redis_client = Arc::new(RedisRateLimitClient::new(
+            cfg,
+            http_client.dns_cache().cloned(),
+            http_client.tls_no_verify(),
+            http_client.tls_ca_bundle_path(),
+        )?);
         Ok(Some(Self {
-            redis_client: Arc::new(RedisRateLimitClient::new(
-                cfg,
-                http_client.dns_cache().cloned(),
-                http_client.tls_no_verify(),
-                http_client.tls_ca_bundle_path(),
-            )),
+            redis_client,
             algorithm,
             key_prefix,
             health_check_interval,

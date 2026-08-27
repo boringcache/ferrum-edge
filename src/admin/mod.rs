@@ -2581,6 +2581,23 @@ async fn handle_admin_request_inner(
         let replay_authority_health =
             crate::plugins::utils::replay_authority::shared_health_snapshot();
         let replay_authority_unavailable = replay_authority_health.unavailable();
+        // Graceful-shutdown drain (issue #4154). A replica that has been told
+        // to terminate must stop being steered NEW traffic even while every
+        // dependency below is still healthy, otherwise Kubernetes keeps it in
+        // the Service endpoints until `failureThreshold` probe periods have
+        // elapsed and kube-proxy steers new connections at accept loops that
+        // are about to close. The process-wide latch is published the moment
+        // the signal is observed — ahead of the accept-loop close — and the
+        // per-instance flag covers a mode that drains without the signal path.
+        // Two `Acquire` loads: no allocation, no lock, no I/O, so an
+        // unauthenticated probe flood cannot drive work. `/live` above is
+        // deliberately untouched: failing liveness during the drain would have
+        // kubelet SIGKILL the pod mid-drain.
+        let instance_draining = state
+            .proxy_state
+            .as_ref()
+            .is_some_and(|proxy| proxy.overload.draining.load(Ordering::Acquire));
+        let draining = crate::overload::shutdown_drain_announced() || instance_draining;
         let ready = startup_ready
             && !serving_degraded
             && jwks_ready
@@ -2588,7 +2605,8 @@ async fn handle_admin_request_inner(
             && !dp_config_stale
             && !cp_trust_blocked
             && !replay_authority_unavailable
-            && !gateway_listeners_not_ready;
+            && !gateway_listeners_not_ready
+            && !draining;
         health_status["ready"] = json!(ready);
         if gateway_listeners_degraded {
             health_status["status"] = json!("degraded");
@@ -2882,7 +2900,13 @@ async fn handle_admin_request_inner(
                 || dp_config_stale
                 || cp_trust_blocked
                 || replay_authority_unavailable;
-            health_status["status"] = json!(if lost_authority {
+            // A terminating replica is neither "starting" nor a lost
+            // dependency: it is doing exactly what it was told to do, and the
+            // orchestrator only needs to know to stop steering traffic at it.
+            // Draining wins over every other label because it is terminal.
+            health_status["status"] = json!(if draining {
+                "draining"
+            } else if lost_authority {
                 "unavailable"
             } else if gateway_listeners_not_ready {
                 "degraded"
@@ -2936,6 +2960,17 @@ async fn handle_admin_request_inner(
                         serde_json::to_value(failures.snapshot()).unwrap_or_default(),
                     );
                 }
+                // Aggregate buffered-request pressure (issue #4153). Inserted
+                // into the DETAIL snapshot only: the coarse unauthenticated
+                // branch below reads `level` back out and discards everything
+                // else, so this never widens the unauthenticated surface.
+                obj.insert(
+                    "request_buffer".to_string(),
+                    serde_json::to_value(
+                        crate::proxy::response_buffer_budget::request_buffer_snapshot(),
+                    )
+                    .unwrap_or_default(),
+                );
             }
             if detailed {
                 return Ok(json_response(status, &snapshot_value));
@@ -2994,6 +3029,14 @@ async fn handle_admin_request_inner(
         metrics_output.push_str(&crate::notifications::render_delivery_prometheus());
         metrics_output.push_str(&crate::plugins::kafka_logging::render_prometheus());
         metrics_output.push_str(&crate::plugins::api_chargeback_sink::render_prometheus());
+        // Data-path families (issue #4156): load shedding, upstream health,
+        // circuit-breaker state, backend retries, pool saturation, and frontend
+        // TLS admission. Sampled here on the cold scrape path from state the
+        // gateway already keeps; nothing is added to the proxy hot path.
+        metrics_output.push_str(&crate::data_path_metrics::render_prometheus(
+            state.proxy_state.as_ref(),
+            &registry.namespace_label_fragment(),
+        ));
         // Append the active `__mesh_bpf_metrics` surface exactly once from the
         // current plugin-cache generation. Absent when the plugin is not in
         // the published configuration; zero-valued when active without an
@@ -4190,7 +4233,14 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            handle_mesh_config_revision_reset(&state, &auth).await
+            handle_mesh_config_revision_reset(
+                &state,
+                &auth,
+                query.as_deref(),
+                &namespace,
+                &audit_request_ctx,
+            )
+            .await
         }
 
         // F7.2: remote-cluster discovery introspection. Read-only operator
@@ -4523,6 +4573,9 @@ async fn handle_mesh_runtime_overlay_get(
 async fn handle_mesh_config_revision_reset(
     state: &AdminState,
     auth: &AuditActor,
+    query: Option<&str>,
+    namespace: &str,
+    request_ctx: &audit::AuditRequestContext,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let Some(mesh_runtime) = state.mesh_runtime_state.as_ref() else {
         return Ok(json_response(
@@ -4530,6 +4583,19 @@ async fn handle_mesh_config_revision_reset(
             &json!({"error": "No active mesh runtime state"}),
         ));
     };
+
+    if !parse_restore_confirm(query) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({
+                "error": "Clearing the mesh config-revision freshness gate is a privileged operation. Pass ?confirm=true to proceed."
+            }),
+        ));
+    }
+
+    if let Err(response) = state.admit_audited_operation().await {
+        return Ok(response);
+    }
 
     let cleared = mesh_runtime.reset_accepted_revision();
     warn!(
@@ -4542,6 +4608,25 @@ async fn handle_mesh_config_revision_reset(
         "Mesh config-revision freshness gate reset by operator; the next accepted slice \
          establishes a new ordering baseline"
     );
+
+    let diff = mesh_config_revision_reset_audit_diff(cleared.as_ref());
+    let resource_id = cleared
+        .as_ref()
+        .map(|revision| revision.authority.as_str())
+        .unwrap_or("none")
+        .to_string();
+    let event = audit::AuditEvent::new(
+        auth,
+        "reset",
+        "mesh_config_revision",
+        resource_id,
+        namespace,
+        diff,
+    )
+    .with_request_context(request_ctx)
+    .with_outcome(audit::outcome::SUCCESS);
+    record_operation_audit(state, event).await;
+
     Ok(json_response(
         StatusCode::OK,
         &json!({
@@ -4549,6 +4634,29 @@ async fn handle_mesh_config_revision_reset(
             "cleared_revision": cleared,
         }),
     ))
+}
+
+fn mesh_config_revision_reset_audit_diff(
+    cleared: Option<&crate::modes::mesh::revision::MeshConfigRevision>,
+) -> Value {
+    match cleared {
+        Some(revision) => json!({
+            "cleared_authority": revision.authority.as_str(),
+            "cleared_sequence": revision.sequence,
+        }),
+        None => json!({ "cleared_revision": null }),
+    }
+}
+
+async fn record_operation_audit(state: &AdminState, event: audit::AuditEvent) {
+    let result = if let Some(db) = state.db.as_ref() {
+        audit::record(state.admin_audit_enabled, db.clone(), event).await
+    } else {
+        audit::record_without_database(state.admin_audit_enabled, event).await
+    };
+    if let Err(error) = result {
+        log_audit_enqueue_failure(&error);
+    }
 }
 
 /// MESH-T6-C: per-DP config drift introspection.
@@ -7408,6 +7516,140 @@ async fn handle_metrics_runtime(state: &AdminState) -> Result<Response<Full<Byte
 
 // ---- Batch Create ----
 
+/// Point uniqueness checks against already-persisted resources.
+///
+/// Intra-batch collisions stay on `ValidationPipeline` (HTTP 400). Collisions
+/// with existing rows are the same typed 409s as single-resource admission.
+/// Every lookup carries the namespace predicate in the query (issue #4234).
+async fn batch_existing_resource_conflict(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    batch: &RestorePayload,
+) -> Result<Option<String>, anyhow::Error> {
+    for consumer in &batch.consumers {
+        if let Some(message) = db
+            .check_consumer_identity_unique(
+                namespace,
+                &consumer.id,
+                &consumer.username,
+                consumer.custom_id.as_deref(),
+                None,
+            )
+            .await?
+        {
+            return Ok(Some(message));
+        }
+        if let Some(message) =
+            crud::check_consumer_credential_uniqueness(db, namespace, consumer, None).await?
+        {
+            return Ok(Some(message));
+        }
+    }
+
+    for proxy in &batch.proxies {
+        if !proxy.dispatch_kind.is_stream() {
+            match db
+                .check_listen_path_unique(
+                    namespace,
+                    proxy.listen_path.as_deref(),
+                    &proxy.hosts,
+                    None,
+                )
+                .await?
+            {
+                true => {}
+                false => {
+                    return Ok(Some(PROXY_ROUTE_CONFLICT_ERROR.to_string()));
+                }
+            }
+        }
+        if let Some(name) = proxy.name.as_deref() {
+            match db.check_proxy_name_unique(namespace, name, None).await? {
+                true => {}
+                false => {
+                    return Ok(Some(format!("Proxy name '{}' already exists", name)));
+                }
+            }
+        }
+    }
+
+    for upstream in &batch.upstreams {
+        if let Some(name) = upstream.name.as_deref() {
+            match db.check_upstream_name_unique(namespace, name, None).await? {
+                true => {}
+                false => {
+                    return Ok(Some(format!("Upstream name '{}' already exists", name)));
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn batch_needs_consumer_snapshot(batch: &RestorePayload) -> bool {
+    batch.consumers.iter().any(|consumer| {
+        consumer.has_credential("mtls_auth") || !consumer.credential_entries("hmac_auth").is_empty()
+    })
+}
+
+fn batch_needs_mtls_plugin_compat(batch: &RestorePayload) -> bool {
+    batch
+        .plugin_configs
+        .iter()
+        .any(|plugin| plugin.plugin_name == "mtls_auth")
+        || batch
+            .proxies
+            .iter()
+            .any(|proxy| proxy.dispatch_kind.is_stream())
+}
+
+fn batch_submits_plugin_graph(batch: &RestorePayload) -> bool {
+    !batch.plugin_configs.is_empty() || batch.proxies.iter().any(|proxy| !proxy.plugins.is_empty())
+}
+
+fn overlay_batch_consumers(candidate: &mut GatewayConfig, consumers: &[Consumer]) {
+    for consumer in consumers {
+        if let Some(existing) = candidate
+            .consumers
+            .iter_mut()
+            .find(|item| item.id == consumer.id)
+        {
+            *existing = consumer.clone();
+        } else {
+            candidate.consumers.push(consumer.clone());
+        }
+    }
+}
+
+fn overlay_batch_proxies(candidate: &mut GatewayConfig, proxies: &[Proxy]) {
+    for proxy in proxies {
+        if let Some(existing) = candidate
+            .proxies
+            .iter_mut()
+            .find(|item| item.id == proxy.id)
+        {
+            *existing = proxy.clone();
+        } else {
+            candidate.proxies.push(proxy.clone());
+        }
+    }
+}
+
+fn overlay_batch_plugin_configs(candidate: &mut GatewayConfig, plugins: &[PluginConfig]) {
+    for plugin in plugins {
+        if let Some(existing) = candidate
+            .plugin_configs
+            .iter_mut()
+            .find(|item| item.id == plugin.id)
+        {
+            *existing = plugin.clone();
+        } else {
+            candidate.plugin_configs.push(plugin.clone());
+        }
+    }
+}
+
 /// Batch create endpoint for proxies, consumers, plugin configs, and upstreams.
 async fn handle_batch_create(
     state: &AdminState,
@@ -7621,67 +7863,54 @@ async fn handle_batch_create(
         ..Default::default()
     };
 
-    match db.load_namespace_snapshot(namespace).await {
-        Ok(mut candidate_config) => {
-            for consumer in &batch.consumers {
-                if let Some(existing) = candidate_config
+    if batch_needs_consumer_snapshot(&batch) {
+        match db.load_namespace_snapshot(namespace).await {
+            Ok(mut candidate_config) => {
+                overlay_batch_consumers(&mut candidate_config, &batch.consumers);
+                overlay_batch_proxies(&mut candidate_config, &batch.proxies);
+                overlay_batch_plugin_configs(&mut candidate_config, &batch.plugin_configs);
+                if let Err(errors) = candidate_config.validate_mtls_auth_compatibility() {
+                    validation_errors.extend(errors);
+                }
+                if let Err(errors) = candidate_config.validate_unique_mtls_credentials() {
+                    validation_errors.extend(errors);
+                }
+                // Match single-resource admission: legacy duplicates are
+                // already quarantined at load time and must not block
+                // unrelated batch writes. Re-evaluate the authoritative
+                // candidate only when this batch submits a Consumer that
+                // carries HMAC credentials.
+                if batch
                     .consumers
-                    .iter_mut()
-                    .find(|item| item.id == consumer.id)
+                    .iter()
+                    .any(|consumer| !consumer.credential_entries("hmac_auth").is_empty())
+                    && let Err(errors) = candidate_config.validate_unique_hmac_credentials()
                 {
-                    *existing = consumer.clone();
-                } else {
-                    candidate_config.consumers.push(consumer.clone());
+                    validation_errors.extend(errors);
                 }
             }
-            for proxy in &batch.proxies {
-                if let Some(existing) = candidate_config
-                    .proxies
-                    .iter_mut()
-                    .find(|item| item.id == proxy.id)
-                {
-                    *existing = proxy.clone();
-                } else {
-                    candidate_config.proxies.push(proxy.clone());
-                }
-            }
-            for plugin in &batch.plugin_configs {
-                if let Some(existing) = candidate_config
-                    .plugin_configs
-                    .iter_mut()
-                    .find(|item| item.id == plugin.id)
-                {
-                    *existing = plugin.clone();
-                } else {
-                    candidate_config.plugin_configs.push(plugin.clone());
-                }
-            }
-            if let Err(errors) = candidate_config.validate_mtls_auth_compatibility() {
-                validation_errors.extend(errors);
-            }
-            if let Err(errors) = candidate_config.validate_unique_mtls_credentials() {
-                validation_errors.extend(errors);
-            }
-            // Match single-resource admission: legacy duplicates are already
-            // quarantined at load time and must not block unrelated batch
-            // writes. Re-evaluate the authoritative candidate only when this
-            // batch submits a Consumer that carries HMAC credentials.
-            if batch
-                .consumers
-                .iter()
-                .any(|consumer| !consumer.credential_entries("hmac_auth").is_empty())
-                && let Err(errors) = candidate_config.validate_unique_hmac_credentials()
-            {
-                validation_errors.extend(errors);
-            }
+            Err(error) => validation_errors.push(format!(
+                "Failed to load namespace config for credential candidate validation: {}",
+                redacted_persistence_error_message("batch_credential_candidate_load", &error,)
+            )),
         }
-        Err(error) => validation_errors.push(format!(
-            "Failed to load namespace config for credential candidate validation: {}",
-            redacted_persistence_error_message("batch_credential_candidate_load", &error)
-        )),
+    } else if batch_needs_mtls_plugin_compat(&batch) {
+        match db.load_namespace_policy_graph(namespace).await {
+            Ok(mut candidate_config) => {
+                overlay_batch_proxies(&mut candidate_config, &batch.proxies);
+                overlay_batch_plugin_configs(&mut candidate_config, &batch.plugin_configs);
+                if let Err(errors) = candidate_config.validate_mtls_auth_compatibility() {
+                    validation_errors.extend(errors);
+                }
+            }
+            Err(error) => validation_errors.push(format!(
+                "Failed to load namespace config for mTLS compatibility validation: {}",
+                redacted_persistence_error_message("batch_mtls_compat_candidate_load", &error,)
+            )),
+        }
     }
 
-    if !batch.proxies.is_empty() || !batch.plugin_configs.is_empty() {
+    if batch_submits_plugin_graph(&batch) {
         match crud::validate_plugin_graph_candidates(
             db.as_ref(),
             state,
@@ -7914,6 +8143,22 @@ async fn handle_batch_create(
                 "validation_errors": validation_errors
             }),
         ));
+    }
+
+    match batch_existing_resource_conflict(db.as_ref(), namespace, &batch).await {
+        Ok(Some(message)) => {
+            return Ok(json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": message}),
+            ));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &db_error_response(&error),
+            ));
+        }
     }
 
     // One transaction covers every dependency phase and every chunk, so there
@@ -11036,14 +11281,15 @@ async fn handle_backend_capabilities_refresh(
             ));
         }
     };
-    // Run synchronously so the caller can assert on the post-refresh
-    // snapshot immediately. The request handler is already on a tokio
-    // worker task so .await is fine.
-    proxy_state.refresh_backend_capabilities().await;
-    Ok(json_response(
-        StatusCode::OK,
-        &json!({"status": "refreshed"}),
-    ))
+    // Run synchronously through the shared RefreshCoalescer so concurrent
+    // admin callers collapse onto one probe pass while the response still
+    // reflects a completed refresh snapshot.
+    let outcome = proxy_state.refresh_backend_capabilities_coalesced().await;
+    let status = match outcome {
+        crate::proxy::backend_capabilities::BackendCapabilityRefreshOutcome::Ran => "refreshed",
+        crate::proxy::backend_capabilities::BackendCapabilityRefreshOutcome::Joined => "joined",
+    };
+    Ok(json_response(StatusCode::OK, &json!({"status": status})))
 }
 
 fn protocol_support_label(
