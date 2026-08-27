@@ -204,7 +204,7 @@ mod tests {
             let labels = HashMap::new();
             let annotations = make_labels(&[("ferrum.io/inject", value)]);
             assert_eq!(
-                evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+                evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
                 EnrollmentDecision::Skip,
                 "ferrum.io/inject={value:?} must skip enrollment"
             );
@@ -217,7 +217,7 @@ mod tests {
             let labels = HashMap::new();
             let annotations = make_labels(&[("ferrum.io/inject", value)]);
             assert_eq!(
-                evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+                evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
                 EnrollmentDecision::Enroll,
                 "ferrum.io/inject={value:?} must enroll"
             );
@@ -230,7 +230,7 @@ mod tests {
             let labels = make_labels(&[("ferrum.io/mesh", value)]);
             let annotations = HashMap::new();
             assert_eq!(
-                evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+                evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
                 EnrollmentDecision::Skip,
                 "ferrum.io/mesh={value:?} must skip enrollment"
             );
@@ -243,7 +243,7 @@ mod tests {
             let labels = make_labels(&[("ferrum.io/mesh", value)]);
             let annotations = HashMap::new();
             assert_eq!(
-                evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+                evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
                 EnrollmentDecision::Enroll,
                 "ferrum.io/mesh={value:?} must enroll"
             );
@@ -255,7 +255,7 @@ mod tests {
         let labels = make_labels(&[("ferrum.io/mesh", "maybe")]);
         let annotations = HashMap::new();
         assert_eq!(
-            evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+            evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
             EnrollmentDecision::Skip
         );
     }
@@ -265,7 +265,7 @@ mod tests {
         let labels = HashMap::new();
         let annotations = make_labels(&[("ferrum.io/inject", "disabled")]);
         assert_eq!(
-            evaluate_enrollment(&labels, &annotations, "default", &default_excluded()),
+            evaluate_enrollment(&labels, &annotations, "default", &default_excluded(), false),
             EnrollmentDecision::Skip
         );
     }
