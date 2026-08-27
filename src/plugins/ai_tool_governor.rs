@@ -2392,21 +2392,21 @@ impl AiToolGovernor {
                         .iter()
                         .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
                 });
-        if anthropic_envelope || anthropic_holds_tool_use {
-            if let Some(content) = json.get_mut("content").and_then(Value::as_array_mut) {
-                for block in content {
-                    match self.redact_named_arguments(
-                        tool_use_block_call_mut(block, "tool_use"),
-                        "input",
-                        &mut redacted_argument_bytes,
-                        redaction_memos,
-                    ) {
-                        RedactTransform::Changed => modified = true,
-                        RedactTransform::AmplificationFailed => {
-                            return RedactTransform::AmplificationFailed;
-                        }
-                        RedactTransform::Unchanged => {}
+        if (anthropic_envelope || anthropic_holds_tool_use)
+            && let Some(content) = json.get_mut("content").and_then(Value::as_array_mut)
+        {
+            for block in content {
+                match self.redact_named_arguments(
+                    tool_use_block_call_mut(block, "tool_use"),
+                    "input",
+                    &mut redacted_argument_bytes,
+                    redaction_memos,
+                ) {
+                    RedactTransform::Changed => modified = true,
+                    RedactTransform::AmplificationFailed => {
+                        return RedactTransform::AmplificationFailed;
                     }
+                    RedactTransform::Unchanged => {}
                 }
             }
         }
