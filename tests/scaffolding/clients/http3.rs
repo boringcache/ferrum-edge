@@ -650,7 +650,7 @@ impl Http3Client {
         Ok(Http3WebSocket {
             stream,
             _send_request: send_request,
-            driver_task,
+            driver_task: Some(driver_task),
             read_buf: Vec::new(),
             status,
             headers,
@@ -1043,6 +1043,58 @@ impl Http3Connection {
                 .map_err(|e| format!("finish request body: {e}"))?;
         }
         Ok(Http3ConnectionStream { stream })
+    }
+
+    /// Open an RFC 9220 WebSocket CONNECT stream on this multiplexed connection.
+    ///
+    /// The parent [`Http3Connection`] owns the H3 driver, so dropping the
+    /// returned stream does not abort sibling streams on the same QUIC
+    /// connection.
+    pub async fn websocket(
+        &mut self,
+        url: &str,
+        options: WebSocketOptions,
+    ) -> Result<Http3WebSocket, Box<dyn std::error::Error + Send + Sync>> {
+        let mut req_builder = Request::builder()
+            .method(http::Method::CONNECT)
+            .version(http::Version::HTTP_3)
+            .uri(url)
+            .header("sec-websocket-version", "13")
+            .header("user-agent", "ferrum-test-h3-ws/1.0");
+        if !options.subprotocols.is_empty() {
+            req_builder =
+                req_builder.header("sec-websocket-protocol", options.subprotocols.join(", "));
+        }
+        for (name, value) in &options.headers {
+            req_builder = req_builder.header(name.as_str(), value.as_str());
+        }
+
+        let mut req = req_builder
+            .body(())
+            .map_err(|e| format!("build request: {e}"))?;
+        req.extensions_mut().insert(h3::ext::Protocol::WEB_SOCKET);
+
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(15), self.send_request.send_request(req))
+                .await
+                .map_err(|_| "send_request timed out")?
+                .map_err(|e| format!("send_request: {e}"))?;
+
+        let resp = tokio::time::timeout(Duration::from_secs(15), stream.recv_response())
+            .await
+            .map_err(|_| "recv_response timed out")?
+            .map_err(|e| format!("recv_response: {e}"))?;
+        let status = resp.status();
+        let headers = resp.headers().clone();
+
+        Ok(Http3WebSocket {
+            stream,
+            _send_request: self.send_request.clone(),
+            driver_task: None,
+            read_buf: Vec::new(),
+            status,
+            headers,
+        })
     }
 
     /// Buffered GET on this connection. Used as the follow-up request after a
@@ -1485,7 +1537,7 @@ impl Http3ConnectUdp {
 pub struct Http3WebSocket {
     stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     _send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
-    driver_task: JoinHandle<()>,
+    driver_task: Option<JoinHandle<()>>,
     read_buf: Vec<u8>,
     pub status: StatusCode,
     pub headers: HeaderMap,
@@ -1619,7 +1671,9 @@ impl Http3WebSocket {
 
 impl Drop for Http3WebSocket {
     fn drop(&mut self) {
-        self.driver_task.abort();
+        if let Some(task) = &self.driver_task {
+            task.abort();
+        }
     }
 }
 

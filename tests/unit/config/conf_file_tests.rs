@@ -137,6 +137,7 @@ FERRUM_GRPC_POOL_READY_WAIT_MS = 3
 FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS = 80
 FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS = 320
 FERRUM_WEBSOCKET_MAX_CONNECTIONS = 1234
+FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP = 9
 ";
     let conf = ConfFile::parse(conf_contents).unwrap();
 
@@ -154,6 +155,7 @@ FERRUM_WEBSOCKET_MAX_CONNECTIONS = 1234
             assert_eq!(config.server_http2_max_pending_accept_reset_streams, 80);
             assert_eq!(config.server_http2_max_local_error_reset_streams, 320);
             assert_eq!(config.websocket_max_connections, 1234);
+            assert_eq!(config.websocket_max_connections_per_ip, 9);
         },
     );
 }

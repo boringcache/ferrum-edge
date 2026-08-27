@@ -746,6 +746,50 @@ pub(crate) async fn handle_h3_websocket(
         }
     };
 
+    // Per-source session bound. Same key and 503 shape as the H1/H2 path.
+    // Held for the session lifetime below (moved past the request-guard
+    // drop at the upgrade boundary).
+    let per_ip_ws_guard = match crate::proxy::try_acquire_per_ip_websocket_session(
+        state.per_ip_websocket_sessions.as_ref(),
+        &ctx.client_ip,
+        state.websocket_max_connections_per_ip,
+    ) {
+        Ok(guard) => guard,
+        Err(_) => {
+            warn!(
+                proxy_id = %proxy.id,
+                client_ip = %ctx.client_ip,
+                websocket_per_ip_limit = state.websocket_max_connections_per_ip,
+                "Rejecting H3 WebSocket upgrade: per-source connection limit reached"
+            );
+            crate::proxy::log_rejected_request_with_path(
+                &plugins,
+                &ctx,
+                503,
+                start_time,
+                "websocket_per_ip_connection_limit",
+                plugin_execution_ns,
+                Some(&original_request_path),
+            )
+            .await;
+            crate::proxy::record_request(&state, 503);
+            send_h3_error_body(
+                &mut stream,
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"WebSocket connection limit exceeded"}"#,
+                &initial_response_header_policy_plugins,
+            )
+            .await;
+            release_h3_ws_circuit_breaker_probe_on_admission_reject(
+                &state,
+                &proxy,
+                cb_target_key.as_deref(),
+                cb_is_half_open_probe,
+            );
+            return Ok(());
+        }
+    };
+
     // Handoff overload accounting from "active request/stream" to
     // "long-lived WebSocket connection" before the backend handshake. This
     // keeps slow or failing backend connects visible to graceful drain and
@@ -1494,12 +1538,13 @@ pub(crate) async fn handle_h3_websocket(
 
     // Per-IP request accounting handoff: the upgrade is complete and the
     // session is now a long-lived "connection" tracked by
-    // `ws_session_guard` (overload `active_connections`) and the WebSocket
-    // connection permit. Dropping the per-IP REQUEST guard here matches
-    // the H1/H2 path — there, `handle_websocket_request_authenticated`
-    // returns the upgrade response and the caller's `_per_ip_guard`
-    // drops as the function unwinds, BEFORE the spawned WS session
-    // continues. Keeping it for the full session lifetime would let one
+    // `ws_session_guard` (overload `active_connections`), the WebSocket
+    // connection permit, and `per_ip_ws_guard` (per-source session budget).
+    // Dropping the per-IP REQUEST guard here matches the H1/H2 path —
+    // there, `handle_websocket_request_authenticated` returns the upgrade
+    // response and the caller's `_per_ip_guard` drops as the function
+    // unwinds, BEFORE the spawned WS session continues. Keeping the
+    // request guard for the full session lifetime would let one
     // long-lived H3 WebSocket block normal H1/H2/H3 requests from the
     // same IP for the entire session duration.
     drop(per_ip_guard);
@@ -1801,6 +1846,7 @@ pub(crate) async fn handle_h3_websocket(
     drop(ws_session_guard);
     drop(ws_lb_guard);
     drop(backend_conn_guard);
+    drop(per_ip_ws_guard);
 
     info!(
         proxy_id = %proxy.id,

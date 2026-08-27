@@ -243,6 +243,7 @@ These settings control the gateway's ability to handle high connection concurren
 | `FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS` | `64` | Max pending HTTP/2 reset streams before GOAWAY |
 | `FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS` | `256` | Max locally reset HTTP/2 streams before GOAWAY |
 | `FERRUM_WEBSOCKET_MAX_CONNECTIONS` | `20000` | Max concurrently upgraded WebSocket connections (`0` = disabled) |
+| `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP` | `0` | Max upgraded WebSocket sessions per resolved client IP (`0` = disabled) |
 
 **`FERRUM_MAX_CONNECTIONS`** — When the limit is reached, new connections queue (not drop) until an existing connection closes. This prevents file descriptor exhaustion and memory runaway under extreme load. Set to `0` to disable the limit entirely.
 
@@ -268,6 +269,8 @@ These settings control the gateway's ability to handle high connection concurren
 **`FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS`** — Bounds repeated locally reset HTTP/2 streams on one connection, which helps contain malformed-request churn and related DoS patterns. The default of 256 is much lower than hyper's default, but still high enough to avoid affecting normal traffic.
 
 **`FERRUM_WEBSOCKET_MAX_CONNECTIONS`** — Caps long-lived upgraded WebSocket sessions separately from the global TCP connection pool. This protects API-heavy deployments from idle WebSocket exhaustion without adding work to the HTTP request path or the WebSocket frame-forwarding loop. Use the `rate_limiting` plugin as the companion defense for upgrade floods.
+
+**`FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP`** — Caps those same upgraded sessions per resolved client IP so one source cannot consume the entire global budget, including over multiplexed H2/H3 Extended CONNECT. Default `0` leaves existing deployments unchanged. Source IP follows the trusted-proxy walk: forwarding headers are ignored from untrusted peers.
 
 ### Runtime Threading
 

@@ -3375,9 +3375,10 @@ pub struct EnvConfig {
     /// Uses the same client IP resolution as trusted proxy XFF walk.
     /// Default: 0 (disabled). When exceeded, returns 429 Too Many Requests.
     pub max_concurrent_requests_per_ip: u64,
-    /// Interval in seconds between cleanup sweeps for per-IP request counters.
-    /// Removes entries where the active request count has dropped to zero.
-    /// Only relevant when `max_concurrent_requests_per_ip > 0`. Default: 60.
+    /// Interval in seconds between cleanup sweeps for per-IP request and
+    /// WebSocket-session counters. Removes entries where the active count has
+    /// dropped to zero. Relevant when `max_concurrent_requests_per_ip > 0`
+    /// and/or `websocket_max_connections_per_ip > 0`. Default: 60.
     pub per_ip_cleanup_interval_seconds: u64,
     /// Process-wide ceiling on requests/connections/datagrams concurrently parked on an
     /// injected `fault_injection` (or `mesh_route_dispatch` route-local) delay.
@@ -3395,8 +3396,8 @@ pub struct EnvConfig {
     /// Default: 10000.
     pub circuit_breaker_cache_max_entries: usize,
     /// DashMap shard count for hot pool/cache maps (HTTP/H2/gRPC connection
-    /// pools, DNS cache, per-IP request counters, TCP connection-throttle
-    /// counters, router prefix/regex caches, response_caching
+    /// pools, DNS cache, per-IP request and WebSocket-session counters, TCP
+    /// connection-throttle counters, router prefix/regex caches, response_caching
     /// cache/Vary-index/predictor maps, and shared local/Redis-fallback
     /// rate-limiter token-state maps). DashMap defaults to `4 * num_cpus`,
     /// which is fine for small maps but starves on write contention at high
@@ -3470,6 +3471,11 @@ pub struct EnvConfig {
     /// Default: 20_000. Set to 0 to disable the dedicated WebSocket cap and
     /// rely only on the global connection limit.
     pub websocket_max_connections: usize,
+    /// Maximum concurrently upgraded WebSocket sessions per resolved client IP.
+    /// Uses the same client IP resolution as `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP`
+    /// (socket peer, or forwarding headers only from `FERRUM_TRUSTED_PROXIES`).
+    /// Default: 0 (disabled). When exceeded, upgrades are rejected with 503.
+    pub websocket_max_connections_per_ip: u64,
 
     // ── Overload management ──────────────────────────────────────────────
     /// How often the overload monitor checks resource pressure in milliseconds.
@@ -4025,6 +4031,7 @@ impl Default for EnvConfig {
             server_http2_max_pending_accept_reset_streams: 64,
             server_http2_max_local_error_reset_streams: 256,
             websocket_max_connections: 20_000,
+            websocket_max_connections_per_ip: 0,
             overload_check_interval_ms: 1000,
             overload_fd_pressure_threshold: 0.80,
             overload_fd_critical_threshold: 0.95,
@@ -4673,6 +4680,7 @@ impl EnvConfig {
             server_http2_max_pending_accept_reset_streams: usize = "FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS" => 64usize, max(1usize);
             server_http2_max_local_error_reset_streams: usize = "FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS" => 256usize, max(1usize);
             websocket_max_connections: usize = "FERRUM_WEBSOCKET_MAX_CONNECTIONS" => 20_000usize;
+            websocket_max_connections_per_ip: u64 = "FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP" => 0u64;
             overload_check_interval_ms: u64 = "FERRUM_OVERLOAD_CHECK_INTERVAL_MS" => 1000u64, max(100u64);
             overload_fd_pressure_threshold: f64 = "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD" => 0.80f64, clamp(0.0f64, 1.0f64);
             overload_fd_critical_threshold: f64 = "FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD" => 0.95f64, clamp(0.0f64, 1.0f64);
@@ -5422,6 +5430,7 @@ impl EnvConfig {
             server_http2_max_pending_accept_reset_streams,
             server_http2_max_local_error_reset_streams,
             websocket_max_connections,
+            websocket_max_connections_per_ip,
             overload_check_interval_ms,
             overload_fd_pressure_threshold,
             overload_fd_critical_threshold,
