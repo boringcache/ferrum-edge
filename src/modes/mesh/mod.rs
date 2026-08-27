@@ -1681,26 +1681,23 @@ fn prepare_normalized_gateway_config_for_mesh(
                 let destinations = match own_identity {
                     Some(identity) => {
                         crate::modes::mesh::config::inbound_relay_destinations_from_workloads(
-                            mesh_slice
-                                .workloads
-                                .iter()
-                                .filter(|workload| {
-                                    // `mesh_slice` here is the MULTICLUSTER-MERGED
-                                    // materialization slice, and
-                                    // `tag_remote_workloads` deliberately keeps a
-                                    // remote workload's SPIFFE id. The same service
-                                    // deployed in two clusters therefore shares an
-                                    // identity, so identity alone would admit a
-                                    // REMOTE pod as an own-pod destination and dial
-                                    // it in plaintext from this pod, bypassing the
-                                    // east-west gateway and its inner mTLS.
-                                    // `remote_provenance` is the reserved
-                                    // `serde(skip)` marker stamped DP-side at
-                                    // remote-poll ingestion, so it cannot be forged
-                                    // by a remote CP or an operator file.
-                                    !workload.remote_provenance
-                                        && workload.spiffe_id.as_str() == identity
-                                }),
+                            mesh_slice.workloads.iter().filter(|workload| {
+                                // `mesh_slice` here is the MULTICLUSTER-MERGED
+                                // materialization slice, and
+                                // `tag_remote_workloads` deliberately keeps a
+                                // remote workload's SPIFFE id. The same service
+                                // deployed in two clusters therefore shares an
+                                // identity, so identity alone would admit a
+                                // REMOTE pod as an own-pod destination and dial
+                                // it in plaintext from this pod, bypassing the
+                                // east-west gateway and its inner mTLS.
+                                // `remote_provenance` is the reserved
+                                // `serde(skip)` marker stamped DP-side at
+                                // remote-poll ingestion, so it cannot be forged
+                                // by a remote CP or an operator file.
+                                !workload.remote_provenance
+                                    && workload.spiffe_id.as_str() == identity
+                            }),
                         )
                     }
                     None => Vec::new(),
