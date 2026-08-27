@@ -281,13 +281,8 @@ async fn start_manager_with_config_arc_on_fresh_port<F>(
 where
     F: FnMut(u16) -> GatewayConfig,
 {
-    let (runtime, config_arc, port) = start_runtime_on_fresh_port(
-        family,
-        build_config,
-        create_manager_runtime,
-        None,
-    )
-    .await;
+    let (runtime, config_arc, port) =
+        start_runtime_on_fresh_port(family, build_config, create_manager_runtime, None).await;
     (runtime.manager, config_arc, port)
 }
 
@@ -742,11 +737,9 @@ async fn test_reconcile_with_empty_config_returns_no_failures() {
 
 #[tokio::test]
 async fn test_reconcile_starts_tcp_listener() {
-    let (manager, port) = start_manager_on_fresh_tcp_port(|port| {
-        GatewayConfig {
-            proxies: vec![create_stream_proxy("tcp1", BackendScheme::Tcp, port)],
-            ..empty_config()
-        }
+    let (manager, port) = start_manager_on_fresh_tcp_port(|port| GatewayConfig {
+        proxies: vec![create_stream_proxy("tcp1", BackendScheme::Tcp, port)],
+        ..empty_config()
     })
     .await;
 
@@ -1199,11 +1192,9 @@ async fn opaque_tcp_sni_group_rebuilds_on_reload_and_delete() {
 
 #[tokio::test]
 async fn test_reconcile_starts_udp_listener() {
-    let (manager, port) = start_manager_on_fresh_udp_port(|port| {
-        GatewayConfig {
-            proxies: vec![create_stream_proxy("udp1", BackendScheme::Udp, port)],
-            ..empty_config()
-        }
+    let (manager, port) = start_manager_on_fresh_udp_port(|port| GatewayConfig {
+        proxies: vec![create_stream_proxy("udp1", BackendScheme::Udp, port)],
+        ..empty_config()
     })
     .await;
 
@@ -1431,13 +1422,12 @@ async fn test_config_skip_surfaced_in_overload_snapshot() {
 
 #[tokio::test]
 async fn test_reconcile_restarts_changed_tcp_listener_without_bind_failure() {
-    let (manager, config_arc, port) = start_manager_with_config_arc_on_fresh_tcp_port(|port| {
-        GatewayConfig {
+    let (manager, config_arc, port) =
+        start_manager_with_config_arc_on_fresh_tcp_port(|port| GatewayConfig {
             proxies: vec![create_stream_proxy("tcp-restart", BackendScheme::Tcp, port)],
             ..empty_config()
-        }
-    })
-    .await;
+        })
+        .await;
 
     let mut restarted_proxy = create_stream_proxy("tcp-restart", BackendScheme::Tcp, port);
     restarted_proxy.backend_scheme = Some(BackendScheme::Tcps);
@@ -1908,11 +1898,13 @@ async fn test_reconcile_defers_udp_without_dtls_config() {
 
 #[tokio::test]
 async fn test_shutdown_all_releases_ports() {
-    let (manager, port) = start_manager_on_fresh_tcp_port(|port| {
-        GatewayConfig {
-            proxies: vec![create_stream_proxy("tcp-shutdown", BackendScheme::Tcp, port)],
-            ..empty_config()
-        }
+    let (manager, port) = start_manager_on_fresh_tcp_port(|port| GatewayConfig {
+        proxies: vec![create_stream_proxy(
+            "tcp-shutdown",
+            BackendScheme::Tcp,
+            port,
+        )],
+        ..empty_config()
     })
     .await;
 
@@ -1950,11 +1942,9 @@ async fn test_wait_until_started_with_empty_config() {
 
 #[tokio::test]
 async fn test_wait_until_started_succeeds_for_tcp() {
-    let (manager, _port) = start_manager_on_fresh_tcp_port(|port| {
-        GatewayConfig {
-            proxies: vec![create_stream_proxy("tcp-wait", BackendScheme::Tcp, port)],
-            ..empty_config()
-        }
+    let (manager, _port) = start_manager_on_fresh_tcp_port(|port| GatewayConfig {
+        proxies: vec![create_stream_proxy("tcp-wait", BackendScheme::Tcp, port)],
+        ..empty_config()
     })
     .await;
 
@@ -1983,11 +1973,9 @@ async fn test_wait_until_started_succeeds_for_tcp() {
 async fn test_global_shutdown_stops_tcp_accept_loop() {
     let (global_tx, global_rx) = tokio::sync::watch::channel(false);
     let (manager, port) =
-        start_manager_with_shutdown_rx_on_fresh_tcp_port(global_rx, |port| {
-            GatewayConfig {
-                proxies: vec![create_stream_proxy("tcp-sigterm", BackendScheme::Tcp, port)],
-                ..empty_config()
-            }
+        start_manager_with_shutdown_rx_on_fresh_tcp_port(global_rx, |port| GatewayConfig {
+            proxies: vec![create_stream_proxy("tcp-sigterm", BackendScheme::Tcp, port)],
+            ..empty_config()
         })
         .await;
 
@@ -2032,11 +2020,9 @@ async fn test_global_shutdown_stops_tcp_accept_loop() {
 async fn test_global_shutdown_stops_udp_recv_loop() {
     let (global_tx, global_rx) = tokio::sync::watch::channel(false);
     let (manager, port) =
-        start_manager_with_shutdown_rx_on_fresh_udp_port(global_rx, |port| {
-            GatewayConfig {
-                proxies: vec![create_stream_proxy("udp-sigterm", BackendScheme::Udp, port)],
-                ..empty_config()
-            }
+        start_manager_with_shutdown_rx_on_fresh_udp_port(global_rx, |port| GatewayConfig {
+            proxies: vec![create_stream_proxy("udp-sigterm", BackendScheme::Udp, port)],
+            ..empty_config()
         })
         .await;
 
@@ -2087,11 +2073,13 @@ async fn test_global_shutdown_stops_udp_recv_loop() {
 async fn test_reconcile_restarts_listener_whose_task_exited() {
     let (first_tx, first_rx) = tokio::sync::watch::channel(false);
     let (manager, port) =
-        start_manager_with_shutdown_rx_on_fresh_tcp_port(first_rx, |port| {
-            GatewayConfig {
-                proxies: vec![create_stream_proxy("tcp-dead-task", BackendScheme::Tcp, port)],
-                ..empty_config()
-            }
+        start_manager_with_shutdown_rx_on_fresh_tcp_port(first_rx, |port| GatewayConfig {
+            proxies: vec![create_stream_proxy(
+                "tcp-dead-task",
+                BackendScheme::Tcp,
+                port,
+            )],
+            ..empty_config()
         })
         .await;
 
@@ -3526,15 +3514,13 @@ async fn udp_stream_proxy_protocol_reload_restarts_listener_and_toggles_gate() {
     spawn_udp_echo_backend(Arc::clone(&backend)).await;
 
     let (runtime, config_arc, frontend_port) =
-        start_datagram_reload_manager_on_fresh_udp_port(|frontend_port| {
-            GatewayConfig {
-                proxies: vec![udp_proxy_for_datagram_reload(
-                    frontend_port,
-                    backend_port,
-                    None,
-                )],
-                ..empty_config()
-            }
+        start_datagram_reload_manager_on_fresh_udp_port(|frontend_port| GatewayConfig {
+            proxies: vec![udp_proxy_for_datagram_reload(
+                frontend_port,
+                backend_port,
+                None,
+            )],
+            ..empty_config()
         })
         .await;
     let gateway_addr = SocketAddr::from(([127, 0, 0, 1], frontend_port));
@@ -3673,11 +3659,7 @@ async fn udp_amplification_policy_reload_retires_sessions_with_stale_budget() {
 
     let (runtime, config_arc, frontend_port) =
         start_datagram_reload_manager_on_fresh_udp_port(|frontend_port| {
-            let mut unlimited = udp_proxy_for_datagram_reload(
-                frontend_port,
-                backend_port,
-                None,
-            );
+            let mut unlimited = udp_proxy_for_datagram_reload(frontend_port, backend_port, None);
             unlimited.udp_max_response_amplification_factor = None;
             GatewayConfig {
                 proxies: vec![unlimited],
