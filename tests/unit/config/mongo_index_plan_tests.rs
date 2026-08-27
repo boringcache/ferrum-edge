@@ -107,6 +107,24 @@ fn canonical_plan_is_non_empty_and_covers_core_collections() {
         listen_port_index.recreate_on_options_conflict,
         "the former unique baseline index must be replaced"
     );
+
+    let listen_path_index = plan
+        .iter()
+        .find(|entry| {
+            entry.collection == "proxies"
+                && entry.model.keys == doc! { "namespace": 1, "listen_path": 1 }
+        })
+        .expect("proxies (namespace, listen_path) covering index");
+    let listen_path_unique = listen_path_index
+        .model
+        .options
+        .as_ref()
+        .and_then(|opts| opts.unique);
+    assert_ne!(
+        listen_path_unique,
+        Some(true),
+        "listen_path uniqueness is host-overlap, not a unique index"
+    );
 }
 
 #[test]

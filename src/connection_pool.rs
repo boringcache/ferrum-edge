@@ -12,7 +12,7 @@
 
 use crate::backend_conn_limit::ReqwestConnectionAdmission;
 use crate::config::PoolConfig;
-use crate::config::types::Proxy;
+use crate::config::types::{GatewayConfig, Proxy};
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::pool::{GenericPool, PoolManager};
 use crate::tls::TlsPolicy;
@@ -20,10 +20,11 @@ use crate::tls::backend::{
     BackendSvidGeneration, BackendTlsConfigBuilder, BackendTlsConfigCache, SvidGenerationMatcher,
     append_backend_tls_pool_key_fields, append_optional_pool_key_component,
     append_pool_key_component, backend_svid_generation_for_client_cert,
+    backend_tls_config_cache_key,
 };
 use anyhow::Result;
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -58,6 +59,32 @@ impl ReqwestPoolManager {
         let mut key = String::with_capacity(192);
         self.build_key(proxy, &proxy.backend_host, proxy.backend_port, 0, &mut key);
         key
+    }
+
+    fn tls_config_cache_key_owned(&self, proxy: &Proxy) -> String {
+        let verify = proxy.resolved_tls.verify_server_cert
+            && (!self.global_env_config.tls_no_verify
+                || !proxy.resolved_tls.allows_global_no_verify());
+        let effective_client_cert_path = proxy.resolved_tls.client_cert_path.as_deref().or(self
+            .global_env_config
+            .backend_tls_client_cert_path
+            .as_deref());
+        let effective_client_key_path = proxy.resolved_tls.client_key_path.as_deref().or(self
+            .global_env_config
+            .backend_tls_client_key_path
+            .as_deref());
+        let svid_generation = backend_svid_generation_for_client_cert(
+            effective_client_cert_path,
+            self.workload_svid_cert_path.as_deref(),
+            self.backend_svid_generation.load(Ordering::Acquire),
+        );
+        backend_tls_config_cache_key(
+            &proxy.resolved_tls,
+            effective_client_cert_path,
+            effective_client_key_path,
+            verify,
+            svid_generation,
+        )
     }
 
     async fn create_client(&self, proxy: &Proxy, config: &PoolConfig) -> Result<reqwest::Client> {
@@ -373,9 +400,44 @@ impl ConnectionPool {
         self.pool.manager().pool_key_owned(proxy)
     }
 
+    /// TLS-config cache key (no host/port / rcfg suffix). Used by unit tests
+    /// to prove two endpoints sharing trust material reuse one `ClientConfig`.
+    #[allow(dead_code)] // exercised from unit tests
+    pub fn tls_config_cache_key_for_warmup(&self, proxy: &Proxy) -> String {
+        self.pool.manager().tls_config_cache_key_owned(proxy)
+    }
+
+    /// Drop H3 TLS configs whose identity is no longer in `config`. Cold-path
+    /// only (config publication); live TLS identities are retained.
+    pub fn retain_live_tls_configs_from_config(&self, config: &GatewayConfig) {
+        let mut live_tls_keys = HashSet::with_capacity(config.proxies.len());
+        for proxy in &config.proxies {
+            live_tls_keys.insert(self.pool.manager().tls_config_cache_key_owned(proxy));
+        }
+        self.pool
+            .manager()
+            .backend_h3_tls_configs
+            .retain_keys(&live_tls_keys);
+    }
+
+    #[allow(dead_code)] // exercised from unit tests
+    pub fn backend_tls_config_cache(&self) -> &BackendTlsConfigCache {
+        &self.pool.manager().backend_h3_tls_configs
+    }
+
     /// Get the global pool configuration.
     pub fn global_pool_config(&self) -> &PoolConfig {
         &self.pool.manager().global_config
+    }
+
+    /// Resident pool entries and the configured per-host idle ceiling.
+    ///
+    /// Scrape-path counterpart to [`Self::get_stats`], which additionally
+    /// snapshots every pool key to build the per-host map. The `/metrics`
+    /// surface never labels by pool key, so it does not pay for that snapshot.
+    pub fn pool_gauges(&self) -> (usize, usize) {
+        let stats = self.pool.stats();
+        (stats.size, stats.max_idle_per_host)
     }
 
     /// Get pool statistics for monitoring.
@@ -402,9 +464,9 @@ impl ConnectionPool {
         proxy: &Proxy,
     ) -> Result<Arc<rustls::ClientConfig>, anyhow::Error> {
         let manager = self.pool.manager();
-        manager
-            .backend_h3_tls_configs
-            .get_or_try_build(manager.pool_key_owned(proxy), || {
+        manager.backend_h3_tls_configs.get_or_try_build(
+            manager.tls_config_cache_key_owned(proxy),
+            || {
                 let crls = manager.crls.load_full();
                 let mut client_config = BackendTlsConfigBuilder {
                     proxy,
@@ -432,7 +494,8 @@ impl ConnectionPool {
 
                 client_config.alpn_protocols = vec![b"h3".to_vec()];
                 Ok(client_config)
-            })
+            },
+        )
     }
 
     /// Clear all pooled connections.

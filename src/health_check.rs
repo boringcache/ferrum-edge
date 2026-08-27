@@ -24,15 +24,18 @@ mod grpc_health_v1 {
 
 use crate::config::pool_config::PoolConfig;
 use crate::config::types::{
-    ActiveHealthCheck, BackendTlsConfig, GatewayConfig, HealthProbeType, PassiveHealthCheck,
-    UpstreamTarget,
+    ActiveHealthCheck, BackendTlsConfig, GatewayConfig, HealthProbeType, MAX_TARGETS_PER_UPSTREAM,
+    PassiveHealthCheck, Upstream, UpstreamTarget,
 };
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::load_balancer::{
     LoadBalancerCache, target_host_port_key, target_key, write_target_host_port_key,
 };
+use crate::tls::backend::SanAllowListVerifier;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
+use crate::tls::{backend_client_config_builder, build_server_verifier_with_crls};
 use dashmap::DashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -47,6 +50,10 @@ thread_local! {
         std::cell::RefCell::new(String::with_capacity(64));
     /// Scratch buffer for namespace-qualified passive-health outer keys.
     static PASSIVE_PROXY_KEY_BUF: std::cell::RefCell<String> =
+        std::cell::RefCell::new(String::with_capacity(64));
+    /// Scratch buffer for namespace-qualified active-probe upstream keys on
+    /// the proxy hot path (`has_running_active_probes`).
+    static ACTIVE_PROBE_UPSTREAM_KEY_BUF: std::cell::RefCell<String> =
         std::cell::RefCell::new(String::with_capacity(64));
 }
 
@@ -589,6 +596,47 @@ pub struct HealthChecker {
     global_backend_tls_client_key_path: Option<String>,
     /// Global TLS no-verify flag.
     global_tls_no_verify: bool,
+    /// Per-upstream probe generation, keyed by namespaced upstream key.
+    ///
+    /// An SD-driven target-set change bumps only this cell so probes for other
+    /// upstreams keep running. Full config reload still bumps
+    /// [`Self::task_generation`] and retires every probe.
+    upstream_probe_generation: DashMap<String, Arc<AtomicU64>>,
+    /// AbortHandles for live probes grouped by namespaced upstream key.
+    /// Targeted abort for [`Self::restart_upstream_probes`] without cancelling
+    /// other upstreams or the passive-recovery scanner.
+    upstream_probe_aborts: Mutex<HashMap<String, Vec<AbortHandle>>>,
+    /// Last shutdown receiver passed to [`Self::start_with_shutdown`], cloned
+    /// into SD-spawned replacement probes.
+    probe_shutdown_rx: Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
+    /// Namespaced upstream keys that currently have at least one live active
+    /// probe task. Read on the proxy hot path to decide whether passive TTFB
+    /// sampling is suppressed.
+    active_probe_upstreams: DashMap<String, ()>,
+    /// Active-probe spec recorded by [`Self::start_with_shutdown`] so service
+    /// discovery can restart probes without re-reading GatewayConfig.
+    active_probe_specs: DashMap<String, Arc<ActiveProbeSpec>>,
+    /// Host:port identity set last spawned per upstream; used to skip a
+    /// no-op SD restart when the live set did not change.
+    upstream_probe_target_keys: DashMap<String, HashSet<String>>,
+}
+
+/// Per-upstream active-probe configuration captured at start/reload.
+struct ActiveProbeSpec {
+    active: ActiveHealthCheck,
+    tls: BackendTlsConfig,
+}
+
+/// Probe TLS server verifier: plain webpki, or the same SAN-pinning wrapper
+/// the data path uses (`SanAllowListVerifier`).
+#[derive(Debug)]
+enum ProbeServerVerifier {
+    /// No SAN allow-list was configured, so probes use the plain webpki
+    /// verifier the builder installs by default. Carries no payload: every
+    /// consumer treats this variant as "not SAN-pinned" and installs nothing,
+    /// unlike `SanAllowList`, whose verifier IS installed.
+    WebPki,
+    SanAllowList(Arc<SanAllowListVerifier>),
 }
 
 /// Per-active-check identity and lifecycle inputs for `start_active_check`.
@@ -598,6 +646,8 @@ struct ActiveCheckStartParams<'a> {
     upstream_id: &'a str,
     shutdown_rx: Option<&'a tokio::sync::watch::Receiver<bool>>,
     generation: u64,
+    upstream_generation: u64,
+    upstream_generation_cell: Arc<AtomicU64>,
 }
 
 impl Default for HealthChecker {
@@ -646,6 +696,12 @@ impl HealthChecker {
             global_backend_tls_client_cert_path: None,
             global_backend_tls_client_key_path: None,
             global_tls_no_verify: false,
+            upstream_probe_generation: DashMap::new(),
+            upstream_probe_aborts: Mutex::new(HashMap::new()),
+            probe_shutdown_rx: Mutex::new(None),
+            active_probe_upstreams: DashMap::new(),
+            active_probe_specs: DashMap::new(),
+            upstream_probe_target_keys: DashMap::new(),
         }
     }
 
@@ -702,6 +758,12 @@ impl HealthChecker {
             global_backend_tls_client_cert_path: None,
             global_backend_tls_client_key_path: None,
             global_tls_no_verify: false,
+            upstream_probe_generation: DashMap::new(),
+            upstream_probe_aborts: Mutex::new(HashMap::new()),
+            probe_shutdown_rx: Mutex::new(None),
+            active_probe_upstreams: DashMap::new(),
+            active_probe_specs: DashMap::new(),
+            upstream_probe_target_keys: DashMap::new(),
         }
     }
 
@@ -801,56 +863,51 @@ impl HealthChecker {
         for handle in old_handles {
             handle.abort();
         }
+        let old_upstream_aborts: HashMap<String, Vec<AbortHandle>> = {
+            let mut guard = match self.upstream_probe_aborts.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            std::mem::take(&mut *guard)
+        };
+        for abort in old_upstream_aborts.into_values().flatten() {
+            abort.abort();
+        }
+        self.active_probe_upstreams.clear();
+        self.upstream_probe_target_keys.clear();
+        self.active_probe_specs.clear();
+
+        {
+            let mut slot = match self.probe_shutdown_rx.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *slot = shutdown_rx.clone();
+        }
 
         drop(publish_guard);
 
         let mut new_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         let mut new_aborts: Vec<AbortHandle> = Vec::new();
         for upstream in &config.upstreams {
-            if let Some(hc_config) = &upstream.health_checks {
-                // Start active health checks
-                if let Some(active) = &hc_config.active {
-                    // Build a per-upstream HTTP client with the upstream's TLS config
-                    let tls_config = BackendTlsConfig::from_upstream(upstream);
-                    // A `backend_tls_sni` HTTPS probe puts the overridden server
-                    // name in the probe URL, so its client must pin the dial to
-                    // ONE target and is therefore built per target below. Every
-                    // other probe keeps the shared per-upstream client.
-                    let probe_pins_dial_host = active.use_tls
-                        && tls_config.sni.is_some()
-                        && matches!(active.probe_type, HealthProbeType::Http);
-                    let upstream_client = if probe_pins_dial_host {
-                        None
-                    } else {
-                        self.build_upstream_health_client(&tls_config, active.use_tls, None)
-                    };
-                    for target in &upstream.targets {
-                        let target_client = if probe_pins_dial_host {
-                            self.build_upstream_health_client(
-                                &tls_config,
-                                active.use_tls,
-                                Some(target.host.as_str()),
-                            )
-                        } else {
-                            upstream_client.clone()
-                        };
-                        let start = ActiveCheckStartParams {
-                            target,
-                            upstream_namespace: &upstream.namespace,
-                            upstream_id: &upstream.id,
-                            shutdown_rx: shutdown_rx.as_ref(),
-                            generation,
-                        };
-                        let handle = self.start_active_check(
-                            start,
-                            active,
-                            target_client.as_ref(),
-                            &tls_config,
-                        );
-                        new_aborts.push(handle.abort_handle());
-                        new_handles.push(handle);
-                    }
-                }
+            if let Some(active) = upstream
+                .health_checks
+                .as_ref()
+                .and_then(|hc| hc.active.as_ref())
+            {
+                let tls_config = BackendTlsConfig::from_upstream(upstream);
+                let targets = self.effective_probe_targets(upstream);
+                let (handles, aborts) = self.spawn_active_probes_for_upstream(
+                    &upstream.namespace,
+                    &upstream.id,
+                    &targets,
+                    active,
+                    &tls_config,
+                    shutdown_rx.as_ref(),
+                    generation,
+                );
+                new_handles.extend(handles);
+                new_aborts.extend(aborts);
             }
         }
 
@@ -938,9 +995,9 @@ impl HealthChecker {
             .flat_map(|u| {
                 let upstream_key =
                     crate::config::db_backend::namespaced_runtime_key(&u.namespace, &u.id);
-                u.targets
-                    .iter()
-                    .map(|t| target_key(&upstream_key, t))
+                self.effective_probe_targets(u)
+                    .into_iter()
+                    .map(move |t| target_key(&upstream_key, &t))
                     .collect::<Vec<_>>()
             })
             .collect();
@@ -950,6 +1007,304 @@ impl HealthChecker {
             .retain(|key, _| active_keys.contains(key));
     }
 
+    /// True when this checker currently has at least one spawned active-probe
+    /// loop for `upstream_id`. Used by the data path to suppress passive TTFB
+    /// sampling only when active probes are actually running — not merely
+    /// configured on an SD-only upstream that has no live endpoints yet.
+    pub fn has_running_active_probes(&self, namespace: &str, upstream_id: &str) -> bool {
+        ACTIVE_PROBE_UPSTREAM_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            crate::config::db_backend::write_namespaced_runtime_key(
+                &mut key,
+                namespace,
+                upstream_id,
+            );
+            self.active_probe_upstreams.contains_key(key.as_str())
+        })
+    }
+
+    /// Restart active probes for one upstream after service discovery publishes
+    /// a merged target set. Looks up the probe spec captured at
+    /// [`HealthChecker::start_with_shutdown`]. No-ops when the upstream has no
+    /// stored active-check spec.
+    pub fn restart_upstream_probes_for_discovered(
+        &self,
+        namespace: &str,
+        upstream_id: &str,
+        targets: &[UpstreamTarget],
+    ) {
+        let spec_key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
+        let spec = self
+            .active_probe_specs
+            .get(&spec_key)
+            .map(|entry| Arc::clone(entry.value()));
+        match spec {
+            Some(spec) => self.restart_upstream_probes(
+                namespace,
+                upstream_id,
+                targets,
+                spec.active.clone(),
+                spec.tls.clone(),
+            ),
+            None => {
+                self.abort_upstream_probe_tasks(&spec_key);
+                self.active_probe_upstreams.remove(&spec_key);
+                self.upstream_probe_target_keys.remove(&spec_key);
+            }
+        }
+    }
+
+    /// Restart active probes for one upstream without bumping the global
+    /// `task_generation`. Other upstreams keep running. Probe count is capped
+    /// at [`MAX_TARGETS_PER_UPSTREAM`] so discovered-endpoint churn cannot
+    /// unbounded-fan-out probe tasks.
+    pub fn restart_upstream_probes(
+        &self,
+        namespace: &str,
+        upstream_id: &str,
+        targets: &[UpstreamTarget],
+        active: ActiveHealthCheck,
+        tls: BackendTlsConfig,
+    ) {
+        let spec_key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
+        self.active_probe_specs.insert(
+            spec_key.clone(),
+            Arc::new(ActiveProbeSpec {
+                active: active.clone(),
+                tls: tls.clone(),
+            }),
+        );
+
+        let bounded = bound_probe_targets(targets);
+        if bounded.len() < targets.len() {
+            tracing::warn!(
+                upstream_id = %upstream_id,
+                discovered = targets.len(),
+                capped = bounded.len(),
+                max = MAX_TARGETS_PER_UPSTREAM,
+                "capping active health-check probes for discovered targets"
+            );
+        }
+
+        let new_keys = probe_target_identity_keys(bounded);
+        if self
+            .upstream_probe_target_keys
+            .get(&spec_key)
+            .is_some_and(|entry| entry.value() == &new_keys)
+            && self.active_probe_upstreams.contains_key(&spec_key)
+        {
+            self.remove_stale_targets(namespace, upstream_id, targets);
+            return;
+        }
+
+        let _lifecycle = match self.lifecycle_publish_guard.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.bump_upstream_probe_generation(&spec_key);
+        self.abort_upstream_probe_tasks(&spec_key);
+        drop(_lifecycle);
+
+        let shutdown_rx = match self.probe_shutdown_rx.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let generation = self.task_generation.load(Ordering::Acquire);
+        let (handles, aborts) = self.spawn_active_probes_for_upstream(
+            namespace,
+            upstream_id,
+            bounded,
+            &active,
+            &tls,
+            shutdown_rx.as_ref(),
+            generation,
+        );
+
+        match self.active_check_handles.lock() {
+            Ok(mut list) => {
+                list.retain(|h| !h.is_finished());
+                list.extend(handles);
+            }
+            Err(poisoned) => {
+                let mut list = poisoned.into_inner();
+                list.retain(|h| !h.is_finished());
+                list.extend(handles);
+            }
+        }
+        match self.active_check_aborts.lock() {
+            Ok(mut list) => {
+                list.retain(|h| !h.is_finished());
+                list.extend(aborts);
+            }
+            Err(poisoned) => {
+                let mut list = poisoned.into_inner();
+                list.retain(|h| !h.is_finished());
+                list.extend(aborts);
+            }
+        }
+
+        self.remove_stale_targets(namespace, upstream_id, targets);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_active_probes_for_upstream(
+        &self,
+        namespace: &str,
+        upstream_id: &str,
+        targets: &[UpstreamTarget],
+        active: &ActiveHealthCheck,
+        tls: &BackendTlsConfig,
+        shutdown_rx: Option<&tokio::sync::watch::Receiver<bool>>,
+        generation: u64,
+    ) -> (Vec<tokio::task::JoinHandle<()>>, Vec<AbortHandle>) {
+        let spec_key = crate::config::db_backend::namespaced_runtime_key(namespace, upstream_id);
+        self.active_probe_specs.insert(
+            spec_key.clone(),
+            Arc::new(ActiveProbeSpec {
+                active: active.clone(),
+                tls: tls.clone(),
+            }),
+        );
+
+        let gen_cell = self
+            .upstream_probe_generation
+            .entry(spec_key.clone())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        let upstream_generation = gen_cell.load(Ordering::Acquire);
+
+        let probe_pins_dial_host = active.use_tls
+            && tls.sni.is_some()
+            && matches!(active.probe_type, HealthProbeType::Http);
+        let upstream_client = if probe_pins_dial_host {
+            None
+        } else {
+            self.build_upstream_health_client(tls, active.use_tls, None)
+        };
+
+        let mut new_handles: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(targets.len());
+        let mut new_aborts: Vec<AbortHandle> = Vec::with_capacity(targets.len());
+        for target in targets {
+            let target_client = if probe_pins_dial_host {
+                self.build_upstream_health_client(tls, active.use_tls, Some(target.host.as_str()))
+            } else {
+                upstream_client.clone()
+            };
+            let start = ActiveCheckStartParams {
+                target,
+                upstream_namespace: namespace,
+                upstream_id,
+                shutdown_rx,
+                generation,
+                upstream_generation,
+                upstream_generation_cell: Arc::clone(&gen_cell),
+            };
+            let handle = self.start_active_check(start, active, target_client.as_ref(), tls);
+            new_aborts.push(handle.abort_handle());
+            new_handles.push(handle);
+        }
+
+        let new_keys = probe_target_identity_keys(targets);
+        if new_aborts.is_empty() {
+            match self.upstream_probe_aborts.lock() {
+                Ok(mut map) => {
+                    map.remove(&spec_key);
+                }
+                Err(poisoned) => {
+                    poisoned.into_inner().remove(&spec_key);
+                }
+            }
+            self.active_probe_upstreams.remove(&spec_key);
+            self.upstream_probe_target_keys.remove(&spec_key);
+            return (new_handles, new_aborts);
+        }
+
+        match self.upstream_probe_aborts.lock() {
+            Ok(mut map) => {
+                map.insert(spec_key.clone(), new_aborts.clone());
+            }
+            Err(poisoned) => {
+                poisoned
+                    .into_inner()
+                    .insert(spec_key.clone(), new_aborts.clone());
+            }
+        }
+        self.active_probe_upstreams.insert(spec_key.clone(), ());
+        self.upstream_probe_target_keys.insert(spec_key, new_keys);
+        (new_handles, new_aborts)
+    }
+
+    fn abort_upstream_probe_tasks(&self, spec_key: &str) {
+        let aborted = match self.upstream_probe_aborts.lock() {
+            Ok(mut map) => map.remove(spec_key).unwrap_or_default(),
+            Err(poisoned) => poisoned.into_inner().remove(spec_key).unwrap_or_default(),
+        };
+        for handle in aborted {
+            handle.abort();
+        }
+        match self.active_check_aborts.lock() {
+            Ok(mut list) => list.retain(|h| !h.is_finished()),
+            Err(poisoned) => poisoned.into_inner().retain(|h| !h.is_finished()),
+        }
+        match self.active_check_handles.lock() {
+            Ok(mut list) => list.retain(|h| !h.is_finished()),
+            Err(poisoned) => poisoned.into_inner().retain(|h| !h.is_finished()),
+        }
+    }
+
+    fn bump_upstream_probe_generation(&self, spec_key: &str) {
+        self.upstream_probe_generation
+            .entry(spec_key.to_string())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn effective_probe_targets(&self, upstream: &Upstream) -> Vec<UpstreamTarget> {
+        let live = self
+            .lb_cache
+            .as_ref()
+            .and_then(|cache| cache.get_upstream(&upstream.namespace, &upstream.id));
+        let source: &[UpstreamTarget] = match live.as_ref() {
+            Some(live) if !live.targets.is_empty() => live.targets.as_slice(),
+            _ => &upstream.targets,
+        };
+        let bounded = bound_probe_targets(source);
+        if bounded.len() < source.len() {
+            tracing::warn!(
+                upstream_id = %upstream.id,
+                discovered = source.len(),
+                capped = bounded.len(),
+                max = MAX_TARGETS_PER_UPSTREAM,
+                "capping active health-check probes"
+            );
+        }
+        bounded.to_vec()
+    }
+}
+
+fn bound_probe_targets(targets: &[UpstreamTarget]) -> &[UpstreamTarget] {
+    if targets.len() > MAX_TARGETS_PER_UPSTREAM {
+        &targets[..MAX_TARGETS_PER_UPSTREAM]
+    } else {
+        targets
+    }
+}
+
+fn probe_target_identity_keys(targets: &[UpstreamTarget]) -> HashSet<String> {
+    targets.iter().map(target_host_port_key).collect()
+}
+
+fn probe_generation_retired(
+    generation_cell: &AtomicU64,
+    generation: u64,
+    upstream_generation_cell: &AtomicU64,
+    upstream_generation: u64,
+) -> bool {
+    generation_cell.load(Ordering::Acquire) != generation
+        || upstream_generation_cell.load(Ordering::Acquire) != upstream_generation
+}
+
+impl HealthChecker {
     /// Get or create the per-proxy passive health state.
     ///
     /// Fast-path: `get()` with a thread-local `namespace|id` key (zero allocation
@@ -1380,6 +1735,7 @@ impl HealthChecker {
         let has_tls_config = tls_config.client_cert_path.is_some()
             || tls_config.client_key_path.is_some()
             || tls_config.server_ca_cert_path.is_some()
+            || !tls_config.san_allow_list.is_empty()
             || !tls_config.verify_server_cert
             || self.global_tls_ca_bundle_path.is_some()
             || self.global_backend_tls_client_cert_path.is_some()
@@ -1423,6 +1779,8 @@ impl HealthChecker {
             upstream_id,
             shutdown_rx,
             generation,
+            upstream_generation,
+            upstream_generation_cell,
         } = start;
         let shutdown_rx = shutdown_rx.cloned();
         let upstream_key =
@@ -1501,10 +1859,18 @@ impl HealthChecker {
         let probe_dns_cache = self.dns_cache.clone();
 
         tokio::spawn(async move {
+            let is_retired = || {
+                probe_generation_retired(
+                    task_generation.as_ref(),
+                    generation,
+                    upstream_generation_cell.as_ref(),
+                    upstream_generation,
+                )
+            };
             let mut timer = tokio::time::interval(interval);
 
             loop {
-                if task_generation.load(Ordering::Acquire) != generation {
+                if is_retired() {
                     return;
                 }
                 if let Some(ref rx) = shutdown_rx {
@@ -1518,7 +1884,7 @@ impl HealthChecker {
                 } else {
                     timer.tick().await;
                 }
-                if task_generation.load(Ordering::Acquire) != generation {
+                if is_retired() {
                     return;
                 }
 
@@ -1681,7 +2047,7 @@ impl HealthChecker {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                if task_generation.load(Ordering::Acquire) != generation {
+                if is_retired() {
                     return;
                 }
 
@@ -1692,13 +2058,13 @@ impl HealthChecker {
                     use dashmap::mapref::entry::Entry;
                     match target_states.entry(key.clone()) {
                         Entry::Occupied(entry) => {
-                            if task_generation.load(Ordering::Acquire) != generation {
+                            if is_retired() {
                                 return;
                             }
                             entry.get().clone()
                         }
                         Entry::Vacant(entry) => {
-                            if task_generation.load(Ordering::Acquire) != generation {
+                            if is_retired() {
                                 return;
                             }
                             entry.insert(Arc::new(TargetHealth::new())).clone()
@@ -1706,7 +2072,7 @@ impl HealthChecker {
                     }
                 };
 
-                if task_generation.load(Ordering::Acquire) != generation {
+                if is_retired() {
                     return;
                 }
 
@@ -1718,7 +2084,7 @@ impl HealthChecker {
                     // Bail before side effects if this probe retired mid-mutation so
                     // a drained generation cannot publish latency or clear marks
                     // under replacement policy.
-                    if task_generation.load(Ordering::Acquire) != generation {
+                    if is_retired() {
                         return;
                     }
 
@@ -1736,9 +2102,7 @@ impl HealthChecker {
                         // Only clear unhealthy under the still-current
                         // generation so a retired success cannot drop a mark
                         // the replacement probe just wrote.
-                        let removed = unhealthy_targets.remove_if(&key, |_, _| {
-                            task_generation.load(Ordering::Acquire) == generation
-                        });
+                        let removed = unhealthy_targets.remove_if(&key, |_, _| !is_retired());
                         if removed.is_some() {
                             info!(
                                 "Active health check: target {} is healthy ({:?} probe)",
@@ -1757,7 +2121,7 @@ impl HealthChecker {
                     state.consecutive_successes.store(0, Ordering::Relaxed);
                     let failures = state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
 
-                    if task_generation.load(Ordering::Acquire) != generation {
+                    if is_retired() {
                         return;
                     }
 
@@ -1774,7 +2138,7 @@ impl HealthChecker {
                             match unhealthy_targets.entry(key.clone()) {
                                 Entry::Occupied(_) => false,
                                 Entry::Vacant(entry) => {
-                                    if task_generation.load(Ordering::Acquire) != generation {
+                                    if is_retired() {
                                         return;
                                     }
                                     entry.insert(now_epoch_ms());
@@ -1825,6 +2189,14 @@ impl Drop for HealthChecker {
         };
         for handle in handles.iter() {
             handle.abort();
+        }
+        let upstream_aborts = self.upstream_probe_aborts.get_mut();
+        let upstream_aborts = match upstream_aborts {
+            Ok(map) => map,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for abort in upstream_aborts.values().flatten() {
+            abort.abort();
         }
     }
 }
@@ -2132,9 +2504,19 @@ async fn grpc_probe(
         && (!tls_config.verify_server_cert
             || (global_no_verify && tls_config.allows_global_no_verify()));
 
+    if skip_verify && !tls_config.san_allow_list.is_empty() {
+        warn!(
+            san_allow_list_entries = tls_config.san_allow_list.len(),
+            "gRPC health probe: backend TLS SAN allow-list is configured but \
+             certificate verification is disabled; SAN allow-list will not be enforced"
+        );
+    }
+
     // When skip_verify is true, tonic's ClientTlsConfig doesn't support disabling
     // cert verification. Build a rustls ClientConfig directly with NoVerifier
     // (same pattern as grpc_proxy.rs) and use connect_with_connector.
+    // Identity-pinned backends (`backend_tls_san_allow_list`) take the same
+    // rustls connector path so the probe reuses `SanAllowListVerifier`.
     let channel = if skip_verify {
         match build_grpc_probe_channel_no_verify(
             &endpoint,
@@ -2161,6 +2543,38 @@ async fn grpc_probe(
                 } else {
                     debug!(
                         "gRPC health probe: connect failed for {}:{}: {}",
+                        host, port, e
+                    );
+                }
+                return ProbeOutcome::failure(format!("grpc connect failed: {e}"));
+            }
+        }
+    } else if use_tls && !tls_config.san_allow_list.is_empty() {
+        match build_grpc_probe_channel_san_pinned(
+            &endpoint,
+            host,
+            timeout,
+            tls_config,
+            global_ca_path,
+            global_cert_path,
+            global_key_path,
+        )
+        .await
+        {
+            Ok(ch) => ch,
+            Err(e) => {
+                let is_exhaustion = crate::retry::is_port_exhaustion(e.as_ref())
+                    || crate::retry::is_port_exhaustion_message(&e.to_string());
+                if is_exhaustion {
+                    tracing::error!(
+                        "gRPC health probe: PORT EXHAUSTION connecting to {}:{}: {}",
+                        host,
+                        port,
+                        e
+                    );
+                } else {
+                    debug!(
+                        "gRPC health probe: SAN-pinned connect failed for {}:{}: {}",
                         host, port, e
                     );
                 }
@@ -2431,6 +2845,95 @@ async fn build_grpc_probe_channel_no_verify(
     Ok(channel)
 }
 
+/// Build a tonic gRPC channel that verifies the peer with the same
+/// [`SanAllowListVerifier`] the data path uses.
+#[allow(clippy::too_many_arguments)]
+async fn build_grpc_probe_channel_san_pinned(
+    endpoint: &tonic::transport::Endpoint,
+    host: &str,
+    timeout: Duration,
+    tls_config: &BackendTlsConfig,
+    global_ca_path: Option<&str>,
+    global_cert_path: Option<&str>,
+    global_key_path: Option<&str>,
+) -> Result<tonic::transport::Channel, Box<dyn std::error::Error + Send + Sync>> {
+    use rustls::pki_types::ServerName;
+    use tokio_rustls::TlsConnector;
+
+    let verifier = match build_probe_server_verifier(tls_config, global_ca_path) {
+        Ok(ProbeServerVerifier::SanAllowList(verifier)) => verifier,
+        Ok(ProbeServerVerifier::WebPki) => {
+            return Err(std::io::Error::other(
+                "gRPC health probe SAN allow-list was empty after verifier build",
+            )
+            .into());
+        }
+        Err(error) => return Err(std::io::Error::other(error.to_string()).into()),
+    };
+
+    let cert_path = tls_config.client_cert_path.as_deref().or(global_cert_path);
+    let key_path = tls_config.client_key_path.as_deref().or(global_key_path);
+    let builder =
+        backend_client_config_builder(None).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let builder = builder
+        .dangerous()
+        .with_custom_certificate_verifier(verifier);
+    let mut client_config = match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let certs = load_probe_tls_certificates(
+                cert_path,
+                MaterialKind::Cert,
+                "gRPC health probe client cert",
+            )
+            .map_err(std::io::Error::other)?;
+            let key_source = CertSource::parse(key_path, MaterialKind::Key);
+            let key_material =
+                load_material_blocking(&key_source, MaterialKind::Key).map_err(|error| {
+                    std::io::Error::other(format!("gRPC health probe client key: {error}"))
+                })?;
+            let key = crate::tls::parse_pem_private_key(
+                key_material.bytes.expose_secret(),
+                "gRPC health probe client key",
+                &key_material.display_source_id,
+            )
+            .map_err(std::io::Error::other)?;
+            builder.with_client_auth_cert(certs, key)?
+        }
+        (None, None) => builder.with_no_client_auth(),
+        _ => {
+            return Err(std::io::Error::other(
+                "gRPC health probe mTLS client certificate and private key must be configured together",
+            )
+            .into());
+        }
+    };
+    client_config.alpn_protocols = vec![b"h2".to_vec()];
+    crate::tls::apply_client_session_resumption(&mut client_config, None);
+
+    let tls_connector = TlsConnector::from(Arc::new(client_config));
+    let host_owned = probe_tls_server_name(tls_config, host).to_string();
+
+    let connector = tower::service_fn(move |uri: http::Uri| {
+        let tls_connector = tls_connector.clone();
+        let host = host_owned.clone();
+        async move {
+            let addr = format_probe_socket_addr(
+                uri.host().unwrap_or("127.0.0.1"),
+                uri.port_u16().unwrap_or(443),
+            );
+            let tcp = tokio::net::TcpStream::connect(&addr).await?;
+            let server_name = ServerName::try_from(host)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            let tls = tls_connector.connect(server_name, tcp).await?;
+            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(tls))
+        }
+    });
+
+    let channel =
+        tokio::time::timeout(timeout, endpoint.connect_with_connector(connector)).await??;
+    Ok(channel)
+}
+
 fn build_health_check_client(
     pool_config: &PoolConfig,
     dns_cache: Option<DnsCache>,
@@ -2527,6 +3030,10 @@ enum HealthCheckClientError {
     /// pin reqwest would resolve THAT name and dial wherever it points —
     /// off the egress-screened candidate set for the target being probed.
     DialPinUnavailable,
+    /// `backend_tls_san_allow_list` could not be installed on the probe
+    /// verifier (invalid entries or the inner webpki verifier failed to build).
+    /// Fail closed: a probe that cannot pin identity must not dial unpinned.
+    SanPinningUnavailable(String),
 }
 
 impl std::fmt::Display for HealthCheckClientError {
@@ -2549,6 +3056,10 @@ impl std::fmt::Display for HealthCheckClientError {
             Self::DialPinUnavailable => write!(
                 f,
                 "backend TLS server-name override requires a DNS cache to pin the probe dial to the real target"
+            ),
+            Self::SanPinningUnavailable(details) => write!(
+                f,
+                "backend TLS SAN allow-list could not be applied ({details})"
             ),
         }
     }
@@ -2680,6 +3191,151 @@ struct HealthCheckClientIdentityPaths<'a> {
     key: &'a Option<String>,
 }
 
+/// Build the probe server verifier using the same wrapping the data path uses.
+fn build_probe_server_verifier(
+    tls_config: &BackendTlsConfig,
+    global_ca_path: Option<&str>,
+) -> Result<ProbeServerVerifier, HealthCheckClientError> {
+    let root_store = if let Some(ca_path) = tls_config.effective_ca_source(global_ca_path) {
+        load_probe_tls_root_store(ca_path, "Health check CA")
+            .map_err(HealthCheckClientError::ExclusiveTrustUnavailable)?
+    } else {
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+    };
+    let inner = build_server_verifier_with_crls(root_store, &[]).map_err(|e| {
+        HealthCheckClientError::SanPinningUnavailable(format!(
+            "failed to build probe server verifier: {e}"
+        ))
+    })?;
+    if tls_config.san_allow_list.is_empty() {
+        Ok(ProbeServerVerifier::WebPki)
+    } else {
+        let wrapped = SanAllowListVerifier::new(inner, tls_config.san_allow_list.clone())
+            .map_err(|e| HealthCheckClientError::SanPinningUnavailable(e.to_string()))?;
+        Ok(ProbeServerVerifier::SanAllowList(Arc::new(wrapped)))
+    }
+}
+
+fn load_probe_rustls_client_auth(
+    tls_config: &BackendTlsConfig,
+    global_identity: HealthCheckClientIdentityPaths<'_>,
+) -> Result<ProbeRustlsClientAuth, HealthCheckClientError> {
+    let cert_path = tls_config
+        .client_cert_path
+        .as_ref()
+        .or(global_identity.cert.as_ref());
+    let key_path = tls_config
+        .client_key_path
+        .as_ref()
+        .or(global_identity.key.as_ref());
+    match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let certs = load_probe_tls_certificates(
+                cert_path,
+                MaterialKind::Cert,
+                "Health check client cert",
+            )
+            .map_err(HealthCheckClientError::ClientIdentityUnavailable)?;
+            let key_source = CertSource::parse(key_path, MaterialKind::Key);
+            let key_material =
+                load_material_blocking(&key_source, MaterialKind::Key).map_err(|error| {
+                    HealthCheckClientError::ClientIdentityUnavailable(error.to_string())
+                })?;
+            let key = crate::tls::parse_pem_private_key(
+                key_material.bytes.expose_secret(),
+                "Health check client key",
+                &key_material.display_source_id,
+            )
+            .map_err(|e| HealthCheckClientError::ClientIdentityUnavailable(e.to_string()))?;
+            Ok(ProbeRustlsClientAuth::Materialized { certs, key })
+        }
+        (Some(_), None) => Err(HealthCheckClientError::ClientIdentityUnavailable(
+            "a backend mTLS client certificate is configured without a matching private key"
+                .to_string(),
+        )),
+        (None, Some(_)) => Err(HealthCheckClientError::ClientIdentityUnavailable(
+            "a backend mTLS private key is configured without a matching client certificate"
+                .to_string(),
+        )),
+        (None, None) => Ok(ProbeRustlsClientAuth::None),
+    }
+}
+
+enum ProbeRustlsClientAuth {
+    None,
+    Materialized {
+        certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+        key: rustls::pki_types::PrivateKeyDer<'static>,
+    },
+}
+
+/// HTTP probe client that installs [`SanAllowListVerifier`] via preconfigured
+/// rustls. Empty-list probes keep the reqwest `tls_certs_only` path.
+fn build_health_check_client_with_san_pinning(
+    pool_config: &PoolConfig,
+    dns_cache: Option<DnsCache>,
+    tls_config: &BackendTlsConfig,
+    global_ca_path: &Option<String>,
+    global_identity: HealthCheckClientIdentityPaths<'_>,
+    dial_host_pin: Option<&str>,
+) -> Result<reqwest::Client, HealthCheckClientError> {
+    let verifier = match build_probe_server_verifier(tls_config, global_ca_path.as_deref())? {
+        ProbeServerVerifier::SanAllowList(verifier) => verifier,
+        ProbeServerVerifier::WebPki => {
+            return Err(HealthCheckClientError::SanPinningUnavailable(
+                "SAN allow-list was empty after verifier build".to_string(),
+            ));
+        }
+    };
+    let client_auth = load_probe_rustls_client_auth(tls_config, global_identity)?;
+    let builder = backend_client_config_builder(None)
+        .map_err(|e| HealthCheckClientError::SanPinningUnavailable(e.to_string()))?;
+    let builder = builder
+        .dangerous()
+        .with_custom_certificate_verifier(verifier);
+    let mut rustls_config = match client_auth {
+        ProbeRustlsClientAuth::None => builder.with_no_client_auth(),
+        ProbeRustlsClientAuth::Materialized { certs, key } => {
+            builder.with_client_auth_cert(certs, key).map_err(|e| {
+                HealthCheckClientError::ClientIdentityUnavailable(format!(
+                    "invalid client certificate/key pair: {e}"
+                ))
+            })?
+        }
+    };
+    if dial_host_pin.is_some() || !pool_config.enable_http2 {
+        rustls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    } else {
+        rustls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    }
+    crate::tls::apply_client_session_resumption(&mut rustls_config, None);
+
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .pool_max_idle_per_host(pool_config.max_idle_per_host)
+        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
+        .redirect(reqwest::redirect::Policy::none())
+        .use_preconfigured_tls(rustls_config);
+    builder = apply_probe_dial_identity(builder, dns_cache, dial_host_pin)?;
+    if pool_config.enable_http_keep_alive {
+        builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
+    }
+    if pool_config.enable_http2 && dial_host_pin.is_none() {
+        builder = builder
+            .http2_keep_alive_interval(Duration::from_secs(
+                pool_config.http2_keep_alive_interval_seconds,
+            ))
+            .http2_keep_alive_timeout(Duration::from_secs(
+                pool_config.http2_keep_alive_timeout_seconds,
+            ));
+    }
+    builder.build().map_err(|e| {
+        HealthCheckClientError::SanPinningUnavailable(format!(
+            "SAN-pinned health-check HTTP client could not be built: {e}"
+        ))
+    })
+}
+
 /// Build a health check HTTP client with upstream-specific TLS configuration.
 ///
 /// Configures the client with the upstream's CA bundle, client cert/key for mTLS,
@@ -2699,13 +3355,15 @@ struct HealthCheckClientIdentityPaths<'a> {
 /// HTTP/2 derives `:authority` from the URI, i.e. from the server name, so an
 /// h2-negotiated probe would present the OVERRIDE as its authority and measure
 /// a request the backend never receives from proxy traffic. `http1_only()` is
-/// load-bearing here rather than a hint: this builder does not use
+/// load-bearing here rather than a hint: the empty-SAN builder does not use
 /// `use_preconfigured_tls`, so reqwest itself derives the client's ALPN from
 /// the version preference and advertises `http/1.1` alone (see
 /// `vendor/reqwest-0.13.3-ferrum-patched/src/async_impl/client.rs`), which means
-/// an h2-capable backend cannot select h2 on this connection. Probes without an
-/// override keep the default h2-capable client: their URL already names the real
-/// target, so there is no authority to lose.
+/// an h2-capable backend cannot select h2 on this connection. Identity-pinned
+/// probes (`backend_tls_san_allow_list`) take the preconfigured-rustls path so
+/// they can install [`SanAllowListVerifier`]; their ALPN is set on that config.
+/// Probes without an override keep the default h2-capable client: their URL
+/// already names the real target, so there is no authority to lose.
 ///
 /// The resolver + ALPN half of that contract lives in
 /// [`apply_probe_dial_identity`] so it can be asserted directly.
@@ -2720,6 +3378,24 @@ fn build_health_check_client_with_tls(
 ) -> Result<reqwest::Client, HealthCheckClientError> {
     let skip_verify = !tls_config.verify_server_cert
         || (global_no_verify && tls_config.allows_global_no_verify());
+
+    if skip_verify && !tls_config.san_allow_list.is_empty() {
+        warn!(
+            san_allow_list_entries = tls_config.san_allow_list.len(),
+            "Health-check probe: backend TLS SAN allow-list is configured but \
+             certificate verification is disabled; SAN allow-list will not be enforced"
+        );
+    }
+    if !skip_verify && !tls_config.san_allow_list.is_empty() {
+        return build_health_check_client_with_san_pinning(
+            pool_config,
+            dns_cache,
+            tls_config,
+            global_ca_path,
+            global_identity,
+            dial_host_pin,
+        );
+    }
 
     let mut builder = reqwest::Client::builder()
         .no_proxy()
@@ -3081,9 +3757,10 @@ mod tests {
     //! per CLAUDE.md private fns belong in inline `#[cfg(test)] mod tests`.
     use super::*;
     use crate::dns::DnsConfig;
-    use rcgen::{CertificateParams, KeyPair};
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
     use rustls::ServerConfig;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime};
     use std::sync::Mutex;
     use std::sync::Once;
     use std::time::Duration;
@@ -3962,6 +4639,117 @@ mod tests {
         assert!(
             source.contains("default_http_client: Option<Arc<reqwest::Client>>"),
             "construction failure must be representable without panicking"
+        );
+    }
+
+    #[test]
+    fn bound_probe_targets_caps_at_max_targets_per_upstream() {
+        let targets: Vec<UpstreamTarget> = (0..=MAX_TARGETS_PER_UPSTREAM)
+            .map(|i| UpstreamTarget {
+                host: format!("h{i}.local"),
+                port: 8080,
+                service_port_policy_key: None,
+                weight: 1,
+                tags: std::collections::HashMap::new(),
+                locality: None,
+                path: None,
+            })
+            .collect();
+        assert_eq!(targets.len(), MAX_TARGETS_PER_UPSTREAM + 1);
+        assert_eq!(
+            bound_probe_targets(&targets).len(),
+            MAX_TARGETS_PER_UPSTREAM
+        );
+    }
+
+    #[test]
+    fn probe_server_verifier_uses_plain_webpki_when_san_allow_list_empty() {
+        ensure_crypto_provider();
+        let verifier = build_probe_server_verifier(&BackendTlsConfig::default_verify(), None)
+            .expect("empty SAN list must still build a verifier");
+        assert!(matches!(verifier, ProbeServerVerifier::WebPki));
+    }
+
+    #[test]
+    fn probe_server_verifier_wraps_when_san_allow_list_configured() {
+        ensure_crypto_provider();
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.san_allow_list = vec!["localhost".to_string()];
+        let verifier =
+            build_probe_server_verifier(&tls, None).expect("configured SAN list must wrap");
+        assert!(matches!(verifier, ProbeServerVerifier::SanAllowList(_)));
+    }
+
+    #[test]
+    fn probe_server_verifier_rejects_peer_not_in_allow_list() {
+        ensure_crypto_provider();
+        let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Probe SAN CA");
+        ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+        ca_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let allowed_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let allowed_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let allowed_cert = allowed_params.signed_by(&allowed_key, &issuer).unwrap();
+        let allowed_der = CertificateDer::from(allowed_cert.der().to_vec());
+
+        let other_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let other_params = CertificateParams::new(vec!["other.example".to_string()]).unwrap();
+        let other_cert = other_params.signed_by(&other_key, &issuer).unwrap();
+        let other_der = CertificateDer::from(other_cert.der().to_vec());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.server_ca_cert_path = Some(ca_path.display().to_string());
+        tls.san_allow_list = vec!["localhost".to_string()];
+        let verifier =
+            build_probe_server_verifier(&tls, None).expect("SAN-pinned verifier must build");
+        let ProbeServerVerifier::SanAllowList(verifier) = verifier else {
+            panic!("configured SAN list must wrap SanAllowListVerifier");
+        };
+
+        let localhost = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let other_name = rustls::pki_types::ServerName::try_from("other.example").unwrap();
+        verifier
+            .verify_server_cert(&allowed_der, &[], &localhost, &[], UnixTime::now())
+            .expect("allow-listed SAN must pass");
+        assert!(
+            verifier
+                .verify_server_cert(&other_der, &[], &other_name, &[], UnixTime::now())
+                .is_err(),
+            "peer whose SAN is not in the allow-list must be rejected"
+        );
+    }
+
+    #[test]
+    fn probe_client_builds_when_san_allow_list_is_configured() {
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.san_allow_list = vec!["localhost".to_string()];
+        assert!(
+            tls_client_result(&tls, false).is_ok(),
+            "a valid SAN allow-list must produce a preconfigured probe client"
+        );
+    }
+
+    #[test]
+    fn probe_client_fails_closed_on_invalid_san_allow_list_entry() {
+        let mut tls = BackendTlsConfig::default_verify();
+        tls.san_allow_list = vec!["https://not-spiffe.example".to_string()];
+        assert!(
+            matches!(
+                tls_client_result(&tls, false),
+                Err(HealthCheckClientError::SanPinningUnavailable(_))
+            ),
+            "an invalid SAN allow-list must not build an unpinned probe client"
         );
     }
 }

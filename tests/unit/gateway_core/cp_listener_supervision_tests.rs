@@ -2,6 +2,8 @@
 //!
 //! Asserts the *mode result* (`Ok` / `Err`) after draining siblings — not only
 //! that shutdown was signaled.
+//!
+//! Panic-inducing tests are `panic = "unwind"` only (issue #4166).
 
 use std::time::{Duration, Instant};
 
@@ -52,6 +54,7 @@ async fn pending_sibling_plus_listener_error_returns_err() {
     );
 }
 
+#[cfg(panic = "unwind")]
 #[tokio::test]
 async fn pending_sibling_plus_listener_panic_returns_err() {
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);

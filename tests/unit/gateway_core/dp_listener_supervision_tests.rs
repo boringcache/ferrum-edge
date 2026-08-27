@@ -6,6 +6,8 @@
 //! [`ferrum_edge::modes::data_plane::await_dp_listener_handles`] with a pending
 //! handle before a panicking/failing handle and keep a bridge-like task off the
 //! supervised set.
+//!
+//! Panic-inducing tests are `panic = "unwind"` only (issue #4166).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use ferrum_edge::_test_support::await_dp_listener_handles;
 
+#[cfg(panic = "unwind")]
 #[tokio::test]
 async fn await_dp_listener_handles_observes_later_panic_while_earlier_listener_pending() {
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);

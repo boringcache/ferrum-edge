@@ -1829,8 +1829,11 @@ pub struct EnvConfig {
     /// Maximum execution time (seconds) for any single SQL statement. Default:
     /// 30, max 3600 (1 hour). Values above 3600 are clamped at parse time with
     /// a warning. Set via `SET statement_timeout` (PostgreSQL) or `SET SESSION
-    /// max_execution_time` (MySQL) on every new connection. 0 = disabled.
-    /// Ignored for SQLite (not supported).
+    /// max_execution_time` (MySQL) on every new connection. On MySQL the same
+    /// budget is additionally applied as `SET SESSION
+    /// innodb_lock_wait_timeout`, because `max_execution_time` only bounds
+    /// read-only `SELECT`s (issue #4146). 0 = disabled. Ignored for SQLite
+    /// (not supported).
     pub db_pool_statement_timeout_seconds: u64,
 
     // MongoDB-specific settings (when FERRUM_DB_TYPE=mongodb).
@@ -2554,6 +2557,31 @@ pub struct EnvConfig {
     /// aggregate cap to fit one huge response would hand the memory bound back
     /// to whoever picks the response. Default: 268435456 (256 MiB).
     pub response_buffer_max_total_bytes: usize,
+    /// Fail-closed per-request ceiling applied when the effective request-body
+    /// limit resolves to `0` ("unlimited") *and* the body is being RETAINED in
+    /// memory for a plugin, a protocol translation, or retry replay rather than
+    /// streamed. `0 = unlimited` remains a valid streaming policy; it is not a
+    /// valid buffering policy, because one client-chosen upload could then grow
+    /// without bound on a path `waf` request-body inspection reaches BEFORE
+    /// authentication (issue #4153). Runtime clamps this fallback to one 64 KiB
+    /// reservation block at minimum and `usize::MAX / 2` at maximum. Default:
+    /// 10485760 (10 MiB).
+    pub request_buffer_fallback_max_bytes: usize,
+    /// Aggregate ceiling (bytes) on everything concurrent buffered REQUEST
+    /// bodies are admitted to retain at once. A finite per-request ceiling
+    /// still multiplies by concurrency, so this is the bound that actually caps
+    /// gateway memory under a flood of buffered uploads. The claim is taken
+    /// before the collect starts, sized to the per-request retained ceiling,
+    /// and released by drop on every exit path. A request that cannot reserve
+    /// capacity is refused with `503` / gRPC `RESOURCE_EXHAUSTED` instead of
+    /// being collected.
+    ///
+    /// Clamped up to at least the FALLBACK per-request ceiling
+    /// ([`Self::request_buffer_fallback_max_bytes`]) and nothing else, for the
+    /// same reason as the response budget: one fallback-sized upload is always
+    /// admissible, but an arbitrarily larger configured per-request ceiling is
+    /// NOT. Default: 268435456 (256 MiB).
+    pub request_buffer_max_total_bytes: usize,
     /// Aggregate ceiling (bytes) on the working set retained while governed
     /// compressed requests are decoded for final request-body policy
     /// inspection. This is deliberately separate from the response-buffer
@@ -3474,6 +3502,21 @@ pub struct EnvConfig {
     /// to complete. Default: 30. Set to 0 to skip draining (immediate shutdown).
     pub shutdown_drain_seconds: u64,
 
+    /// Seconds to keep every listener (proxy AND admin) accepting after
+    /// SIGTERM/SIGINT before the shutdown signal closes the accept loops.
+    ///
+    /// The admin readiness verdict flips to `ready:false` (HTTP 503) as soon as
+    /// the signal is observed, while `/live` keeps returning 200, so an
+    /// orchestrator or load balancer can withdraw the replica from its endpoint
+    /// set before a single new connection is refused. Nothing else changes:
+    /// after the window the ordinary drain runs unmodified.
+    ///
+    /// Default: 0 (no pre-drain window; behavior identical to before). On
+    /// Kubernetes prefer the chart's `preStop` sleep, which delays SIGTERM
+    /// itself; this knob is for load balancers and clusters that cannot use
+    /// `lifecycle.preStop.sleep`. Only serving modes honor it.
+    pub shutdown_predrain_seconds: u64,
+
     // ── Admin status metrics ─────────────────────────────────────────────
     /// Window size in seconds for computing per-second rate metrics on the
     /// admin `/status` endpoint.  A background task snapshots cumulative
@@ -3789,6 +3832,10 @@ impl Default for EnvConfig {
                 crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_RESPONSE_FALLBACK_BYTES,
             response_buffer_max_total_bytes:
                 crate::proxy::response_buffer_budget::DEFAULT_RESPONSE_BUFFER_TOTAL_BYTES,
+            request_buffer_fallback_max_bytes:
+                crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES,
+            request_buffer_max_total_bytes:
+                crate::proxy::response_buffer_budget::DEFAULT_REQUEST_BUFFER_TOTAL_BYTES,
             request_decode_max_total_bytes:
                 crate::proxy::response_buffer_budget::DEFAULT_REQUEST_DECODE_TOTAL_BYTES,
             response_buffer_cutoff_bytes: 65_536,
@@ -3990,6 +4037,7 @@ impl Default for EnvConfig {
             overload_loop_warn_us: 10_000,
             overload_loop_critical_us: 500_000,
             shutdown_drain_seconds: 30,
+            shutdown_predrain_seconds: 0,
             status_metrics_window_seconds: 30,
             tls_offload_threads: 0,
             tcp_fastopen_enabled: AutoBool::Auto,
@@ -4379,6 +4427,8 @@ impl EnvConfig {
             max_response_body_size_bytes: usize = "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES" => 10_485_760usize;
             response_buffer_fallback_max_bytes: usize = "FERRUM_RESPONSE_BUFFER_FALLBACK_MAX_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_RESPONSE_FALLBACK_BYTES;
             response_buffer_max_total_bytes: usize = "FERRUM_RESPONSE_BUFFER_MAX_TOTAL_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_RESPONSE_BUFFER_TOTAL_BYTES;
+            request_buffer_fallback_max_bytes: usize = "FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES;
+            request_buffer_max_total_bytes: usize = "FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_REQUEST_BUFFER_TOTAL_BYTES;
             request_decode_max_total_bytes: usize = "FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_REQUEST_DECODE_TOTAL_BYTES;
             response_buffer_cutoff_bytes: usize = "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES" => 65_536usize;
             h2_coalesce_target_bytes: usize = "FERRUM_H2_COALESCE_TARGET_BYTES" => 131_072usize, clamp(16_384usize, 1_048_576usize);
@@ -4636,6 +4686,7 @@ impl EnvConfig {
             overload_loop_warn_us: u64 = "FERRUM_OVERLOAD_LOOP_WARN_US" => 10_000u64;
             overload_loop_critical_us: u64 = "FERRUM_OVERLOAD_LOOP_CRITICAL_US" => 500_000u64;
             shutdown_drain_seconds: u64 = "FERRUM_SHUTDOWN_DRAIN_SECONDS" => 30u64;
+            shutdown_predrain_seconds: u64 = "FERRUM_SHUTDOWN_PREDRAIN_SECONDS" => 0u64;
             status_metrics_window_seconds: u64 = "FERRUM_STATUS_METRICS_WINDOW_SECONDS" => 30u64, max(1u64);
             tls_offload_threads: usize = "FERRUM_TLS_OFFLOAD_THREADS" => 0usize;
             tcp_fastopen_queue_len: u16 = "FERRUM_TCP_FASTOPEN_QUEUE_LEN" => 256u16;
@@ -5189,6 +5240,8 @@ impl EnvConfig {
             max_response_body_size_bytes,
             response_buffer_fallback_max_bytes,
             response_buffer_max_total_bytes,
+            request_buffer_fallback_max_bytes,
+            request_buffer_max_total_bytes,
             request_decode_max_total_bytes,
             response_buffer_cutoff_bytes,
             h2_coalesce_target_bytes,
@@ -5383,6 +5436,7 @@ impl EnvConfig {
             overload_loop_warn_us,
             overload_loop_critical_us,
             shutdown_drain_seconds,
+            shutdown_predrain_seconds,
             status_metrics_window_seconds,
             tls_offload_threads,
             tcp_fastopen_enabled,

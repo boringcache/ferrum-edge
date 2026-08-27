@@ -566,7 +566,7 @@ jobs:
           shared-key: "ci-test-secrets"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: cargo-nextest
 
@@ -614,7 +614,7 @@ jobs:
           shared-key: "ci-test-service-integration"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: cargo-nextest
 
@@ -745,7 +745,7 @@ jobs:
           shared-key: "ci-test-artifacts"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: cargo-nextest
 
@@ -1010,7 +1010,7 @@ jobs:
         # Same prebuilt-binary install action as `test-functional`. Nextest
         # gives us per-test process isolation, OR'd substring filters via
         # positional args, and a much nicer progress UI than libtest.
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: cargo-nextest
 
@@ -1132,7 +1132,7 @@ jobs:
           toolchain: stable
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           # Pinned to the version the deny.toml schema was validated against, so
           # a future cargo-deny release can't silently change gate behavior.
@@ -1172,7 +1172,7 @@ jobs:
           shared-key: "ci-vendor-patches"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: cargo-nextest
 
@@ -1333,6 +1333,7 @@ jobs:
               functional_injector_serving_test
               functional_response_body_limits_test
               functional_request_body_limits_test
+              functional_request_buffer_budget_test
               functional_header_limits_test
               functional_early_data_test
               functional_ws_origin_test
@@ -1408,7 +1409,7 @@ jobs:
         # Nextest's process-per-test model isolates port/process contention
         # and ships built-in slow-test + retry support, which fits this E2E
         # suite better than libtest's shared-process scheduler.
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: cargo-nextest
 
@@ -1973,7 +1974,7 @@ jobs:
           toolchain: stable
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: cargo-nextest
 
@@ -2689,6 +2690,50 @@ jobs:
             echo "::error title=Development example still uses cluster-wide CP without trust binding::development-values.yaml must stay single-namespace or mount a trust bundle (GHSA-3f2j-wwqw-grmg)"
             exit 1
           fi
+          # PodDisruptionBudget: data-path workloads with replicas >= 2 get
+          # minAvailable protection; single-replica workloads skip PDB so drains
+          # are not deadlocked.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set eastWest.enabled=true \
+            --set injector.enabled=true \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            --show-only templates/pdb.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/pdb-data-path.yaml"
+          grep -c 'kind: PodDisruptionBudget' "$RUNNER_TEMP/ferrum-helm-results/pdb-data-path.yaml" | grep -Fxq '2'
+          grep -Fq 'name: ferrum-mesh-east-west' "$RUNNER_TEMP/ferrum-helm-results/pdb-data-path.yaml"
+          grep -Fq 'name: ferrum-mesh-injector' "$RUNNER_TEMP/ferrum-helm-results/pdb-data-path.yaml"
+          grep -Fq 'minAvailable: 1' "$RUNNER_TEMP/ferrum-helm-results/pdb-data-path.yaml"
+          # A single-replica CP renders NO PodDisruptionBudget, and `--show-only`
+          # exits non-zero with "could not find template" when the selected
+          # template produces nothing — which is the pass condition here, not a
+          # failure. Tolerate that one error and still fail on any other.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --show-only templates/pdb.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/pdb-cp-single.yaml" 2>&1; then
+            if grep -Fq 'kind: PodDisruptionBudget' "$RUNNER_TEMP/ferrum-helm-results/pdb-cp-single.yaml"; then
+              echo "::error title=Single-replica CP PDB rendered::controlPlane.replicas=1 must not render a minAvailable PDB"
+              exit 1
+            fi
+          elif ! grep -Fq 'could not find template' "$RUNNER_TEMP/ferrum-helm-results/pdb-cp-single.yaml"; then
+            echo "::error title=Unexpected helm failure rendering the single-replica CP PDB::see the chart artifact"
+            cat "$RUNNER_TEMP/ferrum-helm-results/pdb-cp-single.yaml"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.replicas=2 \
+            --show-only templates/pdb.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/pdb-cp-ha.yaml"
+          grep -Fq 'name: ferrum-mesh-control-plane' "$RUNNER_TEMP/ferrum-helm-results/pdb-cp-ha.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set eastWest.enabled=true \
+            --set injector.enabled=true \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            --show-only templates/east-west-gateway-deployment.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/east-west-spread.yaml"
+          grep -Fq 'topologyKey: kubernetes.io/hostname' "$RUNNER_TEMP/ferrum-helm-results/east-west-spread.yaml"
+          grep -Fq 'replicas: 2' "$RUNNER_TEMP/ferrum-helm-results/east-west-spread.yaml"
           # Mesh workload probes (#2450): helm stays in this trusted workflow shell;
           # assertions live in .github/scripts/verify_mesh_workload_probes.py so the
           # trusted ARM64 build-policy gate does not freeze probe-shape edits here.
@@ -3020,6 +3065,25 @@ jobs:
           # Default (file mode) renders a runnable, Secret-free gateway.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
+          grep -Fq 'kind: PodDisruptionBudget' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
+          grep -Fq 'minAvailable: 1' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
+          # replicaCount=1 renders NO PodDisruptionBudget, and `--show-only` exits
+          # non-zero with "could not find template" when the selected template
+          # produces nothing — that IS the pass condition. Same shape as the
+          # single-replica control-plane case in the mesh chart above.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set replicaCount=1 \
+            --show-only templates/pdb.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/pdb-single-replica.yaml" 2>&1; then
+            if grep -Fq 'kind: PodDisruptionBudget' "$RUNNER_TEMP/ferrum-gateway-helm-results/pdb-single-replica.yaml"; then
+              echo "::error title=Single-replica gateway PDB rendered::replicaCount=1 must not render a minAvailable PDB"
+              exit 1
+            fi
+          elif ! grep -Fq 'could not find template' "$RUNNER_TEMP/ferrum-gateway-helm-results/pdb-single-replica.yaml"; then
+            echo "::error title=Unexpected helm failure rendering the single-replica gateway PDB::see the chart artifact"
+            cat "$RUNNER_TEMP/ferrum-gateway-helm-results/pdb-single-replica.yaml"
+            exit 1
+          fi
           grep -Fq 'name: FERRUM_FILE_CONFIG_PATH' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
           # GatewayConfig deserialization requires all four top-level lists (version,
           # proxies, consumers, plugin_configs) with no serde defaults, so the default
@@ -3536,13 +3600,73 @@ jobs:
           fi
           grep -F 'extraEnv entry FERRUM_PROXY_HTTP_PORT is managed by first-class' "$RUNNER_TEMP/ferrum-gateway-helm-results/extraenv-reserved.err"
           # shutdownDrainSeconds=0 is a valid skip-draining value and must render.
+          # shutdownPreStopSeconds=0 opts out of the preStop window so this case
+          # keeps exercising the minimum grace period on its own.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
-            --set mode=file --set shutdownDrainSeconds=0 \
+            --set mode=file --set shutdownDrainSeconds=0 --set shutdownPreStopSeconds=0 \
             --set terminationGracePeriodSeconds=25 \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/shutdown-zero.yaml"
           drain_block="$(grep -A1 'name: FERRUM_SHUTDOWN_DRAIN_SECONDS' "$RUNNER_TEMP/ferrum-gateway-helm-results/shutdown-zero.yaml")"
           if ! grep -q '"0"' <<<"$drain_block"; then
             echo "::error title=Zero drain dropped::shutdownDrainSeconds=0 must render FERRUM_SHUTDOWN_DRAIN_SECONDS=0"
+            exit 1
+          fi
+          if grep -Fq 'preStop:' "$RUNNER_TEMP/ferrum-gateway-helm-results/shutdown-zero.yaml"; then
+            echo "::error title=preStop rendered at zero::shutdownPreStopSeconds=0 must omit lifecycle.preStop entirely"
+            exit 1
+          fi
+          # Issue #4154: the default deployment ships a native SleepAction preStop
+          # hook (no shell, so it works on distroless) plus an explicit readiness
+          # failureThreshold, and readiness is drain-aware in the binary.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-default.yaml"
+          if ! grep -Fq 'preStop:' "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-default.yaml"; then
+            echo "::error title=preStop missing::the chart must render lifecycle.preStop by default (issue #4154)"
+            exit 1
+          fi
+          prestop_block="$(grep -A3 'preStop:' "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-default.yaml")"
+          if ! grep -Fq 'sleep:' <<<"$prestop_block"; then
+            echo "::error title=preStop is not a SleepAction::distroless has no shell; preStop must use lifecycle.preStop.sleep"
+            exit 1
+          fi
+          if ! grep -Eq 'seconds: 30' <<<"$prestop_block"; then
+            echo "::error title=preStop seconds missing::preStop.sleep.seconds must render shutdownPreStopSeconds"
+            exit 1
+          fi
+          if ! grep -Eq 'failureThreshold: 3$' "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-default.yaml"; then
+            echo "::error title=Readiness failureThreshold implicit::render it explicitly; it is the endpoint-removal budget"
+            exit 1
+          fi
+          # The preStop window is billed to terminationGracePeriodSeconds, so the
+          # render-time guard must refuse a grace period that only covers the
+          # post-SIGTERM budget.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set shutdownPreStopSeconds=30 \
+            --set terminationGracePeriodSeconds=35 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-low-grace.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-low-grace.err"; then
+            echo "::error title=preStop escaped the grace guard::preStop seconds must be added to the minimum grace period"
+            exit 1
+          fi
+          grep -F 'preStop 30s' "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-low-grace.err"
+          # The post-SIGTERM pre-drain window is additive in exactly the same way.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set shutdownPreStopSeconds=0 --set shutdownPreDrainSeconds=20 \
+            --set terminationGracePeriodSeconds=35 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/predrain-low-grace.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/predrain-low-grace.err"; then
+            echo "::error title=preDrain escaped the grace guard::shutdownPreDrainSeconds must be added to the minimum grace period"
+            exit 1
+          fi
+          grep -F 'preDrain 20s' "$RUNNER_TEMP/ferrum-gateway-helm-results/predrain-low-grace.err"
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set shutdownPreDrainSeconds=20 \
+            --set terminationGracePeriodSeconds=130 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/predrain-env.yaml"
+          predrain_block="$(grep -A1 'name: FERRUM_SHUTDOWN_PREDRAIN_SECONDS' "$RUNNER_TEMP/ferrum-gateway-helm-results/predrain-env.yaml")"
+          if ! grep -q '"20"' <<<"$predrain_block"; then
+            echo "::error title=Pre-drain env missing::shutdownPreDrainSeconds must render FERRUM_SHUTDOWN_PREDRAIN_SECONDS"
             exit 1
           fi
           # Suffixed admin Service name also stays within the DNS label limit.
@@ -3864,11 +3988,13 @@ jobs:
           grep -F 'accepts at most one source' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-admin-jwt-conflict.err"
           # A values file may use explicit nulls to omit shutdown drain and clear the
           # PDB minAvailable default (the schema must accept null for both). The grace
-          # period must still cover the binary's full 78s default shutdown budget.
+          # period must still cover the binary's full 78s default shutdown budget
+          # (issue #4170) PLUS the chart's default 30s preStop window (issue #4154),
+          # i.e. 108s once both land.
           cat > "$RUNNER_TEMP/ferrum-gateway-helm-results/null-values.yaml" <<'NULLEOF'
           mode: file
           shutdownDrainSeconds: null
-          terminationGracePeriodSeconds: 80
+          terminationGracePeriodSeconds: 110
           podDisruptionBudget:
             enabled: true
             minAvailable: null
@@ -3882,7 +4008,7 @@ jobs:
             exit 1
           fi
           # A null shutdownDrainSeconds still drains for the binary's 30s default, so a
-          # grace period below the full 78s budget must fail render instead of being skipped.
+          # grace period below the unified 108s minimum must fail render instead of being skipped.
           cat > "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.yaml" <<'NULLGRACEEOF'
           mode: file
           shutdownDrainSeconds: null
@@ -3896,7 +4022,7 @@ jobs:
             exit 1
           fi
           grep -F 'null shutdownDrainSeconds uses the binary' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.err"
-          grep -F 'must be at least 78' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.err"
+          grep -F 'must be at least 108' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.err"
           grep -Fq 'maxUnavailable: 1' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-rendered.yaml"
           if grep -Fq 'minAvailable:' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-rendered.yaml"; then
             echo "::error title=Null minAvailable still rendered::minAvailable: null must fall through to maxUnavailable"
@@ -4556,12 +4682,19 @@ jobs:
     # request cannot widen the budget, change the target list, add a step, or
     # redirect this job at a repository-supplied script.
     #
-    # Lane split (#3902): the deterministic property smoke stays the required
-    # full-mode pull-request gate. The six-target, sanitizer-instrumented
-    # libFuzzer build spent roughly 39 minutes compiling to buy roughly 48
-    # seconds of fuzzing on every pull request, so it now runs on merge_group,
-    # on the push to `main`, and on manual dispatch instead. Every route a
-    # change takes to `main` still executes it at byte-identical bounds.
+    # Lane split (#3902, narrowed by #4238): the deterministic property smoke
+    # stays the required gate and runs on pull_request AND merge_group. The
+    # six-target, sanitizer-instrumented libFuzzer build spends roughly 39
+    # minutes compiling to buy roughly 48 seconds of fuzzing, so it runs only
+    # on the push to `main` and on manual dispatch.
+    #
+    # #3902 took it off the pull-request path for cost. #4238 takes it off the
+    # merge_group path for blast radius: a hosted-runner reclamation (exit 143)
+    # anywhere in that ~38-minute window ejected the queue entry and cascaded a
+    # rebuild of every entry behind it, and it did so without a defect in the
+    # ejected change. Discovery coverage is unchanged -- every merged change is
+    # still fuzzed at byte-identical bounds by the push to `main` that follows
+    # it, which is also the only event permitted to populate this lane's cache.
     name: Fuzz Smoke
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
@@ -4628,10 +4761,14 @@ jobs:
           echo "Fuzz property smoke seconds: $((SECONDS - property_started))"
 
       - name: Run bounded libFuzzer smoke budget
-        # Issue #3902: off the ordinary pull-request path. Every route to
-        # `main` (merge_group, the push to `main` itself, and manual dispatch)
-        # still executes the whole six-target budget below.
-        if: github.event_name != 'pull_request'
+        # Issue #4238: the push to `main` and manual dispatch only. This step
+        # is a probabilistic DISCOVERY run, not a verdict on one diff, so it
+        # must not be able to eject a merge-queue entry: its bounds buy about
+        # 48 seconds of fuzzing behind roughly 39 minutes of sanitizer compile,
+        # and a runner reclamation in that window costs the whole queue.
+        # Every merged change still reaches this budget through the push to
+        # `main`, at byte-identical bounds, seconds later.
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         working-directory: fuzz
         run: |
           set -euo pipefail
@@ -4661,10 +4798,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-            echo "Fuzz lane shape: deterministic property gate only"
-          else
+          if [ "$GITHUB_EVENT_NAME" = "push" ] || [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             echo "Fuzz lane shape: property gate plus the six-target sanitizer budget"
+          else
+            echo "Fuzz lane shape: deterministic property gate only"
           fi
 
           sccache_bin="${RUSTC_WRAPPER:-}"
@@ -5670,7 +5807,7 @@ jobs:
           targets: aarch64-unknown-linux-gnu
 
       - name: Install checksum-verified Cross 0.2.5
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: cross@0.2.5
           fallback: none
@@ -6040,7 +6177,7 @@ jobs:
           cp Dockerfile.release docker-context/Dockerfile
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -6094,7 +6231,7 @@ jobs:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4

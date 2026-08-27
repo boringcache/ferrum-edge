@@ -29,7 +29,7 @@ use ferrum_edge::config::batch_atomicity::{
     BATCH_ADMISSION_LEASE_LOST_MESSAGE, BatchAdmissionLeaseLost, atomic_batch_test_overrides,
     atomic_batch_unsupported, is_batch_admission_lease_lost,
 };
-use ferrum_edge::config::types::{Consumer, PluginConfig, Proxy, Upstream};
+use ferrum_edge::config::types::{Consumer, PluginAssociation, PluginConfig, Proxy, Upstream};
 use serde_json::json;
 
 const SQL_STORE_SOURCE: &str = include_str!("../../../src/config/db_loader.rs");
@@ -168,6 +168,69 @@ fn empty_graph_is_recognized_and_reports_no_counts() {
         ..Default::default()
     };
     assert!(one_upstream.any());
+}
+
+#[test]
+fn http_only_graphs_skip_post_write_policy_admission() {
+    let consumers = vec![consumer("ferrum", "c1")];
+    let proxies = vec![proxy("ferrum", "p1")];
+    let plugin_configs = vec![plugin_config("ferrum", "pc1")];
+    let http_graph = AtomicBatchGraph {
+        namespace: "ferrum",
+        consumers: &consumers,
+        upstreams: &[],
+        proxies: &proxies,
+        plugin_configs: &[],
+        admission_lease: None,
+    };
+    assert!(
+        !http_graph.requires_post_write_policy_admission(),
+        "HTTP proxy/consumer chunks with empty associations skip the namespace reload"
+    );
+
+    let plugin_graph = AtomicBatchGraph {
+        namespace: "ferrum",
+        consumers: &[],
+        upstreams: &[],
+        proxies: &[],
+        plugin_configs: &plugin_configs,
+        admission_lease: None,
+    };
+    assert!(
+        !plugin_graph.requires_post_write_policy_admission(),
+        "unrelated plugin types do not require post-write policy admission"
+    );
+
+    let mut mtls_consumer = consumer("ferrum", "c-mtls");
+    mtls_consumer.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{ "identity": "spiffe://example.test/ns/default/sa/app" }]),
+    );
+    let mtls_consumers = vec![mtls_consumer];
+    let mtls_graph = AtomicBatchGraph {
+        namespace: "ferrum",
+        consumers: &mtls_consumers,
+        upstreams: &[],
+        proxies: &[],
+        plugin_configs: &[],
+        admission_lease: None,
+    };
+    assert!(mtls_graph.requires_post_write_policy_admission());
+
+    let mut associated = proxy("ferrum", "p-assoc");
+    associated.plugins.push(PluginAssociation {
+        plugin_config_id: "existing-plugin".to_string(),
+    });
+    let associated_proxies = vec![associated];
+    let associated_graph = AtomicBatchGraph {
+        namespace: "ferrum",
+        consumers: &[],
+        upstreams: &[],
+        proxies: &associated_proxies,
+        plugin_configs: &[],
+        admission_lease: None,
+    };
+    assert!(associated_graph.requires_post_write_policy_admission());
 }
 
 #[test]
@@ -565,6 +628,35 @@ fn admin_batch_handler_refuses_before_mutating_and_never_reports_partial_counts(
     // Audit still fires exactly once, and only for a committed graph.
     assert_eq!(handler.matches("\"batch_create\",").count(), 1);
     assert!(handler.contains("if created.any() {"));
+}
+
+#[test]
+fn atomic_batch_persist_skips_namespace_policy_reload_when_unneeded() {
+    let sql_start = SQL_STORE_SOURCE
+        .find("    pub async fn batch_create_config_graph_atomically(")
+        .expect("SQL atomic batch writer");
+    let sql_end = SQL_STORE_SOURCE[sql_start..]
+        .find("\n    fn check_atomic_batch_fault(")
+        .expect("fault helper follows SQL atomic writer")
+        + sql_start;
+    let sql = &SQL_STORE_SOURCE[sql_start..sql_end];
+    assert!(
+        sql.contains("requires_post_write_policy_admission()"),
+        "SQL persist admission must skip the O(namespace) reload for HTTP-only chunks:\n{sql}"
+    );
+
+    let mongo_start = MONGO_STORE_SOURCE
+        .find("        async fn batch_create_config_graph_atomically(")
+        .expect("Mongo atomic batch writer");
+    let mongo_end = MONGO_STORE_SOURCE[mongo_start..]
+        .find("\n        async fn batch_create_proxies(")
+        .expect("batch_create_proxies follows Mongo atomic writer")
+        + mongo_start;
+    let mongo = &MONGO_STORE_SOURCE[mongo_start..mongo_end];
+    assert!(
+        mongo.contains("requires_post_write_policy_admission()"),
+        "Mongo persist admission must skip the O(namespace) reload for HTTP-only chunks:\n{mongo}"
+    );
 }
 
 /// Documented semantics have to match the implementation: no `207` for

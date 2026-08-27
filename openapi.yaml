@@ -357,7 +357,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
         "503":
-          description: Gateway not ready (status `starting` during startup, or `unavailable` after a supervised serving-listener failure); `ready=false`
+          description: Gateway not ready (status `starting` during startup, `unavailable` after a supervised serving-listener failure, or `draining` while the process is terminating); `ready=false`
           content:
             application/json:
               schema:
@@ -389,7 +389,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
         "503":
-          description: Gateway not ready (status `starting` or `unavailable`, `ready=false`)
+          description: Gateway not ready (status `starting`, `unavailable`, or `draining`, `ready=false`)
           content:
             application/json:
               schema:
@@ -1775,7 +1775,8 @@ paths:
         seeing resource internals. The **full** snapshot — resource pressure
         (file descriptors, connections, requests, event-loop latency), active
         counts, port-exhaustion events, load-shedding actions, stream-listener
-        diagnostics, and `listener_failures` — requires a valid admin JWT, a matching
+        diagnostics, `request_buffer` (aggregate buffered-request budget
+        pressure), and `listener_failures` — requires a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS`
         source IP.
 
@@ -2324,9 +2325,15 @@ paths:
       description: |
         Synchronously re-probes every HTTP-family backend in the current
         gateway config and replaces each registry entry with the new
-        classification. Blocks until every probe completes, so callers
-        can issue `GET /backend-capabilities` immediately afterward to
+        classification. Blocks until the coalesced refresh pass completes, so
+        callers can issue `GET /backend-capabilities` immediately afterward to
         observe the post-refresh state.
+
+        Concurrent requests collapse onto the shared `RefreshCoalescer`: at
+        most one probe fan-out runs at a time, with additional callers waiting
+        for the in-flight pass. The response `status` reports whether this
+        request drove the pass (`refreshed`) or joined one already running
+        (`joined`).
 
         This operational recovery action does not persist configuration and is
         available in read-only file, DP, and mesh modes with standard JWT
@@ -2347,7 +2354,10 @@ paths:
         - bearerAuth: []
       responses:
         "200":
-          description: Refresh completed; registry now reflects the latest probe results
+          description: |
+            Refresh completed; registry now reflects the latest probe results.
+            `status=refreshed` when this request drove the coalesced pass;
+            `status=joined` when it waited for an in-flight pass.
           content:
             application/json:
               schema:
@@ -2356,9 +2366,16 @@ paths:
                 properties:
                   status:
                     type: string
-                    enum: [refreshed]
-              example:
-                status: refreshed
+                    enum: [refreshed, joined]
+              examples:
+                drove_pass:
+                  summary: This request drove the refresh pass
+                  value:
+                    status: refreshed
+                joined_pass:
+                  summary: Joined an in-flight refresh pass
+                  value:
+                    status: joined
         "401":
           $ref: "#/components/responses/Unauthorized"
         "503":
@@ -3803,9 +3820,19 @@ paths:
         the calling token's subject and the cleared revision.
 
         Requires the `operator` role. Returns `404 Not Found` outside mesh mode.
+        Requires `?confirm=true` because clearing the freshness gate is a
+        privileged operation that lowers a fail-closed guard.
       tags: [Mesh Config Drift]
       security:
         - bearerAuth: []
+      parameters:
+        - name: confirm
+          in: query
+          required: true
+          description: Must be `true` to confirm the privileged reset operation
+          schema:
+            type: boolean
+            enum: [true]
       responses:
         "200":
           description: Accepted revision cleared
@@ -3847,6 +3874,12 @@ paths:
                     cleared_revision:
                       authority: db
                       sequence: 4821
+        "400":
+          description: Missing `?confirm=true` confirmation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -3860,6 +3893,8 @@ paths:
                 properties:
                   error:
                     type: string
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /mesh/policy-denies/recent:
     get:
@@ -9034,6 +9069,10 @@ components:
             one of these values (case-insensitive comparison). Empty array (default) means
             no origin check. Protects against Cross-Site WebSocket Hijacking (CSWSH).
 
+            Independent of the `cors` plugin, which does not run on WebSocket upgrades.
+            Operators with a strict CORS allowlist on the same proxy should mirror those
+            origins here. See docs/routing.md#websocket-origin-admission.
+
             WebSocket over HTTP/1.1 (`Upgrade: websocket`), HTTP/2
             (RFC 8441 Extended CONNECT), and HTTP/3 (RFC 9220 Extended
             CONNECT) are all supported and use the same Origin check.
@@ -12597,6 +12636,15 @@ components:
           oneOf:
             - $ref: "#/components/schemas/TcpKeepaliveCfg"
             - type: "null"
+        tcp_idle_timeout_seconds:
+          type: [integer, "null"]
+          format: uint64
+          minimum: 0
+          description: >-
+            Bidirectional TCP idle bound in seconds (DestinationRule
+            `connectionPool.tcp.idleTimeout`) for this port. `0` disables the
+            idle watchdog. Distinct from `http_idle_timeout_ms` (HTTP pool
+            idle).
         http_max_requests_per_connection:
           type: [integer, "null"]
           format: uint32
@@ -13448,7 +13496,7 @@ components:
       properties:
         status:
           type: string
-          enum: [ok, degraded, starting, unavailable]
+          enum: [ok, degraded, starting, unavailable, draining]
           description: |
             Aggregate gateway health.
             `ok` — fully ready and healthy (200). Also returned for
@@ -13491,6 +13539,15 @@ components:
             those policies have no local fallback, so every protected request on
             them is failing closed. It clears as soon as the backend recovers,
             with no restart and no config reload — see `replay_authority`.
+            `draining` — the process has received SIGTERM/SIGINT and is
+            terminating (returned with 503 and `ready: false`). It is published
+            the moment the signal is observed, ahead of the accept-loop close,
+            so an orchestrator can withdraw the replica from its endpoint set
+            before new connections are refused; `FERRUM_SHUTDOWN_PREDRAIN_SECONDS`
+            keeps the listeners accepting for that window. Terminal — it wins
+            over every other status and never clears. `/live` is deliberately
+            unaffected and keeps returning 200, so a liveness probe cannot
+            SIGKILL the pod mid-drain.
         ready:
           type: boolean
           description: |
@@ -13502,7 +13559,7 @@ components:
             no expired `withdraw` upstream still has stale targets installed
             because its withdrawal publication is retrying AND no live plugin
             generation's `shared` single-use replay authority is currently
-            unavailable. A recoverable
+            unavailable AND the process has not begun terminating. A recoverable
             dynamic Gateway API listener failure also sets `ready: false` when
             `FERRUM_GATEWAY_LISTENER_FAILURE_FAILS_READINESS=true`; it is ready
             by default. While `false`, the
@@ -15052,6 +15109,44 @@ components:
             reject_new_requests:
               type: boolean
               description: Whether new requests/streams are being rejected with 503
+        request_buffer:
+          type: object
+          description: |
+            Aggregate buffered-request budget pressure
+            (`FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES`). Present only in the
+            authenticated detail snapshot and only when the gateway has a
+            proxy state; the coarse unauthenticated response carries `level`
+            alone.
+          required: [total_bytes, available_bytes, reserved_bytes, reservation_unit_bytes, fallback_max_bytes, rejections]
+          properties:
+            total_bytes:
+              type: integer
+              format: uint64
+              description: Total aggregate capacity after startup clamping.
+            available_bytes:
+              type: integer
+              format: uint64
+              description: Capacity not currently claimed by an in-flight buffered request.
+            reserved_bytes:
+              type: integer
+              format: uint64
+              description: Capacity claimed by in-flight buffered requests right now.
+            reservation_unit_bytes:
+              type: integer
+              format: uint64
+              description: Granularity of one reservation block (64 KiB).
+            fallback_max_bytes:
+              type: integer
+              format: uint64
+              description: |
+                Per-request ceiling applied when the effective request-body
+                limit resolves to `0` (`FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES`).
+            rejections:
+              type: integer
+              format: uint64
+              description: |
+                Buffered requests refused for aggregate capacity since startup
+                (`503` / gRPC `RESOURCE_EXHAUSTED`). Alert when this increases.
         stream_listeners:
           type: object
           description: |
@@ -27567,7 +27662,7 @@ components:
 
     AiToolGovernorConfig:
       type: object
-      description: "Plugin: ai_tool_governor — Deterministic allow/deny/approval policy for AI tool/function calls. Inspects request tool definitions (tools[].function.name / functions[].name), buffered response tool calls (choices[].message.tool_calls[] and legacy function_call), streaming SSE tool-call deltas (held until complete and cleared by policy/approval, then released — or the stream is cut with an SSE error event, never leaking the held call), and optionally MCP tools/call and A2A JSON-RPC methods. Complements ai_semantic_firewall (which catches intent): every decision here is a deterministic function of names, arguments, JSON Schema, regexes, identity, and an optional approval webhook. In enforce mode, governed bodies the plugin cannot inspect fail closed: Content-Encoding'd, oversized (>4 MiB), non-UTF-8, or unparseable JSON request bodies are rejected when request inspection is enabled, oversized JSON responses are rejected, and streaming holds past the 4 MiB cap cut the stream. Configuration is strict: unknown root, inspect, tool-policy, blocked-pattern, approval, response, and observability properties are rejected (with path-qualified diagnostics). The free-form `tools` name map and arbitrary per-tool `json_schema` document remain open. Does not execute tools or replace mcp_gateway/A2A routing. HTTP-family only."
+      description: "Plugin: ai_tool_governor — Deterministic allow/deny/approval policy for AI tool/function calls. Inspects request tool definitions across every provider shape (OpenAI tools[].function.name / functions[].name, Anthropic tools[].name, Google tools[].functionDeclarations[].name, Bedrock toolConfig.tools[].toolSpec.name), buffered response tool calls (OpenAI choices[].message.tool_calls[] and legacy function_call, OpenAI Responses output[] function_call items, Anthropic content[] tool_use blocks, Google candidates[].content.parts[].functionCall, Cohere v2 message.tool_calls[], Bedrock Converse output.message.content[].toolUse), streaming SSE tool-call deltas in the OpenAI, Anthropic (content_block_start / input_json_delta), Cohere v2 (tool-call-start / tool-call-delta), and Google shapes (held until complete and cleared by policy/approval, then released — or the stream is cut with an SSE error event, never leaking the held call), and optionally MCP tools/call and A2A JSON-RPC methods. A payload carrying a tool-call marker this plugin cannot read is ungovernable and fails closed in enforce mode by default (see unknown_shape_action). Complements ai_semantic_firewall (which catches intent): every decision here is a deterministic function of names, arguments, JSON Schema, regexes, identity, and an optional approval webhook. In enforce mode, governed bodies the plugin cannot inspect fail closed: Content-Encoding'd, oversized (>4 MiB), non-UTF-8, or unparseable JSON request bodies are rejected when request inspection is enabled, oversized JSON responses are rejected, and streaming holds past the 4 MiB cap cut the stream. Configuration is strict: unknown root, inspect, tool-policy, blocked-pattern, approval, response, and observability properties are rejected (with path-qualified diagnostics). The free-form `tools` name map and arbitrary per-tool `json_schema` document remain open. Does not execute tools or replace mcp_gateway/A2A routing. HTTP-family only."
       properties:
         enabled:
           type: boolean
@@ -27589,6 +27684,7 @@ components:
                 const: false
               mode: true
               default_action: true
+              unknown_shape_action: true
               inspect: true
               tools: true
               approval: true
@@ -27696,6 +27792,11 @@ components:
           enum: [allow, deny, require_approval]
           default: deny
           description: "Action for a tool with no explicit policy entry. tools may be empty only when default_action governs (deny/require_approval)."
+        unknown_shape_action:
+          type: string
+          enum: [deny, allow]
+          default: deny
+          description: "Posture for a governed payload that carries a live tool-call marker (tool_calls / toolCalls / tool_use / toolUse / function_call / functionCall member names, or a block tagged type: tool_use / function_call / tool-call) from which no call could be extracted — a provider tool-call shape this plugin cannot read. deny (default) treats it as ungovernable: enforce rejects the body or cuts the stream, dry_run forwards. allow forwards it as if no tool call were present. BOTH settings record the fixed ai_tool_governor.uninspectable_reason=unrecognized_tool_call_shape observation without claiming a decision, so an unreadable shape is never silently permitted. Payloads with no tool-call marker at all (ordinary REST JSON on a shared proxy, embeddings/moderations responses, content-only completions) are out of scope under both settings."
         inspect:
           type: object
           additionalProperties: false

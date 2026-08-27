@@ -1868,6 +1868,35 @@ async fn test_backend_timeout_zero_disables_check() {
     );
 }
 
+/// Disabled per-direction watermarks (`None`) plus a 30s bidirectional idle
+/// bound must not tear the session down within a couple of watchdog ticks.
+/// This is the synthesized mesh L4 default after issue #4161: read/write
+/// watermarks off, idle inherited from env/DR (here 30s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_disabled_backend_io_timeouts_do_not_fire_before_idle() {
+    let client = NeverReadStream;
+    let backend = NeverReadStream;
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(2500),
+        bidirectional_copy_for_test_with_timeouts(
+            client,
+            backend,
+            Some(Duration::from_secs(30)),
+            None,
+            None,
+            None,
+            8 * 1024,
+        ),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "with read/write watermarks disabled, a 30s idle bound must not fire within 2.5s"
+    );
+}
+
 /// A slow-but-progressing writer keeps the write watermark fresh, so the
 /// write inactivity timeout should NOT fire even though individual writes
 /// are slow.

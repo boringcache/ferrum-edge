@@ -467,7 +467,10 @@ spec:
       labels:
         app: ferrum-edge
     spec:
-      terminationGracePeriodSeconds: 80
+      # preStop sleep + the full post-SIGTERM shutdown budget must fit inside
+      # this window: Kubernetes starts the grace clock at pod deletion, preStop
+      # included. See docs/graceful_shutdown.md.
+      terminationGracePeriodSeconds: 110
       containers:
         - name: ferrum-edge
           image: ghcr.io/ferrum-edge/ferrum-edge:latest
@@ -520,10 +523,22 @@ spec:
               command: ["/app/ferrum-edge", "health", "-p", "9000", "--host", "127.0.0.1"]
             initialDelaySeconds: 5
             periodSeconds: 10
-          # Note: preStop with shell-based sleep is not available in distroless.
-          # Use terminationGracePeriodSeconds (set on the pod spec) to allow
-          # in-flight requests to drain before SIGKILL. The gateway handles
-          # SIGTERM gracefully.
+            # Rendered explicitly (the Kubernetes default is also 3) because
+            # failureThreshold x periodSeconds is the probe-driven
+            # endpoint-removal latency the preStop window below is sized from.
+            failureThreshold: 3
+          # Endpoint-removal lag. Kubernetes removes the pod from the Service
+          # concurrently with stopping it, so without a preStop hook the gateway
+          # closes its accept loops while kube-proxy is still steering new
+          # connections at it. `sleep` is a native SleepAction (Kubernetes 1.29+,
+          # GA in 1.30) and needs NO shell, so it works on the distroless image.
+          # On older clusters drop this block and set
+          # FERRUM_SHUTDOWN_PREDRAIN_SECONDS instead, which holds the accept
+          # loops open after SIGTERM while readiness already reports 503.
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 30
           resources:
             requests:
               cpu: 250m

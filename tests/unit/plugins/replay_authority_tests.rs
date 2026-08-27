@@ -37,6 +37,11 @@ use ferrum_edge::plugins::utils::replay_authority::{
 const PROFILE: &str = "ferrum-replay-authority-tests-v1";
 const RETENTION: Duration = Duration::from_secs(600);
 
+fn replay_redis_client(config: RedisConfig) -> RedisRateLimitClient {
+    RedisRateLimitClient::for_replay_authority(config, None, false, None)
+        .expect("construction without a CA path must succeed")
+}
+
 /// A distinct protection domain per test, so parallel suite siblings cannot
 /// consume one another's lanes or markers.
 fn domain(sub: &str) -> ReplayDomain {
@@ -1086,9 +1091,7 @@ async fn a_shared_authority_with_an_unreachable_backend_fails_closed() {
     .expect("redis config parses")
     .expect("sync_mode redis yields a config");
 
-    let client = Arc::new(RedisRateLimitClient::for_replay_authority(
-        config, None, false, None,
-    ));
+    let client = Arc::new(replay_redis_client(config));
     let authority = shared_live(client, RETENTION);
     assert_eq!(authority.mode(), "shared");
 
@@ -1125,9 +1128,7 @@ async fn an_unavailable_shared_authority_is_visible_in_the_counters() {
     .expect("redis config parses")
     .expect("sync_mode redis yields a config");
 
-    let client = Arc::new(RedisRateLimitClient::for_replay_authority(
-        config, None, false, None,
-    ));
+    let client = Arc::new(replay_redis_client(config));
     let authority = shared_live(Arc::clone(&client), RETENTION);
 
     let marker = domain("shared-observable").marker(&[b"c", b"proof"]);
@@ -1209,9 +1210,7 @@ fn unreachable_shared_client(prefix: &str) -> Arc<RedisRateLimitClient> {
     )
     .expect("redis config parses")
     .expect("sync_mode redis yields a config");
-    Arc::new(RedisRateLimitClient::for_replay_authority(
-        config, None, false, None,
-    ))
+    Arc::new(replay_redis_client(config))
 }
 
 /// Construct and activate a live shared authority, matching a committed plugin
@@ -1726,7 +1725,8 @@ fn a_generic_redis_client_does_not_contribute_to_shared_replay_health() {
     )
     .expect("redis config parses")
     .expect("sync_mode redis yields a config");
-    let client = RedisRateLimitClient::new(config, None, false, None);
+    let client = RedisRateLimitClient::new(config, None, false, None)
+        .expect("construction without a CA path must succeed");
     assert!(
         client.is_available(),
         "operational Redis clients keep historical initial reachability"
@@ -2474,9 +2474,7 @@ fn claim_client_with_interval(
     )
     .expect("redis config parses")
     .expect("sync_mode redis yields a config");
-    Arc::new(RedisRateLimitClient::for_replay_authority(
-        config, None, false, None,
-    ))
+    Arc::new(replay_redis_client(config))
 }
 
 /// A topology-screened probe restores availability without a protected request
@@ -2711,9 +2709,7 @@ async fn the_shared_claim_primitive_publishes_no_backend_or_key_material() {
     assert!(!redacted.contains("claim-user"));
     assert!(!redacted.contains("claim-password"));
 
-    let client = Arc::new(RedisRateLimitClient::for_replay_authority(
-        config, None, false, None,
-    ));
+    let client = Arc::new(replay_redis_client(config));
     let authority = shared_live(Arc::clone(&client), RETENTION);
     let marker = domain("shared-redaction").marker(&[b"consumer-1", b"nonce-1"]);
 
@@ -3165,9 +3161,7 @@ async fn replay_client_logs_only_classification_and_redacted_endpoint() {
         );
 
         let (logs, guard) = super::plugin_utils::capture_logs();
-        let client = Arc::new(RedisRateLimitClient::for_replay_authority(
-            config, None, false, None,
-        ));
+        let client = Arc::new(replay_redis_client(config));
         let authority = shared_live(Arc::clone(&client), RETENTION);
         let marker = domain("shared-logging").marker(&[b"c", label.as_bytes()]);
         match shape {
@@ -3238,7 +3232,8 @@ async fn generic_redis_client_still_logs_backend_error_text() {
     let (port, _probes, shutdown) = spawn_logging_redis_server(LoggingShape::CommandError).await;
     let config = sentinel_replay_config(port);
     let (logs, guard) = super::plugin_utils::capture_logs();
-    let client = RedisRateLimitClient::new(config, None, false, None);
+    let client = RedisRateLimitClient::new(config, None, false, None)
+        .expect("construction without a CA path must succeed");
     let _ = client
         .set_bytes_nx_with_expire("ferrum:replay:test-key", b"value", 60)
         .await;

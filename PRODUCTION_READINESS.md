@@ -89,6 +89,21 @@ reconciliations. They are **historical evidence**, not the live launch verdict.
   undeterminable (no CRL from their issuing CA) are accepted, matching the shared inbound
   model; removing it would break federated meshes lacking per-CA CRLs. Documented in
   docs/mesh.md.
+- **Fail-fast panics in shipping profiles**: `[profile.release]`,
+  `[profile.ci-release]` (inherits `release`), and `[profile.max-perf]` set
+  `panic = "abort"` (issue #4166). A panic anywhere in the process —
+  including a background poller, accept loop, k8s controller task, or
+  notification settle callback — terminates the gateway. There is no
+  in-process panic recovery in shipping binaries: smaller binaries (no
+  unwind tables) and fail-fast after a violated invariant beat restarting a
+  task whose process state may already be inconsistent. Background-task
+  supervisors still handle non-panic unexpected exits (I/O errors,
+  unexpected completion, cancellation) and keep serving last-known-good
+  config where that policy already exists. Dev/test/`pr-build` keep
+  `panic = "unwind"` so the suite can observe `JoinError::is_panic()`;
+  those tests are not shipping behavior. Operators must run a process
+  supervisor (systemd, Kubernetes `restartPolicy`). Pinned by
+  `tests/unit/gateway_core/build_profile_panic_strategy_tests.rs`.
 - Pre-existing intentional trade-offs re-confirmed: WAF body gates, JWKS retain guard,
   dedup try_lock eviction, MCP stale-template serving, H3 streaming-trailer limitation,
   kTLS KeyUpdate userspace fallback, mcp_gateway V1 tool-result rejection.
