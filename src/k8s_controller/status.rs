@@ -24,6 +24,10 @@ use crate::config_sources::k8s::{
     translate_k8s_objects_collecting_skips, validate_gateway_listener_allowed_routes,
     validate_listenerset_listener_entry,
 };
+use crate::k8s_controller::convert::k8s_time_to_rfc3339;
+use crate::k8s_controller::metrics::{
+    ControllerMetrics, record_route_status_publication, unix_now_ms,
+};
 use crate::k8s_controller::status_plan::{
     StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
 };
@@ -71,11 +75,21 @@ impl Default for GatewayApiStatusContext {
 #[derive(Clone)]
 pub struct GatewayApiStatusWriter {
     client: Client,
+    metrics: Option<Arc<ControllerMetrics>>,
 }
 
 impl GatewayApiStatusWriter {
     pub fn new(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            metrics: None,
+        }
+    }
+
+    /// Attach unlabeled controller counters for route parent-status publication.
+    pub fn with_metrics(mut self, metrics: Arc<ControllerMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     pub async fn patch_updates(
@@ -88,6 +102,7 @@ impl GatewayApiStatusWriter {
         // `tokio::spawn` (no `&GatewayApiStatusUpdate` borrows held across
         // awaits — that would trip rustc's HRTB Send check).
         let client = self.client.clone();
+        let metrics = self.metrics.clone();
         let futures = updates.into_iter().filter_map(move |update| {
             let Some(ar) = api_resource_for_update(&update) else {
                 warn!(
@@ -107,6 +122,7 @@ impl GatewayApiStatusWriter {
             let name = update.name.clone();
             let kind = update.kind.clone();
             let namespace = update.namespace.clone();
+            let metrics = metrics.clone();
             Some(async move {
                 let result = if route_status_kind(&update.kind) || policy_status_kind(&update.kind)
                 {
@@ -114,7 +130,7 @@ impl GatewayApiStatusWriter {
                     // the upstream CRDs: they cannot be split by server-side
                     // apply ownership, so both follow the Gateway API
                     // read-modify-write mandate with a resourceVersion guard.
-                    patch_route_status_with_retry(&api, &update).await
+                    patch_route_status_with_retry(&api, &update, metrics.as_deref()).await
                 } else {
                     patch_gateway_status_with_apply(&api, &update).await
                 };
@@ -180,6 +196,7 @@ async fn patch_gateway_status_with_apply(
 async fn patch_route_status_with_retry(
     api: &Api<DynamicObject>,
     update: &GatewayApiStatusUpdate,
+    metrics: Option<&ControllerMetrics>,
 ) -> Result<(), kube::Error> {
     for attempt in 1..=ROUTE_STATUS_PATCH_MAX_ATTEMPTS {
         let live = api.get_status(&update.name).await?;
@@ -203,7 +220,27 @@ async fn patch_route_status_with_retry(
             .patch_status(&update.name, &params, &Patch::Merge(&patch))
             .await
         {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                if route_status_kind(&update.kind)
+                    && let Some(metrics) = metrics
+                    && let Some(published_unix_ms) = unix_now_ms()
+                {
+                    let created = live
+                        .metadata
+                        .creation_timestamp
+                        .as_ref()
+                        .map(k8s_time_to_rfc3339);
+                    record_route_status_publication(
+                        metrics,
+                        &update.kind,
+                        &update.namespace,
+                        &update.name,
+                        created.as_deref(),
+                        published_unix_ms,
+                    );
+                }
+                return Ok(());
+            }
             Err(error)
                 if kube_error_is_conflict(&error) && attempt < ROUTE_STATUS_PATCH_MAX_ATTEMPTS =>
             {

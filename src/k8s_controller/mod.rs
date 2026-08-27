@@ -709,7 +709,7 @@ pub async fn start_k8s_controller(
     };
     let gateway_status_writer = controller_config
         .watch_gateway_api
-        .then(|| GatewayApiStatusWriter::new(client.clone()));
+        .then(|| GatewayApiStatusWriter::new(client.clone()).with_metrics(metrics.clone()));
     // T2-B: the Istio status writer mirrors the Gateway API writer's
     // construction — only build it when the controller is actually
     // watching Istio CRDs, so non-Istio installs don't pay the (tiny)

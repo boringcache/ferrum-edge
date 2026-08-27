@@ -2859,6 +2859,79 @@ impl MetricsRegistry {
         };
         let snapshot = metrics.snapshot();
         output.push_str(
+            "# HELP ferrum_k8s_controller_errors_total Kubernetes translation skips and hard translation failures observed during reconcile.\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_errors_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_errors_total",
+            snapshot.errors,
+            "",
+        );
+        output.push_str(
+            "# HELP ferrum_k8s_controller_full_syncs_total Periodic Kubernetes controller full-sync reconcile passes.\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_full_syncs_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_full_syncs_total",
+            snapshot.full_syncs,
+            "",
+        );
+        output.push_str(
+            "# HELP ferrum_k8s_controller_last_reconcile_duration_milliseconds Wall-clock duration of the most recently completed Kubernetes controller reconcile, in milliseconds.\n",
+        );
+        output
+            .push_str("# TYPE ferrum_k8s_controller_last_reconcile_duration_milliseconds gauge\n");
+        render_process_gauge(
+            output,
+            "ferrum_k8s_controller_last_reconcile_duration_milliseconds",
+            i64::try_from(snapshot.last_reconcile_duration_ms).unwrap_or(i64::MAX),
+            "",
+        );
+        output.push_str(
+            "# HELP ferrum_k8s_controller_last_route_status_publish_latency_milliseconds Milliseconds from the route object's Kubernetes creationTimestamp to a successful Ferrum parent-status patch. Zero until the first successful publication.\n",
+        );
+        output.push_str(
+            "# TYPE ferrum_k8s_controller_last_route_status_publish_latency_milliseconds gauge\n",
+        );
+        render_process_gauge(
+            output,
+            "ferrum_k8s_controller_last_route_status_publish_latency_milliseconds",
+            i64::try_from(snapshot.last_route_status_publish_latency_ms).unwrap_or(i64::MAX),
+            "",
+        );
+        output.push_str(
+            "# HELP ferrum_k8s_controller_reconciliations_total Kubernetes controller reconcile passes started, including periodic full-syncs and watch-driven reconciles.\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_reconciliations_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_reconciliations_total",
+            snapshot.reconciliations,
+            "",
+        );
+        output.push_str(
+            "# HELP ferrum_k8s_controller_route_status_publications_total Successful Gateway API route parent-status patches (HTTPRoute, GRPCRoute, TCPRoute, TLSRoute, UDPRoute).\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_route_status_publications_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_route_status_publications_total",
+            snapshot.route_status_publications,
+            "",
+        );
+        output.push_str(
+            "# HELP ferrum_k8s_controller_watch_idle_relists_total Watch-scope reflector rebuilds triggered because a scope delivered no event for the configured idle window, or because a replacement generation never finished its initial list.\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_watch_idle_relists_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_watch_idle_relists_total",
+            snapshot.watch_idle_relists,
+            "",
+        );
+        output.push_str(
             "# HELP ferrum_k8s_controller_istio_status_conflicts_total Istio status JSON Merge Patch 409 conflicts observed while applying Ferrum-owned conditions.\n",
         );
         output.push_str("# TYPE ferrum_k8s_controller_istio_status_conflicts_total counter\n");

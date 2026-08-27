@@ -68,7 +68,9 @@ fn is_cluster_scoped(api_version: &str, kind: &str) -> bool {
         || (kind == "GatewayClass" && api_version.starts_with("gateway.networking.k8s.io/"))
 }
 
-fn k8s_time_to_rfc3339(ts: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time) -> String {
+pub(crate) fn k8s_time_to_rfc3339(
+    ts: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time,
+) -> String {
     ts.0.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
