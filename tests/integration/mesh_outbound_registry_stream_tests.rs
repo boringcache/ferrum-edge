@@ -400,17 +400,15 @@ async fn tcp_admitted_destination_passes_through_to_backend() {
     // the backend. Reusing a stolen number (or enforcement built for it)
     // would lose the same bind-drop-rebind race.
     let registry_entry = format!("127.0.0.1:{}", backend_addr.port());
-    let (listen_port, shutdown_tx, join, _metrics) = spawn_tcp_listener_with_retry(
-        backend_addr.port(),
-        |frontend_port| {
+    let (listen_port, shutdown_tx, join, _metrics) =
+        spawn_tcp_listener_with_retry(backend_addr.port(), |frontend_port| {
             make_enforcement(
                 PASSTHROUGH_NAMESPACE,
                 &[registry_entry.as_str()],
                 vec![frontend_port],
             )
-        },
-    )
-    .await;
+        })
+        .await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
 
     let mut stream = TcpStream::connect(gateway_addr)
@@ -447,17 +445,15 @@ async fn tcp_unadmitted_destination_is_dropped_before_backend_dial() {
     let _backend = spawn_tcp_echo_backend(backend_listener, accept_counter.clone()).await;
 
     // Registry admits a different host:port; backend is unadmitted.
-    let (listen_port, shutdown_tx, join, _metrics) = spawn_tcp_listener_with_retry(
-        backend_addr.port(),
-        |frontend_port| {
+    let (listen_port, shutdown_tx, join, _metrics) =
+        spawn_tcp_listener_with_retry(backend_addr.port(), |frontend_port| {
             make_enforcement(
                 TCP_DENY_NAMESPACE,
                 &["mongo.allowed.io:27017"],
                 vec![frontend_port],
             )
-        },
-    )
-    .await;
+        })
+        .await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
 
     // Snapshot the prometheus deny counter before the attempt so we
@@ -710,17 +706,15 @@ async fn udp_admitted_destination_passes_through_to_backend() {
     let _backend = spawn_udp_echo_backend(backend_socket, backend_bytes.clone()).await;
 
     let registry_entry = format!("127.0.0.1:{}", backend_addr.port());
-    let (listen_port, shutdown_tx, join) = spawn_udp_listener_with_retry(
-        backend_addr.port(),
-        |frontend_port| {
+    let (listen_port, shutdown_tx, join) =
+        spawn_udp_listener_with_retry(backend_addr.port(), |frontend_port| {
             make_enforcement(
                 PASSTHROUGH_NAMESPACE,
                 &[registry_entry.as_str()],
                 vec![frontend_port],
             )
-        },
-    )
-    .await;
+        })
+        .await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
 
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
@@ -749,17 +743,15 @@ async fn udp_unadmitted_destination_is_silently_dropped() {
     let backend_bytes = Arc::new(AtomicU64::new(0));
     let _backend = spawn_udp_echo_backend(backend_socket, backend_bytes.clone()).await;
 
-    let (listen_port, shutdown_tx, join) = spawn_udp_listener_with_retry(
-        backend_addr.port(),
-        |frontend_port| {
+    let (listen_port, shutdown_tx, join) =
+        spawn_udp_listener_with_retry(backend_addr.port(), |frontend_port| {
             make_enforcement(
                 UDP_DENY_NAMESPACE,
                 &["redis.allowed.io:6379"],
                 vec![frontend_port],
             )
-        },
-    )
-    .await;
+        })
+        .await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
 
     let deny_before = stream_deny_count(UDP_DENY_NAMESPACE, "udp");

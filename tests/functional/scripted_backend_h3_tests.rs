@@ -2551,14 +2551,13 @@ async fn spawn_h3_frontend_refined_buffering_harness(
         .spawn()
         .expect("spawn h3 backend");
 
-    let (harness, _ca_pem, https_port) =
-        spawn_h3_harness_with_explicit_https_port_config_and_env(
-            file_mode_yaml_for_h3_with_compression(backend_port),
-            true,
-            None,
-            extra_env,
-        )
-        .await;
+    let (harness, _ca_pem, https_port) = spawn_h3_harness_with_explicit_https_port_config_and_env(
+        file_mode_yaml_for_h3_with_compression(backend_port),
+        true,
+        None,
+        extra_env,
+    )
+    .await;
 
     let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
         .await
