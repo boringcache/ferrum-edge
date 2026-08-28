@@ -3988,7 +3988,7 @@ mod keepalive_tests {
 
     use super::apply_tcp_keepalive;
     use crate::config::types::TcpKeepaliveCfg;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
     use std::os::unix::io::AsRawFd;
 
     fn loopback_pair() -> (TcpStream, TcpStream) {
@@ -4260,7 +4260,7 @@ mod original_dst_live_tests {
     //! fail there instead of passing as skips. Local ad-hoc runs still self-skip
     //! without root / `unshare` / `iptables`.
 
-    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
     use std::os::fd::AsRawFd;
     use std::process::{Child, Command};
     use std::time::Duration;
