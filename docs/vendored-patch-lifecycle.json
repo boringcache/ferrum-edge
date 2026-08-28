@@ -12,12 +12,13 @@
   "co_retirement_groups": [
     {
       "id": "h3-all",
-      "description": "All four logical h3 patches share vendor/h3-0.0.8-ferrum-patched and must retire together.",
+      "description": "All five logical h3 patches share vendor/h3-0.0.8-ferrum-patched and must retire together.",
       "patch_ids": [
         "h3-001-recv-frame-drain-on-quic-close",
         "h3-002-extended-connect-websocket-protocol",
         "h3-003-peek-buffered-trailers-before-fin",
-        "h3-004-send-stream-stopped-watch"
+        "h3-004-send-stream-stopped-watch",
+        "h3-005-max-buffered-frame-len"
       ]
     },
     {
@@ -162,7 +163,7 @@
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "Fix ships in an h3 release and patches 002/003/004 are also retired.",
+        "trigger": "Fix ships in an h3 release and patches 002/003/004/005 are also retired.",
         "co_retirement_group": "h3-all",
         "compatible_release_test": {
           "status": "not_started",
@@ -196,7 +197,7 @@
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "Upstream files and merges the variant and patches 001/003/004 are also retired.",
+        "trigger": "Upstream files and merges the variant and patches 001/003/004/005 are also retired.",
         "co_retirement_group": "h3-all",
         "compatible_release_test": {
           "status": "not_started",
@@ -226,7 +227,7 @@
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "Upstream files and merges the API and patches 001/002/004 are also retired.",
+        "trigger": "Upstream files and merges the API and patches 001/002/004/005 are also retired.",
         "co_retirement_group": "h3-all",
         "compatible_release_test": {
           "status": "not_started",
@@ -256,7 +257,7 @@
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "Upstream files and merges the API and patches 001/002/003 are also retired.",
+        "trigger": "Upstream files and merges the API and patches 001/002/003/005 are also retired.",
         "co_retirement_group": "h3-all",
         "compatible_release_test": {
           "status": "not_started",
@@ -269,6 +270,44 @@
         "tests/functional/functional_destination_active_requests_h3_test.rs::functional_destination_active_requests_h3_release_on_client_cancellation",
         "tests/functional/functional_destination_active_requests_h3_test.rs::functional_destination_active_requests_h3_release_on_streaming_upload_cancellation",
         "tests/functional/functional_destination_active_requests_h3_test.rs::functional_destination_active_requests_h3_release_on_streaming_request_reset"
+      ]
+    },
+    {
+      "id": "h3-005-max-buffered-frame-len",
+      "label": "h3 receive-side buffered non-DATA frame ceiling",
+      "crate": "h3",
+      "vendored_version": "0.0.8",
+      "vendor_path": "vendor/h3-0.0.8-ferrum-patched",
+      "docs_path": "docs/upstream-h3-patches/005-max-buffered-frame-len/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "Stock h3 0.0.8 parks on the DECLARED payload length of a non-DATA frame and accumulates QUIC chunks into an unbounded BufList; QUIC flow control caps only bytes in flight because every read re-grants credit, so one unauthenticated stream declaring 2^62-1 bytes drives the process to OOM. The unknown-frame skip arm and the peer control stream have the same shape.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/h3",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": "jeremyjpj0916/h3@feat/max-buffered-frame-len"
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Upstream ships a release that bounds the declared payload length of a buffered non-DATA frame on the receive side, exposes it through the server builder, and refuses an over-declared frame before buffering its payload (a decoded field-section limit alone does not qualify), and patches 001/002/003/004 are also retired.",
+        "co_retirement_group": "h3-all",
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_listener_builder_binds_frame_bounds_to_the_header_policy",
+        "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_vendored_frame_decoder_refuses_oversized_declared_non_data_length",
+        "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_vendored_frame_ceiling_maps_to_excessive_load_on_every_decoder",
+        "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_vendored_frame_ceiling_behavioural_regressions_are_present",
+        "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_advertised_field_section_size_tracks_configured_header_policy",
+        "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_buffered_frame_ceiling_leaves_the_graceful_431_reachable",
+        "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_field_section_limits_refuse_an_unrepresentable_header_policy",
+        "tests/unit/gateway_core/http3_server_dispatch_tests.rs::env_config_validation_screens_h3_field_section_limits",
+        "vendor/h3-0.0.8-ferrum-patched (frame unit tests)"
       ]
     },
     {

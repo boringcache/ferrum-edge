@@ -1,0 +1,707 @@
+diff --git a/vendor/h3-0.0.8-ferrum-patched/src/client/builder.rs b/vendor/h3-0.0.8-ferrum-patched/src/client/builder.rs
+index 5ae628d73..e000104d1 100644
+--- a/vendor/h3-0.0.8-ferrum-patched/src/client/builder.rs
++++ b/vendor/h3-0.0.8-ferrum-patched/src/client/builder.rs
+@@ -88,6 +88,31 @@ impl Builder {
+         self
+     }
+ 
++    /// Set the receive-side ceiling, in bytes, on the DECLARED payload length
++    /// of a non-`DATA` frame.
++    ///
++    /// Non-`DATA` frames — HEADERS, SETTINGS, GOAWAY, PUSH_PROMISE, and every
++    /// unknown type, which has to be buffered before it can be skipped — are
++    /// accumulated whole before they can be interpreted. Without a ceiling a
++    /// peer can declare a 2^62-1 payload and stream bytes until the process
++    /// runs out of memory; QUIC flow control bounds only the bytes in flight,
++    /// because every read re-grants credit.
++    ///
++    /// A frame declaring more than `value` is refused as a connection error of
++    /// type `H3_EXCESSIVE_LOAD` as soon as its type and length varints are
++    /// decoded, before any payload byte is buffered.
++    ///
++    /// `DATA` frames are streamed to the application and are deliberately NOT
++    /// bounded by this value; bound request bodies with an application-level
++    /// policy instead.
++    ///
++    /// Defaults to `FrameDecoder::UNBOUNDED_FRAME_LEN` (`u64::MAX`), which is
++    /// stock upstream behaviour: no receive-side bound.
++    pub fn max_buffered_frame_len(&mut self, value: u64) -> &mut Self {
++        self.config.max_buffered_frame_len = value;
++        self
++    }
++
+     /// Just like in HTTP/2, HTTP/3 also uses the concept of "grease"
+     /// to prevent potential interoperability issues in the future.
+     /// In HTTP/3, the concept of grease is used to ensure that the protocol can evolve
+@@ -131,6 +156,7 @@ impl Builder {
+             open,
+             conn_state,
+             max_field_section_size: self.config.settings.max_field_section_size,
++            max_buffered_frame_len: self.config.max_buffered_frame_len,
+             sender_count: Arc::new(AtomicUsize::new(1)),
+             send_grease_frame: self.config.send_grease,
+             _buf: PhantomData,
+diff --git a/vendor/h3-0.0.8-ferrum-patched/src/client/connection.rs b/vendor/h3-0.0.8-ferrum-patched/src/client/connection.rs
+index 4090d021b..874554b6d 100644
+--- a/vendor/h3-0.0.8-ferrum-patched/src/client/connection.rs
++++ b/vendor/h3-0.0.8-ferrum-patched/src/client/connection.rs
+@@ -114,6 +114,9 @@ where
+     pub(super) open: T,
+     pub(super) conn_state: Arc<SharedState>,
+     pub(super) max_field_section_size: u64, // maximum size for a header we receive
++    /// Receive-side ceiling on the declared payload length of a buffered
++    /// non-`DATA` frame on response streams opened through this sender.
++    pub(super) max_buffered_frame_len: u64,
+     // counts instances of SendRequest to close the connection when the last is dropped.
+     pub(super) sender_count: Arc<AtomicUsize>,
+     pub(super) _buf: PhantomData<fn(B)>,
+@@ -216,7 +219,10 @@ where
+ 
+         let request_stream = RequestStream {
+             inner: connection::RequestStream::new(
+-                FrameStream::new(BufRecvStream::new(stream)),
++                FrameStream::with_max_buffered_frame_len(
++                    BufRecvStream::new(stream),
++                    self.max_buffered_frame_len,
++                ),
+                 self.max_field_section_size,
+                 self.conn_state.clone(),
+                 self.send_grease_frame,
+@@ -241,6 +247,7 @@ where
+             conn_state: self.conn_state.clone(),
+             open: self.open.clone(),
+             max_field_section_size: self.max_field_section_size,
++            max_buffered_frame_len: self.max_buffered_frame_len,
+             sender_count: self.sender_count.clone(),
+             _buf: PhantomData,
+             send_grease_frame: self.send_grease_frame,
+diff --git a/vendor/h3-0.0.8-ferrum-patched/src/config.rs b/vendor/h3-0.0.8-ferrum-patched/src/config.rs
+index c2a6fe647..fb86947ec 100644
+--- a/vendor/h3-0.0.8-ferrum-patched/src/config.rs
++++ b/vendor/h3-0.0.8-ferrum-patched/src/config.rs
+@@ -17,6 +17,23 @@ pub struct Config {
+ 
+     /// HTTP/3 Settings
+     pub settings: Settings,
++
++    /// Receive-side ceiling, in bytes, on the DECLARED payload length of a
++    /// non-`DATA` frame on any stream of this connection.
++    ///
++    /// Non-`DATA` frames (HEADERS, SETTINGS, GOAWAY, PUSH_PROMISE, and every
++    /// unknown type, which must be skipped) are accumulated whole before they
++    /// can be interpreted, so an unbounded declared length is an unbounded
++    /// buffer. QUIC flow control does not bound it: reading re-grants credit.
++    /// A frame declaring more than this is refused as a connection error of
++    /// type `H3_EXCESSIVE_LOAD` before a single payload byte is stored.
++    ///
++    /// `DATA` frames are streamed to the caller and are deliberately NOT
++    /// bounded by this value.
++    ///
++    /// Defaults to [`crate::frame::FrameDecoder::UNBOUNDED_FRAME_LEN`], which
++    /// is stock upstream behaviour.
++    pub(crate) max_buffered_frame_len: u64,
+ }
+ 
+ /// HTTP/3 Settings
+@@ -78,6 +95,8 @@ impl TryFrom<Config> for frame::Settings {
+             send_grease,
+             #[cfg(test)]
+                 send_settings: _,
++            // Local receive policy, not a wire setting.
++            max_buffered_frame_len: _,
+             settings:
+                 Settings {
+                     max_field_section_size,
+@@ -174,6 +193,7 @@ impl Default for Config {
+             #[cfg(test)]
+             send_settings: true,
+             settings: Default::default(),
++            max_buffered_frame_len: crate::frame::FrameDecoder::UNBOUNDED_FRAME_LEN,
+         }
+     }
+ }
+diff --git a/vendor/h3-0.0.8-ferrum-patched/src/connection.rs b/vendor/h3-0.0.8-ferrum-patched/src/connection.rs
+index cfbee8375..b9442697a 100644
+--- a/vendor/h3-0.0.8-ferrum-patched/src/connection.rs
++++ b/vendor/h3-0.0.8-ferrum-patched/src/connection.rs
+@@ -406,9 +406,12 @@ where
+                 .poll_accept_recv(cx)
+                 .map_err(|e| self.handle_connection_error(e))?
+             {
+-                Poll::Ready(stream) => self
+-                    .pending_recv_streams
+-                    .push(Some(AcceptRecvStream::new(stream))),
++                // The same receive-side ceiling covers unidirectional
++                // streams: SETTINGS/GOAWAY on the peer control stream are
++                // decoded by a FrameStream too (issue #4261).
++                Poll::Ready(stream) => self.pending_recv_streams.push(Some(
++                    AcceptRecvStream::new(stream, self.config.max_buffered_frame_len),
++                )),
+                 Poll::Pending => break,
+             }
+         }
+diff --git a/vendor/h3-0.0.8-ferrum-patched/src/error/internal_error.rs b/vendor/h3-0.0.8-ferrum-patched/src/error/internal_error.rs
+index 419799393..c4b83c326 100644
+--- a/vendor/h3-0.0.8-ferrum-patched/src/error/internal_error.rs
++++ b/vendor/h3-0.0.8-ferrum-patched/src/error/internal_error.rs
+@@ -57,6 +57,21 @@ impl InternalConnectionError {
+             //# after the identified fields or a frame payload that terminates before
+             //# the end of the identified fields MUST be treated as a connection
+             //# error of type H3_FRAME_ERROR.
++            //= https://www.rfc-editor.org/rfc/rfc9114#section-8.1
++            //# H3_EXCESSIVE_LOAD (0x0107):  The endpoint detected that its peer is
++            //#    exhibiting a behavior that might be generating excessive load.
++            //
++            // A non-DATA frame is accumulated whole before it can be decoded,
++            // so a declared length above the receive-side ceiling is a
++            // resource-exhaustion attempt, not a malformed frame. It is
++            // refused on the declared length, before any payload is buffered.
++            FrameProtocolError::ExceedsMaxBufferedFrameLen { ty, len, max } => InternalConnectionError {
++                code: Code::H3_EXCESSIVE_LOAD,
++                message: format!(
++                    "frame 0x{:x} declared a payload of {} bytes, above the receive limit of {}",
++                    ty, len, max
++                ),
++            },
+             FrameProtocolError::InvalidFrameValue | FrameProtocolError::Malformed => InternalConnectionError {
+                 code: Code::H3_FRAME_ERROR,
+                 message: "frame payload that contains additional bytes after the identified fields or a frame payload that terminates before the end of the identified fields".to_string(),
+diff --git a/vendor/h3-0.0.8-ferrum-patched/src/frame.rs b/vendor/h3-0.0.8-ferrum-patched/src/frame.rs
+index e859b4023..9173117fd 100644
+--- a/vendor/h3-0.0.8-ferrum-patched/src/frame.rs
++++ b/vendor/h3-0.0.8-ferrum-patched/src/frame.rs
+@@ -30,9 +30,20 @@ pub struct FrameStream<S, B> {
+ 
+ impl<S, B> FrameStream<S, B> {
+     pub fn new(stream: BufRecvStream<S, B>) -> Self {
++        Self::with_max_buffered_frame_len(stream, FrameDecoder::UNBOUNDED_FRAME_LEN)
++    }
++
++    /// Build a [`FrameStream`] whose decoder refuses any non-`DATA` frame that
++    /// declares more than `max_buffered_frame_len` payload bytes.
++    ///
++    /// [`FrameDecoder::UNBOUNDED_FRAME_LEN`] reproduces [`FrameStream::new`].
++    pub fn with_max_buffered_frame_len(
++        stream: BufRecvStream<S, B>,
++        max_buffered_frame_len: u64,
++    ) -> Self {
+         Self {
+             stream,
+-            decoder: FrameDecoder::default(),
++            decoder: FrameDecoder::with_max_buffered_frame_len(max_buffered_frame_len),
+             remaining_data: 0,
+         }
+     }
+@@ -224,10 +235,11 @@ where
+ {
+     pub(crate) fn split(self) -> (FrameStream<S::SendStream, B>, FrameStream<S::RecvStream, B>) {
+         let (send, recv) = self.stream.split();
++        let max_buffered_frame_len = self.decoder.max_buffered_frame_len;
+         (
+             FrameStream {
+                 stream: send,
+-                decoder: FrameDecoder::default(),
++                decoder: FrameDecoder::with_max_buffered_frame_len(max_buffered_frame_len),
+                 remaining_data: 0,
+             },
+             FrameStream {
+@@ -239,12 +251,39 @@ where
+     }
+ }
+ 
+-#[derive(Default)]
+ pub struct FrameDecoder {
+     expected: Option<usize>,
++    /// Receive-side ceiling on the DECLARED payload length of a non-`DATA`
++    /// frame, which this decoder has to accumulate whole before it can be
++    /// interpreted. Without it a peer can declare a 2^62-1 length and stream
++    /// bytes into `BufList` forever: QUIC flow control caps bytes IN FLIGHT,
++    /// and every poll here consumes from the stream and re-grants credit.
++    ///
++    /// Defaults to [`FrameDecoder::UNBOUNDED_FRAME_LEN`], which is stock
++    /// upstream behaviour, so the bound only applies to callers that opt in.
++    max_buffered_frame_len: u64,
++}
++
++impl Default for FrameDecoder {
++    fn default() -> Self {
++        Self::with_max_buffered_frame_len(Self::UNBOUNDED_FRAME_LEN)
++    }
+ }
+ 
+ impl FrameDecoder {
++    /// The ceiling value that applies no receive-side bound beyond what the
++    /// platform can address.
++    pub const UNBOUNDED_FRAME_LEN: u64 = u64::MAX;
++
++    /// Build a decoder that refuses any non-`DATA` frame declaring more than
++    /// `max_buffered_frame_len` payload bytes.
++    pub fn with_max_buffered_frame_len(max_buffered_frame_len: u64) -> Self {
++        Self {
++            expected: None,
++            max_buffered_frame_len,
++        }
++    }
++
+     fn decode<B: Buf>(
+         &mut self,
+         src: &mut BufList<B>,
+@@ -264,7 +303,7 @@ impl FrameDecoder {
+ 
+             let (pos, decoded) = {
+                 let mut cur = src.cursor();
+-                let decoded = Frame::decode(&mut cur);
++                let decoded = Frame::decode_bounded(&mut cur, self.max_buffered_frame_len);
+                 (cur.position(), decoded)
+             };
+ 
+@@ -316,6 +355,14 @@ impl FrameDecoder {
+                 Err(frame::FrameError::Malformed) => {
+                     return Err(FrameStreamError::Proto(FrameProtocolError::Malformed));
+                 }
++                // Refused on the DECLARED length: `src` is left untouched and
++                // `self.expected` is never set, so not one payload byte of the
++                // offending frame is retained.
++                Err(frame::FrameError::ExceedsMaxBufferedLen { ty, len, max }) => {
++                    return Err(FrameStreamError::Proto(
++                        FrameProtocolError::ExceedsMaxBufferedFrameLen { ty, len, max },
++                    ));
++                }
+             }
+         }
+     }
+@@ -338,6 +385,16 @@ pub enum FrameProtocolError {
+     Settings(SettingsError),
+     InvalidStreamId(InvalidStreamId),
+     InvalidPushId(InvalidPushId),
++    /// A non-`DATA` frame declared more payload than the receive-side ceiling
++    /// permits this decoder to buffer, or more than the platform can address.
++    ExceedsMaxBufferedFrameLen {
++        /// The frame type varint as received.
++        ty: u64,
++        /// The declared payload length as received.
++        len: u64,
++        /// The ceiling that was applied.
++        max: u64,
++    },
+ }
+ 
+ #[cfg(test)]
+@@ -423,6 +480,162 @@ mod tests {
+         assert_matches!(decoder.decode(&mut buf), Ok(None));
+     }
+ 
++    // ---------------------------------------------------------------
++    // Receive-side buffered non-DATA frame ceiling (Ferrum patch 005)
++    // ---------------------------------------------------------------
++
++    /// Largest length a QUIC variable-length integer can carry.
++    const QUIC_VARINT_MAX: u64 = (1 << 62) - 1;
++
++    const FRAME_TYPE_DATA: u64 = 0x00;
++    const FRAME_TYPE_HEADERS: u64 = 0x01;
++    const FRAME_TYPE_SETTINGS: u64 = 0x04;
++    /// A reserved "grease" type: unknown to h3, so the decoder's skip arm.
++    const FRAME_TYPE_UNKNOWN: u64 = 0x21;
++
++    /// Encode only a frame header: the type varint followed by a DECLARED
++    /// payload length. No payload byte follows, which is exactly the attacker
++    /// shape — declare an enormous frame, then stream bytes forever.
++    fn declared_frame_header(ty: u64, len: u64) -> BytesMut {
++        use crate::proto::varint::BufMutExt;
++
++        let mut buf = BytesMut::with_capacity(32);
++        buf.write_var(ty);
++        buf.write_var(len);
++        buf
++    }
++
++    /// A HEADERS frame whose DECLARED length is above the ceiling must be
++    /// refused the moment its length varint is decoded: no payload byte is
++    /// buffered, the source buffer is left untouched, and no accumulation
++    /// target is armed.
++    #[test]
++    fn oversized_declared_headers_frame_is_refused_without_buffering() {
++        let header = declared_frame_header(FRAME_TYPE_HEADERS, QUIC_VARINT_MAX);
++        let header_len = header.len();
++        let mut buf = BufList::from(header);
++
++        let mut decoder = FrameDecoder::with_max_buffered_frame_len(16 * 1024);
++
++        assert_matches!(
++            decoder.decode(&mut buf),
++            Err(FrameStreamError::Proto(
++                FrameProtocolError::ExceedsMaxBufferedFrameLen {
++                    ty: FRAME_TYPE_HEADERS,
++                    len: QUIC_VARINT_MAX,
++                    max: 16_384,
++                }
++            ))
++        );
++        // Nothing was consumed and, crucially, nothing was retained: the
++        // decoder did not arm `expected`, so `FrameStream` will not keep
++        // pulling QUIC chunks into its `BufList` waiting for the payload.
++        assert_eq!(buf.remaining(), header_len);
++        assert_eq!(decoder.expected, None);
++    }
++
++    /// Same refusal on the peer control stream, where SETTINGS and GOAWAY are
++    /// decoded by an identically bounded `FrameDecoder`.
++    #[test]
++    fn oversized_declared_settings_frame_is_refused_without_buffering() {
++        let mut buf = BufList::from(declared_frame_header(FRAME_TYPE_SETTINGS, 1 << 40));
++
++        let mut decoder = FrameDecoder::with_max_buffered_frame_len(4096);
++
++        assert_matches!(
++            decoder.decode(&mut buf),
++            Err(FrameStreamError::Proto(
++                FrameProtocolError::ExceedsMaxBufferedFrameLen { .. }
++            ))
++        );
++        assert_eq!(decoder.expected, None);
++    }
++
++    /// The unknown-frame skip arm is reached only AFTER the whole payload is
++    /// buffered, so an oversized unknown frame must be refused too rather than
++    /// accumulated merely to be discarded.
++    #[test]
++    fn oversized_declared_unknown_frame_is_refused_rather_than_buffered_to_skip() {
++        let mut buf = BufList::from(declared_frame_header(FRAME_TYPE_UNKNOWN, QUIC_VARINT_MAX));
++
++        let mut decoder = FrameDecoder::with_max_buffered_frame_len(64 * 1024);
++
++        assert_matches!(
++            decoder.decode(&mut buf),
++            Err(FrameStreamError::Proto(
++                FrameProtocolError::ExceedsMaxBufferedFrameLen {
++                    ty: FRAME_TYPE_UNKNOWN,
++                    ..
++                }
++            ))
++        );
++        assert_eq!(decoder.expected, None);
++    }
++
++    /// A declared length exactly AT the ceiling is legal and still decodes.
++    #[test]
++    fn headers_frame_at_the_max_buffered_frame_len_is_accepted() {
++        const CAP: usize = 1024;
++
++        let mut buf = BytesMut::with_capacity(CAP + 16);
++        Frame::headers(vec![0x2a_u8; CAP]).encode_with_payload(&mut buf);
++        let mut buf = BufList::from(buf);
++
++        let mut decoder = FrameDecoder::with_max_buffered_frame_len(CAP as u64);
++
++        assert_matches!(
++            decoder.decode(&mut buf),
++            Ok(Some(Frame::Headers(payload))) if payload.len() == CAP
++        );
++    }
++
++    /// One byte over the ceiling is refused, so the bound is exact.
++    #[test]
++    fn headers_frame_one_byte_over_the_max_buffered_frame_len_is_refused() {
++        const CAP: usize = 1024;
++
++        let mut buf = BytesMut::with_capacity(CAP + 16);
++        Frame::headers(vec![0x2a_u8; CAP + 1]).encode_with_payload(&mut buf);
++        let mut buf = BufList::from(buf);
++
++        let mut decoder = FrameDecoder::with_max_buffered_frame_len(CAP as u64);
++
++        assert_matches!(
++            decoder.decode(&mut buf),
++            Err(FrameStreamError::Proto(
++                FrameProtocolError::ExceedsMaxBufferedFrameLen { .. }
++            ))
++        );
++    }
++
++    /// DATA payloads are streamed to the caller, never accumulated by the
++    /// decoder, so a request body far larger than the header ceiling must keep
++    /// flowing. Bounding it here would break every large upload.
++    #[test]
++    fn data_frame_length_is_not_bounded_by_max_buffered_frame_len() {
++        let declared: u64 = 64 * 1024 * 1024;
++        let mut buf = BufList::from(declared_frame_header(FRAME_TYPE_DATA, declared));
++
++        let mut decoder = FrameDecoder::with_max_buffered_frame_len(16 * 1024);
++
++        assert_matches!(
++            decoder.decode(&mut buf),
++            Ok(Some(Frame::Data(PayloadLen(len)))) if len as u64 == declared
++        );
++    }
++
++    /// The bound is opt-in: a default decoder reproduces stock upstream
++    /// behaviour, parking on the declared length instead of erroring.
++    #[test]
++    fn default_frame_decoder_keeps_unbounded_upstream_behaviour() {
++        let mut buf = BufList::from(declared_frame_header(FRAME_TYPE_HEADERS, 1 << 40));
++
++        let mut decoder = FrameDecoder::default();
++
++        assert_matches!(decoder.decode(&mut buf), Ok(None));
++        assert!(decoder.expected.is_some());
++    }
++
+     // FrameStream
+ 
+     macro_rules! assert_poll_matches {
+@@ -440,6 +653,27 @@ mod tests {
+         }
+     }
+ 
++    /// End-to-end through `FrameStream`: the refusal surfaces on `poll_next`
++    /// and the payload bytes the peer streamed afterwards are never merged
++    /// into an accumulation buffer.
++    #[tokio::test]
++    async fn frame_stream_refuses_oversized_declared_frame_before_accumulating() {
++        let mut recv = FakeRecv::default();
++        recv.chunk(declared_frame_header(FRAME_TYPE_HEADERS, QUIC_VARINT_MAX).freeze());
++        // The attacker keeps writing payload for the frame it declared.
++        recv.chunk(Bytes::from(vec![0x5a_u8; 4096]));
++
++        let mut stream: FrameStream<_, ()> =
++            FrameStream::with_max_buffered_frame_len(BufRecvStream::new(recv), 16 * 1024);
++
++        assert_poll_matches!(
++            |cx| stream.poll_next(cx),
++            Err(FrameStreamError::Proto(
++                FrameProtocolError::ExceedsMaxBufferedFrameLen { .. }
++            ))
++        );
++    }
++
+     #[tokio::test]
+     async fn poll_full_request() {
+         let mut recv = FakeRecv::default();
+diff --git a/vendor/h3-0.0.8-ferrum-patched/src/proto/frame.rs b/vendor/h3-0.0.8-ferrum-patched/src/proto/frame.rs
+index a09520bb5..ecd2730c1 100644
+--- a/vendor/h3-0.0.8-ferrum-patched/src/proto/frame.rs
++++ b/vendor/h3-0.0.8-ferrum-patched/src/proto/frame.rs
+@@ -22,6 +22,20 @@ pub enum FrameError {
+     UnknownFrame(u64),     // Unknown frames that should be ignored
+     InvalidFrameValue,
+     Incomplete(usize),
++    /// A frame declared a payload length that must not be buffered.
++    ///
++    /// Raised as soon as the frame type and length varint are decoded, before
++    /// any payload byte is stored, for a non-`DATA` frame whose DECLARED
++    /// length exceeds the receive-side ceiling, and for any frame whose
++    /// declared length this platform cannot address.
++    ExceedsMaxBufferedLen {
++        /// The frame type varint as received.
++        ty: u64,
++        /// The declared payload length as received.
++        len: u64,
++        /// The ceiling that was applied.
++        max: u64,
++    },
+     Settings(SettingsError),
+     InvalidStreamId(InvalidStreamId),
+     InvalidPushId(InvalidPushId),
+@@ -37,6 +51,11 @@ impl fmt::Display for FrameError {
+             FrameError::UnknownFrame(c) => write!(f, "frame 0x{:x} ignored", c),
+             FrameError::InvalidFrameValue => write!(f, "frame value is invalid"),
+             FrameError::Incomplete(x) => write!(f, "internal error: frame incomplete {}", x),
++            FrameError::ExceedsMaxBufferedLen { ty, len, max } => write!(
++                f,
++                "frame 0x{:x} declared a payload of {} bytes, above the receive limit of {}",
++                ty, len, max
++            ),
+             FrameError::Settings(x) => write!(f, "invalid settings: {}", x),
+             FrameError::InvalidStreamId(x) => write!(f, "{}", x),
+             FrameError::InvalidPushId(x) => write!(f, "{}", x),
+@@ -79,7 +98,33 @@ impl Frame<PayloadLen> {
+     pub const MAX_ENCODED_SIZE: usize = VarInt::MAX_SIZE * 7;
+ 
+     /// Decodes a Frame from the stream according to <https://www.rfc-editor.org/rfc/rfc9114#section-7.1>
++    ///
++    /// Equivalent to [`Frame::decode_bounded`] with no receive-side ceiling on
++    /// the declared payload length of a buffered non-`DATA` frame, which is
++    /// stock upstream behaviour.
+     pub fn decode<T: Buf>(buf: &mut T) -> Result<Self, FrameError> {
++        Self::decode_bounded(buf, u64::MAX)
++    }
++
++    /// Decodes a Frame, refusing a non-`DATA` frame whose DECLARED payload
++    /// length exceeds `max_buffered_frame_len`.
++    ///
++    /// Every frame type other than `DATA` (and the length-less WebTransport
++    /// bidirectional stream header) has to be accumulated whole before it can
++    /// be interpreted, including the unknown-frame skip arm below. So the
++    /// declared length is refused here — after the type and length varints are
++    /// decoded and before a single payload byte is stored or a caller can park
++    /// on an accumulation target. `DATA` payloads are handed to the caller as
++    /// a streaming length and are deliberately NOT bounded by this ceiling.
++    ///
++    /// The comparison is made on the raw `u64` QUIC varint before any `usize`
++    /// conversion, so a declared length that would truncate on a 32-bit target
++    /// cannot present itself as a short frame. A length this platform cannot
++    /// address is refused the same way, whatever the configured ceiling.
++    pub fn decode_bounded<T: Buf>(
++        buf: &mut T,
++        max_buffered_frame_len: u64,
++    ) -> Result<Self, FrameError> {
+         let remaining = buf.remaining();
+         let ty = FrameType::decode(buf).map_err(|_| FrameError::Incomplete(remaining + 1))?;
+ 
+@@ -97,21 +142,43 @@ impl Frame<PayloadLen> {
+             .get_var()
+             .map_err(|_| FrameError::Incomplete(remaining + 1))?;
+ 
++        // Widest declared length this platform can even represent as a byte
++        // count. On every supported target `usize` is 64 bits or narrower, so
++        // this is a real bound on 32-bit and a no-op on 64-bit.
++        let addressable_max = usize::MAX as u64;
++
+         if ty == FrameType::DATA {
++            if len > addressable_max {
++                return Err(FrameError::ExceedsMaxBufferedLen {
++                    ty: ty.0,
++                    len,
++                    max: addressable_max,
++                });
++            }
+             return Ok(Frame::Data((len as usize).into()));
+         }
+ 
+-        if buf.remaining() < len as usize {
+-            return Err(FrameError::Incomplete(2 + len as usize));
++        let max = max_buffered_frame_len.min(addressable_max);
++        if len > max {
++            return Err(FrameError::ExceedsMaxBufferedLen { ty: ty.0, len, max });
++        }
++        // `len <= max <= usize::MAX`, so this conversion cannot truncate.
++        let len = len as usize;
++
++        if buf.remaining() < len {
++            // `+ 2` is the smallest possible type/length header. Saturating
++            // keeps the accumulation target from wrapping to a tiny value for
++            // a length near the platform maximum.
++            return Err(FrameError::Incomplete(len.saturating_add(2)));
+         }
+ 
+-        let mut payload = buf.take(len as usize);
++        let mut payload = buf.take(len);
+ 
+         #[cfg(feature = "tracing")]
+         trace!("frame ty: {:?}", ty);
+ 
+         let frame = match ty {
+-            FrameType::HEADERS => Ok(Frame::Headers(payload.copy_to_bytes(len as usize))),
++            FrameType::HEADERS => Ok(Frame::Headers(payload.copy_to_bytes(len))),
+             FrameType::SETTINGS => Ok(Frame::Settings(Settings::decode(&mut payload)?)),
+             FrameType::CANCEL_PUSH => Ok(Frame::CancelPush(payload.get_var()?.try_into()?)),
+             FrameType::PUSH_PROMISE => Ok(Frame::PushPromise(PushPromise::decode(&mut payload)?)),
+@@ -127,7 +194,7 @@ impl Frame<PayloadLen> {
+             | FrameType::H2_CONTINUATION => Err(FrameError::UnsupportedFrame(ty.0)),
+             FrameType::WEBTRANSPORT_BI_STREAM | FrameType::DATA => unreachable!(),
+             _ => {
+-                buf.advance(len as usize);
++                buf.advance(len);
+                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
+                 //# Endpoints MUST
+                 //# NOT consider these frames to have any meaning upon receipt.
+diff --git a/vendor/h3-0.0.8-ferrum-patched/src/server/builder.rs b/vendor/h3-0.0.8-ferrum-patched/src/server/builder.rs
+index 08be4f472..57743e9fa 100644
+--- a/vendor/h3-0.0.8-ferrum-patched/src/server/builder.rs
++++ b/vendor/h3-0.0.8-ferrum-patched/src/server/builder.rs
+@@ -76,6 +76,31 @@ impl Builder {
+         self
+     }
+ 
++    /// Set the receive-side ceiling, in bytes, on the DECLARED payload length
++    /// of a non-`DATA` frame.
++    ///
++    /// Non-`DATA` frames — HEADERS, SETTINGS, GOAWAY, PUSH_PROMISE, and every
++    /// unknown type, which has to be buffered before it can be skipped — are
++    /// accumulated whole before they can be interpreted. Without a ceiling a
++    /// peer can declare a 2^62-1 payload and stream bytes until the process
++    /// runs out of memory; QUIC flow control bounds only the bytes in flight,
++    /// because every read re-grants credit.
++    ///
++    /// A frame declaring more than `value` is refused as a connection error of
++    /// type `H3_EXCESSIVE_LOAD` as soon as its type and length varints are
++    /// decoded, before any payload byte is buffered.
++    ///
++    /// `DATA` frames are streamed to the application and are deliberately NOT
++    /// bounded by this value; bound request bodies with an application-level
++    /// policy instead.
++    ///
++    /// Defaults to `FrameDecoder::UNBOUNDED_FRAME_LEN` (`u64::MAX`), which is
++    /// stock upstream behaviour: no receive-side bound.
++    pub fn max_buffered_frame_len(&mut self, value: u64) -> &mut Self {
++        self.config.max_buffered_frame_len = value;
++        self
++    }
++
+     /// Send grease values to the Client.
+     /// See [setting](https://www.rfc-editor.org/rfc/rfc9114.html#settings-parameters), [frame](https://www.rfc-editor.org/rfc/rfc9114.html#frame-reserved) and [stream](https://www.rfc-editor.org/rfc/rfc9114.html#stream-grease) for more information.
+     #[inline]
+diff --git a/vendor/h3-0.0.8-ferrum-patched/src/server/connection.rs b/vendor/h3-0.0.8-ferrum-patched/src/server/connection.rs
+index a9ba582a6..85022931b 100644
+--- a/vendor/h3-0.0.8-ferrum-patched/src/server/connection.rs
++++ b/vendor/h3-0.0.8-ferrum-patched/src/server/connection.rs
+@@ -123,7 +123,14 @@ where
+     pub async fn accept(&mut self) -> Result<Option<RequestResolver<C, B>>, ConnectionError> {
+         // Accept the incoming stream
+         let stream = match poll_fn(|cx| self.poll_accept_request_stream_internal(cx)).await? {
+-            Some(s) => FrameStream::new(BufRecvStream::new(s)),
++            // Issue #4261: every request stream decodes under the connection's
++            // receive-side non-DATA frame ceiling, so a declared HEADERS or
++            // unknown-frame length above it is refused before any payload is
++            // buffered.
++            Some(s) => FrameStream::with_max_buffered_frame_len(
++                BufRecvStream::new(s),
++                self.inner.config.max_buffered_frame_len,
++            ),
+             None => {
+                 // We always send a last GoAway frame to the client, so it knows which was the last
+                 // non-rejected request.
+diff --git a/vendor/h3-0.0.8-ferrum-patched/src/stream.rs b/vendor/h3-0.0.8-ferrum-patched/src/stream.rs
+index 09d1ccfae..5123f58de 100644
+--- a/vendor/h3-0.0.8-ferrum-patched/src/stream.rs
++++ b/vendor/h3-0.0.8-ferrum-patched/src/stream.rs
+@@ -270,6 +270,9 @@ pub(super) struct AcceptRecvStream<S, B> {
+     /// push_id or session_id
+     id: Option<VarInt>,
+     expected: Option<usize>,
++    /// Receive-side ceiling handed to the [`FrameStream`] this stream resolves
++    /// into, for the stream types that are frame-decoded (control and push).
++    max_buffered_frame_len: u64,
+ }
+ 
+ impl<S, B> AcceptRecvStream<S, B>
+@@ -277,19 +280,24 @@ where
+     S: RecvStream,
+     B: Buf,
+ {
+-    pub fn new(stream: S) -> Self {
++    pub fn new(stream: S, max_buffered_frame_len: u64) -> Self {
+         Self {
+             stream: BufRecvStream::new(stream),
+             ty: None,
+             id: None,
+             expected: None,
++            max_buffered_frame_len,
+         }
+     }
+ 
+     pub fn into_stream(self) -> AcceptedRecvStream<S, B> {
+         match self.ty.expect("Stream type not resolved yet") {
+-            StreamType::CONTROL => AcceptedRecvStream::Control(FrameStream::new(self.stream)),
+-            StreamType::PUSH => AcceptedRecvStream::Push(FrameStream::new(self.stream)),
++            StreamType::CONTROL => AcceptedRecvStream::Control(
++                FrameStream::with_max_buffered_frame_len(self.stream, self.max_buffered_frame_len),
++            ),
++            StreamType::PUSH => AcceptedRecvStream::Push(
++                FrameStream::with_max_buffered_frame_len(self.stream, self.max_buffered_frame_len),
++            ),
+             StreamType::ENCODER => AcceptedRecvStream::Encoder(self.stream),
+             StreamType::DECODER => AcceptedRecvStream::Decoder(self.stream),
+             StreamType::WEBTRANSPORT_UNI => AcceptedRecvStream::WebTransportUni(

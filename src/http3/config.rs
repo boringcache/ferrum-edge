@@ -59,6 +59,88 @@ pub const QUIC_INITIAL_MTU_MIN: u16 = 1200;
 /// after accounting for UDP/IP headers).
 pub const QUIC_INITIAL_MTU_MAX: u16 = 65527;
 
+/// Floor applied to the H3 receive-side field-section policy (issue #4261).
+///
+/// `FERRUM_MAX_HEADER_SIZE_BYTES` is a logical header-bytes limit that an
+/// operator may set very low. The advertised `SETTINGS_MAX_FIELD_SECTION_SIZE`
+/// and the buffered-frame ceiling derived from it also have to leave room for
+/// the peer's SETTINGS and GOAWAY frames on the control stream, so both are
+/// floored here. Ferrum's own 431 check still enforces the configured value
+/// exactly; this floor only decides when the connection is torn down instead.
+pub const H3_MIN_FIELD_SECTION_SIZE: usize = 16 * 1024;
+
+/// Multiplier from the advertised field-section policy to the receive-side
+/// buffered non-`DATA` frame ceiling.
+///
+/// The ceiling has to sit ABOVE the advertised policy: a field section that
+/// merely overshoots the operator's limit should still be QPACK-decoded and
+/// answered with the graceful `431` in `src/http3/server.rs`, not met with a
+/// connection-level abort. A QPACK-encoded HEADERS payload is smaller than the
+/// RFC 9114 field-section accounting of the same headers (which adds 32 bytes
+/// per field), so 2x leaves the 431 path reachable for any realistic overshoot
+/// while still bounding what one stream can buffer.
+const H3_BUFFERED_FRAME_LEN_HEADROOM: u64 = 2;
+
+/// The `SETTINGS_MAX_FIELD_SECTION_SIZE` the HTTP/3 frontend advertises, in
+/// bytes, derived from `FERRUM_MAX_HEADER_SIZE_BYTES` (issue #4261).
+///
+/// Mirrors what the H1 and H2 frontends already do with the same policy value
+/// (`http1_parser_max_buf_size` / `h2_parser_max_header_list_size`). Before
+/// this, H3 advertised `VarInt::MAX` while enforcing the configured limit only
+/// after a complete QPACK decode.
+///
+/// Clamped into the QUIC varint range: the value travels the wire as a varint,
+/// so an unrepresentable one could not be advertised at all. Clamping only ever
+/// NARROWS, never widens; [`validate_h3_field_section_limits`] refuses a
+/// configuration where that clamp would silently change the operator's policy.
+pub fn h3_max_field_section_size(max_header_size_bytes: usize) -> u64 {
+    let floored = max_header_size_bytes.max(H3_MIN_FIELD_SECTION_SIZE);
+    u64::try_from(floored)
+        .unwrap_or(QUIC_VARINT_MAX_U64)
+        .min(QUIC_VARINT_MAX_U64)
+}
+
+/// The receive-side ceiling, in bytes, on the DECLARED payload length of a
+/// buffered non-`DATA` HTTP/3 frame (issue #4261).
+///
+/// Handed to the vendored h3 `server::builder().max_buffered_frame_len(...)`.
+/// A HEADERS, SETTINGS, GOAWAY, PUSH_PROMISE, or unknown frame declaring more
+/// than this is refused with `H3_EXCESSIVE_LOAD` as soon as its length varint
+/// is decoded, before any payload byte is buffered. `DATA` frames are never
+/// bounded by it — request bodies stream and keep their existing body policy.
+pub fn h3_max_buffered_frame_len(max_header_size_bytes: usize) -> u64 {
+    h3_max_field_section_size(max_header_size_bytes)
+        .saturating_mul(H3_BUFFERED_FRAME_LEN_HEADROOM)
+        .min(QUIC_VARINT_MAX_U64)
+}
+
+/// Refuse a `FERRUM_MAX_HEADER_SIZE_BYTES` the HTTP/3 frontend could not
+/// enforce as configured (issue #4261).
+///
+/// Both derived values are QUIC varints. A configured header limit above the
+/// varint range would be silently clamped, so the advertised SETTINGS and the
+/// buffered-frame ceiling would no longer be the operator's policy. That is a
+/// configuration error, not something to absorb: the H1 and H2 frontends would
+/// still enforce the configured value and the three frontends would disagree.
+pub fn validate_h3_field_section_limits(max_header_size_bytes: usize) -> Result<(), String> {
+    // The ceiling is the widest derived value, so bounding it bounds both.
+    let representable = u64::try_from(max_header_size_bytes.max(H3_MIN_FIELD_SECTION_SIZE))
+        .ok()
+        .and_then(|floored| floored.checked_mul(H3_BUFFERED_FRAME_LEN_HEADROOM))
+        .is_some_and(|ceiling| ceiling <= QUIC_VARINT_MAX_U64);
+    if !representable {
+        return Err(format!(
+            "FERRUM_MAX_HEADER_SIZE_BYTES ({}) is too large for the HTTP/3 frontend: the \
+             advertised SETTINGS_MAX_FIELD_SECTION_SIZE and the receive-side buffered-frame \
+             ceiling derived from it must both fit in a QUIC variable-length integer (at most \
+             {}).",
+            max_header_size_bytes,
+            QUIC_VARINT_MAX_U64 / H3_BUFFERED_FRAME_LEN_HEADROOM
+        ));
+    }
+    Ok(())
+}
+
 /// Return true when an H3 response DATA chunk is already large enough to send
 /// directly instead of copying it into the coalescing buffer first.
 pub(crate) fn should_direct_send_response_chunk(
