@@ -1379,7 +1379,11 @@ linkage is the platform-specific failure mode `cargo check` cannot see);
 macOS x86_64 and macOS ARM64 run `cargo check --profile pr-build` because
 queue binaries are never published. Pushes to `main` build optimized
 `release` binaries for Linux x86_64, Linux ARM64, macOS x86_64, macOS ARM64,
-and Windows x86_64. Native targets share the ordinary matrix; Linux ARM64
+and Windows x86_64. Linux x86_64 GNU artifacts on that path are built in the
+same digest-pinned AlmaLinux 8.10 sysroot as versioned releases, then
+ABI-scanned against GLIBC_2.34 (`libgcc_s.so.1` / `libz.so.1` allowlist)
+before checksum upload so the moving `latest` prerelease cannot regain a
+`ubuntu-latest` glibc ceiling. Native targets share the ordinary matrix; Linux ARM64
 runs only after code reaches `main`, in the isolated `build-arm64-cross` job
 described below. rust-cache keys are split by profile lane
 (`build-<target>-prbuild` vs `build-<target>-release`) so queue check/pr-build
@@ -2696,13 +2700,19 @@ Depends on `Validate release SHA`, then builds optimized release binaries for al
 **Build Process**:
 1. Checkout code at tag commit
 2. Install Rust toolchain with target
-3. Install protobuf compiler plus platform prerequisites (Linux `libcurl4-openssl-dev`, Windows NASM)
-4. Build release binary in `--release` mode with `--features cloud-secrets`
+3. Linux x86_64 GNU: build inside a digest-pinned AlmaLinux 8.10 sysroot (glibc 2.28) with `LIBZ_SYS_STATIC=1` and a checksum-pinned `protoc`, then fail-closed ABI-scan both `ferrum-edge` and `ferrum-cni` before checksums or artifact upload. The declared runtime floor is GLIBC_2.34; `libgcc_s.so.1` and `libz.so.1` are the only non-glibc dynamic libraries the gate allows.
+4. Other native targets: install protobuf compiler plus platform prerequisites (Windows NASM) and `cargo build --release --features cloud-secrets` on the runner
 5. Generate SHA256 checksum
 6. Upload artifact
 
+**GNU ABI gate** (`verify-linux-gnu-abi`, required on the versioned release path):
+- Downloads the trusted `release-binaries-*` artifacts for both GNU architectures (`ubuntu-latest` for x86_64, `ubuntu-24.04-arm` for ARM64)
+- Re-checks SHA-256 sidecars, rejects GLIBC symbols above 2.34, and rejects unexpected `DT_NEEDED` entries
+- Smokes both binaries and their operator commands (`ferrum-edge version --json` / `validate` / `run` + `health`; `ferrum-cni VERSION` / `install` / `uninstall` / ADD / CHECK / DEL) on digest-pinned AlmaLinux 9.4 (the GLIBC_2.34 floor) and Ubuntu 22.04
+- `linux-gnu-abi-release-gate` joins `create-release` with this job (`if: always()`). Trusted Cross freezes `create-release.needs`, so ABI cannot be added there; the join gate deletes the GitHub Release if the ABI job did not succeed. Checksums, Cosign signatures, and container publish jobs are unchanged.
+
 **Cross-Compilation**:
-- Linux ARM64 uses checksum-verified `cross` 0.2.5 in the isolated protected invocation job; `cross` requires Docker on the build host.
+- Linux ARM64 uses checksum-verified `cross` 0.2.5 in the isolated protected invocation job; `cross` requires Docker on the build host. Those artifacts already target an older glibc than GLIBC_2.34 and still pass through the ABI/smoke job above.
 - Other targets use standard `cargo build`; macOS x86_64 builds on the `macos-latest` runner (currently ARM64) with the standard Apple/Rust target tooling — pin to a concrete runner image such as `macos-14` if the host architecture must be guaranteed.
 
 **Output**:
@@ -2719,7 +2729,11 @@ Docker manifests have been pushed. Durable release publication still fails
 closed on attestation: `release-attestation-gate` requires
 `attest-release-images` to succeed and deletes the GitHub Release if
 attestation verification fails. Trusted Cross freezes `create-release.needs`,
-so attestation cannot be added there directly.
+so attestation cannot be added there directly. The Linux GNU ABI contract is
+enforced the same way: `linux-gnu-abi-release-gate` requires
+`verify-linux-gnu-abi` to succeed (GLIBC_2.34 floor, AlmaLinux 8.10 sysroot,
+`libgcc_s.so.1` / `libz.so.1` allowlist) and deletes the GitHub Release if
+that job did not succeed.
 
 **Release Content**:
 1. Release title: Version tag (e.g., `v0.2.0`)

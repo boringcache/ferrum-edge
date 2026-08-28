@@ -25,6 +25,8 @@ sudo install -m 0755 ferrum-edge-linux-x86_64 /usr/local/bin/ferrum-edge
 ferrum-edge version
 ```
 
+Published Linux GNU artifacts (`ferrum-edge-linux-x86_64`, `ferrum-cni-linux-x86_64`, and the ARM64 pair) are dynamically linked against glibc. The declared runtime floor is **GLIBC_2.34** (RHEL 9 / Rocky Linux 9 / AlmaLinux 9, which also covers Ubuntu 22.04 and Debian 12). x86_64 GNU binaries are built in a digest-pinned **AlmaLinux 8.10** sysroot so that floor cannot track `ubuntu-latest`. Beyond glibc, the remaining dynamic libraries are `libgcc_s.so.1` and, when the Kafka stack does not static-link zlib, `libz.so.1`.
+
 Alternative approaches:
 - **Symlink**: `sudo ln -s /path/to/ferrum-edge /usr/local/bin/ferrum-edge`
 - **Add to PATH**: `export PATH="/path/to/dir:$PATH"` (in `~/.bashrc` or `~/.zshrc`)
