@@ -1639,3 +1639,59 @@ fn test_execute_health_tls_uses_shared_interim_response_parser() {
         "TLS must accept the same bounded interim/final framing: {result:?}"
     );
 }
+
+// ── docs/cli.md parity ──────────────────────────────────────────────────────
+
+const CLI_MD: &str = include_str!("../../../docs/cli.md");
+
+fn cli_md_section<'a>(doc: &'a str, heading: &str, next_heading: &str) -> &'a str {
+    let start = doc
+        .find(heading)
+        .unwrap_or_else(|| panic!("docs/cli.md must contain {heading:?}"));
+    let body = &doc[start + heading.len()..];
+    let end = body
+        .find(next_heading)
+        .unwrap_or_else(|| panic!("docs/cli.md must contain {next_heading:?} after {heading:?}"));
+    &body[..end]
+}
+
+/// `RunArgs` and `ValidateArgs` both expose `--fips-mode`; the canonical CLI
+/// reference must document it on both subcommands and in the precedence list.
+#[test]
+fn cli_md_documents_fips_mode_on_run_validate_and_precedence() {
+    let run_section = cli_md_section(CLI_MD, "## run", "## validate");
+    let validate_section = cli_md_section(CLI_MD, "## validate", "## reload");
+    let precedence_section =
+        cli_md_section(CLI_MD, "## Configuration Precedence", "## Smart Path Defaults");
+
+    for (name, section) in [
+        ("run options table", run_section),
+        ("validate options table", validate_section),
+        ("Configuration Precedence", precedence_section),
+    ] {
+        assert!(
+            section.contains("`--fips-mode <MODE>`"),
+            "{name} must document --fips-mode in docs/cli.md"
+        );
+    }
+
+    for section in [run_section, validate_section] {
+        assert!(
+            section.contains("`off` (default) or `enforce`"),
+            "run/validate tables must document off (default) and enforce"
+        );
+        assert!(
+            section.contains("ferrum.conf") && section.contains("crypto provider"),
+            "run/validate tables must document the ferrum.conf-only late-request refusal"
+        );
+        assert!(
+            section.contains("[FIPS mode](fips.md)"),
+            "run/validate tables must link to docs/fips.md"
+        );
+    }
+
+    assert!(
+        precedence_section.contains("`--fips-mode`") && precedence_section.contains("`FERRUM_FIPS_MODE`"),
+        "precedence must pair the CLI flag with FERRUM_FIPS_MODE"
+    );
+}
