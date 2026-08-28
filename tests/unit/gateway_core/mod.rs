@@ -66,6 +66,7 @@ mod k8s_controller_metrics_tests;
 mod k8s_controller_rbac_parity_tests;
 mod k8s_headless_service_dns_fallback_tests;
 mod k8s_listenerset_translation_tests;
+mod k8s_status_budget_tests;
 mod k8s_status_planning_tests;
 mod k8s_status_snapshot_tests;
 mod k8s_udp_amplification_policy_tests;

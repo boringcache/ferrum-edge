@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::Instant;
 use tracing::warn;
 
 use crate::config_sources::k8s::backend_tls_policy::{
@@ -27,6 +28,10 @@ use crate::config_sources::k8s::{
 use crate::k8s_controller::convert::k8s_time_to_rfc3339;
 use crate::k8s_controller::metrics::{
     ControllerMetrics, record_route_status_publication, unix_now_ms,
+};
+use crate::k8s_controller::status_budget::{
+    STATUS_BATCH_BUDGET, STATUS_BATCH_SLOW_WARN, STATUS_REQUEST_BUDGET, STATUS_UPDATE_BUDGET,
+    StatusOperation, await_status_operation, is_status_timeout_error, status_operation_budget,
 };
 use crate::k8s_controller::status_plan::{
     StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
@@ -96,6 +101,12 @@ impl GatewayApiStatusWriter {
         &self,
         updates: Vec<GatewayApiStatusUpdate>,
     ) -> Result<(), kube::Error> {
+        // Every batch carries one deadline (issue #4239). The batch is awaited
+        // inline on the serialized reconcile loop, so the deadline is also the
+        // longest a stalled Kubernetes status write can stop *every other*
+        // object's status from being published.
+        let started = Instant::now();
+        let deadline = started + STATUS_BATCH_BUDGET;
         // Build one future per update that captures its identity by *move* so
         // partial failures can be logged with the resource they failed on,
         // and so the resulting futures stay `Send + 'static` for
@@ -124,15 +135,28 @@ impl GatewayApiStatusWriter {
             let namespace = update.namespace.clone();
             let metrics = metrics.clone();
             Some(async move {
+                let object_deadline = update_deadline(deadline);
                 let result = if route_status_kind(&update.kind) || policy_status_kind(&update.kind)
                 {
                     // `status.parents` / `status.ancestors` are atomic arrays in
                     // the upstream CRDs: they cannot be split by server-side
                     // apply ownership, so both follow the Gateway API
                     // read-modify-write mandate with a resourceVersion guard.
-                    patch_route_status_with_retry(&api, &update, metrics.as_deref()).await
+                    patch_route_status_with_retry(
+                        &api,
+                        &update,
+                        metrics.as_deref(),
+                        object_deadline,
+                    )
+                    .await
                 } else {
-                    patch_gateway_status_with_apply(&api, &update).await
+                    patch_gateway_status_with_apply(
+                        &api,
+                        &update,
+                        metrics.as_deref(),
+                        object_deadline,
+                    )
+                    .await
                 };
                 (kind, namespace, name, result)
             })
@@ -156,6 +180,15 @@ impl GatewayApiStatusWriter {
                 }
             }
         }
+        let elapsed = started.elapsed();
+        if elapsed >= STATUS_BATCH_SLOW_WARN {
+            warn!(
+                elapsed_ms = elapsed.as_millis() as u64,
+                budget_ms = STATUS_BATCH_BUDGET.as_millis() as u64,
+                "Gateway API status patch batch held the reconcile loop; the API server's status \
+                 path is slow"
+            );
+        }
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -163,12 +196,37 @@ impl GatewayApiStatusWriter {
     }
 }
 
+/// Deadline for one object's status update: its own budget, never past the
+/// batch deadline the whole reconcile loop is waiting on.
+fn update_deadline(batch_deadline: Instant) -> Instant {
+    let now = Instant::now();
+    match status_operation_budget(now, batch_deadline, STATUS_UPDATE_BUDGET) {
+        Some(budget) => now + budget,
+        None => now,
+    }
+}
+
 async fn patch_gateway_status_with_apply(
     api: &Api<DynamicObject>,
     update: &GatewayApiStatusUpdate,
+    metrics: Option<&ControllerMetrics>,
+    deadline: Instant,
 ) -> Result<(), kube::Error> {
-    let live_status = match api.get_status(&update.name).await {
+    let live_status = match await_status_operation(
+        status_operation("read", update),
+        deadline,
+        STATUS_REQUEST_BUDGET,
+        metrics,
+        api.get_status(&update.name),
+    )
+    .await
+    {
         Ok(live) => live.data.get("status").cloned(),
+        // A spent budget is not "the status is unreadable": applying a Gateway
+        // status computed without the live document would spend the batch's
+        // remaining time on a write we could not bound either. Leave the object
+        // for the next reconcile instead.
+        Err(error) if is_status_timeout_error(&error) => return Err(error),
         Err(error) => {
             warn!(
                 api_version = %update.api_version,
@@ -188,18 +246,44 @@ async fn patch_gateway_status_with_apply(
     // owned by another manager. Force adopts Ferrum's legacy merge-patch fields;
     // the apply document remains limited to the status fields Ferrum reconciles.
     let params = gateway_api_status_apply_params();
-    api.patch_status(&update.name, &params, &Patch::Apply(&patch))
-        .await
-        .map(|_| ())
+    await_status_operation(
+        status_operation("patch", update),
+        deadline,
+        STATUS_REQUEST_BUDGET,
+        metrics,
+        api.patch_status(&update.name, &params, &Patch::Apply(&patch)),
+    )
+    .await
+    .map(|_| ())
+}
+
+fn status_operation<'a>(phase: &'a str, update: &'a GatewayApiStatusUpdate) -> StatusOperation<'a> {
+    StatusOperation {
+        phase,
+        kind: &update.kind,
+        namespace: &update.namespace,
+        name: &update.name,
+    }
 }
 
 async fn patch_route_status_with_retry(
     api: &Api<DynamicObject>,
     update: &GatewayApiStatusUpdate,
     metrics: Option<&ControllerMetrics>,
+    deadline: Instant,
 ) -> Result<(), kube::Error> {
     for attempt in 1..=ROUTE_STATUS_PATCH_MAX_ATTEMPTS {
-        let live = api.get_status(&update.name).await?;
+        // A budget expiry surfaces as a non-409 error, so it leaves the loop
+        // through the ordinary error arms: the object keeps its place in the
+        // status plan and is replanned on the next reconcile.
+        let live = await_status_operation(
+            status_operation("read", update),
+            deadline,
+            STATUS_REQUEST_BUDGET,
+            metrics,
+            api.get_status(&update.name),
+        )
+        .await?;
         let Some(resource_version) = live.metadata.resource_version.as_deref() else {
             warn!(
                 api_version = %update.api_version,
@@ -216,9 +300,14 @@ async fn patch_route_status_with_retry(
             route_status_merge_patch_for_update(update, live.data.get("status"), resource_version)
         };
         let params = route_status_patch_params();
-        match api
-            .patch_status(&update.name, &params, &Patch::Merge(&patch))
-            .await
+        match await_status_operation(
+            status_operation("patch", update),
+            deadline,
+            STATUS_REQUEST_BUDGET,
+            metrics,
+            api.patch_status(&update.name, &params, &Patch::Merge(&patch)),
+        )
+        .await
         {
             Ok(_) => {
                 if route_status_kind(&update.kind)
