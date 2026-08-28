@@ -1661,8 +1661,11 @@ fn cli_md_section<'a>(doc: &'a str, heading: &str, next_heading: &str) -> &'a st
 fn cli_md_documents_fips_mode_on_run_validate_and_precedence() {
     let run_section = cli_md_section(CLI_MD, "## run", "## validate");
     let validate_section = cli_md_section(CLI_MD, "## validate", "## reload");
-    let precedence_section =
-        cli_md_section(CLI_MD, "## Configuration Precedence", "## Smart Path Defaults");
+    let precedence_section = cli_md_section(
+        CLI_MD,
+        "## Configuration Precedence",
+        "## Smart Path Defaults",
+    );
 
     for (name, section) in [
         ("run options table", run_section),
@@ -1690,7 +1693,8 @@ fn cli_md_documents_fips_mode_on_run_validate_and_precedence() {
     }
 
     assert!(
-        precedence_section.contains("`--fips-mode`") && precedence_section.contains("`FERRUM_FIPS_MODE`"),
+        precedence_section.contains("`--fips-mode`")
+            && precedence_section.contains("`FERRUM_FIPS_MODE`"),
         "precedence must pair the CLI flag with FERRUM_FIPS_MODE"
     );
 }
