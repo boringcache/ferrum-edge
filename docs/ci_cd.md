@@ -105,9 +105,10 @@ Push to main
 
 ### Required checks and merge queue
 
-Branch protection / repository rulesets for `main` must require these nine
+Branch protection / repository rulesets for `main` must require these eight
 GitHub Actions check names (exact spelling; source app is **GitHub Actions**,
-app id `15368`):
+app id `15368`). The same eight are the publish-blocking set: see
+[Publish-blocking required checks](#publish-blocking-required-checks).
 
 | Required check name | Owning workflow | Owning job |
 |---|---|---|
@@ -166,8 +167,8 @@ under `pull_request_target` and rejects any change to
 `.github/scripts/verify_cross_build_policy.py`. Consequences for operators:
 
 - Do **not** follow the common "trigger required checks on `merge_group` only"
-  advice for these seven owners. Every owner must keep reporting on the pull
-  request as well, and all seven must stay *required* so a failing PR-side check
+  advice for these eight owners. Every owner must keep reporting on the pull
+  request as well, and all eight must stay *required* so a failing PR-side check
   blocks queue entry. `verify_required_ci.py` enforces both the `merge_group`
   trigger and an unfiltered `pull_request` / `pull_request_target` trigger for
   each owner.
@@ -179,7 +180,7 @@ under `pull_request_target` and rejects any change to
 
 **Live admin / no-bypass posture (root-owned repository settings; verified
 2026-08-05):** classic branch protection and ruleset `20208307` both require all
-seven GitHub Actions checks above. Classic protection enforces administrators.
+eight GitHub Actions checks above. Classic protection enforces administrators.
 The active ruleset has no bypass actors, blocks force pushes and deletion,
 requires one approval with stale approvals dismissed on push, resolves review
 threads, and validates the combined result through the merge queue. The owner
@@ -189,14 +190,105 @@ not document or re-enable that distinct restriction without an explicit settings
 decision.
 
 After any future settings edit, re-query both protection APIs and confirm the
-seven exact check names, GitHub Actions app id `15368`, admin enforcement, empty
+eight exact check names, GitHub Actions app id `15368`, admin enforcement, empty
 bypass list, pull-request parameters, and merge-queue parameters. Exercise a
 queued PR to prove every required owner reports on the synthesized SHA.
 
 `.github/scripts/verify_required_ci.py` statically enforces merge_group
 triggers, unfiltered `pull_request` / `pull_request_target` triggers,
 check-name parity, event-aware SHA/base markers, and concurrency markers for
-all seven owners.
+all eight owners.
+
+### Publish-blocking required checks
+
+`.github/required-publication-checks.json` is the ONE canonical,
+machine-consumed inventory of publish-blocking required checks. Nothing may
+carry an independent hard-coded subset beside it. Every artifact publication --
+the mutable `latest` GitHub prerelease, the mutable `latest` / `main-<sha>`
+Docker tags, and the immutable `v*` tag artifacts -- fails closed unless every
+inventoried context is **successful for the exact product SHA** under trusted
+workflow identity.
+
+Each entry declares the required context, the canonical workflow file, path,
+and display name, the owning job, how the `main` publishing path carries it
+(`main_publication`), and how a run is bound to the SHA (`evidence`).
+
+| Required context | Workflow | `main_publication` | `evidence` |
+|---|---|---|---|
+| `Tests` | `ci.yml` | `ci_job_dependency` | `push_main` |
+| `Merge Coverage` | `coverage.yml` | `ci_main_publish_gate` | `push_main` |
+| `Gateway API Conformance` | `gateway-api-conformance.yml` | `ci_main_publish_gate` | `push_main` |
+| `Mesh E2E Sidecar Live` | `mesh-e2e-sidecar-live.yml` | `ci_main_publish_gate` | `push_main` |
+| `Trusted Cross Build Policy` | `cross-build-policy.yml` | `publication_gate_job` | `merge_group_head` |
+| `Multicluster Federation Live` | `multicluster-federation-live.yml` | `publication_gate_job` | `push_main` |
+| `Multicluster Poller Partition Live` | `multicluster-poller-partition-live.yml` | `publication_gate_job` | `push_main` |
+| `Ambient Host UDP Live` | `ambient-host-udp-live.yml` | `publication_gate_job` | `push_main` |
+
+#### Why the `main` path has two halves
+
+`ci.yml`'s `main-publish-gate` job, and the `needs` / `if` of `latest-release`,
+`docker`, and `docker-manifest`, are frozen byte-for-byte by
+`.github/scripts/verify_cross_build_policy.py`, a protected trusted-policy file
+**no pull request may modify**. Its polling array therefore keeps carrying three
+contexts, and the remainder are carried by a second job,
+`main-publication-required-checks`, hosted in `gateway-api-conformance.yml` --
+a workflow whose *run conclusion* the frozen array already requires to be
+successful for the exact SHA before anything publishes. A failure there makes
+that run's conclusion `failure`, so `main-publish-gate` refuses and neither
+`latest-release` nor `docker` runs.
+
+The two halves are not independent lists. `.github/scripts/verify_publication_gate.py`
+parses the frozen array out of `ci.yml` and proves it is **set-equal** to the
+`ci_main_publish_gate` entries, proves the hosted job exists, is scoped to
+`push` on `refs/heads/main`, holds only `actions: read`, and runs the shared
+gate bound to `github.sha`, and proves `release.yml`'s `validate-release-sha`
+runs the same gate over the complete inventory with no hard-coded wait list.
+`.github/scripts/verify_required_ci.py` runs those proofs, plus set-equality
+between the inventory and `REQUIRED_MERGE_GROUP_WORKFLOWS`, on every pull
+request. **Adding a required context without publication coverage fails policy
+CI**, and an adversarial fixture in that verifier proves it.
+
+#### What counts as evidence
+
+For every inventoried context the gate resolves the workflow through the
+canonical `.github/workflows/<file>` endpoint and requires the server-reported
+`id`, `path`, `name`, and `state: active` to match. It then requires **every**
+matching run for the SHA to have `status: completed` and `conclusion: success`.
+A single passing duplicate never masks a failed run of the same workflow.
+
+Blocking in all cases: missing, `queued`, `in_progress`, `waiting`, `failure`,
+`cancelled`, `skipped`, `timed_out`, `stale`, `neutral`, `action_required`,
+`startup_failure`, an unknown conclusion, an unrecognized status, a wrong
+`head_sha`, a wrong `event`, a wrong `head_branch`, a wrong workflow `path` or
+`id`, a run whose `repository` / `head_repository` is not this repository, and a
+tag or commit that is not `main` or an ancestor of it. A display name alone is
+never an identity, and a green aggregate is never accepted as proof of a
+dedicated workflow's success.
+
+`push_main` evidence requires `event: push` on `head_branch: main`.
+`merge_group_head` evidence requires `event: merge_group` on a
+`gh-readonly-queue/main/` branch: GitHub's merge queue lands its synthesized
+head commit on `main` verbatim, so the product SHA carries that run directly.
+
+#### Trigger changes and operational consequences
+
+* `ambient-host-udp-live.yml` gained an unconditional `push: main` trigger
+  (issue #4302) so `Ambient Host UDP Live` yields exact-main-SHA evidence
+  instead of merge-group-only evidence. The frozen trusted-base relevance job
+  force-runs the suite on every non-pull-request event, and the trigger carries
+  no `paths:` filter, because a filtered required gate can make publication
+  evidence absent. Its `push` concurrency group is keyed by commit and is never
+  cancelled, so a later push cannot wedge an earlier SHA's evidence.
+* `cross-build-policy.yml` is itself protected and cannot be given a `push`
+  trigger by an ordinary change, so it stays on `merge_group_head` evidence.
+  A commit pushed **directly to `main` under an administrative bypass** has no
+  merge-queue run and therefore does not publish `latest`, the Docker tags, or a
+  version tag. That is deliberate: such a commit did not clear the required
+  checks. Publication resumes with the next commit that lands through the merge
+  queue.
+* Publication never races ahead of checks. Both gates poll and fail closed at
+  their own deadline (100 minutes on the `main` path, 160 minutes on the release
+  path) rather than proceeding on an unproven result.
 
 ### Release Pipeline Flow
 
@@ -2672,12 +2764,21 @@ or GitHub Release creation. The guard adds no secrets or elevated permissions.
 
 **Runs**: `ubuntu-latest`
 
-Validates that the tag name matches the release pattern and that the tag target
-commit has successful `ci.yml` and `coverage.yml` runs from a `push` event.
-Manual workflow dispatches do not satisfy this release gate because they do not
-necessarily execute the same required `Tests` aggregate. If either workflow has
-not passed for the exact SHA, the release waits for the push run and then fails
-before publishing binaries or registry tags if it still has no success.
+Validates that the tag name matches the release pattern, that the tag target
+resolves to a commit, and that the commit is an ancestor of `origin/main`. It
+then runs `.github/scripts/verify_publication_gate.py --enforce release` over
+the COMPLETE canonical inventory
+(`.github/required-publication-checks.json`; see
+[Publish-blocking required checks](#publish-blocking-required-checks)), which is
+the same contract the `main` publisher is proven set-equal to.
+
+Every inventoried required check must be successful for the exact tag target
+under canonical workflow identity, the expected event, and the expected branch.
+Manual workflow dispatches do not satisfy this gate, and neither does a green
+aggregate: each dedicated workflow is queried on its own canonical endpoint. The
+job holds only `actions: read` and `contents: read`, waits for still-running
+runs, and fails closed at its deadline rather than publishing anything on an
+unproven result.
 
 ### Release Build Job
 

@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "documentation": "docs/ci_cd.md -> 'Publish-blocking required checks'. This file is the ONE canonical, machine-consumed inventory of the repository-required product checks that must be successful, for the exact product SHA, under trusted workflow identity, before any mutable `latest` release, Docker image, or immutable version-tag artifact is published. .github/scripts/verify_publication_gate.py is the only consumer; .github/scripts/verify_required_ci.py proves the branch-protection required set, ci.yml's frozen `main-publish-gate` array, the `main-publication-required-checks` gate, and release.yml's `validate-release-sha` are set-equal to it by construction. Adding a required context without publication coverage fails policy CI.",
+  "main_branch": "main",
+  "merge_queue_branch_prefix": "gh-readonly-queue/main/",
+  "required_checks": [
+    {
+      "context": "Tests",
+      "workflow_file": "ci.yml",
+      "workflow_path": ".github/workflows/ci.yml",
+      "workflow_name": "CI",
+      "job": "test",
+      "main_publication": "ci_job_dependency",
+      "evidence": "push_main",
+      "rationale": "The publishing jobs live in this same workflow run and each declares `needs: test` plus `needs.test.result == 'success'`, so the aggregate is proven in-run rather than through the Actions API. The version-release verifier has no such in-run relationship and requires a successful push run of ci.yml for the exact tag target."
+    },
+    {
+      "context": "Merge Coverage",
+      "workflow_file": "coverage.yml",
+      "workflow_path": ".github/workflows/coverage.yml",
+      "workflow_name": "Coverage",
+      "job": "coverage-merge",
+      "main_publication": "ci_main_publish_gate",
+      "evidence": "push_main",
+      "rationale": "Carried by the frozen `main-publish-gate` same-SHA polling array in ci.yml."
+    },
+    {
+      "context": "Gateway API Conformance",
+      "workflow_file": "gateway-api-conformance.yml",
+      "workflow_path": ".github/workflows/gateway-api-conformance.yml",
+      "workflow_name": "Gateway API Conformance",
+      "job": "gate",
+      "main_publication": "ci_main_publish_gate",
+      "evidence": "push_main",
+      "rationale": "Carried by the frozen `main-publish-gate` same-SHA polling array in ci.yml. This workflow also hosts the `main-publication-required-checks` job, so its own run conclusion additionally carries the publication verdict for every `publication_gate_job` context."
+    },
+    {
+      "context": "Mesh E2E Sidecar Live",
+      "workflow_file": "mesh-e2e-sidecar-live.yml",
+      "workflow_path": ".github/workflows/mesh-e2e-sidecar-live.yml",
+      "workflow_name": "Mesh E2E Sidecar Live Datapath",
+      "job": "gate",
+      "main_publication": "ci_main_publish_gate",
+      "evidence": "push_main",
+      "rationale": "Carried by the frozen `main-publish-gate` same-SHA polling array in ci.yml."
+    },
+    {
+      "context": "Trusted Cross Build Policy",
+      "workflow_file": "cross-build-policy.yml",
+      "workflow_path": ".github/workflows/cross-build-policy.yml",
+      "workflow_name": "Cross Build Policy",
+      "job": "verify",
+      "main_publication": "publication_gate_job",
+      "evidence": "merge_group_head",
+      "rationale": "The workflow is itself a protected trusted-policy file that no pull request may edit, so it cannot be given a push trigger by an ordinary change. GitHub's merge queue lands its synthesized head commit on `main` verbatim, so the exact product SHA carries a `merge_group` run of this workflow on a `gh-readonly-queue/main/` branch. That run is matched by workflow id, canonical path, workflow name, event, queue-branch prefix, and head SHA; a commit pushed directly to `main` under an administrative bypass has no such evidence and therefore does not publish."
+    },
+    {
+      "context": "Multicluster Federation Live",
+      "workflow_file": "multicluster-federation-live.yml",
+      "workflow_path": ".github/workflows/multicluster-federation-live.yml",
+      "workflow_name": "Multicluster Federation Live Datapath",
+      "job": "gate",
+      "main_publication": "publication_gate_job",
+      "evidence": "push_main",
+      "rationale": "Runs unconditionally on every push to main; ci.yml's frozen `main-publish-gate` array cannot be extended by a pull request, so publication evidence is collected by `main-publication-required-checks`."
+    },
+    {
+      "context": "Multicluster Poller Partition Live",
+      "workflow_file": "multicluster-poller-partition-live.yml",
+      "workflow_path": ".github/workflows/multicluster-poller-partition-live.yml",
+      "workflow_name": "Multicluster Poller Partition Live",
+      "job": "gate",
+      "main_publication": "publication_gate_job",
+      "evidence": "push_main",
+      "rationale": "Runs unconditionally on every push to main; ci.yml's frozen `main-publish-gate` array cannot be extended by a pull request, so publication evidence is collected by `main-publication-required-checks`."
+    },
+    {
+      "context": "Ambient Host UDP Live",
+      "workflow_file": "ambient-host-udp-live.yml",
+      "workflow_path": ".github/workflows/ambient-host-udp-live.yml",
+      "workflow_name": "Ambient Host UDP Live Kernel",
+      "job": "gate",
+      "main_publication": "publication_gate_job",
+      "evidence": "push_main",
+      "rationale": "Issue #4302 added an unconditional `push: main` trigger so the required check yields exact-main-SHA evidence instead of merge-group-only evidence; the frozen trusted-base relevance job force-runs the suite on every non-pull-request event."
+    }
+  ]
+}

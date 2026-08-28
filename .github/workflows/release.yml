@@ -52,9 +52,19 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Require CI and coverage success for tag target
+      # Issue #4302. The complete, repository-required product check set --
+      # `.github/required-publication-checks.json`, the one canonical inventory
+      # the `main` publisher is also proven set-equal to -- must be successful
+      # for the EXACT tag target under trusted workflow identity before any
+      # immutable version-tag artifact is built. The previous implementation
+      # kept an independent hard-coded subset here that omitted Gateway API
+      # Conformance, Ambient Host UDP, and the trusted build policy, and
+      # accepted "some successful push run" rather than requiring every matching
+      # run to have concluded successfully.
+      - name: Require every publish-blocking check for the tag target
         env:
           GH_TOKEN: ${{ github.token }}
+          PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -65,56 +75,21 @@ jobs:
           fi
 
           release_sha="$(git rev-list -n 1 "$TAG_NAME")"
+          if [[ ! "$release_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::release tag ${TAG_NAME} did not resolve to a commit" >&2
+            exit 1
+          fi
           echo "Release tag ${TAG_NAME} resolves to ${release_sha}"
 
-          wait_for_success() {
-            local workflow_file="$1"
-            local label="$2"
-            local max_attempts=320
-
-            for attempt in $(seq 1 "$max_attempts"); do
-              local runs
-              runs="$(gh run list \
-                --repo "$GITHUB_REPOSITORY" \
-                --workflow "$workflow_file" \
-                --commit "$release_sha" \
-                --limit 50 \
-                --json status,conclusion,event,url,createdAt 2>/dev/null || true)"
-              if [ -z "$runs" ]; then
-                echo "${label} run lookup for ${release_sha} failed transiently (attempt ${attempt}/${max_attempts}); retrying"
-                sleep 30
-                continue
-              fi
-
-              local success_url
-              success_url="$(jq -r '[.[] | select(.conclusion == "success" and .event == "push")] | sort_by(.createdAt) | last | .url // empty' <<<"$runs" 2>/dev/null || true)"
-              if [ -n "$success_url" ]; then
-                echo "${label} passed for ${release_sha}: ${success_url}"
-                {
-                  echo "### ${label}"
-                  echo ""
-                  echo "Validated ${release_sha}: ${success_url}"
-                  echo ""
-                } >> "$GITHUB_STEP_SUMMARY"
-                return 0
-              fi
-
-              local active
-              active="$(jq -r '[.[] | select((.status == "queued" or .status == "in_progress") and .event == "push")] | length' <<<"$runs" 2>/dev/null || true)"
-              active="${active:-0}"
-              local failed_url
-              failed_url="$(jq -r '[.[] | select(.status == "completed" and .event == "push" and .conclusion != null and .conclusion != "success")] | sort_by(.createdAt) | last | .url // empty' <<<"$runs" 2>/dev/null || true)"
-              if [ "$active" = "0" ] && [ -n "$failed_url" ]; then
-                echo "::error title=Release validation failed::${label} completed unsuccessfully for ${release_sha}: ${failed_url}"
-                return 1
-              fi
-              echo "${label} has no successful push run for ${release_sha} yet (attempt ${attempt}/${max_attempts}, active=${active}); waiting"
-              sleep 30
-            done
-
-            echo "::error title=Missing release validation::${label} did not complete successfully for ${release_sha} from a push event"
-            return 1
-          }
+          # A tag may point anywhere. Publication evidence is only meaningful
+          # for a commit that is on `main`, so prove ancestry from the trusted
+          # remote branch before any check result is trusted. The shared gate
+          # re-proves this through the compare API as well.
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$release_sha" refs/remotes/origin/main; then
+            echo "::error title=Release target is not on main::${release_sha} is not an ancestor of origin/main" >&2
+            exit 1
+          fi
 
           {
             echo "## Release Validation"
@@ -125,22 +100,11 @@ jobs:
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
 
-          wait_for_success "ci.yml" "CI"
-          wait_for_success "coverage.yml" "Coverage"
-          # The M2 sidecar GA contract is release-blocking: the dedicated live
-          # suite runs the fixture AND validates the emitted live-assertions
-          # artifact against ga_contract.yaml on every main push, so a release
-          # SHA without a green, contract-validated live run cannot ship.
-          wait_for_success "mesh-e2e-sidecar-live.yml" "Mesh E2E Sidecar Live Datapath"
-          # The multicluster federation datapath is likewise release-blocking
-          # (issue #2459): every main SHA must carry a successful push run of
-          # the dedicated two-cluster live workflow, whose fixture fails closed
-          # on any required `multicluster.*` live assertion that is missing,
-          # failed, or skipped.
-          wait_for_success "multicluster-federation-live.yml" "Multicluster Federation Live Datapath"
-          # Poller generation retirement and bounded last-good expiry are a
-          # release boundary independently of the static federation datapath.
-          wait_for_success "multicluster-poller-partition-live.yml" "Multicluster Poller Partition Live"
+          # The tag target travels in the environment so this argv stays fully
+          # literal for the trusted-policy scanners.
+          export PUBLICATION_GATE_SHA="$release_sha"
+          python3 .github/scripts/verify_publication_gate.py --self-test
+          python3 .github/scripts/verify_publication_gate.py --enforce release --deadline-seconds 9600
 
   build-release-binaries:
     name: Build (${{ matrix.asset_name }})

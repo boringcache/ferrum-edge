@@ -6,13 +6,27 @@ on:
   merge_group:
     types:
       - checks_requested
+  # Issue #4302: `Ambient Host UDP Live` is a publish-blocking required check
+  # (`.github/required-publication-checks.json`), so every `main` SHA must carry
+  # its own trusted, exact-SHA evidence. Merge-group-only evidence is not enough:
+  # the merge queue reports against a synthesized commit, and a commit that
+  # reaches `main` outside the queue would have none at all. The frozen
+  # trusted-base relevance job force-runs the suite on every non-pull-request
+  # event, so this trigger is unconditional and carries NO `paths:` filter --
+  # a filtered required gate can make publication evidence absent.
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('ambient-host-udp-live-pr-{0}', github.event.pull_request.number) || (github.event_name == 'merge_group' && format('ambient-host-udp-live-merge-group-{0}', github.event.merge_group.head_sha) || 'ambient-host-udp-live-shared') }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+  # `main` pushes are keyed by commit and are never cancelled: a cancelled run
+  # is blocking evidence, so letting a later push cancel an earlier SHA's run
+  # would permanently wedge that SHA's publication instead of validating it.
+  group: ${{ github.event_name == 'pull_request' && format('ambient-host-udp-live-pr-{0}', github.event.pull_request.number) || (github.event_name == 'merge_group' && format('ambient-host-udp-live-merge-group-{0}', github.event.merge_group.head_sha) || (github.event_name == 'push' && format('ambient-host-udp-live-push-{0}', github.sha) || 'ambient-host-udp-live-shared')) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
 
 jobs:
   changes:

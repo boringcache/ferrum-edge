@@ -45,6 +45,14 @@ from verify_install_docs_contract import (
 from verify_install_docs_contract import (
     check_repository as check_install_docs_contract,
 )
+from verify_publication_gate import (
+    ContractError as PublicationContractError,
+    by_mode as publication_entries_by_mode,
+    load_inventory as load_publication_inventory,
+    repository_contract_errors as publication_gate_contract_errors,
+    required_context_parity_errors as publication_context_parity_errors,
+    self_test as publication_gate_self_test,
+)
 from verify_release_image_attestations import (
     run_self_test as release_attestation_self_test,
 )
@@ -1816,6 +1824,51 @@ def main() -> int:
                 planner_errors.append(
                     "ci.yml planner must handle merge_group base/head selection"
                 )
+
+    # Issue #4302: publication of the mutable `latest` release, the Docker
+    # tags, and every immutable version-tag artifact must fail closed unless the
+    # COMPLETE repository-required product check set succeeded for the exact
+    # product SHA. `.github/required-publication-checks.json` is the one
+    # canonical, machine-consumed inventory; the frozen `main-publish-gate`
+    # array, the hosted `main-publication-required-checks` job, and release.yml's
+    # `validate-release-sha` are each proven set-equal to it here rather than
+    # carrying independent hard-coded subsets that can drift.
+    planner_errors.extend(
+        f"publication gate self-test: {failure}"
+        for failure in publication_gate_self_test()
+    )
+    try:
+        publication_inventory = load_publication_inventory()
+    except (OSError, PublicationContractError) as error:
+        planner_errors.append(f"publication inventory failed closed: {error}")
+    else:
+        planner_errors.extend(
+            publication_gate_contract_errors(dict(REQUIRED_MERGE_GROUP_WORKFLOWS))
+        )
+        inventory_main_gate = {
+            entry["workflow_path"]: entry["workflow_name"]
+            for entry in publication_entries_by_mode(
+                publication_inventory,
+                "ci_main_publish_gate",
+            )
+        }
+        if inventory_main_gate != MAIN_PUBLISH_WORKFLOWS:
+            planner_errors.append(
+                "MAIN_PUBLISH_WORKFLOWS must equal the `ci_main_publish_gate` "
+                "entries of .github/required-publication-checks.json; the "
+                "frozen ci.yml array has exactly one source of truth"
+            )
+        # Adversarial fixture: a context that branch protection newly requires
+        # but that nothing publishes against must fail this policy run.
+        fabricated = dict(REQUIRED_MERGE_GROUP_WORKFLOWS)
+        fabricated[".github/workflows/fabricated-required.yml"] = (
+            "Fabricated Required Check"
+        )
+        if not publication_context_parity_errors(fabricated, publication_inventory):
+            planner_errors.append(
+                "a newly required check with no publication-inventory entry "
+                "must fail the publication contract"
+            )
 
     planner_errors.extend(merge_group_self_test())
     planner_errors.extend(optional_live_suite_self_test())
