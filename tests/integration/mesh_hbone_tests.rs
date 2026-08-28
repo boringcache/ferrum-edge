@@ -1629,13 +1629,48 @@ fn relay_guard_workload(service: &str, addresses: &[&str], ports: &[u16]) -> Wor
     }
 }
 
-/// Slice shaped like an own-pod terminator (`Sidecar` / `Ambient`) that runs at
-/// `10.244.1.7` in a namespace where `10.244.9.9` is another pod entirely.
-fn own_pod_terminator_mesh() -> MeshConfig {
+/// Slice shaped like a Sidecar terminator that runs at `10.244.1.7` in a
+/// namespace where `10.244.9.9` is another pod entirely. Sidecar shares the
+/// application pod's network namespace, so loopback is an own-namespace shortcut.
+fn sidecar_terminator_mesh() -> MeshConfig {
     MeshConfig {
         workloads: vec![
             relay_guard_workload("app", &["10.244.1.7", "fd00:10:244:1::7"], &[8080]),
             relay_guard_workload("neighbour", &["10.244.9.9"], &[8080]),
+        ],
+        inbound_relay_admits_accepted_local_address: true,
+        inbound_relay_admits_loopback_namespace: true,
+        ..MeshConfig::default()
+    }
+}
+
+/// Ambient terminator at a non-loopback pod IP, with loopback/DNS-localhost
+/// also present in inventory. Ambient is node-shared and must not inherit
+/// Sidecar's loopback-namespace shortcut.
+fn ambient_terminator_mesh() -> MeshConfig {
+    MeshConfig {
+        workloads: vec![relay_guard_workload(
+            "app",
+            &["10.244.1.7", "127.0.0.1"],
+            &[8080],
+        )],
+        inbound_relay_destinations: vec![
+            MeshInboundRelayDestination {
+                host: MeshInboundRelayHost::Ip(ip("10.244.1.7")),
+                ports: vec![8080],
+            },
+            MeshInboundRelayDestination {
+                host: MeshInboundRelayHost::Ip(ip("127.0.0.1")),
+                ports: vec![8080],
+            },
+            MeshInboundRelayDestination {
+                host: MeshInboundRelayHost::Name("localhost".to_string()),
+                ports: vec![8080],
+            },
+            MeshInboundRelayDestination {
+                host: MeshInboundRelayHost::Name("app.localhost".to_string()),
+                ports: vec![8080],
+            },
         ],
         inbound_relay_admits_accepted_local_address: true,
         ..MeshConfig::default()
@@ -1650,7 +1685,7 @@ fn ip(literal: &str) -> std::net::IpAddr {
 /// terminator's own workload, so the transparent relay serves it.
 #[test]
 fn inbound_relay_admits_the_terminators_own_address() {
-    let mesh = own_pod_terminator_mesh();
+    let mesh = sidecar_terminator_mesh();
     let own = Some(ip("10.244.1.7"));
 
     assert_eq!(
@@ -1667,12 +1702,48 @@ fn inbound_relay_admits_the_terminators_own_address() {
         mesh.inbound_relay_destination_decision("localhost", 8080, own),
         Ok(())
     );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("localhost.", 8080, own),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("app.localhost", 8080, own),
+        Ok(())
+    );
     // A port this pod does not declare is still refused, so a stray local
     // listener is not reachable just because it shares the netns.
     assert_eq!(
         mesh.inbound_relay_destination_decision("127.0.0.1", 15021, own),
         Err(InboundRelayDenial::PortNotDeclared)
     );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("localhost", 15021, own),
+        Err(InboundRelayDenial::PortNotDeclared)
+    );
+}
+
+/// Ambient may admit the accepted socket's non-loopback local destination, but
+/// must not inherit Sidecar's own-network-namespace loopback shortcut.
+#[test]
+fn inbound_relay_ambient_refuses_loopback_namespace() {
+    let mesh = ambient_terminator_mesh();
+    let own = Some(ip("10.244.1.7"));
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, own),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.1.7", 15021, own),
+        Err(InboundRelayDenial::PortNotDeclared)
+    );
+    for host in ["127.0.0.1", "::1", "localhost", "localhost.", "app.localhost"] {
+        assert_eq!(
+            mesh.inbound_relay_destination_decision(host, 8080, own),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "Ambient must refuse loopback-namespace authority {host} even when inventory-listed"
+        );
+    }
 }
 
 /// The issue #4150 fix: another workload the SLICE declares is not a
@@ -1680,7 +1751,7 @@ fn inbound_relay_admits_the_terminators_own_address() {
 /// plaintext from this pod's IP and skip its own AuthorizationPolicy set.
 #[test]
 fn inbound_relay_refuses_a_different_slice_declared_workload() {
-    let mesh = own_pod_terminator_mesh();
+    let mesh = sidecar_terminator_mesh();
     let own = Some(ip("10.244.1.7"));
 
     assert_eq!(
@@ -1705,7 +1776,7 @@ fn inbound_relay_refuses_a_different_slice_declared_workload() {
 /// is a different destination.
 #[test]
 fn inbound_relay_folds_ipv4_mapped_ipv6_to_one_decision() {
-    let mesh = own_pod_terminator_mesh();
+    let mesh = sidecar_terminator_mesh();
     let own_v4 = Some(ip("10.244.1.7"));
     let own_mapped = Some(ip("::ffff:10.244.1.7"));
     let own_v6 = Some(ip("fd00:10:244:1::7"));

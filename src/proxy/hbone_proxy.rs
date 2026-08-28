@@ -1964,12 +1964,13 @@ mod tests {
         assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
-    /// Slice shaped like an own-pod terminator (`Sidecar` / `Ambient`): the
-    /// pod's own workload record, and the marker the apply path sets for those
-    /// topologies so the accepted local address counts as a destination.
+    /// Slice shaped like a Sidecar terminator: the pod's own workload record,
+    /// plus the apply-path markers so the accepted local address and the
+    /// own-network-namespace loopback shortcut both count as destinations.
     fn mesh_with_workload_port(port: u16) -> MeshConfig {
         let mut mesh = MeshConfig {
             inbound_relay_admits_accepted_local_address: true,
+            inbound_relay_admits_loopback_namespace: true,
             ..MeshConfig::default()
         };
         mesh.workloads.push(Workload {

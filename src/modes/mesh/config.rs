@@ -4609,11 +4609,14 @@ pub struct MeshConfig {
     ///   bound services' namespaces), not per-binding.
     ///
     /// `Sidecar` / `Ambient` ALSO set
-    /// [`Self::inbound_relay_admits_accepted_local_address`], because the pod
-    /// IP the peer actually reached is a transport fact no inventory is needed
-    /// for. `EastWestGateway` (SNI passthrough) and `EgressGateway` (external
-    /// ServiceEntry destinations, admitted by their own allowlists) leave both
-    /// unset.
+    /// [`Self::inbound_relay_admits_accepted_local_address`], because a
+    /// non-loopback accepted local address is a transport fact no inventory is
+    /// needed for. Only `Sidecar` sets
+    /// [`Self::inbound_relay_admits_loopback_namespace`]: it shares the
+    /// application pod's network namespace. `Ambient` is node-shared and runs
+    /// outside that pod, so the same names would reach the host. `EastWestGateway`
+    /// (SNI passthrough) and `EgressGateway` (external ServiceEntry destinations,
+    /// admitted by their own allowlists) leave every relay privilege unset.
     ///
     /// **Fail closed by construction.** Assigned UNCONDITIONALLY on every mesh
     /// apply, so an empty vector admits no non-local destination and a withdrawn
@@ -4623,18 +4626,32 @@ pub struct MeshConfig {
     /// relay into, bypassing that workload's own inbound policy.
     #[serde(skip)]
     pub inbound_relay_destinations: Vec<MeshInboundRelayDestination>,
-    /// Runtime-only marker for the inbound CONNECT terminators that serve their
-    /// own workload identity (`Sidecar` / `Ambient`), set on every mesh apply
-    /// (issue #4150).
+    /// Runtime-only marker for inbound CONNECT terminators that may treat the
+    /// accepted connection's own local address as a destination (`Sidecar` /
+    /// `Ambient`), set on every mesh apply (issue #4150).
     ///
-    /// When true, the accepted connection's own local address is an admissible
-    /// relay destination: the peer provably reached the pod it named, on this
-    /// socket, so the destination IS this terminator. The port is still bounded
-    /// by the workload record(s) the slice declares FOR THAT ADDRESS, never by
-    /// some other workload's ports. False for every topology that runs outside
-    /// the destination pod's own network namespace.
+    /// When true, a **non-loopback** accepted local address is an admissible
+    /// relay destination: the peer provably reached that address on this
+    /// socket. The port is still bounded by the workload record(s) the slice
+    /// declares FOR THAT ADDRESS, never by some other workload's ports. This
+    /// is independent of [`Self::inbound_relay_admits_loopback_namespace`].
+    /// False for waypoint and gateway topologies: their accepted local address
+    /// is the waypoint/node/gateway itself, not a workload they terminate for.
     #[serde(skip)]
     pub inbound_relay_admits_accepted_local_address: bool,
+    /// Runtime-only Sidecar own-network-namespace loopback shortcut, set on
+    /// every mesh apply. Default false: fail closed until topology assignment.
+    ///
+    /// When true, `127.0.0.1`, `::1`, `localhost`, and names in `.localhost`
+    /// are admissible on a port this pod's own workload record declares.
+    /// Sidecar shares the application pod's network namespace, so those names
+    /// reach the co-located workload. False for `Ambient`, `NodeWaypoint`,
+    /// `ServiceWaypoint`, and both gateway topologies: they run outside the
+    /// destination pod's network namespace, so the same names would reach the
+    /// host/terminator namespace instead. Inventory entries cannot override
+    /// this refusal.
+    #[serde(skip)]
+    pub inbound_relay_admits_loopback_namespace: bool,
 }
 
 /// One destination the authenticated inbound CONNECT terminator may relay to,
@@ -4842,20 +4859,23 @@ impl MeshConfig {
     ///
     /// Admissible sources, in order:
     ///
-    /// 1. **The accepted connection's own local address** (`Sidecar` /
-    ///    `Ambient`, gated on
+    /// 1. **The accepted connection's own non-loopback local address**
+    ///    (`Sidecar` / `Ambient`, gated on
     ///    [`Self::inbound_relay_admits_accepted_local_address`]). The peer
-    ///    provably reached this pod at the address it named — a transport fact
-    ///    the peer cannot choose. The port is still bounded by the workload
-    ///    record(s) the slice declares FOR THAT ADDRESS.
+    ///    provably reached this terminator at the address it named — a
+    ///    transport fact the peer cannot choose. The port is still bounded by
+    ///    the workload record(s) the slice declares FOR THAT ADDRESS.
     /// 2. **Loopback** (`127.0.0.1` / `::1` / the DNS `localhost` namespace)
-    ///    as an own-namespace shortcut, admissible only for those same own-pod
-    ///    terminators and only on a port this pod's own workload record
-    ///    declares. A `NodeWaypoint` / `ServiceWaypoint` does not get that
-    ///    shortcut — they run outside the destination pods' network
-    ///    namespaces. Loopback is refused even when it appears in
-    ///    [`Self::inbound_relay_destinations`], because dialing it would reach
-    ///    the waypoint's network namespace rather than the destination pod.
+    ///    as an own-network-namespace shortcut, gated on
+    ///    [`Self::inbound_relay_admits_loopback_namespace`] (`Sidecar` only)
+    ///    and only on a port this pod's own workload record declares. `Ambient`
+    ///    is node-shared and runs outside the destination pod's network
+    ///    namespace, so the same names would reach the Ambient/host namespace
+    ///    rather than that pod — even when the accepted socket's local address
+    ///    is a non-loopback pod IP, and even when loopback appears in
+    ///    [`Self::inbound_relay_destinations`]. `NodeWaypoint` /
+    ///    `ServiceWaypoint` / the gateway topologies are refused for the same
+    ///    namespace reason.
     /// 3. **[`Self::inbound_relay_destinations`]** — the deliberate, narrow
     ///    multi-destination allowance for the topologies that are MEANT to
     ///    terminate for a workload other than the pod the proxy runs in
@@ -4864,7 +4884,8 @@ impl MeshConfig {
     ///    An entry is matched by IP when the authority is an IP literal and by
     ///    verbatim (case-insensitive) name when it is not; a name is never
     ///    resolved here, so this cannot reach anything the inventory does not
-    ///    itself declare.
+    ///    itself declare. Loopback/DNS-localhost authorities never fall through
+    ///    to this inventory.
     ///
     /// Everything else fails closed, including a slice-declared workload owned
     /// by a different node. Hot path: no allocation, no lock, and no scan of
@@ -4879,9 +4900,9 @@ impl MeshConfig {
         if host.is_empty() || port == 0 {
             return Err(InboundRelayDenial::UnresolvableHost);
         }
-        // Only an own-pod terminator may treat its socket's local address as a
-        // relay destination; on every other topology the local address is the
-        // waypoint/node itself, not a workload it terminates for.
+        // Sidecar and Ambient may treat a non-loopback accepted local address
+        // as a relay destination; on waypoint/gateway topologies the local
+        // address is the terminator itself, not a workload it terminates for.
         let own_address = terminator_local_ip
             .filter(|_| self.inbound_relay_admits_accepted_local_address)
             .map(|ip| ip.to_canonical());
@@ -4904,17 +4925,20 @@ impl MeshConfig {
         }
 
         if inbound_relay_host_is_loopback_namespace(candidate) {
-            if let Some(own_address) = own_address {
+            // Sidecar alone shares the application pod's network namespace.
+            // Ambient, waypoints, and gateways dial from a different netns, so
+            // loopback would hit the terminator/host — never fall through to
+            // inventory, even when the accepted local address is a non-loopback
+            // pod IP.
+            if self.inbound_relay_admits_loopback_namespace
+                && let Some(own_address) = own_address
+            {
                 return if self.workload_declares_address_port(own_address, port) {
                     Ok(())
                 } else {
                     Err(InboundRelayDenial::PortNotDeclared)
                 };
             }
-            // A waypoint runs outside the destination workload's network
-            // namespace. Never let its inventory turn loopback into a relay
-            // target, because the backend dial would reach the waypoint (or
-            // host) namespace instead of that workload.
             return Err(InboundRelayDenial::AddressNotTerminated);
         }
 
@@ -5241,6 +5265,7 @@ impl Default for MeshConfig {
             external_udp_egress_routes: Vec::new(),
             inbound_relay_destinations: Vec::new(),
             inbound_relay_admits_accepted_local_address: false,
+            inbound_relay_admits_loopback_namespace: false,
         }
     }
 }

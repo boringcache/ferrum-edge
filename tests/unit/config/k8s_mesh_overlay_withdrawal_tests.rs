@@ -1459,6 +1459,7 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
         // resolved per slice from the topology, never Kubernetes-owned.
         inbound_relay_destinations: _,
         inbound_relay_admits_accepted_local_address: _,
+        inbound_relay_admits_loopback_namespace: _,
     } = MeshConfig::default();
 
     // Every namespaced collection is visible to the ownership accounting.
