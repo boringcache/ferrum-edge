@@ -9,7 +9,7 @@
 | Target version | 0.0.8 |
 | State | **Applied via vendored crate at `vendor/h3-0.0.8-ferrum-patched`** |
 | Upstream issue | _Deliberate fork — unfiled upstream (see hand-off below + [policy](../../dependency-policy.md#deliberate-fork-policy-and-sla))_ |
-| Upstream PR | _Deliberate fork — unfiled; target branch `feat/max-buffered-frame-len` on `jeremyjpj0916/h3`_ |
+| Upstream PR | _Deliberate fork — unfiled upstream; no published fork ref yet (see hand-off below + [policy](../../dependency-policy.md#deliberate-fork-policy-and-sla))_ |
 | Tracks | Ferrum Edge HTTP/3 unauthenticated declared-frame-length OOM (#4261) |
 
 ## Why this directory exists

@@ -287,7 +287,7 @@
         "github_repo": "hyperium/h3",
         "pr_number": null,
         "issue_number": null,
-        "fork_ref": "jeremyjpj0916/h3@feat/max-buffered-frame-len"
+        "fork_ref": null
       },
       "reaffirmation": null,
       "retirement": {

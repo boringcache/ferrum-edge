@@ -63,7 +63,7 @@ surface drifts.
 | `h3-002-extended-connect-websocket-protocol` | `h3` | 0.0.8 | Add `Protocol::WEB_SOCKET` (RFC 9220 Extended CONNECT) | **Deliberate fork** — unfiled upstream; branch `feat/extended-connect-websocket-protocol` on `jeremyjpj0916/h3` ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | Stock `h3` 0.0.8 rejects `:protocol=websocket` at the HEADERS layer, making WebSocket-over-HTTP/3 unreachable | Upstream files + merges the variant **and** patches 001/003/004/005 are also retired | [docs/upstream-h3-patches/002-…](upstream-h3-patches/002-extended-connect-websocket-protocol/README.md) |
 | `h3-003-peek-buffered-trailers-before-fin` | `h3` | 0.0.8 | Add `RequestStream::peek_recv_trailers()` for already-buffered trailers before FIN | **Deliberate fork** — unfiled upstream; branch `feat/peek-buffered-trailers-before-fin` on `jeremyjpj0916/h3` ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | `poll_recv_trailers` buffers trailer HEADERS but waits for terminal FIN; gateway trailer-timeout collapse dropped trailers delivered before delayed FIN | Upstream files + merges the API **and** patches 001/002/004/005 are also retired | [docs/upstream-h3-patches/003-…](upstream-h3-patches/003-peek-buffered-trailers-before-fin/README.md) |
 | `h3-004-send-stream-stopped-watch` | `h3` | 0.0.8 | Add `SendStreamStopped` so peer `STOP_SENDING` is observable as a `&self` + `'static` return-position `impl Future` without exclusive send-stream access | **Deliberate fork** — unfiled upstream; branch `feat/send-stream-stopped-watch` on `jeremyjpj0916/h3` ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | After request HEADERS the gateway may block on backend headers without polling H3 frames; a client can cancel one multiplexed stream and leave destination `http2MaxRequests` held until the backend answers | Upstream files + merges the API **and** patches 001/002/003/005 are also retired | [docs/upstream-h3-patches/004-…](upstream-h3-patches/004-send-stream-stopped-watch/README.md) |
-| `h3-005-max-buffered-frame-len` | `h3` | 0.0.8 | Bound the DECLARED payload length of a buffered non-`DATA` frame and refuse an over-declared frame with `H3_EXCESSIVE_LOAD` before any payload is buffered | **Deliberate fork** — unfiled upstream; branch `feat/max-buffered-frame-len` on `jeremyjpj0916/h3` ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | Stock `h3` 0.0.8 parks on the declared length of a non-`DATA` frame and accumulates QUIC chunks without bound; QUIC flow control caps only bytes in flight, so one unauthenticated stream declaring 2^62-1 drives the process to OOM (#4261) | Upstream ships a receive-side declared-length bound refusing the frame BEFORE buffering **and** patches 001/002/003/004 are also retired | [docs/upstream-h3-patches/005-…](upstream-h3-patches/005-max-buffered-frame-len/README.md) |
+| `h3-005-max-buffered-frame-len` | `h3` | 0.0.8 | Bound the DECLARED payload length of a buffered non-`DATA` frame and refuse an over-declared frame with `H3_EXCESSIVE_LOAD` before any payload is buffered | **Deliberate fork** — unfiled upstream; no published fork ref yet ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | Stock `h3` 0.0.8 parks on the declared length of a non-`DATA` frame and accumulates QUIC chunks without bound; QUIC flow control caps only bytes in flight, so one unauthenticated stream declaring 2^62-1 drives the process to OOM (#4261) | Upstream ships a receive-side declared-length bound refusing the frame BEFORE buffering **and** patches 001/002/003/004 are also retired | [docs/upstream-h3-patches/005-…](upstream-h3-patches/005-max-buffered-frame-len/README.md) |
 | `h3-quinn-001-stop-sending-during-in-flight-read` | `h3-quinn` | 0.0.10 | Own `quinn::RecvStream` inline so `stop_sending` works while a read is in flight | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | `RecvStream` parks its `quinn::RecvStream` in a `ReusableBoxFuture` while a read is pending, so `stop_sending` unwraps a `None` and aborts exactly when a full-duplex H3 server must send `STOP_SENDING(H3_NO_ERROR)` after its response completes | `h3-quinn` ships a release whose `stop_sending` is correct while a read is in flight **and** patch 002 is also retired | [docs/upstream-h3-quinn-patches/001-…](upstream-h3-quinn-patches/001-stop-sending-during-in-flight-read/README.md) |
 | `h3-quinn-002-send-stream-stopped-watch` | `h3-quinn` | 0.0.10 | Implement `h3::quic::SendStreamStopped` via Quinn `&self` + `'static` `stopped()` as a return-position `impl Future` | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | Stock h3-quinn does not forward Quinn's `SendStream::stopped`, so a header wait cannot observe per-stream `STOP_SENDING` without exclusive send-stream access | `h3-quinn` ships a release with an equivalent watch **and** patch 001 is also retired | [docs/upstream-h3-quinn-patches/002-…](upstream-h3-quinn-patches/002-send-stream-stopped-watch/README.md) |
 | `tungstenite-001-lossless-takeover` | `tungstenite` | 0.29.0 | `WebSocket::into_inner_with_read_buffer()` (lossless raw takeover) | [snapview/tungstenite-rs#556](https://github.com/snapview/tungstenite-rs/pull/556) | Ferrum Edge maintainers | Tunnel mode lost backend bytes coalesced with the `101` response when dropping to raw relay | **Both** this and tokio-tungstenite#380 ship in compatible releases | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
@@ -78,8 +78,10 @@ surface drifts.
 > Ownership note: `vendor/`, `deny.toml`, this doc, `docs/vendored-patch-lifecycle.json`,
 > `docs/upstream-*-patches/`, and the vendored-patch scripts are owned via
 > [`.github/CODEOWNERS`](../.github/CODEOWNERS) (`@jeremyjpj0916`). Upstream `h3`
-> work is staged from the `jeremyjpj0916/h3` fork referenced in the h3 patch
-> docs. Patches carried without an upstream PR, including the tungstenite frame
+> work is staged from the `jeremyjpj0916/h3` fork where a published `fork_ref`
+> is recorded in `docs/vendored-patch-lifecycle.json`; patch 005 is unfiled with
+> `fork_ref: null` until a maintainer pushes the handoff branch. Patches carried
+> without an upstream PR, including the tungstenite frame
 > error-origin and stray-continuation ordering extensions, the tungstenite `auto_pong` opt-out, the tungstenite /
 > tokio-tungstenite fragment-accounting extension, and the dimpl
 > credential-security patch, are governed by the
@@ -92,7 +94,9 @@ tungstenite #556 / tokio-tungstenite #380); the weekly
 `scripts/check_vendored_patch_status.sh` (backed by
 `docs/vendored-patch-lifecycle.json`) polls those and goes red when one
 merges. Fork-only patches currently include **h3 002** (Extended CONNECT
-`:protocol=websocket`), **h3 003** (`peek_recv_trailers`), the tungstenite
+`:protocol=websocket`), **h3 003** (`peek_recv_trailers`), **h3 004**
+(`SendStreamStopped`), **h3 005** (max buffered frame len; no published fork
+ref yet), the tungstenite
 frame-limit origin and stray-continuation ordering extensions, **tungstenite `auto_pong`** (transparent Ping
 relay), **tungstenite / tokio-tungstenite 004** (fragment accounting and
 incomplete-message bounds), and **dimpl 001** (DTLS certificate chains and private-key
@@ -124,7 +128,7 @@ zeroization). They are not untracked TODOs; they are carried as
   keeps "not yet filed" from silently becoming permanent in a released product.
 - **Retirement is unchanged.** Whether upstreamed via PR or carried as a fork,
   each patch retires per its `README.md` retirement plan and the co-vendoring
-  rule (all four h3 patches retire together — see the inventory `Removal
+  rule (all five h3 patches retire together — see the inventory `Removal
   trigger` column).
 
 ## Enforcement controls

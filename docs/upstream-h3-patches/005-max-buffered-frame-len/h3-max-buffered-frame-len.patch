@@ -1,7 +1,7 @@
-diff --git a/vendor/h3-0.0.8-ferrum-patched/src/client/builder.rs b/vendor/h3-0.0.8-ferrum-patched/src/client/builder.rs
+diff --git a/h3/src/client/builder.rs b/h3/src/client/builder.rs
 index 5ae628d73..e000104d1 100644
---- a/vendor/h3-0.0.8-ferrum-patched/src/client/builder.rs
-+++ b/vendor/h3-0.0.8-ferrum-patched/src/client/builder.rs
+--- a/h3/src/client/builder.rs
++++ b/h3/src/client/builder.rs
 @@ -88,6 +88,31 @@ impl Builder {
          self
      }
@@ -42,10 +42,10 @@ index 5ae628d73..e000104d1 100644
              sender_count: Arc::new(AtomicUsize::new(1)),
              send_grease_frame: self.config.send_grease,
              _buf: PhantomData,
-diff --git a/vendor/h3-0.0.8-ferrum-patched/src/client/connection.rs b/vendor/h3-0.0.8-ferrum-patched/src/client/connection.rs
+diff --git a/h3/src/client/connection.rs b/h3/src/client/connection.rs
 index 4090d021b..874554b6d 100644
---- a/vendor/h3-0.0.8-ferrum-patched/src/client/connection.rs
-+++ b/vendor/h3-0.0.8-ferrum-patched/src/client/connection.rs
+--- a/h3/src/client/connection.rs
++++ b/h3/src/client/connection.rs
 @@ -114,6 +114,9 @@ where
      pub(super) open: T,
      pub(super) conn_state: Arc<SharedState>,
@@ -76,10 +76,10 @@ index 4090d021b..874554b6d 100644
              sender_count: self.sender_count.clone(),
              _buf: PhantomData,
              send_grease_frame: self.send_grease_frame,
-diff --git a/vendor/h3-0.0.8-ferrum-patched/src/config.rs b/vendor/h3-0.0.8-ferrum-patched/src/config.rs
+diff --git a/h3/src/config.rs b/h3/src/config.rs
 index c2a6fe647..fb86947ec 100644
---- a/vendor/h3-0.0.8-ferrum-patched/src/config.rs
-+++ b/vendor/h3-0.0.8-ferrum-patched/src/config.rs
+--- a/h3/src/config.rs
++++ b/h3/src/config.rs
 @@ -17,6 +17,23 @@ pub struct Config {
  
      /// HTTP/3 Settings
@@ -121,10 +121,10 @@ index c2a6fe647..fb86947ec 100644
          }
      }
  }
-diff --git a/vendor/h3-0.0.8-ferrum-patched/src/connection.rs b/vendor/h3-0.0.8-ferrum-patched/src/connection.rs
+diff --git a/h3/src/connection.rs b/h3/src/connection.rs
 index cfbee8375..b9442697a 100644
---- a/vendor/h3-0.0.8-ferrum-patched/src/connection.rs
-+++ b/vendor/h3-0.0.8-ferrum-patched/src/connection.rs
+--- a/h3/src/connection.rs
++++ b/h3/src/connection.rs
 @@ -406,9 +406,12 @@ where
                  .poll_accept_recv(cx)
                  .map_err(|e| self.handle_connection_error(e))?
@@ -141,10 +141,10 @@ index cfbee8375..b9442697a 100644
                  Poll::Pending => break,
              }
          }
-diff --git a/vendor/h3-0.0.8-ferrum-patched/src/error/internal_error.rs b/vendor/h3-0.0.8-ferrum-patched/src/error/internal_error.rs
+diff --git a/h3/src/error/internal_error.rs b/h3/src/error/internal_error.rs
 index 419799393..c4b83c326 100644
---- a/vendor/h3-0.0.8-ferrum-patched/src/error/internal_error.rs
-+++ b/vendor/h3-0.0.8-ferrum-patched/src/error/internal_error.rs
+--- a/h3/src/error/internal_error.rs
++++ b/h3/src/error/internal_error.rs
 @@ -57,6 +57,21 @@ impl InternalConnectionError {
              //# after the identified fields or a frame payload that terminates before
              //# the end of the identified fields MUST be treated as a connection
@@ -167,10 +167,10 @@ index 419799393..c4b83c326 100644
              FrameProtocolError::InvalidFrameValue | FrameProtocolError::Malformed => InternalConnectionError {
                  code: Code::H3_FRAME_ERROR,
                  message: "frame payload that contains additional bytes after the identified fields or a frame payload that terminates before the end of the identified fields".to_string(),
-diff --git a/vendor/h3-0.0.8-ferrum-patched/src/frame.rs b/vendor/h3-0.0.8-ferrum-patched/src/frame.rs
+diff --git a/h3/src/frame.rs b/h3/src/frame.rs
 index e859b4023..9173117fd 100644
---- a/vendor/h3-0.0.8-ferrum-patched/src/frame.rs
-+++ b/vendor/h3-0.0.8-ferrum-patched/src/frame.rs
+--- a/h3/src/frame.rs
++++ b/h3/src/frame.rs
 @@ -30,9 +30,20 @@ pub struct FrameStream<S, B> {
  
  impl<S, B> FrameStream<S, B> {
@@ -479,10 +479,10 @@ index e859b4023..9173117fd 100644
      #[tokio::test]
      async fn poll_full_request() {
          let mut recv = FakeRecv::default();
-diff --git a/vendor/h3-0.0.8-ferrum-patched/src/proto/frame.rs b/vendor/h3-0.0.8-ferrum-patched/src/proto/frame.rs
+diff --git a/h3/src/proto/frame.rs b/h3/src/proto/frame.rs
 index a09520bb5..ecd2730c1 100644
---- a/vendor/h3-0.0.8-ferrum-patched/src/proto/frame.rs
-+++ b/vendor/h3-0.0.8-ferrum-patched/src/proto/frame.rs
+--- a/h3/src/proto/frame.rs
++++ b/h3/src/proto/frame.rs
 @@ -22,6 +22,20 @@ pub enum FrameError {
      UnknownFrame(u64),     // Unknown frames that should be ignored
      InvalidFrameValue,
@@ -607,10 +607,10 @@ index a09520bb5..ecd2730c1 100644
                  //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
                  //# Endpoints MUST
                  //# NOT consider these frames to have any meaning upon receipt.
-diff --git a/vendor/h3-0.0.8-ferrum-patched/src/server/builder.rs b/vendor/h3-0.0.8-ferrum-patched/src/server/builder.rs
+diff --git a/h3/src/server/builder.rs b/h3/src/server/builder.rs
 index 08be4f472..57743e9fa 100644
---- a/vendor/h3-0.0.8-ferrum-patched/src/server/builder.rs
-+++ b/vendor/h3-0.0.8-ferrum-patched/src/server/builder.rs
+--- a/h3/src/server/builder.rs
++++ b/h3/src/server/builder.rs
 @@ -76,6 +76,31 @@ impl Builder {
          self
      }
@@ -643,10 +643,10 @@ index 08be4f472..57743e9fa 100644
      /// Send grease values to the Client.
      /// See [setting](https://www.rfc-editor.org/rfc/rfc9114.html#settings-parameters), [frame](https://www.rfc-editor.org/rfc/rfc9114.html#frame-reserved) and [stream](https://www.rfc-editor.org/rfc/rfc9114.html#stream-grease) for more information.
      #[inline]
-diff --git a/vendor/h3-0.0.8-ferrum-patched/src/server/connection.rs b/vendor/h3-0.0.8-ferrum-patched/src/server/connection.rs
+diff --git a/h3/src/server/connection.rs b/h3/src/server/connection.rs
 index a9ba582a6..85022931b 100644
---- a/vendor/h3-0.0.8-ferrum-patched/src/server/connection.rs
-+++ b/vendor/h3-0.0.8-ferrum-patched/src/server/connection.rs
+--- a/h3/src/server/connection.rs
++++ b/h3/src/server/connection.rs
 @@ -123,7 +123,14 @@ where
      pub async fn accept(&mut self) -> Result<Option<RequestResolver<C, B>>, ConnectionError> {
          // Accept the incoming stream
@@ -663,10 +663,10 @@ index a9ba582a6..85022931b 100644
              None => {
                  // We always send a last GoAway frame to the client, so it knows which was the last
                  // non-rejected request.
-diff --git a/vendor/h3-0.0.8-ferrum-patched/src/stream.rs b/vendor/h3-0.0.8-ferrum-patched/src/stream.rs
+diff --git a/h3/src/stream.rs b/h3/src/stream.rs
 index 09d1ccfae..5123f58de 100644
---- a/vendor/h3-0.0.8-ferrum-patched/src/stream.rs
-+++ b/vendor/h3-0.0.8-ferrum-patched/src/stream.rs
+--- a/h3/src/stream.rs
++++ b/h3/src/stream.rs
 @@ -270,6 +270,9 @@ pub(super) struct AcceptRecvStream<S, B> {
      /// push_id or session_id
      id: Option<VarInt>,
