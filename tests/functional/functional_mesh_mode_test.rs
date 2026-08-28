@@ -9897,6 +9897,12 @@ async fn functional_mesh_udp_dest_untrusted_peer_fails_closed() {
 /// local address (`127.0.0.1`) so the own-pod shortcut cannot stand in for C.
 const THIRD_WORKLOAD_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(127, 0, 0, 2);
 
+/// After a CONNECT result, wait this long for C's backend task to report a
+/// TCP accept or UDP datagram that was already queued while that task had not
+/// yet been polled. An immediate atomic load can miss that race and treat an
+/// admission as a refusal. The wait is a bounded channel recv, not a sleep.
+const THIRD_WORKLOAD_BACKEND_OBSERVE: Duration = Duration::from_secs(2);
+
 /// CONNECT flavor under test. Each flavor takes a different handler with its
 /// own post-plugin re-check (`handle_hbone_request` vs
 /// `handle_hbone_udp_request`).
@@ -9906,50 +9912,55 @@ enum ThirdWorkloadConnectFlavor {
     Datagram,
 }
 
-/// Counting TCP echo bound on `ip`. `accept()` is the destination-side "a
-/// backend dial occurred" signal for the byte-stream relay.
+/// Counting TCP listener bound on `ip`. Each `accept()` is sent on the
+/// returned channel — the destination-side "a backend dial occurred" signal
+/// for the byte-stream relay. The ready oneshot fires before the first
+/// `accept`, so the caller knows the accept loop has been scheduled.
 async fn start_counting_tcp_echo_on(
     ip: std::net::IpAddr,
-) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
+) -> (
+    SocketAddr,
+    mpsc::UnboundedReceiver<()>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = bind_fixture_listener(SocketAddr::new(ip, 0))
         .await
         .expect("bind third-workload TCP echo on 127.0.0.2 — 127.0.0.0/8 must be loopback");
     let addr = listener.local_addr().expect("third-workload TCP echo addr");
-    let accepted = Arc::new(AtomicUsize::new(0));
-    let counter = Arc::clone(&accepted);
+    let (hit_tx, hit_rx) = mpsc::unbounded_channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
+        let _ = ready_tx.send(());
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
+            let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
-            counter.fetch_add(1, Ordering::SeqCst);
-            tokio::spawn(async move {
-                let mut buf = [0u8; 2048];
-                loop {
-                    let Ok(n) = stream.read(&mut buf).await else {
-                        return;
-                    };
-                    if n == 0 {
-                        return;
-                    }
-                    if stream.write_all(&buf[..n]).await.is_err() {
-                        return;
-                    }
-                    let _ = stream.flush().await;
-                }
-            });
+            // Record the dial and drop the socket. Echoing would spawn a
+            // detached per-connection task that aborting this accept loop
+            // cannot join.
+            drop(stream);
+            if hit_tx.send(()).is_err() {
+                return;
+            }
         }
     });
-    (addr, accepted, task)
+    tokio::time::timeout(Duration::from_secs(2), ready_rx)
+        .await
+        .expect("third-workload TCP echo became ready")
+        .expect("third-workload TCP echo task dropped ready");
+    (addr, hit_rx, task)
 }
 
-/// Counting UDP echo bound on `ip`. `recv_from` is the destination-side "a
-/// datagram was delivered" signal for the datagram-over-CONNECT relay.
+/// Counting UDP socket bound on `ip`. Each `recv_from` is sent on the
+/// returned channel — the destination-side "a datagram was delivered" signal
+/// for the datagram-over-CONNECT relay.
 async fn start_counting_udp_echo_on(
     ip: std::net::IpAddr,
-) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+) -> (
+    SocketAddr,
+    mpsc::UnboundedReceiver<()>,
+    tokio::task::JoinHandle<()>,
+) {
     // Re-roll past ports already promised to a mesh gateway subprocess — the
     // UDP counterpart of [`bind_fixture_listener`] (issue #2132). Rejected
     // sockets are held so the kernel cannot re-offer the same port.
@@ -9970,16 +9981,46 @@ async fn start_counting_udp_echo_on(
         chosen.expect("no acceptable ephemeral UDP port for a third-workload fixture socket");
     drop(rejected);
     let addr = socket.local_addr().expect("third-workload UDP echo addr");
-    let received = Arc::new(AtomicUsize::new(0));
-    let counter = Arc::clone(&received);
+    let (hit_tx, hit_rx) = mpsc::unbounded_channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
+        let _ = ready_tx.send(());
         let mut buf = vec![0u8; 65535];
-        while let Ok((n, src)) = socket.recv_from(&mut buf).await {
-            counter.fetch_add(1, Ordering::SeqCst);
-            let _ = socket.send_to(&buf[..n], src).await;
+        while socket.recv_from(&mut buf).await.is_ok() {
+            if hit_tx.send(()).is_err() {
+                return;
+            }
         }
     });
-    (addr, received, task)
+    tokio::time::timeout(Duration::from_secs(2), ready_rx)
+        .await
+        .expect("third-workload UDP echo became ready")
+        .expect("third-workload UDP echo task dropped ready");
+    (addr, hit_rx, task)
+}
+
+/// Wait until C's backend reports a hit, or until `window` elapses with none.
+/// Returning early on the first hit keeps a regression from burning the full
+/// window; a timeout is the only way to conclude zero hits.
+async fn observe_third_workload_backend_hits(
+    hit_rx: &mut mpsc::UnboundedReceiver<()>,
+    window: Duration,
+) -> usize {
+    match tokio::time::timeout(window, hit_rx.recv()).await {
+        Ok(Some(())) => {
+            let mut hits = 1;
+            while hit_rx.try_recv().is_ok() {
+                hits += 1;
+            }
+            hits
+        }
+        Ok(None) | Err(_) => 0,
+    }
+}
+
+async fn abort_third_workload_backend(task: tokio::task::JoinHandle<()>) {
+    task.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
 }
 
 /// Slice consumed by terminator B: B's own-identity record at 127.0.0.1 plus
@@ -10133,7 +10174,7 @@ async fn drive_inbound_relay_third_workload_refusal(
         let temp_b = TempDir::new().map_err(|e| format!("temp dir b: {e}"))?;
         let svids = generate_two_gateway_svids(temp_b.path(), a_spiffe, b_spiffe);
 
-        let (c_addr, hits, echo) = match flavor {
+        let (c_addr, mut hit_rx, echo) = match flavor {
             ThirdWorkloadConnectFlavor::ByteStream => start_counting_tcp_echo_on(third_ip).await,
             ThirdWorkloadConnectFlavor::Datagram => start_counting_udp_echo_on(third_ip).await,
         };
@@ -10187,7 +10228,7 @@ async fn drive_inbound_relay_third_workload_refusal(
             );
             kill_child(&mut child_b);
             cp_b.shutdown().await;
-            echo.abort();
+            abort_third_workload_backend(echo).await;
             tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         }
@@ -10211,16 +10252,26 @@ async fn drive_inbound_relay_third_workload_refusal(
 
         let died = exited_gateway_diagnostic(&mut [("gateway B", &mut child_b)]);
         let logs = captured_output(&temp_b);
-        let backend_hits = hits.load(Ordering::SeqCst);
-        kill_child(&mut child_b);
-        cp_b.shutdown().await;
-        echo.abort();
 
         if let Some(diagnostic) = died {
             last_failure = format!("attempt {attempt}: {diagnostic}\n{logs}");
+            kill_child(&mut child_b);
+            cp_b.shutdown().await;
+            abort_third_workload_backend(echo).await;
             tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         }
+
+        // Observe while the terminator is still alive so a queued dial can
+        // still complete accept/recv and fail the zero-hit assertion.
+        let backend_hits = if connect.is_ok() {
+            observe_third_workload_backend_hits(&mut hit_rx, THIRD_WORKLOAD_BACKEND_OBSERVE).await
+        } else {
+            0
+        };
+        kill_child(&mut child_b);
+        cp_b.shutdown().await;
+        abort_third_workload_backend(echo).await;
 
         return match connect {
             Ok(status) => Ok(ThirdWorkloadRefusalOutcome {
