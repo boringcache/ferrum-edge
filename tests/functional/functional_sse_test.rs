@@ -167,17 +167,11 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
         drop(admin_listener);
 
         let observability_token = crate::common::mint_observability_token("sse");
-        let mut child = start_gateway_file_mode(
-            config_path,
-            proxy_port,
-            admin_port,
-            &observability_token,
-        )
-        .expect("Failed to start gateway");
+        let mut child =
+            start_gateway_file_mode(config_path, proxy_port, admin_port, &observability_token)
+                .expect("Failed to start gateway");
 
-        if wait_for_owned_gateway(&mut child, admin_port, &observability_token)
-            .await
-        {
+        if wait_for_owned_gateway(&mut child, admin_port, &observability_token).await {
             return (child, proxy_port, admin_port);
         }
 

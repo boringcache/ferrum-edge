@@ -280,20 +280,11 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
         drop(admin_listener);
 
         let observability_token = crate::common::mint_observability_token("load-balancer");
-        match start_gateway_in_file_mode(
-            config_path,
-            proxy_port,
-            admin_port,
-            &observability_token,
-        ) {
+        match start_gateway_in_file_mode(config_path, proxy_port, admin_port, &observability_token)
+        {
             Ok(mut child) => {
-                if wait_for_owned_gateway(
-                    &mut child,
-                    admin_port,
-                    proxy_port,
-                    &observability_token,
-                )
-                .await
+                if wait_for_owned_gateway(&mut child, admin_port, proxy_port, &observability_token)
+                    .await
                 {
                     return (child, proxy_port, admin_port);
                 }

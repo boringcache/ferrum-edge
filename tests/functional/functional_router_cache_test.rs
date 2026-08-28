@@ -157,9 +157,7 @@ async fn start_gateway_with_retry(
             &observability_token,
         );
 
-        if wait_for_owned_gateway(&mut child, admin_port, &observability_token)
-            .await
-        {
+        if wait_for_owned_gateway(&mut child, admin_port, &observability_token).await {
             return (child, proxy_port, admin_port);
         }
 

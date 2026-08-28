@@ -127,15 +127,9 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
         let admin_port = ephemeral_port().await;
 
         let observability_token = crate::common::mint_observability_token("service-discovery");
-        let mut child = start_gateway_in_file_mode(
-            config_path,
-            proxy_port,
-            admin_port,
-            &observability_token,
-        );
-        if wait_for_owned_gateway(&mut child, admin_port, &observability_token)
-            .await
-        {
+        let mut child =
+            start_gateway_in_file_mode(config_path, proxy_port, admin_port, &observability_token);
+        if wait_for_owned_gateway(&mut child, admin_port, &observability_token).await {
             return (child, proxy_port, admin_port);
         }
 

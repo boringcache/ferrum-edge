@@ -309,8 +309,8 @@ impl ScalePerfHarness {
         .await
         .map_err(|e| e.to_string())?;
         crate::common::wait_for_admin_jwt(admin_port, &auth, Duration::from_secs(30))
-        .await
-        .map_err(|e| e.to_string())?;
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 

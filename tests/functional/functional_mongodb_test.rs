@@ -469,8 +469,8 @@ impl MongoTestHarness {
         .await
         .map_err(|e| e.to_string())?;
         crate::common::wait_for_admin_jwt(self.admin_port, &auth, Duration::from_secs(30))
-        .await
-        .map_err(|e| e.to_string())?;
+            .await
+            .map_err(|e| e.to_string())?;
         println!("  Gateway (mongodb) is ready!");
         Ok(())
     }

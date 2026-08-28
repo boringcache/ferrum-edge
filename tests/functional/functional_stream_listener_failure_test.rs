@@ -180,8 +180,8 @@ async fn prove_child_owns_admin(
     .map_err(|e| e.to_string())?;
     if let Some(auth) = admin_auth {
         crate::common::wait_for_admin_jwt(admin_port, auth, Duration::from_secs(30))
-        .await
-        .map_err(|e| e.to_string())?;
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -270,13 +270,8 @@ impl DbHarness {
             .spawn()?;
 
         let auth = auth_header();
-        if let Err(e) = prove_child_owns_admin(
-            &mut child,
-            admin_port,
-            &observability_token,
-            Some(&auth),
-        )
-        .await
+        if let Err(e) =
+            prove_child_owns_admin(&mut child, admin_port, &observability_token, Some(&auth)).await
         {
             kill_child(&mut child);
             return Err(e);
@@ -719,14 +714,9 @@ plugin_configs: []
             .spawn()
             .expect("spawn gateway");
 
-        if prove_child_owns_admin(
-            &mut child,
-            admin_port,
-            &observability_token,
-            None,
-        )
-        .await
-        .is_ok()
+        if prove_child_owns_admin(&mut child, admin_port, &observability_token, None)
+            .await
+            .is_ok()
         {
             started = Some((child, stream_port_a, stream_port_b, admin_port, dir));
             stream_b_reservation = Some(reserved_b);

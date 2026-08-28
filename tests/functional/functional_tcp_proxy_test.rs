@@ -357,9 +357,7 @@ where
             }
         };
 
-        if wait_for_owned_gateway(&mut child, admin_port, &observability_token)
-            .await
-        {
+        if wait_for_owned_gateway(&mut child, admin_port, &observability_token).await {
             return (child, proxy_listen_port, admin_port, dir);
         }
 

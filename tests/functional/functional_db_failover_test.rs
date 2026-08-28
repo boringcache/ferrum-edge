@@ -108,9 +108,7 @@ async fn wait_for_owned_health(
     jwt_issuer: &str,
 ) -> bool {
     let auth = auth_header(jwt_secret, jwt_issuer);
-    let jwt = auth
-        .strip_prefix("Bearer ")
-        .unwrap_or(auth.as_str());
+    let jwt = auth.strip_prefix("Bearer ").unwrap_or(auth.as_str());
     if crate::common::wait_for_owned_gateway_identity(
         child,
         admin_port,
@@ -123,8 +121,8 @@ async fn wait_for_owned_health(
         return false;
     }
     crate::common::wait_for_admin_jwt(admin_port, &auth, Duration::from_secs(30))
-    .await
-    .is_ok()
+        .await
+        .is_ok()
 }
 
 /// Kill the child process and reap its zombie before any retry re-binds ports.
@@ -427,9 +425,7 @@ async fn test_db_config_backup_bootstrap() {
         // Note: connecting to the primary DB fails with a short pool timeout,
         // but the backup loader still needs to read and parse the JSON file.
         // Budget plenty of time to avoid timing-out on a slow CI runner.
-        if !wait_for_owned_health(&mut child, admin_port, &jwt_secret, &jwt_issuer)
-            .await
-        {
+        if !wait_for_owned_health(&mut child, admin_port, &jwt_secret, &jwt_issuer).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
             kill_child(child);

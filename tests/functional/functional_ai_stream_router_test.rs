@@ -66,9 +66,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
 
         let observability_token = crate::common::mint_observability_token("ai-stream-router");
         let mut child = start_gateway(config_path, proxy_port, admin_port, &observability_token);
-        if wait_for_owned_gateway(&mut child, admin_port, &observability_token)
-            .await
-        {
+        if wait_for_owned_gateway(&mut child, admin_port, &observability_token).await {
             return (child, proxy_port, admin_port);
         }
         let _ = child.kill();
