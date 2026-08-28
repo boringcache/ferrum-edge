@@ -1407,6 +1407,71 @@ async fn test_jwks_auth_allows_missing_exp_when_require_exp_false() {
 }
 
 #[tokio::test]
+async fn test_jwks_auth_rejects_future_nbf() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let jwks = build_rsa_jwks_from_pem(public_key_pem);
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{ "jwks": jwks }]
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let now = chrono::Utc::now().timestamp();
+    let token = create_rs256_token_exact(
+        &json!({
+            "sub": "nbf-user",
+            "exp": now + 3600,
+            "nbf": now + 3600
+        }),
+        private_key_pem,
+    );
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_reject(result, Some(401));
+    assert!(ctx.authenticated_identity.is_none());
+}
+
+#[tokio::test]
+async fn test_jwks_auth_accepts_past_nbf_with_zero_leeway() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let jwks = build_rsa_jwks_from_pem(public_key_pem);
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{ "jwks": jwks }]
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let now = chrono::Utc::now().timestamp();
+    let token = create_rs256_token_exact(
+        &json!({
+            "sub": "nbf-user",
+            "exp": now + 3600,
+            "nbf": now - 60
+        }),
+        private_key_pem,
+    );
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+
+    let consumer_index = ConsumerIndex::new(&[create_consumer("nbf-user")]);
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("nbf-user"));
+}
+
+#[tokio::test]
 async fn test_jwks_auth_strips_authorization_when_forward_original_token_false() {
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
@@ -3194,6 +3259,82 @@ async fn test_jwks_auth_request_principal_not_set_without_iss() {
         !ctx.metadata.contains_key("mesh.request_principal"),
         "request_principal should not be set without iss claim"
     );
+}
+
+#[tokio::test]
+async fn mesh_shaped_jwks_auth_rejects_aud_less_and_future_nbf_before_identity_staging() {
+    // Config shape produced by mesh RequestAuthentication injection:
+    // issuer + audiences + emit_mesh_request_principal_metadata.
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let jwks = build_rsa_jwks_from_pem(public_key_pem);
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "issuer": "https://issuer.example.com",
+                "jwks": jwks,
+                "audiences": ["orders-api"],
+                "forward_original_token": false
+            }],
+            "require_exp": true,
+            "emit_mesh_request_principal_metadata": true
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let now = chrono::Utc::now().timestamp();
+    let aud_less = create_rs256_token_exact(
+        &json!({
+            "iss": "https://issuer.example.com",
+            "sub": "mesh-user",
+            "exp": now + 3600
+        }),
+        private_key_pem,
+    );
+    let mut aud_less_ctx = make_ctx();
+    aud_less_ctx.headers.insert(
+        "authorization".to_string(),
+        format!("Bearer {aud_less}"),
+    );
+    let aud_less_result = plugin
+        .authenticate(&mut aud_less_ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_reject(aud_less_result, Some(401));
+    assert!(aud_less_ctx.authenticated_identity.is_none());
+    assert!(
+        !aud_less_ctx
+            .metadata
+            .contains_key("mesh.request_principal"),
+        "aud-less tokens must not stage mesh identity attributes"
+    );
+    assert!(aud_less_ctx.mesh_request_auth_audiences.is_empty());
+
+    let future_nbf = create_rs256_token_exact(
+        &json!({
+            "iss": "https://issuer.example.com",
+            "sub": "mesh-user",
+            "aud": "orders-api",
+            "exp": now + 7200,
+            "nbf": now + 3600
+        }),
+        private_key_pem,
+    );
+    let mut nbf_ctx = make_ctx();
+    nbf_ctx.headers.insert(
+        "authorization".to_string(),
+        format!("Bearer {future_nbf}"),
+    );
+    let nbf_result = plugin
+        .authenticate(&mut nbf_ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_reject(nbf_result, Some(401));
+    assert!(nbf_ctx.authenticated_identity.is_none());
+    assert!(
+        !nbf_ctx.metadata.contains_key("mesh.request_principal"),
+        "future-nbf tokens must not stage mesh identity attributes"
+    );
+    assert!(nbf_ctx.mesh_request_auth_audiences.is_empty());
 }
 
 #[tokio::test]

@@ -2138,8 +2138,8 @@ Each `MeshJwtRule` specifies:
 
 | Field | Description |
 |---|---|
-| `issuer` | Expected JWT issuer (`iss` claim) |
-| `audiences` | Accepted audience values (`aud` claim); any configured value may match |
+| `issuer` | Expected JWT issuer (`iss` claim); the injected `jwks_auth` provider requires this claim to be present and exact |
+| `audiences` | Accepted audience values (`aud` claim); when non-empty, `aud` must be present and any configured value may match |
 | `jwks_uri` | URL to fetch the JWKS key set |
 | `jwks` | Inline JWKS JSON (alternative to `jwks_uri`); keys are loaded from config without a fetch loop |
 | `from_headers` | Headers to extract the JWT from (with optional prefix stripping) |
@@ -2149,6 +2149,8 @@ Each `MeshJwtRule` specifies:
 Each JWT rule resolves token locations independently. Rules with custom `from_headers` or `from_params` check those locations in declaration order; rules without custom locations continue to use the standard `Authorization: Bearer ...` lookup. When `forward_original_token: false`, the backend-bound request strips the matched rule's configured token headers or query parameters (or `Authorization` for standard lookup).
 
 **`exp` claim requirement**: the injected plugin requires the JWT `exp` claim by default (`FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP=true`), so tokens that omit `exp` are rejected and cannot live forever — this satisfies the gateway's `validate_exp = true` invariant. Some Istio issuers legitimately omit `exp`; set `FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP=false` to accept them. This knob is independent of expiry *validation*: a present-but-expired `exp` is always rejected regardless of the flag.
+
+**`iss` / `aud` / `nbf`**: a configured issuer requires `iss` presence plus an exact match. Non-empty `audiences` require `aud` presence plus the existing OR-match. `nbf` is optional, but a present not-before is validated (zero JWT leeway). Missing required claims and a future `nbf` fail closed before `mesh.request_principal` or `request.auth.*` attributes are staged.
 
 **Authz attribute emission**: a validated token's `iss/sub` (`request.auth.principal`), audiences (`request.auth.audiences`), and scalar / string-array claims (`request.auth.claims[<name>]`) are surfaced to the `mesh_authz` plugin so `AuthorizationPolicy` `when:` conditions over those attributes are evaluated (see [Rule Matching](#rule-matching)).
 
