@@ -255,9 +255,7 @@ async fn test_db_failover_urls_startup() {
             .spawn()
             .expect("spawn gateway");
 
-        if !wait_for_owned_health(&mut child, admin_port, &jwt_secret, &jwt_issuer)
-            .await
-        {
+        if !wait_for_owned_health(&mut child, admin_port, &jwt_secret, &jwt_issuer).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
             kill_child(child);
@@ -728,9 +726,7 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
             .spawn()
             .expect("spawn gateway");
 
-        if !wait_for_owned_health(&mut child, admin_port, &jwt_secret, &jwt_issuer)
-            .await
-        {
+        if !wait_for_owned_health(&mut child, admin_port, &jwt_secret, &jwt_issuer).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
             kill_child(child);
@@ -909,9 +905,7 @@ async fn test_db_read_replica_startup() {
             .spawn()
             .expect("spawn gateway");
 
-        if !wait_for_owned_health(&mut child, admin_port, &jwt_secret, &jwt_issuer)
-            .await
-        {
+        if !wait_for_owned_health(&mut child, admin_port, &jwt_secret, &jwt_issuer).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
             kill_child(child);
@@ -1061,9 +1055,7 @@ async fn test_db_authoritative_startup_uses_primary_when_replica_is_stale() {
             .spawn()
             .expect("spawn gateway");
 
-        if !wait_for_owned_health(&mut child, admin_port, &jwt_secret, &jwt_issuer)
-            .await
-        {
+        if !wait_for_owned_health(&mut child, admin_port, &jwt_secret, &jwt_issuer).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
             kill_child(child);
