@@ -2059,6 +2059,7 @@ fn test_passive_health_filters_targets() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     // Mark host1 as passively unhealthy
@@ -2123,6 +2124,7 @@ fn ejection_cap_readmits_when_too_many_passively_ejected() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     // Eject 3 targets (host0, host1, host2) — exceeds 50% cap (max 2)
@@ -2241,6 +2243,7 @@ fn ejection_cap_zero_percent_readmits_all() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     // Eject all 3 targets
@@ -2314,6 +2317,7 @@ fn ejection_cap_does_not_affect_active_health_ejections() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
     checker.report_response(
         "ferrum",
@@ -2431,6 +2435,7 @@ fn passthrough_ejection_cap_scoped_to_candidate_pool_not_whole_upstream() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
     let active: DashMap<String, u64> = DashMap::new();
     let in_pool: std::net::SocketAddr = "10.0.0.1:8080".parse().unwrap();
@@ -3193,6 +3198,7 @@ fn family_eligibility_skips_passively_ejected_same_family_target() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
     checker.report_response(
         "ferrum",

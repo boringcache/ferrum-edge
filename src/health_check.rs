@@ -1373,6 +1373,16 @@ impl HealthChecker {
             None => return,
         };
 
+        // Istio `consecutive5xxErrors: 0` disables only the HTTP-5xx detector.
+        // Connection-error accounting and success-reset invariants stay on their
+        // own paths; native windowed policies never set this sentinel.
+        if !connection_error
+            && config.consecutive_5xx_ejection_disabled
+            && config.unhealthy_status_codes.contains(&status_code)
+        {
+            return;
+        }
+
         let proxy_state = self.get_proxy_state(namespace, proxy_id);
 
         // Format "host:port" into a thread-local buffer to avoid a String

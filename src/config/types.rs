@@ -1485,6 +1485,11 @@ pub struct PassiveHealthCheck {
     /// `interval` is an analysis sweep period, not a failure window.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub consecutive_error_mode: bool,
+    /// When true, HTTP 5xx responses in `unhealthy_status_codes` are ignored
+    /// by passive ejection (Istio `consecutive5xxErrors: 0`). Set only by
+    /// translated DestinationRules; native windowed policies never enable this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub consecutive_5xx_ejection_disabled: bool,
 }
 
 impl Default for PassiveHealthCheck {
@@ -1498,6 +1503,7 @@ impl Default for PassiveHealthCheck {
             gateway_error_codes: None,
             split_external_local_origin_errors: None,
             consecutive_error_mode: false,
+            consecutive_5xx_ejection_disabled: false,
         }
     }
 }

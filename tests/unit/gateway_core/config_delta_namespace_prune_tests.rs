@@ -254,6 +254,7 @@ fn health_check_prune_removes_only_matching_namespace() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     checker.report_response(

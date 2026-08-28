@@ -2713,6 +2713,14 @@ fn translate_client_tls_settings(
 /// Ferrum's own uncapped default.
 pub(crate) const ISTIO_DEFAULT_MAX_EJECTION_PERCENT: u8 = 10;
 
+/// Istio/Envoy default `outlierDetection.consecutive5xxErrors` (issue #4292).
+///
+/// Istio defaults the consecutive 5xx streak threshold to 5; Ferrum's native
+/// passive health defaults to 3 failures in a sliding window. Applied only when
+/// a translated DestinationRule omits both `consecutive5xxErrors` and the
+/// legacy `consecutiveErrors` alias.
+pub(crate) const ISTIO_DEFAULT_CONSECUTIVE_5XX_ERRORS: u32 = 5;
+
 /// `outlierDetection` fields Ferrum parses past but does not enforce
 /// (issue #4292). Kept in sync with `deferred_outlier_detection_fields` in
 /// `src/k8s_controller/istio_status.rs`.
@@ -2726,11 +2734,13 @@ fn translate_outlier_detection(
     object: &K8sObject,
     value: &Value,
 ) -> Result<MeshOutlierDetection, K8sTranslateError> {
-    let consecutive_errors = value
+    let consecutive_errors = match value
         .get("consecutive5xxErrors")
         .or_else(|| value.get("consecutiveErrors"))
-        .and_then(Value::as_u64)
-        .and_then(|v| u32::try_from(v).ok());
+    {
+        Some(raw) => raw.as_u64().and_then(|v| u32::try_from(v).ok()),
+        None => Some(ISTIO_DEFAULT_CONSECUTIVE_5XX_ERRORS),
+    };
 
     let interval_seconds = string_field(value, "interval")
         .and_then(parse_istio_duration_secs)

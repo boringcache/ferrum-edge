@@ -457,9 +457,11 @@ need them, or because they are blocked upstream / architecturally:
   not applied: Ferrum's passive health keeps one failure bucket
   (`unhealthy_status_codes` + connection errors) and bounds ejection with
   `maxEjectionPercent` alone. `consecutive5xxErrors` IS applied with Istio's
-  consecutive-streak semantics, and a translated `outlierDetection` that omits
-  `maxEjectionPercent` inherits Istio's own 10% default rather than Ferrum's
-  uncapped native default.
+  consecutive-streak semantics; a translated `outlierDetection` that omits both
+  `consecutive5xxErrors` and `consecutiveErrors` inherits Istio's default of 5
+  (not Ferrum's native threshold of 3), explicit `0` disables 5xx ejection, and
+  a translated block that omits `maxEjectionPercent` inherits Istio's own 10%
+  default rather than Ferrum's uncapped native default.
 - **`RequestAuthentication` / `Telemetry` `targetRefs`** — rejected
   (`FerrumAccepted=False` / `Invalid`) rather than translated (issue #4305).
   Only `AuthorizationPolicy` implements end-to-end `targetRefs` attachment;

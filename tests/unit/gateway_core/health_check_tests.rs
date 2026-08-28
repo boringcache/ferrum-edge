@@ -92,6 +92,7 @@ fn test_passive_health_marks_unhealthy() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     for _ in 0..3 {
@@ -122,6 +123,7 @@ fn test_passive_health_recovers() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     for _ in 0..2 {
@@ -162,6 +164,7 @@ fn test_success_does_not_mark_unhealthy() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     for _ in 0..100 {
@@ -192,6 +195,7 @@ fn test_connection_error_counts_as_failure_regardless_of_status_codes() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     for _ in 0..2 {
@@ -225,6 +229,7 @@ fn test_connection_error_recovery_on_success() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     for _ in 0..2 {
@@ -266,6 +271,7 @@ fn test_remove_stale_passive_targets_for_proxy_cleans_unhealthy() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     for _ in 0..2 {
@@ -315,6 +321,7 @@ fn test_remove_stale_passive_targets_for_proxy_empty_list_clears_all() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     for _ in 0..2 {
@@ -348,6 +355,7 @@ fn test_remove_stale_targets_no_op_when_all_present() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     for _ in 0..2 {
@@ -394,6 +402,7 @@ fn test_passive_health_isolated_across_proxies_sharing_upstream() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     // Proxy-A sends large payloads → backend returns 500s
@@ -453,6 +462,7 @@ fn test_active_and_passive_health_are_independent() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     for _ in 0..2 {
@@ -521,6 +531,7 @@ fn test_prune_removed_proxies() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     // Insert passive health state for 3 proxies by reporting responses
@@ -599,6 +610,7 @@ fn test_passive_window_only_counts_recent_failures() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     // Record 2 failures (under threshold)
@@ -657,6 +669,7 @@ fn test_passive_window_failures_within_window_accumulate() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     // All 3 failures within the 60s window
@@ -708,6 +721,7 @@ fn test_passive_failure_ring_matches_threshold_sequences() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     report_failures(&checker, TEST_PROXY, &target, &config, 1);
@@ -741,6 +755,7 @@ fn test_passive_failure_ring_stays_capped_past_max() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     report_failures(
@@ -783,6 +798,7 @@ fn test_passive_failure_ring_is_isolated_per_proxy() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     report_failures(
@@ -823,6 +839,7 @@ fn test_passive_failure_ring_clears_on_success_recovery() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     report_failures(&checker, TEST_PROXY, &target, &config, 5);
@@ -860,6 +877,7 @@ fn test_remove_stale_passive_targets_drops_failure_ring() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     report_failures(&checker, TEST_PROXY, &target, &config, 4);
@@ -889,6 +907,7 @@ fn test_passive_failure_ring_clears_on_timer_recovery() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     report_failures(&checker, TEST_PROXY, &target, &config, 4);
@@ -919,6 +938,7 @@ fn test_passive_health_threshold_1_immediate_unhealthy() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     checker.report_response(
@@ -951,6 +971,7 @@ fn test_connection_error_ignores_status_code_list() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     // Status code 200 with connection_error=true should still count as failure
@@ -985,6 +1006,7 @@ fn test_passive_health_per_target_isolation() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     // Fail target_a only
@@ -1029,6 +1051,7 @@ fn test_recovery_clears_failures_then_re_threshold() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     // Mark unhealthy
@@ -2219,6 +2242,7 @@ fn consecutive_policy(threshold: u32) -> PassiveHealthCheck {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
         consecutive_error_mode: true,
+        consecutive_5xx_ejection_disabled: false,
     }
 }
 
@@ -2320,5 +2344,42 @@ fn windowed_mode_still_ejects_on_alternating_failures() {
     assert!(
         is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
         "windowed semantics count every in-window failure regardless of streaks"
+    );
+}
+
+/// Istio `consecutive5xxErrors: 0` disables only the HTTP-5xx detector.
+#[test]
+fn disabled_consecutive_5xx_detector_never_ejects_on_status_errors() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        consecutive_5xx_ejection_disabled: true,
+        ..PassiveHealthCheck::default()
+    };
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 100);
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "consecutive5xxErrors: 0 must not eject on HTTP 5xx"
+    );
+}
+
+/// Explicit nonzero consecutive thresholds still eject under consecutive mode.
+#[test]
+fn explicit_nonzero_consecutive_threshold_still_wins_over_disable_sentinel() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = consecutive_policy(7);
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 6);
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "must not eject below the explicit consecutive threshold"
+    );
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 1);
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "the seventh consecutive failure must eject"
     );
 }

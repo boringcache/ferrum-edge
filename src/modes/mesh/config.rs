@@ -7164,10 +7164,12 @@ fn validate_mesh_outlier_detection(
     errors: &mut Vec<String>,
 ) {
     // Istio treats `consecutive5xxErrors: 0` as *disabling* 5xx ejection rather
-    // than as an out-of-range value, and the K8s translator preserves the
-    // `Some(0)` verbatim. Rejecting it here would make a valid Istio config fail
-    // mesh startup/reload, so only reject negatives-via-overflow ranges and the
-    // degenerate zero-interval / zero-base-ejection cases that disable recovery.
+    // than as an out-of-range value. The K8s translator preserves `Some(0)` and
+    // `apply_outlier_detection_to_passive` projects it onto
+    // `PassiveHealthCheck.consecutive_5xx_ejection_disabled`. Rejecting it here
+    // would make a valid Istio config fail mesh startup/reload, so only reject
+    // negatives-via-overflow ranges and the degenerate zero-interval /
+    // zero-base-ejection cases that disable recovery.
     if matches!(outlier.interval_seconds, Some(0)) {
         errors.push(format!(
             "{context}.interval_seconds: must be greater than 0"

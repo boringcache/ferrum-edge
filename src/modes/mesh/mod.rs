@@ -11128,16 +11128,27 @@ fn mesh_hash_on_to_ferrum(lb: &Option<MeshLoadBalancer>) -> Option<String> {
 ///
 /// `consecutive5xxErrors` is a CONSECUTIVE-failure threshold in Istio, not a
 /// windowed count (issue #4292), so the overlay switches the policy into
-/// consecutive mode. Ferrum's native windowed semantics are untouched for
-/// policies this overlay never runs on. `interval` still lands on
+/// consecutive mode for explicit positive values. Omitted fields are defaulted
+/// to 5 at translate time; explicit `0` disables 5xx ejection via
+/// `consecutive_5xx_ejection_disabled`. Ferrum's native windowed semantics are
+/// untouched for policies this overlay never runs on. `interval` still lands on
 /// `unhealthy_window_seconds`: it is inert while consecutive mode is on
 /// (Istio's `interval` is an analysis sweep period), but keeping it recorded
 /// leaves the operator's declared value visible in the admin view and correct
 /// if a policy is later evaluated windowed.
 fn apply_outlier_detection_to_passive(passive: &mut PassiveHealthCheck, od: &MeshOutlierDetection) {
-    if let Some(consecutive) = od.consecutive_errors {
-        passive.unhealthy_threshold = consecutive;
-        passive.consecutive_error_mode = true;
+    match od.consecutive_errors {
+        Some(0) => {
+            // Istio `consecutive5xxErrors: 0` disables the 5xx detector; it
+            // must not map to threshold 0 (which would eject on the first
+            // failure). The sentinel is Istio-translated only.
+            passive.consecutive_5xx_ejection_disabled = true;
+        }
+        Some(consecutive) => {
+            passive.unhealthy_threshold = consecutive;
+            passive.consecutive_error_mode = true;
+        }
+        None => {}
     }
     if let Some(interval) = od.interval_seconds {
         passive.unhealthy_window_seconds = interval;

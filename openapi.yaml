@@ -12883,6 +12883,15 @@ components:
             `outlierDetection.consecutive5xxErrors` semantics, where a single
             success resets the streak and `unhealthy_window_seconds` is not
             consulted. Set automatically for translated Istio DestinationRules.
+        consecutive_5xx_ejection_disabled:
+          type: boolean
+          default: false
+          description: |
+            When true, HTTP 5xx responses in `unhealthy_status_codes` are
+            ignored by passive ejection (Istio `consecutive5xxErrors: 0`).
+            Set automatically for translated Istio DestinationRules that
+            explicitly disable the 5xx detector. Native windowed policies never
+            enable this sentinel.
 
     # ── Service Discovery ──────────────────────────────────────────
     ServiceDiscoveryConfig:

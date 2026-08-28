@@ -428,3 +428,85 @@ fn unenforced_outlier_fields_do_not_reject_the_resource() {
             .is_some()
     );
 }
+
+#[test]
+fn translated_outlier_detection_without_consecutive_fields_inherits_istios_five() {
+    let mesh = translate_in(
+        "default",
+        &[destination_rule(json!({
+            "interval": "10s"
+        }))],
+    )
+    .expect("DestinationRule translates");
+
+    let outlier = mesh.destination_rules[0]
+        .traffic_policy
+        .as_ref()
+        .and_then(|policy| policy.outlier_detection.as_ref())
+        .expect("outlierDetection translated");
+    assert_eq!(
+        outlier.consecutive_errors,
+        Some(5),
+        "omitted consecutive5xxErrors must inherit Istio's default of 5"
+    );
+    assert_eq!(outlier.max_ejection_percent, Some(10));
+}
+
+#[test]
+fn translated_outlier_detection_empty_block_inherits_istios_five() {
+    let mesh = translate_in(
+        "default",
+        &[destination_rule(json!({}))],
+    )
+    .expect("empty outlierDetection translates");
+
+    assert_eq!(
+        mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .and_then(|policy| policy.outlier_detection.as_ref())
+            .and_then(|outlier| outlier.consecutive_errors),
+        Some(5)
+    );
+}
+
+#[test]
+fn explicit_zero_consecutive5xx_errors_is_preserved_as_disabled() {
+    let mesh = translate_in(
+        "default",
+        &[destination_rule(json!({
+            "consecutive5xxErrors": 0,
+            "interval": "10s"
+        }))],
+    )
+    .expect("DestinationRule translates");
+
+    assert_eq!(
+        mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .and_then(|policy| policy.outlier_detection.as_ref())
+            .and_then(|outlier| outlier.consecutive_errors),
+        Some(0)
+    );
+}
+
+#[test]
+fn legacy_consecutive_errors_alias_still_wins_over_default() {
+    let mesh = translate_in(
+        "default",
+        &[destination_rule(json!({
+            "consecutiveErrors": 9
+        }))],
+    )
+    .expect("DestinationRule translates");
+
+    assert_eq!(
+        mesh.destination_rules[0]
+            .traffic_policy
+            .as_ref()
+            .and_then(|policy| policy.outlier_detection.as_ref())
+            .and_then(|outlier| outlier.consecutive_errors),
+        Some(9)
+    );
+}
