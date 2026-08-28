@@ -970,47 +970,47 @@ pub fn build_frontend_dtls_config(
 ) -> Result<FrontendDtlsConfig, anyhow::Error> {
     let certificate = load_dtls_certificate(cert_path, key_path)?;
 
-    let (require_client_cert, client_cert_verifier, client_trust) =
-        if let Some(ca_path) = client_ca_cert_path {
-            // ONE bounded read of the declared client-CA source, through the
-            // repository's `CertSource` abstraction (issue #3857). Both the
-            // trust anchors the verifier enforces and the semantic identity
-            // published for this generation come out of that single read.
-            //
-            // Reading the path twice — once with `std::fs::read` for the
-            // identity and once through `load_root_store_from_pem` for the
-            // store — could observe a rotation in between and publish identity
-            // A while serving verifier B. Going through `CertSource` also keeps
-            // the hostile-input ceiling (`FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`)
-            // and makes an inline / non-file client-CA source work at all,
-            // which a raw path read silently could not.
-            let loaded = load_pem_root_store(ca_path)?;
-            let client_trust = crate::tls::ClientTrustMaterial::from_parts(
-                Some(loaded.material.bytes.expose_secret()),
-                crls,
+    let (require_client_cert, client_cert_verifier, client_trust) = if let Some(ca_path) =
+        client_ca_cert_path
+    {
+        // ONE bounded read of the declared client-CA source, through the
+        // repository's `CertSource` abstraction (issue #3857). Both the
+        // trust anchors the verifier enforces and the semantic identity
+        // published for this generation come out of that single read.
+        //
+        // Reading the path twice — once with `std::fs::read` for the
+        // identity and once through `load_root_store_from_pem` for the
+        // store — could observe a rotation in between and publish identity
+        // A while serving verifier B. Going through `CertSource` also keeps
+        // the hostile-input ceiling (`FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`)
+        // and makes an inline / non-file client-CA source work at all,
+        // which a raw path read silently could not.
+        let loaded = load_pem_root_store(ca_path)?;
+        let client_trust = crate::tls::ClientTrustMaterial::from_parts(
+            Some(loaded.material.bytes.expose_secret()),
+            crls,
+        )
+        .map_err(|e| {
+            // Source-redacted: a client-CA source may be inline PEM, so the
+            // configured "path" can itself be secret material.
+            anyhow::anyhow!(
+                "Invalid DTLS client CA bundle from source {}: {}",
+                loaded.material.display_source_id,
+                e
             )
-            .map_err(|e| {
-                // Source-redacted: a client-CA source may be inline PEM, so the
-                // configured "path" can itself be secret material.
-                anyhow::anyhow!(
-                    "Invalid DTLS client CA bundle from source {}: {}",
-                    loaded.material.display_source_id,
-                    e
-                )
-            })?;
-            let root_store = loaded.roots;
-            let mut verifier_builder =
-                rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
-            verifier_builder =
-                crate::tls::crl_policy::apply_client_crl_policy(verifier_builder, crls);
-            let verifier = verifier_builder
-                .build()
-                .map_err(|e| anyhow::anyhow!("Failed to build DTLS client verifier: {}", e))?;
-            debug!("Frontend DTLS mTLS enabled: requiring and verifying client certificates");
-            (true, Some(verifier), Some(client_trust))
-        } else {
-            (false, None, None)
-        };
+        })?;
+        let root_store = loaded.roots;
+        let mut verifier_builder =
+            rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
+        verifier_builder = crate::tls::crl_policy::apply_client_crl_policy(verifier_builder, crls);
+        let verifier = verifier_builder
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build DTLS client verifier: {}", e))?;
+        debug!("Frontend DTLS mTLS enabled: requiring and verifying client certificates");
+        (true, Some(verifier), Some(client_trust))
+    } else {
+        (false, None, None)
+    };
 
     let config_builder = Config::builder().require_client_certificate(require_client_cert);
     let config = Arc::new(

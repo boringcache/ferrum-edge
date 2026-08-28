@@ -92,7 +92,9 @@ struct ChainPki {
 fn ca_params(common_name: &str, serial: Option<u64>) -> CertificateParams {
     let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.distinguished_name.push(DnType::CommonName, common_name);
+    params
+        .distinguished_name
+        .push(DnType::CommonName, common_name);
     params.key_usages.push(KeyUsagePurpose::KeyCertSign);
     params.key_usages.push(KeyUsagePurpose::CrlSign);
     params.serial_number = serial.map(SerialNumber::from);
@@ -103,7 +105,9 @@ fn ca_params(common_name: &str, serial: Option<u64>) -> CertificateParams {
 /// client-certificate verifier and the server-certificate verifier.
 fn leaf_params(dns: &str, common_name: &str, serial: u64) -> CertificateParams {
     let mut params = CertificateParams::new(vec![dns.to_string()]).expect("leaf params");
-    params.distinguished_name.push(DnType::CommonName, common_name);
+    params
+        .distinguished_name
+        .push(DnType::CommonName, common_name);
     params
         .extended_key_usages
         .push(ExtendedKeyUsagePurpose::ClientAuth);
@@ -124,7 +128,9 @@ fn build_chain_pki() -> ChainPki {
 
     let root_key = ecdsa_key();
     let root_params = ca_params("CRL Policy Root", None);
-    let root_cert = root_params.self_signed(&root_key).expect("self-signed root");
+    let root_cert = root_params
+        .self_signed(&root_key)
+        .expect("self-signed root");
     let root_pem = root_cert.pem();
     let root_der = CertificateDer::from(root_cert.der().to_vec());
     let root_issuer = Issuer::new(root_params, root_key);
@@ -168,11 +174,15 @@ fn build_chain_pki() -> ChainPki {
     spiffe_leaf_params
         .extended_key_usages
         .push(ExtendedKeyUsagePurpose::ClientAuth);
-    spiffe_leaf_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    spiffe_leaf_params
+        .key_usages
+        .push(KeyUsagePurpose::DigitalSignature);
     spiffe_leaf_params.serial_number = Some(SerialNumber::from(LEAF_A_SERIAL));
     let spiffe_uri = format!("spiffe://{TRUST_DOMAIN}/ns/test/sa/peer");
     let spiffe_uri = Ia5String::try_from(spiffe_uri).expect("spiffe uri is IA5");
-    spiffe_leaf_params.subject_alt_names.push(SanType::URI(spiffe_uri));
+    spiffe_leaf_params
+        .subject_alt_names
+        .push(SanType::URI(spiffe_uri));
     let spiffe_leaf_cert = spiffe_leaf_params
         .signed_by(&spiffe_leaf_key, &intermediate_a_issuer)
         .expect("spiffe leaf A");
@@ -1037,8 +1047,7 @@ fn every_crl_consuming_surface_reaches_the_shared_policy() {
     for surface in CRL_VERIFIER_SURFACES {
         let text = read_source(surface);
         assert!(
-            text.contains("crl_policy::apply_")
-                || text.contains("build_server_verifier_with_crls"),
+            text.contains("crl_policy::apply_") || text.contains("build_server_verifier_with_crls"),
             "{surface} consumes CRLs without reaching tls::crl_policy"
         );
     }
