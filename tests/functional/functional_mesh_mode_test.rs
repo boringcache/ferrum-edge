@@ -10134,12 +10134,8 @@ async fn drive_inbound_relay_third_workload_refusal(
         let svids = generate_two_gateway_svids(temp_b.path(), a_spiffe, b_spiffe);
 
         let (c_addr, hits, echo) = match flavor {
-            ThirdWorkloadConnectFlavor::ByteStream => {
-                start_counting_tcp_echo_on(third_ip).await
-            }
-            ThirdWorkloadConnectFlavor::Datagram => {
-                start_counting_udp_echo_on(third_ip).await
-            }
+            ThirdWorkloadConnectFlavor::ByteStream => start_counting_tcp_echo_on(third_ip).await,
+            ThirdWorkloadConnectFlavor::Datagram => start_counting_udp_echo_on(third_ip).await,
         };
         let c_port = c_addr.port();
         // B's own-identity record must declare a port, otherwise the loopback
@@ -10198,16 +10194,14 @@ async fn drive_inbound_relay_third_workload_refusal(
 
         let authority = format!("{third_ip_str}:{c_port}");
         let connect = match flavor {
-            ThirdWorkloadConnectFlavor::ByteStream => {
-                drive_one_waypoint_byte_connect(
-                    hbone_port,
-                    &authority,
-                    &svids.a,
-                    b"third-workload-must-not-be-dialed",
-                )
-                .await
-                .map(|(status, _)| status)
-            }
+            ThirdWorkloadConnectFlavor::ByteStream => drive_one_waypoint_byte_connect(
+                hbone_port,
+                &authority,
+                &svids.a,
+                b"third-workload-must-not-be-dialed",
+            )
+            .await
+            .map(|(status, _)| status),
             ThirdWorkloadConnectFlavor::Datagram => {
                 drive_one_udp_connect(hbone_port, &authority, &svids.a)
                     .await
@@ -10276,11 +10270,10 @@ fn assert_third_workload_connect_refused(outcome: ThirdWorkloadRefusalOutcome, f
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_ambient_hbone_refuses_third_workload_byte_stream() {
-    let outcome = drive_inbound_relay_third_workload_refusal(
-        ThirdWorkloadConnectFlavor::ByteStream,
-    )
-    .await
-    .expect("third-workload byte-stream setup");
+    let outcome =
+        drive_inbound_relay_third_workload_refusal(ThirdWorkloadConnectFlavor::ByteStream)
+            .await
+            .expect("third-workload byte-stream setup");
     assert_third_workload_connect_refused(outcome, "byte-stream HBONE CONNECT");
 }
 
@@ -10291,11 +10284,9 @@ async fn functional_mesh_ambient_hbone_refuses_third_workload_byte_stream() {
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_ambient_hbone_refuses_third_workload_datagram() {
-    let outcome = drive_inbound_relay_third_workload_refusal(
-        ThirdWorkloadConnectFlavor::Datagram,
-    )
-    .await
-    .expect("third-workload datagram setup");
+    let outcome = drive_inbound_relay_third_workload_refusal(ThirdWorkloadConnectFlavor::Datagram)
+        .await
+        .expect("third-workload datagram setup");
     assert_third_workload_connect_refused(outcome, "datagram-over-CONNECT HBONE CONNECT");
 }
 
