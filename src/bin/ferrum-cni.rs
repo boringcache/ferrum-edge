@@ -594,8 +594,40 @@ mod cni_main {
             Ok(CniRpcResponse::Error { reason }) => {
                 emit_error(&cni_version, &CniError::IpcFailed(reason))
             }
-            Err(err) => emit_error(&cni_version, &err),
+            Err(err) => match command {
+                // DEL must not block pod teardown when the node-agent is absent.
+                // Stale Ferrum state is reclaimed by CNI GC and node-agent sweeps.
+                CniCommand::Del => {
+                    log_del_ipc_transport_failure(&err);
+                    emit_empty_success()
+                }
+                // CHECK cannot verify attachment without the node-agent (CNI spec).
+                _ => emit_error(&cni_version, &err),
+            },
         }
+    }
+
+    /// Log a redacted, actionable DEL transport-failure diagnostic. Must not
+    /// echo socket paths, request fields, or other untrusted IPC detail.
+    fn log_del_ipc_transport_failure(err: &CniError) {
+        let category = match err {
+            CniError::IpcFailed(msg) if msg.starts_with("connect failed:") => {
+                "node-agent socket missing or connect refused"
+            }
+            CniError::IpcFailed(msg)
+                if msg.contains("TimedOut") || msg.contains("timeout") =>
+            {
+                "node-agent RPC timed out"
+            }
+            CniError::IpcFailed(_) => "node-agent IPC failed",
+            _ => "node-agent unavailable",
+        };
+        eprintln!(
+            "ferrum-cni: {category}; treating DEL as idempotent success so \
+             kubelet can finish pod teardown. Stale Ferrum capture state is \
+             reclaimed by CNI GC and node-agent sweeps. Restart or recreate the \
+             node-agent pod if immediate cleanup is required."
+        );
     }
 
     fn rpc_timeout() -> Duration {

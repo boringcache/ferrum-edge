@@ -128,8 +128,25 @@ fn run_ferrum_cni_status(stdin_config: serde_json::Value) -> std::process::Outpu
 /// Drive the standalone binary for ADD with the kubelet-shaped env that
 /// supplies pod identity. Used to pin the fail-closed IPC posture.
 fn run_ferrum_cni_add(stdin_config: serde_json::Value) -> std::process::Output {
+    run_ferrum_cni_attachment_verb("ADD", stdin_config)
+}
+
+/// Drive the standalone binary for DEL with kubelet-shaped attachment env.
+fn run_ferrum_cni_del(stdin_config: serde_json::Value) -> std::process::Output {
+    run_ferrum_cni_attachment_verb("DEL", stdin_config)
+}
+
+/// Drive the standalone binary for CHECK with kubelet-shaped attachment env.
+fn run_ferrum_cni_check(stdin_config: serde_json::Value) -> std::process::Output {
+    run_ferrum_cni_attachment_verb("CHECK", stdin_config)
+}
+
+fn run_ferrum_cni_attachment_verb(
+    command: &str,
+    stdin_config: serde_json::Value,
+) -> std::process::Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ferrum-cni"))
-        .env("CNI_COMMAND", "ADD")
+        .env("CNI_COMMAND", command)
         .env("CNI_CONTAINERID", "ctr-crash-loop")
         .env("CNI_NETNS", "/var/run/netns/cni-crash-loop")
         .env("CNI_IFNAME", "eth0")
@@ -1040,6 +1057,85 @@ async fn ferrum_cni_binary_add_fails_closed_when_socket_missing() {
     assert!(
         payload.get("ips").is_none() && payload.get("interfaces").is_none(),
         "fail-closed ADD must not emit a CNI result: {payload}"
+    );
+}
+
+/// Crash-loop / absent node-agent: DEL must not block pod teardown. IPC
+/// transport failure emits the CNI empty-success response (issue #4309).
+#[tokio::test]
+async fn ferrum_cni_binary_del_succeeds_when_socket_missing() {
+    let dir = tempdir().expect("tempdir");
+    let missing_socket = dir.path().join("missing-agent.sock");
+    let missing_socket_string = missing_socket.to_string_lossy().into_owned();
+    let requested_socket = missing_socket_string.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        run_ferrum_cni_del(serde_json::json!({
+            "cniVersion": "1.0.0",
+            "name": "ferrum-mesh-chain",
+            "type": "ferrum-cni",
+            "ferrum": { "socketPath": requested_socket }
+        }))
+    })
+    .await
+    .expect("blocking task joined");
+
+    assert!(
+        output.status.success(),
+        "DEL must succeed when the node-agent socket is absent; stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "DEL success must be empty stdout (CNI empty-success), got: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("treating DEL as idempotent success"),
+        "DEL transport failure must log an actionable diagnostic: {stderr}"
+    );
+    assert!(
+        !stderr.contains(missing_socket_string.as_str()),
+        "DEL diagnostic must not echo the socket path: {stderr}"
+    );
+}
+
+/// CHECK cannot verify attachment without the node-agent; transport failure
+/// stays fail-closed per the CNI spec.
+#[tokio::test]
+async fn ferrum_cni_binary_check_fails_closed_when_socket_missing() {
+    let dir = tempdir().expect("tempdir");
+    let missing_socket = dir.path().join("missing-agent.sock");
+    let missing_socket_string = missing_socket.to_string_lossy().into_owned();
+    let requested_socket = missing_socket_string.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        run_ferrum_cni_check(serde_json::json!({
+            "cniVersion": "0.4.0",
+            "name": "ferrum-mesh-chain",
+            "type": "ferrum-cni",
+            "ferrum": { "socketPath": requested_socket }
+        }))
+    })
+    .await
+    .expect("blocking task joined");
+
+    assert!(
+        !output.status.success(),
+        "CHECK must fail closed when the node-agent socket is absent; stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("CNI error JSON should parse");
+    assert_eq!(
+        payload["code"], 11,
+        "CHECK IPC transport failure must surface as CNI code 11: {payload}"
+    );
+    let message = payload["msg"].as_str().unwrap_or_default();
+    assert!(
+        !message.contains(missing_socket_string.as_str()),
+        "CHECK IPC error must not echo the socket path: {message}"
     );
 }
 
