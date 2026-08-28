@@ -2,8 +2,10 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT, Proxy, Upstream, UpstreamTarget,
+    DEFAULT_NAMESPACE, GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT, Proxy, Upstream,
+    UpstreamTarget,
 };
+use ferrum_edge::health_check::HealthChecker;
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
@@ -327,6 +329,111 @@ fn destination_rule_port_level_outlier_detection_projects_to_dispatch_override()
     assert_eq!(dispatch_passive.unhealthy_window_seconds, 11);
     assert_eq!(dispatch_passive.healthy_after_seconds, 17);
     assert_eq!(dispatch_passive.max_ejection_percent, Some(50));
+}
+
+#[test]
+fn port_level_positive_outlier_overlay_clears_top_level_disable_sentinel() {
+    let mut port_level_settings = HashMap::new();
+    port_level_settings.insert(
+        8080,
+        MeshTrafficPolicy {
+            outlier_detection: Some(MeshOutlierDetection {
+                consecutive_errors: Some(5),
+                interval_seconds: None,
+                base_ejection_seconds: None,
+                max_ejection_percent: None,
+            }),
+            ..MeshTrafficPolicy::default()
+        },
+    );
+    let mut config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    outlier_detection: Some(MeshOutlierDetection {
+                        consecutive_errors: Some(0),
+                        interval_seconds: None,
+                        base_ejection_seconds: None,
+                        max_ejection_percent: None,
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings,
+                subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let port_passive = prepared.upstreams[0]
+        .port_overrides
+        .get(&8080)
+        .and_then(|override_slot| override_slot.passive_health_check.as_ref())
+        .expect("port-level outlier projected");
+    assert!(
+        !port_passive.consecutive_5xx_ejection_disabled,
+        "per-port consecutive5xxErrors must clear a top-level disable sentinel"
+    );
+    assert!(port_passive.consecutive_error_mode);
+    assert_eq!(port_passive.unhealthy_threshold, 5);
+
+    let checker = HealthChecker::new();
+    let target = UpstreamTarget {
+        host: "reviews.default.svc.cluster.local".to_string(),
+        port: 8080,
+        service_port_policy_key: None,
+        weight: 1,
+        tags: HashMap::new(),
+        locality: None,
+        path: None,
+    };
+    for _ in 0..4 {
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            "reviews-p",
+            "reviews-u",
+            &target,
+            500,
+            false,
+            Some(port_passive),
+        );
+    }
+    assert!(
+        !checker
+            .passive_health
+            .get(&ferrum_edge::config::db_backend::namespaced_runtime_key(
+                "ferrum", "reviews-p"
+            ))
+            .is_some_and(|ps| ps.unhealthy.contains_key("reviews.default.svc.cluster.local:8080")),
+        "must not eject below the per-port consecutive threshold"
+    );
+    checker.report_response(
+        DEFAULT_NAMESPACE,
+        "reviews-p",
+        "reviews-u",
+        &target,
+        500,
+        false,
+        Some(port_passive),
+    );
+    assert!(
+        checker
+            .passive_health
+            .get(&ferrum_edge::config::db_backend::namespaced_runtime_key(
+                "ferrum", "reviews-p"
+            ))
+            .is_some_and(|ps| ps.unhealthy.contains_key("reviews.default.svc.cluster.local:8080")),
+        "the fifth consecutive failure must eject once the disable sentinel is cleared"
+    );
 }
 
 #[test]

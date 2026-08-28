@@ -11145,6 +11145,9 @@ fn apply_outlier_detection_to_passive(passive: &mut PassiveHealthCheck, od: &Mes
             passive.consecutive_5xx_ejection_disabled = true;
         }
         Some(consecutive) => {
+            // A higher-precedence overlay with an explicit positive threshold
+            // must clear a stale disable sentinel left by an earlier `Some(0)`.
+            passive.consecutive_5xx_ejection_disabled = false;
             passive.unhealthy_threshold = consecutive;
             passive.consecutive_error_mode = true;
         }
