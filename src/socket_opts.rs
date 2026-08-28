@@ -3988,7 +3988,7 @@ mod keepalive_tests {
 
     use super::apply_tcp_keepalive;
     use crate::config::types::TcpKeepaliveCfg;
-    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
     use std::os::unix::io::AsRawFd;
 
     fn loopback_pair() -> (TcpStream, TcpStream) {
@@ -4322,7 +4322,7 @@ mod original_dst_live_tests {
 
     #[test]
     #[ignore = "requires root + iptables to create a REDIRECT rule in a fresh netns"]
-    fn redirected_connection_reports_pre_nat_destination() {
+    fn redirected_ipv4_connection_on_dual_stack_listener_reports_pre_nat_destination() {
         if !is_root() {
             skip_or_fail("not root; cannot create network namespaces");
             return;
@@ -4357,34 +4357,65 @@ mod original_dst_live_tests {
 
         // Everything runs on one throwaway thread inside the child's netns
         // (`setns` mutates only the calling thread, which exits right after).
-        let orig = std::thread::spawn(move || -> Result<Option<SocketAddr>, String> {
-            let ns = std::fs::File::open(format!("/proc/{pid}/ns/net"))
-                .map_err(|e| format!("open netns handle: {e}"))?;
-            // Safety: `ns` is an open netns handle owned for the call.
-            if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
-                return Err(format!("setns failed: {}", std::io::Error::last_os_error()));
-            }
-            let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, CAPTURE_PORT)))
-                .map_err(|e| format!("bind capture listener: {e}"))?;
-            // Dial the "service port"; netfilter REDIRECTs it onto the
-            // capture listener — exactly the sidecar capture shape.
-            let _client = TcpStream::connect_timeout(
-                &SocketAddr::from((Ipv4Addr::LOCALHOST, DIAL_PORT)),
-                Duration::from_secs(2),
-            )
-            .map_err(|e| format!("redirected connect: {e}"))?;
-            let (accepted, _) = listener.accept().map_err(|e| format!("accept: {e}"))?;
-            let local = accepted
-                .local_addr()
-                .map_err(|e| format!("local_addr: {e}"))?;
-            Ok(crate::socket_opts::original_dst_from_raw_fd(
-                accepted.as_raw_fd(),
-                local,
-            ))
-        })
+        let (local, orig) =
+            std::thread::spawn(move || -> Result<(SocketAddr, Option<SocketAddr>), String> {
+                let ns = std::fs::File::open(format!("/proc/{pid}/ns/net"))
+                    .map_err(|e| format!("open netns handle: {e}"))?;
+                // Safety: `ns` is an open netns handle owned for the call.
+                if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                    return Err(format!(
+                        "setns failed: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                // Match the production issue-#4271 capture shape exactly: one
+                // AF_INET6 wildcard with V6ONLY disabled accepts both native IPv6
+                // and IPv4-mapped traffic. A plain IPv4 listener would not exercise
+                // the family-selection bug this regression test exists to catch.
+                let socket = socket2::Socket::new(
+                    socket2::Domain::IPV6,
+                    socket2::Type::STREAM,
+                    Some(socket2::Protocol::TCP),
+                )
+                .map_err(|e| format!("create dual-stack capture socket: {e}"))?;
+                socket
+                    .set_only_v6(false)
+                    .map_err(|e| format!("disable IPV6_V6ONLY: {e}"))?;
+                socket
+                    .bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, CAPTURE_PORT)).into())
+                    .map_err(|e| format!("bind dual-stack capture listener: {e}"))?;
+                socket
+                    .listen(128)
+                    .map_err(|e| format!("listen on dual-stack capture socket: {e}"))?;
+                let listener: TcpListener = socket.into();
+                // Dial the "service port"; netfilter REDIRECTs it onto the
+                // dual-stack capture listener as an IPv4-mapped accept.
+                let _client = TcpStream::connect_timeout(
+                    &SocketAddr::from((Ipv4Addr::LOCALHOST, DIAL_PORT)),
+                    Duration::from_secs(2),
+                )
+                .map_err(|e| format!("redirected connect: {e}"))?;
+                let (accepted, _) = listener.accept().map_err(|e| format!("accept: {e}"))?;
+                let local = accepted
+                    .local_addr()
+                    .map_err(|e| format!("local_addr: {e}"))?;
+                let orig = crate::socket_opts::original_dst_from_raw_fd(
+                    accepted.as_raw_fd(),
+                    local,
+                );
+                Ok((local, orig))
+            })
         .join()
         .expect("netns scenario thread must not panic")
         .expect("live SO_ORIGINAL_DST scenario must complete");
+
+        assert!(
+            matches!(
+                local.ip(),
+                IpAddr::V6(v6) if v6.to_ipv4_mapped() == Some(Ipv4Addr::LOCALHOST)
+            ),
+            "the AF_INET6 dual-stack listener must expose the IPv4 flow as a mapped local address; got {local}"
+        );
 
         assert_eq!(
             orig,
