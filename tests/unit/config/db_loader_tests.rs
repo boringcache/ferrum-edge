@@ -4277,7 +4277,10 @@ fn replace_api_spec_metadata_shortcut_checks_rows_affected() {
     let replace = source
         .split("pub async fn replace_api_spec_bundle(")
         .nth(1)
-        .and_then(|rest| rest.split("\n    async fn current_api_spec_resource_hash_tx(").next())
+        .and_then(|rest| {
+            rest.split("\n    async fn current_api_spec_resource_hash_tx(")
+                .next()
+        })
         .expect("replace_api_spec_bundle body");
     let shortcut = replace
         .find("Bundle is unchanged — only update the api_specs metadata row.")

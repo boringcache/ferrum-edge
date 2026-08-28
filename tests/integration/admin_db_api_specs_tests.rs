@@ -4321,8 +4321,7 @@ async fn replace_metadata_only_shortcut_fails_when_api_specs_row_missing() {
 
     let proxy_id = uid("proxy");
     let spec_id = uid("spec");
-    let (bundle, spec) =
-        make_spec_with_metadata(&spec_id, &proxy_id, ns, "Dangling API", "0", &[]);
+    let (bundle, spec) = make_spec_with_metadata(&spec_id, &proxy_id, ns, "Dangling API", "0", &[]);
     store
         .submit_api_spec_bundle(&bundle, &spec)
         .await
