@@ -2322,6 +2322,7 @@ Wildcard hosts (`*.example.com`) are supported via bucketed suffix matching. The
 - TCP fallback for large responses.
 - Concurrent query limiting via `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` (default 1024) using a semaphore.
 - Upstream forwarding timeout: 5 seconds.
+- Upstream UDP forwards use FIPS-compatible CSPRNG transaction IDs (collision retry; SERVFAIL if entropy is unavailable) and a fresh connected ephemeral-port socket per in-flight query. A response is accepted only when both the ID and the full question match the pending query; mismatched or unknown packets are discarded without retiring the lookup.
 
 ## Multi-Cluster
 

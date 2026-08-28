@@ -795,8 +795,9 @@ pub struct MetricsRegistry {
     /// disconnect.
     pub stream_disconnect_counter: DashMap<StreamDisconnectKey, TimestampedCounter>,
     /// Mesh DNS upstream transaction-ID exhaustion events. This is process-wide
-    /// because the transparent mesh DNS proxy uses one shared upstream socket.
-    pub mesh_dns_upstream_id_exhaustions: AtomicU64,
+    /// because the transparent mesh DNS proxy shares one 16-bit upstream ID
+    /// space across in-flight forwarded queries.
+    pub mesh_dns_upstream_id_exhaustions: AtomicU64;
     /// HBONE tunnel relay failures keyed by (proxy_id, direction, error_class).
     /// Incremented when the background CONNECT relay observes a copy failure
     /// after the client already received `200 OK`.
