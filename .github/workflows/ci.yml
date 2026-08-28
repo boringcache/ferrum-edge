@@ -4254,7 +4254,7 @@ jobs:
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-bearer-verified-https.yaml"
           grep -Fq 'port: admin-https' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-bearer-verified-https.yaml"
           grep -Fq 'authorization:' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-bearer-verified-https.yaml"
-          if grep -Fq 'port: admin-http' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-bearer-verified-https.yaml"; then
+          if grep -Eq '^\s*port: admin-http\s*$' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-bearer-verified-https.yaml"; then
             echo "::error title=Bearer token sent over plaintext::credentialed ServiceMonitor scrapes must select admin-https"
             exit 1
           fi
