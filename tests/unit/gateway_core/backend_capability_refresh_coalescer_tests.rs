@@ -99,7 +99,7 @@ fn wait_until_idle_cannot_lose_wakeup_between_register_and_recheck() {
 
     let mut idle = std::pin::pin!(coalescer.wait_until_idle());
     let waker = Waker::noop();
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(waker);
     assert!(
         idle.as_mut().poll(&mut cx).is_ready(),
         "register-before-recheck must observe the idle transition that lands \
@@ -114,7 +114,7 @@ fn wait_until_idle_cannot_lose_wakeup_between_register_and_recheck() {
 #[test]
 fn wait_until_idle_wakes_a_parked_waiter_after_runner_finishes() {
     let coalescer = Arc::new(RefreshCoalescer::new());
-    let mut runner = take_runner(&coalescer);
+    let runner = take_runner(&coalescer);
     assert!(coalescer.take_pending());
 
     let mut idle = std::pin::pin!(coalescer.wait_until_idle());

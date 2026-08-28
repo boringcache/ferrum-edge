@@ -744,6 +744,7 @@ impl fmt::Debug for RefreshRole {
 }
 
 impl RefreshRole {
+    #[allow(dead_code)] // Public library/test inspection API; the binary target matches variants directly.
     pub fn is_runner(&self) -> bool {
         matches!(self, Self::Runner(_))
     }
@@ -825,6 +826,7 @@ fn observe_idle_wait_registered() {
 /// proxy hot path; the extra thread-local load is a no-op unless a test
 /// armed a hook.
 #[doc(hidden)]
+#[allow(dead_code)] // External library tests install this seam; the binary target never does.
 pub fn install_idle_wait_observe_hook(hook: Option<Arc<dyn Fn() + 'static>>) {
     AFTER_IDLE_WAIT_REGISTERED.with(|cell| {
         *cell.borrow_mut() = hook;
