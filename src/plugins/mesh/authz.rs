@@ -77,6 +77,7 @@ use crate::plugins::{
     ALL_PROTOCOLS, JwtAuthAttributeValue, Plugin, PluginResult, ProxyProtocol, RequestContext,
     StreamConnectionContext, priority,
 };
+use crate::util::unknown_keys::reject_unknown_keys;
 
 pub(crate) const IGNORED_UDP_SOURCE_SCOPE_METADATA: &str = "mesh_authz.ignored_udp_source_scope";
 
@@ -3841,6 +3842,12 @@ fn parse_trusted_hbone_assertor_entry(
             grant: default_assertion_grant(legacy_mesh_wide),
         }),
         Value::Object(map) => {
+            reject_unknown_keys(
+                map,
+                "trusted_hbone_assertors",
+                &["assertor", "asserts", "scope"],
+                "",
+            )?;
             let Some(raw) = map.get("assertor").and_then(Value::as_str) else {
                 return Err(
                     "trusted_hbone_assertors object entries must carry a string 'assertor'"

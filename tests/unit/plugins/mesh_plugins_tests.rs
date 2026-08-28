@@ -2301,6 +2301,48 @@ fn mesh_authz_rejects_unknown_assertor_scope() {
 }
 
 #[test]
+fn mesh_authz_rejects_trusted_hbone_assertor_object_misspelled_key() {
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
+        "trusted_hbone_assertors": [{"assertor": "waypoint", "scpoe": "mesh_wide"}],
+    })) {
+        Ok(_) => panic!("misspelled object key should fail construction"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("scpoe"),
+        "error should name the unknown field: {err}"
+    );
+    assert!(
+        err.contains("scope"),
+        "error should suggest the intended field: {err}"
+    );
+}
+
+#[test]
+fn mesh_authz_rejects_trusted_hbone_assertor_object_with_extra_key() {
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
+        "trusted_hbone_assertors": [{
+            "assertor": "waypoint",
+            "scope": "same_namespace",
+            "extra": true,
+        }],
+    })) {
+        Ok(_) => panic!("extra object key should fail construction"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("extra"),
+        "error should name the unknown field: {err}"
+    );
+    assert!(
+        !err.contains("same_namespace"),
+        "error should not treat the valid scope as the problem: {err}"
+    );
+}
+
+#[test]
 fn mesh_authz_rejects_assertor_entry_without_assertor_field() {
     let err = match MeshAuthz::new(&json!({
         "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
@@ -3353,6 +3395,24 @@ async fn workload_metrics_accepts_baggage_in_aliased_trust_domain() {
         Some("spiffe://cluster.local/ns/default/sa/client")
     );
     assert!(!ctx.metadata.contains_key("mesh.ignored_baggage"));
+}
+
+#[test]
+fn workload_metrics_rejects_trusted_hbone_assertor_object_unknown_key() {
+    let err = match WorkloadMetrics::new(&json!({
+        "trusted_hbone_assertors": [{"assertor": "waypoint", "scpoe": "mesh_wide"}],
+    })) {
+        Ok(_) => panic!("misspelled object key should fail construction"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("scpoe"),
+        "error should name the unknown field: {err}"
+    );
+    assert!(
+        err.contains("workload_metrics:"),
+        "error should be prefixed by the plugin: {err}"
+    );
 }
 
 #[tokio::test]
