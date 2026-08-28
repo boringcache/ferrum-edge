@@ -595,3 +595,63 @@ async fn concurrent_backend_capabilities_refresh_coalesces_probe_fanout() {
         "uncoalesced refreshes would multiply probe fan-out; got {accepts} accepts"
     );
 }
+
+#[tokio::test]
+async fn aborted_coalesced_refresh_allows_a_later_refresh() {
+    let tc = TestConfig::default();
+    let jwt = create_test_jwt_manager(&tc);
+    let (backend_addr, accepted, _backend_task) =
+        start_slow_counting_http_backend(Duration::from_secs(30)).await;
+    let state = admin_state_with_http_probe_proxy(jwt, backend_addr.port());
+    let proxy_state = state.proxy_state.as_ref().expect("proxy_state").clone();
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let first = tokio::spawn({
+        let proxy_state = proxy_state.clone();
+        async move { proxy_state.refresh_backend_capabilities_coalesced().await }
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while accepted.load(Ordering::SeqCst) == 0 {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("capability probe never reached the slow backend");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    first.abort();
+    assert!(
+        first.await.unwrap_err().is_cancelled(),
+        "first coalesced refresh must be cancelled mid-probe"
+    );
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        proxy_state.refresh_backend_capabilities_coalesced(),
+    )
+    .await
+    .expect("second coalesced refresh hung — runner role leaked");
+    assert_eq!(
+        outcome,
+        ferrum_edge::proxy::backend_capabilities::BackendCapabilityRefreshOutcome::Ran
+    );
+
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(10),
+        admin_request_with_token(
+            reqwest::Method::POST,
+            &base_url,
+            "/backend-capabilities/refresh",
+            &token,
+        ),
+    )
+    .await
+    .expect("admin refresh after abort hung");
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["status"].as_str(),
+        Some("refreshed"),
+        "HTTP refresh must run after the aborted coalesced pass; body: {body}"
+    );
+}

@@ -209,7 +209,8 @@ use crate::util::http_headers::{
 use self::backend_capabilities::{
     BackendCapabilityProbeTarget, BackendCapabilityRecord, BackendCapabilityRefreshOutcome,
     BackendCapabilityRegistry, BackendCapabilitySnapshot, CapabilityCommitOutcome, ProtocolSupport,
-    RefreshCoalescer, SharedBackendCapabilityRegistry, SharedRefreshCoalescer,
+    RefreshCoalescer, RefreshRole, RefreshRunnerGuard, SharedBackendCapabilityRegistry,
+    SharedRefreshCoalescer,
 };
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{
@@ -10713,36 +10714,59 @@ impl ProxyState {
     /// still picked up without spawning N duplicate tasks or orphaning the
     /// queued request.
     pub(crate) fn spawn_backend_capability_refresh(&self) {
-        if !self.backend_capabilities_refresh.request() {
-            debug!("Backend capability refresh coalesced into in-flight task");
-            return;
+        match self.backend_capabilities_refresh.request() {
+            RefreshRole::Joined => {
+                debug!("Backend capability refresh coalesced into in-flight task");
+            }
+            RefreshRole::Runner(guard) => self.spawn_capability_refresh_runner(guard),
         }
+    }
+
+    fn spawn_capability_refresh_runner(&self, guard: RefreshRunnerGuard) {
         let state = self.clone();
+        let continuation_state = self.clone();
+        let guard = guard.with_continuation(Arc::new(move |next_guard| {
+            continuation_state.spawn_capability_refresh_runner(next_guard);
+        }));
         tokio::spawn(async move {
-            state.run_backend_capability_refresh_loop().await;
+            state.run_backend_capability_refresh_loop(guard).await;
         });
     }
 
     /// Synchronously refresh backend capabilities through the shared
     /// [`RefreshCoalescer`], preserving the admin endpoint's post-refresh
     /// snapshot contract while collapsing concurrent callers onto one pass.
+    ///
+    /// The runner future is executed inline so `Ran` versus `Joined` stays
+    /// tied to this caller. A [`RefreshRunnerGuard`] owns the role: if this
+    /// future is cancelled at an await point, Drop releases `running` (and
+    /// transfers ownership when a coalesced rerun is queued) instead of
+    /// freezing every later refresh for the process lifetime.
     pub async fn refresh_backend_capabilities_coalesced(&self) -> BackendCapabilityRefreshOutcome {
-        if self.backend_capabilities_refresh.request() {
-            self.run_backend_capability_refresh_loop().await;
-            BackendCapabilityRefreshOutcome::Ran
-        } else {
-            self.backend_capabilities_refresh.wait_until_idle().await;
-            BackendCapabilityRefreshOutcome::Joined
+        match self.backend_capabilities_refresh.request() {
+            RefreshRole::Runner(guard) => {
+                let continuation_state = self.clone();
+                let guard = guard.with_continuation(Arc::new(move |next_guard| {
+                    continuation_state.spawn_capability_refresh_runner(next_guard);
+                }));
+                self.run_backend_capability_refresh_loop(guard).await;
+                BackendCapabilityRefreshOutcome::Ran
+            }
+            RefreshRole::Joined => {
+                self.backend_capabilities_refresh.wait_until_idle().await;
+                BackendCapabilityRefreshOutcome::Joined
+            }
         }
     }
 
-    async fn run_backend_capability_refresh_loop(&self) {
+    async fn run_backend_capability_refresh_loop(&self, mut guard: RefreshRunnerGuard) {
         loop {
             while self.backend_capabilities_refresh.take_pending() {
                 self.refresh_backend_capabilities().await;
             }
             if self.backend_capabilities_refresh.try_finish() {
                 self.backend_capabilities_refresh.signal_idle();
+                guard.disarm();
                 break;
             }
         }
