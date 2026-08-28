@@ -36,7 +36,12 @@ fn matching_paren(source: &str, open: usize) -> usize {
     panic!("unbalanced parentheses starting at byte {open}");
 }
 
-fn region_between(source: &str, start_marker: &str, end_marker: &str, context: &str) -> &str {
+fn region_between<'a>(
+    source: &'a str,
+    start_marker: &str,
+    end_marker: &str,
+    context: &str,
+) -> &'a str {
     let start = source
         .find(start_marker)
         .unwrap_or_else(|| panic!("{context}: expected to find {start_marker:?}"));
