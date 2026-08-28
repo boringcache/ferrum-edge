@@ -19262,8 +19262,10 @@ components:
                   only from a validated claim, so an unauthenticated or invalid
                   request can never forge one. Duplicate destination headers,
                   reserved/credential-bearing destinations, and invalid header names
-                  are rejected at config load; a missing, null, object, or
-                  header-illegal claim value leaves the destination absent.
+                  are rejected at config load. Only nonblank string, integer, and
+                  boolean claims are published (Istio ClaimToHeader does not support
+                  arrays, objects, null, or floating-point numbers); anything else
+                  or a header-illegal value leaves the destination absent.
               require_mtls_binding:
                 type: boolean
                 default: false

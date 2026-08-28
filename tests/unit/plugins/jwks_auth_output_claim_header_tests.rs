@@ -121,11 +121,10 @@ async fn output_claim_headers_are_overwritten_from_the_validated_claim() {
 }
 
 #[tokio::test]
-async fn scalar_and_array_claims_are_rendered_safely() {
+async fn istio_scalar_claims_are_rendered_safely() {
     let plugin = plugin_with(json!([
         {"header": "x-claim-age", "claim": "age"},
         {"header": "x-claim-active", "claim": "active"},
-        {"header": "x-claim-groups", "claim": "groups"},
         {"header": "x-claim-nested", "claim": "profile.email"},
     ]))
     .expect("valid jwks_auth config");
@@ -134,7 +133,6 @@ async fn scalar_and_array_claims_are_rendered_safely() {
             "sub": "alice",
             "age": 42,
             "active": true,
-            "groups": ["admin", "dev"],
             "profile": {"email": "alice@example.test"},
         }),
         PRIVATE_KEY,
@@ -144,8 +142,42 @@ async fn scalar_and_array_claims_are_rendered_safely() {
 
     assert_eq!(header(&headers, "x-claim-age"), Some("42"));
     assert_eq!(header(&headers, "x-claim-active"), Some("true"));
-    assert_eq!(header(&headers, "x-claim-groups"), Some("admin,dev"));
     assert_eq!(header(&headers, "x-claim-nested"), Some("alice@example.test"));
+}
+
+#[tokio::test]
+async fn array_and_float_claims_leave_the_destination_absent() {
+    let plugin = plugin_with(json!([
+        {"header": "x-claim-groups", "claim": "groups"},
+        {"header": "x-claim-ratio", "claim": "ratio"},
+    ]))
+    .expect("valid jwks_auth config");
+    let token = create_rs256_token(
+        &json!({
+            "sub": "alice",
+            "groups": ["admin", "dev"],
+            "ratio": 1.5,
+        }),
+        PRIVATE_KEY,
+    );
+
+    let headers = run(
+        &plugin,
+        Some(&token),
+        &[("x-claim-groups", "attacker"), ("x-claim-ratio", "attacker")],
+    )
+    .await;
+
+    assert_eq!(
+        header(&headers, "x-claim-groups"),
+        None,
+        "array claims are unsupported by Istio ClaimToHeader: {headers:?}"
+    );
+    assert_eq!(
+        header(&headers, "x-claim-ratio"),
+        None,
+        "floating-point claims are unsupported by Istio ClaimToHeader: {headers:?}"
+    );
 }
 
 #[tokio::test]

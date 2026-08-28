@@ -178,22 +178,19 @@ pub fn parse_claim_header_list(
 /// Stage the values for an `outputClaimToHeaders`-style mapping list.
 ///
 /// Differs from [`emit_claim_headers_to_attempt`] only in the value
-/// conversion: Istio publishes scalar claims (numbers and booleans, not just
-/// strings) into the output header, so those are rendered rather than dropped.
-/// Everything else stays fail-closed — a missing claim, a null, an object, an
-/// array with no usable scalar, a blank result, or a value that is not a legal
-/// HTTP header value leaves the destination ABSENT, and the destination was
-/// already stripped of any client-supplied value by
+/// conversion: Istio `ClaimToHeader` publishes nonblank string, integer, and
+/// boolean claims only. Arrays, objects, null, floating-point / non-integer
+/// numbers, blank strings, and header-illegal values leave the destination
+/// absent. The destination was already stripped of any client-supplied value by
 /// [`apply_claim_headers_from_context`].
 pub fn emit_output_claim_headers_to_attempt(
     attempt: &mut AuthenticationAttempt,
     claims: &Value,
     mappings: &[ClaimHeaderMapping],
-    separator: &str,
+    _separator: &str,
 ) {
     for mapping in mappings {
-        let Some(value) = output_claim_value_for_header(claims, &mapping.claim_path, separator)
-        else {
+        let Some(value) = output_claim_value_for_header(claims, &mapping.claim_path) else {
             continue;
         };
         attempt.stage_claim_header(mapping.metadata_key.clone(), value);
@@ -201,22 +198,10 @@ pub fn emit_output_claim_headers_to_attempt(
 }
 
 /// Render one claim as an output-header value, or `None` when it cannot be
-/// represented safely. Never logs or returns the claim value on refusal.
-fn output_claim_value_for_header(
-    claims: &Value,
-    claim_path: &str,
-    separator: &str,
-) -> Option<String> {
-    let rendered = match resolve_claim_path(claims, claim_path)? {
-        Value::Array(values) => {
-            let parts: Vec<String> = values.iter().filter_map(render_scalar_claim).collect();
-            if parts.is_empty() {
-                return None;
-            }
-            parts.join(separator)
-        }
-        scalar => render_scalar_claim(scalar)?,
-    };
+/// represented under Istio `ClaimToHeader` semantics. Never logs or returns
+/// the claim value on refusal.
+fn output_claim_value_for_header(claims: &Value, claim_path: &str) -> Option<String> {
+    let rendered = render_istio_output_claim(resolve_claim_path(claims, claim_path)?)?;
     if rendered.trim().is_empty() {
         return None;
     }
@@ -227,10 +212,13 @@ fn output_claim_value_for_header(
     Some(rendered)
 }
 
-fn render_scalar_claim(value: &Value) -> Option<String> {
+fn render_istio_output_claim(value: &Value) -> Option<String> {
     match value {
         Value::String(value) => (!value.trim().is_empty()).then(|| value.clone()),
-        Value::Number(number) => Some(number.to_string()),
+        Value::Number(number) => number
+            .as_i64()
+            .map(|value| value.to_string())
+            .or_else(|| number.as_u64().map(|value| value.to_string())),
         Value::Bool(flag) => Some(flag.to_string()),
         Value::Null | Value::Array(_) | Value::Object(_) => None,
     }

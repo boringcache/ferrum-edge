@@ -2154,15 +2154,15 @@ Each JWT rule resolves token locations independently. Rules with custom `from_he
 **gateway-owned**. The injected `jwks_auth` plugin removes every declared header
 from the inbound request — case-insensitively, including duplicates —
 **before** validation, so an unauthenticated or invalid request can never forge
-one, and sets it only from the validated token's claim. A claim that is missing,
-null, an object, an array with no usable scalar, blank, or not a legal HTTP
-header value leaves the destination **absent** rather than restoring the client
-value. String, number, boolean, and scalar-array claims are published (arrays
-join with the provider separator). Duplicate destination headers, reserved or
-credential-bearing destinations (`authorization`, `host`, hop-by-hop/framing
-fields, `x-ferrum-*`, `x-forwarded-*`), malformed header names, and malformed
-claim paths are rejected at translation with `FerrumAccepted=False` / `Invalid`
-— a dropped mapping would leave the header unowned and client-forgeable.
+one, and sets it only from the validated token's claim. Istio `ClaimToHeader`
+supports only nonblank string, integer, and boolean claims; array, object, null,
+floating-point / non-integer, blank, missing, or header-illegal values leave the
+destination **absent** rather than restoring the client value. Duplicate
+destination headers, reserved or credential-bearing destinations
+(`authorization`, `host`, hop-by-hop/framing fields, `x-ferrum-*`,
+`x-forwarded-*`), malformed header names, and malformed claim paths are rejected
+at translation with `FerrumAccepted=False` / `Invalid` — a dropped mapping would
+leave the header unowned and client-forgeable.
 
 **Deferred JWT-rule fields**: `outputPayloadToHeader` and `fromCookies` are
 recognized but not enforced. Both are surfaced in
