@@ -202,7 +202,11 @@ fn empty_principal_patterns_remain_a_no_op_on_l4() {
     // An ALLOW whose principal lists are unset must still grant the L4
     // session: the emptiness check runs before the protocol gate, so an unset
     // field never resolves through the non-HTTP-port model.
-    let allow = vec![policy("allow-all", PolicyAction::Allow, MeshRule::default())];
+    let allow = vec![policy(
+        "allow-all",
+        PolicyAction::Allow,
+        MeshRule::default(),
+    )];
     assert_eq!(evaluate(allow, &l4_request()), MeshAuthzDecision::Allow);
 
     // The DENY side of the same no-op: it matches on its remaining (empty)
