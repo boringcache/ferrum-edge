@@ -520,7 +520,7 @@ async fn test_preflight_continue_passes_through() {
         matches!(result, PluginResult::Continue),
         "preflight_continue should pass through"
     );
-    // Origin should be stashed in metadata for after_proxy
+    // Observability mirror of the matched origin; authorization reads private state.
     assert_eq!(
         ctx.metadata.get("cors_origin").unwrap(),
         "https://example.com"
@@ -2182,6 +2182,190 @@ async fn test_credentialed_literal_exact_preflight_reflects_the_source_origin() 
     ));
 }
 
+// ── Credentialed universal-matcher interlock (issue #4269) ────────────────
+//
+// The credentials interlock must classify matcher BREADTH, not just the
+// `AllowedOrigins::Wildcard` variant. Exact `*` keeps the documented drop-
+// credentials contract; effectively universal prefix/regex + credentials is
+// refused rather than silently weakened.
+
+#[test]
+fn test_constructor_rejects_credentialed_universal_prefix_and_regex() {
+    for origins in [
+        json!([{"prefix": "https://"}]),
+        json!([{"prefix": "h"}]),
+        json!([{"prefix": "http"}]),
+        json!([{"prefix": "https:/"}]),
+        json!([{"regex": ".*"}]),
+        json!([{"regex": "https://.*"}]),
+    ] {
+        let err = CorsPlugin::new(&json!({
+            "allowed_origins": origins.clone(),
+            "allow_credentials": true
+        }))
+        .err()
+        .unwrap_or_else(|| panic!("credentialed universal matcher must be refused: {origins}"));
+        assert!(
+            err.contains("allow_credentials") && err.contains("effectively universal"),
+            "got: {err} for {origins}"
+        );
+    }
+}
+
+#[test]
+fn test_constructor_accepts_credentialed_narrow_prefix() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": [{"prefix": "https://app.example.com"}],
+        "allow_credentials": true
+    }))
+    .expect("host-constraining prefix + credentials must construct");
+    assert!(plugin.uses_strict_origin_policy());
+}
+
+#[tokio::test]
+async fn test_credentialed_narrow_prefix_reflects_matching_origin() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": [{"prefix": "https://app.example.com"}],
+        "allow_credentials": true
+    }))
+    .expect("narrow prefix + credentials");
+
+    let mut ctx = make_cors_ctx("GET", "https://app.example.com");
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    let mut response_headers = HashMap::new();
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_eq!(
+        response_headers.get("access-control-allow-origin").unwrap(),
+        "https://app.example.com"
+    );
+    assert_eq!(
+        response_headers
+            .get("access-control-allow-credentials")
+            .unwrap(),
+        "true"
+    );
+}
+
+#[tokio::test]
+async fn test_uncredentialed_universal_prefix_still_reflects() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": [{"prefix": "https://"}]
+    }))
+    .expect("uncredentialed universal prefix constructs");
+    assert!(!plugin.uses_strict_origin_policy());
+
+    let mut ctx = make_cors_ctx("GET", "https://evil.example");
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    let mut response_headers = HashMap::new();
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_eq!(
+        response_headers.get("access-control-allow-origin").unwrap(),
+        "https://evil.example"
+    );
+    assert!(!response_headers.contains_key("access-control-allow-credentials"));
+}
+
+#[test]
+fn test_narrow_regex_is_not_classified_universal() {
+    // Probe-set false-positive guard: a host-constraining regex must remain
+    // strict even though it would match one synthetic probe host-shape.
+    CorsPlugin::new(&json!({
+        "allowed_origins": [{"regex": "https://.*\\.example\\.com"}],
+        "allow_credentials": true
+    }))
+    .expect("narrow regex + credentials must construct");
+    CorsPlugin::new(&json!({
+        "allowed_origins": [{"prefix": "https://preview-"}],
+        "allow_credentials": true
+    }))
+    .expect("docs example prefix + credentials must construct");
+}
+
+// ── Private matched-origin / trailer ownership (issue #4296) ───────────────
+
+#[tokio::test]
+async fn test_metadata_overwrite_does_not_change_reflected_origin() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["https://app.example.com"],
+        "allow_credentials": true
+    }))
+    .expect("credentialed exact policy");
+
+    let mut ctx = make_cors_ctx("GET", "https://app.example.com");
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get("cors_origin").map(String::as_str),
+        Some("https://app.example.com"),
+        "observability mirror is still written"
+    );
+    ctx.metadata.insert(
+        "cors_origin".to_string(),
+        "https://evil.example.com".to_string(),
+    );
+
+    let mut response_headers = HashMap::new();
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_eq!(
+        response_headers.get("access-control-allow-origin").unwrap(),
+        "https://app.example.com",
+        "reflected origin must come from private CorsRequestState, not metadata"
+    );
+    assert_eq!(
+        response_headers
+            .get("access-control-allow-credentials")
+            .unwrap(),
+        "true"
+    );
+}
+
+#[tokio::test]
+async fn test_metadata_delete_does_not_drop_trailer_ownership_or_reflection() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["https://app.example.com"]
+    }))
+    .expect("strict cors");
+
+    let mut ctx = make_cors_ctx("GET", "https://app.example.com");
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    ctx.metadata.remove("cors_origin");
+    assert!(
+        plugin.owns_deadline_response_header(&ctx, "access-control-allow-origin"),
+        "trailer ownership must not depend on public metadata"
+    );
+    assert!(
+        plugin.owns_deadline_response_header(&ctx, "Access-Control-Allow-Credentials"),
+        "ownership covers the open-ended access-control- family"
+    );
+    assert!(!plugin.owns_deadline_response_header(&ctx, "vary"));
+
+    let mut response_headers = HashMap::new();
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_eq!(
+        response_headers.get("access-control-allow-origin").unwrap(),
+        "https://app.example.com"
+    );
+}
+
 // ── CORS / WebSocket Origin composition diagnostic ───────────────────
 
 fn cors_plugin_config(
@@ -2256,6 +2440,17 @@ fn cors_wildcard_origin_without_ws_allowlist_is_silent() {
 }
 
 #[test]
+fn cors_universal_prefix_without_ws_allowlist_is_silent() {
+    let config = gateway_with_cors_proxy(json!([{"prefix": "https://"}]), vec![]);
+    let (logs, _guard) = capture_logs();
+    PluginCache::new(&config).expect("universal prefix cors cache");
+    assert!(
+        !logs.contents().contains("allowed_ws_origins is empty"),
+        "effectively universal CORS must not emit the WebSocket Origin gap warning"
+    );
+}
+
+#[test]
 fn cors_strict_origin_with_ws_allowlist_is_silent() {
     let config = gateway_with_cors_proxy(
         json!(["https://app.example.com"]),
@@ -2276,4 +2471,35 @@ fn cors_uses_strict_origin_policy_detects_non_wildcard() {
     assert!(strict.uses_strict_origin_policy());
     let wildcard = CorsPlugin::new(&json!({"allowed_origins": ["*"]})).expect("wildcard cors");
     assert!(!wildcard.uses_strict_origin_policy());
+}
+
+#[test]
+fn cors_uses_strict_origin_policy_treats_universal_prefix_and_regex_as_non_strict() {
+    for origins in [
+        json!([{"prefix": "https://"}]),
+        json!([{"prefix": "h"}]),
+        json!([{"regex": ".*"}]),
+        json!([{"regex": "https://.*"}]),
+    ] {
+        let plugin = CorsPlugin::new(&json!({"allowed_origins": origins.clone()}))
+            .unwrap_or_else(|err| {
+                panic!("uncredentialed universal matcher must construct: {origins} ({err})")
+            });
+        assert!(
+            !plugin.uses_strict_origin_policy(),
+            "universal matcher must not report a strict origin policy: {origins}"
+        );
+    }
+
+    let narrow_prefix = CorsPlugin::new(&json!({
+        "allowed_origins": [{"prefix": "https://app.example.com"}]
+    }))
+    .expect("narrow prefix");
+    assert!(narrow_prefix.uses_strict_origin_policy());
+
+    let narrow_regex = CorsPlugin::new(&json!({
+        "allowed_origins": [{"regex": "https://.*\\.example\\.com"}]
+    }))
+    .expect("narrow regex");
+    assert!(narrow_regex.uses_strict_origin_policy());
 }

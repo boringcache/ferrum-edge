@@ -26,7 +26,7 @@ The CORS plugin is configured via the `plugin_configs` section in your YAML conf
 | `allowed_methods` | `string[]` | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Preflight-only policy returned in `Access-Control-Allow-Methods`. Native preflights for unlisted methods are rejected with 403; the list is not evaluated against an actual request's method. |
 | `allowed_headers` | `string[]` | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Preflight-only policy returned in `Access-Control-Allow-Headers`. It is not evaluated against headers on the actual request. |
 | `exposed_headers` | `string[]` | `[]` | Response headers the browser is allowed to access via JavaScript, returned in `Access-Control-Expose-Headers`. |
-| `allow_credentials` | `bool` | `false` | When `true`, sends `Access-Control-Allow-Credentials: true`. Cannot be used with wildcard origins (see below). |
+| `allow_credentials` | `bool` | `false` | When `true`, sends `Access-Control-Allow-Credentials: true`. Cannot be used with wildcard origins or an effectively universal prefix/regex (see below). |
 | `max_age` | `u64` | `86400` | Number of seconds browsers should cache preflight results (`Access-Control-Max-Age`). |
 | `preflight_continue` | `bool` | `false` | When `true`, preflight requests are passed through to the backend instead of being short-circuited by the plugin. Useful if your backend needs to handle `OPTIONS` itself. |
 | `unmatched_preflights` | `forward` or `ignore` | not set | Translation marker used for Istio policies. `forward` represents omitted/`UNSPECIFIED`/`FORWARD`; `ignore` answers unmatched preflights locally with 200 and no CORS authorization fields. Its presence also preserves empty method/header lists and absent max age. Do not combine it with `preflight_continue`. |
@@ -38,7 +38,9 @@ write `allowed_origins: ["*"]` when allow-all is intended.
 
 ### Credentials and Wildcard Origins
 
-Per the CORS specification, `Access-Control-Allow-Origin: *` cannot be combined with `Access-Control-Allow-Credentials: true`. If you configure `allow_credentials: true` with wildcard origins, the plugin logs a warning and automatically disables credentials. To use credentials, specify explicit origins.
+Per the CORS specification, `Access-Control-Allow-Origin: *` cannot be combined with `Access-Control-Allow-Credentials: true`. If you configure `allow_credentials: true` with wildcard origins (`["*"]` or `{exact: "*"}`), the plugin logs a warning and automatically disables credentials. That drop-credentials contract is intentional for exact allow-all.
+
+Effectively universal **prefix** and **regex** matchers are the same security outcome without the wildcard variant — for example `{prefix: "https://"}`, `{prefix: "h"}`, `{regex: ".*"}`, or `{regex: "https://.*"}`. Those combinations are **refused at config load** rather than silently weakening credentials. To use credentials, the origin policy must constrain the host: a prefix needs `://` plus at least one host character (for example `{prefix: "https://app.example.com"}` or `{prefix: "https://preview-"}`), and a regex must not match every origin of a scheme.
 
 ## WebSocket upgrades and CSWSH
 
@@ -217,7 +219,7 @@ Origin matchers are admitted against explicit bounds on the cold config path. Ev
 | Regex lazy-DFA cache | 64 KiB |
 | Regex AST nesting depth | 24 |
 
-The `regex` crate is finite-automaton based, so a hostile pattern cannot cause catastrophic backtracking; the bounds above additionally cap compile-time memory and per-match cache growth. An empty or whitespace-only `exact`, an empty `prefix` (which would match every origin), and an invalid or over-complex pattern are all rejected when the plugin is created. The same predicates gate the Istio VirtualService translator and native/file mesh validation, so an unrepresentable source policy is reported as a deferred field instead of failing plugin construction later.
+The `regex` crate is finite-automaton based, so a hostile pattern cannot cause catastrophic backtracking; the bounds above additionally cap compile-time memory and per-match cache growth. An empty or whitespace-only `exact`, an empty `prefix` (which would match every origin), and an invalid or over-complex pattern are all rejected when the plugin is created. A non-empty prefix that still does not constrain the host (`https://`, `h`, `https:/`) is admitted without credentials but is **not** a strict origin policy; combined with `allow_credentials: true` it is refused. The same predicates gate the Istio VirtualService translator and native/file mesh validation, so an unrepresentable source policy is reported as a deferred field instead of failing plugin construction later.
 
 ### Example 6: Backend Handles OPTIONS
 
@@ -273,8 +275,7 @@ CORS plugin is emitted, and the VirtualService's
 `status.ferrum.translation.deferred_fields` names `http[].corsPolicy`. That
 applies to a malformed or unknown origin matcher, a matcher value or list beyond
 its bound, an un-compilable or over-complex regex, an unparseable `maxAge`, an
-invalid method/header token, and credentialed exact `*` (which cannot emit the
-concrete request origin credentialed CORS requires). Ferrum never approximates
+invalid method/header token, and credentialed exact `*` or an effectively universal prefix/regex (which cannot emit a host-constrained origin credentialed CORS requires). Ferrum never approximates
 or widens such a policy.
 
 These rules do not alter operator-authored native direct-plugin behavior.
@@ -450,7 +451,7 @@ curl -v http://localhost:8000/api/users
 
 3. **Credentials not working with wildcard origins**
 
-   `allow_credentials: true` requires explicit origins. The plugin logs a warning and disables credentials when wildcard origins are used. Specify exact origins to enable credentials.
+   `allow_credentials: true` requires a host-constraining origin policy. Exact wildcard origins log a warning and disable credentials. An effectively universal prefix or regex (`https://`, `.*`, `https://.*`) is refused at config load instead of silently dropping credentials. Specify exact origins or a host-constraining prefix/regex to enable credentials.
 
 4. **CORS headers missing on responses**
 
@@ -478,6 +479,8 @@ Look for log lines starting with `cors:` for preflight approvals, rejections, an
 
 3. **Limit exposed headers.** Only expose response headers that the front-end application actually needs access to via JavaScript.
 
-4. **Use credentials carefully.** `allow_credentials: true` means cookies and authorization headers are sent on cross-origin requests. Only enable this when your front-end application requires it, and always pair it with explicit origins.
+4. **Use credentials carefully.** `allow_credentials: true` means cookies and authorization headers are sent on cross-origin requests. Only enable this when your front-end application requires it, and always pair it with a host-constraining origin policy. Exact `*` drops credentials; an effectively universal prefix or regex is refused.
 
-5. **Set a reasonable max_age.** The default of 86400 seconds (24 hours) means browsers cache preflight results for a day. Shorter values (e.g., 3600) provide more frequent revalidation at the cost of more preflight requests.
+5. **Do not treat `cors_origin` metadata as authorization.** The plugin may write `ctx.metadata["cors_origin"]` as an observability mirror. The matched origin used for `Access-Control-Allow-Origin` and trailer ownership lives in private request state; later plugins cannot change the reflected origin by mutating or deleting that metadata key.
+
+6. **Set a reasonable max_age.** The default of 86400 seconds (24 hours) means browsers cache preflight results for a day. Shorter values (e.g., 3600) provide more frequent revalidation at the cost of more preflight requests.

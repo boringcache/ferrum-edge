@@ -21995,7 +21995,11 @@ components:
                     maxLength: 512
                     description: >-
                       Literal byte-prefix of the request Origin header
-                      (case-sensitive), e.g. "https://app.".
+                      (case-sensitive), e.g. "https://app.". A prefix that does
+                      not constrain the host (missing `://` or empty authority,
+                      such as "https://" or "h") is effectively universal: it
+                      is admitted without credentials but cannot be combined
+                      with allow_credentials.
                   regex:
                     type: string
                     minLength: 1
@@ -22006,7 +22010,9 @@ components:
                       per request) under explicit bounds — 512 pattern bytes, a
                       64 KiB compiled-program limit, a 64 KiB lazy-DFA limit,
                       and an AST nesting limit of 24. An invalid or over-budget
-                      pattern is rejected with a field-specific error.
+                      pattern is rejected with a field-specific error. A regex
+                      that admits every origin of a scheme (for example `.*` or
+                      `https://.*`) cannot be combined with allow_credentials.
           description: >-
             Required permitted-origin policy, bounded at 64 entries. Each entry
             is either a string — NATIVE syntax: `"*"` for intentional allow-all,
@@ -22054,7 +22060,13 @@ components:
         allow_credentials:
           type: boolean
           default: false
-          description: "Send Access-Control-Allow-Credentials: true"
+          description: >-
+            Send Access-Control-Allow-Credentials: true. Incompatible with
+            wildcard origins (native `"*"` / `{exact: "*"}` logs a warning and
+            disables credentials) and with an effectively universal prefix or
+            regex (refused at config load rather than silently weakened). A
+            prefix must constrain the host (`://` plus at least one host
+            character); a regex must not match every origin of a scheme.
         max_age:
           type: integer
           format: uint64

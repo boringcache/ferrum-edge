@@ -1256,7 +1256,8 @@ fn accepted_status(
 /// policy combination Ferrum cannot represent faithfully (a
 /// malformed/unknown origin matcher, an over-budget
 /// matcher list or value, an un-compilable/over-complex regex, an unparseable
-/// `maxAge`, or credentialed exact `*`); exact/prefix/regex origin matchers are
+/// `maxAge`, or credentialed exact `*` / effectively universal prefix or
+/// regex); exact/prefix/regex origin matchers are
 /// otherwise translated.
 fn virtual_service_status(
     object: &K8sObject,
@@ -1346,8 +1347,9 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
     // remains a deferred field when an origin matcher is malformed/unknown, a
     // matcher list or value exceeds its bound, a `regex` does not compile or is
     // too complex, maxAge is unparseable, or credentials are combined with
-    // exact `*` (the native wildcard representation cannot preserve that source
-    // behavior). The shared `cors_policy_translatable` predicate keeps the
+    // exact `*` or an effectively universal prefix/regex (issue #4269; the
+    // native wildcard representation cannot preserve that source behavior). The
+    // shared `cors_policy_translatable` predicate keeps the
     // translator and this report in lockstep.
     let http_routes = spec.get("http").and_then(Value::as_array);
     if http_routes.is_some_and(|routes| {
@@ -3613,6 +3615,44 @@ mod tests {
         assert!(
             deferred.iter().any(|f| f.contains("corsPolicy")),
             "credentialed wildcard http[].corsPolicy must remain deferred, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_cors_policy_credentialed_universal_prefix_is_deferred() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "cors-vs-credentialed-prefix",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [
+                    {
+                        "route": [ { "destination": { "host": "reviews.default.svc.cluster.local" } } ],
+                        "corsPolicy": {
+                            "allowOrigins": [ { "prefix": "https://" } ],
+                            "allowCredentials": true
+                        }
+                    }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|f| f.contains("corsPolicy")),
+            "credentialed universal-prefix http[].corsPolicy must remain deferred, got {deferred:?}"
         );
     }
 

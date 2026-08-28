@@ -36,6 +36,14 @@
 //! construction/reload under the explicit byte/complexity/count bounds below
 //! (issue #3253) — never per request. A matching origin is reflected verbatim
 //! into `Access-Control-Allow-Origin`.
+//!
+//! Matcher breadth is classified once at construction (issue #4269) and shared
+//! by the credentials interlock, `uses_strict_origin_policy`, and Istio/mesh
+//! admission. Exact `*` plus credentials keeps the documented drop-credentials
+//! contract; an effectively universal prefix or regex plus credentials is
+//! refused. The matched origin used for reflection and trailer ownership is
+//! private request state (issue #4296); `ctx.metadata["cors_origin"]` is a
+//! write-only observability mirror.
 
 use async_trait::async_trait;
 use http::Method;
@@ -115,6 +123,158 @@ const ORIGIN_REGEX_DFA_SIZE_LIMIT: usize = 64 * 1024;
 /// bound (the crate default is 250).
 const ORIGIN_REGEX_NEST_LIMIT: u32 = 24;
 
+/// Fixed synthetic HTTPS origins used to detect an effectively universal regex
+/// at construction (issue #4269). Constant-size, no network, no attacker-
+/// amplified cost: each compiled matcher is probed against this closed set
+/// once on the cold path. Hosts are reserved/unrelated (`.invalid` / `.example`
+/// / `.test` / IPv6 / loopback) so a reasonable host-constraining policy such
+/// as `https://.*\.example\.com` cannot match every probe, while `.*` and
+/// `https://.*` do.
+const ORIGIN_REGEX_HTTPS_UNIVERSALITY_PROBES: &[&str] = &[
+    "https://a.invalid",
+    "https://b.example",
+    "https://z.test",
+    "https://[::1]",
+    "https://127.0.0.1",
+];
+
+/// HTTP counterpart of [`ORIGIN_REGEX_HTTPS_UNIVERSALITY_PROBES`]. A regex that
+/// matches every probe in either group is scheme-universal: it would reflect
+/// an arbitrary origin of that scheme under `allow_credentials`.
+const ORIGIN_REGEX_HTTP_UNIVERSALITY_PROBES: &[&str] = &[
+    "http://a.invalid",
+    "http://b.example",
+    "http://z.test",
+    "http://[::1]",
+    "http://127.0.0.1",
+];
+
+/// Construction-time breadth of one origin matcher or of a whole policy.
+///
+/// This is the single classifier used by the credentials interlock,
+/// [`CorsPlugin::uses_strict_origin_policy`], and Istio/mesh admission so those
+/// surfaces cannot drift (issue #4269).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OriginPolicyBreadth {
+    /// Explicit allow-all: native `"*"` or Istio `{exact: "*"}`.
+    Wildcard,
+    /// A prefix or regex that admits every origin, or every origin of `http` /
+    /// `https`. Not the `AllowedOrigins::Wildcard` variant, but equivalent for
+    /// credentialed reflection.
+    EffectivelyUniversal,
+    /// Constrains origins to a non-universal set.
+    Strict,
+}
+
+/// One origin matcher as inspected by [`origin_matcher_breadth`]. Plugin
+/// construction, Istio translation, and native/file mesh validation all go
+/// through this enum so the three cannot disagree on what "universal" means.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum OriginMatcherSpec<'a> {
+    /// Native `"*"` or Istio `{exact: "*"}`.
+    AllowAll,
+    /// Native exact, native wildcard-subdomain, or Istio literal exact. None of
+    /// these is universal (`*` is [`Self::AllowAll`]).
+    Exact,
+    Prefix(&'a str),
+    /// Already-compiled regex (plugin construction).
+    CompiledRegex(&'a Regex),
+    /// Regex pattern string (Istio/mesh cold path). Compiles under the same
+    /// bounds as [`compile_origin_regex`]; an uncompilable pattern is not
+    /// treated as universal — the caller already refused it at admission.
+    RegexPattern(&'a str),
+}
+
+/// Classify one origin matcher. Construction-time, deterministic, and the only
+/// breadth predicate the credentials interlock, strict-policy diagnostic, and
+/// Istio/mesh admission may use.
+pub(crate) fn origin_matcher_breadth(spec: OriginMatcherSpec<'_>) -> OriginPolicyBreadth {
+    match spec {
+        OriginMatcherSpec::AllowAll => OriginPolicyBreadth::Wildcard,
+        OriginMatcherSpec::Exact => OriginPolicyBreadth::Strict,
+        OriginMatcherSpec::Prefix(prefix) => {
+            if origin_prefix_is_effectively_universal(prefix) {
+                OriginPolicyBreadth::EffectivelyUniversal
+            } else {
+                OriginPolicyBreadth::Strict
+            }
+        }
+        OriginMatcherSpec::CompiledRegex(re) => {
+            if origin_regex_is_effectively_universal(re) {
+                OriginPolicyBreadth::EffectivelyUniversal
+            } else {
+                OriginPolicyBreadth::Strict
+            }
+        }
+        OriginMatcherSpec::RegexPattern(pattern) => match compile_origin_regex(pattern) {
+            Ok(re) => origin_matcher_breadth(OriginMatcherSpec::CompiledRegex(&re)),
+            Err(_) => OriginPolicyBreadth::Strict,
+        },
+    }
+}
+
+/// Map one projected `allowed_origins` JSON entry (native string or Istio
+/// object) onto [`OriginMatcherSpec`]. `None` means the entry is not a
+/// recognized matcher — callers have already fail-closed those at admission.
+pub(crate) fn origin_matcher_spec_from_entry(origin: &Value) -> Option<OriginMatcherSpec<'_>> {
+    match origin {
+        Value::String(value) if value == "*" => Some(OriginMatcherSpec::AllowAll),
+        Value::String(_) => Some(OriginMatcherSpec::Exact),
+        Value::Object(map) => {
+            if let Some(exact) = map.get("exact").and_then(Value::as_str) {
+                return Some(if exact == "*" {
+                    OriginMatcherSpec::AllowAll
+                } else {
+                    OriginMatcherSpec::Exact
+                });
+            }
+            if let Some(prefix) = map.get("prefix").and_then(Value::as_str) {
+                return Some(OriginMatcherSpec::Prefix(prefix));
+            }
+            if let Some(regex) = map.get("regex").and_then(Value::as_str) {
+                return Some(OriginMatcherSpec::RegexPattern(regex));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Whether one projected `allowed_origins` entry is wildcard or effectively
+/// universal. Shared Istio/mesh admission screen (issue #4269).
+pub(crate) fn allowed_origin_entry_is_non_strict(origin: &Value) -> bool {
+    origin_matcher_spec_from_entry(origin)
+        .is_some_and(|spec| origin_matcher_breadth(spec) != OriginPolicyBreadth::Strict)
+}
+
+/// A prefix is effectively universal when it does not constrain the origin
+/// authority (scheme+host). Either it is a prefix of `http://` / `https://`
+/// (so every origin of that scheme matches — and `http` also matches every
+/// `https` origin), or it is `http://` / `https://` with an empty authority.
+///
+/// `https://app.` and `https://preview-` constrain the host and are strict.
+/// `h`, `https://`, and `https:/` do not and are effectively universal.
+pub(crate) fn origin_prefix_is_effectively_universal(prefix: &str) -> bool {
+    match prefix.split_once("://") {
+        None => "http://".starts_with(prefix) || "https://".starts_with(prefix),
+        Some((scheme, authority)) => {
+            authority.is_empty() && (scheme == "http" || scheme == "https")
+        }
+    }
+}
+
+/// A compiled origin regex is effectively universal when it full-matches every
+/// probe in at least one scheme group. Bounded: the probe sets are fixed, the
+/// engine is finite-automaton based, and this runs once at config construction.
+pub(crate) fn origin_regex_is_effectively_universal(re: &Regex) -> bool {
+    ORIGIN_REGEX_HTTPS_UNIVERSALITY_PROBES
+        .iter()
+        .all(|origin| re.is_match(origin))
+        || ORIGIN_REGEX_HTTP_UNIVERSALITY_PROBES
+            .iter()
+            .all(|origin| re.is_match(origin))
+}
+
 const CORS_CONFIG_KEYS: &[&str] = &[
     "allowed_origins",
     "allowed_methods",
@@ -143,11 +303,18 @@ enum UnmatchedPreflights {
 /// response policy after every instance has evaluated the request. Keeping the
 /// aggregate out of public metadata prevents internal policy details from
 /// entering transaction logs.
+///
+/// `matched_origin` is the AUTHORITATIVE reflected origin (issue #4296). Public
+/// `ctx.metadata["cors_origin"]` is a write-only observability mirror and must
+/// authorize nothing — later/custom plugins may mutate or delete that key
+/// without changing reflection or trailer ownership.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CorsRequestState {
     policy_count: usize,
     is_preflight: bool,
     response_allowed: bool,
+    /// Authoritative origin to reflect. Independent of public metadata.
+    matched_origin: Option<String>,
     all_wildcard: bool,
     allow_credentials: bool,
     allowed_methods: Option<Arc<Vec<String>>>,
@@ -288,6 +455,37 @@ enum AllowedOrigins {
     List(Vec<OriginPattern>),
 }
 
+impl AllowedOrigins {
+    fn breadth(&self) -> OriginPolicyBreadth {
+        match self {
+            Self::Wildcard => OriginPolicyBreadth::Wildcard,
+            Self::List(patterns) => {
+                let mut breadth = OriginPolicyBreadth::Strict;
+                for pattern in patterns {
+                    match origin_pattern_breadth(pattern) {
+                        OriginPolicyBreadth::Wildcard => return OriginPolicyBreadth::Wildcard,
+                        OriginPolicyBreadth::EffectivelyUniversal => {
+                            breadth = OriginPolicyBreadth::EffectivelyUniversal;
+                        }
+                        OriginPolicyBreadth::Strict => {}
+                    }
+                }
+                breadth
+            }
+        }
+    }
+}
+
+fn origin_pattern_breadth(pattern: &OriginPattern) -> OriginPolicyBreadth {
+    origin_matcher_breadth(match pattern {
+        OriginPattern::Exact(_)
+        | OriginPattern::LiteralExact(_)
+        | OriginPattern::WildcardSubdomain(_) => OriginMatcherSpec::Exact,
+        OriginPattern::Prefix(prefix) => OriginMatcherSpec::Prefix(prefix),
+        OriginPattern::Regex(re) => OriginMatcherSpec::CompiledRegex(re),
+    })
+}
+
 /// CORS (Cross-Origin Resource Sharing) plugin.
 ///
 /// Handles preflight OPTIONS requests at the gateway level and injects the
@@ -377,13 +575,33 @@ impl CorsPlugin {
             );
         }
 
-        // Per CORS spec: Access-Control-Allow-Origin: * cannot be used with credentials.
-        if allow_credentials && matches!(&allowed_origins, AllowedOrigins::Wildcard) {
-            warn!(
-                "cors: allow_credentials=true is incompatible with wildcard origins; \
-                 credentials will be disabled. Specify explicit origins to use credentials."
-            );
-            allow_credentials = false;
+        // Per CORS spec: Access-Control-Allow-Origin: * cannot be used with
+        // credentials. Exact wildcard keeps the documented contract: warn and
+        // drop credentials rather than refusing the config. Effectively
+        // universal prefix/regex matchers are the same security outcome
+        // without the Wildcard variant, so they are refused rather than
+        // silently weakened (issue #4269).
+        let breadth = allowed_origins.breadth();
+        if allow_credentials {
+            match breadth {
+                OriginPolicyBreadth::Wildcard => {
+                    warn!(
+                        "cors: allow_credentials=true is incompatible with wildcard origins; \
+                         credentials will be disabled. Specify explicit origins to use credentials."
+                    );
+                    allow_credentials = false;
+                }
+                OriginPolicyBreadth::EffectivelyUniversal => {
+                    return Err(
+                        "cors: allow_credentials=true is incompatible with an effectively \
+                         universal origin matcher (a prefix that does not constrain the host, \
+                         or a regex that admits every origin of a scheme); specify a \
+                         host-constraining origin policy to use credentials"
+                            .to_string(),
+                    );
+                }
+                OriginPolicyBreadth::Strict => {}
+            }
         }
 
         Ok(Self {
@@ -399,9 +617,11 @@ impl CorsPlugin {
     }
 
     /// Whether this instance restricts origins to an explicit allow-list rather
-    /// than wildcard `*`. Used by plugin-cache composition diagnostics.
+    /// than wildcard `*` or an effectively universal prefix/regex. Used by
+    /// plugin-cache composition diagnostics. Shares [`origin_matcher_breadth`]
+    /// with the credentials interlock and Istio/mesh admission.
     pub fn uses_strict_origin_policy(&self) -> bool {
-        !matches!(self.allowed_origins, AllowedOrigins::Wildcard)
+        self.allowed_origins.breadth() == OriginPolicyBreadth::Strict
     }
 
     /// Parse the `allowed_origins` config field.
@@ -702,9 +922,8 @@ impl Plugin for CorsPlugin {
         }
 
         // Only act on requests that include an Origin header
-        let origin = match ctx.headers.get("origin") {
-            Some(o) => o.clone(),
-            None => return PluginResult::Continue,
+        let Some(origin) = ctx.headers.get("origin") else {
+            return PluginResult::Continue;
         };
 
         // Detect preflight: OPTIONS with Access-Control-Request-Method header
@@ -712,7 +931,7 @@ impl Plugin for CorsPlugin {
             ctx.method == "OPTIONS" && ctx.headers.contains_key("access-control-request-method");
 
         ctx.cors_state.begin_policy(is_preflight);
-        let origin_allowed = self.is_origin_allowed(&origin);
+        let origin_allowed = self.is_origin_allowed(origin);
         if !is_preflight {
             if !origin_allowed {
                 ctx.cors_state.response_allowed = false;
@@ -723,7 +942,7 @@ impl Plugin for CorsPlugin {
                 if self.unmatched_preflights != UnmatchedPreflights::Reject {
                     return self.maybe_finalize_request(ctx);
                 }
-                debug!("cors: request rejected for disallowed origin '{}'", origin);
+                debug!("cors: request rejected for disallowed origin");
                 return PluginResult::Reject {
                     status_code: 403,
                     body: "CORS origin not allowed".to_string(),
@@ -731,8 +950,7 @@ impl Plugin for CorsPlugin {
                 };
             }
             ctx.cors_state.stage_matching_policy(self, false);
-            ctx.metadata
-                .insert("cors_origin".to_string(), origin.clone());
+            record_matched_origin(ctx, origin.clone());
             return self.maybe_finalize_request(ctx);
         }
 
@@ -756,10 +974,7 @@ impl Plugin for CorsPlugin {
                 }
                 UnmatchedPreflights::Reject => {}
             }
-            debug!(
-                "cors: preflight rejected for disallowed origin '{}'",
-                origin
-            );
+            debug!("cors: preflight rejected for disallowed origin");
             return PluginResult::Reject {
                 status_code: 403,
                 body: "CORS origin not allowed".to_string(),
@@ -768,8 +983,7 @@ impl Plugin for CorsPlugin {
         }
 
         ctx.cors_state.stage_matching_policy(self, true);
-        ctx.metadata
-            .insert("cors_origin".to_string(), origin.clone());
+        record_matched_origin(ctx, origin.clone());
 
         // Native backend-handled preflights keep the backend's status/body,
         // but the final response policy is rebuilt from the gateway config.
@@ -790,10 +1004,7 @@ impl Plugin for CorsPlugin {
                 .any(|m| m.eq_ignore_ascii_case(requested_method));
             if !method_allowed {
                 ctx.cors_state.response_allowed = false;
-                debug!(
-                    "cors: preflight rejected method '{}' for origin '{}'",
-                    requested_method, origin
-                );
+                debug!("cors: preflight rejected method '{}'", requested_method);
                 let mut body = String::with_capacity(
                     "CORS method not allowed: ".len() + requested_method.len(),
                 );
@@ -807,7 +1018,7 @@ impl Plugin for CorsPlugin {
             }
         }
 
-        debug!("cors: preflight approved for origin '{}'", origin);
+        debug!("cors: preflight approved");
         self.maybe_finalize_request(ctx)
     }
 
@@ -832,7 +1043,7 @@ impl Plugin for CorsPlugin {
         !ctx.cors_state.defer_finalization
             && ctx.cors_state.policy_count > 0
             && ctx.cors_state.response_allowed
-            && ctx.metadata.contains_key("cors_origin")
+            && ctx.cors_state.matched_origin.is_some()
             && name
                 .get(.."access-control-".len())
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("access-control-"))
@@ -907,7 +1118,7 @@ impl Plugin for CorsFinalizer {
     fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
         ctx.cors_state.policy_count > 0
             && ctx.cors_state.response_allowed
-            && ctx.metadata.contains_key("cors_origin")
+            && ctx.cors_state.matched_origin.is_some()
             && name
                 .get(.."access-control-".len())
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("access-control-"))
@@ -1051,10 +1262,16 @@ fn finalize_cors_response(
     PluginResult::Continue
 }
 
+fn record_matched_origin(ctx: &mut RequestContext, origin: String) {
+    ctx.cors_state.matched_origin = Some(origin.clone());
+    // Observability mirror only — never read back for authorization (issue #4296).
+    ctx.metadata.insert("cors_origin".to_string(), origin);
+}
+
 fn cors_headers(ctx: &RequestContext, preflight: bool) -> HashMap<String, String> {
     let state = &ctx.cors_state;
     let mut headers = HashMap::new();
-    let Some(origin) = ctx.metadata.get("cors_origin") else {
+    let Some(origin) = state.matched_origin.as_ref() else {
         return headers;
     };
 
@@ -1205,6 +1422,9 @@ pub(crate) fn validate_literal_exact_origin(value: &str) -> Result<(), String> {
 /// Admission for an Istio `StringMatch.prefix` origin matcher — see
 /// [`validate_literal_exact_origin`]. An EMPTY prefix would match every origin
 /// (an accidental open CORS policy), so it is refused rather than allowed.
+/// Breadth (whether a non-empty prefix is still effectively universal) is
+/// classified separately by [`origin_prefix_is_effectively_universal`] so the
+/// credentials interlock and Istio/mesh admission share one predicate.
 pub(crate) fn validate_origin_prefix(value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(
