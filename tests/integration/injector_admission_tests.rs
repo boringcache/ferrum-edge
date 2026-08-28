@@ -186,3 +186,115 @@ fn admission_webhook_dry_run_returns_identical_patch() {
     );
     assert!(dry.pointer("/response/patch").is_some());
 }
+
+/// Decode the JSON patch a `CaptureMode::Iptables` injection produces for
+/// `pod`, with `mutate` applied to the injector config first.
+fn injected_patch_ops(pod: Value, mutate: impl FnOnce(&mut InjectorConfig)) -> Vec<Value> {
+    let review = json!({
+        "apiVersion": "admission.k8s.io/v1",
+        "kind": "AdmissionReview",
+        "request": {
+            "uid": "pod-capture",
+            "namespace": "payments",
+            "kind": {"group": "", "version": "v1", "kind": "Pod"},
+            "resource": {"group": "", "version": "v1", "resource": "pods"},
+            "object": pod
+        }
+    });
+    let mut config = injector_config(CaptureMode::Iptables);
+    mutate(&mut config);
+    let response =
+        admission_response(review.to_string().as_bytes(), &config).expect("admission response");
+    let patch = response
+        .pointer("/response/patch")
+        .and_then(Value::as_str)
+        .expect("encoded patch");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(patch)
+        .expect("base64 patch");
+    serde_json::from_slice(&decoded).expect("json patch")
+}
+
+fn init_container_script(ops: &[Value]) -> String {
+    ops.iter()
+        .filter_map(|op| op.get("value"))
+        .find(|value| value.pointer("/name").and_then(Value::as_str) == Some("ferrum-edge-init"))
+        .and_then(|value| value.pointer("/args/0"))
+        .and_then(Value::as_str)
+        .expect("the iptables init container renders a capture script")
+        .to_string()
+}
+
+fn sidecar_env_value<'a>(ops: &'a [Value], name: &str) -> Option<&'a str> {
+    ops.iter()
+        .filter_map(|op| op.get("value"))
+        .find(|value| value.pointer("/name").and_then(Value::as_str) == Some("ferrum-edge"))
+        .and_then(|value| value.pointer("/env"))
+        .and_then(Value::as_array)
+        .and_then(|env| {
+            env.iter()
+                .find(|entry| entry.pointer("/name").and_then(Value::as_str) == Some(name))
+        })
+        .and_then(|entry| entry.pointer("/value"))
+        .and_then(Value::as_str)
+}
+
+/// Issue #4276: the rendered init script must RETURN locally destined traffic
+/// before any outbound REDIRECT, or every intra-pod `127.0.0.1` connection in a
+/// multi-container pod is hairpinned into the mesh outbound proxy.
+#[test]
+fn injected_init_script_returns_local_traffic_before_the_outbound_redirect() {
+    let ops = injected_patch_ops(pod_object(), |_| {});
+    let script = init_container_script(&ops);
+
+    let local_return = script
+        .find("-A FERRUM_MESH_OUTBOUND -m addrtype --dst-type LOCAL -j RETURN")
+        .expect("default injection must carry the loopback/self RETURN");
+    let redirect = script
+        .find("-A FERRUM_MESH_OUTBOUND -p tcp -d 0.0.0.0/0 -j REDIRECT")
+        .or_else(|| script.find("-A FERRUM_MESH_OUTBOUND -p tcp -j REDIRECT"))
+        .expect("default injection must carry the outbound catch-all REDIRECT");
+    assert!(
+        local_return < redirect,
+        "the RETURN must precede the REDIRECT — once REDIRECT fires the chain returns:\n{script}"
+    );
+}
+
+/// Issue #4271: the sidecar must learn that `ip6tables` REDIRECT rules exist, or
+/// it plans an IPv4-only capture listener and every captured IPv6 connection is
+/// refused while the pod reports ready.
+#[test]
+fn injected_sidecar_learns_when_ipv6_capture_rules_are_installed() {
+    let ipv4_only = injected_patch_ops(pod_object(), |_| {});
+    assert_eq!(
+        sidecar_env_value(&ipv4_only, "FERRUM_MESH_CAPTURE_IPV6_ENABLED"),
+        None,
+        "an IPv4-only capture scope must not claim IPv6 capture"
+    );
+
+    let dual_stack = injected_patch_ops(pod_object(), |config| {
+        config.include_outbound_cidrs = vec!["0.0.0.0/0".to_string(), "fd00::/8".to_string()];
+    });
+    let script = init_container_script(&dual_stack);
+    assert!(
+        script.contains("ip6tables"),
+        "an IPv6 include CIDR must render ip6tables rules:\n{script}"
+    );
+    assert_eq!(
+        sidecar_env_value(&dual_stack, "FERRUM_MESH_CAPTURE_IPV6_ENABLED"),
+        Some("true"),
+        "the sidecar must be told to plan IPv6-capable capture listeners"
+    );
+    // The ip6tables fan-out carries the same loopback/self RETURN, and it still
+    // precedes that family's REDIRECT.
+    let v6_return = script
+        .find("ip6tables -t nat -w 5 -A FERRUM_MESH_OUTBOUND -m addrtype --dst-type LOCAL -j RETURN")
+        .expect("the ip6tables chain must carry the loopback/self RETURN too");
+    let v6_redirect = script
+        .find("ip6tables -t nat -w 5 -A FERRUM_MESH_OUTBOUND -p tcp -d fd00::/8 -j REDIRECT")
+        .expect("the ip6tables chain must carry the IPv6 include REDIRECT");
+    assert!(
+        v6_return < v6_redirect,
+        "the ip6tables RETURN must precede the ip6tables REDIRECT:\n{script}"
+    );
+}

@@ -19523,6 +19523,26 @@ pub async fn start_proxy_listener_with_bound_listener_and_mesh_direction(
     Ok(())
 }
 
+/// Opt-in socket options for one bound proxy/capture listener.
+///
+/// Both flags default OFF, so every ordinary listener keeps the historical
+/// posture; each is granted to the narrow caller that needs it and never to a
+/// whole class of listeners through a process-wide switch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProxyListenerBind {
+    /// `IP_TRANSPARENT` / `IPV6_TRANSPARENT`. Lets the socket bind and source
+    /// addresses this host does not own, so it is granted ONLY to the
+    /// NodeWaypoint transparent inbound capture listener (issue #3287).
+    pub transparent: bool,
+    /// Bind an `AF_INET6` wildcard with `IPV6_V6ONLY` explicitly DISABLED, so a
+    /// single socket accepts both native IPv6 and v4-mapped IPv4 connections,
+    /// and downgrade to the IPv4 wildcard when (and only when) IPv6 is
+    /// unavailable on this host. Granted to the mesh TCP capture listeners
+    /// (issue #4271), which must serve whichever families the installed
+    /// `iptables` / `ip6tables` REDIRECT rules divert at them.
+    pub dual_stack: bool,
+}
+
 /// Bind one exclusive TCP listen socket and duplicate it for intra-process
 /// accept workers (issue #3924).
 ///
@@ -19538,10 +19558,42 @@ pub(crate) fn bind_exclusive_proxy_accept_listeners(
     backlog: i32,
     tcp_fastopen_queue_len: Option<u16>,
     accept_threads: usize,
-    transparent: bool,
+    bind: ProxyListenerBind,
 ) -> Result<Vec<TcpListener>, anyhow::Error> {
     let accept_threads = accept_threads.max(1);
-    let first = create_proxy_socket(addr, backlog, tcp_fastopen_queue_len, transparent)?;
+    let first = match create_proxy_socket(addr, backlog, tcp_fastopen_queue_len, bind) {
+        Ok(listener) => listener,
+        // Dual-stack downgrade, and ONLY on a genuine IPv6-unavailability error
+        // (issue #4271). A mesh TCP capture listener PREFERS the `[::]` wildcard
+        // so one socket claims both the v4-mapped and the native-v6 captured
+        // connections; on a host without IPv6 that bind cannot succeed, and the
+        // `ip6tables` rules that would have fed it cannot exist either, so the
+        // v4 wildcard is the complete surface. Any other failure —
+        // `EADDRINUSE` above all — is returned: falling back on it would report
+        // the listener started on IPv4 while IPv6 capture is black-holed behind
+        // a healthy readiness signal.
+        Err(err)
+            if bind.dual_stack
+                && addr.ip().is_ipv6()
+                && addr.ip().is_unspecified()
+                && err
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(crate::socket_opts::is_ipv6_unavailable_io_error) =>
+        {
+            let fallback = SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                addr.port(),
+            );
+            warn!(
+                requested = %addr,
+                fallback = %fallback,
+                "Dual-stack capture listener bind failed because IPv6 is unavailable on this \
+                 host ({err}); falling back to the IPv4 wildcard (IPv6 capture is unavailable here)"
+            );
+            create_proxy_socket(fallback, backlog, tcp_fastopen_queue_len, bind)?
+        }
+        Err(err) => return Err(err),
+    };
     if accept_threads == 1 {
         return Ok(vec![first]);
     }
@@ -19615,8 +19667,12 @@ pub(crate) fn create_proxy_socket(
     addr: SocketAddr,
     backlog: i32,
     tcp_fastopen_queue_len: Option<u16>,
-    transparent: bool,
+    bind: ProxyListenerBind,
 ) -> Result<TcpListener, anyhow::Error> {
+    let ProxyListenerBind {
+        transparent,
+        dual_stack,
+    } = bind;
     let socket = socket2::Socket::new(
         if addr.is_ipv6() {
             socket2::Domain::IPV6
@@ -19638,6 +19694,22 @@ pub(crate) fn create_proxy_socket(
     // sockets therefore require SO_EXCLUSIVEADDRUSE before bind.
     #[cfg(windows)]
     set_windows_exclusive_addr_use(&socket)?;
+
+    // Dual-stack capture listener (issue #4271): disable `IPV6_V6ONLY` so ONE
+    // `AF_INET6` wildcard socket accepts both native IPv6 and IPv4 (reported as
+    // v4-mapped `::ffff:a.b.c.d`) connections. Set EXPLICITLY rather than
+    // inherited from `net.ipv6.bindv6only`: mesh capture correctness must not
+    // depend on a host sysctl, because a `bindv6only=1` node would leave the
+    // IPv4 half of the capture rules pointing at a port with no listener. Only
+    // callers that opt in are affected; every other listener keeps the host
+    // default. Set before `bind`, which is where the option takes effect.
+    if dual_stack && addr.is_ipv6() {
+        socket.set_only_v6(false).map_err(|err| {
+            anyhow::Error::new(err).context(format!(
+                "failed to disable IPV6_V6ONLY on the dual-stack capture listener {addr}"
+            ))
+        })?;
+    }
 
     // IP_TRANSPARENT / IPV6_TRANSPARENT for the NodeWaypoint transparent
     // inbound CAPTURE listener (issue #3287). That listener is the only caller
@@ -19684,8 +19756,12 @@ pub(crate) fn create_proxy_socket(
     }
 
     socket.set_nonblocking(true)?;
+    // `anyhow::Error::new` (not `anyhow!`) so the underlying `io::Error` stays
+    // downcastable: the dual-stack capture bind classifies it to decide whether
+    // an IPv6 failure is a safe downgrade to the v4 wildcard or a real conflict.
     socket.bind(&addr.into()).map_err(|err| {
-        anyhow::anyhow!("failed to bind exclusive TCP proxy listener on {addr}: {err}")
+        anyhow::Error::new(err)
+            .context(format!("failed to bind exclusive TCP proxy listener on {addr}"))
     })?;
 
     // TCP_FASTOPEN: enable TFO on the server socket after bind, before listen.
@@ -19778,6 +19854,7 @@ pub async fn start_proxy_listener_with_tls_and_signal(
             record_mesh_mtls_metric: false,
         },
         None,
+        false,
         started_tx,
     )
     .await
@@ -19789,12 +19866,18 @@ pub async fn start_proxy_listener_with_tls_and_signal(
 /// stamps `mesh_direction` onto every accepted connection so mesh-aware
 /// plugins can gate CLIENT vs SERVER span emission. Used by mesh outbound
 /// capture, which terminates plaintext on a known port.
+///
+/// `dual_stack` is set by the mesh listener plan for a capture listener bound on
+/// the IPv6 wildcard, so one socket serves both the `iptables` and `ip6tables`
+/// REDIRECT rules (issue #4271).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_mesh_plaintext_listener_with_signal(
     addr: SocketAddr,
     state: ProxyState,
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    dual_stack: bool,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
     start_proxy_listener_with_tls_source_and_signal(
@@ -19806,6 +19889,7 @@ pub(crate) async fn start_mesh_plaintext_listener_with_signal(
             record_mesh_mtls_metric: false,
         },
         mesh_direction,
+        dual_stack,
         started_tx,
     )
     .await
@@ -19886,6 +19970,7 @@ pub async fn start_proxy_listener_with_dynamic_tls_and_signal(
             record_mesh_mtls_metric: false,
         },
         None,
+        false,
         started_tx,
     )
     .await
@@ -19902,12 +19987,14 @@ pub async fn start_proxy_listener_with_dynamic_tls_and_signal(
 ///
 /// Each accept performs one `ArcSwap::load()` plus one inner `Arc` clone,
 /// keeping the atomic read off the proxy request path. See `ListenerTlsSource`.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_proxy_listener_with_mesh_inbound_tls_and_signal(
     addr: SocketAddr,
     state: ProxyState,
     shutdown: tokio::sync::watch::Receiver<bool>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     allows_plaintext: bool,
+    dual_stack: bool,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
     start_proxy_listener_with_tls_source_and_signal(
@@ -19916,6 +20003,7 @@ pub async fn start_proxy_listener_with_mesh_inbound_tls_and_signal(
         shutdown,
         ListenerTlsSource::MeshInbound { allows_plaintext },
         mesh_direction,
+        dual_stack,
         started_tx,
     )
     .await
@@ -20402,12 +20490,14 @@ fn resolve_node_waypoint_accept_identity(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_proxy_listener_with_tls_source_and_signal(
     addr: SocketAddr,
     state: ProxyState,
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_source: ListenerTlsSource,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    dual_stack: bool,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
     let backlog = state.env_config.tcp_listen_backlog as i32;
@@ -20443,9 +20533,17 @@ async fn start_proxy_listener_with_tls_source_and_signal(
     // exactly one listener — the NodeWaypoint inbound capture socket, which
     // opts in explicitly in `proxy::node_waypoint_ingress_capture` — and never
     // to a whole class of listeners on the strength of a process-wide env var.
-    let mut listeners =
-        bind_exclusive_proxy_accept_listeners(addr, backlog, tfo_queue, accept_threads, false)
-            .map_err(|err| err.context("Proxy listener bind failed"))?;
+    let mut listeners = bind_exclusive_proxy_accept_listeners(
+        addr,
+        backlog,
+        tfo_queue,
+        accept_threads,
+        ProxyListenerBind {
+            transparent: false,
+            dual_stack,
+        },
+    )
+    .map_err(|err| err.context("Proxy listener bind failed"))?;
     let first_listener = listeners.pop().ok_or_else(|| {
         anyhow::anyhow!("exclusive proxy listener set unexpectedly empty after bind")
     })?;

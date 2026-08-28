@@ -1070,6 +1070,53 @@ pub fn udp_capture_settings_from_env() -> Result<UdpCaptureSettings, String> {
     })
 }
 
+/// Whether the mesh data plane must serve IPv6 CAPTURED traffic on this
+/// workload — i.e. whether `ip6tables` capture rules are (or will be) installed
+/// in this network namespace (issue #4271).
+///
+/// This is the runtime half of a producer/consumer pair. The rule PRODUCER is
+/// the injector's init container, which emits `ip6tables` REDIRECTs when
+/// `FERRUM_MESH_IP6TABLES_ENABLED` is not `disabled` AND at least one
+/// include/exclude CIDR is IPv6 — exactly [`IptablesPlan::for_config`]'s v6
+/// gate. The CONSUMER is the sidecar's TCP capture listener plan, which must
+/// bind a socket able to accept the family those rules divert, or the captured
+/// IPv6 connections land on a port with no listener and are black-holed with
+/// `ECONNREFUSED`.
+///
+/// Resolution order:
+///
+/// 1. `FERRUM_MESH_CAPTURE_IPV6_ENABLED`, the explicit operator/injector signal.
+///    The injector sets it on the sidecar container whenever the init
+///    container's rendered plan actually contains `ip6tables` commands, so the
+///    two containers cannot disagree about the deployed capture surface.
+/// 2. Otherwise the same derivation applied to whatever capture scope env this
+///    process can see, so a hand-rolled (non-injector) sidecar that carries the
+///    capture CIDRs still plans the right listeners.
+///
+/// Errors are the ordinary malformed-env errors of the underlying parsers; the
+/// serving path turns them into a startup failure rather than guessing.
+pub fn capture_ipv6_enabled_from_env() -> Result<bool, String> {
+    if let Some(raw) = resolve_ferrum_var("FERRUM_MESH_CAPTURE_IPV6_ENABLED")
+        && !raw.trim().is_empty()
+    {
+        return parse_bool_env(Some(raw.as_str()), "FERRUM_MESH_CAPTURE_IPV6_ENABLED");
+    }
+    let ip6tables_mode = Ip6TablesMode::parse(
+        &resolve_ferrum_var("FERRUM_MESH_IP6TABLES_ENABLED").unwrap_or_else(|| "auto".to_string()),
+    )?;
+    if ip6tables_mode == Ip6TablesMode::Disabled {
+        return Ok(false);
+    }
+    let include_cidrs =
+        parse_cidr_env(&resolve_ferrum_var("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS").unwrap_or_default());
+    let exclude_cidrs =
+        parse_cidr_env(&resolve_ferrum_var("FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS").unwrap_or_default());
+    Ok(include_cidrs
+        .iter()
+        .chain(exclude_cidrs.iter())
+        .any(|cidr| cidr_family(cidr) == Some(CidrFamily::V6)))
+}
+
 /// Validate a host-side interface name before it is interpolated into an
 /// `iptables -i <iface>` argument inside a `sh -c` script.
 ///
@@ -2028,6 +2075,38 @@ fn commands_for_family(
     let mut commands = Vec::new();
     commands.push(idempotent_new_chain(binary, "nat", "FERRUM_MESH_INBOUND"));
     commands.push(idempotent_new_chain(binary, "nat", "FERRUM_MESH_OUTBOUND"));
+
+    // Loopback / pod-self RETURN, emitted FIRST so it precedes every REDIRECT in
+    // this chain (issue #4276). `nat OUTPUT` is traversed by locally generated
+    // packets, including the universal multi-container-pod pattern where the app
+    // dials a sidecar over `127.0.0.1` (`postgres`, `redis`, an app-local admin
+    // port). With the shipped defaults the include rule is a catch-all
+    // `-p tcp -d 0.0.0.0/0 -j REDIRECT --to-ports <outbound>`, so without this
+    // RETURN that intra-pod connection is DNAT'd into the mesh outbound proxy,
+    // recovers `SO_ORIGINAL_DST = 127.0.0.1:<app port>`, matches no mesh route,
+    // and is handed to the HTTP path (or denied outright under
+    // `outboundTrafficPolicy: REGISTRY_ONLY`). Istio's `ISTIO_OUTPUT` carries
+    // `-d 127.0.0.1/32 -j RETURN` for exactly this.
+    //
+    // `-m addrtype --dst-type LOCAL` is the SAME discriminator the UDP sibling
+    // chain already uses (`udp_tproxy_commands_for_family`'s complementary
+    // `! --dst-type LOCAL` egress scope), and in the POD netns it covers both
+    // loopback and the pod's own IP in one family-agnostic rule — so the
+    // `ip6tables` fan-out gets the identical protection without a second literal.
+    //
+    // Gated on `host_netns` for the same reason the UDP path is: in the HOST
+    // namespace pod IPs are FORWARDED rather than `LOCAL`, so the discriminator
+    // does not describe "this workload's own address" there. The TCP chains are
+    // only ever rendered by the injector's pod-netns init container today, and
+    // this keeps that invariant explicit rather than assumed.
+    if !config.host_netns {
+        commands.push(idempotent_append(
+            binary,
+            "nat",
+            "FERRUM_MESH_OUTBOUND",
+            "-m addrtype --dst-type LOCAL -j RETURN",
+        ));
+    }
 
     for cidr in &exclude_cidrs {
         commands.push(idempotent_append(
