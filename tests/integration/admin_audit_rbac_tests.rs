@@ -8,8 +8,9 @@ use ferrum_edge::{
     },
     config::{
         db_loader::{DatabaseStore, DbPoolConfig},
-        types::{PluginConfig, PluginScope},
+        types::{DEFAULT_NAMESPACE, PluginConfig, PluginScope},
     },
+    modes::mesh::runtime::MeshRuntimeState,
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
@@ -39,6 +40,28 @@ fn token(subject: &str, role: Option<&str>) -> String {
         "nbf": now.timestamp(),
         "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
+    });
+    if let Some(role) = role {
+        claims["role"] = json!(role);
+    }
+    encode(
+        &Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
+    )
+    .unwrap()
+}
+
+fn token_with_ns(subject: &str, role: Option<&str>, ns: Value) -> String {
+    let now = Utc::now();
+    let mut claims = json!({
+        "iss": JWT_ISSUER,
+        "sub": subject,
+        "iat": now.timestamp(),
+        "nbf": now.timestamp(),
+        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        "jti": uuid::Uuid::new_v4().to_string(),
+        "ns": ns,
     });
     if let Some(role) = role {
         claims["role"] = json!(role);
@@ -209,6 +232,50 @@ async fn wait_for_audit_total(base: &str, path: &str, bearer: &str, expected: u6
     panic!(
         "audit list did not reach total={expected}; last status={last_status}, body={last_body:?}"
     );
+}
+
+async fn get_json_ns(base: &str, path: &str, bearer: &str, namespace: &str) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .get(format!("{base}{path}"))
+        .bearer_auth(bearer)
+        .header("X-Ferrum-Namespace", namespace)
+        .send()
+        .await
+        .expect("GET request");
+    let status = response.status().as_u16();
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    (status, body)
+}
+
+async fn wait_for_audit_total_ns(
+    base: &str,
+    path: &str,
+    bearer: &str,
+    namespace: &str,
+    expected: u64,
+) -> Value {
+    let mut last_body = json!({});
+    let mut last_status = 0;
+    for _ in 0..100 {
+        let (status, body) = get_json_ns(base, path, bearer, namespace).await;
+        last_status = status;
+        last_body = body;
+        if status == 200 && last_body["total"].as_u64() == Some(expected) {
+            return last_body;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!(
+        "audit list did not reach total={expected} in namespace {namespace}; last status={last_status}, body={last_body:?}"
+    );
+}
+
+fn test_ca_bundle_pem() -> String {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ca key");
+    let mut params =
+        rcgen::CertificateParams::new(vec!["audit-ca.test".to_string()]).expect("ca params");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.self_signed(&key).expect("self-signed ca").pem()
 }
 
 #[tokio::test]
@@ -2064,5 +2131,148 @@ fn assert_chargeback_projection_redacted(config: &Value) {
     assert_eq!(
         config["clickhouse"]["insert_query_params"]["async_insert"],
         "[REDACTED]"
+    );
+}
+
+#[tokio::test]
+async fn scoped_caller_cannot_file_global_tls_mutation_under_another_tenant() {
+    let tmp = TempDir::new().unwrap();
+    let mut state = admin_state(make_store(&tmp).await);
+    state.admin_require_namespace_claim = true;
+    let (base, _shutdown) = start_admin(state).await;
+
+    let tenant_a = token_with_ns("tenant-a-admin", Some("admin"), json!("tenant-a"));
+    let tenant_b = token_with_ns("tenant-b-admin", Some("admin"), json!("tenant-b"));
+    let global = token_with_ns("global-admin", Some("admin"), json!(DEFAULT_NAMESPACE));
+    let bundle_id = format!("audit-ca-{}", uuid::Uuid::new_v4().simple());
+    let body = json!({
+        "id": bundle_id,
+        "name": bundle_id,
+        "ca_bundle_pem": test_ca_bundle_pem(),
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/admin/tls/ca-bundles"))
+        .bearer_auth(&tenant_a)
+        .header("X-Ferrum-Namespace", "tenant-b")
+        .json(&body)
+        .send()
+        .await
+        .expect("POST ca-bundle");
+    let status = response.status().as_u16();
+    let create_body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(
+        status, 201,
+        "global TLS create must succeed for a scoped admin: {create_body:?}"
+    );
+
+    let audit_path = format!("/audit?resource_type=tls_ca_bundle&resource_id={bundle_id}");
+    let global_body =
+        wait_for_audit_total_ns(&base, &audit_path, &global, DEFAULT_NAMESPACE, 1).await;
+    assert_eq!(global_body["items"][0]["namespace"], DEFAULT_NAMESPACE);
+    assert_eq!(global_body["items"][0]["action"], "create");
+
+    let (tenant_b_status, tenant_b_body) =
+        get_json_ns(&base, &audit_path, &tenant_b, "tenant-b").await;
+    assert_eq!(tenant_b_status, 200, "tenant-b audit body: {tenant_b_body:?}");
+    assert_eq!(
+        tenant_b_body["total"].as_u64(),
+        Some(0),
+        "global TLS mutation must not be filed under the spoofed tenant: {tenant_b_body:?}"
+    );
+
+    let (tenant_a_status, tenant_a_body) =
+        get_json_ns(&base, &audit_path, &tenant_a, "tenant-a").await;
+    assert_eq!(tenant_a_status, 200, "tenant-a audit body: {tenant_a_body:?}");
+    assert_eq!(
+        tenant_a_body["total"].as_u64(),
+        Some(0),
+        "global TLS mutation must not be filed under the caller's tenant either: {tenant_a_body:?}"
+    );
+}
+
+#[tokio::test]
+async fn namespace_claim_denied_backup_is_filed_under_canonical_global_namespace() {
+    let tmp = TempDir::new().unwrap();
+    let mut state = admin_state(make_store(&tmp).await);
+    state.admin_require_namespace_claim = true;
+    let (base, _shutdown) = start_admin(state).await;
+
+    let tenant_a = token_with_ns("tenant-a-admin", Some("admin"), json!("tenant-a"));
+    let tenant_b = token_with_ns("tenant-b-admin", Some("admin"), json!("tenant-b"));
+    let global = token_with_ns("global-admin", Some("admin"), json!(DEFAULT_NAMESPACE));
+
+    let denied = reqwest::Client::new()
+        .get(format!("{base}/backup"))
+        .bearer_auth(&tenant_a)
+        .header("X-Ferrum-Namespace", "tenant-b")
+        .header("X-Request-Id", "denied-backup-audit")
+        .send()
+        .await
+        .expect("GET backup");
+    assert_eq!(denied.status().as_u16(), 403);
+
+    let audit_path = "/audit?action=backup&resource_type=gateway_config";
+    let global_body =
+        wait_for_audit_total_ns(&base, audit_path, &global, DEFAULT_NAMESPACE, 1).await;
+    assert_eq!(global_body["items"][0]["namespace"], DEFAULT_NAMESPACE);
+    assert_eq!(global_body["items"][0]["outcome"], "denied");
+    assert_eq!(
+        global_body["items"][0]["diff"]["failure_category"],
+        "namespace_denied"
+    );
+    assert_eq!(global_body["items"][0]["request_id"], "denied-backup-audit");
+    let rendered = global_body.to_string();
+    assert!(
+        !rendered.contains("tenant-b"),
+        "denied namespace leaked into audit: {rendered}"
+    );
+
+    let (tenant_b_status, tenant_b_body) =
+        get_json_ns(&base, audit_path, &tenant_b, "tenant-b").await;
+    assert_eq!(tenant_b_status, 200, "tenant-b audit body: {tenant_b_body:?}");
+    assert_eq!(
+        tenant_b_body["total"].as_u64(),
+        Some(0),
+        "denied backup must not be filed under the rejected header: {tenant_b_body:?}"
+    );
+}
+
+#[tokio::test]
+async fn mesh_config_revision_reset_audit_ignores_request_namespace_header() {
+    let tmp = TempDir::new().unwrap();
+    let mut state = admin_state(make_store(&tmp).await);
+    state.admin_require_namespace_claim = true;
+    state.mesh_runtime_state = Some(MeshRuntimeState::new());
+    let (base, _shutdown) = start_admin(state).await;
+
+    let tenant_a = token_with_ns("tenant-a-admin", Some("admin"), json!("tenant-a"));
+    let tenant_b = token_with_ns("tenant-b-admin", Some("admin"), json!("tenant-b"));
+    let global = token_with_ns("global-admin", Some("admin"), json!(DEFAULT_NAMESPACE));
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/mesh/config-revision/reset?confirm=true"))
+        .bearer_auth(&tenant_a)
+        .header("X-Ferrum-Namespace", "tenant-b")
+        .send()
+        .await
+        .expect("POST mesh reset");
+    let status = response.status().as_u16();
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(status, 200, "mesh reset body: {body:?}");
+
+    let audit_path = "/audit?action=reset&resource_type=mesh_config_revision";
+    let global_body =
+        wait_for_audit_total_ns(&base, audit_path, &global, DEFAULT_NAMESPACE, 1).await;
+    assert_eq!(global_body["items"][0]["namespace"], DEFAULT_NAMESPACE);
+    assert_eq!(global_body["items"][0]["outcome"], "success");
+
+    let (tenant_b_status, tenant_b_body) =
+        get_json_ns(&base, audit_path, &tenant_b, "tenant-b").await;
+    assert_eq!(tenant_b_status, 200, "tenant-b audit body: {tenant_b_body:?}");
+    assert_eq!(
+        tenant_b_body["total"].as_u64(),
+        Some(0),
+        "mesh reset must not be filed under the spoofed tenant: {tenant_b_body:?}"
     );
 }

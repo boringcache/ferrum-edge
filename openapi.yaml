@@ -38,7 +38,11 @@ info:
     observability, cluster state, backend capabilities, TLS management, and mesh
     topology reflect the current node or control-plane state and are not
     namespace-filtered unless their operation explicitly declares the namespace
-    header. Discover all known resource namespaces via `GET /namespaces`
+    header. Audit events for those fleet-global mutations (TLS/ACME management
+    and `POST /mesh/config-revision/reset`) are stored under the canonical
+    default namespace (`ferrum`), not `X-Ferrum-Namespace`. Invalid namespace
+    headers and `ns`-claim denials use the same canonical audit bucket.
+    Discover all known resource namespaces via `GET /namespaces`
     (a paginated list of name strings). `POST /namespaces` registers an empty
     tenant before any resource exists; `PUT /namespaces/{name}` can rename a
     tenant (moving every resource row) and `DELETE /namespaces/{name}` removes
@@ -1089,7 +1093,9 @@ paths:
       description: |
         Managed TLS record IDs are globally unique across material kinds. Create
         with `allow_overwrite=true` rejects a cross-kind ID collision with
-        `409 Conflict`.
+        `409 Conflict`. This surface is not selected by `X-Ferrum-Namespace`;
+        when ordinary mutation auditing is enabled, the event is stored under
+        the canonical default namespace (`ferrum`).
       tags: [TLS]
       requestBody:
         required: true
@@ -3821,7 +3827,9 @@ paths:
 
         Requires the `operator` role. Returns `404 Not Found` outside mesh mode.
         Requires `?confirm=true` because clearing the freshness gate is a
-        privileged operation that lowers a fail-closed guard.
+        privileged operation that lowers a fail-closed guard. The matching
+        audit event is stored under the canonical default namespace (`ferrum`),
+        not `X-Ferrum-Namespace`, because this route is fleet-global.
       tags: [Mesh Config Drift]
       security:
         - bearerAuth: []
@@ -4079,7 +4087,15 @@ paths:
         plus unconditional security-sensitive backup export and authenticated
         backup-attempt records. Requires an admin-role JWT. Each event
         includes actor, action, resource identity, timestamp, and a JSON diff.
-        Events may also include `namespace_at_event` (the namespace in effect
+        The list is filtered by the request `X-Ferrum-Namespace` (the
+        authorization-scoping field). Namespace-scoped mutations are labeled
+        with that header only after the `ns`-claim gate has authorized it when
+        `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` is on. Fleet-global mutations
+        (TLS/ACME management, `POST /mesh/config-revision/reset`), invalid
+        namespace headers, and `ns`-claim denials are stored under the
+        canonical default namespace (`ferrum`) so a caller cannot file a
+        privileged record under another tenant. Events may also include
+        `namespace_at_event` (the namespace in effect
         when the event was written; never rewritten on tenant rename),
         `source_address` (canonical socket peer), a bounded `request_id`, and a
         fixed-cardinality `outcome`. Consumer
