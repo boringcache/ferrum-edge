@@ -1,5 +1,17 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use bytes::Bytes;
 use chrono::Utc;
+use ferrum_edge::_test_support::{
+    canonical_header_content_length_from_map_for_test,
+    collect_size_limited_stream_chunks_for_test, preserved_response_content_length_for_test,
+    run_after_proxy_hooks_for_test, should_bypass_h2_coalesce_for_large_response_for_test,
+    streaming_response_requires_size_limit_for_test,
+};
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy, ResponseBodyMode};
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::retry::{ErrorClass, classify_body_error};
 
 fn test_proxy() -> Proxy {
     Proxy {
@@ -227,4 +239,147 @@ fn test_streaming_mode_with_stream_config_no_plugins() {
     let should_stream =
         matches!(proxy.response_body_mode, ResponseBodyMode::Stream) && !plugin_requires_buffering;
     assert!(should_stream);
+}
+
+// --- Issue #4279: size-limit enforcement uses trusted backend length --------
+
+struct InsertContentLength {
+    value: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Plugin for InsertContentLength {
+    fn name(&self) -> &str {
+        "insert_content_length"
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        response_headers.insert("content-length".to_string(), self.value.to_string());
+        PluginResult::Continue
+    }
+}
+
+struct RewriteContentLength {
+    value: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Plugin for RewriteContentLength {
+    fn name(&self) -> &str {
+        "rewrite_content_length"
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        response_headers.insert("Content-Length".to_string(), self.value.to_string());
+        PluginResult::Continue
+    }
+}
+
+fn size_limit_ctx() -> RequestContext {
+    RequestContext::new(
+        "203.0.113.7".to_string(),
+        "GET".to_string(),
+        "/stream".to_string(),
+    )
+}
+
+/// A backend response with no Content-Length plus an `after_proxy` hook that
+/// inserts one must still select the size-limited streaming adapter.
+#[tokio::test]
+async fn inserted_content_length_cannot_suppress_size_limited_streaming_adapter() {
+    let mut headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/octet-stream".into(),
+    )]);
+    let trusted = canonical_header_content_length_from_map_for_test(&headers);
+    assert_eq!(trusted, None, "backend did not declare a length");
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(InsertContentLength { value: "1048576" })];
+    let mut ctx = size_limit_ctx();
+    assert!(!run_after_proxy_hooks_for_test(&plugins, &mut ctx, 200, &mut headers).await);
+
+    let declared = preserved_response_content_length_for_test(&headers, 200);
+    assert_eq!(
+        declared,
+        Some(1_048_576),
+        "the hook-authored length is visible for wire/completeness consumers"
+    );
+    assert!(
+        streaming_response_requires_size_limit_for_test(64, trusted),
+        "trusted None must still wrap the size-limited adapter"
+    );
+    assert!(
+        !streaming_response_requires_size_limit_for_test(64, declared),
+        "using the post-hook length would skip the adapter — that is the bug"
+    );
+}
+
+/// Rewriting Content-Length to a large value must not select the direct-H2
+/// passthrough that skips both coalescing and size-limit enforcement.
+#[tokio::test]
+async fn rewritten_content_length_cannot_select_h2_passthrough() {
+    let mut headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/octet-stream".into(),
+    )]);
+    let trusted = canonical_header_content_length_from_map_for_test(&headers);
+    assert_eq!(trusted, None);
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RewriteContentLength { value: "1048576" })];
+    let mut ctx = size_limit_ctx();
+    assert!(!run_after_proxy_hooks_for_test(&plugins, &mut ctx, 200, &mut headers).await);
+
+    let declared = preserved_response_content_length_for_test(&headers, 200);
+    let max = 10 * 1024 * 1024;
+    assert!(
+        !should_bypass_h2_coalesce_for_large_response_for_test(trusted, max),
+        "unknown-length backend must not passthrough"
+    );
+    assert!(
+        should_bypass_h2_coalesce_for_large_response_for_test(declared, max),
+        "using the inserted 1 MiB length would wrongly passthrough — that is the bug"
+    );
+    assert!(streaming_response_requires_size_limit_for_test(max, trusted));
+}
+
+/// A genuine backend Content-Length within the cap still skips the
+/// size-limited adapter (the pre-commit check already admitted it).
+#[test]
+fn trusted_backend_content_length_within_limit_skips_size_limited_adapter() {
+    let headers = HashMap::from([("content-length".to_string(), "100".to_string())]);
+    let trusted = canonical_header_content_length_from_map_for_test(&headers);
+    assert_eq!(trusted, Some(100));
+    assert!(!streaming_response_requires_size_limit_for_test(
+        64 * 1024,
+        trusted,
+    ));
+    assert!(streaming_response_requires_size_limit_for_test(
+        64 * 1024,
+        None
+    ));
+}
+
+/// An oversized unknown-length stream terminates with ResponseBodyTooLarge,
+/// the same protocol error the HTTP/1 builder installs after headers commit.
+#[test]
+fn oversized_unknown_length_stream_terminates_as_response_body_too_large() {
+    let chunks = vec![Bytes::from_static(b"1234"), Bytes::from_static(b"5678")];
+    let err = collect_size_limited_stream_chunks_for_test(chunks, 6)
+        .expect_err("second chunk must cross the 6-byte cap");
+    assert_eq!(err, "response body exceeds maximum size");
+
+    let boxed: Box<dyn std::error::Error + Send + Sync> = err.into();
+    let (class, disconnected) = classify_body_error(&*boxed);
+    assert_eq!(class, ErrorClass::ResponseBodyTooLarge);
+    assert!(!disconnected);
 }

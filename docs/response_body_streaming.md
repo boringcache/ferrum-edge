@@ -910,11 +910,11 @@ When `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` is set (non-zero), the gateway enforc
 |----------|-----------|---------------|----------|
 | Stream mode | Enabled | Present, within limit | Stream directly (or buffer if ≤ cutoff) |
 | Stream mode | Enabled | Present, exceeds limit | Reject with 502 (before reading body) |
-| Stream mode | Enabled | Absent | Stream with `SizeLimitedStreamingResponse` — frame-by-frame enforcement |
+| Stream mode | Enabled | Absent (backend-observed) | Stream with `SizeLimitedStreamingResponse` — frame-by-frame enforcement |
 | Stream mode | Disabled (0) | Any | Stream directly |
 | Buffer mode | Any | Any | Buffer and check size |
 
-When Content-Length is absent, the `SizeLimitedStreamingResponse` adapter in `src/proxy/body.rs` wraps the response byte stream and counts bytes as they flow through. If the accumulated size exceeds the limit, it yields an error. This is the response-side equivalent of `SizeLimitedIncoming` for request bodies — it prevents OOM on large chunked responses that exceed the limit without buffering the entire body into memory.
+When the backend did not declare a canonical Content-Length, the `SizeLimitedStreamingResponse` adapter in `src/proxy/body.rs` wraps the response byte stream and counts bytes as they flow through. That decision uses the length captured before `after_proxy`; a hook that inserts or rewrites `Content-Length` cannot suppress the adapter. If the accumulated size exceeds the limit, it yields an error. This is the response-side equivalent of `SizeLimitedIncoming` for request bodies — it prevents OOM on large chunked responses that exceed the limit without buffering the entire body into memory.
 
 See [docs/size_limits.md](size_limits.md) for the full size limit enforcement architecture.
 

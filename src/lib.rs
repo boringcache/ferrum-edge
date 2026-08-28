@@ -11933,6 +11933,49 @@ pub mod _test_support {
         crate::proxy::canonical_header_content_length_from_map(headers)
     }
 
+    /// Whether a streaming response must wrap the size-limited adapter, using
+    /// the trusted backend-observed length captured before `after_proxy`.
+    pub fn streaming_response_requires_size_limit_for_test(
+        max_response_body_size_bytes: usize,
+        trusted_backend_content_length: Option<u64>,
+    ) -> bool {
+        crate::proxy::streaming_response_requires_size_limit(
+            max_response_body_size_bytes,
+            trusted_backend_content_length,
+        )
+    }
+
+    /// Direct-H2 large-response passthrough predicate. Callers must pass the
+    /// trusted backend-observed length, never a post-hook header.
+    pub fn should_bypass_h2_coalesce_for_large_response_for_test(
+        trusted_backend_content_length: Option<u64>,
+        max_response_body_size_bytes: usize,
+    ) -> bool {
+        crate::proxy::should_bypass_h2_coalesce_for_large_response(
+            trusted_backend_content_length,
+            max_response_body_size_bytes,
+        )
+    }
+
+    /// Post-hook declared length used only for HEAD advertisement and H3
+    /// client-facing completeness — not size-limit enforcement.
+    pub fn preserved_response_content_length_for_test(
+        headers: &std::collections::HashMap<String, String>,
+        status: u16,
+    ) -> Option<u64> {
+        crate::proxy::headers::preserved_response_content_length(headers, status)
+    }
+
+    /// Poll the HTTP/1 size-limited streaming adapter over in-memory chunks.
+    /// An oversized sequence returns the same `response body exceeds maximum
+    /// size` error the production builder emits.
+    pub fn collect_size_limited_stream_chunks_for_test(
+        chunks: Vec<bytes::Bytes>,
+        max_bytes: usize,
+    ) -> Result<Vec<bytes::Bytes>, String> {
+        crate::proxy::body::collect_size_limited_stream_chunks(chunks, max_bytes)
+    }
+
     /// Request-side declared-length reject predicate used by every dispatch path.
     pub fn declared_request_content_length_over_limit_for_test(
         headers: &std::collections::HashMap<String, String>,

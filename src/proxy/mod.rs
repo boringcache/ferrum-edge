@@ -2005,12 +2005,29 @@ pub(crate) fn refine_stream_response_for_content_type(
     })
 }
 
+/// Whether a streaming response must wrap the size-limited adapter.
+///
+/// `trusted_backend_content_length` is the canonical length observed on the
+/// **backend** response, captured before `after_proxy`. A hook-authored
+/// `Content-Length` must never suppress this adapter: inserting a length onto
+/// an originally unknown-length stream would otherwise skip frame-by-frame
+/// enforcement of `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`.
+#[inline]
+pub(crate) fn streaming_response_requires_size_limit(
+    max_response_body_size_bytes: usize,
+    trusted_backend_content_length: Option<u64>,
+) -> bool {
+    max_response_body_size_bytes > 0 && trusted_backend_content_length.is_none()
+}
+
 /// Fix 5: decide whether a plain-HTTPS direct-H2 response body should skip
 /// the `CoalescingH2Body` adapter and stream through hyper's `Incoming`
 /// directly.
 ///
 /// Bypass is safe when:
-///   * `content-length` is known (we can size-check up-front), AND
+///   * the **backend-observed** canonical `Content-Length` is known (we can
+///     size-check up-front; a post-`after_proxy` header must never supply
+///     this value), AND
 ///   * it is ≥ 512 KiB (backend is already emitting large H2 frames —
 ///     `http2_max_frame_size` is 1 MiB in our build — so coalescing just
 ///     adds a `BytesMut::extend_from_slice` copy that the large-frame
@@ -34652,6 +34669,10 @@ async fn handle_proxy_request_inner(
                         grpc_streaming_trailer_governor.take(),
                     )
                 } else if effective_max_response_body_size_bytes > 0 {
+                    // Native gRPC never frames with Content-Length, and a
+                    // hook-authored length must not suppress the cap: always
+                    // wrap the size-limited adapter when the operator ceiling
+                    // is enabled.
                     crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
                         effective_max_response_body_size_bytes,
@@ -37074,17 +37095,19 @@ async fn handle_proxy_request_inner(
     let pristine_streaming_grpc_web_trailers_only_terminal_metadata =
         (grpc_request_is_web_translated && streaming_h2_body_ended)
             .then(|| grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&response_headers));
-    let streaming_h3_header_content_length = match &response_body {
-        ResponseBody::StreamingH3(_) => response_headers
-            .get("content-length")
-            .and_then(|v| v.parse::<u64>().ok()),
-        _ => None,
-    };
+    // Canonical backend-observed Content-Length, captured before any
+    // `after_proxy` mutation. Size-limit adapter selection and the large-H2
+    // passthrough must use this value so a hook-authored Content-Length cannot
+    // suppress `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`. One HashMap scan, no
+    // extra allocation — the same parser dispatch uses for the pre-commit
+    // reject (`GHSA-xrfj-852f-645j`).
+    let trusted_backend_content_length =
+        canonical_header_content_length_from_map(&response_headers);
     // H3 does not expose an `is_end_stream()` signal at response-header time.
     // Treat declared zero-length responses as already ended for the defer gate;
     // HEAD/204/304 are still covered by `streaming_dispatch_should_defer`.
     let streaming_h3_body_ended = matches!(&response_body, ResponseBody::StreamingH3(_))
-        && streaming_h3_header_content_length == Some(0);
+        && trusted_backend_content_length == Some(0);
     let pristine_streaming_grpc_web_terminal_names = (grpc_request_is_web_translated
         && (streaming_h2_body_ended || streaming_h3_body_ended))
         .then(|| {
@@ -37873,16 +37896,14 @@ async fn handle_proxy_request_inner(
             | ResponseBody::StreamingH3(_)
     );
     // Native H3 needs the backend's declared length to distinguish a complete
-    // body followed by a graceful QUIC close from truncation. Preserve it
-    // before an attached inspector strips the client-visible Content-Length.
-    let streaming_h3_backend_content_length =
-        matches!(&response_body, ResponseBody::StreamingH3(_))
-            .then(|| {
-                response_headers
-                    .get("content-length")
-                    .and_then(|value| value.parse::<u64>().ok())
-            })
-            .flatten();
+    // body followed by a graceful QUIC close from truncation. Use the
+    // pre-`after_proxy` capture: a hook-authored Content-Length must not
+    // describe the backend stream. An attached inspector still strips the
+    // client-visible field below so completeness of the *transformed* body
+    // does not judge against this length.
+    let streaming_h3_backend_content_length = matches!(&response_body, ResponseBody::StreamingH3(_))
+        .then_some(trusted_backend_content_length)
+        .flatten();
     // Resolve the inspector before cloning the context into the deferred
     // logger. The resolver stamps a private stream id only when an inspector
     // actually attaches; the terminal hook uses that id to drain plugin-owned
@@ -38127,12 +38148,14 @@ async fn handle_proxy_request_inner(
     // flag remains. Keep the three buffered writers (this one, native H3, and
     // the H3 bridge) in agreement.
     //
-    // Streaming bodies capture their declared length for internal accounting
-    // FIRST: ordinary Streaming framing removes `Content-Length` from the wire
-    // map (a hook-authored value cannot be verified against bytes not yet
-    // written), while the H3 graceful-close classifier and the direct-H2
-    // large-response coalescer bypass still need the length the boundary would
-    // have accepted.
+    // Streaming bodies capture their post-hook declared length for wire /
+    // completeness accounting FIRST: ordinary Streaming framing removes
+    // `Content-Length` from the wire map (a hook-authored value cannot be
+    // verified against bytes not yet written). Only HEAD advertisement and the
+    // H3 graceful-close classifier of the *client-facing* representation still
+    // need the length the boundary would have accepted. Size-limit adapter
+    // selection and the large-H2 passthrough use `trusted_backend_content_length`
+    // captured before `after_proxy`.
     let declared_streaming_content_length =
         headers_mod::preserved_response_content_length(&response_headers, response_status);
     // What the WIRE may advertise, as opposed to what the gateway keeps for its
@@ -38363,11 +38386,17 @@ async fn handle_proxy_request_inner(
                 }
                 inspected
             } else {
-                // `cl` drives the gateway's own construction choices only;
-                // `advertised_cl` is what the body may report as an exact size
-                // hint, and hence what hyper may turn back into a wire
-                // `Content-Length`.
-                let cl = declared_streaming_content_length;
+                // `cl` is the trusted backend-observed length (size-limit
+                // adapter selection). `advertised_cl` is what the body may
+                // report as an exact size hint, and hence what hyper may turn
+                // back into a wire `Content-Length` — HEAD only.
+                let cl = if grpc_web_streaming_adapter.is_some() {
+                    // gRPC-Web reframes the body, so the backend length does
+                    // not describe the client-visible bytes.
+                    None
+                } else {
+                    trusted_backend_content_length
+                };
                 let advertised_cl = advertised_streaming_content_length;
                 // Build the base body from the shared protocol-agnostic builders
                 // first, THEN optionally wrap it in latency tracking via
@@ -38387,9 +38416,14 @@ async fn handle_proxy_request_inner(
                         advertised_cl,
                         proxy.backend_read_timeout_ms,
                     )
-                } else if effective_max_response_body_size_bytes > 0 && cl.is_none() {
-                    // No Content-Length — enforce size limit while streaming instead
-                    // of buffering the entire body into memory.
+                } else if streaming_response_requires_size_limit(
+                    effective_max_response_body_size_bytes,
+                    cl,
+                ) {
+                    // No backend-observed Content-Length — enforce size limit
+                    // while streaming instead of buffering the entire body
+                    // into memory. A hook-authored Content-Length cannot take
+                    // this branch off.
                     crate::proxy::body::size_limited_streaming_body(
                         response,
                         effective_max_response_body_size_bytes,
@@ -38482,11 +38516,17 @@ async fn handle_proxy_request_inner(
                 .extensions_mut()
                 .remove::<crate::proxy::body::PooledBackendLeaseSlot>()
                 .and_then(|slot| slot.take());
-            // `cl` is the gateway's internal size decision input (the
-            // large-response coalescer bypass); `advertised_cl` is the only one
-            // the body may expose as an exact size hint, which hyper would
-            // otherwise re-emit as a wire `Content-Length`.
-            let cl = declared_streaming_content_length;
+            // `cl` is the trusted backend-observed length (size-limit adapter
+            // selection and the large-response coalescer bypass). `advertised_cl`
+            // is the only one the body may expose as an exact size hint, which
+            // hyper would otherwise re-emit as a wire `Content-Length`.
+            let cl = if grpc_web_streaming_adapter.is_some() {
+                // gRPC-Web reframes the body, so the backend length does not
+                // describe the client-visible bytes.
+                None
+            } else {
+                trusted_backend_content_length
+            };
             let advertised_cl = advertised_streaming_content_length;
             // Plain-HTTPS direct-H2 large-response fast path.
             //
@@ -38501,10 +38541,14 @@ async fn handle_proxy_request_inner(
             // That copy was the remaining gap for 5 MB HTTP/2 throughput
             // (81 RPS vs direct 232 RPS).
             //
-            // Decision made ONCE per response using `content-length` — we
-            // only bypass when the size is known AND large. Unknown CL
-            // keeps the coalescer (we cannot be sure frames are already
-            // 1 MiB when the backend is chunked).
+            // Decision made ONCE per response using the backend-observed
+            // canonical `content-length` — we only bypass when that size is
+            // known AND large. A hook-authored Content-Length must never
+            // select this passthrough: unknown-length backends keep the
+            // coalescer (and the size-limited adapter) even if a plugin
+            // later inserts a length. Unknown CL keeps the coalescer (we
+            // cannot be sure frames are already 1 MiB when the backend is
+            // chunked).
             //
             // gRPC still uses the coalescing path (see gRPC streaming
             // response at ~line 5905) because gRPC's +35 % large-payload
@@ -38546,10 +38590,15 @@ async fn handle_proxy_request_inner(
                     None,
                     streaming_trailer_governor.take(),
                 )
-            } else if effective_max_response_body_size_bytes > 0 && cl.is_none() {
-                // No Content-Length — enforce response-size limits while
-                // streaming H2 bodies, including HBONE tunnel responses,
-                // without buffering the whole backend response into memory.
+            } else if streaming_response_requires_size_limit(
+                effective_max_response_body_size_bytes,
+                cl,
+            ) {
+                // No backend-observed Content-Length — enforce response-size
+                // limits while streaming H2 bodies, including HBONE tunnel
+                // responses, without buffering the whole backend response
+                // into memory. A hook-authored Content-Length cannot take
+                // this branch off.
                 crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
                     effective_max_response_body_size_bytes,
@@ -38701,10 +38750,13 @@ async fn handle_proxy_request_inner(
         ResponseBody::StreamingH3(h3_resp) => {
             // The length describing the CLIENT-facing representation (as
             // opposed to `backend_content_length`, the backend's own
-            // pre-transform declaration). Captured before the final wire
+            // pre-`after_proxy` declaration). Captured before the final wire
             // boundary removed the field: it is no longer advertised to the
             // client, but the graceful-close success gate must still distinguish
-            // a complete body from a truncated one.
+            // a complete body from a truncated one. A hook-authored length is
+            // accepted here only as that completeness claim — never as a
+            // size-limit enforcement input (H3 always wraps the size-limited
+            // adapter when the cap is enabled).
             let client_content_length = declared_streaming_content_length;
             let success_on_drop_after_bytes =
                 h3_success_on_drop_after_response_bytes(inbound_version, client_content_length);
@@ -44145,9 +44197,11 @@ async fn proxy_to_backend(
                     );
                 }
 
-                // No Content-Length — stream with coalescing. The response size
-                // limit is still enforced via the `SizeLimitedStreamingResponse`
-                // adapter applied at the response body builder stage.
+                // No backend-observed Content-Length — stream with coalescing.
+                // The response size limit is still enforced via the
+                // `SizeLimitedStreamingResponse` adapter applied at the
+                // response body builder stage from that trusted length, not
+                // from a post-`after_proxy` header.
                 if stream_response {
                     return backend_dispatch_response(
                         retry::BackendResponse {
