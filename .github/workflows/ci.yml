@@ -4241,6 +4241,35 @@ jobs:
             echo "::error title=Chart injected insecureSkipVerify::tlsConfig must render verbatim"
             exit 1
           fi
+          # Bearer authorization must prefer verified HTTPS even when the
+          # default plaintext admin port is also available.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set metrics.enabled=true \
+            --set metrics.bearerToken.existingSecret.name=ferrum-metrics \
+            --set admin.bindAddress=0.0.0.0 \
+            --set admin.service.enabled=true \
+            --set tls.admin.enabled=true --set tls.admin.secretName=admin-tls \
+            --set metrics.serviceMonitor.tlsConfig.serverName=ferrum-admin.ferrum.svc \
+            --show-only templates/metrics-servicemonitor.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-bearer-verified-https.yaml"
+          grep -Fq 'port: admin-https' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-bearer-verified-https.yaml"
+          grep -Fq 'authorization:' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-bearer-verified-https.yaml"
+          if grep -Fq 'port: admin-http' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-bearer-verified-https.yaml"; then
+            echo "::error title=Bearer token sent over plaintext::credentialed ServiceMonitor scrapes must select admin-https"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set metrics.enabled=true \
+            --set metrics.bearerToken.existingSecret.name=ferrum-metrics \
+            --set admin.bindAddress=0.0.0.0 \
+            --set admin.service.enabled=true \
+            --set tls.admin.enabled=true --set tls.admin.secretName=admin-tls \
+            --set metrics.serviceMonitor.tlsConfig.insecureSkipVerify=true \
+            --show-only templates/metrics-servicemonitor.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-bearer-insecure.yaml" 2>&1; then
+            echo "::error title=Bearer token sent without certificate verification::insecureSkipVerify must be rejected for credentialed scrapes"
+            exit 1
+          fi
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set metrics.enabled=true \
             --set metrics.allowedCidrs=10.0.0.0/8 \

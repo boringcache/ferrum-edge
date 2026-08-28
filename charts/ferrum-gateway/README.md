@@ -409,6 +409,12 @@ the admin port. `metrics.bearerToken.value` wires the pod env for development;
 `metrics.bearerToken.existingSecret` is required for ServiceMonitor Bearer
 authorization when `metrics.allowedCidrs` is empty.
 
+When the ServiceMonitor uses Bearer authorization, the chart always scrapes the
+admin HTTPS port and requires a verifying `metrics.serviceMonitor.tlsConfig`
+(for example, `ca.secret` and `serverName`). It refuses plaintext transport and
+`insecureSkipVerify: true` so the observability credential is never sent to an
+unauthenticated endpoint.
+
 `/metrics` also requires a globally scoped `prometheus_metrics` plugin instance or
 the scrape succeeds with an empty exposition. Add it to your gateway config
 (`file.inlineConfig`, database `plugin_configs`, or CP-pushed config):
