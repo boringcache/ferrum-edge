@@ -11878,8 +11878,10 @@ impl Drop for LiveNetnsUdpEcho {
 }
 
 #[cfg(target_os = "linux")]
-async fn start_counting_udp_echo() -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+async fn start_counting_udp_echo(
+    bind_ip: std::net::Ipv4Addr,
+) -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let socket = tokio::net::UdpSocket::bind((bind_ip, 0))
         .await
         .expect("bind live source-capture UDP echo");
     let port = socket.local_addr().expect("UDP echo address").port();
@@ -12546,6 +12548,7 @@ impl Drop for LiveVethPod {
 struct LiveHostUdpVethPod {
     pod: LivePodNetns,
     host_if: String,
+    host_v4: std::net::Ipv4Addr,
     pod_v4: std::net::Ipv4Addr,
     pod_v6: std::net::Ipv6Addr,
 }
@@ -12651,6 +12654,7 @@ impl LiveHostUdpVethPod {
         Ok(Self {
             pod,
             host_if,
+            host_v4,
             pod_v4,
             pod_v6,
         })
@@ -12881,13 +12885,17 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
     let temp_a = TempDir::new().expect("gateway A tempdir");
     let temp_b = TempDir::new().expect("gateway B tempdir");
     let svids = generate_two_gateway_svids(temp_b.path(), a_spiffe, echo_spiffe);
-    let (echo_port, _echo_received, echo_task) = start_counting_udp_echo().await;
+    // The destination Ambient proxy runs in the host network namespace, so
+    // loopback is deliberately not workload authority. Bind the fixture to a
+    // real non-loopback veth address and advertise that exact workload address.
+    let echo_address = pod_a.host_v4.to_string();
+    let (echo_port, _echo_received, echo_task) = start_counting_udp_echo(pod_a.host_v4).await;
     let node_a = "functional-live-host-udp-a";
     let node_b = "functional-live-host-udp-b";
     let mut slice_a = live_source_capture_slice(
         node_a,
         echo_spiffe,
-        "127.0.0.1",
+        &echo_address,
         VIP_V4,
         echo_port,
         AppProtocol::Udp,
@@ -12896,7 +12904,7 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
     let mut slice_b = live_source_capture_slice(
         node_b,
         echo_spiffe,
-        "127.0.0.1",
+        &echo_address,
         VIP_V4,
         echo_port,
         AppProtocol::Udp,
