@@ -1612,10 +1612,7 @@ mod tests {
         runner.disarm();
         // A fresh request is now a new runner (running is released).
         let next = coalescer.request();
-        assert!(
-            next.is_runner(),
-            "after try_finish, next request is runner"
-        );
+        assert!(next.is_runner(), "after try_finish, next request is runner");
         let mut next = match next {
             RefreshRole::Runner(guard) => guard,
             RefreshRole::Joined => panic!("after try_finish, next request is runner"),
