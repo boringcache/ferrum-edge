@@ -642,6 +642,56 @@ fn test_disabled_basic_auth_config_skips_plugin_construction() {
     );
 }
 
+/// Restore is destructive: every admission check must run before the namespace
+/// clear, and it must cover the same contracts as `POST /batch`
+/// (issues #4265, #4282, #4283).
+#[test]
+fn restore_admission_covers_batch_contracts_before_the_namespace_clear() {
+    let source = include_str!("../../../src/admin/mod.rs");
+
+    let pipeline_start = source
+        .find("fn validate_restore_candidate_on_blocking_pool")
+        .expect("restore validation pipeline must exist");
+    let pipeline_end = pipeline_start
+        + source[pipeline_start..]
+            .find(".run();")
+            .expect("restore pipeline must terminate");
+    let pipeline = &source[pipeline_start..pipeline_end];
+    for step in ["validate_unique_upstream_names", "validate_unique_proxy_names"] {
+        assert!(
+            pipeline.contains(step),
+            "restore must reject duplicate names before the clear: {step}"
+        );
+    }
+
+    let restore_start = source
+        .find("async fn handle_restore(")
+        .expect("restore handler must exist");
+    let restore = &source[restore_start..];
+    let clear = restore
+        .find("delete_all_resources(")
+        .expect("restore must clear the namespace");
+    for check in [
+        "candidate.validate_mtls_auth_compatibility()",
+        "collect_plugin_config_admission_errors(",
+    ] {
+        let at = restore
+            .find(check)
+            .unwrap_or_else(|| panic!("restore must run {check}"));
+        assert!(
+            at < clear,
+            "{check} must run before the destructive namespace clear"
+        );
+    }
+
+    // The plugin-name/definition admission helper is shared with batch, so the
+    // two cannot drift apart.
+    let shared_calls = source
+        .matches("collect_plugin_config_admission_errors(")
+        .count();
+    assert!(shared_calls >= 3, "batch and restore must share the admission helper");
+}
+
 #[test]
 fn test_disabled_unknown_plugin_name_remains_invalid() {
     let now = chrono::Utc::now();

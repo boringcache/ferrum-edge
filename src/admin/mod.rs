@@ -7373,6 +7373,51 @@ pub(crate) fn plugin_validation_http_client(state: &AdminState) -> plugins::Plug
         })
 }
 
+/// Collect plugin-name and plugin-definition admission errors for an
+/// operator-provided set of `PluginConfig` rows.
+///
+/// Shared by `POST /batch` and `POST /restore` so the two cannot drift. The
+/// checks are deliberately unconditional: an `enabled: false` row with an
+/// unknown plugin name, an invalid trigger, or a denied config-graph policy
+/// would otherwise be persisted and then be impossible to enable, because
+/// every other write path validates it. This is the admission contract only —
+/// the runtime pipeline keeps its intentional disabled-plugin construction
+/// short circuit, so full schema validation still applies to enabled rows.
+pub(crate) fn collect_plugin_config_admission_errors(
+    state: &AdminState,
+    plugin_configs: &[PluginConfig],
+    validation_errors: &mut Vec<String>,
+) {
+    let known_plugins = plugins::available_plugins();
+    for plugin_config in plugin_configs {
+        if !known_plugins.contains(&plugin_config.plugin_name.as_str()) {
+            validation_errors.push(format!(
+                "PluginConfig '{}': unknown plugin name '{}'",
+                plugin_config.id, plugin_config.plugin_name
+            ));
+        }
+        if crate::plugins::transaction_log_schema::participates_in_config_graph(plugin_config) {
+            if let Err(err) = crate::plugins::validate_plugin_config_policy_only(
+                &plugin_config.plugin_name,
+                &plugin_config.config,
+                &state.backend_allow_ips,
+            ) {
+                validation_errors.push(format!(
+                    "PluginConfig '{}': invalid config: {}",
+                    plugin_config.id, err
+                ));
+            }
+        } else if let Err(err) =
+            validate_plugin_config_definition(plugin_config, plugin_validation_http_client(state))
+        {
+            validation_errors.push(format!(
+                "PluginConfig '{}': invalid config: {}",
+                plugin_config.id, err
+            ));
+        }
+    }
+}
+
 pub(crate) fn validate_plugin_config_definition(
     pc: &PluginConfig,
     http_client: plugins::PluginHttpClient,
@@ -7698,7 +7743,6 @@ async fn handle_batch_create(
 
     let now = Utc::now();
     let validation_ctx = crud::ValidationCtx::from_state(state);
-    let known_plugins = crate::plugins::available_plugins();
     let mut validation_errors: Vec<String> = Vec::new();
 
     if let Err(error) = prepare_batch_items(
@@ -7754,33 +7798,7 @@ async fn handle_batch_create(
         ));
     }
 
-    for plugin_config in &batch.plugin_configs {
-        if !known_plugins.contains(&plugin_config.plugin_name.as_str()) {
-            validation_errors.push(format!(
-                "PluginConfig '{}': unknown plugin name '{}'",
-                plugin_config.id, plugin_config.plugin_name
-            ));
-        }
-        if crate::plugins::transaction_log_schema::participates_in_config_graph(plugin_config) {
-            if let Err(err) = crate::plugins::validate_plugin_config_policy_only(
-                &plugin_config.plugin_name,
-                &plugin_config.config,
-                &state.backend_allow_ips,
-            ) {
-                validation_errors.push(format!(
-                    "PluginConfig '{}': invalid config: {}",
-                    plugin_config.id, err
-                ));
-            }
-        } else if let Err(err) =
-            validate_plugin_config_definition(plugin_config, plugin_validation_http_client(state))
-        {
-            validation_errors.push(format!(
-                "PluginConfig '{}': invalid config: {}",
-                plugin_config.id, err
-            ));
-        }
-    }
+    collect_plugin_config_admission_errors(state, &batch.plugin_configs, &mut validation_errors);
 
     if batch
         .plugin_configs
@@ -8984,6 +9002,13 @@ async fn validate_restore_candidate_on_blocking_pool(
             .validate_unique_resource_ids(ValidationAction::Collect)
             .validate_unique_consumer_identities(ValidationAction::Collect)
             .validate_unique_consumer_credentials(ValidationAction::Collect)
+            // Name uniqueness is enforced by `POST /batch`, file mode, and a
+            // real unique index on `(namespace, name)` in every backend. It
+            // must be refused here too, before the destructive clear, or a
+            // duplicate-name payload wipes the namespace and only then fails
+            // during persistence (issue #4265).
+            .validate_unique_upstream_names(ValidationAction::Collect)
+            .validate_unique_proxy_names(ValidationAction::Collect)
             .validate_hosts(ValidationAction::Collect)
             .validate_regex_listen_paths(ValidationAction::Collect)
             .validate_listen_path_encodings(ValidationAction::Collect)
@@ -9213,6 +9238,22 @@ async fn handle_restore(
             }
         }
     }
+    // Restore replaces the whole namespace, so the candidate is authoritative:
+    // no DB overlay is needed to decide mTLS transport compatibility. Without
+    // this check restore is the only way to persist an enabled `mtls_auth`
+    // instance on a stream proxy that terminates no TLS, which then rejects
+    // every connection with a 401 (issue #4282).
+    if let Err(errors) = candidate.validate_mtls_auth_compatibility() {
+        validation_errors.extend(errors);
+    }
+    // Match `POST /batch` and single-resource admission: plugin names and
+    // definitions are validated even for `enabled: false` rows, which the
+    // pipeline's `PluginConfigs` step deliberately skips (issue #4283).
+    collect_plugin_config_admission_errors(
+        state,
+        &candidate.plugin_configs,
+        &mut validation_errors,
+    );
     match crud::validate_plugin_graph_restore_candidate(state, &candidate) {
         Ok(()) => {}
         Err(
