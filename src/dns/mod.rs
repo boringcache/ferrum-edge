@@ -5,6 +5,7 @@
 //! - DNS lookups are off the hot request path (pre-warmed at startup)
 //! - Answer data is shared per hostname while freshness is evaluated per caller
 //!   (so distinct `dns_cache_ttl_seconds` values on shared backends stay isolated)
+//! - IP literals are policy-screened but never occupy success-cache rows
 //! - Stale-while-revalidate serves the old IP while refreshing in the background
 //! - Background refresh keeps entries warm without per-request DNS query storms
 //!
@@ -118,7 +119,8 @@ pub struct DnsConfig {
     /// resolved address before it is cached, on every insertion path (initial
     /// resolve, stale refresh, background refresh, failed-retry recovery) — so
     /// a hostname that re-resolves to a now-denied address (DNS rebinding) is
-    /// rejected rather than served from cache.
+    /// rejected rather than served from cache. IP literals are screened on
+    /// the same policy and never occupy a success-cache row.
     pub backend_allow_ips: crate::config::BackendEgressPolicy,
     /// DashMap shard count for the DNS cache and refresh-tracking maps.
     /// Sourced from `FERRUM_POOL_SHARD_AMOUNT` (same env var as connection
@@ -169,6 +171,14 @@ fn dns_hostname_key(hostname: &str) -> Cow<'_, str> {
     } else {
         Cow::Borrowed(hostname)
     }
+}
+
+/// Parse `hostname` as a dotted/colon IP literal without allocating.
+///
+/// Used to keep pod-IP / static-literal targets off the success cache so they
+/// cannot displace short-TTL DNS hostnames under capacity eviction (issue #4293).
+fn parse_ip_literal(hostname: &str) -> Option<IpAddr> {
+    hostname.parse().ok()
 }
 
 fn dns_name_without_trailing_root(name: impl std::fmt::Display) -> String {
@@ -857,6 +867,20 @@ impl DnsCache {
         let native_ttl = native_ttl.min(Self::MAX_TTL);
         let addresses = self.screen_backend_addresses_policy(addresses, hostname)?;
         let cache_key = dns_hostname_key(hostname);
+
+        // IP literals are policy-screened above but must not occupy a success
+        // row. A 1-day native TTL would sort after short-TTL FQDNs in Phase-2
+        // eviction, so discovered pod-IP churn would displace the hostnames the
+        // cache exists to keep warm (issue #4293). Drop any leftover row so a
+        // failed-retry of a pre-fix literal error cannot loop forever.
+        if parse_ip_literal(cache_key.as_ref()).is_some() {
+            self.cache.remove(cache_key.as_ref());
+            return Ok(ResolvedAddresses {
+                addresses,
+                start: 0,
+            });
+        }
+
         let now = Instant::now();
 
         let next_start = Arc::new(AtomicU64::new(0));
@@ -944,8 +968,9 @@ impl DnsCache {
     /// Resolution priority:
     /// 1. Per-proxy static override (highest priority)
     /// 2. Global static overrides
-    /// 3. Cache (fresh → return immediately; stale → return + background refresh)
-    /// 4. Actual DNS resolution via hickory-resolver
+    /// 3. IP literal (policy-screened, never cached)
+    /// 4. Cache (fresh → return immediately; stale → return + background refresh)
+    /// 5. Actual DNS resolution via hickory-resolver
     pub async fn resolve_candidates(
         &self,
         hostname: &str,
@@ -971,7 +996,16 @@ impl DnsCache {
             ));
         }
 
-        // 3. Check cache with per-consumer freshness + shared stale-while-revalidate
+        // 3. IP literals need no DNS and must not occupy a success-cache row.
+        // Screen against backend IP policy here so warmup skipping literals
+        // cannot become a divergent policy bypass (issue #4293).
+        if let Some(addr) = parse_ip_literal(cache_hostname) {
+            return Ok(ResolvedAddresses::single(
+                self.check_backend_ip_policy(addr, hostname)?,
+            ));
+        }
+
+        // 4. Check cache with per-consumer freshness + shared stale-while-revalidate
         let mut expired_success_generation = None;
         if let Some(entry) = self.cache.get(cache_hostname) {
             let now = Instant::now();
@@ -1056,7 +1090,7 @@ impl DnsCache {
             }
         }
 
-        // 4. Perform actual DNS resolution.
+        // 5. Perform actual DNS resolution.
         // Do not inherit another consumer's per-proxy TTL on miss — each caller
         // supplies its own policy (or falls through to global/native).
         match self.timed_resolve(cache_hostname).await {
@@ -1215,7 +1249,7 @@ impl DnsCache {
             return Ok(vec![self.check_backend_ip_policy(addr, hostname)?]);
         }
 
-        if let Ok(addr) = lookup_hostname.parse::<IpAddr>() {
+        if let Some(addr) = parse_ip_literal(lookup_hostname) {
             return Ok(vec![self.check_backend_ip_policy(addr, hostname)?]);
         }
 
@@ -1456,9 +1490,10 @@ impl DnsCache {
         &self,
         hostname: &str,
     ) -> Result<(Vec<IpAddr>, Option<CachedRecordType>, Duration), anyhow::Error> {
-        // Try parsing as IP first — bypass DNS entirely
-        if let Ok(addr) = hostname.parse::<IpAddr>() {
-            // Literal IPs get max TTL — they never change
+        // Resolver-level bypass so leftover/test-seeded literal keys do not
+        // hit hickory. `resolve_candidates` and `cache_success_entry` refuse to
+        // persist these as success rows (issue #4293).
+        if let Some(addr) = parse_ip_literal(hostname) {
             return Ok((vec![addr], None, Duration::from_secs(86400)));
         }
 
@@ -1606,6 +1641,12 @@ impl DnsCache {
     /// Returns the number of entries currently in the cache.
     pub fn cache_len(&self) -> usize {
         self.cache.len()
+    }
+
+    /// Whether a success or error row currently occupies this hostname.
+    pub fn is_cached(&self, hostname: &str) -> bool {
+        let cache_key = dns_hostname_key(hostname);
+        self.cache.contains_key(cache_key.as_ref())
     }
 
     /// Check if a cached entry exists and is a cached error.
@@ -2263,6 +2304,9 @@ impl DnsCache {
     /// each later `resolve` evaluates freshness with that caller's own
     /// `dns_cache_ttl_seconds`. Unique hostnames are resolved concurrently up
     /// to the configured limit.
+    ///
+    /// IP literals are skipped: they need no DNS, must not occupy success-cache
+    /// rows, and remain policy-screened at request-time `resolve`.
     pub async fn warmup(&self, hostnames: Vec<(String, Option<String>, Option<u64>)>) {
         let total_hostnames = hostnames.len();
 
@@ -2288,6 +2332,12 @@ impl DnsCache {
         let mut seen: HashMap<String, WarmupPolicy> = HashMap::new();
         for (host, override_ip, ttl) in hostnames {
             if host.trim().is_empty() {
+                continue;
+            }
+            // IP literals need no DNS warmup. Skipping here must not become a
+            // policy bypass: `resolve_candidates` still screens literals at use,
+            // and service-discovery admission already applied egress policy.
+            if parse_ip_literal(&host).is_some() {
                 continue;
             }
             let key = dns_hostname_key(&host).into_owned();
@@ -3049,6 +3099,52 @@ mod tests {
     }
 
     #[test]
+    fn cache_success_entry_does_not_persist_ip_literals() {
+        let cache = DnsCache::new(DnsConfig::default());
+        let addr: IpAddr = "192.0.2.10".parse().unwrap();
+
+        let result = cache
+            .cache_success_entry(
+                "192.0.2.10",
+                vec![addr],
+                None,
+                Duration::from_secs(86400),
+                Some(600),
+                true,
+            )
+            .expect("approved literal must still return");
+
+        assert_eq!(result.first(), Some(addr));
+        assert!(
+            cache.cache.get("192.0.2.10").is_none(),
+            "IP literals must not occupy a success-cache row"
+        );
+    }
+
+    #[test]
+    fn cache_success_entry_still_denies_literals_under_policy() {
+        let cache = DnsCache::new(DnsConfig {
+            backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
+            ..DnsConfig::default()
+        });
+
+        let result = cache.cache_success_entry(
+            "169.254.169.254",
+            vec!["169.254.169.254".parse().unwrap()],
+            None,
+            Duration::from_secs(86400),
+            None,
+            true,
+        );
+
+        assert!(result.is_err());
+        assert!(
+            cache.cache.get("169.254.169.254").is_none(),
+            "denied literals must not be cached"
+        );
+    }
+
+    #[test]
     fn cache_success_entry_clamps_unbounded_ttl_without_panicking() {
         // F20: huge TTLs (from an unbounded FERRUM_DNS_* env var, or an absurd
         // record TTL) must not overflow the `Instant + Duration` /
@@ -3193,10 +3289,9 @@ mod tests {
     #[tokio::test]
     async fn original_per_proxy_ttl_is_recorded_on_resolve() {
         let cache = DnsCache::new(config_with_global_override(None));
-        // 127.0.0.1 takes the literal-IP fast path; native TTL = 24h.
-        let _ = cache.resolve("127.0.0.1", None, Some(600)).await.unwrap();
+        let _ = cache.resolve("localhost", None, Some(600)).await.unwrap();
 
-        let entry = cache.cache.get("127.0.0.1").expect("entry should exist");
+        let entry = cache.cache.get("localhost").expect("entry should exist");
         assert_eq!(
             entry.load_shortest_per_proxy_ttl(),
             Some(600),
@@ -3205,7 +3300,7 @@ mod tests {
         assert_eq!(
             entry.applied_ttl,
             Duration::from_secs(600),
-            "applied_ttl should reflect the per-proxy TTL, not native 24h"
+            "applied_ttl should reflect the per-proxy TTL, not native TTL"
         );
     }
 
@@ -3214,11 +3309,11 @@ mod tests {
     async fn original_per_proxy_ttl_is_recorded_on_resolve_all() {
         let cache = DnsCache::new(config_with_global_override(None));
         let _ = cache
-            .resolve_all("127.0.0.1", None, Some(450))
+            .resolve_all("localhost", None, Some(450))
             .await
             .unwrap();
 
-        let entry = cache.cache.get("127.0.0.1").expect("entry should exist");
+        let entry = cache.cache.get("localhost").expect("entry should exist");
         assert_eq!(entry.load_shortest_per_proxy_ttl(), Some(450));
         assert_eq!(entry.applied_ttl, Duration::from_secs(450));
     }
@@ -3321,9 +3416,8 @@ mod tests {
     ///
     /// The background task scans every 5s. The first `interval.tick()` fires
     /// immediately, so we seed an entry with `remaining < threshold` but
-    /// `remaining > 0` so it's eligible on the first scan, and use `127.0.0.1`
-    /// so `timed_resolve` short-circuits to a literal-IP lookup with a 24h
-    /// native TTL — no network required.
+    /// `remaining > 0` so it's eligible on the first scan, and use `localhost`
+    /// so refresh is a real hostname lookup (IP literals are not cached).
     #[tokio::test]
     async fn background_refresh_task_preserves_per_proxy_ttl() {
         // Global TTL override = 3600s — would win if the bug regresses.
@@ -3337,7 +3431,7 @@ mod tests {
         // remaining≈4s. Stale-deadline 60s in the future so evict_expired does
         // NOT remove it before the refresh scan picks it up.
         cache.cache.insert(
-            "127.0.0.1".to_string(),
+            "localhost".to_string(),
             DnsCacheEntry {
                 addresses: Arc::from([IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]),
                 next_start: Arc::new(AtomicU64::new(0)),
@@ -3373,7 +3467,7 @@ mod tests {
         let mut observed_remaining = Duration::ZERO;
         while Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            if let Some(entry) = cache.cache.get("127.0.0.1") {
+            if let Some(entry) = cache.cache.get("localhost") {
                 let remaining = (entry.resolved_at + entry.applied_ttl)
                     .saturating_duration_since(Instant::now());
                 // Refresh has happened when remaining is significantly larger
@@ -3497,7 +3591,7 @@ mod tests {
     async fn resolve_preserves_prior_ttl_from_expired_error() {
         let cache = DnsCache::new(config_with_global_override(Some(3600)));
         cache.cache.insert(
-            "127.0.0.1".to_string(),
+            "localhost".to_string(),
             DnsCacheEntry {
                 addresses: Arc::from([]),
                 next_start: Arc::new(AtomicU64::new(0)),
@@ -3519,10 +3613,10 @@ mod tests {
             },
         );
 
-        let _ = cache.resolve("127.0.0.1", None, None).await.unwrap();
+        let _ = cache.resolve("localhost", None, None).await.unwrap();
 
         {
-            let entry = cache.cache.get("127.0.0.1").expect("entry should exist");
+            let entry = cache.cache.get("localhost").expect("entry should exist");
             assert!(!entry.is_error);
             assert_eq!(entry.load_shortest_per_proxy_ttl(), Some(600));
             assert_eq!(
@@ -3543,7 +3637,7 @@ mod tests {
     async fn resolve_all_preserves_prior_ttl_from_expired_error() {
         let cache = DnsCache::new(config_with_global_override(Some(3600)));
         cache.cache.insert(
-            "127.0.0.1".to_string(),
+            "localhost".to_string(),
             DnsCacheEntry {
                 addresses: Arc::from([]),
                 next_start: Arc::new(AtomicU64::new(0)),
@@ -3565,9 +3659,9 @@ mod tests {
             },
         );
 
-        let _ = cache.resolve_all("127.0.0.1", None, None).await.unwrap();
+        let _ = cache.resolve_all("localhost", None, None).await.unwrap();
 
-        let entry = cache.cache.get("127.0.0.1").expect("entry should exist");
+        let entry = cache.cache.get("localhost").expect("entry should exist");
         assert!(!entry.is_error);
         assert_eq!(entry.load_shortest_per_proxy_ttl(), Some(450));
         assert_eq!(
@@ -4650,7 +4744,7 @@ mod tests {
                 ttl_override_seconds: None,
                 ..DnsConfig::default()
             });
-            let host = "127.0.0.1";
+            let host = "localhost";
 
             cache
                 .resolve(host, None, Some(first_ttl))
@@ -4704,12 +4798,12 @@ mod tests {
     async fn warmup_reload_reordering_preserves_per_proxy_ttl_isolation() {
         for hostnames in [
             vec![
-                ("127.0.0.1".to_string(), None, Some(1u64)),
-                ("127.0.0.1".to_string(), None, Some(600u64)),
+                ("localhost".to_string(), None, Some(1u64)),
+                ("localhost".to_string(), None, Some(600u64)),
             ],
             vec![
-                ("127.0.0.1".to_string(), None, Some(600u64)),
-                ("127.0.0.1".to_string(), None, Some(1u64)),
+                ("localhost".to_string(), None, Some(600u64)),
+                ("localhost".to_string(), None, Some(1u64)),
             ],
         ] {
             let cache = DnsCache::new(DnsConfig {
@@ -4722,7 +4816,7 @@ mod tests {
             assert_eq!(
                 cache
                     .cache
-                    .get("127.0.0.1")
+                    .get("localhost")
                     .expect("warmed")
                     .load_shortest_per_proxy_ttl(),
                 Some(1)
@@ -4730,7 +4824,7 @@ mod tests {
             assert_eq!(
                 cache
                     .cache
-                    .get("127.0.0.1")
+                    .get("localhost")
                     .expect("warmed")
                     .load_longest_per_proxy_ttl(),
                 Some(600),
@@ -4739,19 +4833,19 @@ mod tests {
 
             tokio::time::sleep(Duration::from_secs(2)).await;
             let now = Instant::now();
-            let entry = cache.cache.get("127.0.0.1").expect("warmed row");
+            let entry = cache.cache.get("localhost").expect("warmed row");
             assert!(cache.consumer_fresh_until(&entry, Some(600)) > now);
             assert!(cache.consumer_fresh_until(&entry, Some(1)) <= now);
         }
 
         for hostnames in [
             vec![
-                ("127.0.0.1".to_string(), None, Some(1u64)),
-                ("127.0.0.1".to_string(), None, None),
+                ("localhost".to_string(), None, Some(1u64)),
+                ("localhost".to_string(), None, None),
             ],
             vec![
-                ("127.0.0.1".to_string(), None, None),
-                ("127.0.0.1".to_string(), None, Some(1u64)),
+                ("localhost".to_string(), None, None),
+                ("localhost".to_string(), None, Some(1u64)),
             ],
         ] {
             let cache = DnsCache::new(DnsConfig {
@@ -4761,7 +4855,7 @@ mod tests {
                 ..DnsConfig::default()
             });
             cache.warmup(hostnames).await;
-            let entry = cache.cache.get("127.0.0.1").expect("warmed");
+            let entry = cache.cache.get("localhost").expect("warmed");
             assert_eq!(entry.load_shortest_per_proxy_ttl(), Some(1));
             assert!(
                 entry.load_default_consumer_observed(),
@@ -4788,15 +4882,15 @@ mod tests {
             stale_ttl_seconds: 0,
             ..DnsConfig::default()
         });
-        // Native for 127.0.0.1 is 24h; global override is 3600s; per-proxy is 1s.
-        cache.resolve("127.0.0.1", None, Some(1)).await.unwrap();
+        // Per-proxy 1s vs global 3600s on a shared hostname row.
+        cache.resolve("localhost", None, Some(1)).await.unwrap();
         // A peer without per-proxy override uses the global 3600s policy on the
         // same shared row.
-        cache.resolve("127.0.0.1", None, None).await.unwrap();
+        cache.resolve("localhost", None, None).await.unwrap();
 
         tokio::time::sleep(Duration::from_secs(2)).await;
         let now = Instant::now();
-        let entry = cache.cache.get("127.0.0.1").expect("shared row");
+        let entry = cache.cache.get("localhost").expect("shared row");
         assert!(
             cache.consumer_fresh_until(&entry, None) > now,
             "global-policy consumer must remain fresh"
