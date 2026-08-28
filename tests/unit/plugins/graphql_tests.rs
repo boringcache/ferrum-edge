@@ -1420,7 +1420,7 @@ async fn test_argument_literals_and_directives_are_not_fields() {
     let plugin = create_plugin("graphql", &config).unwrap().unwrap();
 
     let query = r#"{ x(flag: true, n: null, b: false) @on(if: true) # on query
-y(msg: "on true null") }"#
+y(msg: "on true null") }"#;
     let mut ctx = create_graphql_context(query, None);
     let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
