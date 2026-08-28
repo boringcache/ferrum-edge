@@ -988,18 +988,23 @@ fn every_crl_enabled_verifier_is_built_through_the_shared_policy() {
 #[test]
 fn the_shared_policy_pairs_every_crl_list_with_the_full_policy() {
     let text = read_source(SHARED_POLICY_MODULE);
-    let attachments = text.matches("with_crls(").count();
+    let method_call_count = |method: &str| {
+        text.lines()
+            .filter(|line| line.trim_start().starts_with(method))
+            .count()
+    };
+    let attachments = method_call_count(".with_crls(");
     assert_eq!(
         attachments, 2,
         "expected exactly the client and server verifier policies"
     );
     assert_eq!(
-        text.matches("allow_unknown_revocation_status()").count(),
+        method_call_count(".allow_unknown_revocation_status()"),
         attachments,
         "the deliberate unknown-status tolerance must stay on every policy"
     );
     assert_eq!(
-        text.matches("enforce_revocation_expiration()").count(),
+        method_call_count(".enforce_revocation_expiration()"),
         attachments,
         "issue #4297: every CRL-enabled verifier must enforce the CRL's own \
          validity window"
