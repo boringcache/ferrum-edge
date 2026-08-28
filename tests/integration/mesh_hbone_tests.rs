@@ -1710,6 +1710,20 @@ fn inbound_relay_admits_the_terminators_own_address() {
         mesh.inbound_relay_destination_decision("app.localhost", 8080, own),
         Ok(())
     );
+    // IPv4-mapped loopback is the same namespace: Sidecar admits it only on
+    // an owned declared port, never as a stray local listener.
+    for host in ["::ffff:127.0.0.1", "[::ffff:127.0.0.1]"] {
+        assert_eq!(
+            mesh.inbound_relay_destination_decision(host, 8080, own),
+            Ok(()),
+            "Sidecar must admit mapped-loopback authority {host} on a declared port"
+        );
+        assert_eq!(
+            mesh.inbound_relay_destination_decision(host, 15021, own),
+            Err(InboundRelayDenial::PortNotDeclared),
+            "Sidecar must still bound mapped-loopback authority {host} to declared ports"
+        );
+    }
     // A port this pod does not declare is still refused, so a stray local
     // listener is not reachable just because it shares the netns.
     assert_eq!(
@@ -1737,11 +1751,58 @@ fn inbound_relay_ambient_refuses_loopback_namespace() {
         mesh.inbound_relay_destination_decision("10.244.1.7", 15021, own),
         Err(InboundRelayDenial::PortNotDeclared)
     );
-    for host in ["127.0.0.1", "::1", "localhost", "localhost.", "app.localhost"] {
+    for host in [
+        "127.0.0.1",
+        "::1",
+        "::ffff:127.0.0.1",
+        "[::ffff:127.0.0.1]",
+        "localhost",
+        "localhost.",
+        "app.localhost",
+    ] {
         assert_eq!(
             mesh.inbound_relay_destination_decision(host, 8080, own),
             Err(InboundRelayDenial::AddressNotTerminated),
             "Ambient must refuse loopback-namespace authority {host} even when inventory-listed"
+        );
+    }
+}
+
+/// IPv4-mapped IPv6 loopback (`::ffff:127.0.0.1`) must be classified as the
+/// loopback namespace before accepted-local-address or inventory matching.
+/// `IpAddr::is_loopback()` is false for that form; later `to_canonical()`
+/// would otherwise match a `127.0.0.1` inventory entry and bypass the
+/// Sidecar-only loopback refusal.
+#[test]
+fn inbound_relay_mapped_ipv4_loopback_does_not_fall_through_to_inventory() {
+    let mapped = ["::ffff:127.0.0.1", "[::ffff:127.0.0.1]"];
+    let own = Some(ip("10.244.1.7"));
+
+    let ambient = ambient_terminator_mesh();
+    for host in mapped {
+        assert_eq!(
+            ambient.inbound_relay_destination_decision(host, 8080, own),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "Ambient must refuse mapped-loopback {host} even when inventory lists 127.0.0.1"
+        );
+    }
+
+    // Waypoint / gateway topologies leave both privilege flags false (the
+    // MeshConfig default). Inventory listing canonical loopback still cannot
+    // admit the mapped spelling.
+    let gateway = MeshConfig {
+        inbound_relay_destinations: inbound_relay_destinations_from_workloads(&[
+            relay_guard_workload("loopback-app", &["127.0.0.1"], &[8080]),
+        ]),
+        ..MeshConfig::default()
+    };
+    assert!(!gateway.inbound_relay_admits_accepted_local_address);
+    assert!(!gateway.inbound_relay_admits_loopback_namespace);
+    for host in mapped {
+        assert_eq!(
+            gateway.inbound_relay_destination_decision(host, 8080, own),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "waypoint/gateway default-false must refuse mapped-loopback authority {host}"
         );
     }
 }
@@ -1852,14 +1913,13 @@ fn inbound_relay_admits_only_the_waypoint_termination_inventory() {
         ]),
         ..MeshConfig::default()
     };
-    assert_eq!(
-        loopback_mesh.inbound_relay_destination_decision("127.0.0.1", 8080, waypoint),
-        Err(InboundRelayDenial::AddressNotTerminated)
-    );
-    assert_eq!(
-        loopback_mesh.inbound_relay_destination_decision("::1", 8080, waypoint),
-        Err(InboundRelayDenial::AddressNotTerminated)
-    );
+    for host in ["127.0.0.1", "::1", "::ffff:127.0.0.1", "[::ffff:127.0.0.1]"] {
+        assert_eq!(
+            loopback_mesh.inbound_relay_destination_decision(host, 8080, waypoint),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "waypoint must refuse loopback-namespace authority {host} even when inventory-listed"
+        );
+    }
 
     let localhost_namespace_mesh = MeshConfig {
         inbound_relay_destinations: vec![

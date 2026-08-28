@@ -4642,10 +4642,11 @@ pub struct MeshConfig {
     /// Runtime-only Sidecar own-network-namespace loopback shortcut, set on
     /// every mesh apply. Default false: fail closed until topology assignment.
     ///
-    /// When true, `127.0.0.1`, `::1`, `localhost`, and names in `.localhost`
-    /// are admissible on a port this pod's own workload record declares.
-    /// Sidecar shares the application pod's network namespace, so those names
-    /// reach the co-located workload. False for `Ambient`, `NodeWaypoint`,
+    /// When true, `127.0.0.1`, `::1`, IPv4-mapped IPv6 loopback
+    /// (`::ffff:127.0.0.1`), `localhost`, and names in `.localhost` are
+    /// admissible on a port this pod's own workload record declares. Sidecar
+    /// shares the application pod's network namespace, so those names reach the
+    /// co-located workload. False for `Ambient`, `NodeWaypoint`,
     /// `ServiceWaypoint`, and both gateway topologies: they run outside the
     /// destination pod's network namespace, so the same names would reach the
     /// host/terminator namespace instead. Inventory entries cannot override
@@ -4829,8 +4830,16 @@ pub enum SidecarIngressConnectRelay {
 }
 
 /// Whether `host` is in the reserved DNS `localhost` namespace or is a loopback
-/// IP literal. Case-insensitive; a trailing root dot is ignored. Allocation-free
-/// and never resolves DNS.
+/// IP literal, including IPv4-mapped IPv6 loopback (`::ffff:127.0.0.1`).
+/// Case-insensitive; a trailing root dot is ignored. Allocation-free and never
+/// resolves DNS.
+///
+/// Mapped addresses are classified after `IpAddr::to_canonical()`: Rust treats
+/// `::ffff:127.0.0.1` as IPv6, so a raw `IpAddr::is_loopback()` is false, but
+/// the later relay arms canonicalize it to `127.0.0.1`. Folding first keeps
+/// that form in the loopback-namespace arm and out of accepted-local-address
+/// and inventory matching. Ordinary mapped non-loopback (`::ffff:10.1.2.3`)
+/// stays non-loopback so canonical equivalence is preserved there.
 fn inbound_relay_host_is_loopback_namespace(host: &str) -> bool {
     let host = host.strip_suffix('.').unwrap_or(host);
     const LOCALHOST_SUFFIX: &str = ".localhost";
@@ -4843,7 +4852,7 @@ fn inbound_relay_host_is_loopback_namespace(host: &str) -> bool {
         return true;
     }
     host.parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback())
+        .is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
 impl MeshConfig {
@@ -4865,17 +4874,17 @@ impl MeshConfig {
     ///    provably reached this terminator at the address it named — a
     ///    transport fact the peer cannot choose. The port is still bounded by
     ///    the workload record(s) the slice declares FOR THAT ADDRESS.
-    /// 2. **Loopback** (`127.0.0.1` / `::1` / the DNS `localhost` namespace)
-    ///    as an own-network-namespace shortcut, gated on
-    ///    [`Self::inbound_relay_admits_loopback_namespace`] (`Sidecar` only)
-    ///    and only on a port this pod's own workload record declares. `Ambient`
-    ///    is node-shared and runs outside the destination pod's network
-    ///    namespace, so the same names would reach the Ambient/host namespace
-    ///    rather than that pod — even when the accepted socket's local address
-    ///    is a non-loopback pod IP, and even when loopback appears in
-    ///    [`Self::inbound_relay_destinations`]. `NodeWaypoint` /
-    ///    `ServiceWaypoint` / the gateway topologies are refused for the same
-    ///    namespace reason.
+    /// 2. **Loopback** (`127.0.0.1` / `::1` / IPv4-mapped IPv6 loopback /
+    ///    the DNS `localhost` namespace) as an own-network-namespace shortcut,
+    ///    gated on [`Self::inbound_relay_admits_loopback_namespace`]
+    ///    (`Sidecar` only) and only on a port this pod's own workload record
+    ///    declares. `Ambient` is node-shared and runs outside the destination
+    ///    pod's network namespace, so the same names would reach the
+    ///    Ambient/host namespace rather than that pod — even when the accepted
+    ///    socket's local address is a non-loopback pod IP, and even when
+    ///    loopback appears in [`Self::inbound_relay_destinations`].
+    ///    `NodeWaypoint` / `ServiceWaypoint` / the gateway topologies are
+    ///    refused for the same namespace reason.
     /// 3. **[`Self::inbound_relay_destinations`]** — the deliberate, narrow
     ///    multi-destination allowance for the topologies that are MEANT to
     ///    terminate for a workload other than the pod the proxy runs in
@@ -4927,9 +4936,10 @@ impl MeshConfig {
         if inbound_relay_host_is_loopback_namespace(candidate) {
             // Sidecar alone shares the application pod's network namespace.
             // Ambient, waypoints, and gateways dial from a different netns, so
-            // loopback would hit the terminator/host — never fall through to
-            // inventory, even when the accepted local address is a non-loopback
-            // pod IP.
+            // loopback — including IPv4-mapped `::ffff:127.0.0.1`, which
+            // canonicalizes to `127.0.0.1` — would hit the terminator/host.
+            // Never fall through to inventory, even when the accepted local
+            // address is a non-loopback pod IP.
             if self.inbound_relay_admits_loopback_namespace
                 && let Some(own_address) = own_address
             {
