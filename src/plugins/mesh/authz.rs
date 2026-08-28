@@ -138,12 +138,15 @@ pub struct MeshAuthz {
     /// Default empty: strict same-trust-domain match.
     trust_domain_aliases: Vec<TrustDomain>,
     /// Identity-asserting infrastructure SVIDs that are trusted to rewrite the
-    /// authz principal via HBONE baggage `source.principal`. Any
+    /// authz principal via HBONE baggage `source.principal`. Compiled at
+    /// construction into exact-SPIFFE and service-account maps so request-time
+    /// lookup does not scan unrelated NodeWaypoint inventory entries. Any
     /// authenticated HBONE peer outside this set has its baggage identity
     /// dropped and is authorised under its own peer SPIFFE ID. Default
-    /// `["ztunnel", "waypoint"]` (Istio ambient convention). See the
-    /// `TrustedAssertor` variants for matching semantics.
-    trusted_hbone_assertors: Vec<TrustedAssertor>,
+    /// `["ztunnel", "waypoint"]` (Istio ambient convention). See
+    /// [`TrustedAssertorIndex`] and [`AssertionGrant`] for matching and grant
+    /// semantics.
+    trusted_hbone_assertors: TrustedAssertorIndex,
     /// When `true`, the construction-time slice-level scope filter is
     /// skipped and policies are filtered per-request using
     /// [`RequestContext::node_waypoint_policy_scope`] instead. Used in
@@ -1328,15 +1331,6 @@ pub(crate) enum AssertorMatcher {
     Spiffe(SpiffeId),
 }
 
-impl AssertorMatcher {
-    fn matches(&self, peer: &SpiffeId) -> bool {
-        match self {
-            Self::ServiceAccount(name) => peer.service_account() == Some(name.as_str()),
-            Self::Spiffe(id) => id == peer,
-        }
-    }
-}
-
 /// WHICH identities a matched assertor is authorized to assert (issue #4274).
 ///
 /// Before this existed, matching the allow-list was the whole check, so any
@@ -1362,23 +1356,138 @@ pub(crate) enum AssertionGrant {
     MeshWide,
 }
 
-/// One allow-list entry: who may assert, and what they may assert.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrustedAssertor {
+/// One parsed allow-list entry: who may assert, and what they may assert.
+///
+/// Plugin construction compiles these into a [`TrustedAssertorIndex`]. The
+/// request path never walks this form.
+struct TrustedAssertor {
     matcher: AssertorMatcher,
     grant: AssertionGrant,
 }
 
-impl TrustedAssertor {
-    fn matches(&self, peer: &SpiffeId) -> bool {
-        self.matcher.matches(peer)
+/// Construction-time compilation of [`TrustedAssertor`] entries.
+///
+/// Request-time evaluation looks up the peer's exact SPIFFE id and at most one
+/// service-account name. Duplicate matchers merge their [`AssertionGrant`]s at
+/// construction so insertion order cannot replace, narrow, or widen
+/// incorrectly. A peer matching both an exact entry and a service-account
+/// entry receives the union of those two compiled aggregates — not a scan of
+/// unrelated inventory.
+#[derive(Debug, Default)]
+pub(crate) struct TrustedAssertorIndex {
+    exact: HashMap<SpiffeId, CompiledGrant>,
+    service_account: HashMap<String, CompiledGrant>,
+}
+
+/// Merged grant for one matcher key. `MeshWide` dominates; otherwise
+/// `SameNamespace` and inventory sets are OR-ed.
+#[derive(Debug)]
+enum CompiledGrant {
+    MeshWide,
+    Restricted {
+        same_namespace: bool,
+        /// Union of `FrontedIdentities` sets for this matcher. `None` means no
+        /// inventory grant was present — not the same as an empty inventory,
+        /// which is `Some` of an empty set and authorizes nothing by itself.
+        fronted: Option<Arc<HashSet<String>>>,
+    },
+}
+
+impl TrustedAssertorIndex {
+    fn from_assertors(assertors: Vec<TrustedAssertor>) -> Self {
+        let mut index = Self::default();
+        for entry in assertors {
+            match entry.matcher {
+                AssertorMatcher::Spiffe(id) => {
+                    insert_compiled_grant(&mut index.exact, id, entry.grant);
+                }
+                AssertorMatcher::ServiceAccount(name) => {
+                    insert_compiled_grant(&mut index.service_account, name, entry.grant);
+                }
+            }
+        }
+        index
+    }
+}
+
+fn insert_compiled_grant<K: Eq + std::hash::Hash>(
+    map: &mut HashMap<K, CompiledGrant>,
+    key: K,
+    grant: AssertionGrant,
+) {
+    match map.entry(key) {
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(CompiledGrant::from_grant(grant));
+        }
+        std::collections::hash_map::Entry::Occupied(mut slot) => {
+            slot.get_mut().union_grant(grant);
+        }
+    }
+}
+
+impl CompiledGrant {
+    fn from_grant(grant: AssertionGrant) -> Self {
+        match grant {
+            AssertionGrant::MeshWide => Self::MeshWide,
+            AssertionGrant::SameNamespace => Self::Restricted {
+                same_namespace: true,
+                fronted: None,
+            },
+            AssertionGrant::FrontedIdentities(ids) => Self::Restricted {
+                same_namespace: false,
+                fronted: Some(ids),
+            },
+        }
+    }
+
+    fn union_grant(&mut self, grant: AssertionGrant) {
+        if matches!(self, Self::MeshWide) {
+            return;
+        }
+        match grant {
+            AssertionGrant::MeshWide => *self = Self::MeshWide,
+            AssertionGrant::SameNamespace => {
+                if let Self::Restricted { same_namespace, .. } = self {
+                    *same_namespace = true;
+                }
+            }
+            AssertionGrant::FrontedIdentities(ids) => {
+                if let Self::Restricted { fronted, .. } = self {
+                    union_fronted_identities(fronted, ids);
+                }
+            }
+        }
     }
 
     fn permits(&self, peer: &SpiffeId, asserted: &SpiffeId) -> bool {
-        match &self.grant {
-            AssertionGrant::MeshWide => true,
-            AssertionGrant::SameNamespace => same_namespace_assertion(peer, asserted),
-            AssertionGrant::FrontedIdentities(ids) => ids.contains(asserted.as_str()),
+        match self {
+            Self::MeshWide => true,
+            Self::Restricted {
+                same_namespace,
+                fronted,
+            } => {
+                (*same_namespace && same_namespace_assertion(peer, asserted))
+                    || fronted.as_ref().is_some_and(|ids| ids.contains(asserted.as_str()))
+            }
+        }
+    }
+}
+
+fn union_fronted_identities(
+    existing: &mut Option<Arc<HashSet<String>>>,
+    incoming: Arc<HashSet<String>>,
+) {
+    match existing {
+        None => *existing = Some(incoming),
+        Some(current) => {
+            if incoming.is_empty() || Arc::ptr_eq(current, &incoming) {
+                return;
+            }
+            if current.is_empty() {
+                *current = incoming;
+                return;
+            }
+            Arc::make_mut(current).extend(incoming.iter().cloned());
         }
     }
 }
@@ -3620,27 +3729,30 @@ pub(crate) enum AssertionVerdict {
 /// peer that matches several entries is authorized by the union of the matched
 /// grants. An empty allow-list authorizes nothing.
 ///
-/// Hot path: linear over a short precomputed slice with a precomputed hash set
-/// per inventory entry. No allocation, no locks.
+/// Hot path: two construction-time maps (`exact` SPIFFE, `service_account`),
+/// no locks, no allocation. Lookup is the peer's exact identity plus at most
+/// one service-account key — independent of unrelated NodeWaypoint inventory
+/// size. Duplicate matcher grants are already merged into those aggregates.
 pub(crate) fn hbone_assertion_verdict(
-    assertors: &[TrustedAssertor],
+    assertors: &TrustedAssertorIndex,
     peer: &SpiffeId,
     asserted: &SpiffeId,
 ) -> AssertionVerdict {
-    let mut matched_peer = false;
-    for entry in assertors {
-        if !entry.matches(peer) {
-            continue;
+    let exact = assertors.exact.get(peer);
+    let service_account = peer
+        .service_account()
+        .and_then(|name| assertors.service_account.get(name));
+    match (exact, service_account) {
+        (None, None) => AssertionVerdict::UntrustedAssertor,
+        (exact, service_account) => {
+            if exact.is_some_and(|grant| grant.permits(peer, asserted))
+                || service_account.is_some_and(|grant| grant.permits(peer, asserted))
+            {
+                AssertionVerdict::Allowed
+            } else {
+                AssertionVerdict::OutOfScope
+            }
         }
-        matched_peer = true;
-        if entry.permits(peer, asserted) {
-            return AssertionVerdict::Allowed;
-        }
-    }
-    if matched_peer {
-        AssertionVerdict::OutOfScope
-    } else {
-        AssertionVerdict::UntrustedAssertor
     }
 }
 
@@ -3761,7 +3873,8 @@ fn has_baggage_header_from_request(ctx: &RequestContext) -> bool {
     ctx.raw_header_get(BAGGAGE_HEADER).is_some() || ctx.headers.contains_key(BAGGAGE_HEADER)
 }
 
-/// Parse the trusted-assertor allow-list, resolving each entry's grant.
+/// Parse the trusted-assertor allow-list, resolving each entry's grant and
+/// compiling the request-time index.
 ///
 /// Entry shapes:
 ///
@@ -3773,13 +3886,18 @@ fn has_baggage_header_from_request(ctx: &RequestContext) -> bool {
 /// - `{"assertor": "<sa|spiffe>", "scope": "same_namespace"|"mesh_wide"}` — the
 ///   explicit contract form. `mesh_wide` restores pre-#4274 namespace-blind
 ///   power for that one entry and is announced with a warning.
+///
+/// Duplicate matcher keys union their grants; the returned index is what the
+/// request hot path consults.
 pub(crate) fn parse_trusted_hbone_assertors(
     config: &Value,
-) -> Result<Vec<TrustedAssertor>, String> {
+) -> Result<TrustedAssertorIndex, String> {
     let legacy_mesh_wide = parse_legacy_mesh_wide_hbone_assertion(config)?;
     let items = match config.get("trusted_hbone_assertors") {
         None | Some(Value::Null) => {
-            return Ok(default_trusted_hbone_assertors(legacy_mesh_wide));
+            return Ok(TrustedAssertorIndex::from_assertors(
+                default_trusted_hbone_assertors(legacy_mesh_wide),
+            ));
         }
         Some(Value::Array(items)) => items,
         Some(_) => {
@@ -3796,7 +3914,8 @@ pub(crate) fn parse_trusted_hbone_assertors(
     items
         .iter()
         .map(|item| parse_trusted_hbone_assertor_entry(item, legacy_mesh_wide))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map(TrustedAssertorIndex::from_assertors)
 }
 
 /// Read the deprecated namespace-blind opt-in and shout about it.

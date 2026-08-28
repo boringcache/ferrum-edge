@@ -23,9 +23,9 @@ use crate::modes::mesh::metric_tag_cel::{
 };
 use crate::plugins::mesh::CUSTOM_TRACE_ATTRIBUTES_METADATA;
 use crate::plugins::mesh::authz::{
-    AssertionVerdict, IGNORED_UDP_SOURCE_SCOPE_METADATA, TrustedAssertor, hbone_assertion_verdict,
-    mesh_authz_destination_port, mesh_stream_authz_destination_port, parse_trust_domain_aliases,
-    parse_trusted_hbone_assertors,
+    AssertionVerdict, IGNORED_UDP_SOURCE_SCOPE_METADATA, TrustedAssertorIndex,
+    hbone_assertion_verdict, mesh_authz_destination_port, mesh_stream_authz_destination_port,
+    parse_trust_domain_aliases, parse_trusted_hbone_assertors,
 };
 use crate::plugins::mesh::prometheus_helpers::{
     MESH_METRICS_DISABLED_METADATA, MESH_WORKLOAD_METRICS_OBSERVED_METADATA, MeshMetricFamily,
@@ -160,12 +160,13 @@ pub struct WorkloadMetrics {
     workload_spiffe_id: Option<SpiffeId>,
     labels: HashMap<String, String>,
     trust_domain_aliases: Vec<TrustDomain>,
-    /// HBONE trusted-assertor allow-list. Baggage `source.principal` is honored
-    /// only when the authenticated peer matches this list (default
-    /// ztunnel/waypoint), mirroring `mesh_authz` so telemetry attribution can
-    /// never diverge from the authorization decision. Empty = no peer may
-    /// assert baggage (fail closed).
-    trusted_hbone_assertors: Vec<TrustedAssertor>,
+    /// HBONE trusted-assertor allow-list, compiled at construction into the
+    /// same exact-SPIFFE / service-account index `mesh_authz` uses. Baggage
+    /// `source.principal` is honored only when the authenticated peer matches
+    /// (default ztunnel/waypoint), so telemetry attribution can never diverge
+    /// from the authorization decision. Empty = no peer may assert baggage
+    /// (fail closed).
+    trusted_hbone_assertors: TrustedAssertorIndex,
     /// Tracing sampling percentage 0.0–100.0 (from Telemetry CRD).
     sampling_percentage: Option<f64>,
     /// Custom tags injected into every transaction's metadata.

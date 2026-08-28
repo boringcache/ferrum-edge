@@ -2151,7 +2151,11 @@ The relation is evaluated in this order, and the first failing gate wins:
 4. Otherwise the baggage identity is honored.
 
 A peer matching several entries is authorized by the **union** of the matched
-grants. An empty allow-list authorizes nothing.
+grants. An empty allow-list authorizes nothing. Plugin construction compiles
+the allow-list into an exact-SPIFFE map and a service-account map, merging
+duplicate matcher grants; request-time evaluation looks up the peer and at
+most one service-account key and does not scan unrelated NodeWaypoint
+inventory entries.
 
 `mesh_authz` and `workload_metrics` consume the **same** three-way verdict from
 one shared function — a second telemetry-only predicate is exactly how forged
