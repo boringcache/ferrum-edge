@@ -569,8 +569,13 @@ fn test_load_tls_config_accepts_inline_cert_source() {
     assert!(result.is_ok());
 }
 
+/// Issue #4300: this used to assert that four arbitrary bytes loaded
+/// successfully. A stapled response is now bound to the certificate it will be
+/// served with, so unparseable bytes fail the whole TLS load. Acceptance of a
+/// genuine signed response is covered in
+/// `tests/unit/tls/ocsp_validation_tests.rs`, which owns the fixture builder.
 #[test]
-fn test_load_tls_config_accepts_ocsp_response_source() {
+fn test_load_tls_config_rejects_unparseable_ocsp_response_source() {
     ensure_crypto_provider();
     let dir = TempDir::new().unwrap();
     let (cert_pem, key_pem) = generate_self_signed_cert(&["localhost"]);
@@ -592,7 +597,8 @@ fn test_load_tls_config_accepts_ocsp_response_source() {
         30,
         &[],
     );
-    assert!(result.is_ok());
+    let error = result.expect_err("arbitrary bytes are not a stapled OCSP response");
+    assert!(format!("{error:#}").contains("was rejected"));
 }
 
 #[test]

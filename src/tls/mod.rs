@@ -33,6 +33,7 @@ mod acme_renewal_resume_tests;
 pub mod lease;
 pub mod managed;
 pub mod multi_cert;
+pub mod ocsp;
 #[cfg(feature = "pkcs11")]
 pub mod pkcs11;
 pub(crate) mod private_file;
@@ -1074,19 +1075,28 @@ pub fn load_frontend_tls_candidate(
         &cert_material.display_source_id,
     )?;
 
+    // Issue #4300: a stapled response is only admitted after it has been bound
+    // to *this* leaf and issuer. Accepting arbitrary bytes here made a reload
+    // able to publish a staple that strict clients abort on, while the log said
+    // the response had loaded successfully.
     let ocsp_response = match ocsp_response_source {
         Some(source) => {
             let material = load_material_blocking(source, MaterialKind::Ocsp)?;
             let bytes = material.bytes.expose_secret().to_vec();
-            if bytes.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "OCSP response source '{}' was empty",
-                    material.display_source_id
-                ));
-            }
+            let acceptance = crate::tls::ocsp::validate_stapled_response(&bytes, &cert_chain)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "OCSP response source '{}' was rejected: {error}",
+                        material.display_source_id
+                    )
+                })?;
             info!(
                 ocsp_source = %material.display_source_id,
-                "Loaded stapled OCSP response for server TLS config"
+                ocsp_der_bytes = acceptance.der_len,
+                ocsp_this_update = acceptance.this_update,
+                ocsp_next_update = acceptance.next_update,
+                ocsp_delegated_responder = acceptance.delegated_responder,
+                "Validated and stapled OCSP response for server TLS config"
             );
             bytes
         }

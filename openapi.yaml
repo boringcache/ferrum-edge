@@ -8131,7 +8131,16 @@ components:
           type: string
         ocsp_der_base64:
           type: string
-          description: Base64-encoded DER OCSP response bytes. The decoded response must be non-empty.
+          description: >
+            Base64-encoded DER OCSP response bytes. The decoded response must be
+            at most 65536 bytes and must parse as a successful OCSP response
+            carrying an `id-pkix-ocsp-basic` `BasicOCSPResponse` with at least
+            one `SingleResponse`. This admin boundary cannot bind the response
+            to a certificate, so certificate-bound validation (CertID match,
+            responder authorization, signature, `thisUpdate`/`nextUpdate`, and
+            `good` status) is mandatory before the response is stapled: a
+            structurally valid record that belongs to another certificate is
+            rejected when the frontend TLS config that references it is built.
         allow_overwrite:
           type: boolean
           default: false

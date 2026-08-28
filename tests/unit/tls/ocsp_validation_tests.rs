@@ -1,0 +1,856 @@
+//! Certificate-bound OCSP staple validation (issue #4300).
+//!
+//! Ferrum used to accept any non-empty byte string as a stapled OCSP response.
+//! These tests pin the replacement contract on real, deterministically
+//! constructed fixtures: every positive case is a genuine `BasicOCSPResponse`
+//! signed with a real ECDSA P-256 key over the exact `tbsResponseData` bytes
+//! the validator hashes, and every negative case differs from that fixture in
+//! exactly one respect.
+//!
+//! The builder below is a plain DER encoder rather than an OCSP responder
+//! library on purpose: the point of a negative case is to emit the *malformed*
+//! or *mis-bound* encoding a responder would never produce, which a responder
+//! library will not let a test express.
+
+use std::sync::{Arc, OnceLock};
+
+use ferrum_edge::config::EnvConfig;
+use ferrum_edge::tls::TlsPolicy;
+use ferrum_edge::tls::multi_cert::{GatewayCertificateInput, load_gateway_multi_cert_tls_config};
+use ferrum_edge::tls::ocsp::{
+    MAX_OCSP_RESPONSE_BYTES, OCSP_CLOCK_SKEW_SECONDS, validate_stapled_response_at,
+    validate_structure,
+};
+use ferrum_edge::tls::{frontend_tls_slot_with, load_frontend_tls_candidate_from_paths};
+use ring::rand::SystemRandom;
+use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair as _};
+use rustls::pki_types::CertificateDer;
+use x509_parser::certificate::X509Certificate;
+use x509_parser::prelude::FromDer;
+
+// ── DER encoding helpers ───────────────────────────────────────────────────
+
+/// Encode one DER TLV. Lengths above 127 use the long form, which every
+/// fixture here stays well inside for the header but not for the content.
+fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    let len = content.len();
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        let bytes = len.to_be_bytes();
+        let first = bytes
+            .iter()
+            .position(|byte| *byte != 0)
+            .unwrap_or(bytes.len() - 1);
+        let significant = &bytes[first..];
+        out.push(0x80 | significant.len() as u8);
+        out.extend_from_slice(significant);
+    }
+    out.extend_from_slice(content);
+    out
+}
+
+fn sequence(parts: &[Vec<u8>]) -> Vec<u8> {
+    tlv(0x30, &parts.concat())
+}
+
+fn explicit(number: u8, content: &[u8]) -> Vec<u8> {
+    tlv(0xa0 | number, content)
+}
+
+fn octet_string(content: &[u8]) -> Vec<u8> {
+    tlv(0x04, content)
+}
+
+fn oid(content: &[u8]) -> Vec<u8> {
+    tlv(0x06, content)
+}
+
+fn enumerated(value: u8) -> Vec<u8> {
+    tlv(0x0a, &[value])
+}
+
+fn bit_string(content: &[u8]) -> Vec<u8> {
+    let mut body = vec![0u8];
+    body.extend_from_slice(content);
+    tlv(0x03, &body)
+}
+
+fn generalized_time(unix: i64) -> Vec<u8> {
+    let datetime = time::OffsetDateTime::from_unix_timestamp(unix)
+        .expect("representable GeneralizedTime");
+    let rendered = format!(
+        "{:04}{:02}{:02}{:02}{:02}{:02}Z",
+        datetime.year(),
+        u8::from(datetime.month()),
+        datetime.day(),
+        datetime.hour(),
+        datetime.minute(),
+        datetime.second()
+    );
+    tlv(0x18, rendered.as_bytes())
+}
+
+const OID_SHA1: &[u8] = &[0x2b, 0x0e, 0x03, 0x02, 0x1a];
+const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+const OID_OCSP_BASIC: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01];
+
+fn parse_certificate(der: &[u8]) -> X509Certificate<'_> {
+    let (_, parsed) = X509Certificate::from_der(der).expect("parseable certificate");
+    parsed
+}
+
+fn algorithm_identifier(oid_bytes: &[u8]) -> Vec<u8> {
+    sequence(&[oid(oid_bytes)])
+}
+
+fn sha1(data: &[u8]) -> Vec<u8> {
+    let algorithm = &ring::digest::SHA1_FOR_LEGACY_USE_ONLY;
+    ring::digest::digest(algorithm, data).as_ref().to_vec()
+}
+
+fn sha256(data: &[u8]) -> Vec<u8> {
+    let algorithm = &ring::digest::SHA256;
+    ring::digest::digest(algorithm, data).as_ref().to_vec()
+}
+
+// ── Test PKI ───────────────────────────────────────────────────────────────
+
+fn ensure_crypto_provider() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+/// The PKCS#8 form of an rcgen key pair, retained so the same key that issued a
+/// certificate can also sign raw `tbsResponseData` bytes.
+///
+/// `rcgen::Issuer::new` consumes its `KeyPair`, so the PKCS#8 bytes are taken
+/// before the pair is moved and every OCSP signature is produced from them.
+struct SigningKey {
+    pkcs8: Vec<u8>,
+}
+
+impl SigningKey {
+    fn sign(&self, message: &[u8]) -> Vec<u8> {
+        let rng = SystemRandom::new();
+        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &self.pkcs8, &rng)
+            .expect("ECDSA signing key");
+        // Touch the public key so an accidental key/certificate mismatch in a
+        // fixture surfaces here rather than as an opaque verification failure.
+        assert!(!key.public_key().as_ref().is_empty());
+        key.sign(&rng, message).expect("sign").as_ref().to_vec()
+    }
+}
+
+/// A fresh P-256 key pair plus its PKCS#8 copy.
+fn new_key() -> (rcgen::KeyPair, SigningKey) {
+    let pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
+    let pkcs8 = pair.serialize_der();
+    (pair, SigningKey { pkcs8 })
+}
+
+const LEAF_SERIAL: u64 = 0x4300;
+const OTHER_SERIAL: u64 = 0x4301;
+
+struct TestPki {
+    issuer_key: SigningKey,
+    issuer_der: Vec<u8>,
+    issuer_pem: String,
+    leaf_der: Vec<u8>,
+    leaf_pem: String,
+    leaf_key_pem: String,
+    /// A delegated OCSP responder: issued by the CA, carrying
+    /// `id-kp-OCSPSigning`.
+    delegate_key: SigningKey,
+    delegate_der: Vec<u8>,
+    /// A responder certificate with the OCSP-signing EKU that the CA never
+    /// issued.
+    rogue_key: SigningKey,
+    rogue_der: Vec<u8>,
+    /// A certificate issued by the CA that lacks `id-kp-OCSPSigning`.
+    no_eku_key: SigningKey,
+    no_eku_der: Vec<u8>,
+    /// A second, unrelated CA and a leaf beneath it.
+    other_issuer_der: Vec<u8>,
+}
+
+fn build_pki() -> TestPki {
+    ensure_crypto_provider();
+
+    let (issuer_pair, issuer_key) = new_key();
+    let mut issuer_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+    issuer_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    issuer_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Ferrum OCSP Test CA");
+    issuer_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::KeyCertSign);
+    let issuer_cert = issuer_params
+        .self_signed(&issuer_pair)
+        .expect("self-signed CA");
+    let issuer_der = issuer_cert.der().to_vec();
+    let issuer_pem = issuer_cert.pem();
+    let issuer_handle = rcgen::Issuer::new(issuer_params, issuer_pair);
+
+    let (leaf_pair, _leaf_key) = new_key();
+    let mut leaf_params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .expect("leaf params");
+    leaf_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "ferrum-ocsp-leaf");
+    leaf_params.serial_number = Some(rcgen::SerialNumber::from(LEAF_SERIAL));
+    leaf_params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_pair, &issuer_handle)
+        .expect("leaf cert");
+    let leaf_key_pem = leaf_pair.serialize_pem();
+
+    // A delegated responder: issued by the CA and carrying id-kp-OCSPSigning.
+    let (delegate_pair, delegate_key) = new_key();
+    let mut delegate_params = rcgen::CertificateParams::new(Vec::<String>::new())
+        .expect("delegate params");
+    delegate_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Ferrum OCSP Responder");
+    delegate_params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::OcspSigning);
+    let delegate_cert = delegate_params
+        .signed_by(&delegate_pair, &issuer_handle)
+        .expect("delegate cert");
+
+    // Issued by the same CA, but without the OCSP-signing EKU.
+    let (no_eku_pair, no_eku_key) = new_key();
+    let mut no_eku_params = rcgen::CertificateParams::new(Vec::<String>::new())
+        .expect("no-eku params");
+    no_eku_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Ferrum Non-Responder");
+    let no_eku_cert = no_eku_params
+        .signed_by(&no_eku_pair, &issuer_handle)
+        .expect("no-eku cert");
+
+    // Self-signed with the OCSP-signing EKU, but never issued by the CA.
+    let (rogue_pair, rogue_key) = new_key();
+    let mut rogue_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("rogue");
+    rogue_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Ferrum Rogue Responder");
+    rogue_params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::OcspSigning);
+    let rogue_cert = rogue_params.self_signed(&rogue_pair).expect("rogue cert");
+
+    let (other_pair, _other_key) = new_key();
+    let mut other_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("other CA");
+    other_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    other_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Ferrum Unrelated CA");
+    let other_cert = other_params
+        .self_signed(&other_pair)
+        .expect("other CA cert");
+
+    TestPki {
+        issuer_key,
+        issuer_der,
+        issuer_pem,
+        leaf_pem: leaf_cert.pem(),
+        leaf_der: leaf_cert.der().to_vec(),
+        leaf_key_pem,
+        delegate_key,
+        delegate_der: delegate_cert.der().to_vec(),
+        rogue_key,
+        rogue_der: rogue_cert.der().to_vec(),
+        no_eku_key,
+        no_eku_der: no_eku_cert.der().to_vec(),
+        other_issuer_der: other_cert.der().to_vec(),
+    }
+}
+
+// ── OCSP response builder ──────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Status {
+    Good,
+    Revoked,
+    Unknown,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResponderIdKind {
+    ByName,
+    ByKey,
+}
+
+struct ResponseBuilder<'a> {
+    /// Certificate whose subject/public key names the responder.
+    responder_cert: &'a [u8],
+    /// Key that actually signs `tbsResponseData`.
+    signing_key: &'a SigningKey,
+    responder_id: ResponderIdKind,
+    /// Certificate whose subject name and public key the `CertID` hashes.
+    cert_id_issuer: &'a [u8],
+    serial: u64,
+    hash_oid: &'static [u8],
+    status: Status,
+    this_update: i64,
+    next_update: Option<i64>,
+    embedded_certs: Vec<&'a [u8]>,
+    corrupt_signature: bool,
+    response_status: u8,
+    response_type_oid: &'static [u8],
+}
+
+impl<'a> ResponseBuilder<'a> {
+    fn new(pki: &'a TestPki, now: i64) -> Self {
+        Self {
+            responder_cert: pki.issuer_der.as_slice(),
+            signing_key: &pki.issuer_key,
+            responder_id: ResponderIdKind::ByName,
+            cert_id_issuer: pki.issuer_der.as_slice(),
+            serial: LEAF_SERIAL,
+            hash_oid: OID_SHA1,
+            status: Status::Good,
+            this_update: now - 3_600,
+            next_update: Some(now + 3_600),
+            embedded_certs: Vec::new(),
+            corrupt_signature: false,
+            response_status: 0,
+            response_type_oid: OID_OCSP_BASIC,
+        }
+    }
+
+    fn build(&self) -> Vec<u8> {
+        let responder = parse_certificate(self.responder_cert);
+        let responder_id = match self.responder_id {
+            ResponderIdKind::ByName => explicit(1, responder.subject().as_raw()),
+            ResponderIdKind::ByKey => {
+                let key = responder.public_key().subject_public_key.data.as_ref();
+                explicit(2, &octet_string(&sha1(key)))
+            }
+        };
+
+        let cert_id_issuer = parse_certificate(self.cert_id_issuer);
+        let hash = |data: &[u8]| -> Vec<u8> {
+            if self.hash_oid == OID_SHA256 {
+                sha256(data)
+            } else {
+                sha1(data)
+            }
+        };
+        let name_hash = hash(cert_id_issuer.subject().as_raw());
+        let key_hash = hash(cert_id_issuer.public_key().subject_public_key.data.as_ref());
+
+        let mut serial_bytes = self.serial.to_be_bytes().to_vec();
+        while serial_bytes.len() > 1 && serial_bytes[0] == 0 {
+            serial_bytes.remove(0);
+        }
+        if serial_bytes[0] & 0x80 != 0 {
+            serial_bytes.insert(0, 0);
+        }
+
+        let cert_id = sequence(&[
+            algorithm_identifier(self.hash_oid),
+            octet_string(&name_hash),
+            octet_string(&key_hash),
+            tlv(0x02, &serial_bytes),
+        ]);
+
+        let cert_status = match self.status {
+            // good [0] IMPLICIT NULL
+            Status::Good => tlv(0x80, &[]),
+            // revoked [1] IMPLICIT RevokedInfo { revocationTime GeneralizedTime }
+            Status::Revoked => tlv(0xa1, &generalized_time(self.this_update)),
+            // unknown [2] IMPLICIT UnknownInfo (NULL)
+            Status::Unknown => tlv(0x82, &[]),
+        };
+
+        let mut single_parts = vec![cert_id, cert_status, generalized_time(self.this_update)];
+        if let Some(next_update) = self.next_update {
+            single_parts.push(explicit(0, &generalized_time(next_update)));
+        }
+        let single = sequence(&single_parts);
+
+        let response_data = sequence(&[
+            responder_id,
+            generalized_time(self.this_update),
+            sequence(&[single]),
+        ]);
+
+        let mut signature = self.signing_key.sign(&response_data);
+        if self.corrupt_signature {
+            let last = signature.len() - 1;
+            signature[last] ^= 0xff;
+        }
+
+        let mut basic_parts = vec![
+            response_data,
+            algorithm_identifier(OID_ECDSA_SHA256),
+            bit_string(&signature),
+        ];
+        if !self.embedded_certs.is_empty() {
+            let certs: Vec<Vec<u8>> = self.embedded_certs.iter().map(|d| d.to_vec()).collect();
+            basic_parts.push(explicit(0, &sequence(&certs)));
+        }
+        let basic = sequence(&basic_parts);
+
+        if self.response_status != 0 {
+            return sequence(&[enumerated(self.response_status)]);
+        }
+
+        sequence(&[
+            enumerated(0),
+            explicit(
+                0,
+                &sequence(&[oid(self.response_type_oid), octet_string(&basic)]),
+            ),
+        ])
+    }
+}
+
+fn chain(pki: &TestPki) -> Vec<CertificateDer<'static>> {
+    vec![
+        CertificateDer::from(pki.leaf_der.clone()),
+        CertificateDer::from(pki.issuer_der.clone()),
+    ]
+}
+
+/// Evaluation instant for every fixture.
+///
+/// Real wall-clock time, because the load-path tests go through the production
+/// entry points, which take their own `SystemTime::now()`. Every fixture is
+/// built relative to this value, so the behaviour under test stays
+/// deterministic even though the instant does not.
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs() as i64
+}
+
+/// A complete, correctly signed OCSP response over a freshly built test PKI.
+///
+/// Shared with the managed-TLS admin tests so their fixture is a response that
+/// actually satisfies the issue #4300 structural gate rather than a placeholder
+/// byte string that only happened to be non-empty.
+pub(crate) fn signed_ocsp_response_fixture() -> Vec<u8> {
+    let pki = build_pki();
+    ResponseBuilder::new(&pki, now()).build()
+}
+
+// ── Structural admission (the admin boundary) ──────────────────────────────
+
+#[test]
+fn structural_validation_accepts_a_well_formed_basic_response() {
+    let pki = build_pki();
+    let der = ResponseBuilder::new(&pki, now()).build();
+
+    let structure = validate_structure(&der).expect("structurally valid");
+    assert_eq!(structure.der_len, der.len());
+    assert_eq!(structure.single_responses, 1);
+}
+
+#[test]
+fn structural_validation_rejects_arbitrary_bytes() {
+    // The exact fixture the pre-#4300 unit test called a valid OCSP response.
+    let error = validate_structure(&[1, 2, 3]).expect_err("must reject");
+    assert!(error.contains("malformed DER") || error.contains("SEQUENCE"), "{error}");
+
+    let empty = validate_structure(&[]).expect_err("empty response");
+    assert!(empty.contains("empty"), "{empty}");
+}
+
+#[test]
+fn structural_validation_rejects_an_unsuccessful_envelope() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.response_status = 3;
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("tryLater(3)"), "{error}");
+}
+
+#[test]
+fn structural_validation_rejects_a_non_basic_response_type() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.response_type_oid = OID_SHA256;
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("id-pkix-ocsp-basic"), "{error}");
+}
+
+#[test]
+fn size_bound_is_enforced_before_parsing() {
+    let oversized = vec![0x30_u8; MAX_OCSP_RESPONSE_BYTES + 1];
+    let error = validate_structure(&oversized).expect_err("must reject");
+    assert!(error.contains("exceeds"), "{error}");
+
+    let pki = build_pki();
+    let error = validate_stapled_response_at(&oversized, &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("exceeds"), "{error}");
+}
+
+// ── Certificate-bound validation ───────────────────────────────────────────
+
+#[test]
+fn a_fresh_issuer_signed_response_for_the_configured_leaf_is_accepted() {
+    let pki = build_pki();
+    let der = ResponseBuilder::new(&pki, now()).build();
+
+    let acceptance = validate_stapled_response_at(&der, &chain(&pki), now())
+        .expect("accepted staple");
+    assert_eq!(acceptance.der_len, der.len());
+    assert_eq!(acceptance.this_update, now() - 3_600);
+    assert_eq!(acceptance.next_update, now() + 3_600);
+    assert!(!acceptance.delegated_responder);
+}
+
+#[test]
+fn a_responder_id_by_key_hash_is_accepted() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.responder_id = ResponderIdKind::ByKey;
+
+    validate_stapled_response_at(&builder.build(), &chain(&pki), now()).expect("accepted staple");
+}
+
+#[test]
+fn a_sha256_cert_id_is_accepted() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.hash_oid = OID_SHA256;
+
+    validate_stapled_response_at(&builder.build(), &chain(&pki), now()).expect("accepted staple");
+}
+
+#[test]
+fn a_corrupted_signature_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.corrupt_signature = true;
+
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("signature"), "{error}");
+}
+
+#[test]
+fn a_response_signed_by_an_unrelated_key_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    // Named as the issuer, signed by someone else entirely.
+    builder.signing_key = &pki.rogue_key;
+
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("signature") || error.contains("responder"), "{error}");
+}
+
+#[test]
+fn a_properly_delegated_responder_is_accepted() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.responder_cert = pki.delegate_der.as_slice();
+    builder.signing_key = &pki.delegate_key;
+    builder.embedded_certs = vec![pki.delegate_der.as_slice()];
+
+    let acceptance = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect("accepted staple");
+    assert!(acceptance.delegated_responder);
+}
+
+#[test]
+fn a_delegated_responder_without_the_ocsp_signing_eku_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.responder_cert = pki.no_eku_der.as_slice();
+    builder.signing_key = &pki.no_eku_key;
+    builder.embedded_certs = vec![pki.no_eku_der.as_slice()];
+
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("not authorized"), "{error}");
+}
+
+#[test]
+fn a_self_signed_responder_the_issuer_never_issued_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.responder_cert = pki.rogue_der.as_slice();
+    builder.signing_key = &pki.rogue_key;
+    builder.embedded_certs = vec![pki.rogue_der.as_slice()];
+
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("not authorized"), "{error}");
+}
+
+#[test]
+fn a_response_for_a_different_serial_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.serial = OTHER_SERIAL;
+
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("no entry for the configured certificate"), "{error}");
+}
+
+#[test]
+fn a_response_bound_to_a_different_issuer_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.cert_id_issuer = pki.other_issuer_der.as_slice();
+
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("not the configured issuer"), "{error}");
+}
+
+#[test]
+fn a_revoked_status_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.status = Status::Revoked;
+
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("certStatus revoked"), "{error}");
+}
+
+#[test]
+fn an_unknown_status_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.status = Status::Unknown;
+
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("certStatus unknown"), "{error}");
+}
+
+#[test]
+fn an_expired_response_is_rejected_and_the_skew_window_is_bounded() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.this_update = now() - 7_200;
+    builder.next_update = Some(now() - OCSP_CLOCK_SKEW_SECONDS - 60);
+
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("expired"), "{error}");
+
+    // Just inside the skew allowance the same shape is still served.
+    builder.next_update = Some(now() - OCSP_CLOCK_SKEW_SECONDS + 60);
+    validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect("within the documented skew allowance");
+}
+
+#[test]
+fn a_future_response_is_rejected_and_the_skew_window_is_bounded() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.this_update = now() + OCSP_CLOCK_SKEW_SECONDS + 60;
+    builder.next_update = Some(now() + 86_400);
+
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("future"), "{error}");
+
+    builder.this_update = now() + OCSP_CLOCK_SKEW_SECONDS - 60;
+    validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect("within the documented skew allowance");
+}
+
+#[test]
+fn a_response_without_next_update_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.next_update = None;
+
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("omits nextUpdate"), "{error}");
+}
+
+#[test]
+fn a_chain_without_the_issuer_cannot_bind_a_staple() {
+    let pki = build_pki();
+    let der = ResponseBuilder::new(&pki, now()).build();
+    let leaf_only = vec![CertificateDer::from(pki.leaf_der.clone())];
+
+    let error = validate_stapled_response_at(&der, &leaf_only, now()).expect_err("must reject");
+    assert!(error.contains("does not contain the leaf's issuer"), "{error}");
+}
+
+// ── Load-path integration ──────────────────────────────────────────────────
+
+fn tls_policy() -> TlsPolicy {
+    ensure_crypto_provider();
+    TlsPolicy::from_env_config(&EnvConfig::default()).expect("tls policy")
+}
+
+/// Materialize the served chain (leaf + issuer) and key as files, plus an OCSP
+/// DER file, and return their paths.
+fn write_material(dir: &std::path::Path, pki: &TestPki, ocsp: &[u8]) -> (String, String, String) {
+    let cert_path = dir.join("server.crt");
+    let key_path = dir.join("server.key");
+    let ocsp_path = dir.join("staple.der");
+    std::fs::write(&cert_path, format!("{}{}", pki.leaf_pem, pki.issuer_pem)).expect("write cert");
+    std::fs::write(&key_path, &pki.leaf_key_pem).expect("write key");
+    std::fs::write(&ocsp_path, ocsp).expect("write ocsp");
+    (
+        cert_path.to_string_lossy().into_owned(),
+        key_path.to_string_lossy().into_owned(),
+        ocsp_path.to_string_lossy().into_owned(),
+    )
+}
+
+#[test]
+fn the_single_certificate_loader_admits_a_valid_staple_and_refuses_an_invalid_one() {
+    let pki = build_pki();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let valid = ResponseBuilder::new(&pki, now()).build();
+    let (cert_path, key_path, ocsp_path) = write_material(dir.path(), &pki, &valid);
+    let policy = tls_policy();
+
+    load_frontend_tls_candidate_from_paths(
+        &cert_path,
+        &key_path,
+        None,
+        Some(&ocsp_path),
+        false,
+        &policy,
+        30,
+        &[],
+        None,
+    )
+    .expect("valid staple is admitted");
+
+    // The pre-#4300 accepted-anything fixture must now fail the whole load.
+    std::fs::write(&ocsp_path, [1_u8, 2, 3]).expect("rewrite ocsp");
+    let error = load_frontend_tls_candidate_from_paths(
+        &cert_path,
+        &key_path,
+        None,
+        Some(&ocsp_path),
+        false,
+        &policy,
+        30,
+        &[],
+        None,
+    )
+    .expect_err("garbage staple is refused");
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("was rejected"), "{rendered}");
+    // Diagnostics stay redacted: no certificate or response bytes leak.
+    assert!(!rendered.contains("BEGIN CERTIFICATE"), "{rendered}");
+}
+
+/// A reload that produces an invalid staple must never reach the published
+/// slot: the candidate fails to build, so the atomic `ArcSwap` publication has
+/// nothing to swap in and the last-known-good `ServerConfig` keeps serving.
+#[test]
+fn a_reload_with_a_bad_staple_leaves_the_last_known_good_material_in_service() {
+    let pki = build_pki();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let valid = ResponseBuilder::new(&pki, now()).build();
+    let (cert_path, key_path, ocsp_path) = write_material(dir.path(), &pki, &valid);
+    let policy = tls_policy();
+
+    let rebuild = || {
+        load_frontend_tls_candidate_from_paths(
+            &cert_path,
+            &key_path,
+            None,
+            Some(&ocsp_path),
+            false,
+            &policy,
+            30,
+            &[],
+            None,
+        )
+    };
+
+    let accepted = rebuild().expect("first load");
+    let published = frontend_tls_slot_with(Arc::clone(&accepted.config));
+    let before = published.load_full();
+
+    // A revoked response is exactly the shape that used to be published
+    // silently. Each of these rebuilds must fail, so the reload task has no
+    // candidate to publish.
+    for builder in [
+        {
+            let mut builder = ResponseBuilder::new(&pki, now());
+            builder.status = Status::Revoked;
+            builder
+        },
+        {
+            let mut builder = ResponseBuilder::new(&pki, now());
+            builder.next_update = Some(now() - OCSP_CLOCK_SKEW_SECONDS - 3_600);
+            builder
+        },
+        {
+            let mut builder = ResponseBuilder::new(&pki, now());
+            builder.corrupt_signature = true;
+            builder
+        },
+    ] {
+        std::fs::write(&ocsp_path, builder.build()).expect("rewrite ocsp");
+        let rebuilt = rebuild();
+        assert!(rebuilt.is_err(), "an invalid staple must not produce a candidate");
+        if let Ok(candidate) = rebuilt {
+            published.store(Arc::new(Some(candidate.config)));
+        }
+    }
+
+    let after = published.load_full();
+    assert!(
+        Arc::ptr_eq(&before, &after),
+        "a refused staple must leave the published ServerConfig untouched"
+    );
+    let served = after.as_ref().as_ref().expect("retained ServerConfig");
+    assert!(served.cert_resolver.has_certs());
+
+    // The original, still-valid response reloads cleanly, so the refusal was
+    // about the staple and not about the surrounding material.
+    std::fs::write(&ocsp_path, &valid).expect("restore ocsp");
+    rebuild().expect("the last-known-good staple still reloads");
+}
+
+#[test]
+fn the_multi_certificate_loader_binds_the_staple_to_its_single_certificate() {
+    let pki = build_pki();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let valid = ResponseBuilder::new(&pki, now()).build();
+    let (cert_path, key_path, ocsp_path) = write_material(dir.path(), &pki, &valid);
+    let policy = tls_policy();
+
+    let inputs = vec![GatewayCertificateInput {
+        cert_source: cert_path.clone(),
+        key_source: key_path.clone(),
+        hostname: Some("localhost".to_string()),
+        identity: "ns/gw/listener".to_string(),
+        is_default: true,
+    }];
+
+    load_gateway_multi_cert_tls_config(&inputs, None, Some(&ocsp_path), &policy, 30, &[])
+        .expect("valid staple is admitted");
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.serial = OTHER_SERIAL;
+    std::fs::write(&ocsp_path, builder.build()).expect("rewrite ocsp");
+    let error =
+        load_gateway_multi_cert_tls_config(&inputs, None, Some(&ocsp_path), &policy, 30, &[])
+            .expect_err("wrong-certificate staple is refused");
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("rejected"), "{rendered}");
+}

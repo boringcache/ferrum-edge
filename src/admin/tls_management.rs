@@ -1636,16 +1636,27 @@ fn validate_crl_bundle(crl_pem: &str) -> Result<usize, String> {
     Ok(crls.len())
 }
 
+/// Admin-boundary validation of a stored OCSP response (issue #4300).
+///
+/// A managed OCSP record is stored before anyone has said which certificate it
+/// belongs to, so this is the certificate-*independent* half of the contract:
+/// the size bound, a successful `id-pkix-ocsp-basic` envelope, and a
+/// well-formed `BasicOCSPResponse`. It deliberately does not — and cannot —
+/// prove the response is servable. The mandatory certificate-bound half
+/// (`CertID` binding, responder authorization, signature, time bounds, status)
+/// runs in [`crate::tls::ocsp::validate_stapled_response`] on the frontend and
+/// multi-certificate load paths before the bytes are ever attached to a served
+/// `CertifiedKey`, so storing a structurally valid response that turns out to
+/// be for another certificate fails at activation instead of reaching a client.
 fn validate_ocsp_response_base64(value: &str) -> Result<usize, String> {
     use base64::Engine as _;
 
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(value.trim())
         .map_err(|error| format!("ocsp_der_base64 must be valid base64: {error}"))?;
-    if bytes.is_empty() {
-        return Err("ocsp_der_base64 must decode to non-empty DER bytes".to_string());
-    }
-    Ok(bytes.len())
+    let structure = crate::tls::ocsp::validate_structure(&bytes)
+        .map_err(|error| format!("ocsp_der_base64: {error}"))?;
+    Ok(structure.der_len)
 }
 
 fn parse_cert_chain(
@@ -2689,14 +2700,112 @@ mod tests {
         assert!(validate_jwks_json(r#"{"not_keys":[]}"#).is_err());
     }
 
+    /// Encode one DER TLV, short or long form.
+    fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        if content.len() < 0x80 {
+            out.push(content.len() as u8);
+        } else {
+            let be = content.len().to_be_bytes();
+            let first = be.iter().position(|byte| *byte != 0).unwrap_or(be.len() - 1);
+            out.push(0x80 | (be.len() - first) as u8);
+            out.extend_from_slice(&be[first..]);
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    /// A structurally well-formed `id-pkix-ocsp-basic` response.
+    ///
+    /// The signature bytes are arbitrary on purpose: the admin boundary is the
+    /// certificate-*independent* half of the contract, so it must accept this
+    /// and the certificate-bound half must still be the thing that decides
+    /// whether it can be served. Real signed fixtures, including the
+    /// signature/responder/CertID/time cases, live in
+    /// `tests/unit/tls/ocsp_validation_tests.rs`.
+    fn structurally_valid_ocsp_der() -> Vec<u8> {
+        let name = der_tlv(0x30, &[]);
+        let cert_id = der_tlv(
+            0x30,
+            &[
+                der_tlv(0x30, &der_tlv(0x06, &[0x2b, 0x0e, 0x03, 0x02, 0x1a])),
+                der_tlv(0x04, &[0u8; 20]),
+                der_tlv(0x04, &[1u8; 20]),
+                der_tlv(0x02, &[0x43, 0x00]),
+            ]
+            .concat(),
+        );
+        let time = der_tlv(0x18, b"20260101000000Z");
+        let single = der_tlv(
+            0x30,
+            &[
+                cert_id,
+                der_tlv(0x80, &[]),
+                time.clone(),
+                der_tlv(0xa0, &time),
+            ]
+            .concat(),
+        );
+        let response_data = der_tlv(
+            0x30,
+            &[der_tlv(0xa1, &name), time, der_tlv(0x30, &single)].concat(),
+        );
+        let basic = der_tlv(
+            0x30,
+            &[
+                response_data,
+                der_tlv(
+                    0x30,
+                    &der_tlv(0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]),
+                ),
+                der_tlv(0x03, &[0x00, 0xde, 0xad, 0xbe, 0xef]),
+            ]
+            .concat(),
+        );
+        der_tlv(
+            0x30,
+            &[
+                der_tlv(0x0a, &[0x00]),
+                der_tlv(
+                    0xa0,
+                    &der_tlv(
+                        0x30,
+                        &[
+                            der_tlv(
+                                0x06,
+                                &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01],
+                            ),
+                            der_tlv(0x04, &basic),
+                        ]
+                        .concat(),
+                    ),
+                ),
+            ]
+            .concat(),
+        )
+    }
+
+    /// Issue #4300: the admin boundary used to call `[1, 2, 3]` a valid OCSP
+    /// response, which is how wrong-certificate and malformed staples reached
+    /// the TLS layer with a success log behind them.
     #[test]
-    fn ocsp_response_validation_requires_non_empty_base64_der() {
+    fn ocsp_response_validation_requires_a_parseable_basic_response() {
         use base64::Engine as _;
 
-        let encoded = base64::engine::general_purpose::STANDARD.encode([1_u8, 2, 3]);
-        assert_eq!(validate_ocsp_response_base64(&encoded), Ok(3));
+        let engine = base64::engine::general_purpose::STANDARD;
+
+        let valid = structurally_valid_ocsp_der();
+        assert_eq!(
+            validate_ocsp_response_base64(&engine.encode(&valid)),
+            Ok(valid.len())
+        );
+
+        assert!(validate_ocsp_response_base64(&engine.encode([1_u8, 2, 3])).is_err());
         assert!(validate_ocsp_response_base64("").is_err());
         assert!(validate_ocsp_response_base64("not-base64!!").is_err());
+
+        let oversized = vec![0x30_u8; crate::tls::ocsp::MAX_OCSP_RESPONSE_BYTES + 1];
+        assert!(validate_ocsp_response_base64(&engine.encode(&oversized)).is_err());
     }
 
     #[test]

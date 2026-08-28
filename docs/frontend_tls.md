@@ -477,7 +477,7 @@ Frontend proxy, Admin API, and frontend DTLS cert/key/client-CA/OCSP/CRL sources
 | **Loaded but static** | Inline frontend/admin/DTLS/backend/database/CP-gRPC/DP-gRPC sources |
 | **Gateway SVID rotation** | `FERRUM_GATEWAY_SVID_*_PATH` / `_SOURCE`: file-backed sources are re-read once per second, provider URIs are re-fetched on `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` or the source's `?poll=`, and inline PEM stays static until config reload |
 
-All TLS sources are validated at startup and config load time when their owning runtime is built. Certificate and CA bundles are atomic: Ferrum rejects the complete candidate if any declared `CERTIFICATE` record is malformed or any CA record cannot be admitted as a trust root; it never installs a usable subset. If any configured certificate, key, CA bundle, OCSP response, or CRL source is missing, unreadable, expired, not-yet-valid, mismatched, or contains invalid PEM data where PEM is expected, the gateway refuses to start or rejects the config reload. OCSP response sources must resolve to non-empty DER bytes. There is no silent fallback to unauthenticated or unencrypted connections. Client cert and key sources must always be configured as a pair.
+All TLS sources are validated at startup and config load time when their owning runtime is built. Certificate and CA bundles are atomic: Ferrum rejects the complete candidate if any declared `CERTIFICATE` record is malformed or any CA record cannot be admitted as a trust root; it never installs a usable subset. If any configured certificate, key, CA bundle, OCSP response, or CRL source is missing, unreadable, expired, not-yet-valid, mismatched, or contains invalid PEM data where PEM is expected, the gateway refuses to start or rejects the config reload. OCSP response sources must resolve to a DER response that passes the certificate-bound validation described in [Stapled OCSP Responses](#stapled-ocsp-responses). There is no silent fallback to unauthenticated or unencrypted connections. Client cert and key sources must always be configured as a pair.
 
 Certificate/key PEM parsing is capped at 4 MiB per source and certificate
 bundles at 4096 records. A configured client-CA is still fully admitted when a
@@ -489,6 +489,63 @@ key, and transmits the complete chain; it never publishes only a usable prefix.
 The frontend/admin live-reload poller atomically swaps a validated `rustls::ServerConfig` for new handshakes. The frontend DTLS poller validates cert/key/optional client-CA/CRL inputs as one immutable generation, publishes that generation into shared reconcile state, and live-swaps it into every active DTLS server without rebinding the UDP socket. Cert/key-only rotation and additive client-trust changes leave established TLS/DTLS sessions on the config they negotiated with; an accepted client-trust narrowing retires the affected scope's client-certificate-authenticated sessions as described below. Subsequent sessions use the accepted generation. A failed candidate keeps the complete previous generation in service on every listener and logs a warning without exposing PEM contents, secret URIs, or private material. Disabling `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` preserves static-until-restart behavior for all of these surfaces.
 
 For backend HTTP-family TLS, keep `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` to pick up in-place cert/key/CA/CRL source changes and to watch backend TLS sources added by later config reloads. Database TLS can opt in with `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED=true` in database and CP modes. CP gRPC TLS swaps the server TLS slot for new handshakes when watched source bytes change; DP gRPC TLS reconnects the CP stream with fresh client-side TLS material.
+
+### Stapled OCSP Responses
+
+`FERRUM_FRONTEND_TLS_OCSP_RESPONSE_SOURCE` and
+`FERRUM_ADMIN_TLS_OCSP_RESPONSE_SOURCE` supply DER bytes that Ferrum staples to
+the served certificate. Those bytes are **validated against the certificate they
+will be stapled to** before they are attached — for file, `file://`, inline,
+provider URI, Kubernetes Secret, and `managed://` sources alike, and for both
+the single-certificate frontend and the Gateway API multi-certificate frontend.
+An invalid response fails the whole TLS load: the gateway refuses to start, or
+the reload is rejected and the previous known-good `ServerConfig` keeps serving.
+Ferrum never staples a response it could not validate and never serves a
+partially applied generation.
+
+A response is admitted only when all of the following hold.
+
+| Check | Rejected when |
+|---|---|
+| Size | The DER exceeds 64 KiB. The bound is enforced before parsing. |
+| Envelope | `responseStatus` is not `successful(0)`, or `responseType` is not `id-pkix-ocsp-basic`. |
+| Encoding | The `BasicOCSPResponse`, `ResponseData`, `SingleResponse`, or `CertID` is malformed, carries trailing bytes, declares an unsupported version, or contains no `SingleResponse`. |
+| Certificate binding | No `SingleResponse` `CertID` matches the served leaf's serial number together with the `issuerNameHash` and `issuerKeyHash` of the configured issuer, recomputed under the `CertID` hash algorithm (SHA-1, SHA-256, SHA-384, or SHA-512). |
+| Issuer availability | The served chain does not contain the leaf's issuer and the leaf is not self-issued, so no binding can be proven. |
+| Responder authorization | The signature does not verify against the issuing CA, and no certificate carried in the response is simultaneously named by the `ResponderID`, issued by that CA, currently valid, marked with the `id-kp-OCSPSigning` extended key usage, and able to verify the signature. |
+| Signature | `tbsResponseData` does not verify under the authorized responder's public key. |
+| Validity window | `nextUpdate` is absent, `nextUpdate` is not after `thisUpdate`, `thisUpdate` is in the future, or `nextUpdate` is in the past. |
+| Status | `certStatus` is `revoked` or `unknown`. |
+
+**Clock-skew policy.** The two time bounds are widened by a fixed **5 minutes**
+in the permissive direction, so the accepted window is
+`thisUpdate - 5m <= now <= nextUpdate + 5m`. The allowance is not configurable:
+it exists to absorb ordinary NTP drift between the responder and the gateway,
+not to extend the life of a stale staple.
+
+**`nextUpdate` is required.** RFC 6960 §2.4 makes an absent `nextUpdate` mean
+"newer information is available at all times", which a cached, re-served staple
+cannot satisfy, so such a response has no usable validity window and is refused.
+
+**Revoked and unknown fail closed.** Ferrum refuses to serve them rather than
+stapling them. A client that honours the staple would refuse the connection
+anyway, and a reload must not be able to publish that state silently.
+
+**Admin-managed records.** `POST`/`PUT /admin/tls/ocsp-responses` stores a
+record before any certificate context exists, so it performs the
+certificate-independent half only: the size bound, a successful
+`id-pkix-ocsp-basic` envelope, and a well-formed `BasicOCSPResponse`. Storing a
+record is therefore not a promise it can be served. The certificate-bound half
+above runs when a frontend TLS configuration referencing
+`managed://ocsp-responses/<id>#ocsp` is built, and a mismatch is refused there.
+
+**Multi-certificate frontends.** A stapled response is bound to one
+certificate, so a Gateway data plane staples it only when it serves exactly one
+certificate; with several it is stapled to none and a warning is logged.
+
+**Diagnostics.** Rejections name the redacted source identifier and the
+structural reason. They never contain certificate bytes, response bytes, private
+material, or a secret source reference.
 
 ### Client-Trust Generations and Established-Transport Retirement
 
