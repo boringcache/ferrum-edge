@@ -572,6 +572,7 @@ fn mesh_runtime_config() -> MeshRuntimeConfig {
         xds_connect_timeout_seconds: 10,
         trust_domain_aliases: Vec::new(),
         trusted_hbone_assertors: Vec::new(),
+        legacy_mesh_wide_hbone_assertion: false,
         workload_labels: HashMap::new(),
         dns_enabled: false,
         dns_listen_addr: "127.0.0.1:15053".parse().expect("addr"),

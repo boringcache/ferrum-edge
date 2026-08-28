@@ -13434,6 +13434,7 @@ components:
       required:
         - accepted
         - rejected_untrusted_assertor
+        - rejected_assertion_out_of_scope
         - rejected_trust_domain_mismatch
         - rejected_unauthenticated_hbone
         - rejected_malformed
@@ -13445,6 +13446,12 @@ components:
         rejected_untrusted_assertor:
           type: integer
           format: uint64
+        rejected_assertion_out_of_scope:
+          type: integer
+          format: uint64
+          description: |
+            Baggage assertions refused because the admitted assertor's grant
+            does not cover the claimed workload identity (issue #4274).
         rejected_trust_domain_mismatch:
           type: integer
           format: uint64
@@ -20395,7 +20402,36 @@ components:
         trusted_hbone_assertors:
           type: array
           items:
-            type: string
+            oneOf:
+              - type: string
+              - type: object
+                required: [assertor]
+                properties:
+                  assertor:
+                    type: string
+                    description: |
+                      Bare service-account name or full `spiffe://` SPIFFE ID
+                      identifying the peer this entry admits.
+                  asserts:
+                    type: array
+                    items:
+                      type: string
+                    description: |
+                      Exact SPIFFE IDs this assertor may assert and nothing
+                      else — the inventory of workloads it actually fronts. An
+                      empty array authorizes nothing. Mutually exclusive with
+                      `scope`.
+                  scope:
+                    type: string
+                    enum: [same_namespace, mesh_wide]
+                    description: |
+                      Explicit grant contract. `same_namespace` (the default
+                      for every entry) permits only identities in the
+                      assertor's own Kubernetes namespace; `mesh_wide` permits
+                      any identity that clears the trust-domain gate and logs a
+                      warning at construction. Mutually exclusive with
+                      `asserts`.
+                additionalProperties: false
           default: ["ztunnel", "waypoint"]
           description: |
             Allow-list of identity-asserting infrastructure components whose
@@ -20404,6 +20440,23 @@ components:
             with `/sa/<name>`; full SPIFFE IDs match exactly. Default is
             `["ztunnel", "waypoint"]`. Explicit empty array disables all
             baggage rewriting.
+
+            Matching a peer is necessary but NOT sufficient (issue #4274):
+            every entry also carries a grant that decides WHICH identities that
+            peer may assert. String entries and objects without `asserts` /
+            `scope` grant `same_namespace` only, so a peer in
+            `ns/attacker/sa/waypoint` can no longer assert
+            `ns/prod/sa/payments`. Baggage refused by the grant is dropped, the
+            peer-cert identity is used instead, and the request is stamped
+            `mesh_authz.ignored_baggage.assertion_out_of_scope=true`.
+        legacy_mesh_wide_hbone_assertion:
+          type: boolean
+          default: false
+          description: |
+            Deprecated escape hatch that restores the pre-#4274 namespace-blind
+            behavior: every entry without an explicit contract grants
+            `mesh_wide`. Logs a loud warning on every plugin construction. Pin
+            exact assertor SVIDs with `asserts` or `scope` instead.
 
     MeshOutboundRegistryConfig:
       type: object
@@ -21058,7 +21111,21 @@ components:
         trusted_hbone_assertors:
           type: array
           items:
-            type: string
+            oneOf:
+              - type: string
+              - type: object
+                required: [assertor]
+                properties:
+                  assertor:
+                    type: string
+                  asserts:
+                    type: array
+                    items:
+                      type: string
+                  scope:
+                    type: string
+                    enum: [same_namespace, mesh_wide]
+                additionalProperties: false
           default: ["ztunnel", "waypoint"]
           description: |
             Allow-list of identity-asserting infrastructure components whose
@@ -21067,6 +21134,17 @@ components:
             peer whose SPIFFE path ends with `/sa/<name>`; full SPIFFE IDs
             match exactly. Default is `["ztunnel", "waypoint"]`. Explicit
             empty array disables baggage-derived source attribution.
+
+            Identical schema and identical semantics to the `mesh_authz` field
+            of the same name — the two plugins share ONE relation, so telemetry
+            attribution can never grant what authorization refused (issue
+            #4274). Refused baggage is stamped
+            `mesh.ignored_baggage=assertion_out_of_scope`.
+        legacy_mesh_wide_hbone_assertion:
+          type: boolean
+          default: false
+          description: |
+            Mirrors the `mesh_authz` field of the same name; see there.
         sampling_percentage:
           type: number
           format: double

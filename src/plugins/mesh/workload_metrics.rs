@@ -23,7 +23,7 @@ use crate::modes::mesh::metric_tag_cel::{
 };
 use crate::plugins::mesh::CUSTOM_TRACE_ATTRIBUTES_METADATA;
 use crate::plugins::mesh::authz::{
-    IGNORED_UDP_SOURCE_SCOPE_METADATA, TrustedAssertor, is_trusted_hbone_assertor,
+    AssertionVerdict, IGNORED_UDP_SOURCE_SCOPE_METADATA, TrustedAssertor, hbone_assertion_verdict,
     mesh_authz_destination_port, mesh_stream_authz_destination_port, parse_trust_domain_aliases,
     parse_trusted_hbone_assertors,
 };
@@ -606,17 +606,21 @@ impl WorkloadMetrics {
         ctx: &mut RequestContext,
         hbone_identity: Option<&HboneIdentity>,
     ) -> Option<SpiffeId> {
-        // Resolve the source identity using the SAME baggage trust gate as
-        // `mesh_authz` (shared `is_trusted_hbone_assertor` predicate) so the
-        // telemetry attribution can never diverge from the authorization
-        // decision. On authenticated ambient HBONE the peer cert identifies the
-        // assertor (ztunnel/waypoint, by default) while baggage carries the
-        // originating workload. Baggage `source.principal` is honored ONLY when
-        // the peer is a trusted assertor AND the baggage trust domain matches
-        // the peer's (or an alias). Otherwise the baggage is dropped, we fall
-        // back to the peer-cert identity, and we stamp `mesh.ignored_baggage`
-        // with the reason (mirroring `mesh_authz.ignored_baggage.*`). Without
-        // the assertor gate any authenticated workload pod could forge a baggage
+        // Resolve the source identity using the SAME baggage trust relation as
+        // `mesh_authz` (shared `hbone_assertion_verdict`) so the telemetry
+        // attribution can never diverge from the authorization decision. On
+        // authenticated ambient HBONE the peer cert identifies the assertor
+        // (ztunnel/waypoint, by default) while baggage carries the originating
+        // workload. Baggage `source.principal` is honored ONLY when the peer is
+        // a trusted assertor, the baggage trust domain matches the peer's (or
+        // an alias), AND the matched assertor entry is authorized to assert
+        // THAT identity (issue #4274 — a bare service-account entry grants only
+        // the assertor's own namespace). Otherwise the baggage is dropped, we
+        // fall back to the peer-cert identity, and we stamp
+        // `mesh.ignored_baggage` with a redacted reason (mirroring
+        // `mesh_authz.ignored_baggage.*`; the forged identity is never echoed).
+        // Without this relation any authenticated workload pod running under a
+        // service account named `waypoint` could forge a baggage
         // `source.principal` and mis-attribute its own traffic to a victim
         // workload across metrics, the service graph, spans, and access logs.
         let rejected_udp_source_scope =
@@ -632,20 +636,33 @@ impl WorkloadMetrics {
         };
         match (ctx.peer_spiffe_id.as_ref(), baggage_source_principal) {
             (Some(peer), Some(baggage)) => {
-                if !is_trusted_hbone_assertor(&self.trusted_hbone_assertors, peer) {
-                    ctx.metadata.insert(
-                        "mesh.ignored_baggage".to_string(),
-                        "untrusted_assertor".to_string(),
-                    );
-                    Some(peer.clone())
-                } else if !self.trust_domain_allowed(peer.trust_domain(), baggage.trust_domain()) {
-                    ctx.metadata.insert(
-                        "mesh.ignored_baggage".to_string(),
-                        "trust_domain_mismatch".to_string(),
-                    );
-                    Some(peer.clone())
-                } else {
-                    Some(baggage)
+                let verdict =
+                    hbone_assertion_verdict(&self.trusted_hbone_assertors, peer, &baggage);
+                let trust_domain_ok =
+                    self.trust_domain_allowed(peer.trust_domain(), baggage.trust_domain());
+                match verdict {
+                    AssertionVerdict::UntrustedAssertor => {
+                        ctx.metadata.insert(
+                            "mesh.ignored_baggage".to_string(),
+                            "untrusted_assertor".to_string(),
+                        );
+                        Some(peer.clone())
+                    }
+                    _ if !trust_domain_ok => {
+                        ctx.metadata.insert(
+                            "mesh.ignored_baggage".to_string(),
+                            "trust_domain_mismatch".to_string(),
+                        );
+                        Some(peer.clone())
+                    }
+                    AssertionVerdict::OutOfScope => {
+                        ctx.metadata.insert(
+                            "mesh.ignored_baggage".to_string(),
+                            "assertion_out_of_scope".to_string(),
+                        );
+                        Some(peer.clone())
+                    }
+                    AssertionVerdict::Allowed => Some(baggage),
                 }
             }
             // An unauthenticated request must never have its source identity

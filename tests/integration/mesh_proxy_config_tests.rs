@@ -55,6 +55,7 @@ fn test_runtime() -> MeshRuntimeConfig {
         xds_connect_timeout_seconds: 10,
         trust_domain_aliases: Vec::new(),
         trusted_hbone_assertors: Vec::new(),
+        legacy_mesh_wide_hbone_assertion: false,
         unix_socket_allowed_roots: Vec::new(),
         unix_socket_allowed_uids: Vec::new(),
         // Workload labels — must match the ProxyConfig selector below to

@@ -2116,17 +2116,77 @@ Each entry is matched against the peer's SPIFFE id as follows:
 - **Bare service-account name** (e.g., `ztunnel`): matches any peer whose path is `<...>/sa/<name>` per the Istio convention `ns/<ns>/sa/<sa>`. Trust-domain-independent — `spiffe://cluster.local/.../sa/ztunnel` and `spiffe://partner.local/.../sa/ztunnel` both match.
 - **Full SPIFFE id** (e.g., `spiffe://cluster.local/ns/istio-system/sa/ztunnel`): exact-identity match including trust domain, namespace, and service account.
 
+#### Matching the allow-list is not sufficient (issue #4274)
+
+Matching an entry decides only WHETHER a peer may assert. A second, independent
+check decides WHAT it may assert. Before this split, a bare service-account
+entry made the whole check namespace-blind: any authenticated pod running under
+a service account named `waypoint` — in **any** namespace — could send
+`baggage: source.principal=spiffe://cluster.local/ns/prod/sa/payments` and both
+`mesh_authz` and `workload_metrics` would honor it. `ns/attacker/sa/waypoint`
+impersonating `ns/prod/sa/payments` was a complete authorization bypass, and the
+same forged header mis-attributed metrics, the service graph, spans, and access
+logs to the victim.
+
+Every allow-list entry now carries an **assertion grant**:
+
+| Entry shape | Grant | May assert |
+| --- | --- | --- |
+| `"waypoint"` (bare SA) | `same_namespace` | Identities in the peer's own Kubernetes namespace |
+| `"spiffe://td/ns/x/sa/y"` | `same_namespace` | Identities in namespace `x` |
+| `{"assertor": "<sa\|spiffe>", "asserts": ["spiffe://…", …]}` | inventory | Exactly the listed identities; `[]` authorizes nothing |
+| `{"assertor": "<sa\|spiffe>", "scope": "same_namespace"}` | `same_namespace` | Same as the string form, stated explicitly |
+| `{"assertor": "<sa\|spiffe>", "scope": "mesh_wide"}` | `mesh_wide` | Any identity that clears the trust-domain gate |
+
+`mesh_wide` is the only shape that restores the old power, it must be spelled
+out per entry, and it logs a warning at construction. Both identities must
+expose an `/ns/<ns>/` segment for `same_namespace` to hold; a peer with no
+namespace segment may assert only itself.
+
+The relation is evaluated in this order, and the first failing gate wins:
+
+1. Peer matches no entry → `untrusted_assertor`.
+2. Baggage trust domain is neither the peer's nor a `FERRUM_MESH_TRUST_DOMAIN_ALIASES` alias → `trust_domain_mismatch`.
+3. No matched entry's grant covers the asserted identity → `assertion_out_of_scope`.
+4. Otherwise the baggage identity is honored.
+
+A peer matching several entries is authorized by the **union** of the matched
+grants. An empty allow-list authorizes nothing.
+
+`mesh_authz` and `workload_metrics` consume the **same** three-way verdict from
+one shared function — a second telemetry-only predicate is exactly how forged
+baggage would reach dashboards while authz correctly rejected it. Only the
+redacted reason code is emitted; the rejected identity is attacker-controlled
+and never reaches metadata, logs, or metric labels.
+
+**Identity-backed `NodeWaypoint` needs no operator configuration for this.** A
+node waypoint legitimately fronts pods in namespaces other than its own, so the
+CP-derived `node_waypoint_assertors` inventory carries, per assertor, the exact
+workload identities that NodeWaypoint fronts (derived from the same
+scope-authorized `Workload.node_waypoint` bindings that admitted the assertor).
+Mesh injection projects each entry as
+`{"assertor": "<nodewaypoint svid>", "asserts": [...]}`, so cross-namespace
+source-node assertion keeps working while an assertor that fronts nothing
+authorizes nothing.
+
+**Legacy escape hatch.** `FERRUM_MESH_LEGACY_MESH_WIDE_HBONE_ASSERTION=true`
+(default `false`) upgrades every entry without an explicit contract to
+`mesh_wide`, restoring the pre-#4274 behavior mesh-wide. It emits a loud
+startup warning and another on every plugin construction, and it is threaded
+into **both** `mesh_authz` and `workload_metrics` so the two can never diverge.
+Use it only as a temporary bridge while pinning real assertors.
+
 Operators with Gateway-managed waypoints often run with SA names like `<gateway-name>-istio` instead of `waypoint`; override the allow-list via `FERRUM_MESH_TRUSTED_HBONE_ASSERTORS` (comma-separated, mix-and-match SA names and full SPIFFE ids):
 
 ```
 FERRUM_MESH_TRUSTED_HBONE_ASSERTORS="ztunnel,default-waypoint,spiffe://cluster.local/ns/team-a/sa/team-a-waypoint"
 ```
 
-When the env var is unset or empty, mesh injection usually uses the defaults. The exception is identity-backed `NodeWaypoint`: when the runtime has file SVID material or a mesh CA backend, Ferrum derives the trusted assertor allow-list from the CP-derived `node_waypoint_assertors` inventory, built from scope-authorized `Workload.node_waypoint.spiffe_id` values before namespace/service slice narrowing. If no NodeWaypoint assertor metadata is present, the generated allow-list is empty so HBONE baggage rewrites fail closed instead of falling back to the bare `waypoint` service-account default. To lock down baggage rewriting entirely (no peer can rewrite the authz principal), configure a `mesh_authz` global plugin override with an explicit empty list (`trusted_hbone_assertors: []`).
+When the env var is unset or empty, mesh injection usually uses the defaults. The exception is identity-backed `NodeWaypoint`: when the runtime has file SVID material or a mesh CA backend, Ferrum derives the trusted assertor allow-list from the CP-derived `node_waypoint_assertors` inventory, built from scope-authorized `Workload.node_waypoint.spiffe_id` values before namespace/service slice narrowing, each entry carrying the exact workload identities that NodeWaypoint fronts. If no NodeWaypoint assertor metadata is present, the generated allow-list is empty so HBONE baggage rewrites fail closed instead of falling back to the bare `waypoint` service-account default. To lock down baggage rewriting entirely (no peer can rewrite the authz principal), configure a `mesh_authz` global plugin override with an explicit empty list (`trusted_hbone_assertors: []`).
 
 `FERRUM_MESH_TRUST_DOMAIN_ALIASES` continues to gate the baggage identity's trust domain — both checks apply to a baggage rewrite.
 
-**Observability**: when baggage is dropped because the peer is not a trusted assertor, transaction logs surface `mesh_authz.ignored_baggage=untrusted_assertor` and `mesh_authz.ignored_baggage.untrusted_assertor=true`. If the resulting authz decision is a DENY, `mesh_authz.deny_policy` is stamped as `untrusted_assertor`. Trust-domain-mismatch diagnostics retain their existing `trust_domain_mismatch` reason.
+**Observability**: when baggage is dropped because the peer is not a trusted assertor, transaction logs surface `mesh_authz.ignored_baggage=untrusted_assertor` and `mesh_authz.ignored_baggage.untrusted_assertor=true`. If the resulting authz decision is a DENY, `mesh_authz.deny_policy` is stamped as `untrusted_assertor`. Trust-domain-mismatch diagnostics retain their existing `trust_domain_mismatch` reason. Baggage dropped because a trusted assertor is not authorized for the claimed identity uses the parallel reason `assertion_out_of_scope` (`mesh_authz.ignored_baggage.assertion_out_of_scope=true`, `mesh_authz.deny_policy=assertion_out_of_scope`, `mesh.ignored_baggage=assertion_out_of_scope` on `workload_metrics`), and NodeWaypoint ADR counters gain the matching `reason="assertion_out_of_scope"` label plus the `rejected_assertion_out_of_scope` field on the authenticated `/health` snapshot.
 
 ## RequestAuthentication
 

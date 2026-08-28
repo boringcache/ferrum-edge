@@ -42,11 +42,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
 
-use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
     MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshService, MeshTelemetryResource,
-    MeshVirtualServiceCorsPolicy, MultiClusterConfig, OutboundTrafficPolicy, PeerAuthentication,
-    ResolvedIngressListener, ServiceEntry, TrustBundleSet, Workload,
+    MeshVirtualServiceCorsPolicy, MultiClusterConfig, NodeWaypointAssertor, OutboundTrafficPolicy,
+    PeerAuthentication, ResolvedIngressListener, ServiceEntry, TrustBundleSet, Workload,
 };
 use crate::modes::mesh::revision::MeshConfigRevision;
 use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
@@ -246,7 +245,7 @@ pub enum MeshSliceCarrier {
     ConfigRevision(MeshConfigRevision),
     Workloads(Vec<Workload>),
     AmbientUdpSourceWorkloads(Vec<Workload>),
-    NodeWaypointAssertors(Vec<SpiffeId>),
+    NodeWaypointAssertors(Vec<NodeWaypointAssertor>),
     /// Cross-namespace NodeWaypoint capture destination workloads (issue #3287);
     /// see [`FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_DESTINATIONS_TYPE_URL`].
     NodeWaypointCaptureDestinations(Vec<Workload>),
@@ -1071,7 +1070,7 @@ pub fn decode_node_metadata(bytes: &[u8]) -> XdsNodeMetadata {
 mod tests {
     use super::*;
     use crate::identity::spiffe::{SpiffeId, TrustDomain};
-    use crate::modes::mesh::config::{AppProtocol, TrustBundle};
+    use crate::modes::mesh::config::{AppProtocol, NodeWaypointAssertor, TrustBundle};
 
     fn sample_trust_bundle_set() -> TrustBundleSet {
         TrustBundleSet {
@@ -1109,9 +1108,13 @@ mod tests {
             MeshSliceCarrier::ConfigRevision(MeshConfigRevision::new("db", 42)),
             MeshSliceCarrier::Workloads(Vec::new()),
             MeshSliceCarrier::AmbientUdpSourceWorkloads(Vec::new()),
-            MeshSliceCarrier::NodeWaypointAssertors(vec![
-                SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint").unwrap(),
-            ]),
+            MeshSliceCarrier::NodeWaypointAssertors(vec![NodeWaypointAssertor {
+                spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint")
+                    .unwrap(),
+                asserts: vec![
+                    SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap(),
+                ],
+            }]),
             MeshSliceCarrier::NodeWaypointCaptureDestinations(Vec::new()),
             MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(Vec::new()),
             MeshSliceCarrier::WorkloadLabels(BTreeMap::from([(
@@ -1214,9 +1217,13 @@ mod tests {
             MeshSliceCarrier::ConfigRevision(MeshConfigRevision::new("db", 42)),
             MeshSliceCarrier::Workloads(Vec::new()),
             MeshSliceCarrier::AmbientUdpSourceWorkloads(Vec::new()),
-            MeshSliceCarrier::NodeWaypointAssertors(vec![
-                SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint").unwrap(),
-            ]),
+            MeshSliceCarrier::NodeWaypointAssertors(vec![NodeWaypointAssertor {
+                spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint")
+                    .unwrap(),
+                asserts: vec![
+                    SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap(),
+                ],
+            }]),
             MeshSliceCarrier::NodeWaypointCaptureDestinations(Vec::new()),
             MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(Vec::new()),
             MeshSliceCarrier::WorkloadLabels(BTreeMap::from([(

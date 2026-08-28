@@ -1454,7 +1454,7 @@ impl CpGrpcServer {
         namespace: &str,
         allow_cross_namespace_mesh_visibility: bool,
         scope: Option<&CpScope>,
-    ) -> Vec<crate::identity::spiffe::SpiffeId> {
+    ) -> Vec<crate::modes::mesh::config::NodeWaypointAssertor> {
         node_waypoint_assertors_from_workloads(mesh.workloads.iter().filter(|workload| {
             if !allow_cross_namespace_mesh_visibility && workload.namespace != namespace {
                 return false;

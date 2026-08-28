@@ -10,10 +10,10 @@ use crate::modes::mesh::config::{
     DestinationRuleLookupTier, MeshConfig, MeshDestinationRule, MeshPolicy, MeshProxyConfig,
     MeshRequestAuthentication, MeshRuntimeOverlay, MeshService, MeshSidecar, MeshSidecarEgress,
     MeshTelemetryResource, MeshVirtualServiceCorsPolicy, MtlsMode, MultiClusterConfig,
-    OutboundTrafficPolicy, PeerAuthentication, PolicyScope, ResolvedIngressListener, ServiceEntry,
-    SidecarHostPattern, TrustBundleSet, WaypointAttachment, Workload, WorkloadLabels,
-    destination_rule_exported_to_namespace, destination_rule_lookup_tier, is_false, is_zero_usize,
-    policy_scope_applies_to_workload, policy_scope_applies_with_waypoint,
+    NodeWaypointAssertor, OutboundTrafficPolicy, PeerAuthentication, PolicyScope,
+    ResolvedIngressListener, ServiceEntry, SidecarHostPattern, TrustBundleSet, WaypointAttachment,
+    Workload, WorkloadLabels, destination_rule_exported_to_namespace, destination_rule_lookup_tier,
+    is_false, is_zero_usize, policy_scope_applies_to_workload, policy_scope_applies_with_waypoint,
     policy_target_attachment_applies_to_service, proxy_config_applies_to_workload,
     scope_applies_to_workload, service_entry_applies_to_workload,
     virtual_service_cors_policy_exported_to_namespace, workload_selector_matches,
@@ -308,13 +308,18 @@ pub struct MeshSlice {
     /// backend of the service whose waypoint terminates its HBONE datagram.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ambient_udp_source_workloads: Vec<Workload>,
-    /// Exact NodeWaypoint SPIFFE IDs trusted to assert HBONE source workload
-    /// identity for this slice. Unlike `workloads`, this inventory is derived
-    /// from scope-authorized `Workload.node_waypoint` endpoints before
-    /// namespace or service-scope narrowing so a destination slice can still
-    /// trust the source node waypoint for legitimate cross-namespace traffic.
+    /// NodeWaypoints trusted to assert HBONE source workload identity for this
+    /// slice, each carrying the exact identities it fronts. Unlike `workloads`,
+    /// this inventory is derived from scope-authorized `Workload.node_waypoint`
+    /// endpoints before namespace or service-scope narrowing so a destination
+    /// slice can still trust the source node waypoint for legitimate
+    /// cross-namespace traffic.
+    ///
+    /// The per-entry `asserts` list is the AUTHORIZATION (issue #4274): a
+    /// NodeWaypoint may assert exactly the workloads enrolled on its node and
+    /// nothing else. An entry with no fronted identities authorizes nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub node_waypoint_assertors: Vec<SpiffeId>,
+    pub node_waypoint_assertors: Vec<NodeWaypointAssertor>,
     /// Destination workloads this NodeWaypoint's transparent inbound capture
     /// listener may terminate direct plaintext for (issue #3287).
     ///
@@ -608,17 +613,34 @@ pub struct MeshEgressScopeResource {
     pub ports: Vec<u16>,
 }
 
+/// Derive the trusted NodeWaypoint assertor inventory from workload bindings.
+///
+/// Each assertor is admitted because at least one workload names it, and the
+/// identities it may assert are exactly those workloads' SPIFFE IDs — so the
+/// grant a destination data plane applies is the same forward derivation the
+/// control plane already authorized (issue #4274). Callers narrow `workloads`
+/// first; this function applies no authorization of its own.
 pub(crate) fn node_waypoint_assertors_from_workloads<'a>(
     workloads: impl IntoIterator<Item = &'a Workload>,
-) -> Vec<SpiffeId> {
-    let mut ids = BTreeMap::new();
+) -> Vec<NodeWaypointAssertor> {
+    let mut ids: BTreeMap<String, (SpiffeId, BTreeMap<String, SpiffeId>)> = BTreeMap::new();
     for workload in workloads {
         if let Some(node_waypoint) = workload.node_waypoint.as_ref() {
-            ids.entry(node_waypoint.spiffe_id.as_str().to_string())
-                .or_insert_with(|| node_waypoint.spiffe_id.clone());
+            let entry = ids
+                .entry(node_waypoint.spiffe_id.as_str().to_string())
+                .or_insert_with(|| (node_waypoint.spiffe_id.clone(), BTreeMap::new()));
+            entry
+                .1
+                .entry(workload.spiffe_id.as_str().to_string())
+                .or_insert_with(|| workload.spiffe_id.clone());
         }
     }
-    ids.into_values().collect()
+    ids.into_values()
+        .map(|(spiffe_id, asserts)| NodeWaypointAssertor {
+            spiffe_id,
+            asserts: asserts.into_values().collect(),
+        })
+        .collect()
 }
 
 /// Destination workloads a NodeWaypoint identified by `node_waypoint_spiffe_id`
@@ -5323,10 +5345,32 @@ mod tests {
             slice
                 .node_waypoint_assertors
                 .iter()
-                .map(SpiffeId::as_str)
+                .map(|assertor| assertor.spiffe_id.as_str())
                 .collect::<Vec<_>>(),
             vec![waypoint_alpha, waypoint_beta],
             "NodeWaypoint assertor inventory must include source-node assertors outside the destination namespace"
+        );
+        // Issue #4274: the inventory must also carry WHICH identities each
+        // assertor fronts, or the data plane would have to fall back to a
+        // namespace-blind "trusted peer may assert anything" rule.
+        assert_eq!(
+            slice
+                .node_waypoint_assertors
+                .iter()
+                .map(|assertor| assertor
+                    .asserts
+                    .iter()
+                    .map(SpiffeId::as_str)
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![
+                vec!["spiffe://test.local/ns/alpha/sa/client"],
+                vec![
+                    "spiffe://test.local/ns/beta/sa/ratings",
+                    "spiffe://test.local/ns/beta/sa/reviews",
+                ],
+            ],
+            "each assertor may assert exactly the workloads it fronts"
         );
     }
 
