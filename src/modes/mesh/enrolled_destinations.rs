@@ -53,7 +53,11 @@
 //!   address, contributes nothing.
 //! * Identity-based fallback exists ONLY when no registry source is configured
 //!   at all (see [`NodeLocalEnrolledDestinationsHandle`]), never per missing
-//!   entry.
+//!   entry and never per destination SHAPE. In particular a destination this
+//!   terminator can only NAME is not admitted while the registry is
+//!   authoritative: the guard never resolves a name, and the address the dial
+//!   eventually selects for it is chosen AFTER the decision, so no evidence
+//!   gathered here could still be binding at the socket.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -235,31 +239,28 @@ impl NodeLocalEnrolledDestinations {
         }));
     }
 
-    /// Whether this node currently enrolls the destination described by the
-    /// caller's evidence (issue #4249). HOT PATH: one snapshot load, no
-    /// allocation, no I/O.
+    /// Whether this node currently enrolls the destination pod at `address`
+    /// (issue #4249). HOT PATH: one snapshot load, one hash lookup, no
+    /// allocation and no I/O.
     ///
-    /// * `host` is `Some` for an inventory entry the guard matched by IP
-    ///   literal — the destination address itself must be enrolled here.
-    /// * `declared_addresses` is consulted only for an entry matched by
-    ///   DECLARED NAME. A name is never resolved by the guard (resolving it
-    ///   would produce an address that could not be attributed to this
-    ///   terminator), so the owning workload record's own declared pod
-    ///   addresses are the only node-local evidence available for it. A record
-    ///   that declares NO address — a `ServiceEntry`/`WorkloadEntry`/VM
-    ///   destination, which the node-agent never enrolls and which node-local
-    ///   enrollment simply cannot express — is left to the identity/locality
-    ///   bound rather than refused outright.
-    /// * `identity` and `pod_uid` bind the admission to the actual enrolled
-    ///   pod when both sides carry the evidence: a mismatch is a refusal. The
-    ///   node-agent publishes `spiffe_id=` optionally and the slice publishes
-    ///   `pod_uid` only for per-pod Kubernetes workloads, so an ABSENT value on
-    ///   either side leaves that particular comparison unmade instead of
-    ///   refusing an enrollment the address already proves.
+    /// `address` is the EFFECTIVE DIAL DESTINATION, not a hint: the guard only
+    /// reaches this for an inventory entry matched by IP LITERAL, and an IP
+    /// authority is relayed to verbatim, so admitting the address here admits
+    /// exactly the socket the relay opens. A destination the terminator can
+    /// only NAME never gets here — the caller refuses it outright while this
+    /// index is authoritative, because a name is resolved AFTER the decision
+    /// and could select an off-node sibling or any other address DNS returns.
+    /// See `MeshConfig::destination_is_node_local_enrolled`.
+    ///
+    /// `identity` and `pod_uid` bind the admission to the actual enrolled pod
+    /// when both sides carry the evidence: a mismatch is a refusal. The
+    /// node-agent publishes `spiffe_id=` optionally and the slice publishes
+    /// `pod_uid` only for per-pod Kubernetes workloads, so an ABSENT value on
+    /// either side leaves that particular comparison unmade instead of refusing
+    /// an enrollment the address already proves.
     pub fn terminates_for(
         &self,
-        host: Option<IpAddr>,
-        declared_addresses: &[IpAddr],
+        address: IpAddr,
         identity: Option<&str>,
         pod_uid: Option<&str>,
     ) -> bool {
@@ -267,26 +268,20 @@ impl NodeLocalEnrolledDestinations {
         if !snapshot.published {
             return false;
         }
-        let admits = |address: &IpAddr| {
-            let Some(owner) = snapshot.by_address.get(&address.to_canonical()) else {
-                return false;
-            };
-            if let Some(pod_uid) = pod_uid
-                && owner.pod_uid != pod_uid
-            {
-                return false;
-            }
-            if let (Some(required), Some(attested)) = (identity, owner.identity.as_deref())
-                && required != attested
-            {
-                return false;
-            }
-            true
+        let Some(owner) = snapshot.by_address.get(&address.to_canonical()) else {
+            return false;
         };
-        match host {
-            Some(address) => admits(&address),
-            None => declared_addresses.is_empty() || declared_addresses.iter().any(admits),
+        if let Some(pod_uid) = pod_uid
+            && owner.pod_uid != pod_uid
+        {
+            return false;
         }
+        if let (Some(required), Some(attested)) = (identity, owner.identity.as_deref())
+            && required != attested
+        {
+            return false;
+        }
+        true
     }
 }
 
@@ -294,10 +289,12 @@ impl NodeLocalEnrolledDestinations {
 /// `MeshConfig` (issue #4249).
 ///
 /// `Some` is AUTHORITATIVE: `inbound_relay_destinations` is bounded by what the
-/// node-agent currently enrolls and there is NO per-entry fallback to slice
-/// identity matching. `None` means no registry source is configured for this
-/// topology at all, which is the one case #4249's acceptance contract leaves on
-/// the identity/locality bound.
+/// node-agent currently enrolls, there is NO per-entry fallback to slice
+/// identity matching, and a declared-NAME entry — which has no address this
+/// index could ever vouch for — is refused rather than admitted on identity.
+/// `None` means no registry source is configured for this topology at all,
+/// which is the one case #4249's acceptance contract leaves on the
+/// identity/locality bound.
 ///
 /// Compared by pointer identity: this is a shared live handle, not config
 /// content, so two applies of the same serving cycle must not look different

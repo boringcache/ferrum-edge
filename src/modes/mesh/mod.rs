@@ -1650,61 +1650,43 @@ fn prepare_normalized_gateway_config_for_mesh(
         // slice-wide workload view — which is what made this terminator an
         // open relay into other nodes' pods.
         //
-        // Resolved once, ahead of the match: the own-identity arm filters on
-        // it, and the own-ADDRESS port bound below is authoritative only when
-        // it resolved (issue #4249).
+        // Resolved once, ahead of the match: the owned-workload view below is
+        // built from it, and the own-ADDRESS port bound is authoritative only
+        // when it resolved (issue #4249).
         let own_workload_identity = runtime
             .workload_spiffe_id
             .as_deref()
             .map(str::trim)
             .filter(|identity| !identity.is_empty());
-        let (inbound_relay_destinations, admits_accepted_local_address) = match runtime.topology {
-            // Own-IDENTITY terminators. Two admission sources, both narrow:
-            //
-            // 1. The accepted connection's own local address — the pod IP the
-            //    peer actually reached on this socket. A transport fact, so it
-            //    needs no inventory and works even when the slice resolved no
-            //    local identity.
-            // 2. The slice workload record(s) that ARE this proxy's own local
-            //    workload — its configured identity
-            //    (`FERRUM_MESH_WORKLOAD_SPIFFE_ID`) plus cluster and label
-            //    locality, via the shared `workload_is_local`. Ambient
-            //    is ztunnel-style: it runs OUTSIDE the workload pods' network
-            //    namespaces and terminates inbound HBONE for the pods the
-            //    node-agent enrolls on its node, dialing the destination pod's
-            //    own address (for UDP, straight into that pod's netns — see
-            //    `docs/mesh.md`, "Enrolled Ambient destination pod UDP relay").
-            //    That destination is legitimately NOT the accepted socket's
-            //    local address, so source 1 alone would break the documented
-            //    datapath. A Sidecar reaches the same records through its own
-            //    pod address, so this is a no-op there in practice.
-            //
-            // The LOCAL-workload predicate narrows source 2 to records this
-            // proxy could plausibly own: a workload the slice declares under a
-            // DIFFERENT SPIFFE — another service, or another node's pod of
-            // another service — is refused, which is the issue #4150 property,
-            // and the cluster and configured-label arms drop a cross-cluster
-            // or differently-labelled record. A blank/absent identity yields an
-            // EMPTY inventory (fail closed), leaving only the accepted local
-            // address.
-            //
-            // It is NOT a node bound, and the earlier revision of this comment
-            // was wrong to claim it excluded an off-node sibling: two replicas
-            // of ONE Deployment share a service-account SPIFFE id, a cluster,
-            // and their pod-template labels while running on different nodes.
-            // The node bound is the authoritative node-local enrolled-pod
-            // registry stamped below as
-            // `MeshConfig::inbound_relay_node_local_registry` (issue #4249) —
-            // the node-agent's own enrollment lifecycle, republished
-            // lock-free on its reconcile cadence and consulted LIVE by the
-            // guard, so a withdrawn pod leaves the admitted set within one poll
-            // rather than at the next mesh apply. Where a registry is
-            // configured it is authoritative and there is no per-entry
-            // fallback to this predicate; these records then only supply the
-            // port and declared-name evidence.
-            MeshTopology::Sidecar | MeshTopology::Ambient => {
-                let destinations = match own_workload_identity {
-                    Some(identity) => {
+        // The slice workload record(s) that ARE this proxy's own local
+        // workload: its configured identity (`FERRUM_MESH_WORKLOAD_SPIFFE_ID`)
+        // plus cluster and label locality, via the shared `workload_is_local`.
+        //
+        // The two own-pod topologies both need this view but for DIFFERENT
+        // purposes (issue #4249), which is why it is resolved once here rather
+        // than inside one match arm:
+        //
+        // * `Ambient` publishes it as the general relay inventory. It is
+        //   ztunnel-style — it runs OUTSIDE the workload pods' network
+        //   namespaces and terminates inbound HBONE for the pods the node-agent
+        //   enrols on its node, dialing the destination pod's own address (for
+        //   UDP, straight into that pod's netns; see `docs/mesh.md`, "Enrolled
+        //   Ambient destination pod UDP relay") — so its legitimate
+        //   destinations are genuinely not the accepted socket's own address.
+        // * `Sidecar` does NOT. It shares the application pod's network
+        //   namespace, so the accepted socket's local address is already a
+        //   pod-unique transport proof of every destination it may relay to;
+        //   this view only bounds the PORT of that address (and of the
+        //   own-namespace loopback shortcut).
+        //
+        // `None` means no workload identity is configured: nothing can be
+        // attributed to this terminator, so there is no ownership evidence at
+        // all — fail closed to an empty inventory, and leave the own-address
+        // port bound on its pre-#4249 declared-workload-view fallback.
+        let owned_workload_destinations: Option<Vec<config::MeshInboundRelayDestination>> =
+            match runtime.topology {
+                MeshTopology::Sidecar | MeshTopology::Ambient => {
+                    own_workload_identity.map(|identity| {
                         // Same inputs the slice builder feeds
                         // `resolve_local_workloads`, so the CP-side local view
                         // and this DP-side inventory cannot drift: the cluster
@@ -1750,11 +1732,51 @@ fn prepare_normalized_gateway_config_for_mesh(
                                     )
                             }),
                         )
-                    }
-                    None => Vec::new(),
-                };
-                (destinations, true)
-            }
+                    })
+                }
+                _ => None,
+            };
+        let (inbound_relay_destinations, admits_accepted_local_address) = match runtime.topology {
+            // A `Sidecar` runs INSIDE the application pod's network namespace.
+            // Every destination it may legitimately relay to is therefore the
+            // pod it shares that namespace with, and the accepted connection's
+            // own local address already proves that pod-uniquely — a transport
+            // fact the peer cannot choose. It needs NO multi-destination
+            // inventory, and carrying one is what let a same-SPIFFE,
+            // same-cluster, same-label sibling replica on another node be
+            // relayed to (issue #4249): those three facts are shared by every
+            // replica of one Deployment, and a Sidecar has no node-agent
+            // registry to bound them with. So the general inventory is EMPTY;
+            // the owned-workload view survives only as the own-address /
+            // loopback PORT bound stamped below.
+            MeshTopology::Sidecar => (Vec::new(), true),
+            // `Ambient` is the ztunnel-style own-identity terminator: it runs
+            // OUTSIDE the workload pods' network namespaces, so the accepted
+            // socket's local address alone cannot name the pods it terminates
+            // for and it does carry a multi-destination inventory.
+            //
+            // The LOCAL-workload predicate that built that inventory narrows it
+            // to records this proxy could plausibly own — a workload declared
+            // under a DIFFERENT SPIFFE, in another cluster, or carrying labels
+            // this workload does not have is refused — but it is NOT a node
+            // bound: two replicas of ONE Deployment share a service-account
+            // SPIFFE id, a cluster, and their pod-template labels while running
+            // on different nodes. The node bound is the authoritative
+            // node-local enrolled-pod registry stamped below as
+            // `MeshConfig::inbound_relay_node_local_registry` (issue #4249) —
+            // the node-agent's own enrollment lifecycle, republished lock-free
+            // on its reconcile cadence and consulted LIVE by the guard, so a
+            // withdrawn pod leaves the admitted set within one poll rather than
+            // at the next mesh apply. Where a registry is configured it is
+            // authoritative: an entry is relayable only while the registry
+            // enrols its destination pod at that exact address, a declared NAME
+            // is refused outright (the guard never resolves one, and the
+            // address the dial would pick is chosen afterwards), and there is
+            // NO per-entry fallback to this predicate.
+            MeshTopology::Ambient => (
+                owned_workload_destinations.clone().unwrap_or_default(),
+                true,
+            ),
             // Deliberate multi-destination allowance #1: a NodeWaypoint IS the
             // inbound terminator for every pod enrolled on its node, so those
             // pods' addresses are legitimately not its own. The inventory is the
@@ -1791,21 +1813,24 @@ fn prepare_normalized_gateway_config_for_mesh(
         // their port from the records this terminator OWNS, not from every
         // record that happens to declare the address — `hostNetwork` pods all
         // declare the node IP, so the whole-view scan admitted the union of
-        // their ports. `None` (no resolved identity, or a topology that never
-        // consults it) keeps the pre-#4249 fallback: there is no ownership
-        // evidence to narrow with, and this arm has no inventory either way.
+        // their ports. This is also what keeps a `Sidecar` serving after its
+        // general inventory was emptied above: the two own-address arms read
+        // this owned view, not `inbound_relay_destinations`. `None` (no
+        // resolved identity, or a topology that never consults it) keeps the
+        // pre-#4249 fallback: there is no ownership evidence to narrow with.
         // Assigned UNCONDITIONALLY, like the two fields below it.
-        let own_address_ports = own_workload_identity
-            .filter(|_| admits_accepted_local_address)
-            .map(|_| inbound_relay_destinations.clone());
-        // Issue #4249: the node bound for the own-identity inventory. Only the
-        // own-identity topologies consult a node-local registry — `NodeWaypoint`
-        // already takes its inventory from the CP-authorized enrolled-pod list
-        // and `ServiceWaypoint` from its bound Services — so every other
-        // topology is stamped with the unset handle rather than inheriting an
-        // installed one. Assigned UNCONDITIONALLY, like the three fields above.
+        let own_address_ports =
+            owned_workload_destinations.filter(|_| admits_accepted_local_address);
+        // Issue #4249: the node bound for `Ambient`'s multi-destination
+        // inventory, and only for it. No other topology reads a node-local
+        // registry — a `Sidecar` now carries no general inventory to bound,
+        // `NodeWaypoint` already takes its inventory from the CP-authorized
+        // enrolled-pod list, and `ServiceWaypoint` from its bound Services — so
+        // every other topology is stamped with the unset handle rather than
+        // inheriting an installed one. Assigned UNCONDITIONALLY, like the three
+        // fields above.
         let node_local_registry = match runtime.topology {
-            MeshTopology::Sidecar | MeshTopology::Ambient => {
+            MeshTopology::Ambient => {
                 enrolled_destinations::installed_node_local_enrolled_destinations()
             }
             _ => Default::default(),
@@ -13623,11 +13648,11 @@ pub async fn run(
 /// that per-pod registry exactly for the Ambient and NodeWaypoint-in-netns
 /// postures (`NodeAgentConfig::from_env_config`'s `should_publish_registry`).
 /// A `Sidecar` shares its workload pod's network namespace and no node-agent
-/// registry is ever published for it, so a registry bound there would refuse
-/// every destination rather than narrow anything; it keeps the identity /
-/// locality bound, which #4249's acceptance contract admits as the
-/// no-registry-configured fallback. Its legitimate destination is its own pod,
-/// which the accepted-local-address arm proves as a transport fact regardless.
+/// registry is ever published for it — and since issue #4249 it carries NO
+/// general relay inventory at all, so there is nothing for a registry to bound.
+/// Its only legitimate destination is its own pod, which the
+/// accepted-local-address arm proves as a transport fact, on the ports its own
+/// owned workload view declares.
 ///
 /// An operator who clears `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR` also
 /// opts out, for the same reason: there is no registry to be authoritative.
@@ -40760,7 +40785,7 @@ mod tests {
             "a same-identity sibling whose labels this workload does not carry must be refused"
         );
         // The accepted socket's own local address is admissible in principle
-        // (this arm serves a Sidecar reached at its pod IP), but on a
+        // (it is what a Sidecar reached at its pod IP rides in on), but on a
         // node-shared Ambient proxy no workload record declares the node
         // address, so the port bound refuses it anyway.
         assert_eq!(

@@ -12026,7 +12026,6 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
     const UNROUTABLE_VIP: &str = "192.0.2.41";
     const SOURCE_POD_UID: &str = "functional-udp-source-capture-pod";
     const DEST_POD_UID: &str = "functional-udp-enrolled-destination-pod";
-    const ECHO_HOST: &str = "enrolled-udp-echo.live.ferrum.test";
     let capture_port = ferrum_edge::capture::DEFAULT_UDP_OUTBOUND_PORT;
     let source = match LiveVethPod::spawn_indexed(8) {
         Ok(pod) => pod,
@@ -12102,12 +12101,21 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
     let svids = generate_two_gateway_svids(temp_b.path(), a_spiffe, b_spiffe);
     let node_a = "functional-live-udp-source-a";
     let node_b = "functional-live-udp-source-b";
-    let a_dns_overrides = format!(r#"{{"{ECHO_HOST}":"127.0.0.1"}}"#);
-    let b_dns_overrides = format!(r#"{{"{ECHO_HOST}":"{}"}}"#, destination.pod_ip());
+    // Issue #4249: the destination workload is declared by its ENROLLED POD
+    // ADDRESS, not by a DNS name. Gateway B's inbound relay guard is bounded by
+    // the node-agent registry it was given (`dest_registry`), which is
+    // authoritative for an Ambient proxy, and an authoritative registry refuses
+    // a declared NAME outright — the guard never resolves one, so nothing it
+    // checked would still bind the socket the relay opens. Declaring the pod
+    // address instead keeps this live gate proving the REAL binding end to end:
+    // B admits the CONNECT only because its registry currently enrols exactly
+    // that address for `DEST_POD_UID` under `b_spiffe`, and the same address is
+    // what the relay dials into the destination pod's netns.
+    let workload_address = destination.pod_ip().to_string();
     let cp_a = start_static_mesh_cp(live_source_capture_slice(
         node_a,
         b_spiffe,
-        ECHO_HOST,
+        &workload_address,
         VIP,
         echo_port,
         AppProtocol::Udp,
@@ -12116,7 +12124,7 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
     let cp_b = start_static_mesh_cp(live_source_capture_slice(
         node_b,
         b_spiffe,
-        ECHO_HOST,
+        &workload_address,
         VIP,
         echo_port,
         AppProtocol::Udp,
@@ -12149,7 +12157,6 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
                     "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR",
                     dest_registry.path().display().to_string(),
                 ),
-                ("FERRUM_DNS_OVERRIDES", b_dns_overrides),
             ],
         },
     ));
@@ -12158,6 +12165,23 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
         "UDP destination HBONE listener did not bind\n{}",
         captured_output(&temp_b)
     );
+
+    // Issue #4249: gateway B terminates for the enrolled destination pod but
+    // runs in the HOST netns, while the pod address gateway A now names routes
+    // into the pod's own netns. Model the node's Ambient inbound redirect so the
+    // CONNECT reaches the terminator, exactly as a real node steers
+    // `pod-ip:15008` into its ztunnel. Installed before gateway A starts and
+    // removed on drop.
+    let installed_redirect = LiveHbonePodRedirect::install(destination.pod_ip(), b_hbone_port);
+    let _hbone_pod_redirect = match installed_redirect {
+        Ok(redirect) => redirect,
+        Err(error) => {
+            skip_or_fail_live_source_capture(&format!(
+                "cannot install enrolled-destination HBONE redirect: {error}"
+            ));
+            return;
+        }
+    };
 
     // Disabled-mode negative: the same enrolled pod produces no rules and no
     // capture socket. This is an independent fixture ownership generation;
@@ -12243,7 +12267,6 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
                 ("FERRUM_MESH_CAPTURE_UDP_PORT", capture_port.to_string()),
                 ("FERRUM_MESH_IP6TABLES_ENABLED", "false".to_string()),
                 ("FERRUM_MESH_EGRESS_HBONE_PORT", b_hbone_port.to_string()),
-                ("FERRUM_DNS_OVERRIDES", a_dns_overrides),
             ],
         },
     ));
@@ -12527,6 +12550,73 @@ impl LiveVethPod {
         std::fs::write(&path, contents)
             .map_err(|error| format!("publish enrolled destination registry entry: {error}"))?;
         Ok(path)
+    }
+}
+
+/// Model a node's Ambient inbound redirect for the two-gateway live fixtures
+/// (issue #4249).
+///
+/// A real Ambient node steers traffic aimed at an enrolled pod's HBONE port
+/// into the ztunnel that terminates for that pod, before the packet ever
+/// reaches the pod. In this fixture the terminator (gateway B) runs in the HOST
+/// netns on `127.0.0.1:<hbone port>` while the enrolled pod address routes over
+/// the veth into the pod's own netns, so the same redirect is what lets the
+/// destination be named by its REGISTRY-ENROLLED ADDRESS rather than by a DNS
+/// name the inbound relay guard would (correctly) refuse.
+///
+/// Fixture-owned and exact: one `nat OUTPUT` rule scoped to a single address and
+/// the run's reserved ephemeral HBONE port, deleted on drop.
+#[cfg(target_os = "linux")]
+struct LiveHbonePodRedirect {
+    pod_ip: std::net::Ipv4Addr,
+    port: u16,
+}
+
+#[cfg(target_os = "linux")]
+impl LiveHbonePodRedirect {
+    fn install(pod_ip: std::net::Ipv4Addr, port: u16) -> Result<Self, String> {
+        let redirect = Self { pod_ip, port };
+        // Idempotent: clear any leftover from an aborted earlier run first.
+        let _ = redirect.apply("-D");
+        redirect.apply("-A")?;
+        Ok(redirect)
+    }
+
+    fn apply(&self, op: &str) -> Result<(), String> {
+        let port = self.port.to_string();
+        let args = vec![
+            "-t".to_string(),
+            "nat".to_string(),
+            op.to_string(),
+            "OUTPUT".to_string(),
+            "-p".to_string(),
+            "tcp".to_string(),
+            "-d".to_string(),
+            self.pod_ip.to_string(),
+            "--dport".to_string(),
+            port.clone(),
+            "-j".to_string(),
+            "REDIRECT".to_string(),
+            "--to-ports".to_string(),
+            port,
+        ];
+        let status = Command::new("iptables")
+            .args(&args)
+            .status()
+            .map_err(|error| format!("run iptables {op} for the HBONE pod redirect: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "iptables {op} for the HBONE pod redirect failed with {status}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LiveHbonePodRedirect {
+    fn drop(&mut self) {
+        let _ = self.apply("-D");
     }
 }
 

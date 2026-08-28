@@ -2183,37 +2183,93 @@ fn inbound_relay_ambient_registry_refuses_a_contested_enrolled_address() {
     );
 }
 
-/// Issue #4249, the boundary of what node-local enrollment can express. The
-/// guard never RESOLVES a declared name — whatever it resolved to could not be
-/// attributed to this terminator — so a record whose only address is a name
-/// (a `ServiceEntry` / `WorkloadEntry` / VM destination, and the shape the
-/// `Netns Source Capture Live Tests` gate declares) has no address the
-/// node-agent could ever enrol, and keeps the identity / locality bound.
-///
-/// A record that DOES declare pod addresses is bound by them even when the
-/// authority matched its name, so a name cannot be used to route around the
-/// registry.
+/// Issue #4249: while the registry is authoritative a DECLARED NAME is refused
+/// outright. The guard never resolves a name, and whatever address a dial would
+/// resolve it to is selected AFTER this decision — DNS may answer with an
+/// off-node sibling, or with anything else — so no evidence checked here would
+/// still bind the socket. Admitting a name because some record sharing it
+/// declares an enrolled address is exactly the union this must not perform.
 #[test]
-fn inbound_relay_ambient_registry_bounds_named_destinations_by_declared_addresses() {
+fn inbound_relay_ambient_registry_refuses_declared_name_destinations() {
     let own_spiffe = reviews_spiffe();
 
-    // The live gate's shape: an enrolled destination workload declared only by
-    // DNS name, which the relay resolves after admission on the dial path.
+    // A workload declared ONLY by DNS name — the `ServiceEntry`/`WorkloadEntry`
+    // /VM shape node-local enrollment cannot express.
     let named_only = workload_for(
         "reviews",
         DEFAULT_NAMESPACE,
         [("app", "reviews")],
         ["enrolled-echo.live.ferrum.test"],
     );
-    // A sibling declaring both a name and its own unenrolled pod address.
-    let mut named_and_addressed = workload_for(
+    // A record sharing that same name while ALSO declaring the enrolled pod
+    // address. Merging the two and admitting the name because this one is
+    // enrolled would make the name relayable even though DNS may resolve it to
+    // the other record's (unenrolled, possibly off-node) pod.
+    let mut named_and_enrolled = workload_for(
         "reviews",
         DEFAULT_NAMESPACE,
         [("app", "reviews")],
-        ["sibling-echo.live.ferrum.test", "10.244.9.9"],
+        ["enrolled-echo.live.ferrum.test", "10.244.5.5"],
     );
-    named_and_addressed.pod_uid = Some(OTHER_POD_UID.to_string());
-    let (slice, runtime) = ambient_relay_fixture(vec![named_only, named_and_addressed]);
+    named_and_enrolled.pod_uid = Some(LOCAL_POD_UID.to_string());
+    named_and_enrolled.cluster = Some("cluster-a".to_string());
+    let (slice, runtime) = ambient_relay_fixture(vec![named_only, named_and_enrolled]);
+
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+
+    let named = "enrolled-echo.live.ferrum.test";
+    // Before the registry is bound the name is admitted on the identity /
+    // locality bound alone — the documented no-registry fallback.
+    assert!(!mesh.inbound_relay_node_local_registry.is_authoritative());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision(named, 8080, node),
+        Ok(())
+    );
+
+    let enrollment = [enrolled(LOCAL_POD_UID, &own_spiffe, "10.244.5.5")];
+    bind_enrolled_registry(&mut mesh, &enrollment);
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision(named, 8080, node),
+        Err(InboundRelayDenial::UnresolvableHost),
+        "an authoritative registry must refuse a declared name outright, even when a \
+         record sharing that name declares an address this node does enrol"
+    );
+    // The enrolled ADDRESS itself stays relayable: refusing the name is not a
+    // refusal of the pod.
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+}
+
+/// Issue #4249: several workload records can declare ONE address while
+/// belonging to DIFFERENT pods (`hostNetwork` pods all declare the node IP).
+/// Inventory entries are keyed by the owning record's enrollment evidence as
+/// well as the host, so those records do not merge into one entry whose ports
+/// are their union — an unenrolled sibling cannot lend its ports to the
+/// enrolled pod's admission, and the enrolled pod's ports do not make the
+/// sibling relayable either.
+#[test]
+fn inbound_relay_ambient_registry_does_not_union_shared_address_ports() {
+    let own_spiffe = reviews_spiffe();
+
+    let mut enrolled_pod = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    enrolled_pod.ports = vec![WorkloadPort {
+        port: 8080,
+        protocol: AppProtocol::Http,
+        name: Some("http".to_string()),
+    }];
+    // Same declared address, same SPIFFE / cluster / labels, DIFFERENT pod —
+    // and a port the enrolled pod does not serve.
+    let mut unenrolled_sibling = reviews_replica("10.244.5.5", OTHER_POD_UID);
+    unenrolled_sibling.ports = vec![WorkloadPort {
+        port: 9443,
+        protocol: AppProtocol::Http,
+        name: Some("admin".to_string()),
+    }];
+    let (slice, runtime) = ambient_relay_fixture(vec![enrolled_pod, unenrolled_sibling]);
 
     let mut mesh = prepared_mesh(&slice, &runtime);
     let node = Some(ip("10.244.0.1"));
@@ -2221,27 +2277,119 @@ fn inbound_relay_ambient_registry_bounds_named_destinations_by_declared_addresse
     let enrollment = [enrolled(LOCAL_POD_UID, &own_spiffe, "10.244.5.5")];
     bind_enrolled_registry(&mut mesh, &enrollment);
 
-    let named = "enrolled-echo.live.ferrum.test";
     assert_eq!(
-        mesh.inbound_relay_destination_decision(named, 8080, node),
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
         Ok(()),
-        "a record declaring no pod address has no enrollment the registry could \
-         express; it stays on the identity / locality bound"
-    );
-    let sibling_named = "sibling-echo.live.ferrum.test";
-    assert_eq!(
-        mesh.inbound_relay_destination_decision(sibling_named, 8080, node),
-        Err(InboundRelayDenial::AddressNotTerminated),
-        "a named record that DOES declare a pod address is bound by it, so a name \
-         cannot route around the registry"
+        "the enrolled pod's own declared port stays relayable"
     );
     assert_eq!(
-        mesh.inbound_relay_destination_decision("10.244.9.9", 8080, node),
-        Err(InboundRelayDenial::AddressNotTerminated),
-        "and the same record's unenrolled address is refused directly"
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, node),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "a co-located pod this node does not enrol must not union its port into \
+         the enrolled pod's admission"
     );
 }
 
+/// Issue #4249, the `Sidecar` half. A Sidecar shares the application pod's
+/// network namespace, so the accepted socket's local address is a pod-unique
+/// transport proof of every destination it may relay to — it needs no
+/// multi-destination inventory, and carrying one admitted a same-SPIFFE,
+/// same-cluster, same-label sibling replica it has no node-agent registry to
+/// exclude. The general inventory is now EMPTY; the owned workload view
+/// survives only as the own-address / loopback port bound.
+#[test]
+fn inbound_relay_sidecar_admits_only_its_own_accepted_local_address() {
+    let own_spiffe = format!("spiffe://{DEFAULT_TRUST_DOMAIN}/ns/{DEFAULT_NAMESPACE}/sa/reviews");
+
+    let mut own = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.244.5.5"],
+    );
+    own.cluster = Some("cluster-a".to_string());
+    // Byte-for-byte the same identity, cluster and labels; another pod, on
+    // another node. `workload_is_local` cannot tell it apart.
+    let mut sibling = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.244.9.9"],
+    );
+    sibling.cluster = Some("cluster-a".to_string());
+    // A co-located pod declaring the SAME address on a port this workload does
+    // not serve — the `hostNetwork` shape.
+    let mut co_located = workload_for(
+        "ratings",
+        DEFAULT_NAMESPACE,
+        [("app", "ratings")],
+        ["10.244.5.5"],
+    );
+    co_located.cluster = Some("cluster-a".to_string());
+    co_located.ports = vec![WorkloadPort {
+        port: 9443,
+        protocol: AppProtocol::Http,
+        name: Some("admin".to_string()),
+    }];
+
+    let slice = MeshSlice {
+        node_id: "mesh-test-node".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        version: "test".to_string(),
+        workloads: vec![own, sibling, co_located],
+        multi_cluster: Some(MultiClusterConfig {
+            local_cluster: Some("cluster-a".to_string()),
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshSlice::default()
+    };
+    let runtime = MeshRuntimeConfig {
+        topology: MeshTopology::Sidecar,
+        workload_spiffe_id: Some(own_spiffe),
+        workload_labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+        ..default_mesh_runtime()
+    };
+
+    let mesh = prepared_mesh(&slice, &runtime);
+    assert!(
+        mesh.inbound_relay_destinations.is_empty(),
+        "a Sidecar terminates only for the pod whose netns it shares, so it carries \
+         no multi-destination inventory"
+    );
+    assert!(mesh.inbound_relay_admits_accepted_local_address);
+
+    // The peer reached this pod at its own address, on this socket.
+    let own_ip = Some(ip("10.244.5.5"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, own_ip),
+        Ok(()),
+        "the accepted local address stays admissible on a port this pod declares"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("127.0.0.1", 8080, own_ip),
+        Ok(()),
+        "the own-namespace loopback shortcut is bounded by the same owned records"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "a co-located hostNetwork sibling's port must not widen the own-address bound"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("localhost", 9443, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "nor the loopback shortcut"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.9.9", 8080, own_ip),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a same-SPIFFE, same-cluster, same-label sibling replica is not this \
+         Sidecar's destination"
+    );
+    // ...and a Sidecar never installs a node-local registry, because it has no
+    // inventory for one to bound.
+    assert!(!mesh.inbound_relay_node_local_registry.is_authoritative());
+}
 
 /// Issue #4251: a `ServiceWaypoint` is the L7 terminator for the services bound
 /// to it. The slice's own workload narrowing is only NAMESPACE-level (the

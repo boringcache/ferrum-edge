@@ -2362,9 +2362,11 @@ pub fn is_udp_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig)
 /// for — its own pod (proved by `terminator_local_ip`, the accepted
 /// connection's own local address) plus a narrow slice-derived inventory for
 /// the topologies that legitimately terminate for a workload other than the
-/// pod the proxy runs in (`Sidecar` / `Ambient` own-identity workload records,
-/// `NodeWaypoint` enrolled pods, `ServiceWaypoint` waypoint-bound backing
-/// workloads). Being declared ANYWHERE in the slice is deliberately not
+/// pod the proxy runs in (`Ambient` own-identity workload records, bounded to
+/// what this node's agent currently enrols; `NodeWaypoint` enrolled pods;
+/// `ServiceWaypoint` waypoint-bound backing workloads — a `Sidecar` shares its
+/// pod's netns and carries no such inventory). Being declared ANYWHERE in the
+/// slice is deliberately not
 /// enough: relaying to another node's workload would dial that pod in
 /// plaintext from this pod's IP, skipping the destination's own
 /// `AuthorizationPolicy` set and arriving as a trusted-looking unauthenticated

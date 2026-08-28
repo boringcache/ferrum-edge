@@ -4593,9 +4593,9 @@ pub struct MeshConfig {
     /// topologies legitimately terminate for a workload other than the pod the
     /// proxy runs in, and only those three populate this vector:
     ///
-    /// * `Sidecar` / `Ambient` — the slice workload record(s) this proxy's own
-    ///   workload identity (`FERRUM_MESH_WORKLOAD_SPIFFE_ID`) resolves to under
-    ///   the shared LOCAL-workload predicate
+    /// * `Ambient` — the slice workload record(s) this proxy's own workload
+    ///   identity (`FERRUM_MESH_WORKLOAD_SPIFFE_ID`) resolves to under the
+    ///   shared LOCAL-workload predicate
     ///   (`crate::modes::mesh::slice::workload_is_local`): same SPIFFE, same
     ///   cluster, and a non-vacuous match against
     ///   `FERRUM_MESH_WORKLOAD_LABELS` when those are configured.
@@ -4613,11 +4613,19 @@ pub struct MeshConfig {
     ///   different nodes. The node bound is
     ///   [`Self::inbound_relay_node_local_registry`] (issue #4249) — when a
     ///   node-agent pod registry is configured, each entry is relayable only
-    ///   while that registry currently enrols its destination pod, checked
-    ///   live on the guard path so pod churn cannot leave a stale admission.
-    ///   The predicate above then only decides which records supply the port
-    ///   and name evidence. Identity/label matching is the sole bound ONLY
-    ///   when no registry source is configured at all.
+    ///   while that registry currently enrols its destination pod AT THAT
+    ///   EXACT ADDRESS, checked live on the guard path so pod churn cannot
+    ///   leave a stale admission; a declared NAME is refused outright. The
+    ///   predicate above then only decides which records supply the port
+    ///   evidence. Identity/label matching is the sole bound ONLY when no
+    ///   registry source is configured at all.
+    /// * `Sidecar` — NOTHING (issue #4249). It runs inside the application
+    ///   pod's own network namespace, so the accepted socket's local address is
+    ///   already a pod-unique transport proof of every destination it may
+    ///   relay to; a multi-destination inventory there could only ADD
+    ///   same-identity siblings it has no registry to exclude. Its owned
+    ///   workload view survives as [`Self::inbound_relay_own_address_ports`]
+    ///   alone.
     /// * `NodeWaypoint` — the CP-authorized pods enrolled on THIS node, taken
     ///   from [`Self::node_waypoint_capture_destinations`].
     /// * `ServiceWaypoint` — the workloads that actually BACK one of the
@@ -4627,7 +4635,7 @@ pub struct MeshConfig {
     ///   VISIBLE in the waypoint's namespaces — the slice's namespace-level
     ///   narrowing — is no longer admitted.
     ///
-    /// `Sidecar` / `Ambient` ALSO set
+    /// `Sidecar` / `Ambient` set
     /// [`Self::inbound_relay_admits_accepted_local_address`], because the pod
     /// IP the peer actually reached is a transport fact no inventory is needed
     /// for. `EastWestGateway` (SNI passthrough) and `EgressGateway` (external
@@ -4668,6 +4676,11 @@ pub struct MeshConfig {
     /// ports on that address. An address absent from this inventory is not
     /// port-declared and the own-address / loopback arms refuse it.
     ///
+    /// On `Sidecar` this is the ONLY surviving projection of the owned
+    /// workload view: [`Self::inbound_relay_destinations`] is empty there, so
+    /// emptying it without keeping this would refuse every legitimate own-pod
+    /// port.
+    ///
     /// `None` means this generation resolved NO ownership evidence at all — no
     /// workload identity is configured, so no record can be attributed to this
     /// terminator and there is nothing narrower than the declared workload view
@@ -4685,22 +4698,24 @@ pub struct MeshConfig {
     /// The authoritative node-local enrolled-pod registry bounding
     /// [`Self::inbound_relay_destinations`] (issue #4249).
     ///
-    /// Set for the own-identity topologies (`Sidecar` / `Ambient`) whenever a
-    /// node-agent pod registry is configured for this serving cycle. When it
-    /// is set it is AUTHORITATIVE: an inventory entry is relayable only while
-    /// the node-agent currently enrols the destination pod, and a missing
-    /// registry entry NEVER falls back to slice identity matching. The index
-    /// is republished on the node-agent's own reconcile cadence, so a
-    /// withdrawn pod leaves the admitted set within one poll interval rather
-    /// than at the next mesh apply.
+    /// Set for `Ambient` — the one topology that carries a multi-destination
+    /// inventory of pods it does not share a netns with — whenever a node-agent
+    /// pod registry is configured for this serving cycle. When it is set it is
+    /// AUTHORITATIVE: an inventory entry is relayable only while the node-agent
+    /// currently enrols the destination pod at the entry's own IP, a
+    /// declared-NAME entry is refused outright (the guard never resolves a
+    /// name, and the address a dial would resolve it to is chosen after this
+    /// decision), and a missing registry entry NEVER falls back to slice
+    /// identity matching. The index is republished on the node-agent's own
+    /// reconcile cadence, so a withdrawn pod leaves the admitted set within one
+    /// poll interval rather than at the next mesh apply.
     ///
-    /// Unset means no registry source is configured at all — a `Sidecar`,
-    /// which shares its workload pod's network namespace and has no node-agent
-    /// registry, or an operator who cleared
-    /// `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`. That is the only case
-    /// #4249's acceptance contract leaves on the identity/locality bound, and
-    /// it is also the state for every non-own-identity topology, which never
-    /// consults it.
+    /// Unset means no registry source is configured at all — an operator who
+    /// cleared `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`. That is the only
+    /// case #4249's acceptance contract leaves on the identity/locality bound.
+    /// It is also the state for every other topology: `Sidecar` has no general
+    /// inventory to bound, and the two waypoints take theirs from the CP.
+    /// None of them consult it.
     ///
     /// A live handle rather than config content: `serde(skip)` like the two
     /// fields above, and compared by pointer identity so a republished
@@ -4723,7 +4738,7 @@ pub struct MeshInboundRelayDestination {
     /// Declared application ports, sorted and deduplicated. Empty ⇒ the owning
     /// record declares none and does not constrain the port.
     pub ports: Vec<u16>,
-    /// What the node-local enrolled-pod registry must currently vouch for
+    /// Which enrolled pod the node-local registry must currently vouch for
     /// before this entry may be relayed to (issue #4249). Ignored entirely
     /// when no registry is authoritative for this proxy
     /// ([`MeshConfig::inbound_relay_node_local_registry`]).
@@ -4735,22 +4750,19 @@ pub struct MeshInboundRelayDestination {
 /// node-agent actually enrolls rather than to a SPIFFE identity, a cluster, or
 /// a label set that every replica of a Deployment shares (issue #4249).
 ///
+/// It is part of the inventory entry's IDENTITY, not a payload: two records
+/// that declare one address but belong to DIFFERENT pods keep separate entries
+/// (see [`inbound_relay_destinations_from_workloads`]), so neither can union
+/// its ports into the other's admission.
+///
 /// Built once per mesh apply; the guard only compares it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MeshRelayEnrollmentEvidence {
-    /// Canonical IP addresses the owning record(s) declare, sorted and
-    /// deduplicated. For a [`MeshInboundRelayHost::Ip`] entry the guard checks
-    /// the matched address itself, so this matters only for a DECLARED NAME
-    /// entry: the name is never resolved, so the record's own addresses are the
-    /// only node-local evidence it has. EMPTY means the record declares no
-    /// address at all (a `ServiceEntry`/`WorkloadEntry`/VM destination the
-    /// node-agent never enrolls), which node-local enrollment cannot express.
-    pub declared_addresses: Vec<std::net::IpAddr>,
-    /// SPIFFE identity the owning record(s) carry, when they agree on one.
-    /// Compared against the node-agent's attested identity for the enrolled
-    /// pod when BOTH sides published one.
+    /// SPIFFE identity the owning record carries. Compared against the
+    /// node-agent's attested identity for the enrolled pod when BOTH sides
+    /// published one.
     pub identity: Option<String>,
-    /// Kubernetes pod UID the owning record(s) declare, when they agree on one.
+    /// Kubernetes pod UID the owning record declares, when it declares one.
     /// Compared against the registry key, which is the strongest available
     /// binding to the exact enrolled pod.
     pub pod_uid: Option<String>,
@@ -4825,19 +4837,15 @@ pub fn inbound_relay_destinations_from_workloads<'a>(
     for workload in workloads {
         // The owning record's own node-local enrollment evidence (issue
         // #4249), computed once per record rather than per declared address.
-        let declared_addresses: Vec<std::net::IpAddr> = workload
-            .addresses
-            .iter()
-            .filter_map(|address| address.parse::<std::net::IpAddr>().ok())
-            .map(|address| address.to_canonical())
-            .collect();
-        let identity = Some(workload.spiffe_id.as_str().to_string());
-        let pod_uid = workload
-            .pod_uid
-            .as_deref()
-            .map(str::trim)
-            .filter(|uid| !uid.is_empty())
-            .map(str::to_string);
+        let enrollment = MeshRelayEnrollmentEvidence {
+            identity: Some(workload.spiffe_id.as_str().to_string()),
+            pod_uid: workload
+                .pod_uid
+                .as_deref()
+                .map(str::trim)
+                .filter(|uid| !uid.is_empty())
+                .map(str::to_string),
+        };
         for address in &workload.addresses {
             let host = match address.parse::<std::net::IpAddr>() {
                 Ok(address) => MeshInboundRelayHost::Ip(address.to_canonical()),
@@ -4852,43 +4860,32 @@ pub fn inbound_relay_destinations_from_workloads<'a>(
             let ports: Vec<u16> = workload.ports.iter().map(|port| port.port).collect();
             // Index lookup, not `iter_mut().find()`: the mutable borrow would
             // otherwise still be live in the insert arm.
+            //
+            // Keyed on the ENROLLMENT EVIDENCE as well as the host (issue
+            // #4249). Several records can back ONE pod — several Services on
+            // the same workload — and those agree on identity and pod UID, so
+            // they still collapse into a single entry whose ports are their
+            // union. Records belonging to DIFFERENT pods that happen to declare
+            // one address (`hostNetwork` pods all declare the node IP) stay
+            // SEPARATE entries rather than merging into one whose evidence had
+            // to be collapsed: each is then admitted, or refused, on its own
+            // node-local enrollment, so an unenrolled sibling can never union
+            // its ports into another pod's admission.
             let existing = destinations
                 .iter()
-                .position(|existing| existing.host == host);
+                .position(|existing| existing.host == host && existing.enrollment == enrollment);
             let Some(index) = existing else {
                 destinations.push(MeshInboundRelayDestination {
                     host,
                     ports,
-                    enrollment: MeshRelayEnrollmentEvidence {
-                        declared_addresses: declared_addresses.clone(),
-                        identity: identity.clone(),
-                        pod_uid: pod_uid.clone(),
-                    },
+                    enrollment: enrollment.clone(),
                 });
                 continue;
             };
-            // Several records can back one pod (several Services on the same
-            // workload). Admit the UNION of their declared ports, and let a
-            // record that declares none leave the address unconstrained —
-            // exactly the rule a single record follows.
+            // Same pod, another Service record: admit the UNION of their
+            // declared ports, and let a record that declares none leave the
+            // address unconstrained — exactly the rule a single record follows.
             let existing = &mut destinations[index];
-            // Enrollment evidence merges the OTHER way: the address union
-            // grows (any one of them proving node-local enrollment is what a
-            // declared-name entry needs), while identity and pod UID collapse
-            // to `None` the moment two records disagree, because no single
-            // value can then be required. Collapsing loses a comparison; it
-            // never admits an address the registry does not enrol.
-            for address in &declared_addresses {
-                if !existing.enrollment.declared_addresses.contains(address) {
-                    existing.enrollment.declared_addresses.push(*address);
-                }
-            }
-            if existing.enrollment.identity != identity {
-                existing.enrollment.identity = None;
-            }
-            if existing.enrollment.pod_uid != pod_uid {
-                existing.enrollment.pod_uid = None;
-            }
             if existing.ports.is_empty() {
                 continue;
             }
@@ -4905,7 +4902,6 @@ pub fn inbound_relay_destinations_from_workloads<'a>(
     }
     for destination in &mut destinations {
         destination.ports.sort_unstable();
-        destination.enrollment.declared_addresses.sort_unstable();
     }
     destinations.sort();
     destinations
@@ -4989,10 +4985,11 @@ impl MeshConfig {
     /// 3. **[`Self::inbound_relay_destinations`]** — the deliberate, narrow
     ///    multi-destination allowance for the topologies that are MEANT to
     ///    terminate for a workload other than the pod the proxy runs in
-    ///    (`Sidecar` / `Ambient` LOCAL workload records, additionally bounded
-    ///    to the pods this node's agent currently enrols whenever a registry
-    ///    is configured; `NodeWaypoint` enrolled pods; `ServiceWaypoint`
-    ///    workloads backing its bound services).
+    ///    (`Ambient` LOCAL workload records, additionally bounded to the pods
+    ///    this node's agent currently enrols whenever a registry is
+    ///    configured; `NodeWaypoint` enrolled pods; `ServiceWaypoint`
+    ///    workloads backing its bound services). EMPTY on `Sidecar`, which
+    ///    shares its pod's netns and needs only arms 1 and 2.
     ///    An entry is matched by IP when the authority is an IP literal and by
     ///    verbatim (case-insensitive) name when it is not; a name is never
     ///    resolved here, so this cannot reach anything the inventory does not
@@ -5083,11 +5080,13 @@ impl MeshConfig {
     ///
     /// Issue #4249: when a node-local enrolled-pod registry is authoritative
     /// ([`Self::inbound_relay_node_local_registry`]) an entry is considered
-    /// only while the node-agent currently enrols its destination pod. That
+    /// only while the node-agent currently enrols its destination pod at the
+    /// entry's own IP; a declared-NAME entry is never considered at all. That
     /// check runs BEFORE the entry can mark the host as terminated here, so an
     /// off-node or unenrolled record — including a sibling replica sharing
     /// this proxy's SPIFFE, cluster, and labels — refuses as
-    /// `AddressNotTerminated` rather than `PortNotDeclared`.
+    /// `AddressNotTerminated` (and a name as `UnresolvableHost`) rather than
+    /// `PortNotDeclared`.
     fn inbound_relay_inventory_decision(
         &self,
         host: &str,
@@ -5129,13 +5128,15 @@ impl MeshConfig {
     /// `destination` (issue #4249).
     ///
     /// `true` unconditionally when no registry is authoritative for this proxy
-    /// — the `Sidecar`/no-registry fallback and every topology whose inventory
-    /// is not registry-derived (`NodeWaypoint`'s enrolled-pod list already
-    /// comes from the CP; `ServiceWaypoint`'s comes from its bound Services).
+    /// — the no-registry-configured fallback, and every topology whose
+    /// inventory is not registry-derived (`Sidecar` carries none at all;
+    /// `NodeWaypoint`'s enrolled-pod list already comes from the CP;
+    /// `ServiceWaypoint`'s comes from its bound Services).
     ///
-    /// Otherwise the destination must be one the node-agent enrols HERE, bound
-    /// to the enrolled pod's own identity and UID where both sides publish
-    /// them. Hot path: one `ArcSwap` snapshot load and a hash lookup, no
+    /// Otherwise the destination must be an IP the node-agent enrols HERE,
+    /// bound to the enrolled pod's own identity and UID where both sides
+    /// publish them, and a destination this terminator can only NAME is refused
+    /// outright. Hot path: one `ArcSwap` snapshot load and a hash lookup, no
     /// allocation and no filesystem access — the per-CONNECT registry scan
     /// `hbone_proxy` performs on the DIAL path is explicitly not acceptable
     /// here.
@@ -5146,13 +5147,18 @@ impl MeshConfig {
         let Some(index) = self.inbound_relay_node_local_registry.index() else {
             return true;
         };
-        let host = match &destination.host {
-            MeshInboundRelayHost::Ip(declared) => Some(*declared),
-            MeshInboundRelayHost::Name(_) => None,
+        // A DECLARED NAME is refused outright while the registry is
+        // authoritative. The guard never resolves a name, and the address the
+        // relay eventually dials for it is selected AFTER this decision — DNS
+        // may answer with an off-node sibling, or with anything else — so no
+        // evidence checked here would still bind the socket. Admitting a name
+        // because some record that shares it declares an enrolled address is
+        // exactly the union this must not perform.
+        let MeshInboundRelayHost::Ip(address) = &destination.host else {
+            return false;
         };
         index.terminates_for(
-            host,
-            &destination.enrollment.declared_addresses,
+            *address,
             destination.enrollment.identity.as_deref(),
             destination.enrollment.pod_uid.as_deref(),
         )
