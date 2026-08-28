@@ -1773,8 +1773,8 @@ fn inbound_relay_admits_only_the_waypoint_termination_inventory() {
         Err(InboundRelayDenial::AddressNotTerminated)
     );
 
-    // Loopback in the inventory itself is a real termination target (the
-    // functional waypoint suite declares `127.0.0.1`).
+    // Inventory data cannot make the waypoint/host network namespace's
+    // loopback address into a workload termination target.
     let loopback_mesh = MeshConfig {
         inbound_relay_destinations: inbound_relay_destinations_from_workloads(&[
             relay_guard_workload("loopback-app", &["127.0.0.1"], &[8080]),
@@ -1783,6 +1783,10 @@ fn inbound_relay_admits_only_the_waypoint_termination_inventory() {
     };
     assert_eq!(
         loopback_mesh.inbound_relay_destination_decision("127.0.0.1", 8080, waypoint),
-        Ok(())
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+    assert_eq!(
+        loopback_mesh.inbound_relay_destination_decision("::1", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated)
     );
 }

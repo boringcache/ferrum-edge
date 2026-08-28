@@ -4835,10 +4835,9 @@ impl MeshConfig {
     ///    terminators and only on a port this pod's own workload record
     ///    declares. A `NodeWaypoint` / `ServiceWaypoint` does not get that
     ///    shortcut — they run outside the destination pods' network
-    ///    namespaces — but they MAY still relay to loopback when that
-    ///    address is itself in [`Self::inbound_relay_destinations`] (the
-    ///    functional waypoint suite declares `127.0.0.1` as the workload
-    ///    address).
+    ///    namespaces. Loopback is refused even when it appears in
+    ///    [`Self::inbound_relay_destinations`], because dialing it would reach
+    ///    the waypoint's network namespace rather than the destination pod.
     /// 3. **[`Self::inbound_relay_destinations`]** — the deliberate, narrow
     ///    multi-destination allowance for the topologies that are MEANT to
     ///    terminate for a workload other than the pod the proxy runs in
@@ -4895,14 +4894,11 @@ impl MeshConfig {
                     Err(InboundRelayDenial::PortNotDeclared)
                 };
             }
-            if parsed.is_none() {
-                // `localhost` is a resolver alias, never a declared workload
-                // address, so a terminator without the own-namespace shortcut
-                // has nothing to match it against.
-                return Err(InboundRelayDenial::AddressNotTerminated);
-            }
-            // Fall through: a waypoint/node may still terminate for
-            // 127.0.0.1 / ::1 when that address is in its inventory.
+            // A waypoint runs outside the destination workload's network
+            // namespace. Never let its inventory turn loopback into a relay
+            // target, because the backend dial would reach the waypoint (or
+            // host) namespace instead of that workload.
+            return Err(InboundRelayDenial::AddressNotTerminated);
         }
 
         // Canonicalize so `::ffff:10.1.2.3` and `10.1.2.3`, and the several
