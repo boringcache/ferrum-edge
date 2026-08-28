@@ -2,6 +2,68 @@
 
 This document describes how to safely upgrade Ferrum Edge between versions with zero data loss and a clear rollback path. The approach varies by operating mode, but the core principle is the same: **validate the new version against a copy of your data before cutting over production traffic.**
 
+## Breaking Changes Since 0.9.0
+
+Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
+
+### `hmac_auth` v2 nonce / client rollout and DPoP replay protection (issues [#3834](https://github.com/ferrum-edge/ferrum-edge/issues/3834) / [#3837](https://github.com/ferrum-edge/ferrum-edge/issues/3837))
+
+**Silent HMAC outage.** `hmac_auth` now defaults to **`ferrum-hmac-v2`**. Version 2 requires a client-generated `nonce` in the `Authorization: hmac …` parameters and binds it into the signing base:
+
+```text
+ferrum-hmac-v2\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST}\n{NONCE}
+```
+
+The profile version is the first field and the nonce is the last, so a v1 signature can never verify as v2. Every unmodified HMAC client starts getting `401` at cutover. The nonce must be base64url-unpadded or hex, carry at least 128 bits of entropy (22 base64url or 32 hex characters), and be at most 86 characters. A verbatim transport retry **is** a replay and is rejected with `401`; a client that needs safe retries sends a fresh nonce with a recomputed signature.
+
+`hmac_auth` also requires an explicit **`replay_scope`** (`process` or `shared`) whenever the v2 profile is active. There is no default: a gateway cannot observe its own replica count. A missing `replay_scope` is refused at admission. `clock_skew_seconds` is bounded at **300**. The configuration root is a closed key set (`clock_skew_seconds`, `signing_profile`, `allow_unsafe_replayable_v1`, `replay_scope`, `replay_max_entries`, plus the shared Redis fields); a misspelled key is refused. `require_digest` stays removed; digests remain mandatory.
+
+**Operator action (HMAC):** roll clients to send and sign a v2 nonce **before** cutover; add `"replay_scope": "process"` (single process) or `"replay_scope": "shared"` with `sync_mode: "redis"` and a `redis_url` (multi-replica, including a rolling deploy) to every `hmac_auth` config; lower any `clock_skew_seconds` above 300.
+
+To defer the client change, select the legacy freshness-only profile with **both** `signing_profile: "ferrum-hmac-v1"` and `allow_unsafe_replayable_v1: true`. Plugin admission in `src/plugins/hmac_auth.rs` and [hmac_auth in plugins.md](plugins.md#hmac_auth) require that pair; `signing_profile` alone is refused. That profile accepts neither `replay_scope` nor a Redis backend, has no single-use guarantee (a captured valid request replays verbatim for the whole freshness window), **rejects** a `nonce` parameter rather than ignoring it, and increments `legacy_unsafe_profile_accepted`. Do not use it on non-idempotent routes.
+
+**DPoP / `jwks_auth` as shipped.** Both admission controls claim each proof exactly once through one shared, fail-closed replay authority:
+
+- Every `jwks_auth` provider with `require_dpop: true` needs an explicit `providers[].dpop_replay_scope` (`process` or `shared`) and a nonblank exact `issuer` (the replay realm). `dpop_replay_scope` is rejected when `require_dpop` is false.
+- `dpop_jti_ttl_secs` and `dpop_jti_cache_max_entries` were **removed**. Retention is a fixed 601-second horizon; capacity is `providers[].dpop_replay_max_entries`. Configs that still carry the removed keys are rejected with the replacement named.
+- Equivalent DPoP providers that share a replay domain must declare the same `dpop_replay_scope` and the same process-scope cap. A mixed process/shared pair is refused even when Redis is configured. Providers that share one exact issuer share one realm and must agree on `require_dpop` (a non-DPoP sibling is a bearer-only bypass).
+- Any deployment running more than one gateway replica behind a load balancer — including a rolling deployment — must declare `shared` scope and provision Redis via `sync_mode: "redis"`. `process` scope in a multi-replica deployment means one replay per replica. There is no fallback between scopes: a shared-backend timeout, partition, authentication failure, capacity failure, proven-unsupported topology, or proven-unsafe Redis eviction policy (`allkeys-*` / `volatile-*`) refuses the protected request. Replay Redis clients accept a connection only when `INFO MEMORY` proves `maxmemory == 0` or `maxmemory_policy == noeviction`.
+- Authenticated `/health` and `/status` fail readiness (`status: "unavailable"`) while a live policy's shared backend is unavailable, and publish a bounded `replay_authority` aggregate; recovery restores readiness with no restart. See [admin_api.md](admin_api.md).
+
+**Operator action (DPoP):** add `dpop_replay_scope` to every `require_dpop` provider, declare a nonblank exact `issuer` on those providers, and drop `dpop_jti_ttl_secs` / `dpop_jti_cache_max_entries`.
+
+### WAF custom `match_kind: literal` is now case-sensitive (issue [#3937](https://github.com/ferrum-edge/ferrum-edge/issues/3937))
+
+`literal` was compiled with `(?i)` exactly like `contains`, so a rule spelled `pattern: EVIL-LITERAL` also blocked `evil-literal`, and there was no way to express a case-sensitive literal match. `literal` is now a case-sensitive Unicode substring; `contains` keeps the folded substring semantics and `equals` keeps the folded anchored match. A pre-existing `literal` rule that relied on the accidental folding **silently stops matching** other spellings — there is no config-load error.
+
+**Operator action:** audit every custom `match_kind: literal` rule; change it to `contains` to keep the old folded substring behavior, or to `regex` with an explicit `(?i)` prefix for partial folding. Metacharacters stay escaped under both `literal` and `contains`. See the `match_kind` table in [waf.md](waf.md).
+
+### Untrusted `X-Forwarded-For` is no longer forwarded to backends (issue [#4034](https://github.com/ferrum-edge/ferrum-edge/issues/4034))
+
+With the default empty `FERRUM_TRUSTED_PROXIES`, Ferrum already ignored a client-supplied XFF chain for its own `client_ip` resolution, but the outbound request still carried that spoofable chain with the socket peer appended (`spoofed, peer`). Backends that trust the leftmost hop therefore saw an attacker-injected address. Outbound XFF now matches [client_ip_resolution.md](client_ip_resolution.md): an untrusted peer (including every peer when the trust list is empty) produces `peer` only; a trusted peer still has its inbound chain honored and appended to. The same drop applies to `X-Real-IP` on untrusted peers (Ferrum never regenerates that header). RFC 7239 `Forwarded` is unchanged: when `FERRUM_ADD_FORWARDED_HEADER=true` it is still regenerated from the resolved client IP; when false, pass-through remains the operator contract from issue #2952.
+
+This changes what every backend observes, with no error surface.
+
+**Operator action:** if a backend depended on seeing client-supplied XFF hops in front of an untrusted Ferrum, add the connecting peer to `FERRUM_TRUSTED_PROXIES` so Ferrum will honor and append that chain; otherwise configure the backend to trust only the rightmost hop (Ferrum's socket peer).
+
+### `POST /batch` rejects unknown top-level envelope keys (issue [#4042](https://github.com/ferrum-edge/ferrum-edge/issues/4042))
+
+`POST /batch` is create-only (`consumers`, `upstreams`, `proxies`, `plugin_configs`). Sending `updates`, `deletes`, or `dry_run` previously returned `201` and created only the resource arrays while silently ignoring the other keys. Unknown envelope keys now return `400`. `GET /backup` metadata (`version`, `ferrum_version`, `exported_at`, `source`, `counts`) and the backup-only `api_specs` / `gateway_trust_bundles` sections remain accepted and ignored so a backup file is still a valid additive import. See [admin_api.md](admin_api.md) and [admin_backup_restore.md](admin_backup_restore.md).
+
+**Operator action:** stop sending unimplemented mutation verbs on `/batch`; use per-resource PUT/DELETE or `POST /restore` for replacement.
+
+### File/DP `POST /restore` returns `503` instead of `403` (issue [#4027](https://github.com/ferrum-edge/ferrum-edge/issues/4027))
+
+Restore requires a database. File and data-plane mode now answer `{"error":"No database"}` with `503`, matching [admin_backup_restore.md](admin_backup_restore.md). Other file-mode writes still return `403` `{"error":"Admin API is in read-only mode"}`. Database mode with `FERRUM_ADMIN_READ_ONLY=true` still returns that `403` for restore.
+
+**Operator action:** match file/DP restore unavailability on `503` / `No database`, not on the generic read-only `403`.
+
+### `DELETE /consumers/{id}` returns 409 while `access_control.allowed_consumers` still names the username (issue [#4045](https://github.com/ferrum-edge/ferrum-edge/issues/4045))
+
+The previous 204 left live plugin configs authorizing an identity that no longer exists. Ferrum now scans `access_control` plugin configs in the same namespace and refuses the delete with `{"error":"Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"}`. Plugin configs are not rewritten. A consumer named only in `disallowed_consumers` can still be deleted. See [admin_api.md](admin_api.md).
+
+**Operator action:** remove or edit the username in those plugin configs, then retry.
+
 ## Database Mode (`FERRUM_MODE=database`)
 
 This is the most involved upgrade because schema migrations may alter your database. The strategy is: clone the database, migrate the clone, validate with the new binary, then cut over.
@@ -789,7 +851,7 @@ FERRUM_MODE=file \
 
 ### Pre-Upgrade Checklist
 
-- [ ] Read the release notes for breaking changes, deprecated fields, and new required fields
+- [ ] Read [Breaking Changes Since 0.9.0](#breaking-changes-since-090) and the release notes for breaking changes, deprecated fields, and new required fields
 - [ ] Back up your database (database/CP modes) or config file (file mode)
 - [ ] Back up your `ferrum.conf` if you use one — new versions may add env vars with different defaults
 - [ ] Use `GET /backup` to capture a logical config snapshot (database/CP modes)
