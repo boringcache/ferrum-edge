@@ -1189,6 +1189,36 @@ pub mod _test_support {
         crate::service_discovery::consul::parse_consul_index_header(headers)
     }
 
+    /// Admit one RFC 2782 SRV RR the way [`crate::dns::DnsCache::resolve_srv`]
+    /// does (issue #4291): drop the root target and port 0.
+    pub fn try_srv_answer_for_test(
+        target: &str,
+        port: u16,
+        weight: u16,
+        priority: u16,
+    ) -> Option<crate::dns::SrvAnswer> {
+        crate::dns::try_srv_answer(target, port, weight, priority)
+    }
+
+    /// Map SRV answers into DNS-SD upstream targets (issue #4291).
+    ///
+    /// `records` are `(host, port, weight, priority)` — the same field order
+    /// `DnsCache::resolve_srv` used before it returned [`crate::dns::SrvAnswer`].
+    pub fn dns_sd_targets_from_srv_records_for_test(
+        records: Vec<(String, u16, u16, u16)>,
+        default_weight: u32,
+    ) -> Vec<crate::config::types::UpstreamTarget> {
+        let answers = records.into_iter().map(|(host, port, weight, priority)| {
+            crate::dns::SrvAnswer {
+                host,
+                port,
+                weight,
+                priority,
+            }
+        });
+        crate::service_discovery::dns_sd::targets_from_srv_records(answers, default_weight)
+    }
+
     /// Mutable discovery-loop state used by the production apply pipeline.
     #[derive(Debug, Default)]
     pub struct DiscoveryLoopStateForTest {

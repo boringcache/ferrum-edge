@@ -1316,6 +1316,8 @@ upstreams:
         poll_interval_seconds: 30
 ```
 
+DNS-SD queries SRV records for `service_name` on the poll interval (not on the request path) and publishes a single RFC 2782 priority tier. The root target `.` and port `0` are discarded; remaining ports go through the same `1..=65535` admission Kubernetes and Consul use. Only the numerically-smallest **admissible** priority is published, so a zone advertising `10 → primary` / `20 → dr-site` does not load-balance live traffic onto the disaster-recovery site. A poisoned lowest tier (every RR at that priority is `.` or port 0) falls through to the next dialable tier; if nothing admissible remains, the snapshot is empty. Same-tier SRV weights are preserved (weight `0` uses `default_weight`).
+
 **Kubernetes**:
 ```yaml
 upstreams:

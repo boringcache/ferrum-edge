@@ -94,6 +94,21 @@ Valid values (case-insensitive):
 
 This means: first try the record type that worked last time (for speed), then try SRV, then A, then CNAME.
 
+## DNS-SD SRV selection (RFC 2782)
+
+The DNS-SD provider (`service_discovery.provider: dns_sd`) uses `DnsCache::resolve_srv` on the configured `service_name`. That lookup is **not** on the request path: the discovery poller runs in the background and publishes an atomic target snapshot into the load-balancer cache.
+
+`resolve_srv` returns `SrvAnswer` values (`host`, `port`, `weight`, `priority`) and **discards** the RFC 2782 unavailability signals before callers see them:
+
+- Target `.` (the DNS root; also the empty name after stripping the trailing root label)
+- Port `0`
+
+DNS-SD then admits every surviving port through the same `admit_registry_port` helper Kubernetes and Consul use (`1..=65535`, never wrap) and keeps **only the numerically-smallest remaining priority**. Same-tier records keep their SRV weights (weight `0` becomes `default_weight` so published targets match the static `1..=65535` weight contract).
+
+Invalid records are filtered **before** the minimum priority is chosen. A poisoned lowest tier (every RR at that priority is `.` or port 0) therefore does not occupy the live set: the next priority that still has a dialable host is used. That is the ingest-time reading of RFC 2782's "lowest-numbered priority it can reach". If nothing admissible remains at any priority, the snapshot is empty (fail-closed); the manager's existing empty-after-filter policy applies.
+
+Lower-priority (higher numeric) disaster-recovery records are **never** published alongside the live tier. Runtime unreachability of an admitted live-tier host is health-check / load-balancer failover, not "include the DR site in this poll's snapshot".
+
 ## Stale-While-Revalidate
 
 When a cached DNS entry expires (past its TTL), Ferrum Edge doesn't block the request waiting for a fresh DNS lookup. Instead:

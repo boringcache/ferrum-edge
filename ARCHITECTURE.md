@@ -449,7 +449,7 @@ Async DNS resolution with caching designed to keep lookups off the hot request p
 
 Dynamic upstream target discovery from external registries:
 
-- **DNS-SD** (`dns_sd.rs`) — SRV record-based discovery
+- **DNS-SD** (`dns_sd.rs`) — SRV record-based discovery; RFC 2782 min-priority tier after discarding `.` / port 0
 - **Kubernetes** (`kubernetes.rs`) — Kubernetes API-based endpoint discovery
 - **Consul** (`consul.rs`) — Consul service catalog discovery
 - **Ferrum Mesh** (`mesh.rs`) — CP-delivered mesh service/workload discovery

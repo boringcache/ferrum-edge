@@ -1169,6 +1169,31 @@ async fn test_srv_resolution_nonexistent_service() {
     );
 }
 
+#[test]
+fn resolve_srv_discards_rfc2782_root_target_and_port_zero() {
+    use ferrum_edge::_test_support::try_srv_answer_for_test;
+
+    assert!(
+        try_srv_answer_for_test(".", 8080, 1, 10).is_none(),
+        "RFC 2782 root target '.' must be discarded"
+    );
+    assert!(
+        try_srv_answer_for_test("", 8080, 1, 10).is_none(),
+        "empty name after stripping the root label is the same unavailability signal"
+    );
+    assert!(
+        try_srv_answer_for_test("primary.example.com.", 0, 1, 10).is_none(),
+        "port 0 is the RFC 2782 unavailability / non-dialable signal"
+    );
+
+    let answer = try_srv_answer_for_test("primary.example.com.", 8080, 7, 10)
+        .expect("dialable SRV RR must be admitted");
+    assert_eq!(answer.host, "primary.example.com");
+    assert_eq!(answer.port, 8080);
+    assert_eq!(answer.weight, 7);
+    assert_eq!(answer.priority, 10);
+}
+
 // ============================================================================
 // Per-proxy TTL override tests
 // ============================================================================

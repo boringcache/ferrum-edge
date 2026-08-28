@@ -6107,3 +6107,129 @@ async fn discovered_snapshot_starts_active_probes_for_sd_only_upstream() {
     );
     assert!(health_checker.has_running_active_probes("ferrum", "sd-hc"));
 }
+
+// ── RFC 2782 DNS-SD priority + registry-port admission (issue #4291) ──
+
+/// `(host, port, weight, priority)` — same field order as `resolve_srv`.
+fn dns_sd_from_srv(records: &[(&str, u16, u16, u16)], default_weight: u32) -> Vec<UpstreamTarget> {
+    ferrum_edge::_test_support::dns_sd_targets_from_srv_records_for_test(
+        records
+            .iter()
+            .map(|(host, port, weight, priority)| {
+                (host.to_string(), *port, *weight, *priority)
+            })
+            .collect(),
+        default_weight,
+    )
+}
+
+fn dns_sd_host_ports(targets: &[UpstreamTarget]) -> Vec<(String, u16, u32)> {
+    targets
+        .iter()
+        .map(|t| (t.host.clone(), t.port, t.weight))
+        .collect()
+}
+
+#[test]
+fn dns_sd_mixed_priorities_keep_only_min_admissible_tier() {
+    // Issue #4291 verification fixture: port 0 at the live tier is dropped,
+    // the disaster-recovery tier is not published, and the remaining
+    // priority-10 host is the only live target.
+    let targets = dns_sd_from_srv(
+        &[
+            ("primary", 8080, 1, 10),
+            ("dr", 8080, 1, 20),
+            ("alt", 0, 1, 10),
+        ],
+        1,
+    );
+    assert_eq!(
+        dns_sd_host_ports(&targets),
+        vec![("primary".to_string(), 8080, 1)],
+        "live traffic must not be balanced onto the DR tier or port-0 alt"
+    );
+}
+
+#[test]
+fn dns_sd_same_tier_preserves_srv_weights() {
+    let targets = dns_sd_from_srv(
+        &[
+            ("a.example", 8080, 10, 10),
+            ("b.example", 8080, 20, 10),
+            ("dr.example", 8080, 50, 20),
+        ],
+        99,
+    );
+    assert_eq!(
+        dns_sd_host_ports(&targets),
+        vec![
+            ("a.example".to_string(), 8080, 10),
+            ("b.example".to_string(), 8080, 20),
+        ],
+        "same-tier SRV weights must be preserved; DR must stay unpublished"
+    );
+}
+
+#[test]
+fn dns_sd_zero_srv_weight_uses_default_weight() {
+    let targets = dns_sd_from_srv(&[("primary", 8080, 0, 10)], 7);
+    assert_eq!(
+        dns_sd_host_ports(&targets),
+        vec![("primary".to_string(), 8080, 7)]
+    );
+}
+
+#[test]
+fn dns_sd_port_zero_is_not_published() {
+    let targets = dns_sd_from_srv(&[("alt", 0, 1, 10), ("primary", 8080, 1, 10)], 1);
+    assert_eq!(
+        dns_sd_host_ports(&targets),
+        vec![("primary".to_string(), 8080, 1)]
+    );
+}
+
+#[test]
+fn dns_sd_root_target_is_discarded_explicitly() {
+    let targets = dns_sd_from_srv(
+        &[
+            (".", 8080, 1, 10),
+            ("", 8080, 1, 10),
+            ("primary", 8080, 5, 10),
+        ],
+        1,
+    );
+    assert_eq!(
+        dns_sd_host_ports(&targets),
+        vec![("primary".to_string(), 8080, 5)],
+        "RFC 2782 '.' must not rely on later empty-host validation"
+    );
+}
+
+#[test]
+fn dns_sd_all_invalid_records_fail_closed() {
+    let targets = dns_sd_from_srv(&[(".", 0, 1, 0), ("alt", 0, 1, 10), ("", 8080, 1, 20)], 1);
+    assert!(
+        targets.is_empty(),
+        "when every SRV RR is undialable the snapshot must be empty, not a synthetic target"
+    );
+}
+
+#[test]
+fn dns_sd_falls_back_when_min_tier_has_no_admissible_records() {
+    // Filter-then-min: a poisoned priority-10 tier does not occupy the live
+    // set, so the dialable DR tier is selected. Runtime unreachability of an
+    // *admitted* live host is health-check failover, not "publish both tiers".
+    let targets = dns_sd_from_srv(
+        &[
+            ("primary", 0, 1, 10),
+            (".", 8080, 1, 10),
+            ("dr", 8080, 3, 20),
+        ],
+        1,
+    );
+    assert_eq!(
+        dns_sd_host_ports(&targets),
+        vec![("dr".to_string(), 8080, 3)],
+        "poisoned min-priority RRs must not block a dialable higher-priority tier"
+    );
+}
