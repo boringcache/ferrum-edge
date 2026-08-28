@@ -24,7 +24,7 @@ use ferrum_edge::identity::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, InboundRelayDenial, MeshConfig, MeshEgressUdpDestination,
     MeshEgressUdpDialEndpoint, MultiClusterConfig, Workload, WorkloadPort, WorkloadSelector,
-    inbound_relay_destinations_from_workloads,
+    inbound_relay_destinations_from_workloads, own_address_port_bounds_from_workloads,
 };
 use ferrum_edge::modes::mesh::enrolled_destinations::{
     EnrolledPodEntry, NodeLocalEnrolledDestinations, NodeLocalEnrolledDestinationsHandle,
@@ -1648,6 +1648,12 @@ fn own_pod_terminator_mesh() -> MeshConfig {
             relay_guard_workload("neighbour", &["10.244.9.9"], &[8080]),
         ],
         inbound_relay_admits_accepted_local_address: true,
+        // What the apply path projects for an own-pod terminator: the
+        // per-address port bound of the record it owns (issue #4249). The
+        // own-address / loopback arms read only this.
+        inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
+            relay_guard_workload("app", &["10.244.1.7", "fd00:10:244:1::7"], &[8080]),
+        ]),
         ..MeshConfig::default()
     }
 }
@@ -2389,6 +2395,270 @@ fn inbound_relay_sidecar_admits_only_its_own_accepted_local_address() {
     // ...and a Sidecar never installs a node-local registry, because it has no
     // inventory for one to bound.
     assert!(!mesh.inbound_relay_node_local_registry.is_authoritative());
+}
+
+// ── Own-address port bound: address-level pod ambiguity (issue #4249) ────────
+
+/// Declared application ports for a relay fixture workload.
+fn declared_ports(ports: &[u16]) -> Vec<WorkloadPort> {
+    ports
+        .iter()
+        .map(|port| WorkloadPort {
+            port: *port,
+            protocol: AppProtocol::Http,
+            name: None,
+        })
+        .collect()
+}
+
+/// A `reviews` replica declaring `address` on `ports`, carrying `pod_uid` when
+/// one is given. Same SPIFFE, same cluster and same pod-template labels as
+/// every other replica — the shape the owned-workload filter cannot separate.
+fn reviews_replica_declaring(
+    address: &'static str,
+    pod_uid: Option<&str>,
+    ports: &[u16],
+) -> Workload {
+    let mut workload = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        [address],
+    );
+    workload.cluster = Some("cluster-a".to_string());
+    workload.pod_uid = pod_uid.map(str::to_string);
+    workload.ports = declared_ports(ports);
+    workload
+}
+
+/// One own-pod terminator slice on `topology`, carrying `workloads` in the
+/// local cluster under this proxy's own `reviews` identity.
+fn own_pod_relay_fixture(
+    topology: MeshTopology,
+    workloads: Vec<Workload>,
+) -> (MeshSlice, MeshRuntimeConfig) {
+    let (slice, mut runtime) = ambient_relay_fixture(workloads);
+    runtime.topology = topology;
+    (slice, runtime)
+}
+
+/// Issue #4249, the own-ADDRESS half. Two replicas of one Deployment share a
+/// service-account SPIFFE id, a cluster and their pod-template labels, so both
+/// enter the owned workload view; under `hostNetwork` they also share the node
+/// IP while carrying different pod UIDs. The own-address and loopback arms must
+/// not admit the UNION of the two pods' ports on that address — a co-located
+/// pod's application port would become reachable through this terminator — and
+/// nothing at guard time can pick between them, so the address fails closed for
+/// BOTH.
+#[test]
+fn inbound_relay_sidecar_own_address_fails_closed_on_two_pods_sharing_an_address() {
+    let shared = reviews_replica_declaring("10.244.5.5", Some(LOCAL_POD_UID), &[8080]);
+    let co_located = reviews_replica_declaring("10.244.5.5", Some(OTHER_POD_UID), &[9443]);
+    let (slice, runtime) = own_pod_relay_fixture(MeshTopology::Sidecar, vec![shared, co_located]);
+
+    let mesh = prepared_mesh(&slice, &runtime);
+    // The peer reached the shared (host-network) address on this socket.
+    let own_ip = Some(ip("10.244.5.5"));
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "an address two different pods declare cannot be attributed to either, so \
+         neither record's ports may be admitted through it"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "the co-located pod's port must not ride in on the shared address either"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("127.0.0.1", 8080, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "the own-namespace loopback shortcut stands in for the same ambiguous \
+         address and fails closed with it"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("localhost", 9443, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared)
+    );
+}
+
+/// The `Ambient` half of the same defect. `Ambient` sets the own-address marker
+/// too, and that arm returns BEFORE the registry-bounded inventory is consulted
+/// — so a shared address the node-agent registry would have disambiguated must
+/// still fail closed on the port bound itself.
+#[test]
+fn inbound_relay_ambient_own_address_fails_closed_on_two_pods_sharing_an_address() {
+    let own_spiffe = reviews_spiffe();
+    let shared = reviews_replica_declaring("10.244.5.5", Some(LOCAL_POD_UID), &[8080]);
+    let co_located = reviews_replica_declaring("10.244.5.5", Some(OTHER_POD_UID), &[9443]);
+    let (slice, runtime) = own_pod_relay_fixture(MeshTopology::Ambient, vec![shared, co_located]);
+
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let enrollment = [enrolled(LOCAL_POD_UID, &own_spiffe, "10.244.5.5")];
+    bind_enrolled_registry(&mut mesh, &enrollment);
+    let own_ip = Some(ip("10.244.5.5"));
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "the unenrolled co-located pod's port must not be admitted by the \
+         own-address arm, which never reaches the registry"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "and the address stays ambiguous for the enrolled pod too — the arm has \
+         no evidence to pick between two records declaring it"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("localhost", 8080, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared)
+    );
+
+    // The registry-bounded general inventory is unchanged and still admits the
+    // enrolled pod when the socket's own address is NOT the destination.
+    let node = Some(ip("10.244.0.1"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+}
+
+/// The legitimate multi-record shape stays admitted: several Service records
+/// for ONE pod agree on a non-empty pod UID, which is positive proof they are
+/// the same pod, so their declared ports are unioned exactly as one record's
+/// would be. A lone record with no pod UID at all — a `WorkloadEntry` / VM
+/// record, or an ordinary pod whose carrier does not stamp one — is
+/// unambiguous for its address and keeps working.
+#[test]
+fn inbound_relay_own_address_unions_ports_only_across_one_proven_pod() {
+    let http = reviews_replica_declaring("10.244.5.5", Some(LOCAL_POD_UID), &[8080]);
+    let grpc = reviews_replica_declaring("10.244.5.5", Some(LOCAL_POD_UID), &[9090]);
+    // A second address, declared by a single record carrying no pod UID.
+    let uidless = reviews_replica_declaring("10.244.5.6", None, &[7070]);
+    let (slice, runtime) = own_pod_relay_fixture(MeshTopology::Sidecar, vec![http, grpc, uidless]);
+
+    let mesh = prepared_mesh(&slice, &runtime);
+    let own_ip = Some(ip("10.244.5.5"));
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, own_ip),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9090, own_ip),
+        Ok(()),
+        "two Service records for one proven pod legitimately union their ports"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("localhost", 9090, own_ip),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, own_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "the union is still bounded by what that pod declares"
+    );
+
+    // The single uidless record is the only one on its address, so it is
+    // unambiguous and keeps the pre-#4249 behaviour.
+    let other_ip = Some(ip("10.244.5.6"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 7070, other_ip),
+        Ok(())
+    );
+}
+
+/// A pod UID is only proof when EVERY record on the address carries it and they
+/// agree. A mix of present and missing UIDs, or several records none of which
+/// carries one, is ambiguous — the records may be one pod or several, and the
+/// guard cannot tell — so the address is refused rather than unioned.
+#[test]
+fn inbound_relay_own_address_fails_closed_on_missing_and_mixed_pod_uids() {
+    let with_uid = reviews_replica_declaring("10.244.5.5", Some(LOCAL_POD_UID), &[8080]);
+    let without_uid = reviews_replica_declaring("10.244.5.5", None, &[9443]);
+    // A second shared address where NEITHER record publishes a UID.
+    let anonymous_a = reviews_replica_declaring("10.244.5.6", None, &[7070]);
+    let anonymous_b = reviews_replica_declaring("10.244.5.6", None, &[7071]);
+    let (slice, runtime) = own_pod_relay_fixture(
+        MeshTopology::Sidecar,
+        vec![with_uid, without_uid, anonymous_a, anonymous_b],
+    );
+
+    let mesh = prepared_mesh(&slice, &runtime);
+
+    let mixed = Some(ip("10.244.5.5"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, mixed),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "a record without a pod UID cannot be proven to be the same pod as one \
+         that has it"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, mixed),
+        Err(InboundRelayDenial::PortNotDeclared)
+    );
+
+    let anonymous = Some(ip("10.244.5.6"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 7070, anonymous),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "two records with no pod UID at all may be two pods; fail closed"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 7071, anonymous),
+        Err(InboundRelayDenial::PortNotDeclared)
+    );
+}
+
+/// With NO workload identity configured nothing can be attributed to this
+/// terminator, so there is no owned view to project. That must not become a
+/// permissive fallback to the whole declared workload view: the same ambiguity
+/// rule is applied to that view instead, so a shared address still fails closed
+/// while an unambiguous one still serves.
+#[test]
+fn inbound_relay_own_address_without_identity_does_not_union_a_shared_address() {
+    let shared_a = reviews_replica_declaring("10.244.5.5", Some(LOCAL_POD_UID), &[8080]);
+    let shared_b = reviews_replica_declaring("10.244.5.5", Some(OTHER_POD_UID), &[9443]);
+    let lone = reviews_replica_declaring("10.244.5.6", Some(LOCAL_POD_UID), &[7070]);
+    let (slice, mut runtime) =
+        own_pod_relay_fixture(MeshTopology::Sidecar, vec![shared_a, shared_b, lone]);
+    // No `FERRUM_MESH_WORKLOAD_SPIFFE_ID`.
+    runtime.workload_spiffe_id = None;
+
+    let mesh = prepared_mesh(&slice, &runtime);
+    assert!(
+        mesh.inbound_relay_destinations.is_empty(),
+        "no identity still means no general relay inventory"
+    );
+
+    let shared_ip = Some(ip("10.244.5.5"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, shared_ip),
+        Err(InboundRelayDenial::PortNotDeclared),
+        "an absent identity must not license the pre-#4249 whole-view union"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 9443, shared_ip),
+        Err(InboundRelayDenial::PortNotDeclared)
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("localhost", 9443, shared_ip),
+        Err(InboundRelayDenial::PortNotDeclared)
+    );
+
+    // ...while an address exactly one record declares is still served, so this
+    // is a narrowing rather than an inbound outage.
+    let lone_ip = Some(ip("10.244.5.6"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 7070, lone_ip),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 9443, lone_ip),
+        Err(InboundRelayDenial::PortNotDeclared)
+    );
 }
 
 /// Issue #4251: a `ServiceWaypoint` is the L7 terminator for the services bound

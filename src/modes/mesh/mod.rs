@@ -1681,9 +1681,15 @@ fn prepare_normalized_gateway_config_for_mesh(
         //
         // `None` means no workload identity is configured: nothing can be
         // attributed to this terminator, so there is no ownership evidence at
-        // all — fail closed to an empty inventory, and leave the own-address
-        // port bound on its pre-#4249 declared-workload-view fallback.
-        let owned_workload_destinations: Option<Vec<config::MeshInboundRelayDestination>> =
+        // all — fail closed to an empty inventory. The own-address port bound
+        // does NOT fall back to the declared workload view in that case; it is
+        // rebuilt from the only view available under the same ambiguity rule
+        // (issue #4249, below).
+        //
+        // Kept as the matched RECORDS rather than as the collapsed inventory,
+        // because the own-address projection has to count how many raw records
+        // declare each address before anything merges them.
+        let owned_workload_relay_records: Option<Vec<&crate::modes::mesh::config::Workload>> =
             match runtime.topology {
                 MeshTopology::Sidecar | MeshTopology::Ambient => {
                     own_workload_identity.map(|identity| {
@@ -1705,8 +1711,10 @@ fn prepare_normalized_gateway_config_for_mesh(
                             .iter()
                             .map(|(key, value)| (key.clone(), value.clone()))
                             .collect();
-                        crate::modes::mesh::config::inbound_relay_destinations_from_workloads(
-                            mesh_slice.workloads.iter().filter(|workload| {
+                        mesh_slice
+                            .workloads
+                            .iter()
+                            .filter(|workload| {
                                 // `mesh_slice` here is the MULTICLUSTER-MERGED
                                 // materialization slice, and
                                 // `tag_remote_workloads` deliberately keeps a
@@ -1730,12 +1738,19 @@ fn prepare_normalized_gateway_config_for_mesh(
                                         &workload_labels,
                                         local_cluster,
                                     )
-                            }),
-                        )
+                            })
+                            .collect()
                     })
                 }
                 _ => None,
             };
+        // Flat view of the same records. EMPTY when no identity resolved, which
+        // is NOT the same state as `None` — `is_some()` below is what tells
+        // "this terminator owns nothing" apart from "nothing is attributable".
+        let owned_records: &[&config::Workload] = match &owned_workload_relay_records {
+            Some(records) => records,
+            None => &[],
+        };
         let (inbound_relay_destinations, admits_accepted_local_address) = match runtime.topology {
             // A `Sidecar` runs INSIDE the application pod's network namespace.
             // Every destination it may legitimately relay to is therefore the
@@ -1774,7 +1789,9 @@ fn prepare_normalized_gateway_config_for_mesh(
             // address the dial would pick is chosen afterwards), and there is
             // NO per-entry fallback to this predicate.
             MeshTopology::Ambient => (
-                owned_workload_destinations.clone().unwrap_or_default(),
+                crate::modes::mesh::config::inbound_relay_destinations_from_workloads(
+                    owned_records.iter().copied(),
+                ),
                 true,
             ),
             // Deliberate multi-destination allowance #1: a NodeWaypoint IS the
@@ -1810,17 +1827,37 @@ fn prepare_normalized_gateway_config_for_mesh(
             MeshTopology::EastWestGateway | MeshTopology::EgressGateway => (Vec::new(), false),
         };
         // Issue #4249: the own-address and own-namespace-loopback arms bound
-        // their port from the records this terminator OWNS, not from every
-        // record that happens to declare the address — `hostNetwork` pods all
-        // declare the node IP, so the whole-view scan admitted the union of
-        // their ports. This is also what keeps a `Sidecar` serving after its
-        // general inventory was emptied above: the two own-address arms read
-        // this owned view, not `inbound_relay_destinations`. `None` (no
-        // resolved identity, or a topology that never consults it) keeps the
-        // pre-#4249 fallback: there is no ownership evidence to narrow with.
-        // Assigned UNCONDITIONALLY, like the two fields below it.
-        let own_address_ports =
-            owned_workload_destinations.filter(|_| admits_accepted_local_address);
+        // their port from the record set this terminator can PROVE owns the
+        // address, not from every record that happens to declare it —
+        // `hostNetwork` pods all declare the node IP, and two replicas of one
+        // Deployment share the SPIFFE id, cluster and labels the owned filter
+        // above matches on, so a plain scan admitted the UNION of two pods'
+        // ports on one address. `own_address_port_bounds_from_workloads`
+        // resolves each address to at most ONE owning pod (a lone record, or
+        // several records agreeing on one non-empty pod UID) and OMITS every
+        // address it cannot, so the hot path has nothing left to union.
+        //
+        // This is also what keeps a `Sidecar` serving after its general
+        // inventory was emptied above: the two own-address arms read this
+        // projection, not `inbound_relay_destinations`.
+        //
+        // With no resolved identity there is no owned view to project, but that
+        // must NOT become a permissive fallback to the whole declared workload
+        // view: the same ambiguity rule is applied to that view instead, so a
+        // shared address still fails closed while an unambiguous one still
+        // serves. Topologies that never consult these arms
+        // (`inbound_relay_admits_accepted_local_address` false) get an empty
+        // projection. Assigned UNCONDITIONALLY, like the two fields below it.
+        let own_address_ports = if !admits_accepted_local_address {
+            Vec::new()
+        } else if owned_workload_relay_records.is_some() {
+            crate::modes::mesh::config::own_address_port_bounds_from_workloads(
+                owned_records.iter().copied(),
+            )
+        } else {
+            let declared = mesh.workloads.as_slice();
+            crate::modes::mesh::config::own_address_port_bounds_from_workloads(declared.iter())
+        };
         // Issue #4249: the node bound for `Ambient`'s multi-destination
         // inventory, and only for it. No other topology reads a node-local
         // registry — a `Sidecar` now carries no general inventory to bound,

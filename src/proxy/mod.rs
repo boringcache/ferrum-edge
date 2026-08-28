@@ -62577,7 +62577,9 @@ mod tests {
     /// not every workload the slice happens to declare.
     #[test]
     fn inbound_hbone_relay_guard_allows_only_the_terminators_own_destinations() {
-        use crate::modes::mesh::config::{InboundRelayDenial, MeshConfig};
+        use crate::modes::mesh::config::{
+            InboundRelayDenial, MeshConfig, own_address_port_bounds_from_workloads,
+        };
 
         let own_ip: std::net::IpAddr = "10.1.2.3".parse().expect("own pod IP");
         let own_v6: std::net::IpAddr = "fd00:10:244:1::4".parse().expect("own pod IPv6");
@@ -62600,6 +62602,11 @@ mod tests {
                 relay_guard_workload("peer", &["10.9.9.9"], &[8080]),
             ],
             inbound_relay_admits_accepted_local_address: true,
+            // What the apply path projects for an own-pod terminator: the
+            // per-address port bound of the record it owns (issue #4249).
+            inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
+                relay_guard_workload("app", &["10.1.2.3", "fd00:10:244:1::4"], &[8080]),
+            ]),
             ..MeshConfig::default()
         };
         let decide = |host: &str, port: u16, local: Option<std::net::IpAddr>| {
@@ -62756,11 +62763,14 @@ mod tests {
 
     #[test]
     fn inbound_hbone_relay_proxy_normalizes_bracketed_ipv6_authority() {
-        use crate::modes::mesh::config::MeshConfig;
+        use crate::modes::mesh::config::{MeshConfig, own_address_port_bounds_from_workloads};
 
         let mesh = MeshConfig {
             workloads: vec![relay_guard_workload("app", &["fd00:10:244:1::4"], &[8080])],
             inbound_relay_admits_accepted_local_address: true,
+            inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
+                relay_guard_workload("app", &["fd00:10:244:1::4"], &[8080]),
+            ]),
             ..MeshConfig::default()
         };
         let authority: http::uri::Authority = "[fd00:10:244:1::4]:8080".parse().unwrap();
