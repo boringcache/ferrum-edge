@@ -99,6 +99,17 @@ pub const GRAPHQL_CONFIG_KEYS: &[&str] = &[
 
 const RATE_SPEC_KEYS: &[&str] = &["max_requests", "window_seconds"];
 
+/// Plugin-specific fields that change what a retained local counter *means*.
+///
+/// `limit_by` is the limit dimension and the two rate maps carry every window
+/// and maximum. `max_depth` / `max_complexity` / `max_aliases` /
+/// `introspection_allowed` are stateless per-document checks that never consult
+/// a counter, so changing them must not reset a live budget. The shared
+/// enforcement posture is added by the backend; secret-bearing Redis fields are
+/// never fingerprinted.
+const GRAPHQL_STATE_SEMANTIC_KEYS: &[&str] =
+    &["limit_by", "type_rate_limits", "operation_rate_limits"];
+
 /// A rate window spec parsed from config.
 #[derive(Debug, Clone)]
 struct RateSpec {
@@ -161,6 +172,28 @@ impl GraphqlPlugin {
     pub fn new_with_config_id(
         config: &Value,
         http_client: PluginHttpClient,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, None, config_id)
+    }
+
+    /// Construct with local enforcement state shared across compatible
+    /// plugin-cache generations for the stable `(namespace, plugin kind,
+    /// plugin-config id)` policy identity. See
+    /// [`super::utils::rate_limit::RateLimitBackend::from_plugin_config_with_policy_identity`].
+    pub fn new_with_policy_identity(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, Some(namespace), config_id)
+    }
+
+    fn from_parts(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: Option<&str>,
         config_id: &str,
     ) -> Result<Self, String> {
         let object = config
@@ -242,12 +275,14 @@ impl GraphqlPlugin {
             limit_by,
             type_rate_limits,
             operation_rate_limits,
-            limiter: RateLimitBackend::from_plugin_config_with_config_id(
+            limiter: RateLimitBackend::from_plugin_config_with_policy_identity(
                 "graphql",
+                namespace,
                 config_id,
                 config,
                 &http_client,
                 DynamicHttpRateLimitAlgorithm::new(),
+                GRAPHQL_STATE_SEMANTIC_KEYS,
             )?,
             request_counter: AtomicU64::new(0),
             epoch_base: Instant::now(),
@@ -255,6 +290,16 @@ impl GraphqlPlugin {
             has_any_config,
             instance_id: NEXT_GRAPHQL_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         })
+    }
+
+    /// Whether this instance enforces on the same live local state as `other`.
+    ///
+    /// A compatible reload generation for one policy identity must share; an
+    /// unrelated policy, tenant, plugin kind, or semantically changed policy
+    /// must not. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn shares_local_state_with(&self, other: &Self) -> bool {
+        self.limiter.shares_local_state_with(&other.limiter)
     }
 
     /// Local/fallback DashMap shard count. Test-only; not a production API.

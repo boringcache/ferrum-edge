@@ -47,6 +47,13 @@ pub const UDP_RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
     "redis_failure_policy",
 ];
 
+/// Plugin-specific fields that change what a retained local datagram/byte
+/// budget *means*: the two per-second rates and the window length. The shared
+/// enforcement posture is added by the backend; secret-bearing Redis fields are
+/// never fingerprinted.
+const UDP_RATE_LIMITING_STATE_SEMANTIC_KEYS: &[&str] =
+    &["datagrams_per_second", "bytes_per_second", "window_seconds"];
+
 const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 const EVICTION_CHECK_INTERVAL: u64 = 100_000;
@@ -90,6 +97,33 @@ impl UdpRateLimiting {
     pub fn new_with_config_id(
         config: &Value,
         http_client: PluginHttpClient,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, None, config_id)
+    }
+
+    /// Construct with local enforcement state shared across compatible
+    /// plugin-cache generations for the stable `(namespace, plugin kind,
+    /// plugin-config id)` policy identity.
+    ///
+    /// An inherited limiter keeps the algorithm — and therefore the window
+    /// epoch — it was created with, so an inherited counter is never
+    /// re-indexed onto a replacement generation's fresh epoch. A change to any
+    /// of [`UDP_RATE_LIMITING_STATE_SEMANTIC_KEYS`] isolates onto fresh state
+    /// instead.
+    pub fn new_with_policy_identity(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, Some(namespace), config_id)
+    }
+
+    fn from_parts(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: Option<&str>,
         config_id: &str,
     ) -> Result<Self, String> {
         let object = config
@@ -137,8 +171,9 @@ impl UdpRateLimiting {
             epoch_base,
             last_eviction_secs: AtomicU64::new(0),
             rejection_warn: AtomicLogRateLimiter::new(),
-            limiter: RateLimitBackend::from_plugin_config_with_config_id(
+            limiter: RateLimitBackend::from_plugin_config_with_policy_identity(
                 "udp_rate_limiting",
+                namespace,
                 config_id,
                 config,
                 &http_client,
@@ -148,8 +183,19 @@ impl UdpRateLimiting {
                     window_seconds,
                     epoch_base,
                 ),
+                UDP_RATE_LIMITING_STATE_SEMANTIC_KEYS,
             )?,
         })
+    }
+
+    /// Whether this instance enforces on the same live local state as `other`.
+    ///
+    /// A compatible reload generation for one policy identity must share; an
+    /// unrelated policy, tenant, plugin kind, or semantically changed policy
+    /// must not. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn shares_local_state_with(&self, other: &Self) -> bool {
+        self.limiter.shares_local_state_with(&other.limiter)
     }
 
     /// Local/fallback DashMap shard count. Test-only; not a production API.

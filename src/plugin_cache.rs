@@ -2272,6 +2272,91 @@ fn create_tcp_connection_throttle_plugin(
     Ok(Some(Arc::new(plugin)))
 }
 
+/// Construct one of the six local rate-limit plugins with enforcement state
+/// bound to its stable policy identity.
+///
+/// Identity is `(namespace, plugin kind, plugin-config id)`, so the same bare
+/// id in two namespaces, or two different limiter plugin kinds sharing one id,
+/// never share a budget. Each plugin declares the config fields that change
+/// what its retained counters mean; anything else — an unrelated plugin, a
+/// reordering, a proxy-association edit, or a rebuilt HTTP client — inherits
+/// the live state.
+///
+/// A candidate generation that fails to build simply drops its `Arc`; it never
+/// mutates or steals the live generation's counters, so a rejected config
+/// leaves the currently published cache enforcing exactly as before.
+fn create_local_rate_limit_plugin(
+    pc: &PluginConfig,
+    http_client: &PluginHttpClient,
+) -> Result<Option<Arc<dyn Plugin>>, String> {
+    // The shared factory screens literal client endpoints before construction.
+    // None of these six dial a configured endpoint directly today, but keeping
+    // the screen on this path means a future field cannot quietly skip it.
+    crate::plugins::screen_direct_client_endpoint_egress(
+        &pc.plugin_name,
+        &pc.config,
+        http_client.backend_allow_ips(),
+    )?;
+    let config = &pc.config;
+    let client = http_client.clone();
+    let namespace = pc.namespace.as_str();
+    let id = pc.id.as_str();
+    let plugin: Arc<dyn Plugin> = match pc.plugin_name.as_str() {
+        "rate_limiting" => Arc::new(
+            crate::plugins::rate_limiting::RateLimiting::new_with_policy_identity(
+                config,
+                client,
+                namespace,
+                id,
+            )?,
+        ),
+        "graphql" => Arc::new(
+            crate::plugins::graphql::GraphqlPlugin::new_with_policy_identity(
+                config,
+                client,
+                namespace,
+                id,
+            )?,
+        ),
+        "grpc_method_router" => Arc::new(
+            crate::plugins::grpc_method_router::GrpcMethodRouter::new_with_policy_identity(
+                config,
+                client,
+                namespace,
+                id,
+            )?,
+        ),
+        "ai_rate_limiter" => Arc::new(
+            crate::plugins::ai_rate_limiter::AiRateLimiter::new_with_policy_identity(
+                config,
+                client,
+                namespace,
+                id,
+            )?,
+        ),
+        "ws_rate_limiting" => Arc::new(
+            crate::plugins::ws_rate_limiting::WsRateLimiting::new_with_policy_identity(
+                config,
+                client,
+                namespace,
+                id,
+            )?,
+        ),
+        "udp_rate_limiting" => Arc::new(
+            crate::plugins::udp_rate_limiting::UdpRateLimiting::new_with_policy_identity(
+                config,
+                client,
+                namespace,
+                id,
+            )?,
+        ),
+        // Unreachable: the caller matches exactly the six names above. Return
+        // the unknown-plugin signal rather than panicking on the config path.
+        _ => return Ok(None),
+    };
+    Ok(Some(plugin))
+}
+
 /// Try to create a plugin and apply `priority_override` from the plugin config.
 ///
 /// Enabled plugin configs are load-bearing configuration: unknown plugin names
@@ -2312,14 +2397,33 @@ fn try_create_plugin(
         .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>))
     } else if matches!(
         pc.plugin_name.as_str(),
-        "request_mirror"
-            | "api_chargeback_sink"
-            | "rate_limiting"
+        "rate_limiting"
             | "graphql"
             | "grpc_method_router"
             | "udp_rate_limiting"
             | "ws_rate_limiting"
             | "ai_rate_limiter"
+    ) {
+        // Local rate-limit counters are owned by the stable policy identity
+        // (`namespace` + plugin kind + plugin-config id), not by the instance
+        // this cache generation happened to construct. Without this, a full
+        // reload, a global plugin-config change or deletion anywhere in the
+        // namespace, or a change to the owning proxy's associations handed
+        // every caller a brand new empty budget with no log, metric, or
+        // counter recording the reset — so a configured ceiling became
+        // effectively unbounded for anyone able to churn configuration
+        // (issue #4268).
+        //
+        // The same stable id remains the default Redis key partition, so
+        // cross-gateway behavior is unchanged. A semantic policy change
+        // (limit dimension, windows, maximums, algorithm parameters, sync
+        // mode, Redis key prefix, or failure posture) isolates onto fresh
+        // state instead of inheriting.
+        create_local_rate_limit_plugin(pc, http_client)
+    } else if matches!(
+        pc.plugin_name.as_str(),
+        "request_mirror"
+            | "api_chargeback_sink"
             | "soap_ws_security"
             | "jwks_auth"
             | "hmac_auth"
@@ -2327,14 +2431,10 @@ fn try_create_plugin(
     ) {
         // Pass the stable plugin-config resource id through the production
         // factory so identity-aware plugins partition or attribute sibling
-        // instances. Do not use the process-local runtime instance id here.
-        //
-        // The rate limiters use it as the default Redis key namespace suffix
-        // (`{namespace}:{plugin}:{config_id}`) so two independent policies of
-        // the same type in one namespace no longer increment and reject against
-        // one another's counters. It must be the configured resource id, not a
-        // process-local id: replicas of the same policy on separate data planes
-        // must keep sharing one distributed budget.
+        // instances. Do not use the process-local runtime instance id here. It
+        // must be the configured resource id, not a process-local id: replicas
+        // of the same policy on separate data planes must keep sharing one
+        // distributed keyspace.
         //
         // `soap_ws_security` uses the same stable identity for its process
         // replay registry and shared Redis keyspace. Passing `None` here would

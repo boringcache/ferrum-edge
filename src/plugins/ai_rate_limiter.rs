@@ -336,6 +336,24 @@ pub const AI_RATE_LIMITER_CONFIG_KEYS: &[&str] = &[
     "redis_failure_policy",
 ];
 
+/// Plugin-specific fields that change what a retained local token counter
+/// *means*.
+///
+/// `token_limit` / `window_seconds` are the algorithm parameters, `limit_by` is
+/// the limit dimension, and `count_mode`, `provider`, and `on_unmetered_response`
+/// decide which tokens are charged at all. `expose_headers` is response
+/// presentation only and never resets a live budget. The shared enforcement
+/// posture is added by the backend; secret-bearing Redis fields are never
+/// fingerprinted.
+const AI_RATE_LIMITER_STATE_SEMANTIC_KEYS: &[&str] = &[
+    "token_limit",
+    "window_seconds",
+    "count_mode",
+    "limit_by",
+    "provider",
+    "on_unmetered_response",
+];
+
 pub struct AiRateLimiter {
     token_limit: u64,
     window_seconds: u64,
@@ -377,6 +395,28 @@ impl AiRateLimiter {
     pub fn new_with_config_id(
         config: &Value,
         http_client: PluginHttpClient,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, None, config_id)
+    }
+
+    /// Construct with local enforcement state shared across compatible
+    /// plugin-cache generations for the stable `(namespace, plugin kind,
+    /// plugin-config id)` policy identity. See
+    /// [`super::utils::rate_limit::RateLimitBackend::from_plugin_config_with_policy_identity`].
+    pub fn new_with_policy_identity(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, Some(namespace), config_id)
+    }
+
+    fn from_parts(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: Option<&str>,
         config_id: &str,
     ) -> Result<Self, String> {
         let object = config
@@ -496,17 +536,29 @@ impl AiRateLimiter {
             instance_id,
             keys: InstanceKeys::new(instance_id),
             stream_usage_handoff_key: allocate_response_stream_handoff_id(),
-            limiter: RateLimitBackend::from_plugin_config_with_config_id(
+            limiter: RateLimitBackend::from_plugin_config_with_policy_identity(
                 "ai_rate_limiter",
+                namespace,
                 config_id,
                 config,
                 &http_client,
                 AiTokenRateAlgorithm::new(token_limit, window_seconds),
+                AI_RATE_LIMITER_STATE_SEMANTIC_KEYS,
             )?,
             request_counter: AtomicU64::new(0),
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
         })
+    }
+
+    /// Whether this instance enforces on the same live local state as `other`.
+    ///
+    /// A compatible reload generation for one policy identity must share; an
+    /// unrelated policy, tenant, plugin kind, or semantically changed policy
+    /// must not. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn shares_local_state_with(&self, other: &Self) -> bool {
+        self.limiter.shares_local_state_with(&other.limiter)
     }
 
     /// Local/fallback DashMap shard count. Test-only; not a production API.

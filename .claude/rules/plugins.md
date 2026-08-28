@@ -113,7 +113,25 @@ paths:
   local-mode `request_deduplication` state use per-plugin weak registries
   (`SHARED_STATES`, `SHARED_LOCAL_STATES`) whose entries are pruned on insert,
   so retention is bounded by the currently configured policies plus in-flight
-  holders. A compatible reload inherits live state; a semantic change isolates
+  holders. The six local rate limiters (`rate_limiting`, `ai_rate_limiter`,
+  `graphql`, `grpc_method_router`, `ws_rate_limiting`, `udp_rate_limiting`) use
+  the same weak-registry pattern inside `RateLimitBackend`
+  (`SharedLocalLimiterState` / `LocalLimiterRegistry` in
+  `src/plugins/utils/rate_limit.rs`, reached from `try_create_plugin` ->
+  `create_local_rate_limit_plugin`, issue #4268). Their identity is
+  `namespace` + plugin KIND + plugin-config id — the kind is load-bearing
+  because three of them share one algorithm type — and each registry is
+  statically typed per `(key, algorithm)` pair, so there is no downcast to get
+  wrong. Compatibility is a SHA-256 fingerprint over each plugin's declared
+  enforcement-relevant config fields (limit dimension, windows, maximums,
+  algorithm parameters, plugin-specific shaping) plus the shared posture
+  (`sync_mode`, `redis_failure_policy`, effective Redis key prefix); never add
+  a secret-bearing key to a `*_STATE_SEMANTIC_KEYS` list, and never log the
+  fingerprint. Presentation-only fields (`expose_headers`, `close_reason`) and
+  stateless checks (GraphQL depth/complexity, gRPC allow/deny lists) are
+  deliberately outside the set so they cannot reset a live budget. A
+  construction without a stable identity (config validation, direct/test) keeps
+  private state. A compatible reload inherits live state; a semantic change isolates
   onto fresh state so a retired generation's late release/completion cannot
   corrupt the replacement. For deduplication the semantic set is deliberately
   narrow — `header_name`, `local` vs `redis`, and `on_redis_unavailable` —

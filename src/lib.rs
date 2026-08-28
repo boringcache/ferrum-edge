@@ -4950,6 +4950,235 @@ pub mod _test_support {
         parse_cluster_enabled, parse_memory_policy_fields,
     };
 
+    // ── plugins/utils/rate_limit (stable local-state lifecycle, issue #4268) ──
+
+    /// Number of live local-state generations retained for one rate-limit
+    /// policy identity, or `None` for a plugin that owns no local limiter.
+    ///
+    /// Dead generations are pruned first, so this doubles as the reclaimability
+    /// probe: once every instance for an identity is dropped the count is zero.
+    pub fn shared_local_rate_limit_generations_for_test(
+        plugin_name: &str,
+        namespace: &str,
+        config_id: &str,
+    ) -> Option<usize> {
+        use crate::plugins::utils::rate_limit::{
+            AiTokenRateAlgorithm, DynamicHttpRateLimitAlgorithm, UdpRateLimitAlgorithm,
+            WsFrameRateAlgorithm, shared_local_limiter_generations_for_test,
+        };
+        let count = match plugin_name {
+            "rate_limiting" | "graphql" | "grpc_method_router" => {
+                shared_local_limiter_generations_for_test::<DynamicHttpRateLimitAlgorithm>(
+                    namespace,
+                    plugin_name,
+                    config_id,
+                )
+            }
+            "ai_rate_limiter" => shared_local_limiter_generations_for_test::<AiTokenRateAlgorithm>(
+                namespace,
+                plugin_name,
+                config_id,
+            ),
+            "ws_rate_limiting" => shared_local_limiter_generations_for_test::<WsFrameRateAlgorithm>(
+                namespace,
+                plugin_name,
+                config_id,
+            ),
+            "udp_rate_limiting" => {
+                shared_local_limiter_generations_for_test::<UdpRateLimitAlgorithm>(
+                    namespace,
+                    plugin_name,
+                    config_id,
+                )
+            }
+            _ => return None,
+        };
+        Some(count)
+    }
+
+    /// Build two `rate_limiting` instances on the given policy identities and
+    /// report whether they enforce on the same live local state.
+    pub fn rate_limiting_shares_local_state_for_test(
+        left: (&str, &str, &serde_json::Value),
+        right: (&str, &str, &serde_json::Value),
+    ) -> Result<bool, String> {
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::rate_limiting::RateLimiting;
+
+        let first = RateLimiting::new_with_policy_identity(
+            left.2,
+            PluginHttpClient::default(),
+            left.0,
+            left.1,
+        )?;
+        let second = RateLimiting::new_with_policy_identity(
+            right.2,
+            PluginHttpClient::default(),
+            right.0,
+            right.1,
+        )?;
+        Ok(first.shares_local_state_with(&second))
+    }
+
+    /// Whether two identityless (validation-only) `rate_limiting` instances
+    /// share local state. They must not: an isolated limiter can only refuse
+    /// work, never admit against another policy's accounting.
+    pub fn standalone_rate_limiting_shares_state_for_test(
+        config: &serde_json::Value,
+    ) -> Result<bool, String> {
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::rate_limiting::RateLimiting;
+
+        let first = RateLimiting::new(config, PluginHttpClient::default())?;
+        let second = RateLimiting::new(config, PluginHttpClient::default())?;
+        Ok(first.shares_local_state_with(&second))
+    }
+
+    /// [`rate_limiting_shares_local_state_for_test`] for `graphql`.
+    pub fn graphql_shares_local_state_for_test(
+        left: (&str, &str, &serde_json::Value),
+        right: (&str, &str, &serde_json::Value),
+    ) -> Result<bool, String> {
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::graphql::GraphqlPlugin;
+
+        let first = GraphqlPlugin::new_with_policy_identity(
+            left.2,
+            PluginHttpClient::default(),
+            left.0,
+            left.1,
+        )?;
+        let second = GraphqlPlugin::new_with_policy_identity(
+            right.2,
+            PluginHttpClient::default(),
+            right.0,
+            right.1,
+        )?;
+        Ok(first.shares_local_state_with(&second))
+    }
+
+    /// [`rate_limiting_shares_local_state_for_test`] for `grpc_method_router`.
+    pub fn grpc_method_router_shares_local_state_for_test(
+        left: (&str, &str, &serde_json::Value),
+        right: (&str, &str, &serde_json::Value),
+    ) -> Result<bool, String> {
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::grpc_method_router::GrpcMethodRouter;
+
+        let first = GrpcMethodRouter::new_with_policy_identity(
+            left.2,
+            PluginHttpClient::default(),
+            left.0,
+            left.1,
+        )?;
+        let second = GrpcMethodRouter::new_with_policy_identity(
+            right.2,
+            PluginHttpClient::default(),
+            right.0,
+            right.1,
+        )?;
+        Ok(first.shares_local_state_with(&second))
+    }
+
+    /// [`rate_limiting_shares_local_state_for_test`] for `ai_rate_limiter`.
+    pub fn ai_rate_limiter_shares_local_state_for_test(
+        left: (&str, &str, &serde_json::Value),
+        right: (&str, &str, &serde_json::Value),
+    ) -> Result<bool, String> {
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::ai_rate_limiter::AiRateLimiter;
+
+        let first = AiRateLimiter::new_with_policy_identity(
+            left.2,
+            PluginHttpClient::default(),
+            left.0,
+            left.1,
+        )?;
+        let second = AiRateLimiter::new_with_policy_identity(
+            right.2,
+            PluginHttpClient::default(),
+            right.0,
+            right.1,
+        )?;
+        Ok(first.shares_local_state_with(&second))
+    }
+
+    /// [`rate_limiting_shares_local_state_for_test`] for `udp_rate_limiting`.
+    pub fn udp_rate_limiting_shares_local_state_for_test(
+        left: (&str, &str, &serde_json::Value),
+        right: (&str, &str, &serde_json::Value),
+    ) -> Result<bool, String> {
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::udp_rate_limiting::UdpRateLimiting;
+
+        let first = UdpRateLimiting::new_with_policy_identity(
+            left.2,
+            PluginHttpClient::default(),
+            left.0,
+            left.1,
+        )?;
+        let second = UdpRateLimiting::new_with_policy_identity(
+            right.2,
+            PluginHttpClient::default(),
+            right.0,
+            right.1,
+        )?;
+        Ok(first.shares_local_state_with(&second))
+    }
+
+    /// Build a `ws_rate_limiting` instance bound to a stable policy identity.
+    pub fn ws_rate_limiting_with_policy_identity_for_test(
+        config: &serde_json::Value,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<crate::plugins::ws_rate_limiting::WsRateLimiting, String> {
+        use crate::plugins::PluginHttpClient;
+
+        crate::plugins::ws_rate_limiting::WsRateLimiting::new_with_policy_identity(
+            config,
+            PluginHttpClient::default(),
+            namespace,
+            config_id,
+        )
+    }
+
+    /// Charge one frame at `now` and report whether the local bucket admitted it.
+    pub fn ws_rate_limiting_charge_frame_for_test(
+        plugin: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+        connection_id: u64,
+        now: std::time::Instant,
+    ) -> bool {
+        plugin.charge_frame_locally_at_for_test(connection_id, now)
+    }
+
+    /// Whether `connection_id` still has retained local frame state.
+    pub fn ws_rate_limiting_contains_connection_for_test(
+        plugin: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+        connection_id: u64,
+    ) -> bool {
+        plugin.contains_connection_for_test(connection_id)
+    }
+
+    /// Whether two `ws_rate_limiting` instances enforce on the same live state.
+    pub fn ws_rate_limiting_shares_local_state_for_test(
+        left: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+        right: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+    ) -> bool {
+        left.shares_local_state_with(right)
+    }
+
+    /// Run the production full-reload plugin-cache path: build a candidate
+    /// generation against the currently published one, then publish it
+    /// atomically. Mirrors `ProxyState::update_config`.
+    pub fn plugin_cache_full_reload_for_test(
+        cache: &crate::plugin_cache::PluginCache,
+        config: &crate::config::types::GatewayConfig,
+    ) -> Result<(), String> {
+        let inner = cache.build_inner_with_existing_client(config)?;
+        cache.store_inner(inner);
+        Ok(())
+    }
+
     // ── plugins/utils/rate_limit (Redis failure policy) ──────────────────────
     pub use crate::plugins::utils::rate_limit::{
         ENFORCEMENT_UNAVAILABLE_BODY, ENFORCEMENT_UNAVAILABLE_MESSAGE,

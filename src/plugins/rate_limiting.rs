@@ -29,6 +29,16 @@ const RATE_LIMIT_IDENTITY_HEADER: &str = "x-ratelimit-identity";
 /// `rate_limiting`-specific top-level config keys (excludes shared Redis fields).
 const RATE_LIMITING_POLICY_CONFIG_KEYS: &[&str] = &["limit_by", "expose_headers", "limits"];
 
+/// Plugin-specific fields that change what a retained local counter *means*.
+///
+/// `limit_by` is the limit dimension (which caller a counter belongs to) and
+/// `limits` carries every window, maximum, and consumer override. A change to
+/// either isolates onto fresh state. `expose_headers` is response presentation
+/// only and never resets a live budget. The shared enforcement posture
+/// (`sync_mode`, `redis_failure_policy`, effective Redis key prefix) is added by
+/// the backend; secret-bearing Redis fields are never fingerprinted.
+const RATE_LIMITING_STATE_SEMANTIC_KEYS: &[&str] = &["limit_by", "limits"];
+
 /// Closed top-level key set for `rate_limiting` plugin config.
 ///
 /// Must stay aligned with OpenAPI `RateLimitingConfig` (which already declares
@@ -88,6 +98,31 @@ impl RateLimiting {
         http_client: PluginHttpClient,
         config_id: &str,
     ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, None, config_id)
+    }
+
+    /// Construct with local enforcement state shared across compatible
+    /// plugin-cache generations for the stable `(namespace, plugin kind,
+    /// plugin-config id)` policy identity.
+    ///
+    /// A reload that does not change this policy's enforcement semantics keeps
+    /// the live counters, so a co-tenant churning unrelated configuration can
+    /// no longer hand every caller a fresh budget.
+    pub fn new_with_policy_identity(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, Some(namespace), config_id)
+    }
+
+    fn from_parts(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: Option<&str>,
+        config_id: &str,
+    ) -> Result<Self, String> {
         let object = config
             .as_object()
             .ok_or_else(|| format!("rate_limiting: config must be an object, got: {config}"))?;
@@ -119,12 +154,14 @@ impl RateLimiting {
             );
         }
 
-        let limiter = RateLimitBackend::from_plugin_config_with_config_id(
+        let limiter = RateLimitBackend::from_plugin_config_with_policy_identity(
             "rate_limiting",
+            namespace,
             config_id,
             config,
             &http_client,
             DynamicHttpRateLimitAlgorithm::new(),
+            RATE_LIMITING_STATE_SEMANTIC_KEYS,
         )?;
 
         Ok(Self {
@@ -137,6 +174,16 @@ impl RateLimiting {
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
         })
+    }
+
+    /// Whether this instance enforces on the same live local state as `other`.
+    ///
+    /// A compatible reload generation for one policy identity must share; an
+    /// unrelated policy, tenant, plugin kind, or semantically changed policy
+    /// must not. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn shares_local_state_with(&self, other: &Self) -> bool {
+        self.limiter.shares_local_state_with(&other.limiter)
     }
 
     /// Local/fallback DashMap shard count. Test-only; not a production API.

@@ -46,6 +46,13 @@ pub const WS_RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
     "redis_failure_policy",
 ];
 
+/// Plugin-specific fields that change what a retained local frame budget
+/// *means*: the sustained rate and the burst capacity of the token bucket.
+/// `close_reason` is client-visible presentation only and never resets a live
+/// budget. The shared enforcement posture is added by the backend;
+/// secret-bearing Redis fields are never fingerprinted.
+const WS_RATE_LIMITING_STATE_SEMANTIC_KEYS: &[&str] = &["frames_per_second", "burst_size"];
+
 const MAX_STATE_ENTRIES: usize = 50_000;
 const EVICTION_CHECK_INTERVAL: u64 = 100_000;
 /// Bounds below-cap full-map scans under high frame rates. Over-cap pressure
@@ -78,6 +85,32 @@ impl WsRateLimiting {
     pub fn new_with_config_id(
         config: &Value,
         http_client: PluginHttpClient,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, None, config_id)
+    }
+
+    /// Construct with local enforcement state shared across compatible
+    /// plugin-cache generations for the stable `(namespace, plugin kind,
+    /// plugin-config id)` policy identity.
+    ///
+    /// Local keys are the proxy's process-wide monotonic WebSocket connection
+    /// ids (`ProxyState::ws_connection_counter`), which outlive a config reload,
+    /// so a live connection keeps its consumed frame budget instead of being
+    /// handed a full bucket by an unrelated plugin-config change.
+    pub fn new_with_policy_identity(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, Some(namespace), config_id)
+    }
+
+    fn from_parts(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: Option<&str>,
         config_id: &str,
     ) -> Result<Self, String> {
         let object = config
@@ -124,16 +157,28 @@ impl WsRateLimiting {
             close_reason,
             frame_counter: AtomicU64::new(0),
             redis_instance_id: Uuid::new_v4().simple().to_string(),
-            limiter: RateLimitBackend::from_plugin_config_with_config_id(
+            limiter: RateLimitBackend::from_plugin_config_with_policy_identity(
                 "ws_rate_limiting",
+                namespace,
                 config_id,
                 config,
                 &http_client,
                 WsFrameRateAlgorithm::new(frames_per_second as f64, burst_size as f64),
+                WS_RATE_LIMITING_STATE_SEMANTIC_KEYS,
             )?,
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
         })
+    }
+
+    /// Whether this instance enforces on the same live local state as `other`.
+    ///
+    /// A compatible reload generation for one policy identity must share; an
+    /// unrelated policy, tenant, plugin kind, or semantically changed policy
+    /// must not. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn shares_local_state_with(&self, other: &Self) -> bool {
+        self.limiter.shares_local_state_with(&other.limiter)
     }
 
     /// Local/fallback DashMap shard count. Test-only; not a production API.
@@ -149,6 +194,20 @@ impl WsRateLimiting {
         &self,
     ) -> Option<super::utils::rate_limit::RedisFailurePolicy> {
         self.limiter.redis_failure_policy()
+    }
+
+    /// Charge one frame against the local token bucket at `now` and report
+    /// whether it was admitted. Deterministic (no wall-clock sleep) mirror of
+    /// the frame budget for stable-state coverage. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn charge_frame_locally_at_for_test(
+        &self,
+        connection_id: u64,
+        now: Instant,
+    ) -> bool {
+        self.limiter
+            .check_local_at(connection_id, &WsRateLimitOp::ONE, now)
+            .allowed
     }
 
     /// Controllable-time seed for external cleanup tests. Not a production API.
