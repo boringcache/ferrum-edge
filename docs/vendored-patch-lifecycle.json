@@ -193,7 +193,7 @@
         "github_repo": "hyperium/h3",
         "pr_number": null,
         "issue_number": null,
-        "fork_ref": "jeremyjpj0916/h3@feat/extended-connect-websocket-protocol"
+        "fork_ref": null
       },
       "reaffirmation": null,
       "retirement": {
@@ -223,7 +223,7 @@
         "github_repo": "hyperium/h3",
         "pr_number": null,
         "issue_number": null,
-        "fork_ref": "jeremyjpj0916/h3@feat/peek-buffered-trailers-before-fin"
+        "fork_ref": null
       },
       "reaffirmation": null,
       "retirement": {
@@ -253,7 +253,7 @@
         "github_repo": "hyperium/h3",
         "pr_number": null,
         "issue_number": null,
-        "fork_ref": "jeremyjpj0916/h3@feat/send-stream-stopped-watch"
+        "fork_ref": null
       },
       "reaffirmation": null,
       "retirement": {
