@@ -1007,34 +1007,143 @@ fn local_limiter_policy_identity(namespace: &str, plugin_name: &str, config_id: 
     format!("{namespace}\0{plugin_name}\0{config_id}")
 }
 
+/// Canonical description of one policy's **effective** local enforcement
+/// semantics, built by the plugin after its own parsing, defaulting, and
+/// normalization have already run.
+///
+/// Raw configuration syntax is deliberately not an input. Two configurations
+/// that parse to the same enforcement — an omitted optional field and its
+/// explicit effective default, a value the parser lower-cases or trims, an
+/// omitted rate map and an explicit empty one — describe the same budget and
+/// must keep the same counters, or config churn alone would mint a fresh
+/// budget without changing what is enforced. Conversely any value the parser
+/// keeps is encoded here, so a real enforcement change still isolates.
+///
+/// Fields are self-delimiting and sorted by label before hashing, so neither
+/// the order a plugin records them in nor a hash-map iteration order can change
+/// the result. Never record a credential, URL, username, password, or TLS
+/// material: this value feeds [`local_limiter_fingerprint`], and the shared
+/// Redis posture is added there rather than by a plugin.
+#[derive(Debug, Default)]
+pub struct LocalStateSemantics {
+    fields: Vec<(&'static str, Vec<u8>)>,
+}
+
+impl LocalStateSemantics {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn push(&mut self, label: &'static str, encoded: Vec<u8>) {
+        debug_assert!(
+            !RATE_LIMIT_REDIS_CONFIG_KEYS.contains(&label),
+            "local rate-limit compatibility must not record shared Redis config fields; the \
+             enforcement posture is added by local_limiter_fingerprint"
+        );
+        debug_assert!(
+            !self.fields.iter().any(|(known, _)| *known == label),
+            "duplicate local rate-limit semantic label"
+        );
+        self.fields.push((label, encoded));
+    }
+
+    /// Record an already-normalized effective string (a parsed enum rendered
+    /// canonically, not the operator's raw spelling).
+    pub fn text(&mut self, label: &'static str, value: &str) {
+        self.push(label, value.as_bytes().to_vec());
+    }
+
+    /// Record an effective integer parameter (the value after defaulting).
+    pub fn u64(&mut self, label: &'static str, value: u64) {
+        self.push(label, value.to_le_bytes().to_vec());
+    }
+
+    /// Record an effective optional integer parameter. Unset is a distinct
+    /// enforcement state from any set value (an unlimited axis is not a
+    /// bounded one), so it is encoded distinctly rather than as zero.
+    pub fn optional_u64(&mut self, label: &'static str, value: Option<u64>) {
+        let mut encoded = Vec::with_capacity(9);
+        match value {
+            Some(value) => {
+                encoded.push(1);
+                encoded.extend_from_slice(&value.to_le_bytes());
+            }
+            None => encoded.push(0),
+        }
+        self.push(label, encoded);
+    }
+
+    /// Record one window list (limit + duration per window, in the order the
+    /// limiter evaluates them).
+    pub fn windows(&mut self, label: &'static str, specs: &[RateLimitWindowSpec]) {
+        self.push(label, encode_window_specs(specs));
+    }
+
+    /// Record a keyed set of window lists (per consumer, per operation, per
+    /// method). Entries are sorted by key, so a hash-map iteration order can
+    /// never change the fingerprint, and an omitted map and an explicit empty
+    /// map both encode as zero entries.
+    pub fn window_map<'a, I>(&mut self, label: &'static str, entries: I)
+    where
+        I: IntoIterator<Item = (&'a str, &'a [RateLimitWindowSpec])>,
+    {
+        let mut entries: Vec<(&str, &[RateLimitWindowSpec])> = entries.into_iter().collect();
+        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (key, specs) in entries {
+            encoded.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            encoded.extend_from_slice(key.as_bytes());
+            let specs = encode_window_specs(specs);
+            encoded.extend_from_slice(&(specs.len() as u64).to_le_bytes());
+            encoded.extend_from_slice(&specs);
+        }
+        self.push(label, encoded);
+    }
+}
+
+/// Self-delimiting encoding of one window list. Durations are encoded in
+/// nanoseconds so a sub-second window can never collide with a whole-second one.
+fn encode_window_specs(specs: &[RateLimitWindowSpec]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(8 + specs.len() * 24);
+    encoded.extend_from_slice(&(specs.len() as u64).to_le_bytes());
+    for spec in specs {
+        encoded.extend_from_slice(&spec.limit.to_le_bytes());
+        encoded.extend_from_slice(&spec.duration.as_nanos().to_le_bytes());
+    }
+    encoded
+}
+
 /// Canonical, non-reversible fingerprint of everything that changes what local
 /// enforcement state *means* for one policy.
 ///
-/// Inputs are the plugin's own enforcement-relevant config fields (supplied by
-/// the caller as a fixed list of key names) plus the shared enforcement posture
-/// resolved here: whether a centralized store is authoritative, the outage
-/// policy that decides whether the local map is ever consulted, and the
-/// effective Redis key prefix that names the counter domain.
+/// Inputs are the plugin's effective enforcement semantics
+/// ([`LocalStateSemantics`], built after validation) plus the shared posture
+/// resolved here: whether a centralized store is authoritative, and — only when
+/// it is — the outage policy that decides whether the local map is ever an
+/// admission domain and the effective Redis key prefix that names the counter
+/// domain.
 ///
-/// Secret-bearing configuration is never an input. `redis_url`, `redis_username`,
-/// `redis_password`, and the TLS material keys are deliberately excluded, and a
-/// debug assertion refuses any caller-supplied field name drawn from the shared
-/// Redis key set. The output is a SHA-256 hex digest: it is compared for
-/// equality only, is never logged, and carries no configuration text.
+/// `redis_failure_policy` is deliberately *conditional*. With `sync_mode: local`
+/// there is no centralized store to lose, the local map is the sole enforcement
+/// domain under every posture, and the field changes nothing that is enforced —
+/// so toggling it must not discard a live budget. Once Redis is enabled it
+/// decides whether the local map can admit at all during an outage, which is a
+/// real change in what the retained counters mean, so it isolates.
+///
+/// Secret-bearing configuration is never an input: `redis_url`,
+/// `redis_username`, `redis_password`, and the TLS material keys are excluded
+/// by construction, and [`LocalStateSemantics::push`] debug-asserts that no
+/// plugin records a shared Redis config field. The output is a SHA-256 hex
+/// digest: it is compared for equality only, is never logged, and carries no
+/// configuration text.
 fn local_limiter_fingerprint(
     plugin_name: &str,
-    config: &Value,
-    semantic_fields: &[&str],
+    semantics: &LocalStateSemantics,
     redis_enabled: bool,
     failure_policy: RedisFailurePolicy,
     redis_key_prefix: Option<&str>,
 ) -> String {
-    debug_assert!(
-        semantic_fields
-            .iter()
-            .all(|field| !RATE_LIMIT_REDIS_CONFIG_KEYS.contains(field)),
-        "local rate-limit compatibility must not fingerprint shared Redis config fields"
-    );
     use crate::fips::approved::Sha256;
 
     let mut hasher = Sha256::new();
@@ -1045,29 +1154,29 @@ fn local_limiter_fingerprint(
         hasher.update((value.len() as u64).to_le_bytes());
         hasher.update(value);
     };
-    absorb("v", b"ferrum-edge/rate-limit/local-state/v1");
+    absorb("v", b"ferrum-edge/rate-limit/local-state/v2");
     absorb("plugin", plugin_name.as_bytes());
     absorb("redis", if redis_enabled { b"1" } else { b"0" });
-    absorb(
-        "failure_policy",
-        match failure_policy {
-            RedisFailurePolicy::FailClosed => b"fail_closed".as_slice(),
-            RedisFailurePolicy::LocalFallback => b"local_fallback".as_slice(),
-        },
-    );
-    absorb("redis_key_prefix", redis_key_prefix.unwrap_or("").as_bytes());
-    for field in semantic_fields.iter().copied() {
-        // `serde_json::Map` is a `BTreeMap` in this build, so `to_string()` is a
-        // canonical key-sorted rendering and equality is deterministic across
-        // reload generations and across gateway processes.
-        let rendered = match config.get(field) {
-            Some(value) => value.to_string(),
-            // Absent is a distinct state from any present value: an explicitly
-            // configured default must not be confused with the field being
-            // removed, because a later default change would then be inherited.
-            None => "\u{0}absent".to_string(),
-        };
-        absorb(field, rendered.as_bytes());
+    if redis_enabled {
+        absorb(
+            "failure_policy",
+            match failure_policy {
+                RedisFailurePolicy::FailClosed => b"fail_closed".as_slice(),
+                RedisFailurePolicy::LocalFallback => b"local_fallback".as_slice(),
+            },
+        );
+        absorb("redis_key_prefix", redis_key_prefix.unwrap_or("").as_bytes());
+    }
+    // Sorted by label so the order a plugin records its semantics in is not
+    // itself a compatibility input.
+    let mut fields: Vec<(&str, &[u8])> = semantics
+        .fields
+        .iter()
+        .map(|(label, encoded)| (*label, encoded.as_slice()))
+        .collect();
+    fields.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (label, encoded) in fields {
+        absorb(label, encoded);
     }
     hex::encode(hasher.finalize())
 }
@@ -1209,14 +1318,18 @@ where
     /// private state, which is the conservative choice: isolated state can only
     /// refuse work, never admit against another policy's accounting.
     ///
-    /// `semantic_fields` lists this plugin's own enforcement-relevant root
-    /// config keys — limit dimension, windows, maximums, algorithm parameters,
-    /// and any plugin-specific shaping. Together with the shared posture
-    /// resolved here (`sync_mode`, `redis_failure_policy`, effective Redis key
-    /// prefix) they form the compatibility fingerprint: a change to any of them
-    /// isolates immediately onto fresh state, while an unrelated config,
-    /// ordering, or HTTP-client rebuild inherits the live budget. Never list a
-    /// secret-bearing key here (see [`local_limiter_fingerprint`]).
+    /// `semantics` carries this plugin's **effective** enforcement parameters —
+    /// limit dimension, windows, maximums, algorithm parameters, and any
+    /// plugin-specific shaping — as they are after the plugin's own parsing,
+    /// defaulting, and normalization. It is deliberately not raw config syntax:
+    /// two configurations that parse to the same enforcement keep one budget,
+    /// so config churn alone cannot mint a fresh one. Together with the shared
+    /// posture resolved here (`sync_mode`, and when Redis is enabled the
+    /// failure posture and effective key prefix) it forms the compatibility
+    /// fingerprint: a real enforcement change isolates immediately onto fresh
+    /// state, while an unrelated config, ordering, or HTTP-client rebuild
+    /// inherits the live budget. Never record a secret-bearing value there (see
+    /// [`local_limiter_fingerprint`]).
     pub fn from_plugin_config_with_policy_identity(
         plugin_name: &'static str,
         namespace: Option<&str>,
@@ -1224,7 +1337,7 @@ where
         config: &Value,
         http_client: &PluginHttpClient,
         algorithm: A,
-        semantic_fields: &[&str],
+        semantics: &LocalStateSemantics,
     ) -> Result<Self, String>
     where
         A: SharedLocalLimiterState<Key = K>,
@@ -1245,8 +1358,7 @@ where
                 local_limiter_policy_identity(namespace, plugin_name, config_id),
                 local_limiter_fingerprint(
                     plugin_name,
-                    config,
-                    semantic_fields,
+                    semantics,
                     redis.is_some(),
                     failure_policy,
                     redis.as_ref().map(|redis| redis.key_prefix()),
@@ -2046,13 +2158,34 @@ impl RateLimitAlgorithm for DynamicHttpRateLimitAlgorithm {
         now: Instant,
     ) -> RateLimitOutcome {
         if !Arc::ptr_eq(&state.specs, &op.specs) {
-            if !state.windows.is_empty() {
-                warn!(
-                    "DynamicHttpRateLimitAlgorithm: spec change detected for in-progress key; counter state will be reset"
-                );
+            // Pointer inequality alone is NOT a spec change. Every compatible
+            // plugin rebuild — a full reload, a global plugin-config change or
+            // deletion, a proxy-association edit — constructs a fresh
+            // `DynamicRateLimitOp` with the same window values, so keying the
+            // reset on identity would discard the retained counters on the
+            // first request through the rebuilt instance and defeat the
+            // policy-owned local state entirely (issue #4268). Compare the
+            // window values instead; only a genuinely different spec resets.
+            let specs_changed = {
+                let retained: &[RateLimitWindowSpec] = &state.specs;
+                let requested: &[RateLimitWindowSpec] = &op.specs;
+                retained != requested
+            };
+            if specs_changed {
+                if !state.windows.is_empty() {
+                    warn!(
+                        "DynamicHttpRateLimitAlgorithm: spec change detected for in-progress key; counter state will be reset"
+                    );
+                }
+                state.windows = new_http_window_states(op.specs());
             }
+            // Retarget onto the caller's `Arc` either way, so the steady state
+            // after a rebuild is a pointer comparison again and the value
+            // compare is paid once per key. Two live cache generations that
+            // alternate equal-spec `Arc`s on one key keep retargeting, which is
+            // a short slice compare under the per-key write guard already held
+            // — never a reset, so neither generation can over-admit.
             state.specs = Arc::clone(&op.specs);
-            state.windows = new_http_window_states(op.specs());
         }
         check_http_windows(op.specs(), &mut state.windows, now)
     }

@@ -9,8 +9,8 @@ use tracing::warn;
 
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, ENFORCEMENT_UNAVAILABLE_BODY,
-    ENFORCEMENT_UNAVAILABLE_STATUS, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
-    RateLimitOutcome, RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID,
+    ENFORCEMENT_UNAVAILABLE_STATUS, LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS,
+    RateLimitBackend, RateLimitOutcome, RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID,
     apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
     validate_max_requests, validate_window_seconds,
 };
@@ -28,16 +28,6 @@ const RATE_LIMIT_IDENTITY_HEADER: &str = "x-ratelimit-identity";
 
 /// `rate_limiting`-specific top-level config keys (excludes shared Redis fields).
 const RATE_LIMITING_POLICY_CONFIG_KEYS: &[&str] = &["limit_by", "expose_headers", "limits"];
-
-/// Plugin-specific fields that change what a retained local counter *means*.
-///
-/// `limit_by` is the limit dimension (which caller a counter belongs to) and
-/// `limits` carries every window, maximum, and consumer override. A change to
-/// either isolates onto fresh state. `expose_headers` is response presentation
-/// only and never resets a live budget. The shared enforcement posture
-/// (`sync_mode`, `redis_failure_policy`, effective Redis key prefix) is added by
-/// the backend; secret-bearing Redis fields are never fingerprinted.
-const RATE_LIMITING_STATE_SEMANTIC_KEYS: &[&str] = &["limit_by", "limits"];
 
 /// Closed top-level key set for `rate_limiting` plugin config.
 ///
@@ -70,6 +60,20 @@ enum LimitBy {
     Ip,
     Consumer,
     SpiffeIdentity,
+}
+
+impl LimitBy {
+    /// Canonical rendering of the parsed dimension. `parse_limit_by` accepts
+    /// mixed case and the `spiffe` / `spiffe_identity` spellings, all of which
+    /// enforce identically, so the *parsed* value is what local-state
+    /// compatibility is decided on.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ip => "ip",
+            Self::Consumer => "consumer",
+            Self::SpiffeIdentity => "spiffe_identity",
+        }
+    }
 }
 
 pub struct RateLimiting {
@@ -154,6 +158,21 @@ impl RateLimiting {
             );
         }
 
+        // Effective enforcement semantics, not raw syntax: the parsed dimension
+        // and the parsed window/consumer budgets. `expose_headers` is response
+        // presentation only and never resets a live budget, and the shared
+        // Redis posture is added by the backend.
+        let mut semantics = LocalStateSemantics::new();
+        semantics.text("limit_by", limit_by.as_str());
+        semantics.windows("default_limit", parsed_limits.default_limit.specs());
+        semantics.window_map(
+            "consumer_limits",
+            parsed_limits
+                .consumer_overrides
+                .iter()
+                .map(|(consumer, limit)| (consumer.as_str(), limit.specs())),
+        );
+
         let limiter = RateLimitBackend::from_plugin_config_with_policy_identity(
             "rate_limiting",
             namespace,
@@ -161,7 +180,7 @@ impl RateLimiting {
             config,
             &http_client,
             DynamicHttpRateLimitAlgorithm::new(),
-            RATE_LIMITING_STATE_SEMANTIC_KEYS,
+            &semantics,
         )?;
 
         Ok(Self {

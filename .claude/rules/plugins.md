@@ -122,16 +122,28 @@ paths:
   `namespace` + plugin KIND + plugin-config id — the kind is load-bearing
   because three of them share one algorithm type — and each registry is
   statically typed per `(key, algorithm)` pair, so there is no downcast to get
-  wrong. Compatibility is a SHA-256 fingerprint over each plugin's declared
-  enforcement-relevant config fields (limit dimension, windows, maximums,
-  algorithm parameters, plugin-specific shaping) plus the shared posture
-  (`sync_mode`, `redis_failure_policy`, effective Redis key prefix); never add
-  a secret-bearing key to a `*_STATE_SEMANTIC_KEYS` list, and never log the
+  wrong. Compatibility is a SHA-256 fingerprint over the plugin's EFFECTIVE
+  enforcement semantics — a `LocalStateSemantics` the constructor fills in
+  AFTER its own parsing, defaulting, and normalization (limit dimension,
+  window lists, algorithm parameters, plugin-specific shaping) — plus the
+  shared posture. Never fingerprint raw JSON: an omitted optional field and
+  its explicit effective default, a spelling the parser normalizes, and an
+  omitted rate map vs an explicit empty one are the same enforcement, so
+  hashing syntax would let config churn alone mint a fresh budget. The shared
+  posture is `sync_mode`, and ONLY when Redis is enabled the effective
+  `redis_failure_policy` and effective key prefix — with `sync_mode: local`
+  there is no store to lose, the posture changes nothing enforced, and
+  toggling it must not reset the budget. Never record a credential, URL,
+  username, password, or TLS material in `LocalStateSemantics` (a debug
+  assertion refuses the shared Redis config keys), and never log the
   fingerprint. Presentation-only fields (`expose_headers`, `close_reason`) and
   stateless checks (GraphQL depth/complexity, gRPC allow/deny lists) are
-  deliberately outside the set so they cannot reset a live budget. A
-  construction without a stable identity (config validation, direct/test) keeps
-  private state. A compatible reload inherits live state; a semantic change isolates
+  deliberately outside the set so they cannot reset a live budget. Sharing the
+  limiter is only half of it: `DynamicHttpRateLimitAlgorithm::check_local`
+  compares window VALUES, not `Arc` identity, because a compatible rebuild
+  always constructs a new `DynamicRateLimitOp`. A construction without a
+  stable identity (config validation, direct/test) keeps private state. A
+  compatible reload inherits live state; a semantic change isolates
   onto fresh state so a retired generation's late release/completion cannot
   corrupt the replacement. For deduplication the semantic set is deliberately
   narrow — `header_name`, `local` vs `redis`, and `on_redis_unavailable` —

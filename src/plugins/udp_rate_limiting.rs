@@ -9,9 +9,10 @@ use std::time::Instant;
 use tracing::warn;
 
 use super::utils::rate_limit::{
-    RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend, STANDALONE_RATE_LIMIT_CONFIG_ID,
-    UdpRateLimitAlgorithm, UdpRateLimitOp, apply_rate_limit_cleanup, debug_assert_closed_root_keys,
-    debug_assert_rate_limit_redis_keys, validate_window_seconds,
+    LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
+    STANDALONE_RATE_LIMIT_CONFIG_ID, UdpRateLimitAlgorithm, UdpRateLimitOp,
+    apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
+    validate_window_seconds,
 };
 use super::{
     Plugin, PluginHttpClient, ProxyProtocol, UDP_ONLY_PROTOCOLS, UdpDatagramContext,
@@ -46,13 +47,6 @@ pub const UDP_RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
     "redis_password",
     "redis_failure_policy",
 ];
-
-/// Plugin-specific fields that change what a retained local datagram/byte
-/// budget *means*: the two per-second rates and the window length. The shared
-/// enforcement posture is added by the backend; secret-bearing Redis fields are
-/// never fingerprinted.
-const UDP_RATE_LIMITING_STATE_SEMANTIC_KEYS: &[&str] =
-    &["datagrams_per_second", "bytes_per_second", "window_seconds"];
 
 const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_COOLDOWN_SECS: u64 = 1;
@@ -108,9 +102,9 @@ impl UdpRateLimiting {
     ///
     /// An inherited limiter keeps the algorithm — and therefore the window
     /// epoch — it was created with, so an inherited counter is never
-    /// re-indexed onto a replacement generation's fresh epoch. A change to any
-    /// of [`UDP_RATE_LIMITING_STATE_SEMANTIC_KEYS`] isolates onto fresh state
-    /// instead.
+    /// re-indexed onto a replacement generation's fresh epoch. A change to the
+    /// effective per-window datagram/byte budgets or the window length isolates
+    /// onto fresh state instead.
     pub fn new_with_policy_identity(
         config: &Value,
         http_client: PluginHttpClient,
@@ -164,6 +158,17 @@ impl UdpRateLimiting {
         };
         let datagrams_per_window = per_window_limit(datagrams_per_second, window_seconds)?;
         let bytes_per_window = per_window_limit(bytes_per_second, window_seconds)?;
+        // Effective enforcement semantics, not raw syntax: the per-window
+        // budgets the algorithm actually enforces and the window length after
+        // defaulting (`window_seconds` omitted is 1), so an omitted window and
+        // an explicit `1` describe the same budget. An unset axis is encoded
+        // distinctly from any set value — unlimited is not a bound. The shared
+        // Redis posture is added by the backend.
+        let mut semantics = LocalStateSemantics::new();
+        semantics.optional_u64("datagrams_per_window", datagrams_per_window);
+        semantics.optional_u64("bytes_per_window", bytes_per_window);
+        semantics.u64("window_seconds", window_seconds);
+
         let epoch_base = Instant::now();
 
         Ok(Self {
@@ -183,7 +188,7 @@ impl UdpRateLimiting {
                     window_seconds,
                     epoch_base,
                 ),
-                UDP_RATE_LIMITING_STATE_SEMANTIC_KEYS,
+                &semantics,
             )?,
         })
     }

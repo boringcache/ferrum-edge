@@ -48,8 +48,8 @@ use super::utils::ai_usage_stream::{
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::rate_limit::{
     AiRateLimitOp, AiTokenRateAlgorithm, ENFORCEMENT_UNAVAILABLE_BODY,
-    ENFORCEMENT_UNAVAILABLE_STATUS, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
-    RateLimitOutcome, ReservationBackend, STANDALONE_RATE_LIMIT_CONFIG_ID,
+    ENFORCEMENT_UNAVAILABLE_STATUS, LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS,
+    RateLimitBackend, RateLimitOutcome, ReservationBackend, STANDALONE_RATE_LIMIT_CONFIG_ID,
     apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
     validate_window_seconds,
 };
@@ -336,24 +336,6 @@ pub const AI_RATE_LIMITER_CONFIG_KEYS: &[&str] = &[
     "redis_failure_policy",
 ];
 
-/// Plugin-specific fields that change what a retained local token counter
-/// *means*.
-///
-/// `token_limit` / `window_seconds` are the algorithm parameters, `limit_by` is
-/// the limit dimension, and `count_mode`, `provider`, and `on_unmetered_response`
-/// decide which tokens are charged at all. `expose_headers` is response
-/// presentation only and never resets a live budget. The shared enforcement
-/// posture is added by the backend; secret-bearing Redis fields are never
-/// fingerprinted.
-const AI_RATE_LIMITER_STATE_SEMANTIC_KEYS: &[&str] = &[
-    "token_limit",
-    "window_seconds",
-    "count_mode",
-    "limit_by",
-    "provider",
-    "on_unmetered_response",
-];
-
 pub struct AiRateLimiter {
     token_limit: u64,
     window_seconds: u64,
@@ -524,6 +506,22 @@ impl AiRateLimiter {
         // accounting contract (GHSA-wh4p-pmxm-3784).
         let instance_id = INSTANCE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
 
+        // Effective enforcement semantics, not raw syntax: the algorithm
+        // parameters after defaulting (`window_seconds` omitted is 60), the
+        // parsed limit dimension and count mode, the trimmed/lower-cased
+        // provider (omitted is `auto`), and the parsed unmetered-response
+        // action (omitted is `charge_estimate`) — all of which decide which
+        // tokens are charged. `expose_headers` is response presentation only
+        // and never resets a live budget; the shared Redis posture is added by
+        // the backend.
+        let mut semantics = LocalStateSemantics::new();
+        semantics.u64("token_limit", token_limit);
+        semantics.u64("window_seconds", window_seconds);
+        semantics.text("count_mode", &count_mode);
+        semantics.text("limit_by", &limit_by);
+        semantics.text("provider", &provider);
+        semantics.text("on_unmetered_response", on_unmetered_response.as_str());
+
         Ok(Self {
             token_limit,
             window_seconds,
@@ -543,7 +541,7 @@ impl AiRateLimiter {
                 config,
                 &http_client,
                 AiTokenRateAlgorithm::new(token_limit, window_seconds),
-                AI_RATE_LIMITER_STATE_SEMANTIC_KEYS,
+                &semantics,
             )?,
             request_counter: AtomicU64::new(0),
             epoch_base: Instant::now(),

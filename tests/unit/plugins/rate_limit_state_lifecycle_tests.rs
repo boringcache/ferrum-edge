@@ -113,6 +113,16 @@ async fn request_refused(cache: &PluginCache) -> bool {
     )
 }
 
+/// Drive one request through a directly constructed instance and report
+/// whether it was refused.
+async fn instance_refused(limiter: &RateLimiting) -> bool {
+    let mut ctx = create_test_context();
+    matches!(
+        limiter.on_request_received(&mut ctx).await,
+        PluginResult::Reject { .. }
+    )
+}
+
 async fn exhaust(cache: &PluginCache, budget: usize) {
     for attempt in 0..budget {
         assert!(
@@ -146,6 +156,51 @@ fn ai_shares(left: Identity<'_>, right: Identity<'_>) -> bool {
 
 fn udp_shares(left: Identity<'_>, right: Identity<'_>) -> bool {
     udp_rate_limiting_shares_local_state_for_test(left, right).expect("udp_rate_limiting builds")
+}
+
+fn ws_shares(left: Identity<'_>, right: Identity<'_>) -> bool {
+    let first = ws_rate_limiting_with_policy_identity_for_test(left.2, left.0, left.1)
+        .expect("ws_rate_limiting constructs");
+    let second = ws_rate_limiting_with_policy_identity_for_test(right.2, right.0, right.1)
+        .expect("ws_rate_limiting constructs");
+    ws_rate_limiting_shares_local_state_for_test(&first, &second)
+}
+
+// Two configs on ONE policy identity: the question every compatibility case
+// below asks. `id` must be unique per test — enforcement state is process-wide,
+// so two tests reusing an id would share a budget and race.
+fn rl_pair(id: &str, left: &Value, right: &Value) -> bool {
+    rl_shares((NS, id, left), (NS, id, right))
+}
+
+fn gql_pair(id: &str, left: &Value, right: &Value) -> bool {
+    gql_shares((NS, id, left), (NS, id, right))
+}
+
+fn grpc_pair(id: &str, left: &Value, right: &Value) -> bool {
+    grpc_shares((NS, id, left), (NS, id, right))
+}
+
+fn ai_pair(id: &str, left: &Value, right: &Value) -> bool {
+    ai_shares((NS, id, left), (NS, id, right))
+}
+
+fn udp_pair(id: &str, left: &Value, right: &Value) -> bool {
+    udp_shares((NS, id, left), (NS, id, right))
+}
+
+fn ws_pair(id: &str, left: &Value, right: &Value) -> bool {
+    ws_shares((NS, id, left), (NS, id, right))
+}
+
+/// A `rate_limiting` policy with `sync_mode: redis` pointed at an endpoint that
+/// is never dialed: construction is offline, and only the effective posture
+/// matters here.
+fn redis_backed_policy() -> Value {
+    let mut config = rate_limiting_policy(10, 60, "ip");
+    config["sync_mode"] = json!("redis");
+    config["redis_url"] = json!("redis://cache.internal:6379/0");
+    config
 }
 
 #[tokio::test]
@@ -269,13 +324,15 @@ fn compatible_reloads_share_state_and_semantic_changes_do_not() {
         );
     }
 
-    // Redis failure posture decides whether the local map is ever an admission
-    // domain, so it is part of the compatibility set even for a local policy.
+    // With `sync_mode: local` there is no centralized store to lose, so the
+    // outage posture changes nothing that is enforced and must not discard a
+    // live budget. `a_redis_backed_policy_isolates_a_changed_failure_posture`
+    // covers the Redis-enabled case, where it does isolate.
     let mut fallback = base.clone();
     fallback["redis_failure_policy"] = json!("local_fallback");
     assert!(
-        !rl_shares((NS, "share-c", &base), (NS, "share-c", &fallback)),
-        "a changed redis_failure_policy must isolate onto fresh state"
+        rl_shares((NS, "share-c", &base), (NS, "share-c", &fallback)),
+        "redis_failure_policy is not enforcement-relevant for a local-only policy"
     );
 
     assert!(
@@ -474,5 +531,277 @@ fn a_retired_generation_is_recovered_and_a_removed_policy_is_reclaimed() {
     assert!(
         ws_rate_limiting_charge_frame_for_test(&revived, 1, now),
         "a policy re-added after removal starts fresh"
+    );
+}
+
+#[tokio::test]
+async fn a_rebuilt_instance_keeps_the_exhausted_windows_despite_a_fresh_spec_arc() {
+    // Sharing the limiter is only half the fix. A compatible rebuild also
+    // constructs a brand-new `DynamicRateLimitOp`, so the dynamic HTTP
+    // algorithm sees a different `Arc<[RateLimitWindowSpec]>` on the first
+    // request through the rebuilt instance. Keying the window reset on pointer
+    // identity would discard the inherited counters right there and hand the
+    // caller a fresh budget anyway.
+    let first = RateLimiting::new_with_policy_identity(
+        &rate_limiting_policy(1, 60, "ip"),
+        PluginHttpClient::default(),
+        NS,
+        "arc-retarget",
+    )
+    .expect("rate_limiting constructs");
+
+    assert!(!instance_refused(&first).await, "the budget admits once");
+    assert!(instance_refused(&first).await, "and refuses afterwards");
+
+    let rebuilt = RateLimiting::new_with_policy_identity(
+        &rate_limiting_policy(1, 60, "ip"),
+        PluginHttpClient::default(),
+        NS,
+        "arc-retarget",
+    )
+    .expect("rate_limiting constructs");
+
+    assert!(
+        instance_refused(&rebuilt).await,
+        "a semantically identical rebuild must enforce on the inherited windows, not reset them"
+    );
+
+    // Two live generations alternating on one key is the steady state during a
+    // reload: neither may reset the other's counters.
+    assert!(
+        instance_refused(&first).await,
+        "the original generation must not be reset by the rebuilt one"
+    );
+    assert!(
+        instance_refused(&rebuilt).await,
+        "and alternating equal-spec generations must keep refusing"
+    );
+}
+
+#[test]
+fn a_local_policy_shares_state_across_redis_failure_postures() {
+    let base = rate_limiting_policy(10, 60, "ip");
+    let mut explicit_default = base.clone();
+    explicit_default["redis_failure_policy"] = json!("fail_closed");
+    let mut fallback = base.clone();
+    fallback["redis_failure_policy"] = json!("local_fallback");
+
+    assert!(
+        rl_pair("posture-local", &base, &explicit_default),
+        "the omitted posture and its explicit default spelling are one policy"
+    );
+    assert!(
+        rl_pair("posture-local", &base, &fallback),
+        "with no centralized store to lose the posture changes nothing enforced"
+    );
+}
+
+#[test]
+fn a_redis_backed_policy_isolates_a_changed_failure_posture() {
+    let base = redis_backed_policy();
+    let mut explicit_default = base.clone();
+    explicit_default["redis_failure_policy"] = json!("fail_closed");
+    let mut fallback = base.clone();
+    fallback["redis_failure_policy"] = json!("local_fallback");
+
+    assert!(
+        rl_pair("posture-redis", &base, &explicit_default),
+        "the effective posture is unchanged, so the live budget is inherited"
+    );
+    assert!(
+        !rl_pair("posture-redis-b", &base, &fallback),
+        "with Redis enabled the posture decides whether the local map may admit at all"
+    );
+    assert!(
+        !rl_pair("posture-mode", &rate_limiting_policy(10, 60, "ip"), &base),
+        "enabling the centralized store is a different enforcement domain"
+    );
+}
+
+#[test]
+fn rate_limiting_defaults_and_normalized_spellings_share_state() {
+    let explicit = rate_limiting_policy(60, 60, "ip");
+    let mut omitted = explicit.clone();
+    omitted
+        .as_object_mut()
+        .expect("the policy fixture is an object")
+        .remove("limit_by");
+
+    assert!(
+        rl_pair("norm-rl", &explicit, &omitted),
+        "an omitted limit_by is the 'ip' default and must not reset the budget"
+    );
+    assert!(
+        rl_pair("norm-rl", &explicit, &rate_limiting_policy(60, 60, "IP")),
+        "the parser lower-cases limit_by, so the case spelling is not a policy change"
+    );
+
+    let spiffe = rate_limiting_policy(60, 60, "spiffe");
+    let spiffe_identity = rate_limiting_policy(60, 60, "spiffe_identity");
+    assert!(
+        rl_pair("norm-rl-spiffe", &spiffe, &spiffe_identity),
+        "both accepted spellings parse to one limit dimension"
+    );
+
+    // A preset window and its explicit window_seconds/max_requests spelling
+    // build the same single window: 60 requests per 60 seconds.
+    let preset = json!({
+        "limit_by": "ip",
+        "limits": [{"scope": "default", "requests_per_minute": 60}],
+    });
+    assert!(
+        rl_pair("norm-rl-preset", &explicit, &preset),
+        "two accepted spellings of one window describe one budget"
+    );
+
+    let widened = rate_limiting_policy(61, 60, "ip");
+    assert!(
+        !rl_pair("norm-rl-change", &explicit, &widened),
+        "a real ceiling change must still isolate onto fresh state"
+    );
+}
+
+#[test]
+fn graphql_defaults_and_empty_rate_maps_share_state() {
+    let base = json!({
+        "max_depth": 5,
+        "type_rate_limits": {"query": {"max_requests": 10, "window_seconds": 60}},
+    });
+    let explicit_empty = json!({
+        "max_depth": 5,
+        "type_rate_limits": {"query": {"max_requests": 10, "window_seconds": 60}},
+        "operation_rate_limits": {},
+    });
+    assert!(
+        gql_pair("norm-gql", &base, &explicit_empty),
+        "an omitted rate map and an explicit empty one enforce identically"
+    );
+
+    let stateless_changed = json!({
+        "max_depth": 9,
+        "max_aliases": 3,
+        "type_rate_limits": {"query": {"max_requests": 10, "window_seconds": 60}},
+    });
+    assert!(
+        gql_pair("norm-gql", &base, &stateless_changed),
+        "depth and alias caps are stateless checks that never consult a counter"
+    );
+
+    let real_change = json!({
+        "max_depth": 5,
+        "type_rate_limits": {"query": {"max_requests": 10, "window_seconds": 61}},
+    });
+    assert!(
+        !gql_pair("norm-gql-change", &base, &real_change),
+        "a changed window must still isolate onto fresh state"
+    );
+}
+
+#[test]
+fn grpc_method_router_normalized_paths_and_stateless_lists_share_state() {
+    let base = json!({
+        "limit_by": "ip",
+        "method_rate_limits": {"/pkg.Svc/M": {"max_requests": 10, "window_seconds": 60}},
+    });
+    let normalized = json!({
+        "limit_by": "IP",
+        "method_rate_limits": {" pkg.Svc/M ": {"max_requests": 10, "window_seconds": 60}},
+    });
+    assert!(
+        grpc_pair("norm-grpc", &base, &normalized),
+        "the parser trims, strips the leading slash, and lower-cases limit_by"
+    );
+
+    let with_lists = json!({
+        "limit_by": "ip",
+        "deny_methods": ["pkg.Svc/Other"],
+        "method_rate_limits": {"/pkg.Svc/M": {"max_requests": 10, "window_seconds": 60}},
+    });
+    assert!(
+        grpc_pair("norm-grpc", &base, &with_lists),
+        "allow and deny lists are stateless checks that never consult a counter"
+    );
+
+    let real_change = json!({
+        "limit_by": "consumer",
+        "method_rate_limits": {"/pkg.Svc/M": {"max_requests": 10, "window_seconds": 60}},
+    });
+    assert!(
+        !grpc_pair("norm-grpc-change", &base, &real_change),
+        "a changed limit dimension must still isolate onto fresh state"
+    );
+}
+
+#[test]
+fn ai_rate_limiter_defaults_and_normalized_provider_share_state() {
+    let base = json!({"token_limit": 1000});
+    let explicit_defaults = json!({
+        "token_limit": 1000,
+        "window_seconds": 60,
+        "count_mode": "total_tokens",
+        "limit_by": "consumer",
+        "provider": "auto",
+        "on_unmetered_response": "charge_estimate",
+    });
+    assert!(
+        ai_pair("norm-ai", &base, &explicit_defaults),
+        "every omitted field spelled out at its effective default is one policy"
+    );
+
+    let expose = json!({"token_limit": 1000, "expose_headers": true});
+    assert!(
+        ai_pair("norm-ai", &base, &expose),
+        "expose_headers is response presentation only and never resets a budget"
+    );
+
+    let padded = json!({"token_limit": 1000, "provider": "  OpenAI  "});
+    let plain = json!({"token_limit": 1000, "provider": "openai"});
+    assert!(
+        ai_pair("norm-ai-provider", &padded, &plain),
+        "the parser trims and lower-cases the configured provider"
+    );
+
+    let real_change = json!({"token_limit": 1000, "count_mode": "prompt_tokens"});
+    assert!(
+        !ai_pair("norm-ai-change", &base, &real_change),
+        "a changed count_mode charges different tokens and must still isolate"
+    );
+}
+
+#[test]
+fn ws_rate_limiting_defaults_and_presentation_share_state() {
+    let omitted = json!({});
+    let explicit_defaults = json!({"frames_per_second": 100, "burst_size": 100});
+    assert!(
+        ws_pair("norm-ws", &omitted, &explicit_defaults),
+        "the omitted rate defaults to 100 and the omitted burst to that rate"
+    );
+
+    let close_reason = json!({"close_reason": "slow down"});
+    assert!(
+        ws_pair("norm-ws", &omitted, &close_reason),
+        "close_reason is client-visible presentation only"
+    );
+
+    let real_change = json!({"frames_per_second": 100, "burst_size": 200});
+    assert!(
+        !ws_pair("norm-ws-change", &omitted, &real_change),
+        "a changed burst capacity must still isolate onto fresh state"
+    );
+}
+
+#[test]
+fn udp_rate_limiting_defaults_and_unset_axes_share_state() {
+    let omitted_window = json!({"datagrams_per_second": 10});
+    let explicit_window = json!({"datagrams_per_second": 10, "window_seconds": 1});
+    assert!(
+        udp_pair("norm-udp", &omitted_window, &explicit_window),
+        "an omitted window_seconds is the effective one-second default"
+    );
+
+    let with_bytes = json!({"datagrams_per_second": 10, "bytes_per_second": 1_000});
+    assert!(
+        !udp_pair("norm-udp-axis", &omitted_window, &with_bytes),
+        "an unbounded byte axis is not the same policy as a bounded one"
     );
 }

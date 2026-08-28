@@ -12,9 +12,10 @@ use tracing::warn;
 use uuid::Uuid;
 
 use super::utils::rate_limit::{
-    RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend, STANDALONE_RATE_LIMIT_CONFIG_ID,
-    WsFrameRateAlgorithm, WsRateLimitOp, apply_rate_limit_cleanup, debug_assert_closed_root_keys,
-    debug_assert_rate_limit_redis_keys, validate_ws_frame_rate_params,
+    LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
+    STANDALONE_RATE_LIMIT_CONFIG_ID, WsFrameRateAlgorithm, WsRateLimitOp, apply_rate_limit_cleanup,
+    debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
+    validate_ws_frame_rate_params,
 };
 use super::{Plugin, PluginHttpClient, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection};
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -45,13 +46,6 @@ pub const WS_RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
     "redis_password",
     "redis_failure_policy",
 ];
-
-/// Plugin-specific fields that change what a retained local frame budget
-/// *means*: the sustained rate and the burst capacity of the token bucket.
-/// `close_reason` is client-visible presentation only and never resets a live
-/// budget. The shared enforcement posture is added by the backend;
-/// secret-bearing Redis fields are never fingerprinted.
-const WS_RATE_LIMITING_STATE_SEMANTIC_KEYS: &[&str] = &["frames_per_second", "burst_size"];
 
 const MAX_STATE_ENTRIES: usize = 50_000;
 const EVICTION_CHECK_INTERVAL: u64 = 100_000;
@@ -153,6 +147,16 @@ impl WsRateLimiting {
             ));
         }
 
+        // Effective enforcement semantics, not raw syntax: the token bucket's
+        // sustained rate and burst capacity after defaulting (`frames_per_second`
+        // omitted is 100, `burst_size` omitted is the sustained rate), so an
+        // explicit default and an omission describe the same bucket.
+        // `close_reason` is client-visible presentation only and never resets a
+        // live budget; the shared Redis posture is added by the backend.
+        let mut semantics = LocalStateSemantics::new();
+        semantics.u64("frames_per_second", frames_per_second);
+        semantics.u64("burst_size", burst_size);
+
         Ok(Self {
             close_reason,
             frame_counter: AtomicU64::new(0),
@@ -164,7 +168,7 @@ impl WsRateLimiting {
                 config,
                 &http_client,
                 WsFrameRateAlgorithm::new(frames_per_second as f64, burst_size as f64),
-                WS_RATE_LIMITING_STATE_SEMANTIC_KEYS,
+                &semantics,
             )?,
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),

@@ -39,8 +39,8 @@ use tracing::{debug, warn};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, ENFORCEMENT_UNAVAILABLE_BODY,
-    ENFORCEMENT_UNAVAILABLE_STATUS, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
-    RateLimitOutcome, RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID,
+    ENFORCEMENT_UNAVAILABLE_STATUS, LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS,
+    RateLimitBackend, RateLimitOutcome, RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID,
     apply_rate_limit_cleanup, debug_assert_rate_limit_redis_keys, validate_max_requests,
     validate_window_seconds,
 };
@@ -98,17 +98,6 @@ pub const GRAPHQL_CONFIG_KEYS: &[&str] = &[
 ];
 
 const RATE_SPEC_KEYS: &[&str] = &["max_requests", "window_seconds"];
-
-/// Plugin-specific fields that change what a retained local counter *means*.
-///
-/// `limit_by` is the limit dimension and the two rate maps carry every window
-/// and maximum. `max_depth` / `max_complexity` / `max_aliases` /
-/// `introspection_allowed` are stateless per-document checks that never consult
-/// a counter, so changing them must not reset a live budget. The shared
-/// enforcement posture is added by the backend; secret-bearing Redis fields are
-/// never fingerprinted.
-const GRAPHQL_STATE_SEMANTIC_KEYS: &[&str] =
-    &["limit_by", "type_rate_limits", "operation_rate_limits"];
 
 /// A rate window spec parsed from config.
 #[derive(Debug, Clone)]
@@ -267,6 +256,27 @@ impl GraphqlPlugin {
             );
         }
 
+        // Effective enforcement semantics, not raw syntax: the parsed limit
+        // dimension and the parsed rate maps, so an omitted map and an explicit
+        // empty one describe the same budget. `max_depth` / `max_complexity` /
+        // `max_aliases` / `introspection_allowed` are stateless per-document
+        // checks that never consult a counter, so changing them must not reset
+        // a live budget; the shared Redis posture is added by the backend.
+        let mut semantics = LocalStateSemantics::new();
+        semantics.text("limit_by", &limit_by);
+        semantics.window_map(
+            "type_rate_limits",
+            type_rate_limits
+                .iter()
+                .map(|(op_type, spec)| (op_type.as_str(), spec.op.specs())),
+        );
+        semantics.window_map(
+            "operation_rate_limits",
+            operation_rate_limits
+                .iter()
+                .map(|(op_name, spec)| (op_name.as_str(), spec.op.specs())),
+        );
+
         Ok(Self {
             max_depth,
             max_complexity,
@@ -282,7 +292,7 @@ impl GraphqlPlugin {
                 config,
                 &http_client,
                 DynamicHttpRateLimitAlgorithm::new(),
-                GRAPHQL_STATE_SEMANTIC_KEYS,
+                &semantics,
             )?,
             request_counter: AtomicU64::new(0),
             epoch_base: Instant::now(),

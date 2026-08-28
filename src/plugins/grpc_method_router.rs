@@ -15,8 +15,8 @@ use tracing::{debug, warn};
 
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, ENFORCEMENT_UNAVAILABLE_MESSAGE,
-    ENFORCEMENT_UNAVAILABLE_STATUS, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
-    RateLimitOutcome, RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID,
+    ENFORCEMENT_UNAVAILABLE_STATUS, LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS,
+    RateLimitBackend, RateLimitOutcome, RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID,
     apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
     validate_max_requests, validate_window_seconds,
 };
@@ -70,15 +70,6 @@ pub const GRPC_METHOD_ROUTER_CONFIG_KEYS: &[&str] = &[
 
 /// Closed key set for one `method_rate_limits` entry.
 const RATE_SPEC_KEYS: &[&str] = &["max_requests", "window_seconds"];
-
-/// Plugin-specific fields that change what a retained local counter *means*.
-///
-/// `limit_by` is the limit dimension and `method_rate_limits` carries every
-/// per-method window and maximum. `allow_methods` / `deny_methods` are stateless
-/// admission lists that never consult a counter, so changing them must not reset
-/// a live budget. The shared enforcement posture is added by the backend;
-/// secret-bearing Redis fields are never fingerprinted.
-const GRPC_METHOD_ROUTER_STATE_SEMANTIC_KEYS: &[&str] = &["limit_by", "method_rate_limits"];
 
 /// A rate window spec parsed from config.
 #[derive(Debug, Clone)]
@@ -246,6 +237,20 @@ impl GrpcMethodRouter {
             );
         }
 
+        // Effective enforcement semantics, not raw syntax: the lower-cased limit
+        // dimension and the path-normalized per-method budgets, so a spelling
+        // the parser normalizes keeps one budget. `allow_methods` /
+        // `deny_methods` are stateless admission lists that never consult a
+        // counter; the shared Redis posture is added by the backend.
+        let mut semantics = LocalStateSemantics::new();
+        semantics.text("limit_by", &limit_by);
+        semantics.window_map(
+            "method_rate_limits",
+            method_rate_limits
+                .iter()
+                .map(|(method, spec)| (method.as_str(), spec.op.specs())),
+        );
+
         Ok(Self {
             allow_methods,
             deny_methods,
@@ -258,7 +263,7 @@ impl GrpcMethodRouter {
                 config,
                 &http_client,
                 DynamicHttpRateLimitAlgorithm::new(),
-                GRPC_METHOD_ROUTER_STATE_SEMANTIC_KEYS,
+                &semantics,
             )?,
             request_counter: AtomicU64::new(0),
             epoch_base: Instant::now(),
