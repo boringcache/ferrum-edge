@@ -70,6 +70,46 @@ spreads pods across `kubernetes.io/hostname` (`ScheduleAnyway`). Set
 Set any data-path workload to `replicas: 1` only as a deliberate lab choice; the
 PDB is omitted automatically.
 
+## Graceful shutdown
+
+Serving workloads (`controlPlane`, `ca`, `eastWest`, `ambient`) ship the same
+additive drain contract as `ferrum-gateway` (`docs/graceful_shutdown.md`):
+
+- `FERRUM_SHUTDOWN_DRAIN_SECONDS` / `FERRUM_SHUTDOWN_PREDRAIN_SECONDS`
+- native `lifecycle.preStop.sleep` (Kubernetes 1.29+ SleepAction; distroless has no shell)
+- `terminationGracePeriodSeconds: 110` covering preStop 30s + the 78s post-SIGTERM budget
+
+Render fails when the grace period is under budget. On Kubernetes &lt;1.29 set
+`shutdownPreStopSeconds: 0` and raise `shutdownPreDrainSeconds` to at least
+readiness `failureThreshold × periodSeconds`. One-shot hooks/jobs (CNI uninstall)
+and the injector/node-agent (not Ferrum serving modes) do not receive this
+contract. East-west readiness is drain-aware `ferrum-edge health` against the
+loopback admin listener — not `tcpSocket` on `tls-passthru`.
+
+## Pod security and resources
+
+`controlPlane`, `ca`, and `eastWest` default to restricted-compatible
+PodSecurity (non-root 65532, drop ALL, no privilege escalation, read-only root,
+RuntimeDefault seccomp, `/tmp` emptyDir) with non-empty CPU/memory requests and
+limits. Ambient keeps `hostNetwork` and datapath capabilities (`NET_ADMIN` /
+`NET_RAW`, plus `SYS_ADMIN`/`SYS_PTRACE` only for in-netns capture and
+BPF/PERFMON for NodeWaypoint) after dropping ALL. `priorityClassName` is
+optional; only ambient and node-agent default to `system-node-critical`. Empty
+`priorityClassName` omits the field.
+
+## Metrics scrape
+
+`observability.enabled` (default `false`) does **not** change admin bind
+addresses. When enabled, the chart renders `FERRUM_METRICS_*` auth env,
+dedicated ClusterIP metrics Services for Deployments (the main CP/east-west
+Services stay gRPC / tls-passthru), a `ServiceMonitor`, and `PodMonitor`s for
+host-network DaemonSets. Alerts and monitors fail render without a scrape
+credential (`observability.metrics.allowedCidrs` or
+`bearerToken.existingSecret.name`). Inline `bearerToken.value` wires pod env
+only. Optional Prometheus Operator CRDs stay gated on `observability.enabled`.
+`FerrumMeshControlPlaneConfigStale` does not use `absent()` — it is silent
+no-data until a scraped data plane emits the freshness timestamp.
+
 See [`values.yaml`](values.yaml) for the fully commented value surface and
 [`docs/kubernetes_deployment.md`](../../docs/kubernetes_deployment.md) for the
 deployment guide.

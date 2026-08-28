@@ -44,8 +44,7 @@
     {
       "name": "ferrum-mesh-east-west",
       "kind": "Deployment",
-      "handler": "tcp",
-      "tcp_port": "tls-passthru"
+      "handler": "admin_health"
     },
     {
       "name": "ferrum-mesh-ambient",

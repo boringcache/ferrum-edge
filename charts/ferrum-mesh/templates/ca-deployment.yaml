@@ -1,9 +1,9 @@
 {{- if .Values.ca.enabled }}
 {{- $caEnv := .Values.ca.env | default dict -}}
-{{- $adminTarget := include "ferrum-mesh.adminProbeTargetFromEnv" $caEnv | fromYaml -}}
+{{- $admin := include "ferrum-mesh.resolveComponentAdmin" (dict "env" $caEnv "admin" (.Values.ca.admin | default dict)) | fromYaml -}}
 {{- $handlers := dict "live" (dict) "ready" (dict) -}}
-{{- if ne (toString $adminTarget.port) "0" -}}
-{{- $handlers = include "ferrum-mesh.adminHealthHandlers" $adminTarget | fromYaml -}}
+{{- if ne (toString $admin.port) "0" -}}
+{{- $handlers = include "ferrum-mesh.adminHealthHandlers" $admin | fromYaml -}}
 {{- end -}}
 {{- $liveHandler := .Values.ca.probes.liveness.override | default dict -}}
 {{- if not $liveHandler }}{{- $liveHandler = $handlers.live | default dict -}}{{- end -}}
@@ -30,20 +30,52 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       serviceAccountName: ferrum-mesh
+      terminationGracePeriodSeconds: {{ .Values.ca.terminationGracePeriodSeconds }}
+      {{- with .Values.ca.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.ca.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: ferrum-edge
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["run"]
+          {{- with .Values.ca.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if ne (toString $admin.port) "0" }}
+          ports:
+            - name: admin-http
+              containerPort: {{ $admin.port }}
+              protocol: TCP
+          {{- end }}
           env:
             {{- include "ferrum-mesh.renderControlPlaneRequiredEnv" . | nindent 12 }}
             - name: FERRUM_MODE
               value: cp
+            {{- include "ferrum-mesh.adminEnv" (dict "env" $caEnv "resolved" $admin) | nindent 12 }}
+            {{- include "ferrum-mesh.shutdownEnv" .Values.ca | nindent 12 }}
+            {{- include "ferrum-mesh.metricsEnv" . | nindent 12 }}
             {{- range $name, $value := .Values.ca.env }}
-            {{- if not (has $name (list "FERRUM_DB_TYPE" "FERRUM_DB_URL" "FERRUM_ADMIN_JWT_SECRET" "FERRUM_CP_DP_GRPC_JWT_SECRET")) }}
+            {{- if not (has $name (list "FERRUM_DB_TYPE" "FERRUM_DB_URL" "FERRUM_ADMIN_JWT_SECRET" "FERRUM_CP_DP_GRPC_JWT_SECRET" "FERRUM_ADMIN_HTTP_PORT" "FERRUM_ADMIN_BIND_ADDRESS" "FERRUM_ALLOW_INSECURE_ADMIN_HTTP" "FERRUM_ADMIN_ALLOWED_CIDRS" "FERRUM_MODE")) }}
             - name: {{ $name }}
               value: {{ $value | quote }}
             {{- end }}
             {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.ca.probes "liveHandler" $liveHandler "readyHandler" $readyHandler) }}
+          {{- include "ferrum-mesh.preStopLifecycle" .Values.ca | nindent 10 }}
+          {{- with .Values.ca.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
 {{- end }}

@@ -1,1 +1,24 @@
 {{- include "ferrum-mesh.validateControlPlaneInputs" . -}}
+{{- include "ferrum-mesh.validateServingShutdowns" . -}}
+{{- include "ferrum-mesh.validateObservability" . -}}
+{{- if .Values.controlPlane.enabled -}}
+{{- include "ferrum-mesh.validateResources" (dict "component" "controlPlane" "resources" .Values.controlPlane.resources) -}}
+{{- include "ferrum-mesh.validatePlaintextAdmin" (dict "component" "controlPlane" "resolved" (include "ferrum-mesh.resolveComponentAdmin" (dict "env" (.Values.controlPlane.env | default dict) "admin" (.Values.controlPlane.admin | default dict)) | fromYaml) "hardFail" true) -}}
+{{- end -}}
+{{- if .Values.ca.enabled -}}
+{{- include "ferrum-mesh.validateResources" (dict "component" "ca" "resources" .Values.ca.resources) -}}
+{{- include "ferrum-mesh.validatePlaintextAdmin" (dict "component" "ca" "resolved" (include "ferrum-mesh.resolveComponentAdmin" (dict "env" (.Values.ca.env | default dict) "admin" (.Values.ca.admin | default dict)) | fromYaml) "hardFail" true) -}}
+{{- include "ferrum-mesh.failReservedEnv" (dict "label" "ca.env" "env" .Values.ca.env "names" (list "FERRUM_SHUTDOWN_DRAIN_SECONDS" "FERRUM_SHUTDOWN_PREDRAIN_SECONDS" "FERRUM_METRICS_BEARER_TOKEN" "FERRUM_METRICS_ALLOWED_CIDRS")) -}}
+{{- end -}}
+{{- if .Values.eastWest.enabled -}}
+{{- include "ferrum-mesh.validateResources" (dict "component" "eastWest" "resources" .Values.eastWest.resources) -}}
+{{- include "ferrum-mesh.validatePlaintextAdmin" (dict "component" "eastWest" "resolved" (include "ferrum-mesh.resolveComponentAdmin" (dict "env" (.Values.eastWest.env | default dict) "admin" (.Values.eastWest.admin | default dict)) | fromYaml) "hardFail" false) -}}
+{{- include "ferrum-mesh.failReservedEnv" (dict "label" "eastWest.env" "env" .Values.eastWest.env "names" (list "FERRUM_SHUTDOWN_DRAIN_SECONDS" "FERRUM_SHUTDOWN_PREDRAIN_SECONDS" "FERRUM_METRICS_BEARER_TOKEN" "FERRUM_METRICS_ALLOWED_CIDRS")) -}}
+{{- end -}}
+{{- if .Values.ambient.enabled -}}
+{{- include "ferrum-mesh.validateResources" (dict "component" "ambient" "resources" .Values.ambient.resources) -}}
+{{- include "ferrum-mesh.failReservedEnv" (dict "label" "ambient.env" "env" .Values.ambient.env "names" (list "FERRUM_SHUTDOWN_DRAIN_SECONDS" "FERRUM_SHUTDOWN_PREDRAIN_SECONDS" "FERRUM_METRICS_BEARER_TOKEN" "FERRUM_METRICS_ALLOWED_CIDRS")) -}}
+{{- end -}}
+{{- if .Values.nodeAgent.enabled -}}
+{{- include "ferrum-mesh.failReservedEnv" (dict "label" "nodeAgent.env" "env" .Values.nodeAgent.env "names" (list "FERRUM_SHUTDOWN_DRAIN_SECONDS" "FERRUM_SHUTDOWN_PREDRAIN_SECONDS" "FERRUM_METRICS_BEARER_TOKEN" "FERRUM_METRICS_ALLOWED_CIDRS")) -}}
+{{- end -}}

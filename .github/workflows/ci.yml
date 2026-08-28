@@ -2211,6 +2211,9 @@ jobs:
             --namespace ferrum \
             --set observability.enabled=true \
             --set observability.alerts.enabled=true \
+            --set observability.metrics.allowedCidrs=10.0.0.0/8 \
+            --set observability.metrics.serviceMonitor.enabled=false \
+            --set observability.metrics.podMonitor.enabled=false \
             > "$RUNNER_TEMP/ferrum-helm-results/prometheus-rule-rendered.yaml"
           python3 -I .github/scripts/extract_rendered_prometheus_rules.py \
             "$RUNNER_TEMP/ferrum-helm-results/prometheus-rule-rendered.yaml" \
@@ -3041,6 +3044,75 @@ jobs:
             --set-string nodeAgent.admin.port=19090 \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-waypoint.yaml"
           python3 -I .github/scripts/verify_mesh_workload_probes.py \
+            --results-dir "$RUNNER_TEMP/ferrum-helm-results"
+          # Mesh production-readiness (#4266/#4267/#4288): helm stays in this
+          # trusted workflow shell; assertions live in
+          # verify_mesh_production_readiness.py so the ARM64 build-policy gate
+          # does not freeze PodSpec/monitor-shape edits here.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.terminationGracePeriodSeconds=35 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-low-grace.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-low-grace.err"; then
+            echo "::error title=Under-budget mesh grace accepted::controlPlane.terminationGracePeriodSeconds must cover preStop + full shutdown budget"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --kube-version 1.28.0 \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-kube-1.28.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-kube-1.28.err"; then
+            echo "::error title=SleepAction accepted on Kubernetes 1.28::preStop.sleep requires 1.29+ or shutdownPreStopSeconds=0"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.shutdownDrainSeconds=0 \
+            --set controlPlane.shutdownPreStopSeconds=0 \
+            --set controlPlane.terminationGracePeriodSeconds=25 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-zero-drain.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.resources.requests.cpu= \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-empty-resources.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-empty-resources.err"; then
+            echo "::error title=Empty mesh resources accepted::serving requests.cpu/memory must be non-empty"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set observability.enabled=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-no-cred.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-no-cred.err"; then
+            echo "::error title=Observability without scrape credential accepted::alerts/monitors must fail closed without bearer or allowedCidrs"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set observability.enabled=true \
+            --set observability.metrics.bearerToken.value=lab-only-not-a-secret \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-inline-bearer.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-inline-bearer.err"; then
+            echo "::error title=Inline metrics bearer accepted for ServiceMonitor::monitors without allowedCidrs need existingSecret.name"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ca.enabled=true \
+            --set eastWest.enabled=true \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set injector.enabled=true \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            --set observability.enabled=true \
+            --set observability.metrics.allowedCidrs='10.0.0.0/8,127.0.0.1/32' \
+            --set controlPlane.admin.bindAddress=0.0.0.0 \
+            --set controlPlane.admin.allowedCidrs='10.0.0.0/8,127.0.0.1/32' \
+            --set ca.admin.bindAddress=0.0.0.0 \
+            --set ca.admin.allowedCidrs='10.0.0.0/8,127.0.0.1/32' \
+            --set eastWest.admin.bindAddress=0.0.0.0 \
+            --set ambient.admin.bindAddress=0.0.0.0 \
+            --set nodeAgent.admin.bindAddress=0.0.0.0 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs.yaml"
+          python3 -I .github/scripts/verify_mesh_production_readiness.py \
             --results-dir "$RUNNER_TEMP/ferrum-helm-results"
 
       - name: Core gateway chart static validation

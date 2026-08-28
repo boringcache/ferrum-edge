@@ -74,7 +74,7 @@ terminationGracePeriodSeconds >= preStop + preDrain + drain
   + 5   # finalizer slack
 ```
 
-With the default 30s drain the post-SIGTERM budget is **78s**, and the chart's default 30s `preStop` brings the minimum to **108s**. The Ferrum gateway Helm chart defaults to **110s** and validates this at render time:
+With the default 30s drain the post-SIGTERM budget is **78s**, and the chart's default 30s `preStop` brings the minimum to **108s**. The Ferrum gateway and mesh Helm charts default to **110s** and validate this at render time:
 
 ```yaml
 spec:
@@ -104,7 +104,7 @@ The readiness probe is drain-aware: `ferrum-edge health` exits non-zero as soon 
 
 On clusters older than 1.29 there is no `SleepAction`. Use `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` instead: it holds the accept loops (proxy and admin) open *after* SIGTERM while readiness already reports not-ready, so kubelet's `failureThreshold x periodSeconds` removal path completes before any connection is refused. Set it to at least `failureThreshold x periodSeconds` and add it to the grace period.
 
-The Ferrum gateway Helm chart wires all of this from `shutdownPreStopSeconds`, `shutdownPreDrainSeconds`, `shutdownDrainSeconds`, and `probes.readiness.failureThreshold`, and fails `helm template` when the grace period cannot cover the sum.
+The Ferrum gateway and mesh Helm charts wire all of this from per-workload `shutdownPreStopSeconds`, `shutdownPreDrainSeconds`, `shutdownDrainSeconds`, and `probes.readiness.failureThreshold`, and fail `helm template` when the grace period cannot cover the sum. On Kubernetes older than 1.29, `ferrum-mesh` refuses a non-zero SleepAction `preStop` (except the unversioned `helm template` 1.20.0 sentinel) and tells operators to set `shutdownPreStopSeconds=0` and raise `shutdownPreDrainSeconds`.
 
 ### Load Balancer Integration
 

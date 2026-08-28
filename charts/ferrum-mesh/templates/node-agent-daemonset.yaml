@@ -247,6 +247,9 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: ferrum-node-agent
+      {{- with .Values.nodeAgent.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       hostPID: true
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
@@ -374,6 +377,12 @@ spec:
                 {{- range $cap := $caps }}
                 - {{ $cap }}
                 {{- end }}
+          {{- if and .Values.nodeAgent.admin.enabled (ne $nodeAgentAdminHttpPort "0") }}
+          ports:
+            - name: admin-http
+              containerPort: {{ $nodeAgentAdminHttpPort }}
+              protocol: TCP
+          {{- end }}
           env:
             - name: FERRUM_MODE
               value: "node_agent"
@@ -470,6 +479,7 @@ spec:
             {{- end }}
             {{- end }}
             {{- end }}
+            {{- include "ferrum-mesh.metricsEnv" . | nindent 12 }}
             - name: FERRUM_NODE_AGENT_NODE_NAME
               valueFrom:
                 fieldRef:

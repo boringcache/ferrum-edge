@@ -1,9 +1,17 @@
 {{- if .Values.eastWest.enabled }}
-{{- $tcpHandler := dict "tcpSocket" (dict "port" "tls-passthru") -}}
+{{- $ewEnv := .Values.eastWest.env | default dict -}}
+{{- $admin := include "ferrum-mesh.resolveComponentAdmin" (dict "env" $ewEnv "admin" (.Values.eastWest.admin | default dict)) | fromYaml -}}
+{{- $handlers := dict "live" (dict) "ready" (dict) -}}
+{{- if ne (toString $admin.port) "0" -}}
+{{- $handlers = include "ferrum-mesh.adminHealthHandlers" $admin | fromYaml -}}
+{{- end -}}
 {{- $liveHandler := .Values.eastWest.probes.liveness.override | default dict -}}
-{{- if not $liveHandler }}{{- $liveHandler = $tcpHandler -}}{{- end -}}
+{{- if not $liveHandler }}{{- $liveHandler = $handlers.live | default dict -}}{{- end -}}
 {{- $readyHandler := .Values.eastWest.probes.readiness.override | default dict -}}
-{{- if not $readyHandler }}{{- $readyHandler = $tcpHandler -}}{{- end -}}
+{{- if not $readyHandler }}{{- $readyHandler = $handlers.ready | default dict -}}{{- end -}}
+{{- if and (not $liveHandler) (not $readyHandler) -}}
+{{- fail "eastWest admin HTTP port is 0, so drain-aware ferrum-edge health probes cannot run; set eastWest.admin.httpPort or supply probes.*.override" -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -25,29 +33,60 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       serviceAccountName: ferrum-mesh
+      terminationGracePeriodSeconds: {{ .Values.eastWest.terminationGracePeriodSeconds }}
+      {{- with .Values.eastWest.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
 {{- include "ferrum-mesh.renderTopologySpreadConstraints" (dict
   "Release" .Release
   "replicas" .Values.eastWest.replicas
   "selectorName" "ferrum-mesh-east-west"
   "constraints" .Values.eastWest.topologySpreadConstraints) }}
+      {{- with .Values.eastWest.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: ferrum-edge
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["run"]
+          {{- with .Values.eastWest.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - name: tls-passthru
               containerPort: {{ .Values.eastWest.listenPort }}
+            {{- if ne (toString $admin.port) "0" }}
+            - name: admin-http
+              containerPort: {{ $admin.port }}
+              protocol: TCP
+            {{- end }}
           env:
             - name: FERRUM_MESH_EAST_WEST_LISTEN_PORT
               value: {{ .Values.eastWest.listenPort | quote }}
+            {{- include "ferrum-mesh.adminEnv" (dict "env" $ewEnv "resolved" $admin) | nindent 12 }}
+            {{- include "ferrum-mesh.shutdownEnv" .Values.eastWest | nindent 12 }}
+            {{- include "ferrum-mesh.metricsEnv" . | nindent 12 }}
             {{- range $name, $value := .Values.eastWest.env }}
-            {{- if ne $name "FERRUM_MESH_EAST_WEST_LISTEN_PORT" }}
+            {{- if not (has $name (list "FERRUM_MESH_EAST_WEST_LISTEN_PORT" "FERRUM_ADMIN_HTTP_PORT" "FERRUM_ADMIN_BIND_ADDRESS" "FERRUM_ALLOW_INSECURE_ADMIN_HTTP" "FERRUM_ADMIN_ALLOWED_CIDRS")) }}
             - name: {{ $name }}
               value: {{ $value | quote }}
             {{- end }}
             {{- end }}
           {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.eastWest.probes "liveHandler" $liveHandler "readyHandler" $readyHandler) }}
+          {{- include "ferrum-mesh.preStopLifecycle" .Values.eastWest | nindent 10 }}
+          {{- with .Values.eastWest.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

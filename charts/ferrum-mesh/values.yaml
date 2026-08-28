@@ -134,7 +134,50 @@ controlPlane:
       enabled: true
       initialDelaySeconds: 5
       periodSeconds: 10
+      # Probe-driven endpoint-removal budget; pairs with shutdownPreStopSeconds.
+      failureThreshold: 3
       override: {}
+  # Admin listener used by drain-aware exec probes and optional metrics scrape.
+  # Default loopback keeps admin off the cluster network. ServiceMonitor
+  # requires a non-loopback bindAddress plus allowedCidrs or allowInsecureHttp.
+  admin:
+    bindAddress: "127.0.0.1"
+    httpPort: 9000
+    allowInsecureHttp: false
+    allowedCidrs: ""
+  # Graceful shutdown (issue #4266). terminationGracePeriodSeconds must cover
+  # preStop + preDrain + drain + 6s pool + 5s background + clamp(drain,5,60)s
+  # audit + 2s observability + 5s finalizer slack (docs/graceful_shutdown.md).
+  # SleepAction preStop requires Kubernetes 1.29+; on older clusters set
+  # shutdownPreStopSeconds: 0 and raise shutdownPreDrainSeconds instead.
+  shutdownDrainSeconds: 30
+  shutdownPreStopSeconds: 30
+  shutdownPreDrainSeconds: 0
+  terminationGracePeriodSeconds: 110
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  resources:
+    requests:
+      cpu: 250m
+      memory: 128Mi
+    limits:
+      cpu: "2"
+      memory: 512Mi
+  # Optional. Empty omits the field. Do not default the control plane to
+  # system-node-critical — that class is for node-critical DaemonSets.
+  priorityClassName: ""
   # Operator-supplied mounts (TLS material, CP/DP trust bundle, etc.).
   # Multi-namespace CP (FERRUM_CP_NAMESPACES=* or a CSV set) requires a real
   # file at FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH — declaring the path alone is
@@ -350,7 +393,39 @@ ambient:
       enabled: true
       initialDelaySeconds: 2
       periodSeconds: 5
+      failureThreshold: 3
       override: {}
+  admin:
+    bindAddress: "127.0.0.1"
+    httpPort: 9000
+    allowInsecureHttp: false
+    allowedCidrs: ""
+  shutdownDrainSeconds: 30
+  shutdownPreStopSeconds: 30
+  shutdownPreDrainSeconds: 0
+  terminationGracePeriodSeconds: 110
+  # Restricted-compatible where the datapath allows it. hostNetwork and the
+  # NET_ADMIN/NET_RAW (plus in-netns SYS_ADMIN/SYS_PTRACE) caps stay; drop ALL
+  # first so the rendered add list is the complete privilege surface.
+  podSecurityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "2"
+      memory: 512Mi
+  # Node-critical: losing this DaemonSet takes the datapath down for every
+  # pod on the node. Set to "" to omit.
+  priorityClassName: system-node-critical
 
 eastWest:
   enabled: false
@@ -361,9 +436,15 @@ eastWest:
   env:
     FERRUM_MODE: mesh
     FERRUM_MESH_TOPOLOGY: east_west_gateway
-  # East-west is SNI passthrough on listenPort. Defaults use a TCP probe on that
-  # port so kubelet proves the datapath listener without coupling liveness to
-  # mesh-slice readiness. Override with admin health exec if preferred.
+  # Drain-aware admin health exec (issue #4266). tcpSocket on tls-passthru is
+  # not drain-aware: /health returns 503 as soon as termination begins while
+  # /live stays 200. Admin stays loopback by default so the SNI Service does
+  # not publish unauthenticated admin.
+  admin:
+    bindAddress: "127.0.0.1"
+    httpPort: 9000
+    allowInsecureHttp: false
+    allowedCidrs: ""
   probes:
     startup:
       enabled: true
@@ -379,7 +460,34 @@ eastWest:
       enabled: true
       initialDelaySeconds: 5
       periodSeconds: 10
+      failureThreshold: 3
       override: {}
+  shutdownDrainSeconds: 30
+  shutdownPreStopSeconds: 30
+  shutdownPreDrainSeconds: 0
+  terminationGracePeriodSeconds: 110
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  resources:
+    requests:
+      cpu: 250m
+      memory: 64Mi
+    limits:
+      cpu: "2"
+      memory: 256Mi
+  priorityClassName: ""
 
 ca:
   # Disabled by default. This Deployment runs the Ferrum binary in CP mode, so
@@ -405,13 +513,76 @@ ca:
       enabled: true
       initialDelaySeconds: 5
       periodSeconds: 10
+      failureThreshold: 3
       override: {}
+  admin:
+    bindAddress: "127.0.0.1"
+    httpPort: 9000
+    allowInsecureHttp: false
+    allowedCidrs: ""
+  shutdownDrainSeconds: 30
+  shutdownPreStopSeconds: 30
+  shutdownPreDrainSeconds: 0
+  terminationGracePeriodSeconds: 110
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: "1"
+      memory: 256Mi
+  priorityClassName: ""
 
 observability:
   # Master switch for the observability subtree. Default `false` so a fresh
   # install does not assume the cluster runs Prometheus / a Grafana sidecar.
-  # Flip to `true` to render `PrometheusRule` + dashboard `ConfigMap`s.
+  # Flip to `true` to render dashboards, alerts, metrics env, and optional
+  # Prometheus Operator ServiceMonitor/PodMonitor CRDs. Alerts and monitors
+  # fail render without a scrape credential (bearer token or allowedCidrs).
+  # Enabling observability does NOT change admin.bindAddress.
   enabled: false
+  metrics:
+    # Comma-separated CIDRs/IPs allowed to scrape `/metrics` without a
+    # credential (FERRUM_METRICS_ALLOWED_CIDRS). Bare IPv6, no brackets.
+    allowedCidrs: ""
+    bearerToken:
+      # value: "change-me-to-a-long-random-metrics-token"
+      existingSecret:
+        name: ""
+        key: metrics-bearer-token
+      valueFrom: {}
+    serviceMonitor:
+      # Deployments (control plane, CA, east-west). Requires a non-loopback
+      # admin bind on each enabled Deployment plus a metrics Service.
+      enabled: true
+      interval: 30s
+      scrapeTimeout: 10s
+      labels: {}
+      annotations: {}
+      tlsConfig: {}
+    podMonitor:
+      # Host-network DaemonSets (ambient, node-agent). Requires a non-loopback
+      # admin bind; Prometheus scrapes the node IP.
+      enabled: true
+      interval: 30s
+      scrapeTimeout: 10s
+      labels: {}
+      annotations: {}
+      tlsConfig: {}
   dashboards:
     # When `observability.enabled` is `true`, render a `ConfigMap` that
     # contains the five bundled Grafana dashboards
@@ -618,6 +789,9 @@ nodeAgent:
     limits:
       cpu: 500m
       memory: 256Mi
+  # Node-critical: capture unavailable on a node takes opted-in pods with it.
+  # Set to "" to omit.
+  priorityClassName: system-node-critical
   # Security posture. See docs/node_agent_security.md for the full reference,
   # including the kernel APIs each capability grants and why every mount /
   # host-access flag is required. Default values harden the DaemonSet without

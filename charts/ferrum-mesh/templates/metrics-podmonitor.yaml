@@ -1,0 +1,105 @@
+{{- $obs := .Values.observability | default dict -}}
+{{- $metrics := $obs.metrics | default dict -}}
+{{- $pm := $metrics.podMonitor | default dict -}}
+{{- if and $obs.enabled (ne ($pm.enabled | toString) "false") }}
+{{- $bearer := $metrics.bearerToken | default dict -}}
+{{- $bearerSecret := $bearer.existingSecret | default dict -}}
+{{- $first := true -}}
+{{- if .Values.ambient.enabled }}
+{{- $ambAdmin := include "ferrum-mesh.resolveComponentAdmin" (dict "env" (.Values.ambient.env | default dict) "admin" (.Values.ambient.admin | default dict)) | fromYaml -}}
+{{- if and (ne (toString $ambAdmin.port) "0") (not (include "ferrum-mesh.isLoopbackBind" $ambAdmin.bind)) }}
+{{- $first = false }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: ferrum-mesh-ambient-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-ambient
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: mesh-metrics
+    {{- with $pm.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $pm.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  jobLabel: app.kubernetes.io/name
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-mesh-ambient
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  podMetricsEndpoints:
+    - path: /metrics
+      port: admin-http
+      interval: {{ $pm.interval | default "30s" | quote }}
+      scrapeTimeout: {{ $pm.scrapeTimeout | default "10s" | quote }}
+      {{- if $bearerSecret.name }}
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ $bearerSecret.name | quote }}
+          key: {{ default "metrics-bearer-token" $bearerSecret.key | quote }}
+      {{- end }}
+      {{- with $pm.tlsConfig }}
+      tlsConfig:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- end }}
+{{- if and .Values.nodeAgent.enabled (.Values.nodeAgent.admin.enabled | default true) }}
+{{- $naBind := .Values.nodeAgent.admin.bindAddress | default "127.0.0.1" -}}
+{{- $naPort := toString (.Values.nodeAgent.admin.port | default "19090") -}}
+{{- if and (ne $naPort "0") (not (include "ferrum-mesh.isLoopbackBind" $naBind)) }}
+{{- if not $first }}
+---
+{{- end }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: ferrum-mesh-node-agent-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-node-agent
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: mesh-metrics
+    {{- with $pm.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $pm.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  jobLabel: app.kubernetes.io/name
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-mesh-node-agent
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  podMetricsEndpoints:
+    - path: /metrics
+      port: admin-http
+      interval: {{ $pm.interval | default "30s" | quote }}
+      scrapeTimeout: {{ $pm.scrapeTimeout | default "10s" | quote }}
+      {{- if $bearerSecret.name }}
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ $bearerSecret.name | quote }}
+          key: {{ default "metrics-bearer-token" $bearerSecret.key | quote }}
+      {{- end }}
+      {{- with $pm.tlsConfig }}
+      tlsConfig:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

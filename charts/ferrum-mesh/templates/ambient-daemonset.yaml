@@ -208,15 +208,10 @@
 {{- $ambientSetnsCapture := or $nodeWaypointRegistryEnabled (and $ambientUdpLifecycle (or (not $ambientUdpHostNetns) $ambientUdpMigrationNeedsSetns)) -}}
 {{- $nodeAgentProxyMode := replace "-" "_" (lower (toString .Values.nodeAgent.proxyMode)) -}}
 {{- $nodeAgentCaptureMode := lower (toString .Values.nodeAgent.captureMode) -}}
-{{- $ambientAdminPort := "9000" -}}
-{{- if hasKey $ambientEnv "FERRUM_ADMIN_HTTP_PORT" -}}
-{{- $ambientAdminPort = toString (index $ambientEnv "FERRUM_ADMIN_HTTP_PORT") -}}
-{{- end -}}
-{{- $ambientAdminBindAddress := "0.0.0.0" -}}
-{{- if hasKey $ambientEnv "FERRUM_ADMIN_BIND_ADDRESS" -}}
-{{- $ambientAdminBindAddress = toString (index $ambientEnv "FERRUM_ADMIN_BIND_ADDRESS") -}}
-{{- end -}}
-{{- $ambientAdminProbeHost := include "ferrum-mesh.adminProbeHost" $ambientAdminBindAddress -}}
+{{- $ambientAdminResolved := include "ferrum-mesh.resolveComponentAdmin" (dict "env" $ambientEnv "admin" (.Values.ambient.admin | default dict)) | fromYaml -}}
+{{- $ambientAdminPort := toString $ambientAdminResolved.port -}}
+{{- $ambientAdminBindAddress := toString $ambientAdminResolved.bind -}}
+{{- $ambientAdminProbeHost := $ambientAdminResolved.probeHost -}}
 {{- $nodeAgentAdminPort := toString .Values.nodeAgent.admin.port -}}
 {{- /* Preserve integer httpsPort=0; Sprig `default` would treat 0 as empty. */ -}}
 {{- $nodeAgentAdminHttpsPort := toString .Values.nodeAgent.admin.httpsPort -}}
@@ -356,6 +351,14 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       serviceAccountName: ferrum-mesh
+      terminationGracePeriodSeconds: {{ .Values.ambient.terminationGracePeriodSeconds }}
+      {{- with .Values.ambient.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.ambient.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- /* Disable kubelet's automatic pod token projection so the privileged
              preflight init container is not given a bearer token by default.
              The short-lived kube-api-access volume below is the replacement:
@@ -473,11 +476,16 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["run"]
           securityContext:
+            {{- $ambientSc := .Values.ambient.securityContext | default dict }}
+            allowPrivilegeEscalation: {{ $ambientSc.allowPrivilegeEscalation | default false }}
+            readOnlyRootFilesystem: {{ if hasKey $ambientSc "readOnlyRootFilesystem" }}{{ $ambientSc.readOnlyRootFilesystem }}{{ else }}true{{ end }}
             {{- if $ambientInNetnsCapture }}
             runAsUser: 0
             runAsGroup: 0
             {{- end }}
             capabilities:
+              drop:
+                - ALL
               add:
                 {{- if $nodeWaypointRegistryEnabled }}
                 - BPF
@@ -502,7 +510,15 @@ spec:
               containerPort: {{ .Values.ambient.inboundPort }}
             - name: hbone
               containerPort: {{ .Values.ambient.hbonePort }}
+            {{- if ne $ambientAdminPort "0" }}
+            - name: admin-http
+              containerPort: {{ $ambientAdminPort }}
+              protocol: TCP
+            {{- end }}
           env:
+            {{- include "ferrum-mesh.adminEnv" (dict "env" $ambientEnv "resolved" $ambientAdminResolved) | nindent 12 }}
+            {{- include "ferrum-mesh.shutdownEnv" .Values.ambient | nindent 12 }}
+            {{- include "ferrum-mesh.metricsEnv" . | nindent 12 }}
             - name: FERRUM_MESH_CAPTURE_MODE
               value: {{ .Values.ambient.captureMode | quote }}
             {{- if and $ambientInNetnsCapture (not (hasKey $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR")) }}
@@ -611,6 +627,8 @@ spec:
             {{- with .Values.ambient.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+            - name: tmp
+              mountPath: /tmp
           {{- /* Admin-backed probes when the listener is enabled. NodeWaypoint
                  still requires a non-zero admin port (validated above). Ordinary
                  ambient also probes admin when available so rollouts wait for
@@ -624,6 +642,11 @@ spec:
           {{- $ambientReadyHandler := .Values.ambient.probes.readiness.override | default dict -}}
           {{- if not $ambientReadyHandler }}{{- $ambientReadyHandler = $ambientHandlers.ready | default dict -}}{{- end -}}
           {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.ambient.probes "liveHandler" $ambientLiveHandler "readyHandler" $ambientReadyHandler) }}
+          {{- include "ferrum-mesh.preStopLifecycle" .Values.ambient | nindent 10 }}
+          {{- with .Values.ambient.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
       volumes:
         {{- /* Always rendered, including when no cgroup/SPIRE/preflight
                hostPath volumes exist. automountServiceAccountToken is false, so
@@ -683,4 +706,6 @@ spec:
         {{- with .Values.ambient.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+        - name: tmp
+          emptyDir: {}
 {{- end }}

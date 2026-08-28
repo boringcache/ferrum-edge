@@ -344,7 +344,7 @@ dependency-aware readiness.
 | `controlPlane`, `ca` | `ferrum-edge health --live` against the admin listener | `ferrum-edge health` (503 while starting/unavailable; ready-but-degraded stays HTTP 200 with JSON `status: "degraded"`) |
 | `ambient`, `nodeAgent` | same admin `--live` exec when admin is enabled and port ≠ `0` | same admin `/health` exec; omitted when admin is disabled or port is `0` (NodeWaypoint still requires a non-zero ambient admin port) |
 | `injector` | `tcpSocket` on the `webhook` port | `tcpSocket` on the `webhook` port |
-| `eastWest` | `tcpSocket` on the `tls-passthru` port | `tcpSocket` on the `tls-passthru` port |
+| `eastWest` | `ferrum-edge health --live` against the east-west admin listener | `ferrum-edge health` (drain-aware `/health`; `tcpSocket` on `tls-passthru` is not used because it stays ready after SIGTERM) |
 
 Liveness and startup share the process-only handler so an alive-but-degraded
 workload is not restart-looped. Readiness uses dependency-aware `/health`:
@@ -353,6 +353,26 @@ remains HTTP 200 / Ready with degradation observable in the JSON body (the
 built-in `ferrum-edge health` command evaluates HTTP status). Per-probe
 `override` maps replace only that probe's handler; a shared `probes.override`
 is rejected by `values.schema.json`.
+
+Serving mesh workloads (`controlPlane`, `ca`, `eastWest`, `ambient`) also render
+the gateway chart's graceful-shutdown contract: `FERRUM_SHUTDOWN_DRAIN_SECONDS`,
+optional `FERRUM_SHUTDOWN_PREDRAIN_SECONDS`, native `preStop.sleep`, and
+`terminationGracePeriodSeconds` sized for the full additive budget in
+[graceful_shutdown.md](graceful_shutdown.md). The injector webhook, node-agent,
+and one-shot CNI uninstall hooks do not. Restricted-compatible
+`securityContext` / non-empty `resources` apply to control plane, CA, and
+east-west; ambient keeps host-network datapath capabilities after dropping ALL.
+
+### Mesh metrics scrape
+
+`charts/ferrum-mesh` `observability.enabled` (default `false`) does not change
+admin bind addresses. When enabled it renders `FERRUM_METRICS_ALLOWED_CIDRS` /
+`FERRUM_METRICS_BEARER_TOKEN`, dedicated metrics Services for Deployments (the
+main control-plane Service stays gRPC-only; east-west stays `tls-passthru`), a
+Prometheus Operator `ServiceMonitor`, and `PodMonitor`s for the host-network
+ambient and node-agent DaemonSets. Alerts and monitors fail render without a
+scrape credential. `FerrumMeshControlPlaneConfigStale` does not use `absent()`
+for optional mesh emitters.
 
 Example: disable control-plane probes, or replace injector readiness with HTTPS:
 
