@@ -3293,19 +3293,16 @@ async fn mesh_shaped_jwks_auth_rejects_aud_less_and_future_nbf_before_identity_s
         private_key_pem,
     );
     let mut aud_less_ctx = make_ctx();
-    aud_less_ctx.headers.insert(
-        "authorization".to_string(),
-        format!("Bearer {aud_less}"),
-    );
+    aud_less_ctx
+        .headers
+        .insert("authorization".to_string(), format!("Bearer {aud_less}"));
     let aud_less_result = plugin
         .authenticate(&mut aud_less_ctx, &ConsumerIndex::new(&[]))
         .await;
     assert_reject(aud_less_result, Some(401));
     assert!(aud_less_ctx.authenticated_identity.is_none());
     assert!(
-        !aud_less_ctx
-            .metadata
-            .contains_key("mesh.request_principal"),
+        !aud_less_ctx.metadata.contains_key("mesh.request_principal"),
         "aud-less tokens must not stage mesh identity attributes"
     );
     assert!(aud_less_ctx.mesh_request_auth_audiences.is_empty());
@@ -3321,10 +3318,9 @@ async fn mesh_shaped_jwks_auth_rejects_aud_less_and_future_nbf_before_identity_s
         private_key_pem,
     );
     let mut nbf_ctx = make_ctx();
-    nbf_ctx.headers.insert(
-        "authorization".to_string(),
-        format!("Bearer {future_nbf}"),
-    );
+    nbf_ctx
+        .headers
+        .insert("authorization".to_string(), format!("Bearer {future_nbf}"));
     let nbf_result = plugin
         .authenticate(&mut nbf_ctx, &ConsumerIndex::new(&[]))
         .await;

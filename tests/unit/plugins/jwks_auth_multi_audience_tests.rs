@@ -236,10 +236,9 @@ async fn configured_issuer_rejects_mismatch_and_accepts_exact() {
         private_key_pem,
     );
     let mut mismatch_ctx = make_ctx();
-    mismatch_ctx.headers.insert(
-        "authorization".to_string(),
-        format!("Bearer {mismatch}"),
-    );
+    mismatch_ctx
+        .headers
+        .insert("authorization".to_string(), format!("Bearer {mismatch}"));
     let mismatch_result = plugin
         .authenticate(&mut mismatch_ctx, &ConsumerIndex::new(&[]))
         .await;
@@ -253,10 +252,9 @@ async fn configured_issuer_rejects_mismatch_and_accepts_exact() {
         private_key_pem,
     );
     let mut matching_ctx = make_ctx();
-    matching_ctx.headers.insert(
-        "authorization".to_string(),
-        format!("Bearer {matching}"),
-    );
+    matching_ctx
+        .headers
+        .insert("authorization".to_string(), format!("Bearer {matching}"));
     let matching_result = plugin
         .authenticate(&mut matching_ctx, &ConsumerIndex::new(&[]))
         .await;
@@ -292,10 +290,9 @@ async fn unconfigured_audiences_keep_jsonwebtoken_aud_default() {
         private_key_pem,
     );
     let mut without_ctx = make_ctx();
-    without_ctx.headers.insert(
-        "authorization".to_string(),
-        format!("Bearer {without_aud}"),
-    );
+    without_ctx
+        .headers
+        .insert("authorization".to_string(), format!("Bearer {without_aud}"));
     let without_result = plugin
         .authenticate(&mut without_ctx, &ConsumerIndex::new(&[]))
         .await;
