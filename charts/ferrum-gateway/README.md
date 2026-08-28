@@ -155,7 +155,10 @@ still a live Endpoint. The chart closes that window from both sides:
    **before** SIGTERM, so the gateway keeps serving normally for the whole
    window while endpoint removal propagates. `SleepAction` needs no shell, so
    it works on the distroless image; it requires Kubernetes **1.29+** (GA in
-   1.30). Set it to `0` on older clusters to omit the hook.
+   1.30). Set it to `0` on older clusters to omit the hook. With
+   `shutdownPreStopSeconds > 0`, `helm template` / `helm install` **fail** on
+   clusters older than 1.29 with a remediation message instead of silently
+   dropping the unsupported `sleep` field.
 2. `shutdownPreDrainSeconds` (default `0`, `FERRUM_SHUTDOWN_PREDRAIN_SECONDS`)
    keeps every listener — proxy **and** admin — accepting for a window *after*
    SIGTERM while readiness already reports `ready:false` / 503 and `/live` still
