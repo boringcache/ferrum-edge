@@ -1133,10 +1133,7 @@ fn service_entry_export_to_rejection_does_not_echo_the_hostile_value() {
     let mut se = minimal_valid_service_entry();
     se.export_to = vec![hostile.clone()];
     let errors = validate_mesh_config(&[], &[], &[], &[], &[se], &[], None);
-    assert!(
-        errors.iter().any(|e| e.contains("exportTo")),
-        "{errors:?}"
-    );
+    assert!(errors.iter().any(|e| e.contains("exportTo")), "{errors:?}");
     assert!(
         !errors.iter().any(|e| e.contains(&hostile)),
         "the diagnostic must name the field and index, never echo the raw \
