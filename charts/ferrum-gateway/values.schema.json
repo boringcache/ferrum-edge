@@ -593,7 +593,9 @@
             "high5xxRatePerSecond": { "type": "number", "minimum": 0 },
             "p99LatencyMs": { "type": "number", "minimum": 0 },
             "certExpiringSeconds": { "type": "integer", "minimum": 0 },
-            "databasePollStaleSeconds": { "type": "integer", "minimum": 0 }
+            "databasePollStaleSeconds": { "type": "integer", "minimum": 0 },
+            "upstreamUnhealthyRatio": { "type": "number", "minimum": 0, "maximum": 1 },
+            "frontendTlsHandshakeErrorsPerSecond": { "type": "number", "minimum": 0 }
           }
         }
       }

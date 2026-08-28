@@ -384,7 +384,10 @@ scraper must present a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`
 or originate from `FERRUM_METRICS_ALLOWED_CIDRS`. The chart's optional `metrics`
 subtree (`metrics.enabled`, default `false`) wires those env vars and can render
 a Prometheus Operator `ServiceMonitor` plus a `PrometheusRule` with core gateway
-alerts. Enabling metrics does **not** change `admin.bindAddress`; you must
+alerts. Data-path alerts (overload shedding, upstream health, circuit breakers,
+frontend TLS handshake failures) work without the optional `prometheus_metrics`
+plugin; traffic alerts (5xx rate, P99 latency) require it. Database poll
+freshness alerts render only in `database` and `cp` modes. Enabling metrics does **not** change `admin.bindAddress`; you must
 explicitly expose admin for cluster scraping:
 
 ```yaml

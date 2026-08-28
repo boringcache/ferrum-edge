@@ -46,6 +46,7 @@ mod gateway_backend_lb_policy_tests;
 mod gateway_backend_ref_kinds_tests;
 mod gateway_listener_plan_tests;
 mod gateway_listener_status_tests;
+mod gateway_metrics_alerts_helm_tests;
 mod gateway_trust_runtime_publication_tests;
 mod gatewayclass_helm_tests;
 mod grpc_capability_probe_log_tests;

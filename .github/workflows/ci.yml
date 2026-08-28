@@ -4253,6 +4253,41 @@ jobs:
             "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-prom-rule-rendered.yaml" \
             "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-prometheus-rules.yaml"
           promtool check rules "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-prometheus-rules.yaml"
+          # Issue #4289: database poll freshness must not render in file/dp modes.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set metrics.enabled=true \
+            --set metrics.serviceMonitor.enabled=false \
+            --set metrics.allowedCidrs=10.0.0.0/8 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-file.yaml"
+          if grep -Fq 'FerrumGatewayDatabasePollStale' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-file.yaml"; then
+            echo "::error title=Database poll alert in file mode::FerrumGatewayDatabasePollStale must not render when mode=file"
+            exit 1
+          fi
+          if grep -Fq 'absent(ferrum_database_poll_' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-file.yaml"; then
+            echo "::error title=Database poll absent() in file mode::absent(ferrum_database_poll_*) must not render when mode=file"
+            exit 1
+          fi
+          helm template ferrum-dp ./charts/ferrum-gateway --namespace ferrum \
+            -f ./charts/ferrum-gateway/examples/dp-values.yaml \
+            --set metrics.enabled=true \
+            --set metrics.serviceMonitor.enabled=false \
+            --set metrics.allowedCidrs=10.0.0.0/8 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-dp.yaml"
+          if grep -Fq 'FerrumGatewayDatabasePollStale' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-dp.yaml"; then
+            echo "::error title=Database poll alert in dp mode::FerrumGatewayDatabasePollStale must not render when mode=dp"
+            exit 1
+          fi
+          helm template ferrum-db ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=database \
+            --set metrics.enabled=true \
+            --set metrics.serviceMonitor.enabled=false \
+            --set metrics.allowedCidrs=10.0.0.0/8 \
+            --set admin.jwtSecret.existingSecret.name=ferrum-gateway-credentials \
+            --set database.existingSecret.name=ferrum-db \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-database.yaml"
+          grep -Fq 'FerrumGatewayDatabasePollStale' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-database.yaml"
+          grep -Fq 'ferrum_database_poll_last_completed_timestamp_seconds' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-database.yaml"
+          grep -Fq 'FerrumGatewayOverloadSheddingActive' "$RUNNER_TEMP/ferrum-gateway-helm-results/metrics-alerts-file.yaml"
           # DOC-02: migrate is an external Job workflow, not a chart mode and not
           # redirected to ferrum-mesh. mesh-family modes still point at ferrum-mesh.
           # helm stays in this trusted workflow shell; the automation script only

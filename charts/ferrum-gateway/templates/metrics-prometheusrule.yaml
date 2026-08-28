@@ -6,7 +6,7 @@ metadata:
   name: {{ include "ferrum-gateway.suffixedName" (dict "base" (include "ferrum-gateway.fullname" .) "suffix" "-alerts") }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "ferrum-gateway.labels" . | nindent 4 }}
+    {{- include "ferrum-gateway.labels" | nindent 4 }}
     app.kubernetes.io/component: gateway-metrics
     prometheus: ferrum-gateway
 spec:
@@ -20,7 +20,7 @@ spec:
             severity: warning
           annotations:
             summary: Ferrum gateway 5xx response rate is elevated
-            description: "Gateway 5xx responses are above the configured threshold ({{ "{{ $value }}" }} req/s)."
+            description: "Gateway 5xx responses are above the configured threshold ({{ "{{ $value }}" }} req/s). Requires the globally scoped prometheus_metrics plugin."
         - alert: FerrumGatewayHighP99Latency
           expr: histogram_quantile(0.99, sum(rate(ferrum_request_duration_ms_bucket[5m])) by (le)) > {{ $alerts.p99LatencyMs | default 2000 }}
           for: 5m
@@ -28,7 +28,41 @@ spec:
             severity: warning
           annotations:
             summary: Ferrum gateway P99 latency is elevated
-            description: "Gateway P99 request latency is {{ "{{ $value }}" }} ms (threshold {{ $alerts.p99LatencyMs | default 2000 }} ms)."
+            description: "Gateway P99 request latency is {{ "{{ $value }}" }} ms (threshold {{ $alerts.p99LatencyMs | default 2000 }} ms). Requires the globally scoped prometheus_metrics plugin."
+    - name: ferrum.gateway.datapath
+      rules:
+        - alert: FerrumGatewayOverloadSheddingActive
+          expr: max(ferrum_overload_shedding_active) == 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ferrum gateway load shedding is active
+            description: "Progressive load shedding is engaged on namespace {{ "{{ $labels.namespace }}" }} (action {{ "{{ $labels.action }}" }})."
+        - alert: FerrumGatewayUpstreamMajorityUnhealthy
+          expr: max by (upstream_id, upstream_namespace, namespace) ((ferrum_upstream_targets > 0) and (ferrum_upstream_unhealthy_targets / ferrum_upstream_targets > {{ $alerts.upstreamUnhealthyRatio | default 0.5 }}))
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ferrum gateway upstream has a majority of targets unhealthy
+            description: "Upstream {{ "{{ $labels.upstream_id }}" }}/{{ "{{ $labels.upstream_namespace }}" }} in namespace {{ "{{ $labels.namespace }}" }} has more than {{ $alerts.upstreamUnhealthyRatio | default 0.5 }} of targets ejected by active health probes."
+        - alert: FerrumGatewayCircuitBreakerOpen
+          expr: max by (proxy_id, proxy_namespace, namespace) (ferrum_circuit_breakers{state="open"}) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ferrum gateway circuit breaker is open
+            description: "Proxy {{ "{{ $labels.proxy_id }}" }}/{{ "{{ $labels.proxy_namespace }}" }} in namespace {{ "{{ $labels.namespace }}" }} has at least one upstream circuit breaker in the open state."
+        - alert: FerrumGatewayFrontendTlsHandshakeErrors
+          expr: sum(rate(ferrum_frontend_tls_handshake_failures_total{reason="error"}[5m])) > {{ $alerts.frontendTlsHandshakeErrorsPerSecond | default 0 }}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ferrum gateway frontend TLS handshake errors are elevated
+            description: "Frontend TLS handshakes are being refused with reason=error at {{ "{{ $value }}" }} failures/s (threshold {{ $alerts.frontendTlsHandshakeErrorsPerSecond | default 0 }})."
     - name: ferrum.gateway.tls
       rules:
         - alert: FerrumGatewayTlsCertExpiringSoon
@@ -41,6 +75,7 @@ spec:
             description: "Certificate {{ "{{ $labels.cert_id }}" }} on surface {{ "{{ $labels.surface }}" }} expires in {{ "{{ $value }}" }} seconds."
     - name: ferrum.gateway.config
       rules:
+{{- if or (eq .Values.mode "database") (eq .Values.mode "cp") }}
         - alert: FerrumGatewayDatabasePollStale
           expr: (time() - ferrum_database_poll_last_completed_timestamp_seconds > {{ $alerts.databasePollStaleSeconds | default 300 }}) or absent(ferrum_database_poll_last_completed_timestamp_seconds)
           for: 10m
@@ -49,6 +84,7 @@ spec:
           annotations:
             summary: Ferrum gateway database config poll is stale
             description: "No successful database/CP config poll completed within the freshness window for namespace {{ "{{ $labels.namespace }}" }}."
+{{- end }}
         - alert: FerrumGatewayDpConfigStale
           expr: max by (namespace) (ferrum_dp_config_stale) == 1
           for: 5m

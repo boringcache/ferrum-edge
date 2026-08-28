@@ -1041,7 +1041,7 @@
     ],
     "subsystem": "circuit_breaker",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "alert",
     "emission": "when_series_present"
   },
   {
@@ -1792,7 +1792,7 @@
     ],
     "subsystem": "tls",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "alert",
     "emission": "always"
   },
   {
@@ -3855,7 +3855,7 @@
     ],
     "subsystem": "overload",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "alert",
     "emission": "conditional"
   },
   {
@@ -3954,7 +3954,7 @@
     ],
     "subsystem": "overload",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "alert",
     "emission": "conditional"
   },
   {
@@ -4717,7 +4717,7 @@
     ],
     "subsystem": "upstream_health",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "alert",
     "emission": "when_series_present"
   },
   {
@@ -4731,7 +4731,7 @@
     ],
     "subsystem": "upstream_health",
     "export_surface": "/metrics",
-    "bundled": "documented_only",
+    "bundled": "alert",
     "emission": "when_series_present"
   },
   {

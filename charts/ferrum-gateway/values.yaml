@@ -609,13 +609,17 @@ metrics:
     tlsConfig: {}
   alerts:
     # When `metrics.enabled` is true, render a PrometheusRule with core gateway
-    # alerts (5xx rate, P99 latency, TLS cert expiry, config poll freshness,
-    # DP config staleness, ConfigSync divergence).
+    # alerts. Data-path alerts (overload shedding, upstream health, circuit
+    # breakers, frontend TLS handshake failures) work without the optional
+    # prometheus_metrics plugin. Traffic alerts (5xx rate, P99 latency) require
+    # that plugin. Database poll freshness renders only in database/cp modes.
     enabled: true
     high5xxRatePerSecond: 1
     p99LatencyMs: 2000
     certExpiringSeconds: 604800
     databasePollStaleSeconds: 300
+    upstreamUnhealthyRatio: 0.5
+    frontendTlsHandshakeErrorsPerSecond: 0
 
 # Optional NetworkPolicy. Default off. When enabled, proxy and stream listener
 # ports stay reachable from any source while admin HTTP/HTTPS and CP gRPC ingress
