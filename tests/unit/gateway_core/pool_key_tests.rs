@@ -702,7 +702,7 @@ fn h2_pool_key_basic_format() {
     let key = Http2ConnectionPool::pool_key_for_warmup(&proxy);
     // Format: host|port|dns|subset|h2mcs|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N
     assert_eq!(
-        key, "backend.example.com|8080|||none||||||1|svidg=static",
+        key, "backend.example.com|8080|||1000||||||1|svidg=static",
         "basic H2 key format mismatch"
     );
 }
@@ -1987,8 +1987,8 @@ fn h2_and_grpc_pool_keys_partition_configured_versus_default_h2_cap() {
         "configured vs removed H2 cap must not share direct-H2 keys: {h2_configured} vs {h2_default}"
     );
     assert!(
-        h2_configured.contains("|64|") && h2_default.contains("|none|"),
-        "configured/default H2 keys must use decimal/`none` sentinels: {h2_configured} / {h2_default}"
+        h2_configured.contains("|64|") && h2_default.contains("|1000|"),
+        "configured/default H2 keys must encode the effective stream cap: {h2_configured} / {h2_default}"
     );
 
     let grpc_configured = GrpcConnectionPool::pool_key_for_warmup(&configured);
@@ -1998,8 +1998,130 @@ fn h2_and_grpc_pool_keys_partition_configured_versus_default_h2_cap() {
         "configured vs removed H2 cap must not share gRPC keys: {grpc_configured} vs {grpc_default}"
     );
     assert!(
-        grpc_configured.contains("|64|") && grpc_default.contains("|none|"),
-        "configured/default gRPC keys must use decimal/`none` sentinels: {grpc_configured} / {grpc_default}"
+        grpc_configured.contains("|64|") && grpc_default.contains("|1000|"),
+        "configured/default gRPC keys must encode the effective stream cap: {grpc_configured} / {grpc_default}"
+    );
+}
+
+/// Direct-H2 and gRPC keys encode `PoolConfig::for_proxy` stream caps, not the
+/// raw per-proxy `Option`. Inheriting the process-wide global must share a
+/// key with an explicit setting of that same number.
+#[test]
+fn h2_and_grpc_pool_keys_share_when_inherit_equals_explicit_global() {
+    let global = PoolConfig::default();
+    assert_eq!(global.http2_max_concurrent_streams, Some(1000));
+
+    let inherit = minimal_proxy();
+    assert!(inherit.pool_http2_max_concurrent_streams.is_none());
+
+    let mut explicit = minimal_proxy();
+    explicit.pool_http2_max_concurrent_streams = global.http2_max_concurrent_streams;
+
+    assert_eq!(
+        global.for_proxy(&inherit).http2_max_concurrent_streams,
+        global.for_proxy(&explicit).http2_max_concurrent_streams,
+    );
+    assert_eq!(
+        global.effective_http2_max_concurrent_streams(&inherit),
+        global.effective_http2_max_concurrent_streams(&explicit),
+    );
+
+    let h2_inherit = Http2ConnectionPool::pool_key_for_warmup(&inherit);
+    let h2_explicit = Http2ConnectionPool::pool_key_for_warmup(&explicit);
+    assert_eq!(
+        h2_inherit, h2_explicit,
+        "inherit-global and explicit-global must share a direct-H2 key: {h2_inherit} vs {h2_explicit}"
+    );
+    assert!(
+        h2_inherit.contains("|1000|"),
+        "inherited default must encode the effective decimal, not `none`: {h2_inherit}"
+    );
+
+    let grpc_inherit = GrpcConnectionPool::pool_key_for_warmup(&inherit);
+    let grpc_explicit = GrpcConnectionPool::pool_key_for_warmup(&explicit);
+    assert_eq!(
+        grpc_inherit, grpc_explicit,
+        "inherit-global and explicit-global must share a gRPC key: {grpc_inherit} vs {grpc_explicit}"
+    );
+    assert!(
+        grpc_inherit.contains("|1000|"),
+        "inherited default must encode the effective decimal, not `none`: {grpc_inherit}"
+    );
+}
+
+/// `apply_proxy_overrides` clamps a present stream cap with `.max(1)`, so
+/// `Some(0)` and `Some(1)` must produce byte-identical H2/gRPC keys.
+#[test]
+fn h2_and_grpc_pool_keys_share_after_zero_clamp() {
+    let global = PoolConfig::default();
+    let mut zero = minimal_proxy();
+    zero.pool_http2_max_concurrent_streams = Some(0);
+    let mut one = minimal_proxy();
+    one.pool_http2_max_concurrent_streams = Some(1);
+
+    assert_eq!(
+        global.for_proxy(&zero).http2_max_concurrent_streams,
+        Some(1)
+    );
+    assert_eq!(
+        global.for_proxy(&one).http2_max_concurrent_streams,
+        Some(1)
+    );
+    assert_eq!(
+        Http2ConnectionPool::pool_key_for_warmup(&zero),
+        Http2ConnectionPool::pool_key_for_warmup(&one),
+        "Some(0) and Some(1) must share a direct-H2 key after clamp"
+    );
+    assert_eq!(
+        GrpcConnectionPool::pool_key_for_warmup(&zero),
+        GrpcConnectionPool::pool_key_for_warmup(&one),
+        "Some(0) and Some(1) must share a gRPC key after clamp"
+    );
+    let h2_key = Http2ConnectionPool::pool_key_for_warmup(&zero);
+    let h2mcs = h2_key.split('|').nth(4);
+    assert_eq!(
+        h2mcs,
+        Some("1"),
+        "clamped zero must encode 1, not 0: {h2_key}"
+    );
+}
+
+/// A customized global layer must also collapse inherit vs explicit-equal,
+/// encode `none` only when the effective cap is unlimited, and keep a
+/// mismatched explicit value partitioned.
+#[test]
+fn h2_and_grpc_pool_keys_follow_custom_global_effective_stream_cap() {
+    let mut global = PoolConfig::default();
+    global.http2_max_concurrent_streams = Some(42);
+
+    let inherit = minimal_proxy();
+    let mut explicit_42 = minimal_proxy();
+    explicit_42.pool_http2_max_concurrent_streams = Some(42);
+    let mut explicit_1000 = minimal_proxy();
+    explicit_1000.pool_http2_max_concurrent_streams = Some(1000);
+
+    let h2_inherit = Http2ConnectionPool::pool_key_with_global(&inherit, None, &global);
+    let h2_explicit_42 = Http2ConnectionPool::pool_key_with_global(&explicit_42, None, &global);
+    let h2_explicit_1000 = Http2ConnectionPool::pool_key_with_global(&explicit_1000, None, &global);
+    assert_eq!(h2_inherit, h2_explicit_42);
+    assert_ne!(h2_inherit, h2_explicit_1000);
+    assert!(h2_inherit.contains("|42|"), "{h2_inherit}");
+    assert!(h2_explicit_1000.contains("|1000|"), "{h2_explicit_1000}");
+
+    let grpc_inherit = GrpcConnectionPool::pool_key_with_global(&inherit, None, &global);
+    let grpc_explicit_42 = GrpcConnectionPool::pool_key_with_global(&explicit_42, None, &global);
+    assert_eq!(grpc_inherit, grpc_explicit_42);
+
+    global.http2_max_concurrent_streams = None;
+    let h2_unlimited = Http2ConnectionPool::pool_key_with_global(&inherit, None, &global);
+    let grpc_unlimited = GrpcConnectionPool::pool_key_with_global(&inherit, None, &global);
+    assert!(
+        h2_unlimited.contains("|none|"),
+        "unlimited effective cap must keep the none sentinel: {h2_unlimited}"
+    );
+    assert!(
+        grpc_unlimited.contains("|none|"),
+        "unlimited effective cap must keep the none sentinel: {grpc_unlimited}"
     );
 }
 

@@ -442,6 +442,7 @@ thread_local! {
 /// lookups are fine.
 fn with_grpc_pool_key<R>(
     proxy: &Proxy,
+    global_pool_config: &PoolConfig,
     client_cert_path: Option<&str>,
     client_key_path: Option<&str>,
     svid_generation: Option<u64>,
@@ -454,6 +455,7 @@ fn with_grpc_pool_key<R>(
             &proxy.backend_host,
             proxy.backend_port,
             proxy,
+            global_pool_config,
             client_cert_path,
             client_key_path,
             svid_generation,
@@ -462,11 +464,13 @@ fn with_grpc_pool_key<R>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_grpc_pool_key(
     buf: &mut String,
     host: &str,
     port: u16,
     proxy: &Proxy,
+    global_pool_config: &PoolConfig,
     client_cert_path: Option<&str>,
     client_key_path: Option<&str>,
     svid_generation: Option<u64>,
@@ -488,13 +492,19 @@ fn write_grpc_pool_key(
     // `upstream_subset`.
     append_optional_pool_key_component(buf, proxy.upstream_subset.as_deref());
     buf.push('|');
-    // Effective `pool_http2_max_concurrent_streams` is baked into the hyper
-    // builder (`max_concurrent_streams` + `initial_max_send_streams`), so it
-    // must participate in pool identity. Placed after subset and before TLS
-    // fields so `SvidGenerationMatcher` still sees `|svidg=…` as the final
-    // (pre-shard) segment. `None` → `none` so update/delete of the cap cannot
-    // reuse a connection built under the prior limit.
-    append_http2_max_concurrent_streams_pool_key(buf, proxy.pool_http2_max_concurrent_streams);
+    // Effective `PoolConfig::for_proxy(...).http2_max_concurrent_streams` is
+    // baked into the hyper builder (`max_concurrent_streams` +
+    // `initial_max_send_streams`), so it must participate in pool identity.
+    // Resolved here without cloning `PoolConfig`. Placed after subset and
+    // before TLS fields so `SvidGenerationMatcher` still sees `|svidg=…` as
+    // the final (pre-shard) segment. Effective `None` → `none` (unlimited)
+    // so update/delete of a finite cap cannot reuse a connection built
+    // under the prior limit; inherit-global and an explicit equal value
+    // share a key.
+    append_http2_max_concurrent_streams_pool_key(
+        buf,
+        global_pool_config.effective_http2_max_concurrent_streams(proxy),
+    );
     buf.push('|');
     append_backend_tls_pool_key_fields(
         buf,
@@ -506,13 +516,18 @@ fn write_grpc_pool_key(
     );
 }
 
-fn grpc_pool_key_owned(proxy: &Proxy, svid_generation: Option<u64>) -> String {
+fn grpc_pool_key_owned(
+    proxy: &Proxy,
+    svid_generation: Option<u64>,
+    global_pool_config: &PoolConfig,
+) -> String {
     let mut buf = String::with_capacity(128);
     write_grpc_pool_key(
         &mut buf,
         &proxy.backend_host,
         proxy.backend_port,
         proxy,
+        global_pool_config,
         proxy.resolved_tls.client_cert_path.as_deref(),
         proxy.resolved_tls.client_key_path.as_deref(),
         svid_generation,
@@ -656,11 +671,22 @@ impl GrpcConnectionPool {
         self.pool.pool_size()
     }
 
+    /// Drain generation-keyed TLS configs **and** unreachable `rr_counters`
+    /// for a retired SVID generation.
+    ///
+    /// Called from the rotation consumer's unconditional retirement loop
+    /// (`BackendPoolFamily::drain_tls_config_cache`), including when
+    /// `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS=0`. Retired-generation
+    /// counters are already unreachable — the live counter never revisits a
+    /// generation — so this is a release, not a connection withdrawal.
+    /// Live pooled senders stay until idle prune or `force_drain_*`.
     pub fn drain_backend_tls_config_cache_svid_generation(&self, generation: u64) {
         self.pool
             .manager()
             .tls_configs
             .drain_svid_generation(generation);
+        let matcher = SvidGenerationMatcher::new(generation);
+        self.rr_counters.retain(|key, _| !matcher.matches(key));
     }
 
     pub fn clear_backend_tls_config_cache(&self) {
@@ -720,6 +746,7 @@ impl GrpcConnectionPool {
             &proxy.backend_host,
             proxy.backend_port,
             proxy,
+            &PoolConfig::default(),
             proxy.resolved_tls.client_cert_path.as_deref(),
             proxy.resolved_tls.client_key_path.as_deref(),
             None,
@@ -731,7 +758,7 @@ impl GrpcConnectionPool {
     /// post-refactor (gRPC pool warms lazily); retained for future re-enablement.
     #[allow(dead_code)]
     fn pool_key_owned(proxy: &Proxy) -> String {
-        grpc_pool_key_owned(proxy, None)
+        grpc_pool_key_owned(proxy, None, &PoolConfig::default())
     }
 
     /// Expose the base pool key for warmup deduplication (without shard suffix).
@@ -742,6 +769,21 @@ impl GrpcConnectionPool {
     #[allow(dead_code)]
     pub fn pool_key_for_warmup(proxy: &Proxy) -> String {
         Self::pool_key_owned(proxy)
+    }
+
+    /// Unsharded gRPC base key using `global` as the `PoolConfig` layer
+    /// `for_proxy` / `effective_http2_max_concurrent_streams` resolve against.
+    ///
+    /// `pool_key_for_warmup` is this with `svid_generation = None` and
+    /// `PoolConfig::default()`. Runtime `get_sender` uses the pool manager's
+    /// global instead of reconstructing `PoolConfig` a second time.
+    #[allow(dead_code)] // exercised from unit/integration tests
+    pub fn pool_key_with_global(
+        proxy: &Proxy,
+        svid_generation: Option<u64>,
+        global: &PoolConfig,
+    ) -> String {
+        grpc_pool_key_owned(proxy, svid_generation, global)
     }
 
     /// TLS-config cache key (no host/port). Used by unit tests to prove two
@@ -826,6 +868,7 @@ impl GrpcConnectionPool {
         let manager = self.pool.manager();
         with_grpc_pool_key(
             proxy,
+            &manager.global_pool_config,
             manager.effective_client_cert_path(proxy),
             manager.effective_client_key_path(proxy),
             svid_generation,
@@ -1442,6 +1485,7 @@ impl GrpcPoolManager {
             host,
             port,
             proxy,
+            &self.global_pool_config,
             self.effective_client_cert_path(proxy),
             self.effective_client_key_path(proxy),
             svid_generation,
@@ -5549,7 +5593,7 @@ mod tests {
     #[test]
     fn grpc_pool_key_can_partition_on_svid_generation() {
         let proxy = grpc_pool_test_proxy();
-        let key = grpc_pool_key_owned(&proxy, Some(23));
+        let key = grpc_pool_key_owned(&proxy, Some(23), &PoolConfig::default());
 
         assert!(
             key.ends_with("|svidg=23"),
@@ -5722,6 +5766,7 @@ mod tests {
     ) -> R {
         with_grpc_pool_key(
             proxy,
+            &PoolConfig::default(),
             proxy.resolved_tls.client_cert_path.as_deref(),
             proxy.resolved_tls.client_key_path.as_deref(),
             svid_generation,
@@ -5732,7 +5777,7 @@ mod tests {
     #[test]
     fn with_grpc_pool_key_matches_grpc_pool_key_owned() {
         let proxy = grpc_pool_test_proxy();
-        let owned = grpc_pool_key_owned(&proxy, None);
+        let owned = grpc_pool_key_owned(&proxy, None, &PoolConfig::default());
         let from_thread_local = with_grpc_test_pool_key(&proxy, None, |buf| buf.clone());
         assert_eq!(
             owned, from_thread_local,
@@ -5751,8 +5796,8 @@ mod tests {
         p2.resolved_tls.sni = Some("ratings.mesh.internal".to_string());
 
         assert_ne!(
-            grpc_pool_key_owned(&p1, None),
-            grpc_pool_key_owned(&p2, None),
+            grpc_pool_key_owned(&p1, None, &PoolConfig::default()),
+            grpc_pool_key_owned(&p2, None, &PoolConfig::default()),
             "backend TLS SNI must separate gRPC pool keys"
         );
 
@@ -5760,8 +5805,8 @@ mod tests {
         p2.resolved_tls.san_allow_list = vec!["ratings.mesh.internal".to_string()];
         p2.resolved_tls.recompute_san_digest();
         assert_ne!(
-            grpc_pool_key_owned(&p1, None),
-            grpc_pool_key_owned(&p2, None),
+            grpc_pool_key_owned(&p1, None, &PoolConfig::default()),
+            grpc_pool_key_owned(&p2, None, &PoolConfig::default()),
             "backend TLS SAN allow-list must separate gRPC pool keys"
         );
     }

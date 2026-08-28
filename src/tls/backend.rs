@@ -263,12 +263,18 @@ pub fn append_optional_pool_key_component(buf: &mut String, component: Option<&s
 
 /// Append the effective optional H2 max-concurrent-streams pool-key segment.
 ///
-/// Direct-H2 / native-gRPC builders bake `Proxy.pool_http2_max_concurrent_streams`
-/// into the connection (`max_concurrent_streams` + `initial_max_send_streams`),
-/// so the value must partition those pools. `None` writes the literal sentinel
-/// `none` (delimiter-safe digits-or-sentinel encoding, matching the HBONE /
-/// mesh-mTLS `write_pool_config_key` convention) so a DestinationRule update
-/// that removes the cap cannot reuse a connection built under the old limit.
+/// Direct-H2 / native-gRPC builders bake
+/// `PoolConfig::for_proxy(...).http2_max_concurrent_streams` into the
+/// connection (`max_concurrent_streams` + `initial_max_send_streams`), so the
+/// **effective** cap must partition those pools. Callers must pass that
+/// resolved value, not the raw `Proxy.pool_http2_max_concurrent_streams`
+/// `Option`: inheriting the global and setting the same number explicitly
+/// share a key, and a present override is clamped with `.max(1)`. `None`
+/// writes the literal sentinel `none` (delimiter-safe digits-or-sentinel
+/// encoding, matching the HBONE / mesh-mTLS `write_pool_config_key`
+/// convention) when the effective cap is unlimited, so a DestinationRule
+/// update that removes a finite cap cannot reuse a connection built under
+/// the old limit.
 pub fn append_http2_max_concurrent_streams_pool_key(buf: &mut String, max_streams: Option<u32>) {
     match max_streams {
         Some(value) => {
