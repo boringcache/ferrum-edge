@@ -4269,6 +4269,32 @@ async fn check_consumer_identity_unique_is_namespace_isolated() {
 }
 
 #[test]
+fn replace_api_spec_metadata_shortcut_checks_rows_affected() {
+    // Issue #4285 / #2989 parity: the hash-unchanged metadata-only shortcut must
+    // verify the UPDATE matched a row before reporting success, so a spec deleted
+    // (or dangling api_spec_id without an api_specs row) surfaces an error.
+    let source = include_str!("../../../src/config/db_loader.rs");
+    let replace = source
+        .split("pub async fn replace_api_spec_bundle(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    async fn current_api_spec_resource_hash_tx(").next())
+        .expect("replace_api_spec_bundle body");
+    let shortcut = replace
+        .find("Bundle is unchanged — only update the api_specs metadata row.")
+        .expect("metadata-only shortcut marker");
+    let rows_affected = replace[shortcut..]
+        .find("rows_affected()")
+        .expect("metadata shortcut must verify rows_affected");
+    let commit = replace[shortcut..]
+        .find("tx.commit().await?;")
+        .expect("metadata shortcut commit");
+    assert!(
+        rows_affected < commit,
+        "rows_affected must be checked before the metadata shortcut commits"
+    );
+}
+
+#[test]
 fn consumer_identity_uniqueness_queries_the_identity_index() {
     let source = include_str!("../../../src/config/db_loader.rs");
     let start = source

@@ -4309,6 +4309,61 @@ async fn replace_removes_removed_spec_declared_external_proxy_plugin_association
     );
 }
 
+/// When tagged spec-owned resources exist but the `api_specs` row is missing
+/// (e.g. restore preserved a dangling `api_spec_id`), the metadata-only shortcut
+/// must fail closed instead of committing an empty transaction and reporting
+/// success. Mirrors MongoDB `matched_count != 1` (issue #4285).
+#[tokio::test]
+async fn replace_metadata_only_shortcut_fails_when_api_specs_row_missing() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let spec_id = uid("spec");
+    let (bundle, spec) =
+        make_spec_with_metadata(&spec_id, &proxy_id, ns, "Dangling API", "0", &[]);
+    store
+        .submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("initial submit failed");
+
+    sqlx::query("DELETE FROM api_specs WHERE namespace = ? AND id = ?")
+        .bind(ns)
+        .bind(&spec_id)
+        .execute(store.pool())
+        .await
+        .expect("delete api_specs row for dangling fixture");
+
+    assert!(
+        store
+            .get_api_spec(ns, &spec_id)
+            .await
+            .expect("get_api_spec failed")
+            .is_none(),
+        "fixture must leave tagged resources without an api_specs row"
+    );
+
+    let (bundle_put, mut spec_put) =
+        make_spec_with_metadata(&spec_id, &proxy_id, ns, "Dangling API", "0", &[]);
+    spec_put.description = Some("metadata-only PUT with unchanged resources".to_string());
+    spec_put.updated_at = chrono::Utc::now();
+
+    let err = store
+        .replace_api_spec_bundle(&bundle_put, &spec_put)
+        .await
+        .expect_err("metadata-only replace must fail when api_specs row is absent");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("metadata-only replace"),
+        "error must identify the metadata-only shortcut path, got: {msg}"
+    );
+    assert!(
+        msg.contains("rows_affected=0"),
+        "error must report zero rows affected, got: {msg}"
+    );
+}
+
 #[tokio::test]
 async fn replace_same_hash_reconciles_drifted_spec_owned_proxy() {
     let dir = TempDir::new().unwrap();

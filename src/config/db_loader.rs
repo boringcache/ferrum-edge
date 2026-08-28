@@ -9456,7 +9456,7 @@ impl DatabaseStore {
                 crate::config::types::SpecFormat::Json => "json",
                 crate::config::types::SpecFormat::Yaml => "yaml",
             };
-            sqlx::query(&self.q("UPDATE api_specs SET \
+            let update_result = sqlx::query(&self.q("UPDATE api_specs SET \
                  spec_content = ?, content_encoding = ?, content_hash = ?, \
                  uncompressed_size = ?, resource_hash = ?, \
                  external_ref_snapshot = ?, external_ref_digest = ?, \
@@ -9490,6 +9490,18 @@ impl DatabaseStore {
             .bind(&spec.id)
             .execute(&mut *tx)
             .await?;
+            // The namespace/id predicate matches 0 or 1 row. Zero means the spec
+            // was deleted (or the namespace predicate missed) between the hash check
+            // and this guarded write — never report that as a success.
+            if update_result.rows_affected() != 1 {
+                anyhow::bail!(
+                    "API spec row not found for id '{}' in namespace '{}' during \
+                     metadata-only replace (rows_affected={})",
+                    spec.id,
+                    spec.namespace,
+                    update_result.rows_affected()
+                );
+            }
             tx.commit().await?;
             return Ok(());
         }
