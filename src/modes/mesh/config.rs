@@ -4811,6 +4811,24 @@ pub enum SidecarIngressConnectRelay {
     },
 }
 
+/// Whether `host` is in the reserved DNS `localhost` namespace or is a loopback
+/// IP literal. Case-insensitive; a trailing root dot is ignored. Allocation-free
+/// and never resolves DNS.
+fn inbound_relay_host_is_loopback_namespace(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    const LOCALHOST_SUFFIX: &str = ".localhost";
+    if host.eq_ignore_ascii_case("localhost")
+        || (host.len() > LOCALHOST_SUFFIX.len()
+            && host
+                .get(host.len() - LOCALHOST_SUFFIX.len()..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(LOCALHOST_SUFFIX)))
+    {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
 impl MeshConfig {
     /// Whether an authenticated inbound CONNECT to `host:port` may be
     /// transparently relayed by THIS terminator (issue #4150), and why not when
@@ -4830,8 +4848,8 @@ impl MeshConfig {
     ///    provably reached this pod at the address it named — a transport fact
     ///    the peer cannot choose. The port is still bounded by the workload
     ///    record(s) the slice declares FOR THAT ADDRESS.
-    /// 2. **Loopback** (`127.0.0.1` / `::1` / `localhost`) as an
-    ///    own-namespace shortcut, admissible only for those same own-pod
+    /// 2. **Loopback** (`127.0.0.1` / `::1` / the DNS `localhost` namespace)
+    ///    as an own-namespace shortcut, admissible only for those same own-pod
     ///    terminators and only on a port this pod's own workload record
     ///    declares. A `NodeWaypoint` / `ServiceWaypoint` does not get that
     ///    shortcut — they run outside the destination pods' network
@@ -4885,8 +4903,7 @@ impl MeshConfig {
             return Err(InboundRelayDenial::UnresolvableHost);
         }
 
-        if candidate.eq_ignore_ascii_case("localhost") || parsed.is_some_and(|ip| ip.is_loopback())
-        {
+        if inbound_relay_host_is_loopback_namespace(candidate) {
             if let Some(own_address) = own_address {
                 return if self.workload_declares_address_port(own_address, port) {
                     Ok(())

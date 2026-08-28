@@ -20,8 +20,8 @@ use ferrum_edge::identity::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::MeshTrafficDirection;
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, InboundRelayDenial, MeshConfig, MeshEgressUdpDestination,
-    MeshEgressUdpDialEndpoint, Workload, WorkloadPort, WorkloadSelector,
-    inbound_relay_destinations_from_workloads,
+    MeshEgressUdpDialEndpoint, MeshInboundRelayDestination, MeshInboundRelayHost, Workload,
+    WorkloadPort, WorkloadSelector, inbound_relay_destinations_from_workloads,
 };
 use ferrum_edge::proxy::{
     ProxyState, start_proxy_listener_with_bound_listener,
@@ -1789,4 +1789,25 @@ fn inbound_relay_admits_only_the_waypoint_termination_inventory() {
         loopback_mesh.inbound_relay_destination_decision("::1", 8080, waypoint),
         Err(InboundRelayDenial::AddressNotTerminated)
     );
+
+    let localhost_namespace_mesh = MeshConfig {
+        inbound_relay_destinations: vec![
+            MeshInboundRelayDestination {
+                host: MeshInboundRelayHost::Name("localhost.".to_string()),
+                ports: vec![8080],
+            },
+            MeshInboundRelayDestination {
+                host: MeshInboundRelayHost::Name("app.localhost".to_string()),
+                ports: vec![8080],
+            },
+        ],
+        ..MeshConfig::default()
+    };
+    for host in ["localhost.", "LocalHost", "app.localhost", "APP.Localhost"] {
+        assert_eq!(
+            localhost_namespace_mesh.inbound_relay_destination_decision(host, 8080, waypoint),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "waypoint must refuse loopback-namespace authority {host} even when inventory-listed"
+        );
+    }
 }

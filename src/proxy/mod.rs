@@ -62608,6 +62608,9 @@ mod tests {
         assert_eq!(decide("127.0.0.1", 8080, Some(own_ip)), Ok(()));
         assert_eq!(decide("::1", 8080, Some(own_ip)), Ok(()));
         assert_eq!(decide("localhost", 8080, Some(own_ip)), Ok(()));
+        assert_eq!(decide("localhost.", 8080, Some(own_ip)), Ok(()));
+        assert_eq!(decide("LocalHost", 8080, Some(own_ip)), Ok(()));
+        assert_eq!(decide("app.localhost", 8080, Some(own_ip)), Ok(()));
         // ...but undeclared loopback ports remain refused.
         assert_eq!(
             decide("127.0.0.1", 9999, Some(own_ip)),
@@ -62681,7 +62684,8 @@ mod tests {
     #[test]
     fn inbound_hbone_relay_guard_admits_the_waypoint_termination_inventory_only() {
         use crate::modes::mesh::config::{
-            InboundRelayDenial, MeshConfig, inbound_relay_destinations_from_workloads,
+            InboundRelayDenial, MeshConfig, MeshInboundRelayDestination, MeshInboundRelayHost,
+            inbound_relay_destinations_from_workloads,
         };
 
         let waypoint_ip: std::net::IpAddr = "10.4.4.4".parse().expect("waypoint IP");
@@ -62749,6 +62753,35 @@ mod tests {
             ),
             Err(InboundRelayDenial::AddressNotTerminated)
         );
+
+        // DNS localhost namespace spellings must not bypass the loopback refusal
+        // via inventory Name entries that the backend dial would resolve to
+        // loopback.
+        let localhost_namespace_mesh = MeshConfig {
+            inbound_relay_destinations: vec![
+                MeshInboundRelayDestination {
+                    host: MeshInboundRelayHost::Name("localhost.".to_string()),
+                    ports: vec![8080],
+                },
+                MeshInboundRelayDestination {
+                    host: MeshInboundRelayHost::Name("app.localhost".to_string()),
+                    ports: vec![8080],
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        for host in ["localhost.", "LocalHost", "app.localhost", "APP.Localhost"] {
+            assert_eq!(
+                inbound_hbone_relay_destination_decision(
+                    host,
+                    8080,
+                    Some(&localhost_namespace_mesh),
+                    Some(waypoint_ip),
+                ),
+                Err(InboundRelayDenial::AddressNotTerminated),
+                "waypoint must refuse loopback-namespace authority {host} even when inventory-listed"
+            );
+        }
     }
 
     #[test]
