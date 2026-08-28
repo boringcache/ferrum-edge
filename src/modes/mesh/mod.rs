@@ -40546,7 +40546,9 @@ mod tests {
         // Inventory-listed loopback / DNS localhost still reach the Ambient
         // (host) namespace, so they stay refused. An accepted non-loopback
         // pod IP does not grant that shortcut either.
-        let pod_ip = "10.244.5.5".parse::<std::net::IpAddr>().expect("own pod IP");
+        let pod_ip = "10.244.5.5"
+            .parse::<std::net::IpAddr>()
+            .expect("own pod IP");
         assert_eq!(
             mesh.inbound_relay_destination_decision("10.244.5.5", 8080, Some(pod_ip)),
             Ok(())
