@@ -10,6 +10,7 @@ pub mod access_log_filter;
 pub mod config;
 pub mod config_consumer;
 pub mod dns_proxy;
+pub mod enrolled_destinations;
 pub mod federation;
 pub mod hbone;
 pub mod metric_tag_cel;
@@ -1678,14 +1679,29 @@ fn prepare_normalized_gateway_config_for_mesh(
             //    datapath. A Sidecar reaches the same records through its own
             //    pod address, so this is a no-op there in practice.
             //
-            // The LOCAL-workload predicate is the narrowing: a workload the
-            // slice declares under a DIFFERENT SPIFFE — another service, or
-            // another node's pod of another service — is still refused, which
-            // is the issue #4150 property. Issue #4249 additionally requires
-            // the cluster and the configured workload labels to match, so a
-            // same-identity SIBLING REPLICA on another node no longer rides in
-            // on the SPIFFE alone. A blank/absent identity yields an EMPTY
-            // inventory (fail closed), leaving only the accepted local address.
+            // The LOCAL-workload predicate narrows source 2 to records this
+            // proxy could plausibly own: a workload the slice declares under a
+            // DIFFERENT SPIFFE — another service, or another node's pod of
+            // another service — is refused, which is the issue #4150 property,
+            // and the cluster and configured-label arms drop a cross-cluster
+            // or differently-labelled record. A blank/absent identity yields an
+            // EMPTY inventory (fail closed), leaving only the accepted local
+            // address.
+            //
+            // It is NOT a node bound, and the earlier revision of this comment
+            // was wrong to claim it excluded an off-node sibling: two replicas
+            // of ONE Deployment share a service-account SPIFFE id, a cluster,
+            // and their pod-template labels while running on different nodes.
+            // The node bound is the authoritative node-local enrolled-pod
+            // registry stamped below as
+            // `MeshConfig::inbound_relay_node_local_registry` (issue #4249) —
+            // the node-agent's own enrollment lifecycle, republished
+            // lock-free on its reconcile cadence and consulted LIVE by the
+            // guard, so a withdrawn pod leaves the admitted set within one poll
+            // rather than at the next mesh apply. Where a registry is
+            // configured it is authoritative and there is no per-entry
+            // fallback to this predicate; these records then only supply the
+            // port and declared-name evidence.
             MeshTopology::Sidecar | MeshTopology::Ambient => {
                 let destinations = match own_workload_identity {
                     Some(identity) => {
@@ -1782,9 +1798,22 @@ fn prepare_normalized_gateway_config_for_mesh(
         let own_address_ports = own_workload_identity
             .filter(|_| admits_accepted_local_address)
             .map(|_| inbound_relay_destinations.clone());
+        // Issue #4249: the node bound for the own-identity inventory. Only the
+        // own-identity topologies consult a node-local registry — `NodeWaypoint`
+        // already takes its inventory from the CP-authorized enrolled-pod list
+        // and `ServiceWaypoint` from its bound Services — so every other
+        // topology is stamped with the unset handle rather than inheriting an
+        // installed one. Assigned UNCONDITIONALLY, like the three fields above.
+        let node_local_registry = match runtime.topology {
+            MeshTopology::Sidecar | MeshTopology::Ambient => {
+                enrolled_destinations::installed_node_local_enrolled_destinations()
+            }
+            _ => Default::default(),
+        };
         mesh.inbound_relay_destinations = inbound_relay_destinations;
         mesh.inbound_relay_admits_accepted_local_address = admits_accepted_local_address;
         mesh.inbound_relay_own_address_ports = own_address_ports;
+        mesh.inbound_relay_node_local_registry = node_local_registry;
     }
     materialize_fault_runtime_overlay(&mut config, &mesh_slice.runtime_overlay);
     materialize_transformer_runtime_overlay(&mut config, &mesh_slice.runtime_overlay);
@@ -13238,6 +13267,16 @@ pub async fn run(
         .map_err(|e| anyhow::anyhow!("invalid mesh runtime configuration: {e}"))?;
     ensure_runtime_config_protocol_supported(&runtime)?;
 
+    // Issue #4249: arm the authoritative node-local enrolled-pod registry
+    // BEFORE the bootstrap config is built, so the very first applied
+    // `MeshConfig` already carries the node bound. The index starts UNPUBLISHED
+    // and therefore admits nothing until `serve_mesh_runtime` runs its first
+    // reconcile — fail closed through startup, never a window in which the
+    // identity/label view is silently authoritative. The guard retracts the
+    // installation when this serving cycle unwinds.
+    let _enrolled_destinations_guard =
+        arm_inbound_relay_enrolled_destinations(&env_config, &runtime);
+
     // Open the observability delivery lifecycle for this serving cycle before
     // any plugin activation registers a queue worker. Re-running this mode in
     // one process after a completed drain otherwise targets the closed
@@ -13573,6 +13612,49 @@ pub async fn run(
         },
     )
     .await
+}
+
+/// Install this serving cycle's authoritative node-local enrolled-pod registry
+/// index, when one applies (issue #4249).
+///
+/// `Ambient` only. Ambient is the ztunnel-style topology: the proxy runs
+/// OUTSIDE the workload pods' network namespaces and relays inbound HBONE into
+/// the pods the node-agent enrols on its node, and the node-agent publishes
+/// that per-pod registry exactly for the Ambient and NodeWaypoint-in-netns
+/// postures (`NodeAgentConfig::from_env_config`'s `should_publish_registry`).
+/// A `Sidecar` shares its workload pod's network namespace and no node-agent
+/// registry is ever published for it, so a registry bound there would refuse
+/// every destination rather than narrow anything; it keeps the identity /
+/// locality bound, which #4249's acceptance contract admits as the
+/// no-registry-configured fallback. Its legitimate destination is its own pod,
+/// which the accepted-local-address arm proves as a transport fact regardless.
+///
+/// An operator who clears `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR` also
+/// opts out, for the same reason: there is no registry to be authoritative.
+fn arm_inbound_relay_enrolled_destinations(
+    env_config: &EnvConfig,
+    runtime: &MeshRuntimeConfig,
+) -> Option<enrolled_destinations::InstalledEnrolledDestinationsGuard> {
+    if runtime.topology != MeshTopology::Ambient {
+        return None;
+    }
+    let registry_dir = env_config.mesh_node_waypoint_pod_registry_dir.trim();
+    if registry_dir.is_empty() {
+        warn!(
+            "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR is empty, so no node-local enrolled-pod \
+             registry bounds the authenticated inbound HBONE relay inventory; it falls back to \
+             this proxy's own workload identity, cluster and labels, which a same-identity \
+             replica on another node also satisfies"
+        );
+        return None;
+    }
+    let index = Arc::new(enrolled_destinations::NodeLocalEnrolledDestinations::new());
+    info!(
+        registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
+        "Authenticated inbound HBONE relay destinations are bounded by the node-agent's \
+         enrolled-pod registry"
+    );
+    Some(enrolled_destinations::InstalledEnrolledDestinationsGuard::install(index))
 }
 
 fn ensure_runtime_config_protocol_supported(
@@ -14171,6 +14253,33 @@ async fn arm_mesh_runtime_startup(
                 manager.run(manager_shutdown).await;
             }));
         }
+    }
+
+    // Issue #4249: poll the node-agent's enrolled-pod registry and republish
+    // the lock-free index the inbound HBONE relay guard reads. Armed in `run()`
+    // (Ambient with a configured registry directory), so this is a no-op for
+    // every other posture.
+    //
+    // Deliberately independent of the capture / steering reconcilers below:
+    // those start only when their own datapath feature is enabled, while the
+    // relay guard's node bound must hold for EVERY Ambient proxy. One
+    // synchronous pass runs before the task is spawned so the first
+    // authenticated CONNECT after startup sees the enrolled set rather than the
+    // (fail-closed) unpublished index.
+    if let Some(index) = enrolled_destinations::installed_index() {
+        let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
+            env_config.mesh_node_waypoint_pod_registry_dir.clone(),
+        ));
+        let manager = enrolled_destinations::NodeLocalEnrolledDestinationsManager::new(
+            source,
+            index,
+            std::time::Duration::from_secs(2),
+        );
+        manager.reconcile_once();
+        let manager_shutdown = shutdown_tx.subscribe();
+        owner.push_mesh_background(tokio::spawn(async move {
+            manager.run(manager_shutdown).await;
+        }));
     }
 
     let mut udp_migration_blocks_readiness = false;

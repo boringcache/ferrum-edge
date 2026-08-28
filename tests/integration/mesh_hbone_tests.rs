@@ -26,6 +26,9 @@ use ferrum_edge::modes::mesh::config::{
     MeshEgressUdpDialEndpoint, MultiClusterConfig, Workload, WorkloadPort, WorkloadSelector,
     inbound_relay_destinations_from_workloads,
 };
+use ferrum_edge::modes::mesh::enrolled_destinations::{
+    EnrolledPodEntry, NodeLocalEnrolledDestinations, NodeLocalEnrolledDestinationsHandle,
+};
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::modes::mesh::{
     MeshRuntimeConfig, MeshTopology, MeshTrafficDirection, prepare_gateway_config_from_mesh_slice,
@@ -1945,6 +1948,300 @@ fn inbound_relay_own_address_port_bound_excludes_co_located_workloads() {
         "the own-namespace loopback shortcut is bounded by the same owned records"
     );
 }
+
+/// The pod UIDs the node-agent registry keys these fixtures by. Real registry
+/// keys are Kubernetes `metadata.uid` values; the guard only compares them.
+const LOCAL_POD_UID: &str = "5a3c2f4e-0c11-4b2c-9c3a-000000000001";
+const OTHER_POD_UID: &str = "5a3c2f4e-0c11-4b2c-9c3a-000000000002";
+
+/// Publish `entries` into a fresh node-local enrolled-pod index and bind it to
+/// `mesh` exactly as the mesh serving runtime's registry poller does, returning
+/// the index so a test can re-publish (pod churn) or retract it.
+fn bind_enrolled_registry(
+    mesh: &mut MeshConfig,
+    entries: &[EnrolledPodEntry],
+) -> Arc<NodeLocalEnrolledDestinations> {
+    let index = Arc::new(NodeLocalEnrolledDestinations::new());
+    index.publish(entries);
+    let handle = NodeLocalEnrolledDestinationsHandle::new(index.clone());
+    mesh.inbound_relay_node_local_registry = handle;
+    index
+}
+
+fn enrolled(pod_uid: &str, identity: &str, address: &str) -> EnrolledPodEntry {
+    EnrolledPodEntry {
+        pod_uid: pod_uid.to_string(),
+        identity: Some(identity.to_string()),
+        addresses: vec![ip(address)],
+    }
+}
+
+fn reviews_spiffe() -> String {
+    format!("spiffe://{DEFAULT_TRUST_DOMAIN}/ns/{DEFAULT_NAMESPACE}/sa/reviews")
+}
+
+/// One Ambient slice carrying `workloads`, all in the local cluster.
+fn ambient_relay_fixture(workloads: Vec<Workload>) -> (MeshSlice, MeshRuntimeConfig) {
+    let slice = MeshSlice {
+        node_id: "mesh-test-node".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        version: "test".to_string(),
+        workloads,
+        multi_cluster: Some(MultiClusterConfig {
+            local_cluster: Some("cluster-a".to_string()),
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshSlice::default()
+    };
+    let runtime = MeshRuntimeConfig {
+        topology: MeshTopology::Ambient,
+        workload_spiffe_id: Some(reviews_spiffe()),
+        workload_labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+        ..default_mesh_runtime()
+    };
+    (slice, runtime)
+}
+
+/// A `reviews` replica in the local cluster carrying the shared pod-template
+/// labels — the shape `workload_is_local` cannot tell apart.
+fn reviews_replica(pod_address: &'static str, pod_uid: &str) -> Workload {
+    let mut workload = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        [pod_address],
+    );
+    workload.cluster = Some("cluster-a".to_string());
+    workload.pod_uid = Some(pod_uid.to_string());
+    workload
+}
+
+/// Issue #4249, the residual this closes: two replicas of ONE Deployment share
+/// a service-account SPIFFE id, a cluster, AND their pod-template labels while
+/// running on different nodes. `workload_is_local` compares exactly those three
+/// facts, so it admits the off-node sibling — the assertion below states that
+/// explicitly rather than assuming it.
+///
+/// The node bound is the node-agent's enrolled-pod registry. Once it is
+/// authoritative only the replica this node actually enrols is a destination;
+/// the identical sibling is refused `AddressNotTerminated`, with no per-entry
+/// fallback to identity matching.
+#[test]
+fn inbound_relay_ambient_registry_refuses_same_identity_sibling_on_another_node() {
+    let own_spiffe = reviews_spiffe();
+    let local = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    // Byte-for-byte the same identity, cluster and labels. Only the pod — and
+    // the node whose agent enrols it — differs.
+    let off_node_sibling = reviews_replica("10.244.9.9", OTHER_POD_UID);
+    let (slice, runtime) = ambient_relay_fixture(vec![local, off_node_sibling]);
+
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    // A ztunnel-style proxy's socket address is the node, not a workload, so
+    // nothing below rides in on the own-address arm.
+    let node = Some(ip("10.244.0.1"));
+
+    // With no registry configured the identity/cluster/label predicate is the
+    // only bound, and it admits BOTH replicas. That is the documented
+    // no-registry fallback AND the exact gap #4249 tracks.
+    assert!(
+        !mesh.inbound_relay_node_local_registry.is_authoritative(),
+        "a config prepared outside a serving mesh runtime carries no registry"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.9.9", 8080, node),
+        Ok(()),
+        "identity + cluster + labels alone do NOT exclude a same-workload replica \
+         on another node; the node bound has to come from somewhere else"
+    );
+
+    // Bind the node-agent's registry: this node enrols the local replica only.
+    let enrollment = [enrolled(LOCAL_POD_UID, &own_spiffe, "10.244.5.5")];
+    bind_enrolled_registry(&mut mesh, &enrollment);
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(()),
+        "the replica this node's agent actually enrols stays a termination destination"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.9.9", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a same-cluster, same-SPIFFE, same-label sibling this node does not enrol \
+         must be refused, not fall back to identity matching"
+    );
+}
+
+/// Issue #4249: an ENROLLED address is not enough on its own — the enrolled pod
+/// must be the one the slice record names. A pod address recycled onto another
+/// pod (the ABA case the registry key exists to catch), or enrolled under
+/// another attested identity, is refused.
+#[test]
+fn inbound_relay_ambient_registry_binds_admission_to_the_enrolled_pod() {
+    let own_spiffe = reviews_spiffe();
+    let ratings_spiffe =
+        format!("spiffe://{DEFAULT_TRUST_DOMAIN}/ns/{DEFAULT_NAMESPACE}/sa/ratings");
+    let local = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    let (slice, runtime) = ambient_relay_fixture(vec![local]);
+
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+
+    // The address is enrolled, but by a DIFFERENT pod than the slice names.
+    let recycled = [enrolled(OTHER_POD_UID, &own_spiffe, "10.244.5.5")];
+    bind_enrolled_registry(&mut mesh, &recycled);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "an enrolled address owned by another pod UID is not this record's destination"
+    );
+
+    // Same pod UID, attested by the node-agent under another workload identity.
+    let misattested = [enrolled(LOCAL_POD_UID, &ratings_spiffe, "10.244.5.5")];
+    bind_enrolled_registry(&mut mesh, &misattested);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "an enrolled pod attested under another identity is not this record's destination"
+    );
+
+    // The matching enrollment admits.
+    let matching = [enrolled(LOCAL_POD_UID, &own_spiffe, "10.244.5.5")];
+    bind_enrolled_registry(&mut mesh, &matching);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+}
+
+/// Issue #4249: registry churn must remove admission within the poller's own
+/// bounded lifecycle, never leave a stale fail-open entry. A withdrawn pod
+/// stops being a destination on the next published generation, and a retracted
+/// index (shutdown, aborted poller) vouches for nothing at all. The mesh slice
+/// is unchanged throughout.
+#[test]
+fn inbound_relay_ambient_registry_withdrawal_removes_admission() {
+    let own_spiffe = reviews_spiffe();
+    let local = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    let (slice, runtime) = ambient_relay_fixture(vec![local]);
+
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+
+    let enrollment = [enrolled(LOCAL_POD_UID, &own_spiffe, "10.244.5.5")];
+    let index = bind_enrolled_registry(&mut mesh, &enrollment);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+
+    // The node-agent withdrew the pod; the next published generation stops
+    // admitting it.
+    index.publish(&[]);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a withdrawn pod must leave the admitted set with the registry generation, \
+         not at the next mesh apply"
+    );
+
+    // A re-enrolled pod is admitted again; a retracted index refuses.
+    index.publish(&enrollment);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+    index.clear();
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a retracted index vouches for nothing; it must not fall back to the slice view"
+    );
+}
+
+/// Issue #4249: an address two DIFFERENT enrolled pods claim is ambiguous and
+/// is refused for both, mirroring the contested-interface rule the host-UDP
+/// planner already applies. The registry cannot say which pod owns it, and
+/// guessing would relay to one pod under the other's enrollment.
+#[test]
+fn inbound_relay_ambient_registry_refuses_a_contested_enrolled_address() {
+    let own_spiffe = reviews_spiffe();
+    let local = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    let (slice, runtime) = ambient_relay_fixture(vec![local]);
+
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+
+    let contested = [
+        enrolled(LOCAL_POD_UID, &own_spiffe, "10.244.5.5"),
+        enrolled(OTHER_POD_UID, &own_spiffe, "10.244.5.5"),
+    ];
+    bind_enrolled_registry(&mut mesh, &contested);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "an address claimed by two enrolled pods must be refused for both"
+    );
+}
+
+/// Issue #4249, the boundary of what node-local enrollment can express. The
+/// guard never RESOLVES a declared name — whatever it resolved to could not be
+/// attributed to this terminator — so a record whose only address is a name
+/// (a `ServiceEntry` / `WorkloadEntry` / VM destination, and the shape the
+/// `Netns Source Capture Live Tests` gate declares) has no address the
+/// node-agent could ever enrol, and keeps the identity / locality bound.
+///
+/// A record that DOES declare pod addresses is bound by them even when the
+/// authority matched its name, so a name cannot be used to route around the
+/// registry.
+#[test]
+fn inbound_relay_ambient_registry_bounds_named_destinations_by_declared_addresses() {
+    let own_spiffe = reviews_spiffe();
+
+    // The live gate's shape: an enrolled destination workload declared only by
+    // DNS name, which the relay resolves after admission on the dial path.
+    let named_only = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["enrolled-echo.live.ferrum.test"],
+    );
+    // A sibling declaring both a name and its own unenrolled pod address.
+    let mut named_and_addressed = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["sibling-echo.live.ferrum.test", "10.244.9.9"],
+    );
+    named_and_addressed.pod_uid = Some(OTHER_POD_UID.to_string());
+    let (slice, runtime) = ambient_relay_fixture(vec![named_only, named_and_addressed]);
+
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+
+    let enrollment = [enrolled(LOCAL_POD_UID, &own_spiffe, "10.244.5.5")];
+    bind_enrolled_registry(&mut mesh, &enrollment);
+
+    let named = "enrolled-echo.live.ferrum.test";
+    assert_eq!(
+        mesh.inbound_relay_destination_decision(named, 8080, node),
+        Ok(()),
+        "a record declaring no pod address has no enrollment the registry could \
+         express; it stays on the identity / locality bound"
+    );
+    let sibling_named = "sibling-echo.live.ferrum.test";
+    assert_eq!(
+        mesh.inbound_relay_destination_decision(sibling_named, 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a named record that DOES declare a pod address is bound by it, so a name \
+         cannot route around the registry"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.9.9", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "and the same record's unenrolled address is refused directly"
+    );
+}
+
 
 /// Issue #4251: a `ServiceWaypoint` is the L7 terminator for the services bound
 /// to it. The slice's own workload narrowing is only NAMESPACE-level (the

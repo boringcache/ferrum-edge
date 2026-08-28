@@ -1462,6 +1462,9 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
         inbound_relay_destinations: _,
         inbound_relay_admits_accepted_local_address: _,
         inbound_relay_own_address_ports: _,
+        // Live handle to the node-agent's enrolled-pod registry (issue #4249):
+        // installed by the mesh serving runtime, never Kubernetes-owned.
+        inbound_relay_node_local_registry: _,
     } = MeshConfig::default();
 
     // Every namespaced collection is visible to the ownership accounting.

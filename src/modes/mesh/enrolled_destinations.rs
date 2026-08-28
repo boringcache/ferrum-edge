@@ -1,0 +1,482 @@
+//! Node-local enrolled-pod destination inventory for the authenticated inbound
+//! HBONE relay guard (issue #4249).
+//!
+//! # The gap this closes
+//!
+//! Issue #4150 bounded the inbound CONNECT relay to the destinations a proxy
+//! actually terminates for. For `Sidecar` / `Ambient` the slice-derived half of
+//! that set was the workload record(s) carrying this proxy's own SPIFFE
+//! identity, later narrowed to the shared `slice::workload_is_local` predicate
+//! (SPIFFE + cluster + configured labels).
+//!
+//! None of those three facts is node-local. Two replicas of ONE Deployment
+//! share a service-account SPIFFE id, a cluster, and their pod-template labels
+//! while running on different nodes, so identity/label filtering admits a
+//! sibling this terminator cannot legitimately terminate for: relaying to it
+//! dials that pod in plaintext from this node, skipping the destination's own
+//! `AuthorizationPolicy` set and arriving as a trusted-looking unauthenticated
+//! source under a PERMISSIVE posture.
+//!
+//! The authoritative "which pods does this node terminate for" answer already
+//! exists — it is the node-agent's per-pod registry directory, the same
+//! enrollment lifecycle `crate::proxy::netns_capture` and the Ambient UDP
+//! producer consume. This module turns it into a lock-free index the guard can
+//! read on the CONNECT path.
+//!
+//! # Why an index and not a slice-apply-time snapshot
+//!
+//! Two shapes were rejected in issue #4249 and must not be reintroduced:
+//!
+//! * A filesystem scan per CONNECT (what
+//!   `hbone_proxy::registered_pod_target_for_udp_destination` does on the DIAL
+//!   path) is not acceptable on the guard's hot path.
+//! * Folding the registry into `MeshConfig` once per mesh apply goes STALE
+//!   against pod churn, which is strictly worse than the identity bound: a
+//!   withdrawn pod would stay admitted until the next slice arrives.
+//!
+//! So the registry is polled on the existing 2s node-agent reconcile cadence
+//! and republished wholesale into an [`arc_swap::ArcSwap`]; the guard performs
+//! one `load()` and one hash lookup, with no allocation, no lock, and no I/O.
+//! A pod the node-agent withdraws leaves the admitted set within one poll
+//! interval.
+//!
+//! # Fail closed
+//!
+//! * An index that has never published admits NOTHING. Startup, a missing
+//!   registry directory, and a retracted (shutdown) index are all
+//!   indistinguishable from "this node enrolls no pods", which is the correct
+//!   refusal, not a reason to fall back to the identity view.
+//! * An address claimed by two DIFFERENT pod UIDs is ambiguous and refused for
+//!   BOTH claimants, mirroring the contested-interface rule
+//!   `plan_host_udp_bindings` already applies to ingress interfaces.
+//! * A registry entry with an unsafe/absent pod UID, or with no published pod
+//!   address, contributes nothing.
+//! * Identity-based fallback exists ONLY when no registry source is configured
+//!   at all (see [`NodeLocalEnrolledDestinationsHandle`]), never per missing
+//!   entry.
+
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use arc_swap::{ArcSwap, ArcSwapOption};
+use tokio::sync::watch;
+use tracing::{debug, info};
+
+use crate::proxy::netns_capture::{PodCaptureSource, PodCaptureTarget};
+
+/// One enrolled pod as the relay guard needs it: the node-agent's pod UID, the
+/// workload SPIFFE identity it attested for that pod (when it published one),
+/// and the pod addresses it published.
+///
+/// Deliberately NOT `PodCaptureTarget`: the guard needs no cgroup path and no
+/// netns handle, and keeping the guard's input a plain owned record lets the
+/// index be published from a test without constructing capture machinery.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EnrolledPodEntry {
+    /// Registry-published pod UID (`metadata.uid`), the node-agent's key.
+    pub pod_uid: String,
+    /// Workload SPIFFE identity the node-agent attested for this pod. `None`
+    /// when the node-agent published no `spiffe_id=` line — an older agent, or
+    /// a pod whose service account it could not resolve. Absent attestation is
+    /// NOT a refusal: the published pod ADDRESS is itself the node-local proof
+    /// this guard needs, and requiring an identity line the production
+    /// publisher marks optional would refuse every legitimately enrolled pod on
+    /// such a node.
+    pub identity: Option<String>,
+    /// Pod addresses the node-agent published, canonicalized.
+    pub addresses: Vec<IpAddr>,
+}
+
+impl EnrolledPodEntry {
+    /// Project a node-agent registry record into the guard's view.
+    ///
+    /// Returns `None` for a record that carries no usable node-local evidence:
+    /// an unsafe/empty pod UID, or no published pod address at all. Both are
+    /// refusals, not defaults — an entry with no address can never prove that
+    /// this node terminates for any particular destination.
+    pub fn from_capture_target(target: &PodCaptureTarget) -> Option<Self> {
+        if pod_uid_is_unsafe(&target.pod_uid) {
+            return None;
+        }
+        let mut addresses: Vec<IpAddr> = Vec::new();
+        if let Some(ipv4) = target.source_ips.ipv4 {
+            addresses.push(IpAddr::V4(ipv4).to_canonical());
+        }
+        if let Some(ipv6) = target.source_ips.ipv6 {
+            addresses.push(IpAddr::V6(ipv6).to_canonical());
+        }
+        if addresses.is_empty() {
+            return None;
+        }
+        Some(Self {
+            pod_uid: target.pod_uid.clone(),
+            identity: target
+                .source_identity
+                .as_ref()
+                .map(|identity| identity.principal.as_str().to_string()),
+            addresses,
+        })
+    }
+}
+
+/// Same rule the node-agent publisher applies before writing an entry
+/// (`publish_pod_registry`), re-checked on the consuming side so a directory
+/// this process did not write cannot smuggle a traversal-shaped key into the
+/// index or a diagnostic.
+fn pod_uid_is_unsafe(pod_uid: &str) -> bool {
+    pod_uid.is_empty()
+        || pod_uid.starts_with('.')
+        || pod_uid.contains('/')
+        || pod_uid.contains('\\')
+        || pod_uid.contains("..")
+}
+
+/// What one enrolled address resolves to. Shared behind an `Arc` so a pod with
+/// both families contributes one allocation, not two.
+#[derive(Debug, PartialEq, Eq)]
+struct EnrolledAddressOwner {
+    pod_uid: String,
+    identity: Option<String>,
+}
+
+/// One published generation of the node-local enrolled-pod set. Replaced
+/// wholesale so a reader sees the previous set or the next one, never a
+/// half-applied mix.
+#[derive(Debug, Default)]
+struct EnrolledGeneration {
+    /// Part of the same snapshot as the map, so retraction is atomic with
+    /// replacement: a reader can never pair a stale entry with a separately
+    /// loaded publication flag. `false` ⇒ this index vouches for NOTHING.
+    published: bool,
+    by_address: HashMap<IpAddr, Arc<EnrolledAddressOwner>>,
+}
+
+/// Lock-free, poller-published index of the pods enrolled on THIS node.
+///
+/// Read once per authenticated inbound CONNECT (and per UDP CONNECT) through
+/// [`Self::terminates_for`]: one `ArcSwap::load()` plus at most one hash lookup
+/// per candidate address, no allocation and no filesystem access.
+#[derive(Debug)]
+pub struct NodeLocalEnrolledDestinations {
+    current: ArcSwap<EnrolledGeneration>,
+    next_generation: AtomicU64,
+}
+
+impl Default for NodeLocalEnrolledDestinations {
+    fn default() -> Self {
+        Self {
+            current: ArcSwap::from_pointee(EnrolledGeneration::default()),
+            next_generation: AtomicU64::new(1),
+        }
+    }
+}
+
+impl NodeLocalEnrolledDestinations {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publish a complete new generation, returning its number.
+    ///
+    /// An address claimed by more than one DISTINCT pod UID is dropped for
+    /// every claimant: the registry cannot tell the guard which pod owns it,
+    /// and guessing would let one pod be relayed to under another's
+    /// enrollment. Two records repeating one pod UID (the same pod re-listed)
+    /// collapse rather than contest.
+    pub fn publish(&self, entries: &[EnrolledPodEntry]) -> u64 {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let mut by_address: HashMap<IpAddr, Arc<EnrolledAddressOwner>> = HashMap::new();
+        let mut contested: Vec<IpAddr> = Vec::new();
+        for entry in entries {
+            if pod_uid_is_unsafe(&entry.pod_uid) {
+                continue;
+            }
+            let owner = Arc::new(EnrolledAddressOwner {
+                pod_uid: entry.pod_uid.clone(),
+                identity: entry.identity.clone(),
+            });
+            for address in &entry.addresses {
+                let address = address.to_canonical();
+                match by_address.get(&address) {
+                    Some(existing) if existing.pod_uid == owner.pod_uid => {}
+                    Some(_) => contested.push(address),
+                    None => {
+                        by_address.insert(address, owner.clone());
+                    }
+                }
+            }
+        }
+        for address in contested {
+            by_address.remove(&address);
+        }
+        if !by_address.is_empty() {
+            debug!(
+                generation,
+                enrolled_addresses = by_address.len(),
+                "Node-local enrolled destination index published"
+            );
+        }
+        self.current.store(Arc::new(EnrolledGeneration {
+            published: true,
+            by_address,
+        }));
+        generation
+    }
+
+    /// Retract every entry. The index then vouches for nothing, so every
+    /// registry-bounded relay destination is refused until a later publish.
+    pub fn clear(&self) {
+        self.current.store(Arc::new(EnrolledGeneration {
+            published: false,
+            by_address: HashMap::new(),
+        }));
+    }
+
+    /// Whether this node currently enrolls the destination described by the
+    /// caller's evidence (issue #4249). HOT PATH: one snapshot load, no
+    /// allocation, no I/O.
+    ///
+    /// * `host` is `Some` for an inventory entry the guard matched by IP
+    ///   literal — the destination address itself must be enrolled here.
+    /// * `declared_addresses` is consulted only for an entry matched by
+    ///   DECLARED NAME. A name is never resolved by the guard (resolving it
+    ///   would produce an address that could not be attributed to this
+    ///   terminator), so the owning workload record's own declared pod
+    ///   addresses are the only node-local evidence available for it. A record
+    ///   that declares NO address — a `ServiceEntry`/`WorkloadEntry`/VM
+    ///   destination, which the node-agent never enrolls and which node-local
+    ///   enrollment simply cannot express — is left to the identity/locality
+    ///   bound rather than refused outright.
+    /// * `identity` and `pod_uid` bind the admission to the actual enrolled
+    ///   pod when both sides carry the evidence: a mismatch is a refusal. The
+    ///   node-agent publishes `spiffe_id=` optionally and the slice publishes
+    ///   `pod_uid` only for per-pod Kubernetes workloads, so an ABSENT value on
+    ///   either side leaves that particular comparison unmade instead of
+    ///   refusing an enrollment the address already proves.
+    pub fn terminates_for(
+        &self,
+        host: Option<IpAddr>,
+        declared_addresses: &[IpAddr],
+        identity: Option<&str>,
+        pod_uid: Option<&str>,
+    ) -> bool {
+        let snapshot = self.current.load();
+        if !snapshot.published {
+            return false;
+        }
+        let admits = |address: &IpAddr| {
+            let Some(owner) = snapshot.by_address.get(&address.to_canonical()) else {
+                return false;
+            };
+            if let Some(pod_uid) = pod_uid
+                && owner.pod_uid != pod_uid
+            {
+                return false;
+            }
+            if let (Some(required), Some(attested)) = (identity, owner.identity.as_deref())
+                && required != attested
+            {
+                return false;
+            }
+            true
+        };
+        match host {
+            Some(address) => admits(&address),
+            None => declared_addresses.is_empty() || declared_addresses.iter().any(admits),
+        }
+    }
+}
+
+/// The relay guard's binding to a node-local registry, carried on
+/// `MeshConfig` (issue #4249).
+///
+/// `Some` is AUTHORITATIVE: `inbound_relay_destinations` is bounded by what the
+/// node-agent currently enrolls and there is NO per-entry fallback to slice
+/// identity matching. `None` means no registry source is configured for this
+/// topology at all, which is the one case #4249's acceptance contract leaves on
+/// the identity/locality bound.
+///
+/// Compared by pointer identity: this is a shared live handle, not config
+/// content, so two applies of the same serving cycle must not look different
+/// to `MeshConfig`'s change detection merely because the index republished.
+#[derive(Debug, Clone, Default)]
+pub struct NodeLocalEnrolledDestinationsHandle(Option<Arc<NodeLocalEnrolledDestinations>>);
+
+impl NodeLocalEnrolledDestinationsHandle {
+    #[allow(dead_code)] // Serving runtimes install through the global slot; also an external test seam.
+    pub fn new(index: Arc<NodeLocalEnrolledDestinations>) -> Self {
+        Self(Some(index))
+    }
+
+    /// The index, when a node-local registry is authoritative for this proxy.
+    pub fn index(&self) -> Option<&NodeLocalEnrolledDestinations> {
+        self.0.as_deref()
+    }
+
+    /// Whether a node-local registry bounds this proxy's relay inventory.
+    #[allow(dead_code)] // Diagnostics + external test assertions; unread by the binary target.
+    pub fn is_authoritative(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl PartialEq for NodeLocalEnrolledDestinationsHandle {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for NodeLocalEnrolledDestinationsHandle {}
+
+/// Process-wide installed index for the current mesh serving cycle.
+///
+/// A process runs at most one mesh runtime against at most one node-agent
+/// registry directory, and `prepare_normalized_gateway_config_for_mesh` — which
+/// stamps the handle onto every applied `MeshConfig` — is reached from the
+/// initial bootstrap config, every slice apply, and `validate`, none of which
+/// thread a runtime handle. Installing once per serving cycle keeps the handle
+/// coherent across all of them without widening `MeshRuntimeConfig`.
+///
+/// Unset outside a serving mesh runtime (including `validate` and every test
+/// that builds a config directly), so the guard's default is the identity
+/// bound. Tests that need the registry boundary assign
+/// `MeshConfig::inbound_relay_node_local_registry` on the built config instead
+/// of touching this slot, so no test can leak an index into another.
+static INSTALLED_ENROLLED_DESTINATIONS: std::sync::LazyLock<
+    ArcSwapOption<NodeLocalEnrolledDestinations>,
+> = std::sync::LazyLock::new(ArcSwapOption::empty);
+
+/// Install `index` as this serving cycle's authoritative node-local registry.
+pub fn install_node_local_enrolled_destinations(index: Arc<NodeLocalEnrolledDestinations>) {
+    INSTALLED_ENROLLED_DESTINATIONS.store(Some(index));
+}
+
+/// Retract the installed index. Subsequent applies fall back to the identity
+/// bound, which is correct only because this runs when the serving cycle that
+/// owned the registry is gone.
+pub fn clear_node_local_enrolled_destinations() {
+    INSTALLED_ENROLLED_DESTINATIONS.store(None);
+}
+
+/// The installed index itself, for the serving runtime that owns its poller.
+pub fn installed_index() -> Option<Arc<NodeLocalEnrolledDestinations>> {
+    INSTALLED_ENROLLED_DESTINATIONS.load_full()
+}
+
+/// The handle to stamp onto a `MeshConfig` being prepared.
+pub fn installed_node_local_enrolled_destinations() -> NodeLocalEnrolledDestinationsHandle {
+    match INSTALLED_ENROLLED_DESTINATIONS.load_full() {
+        Some(index) => NodeLocalEnrolledDestinationsHandle::new(index),
+        None => NodeLocalEnrolledDestinationsHandle::default(),
+    }
+}
+
+/// Retracts the installed index when the mesh serving cycle unwinds, so an
+/// aborted or panicking runtime cannot leave a stale registry bound to a later
+/// cycle's config.
+pub struct InstalledEnrolledDestinationsGuard {
+    _private: (),
+}
+
+impl InstalledEnrolledDestinationsGuard {
+    pub fn install(index: Arc<NodeLocalEnrolledDestinations>) -> Self {
+        install_node_local_enrolled_destinations(index);
+        Self { _private: () }
+    }
+}
+
+impl Drop for InstalledEnrolledDestinationsGuard {
+    fn drop(&mut self) {
+        clear_node_local_enrolled_destinations();
+    }
+}
+
+/// Polls the node-agent-published enrolled-pod registry and republishes
+/// [`NodeLocalEnrolledDestinations`].
+///
+/// Deliberately its own manager rather than a hook on the capture/steering
+/// reconcilers: those start only when their datapath feature is enabled, while
+/// the relay guard's bound must hold for every Ambient proxy. It shares their
+/// `PodCaptureSource` abstraction and their 2s cadence, so the enrolled set the
+/// guard admits and the set the capture managers act on cannot drift by more
+/// than one poll.
+pub struct NodeLocalEnrolledDestinationsManager {
+    source: Arc<dyn PodCaptureSource>,
+    index: Arc<NodeLocalEnrolledDestinations>,
+    poll_interval: Duration,
+}
+
+/// Retract the enrolled set whenever the manager future leaves scope — not only
+/// on an orderly shutdown signal. Task abort and unwind both drop the future,
+/// and a retained set with no poller behind it would keep admitting a pod the
+/// node-agent may already have withdrawn.
+struct EnrolledRetractionGuard {
+    index: Arc<NodeLocalEnrolledDestinations>,
+}
+
+impl Drop for EnrolledRetractionGuard {
+    fn drop(&mut self) {
+        self.index.clear();
+    }
+}
+
+impl NodeLocalEnrolledDestinationsManager {
+    pub fn new(
+        source: Arc<dyn PodCaptureSource>,
+        index: Arc<NodeLocalEnrolledDestinations>,
+        poll_interval: Duration,
+    ) -> Self {
+        Self {
+            source,
+            index,
+            poll_interval,
+        }
+    }
+
+    /// One reconcile pass. Returns the entries published so a caller can log or
+    /// assert them without touching the datapath.
+    pub fn reconcile_once(&self) -> Vec<EnrolledPodEntry> {
+        let entries: Vec<EnrolledPodEntry> = self
+            .source
+            .list_targets()
+            .iter()
+            .filter_map(EnrolledPodEntry::from_capture_target)
+            .collect();
+        self.index.publish(&entries);
+        entries
+    }
+
+    pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
+        let retraction = EnrolledRetractionGuard {
+            index: self.index.clone(),
+        };
+        info!(
+            poll_interval_ms = self.poll_interval.as_millis() as u64,
+            "Node-local enrolled destination index started; the authenticated inbound HBONE relay \
+             admits only pods this node's agent currently enrolls"
+        );
+        let mut ticker = tokio::time::interval(self.poll_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    self.reconcile_once();
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+        drop(retraction);
+        debug!("Node-local enrolled destination index retracted at shutdown");
+    }
+}
