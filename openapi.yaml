@@ -25163,9 +25163,13 @@ components:
         backend_read_timeout_ms, else 60000ms, capped at 300000ms). Label-safe
         process-wide ferrum_request_mirror_*_total lifecycle counters are exported
         on authenticated /metrics (no URLs, header names, or plugin IDs). The mirror
-        request-target preserves the raw query (after the same auth credential
-        strips as primary) including repeated pairs, order, flags, empty values,
-        +, percent escapes, and non-ASCII encoded bytes.
+        request-target snapshots the same canonical backend-visible query primary
+        dispatch uses (after auth credential strips), then drops deny-by-default
+        sensitive query pairs from the mirror URL only. Retained pairs keep raw
+        encoding, order, flags, empty values, +, percent escapes, and non-ASCII
+        encoded bytes. The primary backend request-target is never rewritten.
+        Forwarding a denied query name requires forward_sensitive_query=true plus
+        a non-empty exact decoded-name forward_sensitive_query_allowlist.
       required:
         - mirror_host
       properties:
@@ -25306,6 +25310,43 @@ components:
             origin unless it is on the exact-name forward_sensitive_header_allowlist.
             Covers HTTP headers and native gRPC metadata (gRPC metadata is carried
             as HTTP/2 headers). Default empty.
+        forward_sensitive_query:
+          type: boolean
+          default: false
+          description: >-
+            Dangerous opt-in. When true, selected origin-bound credential query
+            parameter names may cross to the distinct mirror origin, but only
+            exact percent-decoded names listed in
+            forward_sensitive_query_allowlist. Construction is fail-closed: both
+            fields are required together and the allowlist must be non-empty.
+            Does not change the primary backend request-target.
+        forward_sensitive_query_allowlist:
+          type: array
+          maxItems: 64
+          items:
+            type: string
+            maxLength: 256
+          description: >-
+            Lowercased exact allowlist of denied sensitive query parameter names
+            to forward when forward_sensitive_query is true. Each entry is matched
+            against the percent-decoded ASCII-lowercased name (at most 256 bytes)
+            that the deny-by-default policy actually strips (a built-in credential
+            or a sensitive_query_patterns match); non-sensitive names are rejected
+            at construction. At most 64 entries. Default (with
+            forward_sensitive_query false) strips every sensitive query pair.
+        sensitive_query_patterns:
+          type: array
+          maxItems: 64
+          items:
+            type: string
+            maxLength: 128
+          description: >-
+            Additional lowercased substrings matched against the percent-decoded
+            query parameter name (case-insensitive; each at most 128 bytes, at
+            most 64 entries) that extend the built-in deny-by-default query
+            credential set. A name whose decoded lowercased form contains any
+            pattern is stripped from the mirror request-target unless it is on the
+            exact-name forward_sensitive_query_allowlist. Default empty.
         max_response_body_bytes:
           type: integer
           format: uint64

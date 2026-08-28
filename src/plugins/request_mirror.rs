@@ -60,11 +60,16 @@
 //! mirrors dial through `PluginHttpClient::get_http2` (h2c prior knowledge for
 //! cleartext `http` targets, ALPN `h2` for `https`); ordinary HTTP mirrors keep
 //! the default all-version client so HTTP/1.1 destinations continue to work.
-//! The request-target prefers the canonical backend-visible query (transformer
+//! The request-target snapshots the canonical backend-visible query (transformer
 //! outbound query when present, otherwise the original raw query, after the
 //! same auth credential strips the primary backend uses) so duplicate keys,
-//! order, flags, `+`, percent escapes, and encoded bytes match the primary
-//! contract.
+//! order, flags, `+`, percent escapes, and encoded bytes of **retained** pairs
+//! match that funnel. Cross-origin **query** credential forwarding is the same
+//! deny-by-default posture as headers: built-in credential names/substrings
+//! (plus operator `sensitive_query_patterns`) are dropped from the mirror
+//! request-target only. The primary backend target is never rewritten. Forwarding
+//! a denied query name requires `forward_sensitive_query=true` plus an exact
+//! decoded-name `forward_sensitive_query_allowlist`.
 //!
 //! Path selection precedence when building the mirror URL:
 //! 1. explicit plugin `mirror_path` (operator override; wins)
@@ -205,6 +210,9 @@
 //! | `forward_sensitive_headers` | bool | `false` | Dangerous opt-in. When `true`, selected origin-bound credential headers may cross to the mirror origin, but only exact names listed in `forward_sensitive_header_allowlist` (fail-closed: both fields required together, allowlist must be non-empty). |
 //! | `forward_sensitive_header_allowlist` | string[] | `[]` | Lowercased exact allowlist of denied sensitive header names to forward when `forward_sensitive_headers` is `true`. Each entry must be a valid HTTP header name (≤256 chars) that the deny-by-default policy actually strips (a built-in credential or a `sensitive_header_patterns` match); at most 64 entries; non-sensitive names are rejected at construction. |
 //! | `sensitive_header_patterns` | string[] | `[]` | Additional lowercased substrings (matched against the header name; each ≤128 chars, at most 64 entries) that extend the built-in deny-by-default credential set. Covers HTTP headers and native gRPC metadata. |
+//! | `forward_sensitive_query` | bool | `false` | Dangerous opt-in. When `true`, selected origin-bound credential query names may cross to the mirror origin, but only exact decoded names listed in `forward_sensitive_query_allowlist` (fail-closed: both fields required together, allowlist must be non-empty). Does not change the primary backend request-target. |
+//! | `forward_sensitive_query_allowlist` | string[] | `[]` | Lowercased exact allowlist of denied sensitive query parameter names to forward when `forward_sensitive_query` is `true`. Each entry is matched against the percent-decoded, ASCII-lowercased name (≤256 chars) that the deny-by-default policy actually strips (a built-in credential or a `sensitive_query_patterns` match); at most 64 entries; non-sensitive names are rejected at construction. |
+//! | `sensitive_query_patterns` | string[] | `[]` | Additional lowercased substrings (matched against the percent-decoded query parameter name; each ≤128 chars, at most 64 entries) that extend the built-in deny-by-default query credential set. |
 //!
 //! ## Percentage sampling
 //!
@@ -242,16 +250,19 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use percent_encoding::percent_decode_str;
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::warn;
-use url::{Host, form_urlencoded};
+use url::Host;
 
 use super::load_testing::{HEADER_FANOUT, HEADER_TRIGGER_KEY};
+use super::utils::query::OrderedQuery;
 use super::utils::response_body::{
     BoundedReadError, measure_response_body_bounded, parse_max_response_body_bytes,
 };
@@ -270,6 +281,8 @@ use crate::util::unknown_keys::suggest_key;
 pub const REQUEST_MIRROR_CONFIG_KEYS: &[&str] = &[
     "forward_sensitive_header_allowlist",
     "forward_sensitive_headers",
+    "forward_sensitive_query",
+    "forward_sensitive_query_allowlist",
     "max_in_flight",
     "max_mirrored_request_body_bytes",
     "max_response_body_bytes",
@@ -282,6 +295,7 @@ pub const REQUEST_MIRROR_CONFIG_KEYS: &[&str] = &[
     "mirror_timeout_ms",
     "percentage",
     "sensitive_header_patterns",
+    "sensitive_query_patterns",
 ];
 
 /// Default cap on the size of mirror response bodies the gateway is willing
@@ -345,6 +359,14 @@ const MAX_SENSITIVE_HEADER_PATTERN_LEN: usize = 128;
 const MAX_FORWARD_SENSITIVE_ALLOWLIST: usize = 64;
 /// Maximum UTF-8 byte length of one allowlist header name.
 const MAX_FORWARD_SENSITIVE_ALLOWLIST_ITEM_LEN: usize = 256;
+/// Hard ceiling on operator `sensitive_query_patterns` entries.
+const MAX_SENSITIVE_QUERY_PATTERNS: usize = 64;
+/// Maximum UTF-8 byte length of one `sensitive_query_patterns` entry.
+const MAX_SENSITIVE_QUERY_PATTERN_LEN: usize = 128;
+/// Hard ceiling on `forward_sensitive_query_allowlist` entries.
+const MAX_FORWARD_SENSITIVE_QUERY_ALLOWLIST: usize = 64;
+/// Maximum UTF-8 byte length of one query-name allowlist entry.
+const MAX_FORWARD_SENSITIVE_QUERY_ALLOWLIST_ITEM_LEN: usize = 256;
 
 /// Well-known origin-bound credential / session header names stripped from
 /// cross-origin mirror requests unless an explicit fail-closed allowlist opts
@@ -396,6 +418,44 @@ const MIRROR_SENSITIVE_HEADER_SUBSTRINGS: &[&str] = &[
     "credential",
 ];
 
+/// Exact lowercased decoded query names that are credentials but must not be
+/// substring-matched. Bare `token`/`sig` as substrings would over-strip
+/// pagination cursors (`continuation_token`) and benign names (`signal`).
+const MIRROR_SENSITIVE_QUERY_EXACT_NAMES: &[&str] = &["token", "sig", "signature"];
+
+/// Built-in credential substrings applied to percent-decoded, ASCII-lowercased
+/// query parameter names. Seeded from [`MIRROR_SENSITIVE_HEADER_SUBSTRINGS`]
+/// with `_` variants of hyphenated families so `access_token` / `api_key`
+/// match the same secret classes the header policy already denies. Bare
+/// `token`/`key`/`session`/`auth`/`sig` substrings are excluded.
+const MIRROR_SENSITIVE_QUERY_SUBSTRINGS: &[&str] = &[
+    "authorization",
+    "cookie",
+    "authenticate",
+    "api-key",
+    "apikey",
+    "api_key",
+    "auth-token",
+    "auth_token",
+    "access-token",
+    "access_token",
+    "refresh-token",
+    "refresh_token",
+    "id-token",
+    "id_token",
+    "session-token",
+    "session_token",
+    "security-token",
+    "security_token",
+    "csrf",
+    "xsrf",
+    "bearer",
+    "password",
+    "passwd",
+    "secret",
+    "credential",
+];
+
 /// Sampling period for percentage decisions: threshold is tenths of a percent
 /// in `0..=SAMPLE_PERIOD`, so each complete cycle of `SAMPLE_PERIOD` requests
 /// mirrors exactly `threshold` of them when `0 < threshold < SAMPLE_PERIOD`.
@@ -436,6 +496,19 @@ fn is_port_suffix(rest: &str) -> bool {
 fn is_mirror_sensitive_header(name_lower: &str, operator_patterns: &[String]) -> bool {
     MIRROR_SENSITIVE_HEADER_NAMES.contains(&name_lower)
         || MIRROR_SENSITIVE_HEADER_SUBSTRINGS
+            .iter()
+            .any(|substr| name_lower.contains(substr))
+        || operator_patterns
+            .iter()
+            .any(|pattern| name_lower.contains(pattern.as_str()))
+}
+
+/// Deny-by-default sensitivity test for a percent-decoded, ASCII-lowercased
+/// query parameter name. Exact built-in credential names, built-in substrings,
+/// and operator `sensitive_query_patterns` all deny. Never logs the name.
+fn is_mirror_sensitive_query_name(name_lower: &str, operator_patterns: &[String]) -> bool {
+    MIRROR_SENSITIVE_QUERY_EXACT_NAMES.contains(&name_lower)
+        || MIRROR_SENSITIVE_QUERY_SUBSTRINGS
             .iter()
             .any(|substr| name_lower.contains(substr))
         || operator_patterns
@@ -534,6 +607,56 @@ fn apply_mirror_credential_policy(
         }
         forward_sensitive_headers && allowlist.iter().any(|allowed| allowed == &lower)
     });
+}
+
+/// Drop deny-by-default credential query pairs from an owned snapshot of the
+/// canonical backend-visible query. Retained pairs keep their original wire
+/// encoding, order, empty values, flags, and repeats. When nothing is stripped
+/// the original string is borrowed so empty separators are not rewritten.
+/// Stripped names and values are never logged.
+fn apply_mirror_query_credential_policy<'a>(
+    query: &'a str,
+    forward_sensitive_query: bool,
+    allowlist: &[String],
+    operator_patterns: &[String],
+) -> Cow<'a, str> {
+    if query.is_empty() {
+        return Cow::Borrowed(query);
+    }
+
+    let mut kept = String::new();
+    let mut removed_any = false;
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
+        let decoded_name = percent_decode_str(raw_name).decode_utf8_lossy();
+        let decoded_lower = decoded_name.to_ascii_lowercase();
+        let raw_lower = raw_name.to_ascii_lowercase();
+        let sensitive = is_mirror_sensitive_query_name(&decoded_lower, operator_patterns)
+            || (raw_lower != decoded_lower
+                && is_mirror_sensitive_query_name(&raw_lower, operator_patterns));
+        if sensitive {
+            let allowed = forward_sensitive_query
+                && (allowlist.iter().any(|allowed| allowed == &decoded_lower)
+                    || allowlist.iter().any(|allowed| allowed == &raw_lower));
+            if !allowed {
+                removed_any = true;
+                continue;
+            }
+        }
+        if !kept.is_empty() {
+            kept.push('&');
+        }
+        kept.push_str(pair);
+    }
+
+    if removed_any {
+        Cow::Owned(kept)
+    } else {
+        Cow::Borrowed(query)
+    }
 }
 
 #[derive(Debug)]
@@ -1120,6 +1243,16 @@ pub struct RequestMirror {
     /// Operator-configured lowercased substrings that extend the built-in
     /// deny-by-default sensitive-header set (`sensitive_header_patterns`).
     sensitive_header_patterns: Vec<String>,
+    /// When true, only decoded names in `forward_sensitive_query_allowlist`
+    /// may cross to the mirror origin. Default false strips the sensitive set.
+    /// Primary backend query is never rewritten by this flag.
+    forward_sensitive_query: bool,
+    /// Lowercased decoded-name allowlist consulted only when
+    /// `forward_sensitive_query`.
+    forward_sensitive_query_allowlist: Vec<String>,
+    /// Operator-configured lowercased substrings that extend the built-in
+    /// deny-by-default sensitive-query set (`sensitive_query_patterns`).
+    sensitive_query_patterns: Vec<String>,
     mirror_hostname: Option<String>,
     /// Bresenham phase accumulator in `0..SAMPLE_PERIOD` for evenly spaced
     /// deterministic percentage sampling. Reset to `0` on construction/reload.
@@ -1314,6 +1447,15 @@ impl RequestMirror {
             &sensitive_header_patterns,
         )?;
 
+        let sensitive_query_patterns = parse_sensitive_query_patterns(config)?;
+        let forward_sensitive_query =
+            optional_bool(config, "forward_sensitive_query")?.unwrap_or(false);
+        let forward_sensitive_query_allowlist = parse_forward_sensitive_query_allowlist(
+            config,
+            forward_sensitive_query,
+            &sensitive_query_patterns,
+        )?;
+
         let max_response_body_bytes = parse_max_response_body_bytes(
             config,
             "request_mirror",
@@ -1344,6 +1486,9 @@ impl RequestMirror {
             forward_sensitive_headers,
             forward_sensitive_header_allowlist,
             sensitive_header_patterns,
+            forward_sensitive_query,
+            forward_sensitive_query_allowlist,
+            sensitive_query_patterns,
             mirror_hostname,
             // Phase 0 defers the first selection until the accumulator crosses
             // SAMPLE_PERIOD — construction/reload never opens with a mirrored prefix.
@@ -1464,12 +1609,15 @@ impl RequestMirror {
 
     /// Build the full mirror URL from the configured or gateway-selected path.
     ///
-    /// Prefer the effective backend query string (transformer outbound query
-    /// composed with auth credential strips) so duplicate keys, ordering,
-    /// flags, empty values, `+`, percent escapes, and non-ASCII encoded bytes
-    /// match primary dispatch. Fall back to the materialised `query_params`
-    /// map only when no raw/outbound query is available (tests / already-decoded
-    /// contexts).
+    /// Prefer an owned snapshot of the effective backend query string
+    /// (transformer outbound query composed with auth credential strips) so
+    /// duplicate keys, ordering, flags, empty values, `+`, percent escapes, and
+    /// non-ASCII encoded bytes of retained pairs match primary dispatch. Sensitive
+    /// query pairs are then dropped from **this** URL only. Fall back to the
+    /// materialised `query_params` map only when no raw/outbound query is
+    /// available (tests / already-decoded contexts); that fallback still applies
+    /// the same deny-by-default query policy and does not round-trip remaining
+    /// pairs through `application/x-www-form-urlencoded`.
     fn build_mirror_url(
         &self,
         original_path: &str,
@@ -1492,16 +1640,28 @@ impl RequestMirror {
             // `Some("")` is authoritative: an auth strip may have removed the
             // entire raw query, so falling back to the materialised map here
             // would reintroduce the credential.
-            if !query.is_empty() {
+            let filtered = apply_mirror_query_credential_policy(
+                query,
+                self.forward_sensitive_query,
+                &self.forward_sensitive_query_allowlist,
+                &self.sensitive_query_patterns,
+            );
+            if !filtered.is_empty() {
                 url.push('?');
-                url.push_str(query);
+                url.push_str(&filtered);
             }
         } else if !query_params.is_empty() {
-            url.push('?');
-            let encoded: String = form_urlencoded::Serializer::new(String::new())
-                .extend_pairs(query_params.iter())
-                .finish();
-            url.push_str(&encoded);
+            let encoded = OrderedQuery::from_map(query_params).serialize();
+            let filtered = apply_mirror_query_credential_policy(
+                &encoded,
+                self.forward_sensitive_query,
+                &self.forward_sensitive_query_allowlist,
+                &self.sensitive_query_patterns,
+            );
+            if !filtered.is_empty() {
+                url.push('?');
+                url.push_str(&filtered);
+            }
         }
 
         url
@@ -1746,6 +1906,121 @@ fn parse_forward_sensitive_header_allowlist(
     }
 }
 
+fn parse_sensitive_query_patterns(config: &Value) -> Result<Vec<String>, String> {
+    match config.get("sensitive_query_patterns") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => {
+            if items.len() > MAX_SENSITIVE_QUERY_PATTERNS {
+                return Err(format!(
+                    "request_mirror: 'sensitive_query_patterns' must contain at most {MAX_SENSITIVE_QUERY_PATTERNS} entries"
+                ));
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for (idx, item) in items.iter().enumerate() {
+                let Some(pattern) = item.as_str() else {
+                    return Err(format!(
+                        "request_mirror: 'sensitive_query_patterns[{idx}]' must be a string"
+                    ));
+                };
+                let trimmed = pattern.trim();
+                if trimmed.is_empty() {
+                    return Err(format!(
+                        "request_mirror: 'sensitive_query_patterns[{idx}]' must not be blank"
+                    ));
+                }
+                if trimmed.len() > MAX_SENSITIVE_QUERY_PATTERN_LEN {
+                    return Err(format!(
+                        "request_mirror: 'sensitive_query_patterns[{idx}]' exceeds maximum length of {MAX_SENSITIVE_QUERY_PATTERN_LEN} bytes"
+                    ));
+                }
+                let lower = trimmed.to_ascii_lowercase();
+                if !out.iter().any(|existing| existing == &lower) {
+                    out.push(lower);
+                }
+            }
+            Ok(out)
+        }
+        Some(_) => Err(
+            "request_mirror: 'sensitive_query_patterns' must be an array of strings".to_string(),
+        ),
+    }
+}
+
+fn parse_forward_sensitive_query_allowlist(
+    config: &Value,
+    forward_sensitive_query: bool,
+    operator_patterns: &[String],
+) -> Result<Vec<String>, String> {
+    let raw = match config.get("forward_sensitive_query_allowlist") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => {
+            if items.len() > MAX_FORWARD_SENSITIVE_QUERY_ALLOWLIST {
+                return Err(format!(
+                    "request_mirror: 'forward_sensitive_query_allowlist' must contain at most {MAX_FORWARD_SENSITIVE_QUERY_ALLOWLIST} entries"
+                ));
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for (idx, item) in items.iter().enumerate() {
+                let Some(name) = item.as_str() else {
+                    return Err(format!(
+                        "request_mirror: 'forward_sensitive_query_allowlist[{idx}]' must be a string"
+                    ));
+                };
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    return Err(format!(
+                        "request_mirror: 'forward_sensitive_query_allowlist[{idx}]' must not be blank"
+                    ));
+                }
+                if trimmed.len() > MAX_FORWARD_SENSITIVE_QUERY_ALLOWLIST_ITEM_LEN {
+                    return Err(format!(
+                        "request_mirror: 'forward_sensitive_query_allowlist[{idx}]' exceeds maximum length of {MAX_FORWARD_SENSITIVE_QUERY_ALLOWLIST_ITEM_LEN} bytes"
+                    ));
+                }
+                if trimmed
+                    .bytes()
+                    .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+                    || trimmed.contains(['=', '&', '?', '#', '/', '@'])
+                    || http::HeaderName::from_bytes(trimmed.as_bytes()).is_err()
+                {
+                    return Err(format!(
+                        "request_mirror: 'forward_sensitive_query_allowlist[{idx}]' is not a valid query parameter name"
+                    ));
+                }
+                let lower = trimmed.to_ascii_lowercase();
+                if !is_mirror_sensitive_query_name(&lower, operator_patterns) {
+                    return Err(format!(
+                        "request_mirror: 'forward_sensitive_query_allowlist[{idx}]' is not a recognized sensitive query name (built-in credential or a configured sensitive_query_patterns match)"
+                    ));
+                }
+                if !out.iter().any(|existing| existing == &lower) {
+                    out.push(lower);
+                }
+            }
+            out
+        }
+        Some(_) => {
+            return Err(
+                "request_mirror: 'forward_sensitive_query_allowlist' must be an array of strings"
+                    .to_string(),
+            );
+        }
+    };
+
+    match (forward_sensitive_query, raw.is_empty()) {
+        (false, true) => Ok(raw),
+        (false, false) => Err(
+            "request_mirror: 'forward_sensitive_query_allowlist' requires forward_sensitive_query=true"
+                .to_string(),
+        ),
+        (true, true) => Err(
+            "request_mirror: forward_sensitive_query=true requires a non-empty forward_sensitive_query_allowlist (fail-closed)"
+                .to_string(),
+        ),
+        (true, false) => Ok(raw),
+    }
+}
+
 fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
     match config.get(key) {
         Some(Value::Bool(value)) => Ok(Some(*value)),
@@ -1981,14 +2256,14 @@ impl Plugin for RequestMirror {
         // that primary dispatch still needs. An explicit operator mirror_path
         // remains authoritative.
         let mirror_path = self.select_mirror_path(ctx);
-        // Match primary backend query construction: transformer-published
-        // outbound query (when present) composed with auth credential strips.
-        // Primary and mirror must observe the same canonical request-target
-        // query identity and ordering. Fall back to the materialised map only
-        // when neither a raw nor outbound query was retained (synthetic tests).
+        // Snapshot the canonical backend-visible query through the same
+        // funnel as primary dispatch, then own that snapshot so later plugin
+        // mutation of `ctx` cannot change the mirror request-target. Sensitive
+        // pairs are dropped from this copy only (`build_mirror_url`); the
+        // primary backend target is never rewritten.
         let effective_query =
             if ctx.outbound_query_string().is_some() || ctx.raw_query_string().is_some() {
-                Some(crate::proxy::effective_backend_query_string(ctx))
+                Some(crate::proxy::effective_backend_query_string(ctx).into_owned())
             } else {
                 None
             };
@@ -2045,11 +2320,11 @@ impl Plugin for RequestMirror {
         self.http_client
             .strip_egress_baggage_in_vec(&mut mirror_headers);
 
-        // Strip query params before ANY logging of the mirror URL — it is built
-        // from the original request's query string and can carry secrets
-        // (`?access_token=`, `?api_key=`, `?sig=`). Computed here, before the
-        // permit-exhaustion drop path, so every log site uses the stripped form
-        // (the full `mirror_url` is still used for the actual mirror request).
+        // Omit the query from every log/metrics URL. The dispatched URL has
+        // already dropped deny-by-default sensitive pairs; logging still
+        // omits the entire query so remaining application parameters are not
+        // echoed either. Computed here, before the permit-exhaustion drop
+        // path, so every log site uses the stripped form.
         let mirror_url_for_log = strip_query_params(&mirror_url).to_string();
 
         // Resolve the concurrency permit and any pre-buffer byte reservation.

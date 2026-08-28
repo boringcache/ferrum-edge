@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`request_mirror` denies cross-origin query credentials by default**
+  (issue #4295). Sensitive query pairs (`access_token`, `api_key`, `sig`,
+  case/percent-encoded variants, and operator `sensitive_query_patterns`) are
+  dropped from the mirror request-target only. The primary backend
+  request-target is unchanged. Forwarding a denied name requires the
+  fail-closed pair `forward_sensitive_query=true` plus an exact decoded-name
+  `forward_sensitive_query_allowlist`. Mirror logs still omit the entire query.
+
 ### Changed
 
 - **BREAKING — `POST /batch` rejects unknown top-level envelope keys**
