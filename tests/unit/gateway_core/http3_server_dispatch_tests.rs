@@ -4951,7 +4951,10 @@ fn h3_advertised_field_section_size_tracks_configured_header_policy() {
 
     // A very small configured limit is floored: Ferrum's own 431 check still
     // enforces the configured value exactly.
-    assert_eq!(h3_max_field_section_size(64), H3_MIN_FIELD_SECTION_SIZE as u64);
+    assert_eq!(
+        h3_max_field_section_size(64),
+        H3_MIN_FIELD_SECTION_SIZE as u64
+    );
 
     // Clamping only ever narrows.
     assert!(h3_max_field_section_size(usize::MAX) <= QUIC_VARINT_MAX_U64);
