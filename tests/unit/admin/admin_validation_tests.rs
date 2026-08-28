@@ -657,7 +657,10 @@ fn restore_admission_covers_batch_contracts_before_the_namespace_clear() {
             .find(".run();")
             .expect("restore pipeline must terminate");
     let pipeline = &source[pipeline_start..pipeline_end];
-    for step in ["validate_unique_upstream_names", "validate_unique_proxy_names"] {
+    for step in [
+        "validate_unique_upstream_names",
+        "validate_unique_proxy_names",
+    ] {
         assert!(
             pipeline.contains(step),
             "restore must reject duplicate names before the clear: {step}"
@@ -689,7 +692,10 @@ fn restore_admission_covers_batch_contracts_before_the_namespace_clear() {
     let shared_calls = source
         .matches("collect_plugin_config_admission_errors(")
         .count();
-    assert!(shared_calls >= 3, "batch and restore must share the admission helper");
+    assert!(
+        shared_calls >= 3,
+        "batch and restore must share the admission helper"
+    );
 }
 
 #[test]

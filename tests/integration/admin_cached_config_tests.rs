@@ -3841,7 +3841,10 @@ async fn restore_rejects_duplicate_proxy_and_upstream_names_before_delete() {
 
     // The same payload is refused by batch, so the two admission paths stay pinned.
     let (status, body) = admin_post(&base_url, "/batch", &token, &restore_payload).await;
-    assert_eq!(status, 400, "batch must refuse duplicate names too: {body:?}");
+    assert_eq!(
+        status, 400,
+        "batch must refuse duplicate names too: {body:?}"
+    );
 
     let (status, _, _) = admin_get(&base_url, "/proxies/dupname-keep", &token).await;
     assert_eq!(
@@ -3890,7 +3893,10 @@ async fn restore_rejects_incompatible_stream_mtls_auth_before_delete() {
     });
     let (status, body) =
         admin_post(&base_url, "/restore?confirm=true", &token, &incompatible).await;
-    assert_eq!(status, 400, "incompatible stream mTLS was admitted: {body:?}");
+    assert_eq!(
+        status, 400,
+        "incompatible stream mTLS was admitted: {body:?}"
+    );
     assert!(
         body["error"]
             .as_str()
@@ -3908,7 +3914,8 @@ async fn restore_rejects_incompatible_stream_mtls_auth_before_delete() {
     let (status, body) = admin_post(&base_url, "/batch", &token, &incompatible).await;
     assert_eq!(status, 400, "batch must refuse the same shape: {body:?}");
     assert!(
-        body.to_string().contains("cannot use mtls_auth PluginConfig"),
+        body.to_string()
+            .contains("cannot use mtls_auth PluginConfig"),
         "batch and restore must share the mTLS compatibility contract: {body:?}"
     );
 
@@ -3947,9 +3954,17 @@ async fn restore_rejects_disabled_plugin_config_with_unknown_name_before_delete(
             "config": {"staged": true}
         }]
     });
-    let (status, body) =
-        admin_post(&base_url, "/restore?confirm=true", &token, &unknown_disabled).await;
-    assert_eq!(status, 400, "unknown disabled plugin was admitted: {body:?}");
+    let (status, body) = admin_post(
+        &base_url,
+        "/restore?confirm=true",
+        &token,
+        &unknown_disabled,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "unknown disabled plugin was admitted: {body:?}"
+    );
     assert!(
         body["error"]
             .as_str()
@@ -3966,7 +3981,10 @@ async fn restore_rejects_disabled_plugin_config_with_unknown_name_before_delete(
 
     // Batch already refuses this payload; the assertion keeps the two pinned.
     let (status, body) = admin_post(&base_url, "/batch", &token, &unknown_disabled).await;
-    assert_eq!(status, 400, "batch must refuse the unknown disabled plugin: {body:?}");
+    assert_eq!(
+        status, 400,
+        "batch must refuse the unknown disabled plugin: {body:?}"
+    );
 
     // A disabled config-graph participant keeps its policy screening on both
     // paths: the definition is admitted or refused identically.
@@ -3998,7 +4016,10 @@ async fn restore_rejects_disabled_plugin_config_with_unknown_name_before_delete(
         admin_post(&base_url, "/restore?confirm=true", &token, &denied_disabled).await;
     let (batch_status, batch_body) =
         admin_post(&base_url, "/batch", &token, &denied_disabled).await;
-    assert_eq!(batch_status, 400, "batch must screen a disabled graph participant: {batch_body:?}");
+    assert_eq!(
+        batch_status, 400,
+        "batch must screen a disabled graph participant: {batch_body:?}"
+    );
     assert_eq!(
         restore_status, 400,
         "restore must screen a disabled graph participant like batch does: {restore_body:?}"
