@@ -91,6 +91,7 @@ fn test_passive_health_marks_unhealthy() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     for _ in 0..3 {
@@ -120,6 +121,7 @@ fn test_passive_health_recovers() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     for _ in 0..2 {
@@ -159,6 +161,7 @@ fn test_success_does_not_mark_unhealthy() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     for _ in 0..100 {
@@ -188,6 +191,7 @@ fn test_connection_error_counts_as_failure_regardless_of_status_codes() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     for _ in 0..2 {
@@ -220,6 +224,7 @@ fn test_connection_error_recovery_on_success() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     for _ in 0..2 {
@@ -260,6 +265,7 @@ fn test_remove_stale_passive_targets_for_proxy_cleans_unhealthy() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     for _ in 0..2 {
@@ -308,6 +314,7 @@ fn test_remove_stale_passive_targets_for_proxy_empty_list_clears_all() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     for _ in 0..2 {
@@ -340,6 +347,7 @@ fn test_remove_stale_targets_no_op_when_all_present() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     for _ in 0..2 {
@@ -385,6 +393,7 @@ fn test_passive_health_isolated_across_proxies_sharing_upstream() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     // Proxy-A sends large payloads → backend returns 500s
@@ -443,6 +452,7 @@ fn test_active_and_passive_health_are_independent() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     for _ in 0..2 {
@@ -510,6 +520,7 @@ fn test_prune_removed_proxies() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     // Insert passive health state for 3 proxies by reporting responses
@@ -587,6 +598,7 @@ fn test_passive_window_only_counts_recent_failures() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     // Record 2 failures (under threshold)
@@ -644,6 +656,7 @@ fn test_passive_window_failures_within_window_accumulate() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     // All 3 failures within the 60s window
@@ -694,6 +707,7 @@ fn test_passive_failure_ring_matches_threshold_sequences() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     report_failures(&checker, TEST_PROXY, &target, &config, 1);
@@ -726,6 +740,7 @@ fn test_passive_failure_ring_stays_capped_past_max() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     report_failures(
@@ -767,6 +782,7 @@ fn test_passive_failure_ring_is_isolated_per_proxy() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     report_failures(
@@ -806,6 +822,7 @@ fn test_passive_failure_ring_clears_on_success_recovery() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     report_failures(&checker, TEST_PROXY, &target, &config, 5);
@@ -842,6 +859,7 @@ fn test_remove_stale_passive_targets_drops_failure_ring() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     report_failures(&checker, TEST_PROXY, &target, &config, 4);
@@ -870,6 +888,7 @@ fn test_passive_failure_ring_clears_on_timer_recovery() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     report_failures(&checker, TEST_PROXY, &target, &config, 4);
@@ -899,6 +918,7 @@ fn test_passive_health_threshold_1_immediate_unhealthy() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     checker.report_response(
@@ -930,6 +950,7 @@ fn test_connection_error_ignores_status_code_list() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     // Status code 200 with connection_error=true should still count as failure
@@ -963,6 +984,7 @@ fn test_passive_health_per_target_isolation() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     // Fail target_a only
@@ -1006,6 +1028,7 @@ fn test_recovery_clears_failures_then_re_threshold() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     // Mark unhealthy
@@ -2180,4 +2203,122 @@ async fn restart_upstream_probes_does_not_cancel_other_upstreams() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(checker.active_task_count(), 3);
     assert!(checker.has_running_active_probes(DEFAULT_NAMESPACE, "up-b"));
+}
+
+// ── Istio consecutive-error semantics (issue #4292) ────────────────────────
+
+fn consecutive_policy(threshold: u32) -> PassiveHealthCheck {
+    PassiveHealthCheck {
+        unhealthy_status_codes: vec![500, 502, 503, 504],
+        unhealthy_threshold: threshold,
+        // Deliberately wide: under consecutive semantics the window must not
+        // participate in the decision at all.
+        unhealthy_window_seconds: 600,
+        healthy_after_seconds: 30,
+        max_ejection_percent: None,
+        gateway_error_codes: None,
+        split_external_local_origin_errors: None,
+        consecutive_error_mode: true,
+    }
+}
+
+/// The test the windowed model could not express: a target alternating
+/// success/failure must NEVER reach the threshold under Istio
+/// `consecutive5xxErrors` semantics, even though the sliding window would have
+/// counted far more than `unhealthy_threshold` failures.
+#[test]
+fn alternating_failures_never_eject_under_consecutive_semantics() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = consecutive_policy(5);
+
+    for _ in 0..50 {
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            200,
+            false,
+            Some(&config),
+        );
+    }
+
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "a success between failures resets the streak, so no ejection may occur"
+    );
+}
+
+/// A true consecutive streak still ejects at exactly the threshold.
+#[test]
+fn true_consecutive_failures_eject_at_the_threshold() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = consecutive_policy(5);
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 4);
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "must not eject below the consecutive threshold"
+    );
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 1);
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "the fifth consecutive failure must eject"
+    );
+}
+
+/// The same alternating pattern DOES eject under Ferrum's native windowed
+/// model — the two semantics stay distinct, and the default is unchanged.
+#[test]
+fn windowed_mode_still_ejects_on_alternating_failures() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_threshold: 5,
+        unhealthy_window_seconds: 600,
+        ..PassiveHealthCheck::default()
+    };
+    assert!(!config.consecutive_error_mode, "windowed is the default");
+
+    // Interleaved, ending on a failure: a trailing success would re-admit the
+    // target through on-success recovery and hide the windowed decision.
+    for index in 0..5 {
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
+        if index < 4 {
+            checker.report_response(
+                DEFAULT_NAMESPACE,
+                TEST_PROXY,
+                "test-upstream",
+                &target,
+                200,
+                false,
+                Some(&config),
+            );
+        }
+    }
+
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "windowed semantics count every in-window failure regardless of streaks"
+    );
 }

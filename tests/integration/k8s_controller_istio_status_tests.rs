@@ -1231,3 +1231,228 @@ fn rejected_sidecar_reports_outbound_policy_as_not_enforced() {
         "a dropped resource enforces nothing; the qualifier must be explicit"
     );
 }
+
+// ── Deferred-field visibility (issues #4277, #4292, #4304, #4305) ─────────
+
+fn deferred_fields_for(obj: K8sObject) -> Vec<String> {
+    let kind = obj.kind.clone();
+    let name = obj.metadata.name.clone();
+    let updates = plan_istio_status_updates(&[obj], options());
+    let update = update_for(&updates, &kind, &name);
+    let condition = find_condition(
+        update.status["conditions"].as_array().unwrap(),
+        "FerrumAccepted",
+    );
+    assert_eq!(
+        condition["status"].as_str(),
+        Some("True"),
+        "{kind}/{name} must stay accepted while reporting deferred fields"
+    );
+    update
+        .ferrum_detail
+        .as_ref()
+        .and_then(|detail| detail["translation"]["deferred_fields"].as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| entry.as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `outputPayloadToHeader` / `fromCookies` are recognized but unenforced, so
+/// they must be visible in `kubectl describe` — by FIELD NAME only. Echoing a
+/// `fromCookies` VALUE would publish the cookie a token rides in.
+#[test]
+fn request_authentication_reports_output_payload_and_cookie_fields_as_deferred() {
+    let deferred = deferred_fields_for(object(
+        "security.istio.io/v1",
+        "RequestAuthentication",
+        "ra-deferred",
+        json!({
+            "jwtRules": [{
+                "issuer": "https://issuer.example.com",
+                "jwksUri": "https://issuer.example.com/jwks",
+                "outputPayloadToHeader": "x-jwt-payload",
+                "fromCookies": ["session-token"],
+            }]
+        }),
+    ));
+
+    assert!(
+        deferred
+            .iter()
+            .any(|entry| entry.contains("outputPayloadToHeader")),
+        "{deferred:?}"
+    );
+    assert!(
+        deferred.iter().any(|entry| entry.contains("fromCookies")),
+        "{deferred:?}"
+    );
+    assert!(
+        !deferred.iter().any(|entry| entry.contains("session-token")),
+        "a deferred-field label must not republish the cookie name: {deferred:?}"
+    );
+}
+
+/// An enforced `outputClaimToHeaders` is NOT deferred — the header is stripped
+/// and re-asserted by the injected `jwks_auth` plugin.
+#[test]
+fn request_authentication_output_claim_to_headers_is_not_deferred() {
+    let deferred = deferred_fields_for(object(
+        "security.istio.io/v1",
+        "RequestAuthentication",
+        "ra-claims",
+        json!({
+            "jwtRules": [{
+                "issuer": "https://issuer.example.com",
+                "jwksUri": "https://issuer.example.com/jwks",
+                "outputClaimToHeaders": [{"header": "x-jwt-claim-sub", "claim": "sub"}],
+            }]
+        }),
+    ));
+    assert!(deferred.is_empty(), "{deferred:?}");
+}
+
+/// The three `outlierDetection` knobs Ferrum parses past must be visible, with
+/// no operator-configured value echoed into the status object.
+#[test]
+fn destination_rule_reports_unenforced_outlier_fields_as_deferred() {
+    let deferred = deferred_fields_for(object(
+        "networking.istio.io/v1",
+        "DestinationRule",
+        "dr-outlier",
+        json!({
+            "host": "reviews.default.svc.cluster.local",
+            "trafficPolicy": {
+                "outlierDetection": {
+                    "consecutive5xxErrors": 5,
+                    "consecutiveGatewayErrors": 3,
+                    "consecutiveLocalOriginFailures": 2,
+                    "minHealthPercent": 40
+                }
+            }
+        }),
+    ));
+
+    for field in [
+        "consecutiveGatewayErrors",
+        "consecutiveLocalOriginFailures",
+        "minHealthPercent",
+    ] {
+        assert!(
+            deferred.iter().any(|entry| entry.contains(field)),
+            "{field} must be reported as deferred: {deferred:?}"
+        );
+    }
+    assert!(
+        !deferred.iter().any(|entry| entry.contains("40")),
+        "labels must not echo configured values: {deferred:?}"
+    );
+}
+
+/// Per-destination header transforms on a weighted split cannot be bound to one
+/// share of the split, so the gap must be operator-visible; the route-level
+/// `http[].headers` block is applied and therefore never deferred.
+#[test]
+fn virtual_service_reports_weighted_destination_headers_as_deferred() {
+    let deferred = deferred_fields_for(object(
+        "networking.istio.io/v1",
+        "VirtualService",
+        "vs-dest-headers",
+        json!({
+            "hosts": ["api.example.com"],
+            "http": [{
+                "match": [{"uri": {"prefix": "/api"}}],
+                "headers": {"request": {"remove": ["x-internal-auth"]}},
+                "route": [
+                    {
+                        "destination": {"host": "a.default.svc.cluster.local", "port": {"number": 8080}},
+                        "weight": 50,
+                        "headers": {"request": {"set": {"x-share": "a"}}}
+                    },
+                    {
+                        "destination": {"host": "b.default.svc.cluster.local", "port": {"number": 8080}},
+                        "weight": 50
+                    }
+                ]
+            }]
+        }),
+    ));
+
+    assert!(
+        deferred
+            .iter()
+            .any(|entry| entry.contains("http[].route[].headers")),
+        "{deferred:?}"
+    );
+    assert!(
+        !deferred
+            .iter()
+            .any(|entry| entry.contains("http[].headers.request")),
+        "the applied route-level block must not be reported as deferred: {deferred:?}"
+    );
+}
+
+/// A `targetRefs`-carrying `RequestAuthentication` / `Telemetry` is rejected
+/// rather than widened, and the status reports the attachment COUNT without
+/// republishing the referenced resource identities.
+#[test]
+fn target_refs_on_request_authentication_and_telemetry_report_invalid() {
+    for obj in [
+        object(
+            "security.istio.io/v1",
+            "RequestAuthentication",
+            "ra-targeted",
+            json!({
+                "targetRefs": [{"kind": "Service", "name": "reviews"}],
+                "jwtRules": [{
+                    "issuer": "https://issuer.example.com",
+                    "jwksUri": "https://issuer.example.com/jwks"
+                }]
+            }),
+        ),
+        object(
+            "telemetry.istio.io/v1",
+            "Telemetry",
+            "tel-targeted",
+            json!({
+                "targetRefs": [{"kind": "Service", "name": "reviews"}],
+                "accessLogging": [{"disabled": true}]
+            }),
+        ),
+    ] {
+        let kind = obj.kind.clone();
+        let name = obj.metadata.name.clone();
+        let updates = plan_istio_status_updates(&[obj], options());
+        let update = update_for(&updates, &kind, &name);
+        let condition = find_condition(
+            update.status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(
+            condition["status"].as_str(),
+            Some("False"),
+            "{kind}/{name} must not be accepted with an unenforceable targetRefs"
+        );
+        assert_eq!(condition["reason"].as_str(), Some("Invalid"));
+        let detail = update
+            .ferrum_detail
+            .as_ref()
+            .unwrap_or_else(|| panic!("{kind}/{name} should carry a detail block"));
+        assert_eq!(
+            detail["translation"]["target_refs_declared"].as_u64(),
+            Some(1),
+            "{kind}/{name} should report the attachment count"
+        );
+        // The structured projection carries a COUNT, never the referenced
+        // group/kind/name/namespace. (The translator diagnostic in
+        // `translation.error` is the operator's actionable message and is
+        // reported as-is, exactly as it is for AuthorizationPolicy.)
+        assert!(
+            detail["translation"]["error"].is_string(),
+            "{kind}/{name} should carry the translator error"
+        );
+    }
+}

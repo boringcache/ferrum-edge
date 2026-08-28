@@ -253,6 +253,7 @@ fn health_check_prune_removes_only_matching_namespace() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
     };
 
     checker.report_response(

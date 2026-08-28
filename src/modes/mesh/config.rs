@@ -2159,6 +2159,109 @@ pub struct MeshJwtRule {
     pub from_params: Vec<String>,
     #[serde(default)]
     pub forward_original_token: bool,
+    /// Istio `jwtRules[].outputClaimToHeaders` (issue #4277).
+    ///
+    /// Ordered list, not a claim-keyed map: Istio allows the same claim to be
+    /// published to more than one header. Every declared header is
+    /// **gateway-owned** — the injected `jwks_auth` plugin removes it from the
+    /// inbound request before validation and re-asserts it only from a
+    /// validated token, so a client cannot forge one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_claim_to_headers: Vec<MeshJwtClaimHeader>,
+}
+
+/// One `outputClaimToHeaders` entry: publish `claim` into request header
+/// `header` after successful JWT validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshJwtClaimHeader {
+    /// Backend-visible request header name (normalized lowercase at
+    /// translation; never a reserved/credential-bearing header).
+    pub header: String,
+    /// Dot-path claim to publish.
+    pub claim: String,
+}
+
+/// Upper bound on `outputClaimToHeaders` entries per JWT rule accepted at the
+/// K8s-translation and native/file/xDS boundaries. Every entry costs one
+/// gateway-owned destination that is stripped from EVERY inbound request, so
+/// the set stays small and bounded.
+pub const MAX_MESH_JWT_OUTPUT_CLAIM_HEADERS: usize = 16;
+
+/// Upper bound on one `outputClaimToHeaders[].claim` dot path.
+pub const MAX_MESH_JWT_CLAIM_PATH_LEN: usize = 256;
+
+/// Validate and normalize one `outputClaimToHeaders` entry.
+///
+/// Fail-closed: an unusable header name or claim path is an error, never a
+/// silently dropped mapping — dropping one would leave the destination
+/// unowned, and therefore client-forgeable, on a workload whose backend was
+/// migrated from Istio and trusts it. The returned header name is lowercase so
+/// the runtime's gateway-owned destination set is case-normalized.
+///
+/// Diagnostics never echo a claim VALUE (there is none at config time) and
+/// sanitize the operator-supplied names.
+pub fn validate_mesh_jwt_claim_header(
+    header: &str,
+    claim: &str,
+) -> Result<(String, String), String> {
+    let header = header.trim();
+    if !mesh_ext_authz_header_name_is_wellformed(header) {
+        return Err(format!(
+            "outputClaimToHeaders header '{}' is not a valid HTTP header name (RFC 9110 token, at most {MAX_MESH_EXT_AUTHZ_HEADER_NAME_LEN} bytes)",
+            sanitize_mesh_ext_authz_diagnostic(header)
+        ));
+    }
+    let lowercase = header.to_ascii_lowercase();
+    if mesh_ext_authz_header_is_reserved(&lowercase)
+        || crate::plugins::utils::claim_header_fanout::is_reserved_header(&lowercase)
+    {
+        return Err(format!(
+            "outputClaimToHeaders header '{lowercase}' is hop-by-hop, framing, routing, credential-bearing, or gateway-reserved and cannot carry a JWT claim"
+        ));
+    }
+    let claim = claim.trim();
+    if claim.is_empty() || claim.split('.').any(str::is_empty) {
+        return Err(format!(
+            "outputClaimToHeaders claim for header '{lowercase}' must be a non-empty dot path without empty segments"
+        ));
+    }
+    if claim.len() > MAX_MESH_JWT_CLAIM_PATH_LEN {
+        return Err(format!(
+            "outputClaimToHeaders claim for header '{lowercase}' must be at most {MAX_MESH_JWT_CLAIM_PATH_LEN} bytes"
+        ));
+    }
+    if claim.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(format!(
+            "outputClaimToHeaders claim for header '{lowercase}' must not contain whitespace or control characters"
+        ));
+    }
+    Ok((lowercase, claim.to_string()))
+}
+
+/// Validate a complete `outputClaimToHeaders` list, rejecting duplicates.
+///
+/// A repeated destination header is refused rather than resolved by order: two
+/// claims mapping onto one header would make the gateway-asserted value depend
+/// on which claim happened to resolve.
+pub fn validate_mesh_jwt_output_claim_headers(
+    entries: &[MeshJwtClaimHeader],
+) -> Result<(), String> {
+    if entries.len() > MAX_MESH_JWT_OUTPUT_CLAIM_HEADERS {
+        return Err(format!(
+            "outputClaimToHeaders supports at most {MAX_MESH_JWT_OUTPUT_CLAIM_HEADERS} entries"
+        ));
+    }
+    let mut seen: Vec<String> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let (header, _claim) = validate_mesh_jwt_claim_header(&entry.header, &entry.claim)?;
+        if seen.contains(&header) {
+            return Err(format!(
+                "outputClaimToHeaders declares header '{header}' more than once; a destination may be asserted from exactly one claim"
+            ));
+        }
+        seen.push(header);
+    }
+    Ok(())
 }
 
 /// A header location from which to extract a JWT.
@@ -6338,6 +6441,18 @@ fn validate_mesh_config_internal(
             if rule.jwks_uri.is_none() && rule.jwks.is_none() {
                 errors.push(format!(
                     "MeshRequestAuthentication '{}' jwt_rules[{}]: one of jwks_uri or jwks is required",
+                    ra.name, i
+                ));
+            }
+            // Fail closed on an unusable claim-output mapping: the runtime
+            // treats every declared header as gateway-owned and strips it from
+            // inbound requests, so admitting a mapping the plugin would refuse
+            // at construction would silently leave the header client-forgeable.
+            let claim_headers =
+                validate_mesh_jwt_output_claim_headers(&rule.output_claim_to_headers);
+            if let Err(error) = claim_headers {
+                errors.push(format!(
+                    "MeshRequestAuthentication '{}' jwt_rules[{}]: {error}",
                     ra.name, i
                 ));
             }

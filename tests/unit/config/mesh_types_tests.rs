@@ -668,6 +668,7 @@ fn request_authentication_round_trips_through_serde() {
             ],
             from_params: vec!["access_token".to_string()],
             forward_original_token: true,
+            output_claim_to_headers: Vec::new(),
         }],
     };
 
@@ -705,6 +706,7 @@ fn request_authentication_optional_fields_omitted_when_default() {
         from_headers: Vec::new(),
         from_params: Vec::new(),
         forward_original_token: false,
+        output_claim_to_headers: Vec::new(),
     };
 
     let json = serde_json::to_string(&rule).unwrap();
@@ -732,6 +734,7 @@ fn request_authentication_meshwide_scope() {
             from_headers: Vec::new(),
             from_params: Vec::new(),
             forward_original_token: false,
+            output_claim_to_headers: Vec::new(),
         }],
     };
 
@@ -758,6 +761,7 @@ fn mesh_config_with_request_authentications_round_trips() {
                     from_headers: Vec::new(),
                     from_params: Vec::new(),
                     forward_original_token: false,
+                    output_claim_to_headers: Vec::new(),
                 }],
             }],
             ..MeshConfig::default()

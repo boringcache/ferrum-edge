@@ -11124,9 +11124,20 @@ fn mesh_hash_on_to_ferrum(lb: &Option<MeshLoadBalancer>) -> Option<String> {
     }
 }
 
+/// Overlay a translated Istio `outlierDetection` onto a passive health policy.
+///
+/// `consecutive5xxErrors` is a CONSECUTIVE-failure threshold in Istio, not a
+/// windowed count (issue #4292), so the overlay switches the policy into
+/// consecutive mode. Ferrum's native windowed semantics are untouched for
+/// policies this overlay never runs on. `interval` still lands on
+/// `unhealthy_window_seconds`: it is inert while consecutive mode is on
+/// (Istio's `interval` is an analysis sweep period), but keeping it recorded
+/// leaves the operator's declared value visible in the admin view and correct
+/// if a policy is later evaluated windowed.
 fn apply_outlier_detection_to_passive(passive: &mut PassiveHealthCheck, od: &MeshOutlierDetection) {
     if let Some(consecutive) = od.consecutive_errors {
         passive.unhealthy_threshold = consecutive;
+        passive.consecutive_error_mode = true;
     }
     if let Some(interval) = od.interval_seconds {
         passive.unhealthy_window_seconds = interval;
@@ -13042,6 +13053,23 @@ fn build_jwks_provider_config(rule: &MeshJwtRule) -> Option<serde_json::Value> {
 
     if !rule.from_params.is_empty() {
         provider["from_params"] = serde_json::json!(rule.from_params);
+    }
+
+    // Istio `outputClaimToHeaders` (issue #4277). The array shape is preserved
+    // (not collapsed into a claim-keyed map) because Istio allows one claim to
+    // be published to several headers. `jwks_auth` owns every destination:
+    // each is stripped from the inbound request before validation and set only
+    // from a validated claim.
+    if !rule.output_claim_to_headers.is_empty() {
+        provider["output_claim_headers"] = serde_json::json!(
+            rule.output_claim_to_headers
+                .iter()
+                .map(|entry| serde_json::json!({
+                    "header": entry.header,
+                    "claim": entry.claim,
+                }))
+                .collect::<Vec<_>>()
+        );
     }
 
     Some(provider)
@@ -27880,6 +27908,12 @@ mod tests {
             .expect("v1 subset passive health resolved from outlierDetection");
         assert_eq!(passive.unhealthy_threshold, 5);
         assert_eq!(passive.unhealthy_window_seconds, 20);
+        // Istio `consecutive5xxErrors` is a consecutive streak, not a windowed
+        // count (issue #4292): the overlay must switch the policy's mode.
+        assert!(
+            passive.consecutive_error_mode,
+            "a translated consecutive5xxErrors must not be evaluated as a sliding-window count"
+        );
     }
 
     #[test]
@@ -33208,6 +33242,7 @@ mod tests {
                 from_headers: Vec::new(),
                 from_params: Vec::new(),
                 forward_original_token: false,
+                output_claim_to_headers: Vec::new(),
             }],
         }
     }
@@ -33529,6 +33564,7 @@ mod tests {
                         from_headers: Vec::new(),
                         from_params: Vec::new(),
                         forward_original_token: false,
+                        output_claim_to_headers: Vec::new(),
                     }],
                 }],
                 ..MeshConfig::default()
@@ -33585,6 +33621,7 @@ mod tests {
                         ],
                         from_params: vec!["access_token".to_string()],
                         forward_original_token: false,
+                        output_claim_to_headers: Vec::new(),
                     }],
                 }],
                 ..MeshConfig::default()
@@ -33638,6 +33675,7 @@ mod tests {
                         from_headers: Vec::new(),
                         from_params: Vec::new(),
                         forward_original_token: false,
+                        output_claim_to_headers: Vec::new(),
                     }],
                 }],
                 ..MeshConfig::default()

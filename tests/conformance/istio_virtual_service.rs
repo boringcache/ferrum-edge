@@ -1202,3 +1202,200 @@ async fn vs_redirect_port_and_derive_port() {
         other => panic!("expected FROM_PROTOCOL_DEFAULT redirect, got {other:?}"),
     }
 }
+
+/// Translate the VS and return every emitted plugin config.
+fn plugins_for(translation_input: &[K8sObject]) -> Vec<PluginConfig> {
+    translate_k8s_objects(translation_input, options())
+        .expect("translation succeeds")
+        .config
+        .plugin_configs
+}
+
+/// VS field: `http[].headers.{request,response}.{set,add,remove}`. Projected
+/// onto every emitted `mesh_route_dispatch` rule and consumed by the
+/// auto-attached `request_transformer` / `response_transformer` instances.
+///
+/// The security-relevant half is `remove`: a dropped
+/// `headers.request.remove: [x-internal-auth]` would forward the CLIENT's copy
+/// of a header the backend trusts, so the rule must actually strip it before
+/// backend dispatch.
+#[tokio::test]
+async fn vs_request_header_set_add_remove_projects_route_transform() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "http[].headers.request/response",
+        status = Status::Supported,
+        notes = "set/add/remove project onto each mesh_route_dispatch rule as request_transform / response_transform, with the istio-vs-req-xform-* / istio-vs-resp-xform-* transformer instances auto-attached to the route's proxy (exactly once, and only when a rule carries transforms of that direction). Malformed header names/values and framing-header writes are rejected at translation rather than silently dropped.",
+    );
+
+    let input = [virtual_service(json!({
+        "hosts": ["api.example.com"],
+        "http": [{
+            "match": [{"uri": {"prefix": "/api"}}],
+            "headers": {
+                "request": {
+                    "set": {"x-route": "canary"},
+                    "add": {"x-tag": "b"},
+                    "remove": ["x-internal-auth"]
+                },
+                "response": {"set": {"x-served-by": "ferrum"}}
+            },
+            "route": [{"destination": {
+                "host": "echo.default.svc.cluster.local",
+                "port": {"number": 8080}
+            }}]
+        }]
+    }))];
+
+    let plugins = plugins_for(&input);
+    let dispatch = plugins
+        .iter()
+        .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+        .expect("header transforms must emit a mesh_route_dispatch plugin");
+    let proxy_id = dispatch
+        .proxy_id
+        .clone()
+        .expect("dispatch plugin is proxy-scoped");
+
+    // Both transformer consumers are attached exactly once, with the
+    // translator-owned deterministic ids.
+    let request_transformers: Vec<&PluginConfig> = plugins
+        .iter()
+        .filter(|plugin| plugin.plugin_name == "request_transformer")
+        .collect();
+    let response_transformers: Vec<&PluginConfig> = plugins
+        .iter()
+        .filter(|plugin| plugin.plugin_name == "response_transformer")
+        .collect();
+    assert_eq!(request_transformers.len(), 1, "{plugins:?}");
+    assert_eq!(response_transformers.len(), 1, "{plugins:?}");
+    assert_eq!(
+        request_transformers[0].id,
+        format!("istio-vs-req-xform-{proxy_id}")
+    );
+    assert_eq!(
+        response_transformers[0].id,
+        format!("istio-vs-resp-xform-{proxy_id}")
+    );
+
+    // The rule carries the exact transform set.
+    let rule = &dispatch.config["rules"][0];
+    assert_eq!(
+        rule["request_transform"],
+        json!([
+            {"operation": "update", "target": "header", "key": "x-route", "value": "canary"},
+            {"operation": "add", "target": "header", "key": "x-tag", "value": "b"},
+            {"operation": "remove", "target": "header", "key": "x-internal-auth"},
+        ])
+    );
+    assert_eq!(
+        rule["response_transform"],
+        json!([
+            {"operation": "update", "target": "header", "key": "x-served-by", "value": "ferrum"},
+        ])
+    );
+
+    // And the transforms actually apply: the client's `x-internal-auth` is
+    // stripped before the backend sees the request.
+    let plugin = MeshRouteDispatch::new(&dispatch.config).expect("plugin config");
+    let mut req = ctx("GET", "/api/users");
+    let mut headers = HashMap::from([
+        ("host".to_string(), "api.example.com".to_string()),
+        ("x-internal-auth".to_string(), "forged".to_string()),
+    ]);
+    match plugin.before_proxy(&mut req, &mut headers).await {
+        PluginResult::Continue => {}
+        other => panic!("expected the route to match and continue, got {other:?}"),
+    }
+    ferrum_edge::plugins::utils::route_header_transform::finalize_route_override_request_headers(
+        &mut req,
+        &mut headers,
+    );
+    assert!(
+        !headers.contains_key("x-internal-auth"),
+        "headers.request.remove must strip the client header: {headers:?}"
+    );
+    assert_eq!(headers.get("x-route").map(String::as_str), Some("canary"));
+    assert_eq!(headers.get("x-tag").map(String::as_str), Some("b"));
+
+    // Both emitted transformer configs must construct.
+    ferrum_edge::plugins::validate_plugin_config(
+        "request_transformer",
+        &request_transformers[0].config,
+    )
+    .expect("emitted request_transformer config is valid");
+    ferrum_edge::plugins::validate_plugin_config(
+        "response_transformer",
+        &response_transformers[0].config,
+    )
+    .expect("emitted response_transformer config is valid");
+}
+
+/// A malformed header transform must reject the VirtualService instead of
+/// silently losing the whole route's transform set at plugin-construction
+/// time — including a security-relevant `remove`.
+#[test]
+fn vs_malformed_header_transform_fails_closed() {
+    for headers in [
+        json!({"request": {"set": {"bad header": "x"}}}),
+        json!({"request": {"set": {"x-ok": "bad\r\nvalue"}}}),
+        json!({"request": {"set": {"x-ok": 42}}}),
+        json!({"request": {"set": {"transfer-encoding": "chunked"}}}),
+        json!({"request": {"remove": ["bad header"]}}),
+        json!({"request": {"unknown": {}}}),
+        json!({"unknown": {}}),
+    ] {
+        let error = translate_k8s_objects(
+            &[virtual_service(json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/api"}}],
+                    "headers": headers,
+                    "route": [{"destination": {
+                        "host": "echo.default.svc.cluster.local",
+                        "port": {"number": 8080}
+                    }}]
+                }]
+            }))],
+            options(),
+        )
+        .expect_err("an unrepresentable header transform must fail closed");
+        assert!(
+            error.to_string().contains("VirtualService http[0].headers"),
+            "diagnostic should name the field, got: {error}"
+        );
+    }
+}
+
+/// A single-destination `http[].route[].headers` block is applied after the
+/// route-level block, so the more specific `set` wins.
+#[test]
+fn vs_single_destination_route_headers_are_applied() {
+    let plugins = plugins_for(&[virtual_service(json!({
+        "hosts": ["api.example.com"],
+        "http": [{
+            "match": [{"uri": {"prefix": "/api"}}],
+            "headers": {"request": {"set": {"x-route": "base"}}},
+            "route": [{
+                "destination": {
+                    "host": "echo.default.svc.cluster.local",
+                    "port": {"number": 8080}
+                },
+                "headers": {"request": {"set": {"x-route": "destination"}}}
+            }]
+        }]
+    }))]);
+    let dispatch = plugins
+        .iter()
+        .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+        .expect("route header transforms must emit a mesh_route_dispatch plugin");
+
+    assert_eq!(
+        dispatch.config["rules"][0]["request_transform"],
+        json!([
+            {"operation": "update", "target": "header", "key": "x-route", "value": "base"},
+            {"operation": "update", "target": "header", "key": "x-route", "value": "destination"},
+        ]),
+        "the per-destination block is appended after the route-level block"
+    );
+}

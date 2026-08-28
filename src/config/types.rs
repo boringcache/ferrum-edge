@@ -1471,6 +1471,20 @@ pub struct PassiveHealthCheck {
     /// not yet applied by passive health.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split_external_local_origin_errors: Option<bool>,
+    /// Evaluate `unhealthy_threshold` against the target's CONSECUTIVE failure
+    /// streak instead of the sliding-window failure count (issue #4292).
+    ///
+    /// `false` (default) keeps Ferrum's native windowed passive health: "N
+    /// failures within `unhealthy_window_seconds`". `true` is Istio/Envoy
+    /// `outlierDetection.consecutive5xxErrors` semantics: a single success
+    /// between failures resets the streak, so a backend erroring at a low rate
+    /// under high load is never ejected. The K8s DestinationRule translator
+    /// sets it; hand-written configs opt in explicitly.
+    ///
+    /// `unhealthy_window_seconds` is not consulted in this mode — Istio's
+    /// `interval` is an analysis sweep period, not a failure window.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub consecutive_error_mode: bool,
 }
 
 impl Default for PassiveHealthCheck {
@@ -1483,6 +1497,7 @@ impl Default for PassiveHealthCheck {
             max_ejection_percent: None,
             gateway_error_codes: None,
             split_external_local_origin_errors: None,
+            consecutive_error_mode: false,
         }
     }
 }

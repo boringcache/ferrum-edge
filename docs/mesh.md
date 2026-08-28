@@ -1457,10 +1457,11 @@ Visibility and the lookup hierarchy compose in that order: `exportTo` is absolut
 | `host` | Supported | Required, lowercased at admission, empty/dot-only rejected |
 | `trafficPolicy.connectionPool.tcp.connectTimeout` | Supported | Applied to `Proxy.backend_connect_timeout_ms` for every proxy referencing the matching upstream |
 | `trafficPolicy.connectionPool.tcp.idleTimeout` | Supported (stream-family / mesh L4 relays) | Bidirectional TCP idle bound, mapped to `tcp_idle_timeout_seconds` (`0` disables). Lands on `Upstream.port_overrides[port].tcp_idle_timeout_seconds` via the same top-level fan-out + per-port overlay as `connectTimeout` / `maxConnections` / `tcpKeepalive`, then `Proxy.dispatch_port_overrides`. Synthesized mesh L4 relays (inbound TCP, HBONE CONNECT, outbound TCP/UDP, east-west passthrough, stream egress) default `backend_read_timeout_ms` / `backend_write_timeout_ms` to `0` (disabled) so a silent backend or one-way sink is not torn down at 30s; the relay is bounded by this idle timeout, or `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` when the per-proxy field is unset. Distinct from HTTP `connectionPool.http.idleTimeout` (pool idle; 0 is rejected). Sub-second durations other than `0s` are rejected; values above `MAX_TCP_IDLE_TIMEOUT` (24h) are rejected. |
-| `trafficPolicy.outlierDetection.consecutive5xxErrors` / `consecutiveErrors` | Supported | → `PassiveHealthCheck.unhealthy_threshold` |
-| `trafficPolicy.outlierDetection.interval` | Supported | → `PassiveHealthCheck.unhealthy_window_seconds` (zero filtered out, sub-second rounded up) |
+| `trafficPolicy.outlierDetection.consecutive5xxErrors` / `consecutiveErrors` | Supported | → `PassiveHealthCheck.unhealthy_threshold` **and** `PassiveHealthCheck.consecutive_error_mode = true`. The threshold is an Istio-style CONSECUTIVE failure streak: a single success resets it, so a backend erroring at a low rate under high load is never ejected (issue #4292). Ferrum's native windowed passive health is unchanged for policies that are not translated from a DestinationRule. |
+| `trafficPolicy.outlierDetection.interval` | Supported | → `PassiveHealthCheck.unhealthy_window_seconds` (zero filtered out, sub-second rounded up). Recorded but **inert** while consecutive mode is on — Istio's `interval` is an analysis sweep period, not a failure window. |
 | `trafficPolicy.outlierDetection.baseEjectionTime` | Supported | → `PassiveHealthCheck.healthy_after_seconds` |
-| `trafficPolicy.outlierDetection.maxEjectionPercent` | Supported | → `PassiveHealthCheck.max_ejection_percent`; values >100 rejected |
+| `trafficPolicy.outlierDetection.maxEjectionPercent` | Supported | → `PassiveHealthCheck.max_ejection_percent`; values >100 rejected. **Omitting it inherits Istio's own 10% default** (Ferrum's native default is uncapped), so a stock DestinationRule cannot eject a whole upstream into degraded mode. |
+| `trafficPolicy.outlierDetection.consecutiveGatewayErrors` / `consecutiveLocalOriginFailures` / `minHealthPercent` | Deferred | Parsed past with a translate-time warning and surfaced in `status.ferrum.translation.deferred_fields` (field names only). Ferrum keeps one failure bucket (`unhealthy_status_codes` + connection errors) and bounds ejection with `maxEjectionPercent` alone. |
 | `trafficPolicy.loadBalancer.simple = ROUND_ROBIN` | Supported | → `LoadBalancerAlgorithm::RoundRobin` |
 | `trafficPolicy.loadBalancer.simple = LEAST_REQUEST` / `LEAST_CONN` | Supported | → `LoadBalancerAlgorithm::LeastConnections` |
 | `trafficPolicy.loadBalancer.simple = RANDOM` | Supported | → `LoadBalancerAlgorithm::Random` |
@@ -1474,7 +1475,7 @@ Visibility and the lookup hierarchy compose in that order: `exportTo` is absolut
 | `subsets[].trafficPolicy.connectionPool.tcp.idleTimeout` | Supported (config.proxies) | Overrides `tcp_idle_timeout_seconds` for proxies bound to the subset (precedence over the DR top-level idleTimeout). Synthesized L4 relays are not in `config.proxies` and honor the top-level / per-port overlay via `dispatch_port_overrides` instead. `0` disables. |
 | `subsets[].trafficPolicy.connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests,idleTimeout,http2MaxRequests,maxConcurrentStreams}` | Supported | Preserved in `SubsetTrafficPolicy`, resolved into `ResolvedSubsetTrafficPolicy`, and overlaid onto the selected proxy's immutable inherited-policy snapshot (`dispatch_port_override_fallback`) for each selected target. Precedence is field-level `portLevelSettings` > selected subset > top-level; sibling subsets and unmatched destinations never inherit the selected subset. **Semantics differ from Istio on purpose:** Istio applies subset > DR `portLevelSettings` and replaces the whole `connectionPool` wholesale when a subset sets any connection-pool field; Ferrum keeps the inverted tier order and field-level merge (same convention as port-level overrides). Example: top-level/port `UPGRADE` plus subset `DO_NOT_UPGRADE` → Istio forces H1 on that port for the subset; Ferrum still negotiates h2. A subset that sets only `maxRetries` also inherits top-level `DO_NOT_UPGRADE` / `idleTimeout` / `http2MaxRequests` here, where Istio's wholesale replacement would clear them. Transport, retry-cap, H1-admission, idle-timeout, destination active-request budget, and H2-stream-cap semantics match the corresponding top-level rows below (including the reqwest-H2 builder residual for `maxConcurrentStreams`). The `http2MaxRequests` admission lane carries the selected subset name, so sibling subsets keep independent budgets. Every HTTP-family shared-client/pool key already carries `upstream_subset`, so same-endpoint sibling subsets cannot first-materialize each other. Invalid values reject the DestinationRule without echoing the value. |
 | `subsets[].trafficPolicy.portLevelSettings` | Deferred | Detected at translate time with a value-redacted warning and listed in `status.ferrum.translation.deferred_fields`. Not parsed or applied — Istio's highest-precedence tier. Express per-port policy at top-level `trafficPolicy.portLevelSettings` or use subset `connectionPool` fields. |
-| `subsets[].trafficPolicy.outlierDetection` | Supported | Ejection thresholds (consecutive errors / interval / base-ejection / min-health) AND the `maxEjectionPercent` cap applied per-subset, overriding upstream-level passive health for subset-bound proxies (`passive_health_for_target` for thresholds, `LoadBalancerCache::max_ejection_percent_resolved_from` for the cap, sharing one per-port > per-subset > upstream tier precedence). The cap is sized against the subset candidate pool (denominator = subset target count). The per-port cap tier applies only when a single dispatch port is resolvable pre-selection; for subset dispatch on a multi-port upstream the subset cap governs (the cap is resolved before a target's port is known). |
+| `subsets[].trafficPolicy.outlierDetection` | Supported | Ejection thresholds (consecutive errors / interval / base-ejection) AND the `maxEjectionPercent` cap applied per-subset (`minHealthPercent` is NOT implemented — it is a deferred field), overriding upstream-level passive health for subset-bound proxies (`passive_health_for_target` for thresholds, `LoadBalancerCache::max_ejection_percent_resolved_from` for the cap, sharing one per-port > per-subset > upstream tier precedence). The cap is sized against the subset candidate pool (denominator = subset target count). The per-port cap tier applies only when a single dispatch port is resolvable pre-selection; for subset dispatch on a multi-port upstream the subset cap governs (the cap is resolved before a target's port is known). |
 | `trafficPolicy.connectionPool.http.maxRequestsPerConnection` | Deferred | Parsed and validated, but not projected onto `Upstream.port_overrides` or `Proxy.pool_max_requests_per_connection` because Ferrum does not enforce backend close-after-N-requests behavior. K8s translation emits a warning and status lists `connectionPool.http.maxRequestsPerConnection` in `status.ferrum.translation.deferred_fields` at top-level, per-port, and subset scope. Negative and `> u32::MAX` values are rejected at translate time; `0` is accepted as Istio's explicit "unlimited" sentinel but still produces no effective policy. Use `http2MaxRequests` for the destination request budget and `maxConcurrentStreams` for per-HTTP/2-connection stream concurrency. |
 | `trafficPolicy.connectionPool.http.idleTimeout` | Supported (HTTP-family) | Lands on the inherited dispatch fallback / explicit per-port override as `http_idle_timeout_ms` and projects onto `Proxy.pool_idle_timeout_seconds` for the per-target effective proxy, which threads into the reqwest/H2 client pool idle timeout. Sub-second durations are rejected at translate time because `pool_idle_timeout_seconds` is whole-second granular; values above `MAX_POOL_IDLE_TIMEOUT` (1 hour) are also rejected so the K8s surface stays consistent with the admin admit-path validator. Top-level and selected-subset values ride `dispatch_port_override_fallback`; explicit `portLevelSettings` entries win per-port. Precedence is field-level per-port > selected subset > top-level. The reqwest pool key includes idle timeout in its `rcfg` client-behavior segment (and every HTTP-family key already carries `upstream_subset`), so divergent idle timeouts / subsets isolate distinct shared clients (no first-creator-wins leak). Direct-H2 / gRPC key the effective H2 stream cap (and `upstream_subset`); remaining builder-only knobs such as keepalive may still document first-materializer tradeoffs. Request-only `backend_connect_timeout_ms` remains per-request and does not fragment. |
 | `trafficPolicy.connectionPool.http.http2MaxRequests` | Supported (destination-wide active-request breaker; HTTP/1.1 **and** HTTP/2) | Istio's contract is "maximum number of active requests to a destination, applicable to both HTTP1.1 and HTTP2" (Envoy cluster `max_requests`), so Ferrum enforces it as a **destination-wide admission budget**, not as an HTTP/2 stream setting. Lands on the inherited dispatch fallback / explicit per-port override as `http2_max_requests`; `src/backend_active_request_limit.rs` holds one shard-locked counter per stable `(namespace, logical destination, DR policy port, selected subset)` lane. The permit is taken during **backend admission** — the single funnel every HTTP-family upstream attempt passes through before dispatch (reqwest HTTP/1.1, reqwest-negotiated HTTP/2, direct H2, native gRPC, HBONE / mesh-mTLS, Unix sidecar ingress, and the HTTP/3 bridges) — and is released only when the client-visible exchange terminates (buffered completion, streamed EOF, gRPC trailers, client disconnect, backend reset, deadline, task cancellation, shutdown), never at response headers. Because the lane is the **logical destination** (referenced upstream id, or the route id for a direct backend) rather than a socket address, connection count, pool shards, LB endpoint rotation, config reloads, and peer SETTINGS cannot multiply or raise it, and two Services that resolve to the same pods keep independent budgets. Every retry attempt reacquires its own permit, and a sequential retry releases the prior attempt's permit before the next attempt acquires (Ferrum has no request hedging, so there are never two concurrent attempts for one client request). Saturation sheds **before any backend dial** with a backend-neutral `503` (gRPC `UNAVAILABLE`) that never touches passive health, the circuit breaker, or adaptive concurrency, and nothing is queued behind the limiter. A reload applies its current cap to the shared active count: lowering sheds until the count drains below the new value, raising takes effect immediately, removing stops new acquisitions while existing permits drain, and re-adding cannot forget those permits. A lane is evicted the moment its count reaches zero. Top-level and selected-subset values ride `dispatch_port_override_fallback`; explicit `portLevelSettings` entries win per-port; precedence is field-level per-port > selected subset > top-level. Zero/negative values rejected at translate time (K8s and native/file). Observability is fixed-cardinality only: `ferrum_destination_active_requests{,_admitted_total,_rejected_total}`; destination identity stays out of labels and appears only in the bounded shed log line. |
@@ -2145,8 +2146,37 @@ Each `MeshJwtRule` specifies:
 | `from_headers` | Headers to extract the JWT from (with optional prefix stripping) |
 | `from_params` | Query parameters to extract the JWT from |
 | `forward_original_token` | Whether to forward the original token to the backend |
+| `output_claim_to_headers` | Istio `outputClaimToHeaders`: ordered `{header, claim}` list published to the backend-bound request after successful validation |
 
 Each JWT rule resolves token locations independently. Rules with custom `from_headers` or `from_params` check those locations in declaration order; rules without custom locations continue to use the standard `Authorization: Bearer ...` lookup. When `forward_original_token: false`, the backend-bound request strips the matched rule's configured token headers or query parameters (or `Authorization` for standard lookup).
+
+**Claim output headers (`outputClaimToHeaders`)**: each declared header is
+**gateway-owned**. The injected `jwks_auth` plugin removes every declared header
+from the inbound request — case-insensitively, including duplicates —
+**before** validation, so an unauthenticated or invalid request can never forge
+one, and sets it only from the validated token's claim. A claim that is missing,
+null, an object, an array with no usable scalar, blank, or not a legal HTTP
+header value leaves the destination **absent** rather than restoring the client
+value. String, number, boolean, and scalar-array claims are published (arrays
+join with the provider separator). Duplicate destination headers, reserved or
+credential-bearing destinations (`authorization`, `host`, hop-by-hop/framing
+fields, `x-ferrum-*`, `x-forwarded-*`), malformed header names, and malformed
+claim paths are rejected at translation with `FerrumAccepted=False` / `Invalid`
+— a dropped mapping would leave the header unowned and client-forgeable.
+
+**Deferred JWT-rule fields**: `outputPayloadToHeader` and `fromCookies` are
+recognized but not enforced. Both are surfaced in
+`status.ferrum.translation.deferred_fields` by FIELD NAME only — a `fromCookies`
+entry names the cookie a token rides in, so the value is never republished into
+a cluster-readable status object.
+
+**`targetRefs`**: rejected (`FerrumAccepted=False` / `Invalid`). Only
+`AuthorizationPolicy` implements end-to-end `targetRefs` attachment; a
+`RequestAuthentication` carrying only `targetRefs` would read as "no selector"
+and widen to the whole namespace — or the whole mesh in the Istio root
+namespace — installing its JWT provider on workloads that were never in scope.
+Scope it with a workload selector instead. The same refusal applies to
+`Telemetry`, where widening would silently disable access logging mesh-wide.
 
 **`exp` claim requirement**: the injected plugin requires the JWT `exp` claim by default (`FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP=true`), so tokens that omit `exp` are rejected and cannot live forever — this satisfies the gateway's `validate_exp = true` invariant. Some Istio issuers legitimately omit `exp`; set `FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP=false` to accept them. This knob is independent of expiry *validation*: a present-but-expired `exp` is always rejected regardless of the flag.
 
@@ -3218,7 +3248,7 @@ Istio `DestinationRule` resources are translated into Ferrum upstream and proxy 
 
 - **`connectionPool.tcp.connectTimeout`**: mapped to the proxy's `backend_connect_timeout_ms`.
 - **`connectionPool.tcp.idleTimeout`**: mapped to `tcp_idle_timeout_seconds` (bidirectional TCP idle; `0` disables). Distinct from HTTP `connectionPool.http.idleTimeout`. Synthesized mesh L4 relays default per-direction `backend_read_timeout_ms` / `backend_write_timeout_ms` to `0` (disabled) so long-lived TCP is bounded by this idle timeout or `FERRUM_TCP_IDLE_TIMEOUT_SECONDS`.
-- **`outlierDetection`**: translated to Ferrum passive health checks (`unhealthy_threshold` / `unhealthy_window_seconds` / `healthy_after_seconds` / `max_ejection_percent`). Automatic recovery after `baseEjectionTime` is scoped to the ejecting proxy and the **effective** per-port / subset / upstream policy that caused the ejection (deadline stored on the entry; independent cooldowns when two proxies share an endpoint; SD-discovered targets recover the same way as static ones). See [Passive Health Checks](load_balancing.md#passive-health-checks).
+- **`outlierDetection`**: translated to Ferrum passive health checks (`unhealthy_threshold` / `unhealthy_window_seconds` / `healthy_after_seconds` / `max_ejection_percent`), with `consecutive_error_mode` set so `consecutive5xxErrors` is a consecutive streak rather than a windowed count, and with Istio's 10% `maxEjectionPercent` default applied when the resource omits it (issue #4292). `consecutiveGatewayErrors`, `consecutiveLocalOriginFailures`, and `minHealthPercent` are deferred fields. Automatic recovery after `baseEjectionTime` is scoped to the ejecting proxy and the **effective** per-port / subset / upstream policy that caused the ejection (deadline stored on the entry; independent cooldowns when two proxies share an endpoint; SD-discovered targets recover the same way as static ones). See [Passive Health Checks](load_balancing.md#passive-health-checks).
 
 ### Load Balancer
 
@@ -3472,6 +3502,13 @@ The injector webhook failure alert uses the Kubernetes API server metric `apiser
 `MeshTelemetryResource` provides per-scope telemetry configuration, merged by specificity (most specific scope wins per section):
 
 **Scope precedence**: `WorkloadSelector` > `Namespace` > `MeshWide`
+
+**`targetRefs` is rejected** (`FerrumAccepted=False` / `Invalid`, issue #4305).
+Only `AuthorizationPolicy` implements end-to-end `targetRefs` attachment. A
+`Telemetry` carrying only `targetRefs` reads as "no selector" and would widen to
+the whole namespace — or, in the Istio root namespace, to `MeshWide` — so a
+resource meant to disable access logging for one gateway would disable it mesh
+wide. Scope it with a workload selector instead.
 
 Each section (tracing, metrics, access logging) is merged independently. Within the same scope level, later resources win. Deterministic ordering is ensured by namespace/name tie-breaking.
 
@@ -5839,6 +5876,41 @@ http:
   }
 }
 ```
+
+### Header Transforms
+
+Per-route `headers.{request,response}.{set,add,remove}` (Istio
+`http[].headers`) is projected onto every emitted `mesh_route_dispatch` rule as
+`request_transform` / `response_transform`, and the translator auto-attaches the
+consuming transformer instances on the materialized proxy —
+`istio-vs-req-xform-{proxy_id}` (`request_transformer`) and
+`istio-vs-resp-xform-{proxy_id}` (`response_transformer`), each emitted exactly
+once and only when a rule actually carries transforms of that direction. An
+operator-configured `request_transformer` / `response_transformer` on the same
+route wins (no second instance is emitted); route-level rules are applied after
+the last eligible instance's static rules, so a later static rule cannot undo a
+route `remove` or `set`.
+
+- `set` → `update` (insert or replace), `add` → append (comma-joined;
+  newline-joined for `Set-Cookie`), `remove` → delete every value for the key.
+  Rules apply in declaration order, so an `add` after a `remove` reinstates the
+  header with the new value.
+- `headers.request.remove: [x-internal-auth]` strips the CLIENT header before
+  backend dispatch — this is the security-relevant case, and it is why a
+  malformed sibling entry is not silently dropped.
+- Per-destination `http[].route[].headers` is applied for a route with exactly
+  ONE destination, after the route-level block (so the more specific `set`
+  wins). On a weighted multi-destination route it is reported in
+  `status.ferrum.translation.deferred_fields` instead: the split materializes
+  one upstream with weighted targets, so no per-destination rule exists to bind
+  the transform to and applying it would hit every share.
+- Malformed header names, non-string or header-illegal values (CR/LF and other
+  control bytes), unknown fields under `headers` / `headers.{direction}`, and
+  `set`/`add` targeting a framing or hop-by-hop header (`host`,
+  `content-length`, `connection`, `keep-alive`, `proxy-connection`, `te`,
+  `trailer`, `transfer-encoding`, `upgrade`) are rejected at translation with
+  `FerrumAccepted=False` / `Invalid`. Diagnostics name the header and field,
+  never the value. `remove` may name any header.
 
 ### Traffic Mirroring
 

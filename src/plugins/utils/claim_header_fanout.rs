@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use http::header::HeaderName;
+use http::header::{HeaderName, HeaderValue};
 use serde_json::{Map, Value};
 
 use crate::plugins::RequestContext;
@@ -108,6 +108,132 @@ pub fn parse_claim_headers(
         });
     }
     Ok(mappings)
+}
+
+/// Parse the ARRAY form of a claim → header mapping list.
+///
+/// Istio `RequestAuthentication.jwtRules[].outputClaimToHeaders` is an ordered
+/// LIST of `{header, claim}` pairs, not a claim-keyed map: the same claim may
+/// legitimately be published to two different headers. An object shape
+/// (`parse_claim_headers`) cannot express that, so the mesh projection carries
+/// the list shape and this parser resolves it into the same
+/// [`ClaimHeaderMapping`] the object form produces.
+///
+/// Two entries naming the SAME destination header are rejected rather than
+/// resolved by declaration order: both would derive the same metadata key, so
+/// whichever claim happened to resolve last would decide the gateway-asserted
+/// value. A configuration whose meaning depends on that is refused at load.
+pub fn parse_claim_header_list(
+    config: &Map<String, Value>,
+    field: &str,
+    plugin: &str,
+    metadata_prefix: &str,
+) -> Result<Vec<ClaimHeaderMapping>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(Vec::new());
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| format!("{plugin}: '{field}' must be an array, got: {value}"))?;
+    let mut mappings: Vec<ClaimHeaderMapping> = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let object = entry
+            .as_object()
+            .ok_or_else(|| format!("{plugin}: '{field}[{index}]' must be an object"))?;
+        for key in object.keys() {
+            if key != "claim" && key != "header" {
+                return Err(format!(
+                    "{plugin}: '{field}[{index}]' does not support field '{key}'"
+                ));
+            }
+        }
+        let claim_value = object
+            .get("claim")
+            .ok_or_else(|| format!("{plugin}: '{field}[{index}].claim' is required"))?;
+        let claim_path =
+            parse_claim_path_value(&format!("{field}[{index}].claim"), claim_value, plugin)?;
+        let raw_header = object
+            .get("header")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{plugin}: '{field}[{index}].header' must be a string"))?;
+        let header_name = normalize_allowed_header(raw_header, plugin, field)?;
+        if mappings
+            .iter()
+            .any(|mapping| mapping.destination_header == header_name)
+        {
+            return Err(format!(
+                "{plugin}: '{field}' declares header '{header_name}' more than once; \
+                 a destination may be asserted from exactly one claim"
+            ));
+        }
+        mappings.push(ClaimHeaderMapping {
+            metadata_key: format!("{metadata_prefix}{header_name}"),
+            claim_path,
+            destination_header: header_name,
+        });
+    }
+    Ok(mappings)
+}
+
+/// Stage the values for an `outputClaimToHeaders`-style mapping list.
+///
+/// Differs from [`emit_claim_headers_to_attempt`] only in the value
+/// conversion: Istio publishes scalar claims (numbers and booleans, not just
+/// strings) into the output header, so those are rendered rather than dropped.
+/// Everything else stays fail-closed — a missing claim, a null, an object, an
+/// array with no usable scalar, a blank result, or a value that is not a legal
+/// HTTP header value leaves the destination ABSENT, and the destination was
+/// already stripped of any client-supplied value by
+/// [`apply_claim_headers_from_context`].
+pub fn emit_output_claim_headers_to_attempt(
+    attempt: &mut AuthenticationAttempt,
+    claims: &Value,
+    mappings: &[ClaimHeaderMapping],
+    separator: &str,
+) {
+    for mapping in mappings {
+        let Some(value) = output_claim_value_for_header(claims, &mapping.claim_path, separator)
+        else {
+            continue;
+        };
+        attempt.stage_claim_header(mapping.metadata_key.clone(), value);
+    }
+}
+
+/// Render one claim as an output-header value, or `None` when it cannot be
+/// represented safely. Never logs or returns the claim value on refusal.
+fn output_claim_value_for_header(
+    claims: &Value,
+    claim_path: &str,
+    separator: &str,
+) -> Option<String> {
+    let rendered = match resolve_claim_path(claims, claim_path)? {
+        Value::Array(values) => {
+            let parts: Vec<String> = values.iter().filter_map(render_scalar_claim).collect();
+            if parts.is_empty() {
+                return None;
+            }
+            parts.join(separator)
+        }
+        scalar => render_scalar_claim(scalar)?,
+    };
+    if rendered.trim().is_empty() {
+        return None;
+    }
+    // The same complete `HeaderValue` gate the outbound adapters apply, so a
+    // claim carrying CR/LF or other control bytes can never be spliced into
+    // the backend-bound request.
+    HeaderValue::from_str(&rendered).ok()?;
+    Some(rendered)
+}
+
+fn render_scalar_claim(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => (!value.trim().is_empty()).then(|| value.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        Value::Null | Value::Array(_) | Value::Object(_) => None,
+    }
 }
 
 pub fn emit_claim_headers_to_attempt(

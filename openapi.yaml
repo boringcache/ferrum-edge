@@ -12873,6 +12873,16 @@ components:
           description: |
             Reserved for DestinationRule parity. Validated and persisted, but
             not yet applied by passive health at runtime.
+        consecutive_error_mode:
+          type: boolean
+          default: false
+          description: |
+            Evaluate `unhealthy_threshold` against the target's consecutive
+            failure streak instead of the sliding-window failure count. False
+            (default) keeps Ferrum's windowed passive health; true is Istio
+            `outlierDetection.consecutive5xxErrors` semantics, where a single
+            success resets the streak and `unhealthy_window_seconds` is not
+            consulted. Set automatically for translated Istio DestinationRules.
 
     # ── Service Discovery ──────────────────────────────────────────
     ServiceDiscoveryConfig:
@@ -19230,6 +19240,30 @@ components:
               claim_headers_separator:
                 type: string
                 description: Separator for array claim header values
+              output_claim_headers:
+                type: array
+                items:
+                  type: object
+                  required: [header, claim]
+                  additionalProperties: false
+                  properties:
+                    header:
+                      type: string
+                      description: Backend-visible request header the claim is published to
+                    claim:
+                      type: string
+                      description: Dot-path claim to publish
+                description: >-
+                  Istio RequestAuthentication jwtRules[].outputClaimToHeaders
+                  projection. An ordered list rather than a map, because one claim
+                  may be published to several headers. Destinations are
+                  gateway-owned exactly like claim_headers: each is removed from
+                  the client request (case-insensitively) before validation and set
+                  only from a validated claim, so an unauthenticated or invalid
+                  request can never forge one. Duplicate destination headers,
+                  reserved/credential-bearing destinations, and invalid header names
+                  are rejected at config load; a missing, null, object, or
+                  header-illegal claim value leaves the destination absent.
               require_mtls_binding:
                 type: boolean
                 default: false

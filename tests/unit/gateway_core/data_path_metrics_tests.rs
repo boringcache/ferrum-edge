@@ -43,6 +43,7 @@ fn target_fixture(host: &str) -> UpstreamTarget {
 fn passive_fixture() -> PassiveHealthCheck {
     let json = serde_json::json!({"unhealthy_threshold": 1});
     serde_json::from_value(json).expect("passive policy fixture")
+    consecutive_error_mode: false,
 }
 
 /// Every sample line for `metric` in `text`, without the trailing newline.

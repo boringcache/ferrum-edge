@@ -3375,8 +3375,30 @@ fn uri_match_for_listen_path(listen_path: &str) -> Option<Value> {
 /// shape the `request_transformer` / `response_transformer` plugins accept).
 /// `direction` is `"request"` or `"response"`.
 pub(crate) fn vs_route_header_transform_rules(http: &Value, direction: &str) -> Vec<Value> {
-    let Some(headers) = http
-        .get("headers")
+    let mut rules = header_block_transform_rules(http.get("headers"), direction);
+    // Per-destination `http[].route[].headers` (issue #4304). Istio applies it
+    // to the selected destination, which Ferrum's per-route dispatch rule can
+    // reproduce EXACTLY when the route has a single destination. A weighted
+    // split materializes one upstream with weighted targets, so there is no
+    // per-destination rule to hang the transform on — that shape is reported as
+    // a deferred field (`virtual_service_deferred_fields`) instead of being
+    // applied to the wrong share of traffic. Destination rules are appended
+    // after the route-level block so the more specific `set` wins.
+    if let Some(destinations) = http.get("route").and_then(Value::as_array)
+        && destinations.len() == 1
+    {
+        rules.extend(header_block_transform_rules(
+            destinations[0].get("headers"),
+            direction,
+        ));
+    }
+    rules
+}
+
+/// Convert one Istio `headers.{direction}.{set,add,remove}` block into the
+/// canonical transformer rule JSON shape.
+fn header_block_transform_rules(headers: Option<&Value>, direction: &str) -> Vec<Value> {
+    let Some(headers) = headers
         .and_then(Value::as_object)
         .and_then(|h| h.get(direction))
         .and_then(Value::as_object)

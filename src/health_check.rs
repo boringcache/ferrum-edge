@@ -1398,27 +1398,42 @@ impl HealthChecker {
 
             if connection_error || config.unhealthy_status_codes.contains(&status_code) {
                 state.consecutive_successes.store(0, Ordering::Relaxed);
-                state.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+                let consecutive_failures =
+                    state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
 
                 let now_ms = now_epoch_ms();
-                let window_start =
-                    now_ms.saturating_sub(config.unhealthy_window_seconds * 1000);
-                // Per-target mutex: a handful of integer ops. Replaces the
-                // previous DashMap insert + full-window retain + cap-eviction
-                // sort on this path. Concurrent reporters for this same
-                // target serialize here so the in-window count is exact.
-                let failures_in_window = {
+                // Istio `consecutive5xxErrors` semantics (issue #4292): the
+                // threshold is a STREAK, and the success arm below resets it,
+                // so an alternating success/failure pattern never ejects. The
+                // per-target failure ring is not touched in this mode — no
+                // window is consulted, and skipping it also skips the lock.
+                let failures_observed = if config.consecutive_error_mode {
+                    consecutive_failures
+                } else {
+                    let window_start =
+                        now_ms.saturating_sub(config.unhealthy_window_seconds * 1000);
+                    // Per-target mutex: a handful of integer ops. Replaces the
+                    // previous DashMap insert + full-window retain + cap-eviction
+                    // sort on this path. Concurrent reporters for this same
+                    // target serialize here so the in-window count is exact.
                     let mut ring = state.lock_recent_failures();
-                    ring.record(now_ms, window_start)
-                } as u32;
+                    ring.record(now_ms, window_start) as u32
+                };
 
-                if failures_in_window >= config.unhealthy_threshold
+                if failures_observed >= config.unhealthy_threshold
                     && !proxy_state.unhealthy.contains_key(buf.as_str())
                 {
-                    warn!(
-                        "Passive health check: marking target {} as unhealthy for proxy {} ({} failures in {}s window)",
-                        buf.as_str(), proxy_id, failures_in_window, config.unhealthy_window_seconds
-                    );
+                    if config.consecutive_error_mode {
+                        warn!(
+                            "Passive health check: marking target {} as unhealthy for proxy {} ({} consecutive failures)",
+                            buf.as_str(), proxy_id, failures_observed
+                        );
+                    } else {
+                        warn!(
+                            "Passive health check: marking target {} as unhealthy for proxy {} ({} failures in {}s window)",
+                            buf.as_str(), proxy_id, failures_observed, config.unhealthy_window_seconds
+                        );
+                    }
                     // Cold path: threshold breach — allocate key for insert.
                     // Capture the effective policy's recovery deadline on the
                     // entry itself so reloads / other proxies cannot change it.
