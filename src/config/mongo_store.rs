@@ -7489,6 +7489,94 @@ mod inner {
         classify_mongo_change_stream_failure(command_code, authentication_failure)
     }
 
+    /// Canonical `config_changes.operation` values accepted by incremental polling.
+    ///
+    /// Anything else must abort the poll (issue #4286). Mapping unknown strings
+    /// to upsert turned a wrong-typed or empty operation into a create/update.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum MongoConfigChangeOp {
+        Upsert,
+        Delete,
+    }
+
+    impl MongoConfigChangeOp {
+        fn parse(value: &str) -> Result<Self, anyhow::Error> {
+            match value {
+                "upsert" => Ok(Self::Upsert),
+                "delete" => Ok(Self::Delete),
+                _ => anyhow::bail!("MongoDB config_changes row has unsupported operation"),
+            }
+        }
+    }
+
+    /// Typed `config_changes` fields required before the incremental cursor may advance.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct MongoConfigChangeRecord {
+        pub sequence: u64,
+        pub resource_type: String,
+        pub resource_id: String,
+        pub operation: MongoConfigChangeOp,
+    }
+
+    fn mongo_config_change_required_str<'a>(
+        doc: &'a Document,
+        field: &'static str,
+    ) -> Result<&'a str, anyhow::Error> {
+        match doc.get(field) {
+            Some(Bson::String(value)) => Ok(value.as_str()),
+            Some(_) => anyhow::bail!("MongoDB config_changes row has non-string field '{field}'"),
+            None => anyhow::bail!("MongoDB config_changes row is missing field '{field}'"),
+        }
+    }
+
+    /// Decode one `config_changes` document the same way replica-set incremental
+    /// polling does. Typed failures return `Err` so the poller cannot fold the
+    /// sequence into `sequence_cursor` and skip the record forever.
+    ///
+    /// Error text names the field and the expected shape only — never the BSON
+    /// payload — so a malformed document cannot leak resource identifiers into logs.
+    pub(crate) fn decode_mongo_config_change_record(
+        doc: &Document,
+    ) -> Result<MongoConfigChangeRecord, anyhow::Error> {
+        let sequence = match doc.get("sequence") {
+            Some(Bson::Int64(value)) if *value >= 0 => *value as u64,
+            Some(Bson::Int32(value)) if *value >= 0 => *value as u64,
+            _ => anyhow::bail!("MongoDB config_changes row has invalid sequence"),
+        };
+        let resource_type = mongo_config_change_required_str(doc, "resource_type")?;
+        if resource_type.is_empty() {
+            anyhow::bail!("MongoDB config_changes row has empty resource_type");
+        }
+        let resource_id = mongo_config_change_required_str(doc, "resource_id")?;
+        if resource_id.is_empty() {
+            anyhow::bail!("MongoDB config_changes row has empty resource_id");
+        }
+        let operation =
+            MongoConfigChangeOp::parse(mongo_config_change_required_str(doc, "operation")?)?;
+        Ok(MongoConfigChangeRecord {
+            sequence,
+            resource_type: resource_type.to_string(),
+            resource_id: resource_id.to_string(),
+            operation,
+        })
+    }
+
+    fn split_mongo_change_ops(
+        ops: std::collections::HashMap<String, MongoConfigChangeOp>,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut upserts = Vec::new();
+        let mut deletes = Vec::new();
+        for (id, op) in ops {
+            match op {
+                MongoConfigChangeOp::Delete => deletes.push(id),
+                MongoConfigChangeOp::Upsert => upserts.push(id),
+            }
+        }
+        upserts.sort();
+        deletes.sort();
+        (upserts, deletes)
+    }
+
     #[async_trait]
     impl DatabaseBackend for MongoStore {
         async fn health_check(&self) -> Result<(), anyhow::Error> {
@@ -8069,35 +8157,35 @@ mod inner {
             while cursor.advance().await? {
                 change_count += 1;
                 let doc = cursor.deserialize_current()?;
-                let sequence = match doc.get("sequence") {
-                    Some(Bson::Int64(value)) if *value >= 0 => *value as u64,
-                    Some(Bson::Int32(value)) if *value >= 0 => *value as u64,
-                    _ => continue,
-                };
-                sequence_cursor = sequence_cursor.max(sequence);
-                let resource_type = doc.get_str("resource_type").unwrap_or_default();
-                let resource_id = doc.get_str("resource_id").unwrap_or_default().to_string();
-                let operation = doc.get_str("operation").unwrap_or_default().to_string();
-                if resource_id.is_empty() {
-                    continue;
-                }
-                match resource_type {
+                // Fail closed on typed decode (issue #4286). Advancing
+                // `sequence_cursor` before validating fields permanently skipped
+                // malformed records, and `unwrap_or_default` turned a wrong-typed
+                // or empty operation into an upsert. Abort the poll so the
+                // existing full-reload fallback runs, matching SQL `try_get`.
+                let change = decode_mongo_config_change_record(&doc)?;
+                sequence_cursor = sequence_cursor.max(change.sequence);
+                match change.resource_type.as_str() {
                     "proxy" => {
-                        proxy_ops.insert(resource_id, operation);
+                        proxy_ops.insert(change.resource_id, change.operation);
                     }
                     "consumer" => {
-                        consumer_ops.insert(resource_id, operation);
+                        consumer_ops.insert(change.resource_id, change.operation);
                     }
                     "plugin_config" => {
-                        plugin_config_ops.insert(resource_id, operation);
+                        plugin_config_ops.insert(change.resource_id, change.operation);
                     }
                     "upstream" => {
-                        upstream_ops.insert(resource_id, operation);
+                        upstream_ops.insert(change.resource_id, change.operation);
                     }
                     GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE => {
                         gateway_trust_bundle_changed = true;
                     }
-                    _ => {}
+                    other => {
+                        warn!(
+                            "Ignoring config_changes row with unknown resource_type '{}'",
+                            other
+                        );
+                    }
                 }
             }
             self.ensure_change_cursor_available(namespace, after_sequence)
@@ -8129,26 +8217,11 @@ mod inner {
                 ));
             }
 
-            let split_ops =
-                |ops: std::collections::HashMap<String, String>| -> (Vec<String>, Vec<String>) {
-                    let mut upserts = Vec::new();
-                    let mut deletes = Vec::new();
-                    for (id, op) in ops {
-                        if op == "delete" {
-                            deletes.push(id);
-                        } else {
-                            upserts.push(id);
-                        }
-                    }
-                    upserts.sort();
-                    deletes.sort();
-                    (upserts, deletes)
-                };
-            let (proxy_upserts, mut removed_proxy_ids) = split_ops(proxy_ops);
-            let (consumer_upserts, mut removed_consumer_ids) = split_ops(consumer_ops);
+            let (proxy_upserts, mut removed_proxy_ids) = split_mongo_change_ops(proxy_ops);
+            let (consumer_upserts, mut removed_consumer_ids) = split_mongo_change_ops(consumer_ops);
             let (plugin_config_upserts, mut removed_plugin_config_ids) =
-                split_ops(plugin_config_ops);
-            let (upstream_upserts, mut removed_upstream_ids) = split_ops(upstream_ops);
+                split_mongo_change_ops(plugin_config_ops);
+            let (upstream_upserts, mut removed_upstream_ids) = split_mongo_change_ops(upstream_ops);
 
             let mut added_or_modified_proxies = Vec::new();
             for doc in self
@@ -18070,11 +18143,13 @@ pub use inner::{
     MongoReconnectTopology, MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,
     MongoStore,
 };
-// Narrow crate-internal test seams (exposed only through `_test_support`): the
-// timeout-precedence application and the identity reservation rollback/release
-// accounting. Everything else stays module-private in `inner`.
+// Narrow crate-internal test seams (exposed only through `_test_support`):
+// timeout-precedence application, identity reservation rollback/release
+// accounting, and the incremental `config_changes` decoder. Everything else
+// stays module-private in `inner`.
 #[allow(unused_imports)] // The binary target has no `_test_support` consumer.
 pub(crate) use inner::{
-    apply_mongo_timeout_overrides, consumer_identity_adoption_failure_release_values,
+    MongoConfigChangeOp, MongoConfigChangeRecord, apply_mongo_timeout_overrides,
+    consumer_identity_adoption_failure_release_values, decode_mongo_config_change_record,
     ordered_insert_newly_inserted_prefix,
 };

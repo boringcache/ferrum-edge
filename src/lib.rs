@@ -5065,7 +5065,9 @@ pub mod _test_support {
 
     // ── config/mongo_store: Admin write-topology / publication test seams ────
     pub use crate::config::mongo_store::{
-        MongoReconnectTopology, MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,
+        MongoConfigChangeOp, MongoConfigChangeRecord, MongoReconnectTopology,
+        MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,
+        decode_mongo_config_change_record,
     };
 
     /// Lazy Mongo store (no live MongoDB) for topology publication tests.
