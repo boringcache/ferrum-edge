@@ -114,7 +114,7 @@ fn wait_until_idle_cannot_lose_wakeup_between_register_and_recheck() {
 #[test]
 fn wait_until_idle_wakes_a_parked_waiter_after_runner_finishes() {
     let coalescer = Arc::new(RefreshCoalescer::new());
-    let runner = take_runner(&coalescer);
+    let mut runner = take_runner(&coalescer);
     assert!(coalescer.take_pending());
 
     let mut idle = std::pin::pin!(coalescer.wait_until_idle());
@@ -297,7 +297,7 @@ async fn queued_joiners_finish_after_detached_owner_drains() {
 #[tokio::test]
 async fn cancel_with_pending_checked_fallback_lets_next_request_unstrand_joiners() {
     let coalescer = Arc::new(RefreshCoalescer::new());
-    let mut runner = take_runner(&coalescer);
+    let runner = take_runner(&coalescer);
     assert!(coalescer.take_pending());
     assert!(matches!(coalescer.request(), RefreshRole::Joined));
 
