@@ -378,10 +378,11 @@ def publication_gate_job_errors(gateway_yml: str, inventory: dict) -> list[str]:
                 f"{PUBLICATION_GATE_WORKFLOW_PATH} jobs.{PUBLICATION_GATE_JOB} "
                 f"must stay scoped by `{marker}`"
             )
-    if "actions: read" not in body:
+    if "contents: read" not in body or "actions: read" not in body:
         errors.append(
             f"{PUBLICATION_GATE_WORKFLOW_PATH} jobs.{PUBLICATION_GATE_JOB} must "
-            "request least-privilege `actions: read` to read run conclusions"
+            "request the least-privilege pair `contents: read` (checkout) and "
+            "`actions: read` (run conclusions)"
         )
     for argument in (
         "python3 .github/scripts/verify_publication_gate.py --self-test",
@@ -441,10 +442,11 @@ def release_gate_errors(release_yml: str, inventory: dict) -> list[str]:
             f"{RELEASE_WORKFLOW_PATH} jobs.{RELEASE_GATE_JOB} must prove the tag "
             "target is an ancestor of `main` before trusting any evidence"
         )
-    if "actions: read" not in body:
+    if "contents: read" not in body or "actions: read" not in body:
         errors.append(
-            f"{RELEASE_WORKFLOW_PATH} jobs.{RELEASE_GATE_JOB} must keep "
-            "least-privilege `actions: read`"
+            f"{RELEASE_WORKFLOW_PATH} jobs.{RELEASE_GATE_JOB} must keep the "
+            "least-privilege pair `contents: read` (checkout) and "
+            "`actions: read` (run conclusions)"
         )
     # Nothing may re-introduce an independent hard-coded subset next to the
     # inventory-driven gate.
@@ -599,14 +601,33 @@ def resolve_workflow(get, repository: str, entry: dict) -> dict:
     return {"id": identifier}
 
 
-def list_runs(get, repository: str, entry: dict, sha: str, event: str) -> list[dict]:
+def list_runs(
+    get,
+    repository: str,
+    entry: dict,
+    sha: str,
+    event: str,
+    *,
+    page_size: int = PAGE_SIZE,
+    max_pages: int = MAX_PAGES,
+) -> list[dict]:
+    """Return every workflow run for this SHA and event, or fail closed.
+
+    A short page is the only proof that the listing ended. Exhausting
+    `max_pages` on a full page would otherwise let a later failed duplicate
+    go unseen, so truncated evidence never counts as "every matching run
+    succeeded". Non-object `workflow_runs` members are rejected rather than
+    silently dropped. The query is always bound to exact `head_sha` and
+    `event`.
+    """
+
     runs: list[dict] = []
-    for page in range(1, MAX_PAGES + 1):
+    for page in range(1, max_pages + 1):
         query = urllib.parse.urlencode(
             {
                 "head_sha": sha,
                 "event": event,
-                "per_page": PAGE_SIZE,
+                "per_page": page_size,
                 "page": page,
             }
         )
@@ -620,10 +641,19 @@ def list_runs(get, repository: str, entry: dict, sha: str, event: str) -> list[d
         page_runs = payload.get("workflow_runs")
         if not isinstance(page_runs, list):
             raise ApiFailure(f"{path} returned no `workflow_runs` array")
-        runs.extend(run for run in page_runs if isinstance(run, dict))
-        if len(page_runs) < PAGE_SIZE:
-            break
-    return runs
+        for index, run in enumerate(page_runs):
+            if not isinstance(run, dict):
+                raise ApiFailure(
+                    f"{path} workflow_runs[{index}] is not a run object"
+                )
+            runs.append(run)
+        if len(page_runs) < page_size:
+            return runs
+    raise ApiFailure(
+        f"/repos/{repository}/actions/workflows/{entry['workflow_file']}/runs "
+        f"exhausted {max_pages} pages of {page_size} runs without a short page; "
+        "refusing to treat truncated evidence as complete"
+    )
 
 
 def run_identity_errors(
@@ -650,16 +680,17 @@ def run_identity_errors(
         problems.append(f"head_sha {run.get('head_sha')!r} != {sha!r}")
     if run.get("event") != event:
         problems.append(f"event {run.get('event')!r} != {event!r}")
-    head_repository = run.get("head_repository")
-    if isinstance(head_repository, dict):
-        if head_repository.get("full_name") != repository:
-            problems.append(
-                f"head_repository {head_repository.get('full_name')!r} is not "
-                f"{repository!r}"
-            )
-    repo = run.get("repository")
-    if isinstance(repo, dict) and repo.get("full_name") != repository:
-        problems.append(f"repository {repo.get('full_name')!r} is not {repository!r}")
+    # Both identity objects must positively prove they are dictionaries whose
+    # full_name equals this repository. Missing, null, string, list, or other
+    # malformed values are a fork mismatch, not a skip.
+    for field in ("repository", "head_repository"):
+        value = run.get(field)
+        if not isinstance(value, dict):
+            problems.append(f"{field} is missing or malformed")
+            continue
+        full_name = value.get("full_name")
+        if full_name != repository:
+            problems.append(f"{field} {full_name!r} is not {repository!r}")
     branch = run.get("head_branch")
     if event == "push":
         if branch != "main":
@@ -893,10 +924,11 @@ def _run(
     status: str = "completed",
     conclusion: str | None = "success",
     repository: str = "ferrum-edge/ferrum-edge",
+    run_id: int = 1,
 ) -> dict:
     return {
-        "id": 1,
-        "html_url": "https://example.invalid/run/1",
+        "id": run_id,
+        "html_url": f"https://example.invalid/run/{run_id}",
         "workflow_id": workflow_id,
         "path": path,
         "name": name,
@@ -935,9 +967,12 @@ def _transport(runs_by_file: dict[str, list[dict]], *, compare_status: str = "be
         workflow_file = match.group(1)
         if match.group(2) is None:
             return workflows[workflow_file]
-        if "&page=1" not in path:
-            return {"workflow_runs": []}
-        return {"workflow_runs": list(runs_by_file.get(workflow_file, []))}
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+        page = int((query.get("page") or ["1"])[0])
+        per_page = int((query.get("per_page") or [str(PAGE_SIZE)])[0])
+        all_runs = list(runs_by_file.get(workflow_file, []))
+        start = (page - 1) * per_page
+        return {"workflow_runs": all_runs[start : start + per_page]}
 
     return get
 
@@ -1025,7 +1060,7 @@ def self_test() -> list[str]:
     runs["alpha.yml"] = [_run(), _run(conclusion="failure")]
     expect(_enforce(runs) == 1, "a failed duplicate run must block publication")
 
-    # Identity: wrong SHA, event, branch, path, workflow id, name, and fork.
+    # Identity: wrong SHA, event, branch, path, workflow id, and name.
     for label, override in (
         ("wrong sha", {"head_sha": "b" * 40}),
         ("wrong event", {"event": "workflow_dispatch"}),
@@ -1033,11 +1068,143 @@ def self_test() -> list[str]:
         ("wrong path", {"path": ".github/workflows/decoy.yml"}),
         ("wrong workflow id", {"workflow_id": 99}),
         ("display-name-only match", {"name": "Alpha Workflow (mirror)"}),
-        ("fork head repository", {"repository": "attacker/ferrum-edge"}),
     ):
         runs = _complete_runs()
         runs["alpha.yml"] = [_run(**override)]
         expect(_enforce(runs) == 1, f"{label} must block publication")
+
+    # Repository identity must be proven independently on both objects.
+    # Missing or malformed values block exactly like a fork mismatch.
+    _absent = object()
+    for field in ("repository", "head_repository"):
+        for label, value in (
+            ("absent", _absent),
+            ("null", None),
+            ("string", "ferrum-edge/ferrum-edge"),
+            ("list", [{"full_name": "ferrum-edge/ferrum-edge"}]),
+            ("empty object", {}),
+            ("mismatch", {"full_name": "attacker/ferrum-edge"}),
+        ):
+            runs = _complete_runs()
+            run = _run()
+            if value is _absent:
+                del run[field]
+            else:
+                run[field] = value
+            runs["alpha.yml"] = [run]
+            expect(
+                _enforce(runs) == 1,
+                f"{label} {field} must block publication",
+            )
+
+    # Pagination: collect every page, fail closed on a full ceiling page, and
+    # reject malformed listing members. Queries stay bound to exact SHA/event.
+    listing_entry = _fixture_inventory()["required_checks"][0]
+    requested_paths: list[str] = []
+
+    def _paged_get(pages: list[list[object]]):
+        requested_paths.clear()
+
+        def get(path: str) -> object:
+            requested_paths.append(path)
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+            page = int((query.get("page") or ["1"])[0])
+            if page > len(pages):
+                return {"workflow_runs": []}
+            return {"workflow_runs": pages[page - 1]}
+
+        return get
+
+    page_one = [_run(run_id=1), _run(run_id=2)]
+    page_two = [_run(run_id=3)]
+    collected = list_runs(
+        _paged_get([page_one, page_two]),
+        "ferrum-edge/ferrum-edge",
+        listing_entry,
+        _SHA,
+        "push",
+        page_size=2,
+        max_pages=5,
+    )
+    expect(
+        [run["id"] for run in collected] == [1, 2, 3],
+        "ordinary multi-page collection must return every run",
+    )
+    expect(
+        all(
+            f"head_sha={_SHA}" in path and "event=push" in path
+            for path in requested_paths
+        ),
+        "run listing must stay bound to exact head_sha and expected event",
+    )
+
+    extra = _complete_runs()
+    extra["alpha.yml"] = [_run(run_id=index) for index in range(PAGE_SIZE + 1)]
+    expect(
+        _enforce(extra) == 0,
+        "ordinary multi-page exact-SHA success must still publish",
+    )
+    later_failure = _complete_runs()
+    later_failure["alpha.yml"] = [
+        *[_run(run_id=index) for index in range(PAGE_SIZE)],
+        _run(run_id=PAGE_SIZE, conclusion="failure"),
+    ]
+    expect(
+        _enforce(later_failure) == 1,
+        "a failed run beyond the first listing page must block publication",
+    )
+
+    full_pages = [
+        [_run(run_id=page * 2), _run(run_id=page * 2 + 1)] for page in range(3)
+    ]
+    try:
+        list_runs(
+            _paged_get(full_pages),
+            "ferrum-edge/ferrum-edge",
+            listing_entry,
+            _SHA,
+            "push",
+            page_size=2,
+            max_pages=3,
+        )
+        ceiling_blocked = False
+    except ApiFailure:
+        ceiling_blocked = True
+    expect(
+        ceiling_blocked,
+        "a full final allowed listing page must fail closed",
+    )
+
+    for label, member in (
+        ("string", "not-a-run"),
+        ("null", None),
+        ("list", [_run()]),
+        ("integer", 1),
+    ):
+        try:
+            list_runs(
+                _paged_get([[_run(), member]]),
+                "ferrum-edge/ferrum-edge",
+                listing_entry,
+                _SHA,
+                "push",
+                page_size=10,
+                max_pages=5,
+            )
+            malformed_listing = False
+        except ApiFailure:
+            malformed_listing = True
+        expect(
+            malformed_listing,
+            f"a {label} workflow_runs member must fail closed",
+        )
+        runs = _complete_runs()
+        runs["alpha.yml"] = [_run(), member]
+        try:
+            code = _enforce(runs)
+        except ApiFailure:
+            code = 1
+        expect(code == 1, f"a {label} workflow_runs member must block publication")
 
     # Merge-group evidence must come from a merge-queue branch for main.
     runs = _complete_runs()

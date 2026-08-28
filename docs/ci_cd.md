@@ -240,7 +240,8 @@ that run's conclusion `failure`, so `main-publish-gate` refuses and neither
 The two halves are not independent lists. `.github/scripts/verify_publication_gate.py`
 parses the frozen array out of `ci.yml` and proves it is **set-equal** to the
 `ci_main_publish_gate` entries, proves the hosted job exists, is scoped to
-`push` on `refs/heads/main`, holds only `actions: read`, and runs the shared
+`push` on `refs/heads/main`, holds the least-privilege pair `contents: read`
+(checkout) and `actions: read` (run conclusions), and runs the shared
 gate bound to `github.sha`, and proves `release.yml`'s `validate-release-sha`
 runs the same gate over the complete inventory with no hard-coded wait list.
 `.github/scripts/verify_required_ci.py` runs those proofs, plus set-equality
@@ -260,10 +261,10 @@ Blocking in all cases: missing, `queued`, `in_progress`, `waiting`, `failure`,
 `cancelled`, `skipped`, `timed_out`, `stale`, `neutral`, `action_required`,
 `startup_failure`, an unknown conclusion, an unrecognized status, a wrong
 `head_sha`, a wrong `event`, a wrong `head_branch`, a wrong workflow `path` or
-`id`, a run whose `repository` / `head_repository` is not this repository, and a
-tag or commit that is not `main` or an ancestor of it. A display name alone is
-never an identity, and a green aggregate is never accepted as proof of a
-dedicated workflow's success.
+`id`, a run whose `repository` / `head_repository` is missing, malformed, or
+not this repository, and a tag or commit that is not `main` or an ancestor of
+it. A display name alone is never an identity, and a green aggregate is never
+accepted as proof of a dedicated workflow's success.
 
 `push_main` evidence requires `event: push` on `head_branch: main`.
 `merge_group_head` evidence requires `event: merge_group` on a
@@ -295,7 +296,7 @@ head commit on `main` verbatim, so the product SHA carries that run directly.
 ```
 Push tag v* (e.g., v0.2.0)
     └─► Validate tag matches the Cargo.toml package version
-            └─► Validate tag target has successful CI and Coverage runs for the exact SHA
+            └─► Validate tag target has the complete publish-blocking required-check set for the exact SHA
             └─► Four-target native matrix (linux-x86_64 / macos-x86_64 /
                 macos-aarch64 / windows-x86_64) + isolated linux-aarch64 Cross job
                     └─► Push versioned Docker images to Docker Hub and GHCR
