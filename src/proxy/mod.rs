@@ -10724,10 +10724,9 @@ impl ProxyState {
 
     fn spawn_capability_refresh_runner(&self, guard: RefreshRunnerGuard) {
         let state = self.clone();
-        let continuation_state = self.clone();
-        let guard = guard.with_continuation(Arc::new(move |next_guard| {
-            continuation_state.spawn_capability_refresh_runner(next_guard);
-        }));
+        // Detached from the caller future: aborting an admin/DP waiter
+        // cannot cancel the probe. Guard Drop is last-resort only, when
+        // this task itself is cancelled (runtime teardown).
         tokio::spawn(async move {
             state.run_backend_capability_refresh_loop(guard).await;
         });
@@ -10737,19 +10736,20 @@ impl ProxyState {
     /// [`RefreshCoalescer`], preserving the admin endpoint's post-refresh
     /// snapshot contract while collapsing concurrent callers onto one pass.
     ///
-    /// The runner future is executed inline so `Ran` versus `Joined` stays
-    /// tied to this caller. A [`RefreshRunnerGuard`] owns the role: if this
-    /// future is cancelled at an await point, Drop releases `running` (and
-    /// transfers ownership when a coalesced rerun is queued) instead of
-    /// freezing every later refresh for the process lifetime.
+    /// The exclusive drain loop always runs in a detached Tokio task so
+    /// dropping this caller (HTTP disconnect, DP task abort) cannot cancel
+    /// the runner. A caller that won the role spawns that task and then
+    /// joins through [`RefreshCoalescer::wait_until_idle`], returning
+    /// [`BackendCapabilityRefreshOutcome::Ran`]. A coalesced caller waits
+    /// the same way and returns
+    /// [`BackendCapabilityRefreshOutcome::Joined`]. `Ran` versus `Joined`
+    /// stays tied to who acquired the role, not to who happened to still
+    /// be awaiting when the probe finished.
     pub async fn refresh_backend_capabilities_coalesced(&self) -> BackendCapabilityRefreshOutcome {
         match self.backend_capabilities_refresh.request() {
             RefreshRole::Runner(guard) => {
-                let continuation_state = self.clone();
-                let guard = guard.with_continuation(Arc::new(move |next_guard| {
-                    continuation_state.spawn_capability_refresh_runner(next_guard);
-                }));
-                self.run_backend_capability_refresh_loop(guard).await;
+                self.spawn_capability_refresh_runner(guard);
+                self.backend_capabilities_refresh.wait_until_idle().await;
                 BackendCapabilityRefreshOutcome::Ran
             }
             RefreshRole::Joined => {

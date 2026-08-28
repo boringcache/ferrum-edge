@@ -1,12 +1,14 @@
-//! External coverage for `RefreshCoalescer` wakeup ordering and runner RAII.
+//! External coverage for `RefreshCoalescer` wakeup ordering and detached
+//! runner ownership.
 //!
 //! Issues #4262 / #4263: `wait_until_idle` used to load flags before
 //! registering on `Notify`, and `request()` handed out a bare bool with no
 //! owner Drop. Those combine to freeze DP readiness and every later refresh.
+//! Production now always detaches the drain loop so cancelling a caller
+//! cannot cancel the runner; guard Drop is last-resort only.
 
 use ferrum_edge::proxy::backend_capabilities::{
-    RefreshCoalescer, RefreshRole, RefreshRunnerContinuation, RefreshRunnerGuard,
-    install_idle_wait_observe_hook,
+    RefreshCoalescer, RefreshRole, RefreshRunnerGuard, install_idle_wait_observe_hook,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -51,6 +53,32 @@ async fn drain_with_guard(coalescer: Arc<RefreshCoalescer>, mut guard: RefreshRu
             break;
         }
     }
+}
+
+fn spawn_detached_probe(
+    coalescer: Arc<RefreshCoalescer>,
+    mut guard: RefreshRunnerGuard,
+    started: Arc<AtomicBool>,
+    mut release: tokio::sync::watch::Receiver<bool>,
+    drained: Arc<AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if coalescer.take_pending() {
+            drained.fetch_add(1, Ordering::SeqCst);
+            started.store(true, Ordering::Release);
+            let _ = release.wait_for(|released| *released).await;
+        }
+        loop {
+            while coalescer.take_pending() {
+                drained.fetch_add(1, Ordering::SeqCst);
+            }
+            if coalescer.try_finish() {
+                coalescer.signal_idle();
+                guard.disarm();
+                break;
+            }
+        }
+    })
 }
 
 #[test]
@@ -166,51 +194,40 @@ async fn dropping_a_runner_future_lets_a_later_request_reacquire() {
 }
 
 #[tokio::test]
-async fn cancel_with_pending_does_not_orphan_work_or_strand_joiners() {
+async fn aborting_the_caller_does_not_cancel_the_detached_runner() {
     let coalescer = Arc::new(RefreshCoalescer::new());
-    let hold = Arc::new(tokio::sync::Notify::new());
-    let hold_for_runner = Arc::clone(&hold);
-    let runner_coalescer = Arc::clone(&coalescer);
     let started = Arc::new(AtomicBool::new(false));
-    let started_for_runner = Arc::clone(&started);
     let drained = Arc::new(AtomicUsize::new(0));
-    let drained_for_cont = Arc::clone(&drained);
-
-    let continuation_coalescer = Arc::clone(&coalescer);
-    let continuation: RefreshRunnerContinuation = Arc::new(move |next_guard| {
-        let coalescer = Arc::clone(&continuation_coalescer);
-        let drained = Arc::clone(&drained_for_cont);
-        tokio::spawn(async move {
-            let mut guard = next_guard;
-            loop {
-                while coalescer.take_pending() {
-                    drained.fetch_add(1, Ordering::SeqCst);
-                }
-                if coalescer.try_finish() {
-                    coalescer.signal_idle();
-                    guard.disarm();
-                    break;
-                }
-            }
-        });
-    });
-
-    let runner = tokio::spawn(async move {
-        let mut guard = take_runner(&runner_coalescer).with_continuation(continuation);
-        assert!(runner_coalescer.take_pending());
-        started_for_runner.store(true, Ordering::Release);
-        hold_for_runner.notified().await;
-        if runner_coalescer.try_finish() {
-            runner_coalescer.signal_idle();
-            guard.disarm();
-        }
-    });
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let guard = take_runner(&coalescer);
+    let owner = spawn_detached_probe(
+        Arc::clone(&coalescer),
+        guard,
+        Arc::clone(&started),
+        release_rx,
+        Arc::clone(&drained),
+    );
 
     while !started.load(Ordering::Acquire) {
         tokio::task::yield_now().await;
     }
-    assert!(matches!(coalescer.request(), RefreshRole::Joined));
-    assert!(coalescer.has_pending_refresh());
+    assert!(coalescer.runner_is_active());
+
+    let caller = tokio::spawn({
+        let coalescer = Arc::clone(&coalescer);
+        async move {
+            coalescer.wait_until_idle().await;
+        }
+    });
+    caller.abort();
+    assert!(
+        caller.await.unwrap_err().is_cancelled(),
+        "aborting the waiter must not be treated as runner completion"
+    );
+    assert!(
+        coalescer.runner_is_active(),
+        "detached drain loop must survive caller abort"
+    );
 
     let joiner = tokio::spawn({
         let coalescer = Arc::clone(&coalescer);
@@ -219,16 +236,59 @@ async fn cancel_with_pending_does_not_orphan_work_or_strand_joiners() {
         }
     });
 
-    runner.abort();
-    assert!(runner.await.unwrap_err().is_cancelled());
+    release_tx.send(true).expect("release detached probe");
+    owner.await.expect("detached runner");
 
     tokio::time::timeout(std::time::Duration::from_secs(2), joiner)
         .await
-        .expect("joiner stranded after cancel-with-pending")
+        .expect("queued joiner stranded after detached drain")
         .expect("joiner task");
+    assert!(drained.load(Ordering::SeqCst) >= 1);
+    assert!(!coalescer.runner_is_active());
+    assert!(!coalescer.has_pending_refresh());
+}
+
+#[tokio::test]
+async fn queued_joiners_finish_after_detached_owner_drains() {
+    let coalescer = Arc::new(RefreshCoalescer::new());
+    let started = Arc::new(AtomicBool::new(false));
+    let drained = Arc::new(AtomicUsize::new(0));
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let guard = take_runner(&coalescer);
+    let owner = spawn_detached_probe(
+        Arc::clone(&coalescer),
+        guard,
+        Arc::clone(&started),
+        release_rx,
+        Arc::clone(&drained),
+    );
+
+    while !started.load(Ordering::Acquire) {
+        tokio::task::yield_now().await;
+    }
+    assert!(matches!(coalescer.request(), RefreshRole::Joined));
+    assert!(coalescer.has_pending_refresh());
+
+    let mut joiners = Vec::new();
+    for _ in 0..8 {
+        let coalescer = Arc::clone(&coalescer);
+        joiners.push(tokio::spawn(async move {
+            coalescer.wait_until_idle().await;
+        }));
+    }
+
+    release_tx.send(true).expect("release detached probe");
+    owner.await.expect("detached owner");
+
+    for joiner in joiners {
+        tokio::time::timeout(std::time::Duration::from_secs(2), joiner)
+            .await
+            .expect("queued joiner hung")
+            .expect("joiner task");
+    }
     assert!(
-        drained.load(Ordering::SeqCst) >= 1,
-        "queued pending refresh must be drained by continuation ownership"
+        drained.load(Ordering::SeqCst) >= 2,
+        "detached owner must drain the coalesced pending rerun"
     );
     assert!(!coalescer.runner_is_active());
     assert!(!coalescer.has_pending_refresh());
@@ -265,6 +325,72 @@ async fn cancel_with_pending_checked_fallback_lets_next_request_unstrand_joiners
         .await
         .expect("joiner stranded after checked pending cancel")
         .expect("joiner task");
+}
+
+#[test]
+fn last_resort_guard_drop_without_runtime_does_not_spawn() {
+    let coalescer = Arc::new(RefreshCoalescer::new());
+    let runner = take_runner(&coalescer);
+    assert!(matches!(coalescer.request(), RefreshRole::Joined));
+    // No Tokio runtime: Drop must not call `tokio::spawn`.
+    drop(runner);
+    assert!(
+        !coalescer.runner_is_active(),
+        "last-resort Drop must release running"
+    );
+    assert!(
+        coalescer.has_pending_refresh(),
+        "queued pending must survive last-resort Drop"
+    );
+
+    let mut next = take_runner(&coalescer);
+    while coalescer.take_pending() {}
+    assert!(coalescer.try_finish());
+    coalescer.signal_idle();
+    next.disarm();
+    assert!(!coalescer.runner_is_active());
+    assert!(!coalescer.has_pending_refresh());
+}
+
+#[test]
+fn guard_drop_during_runtime_teardown_does_not_recursively_spawn() {
+    let coalescer = Arc::new(RefreshCoalescer::new());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on({
+        let coalescer = Arc::clone(&coalescer);
+        async move {
+            let guard = take_runner(&coalescer);
+            assert!(matches!(coalescer.request(), RefreshRole::Joined));
+            let parked = Arc::new(tokio::sync::Notify::new());
+            let parked_for_task = Arc::clone(&parked);
+            tokio::spawn(async move {
+                let _guard = guard;
+                parked_for_task.notified().await;
+            });
+        }
+    });
+    drop(runtime);
+
+    assert!(
+        !coalescer.runner_is_active(),
+        "runtime teardown must release running without re-arming a runner"
+    );
+    assert!(
+        coalescer.has_pending_refresh(),
+        "queued pending must survive cross-thread teardown Drop"
+    );
+
+    let mut next = take_runner(&coalescer);
+    while coalescer.take_pending() {}
+    assert!(coalescer.try_finish());
+    coalescer.signal_idle();
+    next.disarm();
+    assert!(!coalescer.runner_is_active());
+    assert!(!coalescer.has_pending_refresh());
 }
 
 #[tokio::test]
@@ -337,8 +463,22 @@ fn request_role_is_unambiguous() {
     let coalescer = Arc::new(RefreshCoalescer::new());
     let runner = coalescer.request();
     assert!(runner.is_runner());
-    assert!(matches!(runner, RefreshRole::Runner(_)));
+    assert!(
+        matches!(&runner, RefreshRole::Runner(_)),
+        "match by reference so the live guard is not dropped"
+    );
     let joined = coalescer.request();
     assert!(!joined.is_runner());
     assert!(matches!(joined, RefreshRole::Joined));
+
+    let mut guard = match runner {
+        RefreshRole::Runner(guard) => guard,
+        RefreshRole::Joined => panic!("first request must remain the runner"),
+    };
+    while coalescer.take_pending() {}
+    assert!(coalescer.try_finish());
+    coalescer.signal_idle();
+    guard.disarm();
+    assert!(!coalescer.runner_is_active());
+    assert!(!coalescer.has_pending_refresh());
 }

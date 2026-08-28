@@ -692,12 +692,14 @@ pub enum BackendCapabilityRefreshOutcome {
 /// re-checks `pending` before releasing the runner role, so work queued
 /// mid-finish cannot be orphaned.
 ///
-/// The runner role is RAII: dropping a live [`RefreshRunnerGuard`] restores
-/// a coherent state and wakes idle waiters. If `pending` is set at cancel
-/// time, ownership is transferred to a continuation when one is armed,
-/// otherwise `running` is cleared while `pending` is preserved so the next
-/// [`Self::request`] is guaranteed to acquire and existing joiners cannot
-/// observe idle while work is still queued.
+/// Production ownership is detached: whoever wins [`RefreshRole::Runner`]
+/// must `tokio::spawn` the drain loop and then either return (background
+/// fire-and-forget) or join through [`Self::wait_until_idle`]. Dropping the
+/// HTTP/admin/DP caller future therefore cannot cancel the runner. The
+/// guard is last-resort RAII for when that detached task itself is cancelled
+/// (runtime teardown): `Drop` never spawns, never panics, and restores a
+/// coherent `running`/`pending` pair so a later [`Self::request`] can
+/// acquire. If `pending` is still set, idle waiters are not signalled.
 ///
 /// Invariants:
 ///
@@ -705,11 +707,12 @@ pub enum BackendCapabilityRefreshOutcome {
 ///   coalesced pending rerun.
 /// - If a caller sets `pending` after the running task's last
 ///   `take_pending()` but before the runner releases `running`, the
-///   runner observes the new pending flag in `try_finish()` and either
-///   re-acquires the runner role itself or hands off to a freshly-spawned
-///   task — no silent work loss.
-/// - Cancelling any caller future cannot leave `running=true` without a
-///   live owner.
+///   runner observes the new pending flag in `try_finish()` and
+///   re-acquires the runner role itself — no silent work loss.
+/// - Cancelling a user/admin caller cannot leave `running=true` without a
+///   live owner, because that caller does not own the runner future.
+/// - Guard `Drop` cannot recursively spawn or re-arm across scheduler
+///   threads during runtime teardown.
 #[derive(Debug)]
 pub struct RefreshCoalescer {
     running: AtomicBool,
@@ -722,9 +725,9 @@ pub struct RefreshCoalescer {
 /// releases that role.
 #[must_use = "RefreshRole::Runner owns the refresh loop; dropping it releases the role"]
 pub enum RefreshRole {
-    /// This caller acquired exclusive runner ownership and must drive the
-    /// refresh loop (or hold the guard for a spawned owner) until finish
-    /// or cancellation.
+    /// This caller acquired exclusive runner ownership and must spawn the
+    /// detached drain loop (then join via [`RefreshCoalescer::wait_until_idle`]
+    /// if the caller needs to observe completion).
     Runner(RefreshRunnerGuard),
     /// A runner is already in flight; this request is queued as the single
     /// coalesced pending rerun.
@@ -746,23 +749,16 @@ impl RefreshRole {
     }
 }
 
-/// Callback invoked synchronously from [`RefreshRunnerGuard`] Drop when a
-/// cancelled owner still has coalesced work. The callback must take the
-/// replacement guard and continue draining — typically by spawning the
-/// refresh loop. It must not await inline.
-pub type RefreshRunnerContinuation = Arc<dyn Fn(RefreshRunnerGuard) + Send + Sync>;
-
 /// RAII owner of the coalescer's exclusive runner role.
 ///
-/// `Drop` restores coalescer state: idle waiters are signalled when no
-/// pending rerun remains, and a pending rerun is either transferred to a
-/// [`RefreshRunnerContinuation`] or left in the checked
-/// `running=false, pending=true` transition that the next `request()` is
-/// guaranteed to acquire.
+/// Production runners live in a detached Tokio task, so user/admin
+/// cancellation does not drop this guard. `Drop` is the last-resort
+/// coherent release when that task is cancelled or the runtime is
+/// torn down: it never calls `tokio::spawn`, never re-arms a
+/// continuation, and cannot panic for lack of a runtime context.
 pub struct RefreshRunnerGuard {
     coalescer: Arc<RefreshCoalescer>,
     active: bool,
-    continuation: Option<RefreshRunnerContinuation>,
 }
 
 impl fmt::Debug for RefreshRunnerGuard {
@@ -780,37 +776,13 @@ impl RefreshRunnerGuard {
         Self {
             coalescer,
             active: true,
-            continuation: None,
         }
-    }
-
-    /// Arm a continuation that receives ownership if this guard is dropped
-    /// while a coalesced rerun is still queued (or is re-acquired during
-    /// cancel). The continuation is invoked synchronously from `Drop`.
-    pub fn with_continuation(mut self, continuation: RefreshRunnerContinuation) -> Self {
-        self.continuation = Some(continuation);
-        self
     }
 
     /// Mark this guard as no longer owning the runner role. Call after a
     /// successful [`RefreshCoalescer::try_finish`] that released `running`.
     pub fn disarm(&mut self) {
         self.active = false;
-    }
-
-    fn transfer_or_checked_release(&mut self) {
-        if let Some(continuation) = self.continuation.take() {
-            CANCEL_RELEASE_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
-            let _depth = CancelReleaseDepthGuard;
-            let mut next = Self::new(Arc::clone(&self.coalescer));
-            next.continuation = Some(Arc::clone(&continuation));
-            continuation(next);
-            return;
-        }
-        // Checked fallback: the next `request()` observes `running=false`
-        // via AcqRel and becomes the owner. `pending` stays set so
-        // `wait_until_idle` cannot return while work is still queued.
-        self.coalescer.running.store(false, Ordering::Release);
     }
 }
 
@@ -821,45 +793,21 @@ impl Drop for RefreshRunnerGuard {
         }
         self.active = false;
         tracing::debug!("backend capability refresh runner cancelled");
-
-        if CANCEL_RELEASE_DEPTH.with(|depth| depth.get() > 0) {
-            // Nested Drop from a continuation that failed to take ownership
-            // (for example tokio::spawn dropping the future immediately
-            // during runtime shutdown). Do not recurse.
-            self.coalescer.running.store(false, Ordering::Release);
-            if !self.coalescer.pending.load(Ordering::Acquire) {
-                self.coalescer.signal_idle();
-            }
-            return;
-        }
-
+        // Last-resort release only. `try_finish` is sync on the owner task
+        // and cannot be cancelled mid-function, so a live guard here still
+        // uniquely owns `running`. Store `Release` so a later `request()`
+        // can acquire. Leave `pending` set (and do not signal idle) when a
+        // coalesced rerun is queued so joiners cannot observe a false idle.
+        self.coalescer.running.store(false, Ordering::Release);
         if !self.coalescer.pending.load(Ordering::Acquire) {
-            if self.coalescer.try_finish() {
-                self.coalescer.signal_idle();
-                return;
-            }
-            // `try_finish` re-acquired because `pending` flipped during
-            // the finish window. Transfer that ownership rather than
-            // dropping it on the floor.
+            self.coalescer.signal_idle();
         }
-        // `running` is still true here (either never released, or
-        // re-acquired). Transfer or leave the checked pending state.
-        self.transfer_or_checked_release();
     }
 }
 
 thread_local! {
-    static CANCEL_RELEASE_DEPTH: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     static AFTER_IDLE_WAIT_REGISTERED: RefCell<Option<Arc<dyn Fn() + 'static>>> =
         const { RefCell::new(None) };
-}
-
-struct CancelReleaseDepthGuard;
-
-impl Drop for CancelReleaseDepthGuard {
-    fn drop(&mut self) {
-        CANCEL_RELEASE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
-    }
 }
 
 fn observe_idle_wait_registered() {
@@ -933,10 +881,10 @@ impl RefreshCoalescer {
     ///
     /// Guarantees no orphaned `pending` flag: every path leaves either
     /// `running=false, pending=false` (truly idle), or `running=true` with
-    /// *some* task (this one or a freshly-spawned one) responsible for
-    /// draining. `running` is stored `Release` so idle waiters' `Acquire`
-    /// loads observe the release; the re-acquire `swap` is `AcqRel` to
-    /// pair with a concurrent `request()`.
+    /// this detached runner still responsible for draining. `running` is
+    /// stored `Release` so idle waiters' `Acquire` loads observe the
+    /// release; the re-acquire `swap` is `AcqRel` to pair with a concurrent
+    /// `request()`.
     pub fn try_finish(&self) -> bool {
         // Release the runner role. Any concurrent `request()` from here
         // onward sees `running=false` and becomes a fresh runner, so the
@@ -984,8 +932,8 @@ impl RefreshCoalescer {
     /// makes an idle transition in that window wake this waiter instead of
     /// stranding it. Those `Acquire` loads pair with runner acquisition
     /// (`AcqRel` swap), pending take (`AcqRel`), finish (`Release` then
-    /// optional `AcqRel` re-acquire), and cancellation (`Release` /
-    /// `AcqRel` on the same flags).
+    /// optional `AcqRel` re-acquire), and last-resort guard Drop
+    /// (`Release` on `running`).
     pub async fn wait_until_idle(&self) {
         loop {
             let notified = self.idle_notify.notified();
@@ -1545,10 +1493,19 @@ mod tests {
     #[test]
     fn refresh_coalescer_first_request_becomes_runner() {
         let coalescer = Arc::new(RefreshCoalescer::new());
+        let runner = coalescer.request();
         assert!(
-            coalescer.request().is_runner(),
+            runner.is_runner(),
             "first request should transition to runner role"
         );
+        let mut guard = match runner {
+            RefreshRole::Runner(guard) => guard,
+            RefreshRole::Joined => panic!("first request should be runner"),
+        };
+        assert!(coalescer.take_pending());
+        assert!(coalescer.try_finish());
+        coalescer.signal_idle();
+        guard.disarm();
     }
 
     #[test]
@@ -1591,7 +1548,16 @@ mod tests {
         runner.disarm();
 
         // After finish, a new request becomes a fresh runner.
-        assert!(coalescer.request().is_runner());
+        let next = coalescer.request();
+        assert!(next.is_runner());
+        let mut next = match next {
+            RefreshRole::Runner(guard) => guard,
+            RefreshRole::Joined => panic!("after try_finish, next request is runner"),
+        };
+        assert!(coalescer.take_pending());
+        assert!(coalescer.try_finish());
+        coalescer.signal_idle();
+        next.disarm();
     }
 
     #[test]
@@ -1645,10 +1611,19 @@ mod tests {
         assert!(coalescer.try_finish(), "idle try_finish exits cleanly");
         runner.disarm();
         // A fresh request is now a new runner (running is released).
+        let next = coalescer.request();
         assert!(
-            coalescer.request().is_runner(),
+            next.is_runner(),
             "after try_finish, next request is runner"
         );
+        let mut next = match next {
+            RefreshRole::Runner(guard) => guard,
+            RefreshRole::Joined => panic!("after try_finish, next request is runner"),
+        };
+        assert!(coalescer.take_pending());
+        assert!(coalescer.try_finish());
+        coalescer.signal_idle();
+        next.disarm();
     }
 
     /// Stress test: race many `request()` calls against runner loops using
