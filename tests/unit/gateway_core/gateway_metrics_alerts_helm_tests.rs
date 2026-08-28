@@ -56,7 +56,7 @@ fn prometheusrule_datapath_group_uses_always_available_families() {
         "chart must ship a mode-independent data-path alert group"
     );
     for needle in [
-        "ferrum_overload_shedding_active",
+        "max by (action, namespace) (ferrum_overload_shedding_active)",
         "ferrum_upstream_targets > 0",
         "ferrum_upstream_unhealthy_targets / ferrum_upstream_targets",
         "ferrum_circuit_breakers{state=\"open\"}",

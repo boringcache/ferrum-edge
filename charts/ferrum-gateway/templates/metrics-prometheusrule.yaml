@@ -6,7 +6,7 @@ metadata:
   name: {{ include "ferrum-gateway.suffixedName" (dict "base" (include "ferrum-gateway.fullname" .) "suffix" "-alerts") }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "ferrum-gateway.labels" | nindent 4 }}
+    {{- include "ferrum-gateway.labels" . | nindent 4 }}
     app.kubernetes.io/component: gateway-metrics
     prometheus: ferrum-gateway
 spec:
@@ -32,7 +32,7 @@ spec:
     - name: ferrum.gateway.datapath
       rules:
         - alert: FerrumGatewayOverloadSheddingActive
-          expr: max(ferrum_overload_shedding_active) == 1
+          expr: max by (action, namespace) (ferrum_overload_shedding_active) == 1
           for: 5m
           labels:
             severity: warning
