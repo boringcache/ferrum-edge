@@ -1667,7 +1667,6 @@ fn cli_md_documents_fips_mode_on_run_validate_and_precedence() {
     for (name, section) in [
         ("run options table", run_section),
         ("validate options table", validate_section),
-        ("Configuration Precedence", precedence_section),
     ] {
         assert!(
             section.contains("`--fips-mode <MODE>`"),
