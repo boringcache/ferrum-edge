@@ -7,6 +7,7 @@ mod client_trust_retirement_bounds_tests;
 mod client_trust_stream_setup_tests;
 mod client_trust_tests;
 pub(crate) use client_trust_tests::isolated_registry;
+mod crl_policy_tests;
 mod fips_key_admission_tests;
 mod fips_policy_tests;
 mod frontend_trust_binding_tests;

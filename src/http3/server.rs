@@ -362,7 +362,8 @@ pub struct Http3ListenerOptions {
     /// Loaded CRLs for client certificate revocation checking. When non-empty
     /// and `client_ca_bundle_path` is set, the H3 mTLS verifier checks revocation
     /// with the same policy as H1/H2/DTLS frontend mTLS:
-    /// `allow_unknown_revocation_status` + `only_check_end_entity_revocation`.
+    /// the shared `tls::crl_policy` (full-chain revocation, enforced CRL
+    /// validity windows, retained unknown-status tolerance).
     pub client_crls: CrlList,
     pub started_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// Optional opt-in frontend TLS live-reload inputs. When `Some`, the H3

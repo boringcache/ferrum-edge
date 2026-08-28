@@ -1001,12 +1001,8 @@ pub fn build_frontend_dtls_config(
             let root_store = loaded.roots;
             let mut verifier_builder =
                 rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
-            if !crls.is_empty() {
-                verifier_builder = verifier_builder
-                    .with_crls(crls.iter().cloned())
-                    .allow_unknown_revocation_status()
-                    .only_check_end_entity_revocation();
-            }
+            verifier_builder =
+                crate::tls::crl_policy::apply_client_crl_policy(verifier_builder, crls);
             let verifier = verifier_builder
                 .build()
                 .map_err(|e| anyhow::anyhow!("Failed to build DTLS client verifier: {}", e))?;

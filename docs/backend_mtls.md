@@ -355,6 +355,31 @@ cargo test test_backend_mtls_global_config -- --nocapture
 3. **Certificate Rotation**: Keep `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` so backend cert/key/CA/CRL source changes are validated, backend CRLs are refreshed, HTTP-family backend pools are cleared, and active health checks restart with the rotated material.
 4. **Monitoring**: Monitor certificate expiration and renewal.
 
+### Backend CRL Policy
+
+`FERRUM_TLS_CRL_FILE_PATH` / `_SOURCE` is the same gateway-wide CRL source the
+frontend uses, and backend server verification applies the same shared policy.
+The full contract, including the admission table and boundary semantics, is in
+[frontend_tls.md → CRL Policy](frontend_tls.md#crl-policy). What matters
+outbound:
+
+- **Every certificate in the backend chain is checked, not just the leaf.** A
+  backend server whose issuing intermediate has been revoked by its own issuer
+  is refused, even when the leaf itself is not listed.
+- **A chain no configured CRL covers is still accepted.** Configuring a private
+  CRL does not turn every public-CA backend into a failure.
+- **An expired CRL is an error, not a fallback.** Once a loaded CRL passes its
+  `nextUpdate`, new backend connections that would be policed by it fail. In-flight
+  requests on already-established connections are unaffected; the refusal applies
+  to new handshakes. Refresh the CRL ahead of its own `nextUpdate`.
+- **A candidate CRL outside its validity window is refused whole.** Startup
+  fails; a live reload keeps the previously accepted CRL slot, backend pools, and
+  health checks exactly as they were, and logs a redacted warning.
+- The same policy covers the rustls logging sinks (`tcp_logging` TLS,
+  `ws_logging` wss, `udp_logging` DTLS) and `ldap_auth` over `ldaps://` /
+  StartTLS. `kafka_logging` maps the source to librdkafka's `ssl.crl.location`
+  instead, and reqwest-based plugin egress does not apply CRLs at all.
+
 ### Operational Contract for Backend TLS Sources
 
 Ferrum Edge loads backend TLS material from the configured sources and can refresh the HTTP-family backend pools when watched source bytes change:

@@ -27,9 +27,8 @@
 //! - No CA configured → webpki/system roots as default fallback
 //! - `FERRUM_TLS_NO_VERIFY` → skip server certificate verification
 //! - CRL list (`FERRUM_TLS_CRL_FILE_PATH`) is applied via `WebPkiServerVerifier`
-//!   with `allow_unknown_revocation_status() + only_check_end_entity_revocation()`,
-//!   so revoked log-sink certificates are rejected. Matches the proxy backend /
-//!   DTLS / frontend mTLS surfaces.
+//!   under the shared `tls::crl_policy`, so revoked log-sink certificates are
+//!   rejected. Matches the proxy backend / DTLS / frontend mTLS surfaces.
 
 use async_trait::async_trait;
 use futures_util::SinkExt;
@@ -923,8 +922,8 @@ fn build_tls_connector(
             .with_root_certificates(root_store)
             .with_no_client_auth()
     } else {
-        // Apply gateway CRL list via `build_server_verifier_with_crls` (uses
-        // `allow_unknown_revocation_status() + only_check_end_entity_revocation()`).
+        // Apply gateway CRL list via `build_server_verifier_with_crls`, which
+        // applies the shared `tls::crl_policy`.
         let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
             .map_err(|e| format!("ws_logging: failed to build TLS verifier: {e}"))?;
         rustls::ClientConfig::builder()
