@@ -3124,7 +3124,7 @@ async fn sensitive_query_map_fallback_strips_without_form_encoder_rewrite() {
         "map fallback must still strip sensitive names: {request_line}"
     );
     assert!(
-        ctx.query_params.get("access_token").is_some(),
+        ctx.query_params.contains_key("access_token"),
         "primary query_params must remain unchanged"
     );
 }
