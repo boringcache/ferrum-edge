@@ -217,10 +217,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FERRUM_DNS_MAX_CONCURRENT_REFRESHES`, resolves them concurrently through
   the shared stale-while-revalidate semaphore and dedup map, bounds each
   lookup at 15 seconds, observes shutdown with RAII permit/dedup cleanup, and
-  publishes generation-safely so a stale result cannot overwrite a newer row
-  or resurrect an evicted hostname. Capacity eviction runs on its own 5s
-  delayed cadence. **Operator action**: none; the existing concurrency env
-  var now also caps proactive refresh per cycle.
+  publishes generation-safely (stale-while-revalidate and proactive refresh
+  share one success-generation check) so a stale in-flight result cannot
+  overwrite a newer row or resurrect an evicted hostname. Capacity eviction
+  runs on its own 5s delayed cadence. **Operator action**: none; the existing
+  concurrency env var now also caps proactive refresh per cycle.
 
 - **Security — client-asserted `X-Real-IP` no longer reaches mirror or
   load-test targets** (issue #4164). The primary backend builders drop an

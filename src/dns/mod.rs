@@ -536,14 +536,15 @@ struct FailedRetryCandidate {
     generation: FailedRetryGeneration,
 }
 
-/// Generation token for a success-cache row selected for proactive refresh.
+/// Generation token for a success-cache row selected for background refresh
+/// (stale-while-revalidate or proactive near-expiry).
 ///
 /// `next_start` is replaced on every successful publish, so pointer equality
 /// detects a newer foreground / SWR / competing refresh winner. `resolved_at`
 /// is a second check so a recycled row cannot be mistaken for the same
 /// generation. Vacant (evicted) keys never match.
 #[derive(Clone, Debug)]
-struct ProactiveRefreshGeneration {
+struct SuccessRefreshGeneration {
     next_start: Arc<AtomicU64>,
     resolved_at: Instant,
 }
@@ -553,7 +554,7 @@ struct ProactiveRefreshGeneration {
 struct ProactiveRefreshCandidate {
     hostname: String,
     per_proxy_ttl: Option<u64>,
-    generation: ProactiveRefreshGeneration,
+    generation: SuccessRefreshGeneration,
     expires_at: Instant,
 }
 
@@ -585,9 +586,7 @@ enum RefreshStart {
 pub type ProactiveResolveOutput =
     Result<(Vec<IpAddr>, Option<CachedRecordType>, Duration), anyhow::Error>;
 type ProactiveResolveHook = Arc<
-    dyn Fn(String) -> Pin<Box<dyn Future<Output = ProactiveResolveOutput> + Send>>
-        + Send
-        + Sync,
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = ProactiveResolveOutput> + Send>> + Send + Sync,
 >;
 
 /// Asynchronous DNS resolver with in-memory caching, stale-while-revalidate,
@@ -637,9 +636,10 @@ pub struct DnsCache {
     /// hostnames selected (and resolved concurrently) per proactive cycle,
     /// and the number of failed hostnames selected per retry cycle.
     max_concurrent_refreshes: usize,
-    /// Test-only replacement for hickory during proactive refresh. Production
-    /// stays `None` and is never consulted on the request hot path.
-    proactive_resolve_hook: Option<ProactiveResolveHook>,
+    /// Test-only replacement for hickory during SWR and proactive background
+    /// refresh. Production stays `None` and is never consulted on the request
+    /// hot path (foreground `timed_resolve` does not read this field).
+    refresh_resolve_hook: Option<ProactiveResolveHook>,
 }
 
 impl DnsCache {
@@ -663,7 +663,7 @@ impl DnsCache {
     /// Cadence for proactive near-expiry refresh *and* independent
     /// `evict_expired` / `max_cache_size` enforcement. Both loops use
     /// `MissedTickBehavior::Delay` so a slow cycle cannot burst catch-up ticks.
-    const BACKGROUND_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
+    pub const BACKGROUND_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 
     /// Wall-clock bound for one proactive background-refresh resolution.
     ///
@@ -739,7 +739,7 @@ impl DnsCache {
             failed_retry_interval: Duration::from_secs(config.failed_retry_interval_seconds)
                 .min(Self::MAX_TTL),
             max_concurrent_refreshes: config.max_concurrent_refreshes.max(1),
-            proactive_resolve_hook: None,
+            refresh_resolve_hook: None,
         }
     }
 
@@ -935,11 +935,12 @@ impl DnsCache {
         per_proxy_ttl: Option<u64>,
         consume_for_caller: bool,
     ) -> Result<ResolvedAddresses, anyhow::Error> {
-        // This is the success insertion path for foreground resolves and
-        // stale-while-revalidate refreshes. Proactive background refresh and
-        // failed-retry recovery publish through generation-guarded helpers so
-        // a stale in-flight result cannot overwrite a newer winner. Cache
-        // reads intentionally trust entries accepted here.
+        // This is the success insertion path for foreground resolves (including
+        // vacant inserts). Stale-while-revalidate and proactive background
+        // refresh publish through [`Self::apply_refresh_success`] so a stale
+        // in-flight result cannot overwrite a newer winner or resurrect an
+        // evicted hostname. Failed-retry recovery uses its own error-generation
+        // helper. Cache reads intentionally trust entries accepted here.
         //
         // Clamp native TTL so unbounded record TTLs cannot overflow
         // `Instant + Duration` / `Duration * u32` arithmetic later.
@@ -1109,15 +1110,19 @@ impl DnsCache {
                     // Refresh publishes shared data; scheduling uses the
                     // shortest observed per-proxy (including this caller) so
                     // short-TTL peers keep getting updates.
-                    let refresh_ttl =
-                        per_proxy_ttl.or_else(|| entry.load_shortest_per_proxy_ttl());
+                    let refresh_ttl = per_proxy_ttl.or_else(|| entry.load_shortest_per_proxy_ttl());
+                    // Capture the served generation before spawning. Foreground
+                    // synchronous resolves are not serialized by `refreshing`,
+                    // so a later winner must be able to reject this result.
+                    let generation = SuccessRefreshGeneration {
+                        next_start: entry.next_start.clone(),
+                        resolved_at: entry.resolved_at,
+                    };
                     match self.try_begin_refresh(host.clone()) {
                         RefreshStart::Started(guard) => {
                             let cache = self.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = cache.refresh_entry(&host, refresh_ttl).await {
-                                    warn!("DNS stale refresh failed for {}: {}", host, e);
-                                }
+                                cache.refresh_entry(&host, refresh_ttl, generation).await;
                                 drop(guard);
                             });
                             debug!(
@@ -1349,31 +1354,54 @@ impl DnsCache {
         Ok(addresses)
     }
 
-    /// Refresh a single cache entry in the background.
+    /// Refresh a single stale-while-revalidate cache entry in the background.
+    ///
+    /// Publication is generation-safe: a newer foreground/proactive winner or
+    /// an eviction that removed the key causes this result to be abandoned.
+    /// The DashMap guard is not held across the resolve `.await`.
     async fn refresh_entry(
         &self,
         hostname: &str,
         per_proxy_ttl: Option<u64>,
-    ) -> Result<(), anyhow::Error> {
-        let (addrs, record_type, native_ttl) = self.timed_resolve(hostname).await?;
-        if addrs.is_empty() {
-            anyhow::bail!("DNS refresh returned no addresses for {}", hostname);
+        generation: SuccessRefreshGeneration,
+    ) {
+        match self.refresh_resolve(hostname).await {
+            Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
+                match self.apply_refresh_success(
+                    hostname,
+                    &generation,
+                    addrs,
+                    record_type,
+                    native_ttl,
+                    per_proxy_ttl,
+                ) {
+                    Ok(true) => {
+                        debug!(
+                            "DNS background refresh: {} refreshed (native_ttl={:?}, per_proxy_ttl={:?})",
+                            hostname, native_ttl, per_proxy_ttl
+                        );
+                    }
+                    Ok(false) => {
+                        debug!(
+                            "DNS stale refresh: abandoning stale success for '{}' (cache generation changed during resolve)",
+                            hostname
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "DNS stale refresh: '{}' resolved but denied by IP policy: {}",
+                            hostname, e
+                        );
+                    }
+                }
+            }
+            Ok(_) => {
+                warn!("DNS stale refresh: {} returned no addresses", hostname);
+            }
+            Err(e) => {
+                warn!("DNS stale refresh failed for {}: {}", hostname, e);
+            }
         }
-
-        self.cache_success_entry(
-            hostname,
-            addrs,
-            record_type,
-            native_ttl,
-            per_proxy_ttl,
-            false,
-        )?;
-
-        debug!(
-            "DNS background refresh: {} refreshed (native_ttl={:?}, per_proxy_ttl={:?})",
-            hostname, native_ttl, per_proxy_ttl
-        );
-        Ok(())
     }
 
     /// Cache a DNS error to prevent hammering DNS for known-bad hostnames.
@@ -1812,8 +1840,9 @@ impl DnsCache {
         );
     }
 
-    /// Replace proactive resolution with a deterministic future. Production
-    /// caches never install a hook; the request hot path never reads this field.
+    /// Replace SWR and proactive background resolution with a deterministic
+    /// future. Production caches never install a hook; foreground
+    /// `timed_resolve` never reads this field.
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn test_install_proactive_resolve_hook<F, Fut>(&mut self, hook: F)
@@ -1821,7 +1850,7 @@ impl DnsCache {
         F: Fn(String) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ProactiveResolveOutput> + Send + 'static,
     {
-        self.proactive_resolve_hook =
+        self.refresh_resolve_hook =
             Some(Arc::new(move |hostname: String| Box::pin(hook(hostname))));
     }
 
@@ -2388,13 +2417,13 @@ impl DnsCache {
         }
     }
 
-    /// Whether `entry` is still the success generation selected for proactive
+    /// Whether `entry` is still the success generation selected for background
     /// refresh. Pointer equality on `next_start` detects a newer publisher;
     /// `resolved_at` rejects a recycled row. Error rows belong to the
     /// failed-retry task and never match.
-    fn matches_proactive_refresh_generation(
+    fn matches_success_refresh_generation(
         entry: &DnsCacheEntry,
-        generation: &ProactiveRefreshGeneration,
+        generation: &SuccessRefreshGeneration,
     ) -> bool {
         !entry.is_error
             && Arc::ptr_eq(&entry.next_start, &generation.next_start)
@@ -2423,7 +2452,7 @@ impl DnsCache {
                 candidates.push(ProactiveRefreshCandidate {
                     hostname: entry.key().clone(),
                     per_proxy_ttl: entry.load_shortest_per_proxy_ttl(),
-                    generation: ProactiveRefreshGeneration {
+                    generation: SuccessRefreshGeneration {
                         next_start: entry.next_start.clone(),
                         resolved_at: entry.resolved_at,
                     },
@@ -2437,18 +2466,19 @@ impl DnsCache {
         candidates
     }
 
-    /// Publish a proactive refresh success only if the selected generation is
-    /// still live. IP-policy validation runs before any map mutation. Vacant
-    /// keys are not resurrected. The DashMap entry guard is never held across
+    /// Publish a background-refresh success only if the selected generation is
+    /// still live. Used by stale-while-revalidate and proactive near-expiry
+    /// refresh. IP-policy validation runs before any map mutation. Vacant keys
+    /// are not resurrected. The DashMap entry guard is never held across
     /// await — callers resolve DNS before invoking this.
     ///
     /// Returns `Ok(true)` when published, `Ok(false)` when the generation
     /// changed or the key was removed, and `Err` when addresses are denied by
     /// IP policy (nothing is written).
-    fn apply_proactive_refresh_success(
+    fn apply_refresh_success(
         &self,
         hostname: &str,
-        generation: &ProactiveRefreshGeneration,
+        generation: &SuccessRefreshGeneration,
         addresses: Vec<IpAddr>,
         record_type: Option<CachedRecordType>,
         native_ttl: Duration,
@@ -2464,7 +2494,7 @@ impl DnsCache {
 
         match self.cache.entry(cache_key.into_owned()) {
             Entry::Occupied(mut occupied) => {
-                if !Self::matches_proactive_refresh_generation(occupied.get(), generation) {
+                if !Self::matches_success_refresh_generation(occupied.get(), generation) {
                     return Ok(false);
                 }
                 occupied.get().note_per_proxy_ttl(per_proxy_ttl);
@@ -2517,8 +2547,11 @@ impl DnsCache {
         }
     }
 
-    async fn proactive_resolve(&self, hostname: &str) -> ProactiveResolveOutput {
-        if let Some(hook) = self.proactive_resolve_hook.as_ref() {
+    /// Resolve for SWR or proactive background refresh. The test hook is
+    /// consulted only here — never on the foreground `timed_resolve` path —
+    /// so a hanging SWR/proactive future cannot stall a synchronous lookup.
+    async fn refresh_resolve(&self, hostname: &str) -> ProactiveResolveOutput {
+        if let Some(hook) = self.refresh_resolve_hook.as_ref() {
             return hook(hostname.to_string()).await;
         }
         self.timed_resolve(hostname).await
@@ -2529,12 +2562,12 @@ impl DnsCache {
         let per_proxy_ttl = candidate.per_proxy_ttl;
         match tokio::time::timeout(
             Self::PROACTIVE_REFRESH_RESOLVE_TIMEOUT,
-            self.proactive_resolve(hostname),
+            self.refresh_resolve(hostname),
         )
         .await
         {
             Ok(Ok((addrs, record_type, native_ttl))) if !addrs.is_empty() => {
-                match self.apply_proactive_refresh_success(
+                match self.apply_refresh_success(
                     hostname,
                     &candidate.generation,
                     addrs,
@@ -2646,6 +2679,9 @@ impl DnsCache {
     /// 5s `Delay` cadence so resolver latency cannot starve capacity
     /// enforcement. The entire refresh phase is cancelled by the shutdown
     /// watch; RAII releases semaphore permits and `refreshing` markers.
+    /// SWR and proactive success publication share one generation token so a
+    /// stale in-flight result cannot overwrite a newer winner or resurrect an
+    /// evicted hostname.
     ///
     /// Returns the task handle so callers can await graceful completion.
     pub fn start_background_refresh_with_shutdown(

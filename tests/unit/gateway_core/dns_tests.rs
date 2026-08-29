@@ -7,6 +7,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 /// Helper to create a default DnsConfig with custom overrides.
 fn default_dns_config(overrides: HashMap<String, String>) -> DnsConfig {
@@ -1878,31 +1879,65 @@ fn seed_near_expiry(cache: &DnsCache, hostname: &str, remaining: Duration, addr:
     cache.test_seed_success_entry(hostname, vec![addr], resolved_at, native_ttl, None);
 }
 
-async fn wait_until(description: &str, mut cond: impl FnMut() -> bool) {
-    for _ in 0..200 {
-        if cond() {
-            return;
-        }
-        tokio::task::yield_now().await;
-    }
-    panic!("{description}");
+/// Seed a success row that is stale (but still inside the SWR window) for a
+/// 5-second per-proxy consumer. Native TTL is 100s and stale TTL is 3600s.
+fn seed_stale_swr(cache: &DnsCache, hostname: &str, addr: IpAddr) {
+    let per_proxy_ttl = 5u64;
+    let resolved_at = Instant::now() - Duration::from_secs(per_proxy_ttl + 1);
+    cache.test_seed_success_entry(
+        hostname,
+        vec![addr],
+        resolved_at,
+        Duration::from_secs(100),
+        Some(per_proxy_ttl),
+    );
 }
 
-fn install_hanging_proactive_hook(
+fn install_hanging_refresh_hook(
     cache: &mut DnsCache,
     in_flight: Arc<AtomicUsize>,
     max_seen: Arc<AtomicUsize>,
+    started: Arc<Notify>,
+    notify_at: usize,
 ) {
     cache.test_install_proactive_resolve_hook({
-        let in_flight = in_flight.clone();
-        let max_seen = max_seen.clone();
         move |_hostname: String| {
             let in_flight = in_flight.clone();
             let max_seen = max_seen.clone();
+            let started = started.clone();
             async move {
                 let n = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 max_seen.fetch_max(n, Ordering::SeqCst);
+                if n == notify_at {
+                    started.notify_one();
+                }
                 std::future::pending::<ProactiveTestResolve>().await
+            }
+        }
+    });
+}
+
+fn install_gated_refresh_hook(
+    cache: &mut DnsCache,
+    gate: Arc<tokio::sync::Semaphore>,
+    stale_addr: IpAddr,
+    entered: Arc<Notify>,
+    released: Arc<Notify>,
+) {
+    cache.test_install_proactive_resolve_hook({
+        move |_hostname: String| {
+            let gate = gate.clone();
+            let entered = entered.clone();
+            let released = released.clone();
+            async move {
+                entered.notify_one();
+                let _permit = gate.acquire().await.expect("refresh-test gate");
+                released.notify_one();
+                Ok((
+                    vec![stale_addr],
+                    Some(CachedRecordType::A),
+                    Duration::from_secs(30),
+                ))
             }
         }
     });
@@ -1941,9 +1976,24 @@ fn proactive_refresh_and_eviction_intervals_use_missed_tick_delay() {
 #[test]
 fn proactive_refresh_selection_is_soonest_expiry_and_capped() {
     let cache = near_expiry_cache(2, 10_000);
-    seed_near_expiry(&cache, "later-window.test", Duration::from_secs(7), testnet_addr(3));
-    seed_near_expiry(&cache, "soonest.test", Duration::from_secs(1), testnet_addr(1));
-    seed_near_expiry(&cache, "second.test", Duration::from_secs(3), testnet_addr(2));
+    seed_near_expiry(
+        &cache,
+        "later-window.test",
+        Duration::from_secs(7),
+        testnet_addr(3),
+    );
+    seed_near_expiry(
+        &cache,
+        "soonest.test",
+        Duration::from_secs(1),
+        testnet_addr(1),
+    );
+    seed_near_expiry(
+        &cache,
+        "second.test",
+        Duration::from_secs(3),
+        testnet_addr(2),
+    );
     seed_near_expiry(
         &cache,
         "fresh.test",
@@ -1979,8 +2029,15 @@ fn proactive_refresh_selection_is_soonest_expiry_and_capped() {
 async fn proactive_refresh_concurrency_never_exceeds_configured_maximum() {
     let in_flight = Arc::new(AtomicUsize::new(0));
     let max_seen = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(Notify::new());
     let mut cache = near_expiry_cache(2, 10_000);
-    install_hanging_proactive_hook(&mut cache, in_flight.clone(), max_seen.clone());
+    install_hanging_refresh_hook(
+        &mut cache,
+        in_flight.clone(),
+        max_seen.clone(),
+        started.clone(),
+        2,
+    );
     let cache = cache;
 
     for i in 1..=5 {
@@ -1996,13 +2053,7 @@ async fn proactive_refresh_concurrency_never_exceeds_configured_maximum() {
         let cache = cache.clone();
         async move { cache.test_run_proactive_refresh_cycle().await }
     });
-    wait_until("proactive refresh must start hanging work", || {
-        cache.test_refreshing_len() == 2
-    })
-    .await;
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
+    started.notified().await;
     assert!(
         max_seen.load(Ordering::SeqCst) <= 2,
         "in-flight resolves must not exceed max_concurrent_refreshes, saw {}",
@@ -2013,72 +2064,98 @@ async fn proactive_refresh_concurrency_never_exceeds_configured_maximum() {
 
     handle.abort();
     let _ = handle.await;
-    wait_until("abort must drop RefreshInFlight guards", || {
-        cache.test_refreshing_len() == 0 && cache.test_available_refresh_permits() == 2
-    })
-    .await;
+    assert_eq!(cache.test_refreshing_len(), 0);
+    assert_eq!(cache.test_available_refresh_permits(), 2);
 }
 
 #[tokio::test(start_paused = true)]
 async fn eviction_trims_over_capacity_while_refreshes_are_blocked() {
     let in_flight = Arc::new(AtomicUsize::new(0));
     let max_seen = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(Notify::new());
     let mut cache = near_expiry_cache(2, 4);
-    install_hanging_proactive_hook(&mut cache, in_flight.clone(), max_seen.clone());
+    install_hanging_refresh_hook(
+        &mut cache,
+        in_flight.clone(),
+        max_seen.clone(),
+        started.clone(),
+        2,
+    );
     let cache = cache;
 
-    for i in 1..=10 {
+    seed_near_expiry(
+        &cache,
+        "hang-1.test",
+        Duration::from_millis(100),
+        testnet_addr(1),
+    );
+    seed_near_expiry(
+        &cache,
+        "hang-2.test",
+        Duration::from_millis(200),
+        testnet_addr(2),
+    );
+    assert_eq!(cache.cache_len(), 2);
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = cache.start_background_refresh_with_shutdown(Some(shutdown_rx));
+    started.notified().await;
+    assert_eq!(cache.test_refreshing_len(), 2);
+    assert_eq!(cache.test_available_refresh_permits(), 0);
+
+    for i in 3..=12 {
         seed_near_expiry(
             &cache,
-            &format!("full-{i}.test"),
-            Duration::from_millis(50 * i as u64),
+            &format!("fresh-{i}.test"),
+            Duration::from_secs(50),
             testnet_addr(i),
         );
     }
-    assert_eq!(cache.cache_len(), 10);
-
-    let handle = tokio::spawn({
-        let cache = cache.clone();
-        async move { cache.test_run_proactive_refresh_cycle().await }
-    });
-    wait_until("blocked refreshes must hold permits", || {
-        cache.test_refreshing_len() > 0
-    })
-    .await;
     assert!(
         cache.cache_len() > 4,
-        "refresh must not be the only path that can trim the cache"
+        "over-capacity rows must exist while refresh futures stay blocked"
     );
 
-    cache.evict_expired();
+    tokio::time::advance(DnsCache::BACKGROUND_MAINTENANCE_INTERVAL).await;
     assert!(
         cache.cache_len() <= 4,
-        "evict_expired must still enforce max_cache_size while refreshes hang, len={}",
+        "eviction sibling must trim max_cache_size while refreshes hang, len={}",
         cache.cache_len()
     );
-    assert!(
-        cache.test_refreshing_len() > 0,
+    assert_eq!(
+        cache.test_refreshing_len(),
+        2,
         "eviction must not wait for hanging refreshes to finish"
     );
 
-    handle.abort();
-    let _ = handle.await;
-    wait_until("blocked refresh abort must release permits", || {
-        cache.test_refreshing_len() == 0 && cache.test_available_refresh_permits() == 2
-    })
-    .await;
+    shutdown_tx.send(true).expect("shutdown watch");
+    handle
+        .await
+        .expect("shutdown must complete the refresh task");
+    assert_eq!(cache.test_refreshing_len(), 0);
+    assert_eq!(cache.test_available_refresh_permits(), 2);
 }
 
 #[tokio::test(start_paused = true)]
 async fn proactive_refresh_timeout_preserves_last_known_good() {
+    let started = Arc::new(Notify::new());
     let mut cache = near_expiry_cache(2, 10_000);
-    cache.test_install_proactive_resolve_hook(|_hostname: String| async {
-        std::future::pending::<ProactiveTestResolve>().await
-    });
+    install_hanging_refresh_hook(
+        &mut cache,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+        started.clone(),
+        1,
+    );
     let cache = cache;
 
     let original = testnet_addr(10);
-    seed_near_expiry(&cache, "timeout.test", Duration::from_secs(2), original);
+    seed_near_expiry(
+        &cache,
+        "timeout.test",
+        Duration::from_secs(2),
+        original,
+    );
     let resolved_at = cache
         .test_success_resolved_at("timeout.test")
         .expect("seeded");
@@ -2087,14 +2164,13 @@ async fn proactive_refresh_timeout_preserves_last_known_good() {
         let cache = cache.clone();
         async move { cache.test_run_proactive_refresh_cycle().await }
     });
-    wait_until("timeout-bound resolve must start", || {
-        cache.test_refreshing_len() == 1
-    })
-    .await;
+    started.notified().await;
 
     tokio::time::advance(DnsCache::PROACTIVE_REFRESH_RESOLVE_TIMEOUT + Duration::from_millis(1))
         .await;
-    handle.await.expect("cycle must return after timeout");
+    handle
+        .await
+        .expect("cycle must return after timeout");
 
     assert_eq!(
         cache.test_success_addresses("timeout.test"),
@@ -2112,10 +2188,15 @@ async fn proactive_refresh_timeout_preserves_last_known_good() {
 
 #[tokio::test(start_paused = true)]
 async fn proactive_refresh_shutdown_releases_dedup_and_permits() {
+    let started = Arc::new(Notify::new());
     let mut cache = near_expiry_cache(1, 10_000);
-    cache.test_install_proactive_resolve_hook(|_hostname: String| async {
-        std::future::pending::<ProactiveTestResolve>().await
-    });
+    install_hanging_refresh_hook(
+        &mut cache,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+        started.clone(),
+        1,
+    );
     let cache = cache;
     seed_near_expiry(
         &cache,
@@ -2126,14 +2207,14 @@ async fn proactive_refresh_shutdown_releases_dedup_and_permits() {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let handle = cache.start_background_refresh_with_shutdown(Some(shutdown_rx));
-    wait_until("background refresh must observe the first tick", || {
-        cache.test_refreshing_len() == 1
-    })
-    .await;
+    started.notified().await;
+    assert_eq!(cache.test_refreshing_len(), 1);
     assert_eq!(cache.test_available_refresh_permits(), 0);
 
     shutdown_tx.send(true).expect("shutdown watch");
-    handle.await.expect("shutdown must complete the refresh task");
+    handle
+        .await
+        .expect("shutdown must complete the refresh task");
     assert_eq!(cache.test_refreshing_len(), 0);
     assert_eq!(cache.test_available_refresh_permits(), 1);
 }
@@ -2141,36 +2222,33 @@ async fn proactive_refresh_shutdown_releases_dedup_and_permits() {
 #[tokio::test(start_paused = true)]
 async fn stale_proactive_result_cannot_overwrite_or_resurrect_generation() {
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let entered = Arc::new(Notify::new());
+    let released = Arc::new(Notify::new());
     let stale_addr = testnet_addr(99);
     let mut cache = near_expiry_cache(1, 10_000);
-    cache.test_install_proactive_resolve_hook({
-        let gate = gate.clone();
-        move |_hostname: String| {
-            let gate = gate.clone();
-            async move {
-                let _permit = gate.acquire().await.expect("generation-test gate");
-                Ok((
-                    vec![stale_addr],
-                    Some(CachedRecordType::A),
-                    Duration::from_secs(30),
-                ))
-            }
-        }
-    });
+    install_gated_refresh_hook(
+        &mut cache,
+        gate.clone(),
+        stale_addr,
+        entered.clone(),
+        released,
+    );
     let cache = cache;
 
     let original = testnet_addr(1);
-    seed_near_expiry(&cache, "gen.test", Duration::from_secs(2), original);
+    seed_near_expiry(
+        &cache,
+        "gen.test",
+        Duration::from_secs(2),
+        original,
+    );
     let overwrite = testnet_addr(2);
 
     let handle = tokio::spawn({
         let cache = cache.clone();
         async move { cache.test_run_proactive_refresh_cycle().await }
     });
-    wait_until("stale resolve must be in flight", || {
-        cache.test_refreshing_len() == 1
-    })
-    .await;
+    entered.notified().await;
 
     cache.test_seed_success_entry(
         "gen.test",
@@ -2188,37 +2266,108 @@ async fn stale_proactive_result_cannot_overwrite_or_resurrect_generation() {
     );
 
     let gate2 = Arc::new(tokio::sync::Semaphore::new(0));
+    let entered2 = Arc::new(Notify::new());
+    let released2 = Arc::new(Notify::new());
     let mut cache = near_expiry_cache(1, 10_000);
-    cache.test_install_proactive_resolve_hook({
-        let gate2 = gate2.clone();
-        move |_hostname: String| {
-            let gate2 = gate2.clone();
-            async move {
-                let _permit = gate2.acquire().await.expect("resurrection gate");
-                Ok((
-                    vec![stale_addr],
-                    Some(CachedRecordType::A),
-                    Duration::from_secs(30),
-                ))
-            }
-        }
-    });
+    install_gated_refresh_hook(
+        &mut cache,
+        gate2.clone(),
+        stale_addr,
+        entered2.clone(),
+        released2,
+    );
     let cache = cache;
-    seed_near_expiry(&cache, "gone.test", Duration::from_secs(2), original);
+    seed_near_expiry(
+        &cache,
+        "gone.test",
+        Duration::from_secs(2),
+        original,
+    );
     let handle = tokio::spawn({
         let cache = cache.clone();
         async move { cache.test_run_proactive_refresh_cycle().await }
     });
-    wait_until("resurrection resolve must be in flight", || {
-        cache.test_refreshing_len() == 1
-    })
-    .await;
+    entered2.notified().await;
     cache.test_remove_entry("gone.test");
     gate2.add_permits(1);
     handle.await.expect("cycle");
     assert!(
         !cache.is_cached("gone.test"),
         "a stale proactive result must not resurrect an evicted hostname"
+    );
+    assert_eq!(cache.test_refreshing_len(), 0);
+    assert_eq!(cache.test_available_refresh_permits(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_swr_result_cannot_overwrite_or_resurrect_generation() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let entered = Arc::new(Notify::new());
+    let released = Arc::new(Notify::new());
+    let stale_addr = testnet_addr(99);
+    let mut cache = near_expiry_cache(1, 10_000);
+    install_gated_refresh_hook(
+        &mut cache,
+        gate.clone(),
+        stale_addr,
+        entered.clone(),
+        released.clone(),
+    );
+    let cache = cache;
+
+    let original = testnet_addr(1);
+    seed_stale_swr(&cache, "swr-gen.test", original);
+    let overwrite = testnet_addr(2);
+
+    let served = cache
+        .resolve("swr-gen.test", None, Some(5))
+        .await
+        .expect("SWR must serve the stale row");
+    assert_eq!(served, original);
+    entered.notified().await;
+    assert_eq!(cache.test_refreshing_len(), 1);
+
+    cache.test_seed_success_entry(
+        "swr-gen.test",
+        vec![overwrite],
+        Instant::now(),
+        Duration::from_secs(100),
+        Some(5),
+    );
+    gate.add_permits(1);
+    released.notified().await;
+    assert_eq!(
+        cache.test_success_addresses("swr-gen.test"),
+        Some(vec![overwrite]),
+        "a stale SWR result must not overwrite a newer generation"
+    );
+    assert_eq!(cache.test_refreshing_len(), 0);
+    assert_eq!(cache.test_available_refresh_permits(), 1);
+
+    let gate2 = Arc::new(tokio::sync::Semaphore::new(0));
+    let entered2 = Arc::new(Notify::new());
+    let released2 = Arc::new(Notify::new());
+    let mut cache = near_expiry_cache(1, 10_000);
+    install_gated_refresh_hook(
+        &mut cache,
+        gate2.clone(),
+        stale_addr,
+        entered2.clone(),
+        released2.clone(),
+    );
+    let cache = cache;
+    seed_stale_swr(&cache, "swr-gone.test", original);
+    cache
+        .resolve("swr-gone.test", None, Some(5))
+        .await
+        .expect("SWR must serve the stale row");
+    entered2.notified().await;
+    cache.test_remove_entry("swr-gone.test");
+    gate2.add_permits(1);
+    released2.notified().await;
+    assert!(
+        !cache.is_cached("swr-gone.test"),
+        "a stale SWR result must not resurrect an evicted hostname"
     );
     assert_eq!(cache.test_refreshing_len(), 0);
     assert_eq!(cache.test_available_refresh_permits(), 1);
