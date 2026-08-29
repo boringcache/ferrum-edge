@@ -61,6 +61,8 @@ CHECKOUT_USES = (
 
 # Direct fields of the hosted publication gate. Comments are ignored; extra,
 # missing, duplicate, reordered, flow-spelled, or opaque fields fail closed.
+# The unique job itself is proven over the whole `jobs:` mapping: quoted,
+# escaped, or opaque YAML-equivalent duplicates of the protected key fail.
 PUBLICATION_GATE_FIELDS = (
     "name",
     "if",
@@ -95,7 +97,8 @@ PUBLICATION_GATE_ACTIVE_COMMANDS = (
 
 # Direct fields of the version-release SHA gate. Same closed-set rule: a
 # write permission, `continue-on-error`, or other control beside this list
-# cannot hide behind a substring match.
+# cannot hide behind a substring match. The unique job is proven over the
+# whole `jobs:` mapping, matching the hosted publication gate.
 RELEASE_GATE_FIELDS = (
     "name",
     "needs",
@@ -304,15 +307,16 @@ def by_mode(inventory: dict, mode: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 _JOB_BODY = "(?ms)^  {job}:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\\Z)"
+_SIMPLE_MAPPING_KEY = re.compile(
+    r"^(?P<indent> *)(?P<key>[A-Za-z0-9_-]+|'(?:[^']|'')*'|"
+    r'"(?:[^"\\]|\\.)*")\s*:(.*)$'
+)
+_CANONICAL_JOB_HEADER = re.compile(r"^  ([A-Za-z0-9_-]+):\s*(#.*)?$")
 
 
 def job_body(contents: str, job: str) -> str | None:
     match = re.search(_JOB_BODY.format(job=re.escape(job)), contents)
     return None if match is None else match.group("body")
-
-
-def job_header_count(contents: str, job: str) -> int:
-    return len(re.findall(rf"(?m)^  {re.escape(job)}:\n", contents))
 
 
 class StructuralError(RuntimeError):
@@ -430,7 +434,9 @@ def _parse_mapping(
             continue
         indent = _indent_spaces(line)
         if indent < key_indent:
-            break
+            raise StructuralError(
+                "unconsumed lower-indentation content is opaque"
+            )
         if indent > key_indent:
             raise StructuralError("orphaned content is opaque")
         match = _MAPPING_KEY.match(line[key_indent:])
@@ -513,6 +519,110 @@ def _parse_sequence(
 
 def _parse_job(body: str) -> dict[str, tuple[str, object]]:
     return _parse_mapping(body.splitlines(), 4)
+
+
+def _decode_simple_mapping_key(line: str) -> tuple[int, str] | None:
+    """Return `(indent, decoded_key)` for a proven simple mapping key.
+
+    Canonical bare keys and single- or double-quoted scalars GitHub YAML
+    treats as the same key are decoded. Anything this dependency-free parser
+    cannot prove -- tags, explicit keys, aliases, flow keys, multiline
+    quotes, or YAML-only escapes -- returns None so callers fail closed.
+    """
+
+    match = _SIMPLE_MAPPING_KEY.match(line)
+    if match is None:
+        return None
+    raw = match.group("key")
+    if raw.startswith("'"):
+        key = raw[1:-1].replace("''", "'")
+    elif raw.startswith('"'):
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(decoded, str):
+            return None
+        key = decoded
+    else:
+        key = raw
+    return len(match.group("indent")), key
+
+
+def _protected_job_body(contents: str, job: str) -> str:
+    """Return the unique canonical protected job body, or fail closed.
+
+    The whole top-level `jobs:` mapping is scanned. A quoted, escaped, or
+    otherwise YAML-equivalent duplicate of `job`, or any opaque job-key
+    spelling that cannot be proven distinct, is rejected even when a
+    safe-looking bare decoy is present.
+    """
+
+    lines = contents.splitlines()
+    jobs_headers: list[tuple[int, str]] = []
+    for index, line in enumerate(lines):
+        if not line.strip() or _is_comment_line(line):
+            continue
+        indent = _indent_spaces(line)
+        if indent != 0:
+            continue
+        decoded = _decode_simple_mapping_key(line)
+        if decoded is None:
+            raise StructuralError("top-level key is opaque")
+        if decoded == (0, "jobs"):
+            jobs_headers.append((index, line.rstrip("\r\n")))
+    canonical_jobs = [
+        index for index, text in jobs_headers if text.strip() == "jobs:"
+    ]
+    if len(jobs_headers) != 1 or len(canonical_jobs) != 1:
+        raise StructuralError(
+            "must contain exactly one canonical top-level `jobs:` mapping"
+        )
+
+    jobs_index = canonical_jobs[0]
+    jobs_end = len(lines)
+    for index in range(jobs_index + 1, len(lines)):
+        line = lines[index]
+        if not line.strip() or _is_comment_line(line):
+            continue
+        if _indent_spaces(line) == 0:
+            jobs_end = index
+            break
+
+    headers: list[tuple[int, str, bool]] = []
+    for index in range(jobs_index + 1, jobs_end):
+        line = lines[index]
+        if not line.strip() or _is_comment_line(line):
+            continue
+        indent = _indent_spaces(line)
+        if indent > 2:
+            continue
+        if indent < 2:
+            raise StructuralError(
+                "jobs mapping contains unconsumed lower-indentation content"
+            )
+        decoded = _decode_simple_mapping_key(line)
+        if decoded is None or decoded[0] != 2:
+            raise StructuralError("job key is opaque")
+        name = decoded[1]
+        canonical = _CANONICAL_JOB_HEADER.match(line) is not None
+        headers.append((index, name, canonical))
+
+    matching = [header for header in headers if header[1] == job]
+    canonical_matching = [header for header in matching if header[2]]
+    if len(matching) != 1 or len(canonical_matching) != 1:
+        raise StructuralError(
+            "must be the unique canonical job key; quoted, escaped, or "
+            "opaque YAML-equivalent duplicates are rejected"
+        )
+
+    start = canonical_matching[0][0] + 1
+    end = jobs_end
+    for index, _name, _canonical in headers:
+        if index > canonical_matching[0][0]:
+            end = index
+            break
+    return "\n".join(lines[start:end])
 
 
 def _scalar(mapping: dict[str, tuple[str, object]], key: str) -> str | None:
@@ -786,18 +896,8 @@ def publication_gate_job_errors(gateway_yml: str, inventory: dict) -> list[str]:
 
     errors: list[str] = []
     located = f"{PUBLICATION_GATE_WORKFLOW_PATH} jobs.{PUBLICATION_GATE_JOB}"
-    if job_header_count(gateway_yml, PUBLICATION_GATE_JOB) != 1:
-        errors.append(f"{located} must be defined exactly once")
-        return errors
-    body = job_body(gateway_yml, PUBLICATION_GATE_JOB)
-    if body is None:
-        errors.append(
-            f"{PUBLICATION_GATE_WORKFLOW_PATH} must define the "
-            f"`{PUBLICATION_GATE_JOB}` job that carries every "
-            "`publication_gate_job` required context"
-        )
-        return errors
     try:
+        body = _protected_job_body(gateway_yml, PUBLICATION_GATE_JOB)
         job = _parse_job(body)
     except StructuralError as error:
         errors.append(f"{located} {error}")
@@ -878,12 +978,8 @@ def release_gate_errors(release_yml: str, inventory: dict) -> list[str]:
 
     errors: list[str] = []
     located = f"{RELEASE_WORKFLOW_PATH} jobs.{RELEASE_GATE_JOB}"
-    if job_header_count(release_yml, RELEASE_GATE_JOB) != 1:
-        return [f"{RELEASE_WORKFLOW_PATH} must define `{RELEASE_GATE_JOB}` exactly once"]
-    body = job_body(release_yml, RELEASE_GATE_JOB)
-    if body is None:
-        return [f"{RELEASE_WORKFLOW_PATH} must define `{RELEASE_GATE_JOB}`"]
     try:
+        body = _protected_job_body(release_yml, RELEASE_GATE_JOB)
         job = _parse_job(body)
     except StructuralError as error:
         return [f"{located} {error}"]
@@ -2334,6 +2430,114 @@ def self_test() -> list[str]:
     expect(
         _release_errors(missing_ancestry) != [],
         "a missing active ancestry proof must fail the release gate",
+    )
+
+    # Whole-jobs mapping: YAML-equivalent or opaque protected job keys fail
+    # closed even when a canonical decoy is the only header the old regex
+    # would inspect. `_publication_errors` / `_release_errors` wrap the
+    # canonical job; extra sibling keys are appended at the `jobs:` indent.
+    quoted_publication_after = _CONFORMING_PUBLICATION_JOB + (
+        f'  "{PUBLICATION_GATE_JOB}":\n    name: Attack\n    if: always()\n'
+    )
+    expect(
+        _publication_errors(quoted_publication_after) != [],
+        "a quoted duplicate immediately after the publication-gate job must fail",
+    )
+    single_quoted_publication_after = _CONFORMING_PUBLICATION_JOB + (
+        f"  '{PUBLICATION_GATE_JOB}':\n    name: Attack\n    if: always()\n"
+    )
+    expect(
+        _publication_errors(single_quoted_publication_after) != [],
+        "a single-quoted duplicate immediately after the publication-gate job must fail",
+    )
+    escaped_publication_after = _CONFORMING_PUBLICATION_JOB + (
+        '  "main-publication-required-check\\u0073":\n    name: Attack\n'
+    )
+    expect(
+        _publication_errors(escaped_publication_after) != [],
+        "an escaped quoted duplicate of the publication-gate job must fail",
+    )
+    publication_after_intervening = _CONFORMING_PUBLICATION_JOB + (
+        "  ordinary-job:\n    runs-on: ubuntu-latest\n"
+        f'  "{PUBLICATION_GATE_JOB}":\n    name: Attack\n    if: always()\n'
+    )
+    expect(
+        _publication_errors(publication_after_intervening) != [],
+        "a quoted publication-gate duplicate after an intervening job must fail",
+    )
+    publication_quoted_before = (
+        f'jobs:\n  "{PUBLICATION_GATE_JOB}":\n    name: Attack\n    if: always()\n'
+        f"  {PUBLICATION_GATE_JOB}:\n{_CONFORMING_PUBLICATION_JOB}"
+    )
+    expect(
+        publication_gate_job_errors(publication_quoted_before, _gate_inventory())
+        != [],
+        "a quoted publication-gate duplicate before the canonical job must fail",
+    )
+    publication_quoted_only = (
+        f'jobs:\n  "{PUBLICATION_GATE_JOB}":\n{_CONFORMING_PUBLICATION_JOB}'
+    )
+    expect(
+        publication_gate_job_errors(publication_quoted_only, _gate_inventory()) != [],
+        "a quoted-only replacement of the publication-gate job must fail",
+    )
+    publication_opaque_key = _CONFORMING_PUBLICATION_JOB + (
+        f"  ? {PUBLICATION_GATE_JOB}\n  :\n    name: Attack\n"
+    )
+    expect(
+        _publication_errors(publication_opaque_key) != [],
+        "an opaque explicit-key duplicate of the publication-gate job must fail",
+    )
+    try:
+        _parse_job(
+            _CONFORMING_PUBLICATION_JOB + '  "smuggled":\n    name: Attack\n'
+        )
+        publication_unconsumed = False
+    except StructuralError:
+        publication_unconsumed = True
+    expect(
+        publication_unconsumed,
+        "unconsumed lower-indentation content in a publication job region must fail",
+    )
+
+    quoted_release_after = _CONFORMING_RELEASE_JOB + (
+        f'  "{RELEASE_GATE_JOB}":\n    name: Attack\n'
+    )
+    expect(
+        _release_errors(quoted_release_after) != [],
+        "a quoted duplicate immediately after validate-release-sha must fail",
+    )
+    release_after_intervening = _wrap_release_job(_CONFORMING_RELEASE_JOB) + (
+        f'  "{RELEASE_GATE_JOB}":\n    name: Attack\n'
+    )
+    expect(
+        release_gate_errors(release_after_intervening, _gate_inventory()) != [],
+        "a quoted validate-release-sha duplicate after an intervening job must fail",
+    )
+    release_quoted_before = (
+        f'jobs:\n  "{RELEASE_GATE_JOB}":\n    name: Attack\n'
+        f"  {RELEASE_GATE_JOB}:\n{_CONFORMING_RELEASE_JOB}"
+        "  next-job:\n    runs-on: ubuntu-latest\n"
+    )
+    expect(
+        release_gate_errors(release_quoted_before, _gate_inventory()) != [],
+        "a quoted validate-release-sha duplicate before the canonical job must fail",
+    )
+    release_opaque_key = _CONFORMING_RELEASE_JOB + (
+        f"  ? {RELEASE_GATE_JOB}\n  :\n    name: Attack\n"
+    )
+    expect(
+        _release_errors(release_opaque_key) != [],
+        "an opaque explicit-key duplicate of validate-release-sha must fail",
+    )
+    try:
+        _parse_job(_CONFORMING_RELEASE_JOB + '  "smuggled":\n    name: Attack\n')
+        release_unconsumed = False
+    except StructuralError:
+        release_unconsumed = True
+    expect(
+        release_unconsumed,
+        "unconsumed lower-indentation content in a release job region must fail",
     )
 
     return failures

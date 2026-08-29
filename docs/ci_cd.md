@@ -246,7 +246,11 @@ permissions mapping `contents: read` + `actions: read` with no extra or write
 scopes, a pinned checkout, and the one named proof step that owns
 `set -euo pipefail` plus both Python invocations. Comments, unrelated steps,
 flow/duplicate/opaque spellings, `continue-on-error`, and extra job controls
-do not count. It also proves `release.yml`'s `validate-release-sha` the same
+do not count. The proof fail-closes over the whole `jobs:` mapping: a quoted,
+escaped, or otherwise YAML-equivalent duplicate of either protected job, or
+any opaque job-key spelling the dependency-free parser cannot prove distinct,
+is rejected rather than leaving a canonical decoy as the inspected body. It
+also proves `release.yml`'s `validate-release-sha` the same
 way: exact `actions: read` / `contents: read` mapping, no failure-weakening
 fields, and the named tag-target step owning tag resolution, ancestry proof,
 SHA export, self-test, and `--enforce release`. A hard-coded wait list is
