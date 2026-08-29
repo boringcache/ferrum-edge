@@ -492,18 +492,24 @@ impl AiRateLimiter {
 
         // Scope the ENTIRE per-request reservation lifecycle to THIS limiter
         // instance via a process-unique id, not to a budget-config fingerprint.
-        // Each instance owns its own token window (a separate in-memory map for
-        // the local backend, or a distinct `redis_key_prefix` for the centralized
-        // backend), so its reserved estimate, reservation id, Redis window index,
-        // inferred backend, AI classification, unmetered action, release
-        // idempotency, and exposed telemetry must all be per instance too. A
-        // config-derived key would be shared by two limiters with identical
+        // Two instances routinely enforce on SEPARATE token windows: a different
+        // plugin-config policy identity, a semantically changed generation, and an
+        // identityless (config-validation / direct) construction each own their own
+        // in-memory map, and a distinct `redis_key_prefix` owns its own centralized
+        // window. This instance's reserved estimate, reservation id, Redis window
+        // index, inferred backend, AI classification, unmetered action, release
+        // idempotency, and exposed telemetry must therefore all be per instance
+        // too. A config-derived key would be shared by two limiters with identical
         // budget config that are nonetheless SEPARATE budgets (e.g. different
-        // `sync_mode`/`redis_key_prefix`, or just two local instances): the first
-        // to run would overwrite the second's reservation state and its release
-        // would suppress the sibling's, under-counting one window and
+        // `sync_mode`/`redis_key_prefix`, or two distinct plugin-config policies):
+        // the first to run would overwrite the second's reservation state and its
+        // release would suppress the sibling's, under-counting one window and
         // over-counting the other — contradicting the documented per-instance
-        // accounting contract (GHSA-wh4p-pmxm-3784).
+        // accounting contract (GHSA-wh4p-pmxm-3784). Per-instance scoping is still
+        // required where two COMPATIBLE plugin-cache generations for one policy
+        // identity DO share a token window (issue #4268): reservation ids are then
+        // drawn from that single shared window so they cannot collide, and a
+        // retired generation must reconcile only the reservations it took.
         let instance_id = INSTANCE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
 
         // Effective enforcement semantics, not raw syntax: the algorithm
