@@ -977,7 +977,10 @@ fn a_leaf_with_trailing_der_bytes_cannot_bind_a_staple() {
 
     let error = validate_stapled_response_at(&der, &malformed_chain, now())
         .expect_err("trailing leaf bytes must be rejected");
-    assert!(error.contains("server certificate has trailing bytes"), "{error}");
+    assert!(
+        error.contains("server certificate has trailing bytes"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -993,7 +996,10 @@ fn an_issuer_with_trailing_der_bytes_cannot_bind_a_staple() {
 
     let error = validate_stapled_response_at(&der, &malformed_chain, now())
         .expect_err("trailing issuer bytes must be rejected");
-    assert!(error.contains("issuer candidate with trailing bytes"), "{error}");
+    assert!(
+        error.contains("issuer candidate with trailing bytes"),
+        "{error}"
+    );
 }
 
 // ── ResponseData grammar ───────────────────────────────────────────────────
@@ -2119,8 +2125,8 @@ fn served_staple(
         .with_no_client_auth();
     client_config.alpn_protocols = vec![alpn.to_vec()];
 
-    let name = rustls::pki_types::ServerName::try_from(server_name.to_string())
-        .expect("test server name");
+    let name =
+        rustls::pki_types::ServerName::try_from(server_name.to_string()).expect("test server name");
     let mut client =
         rustls::ClientConnection::new(Arc::new(client_config), name).expect("client connection");
     let mut server = rustls::ServerConnection::new(server_config).expect("server connection");
