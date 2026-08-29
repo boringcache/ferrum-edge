@@ -4299,11 +4299,10 @@ fn replace_api_spec_metadata_shortcut_uses_transactional_existence_not_rows_affe
         "existence must document CLIENT_FOUND_ROWS and sqlite branch:\n{existing_sql}"
     );
     assert!(
-        existing_sql.contains(
-            "self.q(\"SELECT * FROM api_specs WHERE namespace = ? AND id = ?\")"
-        ) && existing_sql.contains(
-            "self.q(\"SELECT * FROM api_specs WHERE namespace = ? AND id = ? FOR UPDATE\")"
-        ),
+        existing_sql.contains("self.q(\"SELECT * FROM api_specs WHERE namespace = ? AND id = ?\")")
+            && existing_sql.contains(
+                "self.q(\"SELECT * FROM api_specs WHERE namespace = ? AND id = ? FOR UPDATE\")"
+            ),
         "existence SELECT must lock api_specs with FOR UPDATE except on SQLite:\n{existing_sql}"
     );
 
