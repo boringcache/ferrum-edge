@@ -1921,7 +1921,6 @@ fn reverse_translate(
         // (GAP-2K DR carrier, GAP-1a slice carriers) land their fields in the
         // dedicated slice fields above instead.
         extension_configs: Vec::new(),
-        plugin_configs: Vec::new(),
         // GAP-3E: merged RTDS layers. Empty when no Runtime resources have
         // shipped on this stream.
         runtime_overlay,

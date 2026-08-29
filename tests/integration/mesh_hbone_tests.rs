@@ -2,11 +2,12 @@ use bytes::Bytes;
 use chrono::Utc;
 use hyper::{Method, Request, StatusCode};
 use serde_json::{Map, Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::common::{empty_digest_header, generate_hmac_signature};
 
@@ -1785,4 +1786,356 @@ fn inbound_relay_admits_only_the_waypoint_termination_inventory() {
         loopback_mesh.inbound_relay_destination_decision("127.0.0.1", 8080, waypoint),
         Ok(())
     );
+}
+
+// ── Issue #4252 — post-plugin effective-destination handler re-check ────────
+//
+// Mesh-mode has no deployed source that puts `mesh_route_dispatch` on the
+// synthesized inbound HBONE relay (`MeshSlice::from_gateway_config` does not
+// project `GatewayConfig.plugin_configs`; file source accepts only MeshConfig;
+// xDS reverse translation does not carry operator plugins). The functional
+// cases therefore prove synthesis-time 404. These in-process tests invoke the
+// real dispatcher → `handle_hbone_request` / `handle_hbone_udp_request` path
+// with a normal GatewayConfig plugin cache: CONNECT names a dest B terminates
+// for, a global `mesh_route_dispatch` rewrites onto C, and each handler must
+// 403 with zero backend hits. Deleting either re-check fails these tests;
+// a synthesis 404 would mean this setup never reached the handlers.
+
+fn is_usable_non_loopback_unicast(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !v4.is_loopback()
+                && !v4.is_unspecified()
+                && !v4.is_link_local()
+                && !v4.is_multicast()
+                && !v4.is_broadcast()
+        }
+        IpAddr::V6(v6) => {
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+                && (v6.segments()[0] & 0xffc0) != 0xfe80
+        }
+    }
+}
+
+async fn probe_udp_egress_local_ip(dest: SocketAddr) -> Result<IpAddr, String> {
+    let bind = if dest.is_ipv4() {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+    };
+    let socket = tokio::net::UdpSocket::bind(bind)
+        .await
+        .map_err(|e| format!("probe bind {bind}: {e}"))?;
+    socket
+        .connect(dest)
+        .await
+        .map_err(|e| format!("probe connect {dest}: {e}"))?;
+    socket
+        .local_addr()
+        .map(|addr| addr.ip())
+        .map_err(|e| format!("probe local_addr: {e}"))
+}
+
+/// Fail closed when the runner has only loopback: a 127.0.0.2 C can be
+/// refused by PR #4315's loopback-namespace guard instead of ownership.
+async fn discover_bindable_non_loopback_local_ip() -> IpAddr {
+    let probes = [
+        SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 53)),
+        SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53)),
+        SocketAddr::from((
+            std::net::Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
+            53,
+        )),
+    ];
+    let mut evidence = Vec::new();
+    let mut seen = HashSet::new();
+    for dest in probes {
+        match probe_udp_egress_local_ip(dest).await {
+            Ok(ip) => {
+                if !seen.insert(ip) {
+                    continue;
+                }
+                if !is_usable_non_loopback_unicast(ip) {
+                    evidence.push(format!(
+                        "probe {dest} → {ip}: rejected (loopback/unspecified/link-local/multicast/broadcast)"
+                    ));
+                    continue;
+                }
+                match TcpListener::bind(SocketAddr::new(ip, 0)).await {
+                    Ok(listener) => {
+                        drop(listener);
+                        return ip;
+                    }
+                    Err(e) => evidence.push(format!("probe {dest} → {ip}: TCP bind failed: {e}")),
+                }
+            }
+            Err(e) => evidence.push(format!("probe {dest}: {e}")),
+        }
+    }
+    panic!(
+        "no usable non-loopback local interface address for workload C. Evidence:\n{}",
+        evidence.join("\n")
+    );
+}
+
+fn global_mesh_route_dispatch_to(host: &str, port: u16) -> PluginConfig {
+    PluginConfig {
+        id: "third-workload-route-override".to_string(),
+        plugin_name: "mesh_route_dispatch".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        config: json!({
+            "rules": [{
+                "match": { "methods": ["CONNECT"] },
+                "destination": {
+                    "backend_host": host,
+                    "backend_port": port
+                }
+            }],
+            "reject_unmatched": false
+        }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn post_plugin_refusal_mesh(b_port: u16, c_ip: IpAddr, c_port: u16) -> MeshConfig {
+    let c_addr = c_ip.to_string();
+    MeshConfig {
+        workloads: vec![
+            relay_guard_workload("svc-b", &["127.0.0.1"], &[b_port]),
+            relay_guard_workload("svc-c", &[&c_addr], &[c_port]),
+        ],
+        inbound_relay_admits_accepted_local_address: true,
+        ..MeshConfig::default()
+    }
+}
+
+fn create_post_plugin_third_workload_state(
+    mesh: MeshConfig,
+    route_override: PluginConfig,
+) -> ProxyState {
+    let spiffe_plugin = spiffe_identity_global_plugin_config();
+    let config = GatewayConfig {
+        version: "1".to_string(),
+        // Unrelated HTTP route: CONNECT to 127.0.0.1:b_port misses it, so
+        // synthesis builds `__mesh-inbound-hbone-relay` and the global plugin
+        // chain (including mesh_route_dispatch) runs on that unknown proxy id.
+        proxies: vec![create_mesh_proxy(1)],
+        consumers: vec![],
+        plugin_configs: vec![spiffe_plugin, route_override],
+        upstreams: vec![],
+        loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
+        frontend_tls_cert_path: None,
+        frontend_tls_key_path: None,
+        frontend_tls_source_namespace: None,
+        frontend_tls_certificate_sources: Vec::new(),
+        trust_bundles: None,
+        mesh: Some(Box::new(mesh)),
+        http_tls_listen_ports: Default::default(),
+        mesh_revision: None,
+        node_waypoint_udp_steer_destinations: Vec::new(),
+        node_waypoint_udp_destination_routes: Vec::new(),
+        k8s_mesh_overlay: Default::default(),
+        gateway_trust_bundles: Vec::new(),
+    };
+    let env_config = EnvConfig {
+        mode: OperatingMode::Mesh,
+        log_level: "error".to_string(),
+        proxy_http_port: 0,
+        proxy_https_port: 0,
+        admin_http_port: 0,
+        admin_https_port: 0,
+        shutdown_drain_seconds: 0,
+        max_connections: 0,
+        ..EnvConfig::default()
+    };
+    ProxyState::new(
+        config,
+        DnsCache::new(DnsConfig::default()),
+        env_config,
+        None,
+        None,
+    )
+    .expect("proxy state")
+    .0
+}
+
+#[derive(Clone, Copy)]
+enum PostPluginConnectFlavor {
+    ByteStream,
+    Datagram,
+}
+
+async fn start_counting_tcp_backend(
+    ip: IpAddr,
+) -> (
+    SocketAddr,
+    mpsc::UnboundedReceiver<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind(SocketAddr::new(ip, 0))
+        .await
+        .unwrap_or_else(|e| panic!("bind post-plugin TCP backend on {ip}: {e}"));
+    let addr = listener.local_addr().expect("post-plugin TCP backend addr");
+    let (hit_tx, hit_rx) = mpsc::unbounded_channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = ready_tx.send(());
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            drop(stream);
+            if hit_tx.send(()).is_err() {
+                return;
+            }
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+        .await
+        .expect("post-plugin TCP backend became ready")
+        .expect("post-plugin TCP backend task dropped ready");
+    (addr, hit_rx, task)
+}
+
+async fn start_counting_udp_backend(
+    ip: IpAddr,
+) -> (
+    SocketAddr,
+    mpsc::UnboundedReceiver<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let socket = tokio::net::UdpSocket::bind(SocketAddr::new(ip, 0))
+        .await
+        .unwrap_or_else(|e| panic!("bind post-plugin UDP backend on {ip}: {e}"));
+    let addr = socket.local_addr().expect("post-plugin UDP backend addr");
+    let (hit_tx, hit_rx) = mpsc::unbounded_channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = ready_tx.send(());
+        let mut buf = vec![0u8; 65535];
+        while socket.recv_from(&mut buf).await.is_ok() {
+            if hit_tx.send(()).is_err() {
+                return;
+            }
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+        .await
+        .expect("post-plugin UDP backend became ready")
+        .expect("post-plugin UDP backend task dropped ready");
+    (addr, hit_rx, task)
+}
+
+async fn observe_backend_hits(
+    hit_rx: &mut mpsc::UnboundedReceiver<()>,
+    window: std::time::Duration,
+) -> usize {
+    match tokio::time::timeout(window, hit_rx.recv()).await {
+        Ok(Some(())) => {
+            let mut hits = 1;
+            while hit_rx.try_recv().is_ok() {
+                hits += 1;
+            }
+            hits
+        }
+        Ok(None) | Err(_) => 0,
+    }
+}
+
+async fn collect_h2_body(mut body: h2::RecvStream) -> Bytes {
+    let mut out = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.expect("h2 body chunk");
+        let _ = body.flow_control().release_capacity(chunk.len());
+        out.extend_from_slice(&chunk);
+    }
+    Bytes::from(out)
+}
+
+async fn drive_post_plugin_third_workload_refusal(flavor: PostPluginConnectFlavor) {
+    let certs = generate_hbone_mtls_certs("spiffe://cluster.local/ns/default/sa/client");
+    let c_ip = discover_bindable_non_loopback_local_ip().await;
+    let (c_addr, mut hit_rx, echo) = match flavor {
+        PostPluginConnectFlavor::ByteStream => start_counting_tcp_backend(c_ip).await,
+        PostPluginConnectFlavor::Datagram => start_counting_udp_backend(c_ip).await,
+    };
+    let c_port = c_addr.port();
+    let b_port = if c_port == 18080 { 18081 } else { 18080 };
+    let state = create_post_plugin_third_workload_state(
+        post_plugin_refusal_mesh(b_port, c_ip, c_port),
+        global_mesh_route_dispatch_to(&c_ip.to_string(), c_port),
+    );
+    let (gateway_addr, shutdown_tx) =
+        start_egress_udp_gateway(state, hbone_server_config(&certs)).await;
+    let (mut sender, conn_task) =
+        connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
+
+    let authority = format!("127.0.0.1:{b_port}");
+    let req = match flavor {
+        PostPluginConnectFlavor::ByteStream => Request::builder()
+            .method(Method::CONNECT)
+            .uri(&authority)
+            .body(())
+            .expect("byte-stream CONNECT"),
+        PostPluginConnectFlavor::Datagram => udp_connect_request(&authority),
+    };
+    let (response_fut, _request_body) = sender.send_request(req, false).expect("send CONNECT");
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), response_fut)
+        .await
+        .expect("CONNECT response")
+        .expect("CONNECT response");
+    let status = resp.status();
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        collect_h2_body(resp.into_body()),
+    )
+    .await
+    .unwrap_or_else(|_| Bytes::new());
+    let hits = observe_backend_hits(&mut hit_rx, std::time::Duration::from_secs(2)).await;
+
+    shutdown_tx.send(true).expect("shutdown gateway");
+    echo.abort();
+    conn_task.abort();
+
+    let body_text = String::from_utf8_lossy(&body);
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "post-plugin re-check must return 404-distinct 403; 404 means synthesis \
+         never reached the handler, 200/502 means the override or guard did not \
+         fire. body={body_text}"
+    );
+    assert!(
+        body_text.contains("relay destination not allowed"),
+        "403 must be the destination re-check, not the unauthenticated-peer \
+         gate. body={body_text}"
+    );
+    assert_eq!(
+        hits, 0,
+        "workload C's backend must see zero accepts/datagrams. body={body_text}"
+    );
+}
+
+/// Byte-stream: CONNECT names B so synthesis admits, global mesh_route_dispatch
+/// rewrites onto C, `handle_hbone_request` must 403 before `connect_backend`.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_hbone_relay_refuses_post_plugin_third_workload_byte_stream() {
+    drive_post_plugin_third_workload_refusal(PostPluginConnectFlavor::ByteStream).await;
+}
+
+/// Datagram-over-CONNECT: the independently placed re-check in
+/// `handle_hbone_udp_request` must 403 before `resolve_local_udp_dest`.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_hbone_relay_refuses_post_plugin_third_workload_datagram() {
+    drive_post_plugin_third_workload_refusal(PostPluginConnectFlavor::Datagram).await;
 }

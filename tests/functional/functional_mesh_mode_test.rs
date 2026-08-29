@@ -1128,26 +1128,30 @@ fn fixture_servers_bind_through_the_mesh_port_aware_helper() {
     }
 }
 
-/// Issue #4252: the third-workload cases must CONNECT to a dest B terminates
-/// for, then retarget via production `mesh_route_dispatch`, and refuse with
-/// the handler 403 — not a synthesis 404, and not a loopback-namespace C.
+/// Issue #4252: these functional cases exercise production synthesis-time
+/// refusal (`build_inbound_hbone_relay_proxy` → 404, zero dials). Mesh-mode
+/// has no deployed source that puts `mesh_route_dispatch` on a synthesized
+/// inbound relay; do not invent a `MeshSlice` plugin/config bypass. The
+/// post-plugin handler re-check is proved in-process by
+/// `inbound_hbone_relay_refuses_post_plugin_third_workload_*` in
+/// `tests/integration/mesh_hbone_tests.rs`.
 #[test]
-fn third_workload_refusal_exercises_post_plugin_effective_destination_guard() {
+fn third_workload_refusal_exercises_synthesis_time_guard() {
     let drive = mesh_test_fn_body("drive_inbound_relay_third_workload_refusal");
     assert!(
         drive.contains("discover_bindable_non_loopback_local_ip("),
         "C must be a discovered non-loopback interface address so PR #4315's \
-         loopback-namespace guard cannot stand in for the ownership re-check"
+         loopback-namespace guard cannot stand in for the ownership check"
     );
     assert!(
-        drive.contains("127.0.0.1:{b_local_port}"),
-        "the peer CONNECT authority must name B (own-pod dest B terminates for) \
-         so synthesis reaches the handlers"
+        drive.contains("SocketAddr::new(c_ip, c_port)"),
+        "the peer CONNECT authority must name C (a dest B does not terminate \
+         for) so synthesis refuses without reaching the handlers"
     );
     assert!(
-        drive.contains("third_workload_route_override_plugin("),
-        "the effective destination must move to C through the production \
-         mesh_route_dispatch override, not a test-only bypass"
+        !drive.contains("third_workload_route_override_plugin("),
+        "mesh-mode has no production path that puts mesh_route_dispatch on \
+         the synthesized inbound relay; do not invent a slice/plugin bypass"
     );
 
     let slice_header = "\nfn third_workload_refusal_slice(";
@@ -1160,14 +1164,12 @@ fn third_workload_refusal_exercises_post_plugin_effective_destination_guard() {
         .expect("no top-level closing brace for third_workload_refusal_slice");
     let slice = &slice_rest[..slice_end];
     assert!(
-        slice.contains("mesh_route_dispatch"),
-        "the native slice must carry a global mesh_route_dispatch plugin so \
-         the synthesized inbound relay inherits the production override path"
+        !slice.contains("plugin_configs"),
+        "MeshSlice must not grow a plugin_configs wire field for this test"
     );
     assert!(
-        slice.contains("plugin_configs"),
-        "operator plugin_configs on the native MeshSlice are how the child \
-         loads that override"
+        !slice.contains("mesh_route_dispatch"),
+        "the functional slice must stay production-shaped MeshConfig content"
     );
 
     let assert_header = "\nfn assert_third_workload_connect_refused(";
@@ -1180,13 +1182,13 @@ fn third_workload_refusal_exercises_post_plugin_effective_destination_guard() {
         .expect("no top-level closing brace for assert_third_workload_connect_refused");
     let assertion = &assert_rest[..assert_end];
     assert!(
-        assertion.contains("outcome.status, 403"),
-        "both flavors must require the handler 403; a synthesis-time 404 is a \
-         setup miss, not the post-plugin re-check"
+        assertion.contains("outcome.status, 404"),
+        "both flavors must require synthesis-time 404; this functional setup \
+         never reaches the post-plugin handler re-check"
     );
     assert!(
         !assertion.contains("403 | 404"),
-        "accepting 404 lets the tests stay green if the handler re-check is deleted"
+        "do not treat a handler-path status as equivalent to synthesis refusal"
     );
 }
 
@@ -4493,10 +4495,11 @@ async fn functional_mesh_ambient_egress_routes_a_to_b_over_hbone() {
 }
 
 // The #4150 / #4252 negative of this keystone — an authenticated peer CONNECTs
-// to B naming a destination B terminates for, then a global mesh_route_dispatch
-// rewrites the effective destination onto a third slice-declared workload —
-// is `functional_mesh_ambient_hbone_refuses_third_workload_{byte_stream,datagram}`
-// next to the UDP-dest CONNECT helpers it reuses.
+// to B naming a third slice-declared workload B does not terminate for — is
+// `functional_mesh_ambient_hbone_refuses_third_workload_{byte_stream,datagram}`
+// (synthesis-time 404, zero dials). The post-plugin handler re-check is
+// `inbound_hbone_relay_refuses_post_plugin_third_workload_*` in
+// `tests/integration/mesh_hbone_tests.rs`.
 
 /// Egress keystone (Sidecar): a captured plaintext request at gateway A reaches
 /// the echo backend behind gateway B over **plain SVID-mTLS HTTP/2** to B's
@@ -9967,19 +9970,18 @@ async fn functional_mesh_udp_dest_untrusted_peer_fails_closed() {
 // Issue #4252 — inbound relay refuses a third, slice-declared workload
 // ===================================================================
 //
-// The unit tests pin `MeshConfig::inbound_relay_destination_decision`. They do
-// not prove the guard is still *wired* into `handle_hbone_request` /
-// `handle_hbone_udp_request` *after* `apply_route_overrides_with_upstreams` +
-// `select_upstream_target`. This is the end-to-end negative #4150 asked for
-// beside `functional_mesh_ambient_egress_routes_a_to_b_over_hbone`.
+// Production mesh-mode (native MeshSubscribe / xDS / file MeshConfig) has no
+// path that places operator `mesh_route_dispatch` on the synthesized inbound
+// HBONE relay. These functional cases therefore prove the production-shaped
+// synthesis refusal: an authenticated peer CONNECTs to terminator B naming
+// slice-declared workload C, `build_inbound_hbone_relay_proxy` returns None,
+// the dispatcher 404s, and C's backend records zero hits.
 //
-// Synthesis (`build_inbound_hbone_relay_proxy`) 404s if the peer's CONNECT
-// authority is not a dest B terminates for. A test that CONNECTs straight at
-// C never reaches the handlers, so deleting either post-plugin re-check
-// would stay green if 404 were accepted. The peer therefore CONNECTs to B's
-// own-pod address:port (a dest synthesis admits). A global
-// `mesh_route_dispatch` then rewrites the effective destination onto
-// slice-declared workload C. Only the handler re-check can then 403.
+// That is not the post-plugin handler re-check. The independently placed
+// re-checks in `handle_hbone_request` / `handle_hbone_udp_request` are proved
+// in-process by `inbound_hbone_relay_refuses_post_plugin_third_workload_*` in
+// `tests/integration/mesh_hbone_tests.rs`, which uses a normal GatewayConfig
+// plugin cache (global `mesh_route_dispatch`) and requires exact 403.
 //
 // C is a bindable non-loopback local interface address: PR #4315 can refuse
 // the whole loopback namespace for Ambient/waypoint terminators before
@@ -10076,33 +10078,9 @@ async fn discover_bindable_non_loopback_local_ip() -> Result<IpAddr, String> {
     ))
 }
 
-/// Production `mesh_route_dispatch` carried on native [`MeshSlice::plugin_configs`].
-/// The synthesized inbound HBONE relay is not in `config.proxies`, so it
-/// inherits the global chain; matching CONNECT rewrites the effective
-/// destination onto C after synthesis.
-fn third_workload_route_override_plugin(c_host: &str, c_port: u16) -> serde_json::Value {
-    serde_json::json!({
-        "id": "third-workload-route-override",
-        "plugin_name": "mesh_route_dispatch",
-        "namespace": "ferrum",
-        "scope": "global",
-        "enabled": true,
-        "config": {
-            "rules": [{
-                "match": { "methods": ["CONNECT"] },
-                "destination": {
-                    "backend_host": c_host,
-                    "backend_port": c_port
-                }
-            }],
-            "reject_unmatched": false
-        }
-    })
-}
-
-/// CONNECT flavor under test. Each flavor takes a different handler with its
-/// own post-plugin re-check (`handle_hbone_request` vs
-/// `handle_hbone_udp_request`).
+/// CONNECT flavor under test. Byte-stream and datagram-over-CONNECT take
+/// different dispatch branches into `build_inbound_hbone_relay_proxy`
+/// (UDP forces a route miss); both must synthesis-refuse C.
 #[derive(Clone, Copy)]
 enum ThirdWorkloadConnectFlavor {
     ByteStream,
@@ -10205,8 +10183,8 @@ async fn abort_third_workload_backend(task: tokio::task::JoinHandle<()>) {
 }
 
 /// Slice consumed by terminator B: B's own-identity record at 127.0.0.1 plus
-/// workload C — a different SPIFFE, a discovered non-loopback address — and a
-/// global `mesh_route_dispatch` that retargets CONNECT onto C after synthesis.
+/// workload C — a different SPIFFE, a discovered non-loopback address. No
+/// operator plugins: this is the production MeshSubscribe shape.
 fn third_workload_refusal_slice(
     node_id: &str,
     b_spiffe: &str,
@@ -10317,10 +10295,6 @@ fn third_workload_refusal_slice(
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
-        plugin_configs: vec![third_workload_route_override_plugin(
-            &c_ip.to_string(),
-            c_port,
-        )],
         ..MeshSlice::default()
     }
 }
@@ -10333,10 +10307,9 @@ struct ThirdWorkloadRefusalOutcome {
 }
 
 /// Spawn Ambient terminator B over a slice that also declares workload C, then
-/// drive one authenticated CONNECT at B's HBONE port naming a dest B
-/// terminates for. Global `mesh_route_dispatch` retargets the effective
-/// destination onto C. Setup failures retry; the CONNECT observation is made
-/// exactly once against a live child.
+/// drive one authenticated CONNECT at B's HBONE port naming C. Synthesis
+/// refuses because C is not a dest B terminates for. Setup failures retry;
+/// the CONNECT observation is made exactly once against a live child.
 async fn drive_inbound_relay_third_workload_refusal(
     flavor: ThirdWorkloadConnectFlavor,
 ) -> Result<ThirdWorkloadRefusalOutcome, String> {
@@ -10367,7 +10340,8 @@ async fn drive_inbound_relay_third_workload_refusal(
         let c_port = c_addr.port();
         // B's own-identity record must declare a port, otherwise the loopback
         // arm treats the own address as unconstrained. Keep it distinct from
-        // C's ephemeral port so a missed override cannot be confused with C.
+        // C's ephemeral port so an unconstrained own-address arm cannot admit
+        // C's port on loopback.
         let b_local_port = if c_port == 18080 { 18081 } else { 18080 };
 
         let cp_b = start_static_mesh_cp(third_workload_refusal_slice(
@@ -10420,9 +10394,9 @@ async fn drive_inbound_relay_third_workload_refusal(
             continue;
         }
 
-        // CONNECT names B so synthesis + the plugin chain run. The global
-        // mesh_route_dispatch then moves the effective dest onto C.
-        let authority = format!("127.0.0.1:{b_local_port}");
+        // CONNECT names C, a dest B does not terminate for. Synthesis 404s
+        // before either HBONE handler runs.
+        let authority = SocketAddr::new(c_ip, c_port).to_string();
         let connect = match flavor {
             ThirdWorkloadConnectFlavor::ByteStream => drive_one_waypoint_byte_connect(
                 hbone_port,
@@ -10469,8 +10443,8 @@ async fn drive_inbound_relay_third_workload_refusal(
                 logs,
             }),
             Err(e) => Err(format!(
-                "trusted CONNECT to B (effective dest rewritten onto C) failed \
-                 against a healthy terminator: {e}\n--- gateway B ---\n{logs}"
+                "trusted CONNECT naming C failed against a healthy terminator: \
+                 {e}\n--- gateway B ---\n{logs}"
             )),
         };
     }
@@ -10483,10 +10457,10 @@ async fn drive_inbound_relay_third_workload_refusal(
 
 fn assert_third_workload_connect_refused(outcome: ThirdWorkloadRefusalOutcome, flavor: &str) {
     assert_eq!(
-        outcome.status, 403,
-        "{flavor}: authenticated CONNECT to B must be rewritten onto C and \
-         refused by the handler re-check with 403; 404 is synthesis-time \
-         (setup miss), 200/502 means the override or guard did not fire\n{}",
+        outcome.status, 404,
+        "{flavor}: authenticated CONNECT naming C must be refused at \
+         synthesis time; 200/502 means the terminator relayed a dest it \
+         does not own\n{}",
         outcome.logs
     );
     assert_eq!(
@@ -10498,11 +10472,10 @@ fn assert_third_workload_connect_refused(outcome: ThirdWorkloadRefusalOutcome, f
     );
 }
 
-/// Issue #4252 (byte-stream): an authenticated HBONE CONNECT to terminator B
-/// naming a dest B terminates for is rewritten onto slice-declared workload C
-/// and refused with 403, and C's TCP echo records zero accepts — proving
-/// `handle_hbone_request`'s post-plugin re-check is still on the request path
-/// before `connect_backend`.
+/// Issue #4252 (byte-stream, synthesis): an authenticated HBONE CONNECT to
+/// terminator B naming slice-declared workload C is refused with 404, and C's
+/// TCP echo records zero accepts — proving `build_inbound_hbone_relay_proxy`
+/// still withholds the relay before `handle_hbone_request`.
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_ambient_hbone_refuses_third_workload_byte_stream() {
@@ -10513,10 +10486,11 @@ async fn functional_mesh_ambient_hbone_refuses_third_workload_byte_stream() {
     assert_third_workload_connect_refused(outcome, "byte-stream HBONE CONNECT");
 }
 
-/// Issue #4252 (datagram-over-CONNECT): the same B→C rewrite over the
-/// UDP-marked flavor, asserting handler 403 and C's UDP echo records zero
-/// datagrams — proving `handle_hbone_udp_request`'s independently placed
-/// re-check is still wired before `resolve_local_udp_dest`.
+/// Issue #4252 (datagram-over-CONNECT, synthesis): the same C-named CONNECT
+/// over the UDP-marked flavor, asserting synthesis 404 and C's UDP echo
+/// records zero datagrams — proving the UDP branch of
+/// `build_inbound_hbone_relay_proxy` still withholds the relay before
+/// `handle_hbone_udp_request`.
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_ambient_hbone_refuses_third_workload_datagram() {

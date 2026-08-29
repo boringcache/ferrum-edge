@@ -499,14 +499,6 @@ pub struct MeshSlice {
     /// fragmentary CDS/EDS recoverable fields.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extension_configs: Vec<MeshExtensionConfig>,
-    /// Operator `PluginConfig` objects carried on the native MeshSubscribe
-    /// slice. Ordinary `GatewayConfig.plugin_configs` do not otherwise ride
-    /// `MeshSlice`; native apply decodes these onto the data-plane snapshot
-    /// before mesh-managed globals are injected. A global `mesh_route_dispatch`
-    /// here is the production override path the synthesized inbound HBONE
-    /// relay inherits (unknown proxy id → global chain).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub plugin_configs: Vec<serde_json::Value>,
     /// xDS RTDS (`envoy.service.runtime.v3.Runtime`) overlay merged across
     /// all subscribed layers. Fault-injection values are captured in the
     /// accepted request epoch's plugin cache; transformer gates and tracing
@@ -830,7 +822,6 @@ impl MeshSlice {
             && self.sidecar_outbound_traffic_policy == other.sidecar_outbound_traffic_policy
             && self.sidecar_egress_scope == other.sidecar_egress_scope
             && self.extension_configs == other.extension_configs
-            && self.plugin_configs == other.plugin_configs
             && self.runtime_overlay == other.runtime_overlay
     }
 
@@ -1935,11 +1926,6 @@ impl MeshSlice {
             sidecar_outbound_traffic_policy,
             sidecar_egress_scope,
             extension_configs,
-            // Native MeshSubscribe does not currently reverse-project operator
-            // plugin_configs from GatewayConfig; tests and native CP stubs that
-            // need a global override (e.g. mesh_route_dispatch on the inbound
-            // HBONE relay) set this field on the slice they publish.
-            plugin_configs: Vec::new(),
             // The canonical GatewayConfig has no declarative RTDS surface.
             // xDS reverse translation populates this field directly; native
             // MeshSubscribe configs leave it empty.
@@ -4848,7 +4834,6 @@ mod tests {
             sidecar_outbound_traffic_policy: None,
             sidecar_egress_scope: None,
             extension_configs: Vec::new(),
-            plugin_configs: Vec::new(),
             runtime_overlay: MeshRuntimeOverlay::default(),
             waypoint_name: None,
             istio_root_namespace: "istio-system".into(),
@@ -7130,28 +7115,6 @@ mod tests {
         let resolved = slice.resolved_proxy_config().expect("resolved present");
         assert_eq!(resolved.name, "aaa-early");
         assert_eq!(resolved.tracing_sampling, Some(5.0));
-    }
-
-    #[test]
-    fn content_eq_detects_plugin_configs_change() {
-        let a = MeshSlice {
-            plugin_configs: vec![serde_json::json!({
-                "id": "mrd",
-                "plugin_name": "mesh_route_dispatch",
-                "scope": "global"
-            })],
-            ..MeshSlice::default()
-        };
-        let mut b = a.clone();
-        b.plugin_configs.push(serde_json::json!({
-            "id": "mrd-2",
-            "plugin_name": "mesh_route_dispatch",
-            "scope": "global"
-        }));
-        assert!(
-            !a.content_eq(&b),
-            "plugin_configs difference should be detected"
-        );
     }
 
     #[test]
