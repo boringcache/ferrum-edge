@@ -643,6 +643,7 @@ struct ReconcileContext {
     /// mesh config revision derived from it (issue #3611).
     revision: Arc<K8sConfigRevisionTracker>,
     /// Last Ready NodeWaypoint endpoint per node, shared across reconciles.
+    /// Applied only with same-node trusted replacement evidence.
     node_waypoint_inventory: NodeWaypointInventory,
 }
 

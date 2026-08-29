@@ -141,11 +141,19 @@ struct CoreNodeWaypointPod {
 ///
 /// Destination `Workload.node_waypoint` is derived from trusted host-network
 /// proxy pods that are Ready *now*. A rolling DaemonSet restart withdraws that
-/// Ready set (and, while the replacement is Pending, can empty it) without
-/// advancing the Kubernetes mesh revision watermark, so the CP would otherwise
-/// publish a metadata-stripped snapshot and then retain it. Remembering the
-/// last Ready endpoint keeps hostNetwork identity stable across that gap for
-/// as long as any trusted waypoint pod still exists in the cluster.
+/// Ready set without advancing the Kubernetes mesh revision watermark, so the
+/// CP would otherwise publish a metadata-stripped snapshot and then retain it.
+///
+/// Retention is node-scoped. Restore a node's last Ready endpoint only when
+/// the current snapshot still contains a trusted NodeWaypoint pod on that
+/// same node that is not Ready or is terminating — explicit evidence the
+/// DaemonSet is replacing the proxy there. Another node's trusted pod cannot
+/// retain a withdrawn node. A node with no trusted waypoint object is a
+/// deliberate per-node withdrawal: that remembered endpoint is dropped and
+/// destination metadata is cleared. A newly Ready same-node endpoint replaces
+/// the retained one. Fail-closed identity pinning is unchanged: only a
+/// previously Ready trusted endpoint (already admitted with a trusted SVID)
+/// can be restored.
 #[derive(Clone, Default)]
 pub struct NodeWaypointInventory {
     inner: Arc<Mutex<HashMap<String, CoreNodeWaypointPod>>>,
@@ -175,14 +183,26 @@ impl NodeWaypointInventory {
         self.lock().insert(node_name, waypoint);
     }
 
-    fn apply_to(&self, dest: &mut HashMap<String, CoreNodeWaypointPod>, keep: bool) {
+    /// Restore last Ready endpoints only for nodes that still have a trusted
+    /// NodeWaypoint object in this snapshot, and drop remembered endpoints
+    /// for nodes that do not.
+    ///
+    /// `trusted_nodes` is the set of `spec.nodeName` values on trusted
+    /// waypoint pods (Ready, not-Ready, or terminating). A Ready pod already
+    /// populated `dest` during collect; `or_insert_with` keeps that live
+    /// endpoint. A not-Ready or terminating pod is replacement evidence and
+    /// restores the last Ready endpoint for that node only.
+    fn apply_to(
+        &self,
+        dest: &mut HashMap<String, CoreNodeWaypointPod>,
+        trusted_nodes: &HashSet<String>,
+    ) {
         let mut guard = self.lock();
-        if !keep {
-            guard.clear();
-            return;
-        }
-        for (node, waypoint) in guard.iter() {
-            dest.entry(node.clone()).or_insert(waypoint.clone());
+        guard.retain(|node, _| trusted_nodes.contains(node));
+        for node in trusted_nodes {
+            if let Some(waypoint) = guard.get(node) {
+                dest.entry(node.clone()).or_insert_with(|| waypoint.clone());
+            }
         }
     }
 }
@@ -235,10 +255,10 @@ pub(super) fn collect(
 }
 
 pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError> {
-    let keep_sticky_waypoints = acc.core.pods.values().any(|pod| pod.node_waypoint_proxy);
+    let trusted_nodes = trusted_node_waypoint_nodes(acc);
     acc.options
         .node_waypoint_inventory
-        .apply_to(&mut acc.core.node_waypoints_by_node, keep_sticky_waypoints);
+        .apply_to(&mut acc.core.node_waypoints_by_node, &trusted_nodes);
 
     let mut service_keys: Vec<K8sServiceKey> = acc.core.services.keys().cloned().collect();
     service_keys.sort();
@@ -453,9 +473,10 @@ fn collect_pod(acc: &mut K8sAccumulator, object: &K8sObject) {
         ready: pod_is_ready(object),
         node_waypoint_proxy: false,
     };
-    // Mark every trusted NodeWaypoint proxy pod, including not-Ready
-    // replacements, so rolling-restart snapshots still retain last-known
-    // destination endpoints instead of treating the DaemonSet as gone.
+    // Mark every trusted NodeWaypoint proxy pod, including not-Ready and
+    // terminating replacements. That per-node presence is the only evidence
+    // that may restore this node's last Ready endpoint during a rolling
+    // restart; a missing object on this node is a withdrawal.
     if trusted_node_waypoint_pod_object(&acc.options, object) {
         pod.node_waypoint_proxy = true;
     }
@@ -1261,6 +1282,18 @@ fn node_waypoint_spiffe_id(object: &K8sObject) -> Option<SpiffeId> {
         }
     }
     None
+}
+
+fn trusted_node_waypoint_nodes(acc: &K8sAccumulator) -> HashSet<String> {
+    acc.core
+        .pods
+        .values()
+        .filter(|pod| pod.node_waypoint_proxy)
+        .filter_map(|pod| {
+            let name = pod.node_name.as_deref()?.trim();
+            (!name.is_empty()).then(|| name.to_string())
+        })
+        .collect()
 }
 
 fn node_waypoint_for_node(acc: &K8sAccumulator, node_name: &str) -> Option<NodeWaypointEndpoint> {

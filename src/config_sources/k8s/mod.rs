@@ -178,8 +178,10 @@ pub struct K8sTranslationOptions {
     /// about ownership cannot widen Kubernetes authority by accident.
     pub mesh_overlay_authority: bool,
     /// Process-lifetime last Ready NodeWaypoint endpoint per node. Shared
-    /// across reconciles so a rolling restart does not publish a
+    /// across reconciles so a same-node rolling restart does not publish a
     /// metadata-stripped mesh under an unchanged Kubernetes revision.
+    /// Restore is node-scoped: only a trusted not-Ready or terminating
+    /// replacement on that node may reattach the remembered endpoint.
     pub node_waypoint_inventory: NodeWaypointInventory,
     source_namespaces: Option<HashSet<String>>,
     pod_source_namespaces: Option<HashSet<String>>,
