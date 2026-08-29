@@ -72,7 +72,11 @@ fn operation_budget_is_clamped_by_the_batch_deadline() {
 
     // Batch nearly spent: the operation may not overrun it.
     assert_eq!(
-        status_operation_budget(now, now + Duration::from_millis(400), Duration::from_secs(5)),
+        status_operation_budget(
+            now,
+            now + Duration::from_millis(400),
+            Duration::from_secs(5)
+        ),
         Some(Duration::from_millis(400))
     );
 
@@ -171,9 +175,9 @@ async fn a_spent_batch_refuses_further_requests_without_waiting() {
     )
     .await;
 
-    assert!(is_status_timeout_error(
-        &result.expect_err("a spent batch must refuse, not issue an unbounded request")
-    ));
+    assert!(is_status_timeout_error(&result.expect_err(
+        "a spent batch must refuse, not issue an unbounded request"
+    )));
     assert_eq!(
         started.elapsed(),
         Duration::ZERO,

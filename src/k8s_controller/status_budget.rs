@@ -166,7 +166,9 @@ fn record_status_timeout(
     metrics: Option<&ControllerMetrics>,
 ) -> kube::Error {
     if let Some(metrics) = metrics {
-        metrics.status_request_timeouts.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .status_request_timeouts
+            .fetch_add(1, Ordering::Relaxed);
     }
     warn!(
         phase = operation.phase,

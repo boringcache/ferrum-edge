@@ -1287,7 +1287,14 @@ async fn run_status_patchers(request: StatusPatchersRequest<'_>) {
         .await;
     }
     if let Some(writer) = istio_writer {
-        patch_istio_statuses(writer, snapshot, options.clone(), translation_reuse, metrics).await;
+        patch_istio_statuses(
+            writer,
+            snapshot,
+            options.clone(),
+            translation_reuse,
+            metrics,
+        )
+        .await;
     }
 }
 
@@ -1352,7 +1359,9 @@ async fn patch_gateway_api_statuses(
             );
         }
         Err(_) => {
-            metrics.status_batch_timeouts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics
+                .status_batch_timeouts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             warn!(
                 updates = updates_len,
                 timeout_secs = STATUS_PATCH_BATCH_TIMEOUT.as_secs(),
@@ -1417,7 +1426,9 @@ async fn patch_istio_statuses(
             );
         }
         Err(_) => {
-            metrics.status_batch_timeouts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics
+                .status_batch_timeouts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             warn!(
                 updates = updates_len,
                 timeout_secs = STATUS_PATCH_BATCH_TIMEOUT.as_secs(),
