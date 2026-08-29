@@ -454,10 +454,10 @@ async fn gateway_listener_ports_follow_config_reload_add_and_withdraw() {
         .await
         .expect("file::serve starts");
 
-        assert_eq!(
-            handles.gateway_listeners.active_ports().await,
-            vec![listener_a_port]
-        );
+        // `serve` starts the listener supervisor before returning, but its
+        // initial reconciliation is asynchronous just like later reloads.
+        // Wait for the declared socket instead of racing that first pass.
+        wait_for_listener_ports(&handles, &[listener_a_port]).await;
         assert_eq!(http_get(listener_a_port, "/api/x").await.0, 200);
         if undeclared_port_stolen_externally(&handles, listener_b_port).await {
             eprintln!(
