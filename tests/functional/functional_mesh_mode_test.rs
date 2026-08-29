@@ -10491,13 +10491,15 @@ async fn drive_inbound_relay_third_workload_refusal(
         // wrong topology) would 404 for C and pass as a security proof.
         let control_authority = format!("127.0.0.1:{b_local_port}");
         let control = match flavor {
-            ThirdWorkloadConnectFlavor::ByteStream => drive_one_waypoint_byte_connect(
-                hbone_port,
-                &control_authority,
-                &svids.a,
-                control_payload,
-            )
-            .await,
+            ThirdWorkloadConnectFlavor::ByteStream => {
+                drive_one_waypoint_byte_connect(
+                    hbone_port,
+                    &control_authority,
+                    &svids.a,
+                    control_payload,
+                )
+                .await
+            }
             ThirdWorkloadConnectFlavor::Datagram => {
                 drive_one_udp_connect(hbone_port, &control_authority, &svids.a).await
             }
