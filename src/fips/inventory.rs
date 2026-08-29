@@ -368,6 +368,16 @@ pub const INVENTORY: &[CryptoOperation] = &[
                     DER parsing performs no cryptography",
     },
     CryptoOperation {
+        operation: "OCSP staple certificate binding and responder signature verification",
+        location: "src/tls/ocsp.rs",
+        implementation: "crate::fips::backend, x509-parser",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "CertID and ResponderID digests use the selected-provider backend; issuer, \
+                    delegate, and BasicOCSPResponse signature checks use x509-parser's shared \
+                    verification API, whose `fips` feature arm selects verify-aws (aws-lc-rs) \
+                    and excludes the ring-backed verify arm",
+    },
+    CryptoOperation {
         operation: "Certificate and CSR generation (internal CA, dev bootstrap)",
         location: "src/identity/ca/internal.rs, src/identity/ca/bootstrap.rs",
         implementation: "rcgen",
