@@ -5866,7 +5866,9 @@ mod tests {
                 .await
                 .expect("SWR must serve the stale row");
             entered2.notified().await;
-            cache.cache.remove(dns_hostname_key("swr-gone.test").as_ref());
+            cache
+                .cache
+                .remove(dns_hostname_key("swr-gone.test").as_ref());
             gate2.add_permits(1);
             released2.notified().await;
             wait_until_refresh_idle(&cache).await;
