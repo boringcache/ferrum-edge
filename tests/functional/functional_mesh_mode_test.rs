@@ -1117,8 +1117,8 @@ fn fixture_servers_bind_through_the_mesh_port_aware_helper() {
         "start_counting_udp_echo_on",
     ] {
         let body = mesh_test_fn_body(name);
-        let through_helper = body.contains("bind_fixture_listener(")
-            || body.contains("bind_fixture_udp_socket(");
+        let through_helper =
+            body.contains("bind_fixture_listener(") || body.contains("bind_fixture_udp_socket(");
         assert!(
             through_helper,
             "`{name}` must bind through `bind_fixture_listener` or \
