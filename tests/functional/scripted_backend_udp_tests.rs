@@ -47,17 +47,31 @@ fn write_config(path: &std::path::Path, content: &str) {
     std::fs::write(path, content).expect("write config");
 }
 
+/// Per-spawn `FERRUM_METRICS_BEARER_TOKEN` so authenticated `/health` can prove
+/// this child owns the admin port (issue #4373 / #3428). Never logged.
+fn mint_observability_token() -> String {
+    format!(
+        "ferrum-edge-scripted-udp-probe-{}",
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
 /// Spawn the gateway subprocess with stream-proxy-specific env vars.
 /// `Stdio::null()` for stdout per CLAUDE.md functional-test rule;
 /// `Stdio::piped()` causes deadlock if not drained.
 ///
 /// `capture_logs = true` redirects stderr to a temp file so the test
 /// can grep log output.
+///
+/// Identity env is applied after `extra_env` so a caller (or leaked parent
+/// shell) cannot replace this attempt's token or open a CIDR allowlist that
+/// would let a foreign listener answer the authenticated `/health` tier.
 fn spawn_gateway(
     config_path: &str,
     proxy_http_port: u16,
     admin_port: u16,
     extra_env: &[(&str, String)],
+    observability_token: &str,
     capture_paths: Option<(&std::path::Path, &std::path::Path)>,
 ) -> std::io::Result<std::process::Child> {
     let mut cmd = std::process::Command::new(gateway_binary_path());
@@ -83,6 +97,8 @@ fn spawn_gateway(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
+    cmd.env("FERRUM_METRICS_BEARER_TOKEN", observability_token)
+        .env_remove("FERRUM_METRICS_ALLOWED_CIDRS");
     match capture_paths {
         Some((stdout_path, stderr_path)) => {
             cmd.stdout(std::process::Stdio::from(std::fs::File::create(
@@ -100,32 +116,112 @@ fn spawn_gateway(
     cmd.spawn()
 }
 
-/// Poll `/health` until 2xx or the deadline elapses. Returns true on
-/// success.
-async fn wait_for_health(admin_port: u16, deadline: Duration) -> bool {
-    let end = tokio::time::Instant::now() + deadline;
-    let url = format!("http://127.0.0.1:{admin_port}/health");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(1))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    while tokio::time::Instant::now() < end {
-        if let Ok(r) = client.get(&url).send().await
-            && r.status().is_success()
-        {
-            return true;
+/// Wait until `child` owns its admin listener and reports fully ready.
+///
+/// Unauthenticated `/health` 2xx is not identity and is not readiness: a
+/// foreign process can answer the released admin port, and that probe does
+/// not require JSON `ready: true`. `ready` flips only after every listener
+/// bind, including the UDP/DTLS stream listener these tests actually dial.
+/// Connecting that UDP port as a readiness probe would look like real
+/// traffic, so authenticated `ready: true` is the barrier.
+///
+/// Barrier (same contract as `TestGateway` / passthrough `wait_for_owned_gateway`):
+/// 1. `Child::try_wait` before and after every probe — a dead child voids
+///    the attempt.
+/// 2. Authenticated `/health` detail tier for this attempt's bearer token
+///    with `ready: true`, via the shared `probe_gateway_identity` contract.
+///
+/// Each probe is sliced so `try_wait` runs between attempts. A successful
+/// response from a foreign or previous listener cannot admit this attempt.
+async fn wait_for_owned_gateway(
+    child: &mut std::process::Child,
+    admin_port: u16,
+    observability_token: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    const STARTUP_TIMEOUT_SECS: u64 = 30;
+    const PROBE_SLICE: Duration = Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
+    let mut last_observation = String::from("no response yet");
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(format!(
+                "scripted UDP gateway exited during startup with {status} \
+                 (last observation: {last_observation})"
+            )
+            .into());
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "scripted UDP gateway did not prove ownership of admin port {admin_port} \
+                 within {STARTUP_TIMEOUT_SECS} seconds (last observation: {last_observation})"
+            )
+            .into());
+        }
+        match crate::common::probe_gateway_identity(
+            admin_port,
+            observability_token,
+            remaining.min(PROBE_SLICE),
+        )
+        .await
+        {
+            Ok(()) => {
+                if let Some(status) = child.try_wait()? {
+                    return Err(format!(
+                        "scripted UDP gateway exited after proving ownership with {status}"
+                    )
+                    .into());
+                }
+                return Ok(());
+            }
+            Err(err) => {
+                last_observation = err.to_string();
+                if let Some(status) = child.try_wait()? {
+                    return Err(format!(
+                        "scripted UDP gateway exited during startup with {status} \
+                         (last observation: {last_observation})"
+                    )
+                    .into());
+                }
+            }
+        }
     }
-    false
+}
+
+/// Include the bounded, redacted capture tail in spawn-failure errors.
+/// Tokens are never logged.
+fn attempt_failure_detail(
+    error: &str,
+    capture_paths: &Option<(std::path::PathBuf, std::path::PathBuf)>,
+    observability_token: &str,
+) -> String {
+    let error = error.replace(observability_token, "***");
+    let Some((stdout, stderr)) = capture_paths else {
+        return error;
+    };
+    let out = std::fs::read_to_string(stdout).unwrap_or_default();
+    let err = std::fs::read_to_string(stderr).unwrap_or_default();
+    let combined = if out.is_empty() {
+        err
+    } else if err.is_empty() {
+        out
+    } else {
+        format!("{err}\n{out}")
+    };
+    if combined.trim().is_empty() {
+        return error;
+    }
+    format!(
+        "{error}\n--- captured gateway output ---\n{}",
+        crate::common::scrub_gateway_capture_for_diagnostics(&combined, &[observability_token])
+    )
 }
 
 /// Wrapper that combines "reserve UDP listen port" + "reserve HTTP +
-/// admin ports" + "write config + spawn gateway + wait for health".
-/// Retries up to 3× to absorb the bind-drop-rebind race.
+/// admin ports" + "write config + spawn gateway + wait for owned ready".
+/// Retries up to 3× to absorb the bind-drop-rebind race. An attempt whose
+/// child exits, or whose `/health` answer is not this child's authenticated
+/// `ready: true`, is void: retry with fresh ports and temp state.
 async fn start_gateway_with_retry<F>(
     build_yaml: F,
     extra_env: Vec<(&'static str, String)>,
@@ -135,6 +231,7 @@ where
     F: Fn(u16) -> String,
 {
     const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = String::from("no spawn attempts completed");
     for attempt in 1..=MAX_ATTEMPTS {
         // Stream listen_port: UDP port for the gateway's UDP/DTLS
         // frontend — reserve in the UDP namespace.
@@ -167,41 +264,54 @@ where
         } else {
             None
         };
+        let observability_token = mint_observability_token();
 
-        let child = match spawn_gateway(
+        let mut child = match spawn_gateway(
             config_path.to_str().unwrap(),
             proxy_http_port,
             admin_port,
-            &extra_env
-                .iter()
-                .map(|(k, v)| (*k, v.clone()))
-                .collect::<Vec<_>>(),
+            &extra_env,
+            &observability_token,
             capture_paths
                 .as_ref()
                 .map(|(o, e)| (o.as_path(), e.as_path())),
         ) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                last_err = format!("spawn failed: {e}");
+                continue;
+            }
         };
 
-        if wait_for_health(admin_port, Duration::from_secs(20)).await {
-            return GatewayFixture {
-                child: Some(child),
-                udp_port,
-                admin_port,
-                proxy_http_port,
-                temp_dir,
-                capture_paths,
-            };
+        match wait_for_owned_gateway(&mut child, admin_port, &observability_token).await {
+            Ok(()) => {
+                return GatewayFixture {
+                    child: Some(child),
+                    udp_port,
+                    admin_port,
+                    proxy_http_port,
+                    temp_dir,
+                    capture_paths,
+                };
+            }
+            Err(error) => {
+                last_err = attempt_failure_detail(
+                    &error.to_string(),
+                    &capture_paths,
+                    &observability_token,
+                );
+                eprintln!(
+                    "scripted UDP gateway startup attempt {attempt}/{MAX_ATTEMPTS} failed \
+                     (udp={udp_port}, admin={admin_port}, http={proxy_http_port}): {last_err}"
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
-
-        // Clean up a zombie before retry.
-        let mut dead = child;
-        let _ = dead.kill();
-        let _ = dead.wait();
-        eprintln!("gateway health check attempt {attempt}/{MAX_ATTEMPTS} failed");
     }
-    panic!("gateway did not become healthy after {MAX_ATTEMPTS} attempts");
+    panic!(
+        "scripted UDP gateway did not prove ownership after {MAX_ATTEMPTS} attempts: {last_err}"
+    );
 }
 
 struct GatewayFixture {
@@ -305,7 +415,7 @@ impl Drop for GatewayFixture {
 #[ignore]
 async fn udp_session_idle_timeout_cleans_session_map() {
     // Hold the backend port bound across gateway startup, but start the script
-    // afterwards: a failed health-check attempt costs up to 20 seconds and
+    // afterwards: a failed identity-probe attempt costs up to 30 seconds and
     // would expire the backend's 10-second `ExpectDatagram` deadline before the
     // first client datagram.
     let reservation = reserve_udp_port().await.expect("reserve backend udp port");
@@ -444,8 +554,8 @@ plugin_configs: []
 #[ignore]
 async fn udp_amplification_bound_enforced() {
     // Keep the backend socket bound while the gateway starts, but do not start
-    // its script yet: `start_gateway_with_retry` may spend up to 20 seconds on
-    // a failed health-check attempt, which would expire the backend's
+    // its script yet: `start_gateway_with_retry` may spend up to 30 seconds on
+    // a failed identity-probe attempt, which would expire the backend's
     // 10-second `ExpectDatagram` deadline before the client ever sends and
     // drop the socket. Same ordering as `dtls_passthrough_sni_routes_to_correct_backend`.
     let reservation = reserve_udp_port().await.expect("reserve");
@@ -623,7 +733,7 @@ plugin_configs: []
 #[ignore]
 async fn dtls_passthrough_sni_routes_to_correct_backend() {
     // Keep both backend sockets bound while the gateway starts. The gateway
-    // helper may spend up to 20 seconds on a failed health-check attempt;
+    // helper may spend up to 30 seconds on a failed identity-probe attempt;
     // spawning the scripted backends before it returns would let their
     // 10-second expect deadlines expire and drop the sockets before a retry.
     let res_a = reserve_udp_port().await.expect("reserve a");
