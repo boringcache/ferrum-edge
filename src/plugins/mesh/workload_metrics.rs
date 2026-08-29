@@ -2921,13 +2921,18 @@ mod tests {
 
     #[test]
     fn trusted_hbone_baggage_is_the_inbound_source() {
+        // Bare exact SPIFFE pins grant SameNamespace only (issue #4274). This
+        // test is about honoring trusted baggage, so pin the storefront
+        // identity with an exact-inventory object rather than relying on the
+        // pre-fix namespace-blind reading of a ztunnel SVID in istio-system.
         let metrics = WorkloadMetrics::new(&json!({
             "namespace": "payments",
             "workload_spiffe_id": "spiffe://cluster.local/ns/payments/sa/checkout",
             "labels": {"app": "checkout"},
-            "trusted_hbone_assertors": [
-                "spiffe://cluster.local/ns/istio-system/sa/ztunnel"
-            ]
+            "trusted_hbone_assertors": [{
+                "assertor": "spiffe://cluster.local/ns/istio-system/sa/ztunnel",
+                "asserts": ["spiffe://cluster.local/ns/storefront/sa/frontend"]
+            }]
         }))
         .expect("metrics config");
         let mut ctx = RequestContext::new(
@@ -2954,6 +2959,10 @@ mod tests {
             ctx.metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str),
             Some("spiffe://cluster.local/ns/storefront/sa/frontend")
         );
+        assert!(
+            !ctx.metadata.contains_key("mesh.ignored_baggage"),
+            "trusted inventory must honor baggage rather than dropping it out of scope"
+        );
         assert_eq!(
             ctx.metadata.get("mesh.source.workload").map(String::as_str),
             Some("frontend")
@@ -2968,13 +2977,18 @@ mod tests {
 
     #[tokio::test]
     async fn udp_source_scope_reject_restamps_source_to_attesting_peer() {
+        // Exact inventory so request-received attribution honors the baggage
+        // (the intended starting state). A bare ztunnel pin would fail closed
+        // as assertion_out_of_scope first and never exercise the UDP
+        // pod-UID/source-scope restamp this test is about.
         let metrics = WorkloadMetrics::new(&json!({
             "namespace": "payments",
             "workload_spiffe_id": "spiffe://cluster.local/ns/payments/sa/checkout",
             "labels": {"app": "checkout"},
-            "trusted_hbone_assertors": [
-                "spiffe://cluster.local/ns/istio-system/sa/ztunnel"
-            ]
+            "trusted_hbone_assertors": [{
+                "assertor": "spiffe://cluster.local/ns/istio-system/sa/ztunnel",
+                "asserts": ["spiffe://cluster.local/ns/storefront/sa/frontend"]
+            }]
         }))
         .expect("metrics config");
         let mut ctx = RequestContext::new(
@@ -3002,6 +3016,10 @@ mod tests {
             ctx.metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str),
             Some("spiffe://cluster.local/ns/storefront/sa/frontend")
         );
+        assert!(
+            !ctx.metadata.contains_key("mesh.ignored_baggage"),
+            "UDP restamp coverage must start from honored baggage, not assertion_out_of_scope"
+        );
 
         // mesh_authz then discards the UDP pod-UID/source-scope evidence
         // bundle, falls back to the attesting peer, and rejects before
@@ -3027,6 +3045,11 @@ mod tests {
         assert_eq!(
             ctx.metadata.get(MESH_SOURCE_NAMESPACE).map(String::as_str),
             Some("istio-system")
+        );
+        assert_eq!(
+            ctx.metadata.get("mesh.ignored_baggage").map(String::as_str),
+            Some("pod_uid_not_bound"),
+            "restamp must be the UDP source-scope refusal, not assertion_out_of_scope"
         );
     }
 
