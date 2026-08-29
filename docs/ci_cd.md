@@ -2545,8 +2545,8 @@ relaxing the scan, the trusted policy admits exact retired→adopted pairs
 | `ebpf-live` | `b7596b48641c850f797c84710dd5646013414d6ba01c30f4d4b2805737c8c26c` | `9aa3332bff5c4538f797f31133be0ef7dfc9767a72e7212b39be33ed58dcca87` | PR #3915 / issue #3900 |
 | `netns-capture-live` | `db543d5c35bfbd4a7b987a52635b359ea6268669257cd313146324f5ca79f598` | `b71296ba5929c78cd786301cc8ed677905cca82cd605be46880021b88c243e32` | PR #3915 / issue #3900 |
 | `two-cluster-mesh-live` | `0586ab0b5b8b803f2ee3663b608c40caca06f9c92e58d4cb28c2080d68f23f27` | `9c3d5b4dfbc6a209e801a47bceabd31fe8aa7df033d49989ad8f88a3e4ed73e7` | PR #3915 / issue #3900 |
-| `build-binaries` | `14b0890e2693cd0825fcf25ba7f48810b5ae9a33f2cbb5751bdaaf60186b83b1` | `e5a4f2ac007c1c26201ed59ec481e46c9c7a21160f250cdcfc4c5f212eb40426` | PR #4355 / issue #4301 |
-| `build-release-binaries` (`release.yml`) | `678699fb04a2319c5b7b706c8fdf05f0d4b58a30d07e023091499d27a88bbb9f` | `ec52e9b32bbdd1def962e2fe02acc8d1daf9404df853c9ca9d2c17cad5c35776` | PR #4355 / issue #4301 |
+| `build-binaries` | `14b0890e2693cd0825fcf25ba7f48810b5ae9a33f2cbb5751bdaaf60186b83b1` | `6561ef8614337be946f0a68d8f1f3ef94c2897c5acd266157c15b4d90fdc3240` | PR #4355 / issue #4301 |
+| `build-release-binaries` (`release.yml`) | `678699fb04a2319c5b7b706c8fdf05f0d4b58a30d07e023091499d27a88bbb9f` | `55489ade23f4e15fe047bca88fc18b4a1bd9e000605e99263715df630434b591` | PR #4355 / issue #4301 |
 
 The three `#3915` pairs admit the per-suite planner-gate split (the union
 `run_ebpf_live` output becomes `run_ebpf_kernel_live` /

@@ -12655,12 +12655,12 @@ CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
     (
         "build-binaries",
         "14b0890e2693cd0825fcf25ba7f48810b5ae9a33f2cbb5751bdaaf60186b83b1",
-        "e5a4f2ac007c1c26201ed59ec481e46c9c7a21160f250cdcfc4c5f212eb40426",
+        "6561ef8614337be946f0a68d8f1f3ef94c2897c5acd266157c15b4d90fdc3240",
     ),
     (
         "build-release-binaries",
         "678699fb04a2319c5b7b706c8fdf05f0d4b58a30d07e023091499d27a88bbb9f",
-        "ec52e9b32bbdd1def962e2fe02acc8d1daf9404df853c9ca9d2c17cad5c35776",
+        "55489ade23f4e15fe047bca88fc18b4a1bd9e000605e99263715df630434b591",
     ),
 )
 

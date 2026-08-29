@@ -7,7 +7,28 @@
 # They are not musl. Artifact names stay unchanged so checksums, signatures,
 # and container packaging keep consuming the same trusted asset set.
 
+# TOML binds a bare key to the table header above it, so every top-level
+# key in this contract must stay above the first `[table]` below.
+
 glibc_max_version = "2.34"
+
+# Dynamic libraries the GNU artifacts may reference. libz is listed because
+# librdkafka's cmake build may still pull in libz-sys; the sysroot build sets
+# LIBZ_SYS_STATIC=1 so a clean link typically omits it. glibc SONAMEs (libc,
+# libm, libpthread, libdl, librt, libresolv) and libgcc_s are the remaining
+# runtime contract. Anything else fails the gate.
+allowed_needed = [
+    "libc.so.6",
+    "libm.so.6",
+    "libgcc_s.so.1",
+    "libpthread.so.0",
+    "libdl.so.2",
+    "librt.so.1",
+    "libresolv.so.2",
+    "libz.so.1",
+    "ld-linux-x86-64.so.2",
+    "ld-linux-aarch64.so.1",
+]
 
 # Oldest supported runtime this contract claims: RHEL 9 / Rocky Linux 9 /
 # AlmaLinux 9 (glibc 2.34). Ubuntu 22.04 (2.35) and Debian 12 (2.36) are
@@ -36,21 +57,3 @@ glibc = "2.34"
 image = "ubuntu@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc"
 name = "Ubuntu 22.04"
 glibc = "2.35"
-
-# Dynamic libraries the GNU artifacts may reference. libz is listed because
-# librdkafka's cmake build may still pull in libz-sys; the sysroot build sets
-# LIBZ_SYS_STATIC=1 so a clean link typically omits it. glibc SONAMEs (libc,
-# libm, libpthread, libdl, librt, libresolv) and libgcc_s are the remaining
-# runtime contract. Anything else fails the gate.
-allowed_needed = [
-    "libc.so.6",
-    "libm.so.6",
-    "libgcc_s.so.1",
-    "libpthread.so.0",
-    "libdl.so.2",
-    "librt.so.1",
-    "libresolv.so.2",
-    "libz.so.1",
-    "ld-linux-x86-64.so.2",
-    "ld-linux-aarch64.so.1",
-]

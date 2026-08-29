@@ -5913,20 +5913,24 @@ jobs:
       # Fail closed on the exact bytes that are about to be uploaded. The
       # checksum re-verification proves the scanned and smoked files are the
       # same bytes the `.sha256` sidecars and the `latest` prerelease
-      # advertise. This step runs before `Upload artifacts`, so a floor
+      # advertise. Both steps run before `Upload artifacts`, so a floor
       # violation means the canonical artifact never exists and every
       # downstream consumer (`latest-release`, `docker`, `docker-manifest`)
       # fails closed with it.
+      - name: Re-verify the staged x86_64 GNU asset checksums
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        working-directory: release-assets
+        run: |
+          set -euo pipefail
+          sha256sum -c ferrum-edge-linux-x86_64.sha256
+          sha256sum -c ferrum-cni-linux-x86_64.sha256
+
       - name: Verify published x86_64 GNU ABI floor and oldest baselines
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
         run: |
           set -euo pipefail
-          (
-            cd release-assets
-            sha256sum -c ferrum-edge-linux-x86_64.sha256
-            sha256sum -c ferrum-cni-linux-x86_64.sha256
-          )
           python3 -I .github/scripts/verify_linux_gnu_abi.py \
             release-assets/ferrum-edge-linux-x86_64 \
             release-assets/ferrum-cni-linux-x86_64
@@ -6317,18 +6321,20 @@ jobs:
           name: binary-aarch64-unknown-linux-gnu
           path: gnu-artifacts
 
-      - name: Verify checksums, ABI floor, and oldest-baseline smoke
+      - name: Verify the published ARM64 artifact checksums
+        working-directory: gnu-artifacts
+        run: |
+          set -euo pipefail
+          sha256sum -c ferrum-edge-linux-aarch64.sha256
+          sha256sum -c ferrum-cni-linux-aarch64.sha256
+          chmod +x ferrum-edge-linux-aarch64 ferrum-cni-linux-aarch64
+
+      - name: Verify the ABI floor and oldest baselines
         run: |
           set -euo pipefail
           python3 -I .github/scripts/verify_linux_gnu_abi.py --self-test
           python3 -I .github/scripts/verify_linux_gnu_abi.py --check-contract
           python3 -I .github/scripts/smoke_linux_gnu_baseline.py --self-test
-          (
-            cd gnu-artifacts
-            sha256sum -c ferrum-edge-linux-aarch64.sha256
-            sha256sum -c ferrum-cni-linux-aarch64.sha256
-            chmod +x ferrum-edge-linux-aarch64 ferrum-cni-linux-aarch64
-          )
           python3 -I .github/scripts/verify_linux_gnu_abi.py \
             gnu-artifacts/ferrum-edge-linux-aarch64 \
             gnu-artifacts/ferrum-cni-linux-aarch64

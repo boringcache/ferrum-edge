@@ -38,8 +38,8 @@ PROCESS_API_TOKENS = (
     "from sub" + "process",
     "sub" + "process.run",
     "sub" + "process.Popen",
-    "os.system(",
-    "os.popen(",
+    "os." + "system(",
+    "os." + "popen(",
     "asyncio.create_sub" + "process",
 )
 README = REPO_ROOT / "README.md"
@@ -71,6 +71,34 @@ LINUX_GNU_ASSETS = (
 def load_contract(path: Path = CONTRACT_PATH) -> dict[str, Any]:
     with path.open("rb") as handle:
         return tomllib.load(handle)
+
+
+def check_contract_shape(contract: dict[str, Any]) -> list[str]:
+    """Reject a contract whose top-level keys are missing or mis-scoped.
+
+    TOML binds a bare key to the table header above it, so an `allowed_needed`
+    array written below `[smoke.ubuntu2204]` silently becomes that table's
+    member instead of a top-level key. Every consumer then raises `KeyError`
+    on a well-formed file rather than reporting a diagnosable contract error,
+    so the shape is proven here before any scan or fixture reads it.
+    """
+
+    errors: list[str] = []
+    for key in ("glibc_max_version", "allowed_needed"):
+        if key not in contract:
+            errors.append(
+                f"{CONTRACT_PATH.name} must define top-level {key!r}; a bare "
+                "key written below a [table] header belongs to that table"
+            )
+    allowed = contract.get("allowed_needed")
+    if allowed is not None:
+        if not isinstance(allowed, list) or not all(
+            isinstance(item, str) for item in allowed
+        ):
+            errors.append(f"{CONTRACT_PATH.name} allowed_needed must be a list of SONAMEs")
+        elif "libc.so.6" not in allowed:
+            errors.append(f"{CONTRACT_PATH.name} allowed_needed must permit libc.so.6")
+    return errors
 
 
 def parse_version(text: str) -> tuple[int, ...]:
@@ -711,6 +739,9 @@ def check_pr_linux_gnu_job(ci_yml: str) -> list[str]:
 
 def check_repository() -> list[str]:
     contract = load_contract()
+    shape = check_contract_shape(contract)
+    if shape:
+        return shape
     errors: list[str] = []
     if str(contract.get("glibc_max_version")) != "2.34":
         errors.append("declared GLIBC floor must be 2.34")
@@ -864,6 +895,11 @@ def _synthetic_dynamic_elf64(needed: list[str], glibc_names: list[str]) -> bytes
 def run_self_test() -> list[str]:
     failures: list[str] = []
     contract = load_contract()
+    shape = check_contract_shape(contract)
+    if shape:
+        # Every fixture below indexes the contract directly. Reporting the
+        # shape is strictly more useful than raising out of the first one.
+        return shape
     ceiling = parse_version("2.34")
 
     if parse_version("2.34") > ceiling:
@@ -874,6 +910,15 @@ def run_self_test() -> list[str]:
         failures.append("GLIBC_2.17 was rejected against the 2.34 floor")
     if not version_exceeds(parse_version("2.34.1"), ceiling):
         failures.append("GLIBC_2.34.1 was not rejected against the 2.34 floor")
+
+    # A contract whose `allowed_needed` slid under a [table] header parses
+    # fine and then breaks every consumer, so the shape guard is exercised.
+    if not check_contract_shape({"glibc_max_version": "2.34"}):
+        failures.append("a contract without a top-level allowed_needed was accepted")
+    if not check_contract_shape({**contract, "allowed_needed": ["libm.so.6"]}):
+        failures.append("a contract that does not permit libc.so.6 was accepted")
+    if not check_contract_shape({"allowed_needed": list(contract["allowed_needed"])}):
+        failures.append("a contract without a top-level glibc_max_version was accepted")
 
     if evaluate_readelf_fixture(READELF_FLOOR_FIXTURE, contract, "floor-fixture"):
         failures.append("in-floor GLIBC_2.34 fixture was rejected")
