@@ -204,6 +204,38 @@ fn sidecar_capture_ipv6_is_derived_from_the_same_gate_that_emits_ip6tables_rules
 }
 
 #[test]
+fn malformed_capture_include_cidr_fails_listener_family_validation() {
+    with_sidecar_runtime(
+        &[("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS", "not-a-cidr")],
+        |runtime| {
+            let err = runtime
+                .validate_capture_listener_families()
+                .expect_err("malformed include CIDR must fail closed at startup");
+            assert!(
+                err.contains("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS"),
+                "the startup error must name the offending variable: {err}"
+            );
+        },
+    );
+}
+
+#[test]
+fn malformed_capture_exclude_cidr_fails_listener_family_validation() {
+    with_sidecar_runtime(
+        &[("FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS", "10.0.0.0/64")],
+        |runtime| {
+            let err = runtime
+                .validate_capture_listener_families()
+                .expect_err("malformed exclude CIDR must fail closed at startup");
+            assert!(
+                err.contains("FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS"),
+                "the startup error must name the offending variable: {err}"
+            );
+        },
+    );
+}
+
+#[test]
 fn explicit_false_cannot_contradict_locally_configured_ipv6_rules() {
     let guard = EnvGuard::new(MESH_ENV_KEYS);
     for &key in MESH_ENV_KEYS {

@@ -1130,9 +1130,17 @@ fn capture_ipv6_derived_from_env() -> Result<bool, String> {
     let include_cidrs = parse_cidr_env(
         &resolve_ferrum_var("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS").unwrap_or_default(),
     );
+    if !include_cidrs.is_empty() {
+        validate_cidr_list(&include_cidrs)
+            .map_err(|e| format!("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS: {e}"))?;
+    }
     let exclude_cidrs = parse_cidr_env(
         &resolve_ferrum_var("FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS").unwrap_or_default(),
     );
+    if !exclude_cidrs.is_empty() {
+        validate_cidr_list(&exclude_cidrs)
+            .map_err(|e| format!("FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS: {e}"))?;
+    }
     Ok(include_cidrs
         .iter()
         .chain(exclude_cidrs.iter())
