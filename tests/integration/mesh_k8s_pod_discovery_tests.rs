@@ -681,8 +681,7 @@ fn k8s_pod_discovery_retains_last_ready_node_waypoint_for_same_node_unready_repl
     let retained = reviews_workload_node_waypoint(&translation)
         .expect("same-node unready replacement must keep last Ready endpoint");
     assert_eq!(
-        retained.address,
-        "192.0.2.10",
+        retained.address, "192.0.2.10",
         "sticky inventory is last Ready, not the current unready pod address"
     );
     assert_eq!(
