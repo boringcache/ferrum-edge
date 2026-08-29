@@ -854,6 +854,7 @@ jobs:
               integration::audit_retention_tests
               integration::admin_backend_capabilities_tests
               integration::admin_batch_atomicity_tests
+              integration::admin_batch_reference_check_tests
               integration::admin_runtime_metrics_tests
               integration::admin_observability_auth_tests
               integration::admin_metrics_tls_inventory_snapshot_tests
