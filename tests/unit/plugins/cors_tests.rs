@@ -2186,8 +2186,8 @@ async fn test_credentialed_literal_exact_preflight_reflects_the_source_origin() 
 //
 // The credentials interlock must classify matcher BREADTH, not just the
 // `AllowedOrigins::Wildcard` variant. Exact `*` keeps the documented drop-
-// credentials contract; effectively universal prefix/regex + credentials is
-// refused rather than silently weakened.
+// credentials contract; opaque exact `null` or another effectively universal
+// matcher + credentials is refused rather than silently weakened.
 
 #[test]
 fn test_constructor_rejects_credentialed_universal_prefix_and_regex() {
@@ -2196,8 +2196,13 @@ fn test_constructor_rejects_credentialed_universal_prefix_and_regex() {
         json!([{"prefix": "h"}]),
         json!([{"prefix": "http"}]),
         json!([{"prefix": "https:/"}]),
+        json!([{"prefix": "chrome-extension://"}]),
+        json!([{"prefix": "null"}]),
+        json!([{"exact": "null"}]),
         json!([{"regex": ".*"}]),
         json!([{"regex": "https://.*"}]),
+        json!([{"regex": "chrome-extension://.*"}]),
+        json!([{"regex": "null"}]),
     ] {
         let err = CorsPlugin::new(&json!({
             "allowed_origins": origins.clone(),
@@ -2478,8 +2483,13 @@ fn cors_uses_strict_origin_policy_treats_universal_prefix_and_regex_as_non_stric
     for origins in [
         json!([{"prefix": "https://"}]),
         json!([{"prefix": "h"}]),
+        json!([{"prefix": "chrome-extension://"}]),
+        json!([{"prefix": "null"}]),
+        json!([{"exact": "null"}]),
         json!([{"regex": ".*"}]),
         json!([{"regex": "https://.*"}]),
+        json!([{"regex": "chrome-extension://.*"}]),
+        json!([{"regex": "null"}]),
     ] {
         let plugin =
             CorsPlugin::new(&json!({"allowed_origins": origins.clone()})).unwrap_or_else(|err| {

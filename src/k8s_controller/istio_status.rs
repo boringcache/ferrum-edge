@@ -1256,8 +1256,8 @@ fn accepted_status(
 /// policy combination Ferrum cannot represent faithfully (a
 /// malformed/unknown origin matcher, an over-budget
 /// matcher list or value, an un-compilable/over-complex regex, an unparseable
-/// `maxAge`, or credentialed exact `*` / effectively universal prefix or
-/// regex); exact/prefix/regex origin matchers are
+/// `maxAge`, or credentialed exact `*` / opaque exact `null` / effectively
+/// universal prefix or regex); exact/prefix/regex origin matchers are
 /// otherwise translated.
 fn virtual_service_status(
     object: &K8sObject,
@@ -1347,7 +1347,8 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
     // remains a deferred field when an origin matcher is malformed/unknown, a
     // matcher list or value exceeds its bound, a `regex` does not compile or is
     // too complex, maxAge is unparseable, or credentials are combined with
-    // exact `*` or an effectively universal prefix/regex (issue #4269; the
+    // exact `*`, opaque exact `null`, or an effectively universal prefix/regex
+    // (issue #4269; the
     // native wildcard representation cannot preserve that source behavior). The
     // shared `cors_policy_translatable` predicate keeps the
     // translator and this report in lockstep.

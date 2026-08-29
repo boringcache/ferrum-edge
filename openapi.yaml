@@ -22011,8 +22011,9 @@ components:
                       64 KiB compiled-program limit, a 64 KiB lazy-DFA limit,
                       and an AST nesting limit of 24. An invalid or over-budget
                       pattern is rejected with a field-specific error. A regex
-                      that admits every origin of a scheme (for example `.*` or
-                      `https://.*`) cannot be combined with allow_credentials.
+                      that admits the opaque `null` origin or every origin of a
+                      scheme (for example `.*` or `https://.*`) cannot be
+                      combined with allow_credentials.
           description: >-
             Required permitted-origin policy, bounded at 64 entries. Each entry
             is either a string — NATIVE syntax: `"*"` for intentional allow-all,
@@ -22063,10 +22064,11 @@ components:
           description: >-
             Send Access-Control-Allow-Credentials: true. Incompatible with
             wildcard origins (native `"*"` / `{exact: "*"}` logs a warning and
-            disables credentials) and with an effectively universal prefix or
-            regex (refused at config load rather than silently weakened). A
+            disables credentials), opaque exact `null`, and an effectively
+            universal prefix or regex (refused at config load rather than
+            silently weakened). A
             prefix must constrain the host (`://` plus at least one host
-            character); a regex must not match every origin of a scheme.
+            character); a regex must not match `null` or every origin of a scheme.
         max_age:
           type: integer
           format: uint64

@@ -2790,7 +2790,7 @@ mod virtual_service_cors {
         let errors = validate(vec![credentialed]);
         assert!(
             errors.iter().any(|error| error.contains(
-                "allow_credentials must not be true with an exact `*` origin or an effectively universal prefix/regex matcher"
+                "allow_credentials must not be true with exact `*`, opaque exact `null`, or an effectively universal prefix/regex matcher"
             )),
             "{errors:?}"
         );
@@ -2802,12 +2802,15 @@ mod virtual_service_cors {
     }
 
     #[test]
-    fn credentialed_universal_prefix_and_regex_are_rejected_without_weakening() {
+    fn credentialed_opaque_and_universal_matchers_are_rejected_without_weakening() {
         for origin in [
+            MeshCorsOriginMatch::Exact("null".into()),
             MeshCorsOriginMatch::Prefix("https://".into()),
             MeshCorsOriginMatch::Prefix("h".into()),
+            MeshCorsOriginMatch::Prefix("chrome-extension://".into()),
             MeshCorsOriginMatch::Regex(".*".into()),
             MeshCorsOriginMatch::Regex("https://.*".into()),
+            MeshCorsOriginMatch::Regex("null".into()),
         ] {
             let mut credentialed = policy(vec![origin.clone()]);
             credentialed.cors.allow_credentials = Some(true);
@@ -2815,7 +2818,7 @@ mod virtual_service_cors {
             assert!(
                 errors
                     .iter()
-                    .any(|error| error.contains("effectively universal prefix/regex matcher")),
+                    .any(|error| error.contains("opaque exact `null`")),
                 "credentialed {origin:?} must be refused: {errors:?}"
             );
 

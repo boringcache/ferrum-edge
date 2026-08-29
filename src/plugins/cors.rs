@@ -149,6 +149,19 @@ const ORIGIN_REGEX_HTTP_UNIVERSALITY_PROBES: &[&str] = &[
     "http://127.0.0.1",
 ];
 
+/// Browser extensions can issue credentialed cross-origin requests too. Keep
+/// scheme-wide extension matchers from bypassing the same interlock merely
+/// because they do not admit HTTP(S) origins.
+const ORIGIN_REGEX_CHROME_EXTENSION_UNIVERSALITY_PROBES: &[&str] = &[
+    "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+];
+
+const ORIGIN_REGEX_MOZ_EXTENSION_UNIVERSALITY_PROBES: &[&str] = &[
+    "moz-extension://00000000-0000-4000-8000-000000000000",
+    "moz-extension://11111111-1111-4111-8111-111111111111",
+];
+
 /// Construction-time breadth of one origin matcher or of a whole policy.
 ///
 /// This is the single classifier used by the credentials interlock,
@@ -158,9 +171,9 @@ const ORIGIN_REGEX_HTTP_UNIVERSALITY_PROBES: &[&str] = &[
 pub(crate) enum OriginPolicyBreadth {
     /// Explicit allow-all: native `"*"` or Istio `{exact: "*"}`.
     Wildcard,
-    /// A prefix or regex that admits every origin, or every origin of `http` /
-    /// `https`. Not the `AllowedOrigins::Wildcard` variant, but equivalent for
-    /// credentialed reflection.
+    /// An opaque exact `null`, or a prefix/regex that admits every origin (or
+    /// every origin of a scheme). Not the `AllowedOrigins::Wildcard` variant,
+    /// but equivalent for credentialed reflection.
     EffectivelyUniversal,
     /// Constrains origins to a non-universal set.
     Strict,
@@ -173,9 +186,10 @@ pub(crate) enum OriginPolicyBreadth {
 pub(crate) enum OriginMatcherSpec<'a> {
     /// Native `"*"` or Istio `{exact: "*"}`.
     AllowAll,
-    /// Native exact, native wildcard-subdomain, or Istio literal exact. None of
-    /// these is universal (`*` is [`Self::AllowAll`]).
-    Exact,
+    /// Native exact or Istio literal exact. The opaque serialized origin
+    /// `null` is non-strict because unrelated sandboxed/file origins collapse
+    /// to that same value.
+    Exact(&'a str),
     Prefix(&'a str),
     /// Already-compiled regex (plugin construction).
     CompiledRegex(&'a Regex),
@@ -191,7 +205,13 @@ pub(crate) enum OriginMatcherSpec<'a> {
 pub(crate) fn origin_matcher_breadth(spec: OriginMatcherSpec<'_>) -> OriginPolicyBreadth {
     match spec {
         OriginMatcherSpec::AllowAll => OriginPolicyBreadth::Wildcard,
-        OriginMatcherSpec::Exact => OriginPolicyBreadth::Strict,
+        OriginMatcherSpec::Exact(value) => {
+            if value == "null" {
+                OriginPolicyBreadth::EffectivelyUniversal
+            } else {
+                OriginPolicyBreadth::Strict
+            }
+        }
         OriginMatcherSpec::Prefix(prefix) => {
             if origin_prefix_is_effectively_universal(prefix) {
                 OriginPolicyBreadth::EffectivelyUniversal
@@ -219,13 +239,13 @@ pub(crate) fn origin_matcher_breadth(spec: OriginMatcherSpec<'_>) -> OriginPolic
 pub(crate) fn origin_matcher_spec_from_entry(origin: &Value) -> Option<OriginMatcherSpec<'_>> {
     match origin {
         Value::String(value) if value == "*" => Some(OriginMatcherSpec::AllowAll),
-        Value::String(_) => Some(OriginMatcherSpec::Exact),
+        Value::String(value) => Some(OriginMatcherSpec::Exact(value)),
         Value::Object(map) => {
             if let Some(exact) = map.get("exact").and_then(Value::as_str) {
                 return Some(if exact == "*" {
                     OriginMatcherSpec::AllowAll
                 } else {
-                    OriginMatcherSpec::Exact
+                    OriginMatcherSpec::Exact(exact)
                 });
             }
             if let Some(prefix) = map.get("prefix").and_then(Value::as_str) {
@@ -248,18 +268,15 @@ pub(crate) fn allowed_origin_entry_is_non_strict(origin: &Value) -> bool {
 }
 
 /// A prefix is effectively universal when it does not constrain the origin
-/// authority (scheme+host). Either it is a prefix of `http://` / `https://`
-/// (so every origin of that scheme matches — and `http` also matches every
-/// `https` origin), or it is `http://` / `https://` with an empty authority.
+/// authority (scheme+host). This is scheme-independent: browser-extension and
+/// custom serialized origins are security principals too, not only HTTP(S).
 ///
 /// `https://app.` and `https://preview-` constrain the host and are strict.
 /// `h`, `https://`, and `https:/` do not and are effectively universal.
 pub(crate) fn origin_prefix_is_effectively_universal(prefix: &str) -> bool {
     match prefix.split_once("://") {
-        None => "http://".starts_with(prefix) || "https://".starts_with(prefix),
-        Some((scheme, authority)) => {
-            authority.is_empty() && (scheme == "http" || scheme == "https")
-        }
+        None => true,
+        Some((scheme, authority)) => scheme.is_empty() || authority.is_empty(),
     }
 }
 
@@ -267,12 +284,14 @@ pub(crate) fn origin_prefix_is_effectively_universal(prefix: &str) -> bool {
 /// probe in at least one scheme group. Bounded: the probe sets are fixed, the
 /// engine is finite-automaton based, and this runs once at config construction.
 pub(crate) fn origin_regex_is_effectively_universal(re: &Regex) -> bool {
-    ORIGIN_REGEX_HTTPS_UNIVERSALITY_PROBES
-        .iter()
-        .all(|origin| re.is_match(origin))
-        || ORIGIN_REGEX_HTTP_UNIVERSALITY_PROBES
-            .iter()
-            .all(|origin| re.is_match(origin))
+    // `null` represents every opaque origin (for example sandboxed documents
+    // and local files), so admitting it with credentials is itself non-strict.
+    let matches_all = |probes: &[&str]| probes.iter().all(|origin| re.is_match(origin));
+    re.is_match("null")
+        || matches_all(ORIGIN_REGEX_HTTPS_UNIVERSALITY_PROBES)
+        || matches_all(ORIGIN_REGEX_HTTP_UNIVERSALITY_PROBES)
+        || matches_all(ORIGIN_REGEX_CHROME_EXTENSION_UNIVERSALITY_PROBES)
+        || matches_all(ORIGIN_REGEX_MOZ_EXTENSION_UNIVERSALITY_PROBES)
 }
 
 const CORS_CONFIG_KEYS: &[&str] = &[
@@ -477,13 +496,15 @@ impl AllowedOrigins {
 }
 
 fn origin_pattern_breadth(pattern: &OriginPattern) -> OriginPolicyBreadth {
-    origin_matcher_breadth(match pattern {
-        OriginPattern::Exact(_)
-        | OriginPattern::LiteralExact(_)
-        | OriginPattern::WildcardSubdomain(_) => OriginMatcherSpec::Exact,
+    let spec = match pattern {
+        OriginPattern::Exact(value) | OriginPattern::LiteralExact(value) => {
+            OriginMatcherSpec::Exact(value)
+        }
+        OriginPattern::WildcardSubdomain(_) => return OriginPolicyBreadth::Strict,
         OriginPattern::Prefix(prefix) => OriginMatcherSpec::Prefix(prefix),
         OriginPattern::Regex(re) => OriginMatcherSpec::CompiledRegex(re),
-    })
+    };
+    origin_matcher_breadth(spec)
 }
 
 /// CORS (Cross-Origin Resource Sharing) plugin.
@@ -578,7 +599,7 @@ impl CorsPlugin {
         // Per CORS spec: Access-Control-Allow-Origin: * cannot be used with
         // credentials. Exact wildcard keeps the documented contract: warn and
         // drop credentials rather than refusing the config. Effectively
-        // universal prefix/regex matchers are the same security outcome
+        // universal non-wildcard matchers are the same security outcome
         // without the Wildcard variant, so they are refused rather than
         // silently weakened (issue #4269).
         let breadth = allowed_origins.breadth();
@@ -594,8 +615,9 @@ impl CorsPlugin {
                 OriginPolicyBreadth::EffectivelyUniversal => {
                     return Err(
                         "cors: allow_credentials=true is incompatible with an effectively \
-                         universal origin matcher (a prefix that does not constrain the host, \
-                         or a regex that admits every origin of a scheme); specify a \
+                         universal origin matcher (the opaque exact 'null' origin, a prefix \
+                         that does not constrain the host, or a regex that admits every origin \
+                         of a scheme); specify a \
                          host-constraining origin policy to use credentials"
                             .to_string(),
                     );
@@ -617,7 +639,8 @@ impl CorsPlugin {
     }
 
     /// Whether this instance restricts origins to an explicit allow-list rather
-    /// than wildcard `*` or an effectively universal prefix/regex. Used by
+    /// than wildcard `*`, opaque exact `null`, or another effectively universal
+    /// matcher. Used by
     /// plugin-cache composition diagnostics. Shares [`origin_matcher_breadth`]
     /// with the credentials interlock and Istio/mesh admission.
     pub fn uses_strict_origin_policy(&self) -> bool {

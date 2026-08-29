@@ -5525,8 +5525,9 @@ fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
 /// `allowMethods`/`allowHeaders`/`exposeHeaders` entry passes the plugin's own
 /// method/header-name admission. Credentialed exact `*` is deferred because the
 /// native wildcard representation cannot emit the concrete request origin
-/// required for credentialed CORS. Credentialed effectively universal
-/// prefix/regex matchers are likewise deferred (issue #4269): they would
+/// required for credentialed CORS. Credentialed opaque exact `null` and
+/// effectively universal prefix/regex matchers are likewise deferred (issue
+/// #4269): they would
 /// reflect an arbitrary origin with credentials, and plugin construction
 /// refuses that combination rather than silently dropping credentials. A
 /// malformed/unknown origin matcher, an
@@ -5549,10 +5550,11 @@ pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
         cors.get("allowCredentials"),
         None | Some(Value::Null) | Some(Value::Bool(_))
     );
-    // Exact `*` AND effectively universal prefix/regex matchers share one
+    // Exact `*`, opaque exact `null`, AND effectively universal prefix/regex
+    // matchers share one
     // breadth classifier with plugin construction (issue #4269). Credentialed
     // exact `*` stays deferred because projecting it would drop credentials;
-    // credentialed universal prefix/regex is refused at construction, so it
+    // credentialed opaque/universal matcher is refused at construction, so it
     // must be deferred here rather than failing plugin construction later.
     let credentialed_wildcard_ok = !matches!(cors.get("allowCredentials"), Some(Value::Bool(true)))
         || !allowed_origins.as_ref().is_some_and(|origins| {
@@ -5778,8 +5780,8 @@ fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option
              must be exact/prefix/regex StringMatch, or the legacy allowOrigin exact list, \
              within the bounded matcher count/size and with a compilable, bounded-complexity \
              regex, plus well-typed methods, headers, credentials, unmatched-preflight mode, \
-             and maxAge; credentialed exact '*' or an effectively universal \
-             prefix/regex cannot be represented safely); leaving it \
+             and maxAge; credentialed exact '*' / opaque exact 'null' or an \
+             effectively universal prefix/regex cannot be represented safely); leaving it \
              unprojected. Configure the `cors` plugin directly."
         );
         return None;
