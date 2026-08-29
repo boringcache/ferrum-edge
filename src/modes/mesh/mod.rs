@@ -14826,6 +14826,19 @@ async fn arm_mesh_runtime_startup(
             .await;
     }
 
+    // The first mesh slice was converted and accepted before `ProxyState` /
+    // `StreamListenerManager` existed, so the live apply loop correctly treats
+    // it as already applied and never enters the dynamic owner-scoped DTLS
+    // publication path. Seed that exact accepted generation before the first
+    // listener reconcile. A missing or invalid required DTLS identity is fatal
+    // here: no listener may count as started until its owner-scoped material is
+    // valid and the socket is actually serving.
+    if runtime.topology == MeshTopology::NodeWaypoint
+        && let Some(slice) = initial_applied_mesh_slice.as_deref()
+    {
+        publish_initial_node_waypoint_dtls_generation(&proxy_state, runtime, slice).await?;
+    }
+
     // Spawn the SPIFFE trust-bundle federation poller reconciler before the
     // apply task so the first slice apply observes whatever the poller has
     // already fetched. Unlike the old one-shot spawn, the reconciler watches
@@ -18176,6 +18189,47 @@ pub fn build_node_waypoint_dtls_owner_configs(
         }
     }
     Ok(configs)
+}
+
+/// Publish the owner-scoped DTLS generation for the already-accepted initial
+/// NodeWaypoint slice before stream listeners reconcile.
+///
+/// The background apply loop receives that slice as its last-applied baseline,
+/// so it intentionally skips the no-op generation. Startup must perform the
+/// corresponding DTLS publication itself or a generated listener has routing
+/// but no owner-scoped certificate/verifier generation and remains deferred.
+/// Any required candidate that cannot be built aborts startup fail-closed;
+/// unlike a later update, there is no prior serving generation to retain.
+pub async fn publish_initial_node_waypoint_dtls_generation(
+    proxy_state: &ProxyState,
+    runtime: &MeshRuntimeConfig,
+    slice: &MeshSlice,
+) -> Result<(), anyhow::Error> {
+    if runtime.topology != MeshTopology::NodeWaypoint {
+        return Ok(());
+    }
+    let config = proxy_state.config.load_full();
+    let configs = match build_node_waypoint_dtls_owner_configs(
+        proxy_state,
+        runtime,
+        slice,
+        config.as_ref(),
+    ) {
+        Ok(configs) => configs,
+        Err(reason) => {
+            proxy_state
+                .stream_listener_manager
+                .record_mesh_node_waypoint_dtls_candidate_failure();
+            return Err(anyhow::anyhow!(
+                "initial NodeWaypoint DTLS generation is not servable: {reason}"
+            ));
+        }
+    };
+    proxy_state
+        .stream_listener_manager
+        .publish_mesh_node_waypoint_dtls_generation(configs)
+        .await;
+    Ok(())
 }
 
 /// Effective `PeerAuthentication` mode for one generated NodeWaypoint DTLS

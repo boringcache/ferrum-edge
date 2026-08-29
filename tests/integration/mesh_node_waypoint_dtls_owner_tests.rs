@@ -23,7 +23,7 @@ use ferrum_edge::modes::mesh::config::{
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::modes::mesh::{
     MeshRuntimeConfig, MeshTopology, build_node_waypoint_dtls_owner_configs,
-    node_waypoint_udp_proxy_id,
+    node_waypoint_udp_proxy_id, publish_initial_node_waypoint_dtls_generation,
 };
 use ferrum_edge::proxy::ProxyState;
 use rcgen::{CertificateParams, KeyPair};
@@ -154,6 +154,85 @@ fn listener_key(service: &str, port: u16) -> String {
             .expect("test service names are admitted Kubernetes identities"),
     )
     .runtime_key()
+}
+
+/// The first accepted slice is the apply loop's baseline, so startup must
+/// publish its owner-scoped DTLS generation before the initial listener
+/// reconcile. A generated listener must bind only after that exact generation
+/// exists; deferred-without-a-socket is not startup success.
+#[tokio::test]
+async fn initial_dtls_generation_precedes_generated_listener_startup() {
+    ensure_crypto_provider();
+    let identity = write_dtls_identity();
+    let backend = workload_for(
+        "coap",
+        DEFAULT_NAMESPACE,
+        [("app", "coap")],
+        ["10.244.3.12"],
+    );
+    let holder = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("reserve UDP listener port");
+    let port = holder.local_addr().expect("reserved address").port();
+    drop(holder);
+
+    let slice = dtls_slice(
+        vec![dtls_service("coap", port, &backend)],
+        vec![backend],
+        vec![namespace_peer_auth(MtlsMode::Permissive, HashMap::new())],
+    );
+    let config = GatewayConfig {
+        proxies: vec![generated_dtls_proxy("coap", port)],
+        ..GatewayConfig::default()
+    };
+    let state = test_proxy_state(dtls_env(&identity, None), config);
+    let runtime = node_waypoint_runtime();
+
+    assert!(
+        state
+            .stream_listener_manager
+            .snapshot_mesh_node_waypoint_dtls_generation()
+            .is_none(),
+        "a fresh manager has no owner-scoped generation"
+    );
+    publish_initial_node_waypoint_dtls_generation(&state, &runtime, &slice)
+        .await
+        .expect("initial accepted DTLS generation must be servable");
+
+    let accepted = state
+        .stream_listener_manager
+        .snapshot_mesh_node_waypoint_dtls_generation()
+        .expect("initial owner-scoped generation published");
+    assert_eq!(
+        accepted.covered_listener_keys(),
+        vec![listener_key("coap", port)]
+    );
+    assert!(
+        state
+            .stream_listener_manager
+            .snapshot_frontend_dtls_generation()
+            .is_none(),
+        "initial mesh publication must not seed the operator DTLS slot"
+    );
+
+    state
+        .initial_reconcile_stream_listeners()
+        .await
+        .expect("initial generated listener reconcile");
+    state
+        .stream_listener_manager
+        .wait_until_started(std::time::Duration::from_secs(2))
+        .await
+        .expect("generated listener must bind after its owner generation publishes");
+    assert!(
+        state
+            .stream_listener_manager
+            .stream_bind_failures()
+            .is_empty(),
+        "a covered initial listener must not remain deferred or degraded"
+    );
+
+    state.stream_listener_manager.shutdown_all().await;
 }
 
 /// A mixed Permissive+Strict candidate without a client CA must not return Ok
