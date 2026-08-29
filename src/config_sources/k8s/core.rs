@@ -1215,15 +1215,11 @@ fn matches_node_waypoint_topology(value: &str) -> bool {
 }
 
 fn pod_host_network(object: &K8sObject) -> bool {
-    match object
+    object
         .spec
         .get("hostNetwork")
-        .or_else(|| object.spec.get("host_network"))
-    {
-        Some(Value::Bool(value)) => *value,
-        Some(Value::String(value)) => value.trim().eq_ignore_ascii_case("true"),
-        _ => false,
-    }
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn pod_service_account(object: &K8sObject) -> &str {
@@ -1235,7 +1231,6 @@ fn pod_service_account(object: &K8sObject) -> &str {
 
 fn object_node_name(object: &K8sObject) -> Option<&str> {
     nonempty_node_name(string_field(&object.spec, "nodeName"))
-        .or_else(|| nonempty_node_name(string_field(&object.spec, "node_name")))
 }
 
 fn nonempty_node_name(value: Option<&str>) -> Option<&str> {
@@ -1329,15 +1324,12 @@ fn expand_pod_env_refs(value: &str, values: &HashMap<String, String>) -> String 
 
 fn pod_env_field_ref_value(object: &K8sObject, env: &Value) -> Option<String> {
     let field_ref = env.get("valueFrom")?.get("fieldRef")?;
-    let field_path = field_ref
-        .get("fieldPath")
-        .or_else(|| field_ref.get("field_path"))?
-        .as_str()?;
+    let field_path = field_ref.get("fieldPath")?.as_str()?;
     match field_path {
         "metadata.name" => Some(object.metadata.name.clone()),
         "metadata.namespace" => Some(object.metadata.namespace.clone()),
         "metadata.uid" => Some(object.metadata.uid.clone()),
-        "spec.nodeName" | "spec.node_name" => object_node_name(object).map(ToOwned::to_owned),
+        "spec.nodeName" => object_node_name(object).map(ToOwned::to_owned),
         _ => None,
     }
 }
