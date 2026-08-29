@@ -2941,16 +2941,18 @@ async fn gateway_class_status_apply_is_cluster_scoped_and_generation_fenced() {
         .await
         .expect("generation-current GatewayClass status must publish");
 
-    let state = state.lock().expect("lock mock Kubernetes state");
-    assert_eq!(state.get_count, 1);
-    assert_eq!(state.patch_bodies.len(), 1);
-    let patch = &state.patch_bodies[0];
-    assert!(patch["metadata"].get("namespace").is_none());
-    assert_eq!(patch["metadata"]["resourceVersion"].as_str(), Some("8"));
-    assert_eq!(
-        patch["status"]["conditions"][0]["observedGeneration"].as_i64(),
-        Some(2)
-    );
+    {
+        let state = state.lock().expect("lock mock Kubernetes state");
+        assert_eq!(state.get_count, 1);
+        assert_eq!(state.patch_bodies.len(), 1);
+        let patch = &state.patch_bodies[0];
+        assert!(patch["metadata"].get("namespace").is_none());
+        assert_eq!(patch["metadata"]["resourceVersion"].as_str(), Some("8"));
+        assert_eq!(
+            patch["status"]["conditions"][0]["observedGeneration"].as_i64(),
+            Some(2)
+        );
+    }
 
     let stale_state = Arc::new(Mutex::new(MockGatewayKubeState {
         get_count: 0,
