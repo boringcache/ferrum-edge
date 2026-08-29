@@ -8141,6 +8141,10 @@ components:
             `good` status) is mandatory before the response is stapled: a
             structurally valid record that belongs to another certificate is
             rejected when the frontend TLS config that references it is built.
+            With `FERRUM_FIPS_MODE=enforce` this boundary also refuses a
+            responder signature algorithm of `sha1WithRSAEncryption` or Ed25519,
+            and a carried responder certificate whose public key is outside the
+            approved set.
         allow_overwrite:
           type: boolean
           default: false

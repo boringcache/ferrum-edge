@@ -368,14 +368,41 @@ pub const INVENTORY: &[CryptoOperation] = &[
                     DER parsing performs no cryptography",
     },
     CryptoOperation {
-        operation: "OCSP staple certificate binding and responder signature verification",
+        operation: "OCSP staple signature verification (leaf-to-issuer, delegate-to-issuer, \
+                    BasicOCSPResponse)",
         location: "src/tls/ocsp.rs",
-        implementation: "crate::fips::backend, x509-parser",
+        implementation: "x509-parser",
         disposition: Disposition::ModuleRoutable,
-        rationale: "CertID and ResponderID digests use the selected-provider backend; issuer, \
-                    delegate, and BasicOCSPResponse signature checks use x509-parser's shared \
-                    verification API, whose `fips` feature arm selects verify-aws (aws-lc-rs) \
-                    and excludes the ring-backed verify arm",
+        rationale: "verification uses x509-parser's shared API, whose `fips` feature arm selects \
+                    verify-aws (aws-lc-rs) and excludes the ring-backed verify arm. That API's \
+                    supported set is wider than Ferrum's contract, so `OcspCryptoPolicy` \
+                    allow-lists the algorithm at the grammar under enforcement: \
+                    sha256/384/512WithRSAEncryption, rsassa-pss with SHA-2, ecdsa-with-SHA256, \
+                    and ecdsa-with-SHA384 only. The two sha1WithRSAEncryption OIDs (which also \
+                    select the 1024-bit-floor legacy RSA arm) and Ed25519 are refused",
+    },
+    CryptoOperation {
+        operation: "OCSP responder and issuer certificate key admission",
+        location: "src/tls/ocsp.rs, src/fips/keys.rs",
+        implementation: "crate::fips::keys, x509-parser",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "certificates carried in the OCSP response never pass through \
+                    tls::parse_pem_certificate_bundle, so under enforcement every carried \
+                    responder certificate and the issuer selected from the served chain are \
+                    admitted directly through fips::keys::check_certificate_public_key_enforced \
+                    (RSA 2048-8192, ECDSA P-256/P-384/P-521)",
+    },
+    CryptoOperation {
+        operation: "OCSP CertID issuerNameHash/issuerKeyHash and ResponderID byKey digests",
+        location: "src/tls/ocsp.rs",
+        implementation: "crate::fips::backend",
+        disposition: Disposition::OutsideBoundary,
+        rationale: "RFC 6960 key identifiers, not digital signatures: both are recomputed over \
+                    public issuer/responder material to SELECT an entry or a candidate \
+                    certificate, and admission still rests on the responder signature and a \
+                    byte-exact serialNumber comparison. SHA-1 therefore stays admitted under \
+                    enforcement, as it does for the RFC 6455 Sec-WebSocket-Accept value. The \
+                    digests are computed by the selected provider, not a second implementation",
     },
     CryptoOperation {
         operation: "Certificate and CSR generation (internal CA, dev bootstrap)",

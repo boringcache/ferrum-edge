@@ -457,6 +457,32 @@ the entry and discloses nothing.
   key and protects no secret. Non-security content-addressing digests listed in
   the inventory use the selected provider's SHA-256 seam but remain classified
   as `outside-boundary` because they are not security services.
+- **Stapled OCSP responses** (`src/tls/ocsp.rs`) are a distinct signature surface
+  and are gated separately, because `x509_parser::verify::verify_signature` —
+  which performs the leaf-to-issuer proof, the delegate-to-issuer proof, and the
+  `BasicOCSPResponse` verification — supports more than Ferrum admits. Under
+  enforcement the OCSP binding path allow-lists exactly
+  `sha256/384/512WithRSAEncryption`, `rsassa-pss` with SHA-256/384/512,
+  `ecdsa-with-SHA256`, and `ecdsa-with-SHA384`. Both `sha1WithRSAEncryption`
+  OIDs are refused (SP 800-131A Rev. 2, and that arm also drops the RSA modulus
+  floor to 1024 bits), and so is Ed25519, for the same reason `EdDSA` JWTs are.
+  The refusal is at the response *grammar*, so a non-approved response cannot be
+  stored through `POST /admin/tls/ocsp-responses` either, not merely declined at
+  serving time. Certificates carried in the response's `certs` field never reach
+  `tls::parse_pem_certificate_bundle`, so each one — used or not — plus the
+  issuer selected out of the served chain is admitted directly through the
+  certificate key-form gate above; an embedded Ed25519 or RSA-1024 delegate is
+  refused before it can authorize anything.
+- Two SHA-1 uses on that same OCSP path are **key identifiers, not signatures**,
+  and stay admitted under enforcement: `CertID.issuerNameHash` /
+  `CertID.issuerKeyHash` (RFC 6960 §4.1.1) and `ResponderID.byKey`
+  (RFC 6960 §4.2.1). Both are recomputed over public issuer/responder material
+  to *select* a response entry or a candidate certificate; authenticity comes
+  from the responder signature — which the allow-list above governs — and from a
+  byte-exact `serialNumber` comparison, so a digest collision authorizes
+  nothing. They are computed through the provider seam, and the inventory
+  records them as `outside-boundary` for exactly the same reason as the RFC 6455
+  handshake value. Do not read them as SHA-1 signature verification.
 - JWT-SVID trust material (issue #3617) admits an EC authority only after proving
   the published point actually lies on its named curve. That proof is a bounded
   ephemeral ECDH agreement at the provider seam (`fips::ec_point_on_named_curve`
@@ -611,6 +637,7 @@ than being allowed to run outside the boundary:
 | `ES512` JWTs | ECDSA over P-521 is approved, but the selected `jsonwebtoken/aws_lc_rs` backend exposes no P-521 JWS path — its `Algorithm` enum has no such variant | ES256 / ES384 |
 | ChaCha20-Poly1305, X25519 | not an approved AEAD / not an approved SP 800-56A scheme | AES-GCM suites, secp256r1 / secp384r1 |
 | RSA below 2048 bits; DSA, GOST, Ed25519/Ed448/X25519 certificates | SP 800-131A Rev. 2 / FIPS 186-5 | RSA 2048–8192, ECDSA P-256/P-384/P-521 |
+| Stapled OCSP responses signed with `sha1WithRSAEncryption` or Ed25519, and responses carrying a non-approved responder certificate key | SHA-1 is disallowed for signature verification (SP 800-131A Rev. 2); Ed25519 is not routed through the selected module; an embedded responder certificate bypasses the PEM bundle key gate | a response signed with SHA-2 RSA (PKCS#1 or PSS) or ECDSA P-256/P-384, carrying only approved responder certificates |
 | Any peer-verification opt-out | an unauthenticated peer defeats the approved key exchange | pin the peer's CA (see the table in §"What FIPS mode enforces") |
 | **External secret providers** (`_VAULT`, `_AWS`, `_AZURE`, `_GCP`, and `vault://`, `aws://`, `azure://`, or `gcp://` TLS-material sources) | their SDKs resolve secrets over their own TLS stacks, which are not built from Ferrum's provider seam and are not selected by the `crypto-ring` / `fips` feature pair | a local file or direct value backed by an operator-validated delivery mechanism (mounted secret, init container, KMS-backed volume) |
 

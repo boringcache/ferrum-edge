@@ -527,6 +527,75 @@ fn build_h3_quinn_server_config(
     bind_live_verifier: bool,
     h3_config: &Http3ServerConfig,
 ) -> Result<quinn::ServerConfig, anyhow::Error> {
+    let server_tls_config = build_h3_rustls_server_config(
+        tls_config,
+        tls_policy,
+        client_trust,
+        client_auth_configured,
+        bind_live_verifier,
+    )?;
+
+    let quic_server_config = QuicServerConfig::try_from(server_tls_config)
+        .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
+
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.initial_mtu(h3_config.initial_mtu);
+    // The FRONTEND idle timeout, which the RFC 9298 CONNECT-UDP profile raises
+    // to at least its own tunnel idle bound when enabled: a tunnel carrying no
+    // datagram generates no QUIC activity either, so a smaller connection idle
+    // limit would close it before its configured idle window elapsed. The
+    // derivation only ever raises; it is logged so it is never a silent
+    // override of an operator's `FERRUM_HTTP3_IDLE_TIMEOUT`.
+    if h3_config.connect_udp_raised_frontend_idle_timeout() {
+        info!(
+            configured_idle_timeout_seconds = h3_config.idle_timeout.as_secs(),
+            effective_idle_timeout_seconds = h3_config.frontend_idle_timeout.as_secs(),
+            "HTTP/3 frontend QUIC idle timeout raised to the configured RFC 9298 CONNECT-UDP \
+             tunnel idle timeout; a shorter connection idle limit would close idle tunnels first"
+        );
+    }
+    transport_config.max_idle_timeout(Some(
+        h3_config
+            .frontend_idle_timeout
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("Invalid idle timeout: {}", e))?,
+    ));
+    transport_config.max_concurrent_bidi_streams(h3_config.max_concurrent_streams.into());
+
+    // QUIC flow-control tuning — conservative defaults for untrusted clients.
+    transport_config.stream_receive_window(crate::http3::config::quic_varint_or_default(
+        h3_config.stream_receive_window,
+        crate::http3::config::H3_FRONTEND_STREAM_RECEIVE_WINDOW,
+    ));
+    transport_config.receive_window(crate::http3::config::quic_varint_or_default(
+        h3_config.receive_window,
+        crate::http3::config::H3_FRONTEND_RECEIVE_WINDOW,
+    ));
+    transport_config.send_window(h3_config.send_window);
+
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
+    server_config.transport_config(Arc::new(transport_config));
+    Ok(server_config)
+}
+
+/// The rustls half of [`build_h3_quinn_server_config`]: the TLS 1.3-only
+/// `rustls::ServerConfig` that `QuicServerConfig::try_from` then wraps.
+///
+/// Split out so the certificate-serving half of the H3 conversion is observable
+/// on its own. `QuicServerConfig::try_from` consumes the config and exposes
+/// nothing back, so without this seam "the converted config still serves the
+/// validated OCSP staple" could only be asserted about the *input*. What the
+/// conversion carries forward is `tls_config.cert_resolver` — the same
+/// `Arc<dyn ResolvesServerCert>`, holding the same `CertifiedKey`, and therefore
+/// the same validated `CertifiedKey::ocsp` bytes the H1/H2 listeners serve
+/// (issue #4300).
+fn build_h3_rustls_server_config(
+    tls_config: &Arc<rustls::ServerConfig>,
+    tls_policy: &TlsPolicy,
+    client_trust: &crate::tls::AcceptedClientTrust,
+    client_auth_configured: bool,
+    bind_live_verifier: bool,
+) -> Result<rustls::ServerConfig, anyhow::Error> {
     // HTTP/3 (QUIC) requires TLS 1.3 — rebuild the server config with TLS 1.3 forced.
     // Filter cipher suites to TLS 1.3 only and force TLS 1.3 protocol version.
     let has_tls13 = tls_policy
@@ -674,47 +743,7 @@ fn build_h3_quinn_server_config(
         server_tls_config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
     }
 
-    let quic_server_config = QuicServerConfig::try_from(server_tls_config)
-        .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
-
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.initial_mtu(h3_config.initial_mtu);
-    // The FRONTEND idle timeout, which the RFC 9298 CONNECT-UDP profile raises
-    // to at least its own tunnel idle bound when enabled: a tunnel carrying no
-    // datagram generates no QUIC activity either, so a smaller connection idle
-    // limit would close it before its configured idle window elapsed. The
-    // derivation only ever raises; it is logged so it is never a silent
-    // override of an operator's `FERRUM_HTTP3_IDLE_TIMEOUT`.
-    if h3_config.connect_udp_raised_frontend_idle_timeout() {
-        info!(
-            configured_idle_timeout_seconds = h3_config.idle_timeout.as_secs(),
-            effective_idle_timeout_seconds = h3_config.frontend_idle_timeout.as_secs(),
-            "HTTP/3 frontend QUIC idle timeout raised to the configured RFC 9298 CONNECT-UDP \
-             tunnel idle timeout; a shorter connection idle limit would close idle tunnels first"
-        );
-    }
-    transport_config.max_idle_timeout(Some(
-        h3_config
-            .frontend_idle_timeout
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("Invalid idle timeout: {}", e))?,
-    ));
-    transport_config.max_concurrent_bidi_streams(h3_config.max_concurrent_streams.into());
-
-    // QUIC flow-control tuning — conservative defaults for untrusted clients.
-    transport_config.stream_receive_window(crate::http3::config::quic_varint_or_default(
-        h3_config.stream_receive_window,
-        crate::http3::config::H3_FRONTEND_STREAM_RECEIVE_WINDOW,
-    ));
-    transport_config.receive_window(crate::http3::config::quic_varint_or_default(
-        h3_config.receive_window,
-        crate::http3::config::H3_FRONTEND_RECEIVE_WINDOW,
-    ));
-    transport_config.send_window(h3_config.send_window);
-
-    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
-    server_config.transport_config(Arc::new(transport_config));
-    Ok(server_config)
+    Ok(server_tls_config)
 }
 
 /// Everything the trailer-finish phase needs to re-apply the response-header
@@ -19020,5 +19049,266 @@ mod build_h3_quinn_server_config_mtls_tests {
         let accepted = super::load_configured_h3_client_trust(None, &crls)
             .expect("unenforced CRLs must not prevent non-mTLS H3 startup");
         assert!(accepted.verifier.is_none());
+    }
+}
+
+#[cfg(test)]
+mod h3_ocsp_staple_tests {
+    //! Issue #4300: the HTTP/3 conversion must keep serving the *validated*
+    //! stapled OCSP response.
+    //!
+    //! `build_h3_rustls_server_config` rebuilds a TLS 1.3-only
+    //! `rustls::ServerConfig` from scratch and carries only
+    //! `tls_config.cert_resolver` across. If that ever became a freshly loaded
+    //! resolver, an HTTP/3 listener could serve a certificate with no staple —
+    //! or one whose staple never went through
+    //! `crate::tls::ocsp::validate_stapled_response` — while H1/H2 on the same
+    //! material served the validated bytes. Both functions are module-private,
+    //! so these tests live inline.
+    //!
+    //! The proof is a real, in-memory TLS handshake against the converted
+    //! config: no sockets, no runtime, no timing. The client's certificate
+    //! verifier records the `ocsp_response` rustls delivered alongside the
+    //! certificate, so the assertion is about what a client actually receives
+    //! rather than about a field this test set itself. Certificate-bound OCSP
+    //! validation is proven separately in
+    //! `tests/unit/tls/ocsp_validation_tests.rs`; what this module adds is that
+    //! the accepted bytes survive the H3 conversion.
+
+    use std::sync::{Arc, Mutex, Once};
+
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+    use super::{build_h3_quinn_server_config, build_h3_rustls_server_config};
+    use crate::config::EnvConfig;
+    use crate::http3::config::Http3ServerConfig;
+    use crate::tls::{CrlList, TlsPolicy};
+
+    /// Marker staple. rustls forwards `CertifiedKey::ocsp` verbatim, so the
+    /// contents only have to be distinguishable.
+    const STAPLE: &[u8] = b"ferrum-h3-ocsp-staple-marker";
+
+    fn ensure_crypto_provider() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let _ = crate::fips::base_crypto_provider().install_default();
+        });
+    }
+
+    /// A frontend `ServerConfig` whose resolver serves one `CertifiedKey`,
+    /// optionally carrying [`STAPLE`] — the shape
+    /// `crate::tls::load_frontend_tls_candidate` builds once it has accepted a
+    /// stapled response.
+    fn frontend_config(stapled: bool) -> Arc<rustls::ServerConfig> {
+        ensure_crypto_provider();
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
+        let params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
+        let cert = params.self_signed(&key_pair).expect("self-sign cert");
+        let key_pem = key_pair.serialize_pem();
+        let private_key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+            .expect("read private key")
+            .expect("private key present");
+
+        let provider = crate::fips::base_crypto_provider();
+        let mut certified_key = rustls::sign::CertifiedKey::from_der(
+            vec![CertificateDer::from(cert.der().to_vec())],
+            private_key,
+            &provider,
+        )
+        .expect("certified key");
+        if stapled {
+            certified_key.ocsp = Some(STAPLE.to_vec());
+        }
+
+        let resolver = crate::tls::acme::AcmeTlsAlpnResolver::new(Arc::new(certified_key));
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(resolver));
+        Arc::new(config)
+    }
+
+    /// Records the staple rustls handed the client verifier.
+    #[derive(Debug)]
+    struct StapleRecordingVerifier {
+        observed: Arc<Mutex<Option<Vec<u8>>>>,
+        provider: Arc<rustls::crypto::CryptoProvider>,
+    }
+
+    impl ServerCertVerifier for StapleRecordingVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            *self.observed.lock().expect("staple slot") = Some(ocsp_response.to_vec());
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.provider
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    /// Complete an in-memory handshake against `server_config` and return the
+    /// staple the client's verifier observed. An absent staple is an empty
+    /// slice, which is how rustls reports "no `CertificateStatus`".
+    fn observed_staple(server_config: Arc<rustls::ServerConfig>, alpn: &[u8]) -> Vec<u8> {
+        ensure_crypto_provider();
+        let observed = Arc::new(Mutex::new(None));
+        let provider = Arc::new(crate::fips::base_crypto_provider());
+        let mut client_config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .expect("client protocol versions")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(StapleRecordingVerifier {
+                observed: Arc::clone(&observed),
+                provider,
+            }))
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![alpn.to_vec()];
+
+        let server_name = ServerName::try_from("localhost").expect("static server name");
+        let mut client =
+            rustls::ClientConnection::new(Arc::new(client_config), server_name).expect("client");
+        let mut server = rustls::ServerConnection::new(server_config).expect("server");
+
+        for _ in 0..32 {
+            let mut to_server = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut to_server).expect("client write");
+            }
+            let mut records = to_server.as_slice();
+            while !records.is_empty() {
+                let read = server.read_tls(&mut records).expect("server read");
+                assert!(read > 0, "server TLS reader must make progress");
+                server.process_new_packets().expect("server process");
+            }
+
+            let mut to_client = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut to_client).expect("server write");
+            }
+            let mut records = to_client.as_slice();
+            while !records.is_empty() {
+                let read = client.read_tls(&mut records).expect("client read");
+                assert!(read > 0, "client TLS reader must make progress");
+                client.process_new_packets().expect("client process");
+            }
+
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return observed
+                    .lock()
+                    .expect("staple slot")
+                    .clone()
+                    .expect("the client verifier must have run");
+            }
+        }
+        panic!("in-memory TLS handshake did not converge");
+    }
+
+    /// Run the production H3 conversion over `frontend`.
+    fn convert(frontend: &Arc<rustls::ServerConfig>) -> rustls::ServerConfig {
+        ensure_crypto_provider();
+        let tls_policy = TlsPolicy::from_env_config(&EnvConfig::default()).expect("tls policy");
+        let crls: CrlList = Arc::new(Vec::new());
+        let client_trust =
+            super::load_configured_h3_client_trust(None, &crls).expect("client trust");
+        build_h3_rustls_server_config(frontend, &tls_policy, &client_trust, false, false)
+            .expect("H3 rustls config")
+    }
+
+    #[test]
+    fn the_h3_conversion_still_serves_the_validated_staple() {
+        let frontend = frontend_config(true);
+
+        // Baseline: the shared H1/H2 configuration serves the staple.
+        assert_eq!(
+            observed_staple(Arc::clone(&frontend), b"h2"),
+            STAPLE,
+            "the frontend ServerConfig must serve the stapled response"
+        );
+
+        let converted = convert(&frontend);
+        assert_eq!(
+            converted.alpn_protocols,
+            vec![b"h3".to_vec()],
+            "the converted config must be the H3 one"
+        );
+        assert!(
+            Arc::ptr_eq(&converted.cert_resolver, &frontend.cert_resolver),
+            "the H3 conversion must carry the frontend resolver across, not rebuild one"
+        );
+        assert_eq!(
+            observed_staple(Arc::new(converted), b"h3"),
+            STAPLE,
+            "the converted H3 rustls config must still serve the validated OCSP staple"
+        );
+
+        // `QuicServerConfig::try_from` consumes an equivalent config, so the
+        // whole H3 startup path still builds on exactly these inputs.
+        let tls_policy = TlsPolicy::from_env_config(&EnvConfig::default()).expect("tls policy");
+        let crls: CrlList = Arc::new(Vec::new());
+        let client_trust =
+            super::load_configured_h3_client_trust(None, &crls).expect("client trust");
+        build_h3_quinn_server_config(
+            &frontend,
+            &tls_policy,
+            &client_trust,
+            false,
+            false,
+            &Http3ServerConfig::default(),
+        )
+        .expect("quinn server config");
+    }
+
+    #[test]
+    fn the_h3_conversion_invents_no_staple_when_the_frontend_has_none() {
+        // The negative half: an absent `CertifiedKey::ocsp` must stay absent,
+        // so the positive assertion above cannot be satisfied by some default.
+        let frontend = frontend_config(false);
+        assert!(
+            observed_staple(Arc::clone(&frontend), b"h2").is_empty(),
+            "an unstapled frontend certificate must serve no staple"
+        );
+        assert!(
+            observed_staple(Arc::new(convert(&frontend)), b"h3").is_empty(),
+            "an unstapled certificate must not acquire a staple through the H3 conversion"
+        );
     }
 }

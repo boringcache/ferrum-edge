@@ -545,6 +545,28 @@ above runs when a frontend TLS configuration referencing
 certificate, so a Gateway data plane staples it only when it serves exactly one
 certificate; with several it is stapled to none and a warning is logged.
 
+**Serving.** An accepted response is attached to the `CertifiedKey` the
+listener serves, so a client receives it in the certificate message. The
+single-certificate frontend and the single-entry SNI frontend share one
+`rustls::ServerConfig` for HTTP/1.1 and HTTP/2, and the HTTP/3 listener rebuilds
+a TLS 1.3-only config around **the same certificate resolver** rather than
+reloading the material, so all three protocols serve the same validated bytes.
+An `admin` HTTPS listener behaves identically.
+
+**FIPS mode.** With `FERRUM_FIPS_MODE=enforce`, admission is narrower: the
+`BasicOCSPResponse` signature, the served leaf's own signature, and every
+certificate carried in `certs` must use `sha256/384/512WithRSAEncryption`,
+`rsassa-pss` with SHA-256/384/512, `ecdsa-with-SHA256`, or `ecdsa-with-SHA384`
+— `sha1WithRSAEncryption` and Ed25519 are refused — and every carried responder
+certificate plus the issuer selected from the served chain must carry an
+approved key (RSA 2048–8192, or ECDSA over P-256/P-384/P-521). The refusal is at
+the response grammar, so a non-approved response cannot be stored through the
+admin API either. `CertID` and `ResponderID` **key identifier** digests are
+unaffected: RFC 6960 defines them over public issuer/responder material as a
+selection key, and SHA-1 remains admitted there. See
+[`docs/fips.md`](fips.md). Outside enforcement nothing changes, so ordinary
+deployments keep interoperating with responders that still sign with SHA-1.
+
 **Diagnostics.** Rejections name the redacted source identifier and the
 structural reason. They never contain certificate bytes, response bytes, private
 material, or a secret source reference.

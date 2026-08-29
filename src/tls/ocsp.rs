@@ -97,6 +97,65 @@
 //!    client that honours the staple will refuse the connection, and a reload
 //!    must not be able to publish that state silently.
 //!
+//! # FIPS admission on this path
+//!
+//! Every signature this module verifies — the leaf-to-issuer proof, the
+//! delegate-to-issuer proof, and the `BasicOCSPResponse` signature — goes
+//! through `x509_parser::verify::verify_signature`. That API's supported set is
+//! wider than Ferrum's FIPS contract: it selects
+//! `RSA_PKCS1_1024_8192_SHA1_FOR_LEGACY_USE_ONLY` for `sha1WithRSAEncryption`
+//! (both registered OIDs) and `ED25519` for `id-Ed25519`, while `docs/fips.md`
+//! records SHA-1 as disallowed for signature verification (SP 800-131A Rev. 2)
+//! and Ed25519 as outside the algorithm set Ferrum routes through the selected
+//! module. The SHA-1 arm is doubly wrong here: it also drops the RSA modulus
+//! floor from 2048 bits to 1024.
+//!
+//! [`OcspCryptoPolicy`] is the seam that closes that gap. Under
+//! [`OcspCryptoPolicy::FipsEnforced`] this module admits exactly
+//! `sha256/384/512WithRSAEncryption`, `rsassa-pss` (already constrained to
+//! SHA-2 by the parameter profile above), `ecdsa-with-SHA256`, and
+//! `ecdsa-with-SHA384` — the verifier-supported set minus the two SHA-1 RSA
+//! OIDs and Ed25519 — for the `BasicOCSPResponse` signature, for the served
+//! leaf's own signature, and for every certificate carried in `certs`.
+//!
+//! Certificates carried in `certs` never pass through
+//! [`crate::tls::parse_pem_certificate_bundle`], which is where Ferrum's
+//! certificate key-form and key-strength admission normally runs, so an
+//! embedded delegate could otherwise present an Ed25519 or RSA-1024 key to a
+//! FIPS deployment. Each carried certificate is therefore admitted directly
+//! through [`crate::fips::keys::check_certificate_public_key_enforced`], and so
+//! is the issuer selected out of the served chain, so this module's guarantee
+//! does not depend on what its callers already checked.
+//!
+//! Refusal is at the *grammar*, not only at serving time, so a non-approved
+//! response cannot be stored by the admin boundary either. Outside enforcement
+//! the profile is [`OcspCryptoPolicy::Interoperable`] and nothing here changes,
+//! so ordinary deployments keep interoperating with responders that still sign
+//! with SHA-1.
+//!
+//! ## What is *not* reclassified
+//!
+//! Two SHA-1 uses on this path are **key identifiers, not digital signatures**,
+//! and both remain admitted under enforcement:
+//!
+//! - `CertID.issuerNameHash` / `CertID.issuerKeyHash`. RFC 6960 §4.1.1 defines
+//!   `CertID` over a caller-chosen digest and real responders overwhelmingly
+//!   use SHA-1; a client re-derives the same value to select an entry. Ferrum
+//!   recomputes the hash and compares it, so it is a lookup key. The
+//!   authenticity of the entry comes from the responder signature and from the
+//!   **byte-exact** `serialNumber` comparison, neither of which is a digest.
+//! - `ResponderID.byKey`, which RFC 6960 §4.2.1 defines as the SHA-1 hash of
+//!   the responder's public-key BIT STRING contents. It selects which carried
+//!   certificate to test; that certificate then has to be issuer-signed,
+//!   OCSP-signing, time-valid, and produce a verifying signature.
+//!
+//! Neither digest carries a key, protects a secret, or decides admission on its
+//! own, so neither is a security service in the SP 800-131A sense. Both are
+//! computed through the selected provider ([`crate::fips::backend::digest`]),
+//! not a second implementation. `src/fips/inventory.rs` records them under that
+//! classification; do not conflate them with SHA-1 *signature* verification,
+//! which this module refuses outright under enforcement.
+//!
 //! # Clock-skew policy
 //!
 //! Both time bounds are widened by [`OCSP_CLOCK_SKEW`] (5 minutes) in the
@@ -136,6 +195,98 @@ enum AlgorithmParameterProfile {
     Digest,
     /// `BasicOCSPResponse.signatureAlgorithm`.
     Signature,
+}
+
+/// Cryptographic admission profile applied to the OCSP binding path.
+///
+/// This is the smallest seam that makes the FIPS half of this module testable.
+/// [`crate::fips::is_enforcing`] is process-wide state that an ordinary
+/// (`crypto-ring`) build can never establish at runtime — enforcement fails
+/// closed at bootstrap on such a build — so a policy that only read that state
+/// would be unreachable from any test the repository actually runs. Passing the
+/// profile explicitly is the same split `fips::keys` and `fips::policy` use for
+/// their `*_enforced` halves, expressed once as a value instead of once per
+/// predicate, so the enforced path can be exercised end to end rather than one
+/// isolated predicate at a time.
+///
+/// Production callers never construct a variant: they go through
+/// [`validate_structure`] / [`validate_stapled_response`], which resolve it with
+/// [`OcspCryptoPolicy::current`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OcspCryptoPolicy {
+    /// Ordinary deployments: every algorithm the verification path supports.
+    Interoperable,
+    /// `FERRUM_FIPS_MODE=enforce`: only Ferrum's FIPS-approved algorithms and
+    /// certificate key forms are admitted, at the grammar and at serving time.
+    FipsEnforced,
+}
+
+impl OcspCryptoPolicy {
+    /// Resolve the profile from this process's FIPS posture.
+    pub fn current() -> Self {
+        if crate::fips::is_enforcing() {
+            Self::FipsEnforced
+        } else {
+            Self::Interoperable
+        }
+    }
+
+    fn fips_enforced(self) -> bool {
+        matches!(self, Self::FipsEnforced)
+    }
+}
+
+/// Admit one signature `AlgorithmIdentifier` OID against the FIPS profile.
+///
+/// The admitted set is exactly what `x509_parser::verify::verify_signature`
+/// supports, minus the two `sha1WithRSAEncryption` OIDs and `id-Ed25519`. Every
+/// admitted RSA arm additionally carries ring/aws-lc's own 2048–8192-bit
+/// modulus floor, which matches [`crate::fips::keys::MIN_RSA_MODULUS_BITS`] and
+/// [`crate::fips::keys::MAX_RSA_MODULUS_BITS`]; the refused SHA-1 arm is the one
+/// that would have accepted a 1024-bit modulus.
+///
+/// This is an allow-list, not a deny-list: an OID this build has not classified
+/// is refused rather than passed to the verifier to be classified there.
+fn check_signature_algorithm(
+    oid: &Oid<'_>,
+    field: &str,
+    policy: OcspCryptoPolicy,
+) -> Result<(), String> {
+    if !policy.fips_enforced() {
+        return Ok(());
+    }
+    if *oid == OID_PKCS1_SHA256WITHRSA
+        || *oid == OID_PKCS1_SHA384WITHRSA
+        || *oid == OID_PKCS1_SHA512WITHRSA
+        || *oid == OID_PKCS1_RSASSAPSS
+        || *oid == OID_SIG_ECDSA_WITH_SHA256
+        || *oid == OID_SIG_ECDSA_WITH_SHA384
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "OCSP {field} names a signature algorithm outside Ferrum's FIPS-approved set, so it is \
+         refused while FIPS mode is enforced. SHA-1 signatures are disallowed (SP 800-131A \
+         Rev. 2) and Ed25519 is not in the algorithm set Ferrum routes through the selected \
+         module. Approved: sha256/384/512WithRSAEncryption, rsassa-pss with SHA-256/384/512, \
+         ecdsa-with-SHA256, ecdsa-with-SHA384."
+    ))
+}
+
+/// Admit a certificate that is about to be used on this path — either because
+/// its key verifies a signature, or because it is carried inside the response.
+///
+/// Delegates to the single Ferrum certificate key-form/key-strength gate so the
+/// rule cannot drift from the one `parse_pem_certificate_bundle` applies.
+fn check_certificate_key_form(
+    der: &[u8],
+    surface_label: &str,
+    policy: OcspCryptoPolicy,
+) -> Result<(), String> {
+    if !policy.fips_enforced() {
+        return Ok(());
+    }
+    crate::fips::keys::check_certificate_public_key_enforced(der, surface_label)
 }
 
 /// Maximum accepted size of a stapled OCSP response, in bytes.
@@ -774,7 +925,7 @@ fn response_status_name(value: u32) -> &'static str {
     }
 }
 
-fn parse_basic_response(der: &[u8]) -> Result<BasicResponse<'_>, String> {
+fn parse_basic_response(der: &[u8], policy: OcspCryptoPolicy) -> Result<BasicResponse<'_>, String> {
     let (basic, _, trailing) = take_tlv(der)?;
     if !trailing.is_empty() {
         return Err("BasicOCSPResponse has trailing bytes".to_string());
@@ -789,6 +940,14 @@ fn parse_basic_response(der: &[u8]) -> Result<BasicResponse<'_>, String> {
         rest,
         "signatureAlgorithm",
         AlgorithmParameterProfile::Signature,
+    )?;
+    // Refuse a non-approved responder signature algorithm at the grammar, so a
+    // FIPS deployment cannot store one through the admin boundary either — not
+    // merely decline to serve it later.
+    check_signature_algorithm(
+        &signature_algorithm.algorithm,
+        "BasicOCSPResponse signatureAlgorithm",
+        policy,
     )?;
 
     let (signature_any, _, rest) = take_tlv(rest)?;
@@ -823,7 +982,7 @@ fn parse_basic_response(der: &[u8]) -> Result<BasicResponse<'_>, String> {
             // still be admitted by the admin boundary, and it could still be
             // authorized as long as some *other* carried certificate verified.
             expect_sequence(&cert_any, "certs entry")?;
-            let (trailing, _) = X509Certificate::from_der(raw).map_err(|_| {
+            let (trailing, carried) = X509Certificate::from_der(raw).map_err(|_| {
                 "OCSP certs carries an entry that is not a parseable X.509 certificate".to_string()
             })?;
             if !trailing.is_empty() {
@@ -832,6 +991,18 @@ fn parse_basic_response(der: &[u8]) -> Result<BasicResponse<'_>, String> {
                         .to_string(),
                 );
             }
+            // A carried responder certificate never passes through
+            // `parse_pem_certificate_bundle`, so this is the only place its key
+            // form and the algorithm of the CA signature over it can be
+            // admitted. It is applied to every carried entry, used or not, for
+            // the same reason the parse above is: an entry this pass admits is
+            // one a later loosening could reach.
+            check_certificate_key_form(raw, "OCSP responder certificate", policy)?;
+            check_signature_algorithm(
+                &carried.signature_algorithm.algorithm,
+                "responder certificate signature",
+                policy,
+            )?;
             certs.push(raw);
         }
     }
@@ -1234,9 +1405,20 @@ fn generalized_time_unix(raw: &[u8], field: &str) -> Result<i64, String> {
 /// through [`validate_stapled_response`] against the leaf and issuer actually
 /// configured.
 pub fn validate_structure(der: &[u8]) -> Result<OcspStructure, String> {
+    validate_structure_with_policy(der, OcspCryptoPolicy::current())
+}
+
+/// [`validate_structure`] with an explicit cryptographic admission profile.
+///
+/// See [`OcspCryptoPolicy`] for why the profile is a parameter rather than a
+/// read of process-wide FIPS state.
+pub fn validate_structure_with_policy(
+    der: &[u8],
+    policy: OcspCryptoPolicy,
+) -> Result<OcspStructure, String> {
     enforce_size_bound(der)?;
     let basic_der = basic_response_der(der)?;
-    let basic = parse_basic_response(basic_der)?;
+    let basic = parse_basic_response(basic_der, policy)?;
     Ok(OcspStructure {
         der_len: der.len(),
         single_responses: basic.response_data.single_responses.len(),
@@ -1263,6 +1445,20 @@ pub fn validate_stapled_response_at(
     chain: &[CertificateDer<'_>],
     now: i64,
 ) -> Result<OcspAcceptance, String> {
+    validate_stapled_response_at_with_policy(der, chain, now, OcspCryptoPolicy::current())
+}
+
+/// [`validate_stapled_response_at`] with an explicit cryptographic admission
+/// profile.
+///
+/// See [`OcspCryptoPolicy`] for why the profile is a parameter rather than a
+/// read of process-wide FIPS state.
+pub fn validate_stapled_response_at_with_policy(
+    der: &[u8],
+    chain: &[CertificateDer<'_>],
+    now: i64,
+    policy: OcspCryptoPolicy,
+) -> Result<OcspAcceptance, String> {
     enforce_size_bound(der)?;
 
     let leaf_der = chain
@@ -1271,12 +1467,26 @@ pub fn validate_stapled_response_at(
     let (_, leaf) = X509Certificate::from_der(leaf_der.as_ref())
         .map_err(|_| "server certificate is not parseable X.509 DER".to_string())?;
 
+    // `select_issuer_der` proves the binding by verifying the leaf's own
+    // signature, so the algorithm of that signature is a cryptographic
+    // operation on this path and is admitted before it is performed.
+    check_signature_algorithm(
+        &leaf.signature_algorithm.algorithm,
+        "served certificate signature",
+        policy,
+    )?;
+
     let issuer_der = select_issuer_der(&leaf, chain)?;
     let (_, issuer) = X509Certificate::from_der(issuer_der)
         .map_err(|_| "issuer certificate is not parseable X.509 DER".to_string())?;
+    // The issuer's key verifies the leaf, an undelegated response, and every
+    // delegate. Callers reach this through `parse_pem_certificate_bundle`, but
+    // re-admitting the *selected* issuer keeps that guarantee a property of
+    // this module rather than of its call sites.
+    check_certificate_key_form(issuer_der, "OCSP issuer certificate", policy)?;
 
     let basic_der = basic_response_der(der)?;
-    let basic = parse_basic_response(basic_der)?;
+    let basic = parse_basic_response(basic_der, policy)?;
 
     let single = match_single_response(&basic, &leaf, &issuer)?;
 
@@ -1422,6 +1632,18 @@ fn match_single_response<'a, 'b>(
     Err(message.to_string())
 }
 
+/// Resolve the `CertID` digest, including SHA-1.
+///
+/// SHA-1 stays admitted under FIPS enforcement, deliberately: RFC 6960 §4.1.1
+/// makes `CertID` a caller-chosen digest over the issuer's *public* name and
+/// *public* key, and real responders overwhelmingly emit SHA-1. Ferrum
+/// recomputes it and compares, so it selects which `SingleResponse` to read —
+/// it is a lookup key, not a digital signature and not a security service in
+/// the SP 800-131A Rev. 2 sense. Authenticity comes from the responder
+/// signature (allow-listed by `check_signature_algorithm`) and from the
+/// byte-exact `serialNumber` comparison. The digest itself is computed by the
+/// selected provider through `fips::backend`. See the module docs and
+/// `src/fips/inventory.rs`.
 fn cert_id_digest(oid: &Oid<'_>) -> Result<&'static digest::Algorithm, String> {
     if *oid == OID_HASH_SHA1 {
         Ok(&digest::SHA1_FOR_LEGACY_USE_ONLY)
@@ -1525,6 +1747,13 @@ fn responder_matches(responder_id: &ResponderId<'_>, candidate: &X509Certificate
     match responder_id {
         ResponderId::ByName(name) => candidate.subject().as_raw() == *name,
         ResponderId::ByKey(key_hash) => {
+            // RFC 6960 §4.2.1 fixes this identifier at SHA-1 over the public
+            // key BIT STRING; it selects a candidate certificate and nothing
+            // more. The selected candidate still has to be issuer-signed,
+            // OCSP-signing, time-valid, and produce a verifying signature, so a
+            // digest collision authorizes nothing. Admitted under FIPS
+            // enforcement as a key identifier, not as a signature digest — see
+            // the module docs.
             let key = candidate.public_key().subject_public_key.data.as_ref();
             let hash = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, key);
             hash.as_ref() == *key_hash

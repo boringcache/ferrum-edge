@@ -18,8 +18,9 @@ use ferrum_edge::config::EnvConfig;
 use ferrum_edge::tls::TlsPolicy;
 use ferrum_edge::tls::multi_cert::{GatewayCertificateInput, load_gateway_multi_cert_tls_config};
 use ferrum_edge::tls::ocsp::{
-    MAX_OCSP_RESPONSE_BYTES, OCSP_CLOCK_SKEW_SECONDS, validate_stapled_response_at,
-    validate_structure,
+    MAX_OCSP_RESPONSE_BYTES, OCSP_CLOCK_SKEW_SECONDS, OcspCryptoPolicy,
+    validate_stapled_response_at, validate_stapled_response_at_with_policy, validate_structure,
+    validate_structure_with_policy,
 };
 use ferrum_edge::tls::{frontend_tls_slot_with, load_frontend_tls_candidate_from_paths};
 use ring::rand::SystemRandom;
@@ -1990,4 +1991,530 @@ fn the_multi_certificate_loader_binds_the_staple_to_its_single_certificate() {
             .expect_err("wrong-certificate staple is refused");
     let rendered = format!("{error:#}");
     assert!(rendered.contains("rejected"), "{rendered}");
+}
+
+// ── Serving-path proof (issue #4300) ───────────────────────────────────────
+//
+// The load-path tests above prove which responses are *accepted*. These prove
+// that an accepted response is actually attached to the certificate the
+// protocol stacks serve, for the single-certificate frontend and for the
+// single-entry SNI frontend, and that it survives the shared H1/H2
+// `rustls::ServerConfig`.
+//
+// The proof is a real in-memory TLS handshake — no sockets, no runtime, no
+// timers — whose client certificate verifier records the `ocsp_response`
+// rustls delivered alongside the certificate. That is what a client sees, as
+// opposed to a field the test set itself. The HTTP/3 half of this contract is
+// proven where the conversion lives, in `src/http3/server.rs`
+// (`h3_ocsp_staple_tests`): `build_h3_rustls_server_config` is module-private,
+// and the assertion there is that the converted config carries this same
+// resolver and still serves these same bytes.
+
+/// Records the staple rustls handed the client verifier.
+#[derive(Debug)]
+struct StapleRecordingVerifier {
+    observed: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for StapleRecordingVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        *self.observed.lock().expect("staple slot") = Some(ocsp_response.to_vec());
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Complete an in-memory handshake against `server_config`, offering `alpn` and
+/// the SNI name `server_name`, and return the staple the client observed. An
+/// absent staple is an empty slice.
+fn served_staple(
+    server_config: Arc<rustls::ServerConfig>,
+    server_name: &str,
+    alpn: &[u8],
+) -> Vec<u8> {
+    ensure_crypto_provider();
+    let observed = Arc::new(std::sync::Mutex::new(None));
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut client_config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .expect("client protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(StapleRecordingVerifier {
+            observed: Arc::clone(&observed),
+            provider,
+        }))
+        .with_no_client_auth();
+    client_config.alpn_protocols = vec![alpn.to_vec()];
+
+    let name = rustls::pki_types::ServerName::try_from(server_name.to_string())
+        .expect("test server name");
+    let mut client =
+        rustls::ClientConnection::new(Arc::new(client_config), name).expect("client connection");
+    let mut server = rustls::ServerConnection::new(server_config).expect("server connection");
+
+    for _ in 0..32 {
+        let mut to_server = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut to_server).expect("client write");
+        }
+        let mut records = to_server.as_slice();
+        while !records.is_empty() {
+            let read = server.read_tls(&mut records).expect("server read");
+            assert!(read > 0, "server TLS reader must make progress");
+            server.process_new_packets().expect("server process");
+        }
+
+        let mut to_client = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut to_client).expect("server write");
+        }
+        let mut records = to_client.as_slice();
+        while !records.is_empty() {
+            let read = client.read_tls(&mut records).expect("client read");
+            assert!(read > 0, "client TLS reader must make progress");
+            client.process_new_packets().expect("client process");
+        }
+
+        if !client.is_handshaking() && !server.is_handshaking() {
+            return observed
+                .lock()
+                .expect("staple slot")
+                .clone()
+                .expect("the client verifier must have run");
+        }
+    }
+    panic!("in-memory TLS handshake did not converge");
+}
+
+#[test]
+fn the_single_certificate_frontend_serves_the_validated_staple_on_h1_and_h2() {
+    let pki = build_pki();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let valid = ResponseBuilder::new(&pki, now()).build();
+    let (cert_path, key_path, ocsp_path) = write_material(dir.path(), &pki, &valid);
+    let policy = tls_policy();
+
+    let candidate = load_frontend_tls_candidate_from_paths(
+        &cert_path,
+        &key_path,
+        None,
+        Some(&ocsp_path),
+        false,
+        &policy,
+        30,
+        &[],
+        None,
+    )
+    .expect("valid staple is admitted");
+
+    // One `ServerConfig` backs both HTTP/1.1 and HTTP/2 on this listener, so
+    // the staple has to reach a client under either negotiated protocol.
+    for alpn in [&b"h2"[..], &b"http/1.1"[..]] {
+        assert_eq!(
+            served_staple(Arc::clone(&candidate.config), "localhost", alpn),
+            valid,
+            "the served certificate must carry the validated staple under ALPN {:?}",
+            std::str::from_utf8(alpn).expect("ascii alpn")
+        );
+    }
+
+    // The negative half: with no configured source the same material serves no
+    // staple at all, so the assertion above cannot be met by a default.
+    let unstapled = load_frontend_tls_candidate_from_paths(
+        &cert_path,
+        &key_path,
+        None,
+        None,
+        false,
+        &policy,
+        30,
+        &[],
+        None,
+    )
+    .expect("load without a staple");
+    assert!(
+        served_staple(unstapled.config, "localhost", b"h2").is_empty(),
+        "a certificate loaded without an OCSP source must serve no staple"
+    );
+}
+
+#[test]
+fn the_single_entry_sni_frontend_serves_the_validated_staple() {
+    let pki = build_pki();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let valid = ResponseBuilder::new(&pki, now()).build();
+    let (cert_path, key_path, ocsp_path) = write_material(dir.path(), &pki, &valid);
+    let policy = tls_policy();
+
+    let inputs = vec![GatewayCertificateInput {
+        cert_source: cert_path.clone(),
+        key_source: key_path.clone(),
+        hostname: Some("localhost".to_string()),
+        identity: "ns/gw/listener".to_string(),
+        is_default: true,
+    }];
+
+    let config =
+        load_gateway_multi_cert_tls_config(&inputs, None, Some(&ocsp_path), &policy, 30, &[])
+            .expect("valid staple is admitted");
+    assert_eq!(
+        served_staple(config, "localhost", b"h2"),
+        valid,
+        "the SNI-selected certificate must carry the validated staple"
+    );
+
+    // A staple is bound to one certificate, so a data plane serving several
+    // certificates staples it to none — and must not staple it to the entry
+    // that happens to match the SNI name either.
+    let multi = vec![
+        inputs[0].clone(),
+        pki_second_certificate(dir.path(), "other.localhost"),
+    ];
+    let multi_config =
+        load_gateway_multi_cert_tls_config(&multi, None, Some(&ocsp_path), &policy, 30, &[])
+            .expect("a multi-certificate data plane still loads");
+    assert!(
+        served_staple(multi_config, "localhost", b"h2").is_empty(),
+        "a multi-certificate data plane must staple the response to no certificate"
+    );
+}
+
+/// A second, unrelated self-signed certificate/key pair on disk, as a Gateway
+/// certificate input. Used to make the data plane multi-certificate.
+fn pki_second_certificate(dir: &std::path::Path, hostname: &str) -> GatewayCertificateInput {
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
+    let params = rcgen::CertificateParams::new(vec![hostname.to_string()]).expect("params");
+    let cert = params.self_signed(&key_pair).expect("self-signed");
+    let cert_path = dir.join(format!("{hostname}.crt"));
+    let key_path = dir.join(format!("{hostname}.key"));
+    std::fs::write(&cert_path, cert.pem()).expect("write cert");
+    std::fs::write(&key_path, key_pair.serialize_pem()).expect("write key");
+    GatewayCertificateInput {
+        cert_source: cert_path.to_string_lossy().into_owned(),
+        key_source: key_path.to_string_lossy().into_owned(),
+        hostname: Some(hostname.to_string()),
+        identity: format!("ns/gw/{hostname}"),
+        is_default: false,
+    }
+}
+
+#[test]
+fn a_refused_staple_never_reaches_a_serving_configuration() {
+    // Fail-closed, stated as a serving property rather than a loader one: for
+    // each rejected shape there is no `ServerConfig` at all, so there is
+    // nothing that could serve those bytes.
+    let pki = build_pki();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let valid = ResponseBuilder::new(&pki, now()).build();
+    let (cert_path, key_path, ocsp_path) = write_material(dir.path(), &pki, &valid);
+    let policy = tls_policy();
+
+    let mut revoked = ResponseBuilder::new(&pki, now());
+    revoked.status = Status::Revoked;
+    let mut wrong_certificate = ResponseBuilder::new(&pki, now());
+    wrong_certificate.serial = OTHER_SERIAL;
+    let mut corrupt = ResponseBuilder::new(&pki, now());
+    corrupt.corrupt_signature = true;
+
+    for rejected in [
+        revoked.build(),
+        wrong_certificate.build(),
+        corrupt.build(),
+        vec![1, 2, 3],
+    ] {
+        std::fs::write(&ocsp_path, &rejected).expect("rewrite ocsp");
+        let rebuilt = load_frontend_tls_candidate_from_paths(
+            &cert_path,
+            &key_path,
+            None,
+            Some(&ocsp_path),
+            false,
+            &policy,
+            30,
+            &[],
+            None,
+        );
+        assert!(
+            rebuilt.is_err(),
+            "a refused staple must not produce a servable configuration"
+        );
+    }
+}
+
+// ── FIPS admission on the OCSP binding path (issue #4300) ──────────────────
+//
+// `x509_parser::verify::verify_signature` — which verifies the leaf-to-issuer
+// proof, the delegate-to-issuer proof, and the `BasicOCSPResponse` signature —
+// supports `RSA_PKCS1_1024_8192_SHA1_FOR_LEGACY_USE_ONLY` and Ed25519. Both are
+// outside the contract in `docs/fips.md`, and the SHA-1 arm additionally drops
+// the RSA modulus floor to 1024 bits. Certificates carried in `certs` are also
+// never seen by `parse_pem_certificate_bundle`, where Ferrum's certificate
+// key-form admission lives.
+//
+// `OcspCryptoPolicy` is the seam. These tests drive the enforced profile
+// explicitly, because `fips::is_enforcing()` can never be true on the
+// `crypto-ring` build the test suite runs (an enforce request fails closed at
+// bootstrap on such a build), so a policy read from that global would be
+// untestable here.
+
+/// sha1WithRSAEncryption (1.2.840.113549.1.1.5).
+const OID_SHA1_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x05];
+
+/// Assert a diagnostic is the FIPS admission refusal rather than some later
+/// failure that happens to also be an error.
+fn assert_fips_refusal(error: &str) {
+    assert!(
+        error.contains("FIPS mode is enforced"),
+        "expected a FIPS admission refusal, got: {error}"
+    );
+}
+
+fn assert_not_a_fips_refusal(error: &str) {
+    assert!(
+        !error.contains("FIPS mode is enforced"),
+        "the FIPS gate must not be what refused this: {error}"
+    );
+}
+
+#[test]
+fn an_ordinary_ecdsa_response_is_still_admitted_under_fips_enforcement() {
+    // The interoperability half of the contract, and the one that pins the
+    // identifier carve-out: the default fixture's `CertID` is hashed with
+    // SHA-1, which RFC 6960 defines as a lookup key rather than a signature
+    // digest and which enforcement therefore keeps admitting.
+    let pki = build_pki();
+    let response = ResponseBuilder::new(&pki, now()).build();
+    validate_stapled_response_at_with_policy(
+        &response,
+        &chain(&pki),
+        now(),
+        OcspCryptoPolicy::FipsEnforced,
+    )
+    .expect("an ECDSA-P256/SHA-256 response with a SHA-1 CertID stays admitted under enforcement");
+    validate_structure_with_policy(&response, OcspCryptoPolicy::FipsEnforced)
+        .expect("and is admissible at the certificate-independent admin boundary");
+}
+
+#[test]
+fn a_sha256_cert_id_is_also_admitted_under_fips_enforcement() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.hash_oid = OID_SHA256;
+    let response = builder.build();
+    validate_stapled_response_at_with_policy(
+        &response,
+        &chain(&pki),
+        now(),
+        OcspCryptoPolicy::FipsEnforced,
+    )
+    .expect("a SHA-256 CertID is admitted under enforcement");
+}
+
+#[test]
+fn a_sha1_rsa_responder_signature_is_refused_under_fips_enforcement() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.signature_algorithm_oid = OID_SHA1_RSA;
+    // RSA PKCS#1 requires the canonical NULL, so this fixture is structurally
+    // valid and fails only on the algorithm itself.
+    builder.signature_algorithm_parameters = Some(der_null());
+    let response = builder.build();
+
+    let error = validate_stapled_response_at_with_policy(
+        &response,
+        &chain(&pki),
+        now(),
+        OcspCryptoPolicy::FipsEnforced,
+    )
+    .expect_err("SHA-1 RSA signatures are refused while FIPS mode is enforced");
+    assert_fips_refusal(&error);
+    // The refusal is at the grammar, so the admin boundary cannot store it
+    // either.
+    let structural = validate_structure_with_policy(&response, OcspCryptoPolicy::FipsEnforced)
+        .expect_err("a SHA-1 RSA response cannot be stored under enforcement");
+    assert_fips_refusal(&structural);
+
+    // Outside enforcement nothing changed: the same response reaches signature
+    // verification, which fails for an unrelated reason (an RSA signature
+    // algorithm over an EC key), and the structural pass still admits it.
+    let interoperable = validate_stapled_response_at_with_policy(
+        &response,
+        &chain(&pki),
+        now(),
+        OcspCryptoPolicy::Interoperable,
+    )
+    .expect_err("the fixture is still not a verifiable signature");
+    assert_not_a_fips_refusal(&interoperable);
+    validate_structure_with_policy(&response, OcspCryptoPolicy::Interoperable)
+        .expect("ordinary deployments keep admitting SHA-1 responder signatures structurally");
+}
+
+#[test]
+fn an_ed25519_responder_signature_is_refused_under_fips_enforcement() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.signature_algorithm_oid = OID_ED25519;
+    let response = builder.build();
+
+    let error = validate_stapled_response_at_with_policy(
+        &response,
+        &chain(&pki),
+        now(),
+        OcspCryptoPolicy::FipsEnforced,
+    )
+    .expect_err("Ed25519 is refused while FIPS mode is enforced");
+    assert_fips_refusal(&error);
+
+    let interoperable = validate_stapled_response_at_with_policy(
+        &response,
+        &chain(&pki),
+        now(),
+        OcspCryptoPolicy::Interoperable,
+    )
+    .expect_err("the fixture is still not a verifiable Ed25519 signature");
+    assert_not_a_fips_refusal(&interoperable);
+}
+
+#[test]
+fn an_approved_rsa_signature_algorithm_is_not_what_the_fips_gate_refuses() {
+    // The discriminator for the test above: the same fixture shape with
+    // sha256WithRSAEncryption passes the algorithm gate and fails later, so the
+    // SHA-1 refusal is about SHA-1 and not about "RSA over an EC key".
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.signature_algorithm_oid = OID_SHA256_RSA;
+    builder.signature_algorithm_parameters = Some(der_null());
+    let response = builder.build();
+
+    let error = validate_stapled_response_at_with_policy(
+        &response,
+        &chain(&pki),
+        now(),
+        OcspCryptoPolicy::FipsEnforced,
+    )
+    .expect_err("the fixture is still not a verifiable signature");
+    assert_not_a_fips_refusal(&error);
+    validate_structure_with_policy(&response, OcspCryptoPolicy::FipsEnforced)
+        .expect("sha256WithRSAEncryption is admitted by the algorithm gate");
+}
+
+/// A self-signed Ed25519 certificate: an approved-looking responder that
+/// carries a key form `fips::keys` refuses, and that
+/// `parse_pem_certificate_bundle` never sees because it arrives inside the OCSP
+/// response rather than in the served chain.
+fn ed25519_certificate() -> Vec<u8> {
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("ed25519 key");
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Ferrum OCSP Ed25519 Responder");
+    params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::OcspSigning);
+    let cert = params.self_signed(&key_pair).expect("self-signed");
+    cert.der().to_vec()
+}
+
+#[test]
+fn an_embedded_responder_certificate_with_a_non_approved_key_is_refused_under_fips_enforcement() {
+    let pki = build_pki();
+    let ed25519_der = ed25519_certificate();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.embedded_certs = vec![ed25519_der.as_slice()];
+    let response = builder.build();
+
+    // The response is signed by the issuing CA directly, so the carried
+    // certificate is never *used*. It is still admitted or refused, because a
+    // certificate this pass lets through is one a later loosening could reach.
+    let error = validate_stapled_response_at_with_policy(
+        &response,
+        &chain(&pki),
+        now(),
+        OcspCryptoPolicy::FipsEnforced,
+    )
+    .expect_err("an embedded Ed25519 responder certificate is refused under enforcement");
+    assert_fips_refusal(&error);
+    assert!(
+        error.contains("OCSP responder certificate"),
+        "the diagnostic must name the surface it refused: {error}"
+    );
+    // No certificate bytes, subject names, or response bytes leak.
+    assert!(!error.contains("BEGIN CERTIFICATE"), "{error}");
+    assert!(!error.contains("Ferrum OCSP Ed25519 Responder"), "{error}");
+
+    let structural = validate_structure_with_policy(&response, OcspCryptoPolicy::FipsEnforced)
+        .expect_err("nor can it be stored through the admin boundary");
+    assert_fips_refusal(&structural);
+
+    // Outside enforcement the unused certificate is admitted exactly as before.
+    validate_stapled_response_at_with_policy(
+        &response,
+        &chain(&pki),
+        now(),
+        OcspCryptoPolicy::Interoperable,
+    )
+    .expect("ordinary deployments keep accepting an unused carried certificate");
+}
+
+#[test]
+fn an_approved_embedded_delegate_still_signs_under_fips_enforcement() {
+    // The interoperability control for the test above: a P-256 delegate with
+    // the OCSP-signing EKU passes both the key-form gate and the signature
+    // algorithm gate, so enforcement does not break delegated responders.
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.responder_cert = pki.delegate_der.as_slice();
+    builder.signing_key = &pki.delegate_key;
+    builder.embedded_certs = vec![pki.delegate_der.as_slice()];
+    let response = builder.build();
+
+    let acceptance = validate_stapled_response_at_with_policy(
+        &response,
+        &chain(&pki),
+        now(),
+        OcspCryptoPolicy::FipsEnforced,
+    )
+    .expect("an approved delegated responder is admitted under enforcement");
+    assert!(acceptance.delegated_responder);
 }
