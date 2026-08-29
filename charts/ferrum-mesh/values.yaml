@@ -383,10 +383,11 @@ ambient:
   # FrontendDtlsDeferred.
   extraVolumes: []
   extraVolumeMounts: []
-  # Admin-backed probes (health --live / health). Readiness is skipped when
-  # FERRUM_ADMIN_HTTP_PORT=0 except NodeWaypoint, which still requires admin for
-  # the DaemonSet readiness contract. Timing keeps ambient/node-waypoint boot
-  # (slice + SPIRE) inside the startup window.
+  # Admin-backed probes (health --live / health). Every enabled computed probe
+  # must have a handler: `admin.httpPort: 0` fails render unless that probe is
+  # overridden or disabled. NodeWaypoint still requires a non-zero admin port
+  # for the DaemonSet readiness contract. Timing keeps ambient/node-waypoint
+  # boot (slice + SPIRE) inside the startup window.
   probes:
     startup:
       enabled: true
@@ -423,10 +424,12 @@ ambient:
   # assembles its container SecurityContext field by field, so the schema admits
   # only the four keys below and rejects anything else rather than accepting a
   # supported-looking key the template never reads. runAsUser/runAsGroup are
-  # decided by the capture mode. `capabilities.drop` must stay ["ALL"];
-  # `capabilities.add` MERGES on top of the datapath minimum (NET_ADMIN,
-  # NET_RAW, plus BPF/PERFMON for NodeWaypoint and SYS_ADMIN/SYS_PTRACE for
-  # in-netns capture) and can never remove one.
+  # decided by the capture mode. `capabilities.drop` must stay ["ALL"] (omit the
+  # key for that default; an explicit empty list is rejected rather than
+  # rewritten). `capabilities.add` MERGES on top of the datapath minimum
+  # (NET_ADMIN, NET_RAW, plus BPF/PERFMON for NodeWaypoint and SYS_ADMIN/
+  # SYS_PTRACE for in-netns capture) and can never remove one. Capability names
+  # must match `^(CAP_)?[A-Z][A-Z0-9_]*$`.
   securityContext:
     allowPrivilegeEscalation: false
     readOnlyRootFilesystem: true

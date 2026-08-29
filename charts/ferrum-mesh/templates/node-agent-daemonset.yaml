@@ -572,8 +572,7 @@ spec:
           {{- end -}}
           {{- /* Pass startupHandler explicitly so a liveness.override cannot
                  silently cover an enabled startup probe under HTTPS-only mTLS.
-                 Other workloads omit startupHandler and keep the liveHandler
-                 fallback in renderProbes. */ -}}
+                 Serving workloads do the same independent startup classification. */ -}}
           {{- $nodeAgentStartupHandler := $nodeAgentStartupProbe.override | default dict -}}
           {{- if not $nodeAgentStartupHandler }}{{- $nodeAgentStartupHandler = $nodeAgentHandlers.live | default dict -}}{{- end -}}
           {{- $nodeAgentLiveHandler := $nodeAgentLivenessProbe.override | default dict -}}

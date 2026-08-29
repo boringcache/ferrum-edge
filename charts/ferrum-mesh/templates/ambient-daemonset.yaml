@@ -485,12 +485,25 @@ spec:
                  required set; it can never remove one. */ -}}
           {{- $ambientSc := .Values.ambient.securityContext | default dict -}}
           {{- $ambientScCaps := $ambientSc.capabilities | default dict -}}
-          {{- $ambientScDrop := $ambientScCaps.drop | default (list "ALL") -}}
+          {{- /* Do not use Sprig `default` on drop: an explicit empty list is
+                 empty and would silently become [ALL]. Omit the key to take the
+                 chart default; `drop: []` fails because this contract requires ALL. */ -}}
+          {{- $ambientScDrop := list "ALL" -}}
+          {{- if hasKey $ambientScCaps "drop" -}}
+          {{- $ambientScDrop = $ambientScCaps.drop | default list -}}
+          {{- if eq (len $ambientScDrop) 0 -}}
+          {{- fail "ambient.securityContext.capabilities.drop is an empty list; this chart requires [\"ALL\"] so the rendered add list is the complete privilege surface. Omitting the key uses the default [ALL]; an explicit empty list is not silently rewritten." -}}
+          {{- end -}}
+          {{- end -}}
           {{- /* Indexed only after the length check, so an empty list never
                  evaluates `index ... 0`. */ -}}
           {{- $ambientDropOk := false -}}
-          {{- if eq (len $ambientScDrop) 1 -}}
-          {{- $ambientDropOk = eq (upper (trimPrefix "CAP_" (upper (toString (index $ambientScDrop 0))))) "ALL" -}}
+          {{- $ambientDropNormalized := list -}}
+          {{- range $cap := $ambientScDrop -}}
+          {{- $ambientDropNormalized = append $ambientDropNormalized (include "ferrum-mesh.normalizedLinuxCapability" $cap | trim) -}}
+          {{- end -}}
+          {{- if eq (len $ambientDropNormalized) 1 -}}
+          {{- $ambientDropOk = eq (index $ambientDropNormalized 0) "ALL" -}}
           {{- end -}}
           {{- if not $ambientDropOk -}}
           {{- fail (printf "ambient.securityContext.capabilities.drop must stay [\"ALL\"] (got %v): the rendered add list is the ambient datapath's complete privilege surface, and narrowing the drop would silently retain the container runtime's default capabilities" $ambientScDrop) -}}
@@ -511,7 +524,7 @@ spec:
           {{- end -}}
           {{- $ambientExtraCaps := list -}}
           {{- range $cap := $ambientScCaps.add | default list -}}
-          {{- $normalized := upper (trimPrefix "CAP_" (upper (toString $cap))) -}}
+          {{- $normalized := include "ferrum-mesh.normalizedLinuxCapability" $cap | trim -}}
           {{- if not (has $normalized $ambientRequiredCaps) -}}
           {{- $ambientExtraCaps = append $ambientExtraCaps $normalized -}}
           {{- end -}}
@@ -528,10 +541,10 @@ spec:
             {{- end }}
             capabilities:
               drop:
-                - ALL
+                - {{ index $ambientDropNormalized 0 | quote }}
               add:
                 {{- range $cap := concat $ambientRequiredCaps (uniq $ambientExtraCaps) }}
-                - {{ $cap }}
+                - {{ $cap | quote }}
                 {{- end }}
           ports:
             - name: outbound
@@ -662,7 +675,9 @@ spec:
           {{- /* Admin-backed probes when the listener is enabled. NodeWaypoint
                  still requires a non-zero admin port (validated above). Ordinary
                  ambient also probes admin when available so rollouts wait for
-                 /health. Liveness uses --live so a degraded mesh stays alive. */ -}}
+                 /health. Liveness uses --live so a degraded mesh stays alive.
+                 An enabled computed probe with no handler fails closed (admin
+                 HTTP port 0) instead of omitting the probe. */ -}}
           {{- $ambientHandlers := dict "live" (dict) "ready" (dict) -}}
           {{- if ne $ambientAdminPort "0" -}}
           {{- $ambientHandlers = include "ferrum-mesh.adminHealthHandlers" (dict "port" $ambientAdminPort "probeHost" $ambientAdminProbeHost) | fromYaml -}}
@@ -671,7 +686,10 @@ spec:
           {{- if not $ambientLiveHandler }}{{- $ambientLiveHandler = $ambientHandlers.live | default dict -}}{{- end -}}
           {{- $ambientReadyHandler := .Values.ambient.probes.readiness.override | default dict -}}
           {{- if not $ambientReadyHandler }}{{- $ambientReadyHandler = $ambientHandlers.ready | default dict -}}{{- end -}}
-          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.ambient.probes "liveHandler" $ambientLiveHandler "readyHandler" $ambientReadyHandler) }}
+          {{- $ambientStartupHandler := .Values.ambient.probes.startup.override | default dict -}}
+          {{- if not $ambientStartupHandler }}{{- $ambientStartupHandler = $ambientLiveHandler -}}{{- end -}}
+          {{- include "ferrum-mesh.validateComputedProbeHandlers" (dict "component" "ambient" "probes" .Values.ambient.probes "startupHandler" $ambientStartupHandler "liveHandler" $ambientLiveHandler "readyHandler" $ambientReadyHandler) -}}
+          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.ambient.probes "startupHandler" $ambientStartupHandler "liveHandler" $ambientLiveHandler "readyHandler" $ambientReadyHandler) }}
           {{- include "ferrum-mesh.preStopLifecycle" .Values.ambient | nindent 10 }}
           {{- with .Values.ambient.resources }}
           resources:

@@ -92,9 +92,11 @@ drain-aware `ferrum-edge health` against the loopback admin listener — not
 
 Every **enabled** computed probe must have a usable handler. Setting a
 workload's `admin.httpPort: 0` while a computed probe stays enabled fails render
-instead of silently omitting the probe: an omitted readiness probe would leave
-the pod in its Service endpoint set for the whole shutdown. Supply
+instead of silently omitting the probe — including ambient, where a missing
+readiness probe would leave the host-network datapath unprobed. Supply
 `probes.<probe>.override` or set `probes.<probe>.enabled: false` instead.
+`probes.startup.override` is classified independently of liveness on every
+workload (controlPlane, ca, eastWest, ambient, injector, node-agent).
 
 ## Admin listener validation
 
@@ -114,9 +116,10 @@ instead of CrashLooping the pod:
   only).
 - While the computed exec probes are enabled, a non-empty allowlist must cover
   the **exact** source the admin accept loop observes: `127.0.0.1` for an IPv4
-  or `0.0.0.0` bind, `::1` for an IPv6 wildcard bind. An IPv4-only allowlist in
-  front of an IPv6 wildcard bind renders cleanly and then restart-loops the pod,
-  so the chart refuses it.
+  or `0.0.0.0` bind (including a concrete 127/8 or IPv4-mapped 127/8 dest such
+  as `::ffff:127.0.0.2`), `::1` for an IPv6 wildcard bind. An IPv4-only
+  allowlist in front of an IPv6 wildcard bind renders cleanly and then
+  restart-loops the pod, so the chart refuses it.
 
 `observability.metrics.allowedCidrs` is validated the same way; the runtime
 parses `FERRUM_METRICS_ALLOWED_CIDRS` with the same strict parser.
@@ -139,7 +142,10 @@ keys the template actually reads — `allowPrivilegeEscalation`,
 anything else at lint time rather than silently ignoring it (`runAsUser` /
 `runAsGroup` are decided by the capture mode). `capabilities.drop` must stay
 `["ALL"]`, and `capabilities.add` **merges on top of** the datapath minimum: it
-can add capabilities but can never remove a required one.
+can add capabilities but can never remove a required one. Capability names are
+validated against `^(CAP_)?[A-Z][A-Z0-9_]*$` and rendered quoted. An explicit
+`drop: []` is rejected — it is not silently rewritten to `[ALL]`; omit the key
+to keep the default.
 
 `priorityClassName` is optional; only ambient and node-agent default to
 `system-node-critical`. Empty `priorityClassName` omits the field.

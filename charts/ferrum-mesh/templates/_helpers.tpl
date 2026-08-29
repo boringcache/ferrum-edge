@@ -890,6 +890,20 @@ Sane non-empty resource requests. Empty resources{} would restore BestEffort.
 {{- end -}}
 {{- end -}}
 
+{{/*
+Normalize one Linux capability name. Rejects empty strings, surrounding
+whitespace, and anything outside `^(CAP_)?[A-Z][A-Z0-9_]*$` (YAML punctuation
+included). Returns the unprefixed uppercase form (`NET_ADMIN`, `ALL`).
+*/}}
+{{- define "ferrum-mesh.normalizedLinuxCapability" -}}
+{{- $raw := . | toString -}}
+{{- $trimmed := trim $raw -}}
+{{- if or (ne $raw $trimmed) (eq $trimmed "") (not (regexMatch "^(CAP_)?[A-Z][A-Z0-9_]*$" $trimmed)) -}}
+{{- fail (printf "ambient.securityContext.capabilities entry %q is not a Linux capability name; use names such as NET_ADMIN or ALL (optional CAP_ prefix). Empty strings and YAML punctuation are rejected." $raw) -}}
+{{- end -}}
+{{- upper (trimPrefix "CAP_" (upper $trimmed)) -}}
+{{- end -}}
+
 {{/* ---------------------------------------------------------------------------
 Strict IP / CIDR primitives, ported from charts/ferrum-gateway/templates/_helpers.tpl
 so the mesh chart applies the SAME accept/reject decision the runtime does
@@ -937,12 +951,21 @@ Keep them byte-comparable with the gateway copies.
 {{/* Source address the admin listener observes for the computed exec probe.
      Linux selects 127.0.0.1 when connecting to any concrete 127/8 destination;
      other concrete/wildcard probe hosts use the same local address they dial.
+     IPv4-mapped IPv6 destinations are canonicalized to IPv4 first (matching the
+     runtime), so `::ffff:127.0.0.2` is a 127/8 dial and the observed source is
+     `127.0.0.1`, not the mapped destination text. Ordinary IPv6 is unchanged.
      Input is the already-resolved probe host (`ferrum-mesh.adminProbeHost`),
      because the mesh chart resolves admin per component rather than from one
      chart-wide `.Values.admin`. */}}
 {{- define "ferrum-mesh.probeSource" -}}
 {{- $host := . | toString | trimPrefix "[" | trimSuffix "]" -}}
-{{- if regexMatch "^127\\." $host -}}127.0.0.1
+{{- $v4 := include "ferrum-mesh.ipv4ToInt" $host -}}
+{{- if eq $v4 "" -}}{{- $v4 = include "ferrum-mesh.ipv4MappedToInt" $host -}}{{- end -}}
+{{- if ne $v4 "" -}}
+{{- $int := $v4 | int64 -}}
+{{- if eq (div $int 16777216 | int) 127 -}}127.0.0.1
+{{- else -}}{{ include "ferrum-mesh.ipv4IntToDotted" $int }}
+{{- end -}}
 {{- else -}}{{ $host }}
 {{- end -}}
 {{- end -}}
@@ -966,6 +989,12 @@ Keep them byte-comparable with the gateway copies.
 {{- $parts := splitList "." $v -}}
 {{- add (mul (index $parts 0 | int64) 16777216) (mul (index $parts 1 | int64) 65536) (mul (index $parts 2 | int64) 256) (index $parts 3 | int64) -}}
 {{- end -}}
+{{- end -}}
+
+{{/* Convert an unsigned 32-bit IPv4 integer back to dotted-decimal. */}}
+{{- define "ferrum-mesh.ipv4IntToDotted" -}}
+{{- $v := . | int64 -}}
+{{- printf "%d.%d.%d.%d" (div $v 16777216) (mod (div $v 65536) 256) (mod (div $v 256) 256) (mod $v 256) -}}
 {{- end -}}
 
 {{/* Convert one validated IPv6 hextet to an integer. Helm has no base-16 atoi. */}}
@@ -1098,8 +1127,14 @@ Keep them byte-comparable with the gateway copies.
 {{- if and (eq $networkV4 "") (ne $mappedV4 "") -}}{{- $networkV4 = $mappedV4 -}}{{- end -}}
 {{- if ne $networkV4 "" -}}
 {{- $prefix := 32 -}}
-{{- if eq (len $parts) 2 -}}{{- $prefix = atoi (trim (index $parts 1)) -}}{{- end -}}
+{{- if eq (len $parts) 2 -}}
+{{- $prefix = atoi (trim (index $parts 1)) -}}
+{{- /* Mapped CIDRs are stored as IPv4 after subtracting the 96-bit prefix.
+     Bare mapped addresses have no prefix to subtract: they are already a
+     single IPv4 host (/32). Subtracting 96 from that default 32 produced a
+     negative length and could collapse the family to "permits all". */ -}}
 {{- if ne $mappedV4 "" -}}{{- $prefix = sub $prefix 96 | int -}}{{- end -}}
+{{- end -}}
 {{- $bits := include "ferrum-mesh.ipv4Bits" $networkV4 -}}
 {{- $_ := set $coverage (printf "4:%s" (substr 0 $prefix $bits)) true -}}
 {{- else -}}

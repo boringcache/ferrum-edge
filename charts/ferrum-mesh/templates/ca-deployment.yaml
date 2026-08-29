@@ -9,10 +9,14 @@
 {{- if not $liveHandler }}{{- $liveHandler = $handlers.live | default dict -}}{{- end -}}
 {{- $readyHandler := .Values.ca.probes.readiness.override | default dict -}}
 {{- if not $readyHandler }}{{- $readyHandler = $handlers.ready | default dict -}}{{- end -}}
+{{- $startupHandler := .Values.ca.probes.startup.override | default dict -}}
+{{- if not $startupHandler }}{{- $startupHandler = $liveHandler -}}{{- end -}}
 {{- /* An admin HTTP port of 0 leaves the computed handlers empty; `renderProbes`
        would then silently omit the enabled probe, so a ca rollout would keep
-       serving from the Service endpoint set through shutdown. Fail per probe. */ -}}
-{{- include "ferrum-mesh.validateComputedProbeHandlers" (dict "component" "ca" "probes" .Values.ca.probes "liveHandler" $liveHandler "readyHandler" $readyHandler) -}}
+       serving from the Service endpoint set through shutdown. Fail per probe.
+       Startup is classified independently so liveness.override cannot replace an
+       explicit startup.override (or hide a missing computed startup handler). */ -}}
+{{- include "ferrum-mesh.validateComputedProbeHandlers" (dict "component" "ca" "probes" .Values.ca.probes "startupHandler" $startupHandler "liveHandler" $liveHandler "readyHandler" $readyHandler) -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -73,7 +77,7 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
-          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.ca.probes "liveHandler" $liveHandler "readyHandler" $readyHandler) }}
+          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.ca.probes "startupHandler" $startupHandler "liveHandler" $liveHandler "readyHandler" $readyHandler) }}
           {{- include "ferrum-mesh.preStopLifecycle" .Values.ca | nindent 10 }}
           {{- with .Values.ca.resources }}
           resources:

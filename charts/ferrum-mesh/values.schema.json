@@ -1140,7 +1140,7 @@
     },
     "ambientSecurityContext": {
       "type": "object",
-      "description": "Explicit ambient container SecurityContext. Only the keys listed here are read by the template, so unknown keys are REJECTED rather than silently ignored: runAsUser/runAsGroup are decided by the capture mode, and the capability set is a datapath requirement. capabilities.add merges on top of the required NET_ADMIN/NET_RAW (plus BPF/PERFMON for NodeWaypoint and SYS_ADMIN/SYS_PTRACE for in-netns capture) set and can never remove one.",
+      "description": "Explicit ambient container SecurityContext. Only the keys listed here are read by the template, so unknown keys are REJECTED rather than silently ignored: runAsUser/runAsGroup are decided by the capture mode, and the capability set is a datapath requirement. capabilities.drop must stay [ALL] (omit the key for the default; an explicit empty list is rejected). capabilities.add merges on top of the required NET_ADMIN/NET_RAW (plus BPF/PERFMON for NodeWaypoint and SYS_ADMIN/SYS_PTRACE for in-netns capture) set and can never remove one.",
       "additionalProperties": false,
       "properties": {
         "allowPrivilegeEscalation": {
@@ -1155,16 +1155,20 @@
           "properties": {
             "drop": {
               "type": "array",
-              "description": "Must remain [\"ALL\"]. The rendered add list is the complete privilege surface; render fails on anything narrower.",
+              "description": "Must remain [\"ALL\"] (omit the key for that default). An explicit empty list is rejected rather than rewritten. The rendered add list is the complete privilege surface.",
+              "minItems": 1,
               "items": {
-                "type": "string"
+                "type": "string",
+                "pattern": "^(CAP_)?[A-Z][A-Z0-9_]*$"
               }
             },
             "add": {
               "type": "array",
-              "description": "Extra capabilities merged on top of the datapath minimum. Required capabilities are always rendered regardless of this list.",
+              "description": "Extra capabilities merged on top of the datapath minimum. Required capabilities are always rendered regardless of this list. Names must match ^(CAP_)?[A-Z][A-Z0-9_]*$; empty strings and YAML punctuation are rejected.",
               "items": {
-                "type": "string"
+                "type": "string",
+                "pattern": "^(CAP_)?[A-Z][A-Z0-9_]*$",
+                "minLength": 1
               }
             }
           }

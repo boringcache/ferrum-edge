@@ -194,9 +194,9 @@ def validate_serving_podspecs(results_dir: Path) -> None:
     ambient = resource_document(rendered, "ferrum-mesh-ambient", "DaemonSet")
     require_text(
         ambient,
-        "- NET_ADMIN",
+        '- "NET_ADMIN"',
         "Ambient NET_ADMIN missing",
-        "ambient must retain NET_ADMIN for datapath capture",
+        "ambient must retain quoted NET_ADMIN for datapath capture",
     )
     require_text(
         ambient,
@@ -511,9 +511,39 @@ def validate_strict_admin_validation(results_dir: Path) -> None:
     )
     require_stderr(
         results_dir,
+        "mesh-prod-ambient-drop-empty.err",
+        ("empty list", "ALL"),
+        "Empty ambient capability drop must fail closed instead of becoming [ALL]",
+    )
+    require_stderr(
+        results_dir,
+        "mesh-prod-ambient-add-malformed.err",
+        ("not a Linux capability name",),
+        "Malformed ambient capability add refusal missing",
+    )
+    require_stderr(
+        results_dir,
         "mesh-prod-ambient-unknown-sc.err",
         ("runAsUser",),
         "Unsupported ambient securityContext key refusal missing",
+    )
+    require_stderr(
+        results_dir,
+        "mesh-prod-mapped-catchall.err",
+        ("permits every address in an IP family", "IPv4-mapped"),
+        "Mapped IPv6 /96 catch-all allowlist refusal missing",
+    )
+    require_stderr(
+        results_dir,
+        "mesh-prod-mapped-loopback-probe.err",
+        ("127.0.0.1/32", "source 127.0.0.1"),
+        "Mapped IPv4 loopback probe-source refusal missing",
+    )
+    require_stderr(
+        results_dir,
+        "mesh-prod-ambient-admin-port0.err",
+        ("ambient.probes", "no handler can be computed"),
+        "Ambient admin-port-zero enabled probes must fail closed",
     )
     print("mesh strict admin/metrics validation ok")
 
@@ -557,7 +587,7 @@ def validate_narrow_ipv6_render(results_dir: Path) -> None:
         "shutdownPreStopSeconds=0 must omit lifecycle.preStop entirely",
     )
     ambient = resource_document(rendered, "ferrum-mesh-ambient", "DaemonSet")
-    for cap in ("- NET_ADMIN", "- NET_RAW", "- SYS_RESOURCE"):
+    for cap in ('- "NET_ADMIN"', '- "NET_RAW"', '- "SYS_RESOURCE"'):
         require_text(
             ambient,
             cap,
@@ -566,11 +596,61 @@ def validate_narrow_ipv6_render(results_dir: Path) -> None:
         )
     require_text(
         ambient,
-        "drop:",
+        '- "ALL"',
         "Ambient capability drop missing",
-        "ambient must keep dropping ALL even when extra capabilities are added",
+        "ambient must keep dropping quoted ALL even when extra capabilities are added",
     )
     print("mesh narrow-IPv6 / pre-drain / capability-merge render ok")
+
+
+def validate_mapped_admin_and_probe_source(results_dir: Path) -> None:
+    """Bare mapped IPv6 is /32 IPv4; mapped loopback probes from 127.0.0.1."""
+
+    bare = require_capture(
+        results_dir, "mesh-prod-mapped-bare.yaml"
+    ).read_text(encoding="utf-8")
+    cp = resource_document(bare, "ferrum-mesh-control-plane", "Deployment")
+    if env_value(cp, "FERRUM_ADMIN_ALLOWED_CIDRS") != "::ffff:127.0.0.1":
+        fail(
+            "Bare mapped allowlist dropped",
+            "controlPlane.admin.allowedCidrs=::ffff:127.0.0.1 must render and not be treated as permit-all",
+        )
+    cidr = require_capture(
+        results_dir, "mesh-prod-mapped-cidr-host.yaml"
+    ).read_text(encoding="utf-8")
+    cp_cidr = resource_document(cidr, "ferrum-mesh-control-plane", "Deployment")
+    if env_value(cp_cidr, "FERRUM_ADMIN_ALLOWED_CIDRS") != "::ffff:127.0.0.1/128":
+        fail(
+            "Mapped host CIDR dropped",
+            "controlPlane.admin.allowedCidrs=::ffff:127.0.0.1/128 must render as IPv4 /32, not permit-all",
+        )
+    loopback = require_capture(
+        results_dir, "mesh-prod-mapped-loopback-probe-ok.yaml"
+    ).read_text(encoding="utf-8")
+    cp_lb = resource_document(loopback, "ferrum-mesh-control-plane", "Deployment")
+    if env_value(cp_lb, "FERRUM_ADMIN_BIND_ADDRESS") != "::ffff:127.0.0.2":
+        fail(
+            "Mapped loopback bind dropped",
+            "bindAddress=::ffff:127.0.0.2 must render; probe source is 127.0.0.1",
+        )
+    if env_value(cp_lb, "FERRUM_ADMIN_ALLOWED_CIDRS") != "127.0.0.1/32":
+        fail(
+            "Mapped loopback probe allowlist dropped",
+            "allowlist 127.0.0.1/32 must cover the canonicalized mapped loopback probe source",
+        )
+    disabled = require_capture(
+        results_dir, "mesh-prod-ambient-admin-port0-disabled.yaml"
+    ).read_text(encoding="utf-8")
+    ambient = resource_document(disabled, "ferrum-mesh-ambient", "DaemonSet")
+    if any(
+        probe in ambient
+        for probe in ("startupProbe:", "livenessProbe:", "readinessProbe:")
+    ):
+        fail(
+            "Disabled ambient probes still rendered",
+            "ambient admin httpPort 0 with probes.enabled=false must omit computed probes",
+        )
+    print("mesh mapped-admin / ambient-port0-disabled render ok")
 
 
 def main() -> int:
@@ -593,6 +673,7 @@ def main() -> int:
     validate_observability(results_dir)
     validate_strict_admin_validation(results_dir)
     validate_narrow_ipv6_render(results_dir)
+    validate_mapped_admin_and_probe_source(results_dir)
     print("mesh production-readiness ok")
     return 0
 
