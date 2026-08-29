@@ -79,7 +79,12 @@ docker run --rm \
       exit 1
     fi
     mkdir -p /src/target/linux-gnu-sysroot
-    dnf -y install gcc gcc-c++ make cmake zlib-devel perl unzip curl ca-certificates libcurl-devel openssl-devel
+    dnf -y install gcc gcc-c++ make cmake zlib-devel perl unzip curl ca-certificates libcurl-devel openssl-devel clang clang-devel
+    export LIBCLANG_PATH=/usr/lib64
+    if ! compgen -G "$LIBCLANG_PATH/libclang.so*" > /dev/null; then
+      echo "::error::pinned sysroot is missing libclang under $LIBCLANG_PATH; bindgen build scripts cannot run" >&2
+      exit 1
+    fi
     curl -fsSL "$PROTOC_URL" -o /tmp/protoc.zip
     echo "$PROTOC_SHA256  /tmp/protoc.zip" | sha256sum -c -
     unzip -o /tmp/protoc.zip -d /usr/local bin/protoc

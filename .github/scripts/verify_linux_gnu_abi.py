@@ -695,6 +695,17 @@ def check_sysroot_builder(source: str) -> list[str]:
         errors.append("sysroot builder must copy ferrum-cni to the canonical path")
     if "cp -f --" not in source:
         errors.append("sysroot builder must copy proven binaries with cp -f --")
+    if "clang-devel" not in source:
+        errors.append(
+            "sysroot builder must install clang-devel so bindgen build scripts "
+            "can load libclang inside the pinned sysroot"
+        )
+    if "export LIBCLANG_PATH=/usr/lib64" not in source:
+        errors.append("sysroot builder must pin LIBCLANG_PATH for bindgen build scripts")
+    if 'compgen -G "$LIBCLANG_PATH/libclang.so*"' not in source:
+        errors.append(
+            "sysroot builder must fail closed when libclang is absent from the pinned sysroot"
+        )
     return errors
 
 
@@ -1094,6 +1105,28 @@ def run_self_test() -> list[str]:
     mutated_cni_copy = builder.replace("copy_sysroot_binary ferrum-cni\n", "", 1)
     if not check_sysroot_builder(mutated_cni_copy):
         failures.append("sysroot builder missing ferrum-cni canonical copy was not rejected")
+
+    mutated_clang = builder.replace(" clang clang-devel\n", "\n", 1)
+    if not check_sysroot_builder(mutated_clang):
+        failures.append("sysroot builder without clang-devel was not rejected")
+
+    mutated_libclang_path = builder.replace(
+        "    export LIBCLANG_PATH=/usr/lib64\n", "", 1
+    )
+    if not check_sysroot_builder(mutated_libclang_path):
+        failures.append("sysroot builder without a pinned LIBCLANG_PATH was not rejected")
+
+    mutated_libclang_guard = builder.replace(
+        '    if ! compgen -G "$LIBCLANG_PATH/libclang.so*" > /dev/null; then\n'
+        "      echo \"::error::pinned sysroot is missing libclang under $LIBCLANG_PATH; "
+        'bindgen build scripts cannot run" >&2\n'
+        "      exit 1\n"
+        "    fi\n",
+        "",
+        1,
+    )
+    if not check_sysroot_builder(mutated_libclang_guard):
+        failures.append("sysroot builder without a libclang presence guard was not rejected")
 
     mutated_pr_job = ci_yml.replace(
         "verify-pr-linux-gnu-abi:", "verify-pr-linux-gnu-abi-missing:", 1
