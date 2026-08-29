@@ -109,7 +109,13 @@ fn api_error(code: u16, reason: &str) -> kube::Error {
 
 #[test]
 fn deleted_status_target_is_terminal_but_other_api_errors_retry() {
-    assert!(gateway_api_status_error_is_not_found(&api_error(404, "NotFound")));
-    assert!(!gateway_api_status_error_is_not_found(&api_error(409, "Conflict")));
-    assert!(!gateway_api_status_error_is_not_found(&api_error(504, "Timeout")));
+    assert!(gateway_api_status_error_is_not_found(&api_error(
+        404, "NotFound"
+    )));
+    assert!(!gateway_api_status_error_is_not_found(&api_error(
+        409, "Conflict"
+    )));
+    assert!(!gateway_api_status_error_is_not_found(&api_error(
+        504, "Timeout"
+    )));
 }
