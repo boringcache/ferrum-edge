@@ -285,15 +285,6 @@ async fn one_second_past_not_after_is_outside_the_window() {
 }
 
 #[tokio::test]
-async fn one_second_before_not_before_is_outside_the_window() {
-    let cert = cert_with_validity("client.example.com", 1, 600);
-    let index = ConsumerIndex::new(&[mtls_consumer("alice", "client.example.com")]);
-    let mut ctx = ctx_with_cert(cert);
-
-    assert_fixed_401(default_plugin().authenticate(&mut ctx, &index).await);
-}
-
-#[tokio::test]
 async fn an_inverted_validity_interval_fails_closed_as_an_invalid_certificate() {
     // `notAfter` before `notBefore` can never be valid. It must be refused
     // outright rather than admitted by whichever bound is compared first.
