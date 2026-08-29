@@ -2445,6 +2445,202 @@ fn inbound_relay_registry_malformed_production_entry_retracts_then_recovers() {
     );
 }
 
+/// Strict `list_complete_targets` distinguishes an omitted optional field from a
+/// present malformed one. A valid complete registry publishes; a present invalid
+/// `spiffe_id=` retracts instead of becoming missing evidence (so the address
+/// cannot still admit on address/pod-UID alone); invalid IPv4/IPv6, duplicate
+/// recognized keys, unknown content, and an unsafe pod-UID filename each retract
+/// the whole last-good index; repairing the entry republishes. Hidden
+/// dot-prefixed registry control entries are skipped rather than parsed as pods.
+/// `list_targets` remains the best-effort scan and is not what the manager uses.
+#[test]
+fn inbound_relay_registry_strict_parse_retracts_malformed_evidence_then_recovers() {
+    let own_spiffe = reviews_spiffe();
+    let local = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    let other = reviews_replica("10.244.5.6", OTHER_POD_UID);
+    let (slice, runtime) = ambient_relay_fixture(vec![local, other]);
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+    let index = Arc::new(NodeLocalEnrolledDestinations::new());
+    mesh.inbound_relay_node_local_registry =
+        NodeLocalEnrolledDestinationsHandle::new(index.clone());
+
+    let dir = tempfile::tempdir().expect("registry");
+    write_strict_registry_entry(dir.path(), LOCAL_POD_UID, "10.244.5.5", &own_spiffe);
+    write_strict_registry_entry(dir.path(), OTHER_POD_UID, "10.244.5.6", &own_spiffe);
+    std::fs::create_dir_all(dir.path().join(".ready")).expect("ready control dir");
+    std::fs::write(dir.path().join(".ready").join("marker"), b"").expect("ready marker");
+    std::fs::create_dir_all(dir.path().join(".udp-ready")).expect("udp-ready control dir");
+    std::fs::write(
+        dir.path().join(".udp-ready").join(LOCAL_POD_UID),
+        b"",
+    )
+    .expect("udp-ready marker");
+    let source = DirectoryCaptureSource::new(dir.path());
+    let manager = strict_registry_manager(
+        Arc::new(DirectoryCaptureSource::new(dir.path())),
+        index.clone(),
+    );
+
+    assert_eq!(
+        manager.reconcile_once().len(),
+        2,
+        "a valid complete registry must publish, skipping hidden control entries"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 8080, node),
+        Ok(())
+    );
+
+    let local_body = |spiffe: &str, ipv4: &str, extra: &str| {
+        format!("/sys/fs/cgroup/kubepods/{LOCAL_POD_UID}\nspiffe_id={spiffe}\nipv4={ipv4}\n{extra}")
+    };
+    let other_body = |spiffe: &str, ipv4: &str, extra: &str| {
+        format!("/sys/fs/cgroup/kubepods/{OTHER_POD_UID}\nspiffe_id={spiffe}\nipv4={ipv4}\n{extra}")
+    };
+
+    std::fs::write(
+        dir.path().join(LOCAL_POD_UID),
+        local_body("not-a-spiffe", "10.244.5.5", ""),
+    )
+    .expect("invalid spiffe_id");
+    let permissive = source.list_targets();
+    assert!(
+        permissive.iter().any(|target| {
+            target.pod_uid == LOCAL_POD_UID && target.source_identity.is_none()
+        }),
+        "the best-effort scan must keep the pod and treat a present malformed \
+         spiffe_id= as absent identity"
+    );
+    assert!(
+        source.list_complete_targets().is_err(),
+        "the complete snapshot must refuse a present malformed spiffe_id="
+    );
+    assert!(manager.reconcile_once().is_empty());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a present invalid spiffe_id= must retract rather than publish missing evidence"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a malformed sibling must retract the whole last-good index"
+    );
+    assert!(
+        !index.terminates_for(ip("10.244.5.5"), None, Some(LOCAL_POD_UID)),
+        "malformed identity must not still admit the address on address/pod-UID alone"
+    );
+    assert!(
+        !index.terminates_for(
+            ip("10.244.5.5"),
+            Some(own_spiffe.as_str()),
+            Some(LOCAL_POD_UID),
+        ),
+        "malformed identity must not skip the identity comparison by becoming None"
+    );
+
+    write_strict_registry_entry(dir.path(), LOCAL_POD_UID, "10.244.5.5", &own_spiffe);
+    assert_eq!(manager.reconcile_once().len(), 2);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+
+    let poisons = [
+        (
+            "invalid ipv4",
+            OTHER_POD_UID,
+            other_body(&own_spiffe, "not-an-ipv4", ""),
+        ),
+        (
+            "invalid ipv6",
+            OTHER_POD_UID,
+            other_body(&own_spiffe, "10.244.5.6", "ipv6=not-an-ipv6\n"),
+        ),
+        (
+            "duplicate recognized key",
+            OTHER_POD_UID,
+            other_body(&own_spiffe, "10.244.5.6", "ipv4=10.244.5.7\n"),
+        ),
+        (
+            "unknown content",
+            OTHER_POD_UID,
+            other_body(&own_spiffe, "10.244.5.6", "hostname=evil.example\n"),
+        ),
+        (
+            "empty spiffe_id",
+            OTHER_POD_UID,
+            format!("/sys/fs/cgroup/kubepods/{OTHER_POD_UID}\nspiffe_id=\nipv4=10.244.5.6\n"),
+        ),
+    ];
+    for (reason, uid, body) in poisons {
+        std::fs::write(dir.path().join(uid), body).expect("poison registry entry");
+        assert!(
+            manager.reconcile_once().is_empty(),
+            "{reason}: complete snapshot must retract"
+        );
+        assert_eq!(
+            mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "{reason}: last-good must not be retained"
+        );
+        assert_eq!(
+            mesh.inbound_relay_destination_decision("10.244.5.6", 8080, node),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "{reason}: partial publish of the remaining valid file is forbidden"
+        );
+        write_strict_registry_entry(dir.path(), OTHER_POD_UID, "10.244.5.6", &own_spiffe);
+        assert_eq!(
+            manager.reconcile_once().len(),
+            2,
+            "{reason}: repairing the entry must allow republish"
+        );
+        assert_eq!(
+            mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+            Ok(()),
+            "{reason}: repaired snapshot must recover the sibling"
+        );
+        assert_eq!(
+            mesh.inbound_relay_destination_decision("10.244.5.6", 8080, node),
+            Ok(())
+        );
+    }
+
+    let unsafe_name = "uid with space";
+    std::fs::write(
+        dir.path().join(unsafe_name),
+        b"/sys/fs/cgroup/x\nipv4=10.0.0.9\n",
+    )
+    .expect("unsafe pod-UID filename");
+    assert!(
+        manager.reconcile_once().is_empty(),
+        "an unsafe pod-UID filename must retract the last-good index"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+    std::fs::remove_file(dir.path().join(unsafe_name)).expect("remove unsafe name");
+    assert_eq!(
+        manager.reconcile_once().len(),
+        2,
+        "removing the unsafe leaf must allow republish"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 8080, node),
+        Ok(())
+    );
+}
+
 /// Unsafe names, oversized files, and Unix symlinks are the production
 /// filesystem shapes the strict reader refuses. Each must retract a
 /// previously valid publish; repairing the directory recovers.

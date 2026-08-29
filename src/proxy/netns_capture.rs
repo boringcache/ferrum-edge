@@ -61,7 +61,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::modes::mesh::node_waypoint::parse_pod_uid;
+use crate::modes::mesh::node_waypoint::{is_safe_pod_registry_uid, parse_pod_uid};
 
 use super::{ListenerTlsSource, ProxyState, SourceIpOverride, run_accept_loop};
 
@@ -75,8 +75,11 @@ pub struct PodCaptureTarget {
     pub cgroup_path: String,
     /// Workload SPIFFE identity attested by the node-agent for this registry
     /// entry. Ambient UDP capture stamps it together with `pod_uid` into the
-    /// existing trusted HBONE baggage channel. Missing/malformed registry
-    /// evidence leaves this `None` and preserves mesh-wide authorization.
+    /// existing trusted HBONE baggage channel. The best-effort scan treats a
+    /// missing `spiffe_id=` line, or a present-but-malformed one, as `None`.
+    /// Strict complete snapshots distinguish those cases: omission stays
+    /// `None`, while a present malformed/empty/unbound identity fails the
+    /// production entry so it cannot weaken an identity binding.
     pub source_identity: Option<crate::modes::mesh::hbone::UdpSourceIdentity>,
     /// Source pod IPs, if the node-agent published them. Used to override the
     /// loopback peer of accepted in-netns capture connections so client-IP
@@ -120,8 +123,10 @@ pub trait PodCaptureSource: Send + Sync {
     ///
     /// Production filesystem sources fail closed on any omitted, unsafe, or
     /// malformed entry (entry-count cap, per-entry size cap, Unix `O_NOFOLLOW`,
-    /// regular file, single link, process-owned, safe UTF-8 name). In-memory
-    /// sources are already atomic and default to `Ok(self.list_targets())`.
+    /// regular file, single link, process-owned, canonical pod-UID leaf name,
+    /// and a strict body parse that distinguishes an omitted optional field from a
+    /// present malformed one). In-memory sources are already atomic and default
+    /// to `Ok(self.list_targets())`.
     ///
     /// Shared by durable UDP migration proofs and the inbound HBONE relay
     /// destination guard: both need an all-or-nothing snapshot, not a partial
@@ -135,11 +140,14 @@ const MAX_COMPLETE_REGISTRY_ENTRIES: usize = 100_000;
 const MAX_COMPLETE_REGISTRY_ENTRY_BYTES: u64 = 16 * 1024;
 
 /// Filesystem registry source: the node-agent writes one file per enrolled pod,
-/// named `<pod_uid>`, whose first line is the pod cgroup path and whose
-/// optional keyed lines carry the node-agent-derived workload SPIFFE identity
-/// (`spiffe_id=<id>`) and same-family source IP overrides (`ipv4=<addr>`,
-/// `ipv6=<addr>`). Removing the file (on pod teardown) drops the pod from the
-/// set. This mirrors the existing "pinned path is the entire node-agent ↔
+/// named `<pod_uid>` (canonical leaf grammar: non-empty, ≤256 bytes, ASCII
+/// alphanumeric start, then ASCII alphanumerics / `-` / `_`), whose first line
+/// is the pod cgroup path and whose optional keyed lines carry the
+/// node-agent-derived workload SPIFFE identity (`spiffe_id=<id>`) and
+/// same-family source IP overrides (`ipv4=<addr>`, `ipv6=<addr>`). Dot-prefixed
+/// names are registry control entries (`.ready`, `.udp-ready`, publication
+/// tempfiles), not pods. Removing the file (on pod teardown) drops the pod from
+/// the set. This mirrors the existing "pinned path is the entire node-agent ↔
 /// mesh-proxy IPC surface" contract.
 pub struct DirectoryCaptureSource {
     dir: PathBuf,
@@ -152,8 +160,34 @@ impl DirectoryCaptureSource {
 }
 
 fn parse_capture_target(pod_uid: String, contents: &str) -> Result<PodCaptureTarget, String> {
+    parse_capture_target_inner(pod_uid, contents, CaptureTargetParseMode::Permissive)
+}
+
+fn parse_complete_capture_target(
+    pod_uid: String,
+    contents: &str,
+) -> Result<PodCaptureTarget, String> {
+    parse_capture_target_inner(pod_uid, contents, CaptureTargetParseMode::Strict)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CaptureTargetParseMode {
+    /// Best-effort capture/steering: skip unknown lines and treat a present
+    /// malformed optional field as absent so one bad file cannot drop the rest
+    /// of the enrolled-pod set.
+    Permissive,
+    /// All-or-nothing snapshot: a present malformed or duplicate recognized field,
+    /// or any other non-empty content line, fails the whole production entry.
+    Strict,
+}
+
+fn parse_capture_target_inner(
+    pod_uid: String,
+    contents: &str,
+    mode: CaptureTargetParseMode,
+) -> Result<PodCaptureTarget, String> {
     // Line 1: pod cgroup path (required). Subsequent optional lines are
-    // family-specific source IPs (`ipv4=<addr>`, `ipv6=<addr>`).
+    // `spiffe_id=<id>`, `ipv4=<addr>`, `ipv6=<addr>`.
     let mut lines = contents.lines();
     let cgroup_path = lines.next().unwrap_or("").trim().to_string();
     if cgroup_path.is_empty() {
@@ -161,19 +195,92 @@ fn parse_capture_target(pod_uid: String, contents: &str) -> Result<PodCaptureTar
     }
     let mut source_ips = PodCaptureSourceIps::default();
     let mut source_principal = None;
+    let mut seen_spiffe = false;
+    let mut seen_ipv4 = false;
+    let mut seen_ipv6 = false;
     for line in lines {
         let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
         if let Some(value) = line.strip_prefix("spiffe_id=") {
-            source_principal = crate::identity::SpiffeId::new(value.trim()).ok();
+            if matches!(mode, CaptureTargetParseMode::Strict) && seen_spiffe {
+                return Err(
+                    "Ambient capture registry entry repeats a recognized field".to_string(),
+                );
+            }
+            seen_spiffe = true;
+            let value = value.trim();
+            match crate::identity::SpiffeId::new(value) {
+                Ok(principal) => source_principal = Some(principal),
+                Err(_) => match mode {
+                    CaptureTargetParseMode::Permissive => source_principal = None,
+                    CaptureTargetParseMode::Strict => {
+                        return Err(
+                            "Ambient capture registry entry has a malformed spiffe_id".to_string(),
+                        );
+                    }
+                },
+            }
         } else if let Some(value) = line.strip_prefix("ipv4=") {
-            source_ips.ipv4 = value.trim().parse::<Ipv4Addr>().ok();
+            if matches!(mode, CaptureTargetParseMode::Strict) && seen_ipv4 {
+                return Err(
+                    "Ambient capture registry entry repeats a recognized field".to_string(),
+                );
+            }
+            seen_ipv4 = true;
+            match value.trim().parse::<Ipv4Addr>() {
+                Ok(addr) => source_ips.ipv4 = Some(addr),
+                Err(_) => match mode {
+                    CaptureTargetParseMode::Permissive => source_ips.ipv4 = None,
+                    CaptureTargetParseMode::Strict => {
+                        return Err(
+                            "Ambient capture registry entry has a malformed ipv4 address"
+                                .to_string(),
+                        );
+                    }
+                },
+            }
         } else if let Some(value) = line.strip_prefix("ipv6=") {
-            source_ips.ipv6 = value.trim().parse::<Ipv6Addr>().ok();
+            if matches!(mode, CaptureTargetParseMode::Strict) && seen_ipv6 {
+                return Err(
+                    "Ambient capture registry entry repeats a recognized field".to_string(),
+                );
+            }
+            seen_ipv6 = true;
+            match value.trim().parse::<Ipv6Addr>() {
+                Ok(addr) => source_ips.ipv6 = Some(addr),
+                Err(_) => match mode {
+                    CaptureTargetParseMode::Permissive => source_ips.ipv6 = None,
+                    CaptureTargetParseMode::Strict => {
+                        return Err(
+                            "Ambient capture registry entry has a malformed ipv6 address"
+                                .to_string(),
+                        );
+                    }
+                },
+            }
+        } else if matches!(mode, CaptureTargetParseMode::Strict) {
+            return Err("Ambient capture registry entry has unknown content".to_string());
         }
     }
-    let source_identity = source_principal.and_then(|principal| {
-        crate::modes::mesh::hbone::UdpSourceIdentity::new(principal, pod_uid.clone())
-    });
+    let source_identity = match source_principal {
+        None => None,
+        Some(principal) => {
+            match crate::modes::mesh::hbone::UdpSourceIdentity::new(principal, pod_uid.clone()) {
+                Some(identity) => Some(identity),
+                None => match mode {
+                    CaptureTargetParseMode::Permissive => None,
+                    CaptureTargetParseMode::Strict => {
+                        return Err(
+                            "Ambient capture registry entry identity is not bound to a valid pod UID"
+                                .to_string(),
+                        );
+                    }
+                },
+            }
+        }
+    };
     Ok(PodCaptureTarget {
         pod_uid,
         cgroup_path,
@@ -258,17 +365,16 @@ impl PodCaptureSource for DirectoryCaptureSource {
                 .into_string()
                 .map_err(|_| "Ambient capture registry entry name is not UTF-8")?;
             if pod_uid.starts_with('.') {
+                // Node-agent control entries (`.ready`, `.udp-ready`,
+                // `.pod-registry-entry.tmp.*`) co-located in this directory are
+                // not pods: skip them rather than parsing or retracting.
                 continue;
             }
-            if pod_uid.is_empty()
-                || pod_uid.contains("..")
-                || pod_uid.contains('/')
-                || pod_uid.contains('\\')
-            {
+            if !is_safe_pod_registry_uid(&pod_uid) {
                 return Err("Ambient capture registry entry name is unsafe".to_string());
             }
             let contents = read_complete_registry_entry(&entry.path())?;
-            targets.push(parse_capture_target(pod_uid, &contents)?);
+            targets.push(parse_complete_capture_target(pod_uid, &contents)?);
         }
         Ok(targets)
     }

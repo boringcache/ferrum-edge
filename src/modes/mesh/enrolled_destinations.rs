@@ -50,9 +50,10 @@
 //!   snapshot ([`PodCaptureSource::list_complete_targets`]), never the
 //!   best-effort [`PodCaptureSource::list_targets`] scan. Any missing
 //!   directory, enumeration/read/metadata/ownership/parse error, unsafe name,
-//!   symlink, oversized or non-regular file, or too many entries retracts the
-//!   index immediately: last-good is not retained and a partial snapshot is
-//!   never published. A later complete snapshot may republish.
+//!   symlink, oversized or non-regular file, too many entries, present-but-
+//!   malformed optional field, duplicate recognized key, or unknown content
+//!   retracts the index immediately: last-good is not retained and a partial
+//!   snapshot is never published. A later complete snapshot may republish.
 //! * An address claimed by two DIFFERENT pod UIDs is ambiguous and refused for
 //!   BOTH claimants, mirroring the contested-interface rule
 //!   `plan_host_udp_bindings` already applies to ingress interfaces.
@@ -133,16 +134,13 @@ impl EnrolledPodEntry {
     }
 }
 
-/// Same rule the node-agent publisher applies before writing an entry
-/// (`publish_pod_registry`), re-checked on the consuming side so a directory
-/// this process did not write cannot smuggle a traversal-shaped key into the
+/// Same canonical leaf-name rule the node-agent publisher applies before writing
+/// an entry (`publish_pod_registry` / `is_safe_pod_registry_uid`), re-checked
+/// on the consuming side so a directory this process did not write cannot
+/// smuggle a traversal-shaped, whitespace, or control-character key into the
 /// index or a diagnostic.
 fn pod_uid_is_unsafe(pod_uid: &str) -> bool {
-    pod_uid.is_empty()
-        || pod_uid.starts_with('.')
-        || pod_uid.contains('/')
-        || pod_uid.contains('\\')
-        || pod_uid.contains("..")
+    !crate::modes::mesh::node_waypoint::is_safe_pod_registry_uid(pod_uid)
 }
 
 /// What one enrolled address resolves to. Shared behind an `Arc` so a pod with
@@ -450,7 +448,10 @@ impl NodeLocalEnrolledDestinationsManager {
     /// One reconcile pass. A complete snapshot is published wholesale; any
     /// incomplete, unsafe, or malformed registry snapshot retracts the index
     /// immediately so the guard admits nothing. Last-good is never retained
-    /// and a partial snapshot is never published.
+    /// and a partial snapshot is never published. That includes a present
+    /// malformed `spiffe_id=` / `ipv4=` / `ipv6=` (which must not become missing
+    /// evidence), a duplicate recognized key, unknown content, and an unsafe
+    /// pod-UID leaf name.
     ///
     /// Returns the entries that were published (empty after a retraction).
     /// Diagnostics are a fixed-shape debug line; the error payload is discarded
