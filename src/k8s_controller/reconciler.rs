@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::types::{GatewayConfig, K8sMeshOverlay};
 use crate::config_sources::k8s::{
-    K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
+    K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions, NodeWaypointInventory,
     translate_k8s_objects_collecting_skips,
 };
 use crate::grpc::cp_server::{CpGrpcServer, CpScope, DpNodeRegistry, NamespaceBroadcasts};
@@ -317,6 +317,8 @@ async fn run_reconcile_loop(
         return;
     }
 
+    let node_waypoint_inventory = NodeWaypointInventory::new();
+
     // Initial reconciliation — block until first success.
     do_reconcile(
         Arc::clone(&store_set),
@@ -349,6 +351,7 @@ async fn run_reconcile_loop(
             istio_status_writer: istio_status_writer.clone(),
             metrics: Arc::clone(&metrics),
             revision: Arc::clone(&revision),
+            node_waypoint_inventory: node_waypoint_inventory.clone(),
         },
     )
     .await;
@@ -399,6 +402,7 @@ async fn run_reconcile_loop(
                         istio_status_writer: istio_status_writer.clone(),
                         metrics: Arc::clone(&metrics),
                         revision: Arc::clone(&revision),
+                        node_waypoint_inventory: node_waypoint_inventory.clone(),
                     },
                 ).await;
             }
@@ -443,6 +447,7 @@ async fn run_reconcile_loop(
                         istio_status_writer: istio_status_writer.clone(),
                         metrics: Arc::clone(&metrics),
                         revision: Arc::clone(&revision),
+                        node_waypoint_inventory: node_waypoint_inventory.clone(),
                     },
                 ).await;
             }
@@ -637,6 +642,8 @@ struct ReconcileContext {
     /// Kubernetes `resourceVersion` convergence evidence and the authoritative
     /// mesh config revision derived from it (issue #3611).
     revision: Arc<K8sConfigRevisionTracker>,
+    /// Last Ready NodeWaypoint endpoint per node, shared across reconciles.
+    node_waypoint_inventory: NodeWaypointInventory,
 }
 
 fn namespaces_for_broadcast(
@@ -1110,7 +1117,8 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         .with_pod_source_namespaces(ctx.watch_namespaces.clone())
         .with_pod_discovery_enabled(ctx.pod_discovery_enabled)
         .with_mesh_sidecar_ingress_enforced(ctx.mesh_sidecar_ingress_enforced)
-        .with_mesh_overlay_authority(ctx.mesh_overlay_authority);
+        .with_mesh_overlay_authority(ctx.mesh_overlay_authority)
+        .with_node_waypoint_inventory(ctx.node_waypoint_inventory.clone());
     let Some((translation, translation_errors)) =
         translate_with_skip_retries(&objects, options.clone(), &ctx.metrics)
     else {

@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
 
 use ferrum_edge::config_sources::k8s::{
-    K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    K8sMetadata, K8sObject, K8sTranslation, K8sTranslationOptions, NodeWaypointInventory,
+    translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
+use ferrum_edge::modes::mesh::config::NodeWaypointEndpoint;
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use serde_json::{Value, json};
 
@@ -587,6 +589,144 @@ fn k8s_pod_discovery_does_not_attach_unready_or_different_node_waypoint() {
             .expect("reviews workload");
         assert!(workload.node_waypoint.is_none());
     }
+}
+
+fn reviews_workload_node_waypoint(translation: &K8sTranslation) -> Option<&NodeWaypointEndpoint> {
+    translation
+        .config
+        .mesh
+        .as_ref()?
+        .workloads
+        .iter()
+        .find(|workload| workload.namespace == "default" && workload.service_name == "reviews")?
+        .node_waypoint
+        .as_ref()
+}
+
+#[test]
+fn k8s_pod_discovery_retains_last_ready_node_waypoint_while_trusted_proxy_exists() {
+    let inventory = NodeWaypointInventory::new();
+    let options = options().with_node_waypoint_inventory(inventory);
+
+    let ready_a = node_waypoint_pod_with_spiffe(
+        "node-a",
+        "192.0.2.10",
+        true,
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a",
+    );
+    let translation = translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            ready_a,
+        ],
+        options.clone(),
+    )
+    .expect("K8s core translation succeeds");
+    assert_eq!(
+        reviews_workload_node_waypoint(&translation)
+            .expect("ready waypoint publishes destination metadata")
+            .address,
+        "192.0.2.10"
+    );
+
+    let unready_a = node_waypoint_pod_with_spiffe(
+        "node-a",
+        "192.0.2.99",
+        false,
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a",
+    );
+    let ready_b = node_waypoint_pod_with_spiffe(
+        "node-b",
+        "192.0.2.11",
+        true,
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-b",
+    );
+    let translation = translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            node("node-b", "node-uid-b"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            unready_a,
+            ready_b.clone(),
+        ],
+        options.clone(),
+    )
+    .expect("K8s core translation succeeds");
+    assert_eq!(
+        reviews_workload_node_waypoint(&translation)
+            .expect("unready replacement must keep last Ready endpoint")
+            .address,
+        "192.0.2.10",
+        "sticky inventory is last Ready, not the current unready pod address"
+    );
+
+    let translation = translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            node("node-b", "node-uid-b"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            ready_b,
+        ],
+        options,
+    )
+    .expect("K8s core translation succeeds");
+    assert_eq!(
+        reviews_workload_node_waypoint(&translation)
+            .expect(
+                "absent local proxy must keep last Ready endpoint while another trusted pod exists"
+            )
+            .address,
+        "192.0.2.10"
+    );
+}
+
+#[test]
+fn k8s_pod_discovery_clears_sticky_node_waypoint_when_no_trusted_proxy_remains() {
+    let inventory = NodeWaypointInventory::new();
+    let options = options().with_node_waypoint_inventory(inventory);
+    let ready_a = node_waypoint_pod_with_spiffe(
+        "node-a",
+        "192.0.2.10",
+        true,
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a",
+    );
+    translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            ready_a,
+        ],
+        options.clone(),
+    )
+    .expect("K8s core translation succeeds");
+
+    let translation = translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+        ],
+        options,
+    )
+    .expect("K8s core translation succeeds");
+    assert!(
+        reviews_workload_node_waypoint(&translation).is_none(),
+        "withdrawing every trusted waypoint pod must clear destination metadata"
+    );
 }
 
 #[test]

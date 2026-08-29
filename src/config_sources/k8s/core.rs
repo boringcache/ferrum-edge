@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use crate::fips::approved::Sha256;
 use serde_json::Value;
@@ -136,6 +137,56 @@ struct CoreNodeWaypointPod {
     spiffe_id: SpiffeId,
 }
 
+/// Last Ready NodeWaypoint endpoint observed per Kubernetes node.
+///
+/// Destination `Workload.node_waypoint` is derived from trusted host-network
+/// proxy pods that are Ready *now*. A rolling DaemonSet restart withdraws that
+/// Ready set (and, while the replacement is Pending, can empty it) without
+/// advancing the Kubernetes mesh revision watermark, so the CP would otherwise
+/// publish a metadata-stripped snapshot and then retain it. Remembering the
+/// last Ready endpoint keeps hostNetwork identity stable across that gap for
+/// as long as any trusted waypoint pod still exists in the cluster.
+#[derive(Clone, Default)]
+pub struct NodeWaypointInventory {
+    inner: Arc<Mutex<HashMap<String, CoreNodeWaypointPod>>>,
+}
+
+impl std::fmt::Debug for NodeWaypointInventory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let nodes = self.lock().len();
+        f.debug_struct("NodeWaypointInventory")
+            .field("nodes", &nodes)
+            .finish()
+    }
+}
+
+impl NodeWaypointInventory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, CoreNodeWaypointPod>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn remember(&self, node_name: String, waypoint: CoreNodeWaypointPod) {
+        self.lock().insert(node_name, waypoint);
+    }
+
+    fn apply_to(&self, dest: &mut HashMap<String, CoreNodeWaypointPod>, keep: bool) {
+        let mut guard = self.lock();
+        if !keep {
+            guard.clear();
+            return;
+        }
+        for (node, waypoint) in guard.iter() {
+            dest.entry(node.clone()).or_insert(waypoint.clone());
+        }
+    }
+}
+
 #[derive(Debug)]
 struct CoreAutoWorkload {
     pod_key: PodKey,
@@ -184,6 +235,11 @@ pub(super) fn collect(
 }
 
 pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError> {
+    let keep_sticky_waypoints = acc.core.pods.values().any(|pod| pod.node_waypoint_proxy);
+    acc.options
+        .node_waypoint_inventory
+        .apply_to(&mut acc.core.node_waypoints_by_node, keep_sticky_waypoints);
+
     let mut service_keys: Vec<K8sServiceKey> = acc.core.services.keys().cloned().collect();
     service_keys.sort();
 
@@ -397,6 +453,12 @@ fn collect_pod(acc: &mut K8sAccumulator, object: &K8sObject) {
         ready: pod_is_ready(object),
         node_waypoint_proxy: false,
     };
+    // Mark every trusted NodeWaypoint proxy pod, including not-Ready
+    // replacements, so rolling-restart snapshots still retain last-known
+    // destination endpoints instead of treating the DaemonSet as gone.
+    if trusted_node_waypoint_pod_object(&acc.options, object) {
+        pod.node_waypoint_proxy = true;
+    }
     if let Some((node_name, address)) = node_waypoint_pod_candidate(acc, object, &pod) {
         pod.node_waypoint_proxy = true;
         for address in &pod.addresses {
@@ -405,6 +467,9 @@ fn collect_pod(acc: &mut K8sAccumulator, object: &K8sObject) {
             }
         }
         if let Some(node_waypoint) = node_waypoint_pod_endpoint(object, &pod, address) {
+            acc.options
+                .node_waypoint_inventory
+                .remember(node_name.clone(), node_waypoint.clone());
             acc.core
                 .node_waypoints_by_node
                 .insert(node_name, node_waypoint);

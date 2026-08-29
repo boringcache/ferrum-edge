@@ -16,6 +16,7 @@ mod mesh_config;
 // instead of a binary-unused `pub use` re-export.
 pub mod udp_amplification_policy;
 
+pub use core::NodeWaypointInventory;
 pub(crate) use core::secret_object_is_valid_tls_certificate;
 pub(crate) use gateway_api::{
     allowed_route_namespaces as parse_gateway_listener_allowed_route_namespaces,
@@ -176,6 +177,10 @@ pub struct K8sTranslationOptions {
     /// flag exists to fix. Defaults to `false` so a caller that has not thought
     /// about ownership cannot widen Kubernetes authority by accident.
     pub mesh_overlay_authority: bool,
+    /// Process-lifetime last Ready NodeWaypoint endpoint per node. Shared
+    /// across reconciles so a rolling restart does not publish a
+    /// metadata-stripped mesh under an unchanged Kubernetes revision.
+    pub node_waypoint_inventory: NodeWaypointInventory,
     source_namespaces: Option<HashSet<String>>,
     pod_source_namespaces: Option<HashSet<String>>,
 }
@@ -247,6 +252,7 @@ impl K8sTranslationOptions {
             pod_discovery_enabled: false,
             mesh_sidecar_ingress_enforced: false,
             mesh_overlay_authority: false,
+            node_waypoint_inventory: NodeWaypointInventory::new(),
             source_namespaces: Some(source_namespaces),
             pod_source_namespaces: Some(pod_source_namespaces),
         }
@@ -285,6 +291,12 @@ impl K8sTranslationOptions {
         if !namespace.trim().is_empty() {
             self.node_waypoint_namespace = namespace;
         }
+        self
+    }
+
+    /// Share a process-lifetime NodeWaypoint inventory across translations.
+    pub fn with_node_waypoint_inventory(mut self, inventory: NodeWaypointInventory) -> Self {
+        self.node_waypoint_inventory = inventory;
         self
     }
 
