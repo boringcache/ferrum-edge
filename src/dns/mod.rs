@@ -581,7 +581,8 @@ enum RefreshStart {
     ConcurrencyLimited,
 }
 
-type ProactiveResolveOutput =
+#[doc(hidden)]
+pub type ProactiveResolveOutput =
     Result<(Vec<IpAddr>, Option<CachedRecordType>, Duration), anyhow::Error>;
 type ProactiveResolveHook = Arc<
     dyn Fn(String) -> Pin<Box<dyn Future<Output = ProactiveResolveOutput> + Send>>
