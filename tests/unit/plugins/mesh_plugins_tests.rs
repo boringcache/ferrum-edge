@@ -4018,9 +4018,7 @@ fn workload_metrics_rejects_malformed_effective_authz_gates() {
     assert!(err.contains("nope"), "{err}");
 
     let empty = WorkloadMetrics::new(&metrics_config_with_effective_gates(json!([])));
-    let err = empty
-        .err()
-        .expect("empty gate list must fail construction");
+    let err = empty.err().expect("empty gate list must fail construction");
     assert!(err.contains("at least one gate"), "{err}");
 }
 
