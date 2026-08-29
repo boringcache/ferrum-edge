@@ -713,7 +713,7 @@ fn classify_mirror_query_name(
         if !name_has_valid_percent_escape(current.as_ref()) {
             return if sensitive {
                 MirrorQueryNameDecision::Sensitive {
-                    decoded_lower: lower.into_owned(),
+                    decoded_lower: lower,
                 }
             } else {
                 MirrorQueryNameDecision::NonSensitive
