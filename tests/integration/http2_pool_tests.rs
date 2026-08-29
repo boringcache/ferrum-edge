@@ -1423,7 +1423,8 @@ fn rr_counters_reclaim_retired_generations_for_h2() {
     let live_generation = 10u64;
     let retired = 1..live_generation;
 
-    let live_key = Http2ConnectionPool::pool_key_with_global(&proxy, Some(live_generation), &global);
+    let live_key =
+        Http2ConnectionPool::pool_key_with_global(&proxy, Some(live_generation), &global);
     let static_key = Http2ConnectionPool::pool_key_with_global(&proxy, None, &global);
     pool.insert_rr_counter_for_tests(live_key.clone());
     pool.insert_rr_counter_for_tests(static_key.clone());

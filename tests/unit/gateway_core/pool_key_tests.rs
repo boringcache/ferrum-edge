@@ -2063,10 +2063,7 @@ fn h2_and_grpc_pool_keys_share_after_zero_clamp() {
         global.for_proxy(&zero).http2_max_concurrent_streams,
         Some(1)
     );
-    assert_eq!(
-        global.for_proxy(&one).http2_max_concurrent_streams,
-        Some(1)
-    );
+    assert_eq!(global.for_proxy(&one).http2_max_concurrent_streams, Some(1));
     assert_eq!(
         Http2ConnectionPool::pool_key_for_warmup(&zero),
         Http2ConnectionPool::pool_key_for_warmup(&one),
