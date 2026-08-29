@@ -25,35 +25,47 @@
 //!    trailing elements are refused rather than skipped, because a field this
 //!    parser ignores is still inside the bytes the responder signed. Every
 //!    `GeneralizedTime` is decoded, not merely tagged. An `Extensions`
-//!    container is parsed structurally, and because Ferrum implements no OCSP
-//!    response extension, a *critical* one is refused (RFC 6960 §4.4); a
-//!    non-critical one is ignored after that strict parse.
-//! 4. **A proven issuer.** The issuer is the chain member whose key actually
+//!    container is parsed structurally and must not repeat an extension OID,
+//!    and because Ferrum implements no OCSP response extension, a *critical*
+//!    one is refused (RFC 6960 §4.4); a non-critical one is ignored after that
+//!    strict parse.
+//! 4. **A strict DER encoding, not merely a plausible one.** Every field
+//!    boundary checks the ASN.1 *class* and the primitive/constructed bit as
+//!    well as the tag number, so a context-specific element that reuses a
+//!    universal tag number, a primitive "SEQUENCE", or a constructed OCTET
+//!    STRING is refused instead of being decoded as the field it imitates.
+//!    `ResponseData.version` must be absent: DER omits a `DEFAULT` value, so an
+//!    explicit `[0] INTEGER 0` would be a second encoding of one signed object,
+//!    and any other version is unsupported. Every certificate carried in
+//!    `certs` must parse as one complete X.509 `Certificate` with nothing left
+//!    over — a malformed entry is refused even when a *different* carried
+//!    certificate would have authorized the response.
+//! 5. **A proven issuer.** The issuer is the chain member whose key actually
 //!    signed the leaf, not merely one whose subject name matches the leaf's
 //!    issuer name; same-name candidates are scanned until one verifies, and a
 //!    self-issued leaf must be genuinely self-signed. This is what makes RFC
 //!    6960's "CA that issued the certificate" explicit, and it is the same key
 //!    a delegated responder must chain to.
-//! 5. **`CertID` binding.** The single response for the configured leaf must
+//! 6. **`CertID` binding.** The single response for the configured leaf must
 //!    match the leaf serial number and the `issuerNameHash` / `issuerKeyHash`
 //!    of the configured issuer, recomputed under the `CertID` hash algorithm.
 //!    A response that carries only *other* certificates' entries is rejected as
 //!    wrong-certificate data rather than stapled, and a response carrying more
 //!    than one entry for that certificate is rejected as ambiguous: a strict
 //!    client re-derives the `CertID` itself and might select the other one.
-//! 6. **Signature and responder authorization.** The `tbsResponseData`
+//! 7. **Signature and responder authorization.** The `tbsResponseData`
 //!    signature is verified against a responder that is either the issuer
 //!    itself or a certificate carried in the response that is signed by the
 //!    issuer, currently time-valid, carries the `id-kp-OCSPSigning` extended
 //!    key usage (RFC 6960 §4.2.2.2), and — when it carries a `KeyUsage` at all
 //!    — permits `digitalSignature`. Delegation to anything else is refused.
-//! 7. **Time bounds.** `thisUpdate` must not be in the future and `nextUpdate`
+//! 8. **Time bounds.** `thisUpdate` must not be in the future and `nextUpdate`
 //!    must not be in the past, each widened by [`OCSP_CLOCK_SKEW`]. A response
 //!    without `nextUpdate` has no defined validity window and is refused: RFC
 //!    6960 §2.4 makes an absent `nextUpdate` mean "newer information is
 //!    available at all times", which is precisely the property a *stapled*
 //!    (cached, re-served) response cannot have.
-//! 8. **Status.** Only `good` is stapled. `revoked` and `unknown` fail closed:
+//! 9. **Status.** Only `good` is stapled. `revoked` and `unknown` fail closed:
 //!    serving them is strictly worse than serving no staple at all, because a
 //!    client that honours the staple will refuse the connection, and a reload
 //!    must not be able to publish that state silently.
@@ -176,6 +188,71 @@ fn explicit_context<'a>(any: &Any<'a>, tag: u32, field: &str) -> Result<&'a [u8]
     Ok(any.data)
 }
 
+/// Require a universal, constructed SEQUENCE and return its content bytes.
+///
+/// `Any` keeps the tag *number* separate from the class and the
+/// primitive/constructed bit, so comparing `tag()` alone would admit a
+/// context-specific element that happens to reuse tag number 16 as well as a
+/// primitive "SEQUENCE" that DER does not allow at all. Every SEQUENCE
+/// boundary in this module goes through this helper so the audit is complete
+/// by construction rather than by inspection.
+fn expect_sequence<'a>(any: &Any<'a>, field: &str) -> Result<&'a [u8], String> {
+    if any.class() != Class::Universal || any.tag() != Tag::Sequence || !any.header.constructed() {
+        return Err(format!("OCSP {field} is not a SEQUENCE"));
+    }
+    Ok(any.data)
+}
+
+/// Name of a universal tag, for diagnostics only.
+fn tag_name(tag: Tag) -> &'static str {
+    if tag == Tag::Boolean {
+        "BOOLEAN"
+    } else if tag == Tag::Integer {
+        "INTEGER"
+    } else if tag == Tag::BitString {
+        "BIT STRING"
+    } else if tag == Tag::OctetString {
+        "OCTET STRING"
+    } else if tag == Tag::Oid {
+        "OBJECT IDENTIFIER"
+    } else if tag == Tag::Enumerated {
+        "ENUMERATED"
+    } else if tag == Tag::GeneralizedTime {
+        "GeneralizedTime"
+    } else {
+        "element"
+    }
+}
+
+/// Require a universal, primitive element carrying `tag` and return its content
+/// bytes.
+///
+/// The counterpart of [`expect_sequence`] for the leaf types this grammar uses:
+/// a constructed OCTET STRING, a context-specific element reusing a universal
+/// tag number, or an INTEGER that is really a constructed impostor is refused
+/// here rather than silently decoded.
+fn expect_primitive<'a>(any: &Any<'a>, tag: Tag, field: &str) -> Result<&'a [u8], String> {
+    if any.class() != Class::Universal || any.tag() != tag || any.header.constructed() {
+        return Err(format!("OCSP {field} is not a primitive {}", tag_name(tag)));
+    }
+    Ok(any.data)
+}
+
+/// Require a universal, primitive `GeneralizedTime` and decode it.
+///
+/// Every instant in this grammar is both tag-checked and *decoded*: an
+/// unparseable instant is a malformed response even when the serving decision
+/// does not read that particular field.
+fn expect_generalized_time(any: &Any<'_>, raw: &[u8], field: &str) -> Result<i64, String> {
+    if any.class() != Class::Universal
+        || any.tag() != Tag::GeneralizedTime
+        || any.header.constructed()
+    {
+        return Err(format!("OCSP {field} is not a GeneralizedTime"));
+    }
+    generalized_time_unix(raw, field)
+}
+
 /// A parsed `BasicOCSPResponse`, retaining the byte ranges signature
 /// verification needs.
 struct BasicResponse<'a> {
@@ -239,11 +316,10 @@ fn basic_response_der(der: &[u8]) -> Result<&[u8], String> {
     if !trailing.is_empty() {
         return Err("OCSP response has trailing bytes after the outer SEQUENCE".to_string());
     }
-    if outer.tag() != Tag::Sequence || outer.class() != Class::Universal {
-        return Err("OCSP response is not a SEQUENCE".to_string());
-    }
+    let outer_content = expect_sequence(&outer, "response")?;
 
-    let (status_any, _, rest) = take_tlv(outer.data)?;
+    let (status_any, _, rest) = take_tlv(outer_content)?;
+    expect_primitive(&status_any, Tag::Enumerated, "responseStatus")?;
     let status = Enumerated::try_from(&status_any)
         .map_err(|_| "OCSP responseStatus is not an ENUMERATED".to_string())?;
     if status.0 != 0 {
@@ -264,11 +340,10 @@ fn basic_response_der(der: &[u8]) -> Result<&[u8], String> {
     if !trailing.is_empty() {
         return Err("OCSP responseBytes has trailing bytes".to_string());
     }
-    if bytes_seq.tag() != Tag::Sequence {
-        return Err("OCSP responseBytes is not a SEQUENCE".to_string());
-    }
+    let bytes_seq_content = expect_sequence(&bytes_seq, "responseBytes")?;
 
-    let (type_any, _, rest) = take_tlv(bytes_seq.data)?;
+    let (type_any, _, rest) = take_tlv(bytes_seq_content)?;
+    expect_primitive(&type_any, Tag::Oid, "responseType")?;
     let response_type = type_any
         .as_oid()
         .map_err(|_| "OCSP responseType is not an OBJECT IDENTIFIER".to_string())?;
@@ -280,10 +355,7 @@ fn basic_response_der(der: &[u8]) -> Result<&[u8], String> {
     if !rest.is_empty() {
         return Err("OCSP responseBytes has trailing fields after response".to_string());
     }
-    if response_any.tag() != Tag::OctetString || response_any.header.constructed() {
-        return Err("OCSP response field is not a primitive OCTET STRING".to_string());
-    }
-    Ok(response_any.data)
+    expect_primitive(&response_any, Tag::OctetString, "response field")
 }
 
 fn response_status_name(value: u32) -> &'static str {
@@ -302,20 +374,17 @@ fn parse_basic_response(der: &[u8]) -> Result<BasicResponse<'_>, String> {
     if !trailing.is_empty() {
         return Err("BasicOCSPResponse has trailing bytes".to_string());
     }
-    if basic.tag() != Tag::Sequence {
-        return Err("BasicOCSPResponse is not a SEQUENCE".to_string());
-    }
+    let basic_content = expect_sequence(&basic, "BasicOCSPResponse")?;
 
-    let (tbs_any, tbs_raw, rest) = take_tlv(basic.data)?;
-    if tbs_any.tag() != Tag::Sequence {
-        return Err("OCSP tbsResponseData is not a SEQUENCE".to_string());
-    }
-    let response_data = parse_response_data(tbs_any.data)?;
+    let (tbs_any, tbs_raw, rest) = take_tlv(basic_content)?;
+    let tbs_content = expect_sequence(&tbs_any, "tbsResponseData")?;
+    let response_data = parse_response_data(tbs_content)?;
 
     let (rest, signature_algorithm) = AlgorithmIdentifier::from_der(rest)
         .map_err(|_| "OCSP signatureAlgorithm is malformed".to_string())?;
 
     let (signature_any, _, rest) = take_tlv(rest)?;
+    expect_primitive(&signature_any, Tag::BitString, "signature")?;
     let signature = BitString::try_from(&signature_any)
         .map_err(|_| "OCSP signature is not a BIT STRING".to_string())?;
 
@@ -330,19 +399,34 @@ fn parse_basic_response(der: &[u8]) -> Result<BasicResponse<'_>, String> {
         if !trailing.is_empty() {
             return Err("OCSP certs has trailing bytes".to_string());
         }
-        if certs_seq.tag() != Tag::Sequence {
-            return Err("OCSP certs is not a SEQUENCE".to_string());
-        }
-        let mut cursor = certs_seq.data;
+        let certs_seq_content = expect_sequence(&certs_seq, "certs")?;
+        let mut cursor = certs_seq_content;
         while !cursor.is_empty() {
-            let (_, raw, rest) = take_tlv(cursor)?;
-            certs.push(raw);
+            let (cert_any, raw, rest) = take_tlv(cursor)?;
             cursor = rest;
-            if certs.len() > MAX_RESPONDER_CERTS {
+            if certs.len() == MAX_RESPONDER_CERTS {
                 return Err(format!(
                     "OCSP response carries more than {MAX_RESPONDER_CERTS} responder certificates"
                 ));
             }
+            // `certs` is `SEQUENCE OF Certificate`, so structural admission has
+            // to prove every carried entry really is one complete X.509
+            // certificate. Recording an arbitrary TLV here and skipping the
+            // unparseable ones at authorization time would fail open twice
+            // over: a response whose bytes this parser cannot account for would
+            // still be admitted by the admin boundary, and it could still be
+            // authorized as long as some *other* carried certificate verified.
+            expect_sequence(&cert_any, "certs entry")?;
+            let (trailing, _) = X509Certificate::from_der(raw).map_err(|_| {
+                "OCSP certs carries an entry that is not a parseable X.509 certificate".to_string()
+            })?;
+            if !trailing.is_empty() {
+                return Err(
+                    "OCSP certs carries a certificate with trailing bytes after its encoding"
+                        .to_string(),
+                );
+            }
+            certs.push(raw);
         }
     }
 
@@ -365,26 +449,33 @@ fn parse_response_data(input: &[u8]) -> Result<ResponseData<'_>, String> {
     let (first, _, rest) = take_tlv(input)?;
 
     // version [0] EXPLICIT Version DEFAULT v1
-    let carries_version = context_tag(&first) == Some(0);
-    let (responder_any, rest) = if carries_version {
+    //
+    // DER forbids encoding a DEFAULT value, so a conformant `ResponseData`
+    // omits this field entirely: v1 must be absent, and every other version is
+    // unsupported. Accepting an explicit `[0] INTEGER 0` would give one
+    // response two valid-looking encodings under a single signature, which is
+    // exactly the ambiguity a strict client would resolve differently.
+    if context_tag(&first) == Some(0) {
         let version_content = explicit_context(&first, 0, "version")?;
         let (version_any, _, trailing) = take_tlv(version_content)?;
         if !trailing.is_empty() {
             return Err("OCSP version has trailing bytes".to_string());
         }
+        expect_primitive(&version_any, Tag::Integer, "version")?;
         let version = version_any
             .as_u32()
             .map_err(|_| "OCSP version is not an INTEGER".to_string())?;
-        if version != 0 {
-            return Err(format!(
-                "OCSP response declares unsupported version {version}"
-            ));
+        if version == 0 {
+            return Err(
+                "OCSP ResponseData encodes version v1 explicitly, but DER omits a DEFAULT value"
+                    .to_string(),
+            );
         }
-        let (responder_any, _, rest) = take_tlv(rest)?;
-        (responder_any, rest)
-    } else {
-        (first, rest)
-    };
+        return Err(format!(
+            "OCSP response declares unsupported version {version}"
+        ));
+    }
+    let responder_any = first;
 
     let responder_id = match context_tag(&responder_any) {
         Some(1) => {
@@ -393,9 +484,7 @@ fn parse_response_data(input: &[u8]) -> Result<ResponseData<'_>, String> {
             if !trailing.is_empty() {
                 return Err("OCSP responderID byName has trailing bytes".to_string());
             }
-            if name_any.tag() != Tag::Sequence {
-                return Err("OCSP responderID byName is not a Name SEQUENCE".to_string());
-            }
+            expect_sequence(&name_any, "responderID byName Name")?;
             ResponderId::ByName(name_raw)
         }
         Some(2) => {
@@ -404,10 +493,8 @@ fn parse_response_data(input: &[u8]) -> Result<ResponseData<'_>, String> {
             if !trailing.is_empty() {
                 return Err("OCSP responderID byKey has trailing bytes".to_string());
             }
-            if hash_any.tag() != Tag::OctetString {
-                return Err("OCSP responderID byKey is not an OCTET STRING".to_string());
-            }
-            ResponderId::ByKey(hash_any.data)
+            let hash = expect_primitive(&hash_any, Tag::OctetString, "responderID byKey")?;
+            ResponderId::ByKey(hash)
         }
         _ => {
             return Err("OCSP responderID is neither byName [1] nor byKey [2]".to_string());
@@ -418,30 +505,17 @@ fn parse_response_data(input: &[u8]) -> Result<ResponseData<'_>, String> {
     // unparseable instant is a malformed response even though the serving
     // decision itself is made from thisUpdate/nextUpdate.
     let (produced_any, produced_raw, rest) = take_tlv(rest)?;
-    if produced_any.tag() != Tag::GeneralizedTime
-        || produced_any.class() != Class::Universal
-        || produced_any.header.constructed()
-    {
-        return Err("OCSP producedAt is not a GeneralizedTime".to_string());
-    }
-    generalized_time_unix(produced_raw, "producedAt")?;
+    expect_generalized_time(&produced_any, produced_raw, "producedAt")?;
 
     let (responses_any, _, rest) = take_tlv(rest)?;
-    if responses_any.tag() != Tag::Sequence
-        || responses_any.class() != Class::Universal
-        || !responses_any.header.constructed()
-    {
-        return Err("OCSP responses is not a SEQUENCE".to_string());
-    }
+    let responses_content = expect_sequence(&responses_any, "responses")?;
 
     let mut single_responses = Vec::new();
-    let mut cursor = responses_any.data;
+    let mut cursor = responses_content;
     while !cursor.is_empty() {
         let (single_any, _, next) = take_tlv(cursor)?;
-        if single_any.tag() != Tag::Sequence {
-            return Err("OCSP SingleResponse is not a SEQUENCE".to_string());
-        }
-        single_responses.push(parse_single_response(single_any.data)?);
+        let single_content = expect_sequence(&single_any, "SingleResponse")?;
+        single_responses.push(parse_single_response(single_content)?);
         cursor = next;
         if single_responses.len() > MAX_SINGLE_RESPONSES {
             return Err(format!(
@@ -482,22 +556,14 @@ fn parse_response_data(input: &[u8]) -> Result<ResponseData<'_>, String> {
 
 fn parse_single_response(input: &[u8]) -> Result<SingleResponse<'_>, String> {
     let (cert_id_any, _, rest) = take_tlv(input)?;
-    if cert_id_any.tag() != Tag::Sequence {
-        return Err("OCSP CertID is not a SEQUENCE".to_string());
-    }
-    let cert_id = parse_cert_id(cert_id_any.data)?;
+    let cert_id_content = expect_sequence(&cert_id_any, "CertID")?;
+    let cert_id = parse_cert_id(cert_id_content)?;
 
     let (status_any, _, rest) = take_tlv(rest)?;
     let status = parse_cert_status(&status_any)?;
 
     let (this_update_any, this_update_raw, rest) = take_tlv(rest)?;
-    if this_update_any.tag() != Tag::GeneralizedTime
-        || this_update_any.class() != Class::Universal
-        || this_update_any.header.constructed()
-    {
-        return Err("OCSP thisUpdate is not a GeneralizedTime".to_string());
-    }
-    let this_update = generalized_time_unix(this_update_raw, "thisUpdate")?;
+    let this_update = expect_generalized_time(&this_update_any, this_update_raw, "thisUpdate")?;
 
     // The remaining grammar is exactly `[0] nextUpdate OPTIONAL` followed by
     // `[1] singleExtensions OPTIONAL`, each at most once and in that order. A
@@ -513,13 +579,7 @@ fn parse_single_response(input: &[u8]) -> Result<SingleResponse<'_>, String> {
             if !trailing.is_empty() {
                 return Err("OCSP nextUpdate has trailing bytes".to_string());
             }
-            if time_any.tag() != Tag::GeneralizedTime
-                || time_any.class() != Class::Universal
-                || time_any.header.constructed()
-            {
-                return Err("OCSP nextUpdate is not a GeneralizedTime".to_string());
-            }
-            next_update = Some(generalized_time_unix(time_raw, "nextUpdate")?);
+            next_update = Some(expect_generalized_time(&time_any, time_raw, "nextUpdate")?);
             cursor = next;
         }
     }
@@ -598,13 +658,7 @@ fn parse_cert_status(any: &Any<'_>) -> Result<CertStatus, String> {
 /// revocationReason [0] EXPLICIT CRLReason OPTIONAL }`.
 fn parse_revoked_info(input: &[u8]) -> Result<(), String> {
     let (time_any, time_raw, rest) = take_tlv(input)?;
-    if time_any.tag() != Tag::GeneralizedTime
-        || time_any.class() != Class::Universal
-        || time_any.header.constructed()
-    {
-        return Err("OCSP revocationTime is not a GeneralizedTime".to_string());
-    }
-    generalized_time_unix(time_raw, "revocationTime")?;
+    expect_generalized_time(&time_any, time_raw, "revocationTime")?;
 
     if rest.is_empty() {
         return Ok(());
@@ -618,12 +672,7 @@ fn parse_revoked_info(input: &[u8]) -> Result<(), String> {
     if !trailing.is_empty() {
         return Err("OCSP revocationReason has trailing bytes".to_string());
     }
-    if value_any.tag() != Tag::Enumerated
-        || value_any.class() != Class::Universal
-        || value_any.header.constructed()
-    {
-        return Err("OCSP revocationReason is not an ENUMERATED".to_string());
-    }
+    expect_primitive(&value_any, Tag::Enumerated, "revocationReason")?;
     Ok(())
 }
 
@@ -672,18 +721,20 @@ fn validate_extensions(content: &[u8], field: &str) -> Result<(), String> {
     if !trailing.is_empty() {
         return Err(format!("OCSP {field} has trailing bytes"));
     }
-    if container.tag() != Tag::Sequence
-        || container.class() != Class::Universal
-        || !container.header.constructed()
-    {
-        return Err(format!("OCSP {field} is not a SEQUENCE"));
-    }
-    if container.data.is_empty() {
+    let container_content = expect_sequence(&container, field)?;
+    if container_content.is_empty() {
         return Err(format!("OCSP {field} is an empty SEQUENCE"));
     }
 
-    let mut cursor = container.data;
+    let mut cursor = container_content;
     let mut seen = 0usize;
+    // X.509 forbids repeating one extension type inside an `Extensions`
+    // container. Ferrum ignores supported non-critical extensions, so admitting
+    // a duplicate would let the response mean one thing here and another to a
+    // strict client that rejects the repetition or keeps the other copy. The
+    // fixed-size table is bounded by `MAX_EXTENSIONS`, so the linear scan costs
+    // at most a few hundred slice comparisons and cannot be driven quadratic.
+    let mut seen_ids: [&[u8]; MAX_EXTENSIONS] = [&[]; MAX_EXTENSIONS];
     while !cursor.is_empty() {
         let (extension, _, next) = take_tlv(cursor)?;
         cursor = next;
@@ -693,15 +744,28 @@ fn validate_extensions(content: &[u8], field: &str) -> Result<(), String> {
                 "OCSP {field} carries more than {MAX_EXTENSIONS} extensions"
             ));
         }
-        if extension.tag() != Tag::Sequence
-            || extension.class() != Class::Universal
+        if extension.class() != Class::Universal
+            || extension.tag() != Tag::Sequence
             || !extension.header.constructed()
         {
             return Err(format!("OCSP {field} contains a non-SEQUENCE Extension"));
         }
 
         let (id_any, _, rest) = take_tlv(extension.data)?;
+        if id_any.class() != Class::Universal
+            || id_any.tag() != Tag::Oid
+            || id_any.header.constructed()
+        {
+            return Err(oid_error(field));
+        }
         id_any.as_oid().map_err(|_| oid_error(field))?;
+        let id_bytes = id_any.data;
+        if seen_ids[..seen - 1].contains(&id_bytes) {
+            return Err(format!(
+                "OCSP {field} repeats an extension OID, which X.509 Extensions must not do"
+            ));
+        }
+        seen_ids[seen - 1] = id_bytes;
 
         let (second_any, _, tail) = take_tlv(rest)?;
         let mut critical = false;
@@ -717,8 +781,8 @@ fn validate_extensions(content: &[u8], field: &str) -> Result<(), String> {
         if !rest.is_empty() {
             return Err(format!("OCSP {field} Extension has trailing fields"));
         }
-        if value_any.tag() != Tag::OctetString
-            || value_any.class() != Class::Universal
+        if value_any.class() != Class::Universal
+            || value_any.tag() != Tag::OctetString
             || value_any.header.constructed()
         {
             return Err(format!(
@@ -739,26 +803,20 @@ fn parse_cert_id(input: &[u8]) -> Result<CertId<'_>, String> {
         .map_err(|_| "OCSP CertID hashAlgorithm is malformed".to_string())?;
 
     let (name_hash_any, _, rest) = take_tlv(rest)?;
-    if name_hash_any.tag() != Tag::OctetString {
-        return Err("OCSP CertID issuerNameHash is not an OCTET STRING".to_string());
-    }
+    let issuer_name_hash = expect_primitive(&name_hash_any, Tag::OctetString, "issuerNameHash")?;
     let (key_hash_any, _, rest) = take_tlv(rest)?;
-    if key_hash_any.tag() != Tag::OctetString {
-        return Err("OCSP CertID issuerKeyHash is not an OCTET STRING".to_string());
-    }
+    let issuer_key_hash = expect_primitive(&key_hash_any, Tag::OctetString, "issuerKeyHash")?;
     let (serial_any, _, trailing) = take_tlv(rest)?;
-    if serial_any.tag() != Tag::Integer {
-        return Err("OCSP CertID serialNumber is not an INTEGER".to_string());
-    }
+    let serial_number = expect_primitive(&serial_any, Tag::Integer, "serialNumber")?;
     if !trailing.is_empty() {
         return Err("OCSP CertID has trailing fields".to_string());
     }
 
     Ok(CertId {
         hash_algorithm: hash_algorithm.algorithm,
-        issuer_name_hash: name_hash_any.data,
-        issuer_key_hash: key_hash_any.data,
-        serial_number: serial_any.data,
+        issuer_name_hash,
+        issuer_key_hash,
+        serial_number,
     })
 }
 
@@ -1018,9 +1076,13 @@ fn verify_signature_and_authorization(
         if *candidate_der == issuer_der {
             continue;
         }
-        let Ok((_, candidate)) = X509Certificate::from_der(candidate_der) else {
-            continue;
-        };
+        // Structural admission already proved every carried entry is one
+        // complete X.509 certificate, so this cannot skip an entry: failing
+        // closed here keeps that guarantee explicit rather than re-introducing
+        // a silent skip if the admission pass ever loosens.
+        let (_, candidate) = X509Certificate::from_der(candidate_der).map_err(|_| {
+            "OCSP response carries an unparseable responder certificate".to_string()
+        })?;
         if !responder_matches(&basic.response_data.responder_id, &candidate) {
             continue;
         }

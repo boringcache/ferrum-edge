@@ -457,6 +457,17 @@ struct ResponseBuilder<'a> {
     duplicate_hash_oid: Option<&'static [u8]>,
     /// Emit a leading entry for an unrelated serial.
     leading_serial: Option<u64>,
+    /// Raw element prepended to `ResponseData`, for `version [0]` fixtures.
+    version_field: Option<Vec<u8>>,
+    /// Tag byte of the `CertID` `serialNumber`. `0x02` is the universal
+    /// INTEGER; `0x82` reuses tag *number* 2 in the context-specific class.
+    serial_tag: u8,
+    /// Encode the `CertID` `issuerNameHash` as a constructed OCTET STRING
+    /// (`0x24`) wrapping a primitive segment, which DER forbids.
+    constructed_name_hash: bool,
+    /// Tag byte of the `responses` container. `0x30` is the universal
+    /// constructed SEQUENCE; `0x10` is the primitive form DER forbids.
+    responses_tag: u8,
 }
 
 impl<'a> ResponseBuilder<'a> {
@@ -481,6 +492,10 @@ impl<'a> ResponseBuilder<'a> {
             cert_status: None,
             duplicate_hash_oid: None,
             leading_serial: None,
+            version_field: None,
+            serial_tag: 0x02,
+            constructed_name_hash: false,
+            responses_tag: 0x30,
         }
     }
 
@@ -497,11 +512,16 @@ impl<'a> ResponseBuilder<'a> {
         };
         let name_hash = hash(cert_id_issuer.subject().as_raw());
         let key_hash = hash(cert_id_issuer.public_key().subject_public_key.data.as_ref());
+        let encoded_name_hash = if self.constructed_name_hash {
+            tlv(0x24, &octet_string(&name_hash))
+        } else {
+            octet_string(&name_hash)
+        };
         let cert_id = sequence(&[
             algorithm_identifier(hash_oid),
-            octet_string(&name_hash),
+            encoded_name_hash,
             octet_string(&key_hash),
-            tlv(0x02, &serial_bytes(serial)),
+            tlv(self.serial_tag, &serial_bytes(serial)),
         ]);
 
         let default_status = match self.status {
@@ -548,7 +568,11 @@ impl<'a> ResponseBuilder<'a> {
         let default_produced_at = generalized_time(self.this_update);
         let produced_at = self.produced_at.clone().unwrap_or(default_produced_at);
 
-        let mut response_data_parts = vec![responder_id, produced_at, sequence(&singles)];
+        let responses = tlv(self.responses_tag, &singles.concat());
+        let mut response_data_parts = match &self.version_field {
+            Some(version) => vec![version.clone(), responder_id, produced_at, responses],
+            None => vec![responder_id, produced_at, responses],
+        };
         response_data_parts.extend(self.response_data_tail.iter().cloned());
         let response_data = sequence(&response_data_parts);
 
@@ -1251,6 +1275,164 @@ fn a_delegated_responder_whose_key_usage_excludes_digital_signature_is_rejected(
     let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
         .expect_err("must reject");
     assert!(error.contains("not authorized"), "{error}");
+}
+
+// ── DER class and primitive/constructed form ───────────────────────────────
+
+#[test]
+fn a_context_specific_element_reusing_a_universal_tag_number_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    // `[2] IMPLICIT` primitive: the same tag *number* as a universal INTEGER,
+    // and the same content bytes, in a different class. A parser that compares
+    // only the tag number would decode it as the serial number and bind the
+    // response to the configured certificate.
+    builder.serial_tag = 0x82;
+
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("serialNumber"), "{error}");
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("serialNumber"), "{error}");
+}
+
+#[test]
+fn a_constructed_octet_string_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    // A constructed OCTET STRING carrying one primitive segment holds the same
+    // octets as the DER form, so a tag-number-only check would hash-compare it
+    // against the issuer name and accept the binding.
+    builder.constructed_name_hash = true;
+
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(
+        error.contains("issuerNameHash") || error.contains("malformed DER"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_primitive_sequence_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    // Universal tag number 16 in the primitive form. DER has no such encoding,
+    // so `responses` must be refused rather than walked as a container.
+    builder.responses_tag = 0x10;
+
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(
+        error.contains("responses is not a SEQUENCE") || error.contains("malformed DER"),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_explicitly_encoded_default_version_is_rejected() {
+    let pki = build_pki();
+
+    // DER omits a DEFAULT value, so `[0] EXPLICIT INTEGER 0` is a second
+    // encoding of the same signed object: a strict client refuses it, and
+    // Ferrum must not staple what a strict client refuses.
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.version_field = Some(explicit(0, &tlv(0x02, &[0x00])));
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("DEFAULT value"), "{error}");
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("DEFAULT value"), "{error}");
+
+    // A non-default version is unsupported, and still reported as such.
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.version_field = Some(explicit(0, &tlv(0x02, &[0x01])));
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("unsupported version 1"), "{error}");
+}
+
+// ── Embedded responder certificates ────────────────────────────────────────
+
+#[test]
+fn a_malformed_embedded_certificate_is_rejected() {
+    let pki = build_pki();
+    let malformed = sequence(&[octet_string(b"not a certificate")]);
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.embedded_certs = vec![malformed.as_slice()];
+
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("parseable X.509 certificate"), "{error}");
+}
+
+#[test]
+fn a_malformed_unused_embedded_certificate_is_still_rejected() {
+    let pki = build_pki();
+    let malformed = sequence(&[octet_string(b"not a certificate")]);
+    // The response is signed by the issuing CA itself, and the first carried
+    // entry is a valid certificate, so the malformed one is never consulted
+    // for authorization. Structural admission must still refuse the whole
+    // response: bytes this parser cannot account for sit inside what the
+    // responder signed.
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.embedded_certs = vec![pki.signing_ku_der.as_slice(), malformed.as_slice()];
+
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("parseable X.509 certificate"), "{error}");
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("parseable X.509 certificate"), "{error}");
+}
+
+#[test]
+fn a_well_formed_embedded_certificate_is_still_accepted() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.embedded_certs = vec![pki.signing_ku_der.as_slice()];
+
+    validate_structure(&builder.build()).expect("structurally valid");
+    validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect("an issuer-signed response is accepted alongside a carried certificate");
+}
+
+// ── Extension identity ─────────────────────────────────────────────────────
+
+#[test]
+fn duplicate_extension_oids_are_rejected() {
+    let pki = build_pki();
+
+    // X.509 forbids repeating one extension type. Ferrum ignores a supported
+    // non-critical extension, so admitting the repetition would let Ferrum and
+    // a strict client disagree about the same signed bytes.
+    let repeated = [
+        extension(OID_OCSP_NONCE, false, b"first"),
+        extension(OID_OCSP_NONCE, false, b"second"),
+    ];
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.response_data_tail = vec![extensions_field(1, &repeated)];
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("repeats an extension OID"), "{error}");
+
+    // The same rule applies inside a SingleResponse.
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.single_tail = Some(vec![
+        explicit(0, &generalized_time(now() + 3_600)),
+        extensions_field(1, &repeated),
+    ]);
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("repeats an extension OID"), "{error}");
+}
+
+#[test]
+fn distinct_extension_oids_are_still_accepted() {
+    let pki = build_pki();
+    let distinct = [
+        extension(OID_OCSP_NONCE, false, b"nonce"),
+        extension(OID_SHA256, false, b"other"),
+    ];
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.response_data_tail = vec![extensions_field(1, &distinct)];
+
+    validate_structure(&builder.build()).expect("structurally valid");
+    validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect("distinct non-critical extensions are ignored");
 }
 
 // ── Load-path integration ──────────────────────────────────────────────────
