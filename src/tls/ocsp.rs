@@ -1464,21 +1464,35 @@ pub fn validate_stapled_response_at_with_policy(
     let leaf_der = chain
         .first()
         .ok_or_else(|| "cannot validate an OCSP response against an empty chain".to_string())?;
-    let (_, leaf) = X509Certificate::from_der(leaf_der.as_ref())
+    let (leaf_trailing, leaf) = X509Certificate::from_der(leaf_der.as_ref())
         .map_err(|_| "server certificate is not parseable X.509 DER".to_string())?;
+    if !leaf_trailing.is_empty() {
+        return Err(
+            "server certificate has trailing bytes after its X.509 DER encoding".to_string(),
+        );
+    }
 
     // `select_issuer_der` proves the binding by verifying the leaf's own
-    // signature, so the algorithm of that signature is a cryptographic
-    // operation on this path and is admitted before it is performed.
+    // signature. Admit both the verification algorithm and the public key that
+    // may become the self-signed issuer before that cryptographic operation is
+    // performed; production callers already apply the same key gate while
+    // loading the served bundle, but this validator's contract must stand on
+    // its own.
     check_signature_algorithm(
         &leaf.signature_algorithm.algorithm,
         "served certificate signature",
         policy,
     )?;
+    check_certificate_key_form(leaf_der.as_ref(), "served OCSP certificate", policy)?;
 
-    let issuer_der = select_issuer_der(&leaf, chain)?;
-    let (_, issuer) = X509Certificate::from_der(issuer_der)
+    let issuer_der = select_issuer_der(&leaf, chain, policy)?;
+    let (issuer_trailing, issuer) = X509Certificate::from_der(issuer_der)
         .map_err(|_| "issuer certificate is not parseable X.509 DER".to_string())?;
+    if !issuer_trailing.is_empty() {
+        return Err(
+            "issuer certificate has trailing bytes after its X.509 DER encoding".to_string(),
+        );
+    }
     // The issuer's key verifies the leaf, an undelegated response, and every
     // delegate. Callers reach this through `parse_pem_certificate_bundle`, but
     // re-admitting the *selected* issuer keeps that guarantee a property of
@@ -1545,17 +1559,29 @@ pub fn validate_stapled_response_at_with_policy(
 fn select_issuer_der<'a>(
     leaf: &X509Certificate<'_>,
     chain: &'a [CertificateDer<'_>],
+    policy: OcspCryptoPolicy,
 ) -> Result<&'a [u8], String> {
     let leaf_issuer = leaf.issuer().as_raw();
     let mut saw_name_match = false;
     for candidate in chain.iter().skip(1) {
-        let Ok((_, parsed)) = X509Certificate::from_der(candidate.as_ref()) else {
+        let Ok((trailing, parsed)) = X509Certificate::from_der(candidate.as_ref()) else {
             continue;
         };
         if parsed.subject().as_raw() != leaf_issuer {
             continue;
         }
         saw_name_match = true;
+        if !trailing.is_empty() {
+            return Err(
+                "the served certificate chain carries an issuer candidate with trailing bytes \
+                 after its X.509 DER encoding"
+                    .to_string(),
+            );
+        }
+        // This key is about to verify the served leaf. Apply the FIPS key-form
+        // gate before the proof rather than classifying it after an
+        // unapproved key has already participated in a cryptographic operation.
+        check_certificate_key_form(candidate.as_ref(), "OCSP issuer certificate", policy)?;
         if leaf.verify_signature(Some(parsed.public_key())).is_err() {
             continue;
         }

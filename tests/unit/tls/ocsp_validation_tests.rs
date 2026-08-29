@@ -964,6 +964,38 @@ fn a_chain_without_the_issuer_cannot_bind_a_staple() {
     );
 }
 
+#[test]
+fn a_leaf_with_trailing_der_bytes_cannot_bind_a_staple() {
+    let pki = build_pki();
+    let der = ResponseBuilder::new(&pki, now()).build();
+    let mut leaf = pki.leaf_der.clone();
+    leaf.push(0);
+    let malformed_chain = vec![
+        CertificateDer::from(leaf),
+        CertificateDer::from(pki.issuer_der.clone()),
+    ];
+
+    let error = validate_stapled_response_at(&der, &malformed_chain, now())
+        .expect_err("trailing leaf bytes must be rejected");
+    assert!(error.contains("server certificate has trailing bytes"), "{error}");
+}
+
+#[test]
+fn an_issuer_with_trailing_der_bytes_cannot_bind_a_staple() {
+    let pki = build_pki();
+    let der = ResponseBuilder::new(&pki, now()).build();
+    let mut issuer = pki.issuer_der.clone();
+    issuer.push(0);
+    let malformed_chain = vec![
+        CertificateDer::from(pki.leaf_der.clone()),
+        CertificateDer::from(issuer),
+    ];
+
+    let error = validate_stapled_response_at(&der, &malformed_chain, now())
+        .expect_err("trailing issuer bytes must be rejected");
+    assert!(error.contains("issuer candidate with trailing bytes"), "{error}");
+}
+
 // ── ResponseData grammar ───────────────────────────────────────────────────
 
 #[test]
