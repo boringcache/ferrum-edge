@@ -2404,10 +2404,7 @@ fn inbound_relay_registry_malformed_production_entry_retracts_then_recovers() {
     let dir = tempfile::tempdir().expect("registry");
     write_strict_registry_entry(dir.path(), LOCAL_POD_UID, "10.244.5.5", &own_spiffe);
     write_strict_registry_entry(dir.path(), OTHER_POD_UID, "10.244.5.6", &own_spiffe);
-    let manager = strict_registry_manager(
-        Arc::new(DirectoryCaptureSource::new(dir.path())),
-        index,
-    );
+    let manager = strict_registry_manager(Arc::new(DirectoryCaptureSource::new(dir.path())), index);
 
     assert_eq!(manager.reconcile_once().len(), 2);
     assert_eq!(
@@ -2471,11 +2468,8 @@ fn inbound_relay_registry_strict_parse_retracts_malformed_evidence_then_recovers
     std::fs::create_dir_all(dir.path().join(".ready")).expect("ready control dir");
     std::fs::write(dir.path().join(".ready").join("marker"), b"").expect("ready marker");
     std::fs::create_dir_all(dir.path().join(".udp-ready")).expect("udp-ready control dir");
-    std::fs::write(
-        dir.path().join(".udp-ready").join(LOCAL_POD_UID),
-        b"",
-    )
-    .expect("udp-ready marker");
+    std::fs::write(dir.path().join(".udp-ready").join(LOCAL_POD_UID), b"")
+        .expect("udp-ready marker");
     let source = DirectoryCaptureSource::new(dir.path());
     let manager = strict_registry_manager(
         Arc::new(DirectoryCaptureSource::new(dir.path())),
@@ -2510,9 +2504,9 @@ fn inbound_relay_registry_strict_parse_retracts_malformed_evidence_then_recovers
     .expect("invalid spiffe_id");
     let permissive = source.list_targets();
     assert!(
-        permissive.iter().any(|target| {
-            target.pod_uid == LOCAL_POD_UID && target.source_identity.is_none()
-        }),
+        permissive
+            .iter()
+            .any(|target| { target.pod_uid == LOCAL_POD_UID && target.source_identity.is_none() }),
         "the best-effort scan must keep the pod and treat a present malformed \
          spiffe_id= as absent identity"
     );
@@ -2672,8 +2666,11 @@ fn inbound_relay_registry_unsafe_oversized_or_symlinked_entry_retracts_then_reco
         Ok(())
     );
 
-    std::fs::write(dir.path().join("pod..unsafe"), b"/sys/fs/cgroup/x\nipv4=10.0.0.9\n")
-        .expect("unsafe name");
+    std::fs::write(
+        dir.path().join("pod..unsafe"),
+        b"/sys/fs/cgroup/x\nipv4=10.0.0.9\n",
+    )
+    .expect("unsafe name");
     assert!(manager.reconcile_once().is_empty());
     assert_eq!(
         mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),

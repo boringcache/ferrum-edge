@@ -205,9 +205,7 @@ fn parse_capture_target_inner(
         }
         if let Some(value) = line.strip_prefix("spiffe_id=") {
             if matches!(mode, CaptureTargetParseMode::Strict) && seen_spiffe {
-                return Err(
-                    "Ambient capture registry entry repeats a recognized field".to_string(),
-                );
+                return Err("Ambient capture registry entry repeats a recognized field".to_string());
             }
             seen_spiffe = true;
             let value = value.trim();
@@ -217,16 +215,14 @@ fn parse_capture_target_inner(
                     CaptureTargetParseMode::Permissive => source_principal = None,
                     CaptureTargetParseMode::Strict => {
                         return Err(
-                            "Ambient capture registry entry has a malformed spiffe_id".to_string(),
+                            "Ambient capture registry entry has a malformed spiffe_id".to_string()
                         );
                     }
                 },
             }
         } else if let Some(value) = line.strip_prefix("ipv4=") {
             if matches!(mode, CaptureTargetParseMode::Strict) && seen_ipv4 {
-                return Err(
-                    "Ambient capture registry entry repeats a recognized field".to_string(),
-                );
+                return Err("Ambient capture registry entry repeats a recognized field".to_string());
             }
             seen_ipv4 = true;
             match value.trim().parse::<Ipv4Addr>() {
@@ -243,9 +239,7 @@ fn parse_capture_target_inner(
             }
         } else if let Some(value) = line.strip_prefix("ipv6=") {
             if matches!(mode, CaptureTargetParseMode::Strict) && seen_ipv6 {
-                return Err(
-                    "Ambient capture registry entry repeats a recognized field".to_string(),
-                );
+                return Err("Ambient capture registry entry repeats a recognized field".to_string());
             }
             seen_ipv6 = true;
             match value.trim().parse::<Ipv6Addr>() {
@@ -352,8 +346,8 @@ impl PodCaptureSource for DirectoryCaptureSource {
     }
 
     fn list_complete_targets(&self) -> Result<Vec<PodCaptureTarget>, String> {
-        let entries = std::fs::read_dir(&self.dir)
-            .map_err(|_| "could not scan Ambient capture registry")?;
+        let entries =
+            std::fs::read_dir(&self.dir).map_err(|_| "could not scan Ambient capture registry")?;
         let mut targets = Vec::new();
         for (index, entry) in entries.enumerate() {
             if index >= MAX_COMPLETE_REGISTRY_ENTRIES {

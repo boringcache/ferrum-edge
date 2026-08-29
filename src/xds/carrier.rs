@@ -414,9 +414,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::MultiCluster(_) => "multi-cluster",
             MeshSliceCarrier::SidecarEgressScope(_) => "sidecar-egress-scope",
             MeshSliceCarrier::WaypointGatewayClass(_) => "waypoint-gateway-class",
-            MeshSliceCarrier::ServiceWaypointBoundServices(_) => {
-                "service-waypoint-bound-services"
-            }
+            MeshSliceCarrier::ServiceWaypointBoundServices(_) => "service-waypoint-bound-services",
             MeshSliceCarrier::IstioRootNamespace(_) => "istio-root-namespace",
         };
         format!("{FERRUM_CARRIER_RESOURCE_NAME_PREFIX}{suffix}")

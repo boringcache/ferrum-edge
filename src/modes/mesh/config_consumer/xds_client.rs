@@ -5930,8 +5930,7 @@ mod tests {
         // Services carrier (not the name-only CDS/EDS reconstruction).
         assert_eq!(recovered.services, native.services);
         assert_eq!(
-            recovered.service_waypoint_bound_services,
-            native.service_waypoint_bound_services,
+            recovered.service_waypoint_bound_services, native.service_waypoint_bound_services,
             "ServiceWaypoint bound-service refs must round-trip; missing evidence stays empty"
         );
         // The inbound-only un-narrowed views round-trip via their own carriers.
