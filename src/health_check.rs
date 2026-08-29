@@ -691,6 +691,10 @@ impl HealthChecker {
     /// Test-safe: uses an empty shared CRL list. Production startup must call
     /// [`Self::with_pool_config_and_shared_crls`] with the admitted generation
     /// already published to backend pools.
+    // This module is compiled into both the library and binary targets. The
+    // constructor is exercised by external integration tests through the
+    // library, but is intentionally unused by the production binary.
+    #[allow(dead_code)]
     pub fn with_pool_config(pool_config: &PoolConfig, dns_cache: DnsCache) -> Self {
         Self::with_pool_config_and_shared_crls(pool_config, dns_cache, empty_shared_crl_list())
     }
@@ -3112,6 +3116,9 @@ fn build_probe_server_verifier(
 
 /// Test helper: build the probe server verifier with an explicit CRL snapshot.
 #[doc(hidden)]
+// External integration tests reach this through the library target; the same
+// source module is also compiled into the binary where that export is unused.
+#[allow(dead_code)]
 pub fn build_probe_server_verifier_for_test(
     tls_config: &BackendTlsConfig,
     global_ca_path: Option<&str>,
