@@ -584,10 +584,7 @@ impl<'a> ResponseBuilder<'a> {
             .clone()
             .unwrap_or_else(|| serial_bytes(serial));
         let cert_id = sequence(&[
-            algorithm_identifier_with_params(
-                hash_oid,
-                self.hash_algorithm_parameters.as_deref(),
-            ),
+            algorithm_identifier_with_params(hash_oid, self.hash_algorithm_parameters.as_deref()),
             encoded_name_hash,
             octet_string(&key_hash),
             tlv(self.serial_tag, &serial_content),
@@ -1659,7 +1656,10 @@ fn rsassa_pss_rejects_absent_null_and_malformed_parameters() {
     // Canonical PSS params use a short-form SEQUENCE; append an INTEGER inside
     // it so the verifier's parser would ignore the extra bytes.
     assert_eq!(canonical[0], 0x30);
-    assert!(canonical[1] < 0x80, "canonical PSS params use a short length");
+    assert!(
+        canonical[1] < 0x80,
+        "canonical PSS params use a short length"
+    );
     let mut inner = canonical[2..].to_vec();
     inner.extend_from_slice(&tlv(0x02, &[0x01]));
     let mut builder = ResponseBuilder::new(&pki, now());

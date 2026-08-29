@@ -422,7 +422,10 @@ fn parse_algorithm_identifier<'a>(
 ) -> Result<(AlgorithmIdentifier<'a>, &'a [u8]), String> {
     let (any, _, rest) = take_tlv(input)?;
     let content = expect_sequence(&any, field)?;
-    Ok((parse_algorithm_identifier_content(content, field, profile)?, rest))
+    Ok((
+        parse_algorithm_identifier_content(content, field, profile)?,
+        rest,
+    ))
 }
 
 fn parse_algorithm_identifier_content<'a>(
@@ -505,7 +508,9 @@ fn validate_signature_parameters(
         // emit.
         return match params {
             Some(params) if is_canonical_null(params) => Ok(()),
-            _ => Err(format!("OCSP {field} parameters must be the canonical NULL")),
+            _ => Err(format!(
+                "OCSP {field} parameters must be the canonical NULL"
+            )),
         };
     }
     if *oid == OID_PKCS1_RSASSAPSS {
@@ -612,7 +617,9 @@ fn validate_rsassa_pss_parameters(params: &Any<'_>, field: &str) -> Result<(), S
         AlgorithmParameterProfile::Digest,
     )?;
     if mgf_hash.algorithm != hash_alg.algorithm {
-        return Err(format!("OCSP {mgf_field} hash does not match hashAlgorithm"));
+        return Err(format!(
+            "OCSP {mgf_field} hash does not match hashAlgorithm"
+        ));
     }
 
     let salt_field = format!("{field} rsassa-pss saltLength");
