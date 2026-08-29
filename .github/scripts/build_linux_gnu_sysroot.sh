@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Build ferrum-edge and ferrum-cni inside the digest-pinned GNU sysroot so
 # linked GLIBC symbols cannot track the GitHub-hosted runner image.
+#
+# Cargo output is isolated under /src/target/linux-gnu-sysroot so a restored
+# native ubuntu-latest `target/<triple>/release` tree cannot contaminate the
+# pinned sysroot link. After a successful container build, only the two
+# regular, non-symlink binaries are copied to the canonical paths consumed
+# by ABI scans and artifact uploads.
 set -euo pipefail
 
 contract="${GITHUB_WORKSPACE:-.}/.github/linux-gnu-abi.toml"
@@ -57,6 +63,7 @@ docker run --rm \
   --env CARGO_BUILD_RUSTC_WRAPPER= \
   --env RUSTFLAGS= \
   --env CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc \
+  --env CARGO_TARGET_DIR=/src/target/linux-gnu-sysroot \
   --env PROTOC_URL="$protoc_url" \
   --env PROTOC_SHA256="$protoc_sha256" \
   --env LINUX_GNU_TARGET="$target" \
@@ -67,6 +74,11 @@ docker run --rm \
   "$sysroot_image" \
   bash -lc '
     set -euo pipefail
+    if [[ "${CARGO_TARGET_DIR:-}" != "/src/target/linux-gnu-sysroot" ]]; then
+      echo "::error::CARGO_TARGET_DIR must be /src/target/linux-gnu-sysroot" >&2
+      exit 1
+    fi
+    mkdir -p /src/target/linux-gnu-sysroot
     dnf -y install gcc gcc-c++ make cmake zlib-devel perl unzip curl ca-certificates libcurl-devel openssl-devel
     curl -fsSL "$PROTOC_URL" -o /tmp/protoc.zip
     echo "$PROTOC_SHA256  /tmp/protoc.zip" | sha256sum -c -
@@ -74,9 +86,40 @@ docker run --rm \
     chmod +x /usr/local/bin/protoc
     rm /tmp/protoc.zip
     export PROTOC=/usr/local/bin/protoc
-    cargo build --features "$LINUX_GNU_FEATURES" --profile "$LINUX_GNU_PROFILE" --target "$LINUX_GNU_TARGET"
+    cargo build --features "$LINUX_GNU_FEATURES" --profile "$LINUX_GNU_PROFILE" --target "$LINUX_GNU_TARGET" --target-dir /src/target/linux-gnu-sysroot
     chown -R "${HOST_UID}:${HOST_GID}" \
-      /src/target \
+      /src/target/linux-gnu-sysroot \
       /opt/cargo \
       /opt/rustup
   '
+
+copy_sysroot_binary() {
+  local name="$1"
+  local src="$work_root/target/linux-gnu-sysroot/${target}/${profile}/${name}"
+  local dest="$work_root/target/${target}/${profile}/${name}"
+  if [[ ! -e "$src" ]]; then
+    echo "::error::pinned sysroot build did not produce ${name} at ${src}" >&2
+    exit 1
+  fi
+  if [[ -L "$src" ]]; then
+    echo "::error::pinned sysroot output ${src} is a symlink" >&2
+    exit 1
+  fi
+  if [[ ! -f "$src" ]]; then
+    echo "::error::pinned sysroot output ${src} is not a regular file" >&2
+    exit 1
+  fi
+  mkdir -p "$work_root/target/${target}/${profile}"
+  if [[ -L "$dest" ]]; then
+    echo "::error::canonical output path ${dest} is a symlink" >&2
+    exit 1
+  fi
+  cp -f -- "$src" "$dest"
+  if [[ -L "$dest" || ! -f "$dest" ]]; then
+    echo "::error::canonical copy of ${name} is not a regular file" >&2
+    exit 1
+  fi
+}
+
+copy_sysroot_binary ferrum-edge
+copy_sysroot_binary ferrum-cni

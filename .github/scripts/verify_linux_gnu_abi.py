@@ -25,9 +25,22 @@ CONTRACT_PATH = REPO_ROOT / ".github" / "linux-gnu-abi.toml"
 RELEASE_YML = REPO_ROOT / ".github" / "workflows" / "release.yml"
 CI_YML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 SMOKE_PY = REPO_ROOT / ".github" / "scripts" / "smoke_linux_gnu_baseline.py"
+SYSROOT_BUILD_SH = REPO_ROOT / ".github" / "scripts" / "build_linux_gnu_sysroot.sh"
 README = REPO_ROOT / "README.md"
 CLI_MD = REPO_ROOT / "docs" / "cli.md"
 CI_CD_MD = REPO_ROOT / "docs" / "ci_cd.md"
+
+DEDICATED_SYSROOT_TARGET_DIR = "/src/target/linux-gnu-sysroot"
+PR_LINUX_GNU_JOB = "verify-pr-linux-gnu-abi"
+PR_LINUX_GNU_JOB_HEADER = (
+    "  verify-pr-linux-gnu-abi:\n"
+    "    name: Verify PR Linux GNU ABI\n"
+)
+PR_LINUX_GNU_SCAN_BOTH = (
+    "          python3 -I .github/scripts/verify_linux_gnu_abi.py \\\n"
+    "            target/x86_64-unknown-linux-gnu/release/ferrum-edge \\\n"
+    "            target/x86_64-unknown-linux-gnu/release/ferrum-cni"
+)
 
 GLIBC_VERSION_RE = re.compile(r"\bGLIBC_(\d+(?:\.\d+)*)\b")
 NEEDED_RE = re.compile(r"\(NEEDED\)\s+Shared library:\s+\[([^\]]+)\]")
@@ -232,6 +245,8 @@ def check_release_wiring(contract: dict[str, Any], release_yml: str, ci_yml: str
             'echo "::error::latest-release did not succeed',
             "latest publication fail-closed error",
         ),
+        (PR_LINUX_GNU_JOB_HEADER, "verify-pr-linux-gnu-abi job"),
+        ("build_linux_gnu_sysroot.sh", "sysroot build helper on the PR path"),
     ):
         if not workflow_contains(ci_yml, token):
             errors.append(f"ci.yml is missing required {label} ({token})")
@@ -250,18 +265,29 @@ def check_release_wiring(contract: dict[str, Any], release_yml: str, ci_yml: str
         errors.append("ci.yml must not add an ABI needs edge to frozen main-publish-gate")
     if "verify-latest-linux-gnu-abi" in _job_needs(ci_yml, "build-arm64-cross"):
         errors.append("ci.yml must not add an ABI needs edge to frozen build-arm64-cross")
+    if PR_LINUX_GNU_JOB in _job_needs(ci_yml, "latest-release"):
+        errors.append("ci.yml must not add the PR GNU ABI job to frozen latest-release")
+    if PR_LINUX_GNU_JOB in _job_needs(ci_yml, "main-publish-gate"):
+        errors.append("ci.yml must not add the PR GNU ABI job to frozen main-publish-gate")
+    if PR_LINUX_GNU_JOB in _job_needs(ci_yml, "build-arm64-cross"):
+        errors.append("ci.yml must not add the PR GNU ABI job to frozen build-arm64-cross")
 
+    errors.extend(check_pr_linux_gnu_job(ci_yml))
     return errors
 
 
-def _job_needs(workflow: str, job: str) -> set[str]:
+def _job_body(workflow: str, job: str) -> str:
     match = re.search(
         rf"(?ms)^  {re.escape(job)}:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
         workflow,
     )
-    if not match:
+    return match.group("body") if match else ""
+
+
+def _job_needs(workflow: str, job: str) -> set[str]:
+    body = _job_body(workflow, job)
+    if not body:
         return set()
-    body = match.group("body")
     inline = re.search(
         r"(?m)^    needs: \[(?P<needs>[A-Za-z0-9_-]+(?:, [A-Za-z0-9_-]+)*)\]$",
         body,
@@ -317,6 +343,95 @@ def check_operator_docs(readme: str, cli_md: str, ci_cd_md: str, contract: dict[
     for token in ("verify-latest-linux-gnu-abi", "linux-gnu-abi-latest-gate"):
         if token not in ci_cd_md:
             errors.append(f"docs/ci_cd.md must document the moving-latest GNU ABI job {token}")
+    if "verify-pr-linux-gnu-abi" not in ci_cd_md:
+        errors.append("docs/ci_cd.md must document the pull-request GNU ABI job verify-pr-linux-gnu-abi")
+    if "linux-gnu-sysroot" not in ci_cd_md:
+        errors.append("docs/ci_cd.md must document the isolated sysroot CARGO_TARGET_DIR")
+    return errors
+
+
+def check_sysroot_builder(source: str) -> list[str]:
+    errors: list[str] = []
+    dedicated = DEDICATED_SYSROOT_TARGET_DIR
+    if f"--env CARGO_TARGET_DIR={dedicated}" not in source:
+        errors.append(
+            "sysroot builder must pin docker CARGO_TARGET_DIR to "
+            f"{dedicated} with no host fallback"
+        )
+    if f'[[ "${{CARGO_TARGET_DIR:-}}" != "{dedicated}" ]]' not in source:
+        errors.append(
+            "sysroot builder must fail closed unless CARGO_TARGET_DIR is "
+            f"exactly {dedicated}"
+        )
+    if f"--target-dir {dedicated}" not in source:
+        errors.append(
+            f"sysroot builder must pass cargo --target-dir {dedicated}"
+        )
+    if '--env CARGO_TARGET_DIR="$CARGO_TARGET_DIR"' in source:
+        errors.append("sysroot builder must not pass host CARGO_TARGET_DIR into the container")
+    if re.search(r"(?m)^\s+/src/target\s*$", source):
+        errors.append("sysroot builder must not chown or otherwise use the whole /src/target tree")
+    chown_dedicated = (
+        '    chown -R "${HOST_UID}:${HOST_GID}" \\\n'
+        f"      {dedicated} \\\n"
+    )
+    if chown_dedicated not in source:
+        errors.append(
+            "sysroot builder must scope host ownership repair to "
+            f"{dedicated}"
+        )
+    if '[[ -L "$src" ]]' not in source or '[[ -L "$dest" ]]' not in source:
+        errors.append(
+            "sysroot builder must reject symlink sources and canonical destinations"
+        )
+    if "copy_sysroot_binary ferrum-edge" not in source:
+        errors.append("sysroot builder must copy ferrum-edge to the canonical path")
+    if "copy_sysroot_binary ferrum-cni" not in source:
+        errors.append("sysroot builder must copy ferrum-cni to the canonical path")
+    if "cp -f --" not in source:
+        errors.append("sysroot builder must copy proven binaries with cp -f --")
+    return errors
+
+
+def check_pr_linux_gnu_job(ci_yml: str) -> list[str]:
+    errors: list[str] = []
+    if PR_LINUX_GNU_JOB_HEADER not in ci_yml:
+        errors.append("ci.yml is missing the verify-pr-linux-gnu-abi job")
+        return errors
+    body = _job_body(ci_yml, PR_LINUX_GNU_JOB)
+    if not body:
+        errors.append("ci.yml verify-pr-linux-gnu-abi job body is missing")
+        return errors
+    if _job_needs(ci_yml, PR_LINUX_GNU_JOB) != {"ci-plan"}:
+        errors.append("verify-pr-linux-gnu-abi must need only ci-plan")
+    if "needs.ci-plan.outputs.mode == 'full'" not in body:
+        errors.append("verify-pr-linux-gnu-abi must require full CI mode")
+    if "github.event_name == 'pull_request'" not in body:
+        errors.append("verify-pr-linux-gnu-abi must run on pull_request")
+    if "contents: read" not in body:
+        errors.append("verify-pr-linux-gnu-abi must use contents: read")
+    if re.search(r"(?m)^\s+contents:\s+write\s*$", body):
+        errors.append("verify-pr-linux-gnu-abi must not grant contents: write")
+    if "persist-credentials: false" not in body:
+        errors.append("verify-pr-linux-gnu-abi must disable persist-credentials")
+    if "timeout-minutes:" not in body:
+        errors.append("verify-pr-linux-gnu-abi must set a job timeout")
+    if "build_linux_gnu_sysroot.sh" not in body:
+        errors.append("verify-pr-linux-gnu-abi must invoke the isolated sysroot builder")
+    if "cargo build" in body:
+        errors.append("verify-pr-linux-gnu-abi must not cargo-build on the native runner")
+    if PR_LINUX_GNU_SCAN_BOTH not in body:
+        errors.append("verify-pr-linux-gnu-abi must ABI-scan both x86_64 GNU binaries")
+    if "--edge target/x86_64-unknown-linux-gnu/release/ferrum-edge" not in body:
+        errors.append("verify-pr-linux-gnu-abi must smoke ferrum-edge by exact path")
+    if "--cni target/x86_64-unknown-linux-gnu/release/ferrum-cni" not in body:
+        errors.append("verify-pr-linux-gnu-abi must smoke ferrum-cni by exact path")
+    if "python3 -I .github/scripts/smoke_linux_gnu_baseline.py" not in body:
+        errors.append("verify-pr-linux-gnu-abi must invoke baseline smoke")
+    if "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" not in body:
+        errors.append("verify-pr-linux-gnu-abi must pin actions/checkout")
+    if "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8" not in body:
+        errors.append("verify-pr-linux-gnu-abi must pin dtolnay/rust-toolchain")
     return errors
 
 
@@ -341,6 +456,7 @@ def check_repository() -> list[str]:
         )
     )
     errors.extend(check_smoke_script(SMOKE_PY.read_text(encoding="utf-8")))
+    errors.extend(check_sysroot_builder(SYSROOT_BUILD_SH.read_text(encoding="utf-8")))
     return errors
 
 
@@ -488,6 +604,89 @@ def run_self_test() -> list[str]:
     )
     if not check_smoke_script(mutated_smoke):
         failures.append("read-write /gnu smoke mount was not rejected")
+
+    builder = SYSROOT_BUILD_SH.read_text(encoding="utf-8")
+    mutated_target_dir = builder.replace(
+        "--env CARGO_TARGET_DIR=/src/target/linux-gnu-sysroot",
+        "--env CARGO_TARGET_DIR=/src/target",
+        1,
+    )
+    if not check_sysroot_builder(mutated_target_dir):
+        failures.append("unisolated CARGO_TARGET_DIR in sysroot builder was not rejected")
+
+    mutated_host_override = builder.replace(
+        "--env CARGO_TARGET_DIR=/src/target/linux-gnu-sysroot",
+        '--env CARGO_TARGET_DIR="$CARGO_TARGET_DIR"',
+        1,
+    )
+    if not check_sysroot_builder(mutated_host_override):
+        failures.append("host CARGO_TARGET_DIR passthrough in sysroot builder was not rejected")
+
+    mutated_chown = builder.replace(
+        '    chown -R "${HOST_UID}:${HOST_GID}" \\\n'
+        "      /src/target/linux-gnu-sysroot \\\n"
+        "      /opt/cargo \\\n",
+        '    chown -R "${HOST_UID}:${HOST_GID}" \\\n'
+        "      /src/target \\\n"
+        "      /opt/cargo \\\n",
+        1,
+    )
+    if not check_sysroot_builder(mutated_chown):
+        failures.append("whole /src/target chown in sysroot builder was not rejected")
+
+    mutated_symlink = builder.replace('[[ -L "$src" ]]', '[[ -d "$src" ]]', 1)
+    if not check_sysroot_builder(mutated_symlink):
+        failures.append("sysroot builder without symlink rejection was not rejected")
+
+    mutated_cni_copy = builder.replace("copy_sysroot_binary ferrum-cni\n", "", 1)
+    if not check_sysroot_builder(mutated_cni_copy):
+        failures.append("sysroot builder missing ferrum-cni canonical copy was not rejected")
+
+    mutated_pr_job = ci_yml.replace(
+        "verify-pr-linux-gnu-abi:", "verify-pr-linux-gnu-abi-missing:", 1
+    )
+    if not check_release_wiring(contract, RELEASE_YML.read_text(encoding="utf-8"), mutated_pr_job):
+        failures.append("missing PR GNU ABI job in ci.yml was not rejected")
+
+    pr_body = _job_body(ci_yml, PR_LINUX_GNU_JOB)
+    mutated_pr_smoke = ci_yml.replace(
+        pr_body,
+        pr_body.replace("smoke_linux_gnu_baseline.py", "smoke_linux_gnu_baseline_missing.py"),
+        1,
+    )
+    if not check_pr_linux_gnu_job(mutated_pr_smoke):
+        failures.append("PR GNU ABI job without baseline smoke was not rejected")
+
+    mutated_pr_scan = ci_yml.replace(
+        pr_body,
+        pr_body.replace(PR_LINUX_GNU_SCAN_BOTH, PR_LINUX_GNU_SCAN_BOTH.replace("ferrum-cni", "ferrum-edge")),
+        1,
+    )
+    if not check_pr_linux_gnu_job(mutated_pr_scan):
+        failures.append("PR GNU ABI job that does not scan ferrum-cni was not rejected")
+
+    mutated_pr_native = ci_yml.replace(
+        pr_body,
+        pr_body.replace(
+            "bash .github/scripts/build_linux_gnu_sysroot.sh",
+            "cargo build --release --target x86_64-unknown-linux-gnu",
+            1,
+        ),
+        1,
+    )
+    if not check_pr_linux_gnu_job(mutated_pr_native):
+        failures.append("PR GNU ABI job native cargo build fallback was not rejected")
+
+    mutated_pr_docs = CI_CD_MD.read_text(encoding="utf-8").replace(
+        "verify-pr-linux-gnu-abi", "verify-linux-gnu-abi-on-pr"
+    )
+    if not check_operator_docs(
+        README.read_text(encoding="utf-8"),
+        CLI_MD.read_text(encoding="utf-8"),
+        mutated_pr_docs,
+        contract,
+    ):
+        failures.append("docs/ci_cd.md PR GNU ABI job regression was not rejected")
 
     return failures
 
