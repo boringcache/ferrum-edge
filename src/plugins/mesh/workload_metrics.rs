@@ -164,10 +164,8 @@ pub const EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY: &str = "_effective_mesh_authz_
 /// never with unrelated assertor inventory.
 pub const MAX_EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES: usize = 16;
 
-const EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATE_KEYS: &[&str] = &[
-    "trusted_hbone_assertors",
-    "trust_domain_aliases",
-];
+const EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATE_KEYS: &[&str] =
+    &["trusted_hbone_assertors", "trust_domain_aliases"];
 
 /// One compiled `mesh_authz` baggage gate: the same
 /// [`TrustedAssertorIndex`] + alias list authorization uses.
