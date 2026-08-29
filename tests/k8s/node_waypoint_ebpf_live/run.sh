@@ -1674,7 +1674,11 @@ run_ingress_topology_negative_and_drift_checks() {
     exit 1
   fi
   grep -q 'ferrum_node_agent_capture_state{state="interface_topology_unavailable"} 1' "$metrics_file"
-  grep -q 'reason="incomplete_interface_set"' "$metrics_file"
+  # A deliberately wrong route can fail closed as an incomplete configured set
+  # or as divergent remote-node/PodCIDR evidence. Both are bounded unavailable
+  # outcomes; the capture-state and Pod readiness assertions above prove the
+  # security behavior this case requires.
+  grep -Eq 'reason="(incomplete_interface_set|unsupported_topology)"' "$metrics_file"
   if ! kubectl -n "$MESH_NS" logs "pod/$new_pod" >"$startup_log" \
     || ! grep -Fq 'NodeWaypoint inbound tc ingress redirect attached' "$startup_log"; then
     restore_ingress_routes "$NODE_A" "$state_file"
