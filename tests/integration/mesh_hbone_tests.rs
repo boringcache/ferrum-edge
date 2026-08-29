@@ -2102,12 +2102,12 @@ fn inbound_relay_resolved_loopback_screen_is_wired_on_tcp_and_udp_dial_paths() {
     );
     assert!(
         collapsed.contains(
-            "screen_ordinary_inbound_hbone_relay_dns_candidates ( proxy , mesh , candidates"
+            "screen_ordinary_inbound_hbone_relay_dns_candidates( proxy, mesh, candidates,"
         ),
         "byte-stream connect_backend must screen resolved candidates before dial"
     );
     assert!(
-        collapsed.contains("if external_egress_allowed { dest_candidates } else { match screen_ordinary_inbound_hbone_relay_dns_candidates ( proxy , mesh_config , dest_candidates"),
+        collapsed.contains("if external_egress_allowed { dest_candidates } else { match screen_ordinary_inbound_hbone_relay_dns_candidates( proxy, mesh_config, dest_candidates,"),
         "local UDP relay must screen resolved candidates; external UDP egress must not"
     );
     assert!(
@@ -2183,7 +2183,7 @@ fn inbound_hbone_dns_screen_denial_settles_half_open_via_production_helper() {
     let collapsed: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
         collapsed.contains(
-            "settle_hbone_backend_connect_circuit_breaker_outcome ( &cb , err.status , cb_is_half_open_probe )"
+            "settle_hbone_backend_connect_circuit_breaker_outcome( &cb, err.status, cb_is_half_open_probe, );"
         ),
         "connect_backend error arm must settle the same selected-target breaker"
     );
@@ -2202,7 +2202,7 @@ fn inbound_hbone_dns_screen_denial_settles_half_open_via_production_helper() {
         .split("\"HBONE backend connection failed\"")
         .nth(1)
         .expect("connect_backend error logging")
-        .split("ctx . metadata . insert ( \"error_class\"")
+        .split("ctx.metadata.insert( \"error_class\"")
         .next()
         .expect("error_class metadata after breaker settlement");
     assert!(
