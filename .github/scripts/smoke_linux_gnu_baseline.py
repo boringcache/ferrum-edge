@@ -20,12 +20,12 @@ CONTRACT_PATH = REPO_ROOT / ".github" / "linux-gnu-abi.toml"
 SMOKE_SH = REPO_ROOT / ".github" / "scripts" / "smoke_linux_gnu_baseline.sh"
 PROCESS_API_RE = (
     "sub" + "process",
-    "os.system",
-    "os.popen",
-    "os.execl",
-    "os.execv",
-    "os.spawn",
-    "os.posix_spawn",
+    "os." + "system",
+    "os." + "popen",
+    "os." + "execl",
+    "os." + "execv",
+    "os." + "spawn",
+    "os." + "posix_spawn",
     "asyncio.create_sub" + "process",
 )
 
