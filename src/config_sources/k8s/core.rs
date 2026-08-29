@@ -183,23 +183,24 @@ impl NodeWaypointInventory {
         self.lock().insert(node_name, waypoint);
     }
 
-    /// Restore last Ready endpoints only for nodes that still have a trusted
-    /// NodeWaypoint object in this snapshot, and drop remembered endpoints
-    /// for nodes that do not.
+    /// Restore last Ready endpoints only for nodes that have a trusted
+    /// not-Ready or terminating replacement in this snapshot, and drop
+    /// remembered endpoints for nodes without either a live endpoint or that
+    /// narrow replacement evidence.
     ///
-    /// `trusted_nodes` is the set of `spec.nodeName` values on trusted
-    /// waypoint pods (Ready, not-Ready, or terminating). A Ready pod already
-    /// populated `dest` during collect; `or_insert_with` keeps that live
-    /// endpoint. A not-Ready or terminating pod is replacement evidence and
-    /// restores the last Ready endpoint for that node only.
+    /// `replacement_nodes` is the set of `spec.nodeName` values on trusted
+    /// not-Ready or terminating waypoint pods. A Ready pod with valid endpoint
+    /// material already populated `dest` during collect. A Ready pod without
+    /// valid endpoint material is not replacement evidence and must withdraw
+    /// remembered metadata rather than republishing stale identity.
     fn apply_to(
         &self,
         dest: &mut HashMap<String, CoreNodeWaypointPod>,
-        trusted_nodes: &HashSet<String>,
+        replacement_nodes: &HashSet<String>,
     ) {
         let mut guard = self.lock();
-        guard.retain(|node, _| trusted_nodes.contains(node));
-        for node in trusted_nodes {
+        guard.retain(|node, _| dest.contains_key(node) || replacement_nodes.contains(node));
+        for node in replacement_nodes {
             if let Some(waypoint) = guard.get(node) {
                 dest.entry(node.clone()).or_insert_with(|| waypoint.clone());
             }
@@ -255,10 +256,10 @@ pub(super) fn collect(
 }
 
 pub(super) fn finalize(acc: &mut K8sAccumulator) -> Result<(), K8sTranslateError> {
-    let trusted_nodes = trusted_node_waypoint_nodes(acc);
+    let replacement_nodes = node_waypoint_replacement_nodes(acc);
     acc.options
         .node_waypoint_inventory
-        .apply_to(&mut acc.core.node_waypoints_by_node, &trusted_nodes);
+        .apply_to(&mut acc.core.node_waypoints_by_node, &replacement_nodes);
 
     let mut service_keys: Vec<K8sServiceKey> = acc.core.services.keys().cloned().collect();
     service_keys.sort();
@@ -1284,11 +1285,11 @@ fn node_waypoint_spiffe_id(object: &K8sObject) -> Option<SpiffeId> {
     None
 }
 
-fn trusted_node_waypoint_nodes(acc: &K8sAccumulator) -> HashSet<String> {
+fn node_waypoint_replacement_nodes(acc: &K8sAccumulator) -> HashSet<String> {
     acc.core
         .pods
         .values()
-        .filter(|pod| pod.node_waypoint_proxy)
+        .filter(|pod| pod.node_waypoint_proxy && !pod.ready)
         .filter_map(|pod| {
             let name = pod.node_name.as_deref()?.trim();
             (!name.is_empty()).then(|| name.to_string())

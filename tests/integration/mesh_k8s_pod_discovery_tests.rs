@@ -835,6 +835,48 @@ fn k8s_pod_discovery_clears_sticky_node_waypoint_when_no_trusted_proxy_remains()
 }
 
 #[test]
+fn k8s_pod_discovery_clears_sticky_node_waypoint_for_ready_proxy_without_svid() {
+    let inventory = NodeWaypointInventory::new();
+    let options = options().with_node_waypoint_inventory(inventory);
+    let ready_a = named_node_waypoint_pod(
+        "ferrum-node-waypoint-node-a",
+        "node-a",
+        "192.0.2.10",
+        true,
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a",
+    );
+    translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            ready_a,
+        ],
+        options.clone(),
+    )
+    .expect("K8s core translation succeeds");
+
+    let ready_without_svid = node_waypoint_pod("node-a", "192.0.2.20", true, 15008);
+    let translation = translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            ready_without_svid,
+        ],
+        options,
+    )
+    .expect("K8s core translation succeeds");
+    assert!(
+        reviews_workload_node_waypoint(&translation).is_none(),
+        "a Ready proxy without valid SVID material must withdraw stale destination metadata"
+    );
+}
+
+#[test]
 fn k8s_pod_discovery_replaces_retained_node_waypoint_when_same_node_becomes_ready() {
     let inventory = NodeWaypointInventory::new();
     let options = options().with_node_waypoint_inventory(inventory);
