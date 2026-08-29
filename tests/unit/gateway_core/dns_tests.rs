@@ -3,7 +3,6 @@
 use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Helper to create a default DnsConfig with custom overrides.
 fn default_dns_config(overrides: HashMap<String, String>) -> DnsConfig {
