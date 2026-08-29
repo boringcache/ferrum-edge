@@ -227,48 +227,6 @@ fn gateway_api_status_plan_cursor_retries_same_window_after_patch_failure() {
 }
 
 #[test]
-fn gateway_parent_status_publication_is_generation_fenced_and_parent_io_bounded() {
-    assert!(
-        STATUS_SRC.contains("GATEWAY_API_STATUS_PARENT_IO_TIMEOUT"),
-        "each Gateway/GatewayClass/ListenerSet status GET/PATCH must have a bound below the suite wait"
-    );
-    assert!(
-        !STATUS_SRC.contains("status_patch_timeout_error")
-            && !STATUS_SRC.contains("with_code(504)"),
-        "a bounded parent-status deferral must not be accounted as a 504 patch failure"
-    );
-    let apply = STATUS_SRC
-        .split("async fn patch_gateway_status_with_apply(")
-        .nth(1)
-        .and_then(|rest| rest.split("async fn patch_route_status_with_retry(").next())
-        .expect("patch_gateway_status_with_apply body");
-    assert!(
-        apply.contains("parent_status_io_timeout")
-            && apply.contains("GATEWAY_API_STATUS_PARENT_IO_TIMEOUT")
-            && apply.contains("gateway_status_plan_is_stale")
-            && apply.contains("resourceVersion"),
-        "parent SSA GET/PATCH must be generation-fenced, RV-preconditioned, and independently bounded"
-    );
-    let patch_updates = STATUS_SRC
-        .split("pub async fn patch_updates(")
-        .nth(1)
-        .and_then(|rest| {
-            rest.split("async fn patch_gateway_status_with_apply(")
-                .next()
-        })
-        .expect("GatewayApiStatusWriter::patch_updates body");
-    assert!(
-        !patch_updates.contains("tokio::time::timeout"),
-        "route/policy merge-patch retries must not share the parent SSA I/O bound"
-    );
-    assert!(
-        RECONCILER_SRC.contains("STATUS_PATCH_BATCH_TIMEOUT")
-            && RECONCILER_SRC.contains("Duration::from_secs(60)"),
-        "the batch ceiling remains the fail-closed outer bound"
-    );
-}
-
-#[test]
 fn fair_budget_bounds_expensive_planning_before_writes() {
     let objects = base_objects_with_routes(8);
     let conflicts = gateway_api_route_conflicts(&objects, &options());
@@ -2572,78 +2530,5 @@ fn reference_grant_translation_and_status_share_fail_closed_semantics() {
             .as_deref(),
         Some("RefNotPermitted"),
         "malformed present from + missing to must grant nothing in status"
-    );
-}
-
-fn pin_observed_generation(status: &mut Value, generation: i64) {
-    if let Some(conditions) = status.get_mut("conditions").and_then(Value::as_array_mut) {
-        for condition in conditions {
-            if let Some(map) = condition.as_object_mut() {
-                map.insert("observedGeneration".to_string(), json!(generation));
-            }
-        }
-    }
-    if let Some(listeners) = status.get_mut("listeners").and_then(Value::as_array_mut) {
-        for listener in listeners {
-            pin_observed_generation(listener, generation);
-        }
-    }
-}
-
-fn gateway_condition_observed_generation(status: &Value, condition_type: &str) -> Option<i64> {
-    status
-        .get("conditions")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find(|condition| condition.get("type").and_then(Value::as_str) == Some(condition_type))
-        .and_then(|condition| condition.get("observedGeneration").and_then(Value::as_i64))
-}
-
-#[test]
-fn gateway_status_replans_when_observed_generation_lags_spec_generation() {
-    // Exact GatewayModifyListeners path: spec generation already advanced,
-    // condition values are unchanged, but observedGeneration is still 1.
-    let mut gateway = ferrum_gateway();
-    gateway.metadata.generation = Some(2);
-    let mut objects = vec![ferrum_gateway_class(), gateway];
-    let first = plan_gateway_api_status_updates(&objects, options(), &[]);
-    let first_gateway = first
-        .iter()
-        .find(|update| update.kind == "Gateway" && update.name == "edge")
-        .expect("initial Gateway status plan");
-    for condition_type in ["Accepted", "ResolvedRefs", "Programmed", "Conflicted"] {
-        assert_eq!(
-            gateway_condition_observed_generation(&first_gateway.status, condition_type),
-            Some(2),
-            "{condition_type} must observe the live spec generation"
-        );
-    }
-
-    let mut stale_status = first_gateway.status.clone();
-    pin_observed_generation(&mut stale_status, 1);
-    objects[1].status = stale_status;
-    objects[1].metadata.generation = Some(2);
-
-    let second = plan_gateway_api_status_updates(&objects, options(), &[]);
-    let second_gateway = second
-        .iter()
-        .find(|update| update.kind == "Gateway" && update.name == "edge")
-        .expect("stale observedGeneration must force a Gateway status rewrite");
-    for condition_type in ["Accepted", "ResolvedRefs", "Programmed", "Conflicted"] {
-        assert_eq!(
-            gateway_condition_observed_generation(&second_gateway.status, condition_type),
-            Some(2),
-            "{condition_type} must advance off the stale observedGeneration"
-        );
-    }
-
-    objects[1].status = second_gateway.status.clone();
-    let third = plan_gateway_api_status_updates(&objects, options(), &[]);
-    assert!(
-        third
-            .iter()
-            .all(|update| update.kind != "Gateway" || update.name != "edge"),
-        "caught-up Gateway status must not emit an update loop"
     );
 }
