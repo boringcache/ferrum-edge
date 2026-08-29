@@ -106,6 +106,18 @@ fn command_style_protoc_override_is_discovered_on_path() {
 }
 
 #[test]
+fn command_style_protoc_override_missing_from_path_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let err = protoc_preflight::ensure_protoc_from(
+        Some(OsString::from("Cargo.toml")),
+        Some(OsString::from(dir.path())),
+    )
+    .expect_err("a bare PROTOC command absent from PATH must fail");
+    assert_actionable_protoc_diagnostic(&err);
+    assert!(err.contains("not found on PATH"), "{err}");
+}
+
+#[test]
 fn build_script_preflights_protoc_before_tonic_compile() {
     let build = include_str!("../../../build.rs");
     let preflight = build
