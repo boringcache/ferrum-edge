@@ -1467,7 +1467,9 @@ impl CompiledGrant {
                 fronted,
             } => {
                 (*same_namespace && same_namespace_assertion(peer, asserted))
-                    || fronted.as_ref().is_some_and(|ids| ids.contains(asserted.as_str()))
+                    || fronted
+                        .as_ref()
+                        .is_some_and(|ids| ids.contains(asserted.as_str()))
             }
         }
     }
@@ -3939,7 +3941,9 @@ pub(crate) fn parse_legacy_mesh_wide_hbone_assertion(config: &Value) -> Result<b
             );
             Ok(true)
         }
-        Some(_) => Err(format!("{LEGACY_MESH_WIDE_ASSERTION_KEY} must be a boolean")),
+        Some(_) => Err(format!(
+            "{LEGACY_MESH_WIDE_ASSERTION_KEY} must be a boolean"
+        )),
     }
 }
 

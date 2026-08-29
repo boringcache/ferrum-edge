@@ -1686,7 +1686,9 @@ async fn mesh_authz_trusted_hbone_assertors_accepts_custom_service_account() {
         "trusted_hbone_assertors": ["default-waypoint"],
     }))
     .expect("plugin config");
-    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/default-waypoint"));
+    let mut ctx = request_context(Some(
+        "spiffe://cluster.local/ns/default/sa/default-waypoint",
+    ));
     ctx.metadata
         .insert("request_protocol".to_string(), "hbone".to_string());
     let mut headers = http::HeaderMap::new();
@@ -1882,7 +1884,10 @@ async fn mesh_authz_untrusted_assertor_without_baggage_is_silent() {
 
 /// Build an ALLOW policy for one exact SPIFFE id in the `prod` namespace.
 fn allow_payments_policy() -> MeshPolicy {
-    allow_spiffe_policy("payments-policy", "spiffe://cluster.local/ns/prod/sa/payments")
+    allow_spiffe_policy(
+        "payments-policy",
+        "spiffe://cluster.local/ns/prod/sa/payments",
+    )
 }
 
 fn allow_spiffe_policy(name: &str, spiffe: &str) -> MeshPolicy {
@@ -2303,20 +2308,16 @@ async fn mesh_authz_duplicate_exact_assertor_entries_union_grants() {
         }))
         .expect("plugin config");
 
-        let mut payments = hbone_baggage_context(
-            ZTUNNEL_EXACT,
-            &format!("source.principal={PAYMENTS_ID}"),
-        );
+        let mut payments =
+            hbone_baggage_context(ZTUNNEL_EXACT, &format!("source.principal={PAYMENTS_ID}"));
         assert!(matches!(
             plugin.authorize(&mut payments).await,
             PluginResult::Continue
         ));
         assert!(!payments.metadata.contains_key("mesh_authz.ignored_baggage"));
 
-        let mut ledger = hbone_baggage_context(
-            ZTUNNEL_EXACT,
-            &format!("source.principal={LEDGER_ID}"),
-        );
+        let mut ledger =
+            hbone_baggage_context(ZTUNNEL_EXACT, &format!("source.principal={LEDGER_ID}"));
         assert!(matches!(
             plugin.authorize(&mut ledger).await,
             PluginResult::Continue
@@ -2360,10 +2361,8 @@ async fn mesh_authz_exact_and_service_account_assertor_entries_union_grants() {
     }))
     .expect("plugin config");
 
-    let mut listed = hbone_baggage_context(
-        ZTUNNEL_EXACT,
-        &format!("source.principal={PAYMENTS_ID}"),
-    );
+    let mut listed =
+        hbone_baggage_context(ZTUNNEL_EXACT, &format!("source.principal={PAYMENTS_ID}"));
     assert!(matches!(
         plugin.authorize(&mut listed).await,
         PluginResult::Continue
@@ -2380,10 +2379,8 @@ async fn mesh_authz_exact_and_service_account_assertor_entries_union_grants() {
     ));
     assert!(!same_ns.metadata.contains_key("mesh_authz.ignored_baggage"));
 
-    let mut other_ns = hbone_baggage_context(
-        ZTUNNEL_EXACT,
-        &format!("source.principal={LEDGER_ID}"),
-    );
+    let mut other_ns =
+        hbone_baggage_context(ZTUNNEL_EXACT, &format!("source.principal={LEDGER_ID}"));
     assert!(matches!(
         plugin.authorize(&mut other_ns).await,
         PluginResult::Reject { .. }
@@ -2463,10 +2460,8 @@ async fn mesh_authz_empty_inventory_does_not_inherit_sibling_node_grants() {
         ],
     }))
     .expect("plugin config");
-    let mut ctx = hbone_baggage_context(
-        NODE_WAYPOINT_B,
-        &format!("source.principal={PAYMENTS_ID}"),
-    );
+    let mut ctx =
+        hbone_baggage_context(NODE_WAYPOINT_B, &format!("source.principal={PAYMENTS_ID}"));
 
     assert!(matches!(
         plugin.authorize(&mut ctx).await,

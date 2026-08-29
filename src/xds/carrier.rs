@@ -1111,9 +1111,7 @@ mod tests {
             MeshSliceCarrier::NodeWaypointAssertors(vec![NodeWaypointAssertor {
                 spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint")
                     .unwrap(),
-                asserts: vec![
-                    SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap(),
-                ],
+                asserts: vec![SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap()],
             }]),
             MeshSliceCarrier::NodeWaypointCaptureDestinations(Vec::new()),
             MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(Vec::new()),
@@ -1220,9 +1218,7 @@ mod tests {
             MeshSliceCarrier::NodeWaypointAssertors(vec![NodeWaypointAssertor {
                 spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint")
                     .unwrap(),
-                asserts: vec![
-                    SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap(),
-                ],
+                asserts: vec![SpiffeId::new("spiffe://cluster.local/ns/default/sa/app").unwrap()],
             }]),
             MeshSliceCarrier::NodeWaypointCaptureDestinations(Vec::new()),
             MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(Vec::new()),

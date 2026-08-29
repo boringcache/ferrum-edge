@@ -3440,7 +3440,7 @@ mod tests {
         assert_eq!(
             mesh.node_waypoint_assertors
                 .iter()
-                .map(SpiffeId::as_str)
+                .map(|assertor| assertor.spiffe_id.as_str())
                 .collect::<Vec<_>>(),
             vec![waypoint_alpha, waypoint_beta],
             "CP should derive assertors from scope-authorized workloads before request-visible workload narrowing"
@@ -3451,7 +3451,7 @@ mod tests {
             slice
                 .node_waypoint_assertors
                 .iter()
-                .map(SpiffeId::as_str)
+                .map(|assertor| assertor.spiffe_id.as_str())
                 .collect::<Vec<_>>(),
             vec![waypoint_alpha, waypoint_beta],
             "the narrowed slice must carry source-node assertors that are no longer visible as workloads"
@@ -3469,7 +3469,7 @@ mod tests {
             beta_only_mesh
                 .node_waypoint_assertors
                 .iter()
-                .map(SpiffeId::as_str)
+                .map(|assertor| assertor.spiffe_id.as_str())
                 .collect::<Vec<_>>(),
             vec![waypoint_beta],
             "explicit CP namespace scopes must bound the assertor inventory"

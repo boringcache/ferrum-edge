@@ -12520,10 +12520,11 @@ fn inject_mesh_global_plugins(
     let operator_mesh_authz_trusted_assertors = operator_mesh_authz_config
         .as_ref()
         .and_then(|cfg| cfg.get("trusted_hbone_assertors").cloned());
-    let operator_mesh_authz_legacy_mesh_wide = operator_mesh_authz_config.as_ref().and_then(|cfg| {
-        cfg.get(crate::plugins::mesh::authz::LEGACY_MESH_WIDE_ASSERTION_KEY)
-            .cloned()
-    });
+    let operator_mesh_authz_legacy_mesh_wide =
+        operator_mesh_authz_config.as_ref().and_then(|cfg| {
+            cfg.get(crate::plugins::mesh::authz::LEGACY_MESH_WIDE_ASSERTION_KEY)
+                .cloned()
+        });
     let mesh_managed_trusted_assertors = mesh_managed_trusted_hbone_assertors(runtime, mesh_slice);
     let mut mesh_authz_config = serde_json::json!({
         "mesh_slice": mesh_slice,
