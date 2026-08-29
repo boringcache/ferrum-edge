@@ -10,8 +10,9 @@
 //! disaster-recovery tiers are never load-balanced with the live tier.
 
 use crate::config::types::UpstreamTarget;
-use crate::dns::{DnsCache, SrvAnswer, is_rfc2782_root_target};
+use crate::dns::{DnsCache, SrvAnswer, normalize_srv_target_host};
 use std::collections::HashMap;
+use tracing::debug;
 
 /// DNS-SD service discoverer.
 ///
@@ -37,7 +38,8 @@ impl DnsSdDiscoverer {
 ///
 /// Admission order:
 /// 1. Discard the RFC 2782 root target `.` (and the empty name left after
-///    stripping the trailing root label).
+///    stripping the trailing root label) and ASCII-lowercase the host so it
+///    matches `UpstreamTarget` admission.
 /// 2. Admit ports through `admit_registry_port` — the same `1..=u16::MAX`
 ///    contract Kubernetes and Consul use. Port 0 is rejected.
 /// 3. Among remaining admissible records, keep only the numerically-smallest
@@ -65,10 +67,14 @@ pub(crate) fn targets_from_srv_records(
 ) -> Vec<UpstreamTarget> {
     let admitted: Vec<SrvAnswer> = records
         .into_iter()
-        .filter(|answer| !is_rfc2782_root_target(&answer.host))
         .filter_map(|answer| {
-            super::admit_registry_port(u64::from(answer.port))
-                .map(|port| SrvAnswer { port, ..answer })
+            let host = normalize_srv_target_host(answer.host)?;
+            super::admit_registry_port(u64::from(answer.port)).map(|port| SrvAnswer {
+                host,
+                port,
+                weight: answer.weight,
+                priority: answer.priority,
+            })
         })
         .collect();
 
@@ -99,9 +105,17 @@ pub(crate) fn targets_from_srv_records(
 impl super::ServiceDiscoverer for DnsSdDiscoverer {
     async fn discover(&self) -> Result<super::DiscoverySnapshot, anyhow::Error> {
         let srv_results = self.dns_cache.resolve_srv(&self.service_name).await?;
-        Ok(super::DiscoverySnapshot::from_targets(
-            targets_from_srv_records(srv_results, self.default_weight),
-        ))
+        let answers = srv_results.len();
+        let targets = targets_from_srv_records(srv_results, self.default_weight);
+        if targets.len() != answers {
+            debug!(
+                service = %self.service_name,
+                answers,
+                published = targets.len(),
+                "DNS-SD published only the lowest admissible RFC 2782 priority"
+            );
+        }
+        Ok(super::DiscoverySnapshot::from_targets(targets))
     }
 
     fn provider_name(&self) -> &str {

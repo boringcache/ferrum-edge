@@ -186,6 +186,21 @@ pub(crate) fn is_rfc2782_root_target(host: &str) -> bool {
     host.trim_end_matches('.').is_empty()
 }
 
+/// Strip trailing root labels, reject the RFC 2782 `.` target, and ASCII-
+/// lowercase so the host matches `UpstreamTarget` admission (`validate_host_entry`
+/// requires lowercase; mixed-case DNS names must not be dropped as invalid).
+pub(crate) fn normalize_srv_target_host(target: impl std::fmt::Display) -> Option<String> {
+    let host = dns_name_without_trailing_root(target);
+    if is_rfc2782_root_target(&host) {
+        return None;
+    }
+    if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Some(host.to_ascii_lowercase())
+    } else {
+        Some(host)
+    }
+}
+
 /// One RFC 2782 SRV answer as returned by [`DnsCache::resolve_srv`].
 ///
 /// `resolve_srv` drops the root target (`.`) and port 0 before returning.
@@ -194,7 +209,7 @@ pub(crate) fn is_rfc2782_root_target(host: &str) -> bool {
 /// disaster-recovery tiers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SrvAnswer {
-    /// SRV target hostname with the trailing root label stripped.
+    /// SRV target hostname with the trailing root label stripped and ASCII-lowercased.
     pub host: String,
     /// Dial port. `resolve_srv` never returns `0`.
     pub port: u16,
@@ -206,20 +221,18 @@ pub struct SrvAnswer {
 
 /// Admit one SRV RR into a dialable [`SrvAnswer`].
 ///
-/// Discards the RFC 2782 root target and port 0. SRV ports are already `u16`,
-/// so the only `admit_registry_port` rejection that can occur here is `0`;
-/// DNS-SD still routes the surviving port through that helper for contract
-/// parity with Kubernetes and Consul.
+/// Discards the RFC 2782 root target and port 0, strips trailing root labels,
+/// and ASCII-lowercases the host. SRV ports are already `u16`, so the only
+/// `admit_registry_port` rejection that can occur here is `0`; DNS-SD still
+/// routes the surviving port through that helper for contract parity with
+/// Kubernetes and Consul.
 pub(crate) fn try_srv_answer(
     target: impl std::fmt::Display,
     port: u16,
     weight: u16,
     priority: u16,
 ) -> Option<SrvAnswer> {
-    let host = dns_name_without_trailing_root(target);
-    if is_rfc2782_root_target(&host) {
-        return None;
-    }
+    let host = normalize_srv_target_host(target)?;
     if port == 0 {
         return None;
     }
@@ -1695,15 +1708,26 @@ impl DnsCache {
             .map_err(|e| anyhow::anyhow!("SRV lookup failed for {}: {}", service_name, e))?;
 
         let mut results = Vec::new();
+        let mut dropped = 0usize;
         for record in srv_lookup.answers() {
             let RData::SRV(ref srv) = record.data else {
                 continue;
             };
             let Some(answer) = try_srv_answer(&srv.target, srv.port, srv.weight, srv.priority)
             else {
+                dropped += 1;
                 continue;
             };
             results.push(answer);
+        }
+
+        if dropped > 0 {
+            debug!(
+                service = %service_name,
+                dropped,
+                admitted = results.len(),
+                "SRV lookup discarded RFC 2782 unavailability records"
+            );
         }
 
         Ok(results)

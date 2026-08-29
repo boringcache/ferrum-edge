@@ -1185,6 +1185,14 @@ fn resolve_srv_discards_rfc2782_root_target_and_port_zero() {
         try_srv_answer_for_test("primary.example.com.", 0, 1, 10).is_none(),
         "port 0 is the RFC 2782 unavailability / non-dialable signal"
     );
+    assert!(
+        try_srv_answer_for_test("..", 8080, 1, 10).is_none(),
+        "dotted-only names are the DNS root after stripping trailing labels"
+    );
+    assert!(
+        try_srv_answer_for_test("...", 443, 1, 0).is_none(),
+        "dotted-only names at priority 0 must still be discarded"
+    );
 
     let answer = try_srv_answer_for_test("primary.example.com.", 8080, 7, 10)
         .expect("dialable SRV RR must be admitted");
@@ -1192,6 +1200,13 @@ fn resolve_srv_discards_rfc2782_root_target_and_port_zero() {
     assert_eq!(answer.port, 8080);
     assert_eq!(answer.weight, 7);
     assert_eq!(answer.priority, 10);
+
+    let mixed = try_srv_answer_for_test("Primary.Example.COM.", 65535, 65535, 0)
+        .expect("mixed-case dialable SRV RR must be admitted");
+    assert_eq!(mixed.host, "primary.example.com");
+    assert_eq!(mixed.port, 65535);
+    assert_eq!(mixed.weight, 65535);
+    assert_eq!(mixed.priority, 0);
 }
 
 // ============================================================================

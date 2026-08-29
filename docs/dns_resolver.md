@@ -103,7 +103,7 @@ The DNS-SD provider (`service_discovery.provider: dns_sd`) uses `DnsCache::resol
 - Target `.` (the DNS root; also the empty name after stripping the trailing root label)
 - Port `0`
 
-DNS-SD then admits every surviving port through the same `admit_registry_port` helper Kubernetes and Consul use (`1..=65535`, never wrap) and keeps **only the numerically-smallest remaining priority**. Same-tier records keep their SRV weights (weight `0` becomes `default_weight` so published targets match the static `1..=65535` weight contract).
+Surviving hosts are ASCII-lowercased so they match `UpstreamTarget` admission (`validate_host_entry` requires lowercase). DNS-SD then admits every surviving port through the same `admit_registry_port` helper Kubernetes and Consul use (`1..=65535`, never wrap) and keeps **only the numerically-smallest remaining priority**. Same-tier records keep their SRV weights (weight `0` becomes `default_weight` so published targets match the static `1..=65535` weight contract). Dropped-record and min-priority-filter diagnostics are counts plus the configured service name — never a dump of every RR.
 
 Invalid records are filtered **before** the minimum priority is chosen. A poisoned lowest tier (every RR at that priority is `.` or port 0) therefore does not occupy the live set: the next priority that still has a dialable host is used. That is the ingest-time reading of RFC 2782's "lowest-numbered priority it can reach". If nothing admissible remains at any priority, the snapshot is empty (fail-closed); the manager's existing empty-after-filter policy applies.
 

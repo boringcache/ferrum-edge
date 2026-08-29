@@ -12885,7 +12885,15 @@ components:
           description: Service discovery provider type
         dns_sd:
           type: [object, "null"]
-          description: DNS-SD (SRV record) configuration. Required when provider is `dns_sd`.
+          description: |
+            DNS-SD (SRV record) configuration. Required when provider is `dns_sd`.
+            The poller queries `service_name` off the request path and publishes
+            only the lowest admissible RFC 2782 priority after discarding the
+            root target `.` and port `0`. Surviving ports use the same
+            `1..=65535` admission as Kubernetes and Consul. Same-tier SRV
+            weights are preserved (weight `0` uses `default_weight`). A poisoned
+            lowest tier falls through to the next dialable priority; if nothing
+            admissible remains, the snapshot is empty.
           required: [service_name]
           properties:
             service_name:

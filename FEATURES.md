@@ -50,7 +50,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 
 ### Providers
 
-- **DNS-SD** — discovers targets via DNS SRV record lookups. Honors RFC 2782 priority tiers (live traffic uses only the lowest admissible priority; disaster-recovery records are not published alongside it) and the same `1..=65535` registry-port admission as Kubernetes/Consul. Configurable service name and poll interval.
+- **DNS-SD** — discovers targets via DNS SRV record lookups. Honors RFC 2782 priority tiers (live traffic uses only the lowest admissible priority; disaster-recovery records are not published alongside it), ASCII-lowercases SRV hosts for target admission, and uses the same `1..=65535` registry-port admission as Kubernetes/Consul. Configurable service name and poll interval.
 - **Kubernetes** — queries the Kubernetes API for endpoint addresses backing a named Service. Supports namespace scoping and named port selection. Requires in-cluster credentials or a configured kubeconfig.
 - **Consul** — queries a Consul agent or server for healthy service instances. Supports datacenter selection and ACL token authentication.
 - **Ferrum Mesh** — resolves CP-delivered mesh services and workload SPIFFE references into gateway upstream targets tagged with mesh identity metadata.

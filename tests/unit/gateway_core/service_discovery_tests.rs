@@ -6231,3 +6231,176 @@ fn dns_sd_falls_back_when_min_tier_has_no_admissible_records() {
         "poisoned min-priority RRs must not block a dialable higher-priority tier"
     );
 }
+
+#[test]
+fn dns_sd_priority_selection_is_order_independent() {
+    let targets = dns_sd_from_srv(
+        &[
+            ("dr", 8080, 9, 20),
+            ("alt", 0, 1, 10),
+            ("primary", 8080, 4, 10),
+        ],
+        1,
+    );
+    assert_eq!(
+        dns_sd_host_ports(&targets),
+        vec![("primary".to_string(), 8080, 4)],
+        "min-priority must not depend on RR order in the SRV response"
+    );
+}
+
+#[test]
+fn dns_sd_priority_zero_is_preferred() {
+    let targets = dns_sd_from_srv(
+        &[
+            ("standby", 8080, 1, 10),
+            ("primary", 8080, 2, 0),
+            ("dr", 8080, 3, 20),
+        ],
+        1,
+    );
+    assert_eq!(
+        dns_sd_host_ports(&targets),
+        vec![("primary".to_string(), 8080, 2)],
+        "RFC 2782 priority 0 is the highest preference"
+    );
+}
+
+#[test]
+fn dns_sd_poisoned_intermediate_tier_falls_through() {
+    let targets = dns_sd_from_srv(
+        &[
+            (".", 8080, 1, 10),
+            ("mid", 0, 1, 20),
+            ("far", 9090, 8, 30),
+        ],
+        1,
+    );
+    assert_eq!(
+        dns_sd_host_ports(&targets),
+        vec![("far".to_string(), 9090, 8)],
+        "each undialable tier must be skipped until a dialable priority remains"
+    );
+}
+
+#[test]
+fn dns_sd_empty_answers_fail_closed() {
+    let targets = dns_sd_from_srv(&[], 1);
+    assert!(
+        targets.is_empty(),
+        "an empty SRV answer set must publish no synthetic target"
+    );
+}
+
+#[test]
+fn dns_sd_equal_weights_publish_every_same_tier_record() {
+    let targets = dns_sd_from_srv(
+        &[("a.example", 8080, 1, 10), ("b.example", 8080, 1, 10)],
+        99,
+    );
+    assert_eq!(
+        dns_sd_host_ports(&targets),
+        vec![
+            ("a.example".to_string(), 8080, 1),
+            ("b.example".to_string(), 8080, 1),
+        ],
+        "equal same-tier weights must not drop a peer (selection is unbiased at ingest)"
+    );
+}
+
+#[test]
+fn dns_sd_same_host_two_ports_are_both_published() {
+    let targets = dns_sd_from_srv(
+        &[
+            ("primary.example", 8080, 1, 10),
+            ("primary.example", 8443, 1, 10),
+        ],
+        1,
+    );
+    assert_eq!(
+        dns_sd_host_ports(&targets),
+        vec![
+            ("primary.example".to_string(), 8080, 1),
+            ("primary.example".to_string(), 8443, 1),
+        ]
+    );
+}
+
+#[test]
+fn dns_sd_max_port_and_weight_are_admitted() {
+    let targets = dns_sd_from_srv(&[("primary.example", 65535, 65535, 10)], 1);
+    assert_eq!(
+        dns_sd_host_ports(&targets),
+        vec![("primary.example".to_string(), 65535, 65535)]
+    );
+}
+
+#[test]
+fn dns_sd_zero_weight_among_nonzero_peers_uses_default_weight() {
+    let targets = dns_sd_from_srv(
+        &[("a.example", 8080, 10, 10), ("b.example", 8080, 0, 10)],
+        3,
+    );
+    assert_eq!(
+        dns_sd_host_ports(&targets),
+        vec![
+            ("a.example".to_string(), 8080, 10),
+            ("b.example".to_string(), 8080, 3),
+        ]
+    );
+}
+
+#[test]
+fn dns_sd_mixed_case_host_is_lowercased_for_admission() {
+    let targets = dns_sd_from_srv(&[("Primary.Example.COM.", 8080, 1, 10)], 1);
+    assert_eq!(
+        dns_sd_host_ports(&targets),
+        vec![("primary.example.com".to_string(), 8080, 1)],
+        "mixed-case DNS names must be lowercased so validate_host_entry cannot drop them"
+    );
+}
+
+#[test]
+fn dns_sd_dotted_only_names_are_root_targets() {
+    let targets = dns_sd_from_srv(
+        &[
+            ("..", 8080, 1, 10),
+            ("...", 8080, 1, 10),
+            ("primary", 8080, 1, 10),
+        ],
+        1,
+    );
+    assert_eq!(
+        dns_sd_host_ports(&targets),
+        vec![("primary".to_string(), 8080, 1)]
+    );
+}
+
+#[test]
+fn dns_sd_combined_resolve_then_select_matches_issue_fixture() {
+    use ferrum_edge::_test_support::try_srv_answer_for_test;
+
+    let answers = [
+        ("primary", 8080, 1u16, 10u16),
+        ("dr", 8080, 1, 20),
+        ("alt", 0, 1, 10),
+        (".", 8080, 1, 10),
+        ("Primary.Example.COM.", 8080, 5, 10),
+    ]
+    .into_iter()
+    .filter_map(|(host, port, weight, priority)| {
+        try_srv_answer_for_test(host, port, weight, priority)
+    })
+    .map(|answer| (answer.host, answer.port, answer.weight, answer.priority))
+    .collect();
+
+    let targets = ferrum_edge::_test_support::dns_sd_targets_from_srv_records_for_test(answers, 1);
+    assert_eq!(
+        dns_sd_host_ports(&targets),
+        vec![
+            ("primary".to_string(), 8080, 1),
+            ("primary.example.com".to_string(), 8080, 5),
+        ],
+        "resolve_srv admission plus min-priority must keep every dialable live-tier host"
+    );
+}

@@ -1870,6 +1870,10 @@ pub enum SdProvider {
 }
 
 /// DNS-SD specific configuration (SRV record-based discovery).
+///
+/// The poller honors RFC 2782: undialable RRs (root target `.`, port 0) are
+/// dropped, remaining ports use the same `1..=65535` admission as Kubernetes
+/// and Consul, and only the lowest remaining priority is published.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DnsSdConfig {
     /// The DNS name to query for SRV records (e.g., "_http._tcp.my-service.example.com").
