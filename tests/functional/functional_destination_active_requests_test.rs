@@ -183,11 +183,20 @@ async fn functional_destination_active_requests_release_on_client_disconnect() {
     assert_destination_shed(status, &body, "request while the first is held");
     backend.assert_hits_eq(1, SETTLE).await;
 
-    // Client goes away mid-exchange: abort the in-flight task and drop the
-    // client so its connection is closed. The backend never answered, so the
-    // ONLY way the budget frees is the RAII permit riding the cancelled
-    // response body.
+    // Client goes away mid-exchange: abort the in-flight task, then wait until
+    // Tokio has actually dropped that future before probing admission again.
+    // Without the join, a busy runtime can leave the task's cloned client (and
+    // therefore its connection) alive while the follow-up request races it.
+    // The backend never answered, so the ONLY way the budget frees is the RAII
+    // permit riding the cancelled response body.
     hold.abort();
+    let cancelled = hold
+        .await
+        .expect_err("held request task must be cancelled before the release probe");
+    assert!(
+        cancelled.is_cancelled(),
+        "held request task must end by cancellation: {cancelled}"
+    );
     drop(hold_client);
 
     let after = tokio::spawn({
