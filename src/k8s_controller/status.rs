@@ -31,7 +31,7 @@ use crate::k8s_controller::metrics::{
 };
 use crate::k8s_controller::status_budget::{
     STATUS_BATCH_BUDGET, STATUS_BATCH_SLOW_WARN, STATUS_REQUEST_BUDGET, STATUS_UPDATE_BUDGET,
-    StatusOperation, await_status_operation, is_status_timeout_error, status_operation_budget,
+    StatusOperation, await_status_operation, status_operation_budget,
 };
 use crate::k8s_controller::status_plan::{
     StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
@@ -212,7 +212,12 @@ async fn patch_gateway_status_with_apply(
     metrics: Option<&ControllerMetrics>,
     deadline: Instant,
 ) -> Result<(), kube::Error> {
-    let live_status = match await_status_operation(
+    // The apply document must carry this read's resourceVersion. Dropping a
+    // timed-out SSA future does not prove the API server rejected it; without a
+    // CAS token, the same forced field manager can land a stale apply after a
+    // newer successful reconcile. Fail closed so the status-plan cursor stays
+    // put and the object retries.
+    let live = match await_status_operation(
         status_operation("read", update),
         deadline,
         STATUS_REQUEST_BUDGET,
@@ -221,12 +226,7 @@ async fn patch_gateway_status_with_apply(
     )
     .await
     {
-        Ok(live) => live.data.get("status").cloned(),
-        // A spent budget is not "the status is unreadable": applying a Gateway
-        // status computed without the live document would spend the batch's
-        // remaining time on a write we could not bound either. Leave the object
-        // for the next reconcile instead.
-        Err(error) if is_status_timeout_error(&error) => return Err(error),
+        Ok(live) => live,
         Err(error) => {
             warn!(
                 api_version = %update.api_version,
@@ -234,12 +234,35 @@ async fn patch_gateway_status_with_apply(
                 namespace = %update.namespace,
                 name = %update.name,
                 error = %error,
-                "Gateway API status read failed; applying planned Gateway status"
+                "Gateway API status read failed; refusing unguarded SSA write"
             );
-            None
+            return Err(error);
         }
     };
-    let patch = gateway_status_apply_patch_for_update(update, live_status.as_ref());
+    let Some(resource_version) = live_status_resource_version(&live) else {
+        warn!(
+            api_version = %update.api_version,
+            kind = %update.kind,
+            namespace = %update.namespace,
+            name = %update.name,
+            "Gateway API status read returned no resourceVersion; refusing unguarded SSA write"
+        );
+        return Err(missing_status_resource_version_error(update));
+    };
+    let Some(patch) = gateway_status_apply_patch_for_update(
+        update,
+        live.data.get("status"),
+        resource_version,
+    ) else {
+        warn!(
+            api_version = %update.api_version,
+            kind = %update.kind,
+            namespace = %update.namespace,
+            name = %update.name,
+            "Gateway API status apply document refused an empty resourceVersion"
+        );
+        return Err(missing_status_resource_version_error(update));
+    };
 
     // Gateway/GatewayClass condition and listener arrays are structural
     // list-maps, so SSA can own Ferrum's keyed entries without copying fields
@@ -255,6 +278,23 @@ async fn patch_gateway_status_with_apply(
     )
     .await
     .map(|_| ())
+}
+
+fn live_status_resource_version(live: &DynamicObject) -> Option<&str> {
+    live.metadata
+        .resource_version
+        .as_deref()
+        .filter(|value| !value.is_empty())
+}
+
+fn missing_status_resource_version_error(update: &GatewayApiStatusUpdate) -> kube::Error {
+    let message = format!(
+        "Ferrum refused Gateway API status apply for {} {}/{}: live status had no resourceVersion",
+        update.kind, update.namespace, update.name
+    );
+    let mut status = kube::core::Status::failure(&message, "Invalid");
+    status.code = 422;
+    kube::Error::Api(status.boxed())
 }
 
 fn status_operation<'a>(phase: &'a str, update: &'a GatewayApiStatusUpdate) -> StatusOperation<'a> {
@@ -2991,10 +3031,23 @@ fn route_status_patch_params() -> PatchParams {
     }
 }
 
-fn gateway_status_apply_patch_for_update(
+/// Build the Gateway/GatewayClass/ListenerSet (and other SSA-kind) status apply
+/// document. Returns `None` when `resource_version` is empty so a caller cannot
+/// emit an unguarded SSA write.
+///
+/// kube serializes [`Patch::Apply`] with `serde_json::to_vec` and sends that
+/// body as `application/apply-patch+yaml`. Kubernetes unmarshals
+/// `metadata.resourceVersion` from that body and uses it as the etcd
+/// compare-and-swap precondition on the subsequent update; `force` wins field
+/// ownership, not a stale resourceVersion.
+pub fn gateway_status_apply_patch_for_update(
     update: &GatewayApiStatusUpdate,
     live_status: Option<&Value>,
-) -> Value {
+    resource_version: &str,
+) -> Option<Value> {
+    if resource_version.is_empty() {
+        return None;
+    }
     let mut status_patch = serde_json::Map::new();
 
     match update.kind.as_str() {
@@ -3050,6 +3103,10 @@ fn gateway_status_apply_patch_for_update(
             Value::String(update.namespace.clone()),
         );
     }
+    metadata.insert(
+        "resourceVersion".to_string(),
+        Value::String(resource_version.to_string()),
+    );
 
     let mut patch = serde_json::Map::new();
     patch.insert(
@@ -3059,7 +3116,7 @@ fn gateway_status_apply_patch_for_update(
     patch.insert("kind".to_string(), Value::String(update.kind.clone()));
     patch.insert("metadata".to_string(), Value::Object(metadata));
     patch.insert("status".to_string(), Value::Object(status_patch));
-    Value::Object(patch)
+    Some(Value::Object(patch))
 }
 
 fn route_status_merge_patch_for_update(
@@ -6676,7 +6733,8 @@ mod tests {
             ]
         });
 
-        let patch = gateway_status_apply_patch_for_update(&update, Some(&live_status));
+        let patch = gateway_status_apply_patch_for_update(&update, Some(&live_status), "77")
+            .expect("non-empty resourceVersion must produce an apply document");
 
         assert_eq!(
             patch["apiVersion"].as_str(),
@@ -6685,6 +6743,7 @@ mod tests {
         assert_eq!(patch["kind"].as_str(), Some("Gateway"));
         assert_eq!(patch["metadata"]["name"].as_str(), Some("edge"));
         assert_eq!(patch["metadata"]["namespace"].as_str(), Some("default"));
+        assert_eq!(patch["metadata"]["resourceVersion"].as_str(), Some("77"));
         assert!(patch["status"].get("addresses").is_none());
         let conditions = patch["status"]["conditions"].as_array().unwrap();
         assert_condition(conditions, "Accepted", "True");
@@ -6723,7 +6782,9 @@ mod tests {
             patch_gateway_addresses: false,
             patch_gateway_listeners: false,
         };
-        let listenerset_patch = gateway_status_apply_patch_for_update(&listenerset_update, None);
+        let listenerset_patch =
+            gateway_status_apply_patch_for_update(&listenerset_update, None, "11")
+                .expect("non-empty resourceVersion must produce an apply document");
         assert_eq!(
             listenerset_patch["status"]["conditions"]
                 .as_array()
@@ -6828,10 +6889,12 @@ mod tests {
             patch_gateway_listeners: false,
         };
 
-        let patch = gateway_status_apply_patch_for_update(&update, None);
+        let patch = gateway_status_apply_patch_for_update(&update, None, "9")
+            .expect("non-empty resourceVersion must produce an apply document");
 
         assert_eq!(patch["metadata"]["name"].as_str(), Some("ferrum"));
         assert!(patch["metadata"].get("namespace").is_none());
+        assert_eq!(patch["metadata"]["resourceVersion"].as_str(), Some("9"));
     }
 
     fn assert_condition(conditions: &[Value], condition_type: &str, status: &str) {

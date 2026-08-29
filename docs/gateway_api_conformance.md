@@ -651,7 +651,13 @@ apply document can own Ferrum's entries without copying or claiming another
 manager's fields. The ListenerSet document is limited to Ferrum's
 `Accepted`/`Programmed` conditions and the listener entries it reconciles.
 Ferrum sets `force=true` to reclaim the status fields it continuously
-reconciles after upgrades or legacy merge-patch writes.
+reconciles after upgrades or legacy merge-patch writes. Every SSA status write
+also copies the freshly read object's non-empty `metadata.resourceVersion` into
+the apply document as a compare-and-swap precondition: dropping a timed-out
+client future does not cancel the API server's work, and without that token a
+later-arriving apply from the same forced field manager could overwrite a newer
+reconcile. A live status read that fails or has no `resourceVersion` refuses the
+write so the status-plan cursor stays unchanged.
 
 Route `status.parents` is an atomic list in the upstream Gateway API CRDs, so a
 partial server-side apply would still replace the entire list and could remove

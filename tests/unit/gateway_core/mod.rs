@@ -64,6 +64,7 @@ mod http3_websocket_tests;
 mod json_dup_keys_tests;
 mod k8s_controller_metrics_tests;
 mod k8s_controller_rbac_parity_tests;
+mod k8s_gateway_status_ssa_cas_tests;
 mod k8s_headless_service_dns_fallback_tests;
 mod k8s_listenerset_translation_tests;
 mod k8s_status_budget_tests;

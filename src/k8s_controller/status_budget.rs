@@ -135,12 +135,13 @@ pub fn is_status_timeout_error(error: &kube::Error) -> bool {
 /// the object identity — the evidence that was missing when the whole batch was
 /// dropped by one outer timeout.
 ///
-/// Dropping an in-flight status write is safe: Gateway/GatewayClass status uses
-/// server-side apply under a stable field manager, and route/policy status uses
-/// a `resourceVersion`-guarded merge patch. A write that lands after we stop
-/// waiting is therefore either exactly what we planned or rejected as a 409 on
-/// the next attempt; it can never publish a status we did not compute, and it
-/// can never clobber another controller's `parents[]` entry.
+/// Dropping the client future does **not** prove the API server rejected the
+/// request: a timed-out write can still finish later. Safety therefore comes
+/// from compare-and-swap, not from cancellation. Gateway/GatewayClass/ListenerSet
+/// SSA documents carry the freshly read `metadata.resourceVersion`; route/policy
+/// merge patches already did. A late apply against a newer live object is a 409,
+/// not a stale overwrite of Ferrum-owned conditions. A live read that fails or
+/// lacks a non-empty `resourceVersion` must not issue the write.
 pub async fn await_status_operation<T, F>(
     operation: StatusOperation<'_>,
     deadline: Instant,
