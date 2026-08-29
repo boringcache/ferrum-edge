@@ -360,24 +360,21 @@ async fn connect_backend(
             target_url: Some(target_url.clone()),
             resolved_ip: None,
         })?;
-    let candidates = match screen_ordinary_inbound_hbone_relay_dns_candidates(
-        proxy,
-        mesh,
-        candidates,
-    ) {
-        Ok(candidates) => candidates,
-        Err(denial) => {
-            return Err(HboneConnectError {
-                status: StatusCode::FORBIDDEN,
-                body: br#"{"error":"HBONE relay destination not allowed"}"#,
-                phase: "hbone_relay_destination_denied",
-                class: retry::ErrorClass::DispatchPolicyRejected,
-                message: denial.as_str().to_string(),
-                target_url: Some(target_url),
-                resolved_ip: None,
-            });
-        }
-    };
+    let candidates =
+        match screen_ordinary_inbound_hbone_relay_dns_candidates(proxy, mesh, candidates) {
+            Ok(candidates) => candidates,
+            Err(denial) => {
+                return Err(HboneConnectError {
+                    status: StatusCode::FORBIDDEN,
+                    body: br#"{"error":"HBONE relay destination not allowed"}"#,
+                    phase: "hbone_relay_destination_denied",
+                    class: retry::ErrorClass::DispatchPolicyRejected,
+                    message: denial.as_str().to_string(),
+                    target_url: Some(target_url),
+                    resolved_ip: None,
+                });
+            }
+        };
     let socket_mark = (proxy.id == MESH_INBOUND_HBONE_RELAY_PROXY_ID
         && node_waypoint_inbound_relay_mark_enabled())
     .then_some(NODE_WAYPOINT_INBOUND_AUTH_MARK);
@@ -911,10 +908,7 @@ pub(super) async fn handle_hbone_request(
                 if let Some(target) = err.target_url.as_deref() {
                     ctx.metadata.insert(
                         MESH_RELAY_DENIAL_DESTINATION_METADATA_KEY.to_string(),
-                        target
-                            .strip_prefix("tcp://")
-                            .unwrap_or(target)
-                            .to_string(),
+                        target.strip_prefix("tcp://").unwrap_or(target).to_string(),
                     );
                 }
                 if let Some(terminator_ip) = ctx.mesh_inbound_terminator_ip {

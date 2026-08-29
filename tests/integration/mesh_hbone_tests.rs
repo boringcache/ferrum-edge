@@ -1965,7 +1965,12 @@ fn inbound_relay_resolved_ip_loopback_namespace_uses_canonical_semantics() {
             "{loopback} is in the loopback namespace after canonicalization"
         );
     }
-    for safe in ["10.244.2.9", "::ffff:10.244.2.9", "192.0.2.10", "2001:db8::9"] {
+    for safe in [
+        "10.244.2.9",
+        "::ffff:10.244.2.9",
+        "192.0.2.10",
+        "2001:db8::9",
+    ] {
         assert!(
             !inbound_relay_resolved_ip_is_loopback_namespace(ip(safe)),
             "{safe} must remain eligible"
@@ -2140,11 +2145,7 @@ fn inbound_hbone_dns_screen_denial_releases_half_open_probe_without_tripping() {
     assert_eq!(cb.state_name(), "half_open");
     assert_eq!(cb.half_open_in_flight(), 1);
 
-    settle_hbone_backend_connect_circuit_breaker_outcome_for_test(
-        &cb,
-        StatusCode::FORBIDDEN,
-        true,
-    );
+    settle_hbone_backend_connect_circuit_breaker_outcome_for_test(&cb, StatusCode::FORBIDDEN, true);
     assert_eq!(
         cb.state_name(),
         "half_open",
@@ -2188,7 +2189,9 @@ fn inbound_hbone_dns_screen_denial_settles_half_open_via_production_helper() {
         "connect_backend error arm must settle the same selected-target breaker"
     );
     assert_eq!(
-        collapsed.matches("settle_hbone_backend_connect_circuit_breaker_outcome").count(),
+        collapsed
+            .matches("settle_hbone_backend_connect_circuit_breaker_outcome")
+            .count(),
         2,
         "helper definition plus the one connect_backend error-arm call site"
     );
