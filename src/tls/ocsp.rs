@@ -45,9 +45,22 @@
 //!    the `BasicOCSPResponse` signature BIT STRING must be octet-aligned
 //!    (`unused_bits == 0`) and nonempty, because the verifier hashes only the
 //!    payload bytes and would otherwise accept a second encoding of the same
-//!    signature; and `AlgorithmIdentifier` parameters are either absent or the
-//!    canonical NULL real OCSP responders emit, except `rsassa-pss`, whose
-//!    RFC profile carries a SEQUENCE. `ResponseData.version` must be absent:
+//!    signature; and `AlgorithmIdentifier` parameters follow a field- and
+//!    algorithm-specific profile rather than one absent-or-NULL rule for every
+//!    OID. `CertID.hashAlgorithm` accepts the two standards-compatible forms
+//!    for digest identifiers — absent or canonical NULL — including unknown
+//!    hash OIDs at the certificate-independent admin boundary (full validation
+//!    still refuses an unsupported hash). `BasicOCSPResponse.signatureAlgorithm`
+//!    applies the verifier-supported family: `ecdsa-with-SHA256` /
+//!    `ecdsa-with-SHA384` and Ed25519 require absent parameters (RFC 5758 /
+//!    RFC 8410), so a NULL that `x509_parser::verify_signature` would ignore is
+//!    refused; RSA PKCS#1 (`sha*WithRSAEncryption`) requires the canonical
+//!    NULL RFC 3279 and RFC 5754 specify when generating, so this
+//!    strict-stapling policy rejects an omitted NULL; `rsassa-pss` requires
+//!    present parameters parseable on the verification path, with no trailing
+//!    or DEFAULT-encoded fields that parser would otherwise ignore. An unknown
+//!    signature OID is refused at this grammar so it cannot be stored or
+//!    served. `ResponseData.version` must be absent:
 //!    DER omits a `DEFAULT` value, so an explicit `[0] INTEGER 0` would be a
 //!    second encoding of one signed object, and any other version is
 //!    unsupported. Every certificate carried in `certs` must parse as one
@@ -106,11 +119,24 @@ use x509_parser::asn1_rs::{Any, BitString, Class, FromDer, GeneralizedTime, Oid,
 use x509_parser::certificate::X509Certificate;
 use x509_parser::oid_registry::{
     OID_HASH_SHA1, OID_NIST_HASH_SHA256, OID_NIST_HASH_SHA384, OID_NIST_HASH_SHA512,
-    OID_PKCS1_RSASSAPSS,
+    OID_PKCS1_RSASSAPSS, OID_PKCS1_SHA1WITHRSA, OID_PKCS1_SHA256WITHRSA, OID_PKCS1_SHA384WITHRSA,
+    OID_PKCS1_SHA512WITHRSA, OID_SHA1_WITH_RSA, OID_SIG_ECDSA_WITH_SHA256,
+    OID_SIG_ECDSA_WITH_SHA384, OID_SIG_ED25519,
 };
+use x509_parser::signature_algorithm::RsaSsaPssParams;
 use x509_parser::x509::{AlgorithmIdentifier, SubjectPublicKeyInfo};
 
 use crate::fips::backend::digest;
+
+/// Which `AlgorithmIdentifier` is being parsed, so parameter rules can follow
+/// the field and the algorithm instead of one blanket absent-or-NULL profile.
+#[derive(Debug, Clone, Copy)]
+enum AlgorithmParameterProfile {
+    /// `CertID.hashAlgorithm` and nested digest identifiers inside PSS.
+    Digest,
+    /// `BasicOCSPResponse.signatureAlgorithm`.
+    Signature,
+}
 
 /// Maximum accepted size of a stapled OCSP response, in bytes.
 ///
@@ -128,6 +154,9 @@ pub const OCSP_CLOCK_SKEW_SECONDS: i64 = 300;
 
 /// DER content bytes of `id-pkix-ocsp-basic` (1.3.6.1.5.5.7.48.1.1).
 const OID_PKIX_OCSP_BASIC_BYTES: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01];
+
+/// DER content bytes of `id-mgf1` (1.2.840.113549.1.1.8).
+const OID_MGF1_BYTES: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08];
 
 /// Outcome of the certificate-independent structural pass.
 ///
@@ -386,19 +415,21 @@ fn is_canonical_null(any: &Any<'_>) -> bool {
 }
 
 /// Parse one `AlgorithmIdentifier`, validating the OID encoding and applying
-/// the RFC parameter profile for algorithms this grammar actually uses.
+/// the field- and algorithm-specific parameter profile.
 fn parse_algorithm_identifier<'a>(
     input: &'a [u8],
     field: &str,
+    profile: AlgorithmParameterProfile,
 ) -> Result<(AlgorithmIdentifier<'a>, &'a [u8]), String> {
     let (any, _, rest) = take_tlv(input)?;
     let content = expect_sequence(&any, field)?;
-    Ok((parse_algorithm_identifier_content(content, field)?, rest))
+    Ok((parse_algorithm_identifier_content(content, field, profile)?, rest))
 }
 
 fn parse_algorithm_identifier_content<'a>(
     content: &'a [u8],
     field: &str,
+    profile: AlgorithmParameterProfile,
 ) -> Result<AlgorithmIdentifier<'a>, String> {
     let (oid_any, _, rest) = take_tlv(content)?;
     let algorithm = expect_oid(&oid_any, field)?;
@@ -409,28 +440,206 @@ fn parse_algorithm_identifier_content<'a>(
         if !trailing.is_empty() {
             return Err(format!("OCSP {field} has trailing fields after parameters"));
         }
-        validate_algorithm_parameters(&algorithm, &params_any, field)?;
         Some(params_any)
     };
+    validate_algorithm_parameters(&algorithm, parameters.as_ref(), field, profile)?;
     Ok(AlgorithmIdentifier::new(algorithm, parameters))
 }
 
-/// Supported hash and signature algorithms take absent or canonical NULL
-/// parameters — both encodings appear on real OCSP responders. `rsassa-pss`
-/// is the exception: its RFC 4055 profile carries a SEQUENCE, not NULL.
+/// Apply the parameter profile for this field and OID.
+///
+/// Digest identifiers (CertID and nested PSS hashes) accept the two encodings
+/// RFC 4055 / RFC 5754 require receivers to handle: absent, or canonical NULL.
+/// Signature identifiers follow the verifier-supported family instead of that
+/// digest rule, because `x509_parser::verify::verify_signature` selects ECDSA,
+/// Ed25519, and RSA PKCS#1 by OID and ignores parameters on those paths.
 fn validate_algorithm_parameters(
     oid: &Oid<'_>,
-    params: &Any<'_>,
+    params: Option<&Any<'_>>,
+    field: &str,
+    profile: AlgorithmParameterProfile,
+) -> Result<(), String> {
+    match profile {
+        AlgorithmParameterProfile::Digest => validate_digest_parameters(params, field),
+        AlgorithmParameterProfile::Signature => validate_signature_parameters(oid, params, field),
+    }
+}
+
+fn validate_digest_parameters(params: Option<&Any<'_>>, field: &str) -> Result<(), String> {
+    match params {
+        None => Ok(()),
+        Some(params) if is_canonical_null(params) => Ok(()),
+        Some(_) => Err(format!("OCSP {field} parameters are not absent or NULL")),
+    }
+}
+
+fn ecdsa_or_ed25519_signature_oid(oid: &Oid<'_>) -> bool {
+    *oid == OID_SIG_ECDSA_WITH_SHA256
+        || *oid == OID_SIG_ECDSA_WITH_SHA384
+        || *oid == OID_SIG_ED25519
+}
+
+fn rsa_pkcs1_signature_oid(oid: &Oid<'_>) -> bool {
+    *oid == OID_PKCS1_SHA1WITHRSA
+        || *oid == OID_PKCS1_SHA256WITHRSA
+        || *oid == OID_PKCS1_SHA384WITHRSA
+        || *oid == OID_PKCS1_SHA512WITHRSA
+        || *oid == OID_SHA1_WITH_RSA
+}
+
+fn validate_signature_parameters(
+    oid: &Oid<'_>,
+    params: Option<&Any<'_>>,
     field: &str,
 ) -> Result<(), String> {
+    if ecdsa_or_ed25519_signature_oid(oid) {
+        return match params {
+            None => Ok(()),
+            Some(_) => Err(format!("OCSP {field} parameters must be absent")),
+        };
+    }
+    if rsa_pkcs1_signature_oid(oid) {
+        // RFC 3279 §2.2.1 and RFC 5754 §2: when *generating* sha*WithRSAEncryption
+        // the parameters MUST be NULL. Receivers must also accept an omitted
+        // NULL, but this is a strict stapling gate: an encoding some clients
+        // still reject is not served. Canonical NULL is what real responders
+        // emit.
+        return match params {
+            Some(params) if is_canonical_null(params) => Ok(()),
+            _ => Err(format!("OCSP {field} parameters must be the canonical NULL")),
+        };
+    }
     if *oid == OID_PKCS1_RSASSAPSS {
-        expect_sequence(params, &format!("{field} parameters"))?;
-        return Ok(());
+        let Some(params) = params else {
+            return Err(format!("OCSP {field} rsassa-pss parameters are absent"));
+        };
+        return validate_rsassa_pss_parameters(params, field);
     }
-    if is_canonical_null(params) {
-        return Ok(());
+    Err(format!(
+        "OCSP {field} uses an algorithm whose parameters cannot be validated"
+    ))
+}
+
+/// Parse one optional `[n] EXPLICIT` wrapper and return the inner object.
+fn take_optional_explicit<'a>(
+    input: &'a [u8],
+    tag: u32,
+    field: &str,
+) -> Result<(Option<Any<'a>>, &'a [u8]), String> {
+    if input.is_empty() {
+        return Ok((None, input));
     }
-    Err(format!("OCSP {field} parameters are not absent or NULL"))
+    let (any, _, rest) = take_tlv(input)?;
+    if context_tag(&any) != Some(tag) {
+        return Ok((None, input));
+    }
+    let content = explicit_context(&any, tag, field)?;
+    let (inner, _, trailing) = take_tlv(content)?;
+    if !trailing.is_empty() {
+        return Err(format!("OCSP {field} has trailing bytes"));
+    }
+    Ok((Some(inner), rest))
+}
+
+fn pss_hash_output_len(oid: &Oid<'_>) -> Option<u32> {
+    if *oid == OID_NIST_HASH_SHA256 {
+        Some(32)
+    } else if *oid == OID_NIST_HASH_SHA384 {
+        Some(48)
+    } else if *oid == OID_NIST_HASH_SHA512 {
+        Some(64)
+    } else {
+        None
+    }
+}
+
+/// `rsassa-pss` parameters must be a SEQUENCE the verification path can parse,
+/// without trailing or DEFAULT-encoded fields that `RsaSsaPssParams::try_from`
+/// would otherwise ignore.
+///
+/// This is not a complete RFC 4055 strictness claim. It is the subset that
+/// matches what `x509_parser::verify::verify_signature` actually uses (the hash
+/// OID, mapped onto ring's MGF1-same-hash / salt-length-equals-hash PSS
+/// algorithms) and that refuses a second encoding a strict client would reject.
+fn validate_rsassa_pss_parameters(params: &Any<'_>, field: &str) -> Result<(), String> {
+    let pss_field = format!("{field} rsassa-pss parameters");
+    let content = expect_sequence(params, &pss_field)?;
+    if RsaSsaPssParams::try_from(params).is_err() {
+        return Err(format!("OCSP {pss_field} are not parseable"));
+    }
+
+    let hash_field = format!("{field} rsassa-pss hashAlgorithm");
+    let (hash_any, rest) = take_optional_explicit(content, 0, &hash_field)?;
+    let Some(hash_any) = hash_any else {
+        return Err(format!("OCSP {hash_field} is absent"));
+    };
+    let hash_content = expect_sequence(&hash_any, &hash_field)?;
+    let hash_alg = parse_algorithm_identifier_content(
+        hash_content,
+        &hash_field,
+        AlgorithmParameterProfile::Digest,
+    )?;
+    let Some(hash_len) = pss_hash_output_len(&hash_alg.algorithm) else {
+        return Err(format!(
+            "OCSP {hash_field} is not SHA-256, SHA-384, or SHA-512"
+        ));
+    };
+
+    let mgf_field = format!("{field} rsassa-pss maskGenAlgorithm");
+    let (mgf_any, rest) = take_optional_explicit(rest, 1, &mgf_field)?;
+    let Some(mgf_any) = mgf_any else {
+        return Err(format!("OCSP {mgf_field} is absent"));
+    };
+    let mgf_content = expect_sequence(&mgf_any, &mgf_field)?;
+    let (mgf_oid_any, _, mgf_rest) = take_tlv(mgf_content)?;
+    let mgf_oid = expect_oid(&mgf_oid_any, &mgf_field)?;
+    if mgf_oid.as_bytes() != OID_MGF1_BYTES {
+        return Err(format!("OCSP {mgf_field} is not id-mgf1"));
+    }
+    if mgf_rest.is_empty() {
+        return Err(format!("OCSP {mgf_field} parameters are absent"));
+    }
+    let (mgf_hash_any, _, mgf_trailing) = take_tlv(mgf_rest)?;
+    if !mgf_trailing.is_empty() {
+        return Err(format!(
+            "OCSP {mgf_field} has trailing fields after parameters"
+        ));
+    }
+    let mgf_hash_field = format!("{mgf_field} hashAlgorithm");
+    let mgf_hash_content = expect_sequence(&mgf_hash_any, &mgf_hash_field)?;
+    let mgf_hash = parse_algorithm_identifier_content(
+        mgf_hash_content,
+        &mgf_hash_field,
+        AlgorithmParameterProfile::Digest,
+    )?;
+    if mgf_hash.algorithm != hash_alg.algorithm {
+        return Err(format!("OCSP {mgf_field} hash does not match hashAlgorithm"));
+    }
+
+    let salt_field = format!("{field} rsassa-pss saltLength");
+    let (salt_any, rest) = take_optional_explicit(rest, 2, &salt_field)?;
+    let Some(salt_any) = salt_any else {
+        return Err(format!("OCSP {salt_field} is absent"));
+    };
+    let salt_content = expect_der_integer(&salt_any, &salt_field, true)?;
+    let salt = decode_nonnegative_integer(salt_content, &salt_field)?;
+    if salt != hash_len {
+        return Err(format!(
+            "OCSP {salt_field} does not match the hash output length"
+        ));
+    }
+
+    let trailer_field = format!("{field} rsassa-pss trailerField");
+    let (trailer_any, rest) = take_optional_explicit(rest, 3, &trailer_field)?;
+    if trailer_any.is_some() {
+        return Err(format!(
+            "OCSP {trailer_field} is encoded; DER omits a DEFAULT value"
+        ));
+    }
+    if !rest.is_empty() {
+        return Err(format!("OCSP {pss_field} have trailing fields"));
+    }
+    Ok(())
 }
 
 /// Require a universal, primitive `GeneralizedTime` and decode it.
@@ -570,7 +779,11 @@ fn parse_basic_response(der: &[u8]) -> Result<BasicResponse<'_>, String> {
     let tbs_content = expect_sequence(&tbs_any, "tbsResponseData")?;
     let response_data = parse_response_data(tbs_content)?;
 
-    let (signature_algorithm, rest) = parse_algorithm_identifier(rest, "signatureAlgorithm")?;
+    let (signature_algorithm, rest) = parse_algorithm_identifier(
+        rest,
+        "signatureAlgorithm",
+        AlgorithmParameterProfile::Signature,
+    )?;
 
     let (signature_any, _, rest) = take_tlv(rest)?;
     let signature = expect_octet_aligned_bit_string(&signature_any, "signature")?;
@@ -973,7 +1186,11 @@ fn validate_extensions(content: &[u8], field: &str) -> Result<(), String> {
 }
 
 fn parse_cert_id(input: &[u8]) -> Result<CertId<'_>, String> {
-    let (hash_algorithm, rest) = parse_algorithm_identifier(input, "CertID hashAlgorithm")?;
+    let (hash_algorithm, rest) = parse_algorithm_identifier(
+        input,
+        "CertID hashAlgorithm",
+        AlgorithmParameterProfile::Digest,
+    )?;
 
     let (name_hash_any, _, rest) = take_tlv(rest)?;
     let issuer_name_hash = expect_primitive(&name_hash_any, Tag::OctetString, "issuerNameHash")?;

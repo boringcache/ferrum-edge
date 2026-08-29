@@ -102,7 +102,20 @@ fn generalized_time(unix: i64) -> Vec<u8> {
 
 const OID_SHA1: &[u8] = &[0x2b, 0x0e, 0x03, 0x02, 0x1a];
 const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+/// id-sha224 (2.16.840.1.101.3.4.2.4): a real digest OID Ferrum does not use
+/// for CertID binding.
+const OID_SHA224: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04];
 const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
+/// sha256WithRSAEncryption (1.2.840.113549.1.1.11).
+const OID_SHA256_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
+/// id-rsassa-pss (1.2.840.113549.1.1.10).
+const OID_RSASSA_PSS: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a];
+/// id-mgf1 (1.2.840.113549.1.1.8).
+const OID_MGF1: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08];
+/// ecdsa-with-SHA512 (1.2.840.10045.4.3.4): same family as the supported ECDSA
+/// OIDs, but not a verifier-supported signature algorithm.
+const OID_ECDSA_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04];
 const OID_OCSP_BASIC: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01];
 /// `id-pkix-ocsp-nonce` (1.3.6.1.5.5.7.48.1.2): a real OCSP extension Ferrum
 /// does not implement, used here as the stand-in unknown extension.
@@ -156,6 +169,18 @@ fn algorithm_identifier_with_params(oid_bytes: &[u8], params: Option<&[u8]>) -> 
         Some(params) => sequence(&[oid(oid_bytes), params.to_vec()]),
         None => sequence(&[oid(oid_bytes)]),
     }
+}
+
+/// Canonical `rsassa-pss` parameters for SHA-256: present hash, MGF1 with the
+/// same hash, saltLength 32, trailerField omitted.
+fn rsassa_pss_sha256_parameters() -> Vec<u8> {
+    let hash_alg = algorithm_identifier(OID_SHA256);
+    let mgf1 = algorithm_identifier_with_params(OID_MGF1, Some(&hash_alg));
+    sequence(&[
+        explicit(0, &hash_alg),
+        explicit(1, &mgf1),
+        explicit(2, &tlv(0x02, &[32])),
+    ])
 }
 
 fn sha1(data: &[u8]) -> Vec<u8> {
@@ -496,6 +521,9 @@ struct ResponseBuilder<'a> {
     hash_algorithm_parameters: Option<Vec<u8>>,
     /// Raw `AlgorithmIdentifier` parameters TLV for `signatureAlgorithm`.
     signature_algorithm_parameters: Option<Vec<u8>>,
+    /// OID content bytes for `signatureAlgorithm`. Defaults to
+    /// `ecdsa-with-SHA256`, matching the P-256 test keys.
+    signature_algorithm_oid: &'static [u8],
 }
 
 impl<'a> ResponseBuilder<'a> {
@@ -529,6 +557,7 @@ impl<'a> ResponseBuilder<'a> {
             response_status_content: None,
             hash_algorithm_parameters: None,
             signature_algorithm_parameters: None,
+            signature_algorithm_oid: OID_ECDSA_SHA256,
         }
     }
 
@@ -625,7 +654,7 @@ impl<'a> ResponseBuilder<'a> {
         let mut basic_parts = vec![
             response_data,
             algorithm_identifier_with_params(
-                OID_ECDSA_SHA256,
+                self.signature_algorithm_oid,
                 self.signature_algorithm_parameters.as_deref(),
             ),
             bit_string_with_unused(self.signature_unused_bits, &signature),
@@ -1529,11 +1558,166 @@ fn a_cert_id_hash_algorithm_with_null_parameters_is_still_accepted() {
     let pki = build_pki();
     let mut builder = ResponseBuilder::new(&pki, now());
     builder.hash_algorithm_parameters = Some(der_null());
-    builder.signature_algorithm_parameters = Some(der_null());
 
     validate_structure(&builder.build()).expect("structurally valid");
     validate_stapled_response_at(&builder.build(), &chain(&pki), now())
-        .expect("absent-vs-NULL AlgorithmIdentifier parameters are both canonical");
+        .expect("SHA-1 CertID hashAlgorithm with canonical NULL is accepted");
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.hash_oid = OID_SHA256;
+    builder.hash_algorithm_parameters = Some(der_null());
+    validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect("SHA-256 CertID hashAlgorithm with canonical NULL is accepted");
+}
+
+#[test]
+fn an_ecdsa_signature_algorithm_with_null_parameters_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.signature_algorithm_parameters = Some(der_null());
+    let der = builder.build();
+
+    let error = validate_structure(&der).expect_err("must reject");
+    assert!(error.contains("signatureAlgorithm"), "{error}");
+    assert!(error.contains("absent"), "{error}");
+
+    // The ECDSA signature bytes are cryptographically valid: signatureAlgorithm
+    // sits outside tbsResponseData, and the verifier selects ECDSA by OID while
+    // ignoring parameters. A strict client still refuses the NULL encoding.
+    let error = validate_stapled_response_at(&der, &chain(&pki), now()).expect_err("must reject");
+    assert!(error.contains("signatureAlgorithm"), "{error}");
+    assert!(error.contains("absent"), "{error}");
+}
+
+#[test]
+fn an_ed25519_signature_algorithm_with_null_parameters_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.signature_algorithm_oid = OID_ED25519;
+    builder.signature_algorithm_parameters = Some(der_null());
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("signatureAlgorithm"), "{error}");
+    assert!(error.contains("absent"), "{error}");
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.signature_algorithm_oid = OID_ED25519;
+    validate_structure(&builder.build()).expect("Ed25519 parameters are absent");
+}
+
+#[test]
+fn rsa_pkcs1_signature_algorithm_requires_canonical_null_parameters() {
+    let pki = build_pki();
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.signature_algorithm_oid = OID_SHA256_RSA;
+    builder.signature_algorithm_parameters = Some(der_null());
+    validate_structure(&builder.build())
+        .expect("sha256WithRSAEncryption with canonical NULL is structurally valid");
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.signature_algorithm_oid = OID_SHA256_RSA;
+    let error = validate_structure(&builder.build()).expect_err("must reject absent RSA NULL");
+    assert!(error.contains("signatureAlgorithm"), "{error}");
+    assert!(error.contains("NULL"), "{error}");
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.signature_algorithm_oid = OID_SHA256_RSA;
+    builder.signature_algorithm_parameters = Some(tlv(0x02, &[0x00]));
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("signatureAlgorithm"), "{error}");
+    assert!(error.contains("NULL"), "{error}");
+}
+
+#[test]
+fn rsassa_pss_rejects_absent_null_and_malformed_parameters() {
+    let pki = build_pki();
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.signature_algorithm_oid = OID_RSASSA_PSS;
+    let error = validate_structure(&builder.build()).expect_err("must reject absent PSS");
+    assert!(error.contains("signatureAlgorithm"), "{error}");
+    assert!(error.contains("rsassa-pss"), "{error}");
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("absent PSS must not be served");
+    assert!(error.contains("rsassa-pss"), "{error}");
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.signature_algorithm_oid = OID_RSASSA_PSS;
+    builder.signature_algorithm_parameters = Some(der_null());
+    let error = validate_structure(&builder.build()).expect_err("must reject NULL PSS");
+    assert!(error.contains("signatureAlgorithm"), "{error}");
+    assert!(error.contains("SEQUENCE"), "{error}");
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.signature_algorithm_oid = OID_RSASSA_PSS;
+    builder.signature_algorithm_parameters = Some(tlv(0x30, &[]));
+    let error = validate_structure(&builder.build()).expect_err("must reject empty PSS SEQUENCE");
+    assert!(error.contains("rsassa-pss"), "{error}");
+    assert!(error.contains("hashAlgorithm"), "{error}");
+
+    let canonical = rsassa_pss_sha256_parameters();
+    // Canonical PSS params use a short-form SEQUENCE; append an INTEGER inside
+    // it so the verifier's parser would ignore the extra bytes.
+    assert_eq!(canonical[0], 0x30);
+    assert!(canonical[1] < 0x80, "canonical PSS params use a short length");
+    let mut inner = canonical[2..].to_vec();
+    inner.extend_from_slice(&tlv(0x02, &[0x01]));
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.signature_algorithm_oid = OID_RSASSA_PSS;
+    builder.signature_algorithm_parameters = Some(tlv(0x30, &inner));
+    let error = validate_structure(&builder.build()).expect_err("must reject trailing PSS fields");
+    assert!(error.contains("rsassa-pss"), "{error}");
+    assert!(error.contains("trailing"), "{error}");
+}
+
+#[test]
+fn rsassa_pss_canonical_parameters_are_structurally_accepted() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.signature_algorithm_oid = OID_RSASSA_PSS;
+    builder.signature_algorithm_parameters = Some(rsassa_pss_sha256_parameters());
+
+    validate_structure(&builder.build()).expect("canonical rsassa-pss parameters are structural");
+    // The test PKI is ECDSA, so the staple cannot be served even though the
+    // parameter encoding is the one the verification path can parse.
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("ECDSA key cannot verify rsassa-pss");
+    assert!(
+        error.contains("signature") || error.contains("responder"),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_unknown_signature_algorithm_is_rejected_regardless_of_parameters() {
+    let pki = build_pki();
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.signature_algorithm_oid = OID_ECDSA_SHA512;
+    let error = validate_structure(&builder.build()).expect_err("must reject unknown signature");
+    assert!(error.contains("signatureAlgorithm"), "{error}");
+    assert!(error.contains("cannot be validated"), "{error}");
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.signature_algorithm_oid = OID_ECDSA_SHA512;
+    builder.signature_algorithm_parameters = Some(der_null());
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("signatureAlgorithm"), "{error}");
+    assert!(error.contains("cannot be validated"), "{error}");
+}
+
+#[test]
+fn an_unsupported_cert_id_hash_algorithm_is_structurally_parseable_but_not_served() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.hash_oid = OID_SHA224;
+    builder.hash_algorithm_parameters = Some(der_null());
+
+    validate_structure(&builder.build())
+        .expect("unknown digest OIDs remain structurally parseable");
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject unsupported CertID hash");
+    assert!(error.contains("unsupported hash"), "{error}");
 }
 
 #[test]
