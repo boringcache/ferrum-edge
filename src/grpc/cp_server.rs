@@ -3642,11 +3642,8 @@ mod tests {
             .iter()
             .find(|assertor| assertor.spiffe_id.as_str() == waypoint_mixed)
             .expect("mixed assertor present without bearer bound");
-        let mixed_full_asserts: Vec<&str> = mixed_full
-            .asserts
-            .iter()
-            .map(|id| id.as_str())
-            .collect();
+        let mixed_full_asserts: Vec<&str> =
+            mixed_full.asserts.iter().map(|id| id.as_str()).collect();
         assert_eq!(
             mixed_full_asserts,
             vec![
@@ -3821,11 +3818,7 @@ mod tests {
             "Single plus a bearer bound must still fail closed for a namespace-less identity"
         );
         assert!(
-            CpGrpcServer::node_waypoint_asserted_identity_allowed(
-                &namespaced,
-                Some(&single),
-                None,
-            ),
+            CpGrpcServer::node_waypoint_asserted_identity_allowed(&namespaced, Some(&single), None,),
             "a namespaced identity remains subject to the ordinary scope/bearer check"
         );
         assert!(

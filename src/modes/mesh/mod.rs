@@ -29881,7 +29881,11 @@ mod tests {
             &MeshSlice::default(),
         );
         let gates = injected_effective_authz_gates(&config);
-        assert_eq!(gates.len(), 1, "managed __mesh_authz is the only enabled gate");
+        assert_eq!(
+            gates.len(),
+            1,
+            "managed __mesh_authz is the only enabled gate"
+        );
         assert!(
             gates[0].get("trusted_hbone_assertors").is_none(),
             "sidecar managed authz omits the allow-list so both plugins use shared defaults"

@@ -413,13 +413,7 @@ fn k8s_pod_discovery_attaches_node_waypoint_metadata_to_identity_only_sources() 
             ready_pod(),
             endpoint_slice(),
             source,
-            node_waypoint_pod_with_spiffe(
-                "node-a",
-                "192.0.2.10",
-                true,
-                15008,
-                waypoint_spiffe,
-            ),
+            node_waypoint_pod_with_spiffe("node-a", "192.0.2.10", true, 15008, waypoint_spiffe),
         ],
         options(),
     )
@@ -478,11 +472,7 @@ fn k8s_pod_discovery_attaches_node_waypoint_metadata_to_identity_only_sources() 
     assert_eq!(slice.node_waypoint_assertors.len(), 1);
     let assertor = &slice.node_waypoint_assertors[0];
     assert_eq!(assertor.spiffe_id.as_str(), waypoint_spiffe);
-    let asserted: Vec<&str> = assertor
-        .asserts
-        .iter()
-        .map(|id| id.as_str())
-        .collect();
+    let asserted: Vec<&str> = assertor.asserts.iter().map(|id| id.as_str()).collect();
     assert_eq!(
         asserted,
         vec![source_spiffe, dest_spiffe],

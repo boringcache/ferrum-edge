@@ -3984,14 +3984,20 @@ async fn workload_metrics_conjunctive_refusal_precedence_is_stable() {
     .await;
     assert_eq!(principal, "spiffe://cluster.local/ns/attacker/sa/waypoint");
     assert_eq!(reason.as_deref(), Some("untrusted_assertor"));
-    assert_ne!(reason.as_deref(), Some("spiffe://cluster.local/ns/prod/sa/payments"));
+    assert_ne!(
+        reason.as_deref(),
+        Some("spiffe://cluster.local/ns/prod/sa/payments")
+    );
 }
 
 #[test]
 fn workload_metrics_rejects_malformed_effective_authz_gates() {
     let not_array = WorkloadMetrics::new(&metrics_config_with_effective_gates(json!({})));
     let err = not_array.expect_err("non-array gates must fail construction");
-    assert!(err.contains(EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY), "{err}");
+    assert!(
+        err.contains(EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY),
+        "{err}"
+    );
 
     let not_object =
         WorkloadMetrics::new(&metrics_config_with_effective_gates(json!(["waypoint"])));

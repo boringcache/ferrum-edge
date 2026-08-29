@@ -759,32 +759,30 @@ impl WorkloadMetrics {
             hbone_identity.and_then(|identity| identity.source_principal.clone())
         };
         match (ctx.peer_spiffe_id.as_ref(), baggage_source_principal) {
-            (Some(peer), Some(baggage)) => {
-                match self.baggage_trust.honor(peer, &baggage) {
-                    HboneBaggageHonor::UntrustedAssertor => {
-                        ctx.metadata.insert(
-                            "mesh.ignored_baggage".to_string(),
-                            "untrusted_assertor".to_string(),
-                        );
-                        Some(peer.clone())
-                    }
-                    HboneBaggageHonor::TrustDomainMismatch => {
-                        ctx.metadata.insert(
-                            "mesh.ignored_baggage".to_string(),
-                            "trust_domain_mismatch".to_string(),
-                        );
-                        Some(peer.clone())
-                    }
-                    HboneBaggageHonor::AssertionOutOfScope => {
-                        ctx.metadata.insert(
-                            "mesh.ignored_baggage".to_string(),
-                            "assertion_out_of_scope".to_string(),
-                        );
-                        Some(peer.clone())
-                    }
-                    HboneBaggageHonor::Honored => Some(baggage),
+            (Some(peer), Some(baggage)) => match self.baggage_trust.honor(peer, &baggage) {
+                HboneBaggageHonor::UntrustedAssertor => {
+                    ctx.metadata.insert(
+                        "mesh.ignored_baggage".to_string(),
+                        "untrusted_assertor".to_string(),
+                    );
+                    Some(peer.clone())
                 }
-            }
+                HboneBaggageHonor::TrustDomainMismatch => {
+                    ctx.metadata.insert(
+                        "mesh.ignored_baggage".to_string(),
+                        "trust_domain_mismatch".to_string(),
+                    );
+                    Some(peer.clone())
+                }
+                HboneBaggageHonor::AssertionOutOfScope => {
+                    ctx.metadata.insert(
+                        "mesh.ignored_baggage".to_string(),
+                        "assertion_out_of_scope".to_string(),
+                    );
+                    Some(peer.clone())
+                }
+                HboneBaggageHonor::Honored => Some(baggage),
+            },
             // An unauthenticated request must never have its source identity
             // rewritten by baggage; fall back to the workload hint below.
             (None, Some(_)) => {
