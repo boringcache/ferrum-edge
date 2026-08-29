@@ -1,6 +1,6 @@
 {{- if .Values.eastWest.enabled }}
 {{- $ewEnv := .Values.eastWest.env | default dict -}}
-{{- $admin := include "ferrum-mesh.resolveComponentAdmin" (dict "env" $ewEnv "admin" (.Values.eastWest.admin | default dict)) | fromYaml -}}
+{{- $admin := include "ferrum-mesh.resolveComponentAdmin" (dict "component" "eastWest" "env" $ewEnv "admin" (.Values.eastWest.admin | default dict)) | fromYaml -}}
 {{- $handlers := dict "live" (dict) "ready" (dict) -}}
 {{- if ne (toString $admin.port) "0" -}}
 {{- $handlers = include "ferrum-mesh.adminHealthHandlers" $admin | fromYaml -}}

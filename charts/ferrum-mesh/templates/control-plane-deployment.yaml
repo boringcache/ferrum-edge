@@ -1,6 +1,6 @@
 {{- if .Values.controlPlane.enabled }}
 {{- $cpEnv := .Values.controlPlane.env | default dict -}}
-{{- $admin := include "ferrum-mesh.resolveComponentAdmin" (dict "env" $cpEnv "admin" (.Values.controlPlane.admin | default dict)) | fromYaml -}}
+{{- $admin := include "ferrum-mesh.resolveComponentAdmin" (dict "component" "controlPlane" "env" $cpEnv "admin" (.Values.controlPlane.admin | default dict)) | fromYaml -}}
 {{- $handlers := dict "live" (dict) "ready" (dict) -}}
 {{- if ne (toString $admin.port) "0" -}}
 {{- $handlers = include "ferrum-mesh.adminHealthHandlers" $admin | fromYaml -}}

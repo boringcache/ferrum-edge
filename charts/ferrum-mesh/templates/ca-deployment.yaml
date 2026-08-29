@@ -1,6 +1,6 @@
 {{- if .Values.ca.enabled }}
 {{- $caEnv := .Values.ca.env | default dict -}}
-{{- $admin := include "ferrum-mesh.resolveComponentAdmin" (dict "env" $caEnv "admin" (.Values.ca.admin | default dict)) | fromYaml -}}
+{{- $admin := include "ferrum-mesh.resolveComponentAdmin" (dict "component" "ca" "env" $caEnv "admin" (.Values.ca.admin | default dict)) | fromYaml -}}
 {{- $handlers := dict "live" (dict) "ready" (dict) -}}
 {{- if ne (toString $admin.port) "0" -}}
 {{- $handlers = include "ferrum-mesh.adminHealthHandlers" $admin | fromYaml -}}

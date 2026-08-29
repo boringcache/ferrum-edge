@@ -208,7 +208,7 @@
 {{- $ambientSetnsCapture := or $nodeWaypointRegistryEnabled (and $ambientUdpLifecycle (or (not $ambientUdpHostNetns) $ambientUdpMigrationNeedsSetns)) -}}
 {{- $nodeAgentProxyMode := replace "-" "_" (lower (toString .Values.nodeAgent.proxyMode)) -}}
 {{- $nodeAgentCaptureMode := lower (toString .Values.nodeAgent.captureMode) -}}
-{{- $ambientAdminResolved := include "ferrum-mesh.resolveComponentAdmin" (dict "env" $ambientEnv "admin" (.Values.ambient.admin | default dict)) | fromYaml -}}
+{{- $ambientAdminResolved := include "ferrum-mesh.resolveComponentAdmin" (dict "component" "ambient" "env" $ambientEnv "admin" (.Values.ambient.admin | default dict)) | fromYaml -}}
 {{- $ambientAdminPort := toString $ambientAdminResolved.port -}}
 {{- $ambientAdminBindAddress := toString $ambientAdminResolved.bind -}}
 {{- $ambientAdminProbeHost := $ambientAdminResolved.probeHost -}}

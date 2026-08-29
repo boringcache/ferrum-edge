@@ -854,10 +854,10 @@ falls back to liveHandler exactly as renderProbes does).
 {{- if and $monitoringOn (not $allowedCidrs) (not $bearerSecret) $hasBearer -}}
 {{- fail "observability ServiceMonitor/PodMonitor without metrics.allowedCidrs requires observability.metrics.bearerToken.existingSecret.name so the monitor can attach Bearer authorization (inline bearerToken.value wires the pod env only — create the Secret out-of-band)" -}}
 {{- end -}}
-{{- $cpAdmin := include "ferrum-mesh.resolveComponentAdmin" (dict "env" (.Values.controlPlane.env | default dict) "admin" (.Values.controlPlane.admin | default dict)) | fromYaml -}}
-{{- $caAdmin := include "ferrum-mesh.resolveComponentAdmin" (dict "env" (.Values.ca.env | default dict) "admin" (.Values.ca.admin | default dict)) | fromYaml -}}
-{{- $ewAdmin := include "ferrum-mesh.resolveComponentAdmin" (dict "env" (.Values.eastWest.env | default dict) "admin" (.Values.eastWest.admin | default dict)) | fromYaml -}}
-{{- $ambAdmin := include "ferrum-mesh.resolveComponentAdmin" (dict "env" (.Values.ambient.env | default dict) "admin" (.Values.ambient.admin | default dict)) | fromYaml -}}
+{{- $cpAdmin := include "ferrum-mesh.resolveComponentAdmin" (dict "component" "controlPlane" "env" (.Values.controlPlane.env | default dict) "admin" (.Values.controlPlane.admin | default dict)) | fromYaml -}}
+{{- $caAdmin := include "ferrum-mesh.resolveComponentAdmin" (dict "component" "ca" "env" (.Values.ca.env | default dict) "admin" (.Values.ca.admin | default dict)) | fromYaml -}}
+{{- $ewAdmin := include "ferrum-mesh.resolveComponentAdmin" (dict "component" "eastWest" "env" (.Values.eastWest.env | default dict) "admin" (.Values.eastWest.admin | default dict)) | fromYaml -}}
+{{- $ambAdmin := include "ferrum-mesh.resolveComponentAdmin" (dict "component" "ambient" "env" (.Values.ambient.env | default dict) "admin" (.Values.ambient.admin | default dict)) | fromYaml -}}
 {{- if and $smOn .Values.controlPlane.enabled -}}
 {{- if include "ferrum-mesh.isLoopbackBind" $cpAdmin.bind -}}
 {{- fail "observability.metrics.serviceMonitor.enabled=true with controlPlane.enabled=true requires a non-loopback controlPlane.admin.bindAddress (e.g. 0.0.0.0 or ::); loopback-bound admin is not reachable through a Service" -}}

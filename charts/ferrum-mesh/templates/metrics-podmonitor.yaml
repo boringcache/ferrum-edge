@@ -6,7 +6,7 @@
 {{- $bearerSecret := $bearer.existingSecret | default dict -}}
 {{- $first := true -}}
 {{- if .Values.ambient.enabled }}
-{{- $ambAdmin := include "ferrum-mesh.resolveComponentAdmin" (dict "env" (.Values.ambient.env | default dict) "admin" (.Values.ambient.admin | default dict)) | fromYaml -}}
+{{- $ambAdmin := include "ferrum-mesh.resolveComponentAdmin" (dict "component" "ambient" "env" (.Values.ambient.env | default dict) "admin" (.Values.ambient.admin | default dict)) | fromYaml -}}
 {{- if and (ne (toString $ambAdmin.port) "0") (not (include "ferrum-mesh.isLoopbackBind" $ambAdmin.bind)) }}
 {{- $first = false }}
 apiVersion: monitoring.coreos.com/v1
