@@ -5065,10 +5065,46 @@ pub mod _test_support {
 
     // ── config/mongo_store: Admin write-topology / publication test seams ────
     pub use crate::config::mongo_store::{
-        MongoConfigChangeOp, MongoConfigChangeRecord, MongoReconnectTopology,
-        MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,
-        decode_mongo_config_change_record,
+        MongoReconnectTopology, MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,
     };
+
+    // External test crates only: mirror production `config_changes` shapes without
+    // widening `ferrum_edge::config::mongo_store` public API.
+    /// Canonical `config_changes.operation` values for external unit tests.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MongoConfigChangeOp {
+        Upsert,
+        Delete,
+    }
+
+    /// Typed `config_changes` row decoded by incremental polling.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct MongoConfigChangeRecord {
+        pub sequence: u64,
+        pub resource_type: String,
+        pub resource_id: String,
+        pub operation: MongoConfigChangeOp,
+    }
+
+    /// Decode one `config_changes` document using the production decoder.
+    pub fn decode_mongo_config_change_record(
+        doc: &mongodb::bson::Document,
+    ) -> Result<MongoConfigChangeRecord, anyhow::Error> {
+        let change = crate::config::mongo_store::decode_mongo_config_change_record(doc)?;
+        Ok(MongoConfigChangeRecord {
+            sequence: change.sequence,
+            resource_type: change.resource_type,
+            resource_id: change.resource_id,
+            operation: match change.operation {
+                crate::config::mongo_store::MongoConfigChangeOp::Upsert => {
+                    MongoConfigChangeOp::Upsert
+                }
+                crate::config::mongo_store::MongoConfigChangeOp::Delete => {
+                    MongoConfigChangeOp::Delete
+                }
+            },
+        })
+    }
 
     /// Lazy Mongo store (no live MongoDB) for topology publication tests.
     pub fn mongo_store_new_unconnected_for_test(
