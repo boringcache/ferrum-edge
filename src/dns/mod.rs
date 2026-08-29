@@ -391,6 +391,17 @@ impl ResolvedAddresses {
         }
     }
 
+    /// Build an answer set in the given dial order without rotating again.
+    ///
+    /// Used when a caller has already walked a rotated set and retained a
+    /// subset (for example dropping inbound-relay loopback answers).
+    pub(crate) fn from_dial_order(addresses: Vec<IpAddr>) -> Self {
+        Self {
+            addresses: Arc::from(addresses),
+            start: 0,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.addresses.len()
     }

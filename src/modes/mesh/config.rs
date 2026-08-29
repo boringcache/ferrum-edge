@@ -4650,7 +4650,8 @@ pub struct MeshConfig {
     /// `ServiceWaypoint`, and both gateway topologies: they run outside the
     /// destination pod's network namespace, so the same names would reach the
     /// host/terminator namespace instead. Inventory entries cannot override
-    /// this refusal.
+    /// this refusal, including a declared hostname that later resolves to
+    /// loopback.
     #[serde(skip)]
     pub inbound_relay_admits_loopback_namespace: bool,
 }
@@ -4680,7 +4681,8 @@ pub struct MeshInboundRelayDestination {
 /// the terminator's OWN inventory: a name is compared verbatim and is NEVER
 /// resolved here, so nothing is admitted that this proxy's inventory does not
 /// already name. Resolution stays where it belongs — after admission, on the
-/// dial path.
+/// dial path — where [`MeshConfig::screen_inbound_relay_resolved_ips`] drops
+/// loopback answers unless this terminator admits that namespace.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MeshInboundRelayHost {
     /// Canonicalized IP literal (IPv4-mapped IPv6 folded to IPv4), so the two
@@ -4829,6 +4831,19 @@ pub enum SidecarIngressConnectRelay {
     },
 }
 
+/// Whether a concrete resolved address is in the loopback namespace the
+/// ordinary inbound HBONE relay must not dial unless the terminator shares
+/// the destination pod's network namespace.
+///
+/// Canonicalization covers `127.0.0.0/8`, `::1`, and IPv4-mapped IPv6
+/// loopback (`::ffff:127.0.0.1`). Rust treats the mapped form as IPv6, so a
+/// raw `IpAddr::is_loopback()` is false; folding first matches the later
+/// dial of `127.0.0.1`. Ordinary mapped non-loopback (`::ffff:10.1.2.3`)
+/// stays non-loopback.
+pub fn inbound_relay_resolved_ip_is_loopback_namespace(ip: std::net::IpAddr) -> bool {
+    ip.to_canonical().is_loopback()
+}
+
 /// Whether `host` is in the reserved DNS `localhost` namespace or is a loopback
 /// IP literal, including IPv4-mapped IPv6 loopback (`::ffff:127.0.0.1`).
 /// Case-insensitive; a trailing root dot is ignored. Allocation-free and never
@@ -4852,7 +4867,7 @@ fn inbound_relay_host_is_loopback_namespace(host: &str) -> bool {
         return true;
     }
     host.parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.to_canonical().is_loopback())
+        .is_ok_and(inbound_relay_resolved_ip_is_loopback_namespace)
 }
 
 impl MeshConfig {
@@ -4894,7 +4909,9 @@ impl MeshConfig {
     ///    verbatim (case-insensitive) name when it is not; a name is never
     ///    resolved here, so this cannot reach anything the inventory does not
     ///    itself declare. Loopback/DNS-localhost authorities never fall through
-    ///    to this inventory.
+    ///    to this inventory. A non-reserved declared hostname may still resolve
+    ///    to loopback later; [`Self::screen_inbound_relay_resolved_ips`] enforces
+    ///    the same namespace boundary on concrete DNS answers before dial.
     ///
     /// Everything else fails closed, including a slice-declared workload owned
     /// by a different node. Hot path: no allocation, no lock, and no scan of
@@ -4968,6 +4985,50 @@ impl MeshConfig {
         }
 
         self.inbound_relay_inventory_decision(candidate, address, port)
+    }
+
+    /// Screen DNS answers for the ordinary inbound HBONE relay before any
+    /// TCP or UDP socket opens.
+    ///
+    /// The authority-level guard matches declared names without resolving
+    /// them. A `WorkloadEntry` hostname (or a rebinding DNS answer) can
+    /// still resolve to loopback after admission. When
+    /// [`Self::inbound_relay_admits_loopback_namespace`] is false, every
+    /// loopback answer is dropped using
+    /// [`inbound_relay_resolved_ip_is_loopback_namespace`]. Mixed answers
+    /// keep only the non-loopback addresses, in the iterator's order. An
+    /// empty remainder fails closed as [`InboundRelayDenial::AddressNotTerminated`].
+    ///
+    /// Sidecar (the flag true) returns `Ok(None)` without walking the
+    /// answers: the terminator shares the pod namespace, so a resolved
+    /// loopback on a declared application port is legitimate. Callers must
+    /// still skip this screen for Sidecar `ingress[]` remaps and for the
+    /// separately authorized EgressGateway external-UDP path.
+    ///
+    /// `Ok(None)` means dial the original answer set. `Ok(Some(ips))` means
+    /// dial only `ips`. No extra allocation when the flag admits loopback.
+    pub fn screen_inbound_relay_resolved_ips(
+        &self,
+        ips: impl IntoIterator<Item = std::net::IpAddr>,
+    ) -> Result<Option<Vec<std::net::IpAddr>>, InboundRelayDenial> {
+        if self.inbound_relay_admits_loopback_namespace {
+            return Ok(None);
+        }
+        let mut original_len = 0usize;
+        let mut retained = Vec::new();
+        for ip in ips {
+            original_len += 1;
+            if !inbound_relay_resolved_ip_is_loopback_namespace(ip) {
+                retained.push(ip);
+            }
+        }
+        if retained.is_empty() {
+            Err(InboundRelayDenial::AddressNotTerminated)
+        } else if retained.len() == original_len {
+            Ok(None)
+        } else {
+            Ok(Some(retained))
+        }
     }
 
     /// Match `host` (already bracket-stripped; `address` is its canonical IP
