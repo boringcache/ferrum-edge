@@ -1,9 +1,9 @@
-//! TLS handshake offload runtime for isolating CPU-intensive connection establishment.
+//! Dormant TLS handshake offload runtime.
 //!
-//! Creates dedicated single-threaded tokio runtimes for TLS handshakes, preventing
-//! them from blocking the main event loop during connection storms (startup warmup,
-//! backend failover, burst traffic). Connections are sharded by peer hash for TLS
-//! session cache affinity.
+//! Dedicated single-threaded tokio runtimes for TLS handshakes exist for a
+//! future wiring of `FERRUM_TLS_OFFLOAD_THREADS`. Startup does not initialize
+//! this pool; `EnvConfig` currently rejects any nonzero thread count. Connections
+//! would be sharded by peer hash for TLS session cache affinity.
 //!
 //! Inspired by Cloudflare Pingora's `connectors/offload.rs`, which found that
 //! "scheduling overhead of multithread tokio runtime can be 50% of the on CPU time."
@@ -155,8 +155,8 @@ static TLS_OFFLOAD: OnceLock<Option<Arc<TlsOffloadRuntime>>> = OnceLock::new();
 
 /// Initialize the global TLS offload runtime.
 ///
-/// Call once during startup after the main tokio runtime is created.
-/// Subsequent calls are no-ops (OnceLock semantics).
+/// Not called from current startup. Subsequent calls are no-ops (OnceLock
+/// semantics) if a caller does invoke it.
 pub fn init_tls_offload(config: TlsOffloadConfig) {
     TLS_OFFLOAD.get_or_init(|| TlsOffloadRuntime::new(config).map(Arc::new));
 }

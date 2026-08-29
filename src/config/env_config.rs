@@ -3528,11 +3528,10 @@ pub struct EnvConfig {
     /// counters every N seconds and computes average rates.  Minimum: 1.
     pub status_metrics_window_seconds: u64,
 
-    // ── TLS handshake offload ───────────────────────────────────────────
-    /// Total dedicated threads for offloading TLS handshakes from the main
-    /// event loop. 0 = disabled (handshakes run on tokio worker threads).
-    /// When enabled, threads are organized into shards for TLS session cache
-    /// affinity. Default: 0 (disabled).
+    // ── TLS handshake offload (reserved) ─────────────────────────────────
+    /// Reserved. TLS handshake offload is not implemented. Must remain `0`
+    /// (the default, including when unset). Any nonzero
+    /// `FERRUM_TLS_OFFLOAD_THREADS` fails startup.
     pub tls_offload_threads: usize,
 
     // ── TCP socket optimizations (Linux only) ────────────────────────────
@@ -6371,6 +6370,16 @@ impl EnvConfig {
     }
 
     fn validate(&mut self) -> Result<(), String> {
+        // Reserved: the offload runtime exists but is not wired at startup.
+        // A nonzero value used to parse and then do nothing; fail closed so
+        // operators cannot tune a knob that is silently ignored.
+        if self.tls_offload_threads != 0 {
+            return Err(
+                "FERRUM_TLS_OFFLOAD_THREADS must remain 0; TLS handshake offload is not \
+                 implemented"
+                    .into(),
+            );
+        }
         if !(1..=86_400).contains(&self.websocket_max_lifetime_seconds) {
             return Err(
                 "FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS must be between 1 and 86400 seconds".into(),
