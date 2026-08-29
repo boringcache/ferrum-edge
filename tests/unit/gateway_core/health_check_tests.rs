@@ -2802,7 +2802,10 @@ fn consecutive_mode_timer_recovery_cannot_retract_fresh_post_success_ejection() 
             5,
         );
         {
-            let ps = checker_for_hook.passive_health.get(&rk(TEST_PROXY)).unwrap();
+            let ps = checker_for_hook
+                .passive_health
+                .get(&rk(TEST_PROXY))
+                .unwrap();
             ps.unhealthy.get_mut("backend1:8080").unwrap().recover_at_ms = 1;
         }
         assert_eq!(
@@ -2849,11 +2852,7 @@ fn consecutive_mode_timer_cannot_strand_republished_generation_after_remove() {
         Some(0)
     );
     assert_eq!(
-        checker.consecutive_packed_state_for_test(
-            DEFAULT_NAMESPACE,
-            TEST_PROXY,
-            "backend1:8080",
-        ),
+        checker.consecutive_packed_state_for_test(DEFAULT_NAMESPACE, TEST_PROXY, "backend1:8080",),
         (0, 1),
         "threshold-1 ejection owns packed generation 0"
     );
@@ -2916,11 +2915,7 @@ fn consecutive_mode_timer_cannot_strand_republished_generation_after_remove() {
         "no stale generation-0 ejection may remain after packed retirement"
     );
     assert_eq!(
-        checker.consecutive_packed_state_for_test(
-            DEFAULT_NAMESPACE,
-            TEST_PROXY,
-            "backend1:8080",
-        ),
+        checker.consecutive_packed_state_for_test(DEFAULT_NAMESPACE, TEST_PROXY, "backend1:8080",),
         (1, 1)
     );
 }
