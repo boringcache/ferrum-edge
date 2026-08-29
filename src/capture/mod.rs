@@ -1086,9 +1086,11 @@ pub fn udp_capture_settings_from_env() -> Result<UdpCaptureSettings, String> {
 /// Resolution order:
 ///
 /// 1. `FERRUM_MESH_CAPTURE_IPV6_ENABLED`, the explicit operator/injector signal.
-///    The injector sets it on the sidecar container whenever the init
-///    container's rendered plan actually contains `ip6tables` commands, so the
-///    two containers cannot disagree about the deployed capture surface.
+///    The injector sets it to `true` on the sidecar container whenever the init
+///    container's rendered plan actually contains `ip6tables` commands. An
+///    explicit `false` is rejected when the local rule inputs independently
+///    require IPv6; accepting that contradiction would recreate the silent
+///    listener/rule-family black hole this signal exists to prevent.
 /// 2. Otherwise the same derivation applied to whatever capture scope env this
 ///    process can see, so a hand-rolled (non-injector) sidecar that carries the
 ///    capture CIDRs still plans the right listeners.
@@ -1099,8 +1101,26 @@ pub fn capture_ipv6_enabled_from_env() -> Result<bool, String> {
     if let Some(raw) = resolve_ferrum_var("FERRUM_MESH_CAPTURE_IPV6_ENABLED")
         && !raw.trim().is_empty()
     {
-        return parse_bool_env(Some(raw.as_str()), "FERRUM_MESH_CAPTURE_IPV6_ENABLED");
+        let explicit = parse_bool_env(Some(raw.as_str()), "FERRUM_MESH_CAPTURE_IPV6_ENABLED")?;
+        if explicit {
+            return Ok(true);
+        }
+        if capture_ipv6_derived_from_env()? {
+            return Err(
+                "FERRUM_MESH_CAPTURE_IPV6_ENABLED=false contradicts the configured IPv6 capture \
+                 rule inputs: FERRUM_MESH_IP6TABLES_ENABLED is not false and an include/exclude \
+                 CIDR is IPv6. Disable the IPv6 rule producer with \
+                 FERRUM_MESH_IP6TABLES_ENABLED=false (or remove the IPv6 CIDRs) instead of \
+                 leaving ip6tables REDIRECTs without a listener"
+                    .to_string(),
+            );
+        }
+        return Ok(false);
     }
+    capture_ipv6_derived_from_env()
+}
+
+fn capture_ipv6_derived_from_env() -> Result<bool, String> {
     let ip6tables_mode = Ip6TablesMode::parse(
         &resolve_ferrum_var("FERRUM_MESH_IP6TABLES_ENABLED").unwrap_or_else(|| "auto".to_string()),
     )?;
@@ -1647,8 +1667,10 @@ impl IptablesPlan {
         // init phase fails, instead of starting the workload with a partial
         // capture ruleset that would let egress silently bypass the mesh proxy
         // (and therefore `mesh_authz`). The idempotent command shapes are
-        // `set -e`-safe — `-N ... || true` and `-C ... || -A ...` only abort on
-        // a real `-A` append failure, never on the expected `-C`/`-N` misses.
+        // `set -e`-safe: `-N ... || true` and `-C ... || -A ...` tolerate the
+        // expected existence probes, while the ordered safety rule uses
+        // `-D ... || true; -I ... 1` and therefore still aborts on a real insert
+        // failure.
         format!(
             "set -e\n{}",
             iptables_script(
@@ -2102,7 +2124,7 @@ fn commands_for_family(
     // only ever rendered by the injector's pod-netns init container today, and
     // this keeps that invariant explicit rather than assumed.
     if !config.host_netns {
-        commands.push(idempotent_append(
+        commands.push(idempotent_insert_first(
             binary,
             "nat",
             "FERRUM_MESH_OUTBOUND",
@@ -3631,6 +3653,17 @@ fn idempotent_new_chain(binary: &str, table: &str, chain: &str) -> String {
 fn idempotent_append(binary: &str, table: &str, chain: &str, rule: &str) -> String {
     format!(
         "{binary} -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -C {chain} {rule} 2>/dev/null || {binary} -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -A {chain} {rule}"
+    )
+}
+
+/// Install one rule at position 1 even when the chain survived an earlier
+/// generation. A simple `-C || -I` is not sufficient: if the rule already
+/// exists below a REDIRECT, `-C` succeeds and leaves the safety rule dead. The
+/// exact delete plus insert is idempotent and makes the documented "leads with"
+/// contract true across guarded retries as well as a fresh chain.
+fn idempotent_insert_first(binary: &str, table: &str, chain: &str, rule: &str) -> String {
+    format!(
+        "{binary} -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -D {chain} {rule} 2>/dev/null || true; {binary} -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -I {chain} 1 {rule}"
     )
 }
 

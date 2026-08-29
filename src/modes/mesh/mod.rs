@@ -19855,8 +19855,8 @@ fn sidecar_capture_listener_addrs(
         "IPv6 mesh capture is active (ip6tables REDIRECT rules point at port {port}), but the \
          configured capture address {configured} is a specific {} literal, so captured IPv6 \
          connections would be refused with ECONNREFUSED. Use a wildcard (0.0.0.0 / ::) or a \
-         loopback address, or disable IPv6 capture with \
-         FERRUM_MESH_CAPTURE_IPV6_ENABLED=false / FERRUM_MESH_IP6TABLES_ENABLED=false",
+         loopback address, or disable the IPv6 rule producer with \
+         FERRUM_MESH_IP6TABLES_ENABLED=false (or remove the IPv6 CIDRs)",
         if ip.is_ipv4() { "IPv4" } else { "IPv6" }
     ))
 }

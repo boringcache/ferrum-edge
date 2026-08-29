@@ -248,7 +248,7 @@ fn injected_init_script_returns_local_traffic_before_the_outbound_redirect() {
     let script = init_container_script(&ops);
 
     let local_return = script
-        .find("-A FERRUM_MESH_OUTBOUND -m addrtype --dst-type LOCAL -j RETURN")
+        .find("-I FERRUM_MESH_OUTBOUND 1 -m addrtype --dst-type LOCAL -j RETURN")
         .expect("default injection must carry the loopback/self RETURN");
     let redirect = script
         .find("-A FERRUM_MESH_OUTBOUND -p tcp -d 0.0.0.0/0 -j REDIRECT")
@@ -289,7 +289,7 @@ fn injected_sidecar_learns_when_ipv6_capture_rules_are_installed() {
     // precedes that family's REDIRECT.
     let v6_return = script
         .find(
-            "ip6tables -t nat -w 5 -A FERRUM_MESH_OUTBOUND -m addrtype --dst-type LOCAL -j RETURN",
+            "ip6tables -t nat -w 5 -I FERRUM_MESH_OUTBOUND 1 -m addrtype --dst-type LOCAL -j RETURN",
         )
         .expect("the ip6tables chain must carry the loopback/self RETURN too");
     let v6_redirect = script

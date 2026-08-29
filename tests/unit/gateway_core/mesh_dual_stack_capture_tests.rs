@@ -204,6 +204,31 @@ fn sidecar_capture_ipv6_is_derived_from_the_same_gate_that_emits_ip6tables_rules
 }
 
 #[test]
+fn explicit_false_cannot_contradict_locally_configured_ipv6_rules() {
+    let guard = EnvGuard::new(MESH_ENV_KEYS);
+    for &key in MESH_ENV_KEYS {
+        guard.unset(key);
+    }
+    guard.set("FERRUM_MODE", "mesh");
+    guard.set("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051");
+    guard.set(
+        "FERRUM_CP_DP_GRPC_JWT_SECRET",
+        "secret-padding-for-32-char-min!!",
+    );
+    guard.set("FERRUM_MESH_ALLOW_NO_CA", "true");
+    guard.set("FERRUM_MESH_CAPTURE_IPV6_ENABLED", "false");
+    guard.set("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS", "0.0.0.0/0,fd00::/8");
+
+    let env = EnvConfig::from_env().expect("mesh env config");
+    let runtime = MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+    let err = runtime
+        .validate_capture_listener_families()
+        .expect_err("a listener-only false override must not leave IPv6 REDIRECT rules live");
+    assert!(err.contains("FERRUM_MESH_CAPTURE_IPV6_ENABLED=false"), "{err}");
+    assert!(err.contains("FERRUM_MESH_IP6TABLES_ENABLED=false"), "{err}");
+}
+
+#[test]
 fn a_specific_capture_address_under_ipv6_capture_is_a_startup_error() {
     with_sidecar_runtime(
         &[
@@ -335,6 +360,12 @@ fn assert_local_return_precedes_every_redirect(commands: &[String], family: &str
         .unwrap_or_else(|| {
             panic!("{family}: no loopback/self RETURN in FERRUM_MESH_OUTBOUND: {commands:#?}")
         });
+    assert!(
+        commands[local_return].contains("-D FERRUM_MESH_OUTBOUND")
+            && commands[local_return].contains("-I FERRUM_MESH_OUTBOUND 1"),
+        "{family}: the safety rule must be repositioned at chain head during a reconcile, not \
+         merely appended on fresh creation: {commands:#?}"
+    );
     assert!(
         redirects.iter().all(|index| local_return < *index),
         "{family}: the loopback/self RETURN must precede every outbound REDIRECT — \
