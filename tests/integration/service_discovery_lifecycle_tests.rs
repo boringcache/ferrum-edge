@@ -950,7 +950,7 @@ async fn a_replacement_generation_cannot_register_during_a_fenced_withdrawal() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_superseded_supervisor_does_not_withdraw_when_its_staleness_bound_elapses() {
     let _guard = isolated().await;
 
@@ -961,8 +961,12 @@ async fn a_superseded_supervisor_does_not_withdraw_when_its_staleness_bound_elap
         None,
     )]);
     let lb_cache = Arc::new(LoadBalancerCache::new(&config));
+    // IP literal: publication preparation DNS-warms discovered hostnames, and a
+    // `.local` lookup is real I/O. Hosted CI let that warmup outlive the 3s
+    // gen-1 bound, so the still-current poller fail-closed withdrew (metric=1)
+    // and a later poll republished before this test could supersede.
     let discoverer = Arc::new(ScriptedDiscoverer::new(vec![target(
-        "discovered.local",
+        PAUSED_PREPARATION_DISCOVERED_HOST,
         8080,
     )]));
     let hang = Arc::clone(&discoverer.hang);
@@ -988,28 +992,61 @@ async fn a_superseded_supervisor_does_not_withdraw_when_its_staleness_bound_elap
     );
 
     assert!(
-        wait_for(|| {
-            lb_hosts(&lb_cache, "superseded-stale").contains(&"discovered.local".to_string())
+        wait_for_progress(|| {
+            health::snapshot().upstreams.iter().any(|upstream| {
+                upstream.upstream == task.key && upstream.last_success_age_seconds.is_some()
+            })
         })
         .await,
         "initial discovered snapshot must publish"
     );
+    assert!(
+        lb_has_host(
+            &lb_cache,
+            "superseded-stale",
+            PAUSED_PREPARATION_DISCOVERED_HOST
+        ),
+        "initial discovered snapshot must be routable"
+    );
+
     // Park the poller inside discover() so the registry stops answering, then
     // supersede it exactly as a reconcile would — before its 3s staleness bound
     // elapses. A deadline armed before the replacement registered still reaches
     // the expiry path, where the fence must refuse it.
     hang.store(true, Ordering::SeqCst);
-    health::register_task_for_test(&task.key, 99, "scripted", scripted_staleness());
+    // Next poll is 1s out; the 3s bound is still in the future. Advance only
+    // the poll interval so the hung discover() samples its deadline while
+    // generation 1 still owns the key.
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
     assert!(
-        calls.load(Ordering::SeqCst) >= 1,
-        "the poller must have run before it was superseded"
+        wait_for_progress(|| calls.load(Ordering::SeqCst) >= 2).await,
+        "the poller must park inside discover() with its pre-supersession deadline armed"
+    );
+    health::register_task_for_test(&task.key, 99, "scripted", scripted_staleness());
+
+    // Remaining window after the 1s poll advance. The fence must refuse the
+    // deadline that was armed while generation 1 still owned the key.
+    let withdrew = wait_for_deadline_action(std::time::Duration::from_secs(2), || {
+        metrics.service_discovery_stale_withdrawals_total() > withdrawals_before
+            || health::expiry_applied_for_test(&task.key) == Some(true)
+            || !lb_has_host(
+                &lb_cache,
+                "superseded-stale",
+                PAUSED_PREPARATION_DISCOVERED_HOST,
+            )
+    })
+    .await;
+    assert!(
+        !withdrew,
+        "a superseded generation must not withdraw after its pre-supersession deadline elapses"
     );
 
-    // Well past the effective staleness bound: nothing may be withdrawn.
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
     assert!(
-        lb_hosts(&lb_cache, "superseded-stale").contains(&"discovered.local".to_string()),
+        lb_has_host(
+            &lb_cache,
+            "superseded-stale",
+            PAUSED_PREPARATION_DISCOVERED_HOST
+        ),
         "a superseded generation must not withdraw discovered targets"
     );
     assert_eq!(
