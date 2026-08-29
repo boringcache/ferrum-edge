@@ -2655,3 +2655,83 @@ pub(crate) fn admit_registry_target_weight(raw: u64) -> Option<u32> {
         .ok()
         .filter(|weight| (1..=MAX_TARGET_WEIGHT).contains(weight))
 }
+
+/// RESERVED tag-key namespace owned exclusively by Ferrum service-discovery
+/// internals for RFC 2782 SRV metadata (issue #4291).
+///
+/// The only key in it today is [`SRV_PRIORITY_TAG`]. It is an INTERNAL contract
+/// between the DNS-SD discoverer (the single writer) and the load balancer's
+/// candidate filter (the single reader), never an operator-authored label:
+///
+/// 1. **Operator config cannot set it.** Every operator-PROVIDED config load
+///    (admin API POST/PUT/import/restore and the file-mode loader) rejects the
+///    namespace in `targets[].tags` and `subsets[].labels` via
+///    `Upstream::validate_operator_provided_fields`, exactly as it already
+///    rejects the reserved `mesh.*` namespace.
+/// 2. **Copied workload/operator labels cannot smuggle it.** Every target
+///    builder that copies labels wholesale into `UpstreamTarget.tags` strips
+///    this namespace first via [`strip_reserved_srv_tags`].
+/// 3. **A forged value can only turn the feature OFF.** The load balancer
+///    accepts only a canonical decimal `u16` ([`parse_srv_priority_tag`]) and
+///    treats any malformed or over-cardinality tier map as "no SRV tiers"
+///    (fail-open to plain health/locality selection). There is no value an
+///    attacker can inject that manufactures a tier preference for a target the
+///    DNS zone did not place there.
+pub(crate) const RESERVED_SRV_TAG_PREFIX: &str = "ferrum.srv.";
+
+/// Reserved tag carrying a discovered target's RFC 2782 SRV `priority`.
+///
+/// Written ONLY by [`dns_sd::targets_from_srv_records`], as a canonical decimal
+/// `u16` with no sign, no leading `+`, and no leading zeros (except the literal
+/// `"0"`). Read ONLY by `LoadBalancer`'s precomputed SRV tier map. A target
+/// WITHOUT this tag is "unprioritized" and keeps its existing availability
+/// semantics: it belongs to no SRV tier and is eligible in every tier.
+pub(crate) const SRV_PRIORITY_TAG: &str = "ferrum.srv.priority";
+
+/// Largest number of distinct RFC 2782 priority tiers DNS-SD publishes for one
+/// upstream, and the largest tier cardinality the load balancer will honor.
+///
+/// Bounds both the published target count and the precomputed per-target tier
+/// metadata. Tiers beyond the 8 numerically-smallest admissible priorities can
+/// only matter when every one of those 8 tiers is simultaneously unhealthy, so
+/// dropping them at ingest keeps the snapshot bounded without a reachable
+/// availability loss. A tag map that somehow exceeds this cardinality makes the
+/// balancer fail OPEN (SRV tier selection disabled for that upstream) rather
+/// than allocate unbounded tier state on a reload.
+pub(crate) const MAX_SRV_PRIORITY_TIERS: usize = 8;
+
+/// Drop every reserved `ferrum.srv.*` key from a label map copied from
+/// operator/workload-controlled input, in place.
+///
+/// Mirrors [`crate::modes::mesh::multicluster::strip_reserved_mesh_tags`].
+/// Discovery re-stamps the legitimate tag itself, so this only removes forge
+/// attempts, never a real marker.
+pub(crate) fn strip_reserved_srv_tags(tags: &mut std::collections::HashMap<String, String>) {
+    tags.retain(|key, _| !key.starts_with(RESERVED_SRV_TAG_PREFIX));
+}
+
+/// Render an RFC 2782 priority into the canonical [`SRV_PRIORITY_TAG`] value.
+///
+/// Single source of truth shared with [`parse_srv_priority_tag`] so the writer
+/// and reader can never drift.
+pub(crate) fn format_srv_priority(priority: u16) -> String {
+    priority.to_string()
+}
+
+/// Parse a [`SRV_PRIORITY_TAG`] value written by [`format_srv_priority`].
+///
+/// Deliberately STRICTER than `u16::from_str`: the value must be a canonical
+/// decimal — ASCII digits only (so no `+`, `-`, whitespace, or underscore) and
+/// no leading zero unless the value is exactly `"0"`. Two spellings of one tier
+/// would otherwise partition a single SRV priority into two tiers and let a
+/// forged `"010"` sit below a real `"10"`. Returns `None` for anything else;
+/// callers disable SRV tier selection entirely when any value fails to parse.
+pub(crate) fn parse_srv_priority_tag(value: &str) -> Option<u16> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if value.len() > 1 && value.starts_with('0') {
+        return None;
+    }
+    value.parse::<u16>().ok()
+}

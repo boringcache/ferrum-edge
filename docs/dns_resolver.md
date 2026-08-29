@@ -98,16 +98,64 @@ This means: first try the record type that worked last time (for speed), then tr
 
 The DNS-SD provider (`service_discovery.provider: dns_sd`) uses `DnsCache::resolve_srv` on the configured `service_name`. That lookup is **not** on the request path: the discovery poller runs in the background and publishes an atomic target snapshot into the load-balancer cache.
 
+RFC 2782 requires a client to contact "the target host with the lowest-numbered priority it **can reach**", falling back when it cannot. Reachability is a runtime property, so Ferrum splits the rule across two stages.
+
+### Stage 1 — ingest (`resolve_srv` + `dns_sd`)
+
 `resolve_srv` returns `SrvAnswer` values (`host`, `port`, `weight`, `priority`) and **discards** the RFC 2782 unavailability signals before callers see them:
 
-- Target `.` (the DNS root; also the empty name after stripping the trailing root label)
+- Target `.` (the DNS root; also the empty name after stripping the trailing root label, and dotted-only names)
 - Port `0`
 
-Surviving hosts are ASCII-lowercased so they match `UpstreamTarget` admission (`validate_host_entry` requires lowercase). DNS-SD then admits every surviving port through the same `admit_registry_port` helper Kubernetes and Consul use (`1..=65535`, never wrap) and keeps **only the numerically-smallest remaining priority**. Same-tier records keep their SRV weights (weight `0` becomes `default_weight` so published targets match the static `1..=65535` weight contract). Dropped-record and min-priority-filter diagnostics are counts plus the configured service name — never a dump of every RR.
+Surviving hosts are ASCII-lowercased so they match `UpstreamTarget` admission (`validate_host_entry` requires lowercase). DNS-SD then:
 
-Invalid records are filtered **before** the minimum priority is chosen. A poisoned lowest tier (every RR at that priority is `.` or port 0) therefore does not occupy the live set: the next priority that still has a dialable host is used. That is the ingest-time reading of RFC 2782's "lowest-numbered priority it can reach". If nothing admissible remains at any priority, the snapshot is empty (fail-closed); the manager's existing empty-after-filter policy applies.
+1. admits every surviving port through the same `admit_registry_port` helper Kubernetes and Consul use (`1..=65535`, never wrap);
+2. deduplicates on the dial identity `host:port`, keeping the **lowest** priority, so a zone that lists one endpoint in two tiers neither doubles its share nor gets pinned to the DR tier by record order;
+3. keeps the eight numerically-smallest remaining priorities (`MAX_SRV_PRIORITY_TIERS`) and **publishes all of them**, stamping each target with the reserved tag `ferrum.srv.priority`;
+4. preserves per-record SRV weights (weight `0` becomes `default_weight` so published targets match the static `1..=MAX_TARGET_WEIGHT` contract).
 
-Lower-priority (higher numeric) disaster-recovery records are **never** published alongside the live tier. Runtime unreachability of an admitted live-tier host is health-check / load-balancer failover, not "include the DR site in this poll's snapshot".
+Output is ordered by `(priority, first-seen)`, so the published set is a function of the answer set rather than the resolver's ordering. Invalid records are filtered **before** tiers are formed, so a poisoned tier (every RR at that priority is `.` or port 0) never occupies a tier: the next dialable priority simply becomes the best tier. If nothing admissible remains at any priority the snapshot is empty (fail-closed) and the manager's existing empty-after-filter policy applies. Dropped-record diagnostics are counts plus the configured service name — never a dump of every RR.
+
+### Stage 2 — selection (load balancer)
+
+The load balancer precomputes a per-target priority map at cache-build time and applies it inside the **shared candidate (health) filter**, so every selection entry point sees the same decision: HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, raw TCP and UDP dispatch, plus subset, per-port, retry-exclusion and sticky-session eligibility. Per selection it keeps:
+
+- every healthy target in the lowest-numbered priority tier that still has a healthy member, **and**
+- every healthy target with no SRV tier at all.
+
+Consequences:
+
+- A healthy DR tier is never mixed with a healthy primary tier.
+- The next tier becomes eligible exactly when no target in any lower tier is healthy, and stops being eligible as soon as a lower tier recovers. Nothing is latched, so there is no flap hysteresis to tune.
+- Same-tier weights and the configured load-balancing algorithm (round-robin, WRR, least-connections, least-latency, consistent hashing, random, passthrough) behave normally **within** the selected tier.
+- The filter runs *before* locality LB, so it cannot be bypassed by `localityLbSetting.enabled: false`, `distribute`, `failoverPriority`, a missing source locality, or strict local-first mode. It is an additive mechanism, not an overload of Istio locality tiers.
+- It does **not** apply to the all-unhealthy degraded fallback, or to strict mode's fail-closed widening to unhealthy local endpoints. Once nothing is healthy there is no reachable tier to prefer, and narrowing the last-resort pool would reduce availability rather than direct it.
+
+Hot-path cost is one `is_empty()` branch for every upstream that has no SRV tiers (that is, every non-DNS-SD upstream and every single-tier DNS-SD upstream). When tiers are active it is two passes over a stack `u128` bitset — no allocation, no locks, no string work — or an in-place `Vec::retain` on the >128-target fallback path.
+
+### Static and unprioritized targets
+
+`ferrum.srv.priority` is present only on DNS-SD-discovered targets. A target without it is **unprioritized** and eligible in every tier. That covers statically configured `targets`, targets from Kubernetes/Consul/mesh discovery, and any discovered target that a static entry shadowed during `merge_targets` (static wins on an identical `host:port`). Demoting explicitly configured capacity behind a DNS tier would silently withdraw it, so the two rules are deliberately aligned: static capacity always serves, and the SRV tiers fail over around it.
+
+### The reserved `ferrum.srv.*` tag namespace
+
+`ferrum.srv.*` is an internal contract between the DNS-SD discoverer (its only writer) and the load balancer (its only reader), not an operator-authored label:
+
+- Operator-provided config loads — admin API `POST`/`PUT`/import/restore and the file-mode loader — reject any `targets[].tags` key or `subsets[].labels` key in the namespace, exactly as they already reject reserved `mesh.*` tags.
+- Target builders that copy workload/operator labels wholesale (mesh east-west, egress `ServiceEntry`) strip the namespace first.
+- The balancer accepts only a canonical decimal `u16`: ASCII digits, no sign, no leading zeros except the literal `0`. A malformed value, or more distinct tiers than `MAX_SRV_PRIORITY_TIERS`, disables SRV tier selection for that upstream and logs a warning.
+
+That last rule sets the direction of the failure mode. A bad tag can only turn tiering **off** (restoring flat health/locality selection); there is no value that manufactures a preference promoting or demoting a target relative to what the DNS zone published.
+
+## Address-only SRV mode
+
+`FERRUM_DNS_RECORD_TYPES` may include `srv`, which is a different feature from DNS-SD discovery. There, an SRV lookup answers "what IP addresses back this hostname"; the caller dials the proxy's own configured backend port. That mode therefore:
+
+- **ignores the RR's `port` entirely, including port `0`** — it does not apply the `admit_registry_port` rejection `resolve_srv` uses, because a port-0 RR still carries a perfectly usable target address and dropping it would blackhole a resolvable host over a field this mode never reads;
+- **honors the `.` root target**, which is a genuine availability signal rather than a port question, and skips it;
+- **walks answers in ascending `priority`**, so the lowest reachable tier wins and the chosen address does not depend on the order the resolver returned records in.
+
+The distinction is deliberate: port/priority semantics that gate *service availability* belong to DNS-SD, while address-only resolution inherits only the signals that are actually about availability.
 
 ## Stale-While-Revalidate
 

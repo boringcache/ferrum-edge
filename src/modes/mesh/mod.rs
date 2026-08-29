@@ -4504,6 +4504,11 @@ where
             // masquerade as remote and be excluded by strict locality LB.
             let mut tags = workload.selector.labels.clone();
             crate::modes::mesh::multicluster::strip_reserved_mesh_tags(&mut tags);
+            // Same reasoning for the reserved `ferrum.srv.*` namespace (issue
+            // #4291): it carries the internal RFC 2782 SRV priority-tier
+            // contract, and a copied workload label must not be able to place a
+            // mesh endpoint into a DNS-SD tier.
+            crate::service_discovery::strip_reserved_srv_tags(&mut tags);
             crate::config::types::merge_derived_topology_labels(
                 &mut tags,
                 workload.locality.as_deref(),
@@ -12015,6 +12020,7 @@ fn build_egress_upstream_targets(
                 // mesh provenance/transport marker the data plane owns.
                 let mut tags = ep.labels.clone();
                 crate::modes::mesh::multicluster::strip_reserved_mesh_tags(&mut tags);
+                crate::service_discovery::strip_reserved_srv_tags(&mut tags);
                 crate::config::types::merge_derived_topology_labels(
                     &mut tags,
                     None,

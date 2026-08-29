@@ -204,9 +204,11 @@ pub(crate) fn normalize_srv_target_host(target: impl std::fmt::Display) -> Optio
 /// One RFC 2782 SRV answer as returned by [`DnsCache::resolve_srv`].
 ///
 /// `resolve_srv` drops the root target (`.`) and port 0 before returning.
-/// DNS-SD still re-runs `admit_registry_port` and selects the minimum remaining
-/// priority so live traffic is never balanced across lower-priority
-/// disaster-recovery tiers.
+/// DNS-SD still re-runs `admit_registry_port`, then publishes EVERY remaining
+/// priority tier with `priority` stamped into the reserved
+/// `ferrum.srv.priority` tag. Choosing which tier serves traffic is a runtime,
+/// health-aware decision made by the load balancer's shared candidate filter,
+/// so a fully-unhealthy primary tier can actually fail over to the DR tier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SrvAnswer {
     /// SRV target hostname with the trailing root label stripped and ASCII-lowercased.
@@ -1626,8 +1628,31 @@ impl DnsCache {
                     match self.resolver.srv_lookup(hostname).await {
                         Ok(srv_lookup) => {
                             let srv_ttl = extract_ttl(srv_lookup.valid_until());
-                            // SRV records point to target hostnames -- resolve them to IPs
-                            for record in srv_lookup.answers() {
+                            // ADDRESS-ONLY SRV mode. This resolver path answers
+                            // "what IPs back this hostname"; the caller dials
+                            // the proxy's own configured backend port, so the
+                            // RR's `port` is never used. It therefore
+                            // deliberately does NOT apply the `admit_registry_port`
+                            // rejection that `resolve_srv` (the DNS-SD
+                            // service-availability path) applies: a port-0 RR
+                            // still carries a perfectly usable target address
+                            // here, and dropping it would blackhole a resolvable
+                            // host for a field this mode ignores. See
+                            // `docs/dns_resolver.md` → "Address-only SRV mode".
+                            //
+                            // The RFC 2782 signals that ARE about availability
+                            // still apply: the root target `.` means "decidedly
+                            // not available" and is skipped, and answers are
+                            // walked in ascending `priority` so the lowest
+                            // reachable tier wins instead of whatever order the
+                            // resolver happened to return. Sorting also makes
+                            // the chosen address independent of answer order.
+                            let mut ordered: Vec<_> = srv_lookup.answers().iter().collect();
+                            ordered.sort_by_key(|record| match &record.data {
+                                RData::SRV(srv) => srv.priority,
+                                _ => u16::MAX,
+                            });
+                            for record in ordered {
                                 let RData::SRV(ref srv) = record.data else {
                                     continue;
                                 };
@@ -1693,13 +1718,17 @@ impl DnsCache {
     /// manage their own polling intervals. Reuses the configured resolver
     /// so custom nameservers from `FERRUM_DNS_RESOLVER_ADDRESS` are respected.
     ///
-    /// Each answer carries RFC 2782 `priority` so callers can select a single
-    /// live tier. The root target (`.`) and port 0 are discarded here: they are
-    /// the RFC 2782 "service decidedly not available" signal and are not
-    /// dialable. Surviving records keep their original weights. Priority-tier
-    /// selection itself happens in DNS-SD after this filter so a poisoned
-    /// lowest tier cannot occupy the live set (see
-    /// `service_discovery::dns_sd::targets_from_srv_records`).
+    /// Each answer carries RFC 2782 `priority`. The root target (`.`) and port
+    /// 0 are discarded here: they are the RFC 2782 "service decidedly not
+    /// available" signal and are not dialable. Surviving records keep their
+    /// original weights. Tier FORMATION happens in DNS-SD after this filter, so
+    /// a poisoned tier never becomes a tier (see
+    /// `service_discovery::dns_sd::targets_from_srv_records`); tier SELECTION
+    /// happens per request in the load balancer's candidate filter.
+    ///
+    /// Distinct from the address-only SRV mode in `resolve_with_type`, which
+    /// answers "what IPs back this hostname", never dials the RR's port, and
+    /// therefore deliberately does not reject port 0.
     pub async fn resolve_srv(&self, service_name: &str) -> Result<Vec<SrvAnswer>, anyhow::Error> {
         let srv_lookup = self
             .resolver

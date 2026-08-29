@@ -992,6 +992,85 @@ fn target_is_cross_cluster(target: &UpstreamTarget) -> bool {
         == Some("true")
 }
 
+/// Sentinel in `LoadBalancer.srv_priorities` for an UNPRIORITIZED target — one
+/// carrying no `ferrum.srv.priority` tag.
+///
+/// `u32` (not `u16`) precisely so the sentinel is OUTSIDE the RFC 2782 priority
+/// domain: `65535` is a legal SRV priority and must stay distinguishable from
+/// "no tier". Unprioritized targets are eligible in EVERY tier — see
+/// [`LoadBalancer::filter_srv_priority_bitset`].
+const SRV_PRIORITY_NONE: u32 = u32::MAX;
+
+/// Pre-compute the per-target RFC 2782 SRV priority map for one upstream
+/// (issue #4291).
+///
+/// Returns an EMPTY `Vec` — SRV tier selection disabled, request path
+/// unchanged — in every one of these cases:
+///
+/// * No target carries [`crate::service_discovery::SRV_PRIORITY_TAG`]. This is
+///   every non-DNS-SD upstream, so the feature costs those upstreams one
+///   `is_empty()` branch per selection and nothing else.
+/// * Fewer than two DISTINCT priorities are present. With a single tier the
+///   filter is provably a no-op (the best tier is that tier, plus the always-
+///   eligible unprioritized targets, i.e. the whole pool), so skipping it is
+///   behavior-preserving and keeps the hot path off the filter entirely.
+/// * Any tag value is not a canonical decimal `u16`
+///   ([`crate::service_discovery::parse_srv_priority_tag`]).
+/// * More distinct tiers than
+///   [`crate::service_discovery::MAX_SRV_PRIORITY_TIERS`].
+///
+/// The last two cases FAIL OPEN, by design. The tag is an internal contract
+/// that only `dns_sd::targets_from_srv_records` writes, and it writes canonical
+/// values within the tier bound; operator config carrying the reserved
+/// `ferrum.srv.*` namespace is rejected at admission by
+/// `Upstream::validate_operator_provided_fields`, and label-copying target
+/// builders strip it via `strip_reserved_srv_tags`. So a malformed or
+/// over-cardinality map means the contract was violated, and the only safe
+/// response is to stop making tier decisions from it. Note the direction of the
+/// failure mode: because a bad value disables tiering rather than defining one,
+/// no injected tag can ever manufacture a preference that promotes or demotes a
+/// target relative to what the DNS zone published — the worst an injection can
+/// do is restore pre-#4291 flat selection, which is logged.
+fn build_srv_priorities(upstream_id: &str, targets: &[UpstreamTarget]) -> Vec<u32> {
+    let mut priorities: Vec<u32> = Vec::new();
+    let mut tagged = 0usize;
+    let mut distinct: Vec<u16> = Vec::new();
+
+    for target in targets {
+        let Some(raw) = target.tags.get(crate::service_discovery::SRV_PRIORITY_TAG) else {
+            priorities.push(SRV_PRIORITY_NONE);
+            continue;
+        };
+        tagged += 1;
+        let Some(priority) = crate::service_discovery::parse_srv_priority_tag(raw) else {
+            tracing::warn!(
+                upstream = %upstream_id,
+                "Upstream carries a malformed RFC 2782 SRV priority tag; SRV priority-tier \
+                 selection is disabled for this upstream and every target stays eligible"
+            );
+            return Vec::new();
+        };
+        if !distinct.contains(&priority) {
+            if distinct.len() == crate::service_discovery::MAX_SRV_PRIORITY_TIERS {
+                tracing::warn!(
+                    upstream = %upstream_id,
+                    max_tiers = crate::service_discovery::MAX_SRV_PRIORITY_TIERS,
+                    "Upstream carries more RFC 2782 SRV priority tiers than the bound; SRV \
+                     priority-tier selection is disabled for this upstream"
+                );
+                return Vec::new();
+            }
+            distinct.push(priority);
+        }
+        priorities.push(u32::from(priority));
+    }
+
+    if tagged == 0 || distinct.len() < 2 {
+        return Vec::new();
+    }
+    priorities
+}
+
 /// Warm-up bias subtracted from `min_known_ewma` for unsampled (late-joiner)
 /// targets during the mixed warm-up phase.
 ///
@@ -3056,6 +3135,24 @@ pub struct LoadBalancer {
     /// (it is dropped after construction); diagnostic callers can read it
     /// from `LoadBalancerCacheInner.upstreams[id].source_locality`.
     target_locality_ranks: Vec<u8>,
+    /// Pre-computed RFC 2782 SRV priority per target (issue #4291), index-
+    /// aligned with `targets`. `SRV_PRIORITY_NONE` marks an UNPRIORITIZED
+    /// target — one that carries no `ferrum.srv.priority` tag (a static
+    /// operator-authored target, or a target from a non-SRV discovery
+    /// provider).
+    ///
+    /// Empty `Vec` means SRV tier selection is INERT for this upstream, and
+    /// the request path skips it with a single `is_empty()` test. It is inert
+    /// unless the upstream has at least two DISTINCT well-formed priorities:
+    /// see [`build_srv_priorities`] for the exact (deliberately fail-open)
+    /// admission rules.
+    ///
+    /// Read only by [`Self::filter_srv_priority_bitset`] /
+    /// [`Self::filter_srv_priority_vec`], which run inside the shared health
+    /// (candidate) filter so every selection entry point — HTTP/1.1, H2, H3,
+    /// gRPC, WebSocket, TCP, UDP, subset, per-port, retry-exclusion, and the
+    /// sticky-session eligibility probe — sees the same tier decision.
+    srv_priorities: Vec<u32>,
     /// O(1) reverse lookup from "host:port" string to index in `targets`/`host_port_keys`.
     /// Replaces the O(n) linear scan in `find_target_key()`. Keys are the same
     /// "host:port" format as `host_port_keys`, enabling zero-allocation lookup
@@ -3610,11 +3707,16 @@ impl LoadBalancer {
             Vec::new()
         };
 
+        // RFC 2782 SRV tier metadata (issue #4291). Cold-path only: the
+        // request path reads the resulting `Vec<u32>` by index.
+        let srv_priorities = build_srv_priorities(upstream_id, targets);
+
         Self {
             targets: targets.iter().cloned().map(Arc::new).collect(),
             target_keys,
             host_port_keys,
             target_locality_ranks,
+            srv_priorities,
             target_index,
             sticky_token_index,
             has_wildcard_host_target,
@@ -3895,6 +3997,116 @@ impl LoadBalancer {
         })
     }
 
+    /// RFC 2782 priority-tier filter for the bitset path (issue #4291).
+    ///
+    /// Given the HEALTHY candidate set for a pool, keep only:
+    ///
+    /// * every healthy target in the BEST (numerically smallest) priority tier
+    ///   that still has at least one healthy member in this pool, and
+    /// * every healthy UNPRIORITIZED target (`SRV_PRIORITY_NONE`).
+    ///
+    /// That is the whole contract, and each clause is load-bearing:
+    ///
+    /// * **No mixing.** A healthy DR tier is never selected alongside a healthy
+    ///   primary tier — RFC 2782 says the client contacts "the target host with
+    ///   the lowest-numbered priority it can reach", not a blend.
+    /// * **Real failover.** The next tier becomes eligible the moment no target
+    ///   in ANY lower tier is healthy, and stops being eligible again as soon as
+    ///   one recovers, because the best tier is recomputed per selection from
+    ///   live health rather than latched.
+    /// * **Static targets keep their semantics.** Operator-authored static
+    ///   targets and targets from other discovery providers carry no SRV tier.
+    ///   Demoting them behind a DNS SRV tier would silently withdraw
+    ///   explicitly-configured capacity, so they are unioned into every tier.
+    ///   `merge_targets` already lets a static entry shadow a discovered one on
+    ///   the same `host:port`, and a shadowed entry is unprioritized, hence
+    ///   always eligible — the two rules agree.
+    /// * **Never empties the pool.** The best tier is only chosen when it has a
+    ///   healthy member, and when NO prioritized target is healthy the input is
+    ///   returned unchanged (which at that point contains only unprioritized
+    ///   targets, or is itself empty).
+    ///
+    /// Cost when inert (`srv_priorities` empty — every non-DNS-SD upstream):
+    /// one branch. Cost when active: two passes over a stack `u128`, no
+    /// allocation, no locks, no `String` work.
+    ///
+    /// This runs INSIDE the shared health filter, so it is applied before —
+    /// and cannot be bypassed by — any locality-LB path: `enabled: false`,
+    /// `distribute`, `failoverPriority`, a missing source locality, and strict
+    /// mode all operate on the already tier-selected candidate set. It is a
+    /// separate, additive mechanism, not an overload of Istio locality tiers.
+    ///
+    /// It deliberately does NOT apply to the all-unhealthy degraded fallbacks
+    /// (`HealthBitset::all(...)` in `select`, and strict mode's fail-closed
+    /// widening to unhealthy local endpoints). Once nothing is healthy there is
+    /// no reachable tier to prefer, and narrowing the last-resort pool would
+    /// shrink availability rather than direct it.
+    #[inline]
+    fn filter_srv_priority_bitset(&self, healthy: HealthBitset) -> HealthBitset {
+        if self.srv_priorities.is_empty() {
+            return healthy;
+        }
+        let mut best = SRV_PRIORITY_NONE;
+        healthy.for_each_set_bit(|idx| {
+            let priority = self.srv_priority(idx);
+            if priority < best {
+                best = priority;
+            }
+        });
+        if best == SRV_PRIORITY_NONE {
+            // No healthy target belongs to any tier: nothing to prefer.
+            return healthy;
+        }
+        let mut selected = HealthBitset::empty();
+        healthy.for_each_set_bit(|idx| {
+            let priority = self.srv_priority(idx);
+            if priority == best || priority == SRV_PRIORITY_NONE {
+                selected.set(idx);
+            }
+        });
+        selected
+    }
+
+    /// Vec-path counterpart of [`Self::filter_srv_priority_bitset`], for the
+    /// >128-target pools the `u128` bitset cannot represent.
+    ///
+    /// Filters in place with `Vec::retain`, so it allocates nothing and
+    /// preserves the ascending-original-index invariant WRR schedule keys and
+    /// `binary_search_by_key` hit resolution depend on.
+    #[inline]
+    fn filter_srv_priority_vec(&self, healthy: &mut Vec<(usize, &Arc<UpstreamTarget>)>) {
+        if self.srv_priorities.is_empty() || healthy.is_empty() {
+            return;
+        }
+        let mut best = SRV_PRIORITY_NONE;
+        for &(idx, _) in healthy.iter() {
+            let priority = self.srv_priority(idx);
+            if priority < best {
+                best = priority;
+            }
+        }
+        if best == SRV_PRIORITY_NONE {
+            return;
+        }
+        healthy.retain(|&(idx, _)| {
+            let priority = self.srv_priority(idx);
+            priority == best || priority == SRV_PRIORITY_NONE
+        });
+    }
+
+    /// Pre-computed RFC 2782 priority for `idx`, or `SRV_PRIORITY_NONE`.
+    ///
+    /// An out-of-range index (and the inert empty map) reads as unprioritized,
+    /// so a bounds slip can only ever widen eligibility, never silently drop a
+    /// target out of every tier.
+    #[inline]
+    fn srv_priority(&self, idx: usize) -> u32 {
+        self.srv_priorities
+            .get(idx)
+            .copied()
+            .unwrap_or(SRV_PRIORITY_NONE)
+    }
+
     /// Compute a stack-allocated bitset of healthy target indices in a single
     /// pass. Each target requires at most 2 `DashMap` lookups (active + passive),
     /// done once per `select()` call. All subsequent algorithm steps use free
@@ -3905,7 +4117,7 @@ impl LoadBalancer {
     fn compute_health_bitset(&self, health: Option<&HealthContext<'_>>) -> HealthBitset {
         let n = self.targets.len();
         let Some(h) = health else {
-            return HealthBitset::all(n);
+            return self.filter_srv_priority_bitset(HealthBitset::all(n));
         };
 
         // Fast check: if both health maps are empty, all targets are healthy.
@@ -3914,7 +4126,7 @@ impl LoadBalancer {
                 .as_ref()
                 .is_none_or(|ps| ps.unhealthy.is_empty())
         {
-            return HealthBitset::all(n);
+            return self.filter_srv_priority_bitset(HealthBitset::all(n));
         }
 
         let mut bitset = HealthBitset::empty();
@@ -3945,7 +4157,7 @@ impl LoadBalancer {
             bitset.set(idx);
         }
 
-        bitset
+        self.filter_srv_priority_bitset(bitset)
     }
 
     /// Compute healthy indices for a pre-filtered target set. This keeps
@@ -3959,7 +4171,7 @@ impl LoadBalancer {
         indices: &[usize],
     ) -> HealthBitset {
         let Some(h) = health else {
-            return bitset_for_indices(indices);
+            return self.filter_srv_priority_bitset(bitset_for_indices(indices));
         };
 
         if h.active_unhealthy.is_empty()
@@ -3999,7 +4211,7 @@ impl LoadBalancer {
             bitset.set(idx);
         }
 
-        bitset
+        self.filter_srv_priority_bitset(bitset)
     }
 
     /// Alloc-free analogue of [`Self::compute_health_bitset_for_indices`] that
@@ -4016,7 +4228,7 @@ impl LoadBalancer {
         mask: &HealthBitset,
     ) -> HealthBitset {
         let Some(h) = health else {
-            return *mask;
+            return self.filter_srv_priority_bitset(*mask);
         };
 
         if h.active_unhealthy.is_empty()
@@ -4024,7 +4236,7 @@ impl LoadBalancer {
                 .as_ref()
                 .is_none_or(|ps| ps.unhealthy.is_empty())
         {
-            return *mask;
+            return self.filter_srv_priority_bitset(*mask);
         }
 
         let candidate_count = mask.count();
@@ -4057,7 +4269,7 @@ impl LoadBalancer {
             bitset.set(idx);
         }
 
-        bitset
+        self.filter_srv_priority_bitset(bitset)
     }
 
     /// Collect healthy targets into a Vec — fallback for upstreams with >128
@@ -4072,7 +4284,10 @@ impl LoadBalancer {
     ) -> Vec<(usize, &Arc<UpstreamTarget>)> {
         let n = self.targets.len();
         let Some(h) = health else {
-            return self.targets.iter().enumerate().collect();
+            let mut all: Vec<(usize, &Arc<UpstreamTarget>)> =
+                self.targets.iter().enumerate().collect();
+            self.filter_srv_priority_vec(&mut all);
+            return all;
         };
 
         let mut healthy: Vec<(usize, &Arc<UpstreamTarget>)> = Vec::new();
@@ -4102,6 +4317,7 @@ impl LoadBalancer {
             healthy.sort_unstable_by_key(|(idx, _)| *idx);
         }
 
+        self.filter_srv_priority_vec(&mut healthy);
         healthy
     }
 
@@ -4116,11 +4332,13 @@ impl LoadBalancer {
         indices: &[usize],
     ) -> Vec<(usize, &Arc<UpstreamTarget>)> {
         let Some(h) = health else {
-            return indices
+            let mut all: Vec<(usize, &Arc<UpstreamTarget>)> = indices
                 .iter()
                 .copied()
                 .filter_map(|idx| self.targets.get(idx).map(|target| (idx, target)))
                 .collect();
+            self.filter_srv_priority_vec(&mut all);
+            return all;
         };
 
         let mut healthy: Vec<(usize, &Arc<UpstreamTarget>)> = Vec::new();
@@ -4154,6 +4372,7 @@ impl LoadBalancer {
             healthy.sort_unstable_by_key(|(idx, _)| *idx);
         }
 
+        self.filter_srv_priority_vec(&mut healthy);
         healthy
     }
 

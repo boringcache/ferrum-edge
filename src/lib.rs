@@ -1220,6 +1220,34 @@ pub mod _test_support {
         crate::service_discovery::dns_sd::targets_from_srv_records(answers, default_weight)
     }
 
+    /// Reserved tag key carrying a discovered target's RFC 2782 SRV priority
+    /// (issue #4291). The DNS-SD discoverer is its only writer and the load
+    /// balancer's candidate filter its only reader.
+    pub fn srv_priority_tag_for_test() -> &'static str {
+        crate::service_discovery::SRV_PRIORITY_TAG
+    }
+
+    /// Reserved tag-key namespace owning [`srv_priority_tag_for_test`].
+    pub fn reserved_srv_tag_prefix_for_test() -> &'static str {
+        crate::service_discovery::RESERVED_SRV_TAG_PREFIX
+    }
+
+    /// Largest number of distinct RFC 2782 priority tiers DNS-SD publishes and
+    /// the load balancer honors (issue #4291).
+    pub fn max_srv_priority_tiers_for_test() -> usize {
+        crate::service_discovery::MAX_SRV_PRIORITY_TIERS
+    }
+
+    /// Canonical-decimal parse for the reserved SRV priority tag value.
+    pub fn parse_srv_priority_tag_for_test(value: &str) -> Option<u16> {
+        crate::service_discovery::parse_srv_priority_tag(value)
+    }
+
+    /// Drop every reserved `ferrum.srv.*` key from a copied label map.
+    pub fn strip_reserved_srv_tags_for_test(tags: &mut std::collections::HashMap<String, String>) {
+        crate::service_discovery::strip_reserved_srv_tags(tags);
+    }
+
     /// Mutable discovery-loop state used by the production apply pipeline.
     #[derive(Debug, Default)]
     pub struct DiscoveryLoopStateForTest {

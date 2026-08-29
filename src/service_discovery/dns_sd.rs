@@ -4,20 +4,34 @@
 //! into upstream targets. Reuses the gateway's existing DnsCache resolver
 //! so that custom nameservers and DNS configuration are respected.
 //!
-//! RFC 2782 selection happens at ingest, not on the request path: undialable
-//! records (root target `.`, port 0) are dropped first, then only the
-//! numerically-smallest remaining priority is published. Lower-priority
-//! disaster-recovery tiers are never load-balanced with the live tier.
+//! RFC 2782 selection is split across two stages (issue #4291):
+//!
+//! * **Ingest (here).** Undialable records — the root target `.` and port `0`,
+//!   the RFC 2782 "service decidedly not available" signals — are discarded.
+//!   Every surviving tier is published, each target stamped with its priority
+//!   in the reserved [`crate::service_discovery::SRV_PRIORITY_TAG`].
+//! * **Selection (`LoadBalancer`).** The candidate filter keeps only the
+//!   numerically-smallest tier that still has a HEALTHY target, and falls
+//!   through to the next tier only when every lower tier is unhealthy.
+//!
+//! Discarding the disaster-recovery tiers at ingest (the earlier behavior)
+//! stopped live primary/DR mixing but made the DR tier permanently
+//! unreachable: once every primary target went unhealthy the load balancer had
+//! nothing left to fail over to. RFC 2782 requires the client to use the
+//! lowest-numbered priority it **can reach**, so reachability has to be a
+//! runtime question, not a poll-time one.
 
-use crate::config::types::UpstreamTarget;
+use crate::config::types::{MAX_TARGETS_PER_UPSTREAM, UpstreamTarget};
 use crate::dns::{DnsCache, SrvAnswer, normalize_srv_target_host};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use tracing::debug;
 
 /// DNS-SD service discoverer.
 ///
-/// Resolves SRV records for the configured service name and converts
-/// admissible records at the lowest RFC 2782 priority into `UpstreamTarget`s.
+/// Resolves SRV records for the configured service name and converts every
+/// admissible RFC 2782 priority tier into `UpstreamTarget`s carrying their
+/// priority tag.
 pub struct DnsSdDiscoverer {
     dns_cache: DnsCache,
     service_name: String,
@@ -42,61 +56,116 @@ impl DnsSdDiscoverer {
 ///    matches `UpstreamTarget` admission.
 /// 2. Admit ports through `admit_registry_port` — the same `1..=u16::MAX`
 ///    contract Kubernetes and Consul use. Port 0 is rejected.
-/// 3. Among remaining admissible records, keep only the numerically-smallest
-///    RFC 2782 priority, preserving each record's weight (weight `0` is
-///    remapped to `default_weight` so published targets match the static
-///    `1..=MAX_TARGET_WEIGHT` contract).
+/// 3. Deduplicate on the dial identity `host:port`, keeping the LOWEST
+///    priority (and, at equal priority, the first record seen). A zone that
+///    lists one endpoint in two tiers must not double its share of the tier it
+///    actually serves, and must not be pinned to the DR tier by record order.
+/// 4. Group the survivors into ascending priority tiers, keep at most
+///    [`crate::service_discovery::MAX_SRV_PRIORITY_TIERS`] of them (lowest
+///    first), and stamp each target with
+///    [`crate::service_discovery::SRV_PRIORITY_TAG`]. Weights are preserved
+///    per record; weight `0` becomes `default_weight` so published targets
+///    match the static `1..=MAX_TARGET_WEIGHT` contract.
+/// 5. Truncate to `MAX_TARGETS_PER_UPSTREAM`. Because the output is ordered by
+///    ascending priority, truncation can only ever drop the LEAST preferred
+///    records.
 ///
-/// Invalid records are filtered **before** min-priority. A poisoned lowest
-/// tier (every RR is `.` or port 0) therefore does not occupy the live set:
-/// the next priority that still has a dialable host is used. That is the
-/// ingest-time reading of RFC 2782's "lowest-numbered priority it can reach"
-/// — undialable RRs are not reachable, so they must not block a higher
-/// (numerically larger) disaster-recovery tier that *is* dialable, and they
-/// also must not be published *alongside* a valid live tier.
+/// Invalid records are filtered **before** tiers are formed. A poisoned lowest
+/// tier (every RR at that priority is `.` or port 0) therefore does not occupy
+/// the live set at all: the next priority that still has a dialable host
+/// becomes the best tier. Undialable RRs are not reachable, so they must not
+/// block a numerically larger tier that *is*.
 ///
-/// If no admissible records remain at any priority, the snapshot is empty
-/// (fail-closed). The discovery manager's existing empty-after-filter policy
-/// then applies; live traffic is not balanced onto leftover junk.
+/// If no admissible records remain at any priority the snapshot is empty
+/// (fail-closed) and the discovery manager's existing empty-after-filter
+/// policy applies.
 ///
-/// Runtime unreachability of an admitted live-tier host is health-check /
-/// load-balancer failover, not "include the DR tier in this poll's snapshot".
+/// Returned targets are ordered by `(priority, first-seen)`, so the output is a
+/// deterministic function of the answer SET, not of the order the resolver
+/// happened to return records in.
 pub(crate) fn targets_from_srv_records(
     records: impl IntoIterator<Item = SrvAnswer>,
     default_weight: u32,
 ) -> Vec<UpstreamTarget> {
-    let admitted: Vec<SrvAnswer> = records
-        .into_iter()
-        .filter_map(|answer| {
-            let host = normalize_srv_target_host(answer.host)?;
-            super::admit_registry_port(u64::from(answer.port)).map(|port| SrvAnswer {
-                host,
-                port,
-                weight: answer.weight,
-                priority: answer.priority,
-            })
-        })
-        .collect();
+    // Dial-identity dedup, lowest priority wins. `seen` maps `host:port` to the
+    // slot in `admitted` so a later, better tier can replace an earlier one
+    // in place without disturbing first-seen ordering.
+    let mut admitted: Vec<SrvAnswer> = Vec::new();
+    let mut seen: HashMap<(String, u16), usize> = HashMap::new();
+    for answer in records {
+        let Some(host) = normalize_srv_target_host(answer.host) else {
+            continue;
+        };
+        let Some(port) = super::admit_registry_port(u64::from(answer.port)) else {
+            continue;
+        };
+        let admitted_answer = SrvAnswer {
+            host,
+            port,
+            weight: answer.weight,
+            priority: answer.priority,
+        };
+        match seen.entry((admitted_answer.host.clone(), port)) {
+            Entry::Occupied(existing) => {
+                let slot = *existing.get();
+                if admitted_answer.priority < admitted[slot].priority {
+                    admitted[slot] = admitted_answer;
+                }
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(admitted.len());
+                admitted.push(admitted_answer);
+            }
+        }
+    }
 
-    let Some(min_priority) = admitted.iter().map(|answer| answer.priority).min() else {
+    if admitted.is_empty() {
         return Vec::new();
-    };
+    }
+
+    // Ascending priority; `sort_by_key` is stable, so records inside one tier
+    // keep their first-seen order.
+    admitted.sort_by_key(|answer| answer.priority);
+
+    // Bound the retained tier count. `admitted` is already ascending, so the
+    // cutoff is the first record whose priority is not among the
+    // `MAX_SRV_PRIORITY_TIERS` smallest.
+    let mut retained_tiers = 0usize;
+    let mut last_priority: Option<u16> = None;
+    let mut cutoff = admitted.len();
+    for (idx, answer) in admitted.iter().enumerate() {
+        if last_priority != Some(answer.priority) {
+            if retained_tiers == super::MAX_SRV_PRIORITY_TIERS {
+                cutoff = idx;
+                break;
+            }
+            retained_tiers += 1;
+            last_priority = Some(answer.priority);
+        }
+    }
+    admitted.truncate(cutoff.min(MAX_TARGETS_PER_UPSTREAM));
 
     admitted
         .into_iter()
-        .filter(|answer| answer.priority == min_priority)
-        .map(|answer| UpstreamTarget {
-            host: answer.host,
-            port: answer.port,
-            service_port_policy_key: None,
-            weight: if answer.weight > 0 {
-                u32::from(answer.weight)
-            } else {
-                default_weight
-            },
-            tags: HashMap::new(),
-            locality: None,
-            path: None,
+        .map(|answer| {
+            let mut tags = HashMap::with_capacity(1);
+            tags.insert(
+                super::SRV_PRIORITY_TAG.to_string(),
+                super::format_srv_priority(answer.priority),
+            );
+            UpstreamTarget {
+                host: answer.host,
+                port: answer.port,
+                service_port_policy_key: None,
+                weight: if answer.weight > 0 {
+                    u32::from(answer.weight)
+                } else {
+                    default_weight
+                },
+                tags,
+                locality: None,
+                path: None,
+            }
         })
         .collect()
 }
@@ -112,7 +181,7 @@ impl super::ServiceDiscoverer for DnsSdDiscoverer {
                 service = %self.service_name,
                 answers,
                 published = targets.len(),
-                "DNS-SD published only the lowest admissible RFC 2782 priority"
+                "DNS-SD dropped undialable, duplicate, or over-cardinality RFC 2782 SRV records"
             );
         }
         Ok(super::DiscoverySnapshot::from_targets(targets))
