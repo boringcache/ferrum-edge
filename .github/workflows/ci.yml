@@ -4279,6 +4279,7 @@ jobs:
           fi
           helm template ferrum-db ./charts/ferrum-gateway --namespace ferrum \
             --set mode=database \
+            --set database.type=sqlite \
             --set metrics.enabled=true \
             --set metrics.serviceMonitor.enabled=false \
             --set metrics.allowedCidrs=10.0.0.0/8 \
