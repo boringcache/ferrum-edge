@@ -1107,10 +1107,12 @@ pub fn capture_ipv6_enabled_from_env() -> Result<bool, String> {
     if ip6tables_mode == Ip6TablesMode::Disabled {
         return Ok(false);
     }
-    let include_cidrs =
-        parse_cidr_env(&resolve_ferrum_var("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS").unwrap_or_default());
-    let exclude_cidrs =
-        parse_cidr_env(&resolve_ferrum_var("FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS").unwrap_or_default());
+    let include_cidrs = parse_cidr_env(
+        &resolve_ferrum_var("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS").unwrap_or_default(),
+    );
+    let exclude_cidrs = parse_cidr_env(
+        &resolve_ferrum_var("FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS").unwrap_or_default(),
+    );
     Ok(include_cidrs
         .iter()
         .chain(exclude_cidrs.iter())

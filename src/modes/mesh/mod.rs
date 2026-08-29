@@ -19841,8 +19841,14 @@ fn sidecar_capture_listener_addrs(
     }
     if ip.is_loopback() {
         return Ok(vec![
-            (SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port), false),
-            (SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port), false),
+            (
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+                false,
+            ),
+            (
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
+                false,
+            ),
         ]);
     }
     Err(format!(

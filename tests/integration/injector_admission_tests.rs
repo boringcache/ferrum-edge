@@ -288,7 +288,9 @@ fn injected_sidecar_learns_when_ipv6_capture_rules_are_installed() {
     // The ip6tables fan-out carries the same loopback/self RETURN, and it still
     // precedes that family's REDIRECT.
     let v6_return = script
-        .find("ip6tables -t nat -w 5 -A FERRUM_MESH_OUTBOUND -m addrtype --dst-type LOCAL -j RETURN")
+        .find(
+            "ip6tables -t nat -w 5 -A FERRUM_MESH_OUTBOUND -m addrtype --dst-type LOCAL -j RETURN",
+        )
         .expect("the ip6tables chain must carry the loopback/self RETURN too");
     let v6_redirect = script
         .find("ip6tables -t nat -w 5 -A FERRUM_MESH_OUTBOUND -p tcp -d fd00::/8 -j REDIRECT")

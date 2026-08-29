@@ -4357,16 +4357,13 @@ mod original_dst_live_tests {
 
         // Everything runs on one throwaway thread inside the child's netns
         // (`setns` mutates only the calling thread, which exits right after).
-        let (local, orig) =
-            std::thread::spawn(move || -> Result<(SocketAddr, Option<SocketAddr>), String> {
+        let (local, orig) = std::thread::spawn(
+            move || -> Result<(SocketAddr, Option<SocketAddr>), String> {
                 let ns = std::fs::File::open(format!("/proc/{pid}/ns/net"))
                     .map_err(|e| format!("open netns handle: {e}"))?;
                 // Safety: `ns` is an open netns handle owned for the call.
                 if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
-                    return Err(format!(
-                        "setns failed: {}",
-                        std::io::Error::last_os_error()
-                    ));
+                    return Err(format!("setns failed: {}", std::io::Error::last_os_error()));
                 }
                 // Match the production issue-#4271 capture shape exactly: one
                 // AF_INET6 wildcard with V6ONLY disabled accepts both native IPv6
@@ -4399,12 +4396,11 @@ mod original_dst_live_tests {
                 let local = accepted
                     .local_addr()
                     .map_err(|e| format!("local_addr: {e}"))?;
-                let orig = crate::socket_opts::original_dst_from_raw_fd(
-                    accepted.as_raw_fd(),
-                    local,
-                );
+                let orig =
+                    crate::socket_opts::original_dst_from_raw_fd(accepted.as_raw_fd(), local);
                 Ok((local, orig))
-            })
+            },
+        )
         .join()
         .expect("netns scenario thread must not panic")
         .expect("live SO_ORIGINAL_DST scenario must complete");

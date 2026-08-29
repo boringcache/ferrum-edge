@@ -19760,8 +19760,9 @@ pub(crate) fn create_proxy_socket(
     // downcastable: the dual-stack capture bind classifies it to decide whether
     // an IPv6 failure is a safe downgrade to the v4 wildcard or a real conflict.
     socket.bind(&addr.into()).map_err(|err| {
-        anyhow::Error::new(err)
-            .context(format!("failed to bind exclusive TCP proxy listener on {addr}"))
+        anyhow::Error::new(err).context(format!(
+            "failed to bind exclusive TCP proxy listener on {addr}"
+        ))
     })?;
 
     // TCP_FASTOPEN: enable TFO on the server socket after bind, before listen.

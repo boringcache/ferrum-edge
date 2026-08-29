@@ -277,7 +277,10 @@ fn a_v4_mapped_local_address_selects_the_ipv4_conntrack_lookup() {
 
 #[test]
 fn native_addresses_keep_their_own_conntrack_lookup_family() {
-    let native_v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 7)), 15006);
+    let native_v6 = SocketAddr::new(
+        IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 7)),
+        15006,
+    );
     assert_eq!(
         original_dst_lookup_addr(native_v6),
         native_v6,
