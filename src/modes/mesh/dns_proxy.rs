@@ -1159,6 +1159,11 @@ struct PendingForward {
     query: DnsQuery,
     expires_at: Instant,
     abort: AbortHandle,
+    /// Monotonic token identifying this exact forward. A timed-out entry frees
+    /// its 16-bit upstream ID immediately, so a later forward can be allocated
+    /// the same ID while the earlier recv task's already-queued outcome has not
+    /// been drained yet. The token is what refuses that stale outcome.
+    forward_seq: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1171,10 +1176,12 @@ enum UpstreamIdAllocError {
 enum UpstreamRecvOutcome {
     Matched {
         upstream_id: u16,
+        forward_seq: u64,
         packet: Vec<u8>,
     },
     RecvFailed {
         upstream_id: u16,
+        forward_seq: u64,
         error: std::io::Error,
     },
 }
@@ -1221,6 +1228,7 @@ async fn run_udp_forwarder_with_entropy(
 ) {
     let mut pending: HashMap<u16, PendingForward> = HashMap::new();
     let mut upstream_recvs: JoinSet<UpstreamRecvOutcome> = JoinSet::new();
+    let mut next_forward_seq: u64 = 0;
     let mut expired_ids = Vec::new();
     let mut cleanup = tokio::time::interval(Duration::from_secs(1));
 
@@ -1286,9 +1294,12 @@ async fn run_udp_forwarder_with_entropy(
                 upstream_packet[..2].copy_from_slice(&upstream_id.to_be_bytes());
                 match socket.send(&upstream_packet).await {
                     Ok(_) => {
+                        let forward_seq = next_forward_seq;
+                        next_forward_seq = next_forward_seq.wrapping_add(1);
                         let abort = upstream_recvs.spawn(wait_for_matching_upstream_response(
                             socket,
                             upstream_id,
+                            forward_seq,
                             request.query.clone(),
                         ));
                         pending.insert(
@@ -1300,6 +1311,7 @@ async fn run_udp_forwarder_with_entropy(
                                 expires_at: Instant::now()
                                     + Duration::from_secs(DNS_UPSTREAM_TIMEOUT_SECS),
                                 abort,
+                                forward_seq,
                             },
                         );
                     }
@@ -1317,9 +1329,12 @@ async fn run_udp_forwarder_with_entropy(
                 match completed {
                     Some(Ok(UpstreamRecvOutcome::Matched {
                         upstream_id,
+                        forward_seq,
                         mut packet,
                     })) => {
-                        let Some(pending_request) = pending.remove(&upstream_id) else {
+                        let Some(pending_request) =
+                            take_pending_forward(&mut pending, upstream_id, forward_seq)
+                        else {
                             continue;
                         };
                         packet[..2].copy_from_slice(&pending_request.original_id.to_be_bytes());
@@ -1330,8 +1345,14 @@ async fn run_udp_forwarder_with_entropy(
                             "Forwarded DNS response from upstream"
                         );
                     }
-                    Some(Ok(UpstreamRecvOutcome::RecvFailed { upstream_id, error })) => {
-                        if let Some(pending_request) = pending.remove(&upstream_id) {
+                    Some(Ok(UpstreamRecvOutcome::RecvFailed {
+                        upstream_id,
+                        forward_seq,
+                        error,
+                    })) => {
+                        if let Some(pending_request) =
+                            take_pending_forward(&mut pending, upstream_id, forward_seq)
+                        {
                             warn!(
                                 error = %error,
                                 upstream = %upstream,
@@ -1378,6 +1399,27 @@ async fn run_udp_forwarder_with_entropy(
     upstream_recvs.abort_all();
 }
 
+/// Retire a pending forward only when the completed recv task belongs to it.
+///
+/// `join_next` drains outcomes after they are produced, so a task that matched
+/// an upstream response at the same instant its entry timed out can surface its
+/// result once the freed upstream ID has already been re-allocated to a newer
+/// query. Matching on the ID alone would then hand one client another client's
+/// answer, or SERVFAIL a healthy lookup.
+fn take_pending_forward(
+    pending: &mut HashMap<u16, PendingForward>,
+    upstream_id: u16,
+    forward_seq: u64,
+) -> Option<PendingForward> {
+    if !pending
+        .get(&upstream_id)
+        .is_some_and(|entry| entry.forward_seq == forward_seq)
+    {
+        return None;
+    }
+    pending.remove(&upstream_id)
+}
+
 async fn bind_connected_upstream_socket(upstream: SocketAddr) -> std::io::Result<UdpSocket> {
     let bind_addr = if upstream.is_ipv6() {
         SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
@@ -1392,6 +1434,7 @@ async fn bind_connected_upstream_socket(upstream: SocketAddr) -> std::io::Result
 async fn wait_for_matching_upstream_response(
     socket: UdpSocket,
     upstream_id: u16,
+    forward_seq: u64,
     query: DnsQuery,
 ) -> UpstreamRecvOutcome {
     let mut buf = vec![0u8; DNS_MAX_UDP_PACKET_SIZE];
@@ -1411,11 +1454,16 @@ async fn wait_for_matching_upstream_response(
                 buf.truncate(len);
                 return UpstreamRecvOutcome::Matched {
                     upstream_id,
+                    forward_seq,
                     packet: buf,
                 };
             }
             Err(error) => {
-                return UpstreamRecvOutcome::RecvFailed { upstream_id, error };
+                return UpstreamRecvOutcome::RecvFailed {
+                    upstream_id,
+                    forward_seq,
+                    error,
+                };
             }
         }
     }
@@ -2383,6 +2431,45 @@ mod tests {
         let local = socket.local_addr().expect("local addr");
         assert_ne!(local.port(), 0);
         assert_eq!(socket.peer_addr().expect("peer addr"), upstream);
+    }
+
+    #[tokio::test]
+    async fn a_reused_upstream_id_does_not_retire_the_replacement_forward() {
+        let query = parse_dns_query(&build_a_query("example.com")).expect("query parses");
+        let client: SocketAddr = "127.0.0.1:53000".parse().expect("client addr");
+        let mut idle: JoinSet<()> = JoinSet::new();
+        let abort = idle.spawn(std::future::pending::<()>());
+
+        let mut pending: HashMap<u16, PendingForward> = HashMap::new();
+        // The replacement forward that was allocated the freed upstream ID.
+        pending.insert(
+            0xBEEF,
+            PendingForward {
+                client,
+                original_id: query.id,
+                query: query.clone(),
+                expires_at: Instant::now() + Duration::from_secs(DNS_UPSTREAM_TIMEOUT_SECS),
+                abort,
+                forward_seq: 7,
+            },
+        );
+
+        // The timed-out predecessor's queued outcome names the same ID.
+        assert!(
+            take_pending_forward(&mut pending, 0xBEEF, 6).is_none(),
+            "a stale outcome must not retire the forward that reused its upstream ID"
+        );
+        assert!(
+            pending.contains_key(&0xBEEF),
+            "the replacement lookup must still be pending"
+        );
+
+        let retired =
+            take_pending_forward(&mut pending, 0xBEEF, 7).expect("its own outcome must retire it");
+        assert_eq!(retired.forward_seq, 7);
+        assert!(pending.is_empty());
+
+        idle.abort_all();
     }
 
     #[tokio::test]
