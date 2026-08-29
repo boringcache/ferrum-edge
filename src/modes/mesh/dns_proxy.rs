@@ -1163,8 +1163,14 @@ enum UpstreamIdAllocError {
 }
 
 enum UpstreamRecvOutcome {
-    Matched { upstream_id: u16, packet: Vec<u8> },
-    RecvFailed { upstream_id: u16, error: std::io::Error },
+    Matched {
+        upstream_id: u16,
+        packet: Vec<u8>,
+    },
+    RecvFailed {
+        upstream_id: u16,
+        error: std::io::Error,
+    },
 }
 
 trait UpstreamIdEntropy {
@@ -1412,10 +1418,7 @@ async fn wait_for_matching_upstream_response(
                 };
             }
             Err(error) => {
-                return UpstreamRecvOutcome::RecvFailed {
-                    upstream_id,
-                    error,
-                };
+                return UpstreamRecvOutcome::RecvFailed { upstream_id, error };
             }
         }
     }
@@ -2431,9 +2434,7 @@ mod tests {
     async fn concurrent_forwarded_queries_use_distinct_upstream_source_ports() {
         let harness =
             ForwarderHarness::start(8, ScriptedEntropy::new([Ok(0xAAA1), Ok(0xAAA2)])).await;
-        let second_client = UdpSocket::bind("127.0.0.1:0")
-            .await
-            .expect("second client");
+        let second_client = UdpSocket::bind("127.0.0.1:0").await.expect("second client");
         let second_addr = second_client.local_addr().expect("second addr");
 
         harness.send_query(build_a_query("one.example.com"));
@@ -2471,9 +2472,7 @@ mod tests {
     async fn max_outstanding_servfails_without_a_second_upstream_send() {
         let harness =
             ForwarderHarness::start(1, ScriptedEntropy::new([Ok(0xBEEF), Ok(0xAA01)])).await;
-        let second_client = UdpSocket::bind("127.0.0.1:0")
-            .await
-            .expect("second client");
+        let second_client = UdpSocket::bind("127.0.0.1:0").await.expect("second client");
         let second_addr = second_client.local_addr().expect("second addr");
 
         harness.send_query(build_a_query("example.com"));
