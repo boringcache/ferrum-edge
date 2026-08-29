@@ -5,10 +5,10 @@ use ferrum_edge::config::types::{
     DEFAULT_NAMESPACE, GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT, Proxy, Upstream,
     UpstreamTarget,
 };
-use ferrum_edge::health_check::HealthChecker;
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
+use ferrum_edge::health_check::HealthChecker;
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshCorsUnmatchedPreflights, MeshDestinationRule, MeshLoadBalancer,
@@ -411,9 +411,12 @@ fn port_level_positive_outlier_overlay_clears_top_level_disable_sentinel() {
         !checker
             .passive_health
             .get(&ferrum_edge::config::db_backend::namespaced_runtime_key(
-                "ferrum", "reviews-p"
+                "ferrum",
+                "reviews-p"
             ))
-            .is_some_and(|ps| ps.unhealthy.contains_key("reviews.default.svc.cluster.local:8080")),
+            .is_some_and(|ps| ps
+                .unhealthy
+                .contains_key("reviews.default.svc.cluster.local:8080")),
         "must not eject below the per-port consecutive threshold"
     );
     checker.report_response(
@@ -429,9 +432,12 @@ fn port_level_positive_outlier_overlay_clears_top_level_disable_sentinel() {
         checker
             .passive_health
             .get(&ferrum_edge::config::db_backend::namespaced_runtime_key(
-                "ferrum", "reviews-p"
+                "ferrum",
+                "reviews-p"
             ))
-            .is_some_and(|ps| ps.unhealthy.contains_key("reviews.default.svc.cluster.local:8080")),
+            .is_some_and(|ps| ps
+                .unhealthy
+                .contains_key("reviews.default.svc.cluster.local:8080")),
         "the fifth consecutive failure must eject once the disable sentinel is cleared"
     );
 }

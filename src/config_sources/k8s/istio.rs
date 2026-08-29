@@ -391,9 +391,7 @@ fn resolve_authorization_policy_target_refs(
     if entries.len() > AUTHZ_TARGET_REF_MAX {
         return Err(invalid_resource(
             object,
-            format!(
-                "{kind} targetRefs supports at most {AUTHZ_TARGET_REF_MAX} entries"
-            ),
+            format!("{kind} targetRefs supports at most {AUTHZ_TARGET_REF_MAX} entries"),
         ));
     }
 
@@ -419,12 +417,8 @@ fn resolve_one_authorization_policy_target_ref(
     };
 
     let path = format!("targetRefs[{index}]");
-    let kind = string_field(entry, "kind").ok_or_else(|| {
-        invalid_resource(
-            object,
-            format!("{kind_label} {path}.kind is required"),
-        )
-    })?;
+    let kind = string_field(entry, "kind")
+        .ok_or_else(|| invalid_resource(object, format!("{kind_label} {path}.kind is required")))?;
     if kind.len() > MAX_POLICY_TARGET_REF_KIND_LEN {
         return Err(invalid_resource(
             object,
@@ -433,12 +427,8 @@ fn resolve_one_authorization_policy_target_ref(
             ),
         ));
     }
-    let name = string_field(entry, "name").ok_or_else(|| {
-        invalid_resource(
-            object,
-            format!("{kind_label} {path}.name is required"),
-        )
-    })?;
+    let name = string_field(entry, "name")
+        .ok_or_else(|| invalid_resource(object, format!("{kind_label} {path}.name is required")))?;
     if name.trim().is_empty() {
         return Err(invalid_resource(
             object,
@@ -3231,7 +3221,11 @@ fn validate_vs_header_transforms(
     http: &Value,
     index: usize,
 ) -> Result<(), K8sTranslateError> {
-    validate_vs_header_block(object, http.get("headers"), &format!("http[{index}].headers"))?;
+    validate_vs_header_block(
+        object,
+        http.get("headers"),
+        &format!("http[{index}].headers"),
+    )?;
     for (destination_index, destination) in http
         .get("route")
         .and_then(Value::as_array)

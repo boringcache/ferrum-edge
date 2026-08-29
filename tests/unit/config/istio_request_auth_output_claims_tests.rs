@@ -52,11 +52,23 @@ fn object(api_version: &str, kind: &str, namespace: &str, name: &str, spec: Valu
 }
 
 fn request_authentication(namespace: &str, spec: Value) -> K8sObject {
-    object("security.istio.io/v1", "RequestAuthentication", namespace, "ra", spec)
+    object(
+        "security.istio.io/v1",
+        "RequestAuthentication",
+        namespace,
+        "ra",
+        spec,
+    )
 }
 
 fn telemetry(namespace: &str, spec: Value) -> K8sObject {
-    object("telemetry.istio.io/v1", "Telemetry", namespace, "telemetry", spec)
+    object(
+        "telemetry.istio.io/v1",
+        "Telemetry",
+        namespace,
+        "telemetry",
+        spec,
+    )
 }
 
 fn translate_in(namespace: &str, objects: &[K8sObject]) -> Result<MeshConfig, String> {
@@ -341,10 +353,16 @@ fn a_selector_scoped_resource_keeps_its_workload_scope() {
 fn a_root_namespace_resource_without_target_refs_is_still_mesh_wide() {
     let mesh = translate_in(
         ROOT_NS,
-        &[telemetry(ROOT_NS, json!({"accessLogging": [{"disabled": true}]}))],
+        &[telemetry(
+            ROOT_NS,
+            json!({"accessLogging": [{"disabled": true}]}),
+        )],
     )
     .expect("a selector-less root-namespace Telemetry is mesh-wide as before");
-    assert!(matches!(mesh.telemetry_resources[0].scope, PolicyScope::MeshWide));
+    assert!(matches!(
+        mesh.telemetry_resources[0].scope,
+        PolicyScope::MeshWide
+    ));
 }
 
 // ── #4292 outlier detection defaults ──────────────────────────────────────
@@ -454,11 +472,8 @@ fn translated_outlier_detection_without_consecutive_fields_inherits_istios_five(
 
 #[test]
 fn translated_outlier_detection_empty_block_inherits_istios_five() {
-    let mesh = translate_in(
-        "default",
-        &[destination_rule(json!({}))],
-    )
-    .expect("empty outlierDetection translates");
+    let mesh = translate_in("default", &[destination_rule(json!({}))])
+        .expect("empty outlierDetection translates");
 
     assert_eq!(
         mesh.destination_rules[0]

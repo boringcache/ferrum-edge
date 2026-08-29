@@ -814,12 +814,14 @@ impl JwksAuth {
         // `output_claim_headers` destination must be stripped from every
         // inbound request, including the requests that never authenticate.
         let claim_header_destinations = ClaimHeaderDestinations::from_mapping_groups(
-            std::iter::once(claim_headers.as_slice()).chain(providers.iter().flat_map(|provider| {
-                [
-                    provider.claim_headers.as_slice(),
-                    provider.output_claim_headers.as_slice(),
-                ]
-            })),
+            std::iter::once(claim_headers.as_slice()).chain(providers.iter().flat_map(
+                |provider| {
+                    [
+                        provider.claim_headers.as_slice(),
+                        provider.output_claim_headers.as_slice(),
+                    ]
+                },
+            )),
         );
 
         Ok(Self {

@@ -69,7 +69,8 @@ async fn run(
             .insert("authorization".to_string(), format!("Bearer {token}"));
     }
     for (name, value) in client_headers {
-        ctx.headers.insert((*name).to_string(), (*value).to_string());
+        ctx.headers
+            .insert((*name).to_string(), (*value).to_string());
     }
     assert_continue(plugin.authenticate(&mut ctx, &consumer_index()).await);
     let mut headers = ctx.headers.clone();
@@ -142,7 +143,10 @@ async fn istio_scalar_claims_are_rendered_safely() {
 
     assert_eq!(header(&headers, "x-claim-age"), Some("42"));
     assert_eq!(header(&headers, "x-claim-active"), Some("true"));
-    assert_eq!(header(&headers, "x-claim-nested"), Some("alice@example.test"));
+    assert_eq!(
+        header(&headers, "x-claim-nested"),
+        Some("alice@example.test")
+    );
 }
 
 #[tokio::test]
@@ -164,7 +168,10 @@ async fn array_and_float_claims_leave_the_destination_absent() {
     let headers = run(
         &plugin,
         Some(&token),
-        &[("x-claim-groups", "attacker"), ("x-claim-ratio", "attacker")],
+        &[
+            ("x-claim-groups", "attacker"),
+            ("x-claim-ratio", "attacker"),
+        ],
     )
     .await;
 
