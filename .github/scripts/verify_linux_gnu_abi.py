@@ -544,11 +544,12 @@ def check_release_wiring(contract: dict[str, Any], release_yml: str, ci_yml: str
 
     # Frozen latest-release cannot gain an ABI needs edge; the ARM64 join gate
     # is the admitted place to fail-close after that frozen publisher.
-    if (
-        "    needs: [test, build-binaries, build-arm64-cross, "
-        "main-publish-gate]\n"
-        not in ci_yml
-    ):
+    if _job_needs(ci_yml, "latest-release") != {
+        "test",
+        "build-binaries",
+        "build-arm64-cross",
+        "main-publish-gate",
+    }:
         errors.append("ci.yml changed the frozen latest-release needs graph")
     for frozen_job in ("latest-release", "main-publish-gate", "build-arm64-cross"):
         for additive in (
@@ -615,6 +616,10 @@ def check_smoke_script(source: str) -> list[str]:
         errors.append(
             "smoke_linux_gnu_baseline.sh must bind-mount the staged GNU "
             "directory read-only at /gnu"
+        )
+    if ":/gnu:rw" in source:
+        errors.append(
+            "smoke_linux_gnu_baseline.sh must not expose a read-write /gnu mount"
         )
     if 'chmod +x -- "$stage/ferrum-edge" "$stage/ferrum-cni"' not in source:
         errors.append(

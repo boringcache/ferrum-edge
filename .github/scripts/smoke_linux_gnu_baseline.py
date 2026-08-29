@@ -48,6 +48,10 @@ def check_smoke_script(source: str) -> list[str]:
             "smoke_linux_gnu_baseline.sh must bind-mount the staged GNU "
             "directory read-only at /gnu"
         )
+    if ":/gnu:rw" in source:
+        errors.append(
+            "smoke_linux_gnu_baseline.sh must not expose a read-write /gnu mount"
+        )
     if 'chmod +x -- "$stage/ferrum-edge" "$stage/ferrum-cni"' not in source:
         errors.append(
             "smoke_linux_gnu_baseline.sh must set +x on host staged copies "
