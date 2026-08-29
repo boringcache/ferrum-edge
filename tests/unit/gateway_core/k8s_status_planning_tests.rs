@@ -253,7 +253,8 @@ fn gateway_parent_status_publication_is_generation_fenced_and_parent_io_bounded(
         .split("pub async fn patch_updates(")
         .nth(1)
         .and_then(|rest| {
-            rest.split("async fn patch_gateway_status_with_apply(").next()
+            rest.split("async fn patch_gateway_status_with_apply(")
+                .next()
         })
         .expect("GatewayApiStatusWriter::patch_updates body");
     assert!(
