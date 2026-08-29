@@ -3993,7 +3993,9 @@ async fn workload_metrics_conjunctive_refusal_precedence_is_stable() {
 #[test]
 fn workload_metrics_rejects_malformed_effective_authz_gates() {
     let not_array = WorkloadMetrics::new(&metrics_config_with_effective_gates(json!({})));
-    let err = not_array.expect_err("non-array gates must fail construction");
+    let err = not_array
+        .err()
+        .expect("non-array gates must fail construction");
     assert!(
         err.contains(EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY),
         "{err}"
@@ -4001,18 +4003,24 @@ fn workload_metrics_rejects_malformed_effective_authz_gates() {
 
     let not_object =
         WorkloadMetrics::new(&metrics_config_with_effective_gates(json!(["waypoint"])));
-    let err = not_object.expect_err("non-object gate must fail construction");
+    let err = not_object
+        .err()
+        .expect("non-object gate must fail construction");
     assert!(err.contains("must be an object"), "{err}");
 
     let unknown = WorkloadMetrics::new(&metrics_config_with_effective_gates(json!([{
         "trusted_hbone_assertors": [],
         "nope": true
     }])));
-    let err = unknown.expect_err("unknown gate key must fail construction");
+    let err = unknown
+        .err()
+        .expect("unknown gate key must fail construction");
     assert!(err.contains("nope"), "{err}");
 
     let empty = WorkloadMetrics::new(&metrics_config_with_effective_gates(json!([])));
-    let err = empty.expect_err("empty gate list must fail construction");
+    let err = empty
+        .err()
+        .expect("empty gate list must fail construction");
     assert!(err.contains("at least one gate"), "{err}");
 }
 
@@ -4022,7 +4030,8 @@ fn workload_metrics_rejects_over_bound_effective_authz_gates() {
     let err = WorkloadMetrics::new(&metrics_config_with_effective_gates(
         serde_json::Value::Array(gates),
     ))
-    .expect_err("over-bound gate list must fail construction");
+    .err()
+    .expect("over-bound gate list must fail construction");
     assert!(
         err.contains(&MAX_EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES.to_string()),
         "{err}"
