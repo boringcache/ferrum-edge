@@ -367,3 +367,49 @@ fn trusted_backend_content_length_within_limit_skips_size_limited_adapter() {
         None
     ));
 }
+
+/// Conflicting folded Content-Length values are unusable, not a trusted
+/// length: the HashMap parser must fail closed so the streaming adapter still
+/// wraps (matching the HeaderMap pre-commit path, which also returns None).
+#[test]
+fn conflicting_backend_content_length_still_requires_size_limited_adapter() {
+    let headers = HashMap::from([("content-length".to_string(), "100, 200".to_string())]);
+    let trusted = canonical_header_content_length_from_map_for_test(&headers);
+    assert_eq!(
+        trusted, None,
+        "ambiguous backend length must not be treated as Exact"
+    );
+    assert!(streaming_response_requires_size_limit_for_test(
+        64 * 1024,
+        trusted
+    ));
+}
+
+/// Rewriting an existing small backend Content-Length to a large value must
+/// not select the direct-H2 passthrough: passthrough is keyed on the trusted
+/// backend length, not the post-hook map.
+#[tokio::test]
+async fn rewritten_small_backend_content_length_cannot_select_h2_passthrough() {
+    let mut headers = HashMap::from([("content-length".to_string(), "100".to_string())]);
+    let trusted = canonical_header_content_length_from_map_for_test(&headers);
+    assert_eq!(trusted, Some(100));
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RewriteContentLength { value: "1048576" })];
+    let mut ctx = size_limit_ctx();
+    assert!(!run_after_proxy_hooks_for_test(&plugins, &mut ctx, 200, &mut headers).await);
+
+    let declared = preserved_response_content_length_for_test(&headers, 200);
+    assert_eq!(declared, Some(1_048_576));
+    let max = 10 * 1024 * 1024;
+    assert!(
+        !should_bypass_h2_coalesce_for_large_response_for_test(trusted, max),
+        "trusted 100-byte length must not passthrough"
+    );
+    assert!(
+        should_bypass_h2_coalesce_for_large_response_for_test(declared, max),
+        "using the rewritten 1 MiB length would wrongly passthrough — that is the bug"
+    );
+    assert!(!streaming_response_requires_size_limit_for_test(
+        max, trusted
+    ));
+}

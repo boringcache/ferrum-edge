@@ -985,7 +985,7 @@ Helper constructors:
 - `ProxyBody::empty()` — Create an empty body
 - `body::coalescing_body(response, content_length)` — Create a streaming body with chunk coalescing (128 KB target). Default for reqwest-backed HTTP/1.1 responses. Builds `Coalescing<ReqwestFrameSource>`.
 - `body::direct_streaming_body(response, content_length)` — Zero-overhead passthrough for reqwest streams. Used when both `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0` and `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0`.
-- `body::size_limited_streaming_body(response, max_bytes, content_length)` — Streaming body with frame-by-frame size enforcement via `SizeLimitedStreamingResponse` + coalescing. Used when `max_response_body_size_bytes > 0` and Content-Length is absent.
+- `body::size_limited_streaming_body(response, max_bytes, content_length)` — Streaming body with frame-by-frame size enforcement via `SizeLimitedStreamingResponse` + coalescing. Used when `max_response_body_size_bytes > 0` and the **backend** did not declare a canonical Content-Length (captured before `after_proxy`; a hook-authored field cannot skip this constructor).
 - `body::coalescing_h2_body(body, content_length, coalesce_target)` — H2 DATA frame coalescing for gRPC streaming and HTTP/2 direct pool. Builds `Coalescing<Incoming>`. Trailer-safe.
 - `body::direct_streaming_h2_body(body, content_length)` — Zero-overhead H2 passthrough; used for the large-response bypass and the H2 fast path.
 - `body::coalescing_h3_body(recv_stream, content_length, coalesce_min, coalesce_max, flush_interval)` — Bridges h3's `recv_data()` API to `http_body::Body` with chunk coalescing. Builds `Coalescing<H3FrameSource>`. Used for H1/H2 frontend → H3 backend streaming via `ResponseBody::StreamingH3`.
@@ -1014,7 +1014,7 @@ after-headers retry opt-in, so a response it will not sample is released to
 stream there too; only the responses it actually captures stay buffered and
 mid-body retryable.
 
-Note: response body size limits are now enforced via `SizeLimitedStreamingResponse` even when Content-Length is absent — explicit buffer mode is no longer required for size enforcement.
+Note: response body size limits are now enforced via `SizeLimitedStreamingResponse` even when the backend omitted Content-Length — explicit buffer mode is no longer required for size enforcement. A post-`after_proxy` Content-Length cannot suppress that adapter.
 
 Use `response_body_mode: stream` (default) when:
 
