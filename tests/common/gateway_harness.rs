@@ -1724,24 +1724,6 @@ pub async fn wait_for_owned_gateway_identity(
     )
 }
 
-/// Poll `GET /proxies` until this instance's admin JWT is accepted, coupled to
-/// `child` so an exiting process cannot be replaced by a foreign listener.
-pub async fn wait_for_admin_jwt(
-    child: &mut Child,
-    admin_port: u16,
-    auth_header: &str,
-    timeout: Duration,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    wait_for_admin_auth_inner(admin_port, auth_header, timeout, Some(child)).await
-}
-
-/// Per-spawn `FERRUM_METRICS_BEARER_TOKEN` for callers that do not need the
-/// full [`SpawnedGatewayIdentity`]. Prefer [`SpawnedGatewayIdentity::mint`]
-/// for spawned-gateway ownership.
-pub fn mint_observability_token(label: &str) -> String {
-    SpawnedGatewayIdentity::mint(label).observability_token
-}
-
 async fn wait_for_admin_auth_inner(
     admin_port: u16,
     auth_header: &str,
