@@ -680,7 +680,10 @@ async fn aborted_coalesced_refresh_allows_a_later_refresh() {
     // let a fast drain finish first, handing `joined` the runner role and a
     // `Ran` outcome.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !proxy_state.backend_capabilities_refresh.has_pending_refresh() {
+    while !proxy_state
+        .backend_capabilities_refresh
+        .has_pending_refresh()
+    {
         if tokio::time::Instant::now() >= deadline {
             panic!("joiner never queued a coalesced rerun behind the held probe");
         }
