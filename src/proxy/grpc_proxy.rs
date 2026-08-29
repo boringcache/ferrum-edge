@@ -671,15 +671,21 @@ impl GrpcConnectionPool {
         self.pool.pool_size()
     }
 
-    /// Drain generation-keyed TLS configs **and** unreachable `rr_counters`
-    /// for a retired SVID generation.
+    /// Drain generation-keyed TLS configs **and** `rr_counters` for a
+    /// retired SVID generation.
     ///
     /// Called from the rotation consumer's unconditional retirement loop
     /// (`BackendPoolFamily::drain_tls_config_cache`), including when
-    /// `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS=0`. Retired-generation
-    /// counters are already unreachable — the live counter never revisits a
-    /// generation — so this is a release, not a connection withdrawal.
-    /// Live pooled senders stay until idle prune or `force_drain_*`.
+    /// `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS=0`. This `retain` is a
+    /// release of already-unreachable entries, not a connection
+    /// withdrawal. Live pooled senders stay until idle prune or
+    /// `force_drain_*`.
+    ///
+    /// A cold `rr_counters` insert that captured generation `N` can still
+    /// race this sweep. That race is closed on the cold-insert path by
+    /// `get_or_seed_rr_counter`: after inserting, it drops the exact key when
+    /// the live SVID generation has already moved on. The `Arc` counter
+    /// already handed to the in-flight request is kept.
     pub fn drain_backend_tls_config_cache_svid_generation(&self, generation: u64) {
         self.pool
             .manager()
@@ -838,6 +844,24 @@ impl GrpcConnectionPool {
             .insert(key.into(), Arc::new(AtomicUsize::new(0)));
     }
 
+    /// Production cold-insert path for `rr_counters`, including the
+    /// post-insert stale-generation removal. Used by integration tests to
+    /// prove insert-before-retire and retire-before-insert without a live
+    /// backend handshake.
+    #[allow(dead_code)] // exercised from integration tests
+    pub fn get_or_seed_rr_counter_for_tests(
+        &self,
+        key: &str,
+        captured_svid_generation: Option<u64>,
+    ) -> Arc<AtomicUsize> {
+        crate::proxy::http2_pool::get_or_seed_rr_counter(
+            &self.rr_counters,
+            key,
+            captured_svid_generation,
+            &self.pool.manager().backend_svid_generation,
+        )
+    }
+
     #[allow(dead_code)] // exercised from unit tests
     pub fn rr_counter_len(&self) -> usize {
         self.rr_counters.len()
@@ -926,19 +950,12 @@ impl GrpcConnectionPool {
             // the atomic counter wraps around. `AtomicUsize::fetch_add(1,
             // Relaxed)` is wait-free after the seed — the seed only matters
             // for the first `shard_count` picks per host on this gateway.
-            let rr = match self.rr_counters.get(key_buf.as_str()) {
-                Some(existing) => existing.value().clone(),
-                // Cold-path allocation: `to_owned()` runs only on the first
-                // request to a given backend host — subsequent requests find
-                // the existing entry via the `get()` above.
-                None => self
-                    .rr_counters
-                    .entry(key_buf[..base_len].to_owned())
-                    .or_insert_with(|| {
-                        Arc::new(AtomicUsize::new(crate::proxy::http2_pool::rr_seed()))
-                    })
-                    .clone(),
-            };
+            let rr = crate::proxy::http2_pool::get_or_seed_rr_counter(
+                &self.rr_counters,
+                &key_buf[..base_len],
+                svid_generation,
+                &self.pool.manager().backend_svid_generation,
+            );
             let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
 
             // Cheap probe pass — any shard whose cached sender is

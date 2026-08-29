@@ -19,12 +19,11 @@ use ferrum_edge::proxy::backend_capabilities::{
 };
 use ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool;
 use ferrum_edge::proxy::http2_pool::Http2ConnectionPool;
-use ferrum_edge::tls::backend::pool_key_host_port_prefix;
+use ferrum_edge::tls::backend::{BackendTlsConfigCache, pool_key_host_port_prefix};
 use ferrum_edge::tls::source::SYSTEM_TRUST_ROOTS_SOURCE;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::Once;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Once};
 
 /// Build a minimal `Proxy` with sensible defaults for pool key testing.
 fn minimal_proxy() -> Proxy {
@@ -2088,8 +2087,10 @@ fn h2_and_grpc_pool_keys_share_after_zero_clamp() {
 /// mismatched explicit value partitioned.
 #[test]
 fn h2_and_grpc_pool_keys_follow_custom_global_effective_stream_cap() {
-    let mut global = PoolConfig::default();
-    global.http2_max_concurrent_streams = Some(42);
+    let mut global = PoolConfig {
+        http2_max_concurrent_streams: Some(42),
+        ..Default::default()
+    };
 
     let inherit = minimal_proxy();
     let mut explicit_42 = minimal_proxy();
@@ -2522,4 +2523,110 @@ async fn h3_tls_cache_retain_keeps_live_identity() {
     assert!(cache.contains_key(&live_key));
     assert!(!cache.contains_key(&stale_key));
     assert_eq!(cache.len(), 1);
+}
+
+/// A build that starts under generation N, is paused while N is retired,
+/// then finishes must still hand the caller a usable `Arc` without caching
+/// the retired key. Current-generation and `svidg=static` keys stay cached.
+/// Generation 0 is cacheable until a drain publishes retirement.
+#[tokio::test]
+async fn backend_tls_config_cache_late_insert_after_retire_is_not_cached() {
+    ensure_crypto_provider();
+    let cache = BackendTlsConfigCache::new();
+    let proxy = minimal_proxy();
+    let gen0_key = Http2ConnectionPool::tls_config_cache_key_for_warmup(&proxy, Some(0));
+    let retired_key = Http2ConnectionPool::tls_config_cache_key_for_warmup(&proxy, Some(4));
+    let live_key = Http2ConnectionPool::tls_config_cache_key_for_warmup(&proxy, Some(5));
+    let static_key = Http2ConnectionPool::tls_config_cache_key_for_warmup(&proxy, None);
+
+    let gen0 = cache
+        .get_or_try_build(gen0_key.clone(), || Ok::<_, String>(test_client_config()))
+        .expect("generation 0 is cacheable before any drain");
+    assert!(cache.contains_key(&gen0_key));
+    assert!(Arc::strong_count(&gen0) >= 1);
+
+    let entered = Arc::new(Barrier::new(2));
+    let released = Arc::new(Barrier::new(2));
+    let cache_for_build = cache.clone();
+    let retired_for_build = retired_key.clone();
+    let handle = std::thread::spawn({
+        let entered = Arc::clone(&entered);
+        let released = Arc::clone(&released);
+        move || {
+            cache_for_build.get_or_try_build(retired_for_build, || {
+                entered.wait();
+                released.wait();
+                Ok::<_, String>(test_client_config())
+            })
+        }
+    });
+    entered.wait();
+    cache.drain_svid_generation(4);
+    released.wait();
+    let returned = handle
+        .join()
+        .expect("builder thread")
+        .expect("in-flight build must still return an Arc");
+    assert!(
+        !cache.contains_key(&retired_key),
+        "retired generation must not be re-inserted after the drain"
+    );
+    let usable = Arc::clone(&returned);
+    assert!(Arc::ptr_eq(&returned, &usable));
+
+    let live_builds = AtomicUsize::new(0);
+    let live = cache
+        .get_or_try_build(live_key.clone(), || {
+            live_builds.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, String>(test_client_config())
+        })
+        .expect("current generation");
+    let live_again = cache
+        .get_or_try_build(live_key.clone(), || {
+            live_builds.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, String>(test_client_config())
+        })
+        .expect("current generation hit");
+    assert_eq!(live_builds.load(Ordering::Relaxed), 1);
+    assert!(cache.contains_key(&live_key));
+    assert!(Arc::ptr_eq(&live, &live_again));
+
+    let static_builds = AtomicUsize::new(0);
+    let static_cfg = cache
+        .get_or_try_build(static_key.clone(), || {
+            static_builds.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, String>(test_client_config())
+        })
+        .expect("static");
+    let static_again = cache
+        .get_or_try_build(static_key.clone(), || {
+            static_builds.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, String>(test_client_config())
+        })
+        .expect("static hit");
+    assert_eq!(static_builds.load(Ordering::Relaxed), 1);
+    assert!(cache.contains_key(&static_key));
+    assert!(Arc::ptr_eq(&static_cfg, &static_again));
+
+    cache.drain_svid_generation(0);
+    assert!(!cache.contains_key(&gen0_key));
+    let gen0_late = cache
+        .get_or_try_build(gen0_key.clone(), || Ok::<_, String>(test_client_config()))
+        .expect("in-flight Arc for retired generation 0");
+    assert!(
+        !cache.contains_key(&gen0_key),
+        "generation 0 must not re-enter the cache after drain(0)"
+    );
+    assert!(Arc::strong_count(&gen0_late) >= 1);
+
+    let max_key = Http2ConnectionPool::tls_config_cache_key_for_warmup(&proxy, Some(u64::MAX));
+    cache.drain_svid_generation(u64::MAX);
+    let max_cfg = cache
+        .get_or_try_build(max_key.clone(), || Ok::<_, String>(test_client_config()))
+        .expect("in-flight Arc for retired u64::MAX");
+    assert!(
+        !cache.contains_key(&max_key),
+        "u64::MAX retirement must not be encoded as an un-retired wrap"
+    );
+    assert!(Arc::strong_count(&max_cfg) >= 1);
 }
