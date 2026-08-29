@@ -95,7 +95,7 @@ When the matched proxy has `backend_scheme: https`, the concrete backend target 
 
 The same native QUIC fast path now also serves **`Grpc`** flavor via `dispatch_grpc_native_h3()`, and it is **fully bidirectional**. The response body streams back through the shared QUIC coalescer, and the terminal `grpc-status` / `grpc-message` trailer is forwarded after response-direction hop-by-hop stripping and response-header-policy reconciliation of its application metadata (the reserved status fields always survive — see [Native gRPC terminal metadata](#native-grpc-terminal-metadata)). This is the **only** path that can reach an H3-only gRPC backend, because the gRPC pool (`GrpcConnectionPool`) speaks only HTTP/2 (h2 TLS / h2c). It is gated to the streamable case (no retry / body-plugin buffering, no reqwest-forcing plugin); unary, server-streaming, client-streaming, and bidirectional RPCs are all supported. Retry / body-buffering gRPC still falls through to the H2 gRPC bridge. Every downstream DATA/coalescer write is deadline-biased: expiry before the first client-visible DATA completes with `grpc-status: 4`, including simultaneous readiness, while expiry after any visible DATA resets because a length-prefixed message may be partial. CB / passive-health key off the HTTP transport status (gRPC failures ride on HTTP 200); the adaptive-concurrency sample maps a non-OK backend `grpc-status` to a 5xx, matching the H2 streaming gRPC bridge.
 
-### Committed streaming responses always reset on a non-clean exit (issue #4112)
+### Committed streaming responses always reset on a non-clean exit (issue #4112 / #4363)
 
 `quinn::SendStream::drop` implicitly `finish()`es a send half that was neither
 finished nor reset. Once a streaming response's HEADERS have committed, any way
@@ -112,22 +112,49 @@ The inline native-H3 streaming relay in `handle_h3_request` therefore holds its
 committed send half in `stream_util::CommittedH3ResponseStream`. The predicate
 is inverted relative to `stream_util::committed_response_requires_reset` (the
 conditional post-relay re-assertion the cross-protocol relays apply): the
-terminal is a **reset unless the relay proved a `finish()` returned `Ok`**, so a
-branch that stops writing without latching an error class is still fail closed,
-and `Drop` covers a task that never reaches the post-relay settle at all. Same
-shape as `ConnectUdpSendHalf` (issue #4072). The relay calls
+terminal is a **reset unless the relay proved a `finish()` returned `Ok` and
+the stream was not already forced to reset**, so a branch that stops writing
+without latching an error class is still fail closed, and `Drop` covers a task
+that never reaches the post-relay settle at all. Same shape as
+`ConnectUdpSendHalf` (issue #4072). The relay calls
 `settle_committed_terminal()` immediately after its loop so the reset reaches
 the wire before the response-termination hooks and transaction logging await;
 `Drop` is only the backstop.
+
+`abort_committed()` latches `force_reset` and applies `stop_stream` immediately.
+That latch is authorization-first: a later `finish()` that returns `Ok` cannot
+disarm it. Settle skips the reset only for a proven clean authorized FIN
+(`clean_finish && !force_reset`); otherwise it always retries `stop_stream`.
+A previous `reset_applied` flag set *before* a no-op abort skipped the Drop
+retry, and `quinn::SendStream::drop` then FINned — which is how a stalled
+client observed `recv_data() == Ok(None)` after the credential had already been
+counted as expired (issue #4363). `h3-quinn`'s `reset` ignores Quinn errors and
+does not clear a cancelled `send_data`'s `writing` buffer, so the first abort
+while a write is parked can be a no-op; Drop retries after that future is gone.
+`stop_stream` is idempotent, matching `ConnectUdpSendHalf`.
+
+Native **plain** relays (`handle_h3_request`, `stream_h3_open_response_to_client`,
+`proxy_to_backend_h3_streaming`) use a **biased** `select!` with the
+authorization arm first, so a simultaneously-ready backend EOS cannot proceed
+to `finish()`. `h3-quinn`'s `poll_finish` calls Quinn `finish()` synchronously
+and does not park on a stalled client, so reaching that call after expiry would
+present a clean FIN. Backend EOS (`recv_data` `Ok(None)` or a graceful-close
+treated as complete) also consults the **captured** authorization Instant
+before any client FIN; a spent plan aborts rather than finishing. The post-body
+trailer read in `finish_h3_response_with_backend_trailers` races the same
+captured plan through `await_deadline_first`, so an operator
+`backend_read_timeout_ms` longer than the credential cannot outlive it. A
+response that genuinely completes before expiry still FINs cleanly.
 
 The sibling relays `stream_h3_open_response_to_client` and
 `proxy_to_backend_h3_streaming` receive their send half as a `&mut` from the H3
 request handler, so they cannot move it into the owning guard. They hold it in
 `stream_util::BorrowedCommittedH3ResponseStream` instead (issue #4125) — the
-same inverted predicate, the same `Drop` backstop, the same explicit settle
-after the relay loop, differing only in that the guard borrows rather than owns.
-Every reset site in the committed region reborrows through the guard
-(`&mut *h3_stream`), so a write can no longer reach the send half around it.
+same inverted predicate, the same `force_reset` latch, the same `Drop`
+backstop, the same explicit settle after the relay loop, differing only in that
+the guard borrows rather than owns. Every reset site in the committed region
+goes through `abort_committed()` so a write can no longer reach the send half
+around the guard and a no-op abort cannot skip Drop's retry.
 
 In both borrowing relays the disarm is a SINGLE site, and the invariant that
 makes that safe is stronger than the native relay's: inside the committed region
@@ -137,7 +164,8 @@ its `h3_stream.finish()` produced `H3AuthorizedWrite::Written`, and that one
 match arm is also the relay's only `body_completed = true`. One disarm per
 relay, coinciding with one clean-completion latch, is therefore the complete
 set — locked by
-`committed_borrowed_h3_streaming_responses_reset_unless_a_finish_landed` in
+`committed_borrowed_h3_streaming_responses_reset_unless_a_finish_landed` and
+`native_plain_h3_streaming_relays_are_authorization_first_at_backend_eos` in
 `tests/unit/gateway_core/http3_server_dispatch_tests.rs`.
 
 As with the native relay, the behaviour change beyond the drop hazard is that

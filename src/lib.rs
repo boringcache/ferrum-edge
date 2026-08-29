@@ -6772,6 +6772,15 @@ pub mod _test_support {
         )
     }
 
+    /// Whether a captured authorization plan has already elapsed — the exact
+    /// Instant check native plain-H3 relays use at backend EOS before `finish()`
+    /// (issue #4363).
+    pub fn captured_authorization_elapsed_for_test(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        crate::http3::stream_util::captured_authorization_elapsed(plan)
+    }
+
     /// Outcome of racing one native-H3 gRPC upload-pump await against shutdown
     /// and the admitted authorization plan.
     #[derive(Debug, PartialEq, Eq)]
