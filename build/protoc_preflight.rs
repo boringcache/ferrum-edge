@@ -30,10 +30,10 @@ fn validate_protoc_override(
         return Err(protoc_override_diagnostic("PROTOC is set but empty"));
     }
     let path = PathBuf::from(raw);
-    if path.components().count() == 1 {
-        if let Some(resolved) = find_named_executable_on_path(&path, path_env) {
-            return Ok(resolved);
-        }
+    if path.components().count() == 1
+        && let Some(resolved) = find_named_executable_on_path(&path, path_env)
+    {
+        return Ok(resolved);
     }
     validate_protoc_path(&path)
 }
