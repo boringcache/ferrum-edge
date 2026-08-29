@@ -3002,6 +3002,26 @@ impl MetricsRegistry {
             snapshot.istio_status_unsupported,
             "",
         );
+        output.push_str(
+            "# HELP ferrum_k8s_controller_status_batch_timeouts_total Kubernetes status patch batches abandoned by the reconciler's defensive outer timeout after the batch failed to bound itself.\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_status_batch_timeouts_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_status_batch_timeouts_total",
+            snapshot.status_batch_timeouts,
+            "",
+        );
+        output.push_str(
+            "# HELP ferrum_k8s_controller_status_request_timeouts_total Kubernetes status reads and writes abandoned because they exceeded their wall-clock budget on the serialized reconcile loop.\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_status_request_timeouts_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_status_request_timeouts_total",
+            snapshot.status_request_timeouts,
+            "",
+        );
     }
 
     /// Append the process-static mesh observability families from live state.
