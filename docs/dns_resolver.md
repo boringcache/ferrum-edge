@@ -65,7 +65,7 @@ If a caller past its own stale window attempts a synchronous refresh and DNS fai
 | `FERRUM_DNS_SLOW_THRESHOLD_MS` | `u64` | Disabled | Threshold in milliseconds above which DNS resolutions are logged as slow (`warn` level). Useful for diagnosing upstream DNS latency. When unset, no timing overhead is added. |
 | `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` | `u8` | `90` | Percentage of TTL elapsed before the background refresh task proactively re-resolves an entry (1-99). At 90%, a 60s-TTL entry refreshes after 54s. Lower values add safety margin at the cost of more DNS queries. |
 | `FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS` | `u64` | `10` | Interval (seconds) for the background task that retries failed DNS lookups. Error-cached entries whose current (possibly backed-off) error TTL has expired are re-attempted at this interval, subject to age eviction and per-cycle work bounds. Set to `0` to disable. |
-| `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` | `usize` | `64` | Maximum number of concurrent stale-while-revalidate background refresh tasks system-wide, and the per-cycle cap on failed-DNS retries (selection count and resolve concurrency). Prevents unbounded task spawning when many distinct stale or failed hostnames are hit simultaneously. When all SWR permits are taken, additional refresh requests are skipped and the stale entry is served as-is until a permit frees up. Range: 1-1000. |
+| `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` | `usize` | `64` | Maximum number of concurrent stale-while-revalidate background refresh tasks system-wide, the per-cycle cap on proactive background refreshes (soonest-expiry selection and resolve concurrency), and the per-cycle cap on failed-DNS retries. Prevents unbounded task spawning when many distinct stale, near-expiry, or failed hostnames are hit simultaneously. When all SWR/proactive permits are taken, additional SWR refresh requests are skipped and the stale entry is served as-is until a permit frees up; the next proactive cycle retries leftover near-expiry hostnames. Range: 1-1000. |
 
 ### System-Level DNS Settings
 
@@ -108,7 +108,7 @@ When multiple proxies share a hostname with different `dns_cache_ttl_seconds`, e
 
 This ensures that DNS resolution almost never blocks the hot request path, even when entries expire.
 
-Background refresh tasks are bounded by a system-wide semaphore (`FERRUM_DNS_MAX_CONCURRENT_REFRESHES`, default 64). When many distinct stale hostnames are hit simultaneously (e.g., after a prolonged DNS outage), at most this many refresh tasks run concurrently. Excess refresh requests are skipped -- the stale entry is served and the next request retries the semaphore. Per-hostname deduplication prevents duplicate refresh tasks for the same hostname.
+Background refresh tasks (stale-while-revalidate *and* proactive near-expiry refresh) share a system-wide semaphore (`FERRUM_DNS_MAX_CONCURRENT_REFRESHES`, default 64) and a per-hostname dedup map, so a hostname is never resolved twice at once and total in-flight work cannot exceed the configured ceiling. When many distinct stale hostnames are hit simultaneously (e.g., after a prolonged DNS outage), at most this many refresh tasks run concurrently. Excess SWR refresh requests are skipped -- the stale entry is served and the next request retries the semaphore.
 
 **Example:** With a DNS record that has a native 60s TTL and `FERRUM_DNS_STALE_TTL=3600`:
 - For the first 60 seconds: cached result served directly.
@@ -151,6 +151,15 @@ On successful retry, the entry is promoted from error to a healthy cached entry 
 A background task proactively refreshes cache entries before they expire. By default, entries are refreshed when 90% of their TTL has elapsed (configurable via `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT`). This keeps the cache warm and prevents any request from hitting DNS directly.
 
 Since each record has its own native TTL, the background refresh task uses each entry's refresh TTL — the shortest effective TTL among policies actually observed for that hostname (default/global/native only when a `None` consumer was observed) — for threshold computation, not a single global value. The scan runs every 5 seconds to handle short-TTL records promptly.
+
+Hardening for a large cache and a slow or dead resolver (issue #4270):
+
+- **No catch-up bursts**: missed interval ticks use delayed behavior, matching the failed-retry task. A slow cycle does not fire back-to-back sweeps.
+- **Soonest-expiry cap**: each cycle selects at most `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` eligible success rows, soonest logical expiry first. Error rows stay owned by the [failed-retry task](#failed-dns-retry-task).
+- **Shared concurrency ceiling**: selected hostnames resolve concurrently through the same `refresh_semaphore` and `refreshing` dedup map as stale-while-revalidate, so proactive and SWR work share one global cap and a hostname never runs twice.
+- **Per-lookup timeout**: every proactive resolution is bounded by a 15-second wall-clock timeout (Hickory's default per-query timeout is 5s with 2 attempts; 15s covers one record type with margin and cuts off a sequential `FERRUM_DNS_ORDER` walk). A timeout is a failed refresh: the last known good success row is preserved and never rewritten or TTL-extended.
+- **Independent eviction**: `FERRUM_DNS_CACHE_MAX_SIZE` / age enforcement (`evict_expired`) runs on its own 5-second delayed cadence concurrently with refresh resolution, so a hung resolver cannot starve capacity enforcement.
+- **Shutdown and generation safety**: the refresh phase observes the process shutdown watch and cancels in-flight work with RAII release of permits and dedup markers. If eviction, a foreground lookup, or another refresh winner changes or removes the selected row while DNS is in flight, the stale proactive result is abandoned — it cannot overwrite the new generation or resurrect an evicted hostname.
 
 ## DNS Warmup
 

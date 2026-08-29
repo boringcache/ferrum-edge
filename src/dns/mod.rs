@@ -29,6 +29,7 @@ use std::fs::File;
 use std::future::Future;
 use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -111,9 +112,11 @@ pub struct DnsConfig {
     /// Maximum in-flight queries per multiplexed connection. Default: 512.
     pub max_active_requests: usize,
     /// Maximum number of concurrent stale-while-revalidate background refresh
-    /// tasks system-wide, and the per-cycle cap on failed-DNS retries (selection
-    /// count and resolve concurrency). Prevents unbounded task spawning when
-    /// many distinct stale or failed hostnames are hit simultaneously. Default: 64.
+    /// tasks system-wide, the per-cycle cap on proactive background refreshes
+    /// (soonest-expiry selection and resolve concurrency), and the per-cycle
+    /// cap on failed-DNS retries. Prevents unbounded task spawning when many
+    /// distinct stale, near-expiry, or failed hostnames are hit simultaneously.
+    /// Default: 64.
     pub max_concurrent_refreshes: usize,
     /// Backend egress policy for SSRF protection. Applied to every freshly
     /// resolved address before it is cached, on every insertion path (initial
@@ -533,6 +536,59 @@ struct FailedRetryCandidate {
     generation: FailedRetryGeneration,
 }
 
+/// Generation token for a success-cache row selected for proactive refresh.
+///
+/// `next_start` is replaced on every successful publish, so pointer equality
+/// detects a newer foreground / SWR / competing refresh winner. `resolved_at`
+/// is a second check so a recycled row cannot be mistaken for the same
+/// generation. Vacant (evicted) keys never match.
+#[derive(Clone, Debug)]
+struct ProactiveRefreshGeneration {
+    next_start: Arc<AtomicU64>,
+    resolved_at: Instant,
+}
+
+/// One hostname selected for a proactive refresh cycle.
+#[derive(Clone, Debug)]
+struct ProactiveRefreshCandidate {
+    hostname: String,
+    per_proxy_ttl: Option<u64>,
+    generation: ProactiveRefreshGeneration,
+    expires_at: Instant,
+}
+
+/// RAII ownership of one in-flight refresh (proactive or stale-while-revalidate).
+///
+/// Dropping this value — including on task abort / `select!` cancellation —
+/// removes the per-hostname dedup marker and releases the system-wide refresh
+/// semaphore permit. Never hold a DashMap guard across the resolve `.await`;
+/// this struct owns only the dedup map Arc and the owned permit.
+struct RefreshInFlight {
+    hostname: String,
+    refreshing: Arc<DashMap<String, ()>>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for RefreshInFlight {
+    fn drop(&mut self) {
+        self.refreshing.remove(&self.hostname);
+    }
+}
+
+enum RefreshStart {
+    Started(RefreshInFlight),
+    AlreadyInProgress,
+    ConcurrencyLimited,
+}
+
+type ProactiveResolveOutput =
+    Result<(Vec<IpAddr>, Option<CachedRecordType>, Duration), anyhow::Error>;
+type ProactiveResolveHook = Arc<
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = ProactiveResolveOutput> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Asynchronous DNS resolver with in-memory caching, stale-while-revalidate,
 /// error caching, configurable record type ordering, and hickory-resolver backend.
 #[derive(Clone)]
@@ -576,9 +632,13 @@ pub struct DnsCache {
     /// `tokio::time::interval` deadline arithmetic cannot overflow.
     failed_retry_interval: Duration,
     /// Maximum concurrent background DNS refresh / failed-retry work items.
-    /// Caps both the stale-while-revalidate semaphore and the number of
-    /// failed hostnames selected (and resolved concurrently) per retry cycle.
+    /// Caps the stale-while-revalidate semaphore, the number of near-expiry
+    /// hostnames selected (and resolved concurrently) per proactive cycle,
+    /// and the number of failed hostnames selected per retry cycle.
     max_concurrent_refreshes: usize,
+    /// Test-only replacement for hickory during proactive refresh. Production
+    /// stays `None` and is never consulted on the request hot path.
+    proactive_resolve_hook: Option<ProactiveResolveHook>,
 }
 
 impl DnsCache {
@@ -598,6 +658,21 @@ impl DnsCache {
     /// outcome logs demote to `debug` so a permanently dead hostname cannot
     /// spam the operator log every retry cycle.
     const FAILED_RETRY_WARN_FAILURES: u32 = 3;
+
+    /// Cadence for proactive near-expiry refresh *and* independent
+    /// `evict_expired` / `max_cache_size` enforcement. Both loops use
+    /// `MissedTickBehavior::Delay` so a slow cycle cannot burst catch-up ticks.
+    const BACKGROUND_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
+
+    /// Wall-clock bound for one proactive background-refresh resolution.
+    ///
+    /// Hickory's default per-query timeout is 5s with 2 attempts (10s for one
+    /// record type). This 15s ceiling covers one record type with margin while
+    /// preventing a sequential `FERRUM_DNS_ORDER` walk (default
+    /// `CACHE,SRV,A,CNAME`) from stalling a hostname for ~30s. A timeout is a
+    /// failed refresh: the last known good success row is preserved and never
+    /// rewritten or TTL-extended.
+    pub const PROACTIVE_REFRESH_RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
 
     /// Expose the configured backend egress policy for non-DNS backend target
     /// validation paths (for example, service discovery).
@@ -663,6 +738,7 @@ impl DnsCache {
             failed_retry_interval: Duration::from_secs(config.failed_retry_interval_seconds)
                 .min(Self::MAX_TTL),
             max_concurrent_refreshes: config.max_concurrent_refreshes.max(1),
+            proactive_resolve_hook: None,
         }
     }
 
@@ -858,9 +934,11 @@ impl DnsCache {
         per_proxy_ttl: Option<u64>,
         consume_for_caller: bool,
     ) -> Result<ResolvedAddresses, anyhow::Error> {
-        // This is the single success insertion path for foreground resolves,
-        // stale refreshes, proactive background refreshes, and failed-retry
-        // recovery. Cache reads intentionally trust entries accepted here.
+        // This is the success insertion path for foreground resolves and
+        // stale-while-revalidate refreshes. Proactive background refresh and
+        // failed-retry recovery publish through generation-guarded helpers so
+        // a stale in-flight result cannot overwrite a newer winner. Cache
+        // reads intentionally trust entries accepted here.
         //
         // Clamp native TTL so unbounded record TTLs cannot overflow
         // `Instant + Duration` / `Duration * u32` arithmetic later.
@@ -1027,40 +1105,37 @@ impl DnsCache {
                 // shared data and trigger one deduplicated background refresh.
                 if self.consumer_stale_until(&entry, per_proxy_ttl) > now {
                     let host = cache_hostname.to_string();
-                    if self.refreshing.insert(host.clone(), ()).is_none() {
-                        match self.refresh_semaphore.clone().try_acquire_owned() {
-                            Ok(permit) => {
-                                let cache = self.clone();
-                                // Refresh publishes shared data; scheduling uses
-                                // the shortest observed per-proxy (including this
-                                // caller) so short-TTL peers keep getting updates.
-                                let refresh_ttl =
-                                    per_proxy_ttl.or_else(|| entry.load_shortest_per_proxy_ttl());
-                                tokio::spawn(async move {
-                                    if let Err(e) = cache.refresh_entry(&host, refresh_ttl).await {
-                                        warn!("DNS stale refresh failed for {}: {}", host, e);
-                                    }
-                                    cache.refreshing.remove(&host);
-                                    drop(permit);
-                                });
-                                debug!(
-                                    "DNS serving stale entry for {} (background refresh triggered)",
-                                    hostname
-                                );
-                            }
-                            Err(_) => {
-                                self.refreshing.remove(&host);
-                                debug!(
-                                    "DNS serving stale entry for {} (refresh skipped, concurrency limit reached)",
-                                    hostname
-                                );
-                            }
+                    // Refresh publishes shared data; scheduling uses the
+                    // shortest observed per-proxy (including this caller) so
+                    // short-TTL peers keep getting updates.
+                    let refresh_ttl =
+                        per_proxy_ttl.or_else(|| entry.load_shortest_per_proxy_ttl());
+                    match self.try_begin_refresh(host.clone()) {
+                        RefreshStart::Started(guard) => {
+                            let cache = self.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = cache.refresh_entry(&host, refresh_ttl).await {
+                                    warn!("DNS stale refresh failed for {}: {}", host, e);
+                                }
+                                drop(guard);
+                            });
+                            debug!(
+                                "DNS serving stale entry for {} (background refresh triggered)",
+                                hostname
+                            );
                         }
-                    } else {
-                        debug!(
-                            "DNS serving stale entry for {} (refresh already in progress)",
-                            hostname
-                        );
+                        RefreshStart::ConcurrencyLimited => {
+                            debug!(
+                                "DNS serving stale entry for {} (refresh skipped, concurrency limit reached)",
+                                hostname
+                            );
+                        }
+                        RefreshStart::AlreadyInProgress => {
+                            debug!(
+                                "DNS serving stale entry for {} (refresh already in progress)",
+                                hostname
+                            );
+                        }
                     }
                     crate::runtime_metrics::global_ref().record_dns_stale();
                     return Ok(ResolvedAddresses::rotated(
@@ -1659,6 +1734,158 @@ impl DnsCache {
             .unwrap_or(false)
     }
 
+    /// Seed a success-cache row with a controlled publish time and TTL for
+    /// external proactive-refresh tests. Not used on the request hot path.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn test_seed_success_entry(
+        &self,
+        hostname: &str,
+        addresses: Vec<IpAddr>,
+        resolved_at: Instant,
+        native_ttl: Duration,
+        per_proxy_ttl: Option<u64>,
+    ) {
+        let default_consumer_observed = per_proxy_ttl.is_none();
+        let applied_ttl =
+            self.observed_refresh_ttl(native_ttl, per_proxy_ttl, default_consumer_observed);
+        let stale_deadline = self.shared_stale_deadline(
+            resolved_at,
+            native_ttl,
+            per_proxy_ttl,
+            default_consumer_observed,
+        );
+        self.cache.insert(
+            dns_hostname_key(hostname).into_owned(),
+            DnsCacheEntry {
+                addresses: addresses.into(),
+                next_start: Arc::new(AtomicU64::new(0)),
+                resolved_at,
+                native_ttl,
+                stale_deadline,
+                applied_ttl,
+                record_type_used: Some(CachedRecordType::A),
+                is_error: false,
+                refresh_error_deadline: None,
+                shortest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(
+                    per_proxy_ttl.unwrap_or(NO_PER_PROXY_TTL),
+                )),
+                longest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(
+                    per_proxy_ttl.unwrap_or(NO_LONGEST_PER_PROXY_TTL),
+                )),
+                default_consumer_observed: Arc::new(AtomicBool::new(default_consumer_observed)),
+                consecutive_failures: 0,
+                first_failed_at: None,
+            },
+        );
+    }
+
+    /// Seed an error-cache row so selection tests can prove error ownership
+    /// stays with the failed-retry task.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn test_seed_error_entry(
+        &self,
+        hostname: &str,
+        resolved_at: Instant,
+        applied_ttl: Duration,
+    ) {
+        self.cache.insert(
+            dns_hostname_key(hostname).into_owned(),
+            DnsCacheEntry {
+                addresses: Arc::from([]),
+                next_start: Arc::new(AtomicU64::new(0)),
+                resolved_at,
+                native_ttl: Duration::ZERO,
+                stale_deadline: resolved_at + applied_ttl,
+                applied_ttl,
+                record_type_used: None,
+                is_error: true,
+                refresh_error_deadline: None,
+                shortest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(NO_PER_PROXY_TTL)),
+                longest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(NO_LONGEST_PER_PROXY_TTL)),
+                default_consumer_observed: Arc::new(AtomicBool::new(false)),
+                consecutive_failures: 0,
+                first_failed_at: Some(resolved_at),
+            },
+        );
+    }
+
+    /// Replace proactive resolution with a deterministic future. Production
+    /// caches never install a hook; the request hot path never reads this field.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn test_install_proactive_resolve_hook<F, Fut>(&mut self, hook: F)
+    where
+        F: Fn(String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ProactiveResolveOutput> + Send + 'static,
+    {
+        self.proactive_resolve_hook =
+            Some(Arc::new(move |hostname: String| Box::pin(hook(hostname))));
+    }
+
+    /// Run one proactive refresh cycle without waiting on the 5s interval.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub async fn test_run_proactive_refresh_cycle(&self) {
+        self.run_proactive_refresh_cycle().await;
+    }
+
+    /// Hostnames selected for the next proactive cycle, soonest-expiry first.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn test_select_proactive_refresh_hostnames(&self) -> Vec<String> {
+        self.select_proactive_refresh_candidates(Instant::now())
+            .into_iter()
+            .map(|c| c.hostname)
+            .collect()
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn test_refreshing_len(&self) -> usize {
+        self.refreshing.len()
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn test_available_refresh_permits(&self) -> usize {
+        self.refresh_semaphore.available_permits()
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn test_success_addresses(&self, hostname: &str) -> Option<Vec<IpAddr>> {
+        let cache_key = dns_hostname_key(hostname);
+        self.cache.get(cache_key.as_ref()).and_then(|entry| {
+            if entry.is_error {
+                None
+            } else {
+                Some(entry.addresses.as_ref().to_vec())
+            }
+        })
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn test_success_resolved_at(&self, hostname: &str) -> Option<Instant> {
+        let cache_key = dns_hostname_key(hostname);
+        self.cache.get(cache_key.as_ref()).and_then(|entry| {
+            if entry.is_error {
+                None
+            } else {
+                Some(entry.resolved_at)
+            }
+        })
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn test_remove_entry(&self, hostname: &str) {
+        let cache_key = dns_hostname_key(hostname);
+        self.cache.remove(cache_key.as_ref());
+    }
+
     /// Resolve a DNS SRV record to a list of (hostname, port, weight) tuples.
     ///
     /// Used by DNS-SD service discovery. Does not use the cache — callers
@@ -2137,6 +2364,270 @@ impl DnsCache {
             .await;
     }
 
+    /// Claim one system-wide refresh slot for `hostname`.
+    ///
+    /// Inserts the dedup marker before taking a semaphore permit so a failed
+    /// acquire cannot leak a marker, and both are owned by [`RefreshInFlight`]
+    /// so abort/cancellation cannot leak either. Sync: never called while
+    /// holding a cache-map guard across `.await`.
+    fn try_begin_refresh(&self, hostname: String) -> RefreshStart {
+        if self.refreshing.insert(hostname.clone(), ()).is_some() {
+            return RefreshStart::AlreadyInProgress;
+        }
+        match self.refresh_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => RefreshStart::Started(RefreshInFlight {
+                hostname,
+                refreshing: Arc::clone(&self.refreshing),
+                _permit: permit,
+            }),
+            Err(_) => {
+                self.refreshing.remove(&hostname);
+                RefreshStart::ConcurrencyLimited
+            }
+        }
+    }
+
+    /// Whether `entry` is still the success generation selected for proactive
+    /// refresh. Pointer equality on `next_start` detects a newer publisher;
+    /// `resolved_at` rejects a recycled row. Error rows belong to the
+    /// failed-retry task and never match.
+    fn matches_proactive_refresh_generation(
+        entry: &DnsCacheEntry,
+        generation: &ProactiveRefreshGeneration,
+    ) -> bool {
+        !entry.is_error
+            && Arc::ptr_eq(&entry.next_start, &generation.next_start)
+            && entry.resolved_at == generation.resolved_at
+    }
+
+    /// Select success entries eligible for a proactive refresh cycle.
+    ///
+    /// Returns at most `max_concurrent_refreshes` hostnames whose remaining
+    /// refresh TTL is inside the configured threshold window, ordered by
+    /// soonest logical expiry. Error entries are owned by the failed-retry
+    /// task and are never selected. DashMap guards are dropped before return.
+    fn select_proactive_refresh_candidates(&self, now: Instant) -> Vec<ProactiveRefreshCandidate> {
+        let refresh_remaining_pct = (100 - self.refresh_threshold_percent as u32).max(1);
+        let mut candidates: Vec<ProactiveRefreshCandidate> = Vec::new();
+
+        for entry in self.cache.iter() {
+            if entry.is_error {
+                continue;
+            }
+            let refresh_ttl = self.refresh_ttl_for_entry(entry.value());
+            let expires_at = entry.resolved_at + refresh_ttl;
+            let remaining = expires_at.saturating_duration_since(now);
+            let threshold = refresh_ttl * refresh_remaining_pct / 100;
+            if remaining < threshold && remaining > Duration::ZERO {
+                candidates.push(ProactiveRefreshCandidate {
+                    hostname: entry.key().clone(),
+                    per_proxy_ttl: entry.load_shortest_per_proxy_ttl(),
+                    generation: ProactiveRefreshGeneration {
+                        next_start: entry.next_start.clone(),
+                        resolved_at: entry.resolved_at,
+                    },
+                    expires_at,
+                });
+            }
+        }
+
+        candidates.sort_by_key(|c| c.expires_at);
+        candidates.truncate(self.max_concurrent_refreshes);
+        candidates
+    }
+
+    /// Publish a proactive refresh success only if the selected generation is
+    /// still live. IP-policy validation runs before any map mutation. Vacant
+    /// keys are not resurrected. The DashMap entry guard is never held across
+    /// await — callers resolve DNS before invoking this.
+    ///
+    /// Returns `Ok(true)` when published, `Ok(false)` when the generation
+    /// changed or the key was removed, and `Err` when addresses are denied by
+    /// IP policy (nothing is written).
+    fn apply_proactive_refresh_success(
+        &self,
+        hostname: &str,
+        generation: &ProactiveRefreshGeneration,
+        addresses: Vec<IpAddr>,
+        record_type: Option<CachedRecordType>,
+        native_ttl: Duration,
+        per_proxy_ttl: Option<u64>,
+    ) -> Result<bool, anyhow::Error> {
+        let native_ttl = native_ttl.min(Self::MAX_TTL);
+        let addresses = self.screen_backend_addresses_policy(addresses, hostname)?;
+        let cache_key = dns_hostname_key(hostname);
+        if parse_ip_literal(cache_key.as_ref()).is_some() {
+            return Ok(false);
+        }
+        let now = Instant::now();
+
+        match self.cache.entry(cache_key.into_owned()) {
+            Entry::Occupied(mut occupied) => {
+                if !Self::matches_proactive_refresh_generation(occupied.get(), generation) {
+                    return Ok(false);
+                }
+                occupied.get().note_per_proxy_ttl(per_proxy_ttl);
+                let shortest = occupied.get().shortest_per_proxy_ttl_secs.clone();
+                let longest = occupied.get().longest_per_proxy_ttl_secs.clone();
+                let default_obs = occupied.get().default_consumer_observed.clone();
+                let shortest_ttl = {
+                    let secs = shortest.load(Ordering::Relaxed);
+                    if secs == NO_PER_PROXY_TTL {
+                        None
+                    } else {
+                        Some(secs)
+                    }
+                };
+                let longest_ttl = {
+                    let secs = longest.load(Ordering::Relaxed);
+                    if secs == NO_LONGEST_PER_PROXY_TTL {
+                        None
+                    } else {
+                        Some(secs)
+                    }
+                };
+                let default_consumer_observed = default_obs.load(Ordering::Relaxed);
+                let applied_ttl =
+                    self.observed_refresh_ttl(native_ttl, shortest_ttl, default_consumer_observed);
+                occupied.insert(DnsCacheEntry {
+                    addresses,
+                    next_start: Arc::new(AtomicU64::new(0)),
+                    resolved_at: now,
+                    native_ttl,
+                    stale_deadline: self.shared_stale_deadline(
+                        now,
+                        native_ttl,
+                        longest_ttl,
+                        default_consumer_observed,
+                    ),
+                    applied_ttl,
+                    record_type_used: record_type,
+                    is_error: false,
+                    refresh_error_deadline: None,
+                    shortest_per_proxy_ttl_secs: shortest,
+                    longest_per_proxy_ttl_secs: longest,
+                    default_consumer_observed: default_obs,
+                    consecutive_failures: 0,
+                    first_failed_at: None,
+                });
+                Ok(true)
+            }
+            Entry::Vacant(_) => Ok(false),
+        }
+    }
+
+    async fn proactive_resolve(&self, hostname: &str) -> ProactiveResolveOutput {
+        if let Some(hook) = self.proactive_resolve_hook.as_ref() {
+            return hook(hostname.to_string()).await;
+        }
+        self.timed_resolve(hostname).await
+    }
+
+    async fn refresh_proactive_candidate(&self, candidate: ProactiveRefreshCandidate) {
+        let hostname = &candidate.hostname;
+        let per_proxy_ttl = candidate.per_proxy_ttl;
+        match tokio::time::timeout(
+            Self::PROACTIVE_REFRESH_RESOLVE_TIMEOUT,
+            self.proactive_resolve(hostname),
+        )
+        .await
+        {
+            Ok(Ok((addrs, record_type, native_ttl))) if !addrs.is_empty() => {
+                match self.apply_proactive_refresh_success(
+                    hostname,
+                    &candidate.generation,
+                    addrs,
+                    record_type,
+                    native_ttl,
+                    per_proxy_ttl,
+                ) {
+                    Ok(true) => {
+                        debug!(
+                            "DNS background refresh: {} refreshed (native_ttl={:?}, per_proxy_ttl={:?})",
+                            hostname, native_ttl, per_proxy_ttl
+                        );
+                    }
+                    Ok(false) => {
+                        debug!(
+                            "DNS background refresh: abandoning stale success for '{}' (cache generation changed during resolve)",
+                            hostname
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "DNS background refresh: '{}' resolved but denied by IP policy: {}",
+                            hostname, e
+                        );
+                    }
+                }
+            }
+            Ok(Ok(_)) => {
+                warn!("DNS background refresh: {} returned no addresses", hostname);
+            }
+            Ok(Err(e)) => {
+                warn!("DNS background refresh failed for {}: {}", hostname, e);
+            }
+            Err(_) => {
+                warn!(
+                    "DNS background refresh timed out for {} after {:?}",
+                    hostname,
+                    Self::PROACTIVE_REFRESH_RESOLVE_TIMEOUT
+                );
+            }
+        }
+    }
+
+    /// Run one proactive refresh cycle: select soonest-expiry success entries
+    /// up to `max_concurrent_refreshes`, resolve them concurrently through the
+    /// shared `refresh_semaphore` + `refreshing` dedup map, and publish only
+    /// when the selected generation is still current.
+    async fn run_proactive_refresh_cycle(&self) {
+        let now = Instant::now();
+        let to_refresh = self.select_proactive_refresh_candidates(now);
+        if to_refresh.is_empty() {
+            return;
+        }
+
+        let concurrency = self.max_concurrent_refreshes;
+        stream::iter(to_refresh)
+            .for_each_concurrent(concurrency, |candidate| {
+                let cache = self.clone();
+                async move {
+                    let hostname = candidate.hostname.clone();
+                    match cache.try_begin_refresh(hostname) {
+                        RefreshStart::Started(guard) => {
+                            cache.refresh_proactive_candidate(candidate).await;
+                            drop(guard);
+                        }
+                        RefreshStart::AlreadyInProgress | RefreshStart::ConcurrencyLimited => {}
+                    }
+                }
+            })
+            .await;
+    }
+
+    async fn proactive_refresh_loop(self) {
+        let mut interval = tokio::time::interval(Self::BACKGROUND_MAINTENANCE_INTERVAL);
+        // Issue #4270: a slow proactive cycle must not Burst catch-up ticks
+        // that re-issue the full near-expiry sweep back-to-back.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            self.run_proactive_refresh_cycle().await;
+        }
+    }
+
+    async fn cache_eviction_loop(self) {
+        let mut interval = tokio::time::interval(Self::BACKGROUND_MAINTENANCE_INTERVAL);
+        // Independent of refresh resolution so a dead resolver cannot starve
+        // `max_cache_size` / age enforcement (issue #4270).
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            self.evict_expired();
+        }
+    }
+
     /// Start a background task that proactively refreshes cache entries before
     /// they expire. Entries are refreshed when the configured percentage of their
     /// TTL has elapsed (default 90%), keeping DNS resolution off the hot request path.
@@ -2150,95 +2641,32 @@ impl DnsCache {
     /// When `shutdown_rx` is provided, the task will exit cleanly when the
     /// shutdown signal is received. Without it, the task runs until aborted.
     ///
+    /// Proactive refresh and `evict_expired` run as sibling loops on the same
+    /// 5s `Delay` cadence so resolver latency cannot starve capacity
+    /// enforcement. The entire refresh phase is cancelled by the shutdown
+    /// watch; RAII releases semaphore permits and `refreshing` markers.
+    ///
     /// Returns the task handle so callers can await graceful completion.
     pub fn start_background_refresh_with_shutdown(
         &self,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> tokio::task::JoinHandle<()> {
         let cache = self.clone();
-        // Check interval: scan frequently enough to catch the shortest-lived entries.
-        // With native TTL respect, entries may have wildly different TTLs (e.g., 30s vs 3600s).
-        // We use a fixed 5s scan interval to handle short-TTL records promptly.
-        let check_interval = 5u64;
-
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(check_interval));
-
-            loop {
-                if let Some(ref rx) = shutdown_rx {
-                    tokio::select! {
-                        _ = interval.tick() => {}
-                        _ = wait_for_shutdown(rx.clone()) => {
-                            info!("DNS background refresh shutting down");
-                            return;
-                        }
-                    }
-                } else {
-                    interval.tick().await;
-                }
-
-                // Evict expired entries and enforce max cache size
-                cache.evict_expired();
-
-                // Collect entries nearing expiration (past the configured refresh threshold).
-                // Freshness for request callers is per-consumer; proactive refresh uses the
-                // shortest effective TTL among policies actually observed for the hostname
-                // so short-TTL peers stay warm without spawning per-consumer DNS storms.
-                // Capture the shortest explicit TTL so the refresh re-threads observation
-                // state through `cache_success_entry` (default-consumer flag is preserved
-                // via the shared atomic Arc).
-                let now = Instant::now();
-                let mut to_refresh: Vec<(String, Option<u64>)> = Vec::new();
-                let refresh_remaining_pct = (100 - cache.refresh_threshold_percent as u32).max(1);
-
-                for entry in cache.cache.iter() {
-                    // Skip error entries — those are handled by the failed retry task
-                    if entry.is_error {
-                        continue;
-                    }
-
-                    let refresh_ttl = cache.refresh_ttl_for_entry(entry.value());
-                    let expires_at = entry.resolved_at + refresh_ttl;
-                    let remaining = expires_at.saturating_duration_since(now);
-                    let threshold = refresh_ttl * refresh_remaining_pct / 100;
-                    if remaining < threshold && remaining > Duration::ZERO {
-                        to_refresh.push((entry.key().clone(), entry.load_shortest_per_proxy_ttl()));
+            let refresh = cache.clone().proactive_refresh_loop();
+            let eviction = cache.cache_eviction_loop();
+            if let Some(rx) = shutdown_rx {
+                tokio::select! {
+                    _ = refresh => {}
+                    _ = eviction => {}
+                    _ = wait_for_shutdown(rx) => {
+                        info!("DNS background refresh shutting down");
                     }
                 }
-
-                // Refresh entries in the background
-                for (hostname, per_proxy_ttl) in to_refresh {
-                    match cache.timed_resolve(&hostname).await {
-                        Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
-                            match cache.cache_success_entry(
-                                &hostname,
-                                addrs,
-                                record_type,
-                                native_ttl,
-                                per_proxy_ttl,
-                                false,
-                            ) {
-                                Ok(_) => {
-                                    debug!(
-                                        "DNS background refresh: {} refreshed (native_ttl={:?}, per_proxy_ttl={:?})",
-                                        hostname, native_ttl, per_proxy_ttl
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "DNS background refresh: '{}' resolved but denied by IP policy: {}",
-                                        hostname, e
-                                    );
-                                }
-                            }
-                        }
-                        Ok(_) => {
-                            warn!("DNS background refresh: {} returned no addresses", hostname);
-                        }
-                        Err(e) => {
-                            warn!("DNS background refresh failed for {}: {}", hostname, e);
-                        }
-                    }
+            } else {
+                tokio::select! {
+                    _ = refresh => {}
+                    _ = eviction => {}
                 }
             }
         })

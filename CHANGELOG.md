@@ -208,6 +208,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **DNS background refresh no longer stalls cache eviction** (issue #4270). The
+  proactive refresh task scanned every near-expiry hostname sequentially with
+  no cap, timeout, or delayed tick behavior, and it owned the only production
+  `evict_expired()` call. A degraded resolver with a large cache could leave
+  `FERRUM_DNS_CACHE_MAX_SIZE` unenforced for hours and then burst catch-up
+  sweeps. Refresh now selects soonest-expiry success rows up to
+  `FERRUM_DNS_MAX_CONCURRENT_REFRESHES`, resolves them concurrently through
+  the shared stale-while-revalidate semaphore and dedup map, bounds each
+  lookup at 15 seconds, observes shutdown with RAII permit/dedup cleanup, and
+  publishes generation-safely so a stale result cannot overwrite a newer row
+  or resurrect an evicted hostname. Capacity eviction runs on its own 5s
+  delayed cadence. **Operator action**: none; the existing concurrency env
+  var now also caps proactive refresh per cycle.
+
 - **Security — client-asserted `X-Real-IP` no longer reaches mirror or
   load-test targets** (issue #4164). The primary backend builders drop an
   untrusted peer's `X-Real-IP`, but the shared secondary-request boundary took
