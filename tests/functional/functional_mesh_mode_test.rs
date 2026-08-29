@@ -1115,6 +1115,7 @@ fn fixture_servers_bind_through_the_mesh_port_aware_helper() {
         "start_loopback_tcp_echo",
         "start_counting_tcp_echo_on",
         "start_counting_udp_echo_on",
+        "start_loopback_udp_echo",
     ] {
         let body = mesh_test_fn_body(name);
         let through_helper =
@@ -1152,6 +1153,24 @@ fn third_workload_refusal_exercises_synthesis_time_guard() {
         !drive.contains("third_workload_route_override_plugin("),
         "mesh-mode has no production path that puts mesh_route_dispatch on \
          the synthesized inbound relay; do not invent a slice/plugin bypass"
+    );
+    // Without an in-fixture positive control, a terminator that refuses EVERY
+    // destination (slice never applied, SVID mismatch, wrong topology) 404s for
+    // C and passes as a security proof. These pin the control in place.
+    assert!(
+        drive.contains("start_own_dest_echo_for("),
+        "the driver must stand up B's OWN declared destination as a live echo \
+         so the same terminator can be proved to still relay"
+    );
+    assert!(
+        drive.contains("control_failure"),
+        "the driver must require a positive control CONNECT that IS relayed; \
+         otherwise C's 404 is not attributable to C being a third workload"
+    );
+    assert!(
+        drive.contains("observe_third_workload_backend_hits("),
+        "zero backend hits must come from the bounded observation helper, \
+         which reports a dead backend as inconclusive rather than as zero"
     );
 
     let slice_header = "\nfn third_workload_refusal_slice(";
@@ -9987,6 +10006,14 @@ async fn functional_mesh_udp_dest_untrusted_peer_fails_closed() {
 // the whole loopback namespace for Ambient/waypoint terminators before
 // inventory fall-through, which would keep a 127.0.0.2 fixture green even if
 // the ownership guard regressed to accepting the full slice inventory.
+//
+// Each case carries an IN-FIXTURE POSITIVE CONTROL: before the C-named
+// CONNECT, the same peer SVID and the same CONNECT flavor name B's OWN
+// declared loopback destination and must be relayed (200 + byte-exact echo).
+// A 404 is only evidence of an ownership refusal once the same terminator has
+// been shown to relay something. Without the control, a fixture whose slice
+// never applied, whose SVID did not chain, or whose topology was wrong would
+// 404 for C and pass as a security proof.
 
 /// After a CONNECT result, wait this long for C's backend task to report a
 /// TCP accept or UDP datagram that was already queued while that task had not
@@ -10161,19 +10188,62 @@ async fn start_counting_udp_echo_on(
 /// Wait until C's backend reports a hit, or until `window` elapses with none.
 /// Returning early on the first hit keeps a regression from burning the full
 /// window; a timeout is the only way to conclude zero hits.
+///
+/// `None` means the channel CLOSED — C's backend task exited, so it could not
+/// have recorded a dial and "zero hits" is not evidence of anything. That is
+/// reported as a setup failure rather than folded into a passing `0`.
 async fn observe_third_workload_backend_hits(
     hit_rx: &mut mpsc::UnboundedReceiver<()>,
     window: Duration,
-) -> usize {
+) -> Option<usize> {
     match tokio::time::timeout(window, hit_rx.recv()).await {
         Ok(Some(())) => {
             let mut hits = 1;
             while hit_rx.try_recv().is_ok() {
                 hits += 1;
             }
-            hits
+            Some(hits)
         }
-        Ok(None) | Err(_) => 0,
+        // Timed out with the backend still listening: a genuine zero.
+        Err(_) => Some(0),
+        Ok(None) => None,
+    }
+}
+
+/// Loopback UDP echo bound through the mesh-port-aware helper (issue #2132).
+/// This is B's OWN declared destination for the datagram control, so it must
+/// echo: `drive_one_udp_connect` only reports 200 after a framed round trip.
+async fn start_loopback_udp_echo() -> (u16, tokio::task::JoinHandle<()>) {
+    let socket = bind_fixture_udp_socket(loopback_ephemeral())
+        .await
+        .expect("bind third-workload control UDP echo");
+    let port = socket
+        .local_addr()
+        .expect("third-workload control UDP echo addr")
+        .port();
+    let task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        while let Ok((n, src)) = socket.recv_from(&mut buf).await {
+            if socket.send_to(&buf[..n], src).await.is_err() {
+                return;
+            }
+        }
+    });
+    (port, task)
+}
+
+/// Stand up B's OWN declared destination on loopback for the in-fixture
+/// positive control. Both CONNECT helpers require a byte-exact round trip
+/// before they report 200, so this echoes rather than counting.
+async fn start_own_dest_echo_for(
+    flavor: ThirdWorkloadConnectFlavor,
+) -> (u16, tokio::task::JoinHandle<()>) {
+    match flavor {
+        ThirdWorkloadConnectFlavor::ByteStream => {
+            let (port, _accepted, task) = start_loopback_tcp_echo().await;
+            (port, task)
+        }
+        ThirdWorkloadConnectFlavor::Datagram => start_loopback_udp_echo().await,
     }
 }
 
@@ -10306,10 +10376,13 @@ struct ThirdWorkloadRefusalOutcome {
     logs: String,
 }
 
-/// Spawn Ambient terminator B over a slice that also declares workload C, then
-/// drive one authenticated CONNECT at B's HBONE port naming C. Synthesis
-/// refuses because C is not a dest B terminates for. Setup failures retry;
-/// the CONNECT observation is made exactly once against a live child.
+/// Spawn Ambient terminator B over a slice that also declares workload C, prove
+/// the terminator live with a positive control CONNECT naming B's OWN declared
+/// destination, then drive one authenticated CONNECT at B's HBONE port naming
+/// C. Synthesis refuses because C is not a dest B terminates for. Setup
+/// failures retry; both CONNECT observations are made exactly once against a
+/// live child, and a control that is NOT relayed is a hard failure rather than
+/// another retry — it means the fixture, not the guard, produced the refusal.
 async fn drive_inbound_relay_third_workload_refusal(
     flavor: ThirdWorkloadConnectFlavor,
 ) -> Result<ThirdWorkloadRefusalOutcome, String> {
@@ -10325,6 +10398,12 @@ async fn drive_inbound_relay_third_workload_refusal(
         ThirdWorkloadConnectFlavor::ByteStream => AppProtocol::Tcp,
         ThirdWorkloadConnectFlavor::Datagram => AppProtocol::Udp,
     };
+    // `drive_one_udp_connect` sends a fixed `ping`; the byte helper takes the
+    // payload. Both require the echo back byte-for-byte before reporting 200.
+    let control_payload: &[u8] = match flavor {
+        ThirdWorkloadConnectFlavor::ByteStream => b"own-dest-control",
+        ThirdWorkloadConnectFlavor::Datagram => b"ping",
+    };
     let c_ip = discover_bindable_non_loopback_local_ip().await?;
 
     let mut last_failure = String::new();
@@ -10339,10 +10418,19 @@ async fn drive_inbound_relay_third_workload_refusal(
         };
         let c_port = c_addr.port();
         // B's own-identity record must declare a port, otherwise the loopback
-        // arm treats the own address as unconstrained. Keep it distinct from
-        // C's ephemeral port so an unconstrained own-address arm cannot admit
-        // C's port on loopback.
-        let b_local_port = if c_port == 18080 { 18081 } else { 18080 };
+        // arm treats the own address as unconstrained. It is a LIVE echo so the
+        // positive control below can prove this terminator still relays for the
+        // destination it owns.
+        let (b_local_port, control_echo) = start_own_dest_echo_for(flavor).await;
+        if b_local_port == c_port {
+            // Keep the two ports distinct so an unconstrained own-address arm
+            // could not admit C's port on loopback. Both are ephemeral, so this
+            // is a re-roll, not a failure.
+            abort_third_workload_backend(echo).await;
+            abort_third_workload_backend(control_echo).await;
+            last_failure = format!("attempt {attempt}: B and C drew the same port {c_port}");
+            continue;
+        }
 
         let cp_b = start_static_mesh_cp(third_workload_refusal_slice(
             &node_b,
@@ -10390,8 +10478,67 @@ async fn drive_inbound_relay_third_workload_refusal(
             kill_child(&mut child_b);
             cp_b.shutdown().await;
             abort_third_workload_backend(echo).await;
+            abort_third_workload_backend(control_echo).await;
             tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
+        }
+
+        // In-fixture POSITIVE CONTROL. Same terminator, same peer SVID, same
+        // CONNECT flavor — but naming B's OWN declared destination. A 200 with
+        // a byte-exact echo proves the slice loaded, the peer is trusted, and
+        // synthesis still builds a relay on this child. Without it, a fixture
+        // that refuses EVERY destination (slice never applied, SVID mismatch,
+        // wrong topology) would 404 for C and pass as a security proof.
+        let control_authority = format!("127.0.0.1:{b_local_port}");
+        let control = match flavor {
+            ThirdWorkloadConnectFlavor::ByteStream => drive_one_waypoint_byte_connect(
+                hbone_port,
+                &control_authority,
+                &svids.a,
+                control_payload,
+            )
+            .await,
+            ThirdWorkloadConnectFlavor::Datagram => {
+                drive_one_udp_connect(hbone_port, &control_authority, &svids.a).await
+            }
+        };
+
+        // Two steps on purpose: the `&mut [..]` scrutinee temporary must be
+        // dropped before the body reborrows `child_b` for `kill_child`.
+        let control_died = exited_gateway_diagnostic(&mut [("gateway B", &mut child_b)]);
+        if let Some(diagnostic) = control_died {
+            let logs = captured_output(&temp_b);
+            last_failure = format!("attempt {attempt}: {diagnostic}\n{logs}");
+            kill_child(&mut child_b);
+            cp_b.shutdown().await;
+            abort_third_workload_backend(echo).await;
+            abort_third_workload_backend(control_echo).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let control_failure = match &control {
+            Ok((200, echoed)) if echoed.as_deref() == Some(control_payload) => None,
+            Ok((200, echoed)) => Some(format!(
+                "own-destination control CONNECT to {control_authority} relayed but echoed \
+                 {echoed:?}, expected {control_payload:?}"
+            )),
+            Ok((status, _)) => Some(format!(
+                "own-destination control CONNECT to {control_authority} returned {status}, \
+                 expected 200: this terminator refuses even the destination it owns, so a \
+                 404 for C would not be attributable to C being a third workload"
+            )),
+            Err(e) => Some(format!(
+                "own-destination control CONNECT to {control_authority} failed: {e}"
+            )),
+        };
+        if let Some(failure) = control_failure {
+            let logs = captured_output(&temp_b);
+            kill_child(&mut child_b);
+            cp_b.shutdown().await;
+            abort_third_workload_backend(echo).await;
+            abort_third_workload_backend(control_echo).await;
+            return Err(format!("{failure}\n--- gateway B ---\n{logs}"));
         }
 
         // CONNECT names C, a dest B does not terminate for. Synthesis 404s
@@ -10421,20 +10568,29 @@ async fn drive_inbound_relay_third_workload_refusal(
             kill_child(&mut child_b);
             cp_b.shutdown().await;
             abort_third_workload_backend(echo).await;
+            abort_third_workload_backend(control_echo).await;
             tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         }
 
         // Observe while the terminator is still alive so a queued dial can
         // still complete accept/recv and fail the zero-hit assertion.
-        let backend_hits = if connect.is_ok() {
+        let observed = if connect.is_ok() {
             observe_third_workload_backend_hits(&mut hit_rx, THIRD_WORKLOAD_BACKEND_OBSERVE).await
         } else {
-            0
+            Some(0)
         };
         kill_child(&mut child_b);
         cp_b.shutdown().await;
         abort_third_workload_backend(echo).await;
+        abort_third_workload_backend(control_echo).await;
+
+        let Some(backend_hits) = observed else {
+            return Err(format!(
+                "workload C's backend task exited before the observation window, so zero \
+                 hits proves nothing\n--- gateway B ---\n{logs}"
+            ));
+        };
 
         return match connect {
             Ok(status) => Ok(ThirdWorkloadRefusalOutcome {
@@ -10475,7 +10631,9 @@ fn assert_third_workload_connect_refused(outcome: ThirdWorkloadRefusalOutcome, f
 /// Issue #4252 (byte-stream, synthesis): an authenticated HBONE CONNECT to
 /// terminator B naming slice-declared workload C is refused with 404, and C's
 /// TCP echo records zero accepts — proving `build_inbound_hbone_relay_proxy`
-/// still withholds the relay before `handle_hbone_request`.
+/// still withholds the relay before `handle_hbone_request`. The same
+/// terminator relays B's own declared destination in the same attempt, so the
+/// 404 is attributable to C being a third workload.
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_ambient_hbone_refuses_third_workload_byte_stream() {
@@ -10490,7 +10648,8 @@ async fn functional_mesh_ambient_hbone_refuses_third_workload_byte_stream() {
 /// over the UDP-marked flavor, asserting synthesis 404 and C's UDP echo
 /// records zero datagrams — proving the UDP branch of
 /// `build_inbound_hbone_relay_proxy` still withholds the relay before
-/// `handle_hbone_udp_request`.
+/// `handle_hbone_udp_request`. The same terminator round-trips a datagram to
+/// B's own declared destination in the same attempt.
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_ambient_hbone_refuses_third_workload_datagram() {

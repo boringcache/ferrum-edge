@@ -2036,26 +2036,37 @@ async fn start_counting_udp_backend(
     (addr, hit_rx, task)
 }
 
+/// `None` means the channel CLOSED — C's backend task exited, so it could not
+/// have recorded a dial and "zero hits" is not evidence. Only a timeout with
+/// the backend still listening is a genuine zero.
 async fn observe_backend_hits(
     hit_rx: &mut mpsc::UnboundedReceiver<()>,
     window: std::time::Duration,
-) -> usize {
+) -> Option<usize> {
     match tokio::time::timeout(window, hit_rx.recv()).await {
         Ok(Some(())) => {
             let mut hits = 1;
             while hit_rx.try_recv().is_ok() {
                 hits += 1;
             }
-            hits
+            Some(hits)
         }
-        Ok(None) | Err(_) => 0,
+        Err(_) => Some(0),
+        Ok(None) => None,
     }
 }
 
+/// Collect a refusal body, stopping at the first stream error instead of
+/// panicking. The CONNECT request stream is deliberately left OPEN with
+/// unread payload on it, so a peer that completes its response may RST the
+/// stream afterwards; that must not turn a correct 403 into a panic. Whatever
+/// was received still has to satisfy the body assertion.
 async fn collect_h2_body(mut body: h2::RecvStream) -> Bytes {
     let mut out = Vec::new();
     while let Some(chunk) = body.data().await {
-        let chunk = chunk.expect("h2 body chunk");
+        let Ok(chunk) = chunk else {
+            break;
+        };
         let _ = body.flow_control().release_capacity(chunk.len());
         out.extend_from_slice(&chunk);
     }
@@ -2089,7 +2100,24 @@ async fn drive_post_plugin_third_workload_refusal(flavor: PostPluginConnectFlavo
             .expect("byte-stream CONNECT"),
         PostPluginConnectFlavor::Datagram => udp_connect_request(&authority),
     };
-    let (response_fut, _request_body) = sender.send_request(req, false).expect("send CONNECT");
+    let (response_fut, mut request_body) = sender.send_request(req, false).expect("send CONNECT");
+    // Put real bytes on the CONNECT stream. Without them the datagram flavor
+    // would never forward anything even if the re-check were deleted, so its
+    // zero-hit assertion would be vacuous rather than evidence. The stream is
+    // left OPEN (`end_stream = false`) so a relay that WAS established would
+    // stay alive long enough to deliver them.
+    match flavor {
+        PostPluginConnectFlavor::ByteStream => {
+            let payload = Bytes::from_static(b"third-workload-must-not-be-dialed");
+            let _ = request_body.send_data(payload, false);
+        }
+        PostPluginConnectFlavor::Datagram => {
+            let mut framed = bytes::BytesMut::new();
+            ferrum_edge::proxy::mesh_udp_frame::encode_datagram(&mut framed, b"ping")
+                .expect("encode datagram");
+            let _ = request_body.send_data(framed.freeze(), false);
+        }
+    }
     let resp = tokio::time::timeout(std::time::Duration::from_secs(5), response_fut)
         .await
         .expect("CONNECT response")
@@ -2101,13 +2129,19 @@ async fn drive_post_plugin_third_workload_refusal(flavor: PostPluginConnectFlavo
     )
     .await
     .unwrap_or_else(|_| Bytes::new());
-    let hits = observe_backend_hits(&mut hit_rx, std::time::Duration::from_secs(2)).await;
+    let observed = observe_backend_hits(&mut hit_rx, std::time::Duration::from_secs(2)).await;
 
     shutdown_tx.send(true).expect("shutdown gateway");
     echo.abort();
     conn_task.abort();
 
     let body_text = String::from_utf8_lossy(&body);
+    let Some(hits) = observed else {
+        panic!(
+            "workload C's backend task exited before the observation window, so zero hits \
+             proves nothing. body={body_text}"
+        )
+    };
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
