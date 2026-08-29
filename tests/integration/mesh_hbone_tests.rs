@@ -2635,6 +2635,81 @@ fn inbound_relay_registry_strict_parse_retracts_malformed_evidence_then_recovers
     );
 }
 
+/// A path-safe alphanumeric registry leaf is a valid filename, but pairing it
+/// with `spiffe_id=` does not produce a `UdpSourceIdentity`: production
+/// identity binding requires a Kubernetes UUID. The strict complete snapshot
+/// must retract rather than publish missing evidence (the live #4258 timeout
+/// was this fixture shape). Permissive `list_targets` may keep the pod with
+/// `source_identity=None`; that scan is not what the inbound relay uses.
+#[test]
+fn inbound_relay_registry_strict_parse_retracts_spiffe_on_non_uuid_leaf() {
+    let own_spiffe = reviews_spiffe();
+    let local = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    let (slice, runtime) = ambient_relay_fixture(vec![local]);
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+    let index = Arc::new(NodeLocalEnrolledDestinations::new());
+    mesh.inbound_relay_node_local_registry =
+        NodeLocalEnrolledDestinationsHandle::new(index.clone());
+
+    let dir = tempfile::tempdir().expect("registry");
+    write_strict_registry_entry(dir.path(), LOCAL_POD_UID, "10.244.5.5", &own_spiffe);
+    let source = DirectoryCaptureSource::new(dir.path());
+    let manager = strict_registry_manager(
+        Arc::new(DirectoryCaptureSource::new(dir.path())),
+        index.clone(),
+    );
+    assert_eq!(manager.reconcile_once().len(), 1);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+
+    let safe_non_uuid = "functional-udp-enrolled-destination-pod";
+    std::fs::write(
+        dir.path().join(safe_non_uuid),
+        format!(
+            "/sys/fs/cgroup/kubepods/{safe_non_uuid}\nspiffe_id={own_spiffe}\nipv4=10.244.5.7\n"
+        ),
+    )
+    .expect("path-safe non-UUID leaf with identity");
+
+    let permissive = source.list_targets();
+    assert!(
+        permissive
+            .iter()
+            .any(|target| { target.pod_uid == safe_non_uuid && target.source_identity.is_none() }),
+        "the best-effort scan must keep the path-safe leaf and treat the unbound \
+         identity as absent"
+    );
+    assert!(
+        source.list_complete_targets().is_err(),
+        "the complete snapshot must refuse spiffe_id= bound to a non-UUID pod UID"
+    );
+    assert!(manager.reconcile_once().is_empty());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a sibling with spiffe_id= on a non-UUID leaf must retract the whole last-good index"
+    );
+    assert!(
+        !index.terminates_for(
+            ip("10.244.5.7"),
+            Some(own_spiffe.as_str()),
+            Some(safe_non_uuid),
+        ),
+        "the non-UUID identity binding must not still admit on address/pod-UID alone"
+    );
+
+    std::fs::remove_file(dir.path().join(safe_non_uuid)).expect("remove non-UUID leaf");
+    assert_eq!(manager.reconcile_once().len(), 1);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(()),
+        "removing the non-UUID identity-bound leaf must allow republish"
+    );
+}
+
 /// Unsafe names, oversized files, and Unix symlinks are the production
 /// filesystem shapes the strict reader refuses. Each must retract a
 /// previously valid publish; repairing the directory recovers.

@@ -11451,6 +11451,38 @@ impl Drop for LiveGatewayChild {
     }
 }
 
+/// Registry leaves that publish `spiffe_id=` are identity-bound: the production
+/// strict snapshot constructs `UdpSourceIdentity::new`, which requires a
+/// Kubernetes UUID. A merely path-safe alphanumeric token is a valid registry
+/// filename but retracts the enrolled-destination index.
+#[cfg(target_os = "linux")]
+fn require_identity_bound_pod_uid(pod_uid: &str) -> Result<(), String> {
+    ferrum_edge::modes::mesh::node_waypoint::parse_pod_uid(pod_uid)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "registry spiffe_id= requires a Kubernetes UUID pod UID, \
+                 not a path-safe alphanumeric leaf: {error}"
+            )
+        })
+}
+
+/// Drift guard for identity-bound live registry helpers. An alphanumeric leaf
+/// with `spiffe_id=` is the exact fixture shape that timed out the enrolled-
+/// destination live gate; fail at construction instead of after 30s of HBONE 404s.
+#[cfg(target_os = "linux")]
+#[test]
+fn identity_bound_registry_helpers_reject_non_uuid_pod_uid() {
+    assert!(
+        require_identity_bound_pod_uid("functional-udp-enrolled-destination-pod").is_err(),
+        "the alphanumeric dest-pod fixture must fail at setup when paired with spiffe_id="
+    );
+    assert!(
+        require_identity_bound_pod_uid("dddddddd-dddd-4ddd-8ddd-dddddddddddd").is_ok(),
+        "a Kubernetes UUID must remain valid identity-binding evidence"
+    );
+}
+
 /// A pod-shaped network namespace plus a synthetic cgroup directory. Production
 /// cgroup resolution only needs `cgroup.procs`, so this lets the real manager and
 /// backend resolve `/proc/<pid>/ns/net` without mutating the runner's cgroup tree.
@@ -11572,6 +11604,9 @@ impl LivePodNetns {
         pod_uid: &str,
         spiffe_id: Option<&str>,
     ) -> Result<PathBuf, String> {
+        if spiffe_id.is_some() {
+            require_identity_bound_pod_uid(pod_uid)?;
+        }
         std::fs::create_dir_all(registry_dir)
             .map_err(|error| format!("create pod registry: {error}"))?;
         let path = registry_dir.join(pod_uid);
@@ -12035,8 +12070,16 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
 
     const VIP: &str = "192.0.2.40";
     const UNROUTABLE_VIP: &str = "192.0.2.41";
+    // Source capture publishes cgroup-only (no `spiffe_id=`): a path-safe
+    // alphanumeric leaf is the production registry grammar, not an identity
+    // binding. The destination entry below publishes identity and must be a UUID.
     const SOURCE_POD_UID: &str = "functional-udp-source-capture-pod";
-    const DEST_POD_UID: &str = "functional-udp-enrolled-destination-pod";
+    // Registry filenames ARE the pod UIDs. `publish_enrolled` writes `spiffe_id=`,
+    // so the strict complete-snapshot reader constructs `UdpSourceIdentity::new`
+    // and requires a Kubernetes UUID. An alphanumeric token is a safe registry
+    // leaf but retracts the enrolled-destination index (Gateway B then 404s the
+    // UDP CONNECT and this live gate times out).
+    const DEST_POD_UID: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
     let capture_port = ferrum_edge::capture::DEFAULT_UDP_OUTBOUND_PORT;
     let source = match LiveVethPod::spawn_indexed(8) {
         Ok(pod) => pod,
@@ -12123,24 +12166,26 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
     // that address for `DEST_POD_UID` under `b_spiffe`, and the same address is
     // what the relay dials into the destination pod's netns.
     let workload_address = destination.pod_ip().to_string();
-    let cp_a = start_static_mesh_cp(live_source_capture_slice(
+    let mut slice_a = live_source_capture_slice(
         node_a,
         b_spiffe,
         &workload_address,
         VIP,
         echo_port,
         AppProtocol::Udp,
-    ))
-    .await;
-    let cp_b = start_static_mesh_cp(live_source_capture_slice(
+    );
+    slice_a.workloads[0].pod_uid = Some(DEST_POD_UID.to_string());
+    let mut slice_b = live_source_capture_slice(
         node_b,
         b_spiffe,
         &workload_address,
         VIP,
         echo_port,
         AppProtocol::Udp,
-    ))
-    .await;
+    );
+    slice_b.workloads[0].pod_uid = Some(DEST_POD_UID.to_string());
+    let cp_a = start_static_mesh_cp(slice_a).await;
+    let cp_b = start_static_mesh_cp(slice_b).await;
 
     let ports_b = reserve_mesh_ports().await;
     let b_hbone_port = ports_b.hbone;
@@ -12550,6 +12595,7 @@ impl LiveVethPod {
         pod_uid: &str,
         spiffe_id: &str,
     ) -> Result<PathBuf, String> {
+        require_identity_bound_pod_uid(pod_uid)?;
         std::fs::create_dir_all(registry_dir)
             .map_err(|error| format!("create enrolled destination registry: {error}"))?;
         let path = registry_dir.join(pod_uid);
@@ -12763,6 +12809,7 @@ impl LiveHostUdpVethPod {
         pod_uid: &str,
         spiffe_id: &str,
     ) -> Result<PathBuf, String> {
+        require_identity_bound_pod_uid(pod_uid)?;
         std::fs::create_dir_all(registry_dir)
             .map_err(|error| format!("create host-udp registry: {error}"))?;
         let path = registry_dir.join(pod_uid);
