@@ -1374,34 +1374,35 @@ hard either way. The floor value is not lowered.
 Full-mode PRs compile the native Linux x86_64 verification binary with
 `--profile pr-build`. They also run `verify-pr-linux-gnu-abi`, which builds
 both x86_64 GNU release binaries (`ferrum-edge` and `ferrum-cni`) through
-the same digest-pinned AlmaLinux 8.10 sysroot builder used on versioned
-releases and main-push `latest`, ABI-scans them against GLIBC_2.34, and
-smokes them on digest-pinned AlmaLinux 9.4 and Ubuntu 22.04. That job is
-additive (not wired into frozen Cross or publisher jobs) so GitHub compiles
-and scans this builder on the pull request, not only after merge. `merge_group` keeps all four native
+the digest-pinned AlmaLinux 8.10 sysroot builder, ABI-scans them against
+GLIBC_2.34, and smokes them on digest-pinned AlmaLinux 9.4 and Ubuntu 22.04.
+That job is additive (not wired into frozen publisher jobs) so GitHub
+compiles and scans this builder on the pull request, not only after merge.
+`merge_group` keeps all four native
 targets as fail-closed compile gates whose outputs are discarded: Linux
 x86_64 and Windows x86_64 still `cargo build --profile pr-build` (Windows
 MSVC/NASM linkage is the platform-specific failure mode `cargo check`
 cannot see); macOS x86_64 and macOS ARM64 run `cargo check --profile
 pr-build` because queue binaries are never published. Pushes to `main`
 build optimized `release` binaries for Linux x86_64, Linux ARM64, macOS
-x86_64, macOS ARM64, and Windows x86_64. Linux x86_64 GNU artifacts on
-that path are built in the same digest-pinned AlmaLinux 8.10 sysroot as
-versioned releases, then ABI-scanned against GLIBC_2.34 (`libgcc_s.so.1` /
-`libz.so.1` allowlist) before checksum upload. The sysroot builder compiles
-exclusively under `CARGO_TARGET_DIR=/src/target/linux-gnu-sysroot` so a
-restored native `target/<triple>/release` cache cannot contaminate the
+x86_64, macOS ARM64, and Windows x86_64. Frozen `build-binaries` still
+native-compiles `ubuntu-latest` x86_64 GNU artifacts; replacing that cargo
+step requires a later trusted-policy generation. Additive
+`verify-latest-linux-gnu-abi` independently sysroot-builds and ABI-scans
+x86_64 GNU binaries, then ABI-scans the frozen ARM64 artifacts
+(`binary-x86_64-unknown-linux-gnu` / `binary-aarch64-unknown-linux-gnu`)
+against GLIBC_2.34 (`libgcc_s.so.1` / `libz.so.1` allowlist) and smokes both
+architectures on digest-pinned AlmaLinux 9.4 and Ubuntu 22.04. The sysroot
+builder compiles exclusively under `CARGO_TARGET_DIR=/src/target/linux-gnu-sysroot`
+so a restored native `target/<triple>/release` cache cannot contaminate the
 pinned link, then copies only the two regular, non-symlink binaries into
-the canonical scan/upload paths. The protected `build-arm64-cross` job is
+the canonical scan paths. The protected `build-arm64-cross` job is
 byte-frozen
 and does not run that scanner; both GNU architectures are re-checked by
-`verify-latest-linux-gnu-abi`, which downloads the existing
-`binary-x86_64-unknown-linux-gnu` and `binary-aarch64-unknown-linux-gnu`
-artifacts, re-checks SHA-256 sidecars, ABI-scans `ferrum-edge` and
-`ferrum-cni` on native `ubuntu-latest` / `ubuntu-24.04-arm` runners, and
-smokes both binaries on digest-pinned AlmaLinux 9.4 and Ubuntu 22.04.
+`verify-latest-linux-gnu-abi` as described above.
 `linux-gnu-abi-latest-gate` joins that job with frozen `latest-release`
-(`if: always()` on main pushes). Trusted Cross freezes `latest-release.needs`,
+(`if: always()` on main pushes). The protected ARM64 policy freezes
+`latest-release.needs`,
 so ABI cannot be added there; the join gate fails the workflow unless both
 verification and publication succeeded, and it deletes `latest` only when that
 prerelease is proven to target the current `GITHUB_SHA`. Native targets share
@@ -2722,26 +2723,25 @@ Depends on `Validate release SHA`, then builds optimized release binaries for al
 **Build Process**:
 1. Checkout code at tag commit
 2. Install Rust toolchain with target
-3. Linux x86_64 GNU: build inside a digest-pinned AlmaLinux 8.10 sysroot (glibc 2.28) with `LIBZ_SYS_STATIC=1`, a checksum-pinned `protoc`, and `CARGO_TARGET_DIR=/src/target/linux-gnu-sysroot` so native runner caches cannot contaminate the pinned link. After a successful container build, only the two regular, non-symlink `ferrum-edge` and `ferrum-cni` binaries are copied to the canonical `target/<triple>/release/` paths, then fail-closed ABI-scanned before checksums or artifact upload. The declared runtime floor is GLIBC_2.34; `libgcc_s.so.1` and `libz.so.1` are the only non-glibc dynamic libraries the gate allows.
-4. Other native targets: install protobuf compiler plus platform prerequisites (Windows NASM) and `cargo build --release --features cloud-secrets` on the runner
-5. Generate SHA256 checksum
-6. Upload artifact
+3. Frozen native jobs: install protobuf compiler plus platform prerequisites (Windows NASM) and `cargo build --release --features cloud-secrets` on the runner. Linux x86_64 GNU producers stay native `ubuntu-latest` until a later trusted-policy generation can replace that cargo step. Additive `verify-linux-gnu-abi` independently builds x86_64 GNU binaries inside a digest-pinned AlmaLinux 8.10 sysroot (glibc 2.28) with `LIBZ_SYS_STATIC=1`, a checksum-pinned `protoc`, and `CARGO_TARGET_DIR=/src/target/linux-gnu-sysroot` so native runner caches cannot contaminate the pinned link. After a successful container build, only the two regular, non-symlink `ferrum-edge` and `ferrum-cni` binaries are copied to the canonical `target/<triple>/release/` paths, then fail-closed ABI-scanned. The declared runtime floor is GLIBC_2.34; `libgcc_s.so.1` and `libz.so.1` are the only non-glibc dynamic libraries the gate allows.
+4. Generate SHA256 checksum
+5. Upload artifact
 
 **GNU ABI gate** (`verify-linux-gnu-abi`, required on the versioned release path):
-- Downloads the trusted `release-binaries-*` artifacts for both GNU architectures (`ubuntu-latest` for x86_64, `ubuntu-24.04-arm` for ARM64)
-- Re-checks SHA-256 sidecars, rejects GLIBC symbols above 2.34, and rejects unexpected `DT_NEEDED` entries
-- Smokes both binaries and their operator commands (`ferrum-edge version --json` / `validate` / `run` + `health`; `ferrum-cni VERSION` / `install` / `uninstall` / ADD / CHECK / DEL) on digest-pinned AlmaLinux 9.4 (the GLIBC_2.34 floor) and Ubuntu 22.04
-- `linux-gnu-abi-release-gate` joins `create-release` with this job (`if: always()`). Trusted Cross freezes `create-release.needs`, so ABI cannot be added there; the join gate deletes the GitHub Release if the ABI job did not succeed. Checksums, Cosign signatures, and container publish jobs are unchanged.
+- Independently sysroot-builds x86_64 GNU binaries on `ubuntu-latest`, and downloads the trusted `release-binaries-*` ARM64 artifacts on `ubuntu-24.04-arm`
+- Rejects GLIBC symbols above 2.34 and unexpected `DT_NEEDED` entries; re-checks SHA-256 sidecars on the frozen ARM64 artifacts
+- Smokes both binaries and their operator commands (`ferrum-edge version --json` / `validate` / `run` + `health`; `ferrum-cni VERSION` / `install` / `uninstall` / ADD / CHECK / DEL) on digest-pinned AlmaLinux 9.4 (the GLIBC_2.34 floor) and Ubuntu 22.04 via `bash .github/scripts/smoke_linux_gnu_baseline.sh`
+- `linux-gnu-abi-release-gate` joins `create-release` with this job (`if: always()`). The protected ARM64 policy freezes `create-release.needs`, so ABI cannot be added there; the join gate deletes the GitHub Release if the ABI job did not succeed. Checksums, Cosign signatures, and container publish jobs are unchanged.
 
 **GNU ABI gate** (`verify-latest-linux-gnu-abi`, required on the main-push `latest` path):
-- Downloads the trusted `binary-x86_64-unknown-linux-gnu` and `binary-aarch64-unknown-linux-gnu` artifacts (`ubuntu-latest` for x86_64, `ubuntu-24.04-arm` for ARM64)
-- Re-checks SHA-256 sidecars, ABI-scans both `ferrum-edge` and `ferrum-cni`, and runs the same digest-pinned AlmaLinux 9.4 / Ubuntu 22.04 smoke matrix as the versioned path
-- `linux-gnu-abi-latest-gate` joins frozen `latest-release` with this job (`if: always()` on main pushes). Trusted Cross freezes `latest-release.needs`, `build-arm64-cross`, and `main-publish-gate`, so ABI cannot be added there. On ABI failure the gate deletes `latest` only when that prerelease is proven to target the current `GITHUB_SHA`; it leaves an older known-good `latest` in place if the current publisher did not replace it. The workflow fails unless both verification and publication succeeded.
+- Independently sysroot-builds x86_64 GNU binaries, and downloads the trusted `binary-aarch64-unknown-linux-gnu` artifacts (`ubuntu-latest` for x86_64, `ubuntu-24.04-arm` for ARM64)
+- ABI-scans both `ferrum-edge` and `ferrum-cni`, and runs the same digest-pinned AlmaLinux 9.4 / Ubuntu 22.04 smoke matrix as the versioned path
+- `linux-gnu-abi-latest-gate` joins frozen `latest-release` with this job (`if: always()` on main pushes). The protected ARM64 policy freezes `latest-release.needs`, `build-arm64-cross`, and `main-publish-gate`, so ABI cannot be added there. On ABI failure the gate deletes `latest` only when that prerelease is proven to target the current `GITHUB_SHA`; it leaves an older known-good `latest` in place if the current publisher did not replace it. The workflow fails unless both verification and publication succeeded.
 
 **GNU ABI gate** (`verify-pr-linux-gnu-abi`, full-mode pull requests):
 - Builds both x86_64 GNU release binaries through `build_linux_gnu_sysroot.sh` (isolated `CARGO_TARGET_DIR=/src/target/linux-gnu-sysroot`, then a controlled canonical copy)
 - ABI-scans `target/x86_64-unknown-linux-gnu/release/ferrum-edge` and `ferrum-cni`, then smokes both on digest-pinned AlmaLinux 9.4 and Ubuntu 22.04
-- Contents-read-only, pinned checkout/toolchain/images, exact output paths, not added to frozen Cross or publisher `needs`
+- Contents-read-only, pinned checkout/toolchain/images, exact output paths, not added to frozen publisher `needs`
 
 **Cross-Compilation**:
 - Linux ARM64 uses checksum-verified `cross` 0.2.5 in the isolated protected invocation job; `cross` requires Docker on the build host. Those artifacts already target an older glibc than GLIBC_2.34 and still pass through the versioned `verify-linux-gnu-abi` job above and, on the main-push `latest` path, `verify-latest-linux-gnu-abi`.
