@@ -4269,10 +4269,12 @@ async fn check_consumer_identity_unique_is_namespace_isolated() {
 }
 
 #[test]
-fn replace_api_spec_metadata_shortcut_checks_rows_affected() {
-    // Issue #4285 / #2989 parity: the hash-unchanged metadata-only shortcut must
-    // verify the UPDATE matched a row before reporting success, so a spec deleted
-    // (or dangling api_spec_id without an api_specs row) surfaces an error.
+fn replace_api_spec_metadata_shortcut_uses_transactional_existence_not_rows_affected() {
+    // Issue #4285: fail closed when the api_specs row is missing, but do not treat
+    // MySQL changed-row count as existence. sqlx MySQL without CLIENT_FOUND_ROWS
+    // reports 0 for an UPDATE that matches an existing row and writes identical
+    // values. Existence is the same-transaction SELECT (FOR UPDATE on
+    // PostgreSQL/MySQL; SQLite write-tx writer lock).
     let source = include_str!("../../../src/config/db_loader.rs");
     let replace = source
         .split("pub async fn replace_api_spec_bundle(")
@@ -4282,18 +4284,50 @@ fn replace_api_spec_metadata_shortcut_checks_rows_affected() {
                 .next()
         })
         .expect("replace_api_spec_bundle body");
+
+    let existing = replace
+        .find("Existence read inside the transaction is the not-found authority")
+        .expect("existence-authority comment");
+    let existing_end = replace[existing..]
+        .find("let previous_declared_assoc_ids")
+        .expect("existence select ends before declared assoc ids")
+        + existing;
+    let existing_sql = &replace[existing..existing_end];
+    assert!(
+        existing_sql.contains("CLIENT_FOUND_ROWS")
+            && existing_sql.contains("if self.db_type == \"sqlite\""),
+        "existence must document CLIENT_FOUND_ROWS and sqlite branch:\n{existing_sql}"
+    );
+    assert!(
+        existing_sql.contains(
+            "self.q(\"SELECT * FROM api_specs WHERE namespace = ? AND id = ?\")"
+        ) && existing_sql.contains(
+            "self.q(\"SELECT * FROM api_specs WHERE namespace = ? AND id = ? FOR UPDATE\")"
+        ),
+        "existence SELECT must lock api_specs with FOR UPDATE except on SQLite:\n{existing_sql}"
+    );
+
     let shortcut = replace
         .find("Bundle is unchanged — only update the api_specs metadata row.")
         .expect("metadata-only shortcut marker");
-    let rows_affected = replace[shortcut..]
-        .find("rows_affected()")
-        .expect("metadata shortcut must verify rows_affected");
     let commit = replace[shortcut..]
         .find("tx.commit().await?;")
         .expect("metadata shortcut commit");
+    let shortcut_to_commit = &replace[shortcut..shortcut + commit];
+    let missing = shortcut_to_commit
+        .find("existing_spec.is_none()")
+        .expect("shortcut must fail closed when the locked existence read found no row");
     assert!(
-        rows_affected < commit,
-        "rows_affected must be checked before the metadata shortcut commits"
+        !shortcut_to_commit.contains("rows_affected()")
+            && !shortcut_to_commit.contains("update_result"),
+        "shortcut must not use UPDATE rows_affected as existence:\n{shortcut_to_commit}"
+    );
+    let update = shortcut_to_commit
+        .find("UPDATE api_specs SET")
+        .expect("shortcut must still UPDATE metadata on an existing row");
+    assert!(
+        missing < update,
+        "missing-row fail-closed must run before the metadata UPDATE:\n{shortcut_to_commit}"
     );
 }
 

@@ -4312,7 +4312,8 @@ async fn replace_removes_removed_spec_declared_external_proxy_plugin_association
 /// When tagged spec-owned resources exist but the `api_specs` row is missing
 /// (e.g. restore preserved a dangling `api_spec_id`), the metadata-only shortcut
 /// must fail closed instead of committing an empty transaction and reporting
-/// success. Mirrors MongoDB `matched_count != 1` (issue #4285).
+/// success. Existence is the same-transaction SELECT, not UPDATE rows_affected
+/// (issue #4285).
 #[tokio::test]
 async fn replace_metadata_only_shortcut_fails_when_api_specs_row_missing() {
     let dir = TempDir::new().unwrap();
@@ -4358,9 +4359,54 @@ async fn replace_metadata_only_shortcut_fails_when_api_specs_row_missing() {
         "error must identify the metadata-only shortcut path, got: {msg}"
     );
     assert!(
-        msg.contains("rows_affected=0"),
-        "error must report zero rows affected, got: {msg}"
+        msg.contains("not found") && msg.contains(&spec_id) && msg.contains(ns),
+        "error must identify the missing namespace/id row, got: {msg}"
     );
+    assert!(
+        !msg.contains("rows_affected"),
+        "error must not treat changed-row count as the missing-row authority, got: {msg}"
+    );
+}
+
+/// An existing `api_specs` row whose spec-owned resource graph already matches
+/// must succeed on the metadata-only shortcut. A MySQL UPDATE that writes
+/// identical values can report `rows_affected=0` without `CLIENT_FOUND_ROWS`;
+/// that must not be misclassified as a missing row (issue #4285).
+#[tokio::test]
+async fn replace_metadata_only_shortcut_succeeds_when_api_specs_row_exists() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let spec_id = uid("spec");
+    let (bundle, spec) = make_spec_with_metadata(&spec_id, &proxy_id, ns, "Existing API", "0", &[]);
+    store
+        .submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("initial submit failed");
+
+    let (bundle_put, mut spec_put) =
+        make_spec_with_metadata(&spec_id, &proxy_id, ns, "Existing API", "0", &[]);
+    spec_put.description = spec.description.clone();
+    spec_put.updated_at = spec.updated_at;
+
+    store
+        .replace_api_spec_bundle(&bundle_put, &spec_put)
+        .await
+        .expect(
+            "metadata-only replace must succeed when the namespace/id row exists, even if the \
+             UPDATE is a no-op on changed-row count",
+        );
+
+    let stored = store
+        .get_api_spec(ns, &spec_id)
+        .await
+        .expect("get_api_spec failed")
+        .expect("api_specs row must still exist after idempotent metadata replace");
+    assert_eq!(stored.id, spec_id);
+    assert_eq!(stored.namespace, ns);
+    assert_eq!(stored.resource_hash, spec.resource_hash);
 }
 
 #[tokio::test]
