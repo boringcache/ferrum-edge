@@ -9,9 +9,10 @@
 {{- if not $liveHandler }}{{- $liveHandler = $handlers.live | default dict -}}{{- end -}}
 {{- $readyHandler := .Values.eastWest.probes.readiness.override | default dict -}}
 {{- if not $readyHandler }}{{- $readyHandler = $handlers.ready | default dict -}}{{- end -}}
-{{- if and (not $liveHandler) (not $readyHandler) -}}
-{{- fail "eastWest admin HTTP port is 0, so drain-aware ferrum-edge health probes cannot run; set eastWest.admin.httpPort or supply probes.*.override" -}}
-{{- end -}}
+{{- /* Per-probe, not the pair: one custom override must not let a DIFFERENT
+       enabled probe render with no handler, which `renderProbes` would silently
+       omit — losing drain-aware readiness on the SNI Service. */ -}}
+{{- include "ferrum-mesh.validateComputedProbeHandlers" (dict "component" "eastWest" "probes" .Values.eastWest.probes "liveHandler" $liveHandler "readyHandler" $readyHandler) -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:

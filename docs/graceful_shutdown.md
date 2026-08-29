@@ -4,10 +4,10 @@ When the gateway receives SIGTERM or SIGINT, it performs a graceful shutdown tha
 
 ## Shutdown Sequence
 
-Serving modes (database, file, dp, mesh) run these phases **sequentially**, each with its own bounded budget. The worst-case total is the sum of every phase below, not just `FERRUM_SHUTDOWN_DRAIN_SECONDS`.
+Serving modes (database, file, cp, dp, mesh) run these phases **sequentially**, each with its own bounded budget. The worst-case total is the sum of every phase below, not just `FERRUM_SHUTDOWN_DRAIN_SECONDS`.
 
 1. **Signal received** — the process publishes its draining verdict *before* anything else: `/health` and `/status` immediately report `{"status": "draining", "ready": false}` with HTTP 503, while `/live` deliberately keeps returning 200 so a Kubernetes livenessProbe cannot SIGKILL the pod mid-drain
-2. **Pre-drain window (optional)** — for `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` (default `0`) every listener, proxy **and** admin, keeps accepting normally while readiness already reports not-ready. This is the window in which a load balancer or orchestrator can withdraw the replica from its endpoint set before a single new connection is refused. At the default `0` the shutdown broadcast fires immediately, exactly as before
+2. **Pre-drain window (optional)** — for `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` (default `0`) every listener keeps accepting normally while readiness already reports not-ready. In `database`/`file`/`dp`/`mesh` that is the proxy **and** admin listeners; in `cp` (the mesh chart's `controlPlane` and `ca` workloads) it is the admin HTTP/HTTPS plus CP gRPC / xDS listeners, all of which close on the same broadcast this window delays. This is the window in which a load balancer or orchestrator can withdraw the replica from its endpoint set before a single new connection is refused. At the default `0` the shutdown broadcast fires immediately, exactly as before
 3. **Shutdown broadcast** — SIGTERM/SIGINT is broadcast to all components
 4. **Accept loops exit** — no new connections are accepted on any listener (HTTP, HTTPS, H3, TCP, UDP)
 5. **Drain phase begins** — the per-instance `draining` flag is set, causing:
@@ -34,7 +34,8 @@ FERRUM_SHUTDOWN_DRAIN_SECONDS=30
 
 # Seconds every listener (proxy AND admin) keeps accepting after the signal,
 # while readiness already reports ready:false / 503 (default: 0 = disabled).
-# Serving modes only (database, file, dp, mesh).
+# Listener-serving modes only (database, file, cp, dp, mesh); injector,
+# node_agent, and migrate ignore it.
 FERRUM_SHUTDOWN_PREDRAIN_SECONDS=0
 
 # Shared observability shutdown budget in milliseconds (default: 2000)

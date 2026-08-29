@@ -81,21 +81,68 @@ additive drain contract as `ferrum-gateway` (`docs/graceful_shutdown.md`):
 
 Render fails when the grace period is under budget. On Kubernetes &lt;1.29 set
 `shutdownPreStopSeconds: 0` and raise `shutdownPreDrainSeconds` to at least
-readiness `failureThreshold × periodSeconds`. One-shot hooks/jobs (CNI uninstall)
-and the injector/node-agent (not Ferrum serving modes) do not receive this
-contract. East-west readiness is drain-aware `ferrum-edge health` against the
-loopback admin listener — not `tcpSocket` on `tls-passthru`.
+readiness `failureThreshold × periodSeconds`. That remediation is real for every
+serving workload here, `controlPlane` and `ca` included: `cp` mode honors
+`FERRUM_SHUTDOWN_PREDRAIN_SECONDS` (its admin and CP-gRPC accept loops close on
+the same broadcast the window delays, while `/health` already reports
+`ready: false`). One-shot hooks/jobs (CNI uninstall) and the injector/node-agent
+(not Ferrum serving modes) do not receive this contract. East-west readiness is
+drain-aware `ferrum-edge health` against the loopback admin listener — not
+`tcpSocket` on `tls-passthru`.
+
+Every **enabled** computed probe must have a usable handler. Setting a
+workload's `admin.httpPort: 0` while a computed probe stays enabled fails render
+instead of silently omitting the probe: an omitted readiness probe would leave
+the pod in its Service endpoint set for the whole shutdown. Supply
+`probes.<probe>.override` or set `probes.<probe>.enabled: false` instead.
+
+## Admin listener validation
+
+`<workload>.admin.bindAddress` and `<workload>.admin.allowedCidrs` are validated
+against the same rules the binary applies, so a typo fails `helm template`
+instead of CrashLooping the pod:
+
+- `bindAddress` must be an IP literal. Hostnames (`localhost`, a Service name)
+  are rejected — `EnvConfig::validate()` exits on them.
+- `allowedCidrs` is parsed entry-for-entry like `CidrSet::parse_strict`: bare
+  IPv4/IPv6 addresses or CIDRs, no brackets, prefixes in family range.
+- For `controlPlane` and `ca` (which run `cp` mode and hard-fail on a
+  non-loopback plaintext admin listener), a **full-family** allowlist —
+  `0.0.0.0/0`, `::/0`, an IPv4-mapped `/96`, or a union that covers a whole
+  family — does not count as protection. Use a narrower allowlist, keep the
+  loopback default, or set `admin.allowInsecureHttp: true` (insecure development
+  only).
+- While the computed exec probes are enabled, a non-empty allowlist must cover
+  the **exact** source the admin accept loop observes: `127.0.0.1` for an IPv4
+  or `0.0.0.0` bind, `::1` for an IPv6 wildcard bind. An IPv4-only allowlist in
+  front of an IPv6 wildcard bind renders cleanly and then restart-loops the pod,
+  so the chart refuses it.
+
+`observability.metrics.allowedCidrs` is validated the same way; the runtime
+parses `FERRUM_METRICS_ALLOWED_CIDRS` with the same strict parser.
 
 ## Pod security and resources
 
 `controlPlane`, `ca`, and `eastWest` default to restricted-compatible
 PodSecurity (non-root 65532, drop ALL, no privilege escalation, read-only root,
 RuntimeDefault seccomp, `/tmp` emptyDir) with non-empty CPU/memory requests and
-limits. Ambient keeps `hostNetwork` and datapath capabilities (`NET_ADMIN` /
-`NET_RAW`, plus `SYS_ADMIN`/`SYS_PTRACE` only for in-netns capture and
-BPF/PERFMON for NodeWaypoint) after dropping ALL. `priorityClassName` is
-optional; only ambient and node-agent default to `system-node-critical`. Empty
-`priorityClassName` omits the field.
+limits. Their `podSecurityContext` / `securityContext` are free-form and
+rendered verbatim.
+
+Ambient is different and its schema says so. It keeps `hostNetwork` and datapath
+capabilities (`NET_ADMIN` / `NET_RAW`, plus `SYS_ADMIN`/`SYS_PTRACE` only for
+in-netns capture and `BPF`/`PERFMON` for NodeWaypoint) after dropping ALL, and it
+assembles its container `securityContext` field by field rather than rendering
+the operator's map verbatim. `ambient.securityContext` therefore accepts only the
+keys the template actually reads — `allowPrivilegeEscalation`,
+`readOnlyRootFilesystem`, `capabilities.drop`, `capabilities.add` — and rejects
+anything else at lint time rather than silently ignoring it (`runAsUser` /
+`runAsGroup` are decided by the capture mode). `capabilities.drop` must stay
+`["ALL"]`, and `capabilities.add` **merges on top of** the datapath minimum: it
+can add capabilities but can never remove a required one.
+
+`priorityClassName` is optional; only ambient and node-agent default to
+`system-node-critical`. Empty `priorityClassName` omits the field.
 
 ## Metrics scrape
 

@@ -436,10 +436,21 @@ spec:
 {{/*
 True when the bind is loopback (or empty, which the binary defaults to
 127.0.0.1). Wildcards 0.0.0.0 / :: are not loopback.
+
+Decided from the PARSED address rather than a prefix string, so every spelling
+the runtime's `IpAddr::is_loopback()` accepts is classified the same way here:
+any address in 127.0.0.0/8, `::1` in any valid contraction, and the IPv4-mapped
+form of a 127/8 address (which the runtime canonicalizes to IPv4).
 */}}
 {{- define "ferrum-mesh.isLoopbackBind" -}}
 {{- $bind := . | toString | trim | trimPrefix "[" | trimSuffix "]" -}}
-{{- if or (eq $bind "") (eq $bind "127.0.0.1") (eq $bind "::1") (regexMatch "^127\\." $bind) -}}
+{{- $v4 := include "ferrum-mesh.ipv4ToInt" $bind -}}
+{{- if eq $v4 "" -}}{{- $v4 = include "ferrum-mesh.ipv4MappedToInt" $bind -}}{{- end -}}
+{{- if eq $bind "" -}}
+true
+{{- else if ne $v4 "" -}}
+{{- if eq (div ($v4 | int64) 16777216 | int) 127 -}}true{{- end -}}
+{{- else if eq (include "ferrum-mesh.ipv6Hextets" $bind) "0,0,0,0,0,0,0,1" -}}
 true
 {{- end -}}
 {{- end -}}
@@ -493,6 +504,13 @@ suites keep working. Returns YAML dict: port, bind, probeHost, allowInsecureHttp
 {{- end -}}
 {{- if hasKey $env "FERRUM_ADMIN_BIND_ADDRESS" -}}
 {{- $bind = toString (index $env "FERRUM_ADMIN_BIND_ADDRESS") -}}
+{{- end -}}
+{{- /* The runtime parses FERRUM_ADMIN_BIND_ADDRESS as a bare IP literal, so a
+       balanced bracketed IPv6 literal is normalized here rather than rendered
+       into the env. A MISMATCHED bracket is left intact so
+       `ferrum-mesh.validateAdminBind` can reject it with a precise message. */ -}}
+{{- if and (hasPrefix "[" $bind) (hasSuffix "]" $bind) -}}
+{{- $bind = $bind | trimPrefix "[" | trimSuffix "]" -}}
 {{- end -}}
 {{- dict "port" $port "bind" $bind "probeHost" (include "ferrum-mesh.adminProbeHost" $bind) "allowInsecureHttp" ($admin.allowInsecureHttp | default false) "allowedCidrs" ($admin.allowedCidrs | default "") | toYaml -}}
 {{- end -}}
@@ -649,34 +667,136 @@ FERRUM_METRICS_ALLOWED_CIDRS
 {{- end -}}
 
 {{/*
-CP/CA hard-fail on non-loopback plaintext admin without an allowlist or the
-insecure opt-in (mirrors src/config/env_config.rs). Mesh-mode workloads warn
-at runtime; the chart still refuses a ServiceMonitor/PodMonitor scrape against
-loopback because Prometheus cannot reach it.
+Strictly validate one comma-separated allowlist against `CidrSet::parse_strict`.
+An empty string is "no allowlist" and is accepted; anything non-empty must parse
+entry-for-entry, or the pod renders cleanly and then CrashLoops at startup.
+Dict: label (values path used in the message), cidrs.
+*/}}
+{{- define "ferrum-mesh.validateCidrList" -}}
+{{- $label := .label -}}
+{{- $cidrs := trim (.cidrs | default "" | toString) -}}
+{{- if $cidrs -}}
+{{- range $raw := splitList "," $cidrs -}}
+{{- $entry := trim $raw -}}
+{{- if or (contains "[" $entry) (contains "]" $entry) -}}
+{{- fail (printf "%s entry %q uses bracketed IPv6 syntax, but the runtime requires bare IPv6 addresses/CIDRs (for example fd00::/8 or ::1/128)" $label $entry) -}}
+{{- end -}}
+{{- if not (include "ferrum-mesh.validAdminCidrEntry" $entry) -}}
+{{- $display := $entry | default "<empty>" -}}
+{{- fail (printf "%s entry %q is not a valid IP address or CIDR; expected forms such as 10.0.0.0/8, 192.168.1.1, ::1, or fd00::/8" $label $display) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+`EnvConfig::validate()` rejects any FERRUM_ADMIN_BIND_ADDRESS that is not an IP
+literal, so a hostname bind renders cleanly and then exits at boot. Reject it at
+render with the IP to use instead. Dict: component, bind.
+*/}}
+{{- define "ferrum-mesh.validateAdminBind" -}}
+{{- $component := .component -}}
+{{- $bind := .bind | default "" | toString -}}
+{{- $open := hasPrefix "[" $bind -}}
+{{- $close := hasSuffix "]" $bind -}}
+{{- if ne $open $close -}}
+{{- fail (printf "%s.admin.bindAddress=%q has mismatched IPv6 brackets; use a bare IPv6 literal such as :: or ::1" $component $bind) -}}
+{{- end -}}
+{{- $host := $bind | trimPrefix "[" | trimSuffix "]" -}}
+{{- if and $open (not (contains ":" $host)) -}}
+{{- fail (printf "%s.admin.bindAddress=%q brackets a non-IPv6 address; IPv4 bind addresses must use bare form such as 127.0.0.1 or 0.0.0.0" $component $bind) -}}
+{{- end -}}
+{{- if eq (lower $host) "localhost" -}}
+{{- fail (printf "%s.admin.bindAddress=localhost is rejected: the binary requires FERRUM_ADMIN_BIND_ADDRESS to be an IP literal and exits otherwise. Use 127.0.0.1 (or ::1) for the loopback default, or 0.0.0.0/:: to expose admin." $component) -}}
+{{- end -}}
+{{- if and $host (not (include "ferrum-mesh.isIpLiteral" $host)) -}}
+{{- fail (printf "%s.admin.bindAddress=%q is not an IP literal: the binary requires FERRUM_ADMIN_BIND_ADDRESS to parse as an IP address (e.g. 127.0.0.1, ::1, 0.0.0.0, ::) and exits otherwise. Use an IP literal, not a hostname." $component $bind) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Component admin validation.
+
+1. The bind must be an IP literal and the allowlist must parse strictly, in
+   EVERY component — the runtime parses both the same way regardless of mode.
+2. CP/CA (`hardFail`) additionally refuse a non-loopback PLAINTEXT admin bind
+   without an EFFECTIVE allowlist or the explicit insecure opt-in. "Effective"
+   means it does not cover a whole IP family: `0.0.0.0/0`, an IPv4-mapped `/96`,
+   and a full-coverage union all restrict nothing, so none of them count as
+   plaintext protection.
+3. Whenever a computed exec probe is active AND an allowlist is set, the exact
+   source address the admin TCP accept loop observes must be covered. Substring
+   matching is not enough: an IPv6 wildcard bind dials `::1` and is dropped by an
+   IPv4-only allowlist (and vice versa), which the kubelet sees as a restart
+   loop, not a render error.
+
+Dict: component, resolved, hardFail, probes.
 */}}
 {{- define "ferrum-mesh.validatePlaintextAdmin" -}}
 {{- $component := .component -}}
 {{- $resolved := .resolved -}}
 {{- $hardFail := .hardFail -}}
+{{- $probes := .probes | default dict -}}
+{{- $cidrs := trim ($resolved.allowedCidrs | default "" | toString) -}}
+{{- include "ferrum-mesh.validateAdminBind" (dict "component" $component "bind" $resolved.bind) -}}
+{{- include "ferrum-mesh.validateCidrList" (dict "label" (printf "%s.admin.allowedCidrs" $component) "cidrs" $cidrs) -}}
 {{- $port := toString $resolved.port -}}
-{{- if eq $port "0" -}}
-{{- else -}}
+{{- if ne $port "0" -}}
 {{- $loopback := include "ferrum-mesh.isLoopbackBind" $resolved.bind -}}
 {{- if and (not $loopback) $hardFail -}}
-{{- $cidrs := trim ($resolved.allowedCidrs | toString) -}}
-{{- if and (not $cidrs) (not $resolved.allowInsecureHttp) -}}
-{{- fail (printf "%s admin bind %q is a non-loopback plaintext listener. Set %s.admin.allowedCidrs, %s.admin.allowInsecureHttp=true (lab only), or keep the loopback default. Control-plane/CA mode refuses to start otherwise." $component $resolved.bind $component $component) -}}
+{{- $permitsAll := include "ferrum-mesh.adminAllowlistPermitsAll" $cidrs -}}
+{{- $effective := and $cidrs (not $permitsAll) -}}
+{{- if not (or $effective $resolved.allowInsecureHttp) -}}
+{{- if $permitsAll -}}
+{{- fail (printf "%s.admin.allowedCidrs permits every address in an IP family (for example via /0, an IPv4-mapped /96, or a full-coverage CIDR union), which does not restrict the non-loopback plaintext admin listener on bind %q. Use a narrower allowlist, keep the loopback default, or set %s.admin.allowInsecureHttp=true (insecure development only)." $component $resolved.bind $component) -}}
+{{- end -}}
+{{- fail (printf "%s admin bind %q is a non-loopback plaintext listener. Set %s.admin.allowedCidrs to a narrower allowlist, set %s.admin.allowInsecureHttp=true (insecure development only), or keep the loopback default. Control-plane/CA mode refuses to start otherwise." $component $resolved.bind $component $component) -}}
 {{- end -}}
 {{- end -}}
-{{- if and (not $loopback) $hardFail -}}
-{{- $cidrs := trim ($resolved.allowedCidrs | toString) -}}
-{{- if $cidrs -}}
-{{- $hasLoopbackProbe := or (contains "127.0.0.1" $cidrs) (contains "127.0.0.0/8" $cidrs) (contains "::1" $cidrs) -}}
-{{- if not $hasLoopbackProbe -}}
-{{- fail (printf "%s.admin.allowedCidrs must include 127.0.0.1/32 (or 127.0.0.0/8) so in-pod exec probes can reach the admin listener" $component) -}}
+{{- $startup := $probes.startup | default dict -}}
+{{- $liveness := $probes.liveness | default dict -}}
+{{- $readiness := $probes.readiness | default dict -}}
+{{- $computedLive := and (or ($startup.enabled | default false) ($liveness.enabled | default false)) (not ($liveness.override | default dict)) -}}
+{{- $computedReady := and ($readiness.enabled | default false) (not ($readiness.override | default dict)) -}}
+{{- if and $cidrs (or $computedLive $computedReady) -}}
+{{- $probeHost := $resolved.probeHost | default (include "ferrum-mesh.adminProbeHost" $resolved.bind) -}}
+{{- $probeSource := include "ferrum-mesh.probeSource" $probeHost -}}
+{{- if not (include "ferrum-mesh.adminAllowlistContainsIp" (dict "ip" $probeSource "allowedCidrs" $cidrs)) -}}
+{{- $probeCidr := ternary (printf "%s/128" $probeSource) (printf "%s/32" $probeSource) (contains ":" $probeSource) -}}
+{{- fail (printf "%s.admin.allowedCidrs must include %s (or bare %s) while the computed exec probes are enabled; they dial admin host %s from source %s and the admin TCP allowlist otherwise drops the in-pod health checks. Add the exact probe source (or a covering CIDR), or override/disable every computed probe handler." $component $probeCidr $probeSource $probeHost $probeSource) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
+
+{{/*
+Every ENABLED computed probe must have a usable handler.
+
+`ferrum-mesh.renderProbes` skips a probe whose handler is empty, so an admin
+HTTP port of 0 (or any other configuration that yields no computed handler)
+silently drops readiness — the workload then never leaves the Service endpoint
+set on drain. Checking the pair (`not live` AND `not ready`) is not enough: one
+custom override satisfies it while the other enabled probe is still handler-less.
+
+Dict: component, probes, liveHandler, readyHandler, startupHandler (optional;
+falls back to liveHandler exactly as renderProbes does).
+*/}}
+{{- define "ferrum-mesh.validateComputedProbeHandlers" -}}
+{{- $component := .component -}}
+{{- $probes := .probes | default dict -}}
+{{- $liveHandler := .liveHandler | default dict -}}
+{{- $readyHandler := .readyHandler | default dict -}}
+{{- $startupHandler := .startupHandler | default dict -}}
+{{- if not $startupHandler -}}{{- $startupHandler = $liveHandler -}}{{- end -}}
+{{- $hint := printf "set %s.admin.httpPort to a non-zero port, supply an explicit %s.probes.<probe>.override handler, or disable that probe with %s.probes.<probe>.enabled=false" $component $component $component -}}
+{{- if and ((($probes.startup | default dict).enabled) | default false) (not $startupHandler) -}}
+{{- fail (printf "%s.probes.startup is enabled but no handler can be computed for it, so the rendered PodSpec would silently omit the probe: %s" $component $hint) -}}
+{{- end -}}
+{{- if and ((($probes.liveness | default dict).enabled) | default false) (not $liveHandler) -}}
+{{- fail (printf "%s.probes.liveness is enabled but no handler can be computed for it, so the rendered PodSpec would silently omit the probe: %s" $component $hint) -}}
+{{- end -}}
+{{- if and ((($probes.readiness | default dict).enabled) | default false) (not $readyHandler) -}}
+{{- fail (printf "%s.probes.readiness is enabled but no handler can be computed for it, so the rendered PodSpec would silently omit drain-aware readiness and the workload would stay in the Service endpoint set through shutdown: %s" $component $hint) -}}
 {{- end -}}
 {{- end -}}
 
@@ -695,18 +815,10 @@ loopback because Prometheus cannot reach it.
 {{- $alertsOn := ne ($alerts.enabled | toString) "false" -}}
 {{- $monitoringOn := or $smOn $pmOn -}}
 {{- $allowedCidrs := trim ($metrics.allowedCidrs | default "") -}}
-{{- if $allowedCidrs -}}
-{{- range $raw := splitList "," $allowedCidrs -}}
-{{- $entry := trim $raw -}}
-{{- if or (contains "[" $entry) (contains "]" $entry) -}}
-{{- fail (printf "observability.metrics.allowedCidrs entry %q uses bracketed IPv6 syntax, but the runtime requires bare IPv6 addresses/CIDRs (for example fd00::/8 or ::1/128)" $entry) -}}
-{{- end -}}
-{{- if or (eq $entry "") (and (not (contains "." $entry)) (not (contains ":" $entry))) -}}
-{{- $display := $entry | default "<empty>" -}}
-{{- fail (printf "observability.metrics.allowedCidrs entry %q is not a valid IP address or CIDR; expected forms such as 10.0.0.0/8, 192.168.1.1, ::1, or fd00::/8" $display) -}}
-{{- end -}}
-{{- end -}}
-{{- end -}}
+{{- /* The runtime parses FERRUM_METRICS_ALLOWED_CIDRS with the same strict
+     CidrSet parser as the admin allowlist, so validate it identically instead
+     of accepting anything that merely contains a dot or a colon. */ -}}
+{{- include "ferrum-mesh.validateCidrList" (dict "label" "observability.metrics.allowedCidrs" "cidrs" $allowedCidrs) -}}
 {{- $bearer := $metrics.bearerToken | default dict -}}
 {{- include "ferrum-mesh.validateOptionalSource" (dict "label" "observability.metrics.bearerToken" "source" $bearer) -}}
 {{- $hasBearer := include "ferrum-mesh.sourceConfigured" $bearer -}}
@@ -776,4 +888,301 @@ Sane non-empty resource requests. Empty resources{} would restore BestEffort.
 {{- if or (not $req.cpu) (not $req.memory) -}}
 {{- fail (printf "%s.resources.requests.cpu and %s.resources.requests.memory must be non-empty so the mesh workload is not BestEffort QoS" $component $component) -}}
 {{- end -}}
+{{- end -}}
+
+{{/* ---------------------------------------------------------------------------
+Strict IP / CIDR primitives, ported from charts/ferrum-gateway/templates/_helpers.tpl
+so the mesh chart applies the SAME accept/reject decision the runtime does
+(`CidrSet::parse_strict` and `IpAddr`/`IpNet` parsing in src/config/). A weaker
+approximation renders cleanly and then CrashLoops (or has the admin accept loop
+silently drop the in-pod exec probes), which is exactly what these mirror.
+Keep them byte-comparable with the gateway copies.
+--------------------------------------------------------------------------- */}}
+
+{{/* Render a non-negative int64 as a fixed-width binary string. Widths used by
+     this chart are 16 (one IPv6 hextet) and 32 (one IPv4 address). */}}
+{{- define "ferrum-mesh.unsignedBinaryBits" -}}
+{{- $value := .value | int64 -}}
+{{- $width := .width | int -}}
+{{- $divisor := 1 | int64 -}}
+{{- range until (sub $width 1 | int) -}}{{- $divisor = mul $divisor 2 -}}{{- end -}}
+{{- $bits := "" -}}
+{{- range until $width -}}
+{{- if ge $value $divisor -}}
+{{- $bits = printf "%s1" $bits -}}
+{{- $value = sub $value $divisor -}}
+{{- else -}}
+{{- $bits = printf "%s0" $bits -}}
+{{- end -}}
+{{- if gt $divisor 1 -}}{{- $divisor = div $divisor 2 -}}{{- end -}}
+{{- end -}}
+{{- $bits -}}
+{{- end -}}
+
+{{- define "ferrum-mesh.ipv4Bits" -}}
+{{- include "ferrum-mesh.unsignedBinaryBits" (dict "value" (. | int64) "width" 32) -}}
+{{- end -}}
+
+{{- define "ferrum-mesh.ipv6Bits" -}}
+{{- $hextets := include "ferrum-mesh.ipv6Hextets" (. | toString) -}}
+{{- $bits := "" -}}
+{{- if $hextets -}}
+{{- range $part := splitList "," $hextets -}}
+{{- $bits = printf "%s%s" $bits (include "ferrum-mesh.unsignedBinaryBits" (dict "value" ($part | int64) "width" 16)) -}}
+{{- end -}}
+{{- end -}}
+{{- $bits -}}
+{{- end -}}
+
+{{/* Source address the admin listener observes for the computed exec probe.
+     Linux selects 127.0.0.1 when connecting to any concrete 127/8 destination;
+     other concrete/wildcard probe hosts use the same local address they dial.
+     Input is the already-resolved probe host (`ferrum-mesh.adminProbeHost`),
+     because the mesh chart resolves admin per component rather than from one
+     chart-wide `.Values.admin`. */}}
+{{- define "ferrum-mesh.probeSource" -}}
+{{- $host := . | toString | trimPrefix "[" | trimSuffix "]" -}}
+{{- if regexMatch "^127\\." $host -}}127.0.0.1
+{{- else -}}{{ $host }}
+{{- end -}}
+{{- end -}}
+
+{{/* "true" when the value parses as a strict IPv4 or IPv6 literal, else "".
+     Mirrors the runtime's IpAddr parsing: IPv4 octets are canonical decimal and
+     IPv6 is fully expanded/validated, including an optional embedded IPv4 tail. */}}
+{{- define "ferrum-mesh.isIpLiteral" -}}
+{{- $v := . | toString -}}
+{{- $octet := "(0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])" -}}
+{{- $ipv4 := printf "^%s\\.%s\\.%s\\.%s$" $octet $octet $octet $octet -}}
+{{- if regexMatch $ipv4 $v -}}true
+{{- else if and (contains ":" $v) (include "ferrum-mesh.ipv6Hextets" $v) -}}true
+{{- end -}}
+{{- end -}}
+
+{{/* Convert a validated IPv4 literal to its unsigned 32-bit integer value. */}}
+{{- define "ferrum-mesh.ipv4ToInt" -}}
+{{- $v := . | toString -}}
+{{- if and (include "ferrum-mesh.isIpLiteral" $v) (not (contains ":" $v)) -}}
+{{- $parts := splitList "." $v -}}
+{{- add (mul (index $parts 0 | int64) 16777216) (mul (index $parts 1 | int64) 65536) (mul (index $parts 2 | int64) 256) (index $parts 3 | int64) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Convert one validated IPv6 hextet to an integer. Helm has no base-16 atoi. */}}
+{{- define "ferrum-mesh.hexToInt" -}}
+{{- $digits := dict "0" 0 "1" 1 "2" 2 "3" 3 "4" 4 "5" 5 "6" 6 "7" 7 "8" 8 "9" 9 "a" 10 "b" 11 "c" 12 "d" 13 "e" 14 "f" 15 -}}
+{{- $value := 0 -}}
+{{- range $digit := regexFindAll "." (lower (. | toString)) -1 -}}
+{{- $value = add (mul $value 16) (get $digits $digit) -}}
+{{- end -}}
+{{- $value -}}
+{{- end -}}
+
+{{/* Expand an IPv6 literal to eight decimal hextets. Embedded IPv4 tails are
+     converted to two hextets before expanding `::`. */}}
+{{- define "ferrum-mesh.ipv6Hextets" -}}
+{{- $ip := lower (. | toString) -}}
+{{- $valid := and (contains ":" $ip) (regexMatch "^[0-9a-f:.]+$" $ip) (not (regexMatch "[0-9a-f]{5,}" $ip)) -}}
+{{- if and $valid (contains "." $ip) -}}
+{{- $tail := regexFind "[0-9.]+$" $ip -}}
+{{- $tailInt := include "ferrum-mesh.ipv4ToInt" $tail -}}
+{{- if not $tailInt -}}
+{{- $valid = false -}}
+{{- else -}}
+{{- $tailValue := $tailInt | int64 -}}
+{{- $ip = regexReplaceAll "[0-9.]+$" $ip (printf "%x:%x" (div $tailValue 65536) (mod $tailValue 65536)) -}}
+{{- end -}}
+{{- end -}}
+{{- $hextets := list -}}
+{{- if $valid -}}
+{{- $sides := splitList "::" $ip -}}
+{{- if gt (len $sides) 2 -}}
+{{- $valid = false -}}
+{{- else if eq (len $sides) 2 -}}
+{{- $left := list -}}
+{{- $right := list -}}
+{{- if index $sides 0 -}}{{- $left = splitList ":" (index $sides 0) -}}{{- end -}}
+{{- if index $sides 1 -}}{{- $right = splitList ":" (index $sides 1) -}}{{- end -}}
+{{- $missing := sub 8 (add (len $left) (len $right)) | int -}}
+{{- if lt $missing 1 -}}
+{{- $valid = false -}}
+{{- else -}}
+{{- range $part := $left -}}{{- $hextets = append $hextets $part -}}{{- end -}}
+{{- range until $missing -}}{{- $hextets = append $hextets "0" -}}{{- end -}}
+{{- range $part := $right -}}{{- $hextets = append $hextets $part -}}{{- end -}}
+{{- end -}}
+{{- else -}}
+{{- $hextets = splitList ":" $ip -}}
+{{- if ne (len $hextets) 8 -}}{{- $valid = false -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $decimal := list -}}
+{{- if $valid -}}
+{{- range $part := $hextets -}}
+{{- if not (regexMatch "^[0-9a-f]{1,4}$" $part) -}}
+{{- $valid = false -}}
+{{- else -}}
+{{- $decimal = append $decimal (include "ferrum-mesh.hexToInt" $part) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and $valid (eq (len $decimal) 8) -}}{{- join "," $decimal -}}{{- end -}}
+{{- end -}}
+
+{{/* Return the embedded IPv4 integer for an IPv4-mapped IPv6 literal. */}}
+{{- define "ferrum-mesh.ipv4MappedToInt" -}}
+{{- $hextets := include "ferrum-mesh.ipv6Hextets" (. | toString) -}}
+{{- if $hextets -}}
+{{- $h := splitList "," $hextets -}}
+{{- if and (eq (index $h 0 | int) 0) (eq (index $h 1 | int) 0) (eq (index $h 2 | int) 0) (eq (index $h 3 | int) 0) (eq (index $h 4 | int) 0) (eq (index $h 5 | int) 65535) -}}
+{{- add (mul (index $h 6 | int64) 65536) (index $h 7 | int64) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Strictly validate one admin allowlist entry using the same accepted shapes
+     as CidrSet::parse_strict: a bare IPv4/IPv6 literal or one literal plus a
+     decimal prefix in the family range. IPv4-mapped IPv6 CIDRs require a prefix
+     of at least 96 because the runtime canonicalizes them to IPv4. */}}
+{{- define "ferrum-mesh.validAdminCidrEntry" -}}
+{{- $entry := trim (. | toString) -}}
+{{- $parts := splitList "/" $entry -}}
+{{- $valid := false -}}
+{{- if and $entry (or (eq (len $parts) 1) (eq (len $parts) 2)) -}}
+{{- $network := trim (index $parts 0) -}}
+{{- $ipValid := false -}}
+{{- $isV6 := contains ":" $network -}}
+{{- $mappedV6 := false -}}
+{{- if $isV6 -}}
+{{- $hextets := include "ferrum-mesh.ipv6Hextets" $network -}}
+{{- if $hextets -}}
+{{- $ipValid = true -}}
+{{- $h := splitList "," $hextets -}}
+{{- $mappedV6 = and (eq (index $h 0 | int) 0) (eq (index $h 1 | int) 0) (eq (index $h 2 | int) 0) (eq (index $h 3 | int) 0) (eq (index $h 4 | int) 0) (eq (index $h 5 | int) 65535) -}}
+{{- end -}}
+{{- else -}}
+{{- $ipv4 := include "ferrum-mesh.ipv4ToInt" $network -}}
+{{- if ne $ipv4 "" -}}{{- $ipValid = true -}}{{- end -}}
+{{- end -}}
+{{- if $ipValid -}}
+{{- if eq (len $parts) 1 -}}
+{{- $valid = true -}}
+{{- else -}}
+{{- $prefixText := trim (index $parts 1) -}}
+{{- if regexMatch "^\\+?[0-9]+$" $prefixText -}}
+{{- $unsignedPrefix := trimPrefix "+" $prefixText -}}
+{{- $normalizedPrefix := regexReplaceAll "^0+" $unsignedPrefix "" -}}
+{{- if eq $normalizedPrefix "" -}}{{- $normalizedPrefix = "0" -}}{{- end -}}
+{{- if le (len $normalizedPrefix) 3 -}}
+{{- $prefix := atoi $normalizedPrefix -}}
+{{- if and (not $isV6) (le $prefix 32) -}}{{- $valid = true -}}{{- end -}}
+{{- if and $isV6 (le $prefix 128) (or (not $mappedV6) (ge $prefix 96)) -}}{{- $valid = true -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if $valid -}}true{{- end -}}
+{{- end -}}
+
+{{/* "true" when validated CIDRs jointly cover every address in either family.
+     Each CIDR becomes a binary prefix; sibling prefixes collapse recursively to
+     their parent, mirroring CidrSet::permits_all_family for /0s and unions. */}}
+{{- define "ferrum-mesh.adminAllowlistPermitsAll" -}}
+{{- $coverage := dict -}}
+{{- range $raw := splitList "," (. | toString) -}}
+{{- $parts := splitList "/" (trim $raw) -}}
+{{- $network := trim (index $parts 0) -}}
+{{- $networkV4 := include "ferrum-mesh.ipv4ToInt" $network -}}
+{{- $mappedV4 := include "ferrum-mesh.ipv4MappedToInt" $network -}}
+{{- if and (eq $networkV4 "") (ne $mappedV4 "") -}}{{- $networkV4 = $mappedV4 -}}{{- end -}}
+{{- if ne $networkV4 "" -}}
+{{- $prefix := 32 -}}
+{{- if eq (len $parts) 2 -}}{{- $prefix = atoi (trim (index $parts 1)) -}}{{- end -}}
+{{- if ne $mappedV4 "" -}}{{- $prefix = sub $prefix 96 | int -}}{{- end -}}
+{{- $bits := include "ferrum-mesh.ipv4Bits" $networkV4 -}}
+{{- $_ := set $coverage (printf "4:%s" (substr 0 $prefix $bits)) true -}}
+{{- else -}}
+{{- $bits := include "ferrum-mesh.ipv6Bits" $network -}}
+{{- if $bits -}}
+{{- $prefix := 128 -}}
+{{- if eq (len $parts) 2 -}}{{- $prefix = atoi (trim (index $parts 1)) -}}{{- end -}}
+{{- $_ := set $coverage (printf "6:%s" (substr 0 $prefix $bits)) true -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{/* Collapse from leaves toward each family root. Re-reading keys at every
+     depth lets a parent created at depth N participate at depth N-1. */}}
+{{- range $depth := untilStep 128 0 -1 -}}
+{{- range $key := keys $coverage -}}
+{{- $keyParts := splitList ":" $key -}}
+{{- $family := index $keyParts 0 -}}
+{{- $bits := index $keyParts 1 -}}
+{{- if eq (len $bits) $depth -}}
+{{- $parentBits := substr 0 (sub $depth 1 | int) $bits -}}
+{{- $lastBit := substr (sub $depth 1 | int) $depth $bits -}}
+{{- $siblingBit := ternary "0" "1" (eq $lastBit "1") -}}
+{{- $sibling := printf "%s:%s%s" $family $parentBits $siblingBit -}}
+{{- if hasKey $coverage $sibling -}}
+{{- $_ := set $coverage (printf "%s:%s" $family $parentBits) true -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if or (hasKey $coverage "4:") (hasKey $coverage "6:") -}}true{{- end -}}
+{{- end -}}
+
+{{/* Return "true" when one comma-separated allowlist entry contains the supplied
+     probe source. This mirrors IpNet::contains for both IP families so ordinary
+     covering subnets (127.0.0.0/8, 10.0.0.0/8, fd00::/8, ...) are accepted. */}}
+{{- define "ferrum-mesh.adminAllowlistContainsIp" -}}
+{{- $target := .ip | toString | trimPrefix "[" | trimSuffix "]" | lower -}}
+{{- $targetV4 := include "ferrum-mesh.ipv4ToInt" $target -}}
+{{- if eq $targetV4 "" -}}{{- $targetV4 = include "ferrum-mesh.ipv4MappedToInt" $target -}}{{- end -}}
+{{- $targetV6 := include "ferrum-mesh.ipv6Hextets" $target -}}
+{{- $found := false -}}
+{{- range $raw := splitList "," (.allowedCidrs | default "") -}}
+{{- $entry := trim $raw | lower -}}
+{{- $parts := splitList "/" $entry -}}
+{{- $network := trim (index $parts 0) -}}
+{{- $networkV4 := include "ferrum-mesh.ipv4ToInt" $network -}}
+{{- $networkMappedV4 := include "ferrum-mesh.ipv4MappedToInt" $network -}}
+{{- if and (eq $networkV4 "") $networkMappedV4 -}}{{- $networkV4 = $networkMappedV4 -}}{{- end -}}
+{{- $networkV6 := include "ferrum-mesh.ipv6Hextets" $network -}}
+{{- if eq (len $parts) 1 -}}
+{{- if and (ne $targetV4 "") (ne $networkV4 "") (eq ($targetV4 | int64) ($networkV4 | int64)) -}}
+{{- $found = true -}}
+{{- else if and $targetV6 $networkV6 (eq $targetV6 $networkV6) -}}
+{{- $found = true -}}
+{{- end -}}
+{{- else if and (eq (len $parts) 2) (regexMatch "^\\+?[0-9]+$" (trim (index $parts 1))) -}}
+{{- $prefix := atoi (trim (index $parts 1)) -}}
+{{- $v4Prefix := $prefix -}}
+{{- if $networkMappedV4 -}}{{- $v4Prefix = sub $prefix 96 | int -}}{{- end -}}
+{{- if and (ne $targetV4 "") (ne $networkV4 "") (ge $v4Prefix 0) (le $v4Prefix 32) -}}
+{{- $blockSize := 1 | int64 -}}
+{{- range until (sub 32 $v4Prefix | int) -}}{{- $blockSize = mul $blockSize 2 -}}{{- end -}}
+{{- if eq (div ($targetV4 | int64) $blockSize) (div ($networkV4 | int64) $blockSize) -}}{{- $found = true -}}{{- end -}}
+{{- end -}}
+{{/* A mapped IPv6 query still matches ordinary IPv6 rules at runtime. Mapped
+     networks are excluded here because the runtime folds those into IPv4. */}}
+{{- if and (not $networkMappedV4) $targetV6 $networkV6 (ge $prefix 0) (le $prefix 128) -}}
+{{- $targetParts := splitList "," $targetV6 -}}
+{{- $networkParts := splitList "," $networkV6 -}}
+{{- $matches := true -}}
+{{- $fullHextets := div $prefix 16 | int -}}
+{{- range $i := until $fullHextets -}}
+{{- if ne (index $targetParts $i | int) (index $networkParts $i | int) -}}{{- $matches = false -}}{{- end -}}
+{{- end -}}
+{{- $remainingBits := mod $prefix 16 | int -}}
+{{- if and $matches (gt $remainingBits 0) -}}
+{{- $blockSize := 1 -}}
+{{- range until (sub 16 $remainingBits | int) -}}{{- $blockSize = mul $blockSize 2 -}}{{- end -}}
+{{- if ne (div (index $targetParts $fullHextets | int) $blockSize) (div (index $networkParts $fullHextets | int) $blockSize) -}}{{- $matches = false -}}{{- end -}}
+{{- end -}}
+{{- if $matches -}}{{- $found = true -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if $found -}}true{{- end -}}
 {{- end -}}

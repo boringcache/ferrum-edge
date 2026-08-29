@@ -140,6 +140,15 @@ controlPlane:
   # Admin listener used by drain-aware exec probes and optional metrics scrape.
   # Default loopback keeps admin off the cluster network. ServiceMonitor
   # requires a non-loopback bindAddress plus allowedCidrs or allowInsecureHttp.
+  #
+  # bindAddress must be an IP literal (the binary rejects hostnames) and
+  # allowedCidrs is parsed exactly as the runtime parses
+  # FERRUM_ADMIN_ALLOWED_CIDRS: bare IPv4/IPv6 addresses or CIDRs, no brackets.
+  # A full-family allowlist (0.0.0.0/0, ::/0, an IPv4-mapped /96, or a union
+  # that covers a whole family) does NOT count as plaintext protection for
+  # control-plane/CA mode. While the computed exec probes are enabled the
+  # allowlist must also cover the exact source address the admin accept loop
+  # observes (127.0.0.1 for an IPv4 or wildcard bind, ::1 for an IPv6 wildcard).
   admin:
     bindAddress: "127.0.0.1"
     httpPort: 9000
@@ -410,12 +419,21 @@ ambient:
   podSecurityContext:
     seccompProfile:
       type: RuntimeDefault
+  # Unlike the Deployment workloads this is NOT rendered verbatim: ambient
+  # assembles its container SecurityContext field by field, so the schema admits
+  # only the four keys below and rejects anything else rather than accepting a
+  # supported-looking key the template never reads. runAsUser/runAsGroup are
+  # decided by the capture mode. `capabilities.drop` must stay ["ALL"];
+  # `capabilities.add` MERGES on top of the datapath minimum (NET_ADMIN,
+  # NET_RAW, plus BPF/PERFMON for NodeWaypoint and SYS_ADMIN/SYS_PTRACE for
+  # in-netns capture) and can never remove one.
   securityContext:
     allowPrivilegeEscalation: false
     readOnlyRootFilesystem: true
     capabilities:
       drop:
         - ALL
+      # add: []
   resources:
     requests:
       cpu: 100m

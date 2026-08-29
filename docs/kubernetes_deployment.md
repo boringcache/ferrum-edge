@@ -358,10 +358,28 @@ Serving mesh workloads (`controlPlane`, `ca`, `eastWest`, `ambient`) also render
 the gateway chart's graceful-shutdown contract: `FERRUM_SHUTDOWN_DRAIN_SECONDS`,
 optional `FERRUM_SHUTDOWN_PREDRAIN_SECONDS`, native `preStop.sleep`, and
 `terminationGracePeriodSeconds` sized for the full additive budget in
-[graceful_shutdown.md](graceful_shutdown.md). The injector webhook, node-agent,
-and one-shot CNI uninstall hooks do not. Restricted-compatible
-`securityContext` / non-empty `resources` apply to control plane, CA, and
-east-west; ambient keeps host-network datapath capabilities after dropping ALL.
+[graceful_shutdown.md](graceful_shutdown.md). `controlPlane` and `ca` run `cp`
+mode, which honors the pre-drain window on its admin and CP-gRPC accept loops,
+so the `<1.29` remediation (`shutdownPreStopSeconds: 0` plus a raised
+`shutdownPreDrainSeconds`) is a real contract there and not just a rendered env.
+The injector webhook, node-agent, and one-shot CNI uninstall hooks do not
+receive any of it. Restricted-compatible `securityContext` / non-empty
+`resources` apply to control plane, CA, and east-west; ambient keeps
+host-network datapath capabilities after dropping ALL, and its
+`securityContext` is a constrained explicit surface
+(`allowPrivilegeEscalation`, `readOnlyRootFilesystem`, `capabilities.drop`,
+`capabilities.add`) so an unsupported key is rejected rather than ignored.
+
+Each workload's `admin.bindAddress` must be an IP literal and its
+`admin.allowedCidrs` (and `observability.metrics.allowedCidrs`) is validated
+entry-for-entry against the runtime's strict CIDR parser. For `controlPlane` and
+`ca` a full-family allowlist (`0.0.0.0/0`, `::/0`, an IPv4-mapped `/96`, or a
+covering union) is not accepted as plaintext-admin protection, and while the
+computed exec probes are enabled the allowlist must cover the exact probe source
+(`127.0.0.1` for an IPv4/wildcard bind, `::1` for an IPv6 wildcard bind). An
+enabled computed probe with no usable handler — for example `admin.httpPort: 0`
+with readiness still enabled — fails render instead of silently omitting the
+probe.
 
 ### Mesh metrics scrape
 

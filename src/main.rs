@@ -1027,19 +1027,12 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     );
     let observability_delivery_timeout =
         std::time::Duration::from_millis(env_config.log_shutdown_drain_timeout_ms);
-    // Pre-drain window (issue #4154). Serving modes only: the knob exists so a
-    // replica can report `ready:false` while it is still accepting, which only
-    // means anything where there are listeners and a readiness consumer.
-    let predrain_seconds = match env_config.mode {
-        OperatingMode::Database
-        | OperatingMode::File
-        | OperatingMode::DataPlane
-        | OperatingMode::Mesh => env_config.shutdown_predrain_seconds,
-        OperatingMode::ControlPlane
-        | OperatingMode::Injector
-        | OperatingMode::NodeAgent
-        | OperatingMode::Migrate => 0,
-    };
+    // Pre-drain window (issue #4154, extended to `cp` for issue #4266). The
+    // knob exists so a replica can report `ready:false` while it is still
+    // accepting, which only means anything where there are listeners AND a
+    // readiness consumer. The mode gate is a lib-side helper so it is covered
+    // by external tests rather than an inline `main.rs` test.
+    let predrain_seconds = env_config.effective_shutdown_predrain_seconds();
     let shutdown_predrain = std::time::Duration::from_secs(predrain_seconds);
     let gateway_exit_code: i32 = rt.block_on(async {
         // Shutdown signal

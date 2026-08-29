@@ -452,6 +452,127 @@ def validate_observability(results_dir: Path) -> None:
     print("mesh observability scrape path ok")
 
 
+def require_stderr(results_dir: Path, relative: str, needles: tuple[str, ...], title: str) -> None:
+    text = require_capture(results_dir, relative).read_text(encoding="utf-8")
+    missing = [needle for needle in needles if needle not in text]
+    if missing:
+        fail(title, f"{relative} must explain the refusal; missing {missing!r}")
+
+
+def validate_strict_admin_validation(results_dir: Path) -> None:
+    """Issue #4267: the mesh chart must reach the runtime's accept/reject line.
+
+    Every capture below renders cleanly under a permissive approximation and
+    then either CrashLoops the pod (`CidrSet::parse_strict`, the CP plaintext
+    admin guard, `EnvConfig::validate`'s IP-literal bind requirement) or has the
+    admin TCP accept loop silently drop the in-pod exec probes.
+    """
+    require_stderr(
+        results_dir,
+        "mesh-prod-bad-cidr.err",
+        ("controlPlane.admin.allowedCidrs", "not a valid IP address or CIDR"),
+        "Malformed admin CIDR refusal missing",
+    )
+    require_stderr(
+        results_dir,
+        "mesh-prod-catchall-cidr.err",
+        ("permits every address in an IP family", "allowInsecureHttp"),
+        "Catch-all admin allowlist refusal missing",
+    )
+    require_stderr(
+        results_dir,
+        "mesh-prod-hostname-bind.err",
+        ("controlPlane.admin.bindAddress", "IP literal"),
+        "Hostname admin bind refusal missing",
+    )
+    require_stderr(
+        results_dir,
+        "mesh-prod-probe-family.err",
+        ("::1/128", "computed exec probes"),
+        "Probe-source family refusal missing",
+    )
+    require_stderr(
+        results_dir,
+        "mesh-prod-bad-metrics-cidr.err",
+        ("observability.metrics.allowedCidrs", "not a valid IP address or CIDR"),
+        "Malformed metrics CIDR refusal missing",
+    )
+    require_stderr(
+        results_dir,
+        "mesh-prod-missing-ready-handler.err",
+        ("eastWest.probes.readiness", "drain-aware readiness"),
+        "Handler-less readiness refusal missing",
+    )
+    require_stderr(
+        results_dir,
+        "mesh-prod-ambient-drop.err",
+        ("ambient.securityContext.capabilities.drop",),
+        "Narrowed ambient capability drop refusal missing",
+    )
+    require_stderr(
+        results_dir,
+        "mesh-prod-ambient-unknown-sc.err",
+        ("runAsUser",),
+        "Unsupported ambient securityContext key refusal missing",
+    )
+    print("mesh strict admin/metrics validation ok")
+
+
+def validate_narrow_ipv6_render(results_dir: Path) -> None:
+    """A valid narrow IPv6 allowlist, the <1.29 pre-drain remediation, and an
+    ambient capability merge must all still render."""
+    rendered = require_capture(results_dir, "mesh-prod-narrow-ipv6.yaml").read_text(
+        encoding="utf-8"
+    )
+    cp = resource_document(rendered, "ferrum-mesh-control-plane", "Deployment")
+    cidrs = env_value(cp, "FERRUM_ADMIN_ALLOWED_CIDRS")
+    if cidrs != "fd00::/8,::1/128":
+        fail(
+            "Narrow IPv6 allowlist dropped",
+            f"controlPlane.admin.allowedCidrs must render verbatim, got {cidrs!r}",
+        )
+    if env_value(cp, "FERRUM_ADMIN_BIND_ADDRESS") != "::":
+        fail(
+            "IPv6 wildcard bind dropped",
+            "controlPlane.admin.bindAddress=:: must render as a bare IPv6 literal",
+        )
+    require_text(
+        cp,
+        '"::1"',
+        "IPv6 probe host missing",
+        "the computed exec probes must dial ::1 for an IPv6 wildcard bind",
+    )
+    # Issue #4266: the <1.29 remediation the SleepAction guard recommends must be
+    # a real runtime contract. `cp` mode honors FERRUM_SHUTDOWN_PREDRAIN_SECONDS
+    # (EnvConfig::effective_shutdown_predrain_seconds), so the chart may budget it.
+    if env_value(cp, "FERRUM_SHUTDOWN_PREDRAIN_SECONDS") != "30":
+        fail(
+            "Pre-drain remediation not rendered",
+            "shutdownPreDrainSeconds=30 must render FERRUM_SHUTDOWN_PREDRAIN_SECONDS=30 on the cp-mode control plane",
+        )
+    forbid_text(
+        cp,
+        "preStop:",
+        "preStop rendered with the pre-drain remediation",
+        "shutdownPreStopSeconds=0 must omit lifecycle.preStop entirely",
+    )
+    ambient = resource_document(rendered, "ferrum-mesh-ambient", "DaemonSet")
+    for cap in ("- NET_ADMIN", "- NET_RAW", "- SYS_RESOURCE"):
+        require_text(
+            ambient,
+            cap,
+            "Ambient capability merge broken",
+            f"ambient.securityContext.capabilities.add must merge on top of the datapath minimum ({cap})",
+        )
+    require_text(
+        ambient,
+        "drop:",
+        "Ambient capability drop missing",
+        "ambient must keep dropping ALL even when extra capabilities are added",
+    )
+    print("mesh narrow-IPv6 / pre-drain / capability-merge render ok")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -470,6 +591,8 @@ def main() -> int:
     validate_zero_drain(results_dir)
     validate_optional_crds_off(results_dir)
     validate_observability(results_dir)
+    validate_strict_admin_validation(results_dir)
+    validate_narrow_ipv6_render(results_dir)
     print("mesh production-readiness ok")
     return 0
 

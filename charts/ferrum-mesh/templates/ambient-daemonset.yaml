@@ -475,8 +475,51 @@ spec:
           image: {{ $ambientImage | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["run"]
+          {{- /* Ambient's container SecurityContext is assembled field by field, not
+                 `toYaml`-ed wholesale: `runAsUser`/`runAsGroup` are decided by the
+                 capture mode and the capability set is a datapath requirement. The
+                 schema therefore admits only the keys read here
+                 (`allowPrivilegeEscalation`, `readOnlyRootFilesystem`,
+                 `capabilities.drop`, `capabilities.add`) so a supported-looking key
+                 cannot be silently ignored. `capabilities.add` MERGES on top of the
+                 required set; it can never remove one. */ -}}
+          {{- $ambientSc := .Values.ambient.securityContext | default dict -}}
+          {{- $ambientScCaps := $ambientSc.capabilities | default dict -}}
+          {{- $ambientScDrop := $ambientScCaps.drop | default (list "ALL") -}}
+          {{- /* Indexed only after the length check, so an empty list never
+                 evaluates `index ... 0`. */ -}}
+          {{- $ambientDropOk := false -}}
+          {{- if eq (len $ambientScDrop) 1 -}}
+          {{- $ambientDropOk = eq (upper (trimPrefix "CAP_" (upper (toString (index $ambientScDrop 0))))) "ALL" -}}
+          {{- end -}}
+          {{- if not $ambientDropOk -}}
+          {{- fail (printf "ambient.securityContext.capabilities.drop must stay [\"ALL\"] (got %v): the rendered add list is the ambient datapath's complete privilege surface, and narrowing the drop would silently retain the container runtime's default capabilities" $ambientScDrop) -}}
+          {{- end -}}
+          {{- $ambientRequiredCaps := list -}}
+          {{- if $nodeWaypointRegistryEnabled -}}
+          {{- $ambientRequiredCaps = concat $ambientRequiredCaps (list "BPF" "PERFMON") -}}
+          {{- end -}}
+          {{- $ambientRequiredCaps = concat $ambientRequiredCaps (list "NET_ADMIN" "NET_RAW") -}}
+          {{- if $ambientSetnsCapture -}}
+          {{- /* setns(CLONE_NEWNET) + ptrace_may_access on /proc/pid/ns/net;
+                 shared by the NodeWaypoint TCP path and the per-pod-netns
+                 Ambient UDP producer. The host-network UDP placement enters
+                 no other namespace and so is deliberately excluded — the
+                 rendered container retains its baseline NET_ADMIN/NET_RAW
+                 pair. BPF/PERFMON stay NodeWaypoint-only (no eBPF here). */ -}}
+          {{- $ambientRequiredCaps = concat $ambientRequiredCaps (list "SYS_ADMIN" "SYS_PTRACE") -}}
+          {{- end -}}
+          {{- $ambientExtraCaps := list -}}
+          {{- range $cap := $ambientScCaps.add | default list -}}
+          {{- $normalized := upper (trimPrefix "CAP_" (upper (toString $cap))) -}}
+          {{- if not (has $normalized $ambientRequiredCaps) -}}
+          {{- $ambientExtraCaps = append $ambientExtraCaps $normalized -}}
+          {{- end -}}
+          {{- /* Closes with `}}`, not `-}}`: every action above trims both sides,
+                 so a trailing trim here would splice `securityContext:` onto the
+                 preceding `args: ["run"]` line. */ -}}
+          {{- end }}
           securityContext:
-            {{- $ambientSc := .Values.ambient.securityContext | default dict }}
             allowPrivilegeEscalation: {{ $ambientSc.allowPrivilegeEscalation | default false }}
             readOnlyRootFilesystem: {{ if hasKey $ambientSc "readOnlyRootFilesystem" }}{{ $ambientSc.readOnlyRootFilesystem }}{{ else }}true{{ end }}
             {{- if $ambientInNetnsCapture }}
@@ -487,21 +530,8 @@ spec:
               drop:
                 - ALL
               add:
-                {{- if $nodeWaypointRegistryEnabled }}
-                - BPF
-                - PERFMON
-                {{- end }}
-                - NET_ADMIN
-                - NET_RAW
-                {{- if $ambientSetnsCapture }}
-                {{- /* setns(CLONE_NEWNET) + ptrace_may_access on /proc/pid/ns/net;
-                       shared by the NodeWaypoint TCP path and the per-pod-netns
-                       Ambient UDP producer. The host-network UDP placement enters
-                       no other namespace and so is deliberately excluded — the
-                       rendered container retains its baseline NET_ADMIN/NET_RAW
-                       pair. BPF/PERFMON stay NodeWaypoint-only (no eBPF here). */}}
-                - SYS_ADMIN
-                - SYS_PTRACE
+                {{- range $cap := concat $ambientRequiredCaps (uniq $ambientExtraCaps) }}
+                - {{ $cap }}
                 {{- end }}
           ports:
             - name: outbound
