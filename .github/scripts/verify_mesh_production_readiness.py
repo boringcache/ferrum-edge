@@ -119,6 +119,7 @@ def validate_admin_env_override(results_dir: Path) -> None:
     for name, expected in (
         ("FERRUM_ADMIN_HTTP_PORT", "19000"),
         ("FERRUM_ADMIN_BIND_ADDRESS", "0.0.0.0"),
+        ("FERRUM_ALLOW_INSECURE_ADMIN_HTTP", "true"),
         ("FERRUM_ADMIN_ALLOWED_CIDRS", "127.0.0.0/8"),
     ):
         actual = env_value(cp, name)
@@ -556,6 +557,23 @@ def validate_strict_admin_validation(results_dir: Path) -> None:
     admin guard, `EnvConfig::validate`'s IP-literal bind requirement) or has the
     admin TCP accept loop silently drop the in-pod exec probes.
     """
+    require_stderr(
+        results_dir,
+        "mesh-prod-bad-admin-bool.err",
+        (
+            "controlPlane.env.FERRUM_ALLOW_INSECURE_ADMIN_HTTP",
+            "true, false, 1, or 0",
+        ),
+        "Invalid admin insecure-http boolean refusal missing",
+    )
+    bad_bool = require_capture(
+        results_dir, "mesh-prod-bad-admin-bool.err"
+    ).read_text(encoding="utf-8")
+    if "not-a-bool" in bad_bool:
+        fail(
+            "Invalid admin bool echoed value",
+            "mesh-prod-bad-admin-bool.err must not echo the operator-supplied value",
+        )
     require_stderr(
         results_dir,
         "mesh-prod-bad-cidr.err",

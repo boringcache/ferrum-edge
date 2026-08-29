@@ -466,13 +466,27 @@ true
 {{- end -}}
 
 {{/*
+Parse a boolean env override the same way `EnvConfig`'s bool parser does:
+trim, lowercase, accept true/false/1/0 only. Returns canonical "true" or
+"false". Dict: field (for value-redacted diagnostics), value.
+*/}}
+{{- define "ferrum-mesh.parseEnvBool" -}}
+{{- $field := .field -}}
+{{- $lower := lower (trim (toString (.value | default ""))) -}}
+{{- if not (has $lower (list "true" "false" "1" "0")) -}}
+{{- fail (printf "%s is not a valid boolean; expected true, false, 1, or 0" $field) -}}
+{{- end -}}
+{{- if has $lower (list "true" "1") -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{/*
 Resolve the admin listener for a serving component. First-class
 `<component>.admin` is the chart-managed source; an explicit env map entry
 still wins so existing ambient.env.FERRUM_ADMIN_* collision tests and live
 suites keep working. All FOUR admin keys are resolved here, because
 `ferrum-mesh.adminEnv` renders exclusively from this result and every workload
 env loop filters those keys out. Returns YAML dict: port, bind, probeHost,
-allowInsecureHttp, allowedCidrs.
+allowInsecureHttp, allowInsecureHttpFromEnv, allowedCidrs.
 */}}
 {{- define "ferrum-mesh.resolveComponentAdmin" -}}
 {{- $env := .env | default dict -}}
@@ -505,14 +519,21 @@ allowInsecureHttp, allowedCidrs.
        FERRUM_ADMIN_ALLOWED_CIDRS would leave a non-loopback plaintext admin
        listener with no allowlist. */ -}}
 {{- $allowInsecureHttp := $admin.allowInsecureHttp | default false -}}
+{{- $allowInsecureHttpFromEnv := false -}}
 {{- if hasKey $env "FERRUM_ALLOW_INSECURE_ADMIN_HTTP" -}}
-{{- $allowInsecureHttp = eq (lower (trim (toString (index $env "FERRUM_ALLOW_INSECURE_ADMIN_HTTP")))) "true" -}}
+{{- $boolField := "FERRUM_ALLOW_INSECURE_ADMIN_HTTP" -}}
+{{- if .component -}}
+{{- $boolField = printf "%s.env.FERRUM_ALLOW_INSECURE_ADMIN_HTTP" .component -}}
+{{- end -}}
+{{- $canonical := include "ferrum-mesh.parseEnvBool" (dict "field" $boolField "value" (index $env "FERRUM_ALLOW_INSECURE_ADMIN_HTTP")) -}}
+{{- $allowInsecureHttp = eq $canonical "true" -}}
+{{- $allowInsecureHttpFromEnv = true -}}
 {{- end -}}
 {{- $allowedCidrs := $admin.allowedCidrs | default "" -}}
 {{- if hasKey $env "FERRUM_ADMIN_ALLOWED_CIDRS" -}}
 {{- $allowedCidrs = toString (index $env "FERRUM_ADMIN_ALLOWED_CIDRS") -}}
 {{- end -}}
-{{- dict "port" $port "bind" $bind "probeHost" (include "ferrum-mesh.adminProbeHost" $bind) "allowInsecureHttp" $allowInsecureHttp "allowedCidrs" $allowedCidrs | toYaml -}}
+{{- dict "port" $port "bind" $bind "probeHost" (include "ferrum-mesh.adminProbeHost" $bind) "allowInsecureHttp" $allowInsecureHttp "allowInsecureHttpFromEnv" $allowInsecureHttpFromEnv "allowedCidrs" $allowedCidrs | toYaml -}}
 {{- end -}}
 
 {{/*
@@ -531,7 +552,10 @@ this helper skipped it, not at all.
   value: {{ $resolved.port | quote }}
 - name: FERRUM_ADMIN_BIND_ADDRESS
   value: {{ $resolved.bind | quote }}
-{{- if $resolved.allowInsecureHttp }}
+{{- if $resolved.allowInsecureHttpFromEnv }}
+- name: FERRUM_ALLOW_INSECURE_ADMIN_HTTP
+  value: {{ ternary "true" "false" $resolved.allowInsecureHttp | quote }}
+{{- else if $resolved.allowInsecureHttp }}
 - name: FERRUM_ALLOW_INSECURE_ADMIN_HTTP
   value: "true"
 {{- end }}

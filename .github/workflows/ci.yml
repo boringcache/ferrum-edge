@@ -3303,6 +3303,14 @@ jobs:
             --set ambient.probes.liveness.enabled=false \
             --set ambient.probes.readiness.enabled=false \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-admin-port0-disabled.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.env.FERRUM_ALLOW_INSECURE_ADMIN_HTTP=not-a-bool \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-bad-admin-bool.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-bad-admin-bool.err"; then
+            echo "::error title=Invalid admin insecure-http boolean accepted::EnvConfig rejects non-boolean FERRUM_ALLOW_INSECURE_ADMIN_HTTP at startup"
+            exit 1
+          fi
           # Valid narrow IPv6 allowlist covering the IPv6 probe source, plus the
           # <1.29 pre-drain remediation on a cp-mode workload and an ambient
           # capabilities.add merge, must all render.
@@ -3326,6 +3334,7 @@ jobs:
             --set-string controlPlane.env.FERRUM_ADMIN_HTTP_PORT=19000 \
             --set-string controlPlane.env.FERRUM_ADMIN_BIND_ADDRESS=0.0.0.0 \
             --set-string controlPlane.env.FERRUM_ADMIN_ALLOWED_CIDRS=127.0.0.0/8 \
+            --set-string controlPlane.env.FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-admin-env-override.yaml"
           python3 -I .github/scripts/verify_mesh_production_readiness.py \
             --results-dir "$RUNNER_TEMP/ferrum-helm-results"
