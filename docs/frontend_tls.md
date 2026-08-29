@@ -467,11 +467,11 @@ curl https://localhost:8443/api/v1
 `-----BEGIN X509 CRL-----` blocks. One policy governs every verifier that
 consumes them — frontend and admin mTLS (HTTP/1.1, HTTP/2, HTTP/3, and TCP+TLS),
 frontend DTLS, the mesh operator-CA and SPIFFE peer verifiers, rustls backend
-server verification on the proxy data path, and the rustls LDAP / TCP / UDP /
-WebSocket logging sinks. Across those surfaces there is no per-surface CRL
-setting and no way for one of them to run a weaker posture than another. The
-surfaces the CRL source does not reach at all are listed at the end of this
-section.
+server verification on the proxy data path, active HTTPS and gRPC health-check
+probes, and the rustls LDAP / TCP / UDP / WebSocket logging sinks. Across those
+surfaces there is no per-surface CRL setting and no way for one of them to run a
+weaker posture than another. The surfaces the CRL source does not reach at all
+are listed at the end of this section.
 
 ### What the verifier enforces
 
@@ -530,15 +530,17 @@ timestamps, and secret source URIs are never logged.
 CRLs are not applied to DP-to-CP gRPC or to reqwest-based plugin egress; those
 stacks do not expose a compatible CRL configuration. `kafka_logging` uses
 librdkafka/OpenSSL and maps the CRL source to `ssl.crl.location` instead.
+Skip-verify health probes (`backend_tls_verify_server_cert: false` or
+`FERRUM_TLS_NO_VERIFY`) skip CRL enforcement, matching the data-path skip-verify
+contract. TCP and UDP probes perform no TLS handshake and are unaffected.
 
-Active **health-check probes** are also outside the policy: the probe server
-verifier is built with an empty CRL list, so a backend whose certificate has
-been revoked can still answer a health probe successfully and stay in the
-load-balancer pool. This is not a bypass of the data path — the proxy's own
-backend connection to that destination still applies the CRL and refuses it —
-but it does mean revocation shows up as backend request failures rather than as
-an unhealthy destination. See [backend_mtls.md](backend_mtls.md) for the
-backend-side reload contract.
+Verified **HTTPS and gRPC health-check probes** share this policy. They snapshot
+the same admitted `SharedCrlList` generation backend data-path pools use when
+each probe task is spawned. Backend TLS live reload stores a new generation
+first, then restarts probes so replacement tasks load that exact snapshot. A
+refused candidate keeps the previous generation, verifiers, and probe tasks in
+service. See [backend_mtls.md](backend_mtls.md) for the backend-side reload
+contract.
 
 ## Certificate Reload Behavior
 

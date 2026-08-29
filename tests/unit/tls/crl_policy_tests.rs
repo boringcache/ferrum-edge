@@ -32,6 +32,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use ferrum_edge::config::types::BackendTlsConfig;
+use ferrum_edge::health_check::build_probe_server_verifier_for_test;
 use ferrum_edge::identity::{SpiffeId, SvidBundle, TrustBundle, TrustBundleSet, TrustDomain};
 use ferrum_edge::tls::crl_policy::{
     self, CrlWindowRejection, apply_client_crl_policy, classify_crl_window, validate_crl_windows_at,
@@ -82,6 +84,7 @@ struct ChainPki {
     root_der: CertificateDer<'static>,
     root_issuer: Issuer<'static, KeyPair>,
     intermediate_a_der: CertificateDer<'static>,
+    intermediate_a_issuer: Issuer<'static, KeyPair>,
     intermediate_b_der: CertificateDer<'static>,
     leaf_a_der: CertificateDer<'static>,
     leaf_b_der: CertificateDer<'static>,
@@ -197,6 +200,7 @@ fn build_chain_pki() -> ChainPki {
         root_der,
         root_issuer,
         intermediate_a_der,
+        intermediate_a_issuer,
         intermediate_b_der,
         leaf_a_der,
         leaf_b_der,
@@ -824,6 +828,130 @@ fn the_backend_server_verifier_enforces_the_same_policy() {
     );
 }
 
+fn probe_verifier(
+    pki: &ChainPki,
+    crls: &[CertificateRevocationListDer<'static>],
+    san_allow_list: Vec<String>,
+) -> (TempDir, Arc<dyn ServerCertVerifier>) {
+    let dir = TempDir::new().expect("temp dir");
+    let ca_path = dir.path().join("root.pem");
+    std::fs::write(&ca_path, &pki.root_pem).expect("write root");
+    let mut tls = BackendTlsConfig::default_verify();
+    tls.server_ca_cert_path = Some(ca_path.to_str().expect("utf-8 path").to_string());
+    tls.san_allow_list = san_allow_list;
+    let verifier = build_probe_server_verifier_for_test(&tls, None, crls)
+        .expect("probe server verifier");
+    (dir, verifier)
+}
+
+fn verify_probe(
+    verifier: &dyn ServerCertVerifier,
+    leaf: &CertificateDer<'static>,
+    intermediate: &CertificateDer<'static>,
+    dns: &str,
+) -> Result<(), RustlsError> {
+    let name = ServerName::try_from(dns).expect("server name");
+    verifier
+        .verify_server_cert(
+            leaf,
+            std::slice::from_ref(intermediate),
+            &name,
+            &[],
+            UnixTime::now(),
+        )
+        .map(|_| ())
+}
+
+fn assert_revoked(error: RustlsError, context: &str) {
+    assert!(
+        matches!(
+            error,
+            RustlsError::InvalidCertificate(CertificateError::Revoked)
+        ),
+        "{context}: expected CertificateError::Revoked, got {error:?}"
+    );
+}
+
+#[test]
+fn health_probe_verifier_refuses_a_revoked_intermediate() {
+    let pki = build_chain_pki();
+    let crls = crl_list(vec![fresh_crl(&pki.root_issuer, &[INTERMEDIATE_A_SERIAL])]);
+    let (_dir, verifier) = probe_verifier(&pki, &crls, Vec::new());
+
+    let error = verify_probe(
+        verifier.as_ref(),
+        &pki.leaf_a_der,
+        &pki.intermediate_a_der,
+        LEAF_A_DNS,
+    )
+    .expect_err("a probe chain through a revoked intermediate must be refused");
+    assert_revoked(error, "health probe intermediate revocation");
+
+    verify_probe(
+        verifier.as_ref(),
+        &pki.leaf_b_der,
+        &pki.intermediate_b_der,
+        LEAF_B_DNS,
+    )
+    .expect("the sibling probe branch must still verify");
+}
+
+#[test]
+fn health_probe_verifier_refuses_a_revoked_leaf() {
+    let pki = build_chain_pki();
+    let crls = crl_list(vec![fresh_crl(
+        &pki.intermediate_a_issuer,
+        &[LEAF_A_SERIAL],
+    )]);
+    let (_dir, verifier) = probe_verifier(&pki, &crls, Vec::new());
+
+    let error = verify_probe(
+        verifier.as_ref(),
+        &pki.leaf_a_der,
+        &pki.intermediate_a_der,
+        LEAF_A_DNS,
+    )
+    .expect_err("a revoked probe leaf must be refused");
+    assert_revoked(error, "health probe leaf revocation");
+
+    verify_probe(
+        verifier.as_ref(),
+        &pki.leaf_b_der,
+        &pki.intermediate_b_der,
+        LEAF_B_DNS,
+    )
+    .expect("an unrevoked sibling leaf must still verify");
+}
+
+#[test]
+fn health_probe_verifier_accepts_an_unrevoked_chain_with_an_empty_crl_list() {
+    let pki = build_chain_pki();
+    let (_dir, verifier) = probe_verifier(&pki, &[], Vec::new());
+    verify_probe(
+        verifier.as_ref(),
+        &pki.leaf_a_der,
+        &pki.intermediate_a_der,
+        LEAF_A_DNS,
+    )
+    .expect("with no CRL the probe chain verifies");
+}
+
+#[test]
+fn health_probe_san_wrap_still_enforces_revocation() {
+    let pki = build_chain_pki();
+    let crls = crl_list(vec![fresh_crl(&pki.root_issuer, &[INTERMEDIATE_A_SERIAL])]);
+    let (_dir, verifier) = probe_verifier(&pki, &crls, vec![LEAF_A_DNS.to_string()]);
+
+    let error = verify_probe(
+        verifier.as_ref(),
+        &pki.leaf_a_der,
+        &pki.intermediate_a_der,
+        LEAF_A_DNS,
+    )
+    .expect_err("SAN wrapping must not bypass CRL enforcement");
+    assert_revoked(error, "SAN-wrapped health probe revocation");
+}
+
 #[test]
 fn the_spiffe_peer_verifier_enforces_the_same_policy() {
     let pki = build_chain_pki();
@@ -1066,6 +1194,36 @@ fn every_crl_consuming_surface_reaches_the_shared_policy() {
             "{surface} consumes CRLs without reaching tls::crl_policy"
         );
     }
+}
+
+#[test]
+fn health_probes_pass_the_admitted_crl_snapshot_not_an_empty_literal() {
+    let text = read_source("src/health_check.rs");
+    let probe_builder = text
+        .split("fn build_probe_server_verifier(")
+        .nth(1)
+        .expect("build_probe_server_verifier must exist");
+    let probe_builder = probe_builder
+        .split("\nfn ")
+        .next()
+        .expect("function body");
+    assert!(
+        probe_builder.contains("build_server_verifier_with_crls"),
+        "probe verifiers must reach the shared helper"
+    );
+    assert!(
+        probe_builder.contains("crls"),
+        "probe verifiers must pass the admitted CRL snapshot, not a hardcoded list"
+    );
+    assert!(
+        !probe_builder.contains("&[]"),
+        "issue #4298: an empty CRL literal would let a revoked backend probe healthy"
+    );
+    let production = read_source("src/proxy/mod.rs");
+    assert!(
+        production.contains("with_pool_config_and_shared_crls"),
+        "production HealthChecker construction must receive the shared CRL list"
+    );
 }
 
 #[test]

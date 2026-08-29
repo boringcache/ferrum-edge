@@ -8500,6 +8500,10 @@ impl ProxyState {
     fn reload_backend_tls_material(&self) -> Result<(), anyhow::Error> {
         let active_crls = crate::tls::load_crls(self.env_config.tls_crl_file_path.as_deref())?;
         let validated = self.validate_backend_tls_material(active_crls.as_ref().as_slice())?;
+        // Publish the admitted CRL generation before restarting health probes
+        // so replacement tasks snapshot this exact generation. A refused
+        // candidate never reaches this store, so previous verifiers,
+        // generation, and probe tasks stay in service.
         self.shared_crls.store(active_crls);
         let pools = self.backend_pool_family();
         pools.clear_tls_config_caches();
@@ -9128,8 +9132,11 @@ impl ProxyState {
         // Initialize health checker with the gateway's pool settings so active
         // probes share connection tuning (keep-alive, idle timeout, HTTP/2) with
         // regular proxy traffic.
-        let mut health_checker =
-            HealthChecker::with_pool_config(&global_pool_config, dns_cache.clone());
+        let mut health_checker = HealthChecker::with_pool_config_and_shared_crls(
+            &global_pool_config,
+            dns_cache.clone(),
+            shared_crls.clone(),
+        );
         health_checker.set_global_tls_config(
             env_config_arc.tls_ca_bundle_path.clone(),
             env_config_arc.backend_tls_client_cert_path.clone(),
