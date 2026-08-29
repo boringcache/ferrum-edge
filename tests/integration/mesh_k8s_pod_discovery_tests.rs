@@ -974,11 +974,9 @@ fn k8s_pod_discovery_stamps_identity_only_workloads_with_node_waypoint() {
         "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)",
     );
 
-    let translation = translate_k8s_objects(
-        &[node("node-a", "node-uid-a"), source, waypoint],
-        options(),
-    )
-    .expect("K8s core translation succeeds");
+    let translation =
+        translate_k8s_objects(&[node("node-a", "node-uid-a"), source, waypoint], options())
+            .expect("K8s core translation succeeds");
 
     let mesh = translation.config.mesh.as_ref().expect("mesh config");
     let workload = mesh
