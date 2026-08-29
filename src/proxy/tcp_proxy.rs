@@ -2210,7 +2210,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         backlog,
         tfo_queue,
         actual_accept_threads,
-        false,
+        crate::proxy::ProxyListenerBind::default(),
     )?;
 
     // Convert to Arc<str> so per-connection clones are a cheap pointer bump.
