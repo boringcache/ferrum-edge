@@ -89,6 +89,58 @@ def env_value(doc: str, name: str) -> str | None:
     return match.group(1).strip().strip('"').strip("'")
 
 
+def env_occurrences(doc: str, name: str) -> int:
+    return len(
+        re.findall(rf"(?m)^\s+- name:\s*{re.escape(name)}\s*$", doc)
+    )
+
+
+ADMIN_ENV_KEYS = (
+    "FERRUM_ADMIN_HTTP_PORT",
+    "FERRUM_ADMIN_BIND_ADDRESS",
+    "FERRUM_ALLOW_INSECURE_ADMIN_HTTP",
+    "FERRUM_ADMIN_ALLOWED_CIDRS",
+)
+
+
+def validate_admin_env_override(results_dir: Path) -> None:
+    """`<workload>.env.FERRUM_ADMIN_*` must reach the container exactly once.
+
+    `ferrum-mesh.adminEnv` is the sole renderer of these four keys and every
+    workload env loop filters them out, so a resolver that deferred to the loop
+    for an env-supplied value would drop it from the PodSpec while the container
+    port and the computed exec probes still used it — a pod that never becomes
+    ready, or a non-loopback plaintext admin listener with no allowlist.
+    """
+    rendered = require_capture(
+        results_dir, "mesh-prod-admin-env-override.yaml"
+    ).read_text(encoding="utf-8")
+    cp = resource_document(rendered, "ferrum-mesh-control-plane", "Deployment")
+    for name, expected in (
+        ("FERRUM_ADMIN_HTTP_PORT", "19000"),
+        ("FERRUM_ADMIN_BIND_ADDRESS", "0.0.0.0"),
+        ("FERRUM_ADMIN_ALLOWED_CIDRS", "127.0.0.0/8"),
+    ):
+        actual = env_value(cp, name)
+        if actual != expected:
+            fail(
+                "Admin env override dropped",
+                f"controlPlane.env.{name} must render as {expected!r}, got {actual!r}",
+            )
+        count = env_occurrences(cp, name)
+        if count != 1:
+            fail(
+                "Admin env override duplicated",
+                f"{name} must appear exactly once on the control plane, found {count}",
+            )
+    if not re.search(r"(?m)^\s+containerPort:\s*19000\s*$", cp):
+        fail(
+            "Admin container port not resolved from env",
+            "controlPlane.env.FERRUM_ADMIN_HTTP_PORT must drive the admin-http containerPort",
+        )
+    print("mesh admin env override ok")
+
+
 def validate_serving_podspecs(results_dir: Path) -> None:
     rendered = require_capture(results_dir, "mesh-probes-default.yaml").read_text(
         encoding="utf-8"
@@ -727,6 +779,29 @@ def validate_node_waypoint_ebpf_caps(results_dir: Path) -> None:
         for cap in ("BPF", "PERFMON", "SYS_ADMIN"):
             _unquoted_cap(doc, cap, name)
     _unquoted_cap(ambient, "SYS_PTRACE", "ambient")
+    # This capture sets ambient.env.FERRUM_ADMIN_HTTP_PORT, so it also proves
+    # the steady-state env loop does not re-emit what ferrum-mesh.adminEnv
+    # rendered. Scoped past `containers:` so the one-shot preflight init
+    # container (which renders the raw env map) cannot mask a real duplicate.
+    marker = "\n      containers:\n"
+    if marker not in ambient:
+        fail(
+            "Ambient containers section missing",
+            "the ambient DaemonSet render must contain a pod-level containers list",
+        )
+    proxy = ambient.split(marker, 1)[1]
+    for name in ADMIN_ENV_KEYS:
+        count = env_occurrences(proxy, name)
+        if count > 1:
+            fail(
+                "Ambient admin env duplicated",
+                f"{name} must appear exactly once on the ambient proxy, found {count}",
+            )
+    if env_value(proxy, "FERRUM_ADMIN_HTTP_PORT") != "19091":
+        fail(
+            "Ambient admin env override dropped",
+            "ambient.env.FERRUM_ADMIN_HTTP_PORT must reach the proxy container as 19091",
+        )
     require_text(
         ambient,
         "allowPrivilegeEscalation: false",
@@ -781,6 +856,7 @@ def main() -> int:
     validate_strict_admin_validation(results_dir)
     validate_narrow_ipv6_render(results_dir)
     validate_mapped_admin_and_probe_source(results_dir)
+    validate_admin_env_override(results_dir)
     validate_node_waypoint_ebpf_caps(results_dir)
     validate_udp_cleanup_upgrade(results_dir)
     print("mesh production-readiness ok")

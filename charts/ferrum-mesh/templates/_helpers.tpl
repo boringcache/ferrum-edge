@@ -185,23 +185,6 @@ Wildcards become loopback; concrete binds are used as-is.
 {{- end -}}
 
 {{/*
-Resolve admin HTTP port/bind from a workload env map, falling back to binary
-defaults (9000 / 127.0.0.1). Returns a dict with keys port, bind, probeHost.
-*/}}
-{{- define "ferrum-mesh.adminProbeTargetFromEnv" -}}
-{{- $env := . | default dict -}}
-{{- $port := "9000" -}}
-{{- if hasKey $env "FERRUM_ADMIN_HTTP_PORT" -}}
-{{- $port = toString (index $env "FERRUM_ADMIN_HTTP_PORT") -}}
-{{- end -}}
-{{- $bind := "127.0.0.1" -}}
-{{- if hasKey $env "FERRUM_ADMIN_BIND_ADDRESS" -}}
-{{- $bind = toString (index $env "FERRUM_ADMIN_BIND_ADDRESS") -}}
-{{- end -}}
-{{- dict "port" $port "bind" $bind "probeHost" (include "ferrum-mesh.adminProbeHost" $bind) | toYaml -}}
-{{- end -}}
-
-{{/*
 Build the process-only (/live) and dependency-aware (/health) exec handlers for
 workloads that expose the admin listener. Liveness/startup MUST use --live so an
 alive-but-degraded process is not restart-looped.
@@ -483,10 +466,13 @@ true
 {{- end -}}
 
 {{/*
-Resolve admin HTTP port/bind for a serving component. First-class
+Resolve the admin listener for a serving component. First-class
 `<component>.admin` is the chart-managed source; an explicit env map entry
 still wins so existing ambient.env.FERRUM_ADMIN_* collision tests and live
-suites keep working. Returns YAML dict: port, bind, probeHost, allowInsecureHttp, allowedCidrs.
+suites keep working. All FOUR admin keys are resolved here, because
+`ferrum-mesh.adminEnv` renders exclusively from this result and every workload
+env loop filters those keys out. Returns YAML dict: port, bind, probeHost,
+allowInsecureHttp, allowedCidrs.
 */}}
 {{- define "ferrum-mesh.resolveComponentAdmin" -}}
 {{- $env := .env | default dict -}}
@@ -512,30 +498,45 @@ suites keep working. Returns YAML dict: port, bind, probeHost, allowInsecureHttp
 {{- if and (hasPrefix "[" $bind) (hasSuffix "]" $bind) -}}
 {{- $bind = $bind | trimPrefix "[" | trimSuffix "]" -}}
 {{- end -}}
-{{- dict "port" $port "bind" $bind "probeHost" (include "ferrum-mesh.adminProbeHost" $bind) "allowInsecureHttp" ($admin.allowInsecureHttp | default false) "allowedCidrs" ($admin.allowedCidrs | default "") | toYaml -}}
+{{- /* The allowlist and the insecure opt-in are resolved from the env map for
+       the same reason the port and the bind are: `ferrum-mesh.adminEnv` is the
+       SOLE renderer of all four keys, so a value that is not resolved here is
+       dropped from the rendered PodSpec entirely. Silently losing
+       FERRUM_ADMIN_ALLOWED_CIDRS would leave a non-loopback plaintext admin
+       listener with no allowlist. */ -}}
+{{- $allowInsecureHttp := $admin.allowInsecureHttp | default false -}}
+{{- if hasKey $env "FERRUM_ALLOW_INSECURE_ADMIN_HTTP" -}}
+{{- $allowInsecureHttp = eq (lower (trim (toString (index $env "FERRUM_ALLOW_INSECURE_ADMIN_HTTP")))) "true" -}}
+{{- end -}}
+{{- $allowedCidrs := $admin.allowedCidrs | default "" -}}
+{{- if hasKey $env "FERRUM_ADMIN_ALLOWED_CIDRS" -}}
+{{- $allowedCidrs = toString (index $env "FERRUM_ADMIN_ALLOWED_CIDRS") -}}
+{{- end -}}
+{{- dict "port" $port "bind" $bind "probeHost" (include "ferrum-mesh.adminProbeHost" $bind) "allowInsecureHttp" $allowInsecureHttp "allowedCidrs" $allowedCidrs | toYaml -}}
 {{- end -}}
 
 {{/*
-Chart-managed admin env for a serving component. Skips keys already present
-in the workload env map so an explicit override is not duplicated.
+Chart-managed admin env for a serving component.
+
+This helper is the ONLY renderer of the four admin env keys: every workload
+template that includes it also filters them out of its own `env` map loop (the
+ambient DaemonSet included), so an explicit `<workload>.env.FERRUM_ADMIN_*`
+entry reaches the container through `ferrum-mesh.resolveComponentAdmin` — which
+also normalizes a bracketed IPv6 bind — instead of being rendered twice or, if
+this helper skipped it, not at all.
 */}}
 {{- define "ferrum-mesh.adminEnv" -}}
-{{- $env := .env | default dict -}}
 {{- $resolved := .resolved -}}
-{{- if not (hasKey $env "FERRUM_ADMIN_HTTP_PORT") }}
 - name: FERRUM_ADMIN_HTTP_PORT
   value: {{ $resolved.port | quote }}
-{{- end }}
-{{- if not (hasKey $env "FERRUM_ADMIN_BIND_ADDRESS") }}
 - name: FERRUM_ADMIN_BIND_ADDRESS
   value: {{ $resolved.bind | quote }}
-{{- end }}
-{{- if and $resolved.allowInsecureHttp (not (hasKey $env "FERRUM_ALLOW_INSECURE_ADMIN_HTTP")) }}
+{{- if $resolved.allowInsecureHttp }}
 - name: FERRUM_ALLOW_INSECURE_ADMIN_HTTP
   value: "true"
 {{- end }}
 {{- $cidrs := trim ($resolved.allowedCidrs | toString) -}}
-{{- if and $cidrs (not (hasKey $env "FERRUM_ADMIN_ALLOWED_CIDRS")) }}
+{{- if $cidrs }}
 - name: FERRUM_ADMIN_ALLOWED_CIDRS
   value: {{ $cidrs | quote }}
 {{- end }}

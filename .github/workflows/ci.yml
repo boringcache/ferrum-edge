@@ -3317,6 +3317,16 @@ jobs:
             --set controlPlane.shutdownPreDrainSeconds=30 \
             --set controlPlane.terminationGracePeriodSeconds=115 \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-narrow-ipv6.yaml"
+          # A <workload>.env-supplied admin key must still reach the container.
+          # ferrum-mesh.adminEnv is the sole renderer of the four admin keys and
+          # the workload env loops filter them, so a resolver that skipped an
+          # env-supplied value would drop it from the PodSpec entirely.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.env.FERRUM_ADMIN_HTTP_PORT=19000 \
+            --set-string controlPlane.env.FERRUM_ADMIN_BIND_ADDRESS=0.0.0.0 \
+            --set-string controlPlane.env.FERRUM_ADMIN_ALLOWED_CIDRS=127.0.0.0/8 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-admin-env-override.yaml"
           python3 -I .github/scripts/verify_mesh_production_readiness.py \
             --results-dir "$RUNNER_TEMP/ferrum-helm-results"
 

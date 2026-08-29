@@ -646,9 +646,16 @@ spec:
             - name: FERRUM_MESH_PRODUCTION_MODE
               value: {{ $ambientSpireProductionMode | quote }}
             {{- end }}
+            {{- /* The four admin keys are rendered once, above, by
+                   `ferrum-mesh.adminEnv` from the resolved (and bracket-
+                   normalized) admin target, which already honors an explicit
+                   `ambient.env` entry. Re-emitting them here would duplicate the
+                   variable in this container's env list. */ -}}
             {{- range $name, $value := $ambientEnv }}
+            {{- if not (has $name (list "FERRUM_ADMIN_HTTP_PORT" "FERRUM_ADMIN_BIND_ADDRESS" "FERRUM_ALLOW_INSECURE_ADMIN_HTTP" "FERRUM_ADMIN_ALLOWED_CIDRS")) }}
             - name: {{ $name }}
               value: {{ $value | quote }}
+            {{- end }}
             {{- end }}
           volumeMounts:
             {{- /* Always mount the projected in-cluster credentials. Pod-level
