@@ -2364,8 +2364,8 @@ fn incremental_poll_rejects_missing_fields() {
     for field in ["sequence", "resource_type", "resource_id", "operation"] {
         let mut doc = well_formed_change_doc(1, "secret-resource-id", "upsert");
         doc.remove(field);
-        let error = decode_mongo_config_change_record(&doc)
-            .expect_err("missing field must abort the poll");
+        let error =
+            decode_mongo_config_change_record(&doc).expect_err("missing field must abort the poll");
         let message = error.to_string();
         if field == "sequence" {
             assert!(
