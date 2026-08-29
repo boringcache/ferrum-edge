@@ -50,9 +50,9 @@ pub const STATUS_UPDATE_BUDGET: Duration = Duration::from_secs(10);
 /// stalled Kubernetes status write can hold the serialized reconcile loop.
 ///
 /// Deliberately far below the Gateway API conformance suite's 60-second
-/// parent-status wait *and* below the lab's 15-second full-sync interval, so a
-/// stall costs at most one reconcile round rather than the observer's entire
-/// patience.
+/// parent-status wait *and* no longer than the lab's 15-second full-sync
+/// interval, so a stall costs at most one reconcile round rather than the
+/// observer's entire patience.
 pub const STATUS_BATCH_BUDGET: Duration = Duration::from_secs(15);
 
 /// Defensive outer timeout the reconciler still wraps a batch in. The batch

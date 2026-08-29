@@ -782,6 +782,12 @@ the timing is. Two causes look identical in the suite output:
   `ferrum_k8s_controller_status_request_timeouts_total`. Ferrum bounds this at
   15s per batch (issue #4239), well below the suite's wait, so it should no
   longer be able to fail a test on its own.
+- **A status plan racing object deletion.** A test can delete a Gateway or route
+  after Ferrum plans its status write but before the API request arrives. The
+  resulting 404 is terminal success for that status-only operation: no object
+  remains to retry. Ferrum skips the stale write and lets the fairness cursor
+  advance; retaining the cursor on that expected 404 would replay the same dead
+  window and starve live status updates behind it.
 - **A watch that stopped delivering.** The controller keeps reconciling with a
   frozen object set, so reconciles stay fast and the route never appears in any
   plan at all. Look for `ferrum_k8s_controller_watch_idle_relists_total` and the

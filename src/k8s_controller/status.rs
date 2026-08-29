@@ -167,17 +167,33 @@ impl GatewayApiStatusWriter {
         let mut stream = futures_util::stream::iter(futures)
             .buffer_unordered(GATEWAY_API_STATUS_PATCH_PARALLELISM);
         while let Some((kind, namespace, name, result)) = stream.next().await {
-            if let Err(error) = result {
-                warn!(
-                    %kind,
-                    %namespace,
-                    %name,
-                    error = %error,
-                    "Gateway API status patch failed"
-                );
-                if first_error.is_none() {
-                    first_error = Some(error);
+            match result {
+                Err(error) if gateway_api_status_error_is_not_found(&error) => {
+                    // Status plans race ordinary object deletion. Once the API
+                    // server proves the target is gone, there is nothing left
+                    // to retry: treating this expected terminal state as a
+                    // batch failure would pin the fairness cursor on a stale
+                    // object and starve every later status update.
+                    warn!(
+                        %kind,
+                        %namespace,
+                        %name,
+                        "Gateway API status object was not found; skipping stale write"
+                    );
                 }
+                Err(error) => {
+                    warn!(
+                        %kind,
+                        %namespace,
+                        %name,
+                        error = %error,
+                        "Gateway API status patch failed"
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                Ok(()) => {}
             }
         }
         let elapsed = started.elapsed();
@@ -249,11 +265,9 @@ async fn patch_gateway_status_with_apply(
         );
         return Err(missing_status_resource_version_error(update));
     };
-    let Some(patch) = gateway_status_apply_patch_for_update(
-        update,
-        live.data.get("status"),
-        resource_version,
-    ) else {
+    let Some(patch) =
+        gateway_status_apply_patch_for_update(update, live.data.get("status"), resource_version)
+    else {
         warn!(
             api_version = %update.api_version,
             kind = %update.kind,
@@ -409,6 +423,16 @@ fn policy_status_kind(kind: &str) -> bool {
 
 fn kube_error_is_conflict(error: &kube::Error) -> bool {
     matches!(error, kube::Error::Api(response) if response.code == 409)
+}
+
+/// Whether a Gateway API status target no longer exists.
+///
+/// Exposed for the external unit suite. A 404 is a terminal success for a
+/// status-only write: the deleted resource has no status left to publish, so it
+/// must not retain the status-plan cursor and starve live objects behind it.
+#[doc(hidden)]
+pub fn gateway_api_status_error_is_not_found(error: &kube::Error) -> bool {
+    matches!(error, kube::Error::Api(response) if response.code == 404)
 }
 
 fn route_status_retry_delay(attempt: usize) -> Duration {

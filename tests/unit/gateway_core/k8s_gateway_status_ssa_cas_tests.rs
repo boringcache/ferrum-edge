@@ -5,7 +5,8 @@
 //! precondition (`Patch::Apply` → `serde_json::to_vec`).
 
 use ferrum_edge::k8s_controller::status::{
-    GatewayApiStatusUpdate, gateway_status_apply_patch_for_update,
+    GatewayApiStatusUpdate, gateway_api_status_error_is_not_found,
+    gateway_status_apply_patch_for_update,
 };
 use serde_json::{Value, json};
 
@@ -62,12 +63,9 @@ fn cluster_scoped_gatewayclass_apply_carries_live_resource_version() {
 
 #[test]
 fn namespaced_gateway_apply_carries_live_resource_version() {
-    let patch = gateway_status_apply_patch_for_update(
-        &update("Gateway", "default", "edge"),
-        None,
-        "202",
-    )
-    .expect("non-empty resourceVersion must produce an apply document");
+    let patch =
+        gateway_status_apply_patch_for_update(&update("Gateway", "default", "edge"), None, "202")
+            .expect("non-empty resourceVersion must produce an apply document");
 
     assert_ssa_identity(&patch, "Gateway", "edge", Some("default"), "202");
 }
@@ -101,4 +99,17 @@ fn missing_resource_version_cannot_produce_an_unguarded_status_write() {
             .is_none(),
         "namespaced kinds must fail closed the same way"
     );
+}
+
+fn api_error(code: u16, reason: &str) -> kube::Error {
+    let mut status = kube::core::Status::failure("synthetic status error", reason);
+    status.code = code;
+    kube::Error::Api(status.boxed())
+}
+
+#[test]
+fn deleted_status_target_is_terminal_but_other_api_errors_retry() {
+    assert!(gateway_api_status_error_is_not_found(&api_error(404, "NotFound")));
+    assert!(!gateway_api_status_error_is_not_found(&api_error(409, "Conflict")));
+    assert!(!gateway_api_status_error_is_not_found(&api_error(504, "Timeout")));
 }
