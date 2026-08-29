@@ -294,6 +294,7 @@ struct LoadTestHarness {
     admin_base_url: String,
     jwt_secret: String,
     jwt_issuer: String,
+    observability_token: String,
     proxy_port: u16,
     backend_port: u16,
     db_label: String,
@@ -377,8 +378,10 @@ impl LoadTestHarness {
         db_label: &str,
         enable_http2: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let jwt_secret = "load-test-secret-key-9876567890ab".to_string();
-        let jwt_issuer = "ferrum-edge-load-test".to_string();
+        let identity = crate::common::SpawnedGatewayIdentity::mint("load-stress");
+        let jwt_secret = identity.jwt_secret.clone();
+        let jwt_issuer = identity.jwt_issuer.clone();
+        let observability_token = identity.observability_token.clone();
         let basic_auth_hmac_secret = "load-test-hmac-secret-54321-0123456789".to_string();
 
         let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -435,10 +438,8 @@ impl LoadTestHarness {
             }
         }
 
-        let child = Command::new(binary_path)
-            .env("FERRUM_MODE", "database")
-            .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
+        let mut cmd = Command::new(binary_path);
+        cmd.env("FERRUM_MODE", "database")
             .env(
                 "FERRUM_ADMIN_JWT_MAX_TTL",
                 scheduled_scaling_admin_jwt_max_ttl_value(),
@@ -487,8 +488,9 @@ impl LoadTestHarness {
             .env("FERRUM_HTTP3_STREAM_RECEIVE_WINDOW", "8388608")
             .env("FERRUM_HTTP3_RECEIVE_WINDOW", "33554432")
             .env("FERRUM_HTTP3_SEND_WINDOW", "8388608")
-            .env("FERRUM_LOG_LEVEL", "error")
-            .spawn()?;
+            .env("FERRUM_LOG_LEVEL", "error");
+        identity.apply_to_command(&mut cmd);
+        let child = cmd.spawn()?;
 
         let proxy_base_url = format!("http://127.0.0.1:{}", proxy_port);
         let admin_base_url = format!("http://127.0.0.1:{}", admin_port);
@@ -500,6 +502,7 @@ impl LoadTestHarness {
             admin_base_url,
             jwt_secret,
             jwt_issuer,
+            observability_token,
             proxy_port,
             backend_port,
             db_label: db_label.to_string(),
@@ -526,10 +529,11 @@ impl LoadTestHarness {
             .next()
             .ok_or("admin_base_url missing port")?
             .parse()?;
-        let identity = crate::common::SpawnedGatewayIdentity::from_admin_jwt(
-            self.jwt_secret.clone(),
-            self.jwt_issuer.clone(),
-        );
+        let identity = crate::common::SpawnedGatewayIdentity {
+            jwt_secret: self.jwt_secret.clone(),
+            jwt_issuer: self.jwt_issuer.clone(),
+            observability_token: self.observability_token.clone(),
+        };
         let child = self
             .gateway_process
             .as_mut()

@@ -1237,6 +1237,7 @@ const SCRUB_DEFAULTS: &[&str] = &[
 ///
 /// The admin JWT secret is always at least 32 characters (the repository
 /// minimum for `FERRUM_ADMIN_JWT_SECRET`).
+#[derive(Clone)]
 pub struct SpawnedGatewayIdentity {
     pub jwt_secret: String,
     pub jwt_issuer: String,
@@ -1257,22 +1258,6 @@ impl SpawnedGatewayIdentity {
             jwt_secret,
             jwt_issuer: format!("ferrum-edge-{label}-{nonce}"),
             observability_token: format!("ferrum-edge-{label}-probe-{nonce}"),
-        }
-    }
-
-    /// Reuse a harness that already has a per-instance admin JWT, and mint a
-    /// unique metrics bearer so `/health` readiness is still authenticated.
-    pub fn from_admin_jwt(secret: impl Into<String>, issuer: impl Into<String>) -> Self {
-        let jwt_secret = secret.into();
-        debug_assert!(
-            jwt_secret.len() >= 32,
-            "admin JWT secret must satisfy the repository minimum"
-        );
-        let nonce = Uuid::new_v4().simple().to_string();
-        Self {
-            jwt_secret,
-            jwt_issuer: issuer.into(),
-            observability_token: format!("ferrum-edge-harness-probe-{nonce}"),
         }
     }
 
@@ -1676,14 +1661,19 @@ fn fail_if_child_exited(
     admin_port: u16,
     last_observation: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Ok(Some(status)) = child.try_wait() {
-        return Err(format!(
+    match child.try_wait() {
+        Ok(None) => Ok(()),
+        Ok(Some(status)) => Err(format!(
             "gateway process exited with {status} before proving ownership of admin \
              port {admin_port} (last observation: {last_observation})"
         )
-        .into());
+        .into()),
+        Err(err) => Err(format!(
+            "could not confirm gateway process is still alive on admin port {admin_port} \
+             (try_wait failed: {err}; last observation: {last_observation})"
+        )
+        .into()),
     }
-    Ok(())
 }
 
 /// Ownership probe without a child handle — for callers that only hold the
@@ -1774,16 +1764,18 @@ async fn wait_for_admin_auth_inner(
             .send()
             .await
         {
-            Ok(r) if r.status().as_u16() != 401 => {
-                last_observation = format!("HTTP {}", r.status());
-                if let Some(child) = child.as_deref_mut() {
-                    fail_if_child_exited(child, admin_port, &last_observation)?;
-                }
-                return Ok(());
-            }
             Ok(r) => {
                 let status = r.status();
-                let _ = r.text().await;
+                // Drain the body so the connection can close, but never echo it:
+                // a foreign listener may be serving another test's admin data.
+                let _ = r.bytes().await;
+                if status.as_u16() == 200 {
+                    last_observation = "HTTP 200 on GET /proxies".to_string();
+                    if let Some(child) = child.as_deref_mut() {
+                        fail_if_child_exited(child, admin_port, &last_observation)?;
+                    }
+                    return Ok(());
+                }
                 last_observation = format!("HTTP {status} on GET /proxies");
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
@@ -2121,6 +2113,9 @@ mod ownership_proof_tests {
         /// Full `/health` detail for every caller (CIDR grant) and 401 on
         /// JWT-only `GET /proxies`.
         CidrHealthJwtRejected,
+        /// Full `/health` detail (CIDR grant) and a non-401 non-success
+        /// `GET /proxies` — must not count as JWT ownership.
+        CidrHealthProxiesNonSuccess,
         /// Full `/health` detail after SIGKILL of `pid`, then 200 on `/proxies`.
         #[cfg(unix)]
         KillChildThenHealth { pid: u32 },
@@ -2164,6 +2159,9 @@ mod ownership_proof_tests {
                             FakeAdminBehavior::CidrHealthJwtRejected => {
                                 r#"{"error":"Token verification failed: InvalidSignature"}"#
                             }
+                            FakeAdminBehavior::CidrHealthProxiesNonSuccess => {
+                                r#"{"error":"internal"}"#
+                            }
                             #[cfg(unix)]
                             FakeAdminBehavior::KillChildThenHealth { .. } => "[]",
                         }
@@ -2173,6 +2171,9 @@ mod ownership_proof_tests {
                     let status = if is_proxies {
                         match &behavior {
                             FakeAdminBehavior::CidrHealthJwtRejected => "401 Unauthorized",
+                            FakeAdminBehavior::CidrHealthProxiesNonSuccess => {
+                                "500 Internal Server Error"
+                            }
                             #[cfg(unix)]
                             FakeAdminBehavior::KillChildThenHealth { .. } => "200 OK",
                         }
@@ -2229,6 +2230,53 @@ mod ownership_proof_tests {
         let _ = child.kill();
         let _ = child.wait();
         listener.abort();
+    }
+
+    #[tokio::test]
+    async fn jwt_ownership_rejects_non_success_foreign_proxies() {
+        let (port, listener) =
+            spawn_fake_admin(FakeAdminBehavior::CidrHealthProxiesNonSuccess).await;
+        let identity = SpawnedGatewayIdentity::mint("proxies-non-success");
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn live child");
+
+        let err =
+            wait_for_owned_gateway_identity(&mut child, port, &identity, Duration::from_secs(2))
+                .await
+                .expect_err("HTTP 500 on GET /proxies must not satisfy JWT ownership");
+        let err = err.to_string();
+        assert!(
+            err.contains("GET /proxies") && err.contains("500"),
+            "error should name the unsuccessful JWT proof, got: {err}"
+        );
+        assert!(
+            !err.contains(&identity.jwt_secret) && !err.contains(&identity.observability_token),
+            "diagnostics must not echo credentials: {err}"
+        );
+        assert!(
+            !err.contains("internal"),
+            "diagnostics must not echo the foreign response body: {err}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        listener.abort();
+    }
+
+    #[test]
+    fn mint_produces_unique_admin_credentials_per_call() {
+        let a = SpawnedGatewayIdentity::mint("shared-harness");
+        let b = SpawnedGatewayIdentity::mint("shared-harness");
+        assert_ne!(a.jwt_secret, b.jwt_secret);
+        assert_ne!(a.jwt_issuer, b.jwt_issuer);
+        assert_ne!(a.observability_token, b.observability_token);
+        assert!(a.jwt_secret.len() >= 32);
+        assert!(b.jwt_secret.len() >= 32);
     }
 
     #[tokio::test]

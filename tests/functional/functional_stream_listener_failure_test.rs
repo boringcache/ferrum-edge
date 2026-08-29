@@ -30,8 +30,6 @@
 //! TODO: add a DP-mode bind-failure case if/when the CP test harness is
 //! refactored to allow injecting a bad-port proxy from an in-process CP.
 
-use chrono::Utc;
-use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -41,14 +39,14 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
-use uuid::Uuid;
 
 // ============================================================================
 // Shared helpers
 // ============================================================================
 
-const JWT_SECRET: &str = "stream-listener-test-jwt-secret-0123456789";
-const JWT_ISSUER: &str = "ferrum-edge-stream-listener-test";
+fn mint_stream_listener_db_identity() -> crate::common::SpawnedGatewayIdentity {
+    crate::common::SpawnedGatewayIdentity::mint("stream-listener-db")
+}
 
 fn gateway_binary_path() -> &'static str {
     if std::path::Path::new("./target/debug/ferrum-edge").exists() {
@@ -58,26 +56,6 @@ fn gateway_binary_path() -> &'static str {
     } else {
         panic!("ferrum-edge binary not found. Run `cargo build --bin ferrum-edge` first.");
     }
-}
-
-fn admin_jwt() -> String {
-    let now = Utc::now();
-    let claims = json!({
-        "iss": JWT_ISSUER,
-        "sub": "stream-listener-test-admin",
-        "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
-        "jti": Uuid::new_v4().to_string(),
-    });
-    let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret(JWT_SECRET.as_bytes());
-    encode(&header, &claims, &key).expect("encode admin JWT")
-}
-
-fn auth_header() -> String {
-    format!("Bearer {}", admin_jwt())
 }
 
 /// Bind an ephemeral port then drop the listener. Vulnerable to races — only
@@ -198,12 +176,17 @@ async fn port_is_bound(port: u16) -> bool {
 struct DbHarness {
     _temp_dir: TempDir,
     gateway_process: Option<Child>,
+    identity: crate::common::SpawnedGatewayIdentity,
     admin_base_url: String,
     admin_port: u16,
     _proxy_port: u16,
 }
 
 impl DbHarness {
+    fn auth_header(&self) -> String {
+        self.identity.auth_header()
+    }
+
     async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         const MAX_ATTEMPTS: u32 = 3;
         let mut last_err = String::new();
@@ -234,8 +217,7 @@ impl DbHarness {
 
         let admin_port = ephemeral_port().await;
         let proxy_port = ephemeral_port().await;
-        let identity =
-            crate::common::SpawnedGatewayIdentity::from_admin_jwt(JWT_SECRET, JWT_ISSUER);
+        let identity = mint_stream_listener_db_identity();
 
         let db_url = format!(
             "sqlite:{}?mode=rwc",
@@ -264,6 +246,7 @@ impl DbHarness {
         Ok(Self {
             _temp_dir: temp_dir,
             gateway_process: Some(child),
+            identity,
             admin_base_url: format!("http://127.0.0.1:{}", admin_port),
             admin_port,
             _proxy_port: proxy_port,
@@ -278,6 +261,23 @@ impl Drop for DbHarness {
             let _ = c.wait();
         }
     }
+}
+
+#[test]
+fn db_harness_mints_unique_admin_identity_per_attempt() {
+    let a = mint_stream_listener_db_identity();
+    let b = mint_stream_listener_db_identity();
+    assert_ne!(
+        a.jwt_secret, b.jwt_secret,
+        "DbHarness spawn identity must not share a static admin JWT secret"
+    );
+    assert_ne!(
+        a.jwt_issuer, b.jwt_issuer,
+        "DbHarness spawn identity must not share a static admin JWT issuer"
+    );
+    assert_ne!(a.observability_token, b.observability_token);
+    assert!(a.jwt_secret.len() >= 32);
+    assert!(b.jwt_secret.len() >= 32);
 }
 
 // ============================================================================
@@ -300,7 +300,7 @@ async fn functional_stream_listener_reserved_port_rejected() {
 
     let resp = client
         .post(format!("{}/proxies", harness.admin_base_url))
-        .header("Authorization", auth_header())
+        .header("Authorization", harness.auth_header())
         .json(&body)
         .send()
         .await
@@ -341,7 +341,7 @@ async fn functional_stream_listener_duplicate_port_same_namespace() {
 
     let resp_a = client
         .post(format!("{}/proxies", harness.admin_base_url))
-        .header("Authorization", auth_header())
+        .header("Authorization", harness.auth_header())
         .json(&sample_stream_proxy("dup-a", shared_port, 9001))
         .send()
         .await
@@ -355,7 +355,7 @@ async fn functional_stream_listener_duplicate_port_same_namespace() {
 
     let resp_b = client
         .post(format!("{}/proxies", harness.admin_base_url))
-        .header("Authorization", auth_header())
+        .header("Authorization", harness.auth_header())
         .json(&sample_stream_proxy("dup-b", shared_port, 9002))
         .send()
         .await
@@ -393,7 +393,7 @@ async fn functional_stream_listener_duplicate_port_different_namespaces() {
     // Namespace "foo" — succeeds.
     let resp_a = client
         .post(format!("{}/proxies", harness.admin_base_url))
-        .header("Authorization", auth_header())
+        .header("Authorization", harness.auth_header())
         .header("X-Ferrum-Namespace", "foo")
         .json(&sample_stream_proxy("ns-foo-tcp", shared_port, 9001))
         .send()
@@ -414,7 +414,7 @@ async fn functional_stream_listener_duplicate_port_different_namespaces() {
     // not become a false same-port peer.
     let resp_b = client
         .post(format!("{}/proxies", harness.admin_base_url))
-        .header("Authorization", auth_header())
+        .header("Authorization", harness.auth_header())
         .header("X-Ferrum-Namespace", "bar")
         .json(&sample_stream_proxy("ns-bar-tcp", shared_port, 9002))
         .send()
@@ -473,12 +473,12 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
     // shard, and a one-shot health wait is not the fatal-bind assertion.
     const SEED_ATTEMPTS: u32 = 3;
     let mut seed_gw = None;
+    let mut seed_identity = None;
     let mut admin_port_seed = 0u16;
     for attempt in 1..=SEED_ATTEMPTS {
         admin_port_seed = ephemeral_port().await;
         let proxy_port_seed = ephemeral_port().await;
-        let identity =
-            crate::common::SpawnedGatewayIdentity::from_admin_jwt(JWT_SECRET, JWT_ISSUER);
+        let identity = mint_stream_listener_db_identity();
         let mut cmd = Command::new(gateway_binary_path());
         cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
@@ -497,6 +497,7 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
             .is_ok()
         {
             seed_gw = Some(child);
+            seed_identity = Some(identity);
             break;
         }
         kill_child(&mut child);
@@ -506,13 +507,14 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
         sleep(Duration::from_secs(1)).await;
     }
     let mut seed_gw = seed_gw.expect("seed gateway");
+    let seed_identity = seed_identity.expect("seed identity");
 
     let stream_listen_port = ephemeral_port().await;
 
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("http://127.0.0.1:{}/proxies", admin_port_seed))
-        .header("Authorization", auth_header())
+        .header("Authorization", seed_identity.auth_header())
         .json(&sample_stream_proxy(
             "bind-failure-tcp",
             stream_listen_port,
@@ -543,22 +545,23 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
     let admin_port_retry = ephemeral_port().await;
     let proxy_port_retry = ephemeral_port().await;
 
+    let retry_identity = mint_stream_listener_db_identity();
     #[allow(clippy::zombie_processes)]
-    let mut child = Command::new(gateway_binary_path())
-        .env("FERRUM_MODE", "database")
-        .env("FERRUM_ADMIN_JWT_SECRET", JWT_SECRET)
-        .env("FERRUM_ADMIN_JWT_ISSUER", JWT_ISSUER)
-        .env("FERRUM_DB_TYPE", "sqlite")
-        .env("FERRUM_DB_URL", &db_url)
-        .env("FERRUM_DB_POLL_INTERVAL", "2")
-        .env("FERRUM_PROXY_HTTP_PORT", proxy_port_retry.to_string())
-        .env("FERRUM_ADMIN_HTTP_PORT", admin_port_retry.to_string())
-        .env("FERRUM_LOG_LEVEL", "info")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped()) // we need stderr to confirm the bind failure
-        .spawn()
-        .expect("spawn test gateway");
+    let mut child = {
+        let mut cmd = Command::new(gateway_binary_path());
+        cmd.env("FERRUM_MODE", "database")
+            .env("FERRUM_DB_TYPE", "sqlite")
+            .env("FERRUM_DB_URL", &db_url)
+            .env("FERRUM_DB_POLL_INTERVAL", "2")
+            .env("FERRUM_PROXY_HTTP_PORT", proxy_port_retry.to_string())
+            .env("FERRUM_ADMIN_HTTP_PORT", admin_port_retry.to_string())
+            .env("FERRUM_LOG_LEVEL", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()); // we need stderr to confirm the bind failure
+        retry_identity.apply_to_command(&mut cmd);
+        cmd.spawn().expect("spawn test gateway")
+    };
 
     // Wait up to 15s for the process to exit. It must exit non-zero because
     // the stream listener cannot bind its port.
