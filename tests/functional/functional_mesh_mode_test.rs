@@ -11881,6 +11881,10 @@ impl Drop for LiveNetnsUdpEcho {
 async fn start_counting_udp_echo(
     bind_ip: std::net::Ipv4Addr,
 ) -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    assert!(
+        !bind_ip.is_loopback(),
+        "Ambient host-UDP echo must not bind loopback; Sidecar alone has that namespace authority"
+    );
     let socket = tokio::net::UdpSocket::bind((bind_ip, 0))
         .await
         .expect("bind live source-capture UDP echo");
@@ -12690,6 +12694,49 @@ impl Drop for LiveHostUdpVethPod {
     }
 }
 
+/// Host-netns IPv4 that is local via `lo` but not in the loopback namespace.
+///
+/// Destination Ambient UDP relay must dial a terminator-owned non-loopback
+/// address. Attaching that address to `lo` keeps delivery inside the host
+/// netns so the datagram never appears on a captured pod veth, where host-UDP
+/// TPROXY would intercept it before the echo socket.
+#[cfg(target_os = "linux")]
+struct LiveHostLocalNonLoopbackV4 {
+    ip: std::net::Ipv4Addr,
+}
+
+#[cfg(target_os = "linux")]
+impl LiveHostLocalNonLoopbackV4 {
+    fn install(ip: std::net::Ipv4Addr) -> Result<Self, String> {
+        if ip.is_loopback() {
+            return Err(format!(
+                "refusing to install loopback {ip} as Ambient host-UDP echo authority"
+            ));
+        }
+        let spec = format!("{ip}/32");
+        let status = Command::new("ip")
+            .args(["addr", "add", &spec, "dev", "lo"])
+            .status()
+            .map_err(|error| format!("add host-local echo address {spec} on lo: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "add host-local echo address {spec} on lo failed with {status}"
+            ));
+        }
+        Ok(Self { ip })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LiveHostLocalNonLoopbackV4 {
+    fn drop(&mut self) {
+        let spec = format!("{}/32", self.ip);
+        let _ = Command::new("ip")
+            .args(["addr", "del", &spec, "dev", "lo"])
+            .status();
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn seed_host_udp_placement_state(
     registry_dir: &std::path::Path,
@@ -12885,11 +12932,38 @@ async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
     let temp_a = TempDir::new().expect("gateway A tempdir");
     let temp_b = TempDir::new().expect("gateway B tempdir");
     let svids = generate_two_gateway_svids(temp_b.path(), a_spiffe, echo_spiffe);
-    // The destination Ambient proxy runs in the host network namespace, so
-    // loopback is deliberately not workload authority. Bind the fixture to a
-    // real non-loopback veth address and advertise that exact workload address.
-    let echo_address = pod_a.host_v4.to_string();
-    let (echo_port, _echo_received, echo_task) = start_counting_udp_echo(pod_a.host_v4).await;
+    // Destination Ambient runs in the host netns and must not use loopback
+    // authority. Binding the echo to a source-pod veth /32 is also wrong:
+    // the destination relay's connect() can egress that captured interface,
+    // host-UDP TPROXY intercepts the datagram, and the client recv times out
+    // with EAGAIN. Attach a TEST-NET IPv4 to lo so delivery stays host-local.
+    const ECHO_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 0, 2, 80);
+    let _echo_local = match LiveHostLocalNonLoopbackV4::install(ECHO_V4) {
+        Ok(addr) => addr,
+        Err(error) => {
+            skip_or_fail_live_source_capture(&format!(
+                "cannot install host-local non-loopback echo address: {error}"
+            ));
+            return;
+        }
+    };
+    assert!(
+        !ECHO_V4.is_loopback(),
+        "Ambient host-UDP echo authority must stay outside the loopback namespace"
+    );
+    for (label, ip) in [
+        ("pod A host veth", pod_a.host_v4),
+        ("pod A pod IP", pod_a.pod_v4),
+        ("pod B host veth", pod_b.host_v4),
+        ("pod B pod IP", pod_b.pod_v4),
+    ] {
+        assert_ne!(
+            ECHO_V4, ip,
+            "Ambient host-UDP echo authority must not be the captured {label} address"
+        );
+    }
+    let echo_address = ECHO_V4.to_string();
+    let (echo_port, _echo_received, echo_task) = start_counting_udp_echo(ECHO_V4).await;
     let node_a = "functional-live-host-udp-a";
     let node_b = "functional-live-host-udp-b";
     let mut slice_a = live_source_capture_slice(
