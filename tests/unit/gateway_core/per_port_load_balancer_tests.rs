@@ -946,6 +946,7 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port() {
             upstream_id: "test-upstream".to_string(),
             host: targets[0].host.clone(),
             port: targets[0].port,
+            consecutive_generation: None,
         },
     );
     proxy_state.unhealthy.insert(
@@ -957,6 +958,7 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port() {
             upstream_id: "test-upstream".to_string(),
             host: targets[1].host.clone(),
             port: targets[1].port,
+            consecutive_generation: None,
         },
     );
 
@@ -1046,6 +1048,7 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port_vec_path() {
             upstream_id: "test-upstream".to_string(),
             host: targets[0].host.clone(),
             port: targets[0].port,
+            consecutive_generation: None,
         },
     );
     proxy_state.unhealthy.insert(
@@ -1057,6 +1060,7 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port_vec_path() {
             upstream_id: "test-upstream".to_string(),
             host: targets[1].host.clone(),
             port: targets[1].port,
+            consecutive_generation: None,
         },
     );
 
@@ -1413,6 +1417,7 @@ fn passive_ctx_ejecting<'a>(
                 upstream_id: "test-upstream".to_string(),
                 host: t.host.clone(),
                 port: t.port,
+                consecutive_generation: None,
             },
         );
     }

@@ -2168,6 +2168,7 @@ fn ejection_cap_readmits_when_too_many_passively_ejected() {
             upstream_id: TEST_UPSTREAM.to_string(),
             host: targets[0].host.clone(),
             port: targets[0].port,
+            consecutive_generation: None,
         },
     );
     proxy_passive.unhealthy.insert(
@@ -2179,6 +2180,7 @@ fn ejection_cap_readmits_when_too_many_passively_ejected() {
             upstream_id: TEST_UPSTREAM.to_string(),
             host: targets[1].host.clone(),
             port: targets[1].port,
+            consecutive_generation: None,
         },
     );
     proxy_passive.unhealthy.insert(
@@ -2190,6 +2192,7 @@ fn ejection_cap_readmits_when_too_many_passively_ejected() {
             upstream_id: TEST_UPSTREAM.to_string(),
             host: targets[2].host.clone(),
             port: targets[2].port,
+            consecutive_generation: None,
         },
     );
 
@@ -2471,6 +2474,7 @@ fn passthrough_ejection_cap_scoped_to_candidate_pool_not_whole_upstream() {
                     upstream_id: "test-upstream".to_string(),
                     host: t.host.clone(),
                     port: t.port,
+                    consecutive_generation: None,
                 },
             );
         }

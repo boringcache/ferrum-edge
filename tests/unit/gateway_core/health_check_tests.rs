@@ -42,6 +42,19 @@ fn is_passive_unhealthy(checker: &HealthChecker, proxy_id: &str, host_port: &str
         .is_some_and(|ps| ps.unhealthy.contains_key(host_port))
 }
 
+fn consecutive_ejection_generation(
+    checker: &HealthChecker,
+    proxy_id: &str,
+    host_port: &str,
+) -> Option<u64> {
+    checker
+        .passive_health
+        .get(&rk(proxy_id))?
+        .unhealthy
+        .get(host_port)
+        .and_then(|ejection| ejection.consecutive_generation)
+}
+
 /// Count total passive unhealthy entries across all proxies.
 fn passive_unhealthy_count(checker: &HealthChecker) -> usize {
     checker
@@ -2562,5 +2575,249 @@ fn consecutive_mode_success_wins_over_stale_threshold_insert() {
     assert!(
         is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
         "a fresh consecutive streak after the interleaved success must still eject"
+    );
+}
+
+/// F1 publishes at generation G, then a later success plus a complete
+/// post-success streak publish generation G+1 before F1's stale retract.
+/// Retract must use the owned generation token and leave G+1 in place.
+#[test]
+fn consecutive_mode_stale_cleanup_cannot_retract_fresh_post_success_ejection() {
+    let checker = Arc::new(HealthChecker::new());
+    let target = make_target("backend1", 8080);
+    let config = consecutive_policy(5);
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 4);
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "must not eject below the consecutive threshold"
+    );
+
+    let checker_for_hook = Arc::clone(&checker);
+    let target_for_hook = target.clone();
+    let config_for_hook = config.clone();
+    let mut hook_saw_new_generation = false;
+    let mut hook = || {
+        assert!(
+            is_passive_unhealthy(&checker_for_hook, TEST_PROXY, "backend1:8080"),
+            "F1 must have published before the interleaving hook"
+        );
+        assert_eq!(
+            consecutive_ejection_generation(&checker_for_hook, TEST_PROXY, "backend1:8080"),
+            Some(0),
+            "F1 owns generation 0"
+        );
+
+        checker_for_hook.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target_for_hook,
+            200,
+            false,
+            Some(&config_for_hook),
+        );
+        report_failures(
+            &checker_for_hook,
+            TEST_PROXY,
+            &target_for_hook,
+            &config_for_hook,
+            5,
+        );
+        assert!(
+            is_passive_unhealthy(&checker_for_hook, TEST_PROXY, "backend1:8080"),
+            "the fresh post-success streak must publish a newer ejection"
+        );
+        assert_eq!(
+            consecutive_ejection_generation(&checker_for_hook, TEST_PROXY, "backend1:8080"),
+            Some(1),
+            "the newer ejection must carry generation 1"
+        );
+        hook_saw_new_generation = true;
+    };
+    checker.report_response_with_after_consecutive_ejection_insert_hook_for_test(
+        DEFAULT_NAMESPACE,
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+        &mut hook,
+    );
+
+    assert!(
+        hook_saw_new_generation,
+        "the insert hook must run so the race is deterministic"
+    );
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "stale F1 cleanup must not retract a fresh post-success ejection"
+    );
+    assert_eq!(
+        consecutive_ejection_generation(&checker, TEST_PROXY, "backend1:8080"),
+        Some(1),
+        "the live ejection must still be the post-success generation"
+    );
+}
+
+/// Threshold 1: a failure CAS-increments, then a success retires that
+/// generation before publication. Linearizable order is failure-then-success:
+/// no ejection, packed streak 0. The two-atomic sequence could leave streak 1
+/// while suppressing the failure as stale.
+#[test]
+fn consecutive_mode_overlapping_success_does_not_leave_orphan_streak_at_threshold_one() {
+    let checker = Arc::new(HealthChecker::new());
+    let target = make_target("backend1", 8080);
+    let config = consecutive_policy(1);
+
+    let checker_for_hook = Arc::clone(&checker);
+    let target_for_hook = target.clone();
+    let config_for_hook = config.clone();
+    let mut hook = || {
+        checker_for_hook.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target_for_hook,
+            200,
+            false,
+            Some(&config_for_hook),
+        );
+    };
+    checker.report_response_with_after_consecutive_failure_count_hook_for_test(
+        DEFAULT_NAMESPACE,
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+        &mut hook,
+    );
+
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "success linearized after the overlapping failure must not leave an ejection"
+    );
+    assert_eq!(
+        checker.consecutive_failures_for_test(DEFAULT_NAMESPACE, TEST_PROXY, "backend1:8080"),
+        0,
+        "packed CAS must not leave streak 1 after the success retired that generation"
+    );
+}
+
+/// Success retires generation G, then a fresh threshold streak publishes G+1
+/// before success `remove_if`. Cleanup must not delete the newer token.
+#[test]
+fn consecutive_mode_success_cleanup_cannot_retract_fresh_post_success_ejection() {
+    let checker = Arc::new(HealthChecker::new());
+    let target = make_target("backend1", 8080);
+    let config = consecutive_policy(1);
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 1);
+    assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+    assert_eq!(
+        consecutive_ejection_generation(&checker, TEST_PROXY, "backend1:8080"),
+        Some(0)
+    );
+
+    let checker_for_hook = Arc::clone(&checker);
+    let target_for_hook = target.clone();
+    let config_for_hook = config.clone();
+    let mut hook = || {
+        report_failures(
+            &checker_for_hook,
+            TEST_PROXY,
+            &target_for_hook,
+            &config_for_hook,
+            1,
+        );
+        assert_eq!(
+            consecutive_ejection_generation(&checker_for_hook, TEST_PROXY, "backend1:8080"),
+            Some(1),
+            "the post-success failure must publish generation 1 before success cleanup"
+        );
+    };
+    checker.report_response_with_after_consecutive_success_reset_hook_for_test(
+        DEFAULT_NAMESPACE,
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        200,
+        false,
+        Some(&config),
+        &mut hook,
+    );
+
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "success cleanup must not retract a newer generation"
+    );
+    assert_eq!(
+        consecutive_ejection_generation(&checker, TEST_PROXY, "backend1:8080"),
+        Some(1)
+    );
+}
+
+/// Timer snapshots a due generation-0 ejection, then a success plus a fresh
+/// streak publish generation 1 with the same backdated deadline. Deadline
+/// equality alone would delete the newer record; the generation token must
+/// keep it.
+#[test]
+fn consecutive_mode_timer_recovery_cannot_retract_fresh_post_success_ejection() {
+    let checker = Arc::new(HealthChecker::new());
+    let target = make_target("backend1", 8080);
+    let config = consecutive_policy(5);
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 5);
+    assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+    {
+        let ps = checker.passive_health.get(&rk(TEST_PROXY)).unwrap();
+        ps.unhealthy.get_mut("backend1:8080").unwrap().recover_at_ms = 1;
+    }
+    assert_eq!(
+        consecutive_ejection_generation(&checker, TEST_PROXY, "backend1:8080"),
+        Some(0)
+    );
+
+    let checker_for_hook = Arc::clone(&checker);
+    let target_for_hook = target.clone();
+    let config_for_hook = config.clone();
+    let mut hook = || {
+        checker_for_hook.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target_for_hook,
+            200,
+            false,
+            Some(&config_for_hook),
+        );
+        report_failures(
+            &checker_for_hook,
+            TEST_PROXY,
+            &target_for_hook,
+            &config_for_hook,
+            5,
+        );
+        {
+            let ps = checker_for_hook.passive_health.get(&rk(TEST_PROXY)).unwrap();
+            ps.unhealthy.get_mut("backend1:8080").unwrap().recover_at_ms = 1;
+        }
+        assert_eq!(
+            consecutive_ejection_generation(&checker_for_hook, TEST_PROXY, "backend1:8080"),
+            Some(1)
+        );
+    };
+    checker.recover_due_passive_ejections_with_after_scan_hook_for_test(&mut hook);
+
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "timer recovery must not retract a newer generation with the same deadline"
+    );
+    assert_eq!(
+        consecutive_ejection_generation(&checker, TEST_PROXY, "backend1:8080"),
+        Some(1)
     );
 }
