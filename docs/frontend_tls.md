@@ -567,6 +567,17 @@ selection key, and SHA-1 remains admitted there. See
 [`docs/fips.md`](fips.md). Outside enforcement nothing changes, so ordinary
 deployments keep interoperating with responders that still sign with SHA-1.
 
+**Freshness is checked when the material is loaded, not per handshake.** The
+validity window above is evaluated while the `ServerConfig` candidate is being
+built — at startup, at config reload, and when a watched OCSP source's bytes
+change. An accepted staple is then served unchanged until one of those events
+happens again, so a response that passes `nextUpdate` while the gateway is
+running keeps being stapled. Refresh the OCSP source before `nextUpdate`
+elapses: with `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true` a file or provider
+source is re-read and re-validated as soon as its bytes change, and rewriting
+the source with a stale or otherwise invalid response is rejected while the
+previous known-good material keeps serving.
+
 **Diagnostics.** Rejections name the redacted source identifier and the
 structural reason. They never contain certificate bytes, response bytes, private
 material, or a secret source reference.

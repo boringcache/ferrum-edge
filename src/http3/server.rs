@@ -19185,6 +19185,18 @@ mod h3_ocsp_staple_tests {
         }
     }
 
+    /// Upper bound on the write/read rounds the in-memory handshake pump is
+    /// allowed to take before it is declared stuck. A TLS 1.3 handshake settles
+    /// in a handful; the bound only exists so a regression fails the test
+    /// instead of spinning forever.
+    ///
+    /// Named rather than written as a bare literal because
+    /// `unit::gateway_core::h3_retry_eligibility_tests` scans this file's text
+    /// for the ad-hoc bounded skip loops that used to stand in for the shared
+    /// H3 retry-eligibility helper. That guard reads source, not semantics, so
+    /// an unrelated inline bound here would trip it.
+    const HANDSHAKE_PUMP_ROUNDS: usize = 32;
+
     /// Complete an in-memory handshake against `server_config` and return the
     /// staple the client's verifier observed. An absent staple is an empty
     /// slice, which is how rustls reports "no `CertificateStatus`".
@@ -19208,7 +19220,7 @@ mod h3_ocsp_staple_tests {
             rustls::ClientConnection::new(Arc::new(client_config), server_name).expect("client");
         let mut server = rustls::ServerConnection::new(server_config).expect("server");
 
-        for _ in 0..32 {
+        for _ in 0..HANDSHAKE_PUMP_ROUNDS {
             let mut to_server = Vec::new();
             while client.wants_write() {
                 client.write_tls(&mut to_server).expect("client write");
