@@ -210,11 +210,11 @@ def validate_serving_podspecs(results_dir: Path) -> None:
         "Ambient capabilities.drop ALL missing",
         "ambient must drop unquoted ALL so the add list is the complete privilege surface",
     )
-    forbid_text(
+    require_text(
         ambient,
-        "allowPrivilegeEscalation",
-        "Ambient proxy inherited preflight privilege-escalation",
-        "the steady-state ambient proxy must not emit allowPrivilegeEscalation; that field is the UDP preflight init container's privilege surface",
+        "allowPrivilegeEscalation: false",
+        "Ambient Restricted allowPrivilegeEscalation missing",
+        "the steady-state ambient proxy must set allowPrivilegeEscalation: false (Restricted); omitting it lets Kubernetes default permissively",
     )
     forbid_text(
         ambient,
@@ -319,22 +319,6 @@ def validate_refusals(results_dir: Path) -> None:
         fail(
             "Empty resources refusal missing",
             "empty serving requests.cpu/memory must fail closed (BestEffort QoS)",
-        )
-    esc = require_capture(
-        results_dir, "mesh-prod-ambient-privilege-escalation.err"
-    ).read_text(encoding="utf-8")
-    if "allowPrivilegeEscalation" not in esc:
-        fail(
-            "Ambient privilege-escalation schema refusal missing",
-            "ambient.securityContext.allowPrivilegeEscalation must be rejected as an unknown proxy key",
-        )
-    esc_skip = require_capture(
-        results_dir, "mesh-prod-ambient-privilege-escalation-skip-schema.err"
-    ).read_text(encoding="utf-8")
-    if "not a steady-state proxy field" not in esc_skip:
-        fail(
-            "Ambient privilege-escalation template refusal missing",
-            "--skip-schema-validation must still fail closed so the proxy cannot inherit the preflight field",
         )
     print("mesh shutdown/resource refusals ok")
 
@@ -730,11 +714,11 @@ def validate_node_waypoint_ebpf_caps(results_dir: Path) -> None:
         for cap in ("BPF", "PERFMON", "SYS_ADMIN"):
             _unquoted_cap(doc, cap, name)
     _unquoted_cap(ambient, "SYS_PTRACE", "ambient")
-    forbid_text(
+    require_text(
         ambient,
-        "allowPrivilegeEscalation",
-        "NodeWaypoint proxy inherited preflight privilege-escalation",
-        "NodeWaypoint does not run the UDP preflight; the proxy must not emit allowPrivilegeEscalation",
+        "allowPrivilegeEscalation: false",
+        "NodeWaypoint Restricted allowPrivilegeEscalation missing",
+        "the NodeWaypoint proxy must set allowPrivilegeEscalation: false (Restricted); omitting it lets Kubernetes default permissively",
     )
     print("mesh node-waypoint eBPF capabilities ok")
 

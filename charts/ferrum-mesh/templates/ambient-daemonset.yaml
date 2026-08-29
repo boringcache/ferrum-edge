@@ -204,15 +204,6 @@
 {{- if and $ambientUdpRunNodePreflight (not $ambientUdpNodeProofGeneration) (not (hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION")) -}}
 {{- fail "settled host-netns Ambient UDP placement requires an installed placement contract to derive FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION; run the explicit cleanup/finalize releases (a client-render pipeline must supply the value itself)" -}}
 {{- end -}}
-{{- /* The privileged UDP preflight init container hard-codes no-escalation as
-       part of its declared privilege surface. That field must not appear on the
-       steady-state proxy: Kubernetes would treat it as the running container's
-       surface, and the established Ambient UDP contract forbids the proxy from
-       inheriting any preflight privilege field. Schema rejects the key; this
-       fail-closed path covers --skip-schema-validation. */ -}}
-{{- if hasKey (.Values.ambient.securityContext | default dict) "allowPrivilegeEscalation" -}}
-{{- fail "ambient.securityContext.allowPrivilegeEscalation is not a steady-state proxy field; the privileged UDP preflight init container hard-codes no-escalation. Ambient's container securityContext admits readOnlyRootFilesystem and capabilities only." -}}
-{{- end -}}
 {{- $ambientUdpMigrationNeedsSetns := and (eq $ambientUdpMigrationPhase "cleanup") (has $ambientUdpMigrationFrom (list "pod-netns" "disabled")) -}}
 {{- $ambientSetnsCapture := or $nodeWaypointRegistryEnabled (and $ambientUdpLifecycle (or (not $ambientUdpHostNetns) $ambientUdpMigrationNeedsSetns)) -}}
 {{- $nodeAgentProxyMode := replace "-" "_" (lower (toString .Values.nodeAgent.proxyMode)) -}}
@@ -488,12 +479,15 @@ spec:
                  `toYaml`-ed wholesale: `runAsUser`/`runAsGroup` are decided by the
                  capture mode and the capability set is a datapath requirement. The
                  schema therefore admits only the keys read here
-                 (`readOnlyRootFilesystem`, `capabilities.drop`, `capabilities.add`)
-                 so a supported-looking key cannot be silently ignored.
-                 `capabilities.add` MERGES on top of the required set; it can never
-                 remove one. Normalized ALL (including CAP_ALL) is rejected in add
-                 so drop ALL is not undone. Required names are rendered unquoted so
-                 they match the established live/CI capability greps. */ -}}
+                 (`allowPrivilegeEscalation`, `readOnlyRootFilesystem`,
+                 `capabilities.drop`, `capabilities.add`) so a supported-looking key
+                 cannot be silently ignored. `allowPrivilegeEscalation` defaults to
+                 false (Restricted); an explicit true follows the chart's override
+                 convention. `capabilities.add` MERGES on top of the required set;
+                 it can never remove one. Normalized ALL (including CAP_ALL) is
+                 rejected in add so drop ALL is not undone. Required names are
+                 rendered unquoted so they match the established live/CI capability
+                 greps. */ -}}
           {{- $ambientSc := .Values.ambient.securityContext | default dict -}}
           {{- $ambientScCaps := $ambientSc.capabilities | default dict -}}
           {{- /* Do not use Sprig `default` on drop: an explicit empty list is
@@ -547,6 +541,7 @@ spec:
                  preceding `args: ["run"]` line. */ -}}
           {{- end }}
           securityContext:
+            allowPrivilegeEscalation: {{ $ambientSc.allowPrivilegeEscalation | default false }}
             readOnlyRootFilesystem: {{ if hasKey $ambientSc "readOnlyRootFilesystem" }}{{ $ambientSc.readOnlyRootFilesystem }}{{ else }}true{{ end }}
             {{- if $ambientInNetnsCapture }}
             runAsUser: 0

@@ -367,10 +367,10 @@ receive any of it. Restricted-compatible `securityContext` / non-empty
 `resources` apply to control plane, CA, and east-west; ambient keeps
 host-network datapath capabilities after dropping ALL, and its
 `securityContext` is a constrained explicit surface
-(`readOnlyRootFilesystem`, `capabilities.drop`, `capabilities.add`) so an
-unsupported key is rejected rather than ignored. Privilege-escalation is
-hard-coded on the Ambient UDP preflight init container only and is not a
-steady-state proxy field.
+(`allowPrivilegeEscalation`, `readOnlyRootFilesystem`, `capabilities.drop`,
+`capabilities.add`) so an unsupported key is rejected rather than ignored.
+`allowPrivilegeEscalation` defaults to `false` on the steady-state proxy
+(Restricted); it is not a UDP-preflight-only field.
 
 Each workload's `admin.bindAddress` must be an IP literal and its
 `admin.allowedCidrs` (and `observability.metrics.allowedCidrs`) is validated

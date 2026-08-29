@@ -3253,27 +3253,6 @@ jobs:
           fi
           if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
-            --set ambient.enabled=true \
-            --set nodeAgent.enabled=true \
-            --set ambient.securityContext.allowPrivilegeEscalation=true \
-            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-privilege-escalation.yaml" \
-            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-privilege-escalation.err"; then
-            echo "::error title=Ambient proxy inherited preflight privilege-escalation::allowPrivilegeEscalation is the UDP preflight init surface, not a steady-state proxy key"
-            exit 1
-          fi
-          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
-            -f ./charts/ferrum-mesh/examples/development-values.yaml \
-            --set ambient.enabled=true \
-            --set nodeAgent.enabled=true \
-            --skip-schema-validation \
-            --set ambient.securityContext.allowPrivilegeEscalation=true \
-            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-privilege-escalation-skip-schema.yaml" \
-            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-privilege-escalation-skip-schema.err"; then
-            echo "::error title=Ambient privilege-escalation skipped schema and rendered::the template must still refuse the preflight field on the proxy"
-            exit 1
-          fi
-          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
-            -f ./charts/ferrum-mesh/examples/development-values.yaml \
             --set-string controlPlane.admin.bindAddress=0.0.0.0 \
             --set-string 'controlPlane.admin.allowedCidrs=::ffff:0.0.0.0/96' \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-catchall.yaml" \

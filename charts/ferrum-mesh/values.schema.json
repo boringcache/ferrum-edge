@@ -1140,9 +1140,12 @@
     },
     "ambientSecurityContext": {
       "type": "object",
-      "description": "Explicit ambient container SecurityContext. Only the keys listed here are read by the template, so unknown keys are REJECTED rather than silently ignored: runAsUser/runAsGroup are decided by the capture mode, privilege-escalation is hard-coded on the UDP preflight init container only, and the capability set is a datapath requirement. capabilities.drop must stay [ALL] (omit the key for the default; an explicit empty list is rejected). capabilities.add merges on top of the required NET_ADMIN/NET_RAW (plus BPF/PERFMON for NodeWaypoint and SYS_ADMIN/SYS_PTRACE for in-netns capture) set and can never remove one. ALL and CAP_ALL are rejected in add: they would re-grant the complete Linux capability set after drop ALL. Required capability names are rendered unquoted.",
+      "description": "Explicit ambient container SecurityContext. Only the keys listed here are read by the template, so unknown keys are REJECTED rather than silently ignored: runAsUser/runAsGroup are decided by the capture mode, allowPrivilegeEscalation defaults to false for Restricted (an explicit true is an operator override), and the capability set is a datapath requirement. capabilities.drop must stay [ALL] (omit the key for the default; an explicit empty list is rejected). capabilities.add merges on top of the required NET_ADMIN/NET_RAW (plus BPF/PERFMON for NodeWaypoint and SYS_ADMIN/SYS_PTRACE for in-netns capture) set and can never remove one. ALL and CAP_ALL are rejected in add: they would re-grant the complete Linux capability set after drop ALL. Required capability names are rendered unquoted.",
       "additionalProperties": false,
       "properties": {
+        "allowPrivilegeEscalation": {
+          "type": "boolean"
+        },
         "readOnlyRootFilesystem": {
           "type": "boolean"
         },
