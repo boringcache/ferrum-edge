@@ -3445,7 +3445,7 @@ fn inbound_relay_service_waypoint_exact_binding_from_gateway_config_admits_only_
 /// and must stamp the same exact bound-service refs as `service`.
 #[test]
 fn inbound_relay_service_waypoint_waypoint_for_all_from_gateway_config_admits_only_bound_backends()
- {
+{
     for waypoint_for in ["all", "All"] {
         let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
             reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding(waypoint_for)]),
@@ -3476,7 +3476,7 @@ fn inbound_relay_service_waypoint_waypoint_for_none_from_gateway_config_terminat
 /// claim service traffic, so inbound service relay must terminate for nothing.
 #[test]
 fn inbound_relay_service_waypoint_waypoint_for_workload_from_gateway_config_terminates_for_nothing()
- {
+{
     let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
         reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding("workload")]),
         "reviews-waypoint",
@@ -3498,7 +3498,7 @@ fn inbound_relay_service_waypoint_waypoint_for_workload_from_gateway_config_term
 /// values fail closed for inbound service-relay evidence.
 #[test]
 fn inbound_relay_service_waypoint_unknown_waypoint_for_from_gateway_config_terminates_for_nothing()
- {
+{
     for waypoint_for in ["", "direct"] {
         let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
             reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding(waypoint_for)]),
