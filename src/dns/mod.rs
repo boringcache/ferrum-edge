@@ -1634,8 +1634,8 @@ impl DnsCache {
                             // "what IPs back this hostname"; the caller dials
                             // the proxy's own configured backend port, so the
                             // RR's `port` is never used. It therefore
-                            // deliberately does NOT apply the `admit_registry_port`
-                            // rejection that `resolve_srv` (the DNS-SD
+                            // deliberately does NOT apply the DNS-SD
+                            // registry-port admission that `resolve_srv` (the
                             // service-availability path) applies: a port-0 RR
                             // still carries a perfectly usable target address
                             // here, and dropping it would blackhole a resolvable

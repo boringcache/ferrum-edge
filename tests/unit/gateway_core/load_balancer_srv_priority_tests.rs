@@ -544,7 +544,16 @@ fn retry_exclusion_falls_over_within_the_tier_before_leaving_it() {
 #[test]
 fn sticky_session_eligibility_follows_the_tier_filter() {
     let targets = two_tier_targets();
-    let lb = rr(&targets);
+    // `select_sticky` fail-closes on an empty binding index. The index is
+    // materialized only for Cookie hash-on (Gateway API session persistence),
+    // so this balancer must mint sticky tokens or the assertion never reaches
+    // the shared SRV-tier health filter.
+    let lb = LoadBalancer::new(
+        UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        Some("cookie:lb-affinity-fe-0123456789abcdef".to_string()),
+    );
     let active = DashMap::new();
 
     // Resolve the DR target's sticky token through the balancer's own index by

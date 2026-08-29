@@ -6494,10 +6494,10 @@ fn reserved_srv_tag_namespace_is_stripped_from_copied_labels() {
 
     assert_eq!(tags.get("app").map(String::as_str), Some("checkout"));
     assert!(
-        tags.get(tag).is_none(),
+        !tags.contains_key(tag),
         "a copied label cannot forge the priority tag"
     );
-    assert!(tags.get(&format!("{prefix}future")).is_none());
+    assert!(!tags.contains_key(&format!("{prefix}future")));
     assert_eq!(
         tags.get("srv.priority").map(String::as_str),
         Some("0"),
