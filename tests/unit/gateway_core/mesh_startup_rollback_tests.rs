@@ -12,8 +12,44 @@ use ferrum_edge::_test_support::{
     mesh_startup_failure_listener_join_bounded_probe_for_test,
 };
 
+use crate::unit::env_lock::EnvGuard;
+
+/// Process env vars the mesh startup path resolves while a probe runs.
+///
+/// `serve_mesh_runtime` resolves the UDP capture settings from the PROCESS
+/// environment and then validates them against the probe's resolved topology
+/// (`Sidecar`). `mesh_host_udp_capture_plan_tests` legitimately sets
+/// `FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` for the duration of its
+/// own assertions, and `cargo test --test unit_tests` runs the two files in
+/// parallel — so without this serialization a probe can observe that mutation
+/// and abort on the host-placement topology error instead of on its injected
+/// fault.
+const MESH_STARTUP_PROBE_ENV_KEYS: &[&str] = &[
+    "FERRUM_MESH_CAPTURE_UDP_ENABLED",
+    "FERRUM_MESH_CAPTURE_UDP_PORT",
+    "FERRUM_MESH_TPROXY_MARK",
+    "FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED",
+];
+
+/// Take the process-wide env lock and pin the capture keys to their defaults
+/// for the duration of one probe. Held across the probe's `.await` on purpose:
+/// the probe reads the environment throughout mesh startup, not only at entry.
+fn mesh_startup_probe_env_guard() -> EnvGuard {
+    let guard = EnvGuard::new(MESH_STARTUP_PROBE_ENV_KEYS);
+    for key in MESH_STARTUP_PROBE_ENV_KEYS {
+        guard.unset(key);
+    }
+    guard
+}
+
+// The env guard owns a std mutex and is deliberately held across the probe's
+// `.await`: mesh startup reads the process environment throughout, not only at
+// entry, and this test runs on a single-threaded runtime where no other task
+// can contend for it.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "current_thread")]
 async fn failure_before_owner_drains_spawned_tasks() {
+    let _env = mesh_startup_probe_env_guard();
     let probe = mesh_startup_failure_before_owner_probe_for_test().await;
 
     assert!(
@@ -37,8 +73,14 @@ async fn failure_before_owner_drains_spawned_tasks() {
     );
 }
 
+// The env guard owns a std mutex and is deliberately held across the probe's
+// `.await`: mesh startup reads the process environment throughout, not only at
+// entry, and this test runs on a single-threaded runtime where no other task
+// can contend for it.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "current_thread")]
 async fn failure_before_startup_result_gate_drains_spawned_tasks() {
+    let _env = mesh_startup_probe_env_guard();
     let probe = mesh_startup_failure_before_startup_result_gate_probe_for_test().await;
 
     assert!(
@@ -62,8 +104,14 @@ async fn failure_before_startup_result_gate_drains_spawned_tasks() {
     );
 }
 
+// The env guard owns a std mutex and is deliberately held across the probe's
+// `.await`: mesh startup reads the process environment throughout, not only at
+// entry, and this test runs on a single-threaded runtime where no other task
+// can contend for it.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "current_thread")]
 async fn failure_inside_startup_result_gate_drains_spawned_tasks() {
+    let _env = mesh_startup_probe_env_guard();
     let probe = mesh_startup_failure_inside_startup_result_gate_probe_for_test().await;
 
     assert!(

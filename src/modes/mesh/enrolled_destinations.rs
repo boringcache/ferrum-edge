@@ -54,6 +54,12 @@
 //!   malformed optional field, duplicate recognized key, or unknown content
 //!   retracts the index immediately: last-good is not retained and a partial
 //!   snapshot is never published. A later complete snapshot may republish.
+//!   The one enumerated leaf that is SKIPPED instead is one that has already
+//!   been unlinked when the reader opens it — the ordinary pod-teardown race
+//!   against every scan. An absent entry only ever REMOVES an admission, so
+//!   skipping it is exactly as fail-closed as retracting, and retracting there
+//!   would instead take every authenticated inbound relay on this node out for
+//!   a poll interval on each pod deletion.
 //! * An address claimed by two DIFFERENT pod UIDs is ambiguous and refused for
 //!   BOTH claimants, mirroring the contested-interface rule
 //!   `plan_host_udp_bindings` already applies to ingress interfaces.
@@ -360,11 +366,21 @@ pub fn install_node_local_enrolled_destinations(index: Arc<NodeLocalEnrolledDest
     INSTALLED_ENROLLED_DESTINATIONS.store(Some(index));
 }
 
-/// Retract the installed index. Subsequent applies fall back to the identity
-/// bound, which is correct only because this runs when the serving cycle that
-/// owned the registry is gone.
-pub fn clear_node_local_enrolled_destinations() {
-    INSTALLED_ENROLLED_DESTINATIONS.store(None);
+/// Retract `index` if it is still the installed one.
+///
+/// Identity-checked rather than an unconditional `store(None)`: retraction runs
+/// from a `Drop`, and clearing a slot some OTHER serving cycle owns would leave
+/// that cycle's applies falling back to the identity bound — a FAIL-OPEN
+/// direction, and precisely the "retire what you do not own" the guard exists
+/// to prevent. A process runs one mesh runtime at a time, so this is
+/// belt-and-braces; it is not a lock, and it does not need to be, because the
+/// only writers are one cycle's install and that same cycle's retraction.
+fn retract_installed_index_if_ours(index: &Arc<NodeLocalEnrolledDestinations>) {
+    if let Some(current) = INSTALLED_ENROLLED_DESTINATIONS.load_full()
+        && Arc::ptr_eq(&current, index)
+    {
+        INSTALLED_ENROLLED_DESTINATIONS.store(None);
+    }
 }
 
 /// The installed index itself, for the serving runtime that owns its poller.
@@ -384,19 +400,24 @@ pub fn installed_node_local_enrolled_destinations() -> NodeLocalEnrolledDestinat
 /// aborted or panicking runtime cannot leave a stale registry bound to a later
 /// cycle's config.
 pub struct InstalledEnrolledDestinationsGuard {
-    _private: (),
+    /// The index this guard installed, kept so retraction can prove the slot it
+    /// clears is still its own.
+    index: Arc<NodeLocalEnrolledDestinations>,
 }
 
 impl InstalledEnrolledDestinationsGuard {
     pub fn install(index: Arc<NodeLocalEnrolledDestinations>) -> Self {
-        install_node_local_enrolled_destinations(index);
-        Self { _private: () }
+        install_node_local_enrolled_destinations(index.clone());
+        Self { index }
     }
 }
 
 impl Drop for InstalledEnrolledDestinationsGuard {
     fn drop(&mut self) {
-        clear_node_local_enrolled_destinations();
+        // The index's own contents are retracted by the poller's
+        // `EnrolledRetractionGuard`; this only gives up the shared installation,
+        // and only while it is still ours.
+        retract_installed_index_if_ours(&self.index);
     }
 }
 
@@ -451,7 +472,9 @@ impl NodeLocalEnrolledDestinationsManager {
     /// and a partial snapshot is never published. That includes a present
     /// malformed `spiffe_id=` / `ipv4=` / `ipv6=` (which must not become missing
     /// evidence), a duplicate recognized key, unknown content, and an unsafe
-    /// pod-UID leaf name.
+    /// pod-UID leaf name. A leaf already unlinked when the reader opens it is a
+    /// withdrawn pod, not an incomplete snapshot, and is skipped — see the
+    /// module docs.
     ///
     /// Returns the entries that were published (empty after a retraction).
     /// Diagnostics are a fixed-shape debug line; the error payload is discarded

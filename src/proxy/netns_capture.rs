@@ -125,8 +125,11 @@ pub trait PodCaptureSource: Send + Sync {
     /// malformed entry (entry-count cap, per-entry size cap, Unix `O_NOFOLLOW`,
     /// regular file, single link, process-owned, canonical pod-UID leaf name,
     /// and a strict body parse that distinguishes an omitted optional field from a
-    /// present malformed one). In-memory sources are already atomic and default
-    /// to `Ok(self.list_targets())`.
+    /// present malformed one). The sole exception is a leaf that no longer
+    /// exists when it is opened — the pod-teardown race, which removes an
+    /// enrolled pod rather than hiding one — which is skipped; see
+    /// [`read_complete_registry_entry`]. In-memory sources are already atomic
+    /// and default to `Ok(self.list_targets())`.
     ///
     /// Shared by durable UDP migration proofs and the inbound HBONE relay
     /// destination guard: both need an all-or-nothing snapshot, not a partial
@@ -283,7 +286,18 @@ fn parse_capture_target_inner(
     })
 }
 
-fn read_complete_registry_entry(path: &Path) -> Result<String, String> {
+/// Read one registry entry under the strict all-or-nothing rules.
+///
+/// `Ok(None)` means the leaf `read_dir` enumerated no longer exists by the time
+/// it was opened — the ordinary pod-teardown race, since the node-agent unlinks
+/// an entry the instant a pod is withdrawn. That is NOT a partial or
+/// untrustworthy snapshot: an absent entry can only ever REMOVE an admission,
+/// so skipping it is exactly as fail-closed as retracting, without taking the
+/// whole node's enrolled-destination index (and therefore every authenticated
+/// inbound relay on it) out for a poll interval on every pod deletion. Every
+/// other failure — including `ELOOP` from `O_NOFOLLOW` on a symlinked entry, a
+/// permission error, and an unreadable or oversized body — still retracts.
+fn read_complete_registry_entry(path: &Path) -> Result<Option<String>, String> {
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -294,7 +308,11 @@ fn read_complete_registry_entry(path: &Path) -> Result<String, String> {
     };
     #[cfg(not(unix))]
     let file = std::fs::File::open(path);
-    let file = file.map_err(|_| "could not securely open Ambient capture registry entry")?;
+    let file = match file {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("could not securely open Ambient capture registry entry".to_string()),
+    };
     let metadata = file
         .metadata()
         .map_err(|_| "could not inspect Ambient capture registry entry")?;
@@ -319,7 +337,7 @@ fn read_complete_registry_entry(path: &Path) -> Result<String, String> {
     if contents.len() as u64 > MAX_COMPLETE_REGISTRY_ENTRY_BYTES {
         return Err("Ambient capture registry entry exceeds its size limit".to_string());
     }
-    Ok(contents)
+    Ok(Some(contents))
 }
 
 impl PodCaptureSource for DirectoryCaptureSource {
@@ -367,7 +385,11 @@ impl PodCaptureSource for DirectoryCaptureSource {
             if !is_safe_pod_registry_uid(&pod_uid) {
                 return Err("Ambient capture registry entry name is unsafe".to_string());
             }
-            let contents = read_complete_registry_entry(&entry.path())?;
+            // A leaf that vanished between enumeration and open is a
+            // withdrawn pod, not an incomplete snapshot: skip it.
+            let Some(contents) = read_complete_registry_entry(&entry.path())? else {
+                continue;
+            };
             targets.push(parse_complete_capture_target(pod_uid, &contents)?);
         }
         Ok(targets)
@@ -1662,6 +1684,52 @@ mod tests {
     fn directory_source_absent_dir_is_empty_not_error() {
         let source = DirectoryCaptureSource::new("/definitely/not/a/dir");
         assert!(source.list_targets().is_empty());
+    }
+
+    /// Issue #4249: the node-agent unlinks a registry entry the instant a pod is
+    /// withdrawn, so an ordinary pod teardown races every strict scan between
+    /// `read_dir` yielding a leaf and the reader opening it. That leaf is a
+    /// withdrawn pod, not an incomplete snapshot — reporting it as a snapshot
+    /// error would retract the whole node's enrolled-destination index (and with
+    /// it every authenticated inbound relay on the node) for a poll interval on
+    /// each pod deletion, while proving nothing an absent entry does not already
+    /// prove. Every other open failure must still retract.
+    #[test]
+    fn a_registry_entry_that_vanished_before_it_was_opened_is_skipped_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let vanished = dir.path().join("6ba7b810-9dad-11d1-80b4-00c04fd430c8");
+        assert!(!vanished.exists());
+        assert_eq!(
+            read_complete_registry_entry(&vanished),
+            Ok(None),
+            "an already-unlinked leaf is a withdrawn pod, not a snapshot error"
+        );
+
+        // The surviving sibling still publishes: skipping the vanished leaf is
+        // not a partial publish of a snapshot that failed.
+        let present = "7ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        let entry = dir.path().join(present);
+        std::fs::write(&entry, "/sys/fs/cgroup/pod\nipv4=10.0.0.7\n").unwrap();
+        let targets = DirectoryCaptureSource::new(dir.path())
+            .list_complete_targets()
+            .expect("a complete snapshot");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].pod_uid, present);
+    }
+
+    /// The skip above is scoped to ABSENCE. A symlinked entry is refused by
+    /// `O_NOFOLLOW` with `ELOOP`, not `ENOENT`, so it still retracts — including
+    /// when its target does not exist.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_entry_still_retracts_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let leaf = dir.path().join("8ba7b810-9dad-11d1-80b4-00c04fd430c8");
+        std::os::unix::fs::symlink(dir.path().join("absent"), &leaf).unwrap();
+        assert!(
+            DirectoryCaptureSource::new(dir.path()).list_complete_targets().is_err(),
+            "a symlinked entry is refused, never mistaken for a withdrawn pod"
+        );
     }
 
     #[test]
