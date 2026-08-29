@@ -173,18 +173,10 @@ const EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATE_KEYS: &[&str] = &[
 
 /// One compiled `mesh_authz` baggage gate: the same
 /// [`TrustedAssertorIndex`] + alias list authorization uses.
+#[derive(Default)]
 struct BaggageTrustGate {
     trusted_hbone_assertors: TrustedAssertorIndex,
     trust_domain_aliases: Vec<TrustDomain>,
-}
-
-impl Default for BaggageTrustGate {
-    fn default() -> Self {
-        Self {
-            trusted_hbone_assertors: TrustedAssertorIndex::default(),
-            trust_domain_aliases: Vec::new(),
-        }
-    }
 }
 
 impl BaggageTrustGate {
