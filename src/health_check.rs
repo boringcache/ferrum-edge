@@ -579,6 +579,18 @@ mod consecutive_state_tests {
             (1, 1)
         );
     }
+
+    #[test]
+    fn failure_after_retire_belongs_to_the_next_generation() {
+        let state = TargetHealth::new();
+        assert_eq!(state.record_consecutive_failure(), (0, 1));
+        assert!(state.retire_consecutive_generation(0));
+        assert_eq!(state.record_consecutive_failure(), (1, 1));
+        assert_eq!(
+            unpack_consecutive_state(state.consecutive_state.load(Ordering::Acquire)),
+            (1, 1)
+        );
+    }
 }
 
 /// Passive-ejection record stored per `(proxy_id, host:port)`.
@@ -683,9 +695,12 @@ impl ConsecutiveInterleaveHooks<'_> {
 
 /// Insert a consecutive-mode ejection only when this failure still owns
 /// `my_generation` and the map does not already hold an equal or newer
-/// generation. The DashMap entry lock serializes publishers on this key;
-/// the packed CAS is re-checked while the entry is held so a success that
-/// retired `my_generation` cannot overwrite a later publication.
+/// generation. The DashMap entry lock serializes publishers on this key
+/// with timer recovery; the packed CAS is re-checked while the entry is
+/// held so a success or timer that retired `my_generation` cannot
+/// overwrite a later publication. Timer recovery retires packed G under
+/// this same lock before deleting G, so a Vacant insert cannot republish
+/// a generation the timer is about to retire.
 fn try_publish_consecutive_ejection(
     proxy_state: &ProxyHealthState,
     state: &TargetHealth,
@@ -2103,6 +2118,25 @@ impl HealthChecker {
         }
     }
 
+    /// Test-only packed consecutive-mode `(generation, streak)` for one target.
+    /// Missing state is `(0, 0)`, matching a never-touched packed word.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn consecutive_packed_state_for_test(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        host_port: &str,
+    ) -> (u64, u32) {
+        let Some(proxy_state) = self.passive_state(namespace, proxy_id) else {
+            return (0, 0);
+        };
+        let Some(state) = proxy_state.states.get(host_port) else {
+            return (0, 0);
+        };
+        unpack_consecutive_state(state.consecutive_state.load(Ordering::Acquire))
+    }
+
     /// Run one passive-recovery pass: clear every auto-recoverable ejection
     /// whose stored deadline has elapsed, scoped to that proxy entry only.
     ///
@@ -2115,11 +2149,15 @@ impl HealthChecker {
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn recover_due_passive_ejections(&self) {
-        recover_due_passive_ejections_inner(&self.passive_health, self.lb_cache.as_ref(), None);
+        recover_due_passive_ejections_inner(
+            &self.passive_health,
+            self.lb_cache.as_ref(),
+            PassiveRecoveryInterleaveHooks::none(),
+        );
     }
 
     /// Test-only: run one recovery pass with `hook` after due ejections are
-    /// snapshotted and before generation-checked `remove_if`, so a newer
+    /// snapshotted and before generation-checked removal, so a newer
     /// publication can be installed without a timing sleep.
     #[doc(hidden)]
     #[allow(dead_code)]
@@ -2130,7 +2168,30 @@ impl HealthChecker {
         recover_due_passive_ejections_inner(
             &self.passive_health,
             self.lb_cache.as_ref(),
-            Some(hook),
+            PassiveRecoveryInterleaveHooks {
+                after_scan: Some(hook),
+                after_consecutive_remove: None,
+            },
+        );
+    }
+
+    /// Test-only: run one recovery pass with `hook` after a consecutive-mode
+    /// publication is removed. Packed retirement has already run under the
+    /// same DashMap entry lock, so the hook observes the old remove-before-retire
+    /// gap without a timing sleep: map vacant, packed already advanced.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn recover_due_passive_ejections_with_after_consecutive_remove_hook_for_test(
+        &self,
+        hook: &mut dyn FnMut(),
+    ) {
+        recover_due_passive_ejections_inner(
+            &self.passive_health,
+            self.lb_cache.as_ref(),
+            PassiveRecoveryInterleaveHooks {
+                after_scan: None,
+                after_consecutive_remove: Some(hook),
+            },
         );
     }
 
@@ -2201,7 +2262,11 @@ impl HealthChecker {
                         );
                         return;
                     }
-                    recover_due_passive_ejections_inner(&passive_health, lb_cache.as_ref(), None);
+                    recover_due_passive_ejections_inner(
+                        &passive_health,
+                        lb_cache.as_ref(),
+                        PassiveRecoveryInterleaveHooks::none(),
+                    );
                 }
             }
         })
@@ -4126,10 +4191,71 @@ fn reset_latency_after_passive_recovery_inner(
     }
 }
 
+/// Deterministic recovery interleaving points for tests. Production callers
+/// pass [`PassiveRecoveryInterleaveHooks::none`].
+struct PassiveRecoveryInterleaveHooks<'a> {
+    after_scan: Option<&'a mut dyn FnMut()>,
+    /// After a consecutive-mode publication is removed. Packed retirement has
+    /// already linearized under the same DashMap entry lock.
+    after_consecutive_remove: Option<&'a mut dyn FnMut()>,
+}
+
+impl PassiveRecoveryInterleaveHooks<'_> {
+    fn none() -> Self {
+        Self {
+            after_scan: None,
+            after_consecutive_remove: None,
+        }
+    }
+}
+
+/// Drop a due consecutive-mode publication only after retiring its packed
+/// generation under the same DashMap entry lock.
+///
+/// Linearization: `OccupiedEntry` serializes this timer against
+/// [`try_publish_consecutive_ejection`] on the same key. Packed CAS runs
+/// before `remove()`, so a concurrent failure cannot observe vacant+live-G:
+///
+/// - Failure CAS before retire still lives in G. Retire advances G→G+1
+///   (streak 0), then `remove()`. Publish of G then sees packed ≠ G and
+///   aborts. The map never holds a republished G after packed has moved on.
+/// - Failure CAS after retire (timer still holds the entry lock) retries
+///   into G+1 and blocks on `unhealthy.entry()`. After `remove()` releases
+///   the lock, that failure publishes G+1 into the vacant slot.
+/// - A newer map generation (or a different deadline) fails the snapshot
+///   match and is left untouched; packed retire is a no-op unless the live
+///   word is still G.
+fn remove_due_consecutive_ejection(
+    proxy_state: &ProxyHealthState,
+    hp: &str,
+    snapshotted: &PassiveEjection,
+    generation: u64,
+    now: u64,
+) -> Option<PassiveEjection> {
+    use dashmap::mapref::entry::Entry;
+    match proxy_state.unhealthy.entry(hp.to_owned()) {
+        Entry::Occupied(occupied) => {
+            let current = occupied.get();
+            if !(current.auto_recover
+                && now >= current.recover_at_ms
+                && current.recover_at_ms == snapshotted.recover_at_ms
+                && current.consecutive_generation == Some(generation))
+            {
+                return None;
+            }
+            if let Some(state) = proxy_state.states.get(hp) {
+                state.retire_consecutive_generation(generation);
+            }
+            Some(occupied.remove())
+        }
+        Entry::Vacant(_) => None,
+    }
+}
+
 fn recover_due_passive_ejections_inner(
     passive_health: &DashMap<String, Arc<ProxyHealthState>>,
     lb_cache: Option<&Arc<LoadBalancerCache>>,
-    mut after_scan: Option<&mut dyn FnMut()>,
+    mut hooks: PassiveRecoveryInterleaveHooks<'_>,
 ) {
     let now = now_epoch_ms();
 
@@ -4161,7 +4287,7 @@ fn recover_due_passive_ejections_inner(
     }
 
     if !pending.is_empty()
-        && let Some(hook) = after_scan.as_mut()
+        && let Some(hook) = hooks.after_scan.as_mut()
     {
         hook();
     }
@@ -4181,13 +4307,25 @@ fn recover_due_passive_ejections_inner(
             // stays. Equality on both `recover_at_ms` and
             // `consecutive_generation` closes the same-millisecond ABA the
             // deadline alone cannot distinguish.
-            let removed = proxy_state.unhealthy.remove_if(hp, |_, current| {
-                current.auto_recover
-                    && now >= current.recover_at_ms
-                    && current.recover_at_ms == ejection.recover_at_ms
-                    && current.consecutive_generation == ejection.consecutive_generation
-            });
-            let Some((_, current)) = removed else {
+            //
+            // Consecutive mode retires packed G *before* dropping the map
+            // entry, while still holding the DashMap shard lock. Native
+            // windowed ejections have no packed generation and keep the
+            // previous `remove_if` path.
+            let current = if let Some(generation) = ejection.consecutive_generation {
+                remove_due_consecutive_ejection(&proxy_state, hp, ejection, generation, now)
+            } else {
+                proxy_state
+                    .unhealthy
+                    .remove_if(hp, |_, current| {
+                        current.auto_recover
+                            && now >= current.recover_at_ms
+                            && current.recover_at_ms == ejection.recover_at_ms
+                            && current.consecutive_generation.is_none()
+                    })
+                    .map(|(_, current)| current)
+            };
+            let Some(current) = current else {
                 continue;
             };
 
@@ -4196,9 +4334,7 @@ fn recover_due_passive_ejections_inner(
                 hp, proxy_key, current.upstream_id
             );
             if let Some(state) = proxy_state.states.get(hp) {
-                if let Some(generation) = current.consecutive_generation {
-                    state.retire_consecutive_generation(generation);
-                } else {
+                if current.consecutive_generation.is_none() {
                     state.consecutive_failures.store(0, Ordering::Release);
                 }
                 state.consecutive_successes.store(0, Ordering::Relaxed);
@@ -4222,6 +4358,12 @@ fn recover_due_passive_ejections_inner(
                 &current.upstream_id,
                 &recovered,
             );
+
+            if current.consecutive_generation.is_some()
+                && let Some(hook) = hooks.after_consecutive_remove.as_mut()
+            {
+                hook();
+            }
         }
     }
 }

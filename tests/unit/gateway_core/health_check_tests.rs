@@ -2821,3 +2821,106 @@ fn consecutive_mode_timer_recovery_cannot_retract_fresh_post_success_ejection() 
         Some(1)
     );
 }
+
+/// Timer used to `remove_if` generation G, drop the DashMap lock, then retire
+/// packed G. In that gap a concurrent failure could increment still-live G,
+/// see a vacant map, republish G, and then the timer would advance packed
+/// state to G+1 — stranding a stale G ejection.
+///
+/// The coupled retire-under-entry-lock closes that gap. This hook runs after
+/// removal (lock released) and is the exact observation of the old
+/// remove-before-retire window: the map is vacant, but packed G must already
+/// be retired. A threshold failure in the hook therefore publishes G+1, never
+/// a leftover G.
+#[test]
+fn consecutive_mode_timer_cannot_strand_republished_generation_after_remove() {
+    let checker = Arc::new(HealthChecker::new());
+    let target = make_target("backend1", 8080);
+    let config = consecutive_policy(1);
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 1);
+    assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+    {
+        let ps = checker.passive_health.get(&rk(TEST_PROXY)).unwrap();
+        ps.unhealthy.get_mut("backend1:8080").unwrap().recover_at_ms = 1;
+    }
+    assert_eq!(
+        consecutive_ejection_generation(&checker, TEST_PROXY, "backend1:8080"),
+        Some(0)
+    );
+    assert_eq!(
+        checker.consecutive_packed_state_for_test(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "backend1:8080",
+        ),
+        (0, 1),
+        "threshold-1 ejection owns packed generation 0"
+    );
+
+    let checker_for_hook = Arc::clone(&checker);
+    let target_for_hook = target.clone();
+    let config_for_hook = config.clone();
+    let mut hook_ran = false;
+    let mut hook = || {
+        assert_eq!(
+            checker_for_hook.consecutive_packed_state_for_test(
+                DEFAULT_NAMESPACE,
+                TEST_PROXY,
+                "backend1:8080",
+            ),
+            (1, 0),
+            "packed G must already be retired before the map lock is released"
+        );
+        assert!(
+            !is_passive_unhealthy(&checker_for_hook, TEST_PROXY, "backend1:8080"),
+            "generation 0 must already be gone from the map"
+        );
+
+        report_failures(
+            &checker_for_hook,
+            TEST_PROXY,
+            &target_for_hook,
+            &config_for_hook,
+            1,
+        );
+        assert_eq!(
+            consecutive_ejection_generation(&checker_for_hook, TEST_PROXY, "backend1:8080"),
+            Some(1),
+            "a post-retirement failure must publish the new generation"
+        );
+        assert_eq!(
+            checker_for_hook.consecutive_packed_state_for_test(
+                DEFAULT_NAMESPACE,
+                TEST_PROXY,
+                "backend1:8080",
+            ),
+            (1, 1),
+            "the post-retirement failure must increment packed generation 1"
+        );
+        hook_ran = true;
+    };
+    checker.recover_due_passive_ejections_with_after_consecutive_remove_hook_for_test(&mut hook);
+
+    assert!(
+        hook_ran,
+        "the remove hook must run so the race is deterministic"
+    );
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "the post-retirement publication must remain"
+    );
+    assert_eq!(
+        consecutive_ejection_generation(&checker, TEST_PROXY, "backend1:8080"),
+        Some(1),
+        "no stale generation-0 ejection may remain after packed retirement"
+    );
+    assert_eq!(
+        checker.consecutive_packed_state_for_test(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "backend1:8080",
+        ),
+        (1, 1)
+    );
+}
