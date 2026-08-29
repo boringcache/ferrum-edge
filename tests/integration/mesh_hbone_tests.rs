@@ -2187,11 +2187,7 @@ fn inbound_relay_resolved_loopback_screen_is_wired_on_tcp_and_udp_dial_paths() {
         "local UDP relay must screen resolved candidates; external UDP egress must not"
     );
     assert!(
-        contains_call(
-            &udp,
-            helper,
-            &["proxy", "mesh_config", "dest_candidates"],
-        ),
+        contains_call(&udp, helper, &["proxy", "mesh_config", "dest_candidates"],),
         "datagram CONNECT must screen dest_candidates on the ordinary local-relay path"
     );
 

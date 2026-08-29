@@ -10959,9 +10959,7 @@ async fn start_tcp_echo_on(
 ) -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let listener = bind_fixture_listener(addr)
-        .await
-        .expect("bind TCP echo");
+    let listener = bind_fixture_listener(addr).await.expect("bind TCP echo");
     let port = listener.local_addr().expect("TCP echo address").port();
     let accepted = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&accepted);
