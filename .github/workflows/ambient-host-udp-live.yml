@@ -10,10 +10,16 @@ on:
   # (`.github/required-publication-checks.json`), so every `main` SHA must carry
   # its own trusted, exact-SHA evidence. Merge-group-only evidence is not enough:
   # the merge queue reports against a synthesized commit, and a commit that
-  # reaches `main` outside the queue would have none at all. The frozen
-  # trusted-base relevance job force-runs the suite on every non-pull-request
-  # event, so this trigger is unconditional and carries NO `paths:` filter --
-  # a filtered required gate can make publication evidence absent.
+  # reaches `main` outside the queue would have none at all. On this event the
+  # frozen trusted-base relevance job takes its `--force-run` branch -- the one
+  # it uses for every event that is neither `pull_request` nor `merge_group` --
+  # so a `main` push always executes the full suite rather than a relevance
+  # decision. `merge_group` is NOT force-run; it still classifies its change
+  # set. This trigger is therefore unconditional and carries NO `paths:` filter:
+  # a filtered required gate can make publication evidence absent. The cost is
+  # deliberate -- every `main` commit now runs the full ~45-minute host-UDP
+  # kernel lab, and (see the concurrency note below) superseded runs are not
+  # cancelled, so a burst of `main` pushes runs one lab per commit.
   push:
     branches:
       - main

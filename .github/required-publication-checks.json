@@ -82,7 +82,7 @@
       "job": "gate",
       "main_publication": "publication_gate_job",
       "evidence": "push_main",
-      "rationale": "Issue #4302 added an unconditional `push: main` trigger so the required check yields exact-main-SHA evidence instead of merge-group-only evidence; the frozen trusted-base relevance job force-runs the suite on every non-pull-request event."
+      "rationale": "Issue #4302 added an unconditional `push: main` trigger so the required check yields exact-main-SHA evidence instead of merge-group-only evidence. On a `main` push the frozen trusted-base relevance job takes its `--force-run` branch, so the full suite always executes; `merge_group` is not force-run and still classifies its change set, which is why merge-group evidence alone was not sufficient."
     }
   ]
 }

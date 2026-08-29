@@ -294,11 +294,19 @@ head commit on `main` verbatim, so the product SHA carries that run directly.
 
 * `ambient-host-udp-live.yml` gained an unconditional `push: main` trigger
   (issue #4302) so `Ambient Host UDP Live` yields exact-main-SHA evidence
-  instead of merge-group-only evidence. The frozen trusted-base relevance job
-  force-runs the suite on every non-pull-request event, and the trigger carries
-  no `paths:` filter, because a filtered required gate can make publication
-  evidence absent. Its `push` concurrency group is keyed by commit and is never
-  cancelled, so a later push cannot wedge an earlier SHA's evidence.
+  instead of merge-group-only evidence. On a `main` push the frozen
+  trusted-base relevance job takes its `--force-run` branch -- the branch it
+  uses for every event that is neither `pull_request` nor `merge_group` -- so
+  the full suite always executes and the required check is never a
+  relevance-skipped green. `merge_group` is **not** force-run; it still
+  classifies its own change set, which is exactly why merge-group-only evidence
+  was insufficient. The trigger carries no `paths:` filter, because a filtered
+  required gate can make publication evidence absent. Its `push` concurrency
+  group is keyed by commit and is never cancelled, so a later push cannot wedge
+  an earlier SHA's evidence. The cost is deliberate and material: every `main`
+  commit now runs the full ~45-minute host-UDP kernel lab, superseded runs are
+  not cancelled, and a burst of `main` pushes therefore runs one lab per commit
+  concurrently.
 * `cross-build-policy.yml` is itself protected and cannot be given a `push`
   trigger by an ordinary change, so it stays on `merge_group_head` evidence.
   A commit pushed **directly to `main` under an administrative bypass** has no
@@ -312,6 +320,32 @@ head commit on `main` verbatim, so the product SHA carries that run directly.
   A success observed mid-wait is not a publication proof; the final permitting
   sweep must still see the entire selected set successful under freshly
   revalidated workflow identity.
+* On the `main` path the hosted gate's own 100-minute deadline is not the
+  binding constraint. `main-publication-required-checks` runs inside the
+  `Gateway API Conformance` workflow run, and the frozen `main-publish-gate`
+  waits for that **run** to conclude under its own 3600-second budget, which
+  starts only after `test` and `build-binaries` finish. The hosted gate must
+  therefore conclude inside `main-publish-gate`'s remaining window, not merely
+  inside its own. Because the hosted gate waits on the ~45-minute host-UDP lab,
+  a `main` push typically leaves the `Gateway API Conformance` run in progress
+  for roughly 50 minutes. If the labs are slow or runner-starved beyond that,
+  `main-publish-gate` times out and `latest` / the Docker tags are simply not
+  republished for that commit; the next `main` commit publishes normally. That
+  is a deliberate fail-closed miss, not a wedge.
+* A superseded `main` push does not publish and cannot be released.
+  `ci.yml`, `coverage.yml`, `gateway-api-conformance.yml`, and
+  `mesh-e2e-sidecar-live.yml` key their `push` concurrency by branch with
+  `cancel-in-progress`, so a second push to `main` cancels the first commit's
+  runs. For the `latest` / Docker path this is self-consistent -- the
+  publishing `ci.yml` run is cancelled together with the evidence it was
+  waiting on, and the newest commit publishes instead. For the **version-tag**
+  path it is a real constraint: a `cancelled` run is blocking evidence, so a
+  `v*` tag must target a `main` commit whose push runs actually completed --
+  in practice the tip after `main` has been quiet long enough for them to
+  finish. Tagging a commit that was superseded mid-run leaves
+  `validate-release-sha` waiting until its deadline and then failing closed.
+  Re-running the cancelled workflows for that exact SHA, or moving the tag to a
+  commit with complete evidence, are the two supported remedies.
 
 ### Release Pipeline Flow
 
