@@ -57,6 +57,20 @@ def check_smoke_script(source: str) -> list[str]:
         errors.append(
             "smoke_linux_gnu_baseline.sh must keep docker argv0 a literal docker"
         )
+    if (
+        'export FERRUM_GNU_SMOKE_READY="$rpc_dir/ready"' not in source
+        or 'Path(os.environ["FERRUM_GNU_SMOKE_READY"]).write_text' not in source
+        or 'if [[ -f "$FERRUM_GNU_SMOKE_READY" ]]' not in source
+    ):
+        errors.append(
+            "smoke_linux_gnu_baseline.sh must use an explicit bounded RPC "
+            "readiness handshake"
+        )
+    if "sleep 0.2" in source:
+        errors.append(
+            "smoke_linux_gnu_baseline.sh must not use a fixed delay as RPC "
+            "readiness evidence"
+        )
     return errors
 
 
@@ -91,6 +105,13 @@ def run_self_test() -> list[str]:
     mutated = script.replace('--volume "$stage:/gnu:ro"', '--volume "$stage:/gnu:rw"', 1)
     if not check_smoke_script(mutated):
         failures.append("read-write /gnu smoke mount was not rejected")
+    mutated = script.replace(
+        'if [[ -f "$FERRUM_GNU_SMOKE_READY" ]]',
+        'if [[ -S "$FERRUM_GNU_SMOKE_RPC" ]]',
+        1,
+    )
+    if not check_smoke_script(mutated):
+        failures.append("missing explicit RPC readiness handshake was not rejected")
     return failures
 
 

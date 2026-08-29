@@ -117,6 +117,7 @@ cat > "$fixture/cni-conf/10-bridge.conf" <<'CNI'
 CNI
 
 export FERRUM_GNU_SMOKE_RPC="$rpc_dir/cni.sock"
+export FERRUM_GNU_SMOKE_READY="$rpc_dir/ready"
 python3 <<'PY' &
 import json
 import os
@@ -166,6 +167,7 @@ def loop() -> None:
 
 thread = threading.Thread(target=loop, daemon=True)
 thread.start()
+Path(os.environ["FERRUM_GNU_SMOKE_READY"]).write_text("ready\n", encoding="utf-8")
 try:
     thread.join()
 finally:
@@ -173,7 +175,23 @@ finally:
     sock.close()
 PY
 rpc_pid=$!
-sleep 0.2
+rpc_ready=false
+for _ in $(seq 1 100); do
+  if [[ -f "$FERRUM_GNU_SMOKE_READY" ]]; then
+    rpc_ready=true
+    break
+  fi
+  if ! kill -0 "$rpc_pid" >/dev/null 2>&1; then
+    wait "$rpc_pid" || true
+    echo "::error::GNU smoke RPC server exited before becoming ready" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+if [[ "$rpc_ready" != true ]]; then
+  echo "::error::GNU smoke RPC server did not become ready within 10 seconds" >&2
+  exit 1
+fi
 
 require_json_key() {
   local key="$1"
