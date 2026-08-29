@@ -4265,7 +4265,9 @@ pub(crate) fn validate_plugin_security_composition_candidate(
             if !applies {
                 continue;
             }
-            remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
+            if !is_istio_route_transform_consumer(plugin_config, &proxy.id) {
+                remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
+            }
             merged.push(Arc::clone(plugin));
         }
         if let Err(error) = validate_plugin_security_composition(&merged) {
@@ -4323,6 +4325,36 @@ fn remove_shadowed_global_plugin(
         plugin.name() != plugin_name
             || !global_ptrs.contains(&(Arc::as_ptr(plugin) as *const () as usize))
     });
+}
+
+/// Whether this is the exact no-static-rules transformer instance emitted by
+/// the Istio VirtualService translator to consume per-route header overrides.
+///
+/// These instances are additive to a same-name global transformer: dropping
+/// the global would also drop unrelated operator-authored static rules merely
+/// because one VirtualService route declares a header transform. Exact id,
+/// scope, proxy ownership, and config-shape checks keep ordinary operator
+/// proxy configs on the established proxy-overrides-global path.
+fn is_istio_route_transform_consumer(config: &PluginConfig, proxy_id: &str) -> bool {
+    if config.scope != PluginScope::Proxy || config.proxy_id.as_deref() != Some(proxy_id) {
+        return false;
+    }
+    let expected_prefix = match config.plugin_name.as_str() {
+        "request_transformer" => "istio-vs-req-xform-",
+        "response_transformer" => "istio-vs-resp-xform-",
+        _ => return false,
+    };
+    config.id.strip_prefix(expected_prefix) == Some(proxy_id)
+        && config
+            .config
+            .get("rules")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty)
+        && config
+            .config
+            .get("apply_route_overrides")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
 }
 
 /// Cross-plugin composition candidate validation. The security composition
@@ -7071,48 +7103,29 @@ impl PluginCache {
                             &mut tcp_connection_throttle_instances,
                         ) {
                             Ok(Some(plugin)) => {
-                                // Detect when an auto-emitted plugin instance
-                                // (Istio VirtualService translator helpers) is
-                                // about to shadow an operator-configured global
-                                // of the same name. The operator's global will
-                                // not apply to this proxy, which may surprise
-                                // operators who expected the global's static
-                                // rules to also run for VS-translated routes.
-                                // Emit a warn so the silent shadowing is at
-                                // least operator-visible.
-                                if pc.id.starts_with("istio-vs-req-xform-")
-                                    || pc.id.starts_with("istio-vs-resp-xform-")
-                                {
-                                    let shadowed = merged.iter().any(|p| {
-                                        p.name() == plugin.name()
-                                            && global_ptrs
-                                                .contains(&(Arc::as_ptr(p) as *const () as usize))
-                                    });
-                                    if shadowed {
-                                        warn!(
-                                            proxy = %proxy.id,
-                                            plugin = plugin.name(),
-                                            auto_emit_id = %pc.id,
-                                            "Istio VirtualService translator auto-emitted a proxy-scoped {} instance to consume route-level header transforms; this shadows the operator-configured global {} on this proxy. Move the global's rules to the VirtualService or pre-create a proxy-scoped instance with the merged ruleset to retain both behaviors.",
-                                            plugin.name(),
-                                            plugin.name(),
-                                        );
-                                    }
+                                // Translator-owned no-static-rules consumers
+                                // are additive: the global instance keeps its
+                                // operator-authored rules, then this proxy-local
+                                // instance applies the selected route override.
+                                // Every ordinary scoped config keeps the normal
+                                // proxy-overrides-global contract.
+                                if !is_istio_route_transform_consumer(pc, &proxy.id) {
+                                    remove_shadowed_global_plugin(
+                                        &mut merged,
+                                        &global_ptrs,
+                                        plugin.name(),
+                                    );
                                 }
-                                // Remove only GLOBAL plugins of the same name.
-                                remove_shadowed_global_plugin(
-                                    &mut merged,
-                                    &global_ptrs,
-                                    plugin.name(),
-                                );
                                 merged.push(plugin);
                             }
                             Ok(None) => {
-                                remove_shadowed_global_plugin(
-                                    &mut merged,
-                                    &global_ptrs,
-                                    &pc.plugin_name,
-                                );
+                                if !is_istio_route_transform_consumer(pc, &proxy.id) {
+                                    remove_shadowed_global_plugin(
+                                        &mut merged,
+                                        &global_ptrs,
+                                        &pc.plugin_name,
+                                    );
+                                }
                             }
                             Err(e) => {
                                 error!(proxy_id = %proxy.id, "Config reload: {}", e);
@@ -7875,19 +7888,23 @@ impl PluginCache {
                                 // Remove only GLOBAL plugins of the same name —
                                 // other proxy-scoped instances are preserved,
                                 // allowing multiple instances of the same plugin type.
-                                remove_shadowed_global_plugin(
-                                    &mut merged,
-                                    &global_ptrs,
-                                    plugin.name(),
-                                );
+                                if !is_istio_route_transform_consumer(pc, &proxy.id) {
+                                    remove_shadowed_global_plugin(
+                                        &mut merged,
+                                        &global_ptrs,
+                                        plugin.name(),
+                                    );
+                                }
                                 merged.push(plugin);
                             }
                             Ok(None) => {
-                                remove_shadowed_global_plugin(
-                                    &mut merged,
-                                    &global_ptrs,
-                                    &pc.plugin_name,
-                                );
+                                if !is_istio_route_transform_consumer(pc, &proxy.id) {
+                                    remove_shadowed_global_plugin(
+                                        &mut merged,
+                                        &global_ptrs,
+                                        &pc.plugin_name,
+                                    );
+                                }
                             }
                             Err(e) => plugin_errors.push(format!("proxy_id={}: {}", proxy.id, e)),
                         }

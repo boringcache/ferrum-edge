@@ -3399,12 +3399,11 @@ fn materialize_route_candidate(
     // per-rule transforms onto `RequestContext` at match time; without a
     // consumer plugin on the proxy, those overrides would never apply.
     //
-    // Operator-configured proxy-scoped plugins win because we only emit
-    // when none exists in `route_plugins`. Operators who configure a global
-    // request_transformer on the gateway should be aware that a VS-driven
-    // proxy will use the auto-emitted instance (proxy-scope replaces same-
-    // named global) — keep route-level transforms out of the VS when that
-    // is undesired.
+    // Operator-configured proxy-scoped plugins win because we only emit when
+    // none exists in `route_plugins`. The exact translator-owned empty
+    // consumer is additive to any same-name global transformer: global static
+    // rules remain active and the selected VirtualService route transform is
+    // applied once in the authoritative route-header final phase.
     let dispatch_rules_have_request_transform =
         dispatch_rules_carry_transform(&dispatch_rules, "request_transform");
     let dispatch_rules_have_response_transform =
