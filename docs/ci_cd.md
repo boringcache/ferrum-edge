@@ -266,6 +266,15 @@ canonical `.github/workflows/<file>` endpoint and requires the server-reported
 `id`, `path`, `name`, and `state: active` to match. It then requires **every**
 matching run for the SHA to have `status: completed` and `conclusion: success`.
 A single passing duplicate never masks a failed run of the same workflow.
+Each one-minute polling sweep re-evaluates the complete selected set: a
+completed success observed while another required context is still pending is
+never cached, because GitHub permits rerunning a completed workflow and its
+API record can return to `queued` / `in_progress` and later fail during the
+wait. Publication is permitted only when one complete sweep sees every
+selected context successful. Workflow identity may be reused while a context
+is still pending so the token budget stays bounded; the sweep that would
+permit freshly revalidates canonical workflow `id` / `path` / `name` /
+`state: active` before returning.
 
 Blocking in all cases: missing, `queued`, `in_progress`, `waiting`, `failure`,
 `cancelled`, `skipped`, `timed_out`, `stale`, `neutral`, `action_required`,
@@ -297,9 +306,12 @@ head commit on `main` verbatim, so the product SHA carries that run directly.
   version tag. That is deliberate: such a commit did not clear the required
   checks. Publication resumes with the next commit that lands through the merge
   queue.
-* Publication never races ahead of checks. Both gates poll and fail closed at
-  their own deadline (100 minutes on the `main` path, 160 minutes on the release
-  path) rather than proceeding on an unproven result.
+* Publication never races ahead of checks. Both gates poll once a minute and
+  fail closed at their own deadline (100 minutes on the `main` path, 160
+  minutes on the release path) rather than proceeding on an unproven result.
+  A success observed mid-wait is not a publication proof; the final permitting
+  sweep must still see the entire selected set successful under freshly
+  revalidated workflow identity.
 
 ### Release Pipeline Flow
 

@@ -18,9 +18,12 @@ This module is the only consumer of that inventory. It provides two things:
 * a RUNTIME gate (`enforce`) that both publication paths execute. It resolves
   each required workflow by its canonical file, workflow id, path, and name, and
   then requires EVERY matching run to have completed successfully for the exact
-  SHA under the expected event and branch. Missing, queued, in-progress, waiting,
-  failed, cancelled, skipped, timed-out, stale, neutral, and unknown results are
-  all blocking, as are wrong-SHA, wrong-event, wrong-branch, wrong-path,
+  SHA under the expected event and branch. Each polling sweep re-evaluates the
+  complete selected set; a success observed while another context is still
+  pending is never cached, and the permitting sweep revalidates workflow
+  identity before returning. Missing, queued, in-progress, waiting, failed,
+  cancelled, skipped, timed-out, stale, neutral, and unknown results are all
+  blocking, as are wrong-SHA, wrong-event, wrong-branch, wrong-path,
   wrong-workflow-id, and fork/untrusted runs. A display name alone is never an
   identity.
 
@@ -187,9 +190,15 @@ PAGE_SIZE = 100
 MAX_PAGES = 20
 TRANSIENT_ATTEMPTS = 3
 # The Actions token is rate limited per repository, and these gates can poll for
-# well over an hour. Poll once a minute, resolve each workflow's identity once,
-# and stop querying a context after it is proven, so a long wait on one slow
-# suite cannot exhaust the budget the gate itself depends on.
+# well over an hour. Poll once a minute and reuse a workflow-identity lookup
+# while any selected context is still pending, so a long wait on one slow suite
+# cannot exhaust the budget the gate itself depends on. A completed success is
+# never cached across sweeps: GitHub permits rerunning a completed workflow, so
+# the run record can return to queued/in_progress and later fail while this
+# wait is still in progress. Every sweep re-lists every selected context under
+# the same bounded pagination; the sweep that would permit then re-resolves
+# canonical workflow id/path/name/active state and re-observes the complete set
+# before returning.
 POLL_SECONDS = 60
 
 # Anything that is not a completed success blocks. Statuses are listed only so
@@ -1299,7 +1308,15 @@ def evaluate_entry(
     queue_prefix: str,
     resolved: dict[str, dict] | None = None,
 ) -> tuple[str, str]:
-    """Return ("success" | "pending" | "blocked", diagnostic) for one context."""
+    """Return ("success" | "pending" | "blocked", diagnostic) for one context.
+
+    `resolved` caches canonical workflow id/path/name/active lookups so a long
+    pending wait does not re-GET identity every minute. That cache is not a
+    permitting proof: `enforce` drops it and re-observes the complete selected
+    set before returning success, because a record resolved at the start of the
+    wait can drift (rename, relocate, disable) during the same window a run
+    can be rerun.
+    """
 
     event = "push" if entry["evidence"] == "push_main" else "merge_group"
     if resolved is None:
@@ -1394,7 +1411,15 @@ def enforce(
     monotonic=time.monotonic,
     log=print,
 ) -> int:
-    """Poll until every selected context is proven successful, or fail closed."""
+    """Poll until one complete sweep observes every selected context successful.
+
+    A prior successful observation is never reused. GitHub allows a completed
+    workflow run to be rerun, so its API record can return to queued /
+    in_progress and later fail while another required context is still
+    pending. Publication is permitted only when a single sweep sees the entire
+    selected set successful, and that permitting sweep freshly revalidates
+    canonical workflow identity before returning.
+    """
 
     queue_prefix = str(inventory.get("merge_queue_branch_prefix"))
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
@@ -1409,12 +1434,22 @@ def enforce(
 
     start = monotonic()
     resolved: dict[str, dict] = {}
-    proven: set[str] = set()
-    while True:
-        pending: list[str] = []
+
+    def observe(*, refresh_identities: bool) -> tuple[str, list[str]]:
+        """Re-evaluate every selected entry. Never skip a context.
+
+        Returns ("blocked" | "pending" | "success", messages). A blocked
+        entry fails immediately. Identity lookups may be reused while
+        waiting; the permitting path must call this with
+        `refresh_identities=True` so canonical id/path/name/active state
+        is not a record resolved many minutes earlier.
+        """
+
+        if refresh_identities:
+            resolved.clear()
+        pending_messages: list[str] = []
+        success_messages: list[str] = []
         for entry in selected:
-            if entry["context"] in proven:
-                continue
             verdict, message = evaluate_entry(
                 get,
                 repository,
@@ -1424,24 +1459,39 @@ def enforce(
                 resolved,
             )
             if verdict == "blocked":
-                log(f"::error::{message}")
-                return 1
+                return ("blocked", [message])
             if verdict == "pending":
-                pending.append(message)
+                pending_messages.append(message)
             else:
-                proven.add(entry["context"])
-                log(message)
-        if not pending:
-            log(
-                f"All {len(selected)} publish-blocking required checks passed for {sha}."
-            )
-            return 0
-        for message in pending:
+                success_messages.append(message)
+        if pending_messages:
+            return ("pending", pending_messages)
+        return ("success", success_messages)
+
+    while True:
+        outcome, messages = observe(refresh_identities=False)
+        if outcome == "blocked":
+            log(f"::error::{messages[0]}")
+            return 1
+        if outcome == "success":
+            outcome, messages = observe(refresh_identities=True)
+            if outcome == "blocked":
+                log(f"::error::{messages[0]}")
+                return 1
+            if outcome == "success":
+                for message in messages:
+                    log(message)
+                log(
+                    f"All {len(selected)} publish-blocking required checks "
+                    f"passed for {sha}."
+                )
+                return 0
+        for message in messages:
             log(f"Waiting: {message}")
         if monotonic() - start >= deadline_seconds:
             log(
                 "::error::timed out waiting for publish-blocking required checks "
-                f"for {sha}: {'; '.join(pending)}"
+                f"for {sha}: {'; '.join(messages)}"
             )
             return 1
         sleep(POLL_SECONDS)
@@ -1578,6 +1628,82 @@ def _enforce(runs_by_file, **kwargs) -> int:
         monotonic=lambda: 1.0,
         log=lambda *_args, **_kwargs: None,
     )
+
+
+def _enforce_across_sweeps(
+    sweep_runs: list[dict[str, list[dict]]],
+    *,
+    workflow_mutations: list[dict[str, dict]] | None = None,
+    deadline_seconds: int = 90,
+    compare_status: str = "behind",
+) -> tuple[int, list[float]]:
+    """Drive `enforce` across successive API snapshots advanced by `sleep`.
+
+    Index 0 is the first polling sweep. `sleep` advances both the monotonic
+    clock by the requested interval and the snapshot index, matching the
+    production one-minute cadence. Workflow-identity GETs in sweep *i* see
+    `workflow_mutations[i]` overlaid on the canonical fixture records when
+    that list is provided.
+    """
+
+    inventory = _fixture_inventory()
+    state = {"sweep": 0, "t": 0.0}
+    slept: list[float] = []
+    workflows = {
+        "alpha.yml": {
+            "id": 11,
+            "path": ".github/workflows/alpha.yml",
+            "name": "Alpha Workflow",
+            "state": "active",
+        },
+        "beta.yml": {
+            "id": 22,
+            "path": ".github/workflows/beta.yml",
+            "name": "Beta Workflow",
+            "state": "active",
+        },
+    }
+
+    def get(path: str) -> object:
+        index = min(state["sweep"], len(sweep_runs) - 1)
+        if "/compare/" in path:
+            return {"status": compare_status}
+        match = re.search(r"/actions/workflows/([^/?]+)(/runs)?", path)
+        if match is None:  # pragma: no cover - defensive
+            raise ApiFailure(f"unexpected path {path}")
+        workflow_file = match.group(1)
+        if match.group(2) is None:
+            payload = dict(workflows[workflow_file])
+            if workflow_mutations is not None and index < len(workflow_mutations):
+                payload.update(workflow_mutations[index].get(workflow_file, {}))
+            return payload
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+        page = int((query.get("page") or ["1"])[0])
+        per_page = int((query.get("per_page") or [str(PAGE_SIZE)])[0])
+        all_runs = list(sweep_runs[index].get(workflow_file, []))
+        start = (page - 1) * per_page
+        return {"workflow_runs": all_runs[start : start + per_page]}
+
+    def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        state["t"] += seconds
+        state["sweep"] += 1
+
+    try:
+        code = enforce(
+            get,
+            "ferrum-edge/ferrum-edge",
+            _SHA,
+            inventory,
+            select_entries(inventory, "main"),
+            deadline_seconds,
+            sleep=sleep,
+            monotonic=lambda: state["t"],
+            log=lambda *_args, **_kwargs: None,
+        )
+    except ApiFailure:
+        code = 1
+    return code, slept
 
 
 def _beta_run(**overrides) -> dict:
@@ -1782,6 +1908,94 @@ def self_test() -> list[str]:
     runs = _complete_runs()
     runs["alpha.yml"] = [_run(), _run(conclusion="failure")]
     expect(_enforce(runs) == 1, "a failed duplicate run must block publication")
+
+    # Time-of-check/time-of-use: a completed success observed while another
+    # required context is still pending must not be cached. GitHub permits
+    # rerunning a completed workflow, so the first context can return to
+    # queued or fail as the second becomes successful. Both sequences would
+    # incorrectly permit under a permanent `proven` set.
+    pending_then_success_alpha = _complete_runs()
+    pending_then_success_alpha["beta.yml"] = [
+        _beta_run(status="in_progress", conclusion=None)
+    ]
+    later_complete = _complete_runs()
+    code, slept = _enforce_across_sweeps(
+        [pending_then_success_alpha, later_complete]
+    )
+    expect(
+        code == 0,
+        "a later complete exact-SHA sweep must publish after a pending wait",
+    )
+    expect(
+        slept == [POLL_SECONDS],
+        "a pending wait must keep the one-minute poll cadence",
+    )
+
+    queued_after_success = _complete_runs()
+    queued_after_success["alpha.yml"] = [_run(status="queued", conclusion=None)]
+    code, slept = _enforce_across_sweeps(
+        [pending_then_success_alpha, queued_after_success]
+    )
+    expect(
+        code == 1,
+        "a previously successful context that returns to queued while another "
+        "succeeds must block publication",
+    )
+    expect(
+        slept and all(interval == POLL_SECONDS for interval in slept),
+        "a queued regression must keep waiting at the one-minute cadence",
+    )
+
+    failed_after_success = _complete_runs()
+    failed_after_success["alpha.yml"] = [_run(conclusion="failure")]
+    code, slept = _enforce_across_sweeps(
+        [pending_then_success_alpha, failed_after_success]
+    )
+    expect(
+        code == 1,
+        "a previously successful context that fails while another succeeds "
+        "must block publication",
+    )
+    expect(
+        slept == [POLL_SECONDS],
+        "a failure regression must fail closed after one pending wait",
+    )
+
+    duplicate_at_permit = _complete_runs()
+    duplicate_at_permit["alpha.yml"] = [_run(), _run(conclusion="failure")]
+    code, _slept = _enforce_across_sweeps(
+        [pending_then_success_alpha, duplicate_at_permit]
+    )
+    expect(
+        code == 1,
+        "a failed duplicate that appears only on the permitting sweep must block",
+    )
+
+    # Workflow identity cached while pending is not a permitting proof. The
+    # all-green path must re-resolve canonical id/path/name/active state; a
+    # rename or disable that lands during the wait must fail closed.
+    code, _slept = _enforce_across_sweeps(
+        [pending_then_success_alpha, later_complete],
+        workflow_mutations=[
+            {},
+            {"alpha.yml": {"name": "Alpha Workflow v2"}},
+        ],
+    )
+    expect(
+        code == 1,
+        "a workflow renamed after a pending wait must not permit on cached identity",
+    )
+    code, _slept = _enforce_across_sweeps(
+        [pending_then_success_alpha, later_complete],
+        workflow_mutations=[
+            {},
+            {"alpha.yml": {"state": "disabled_manually"}},
+        ],
+    )
+    expect(
+        code == 1,
+        "a workflow disabled after a pending wait must not permit on cached identity",
+    )
 
     # Identity: wrong SHA, event, branch, path, workflow id, and name.
     for label, override in (
