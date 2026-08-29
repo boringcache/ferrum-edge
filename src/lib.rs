@@ -7768,11 +7768,7 @@ pub mod _test_support {
         not_after_unix: i64,
         now_unix: i64,
     ) -> Option<bool> {
-        crate::plugins::mtls_auth::cert_is_valid_at_unix(
-            not_before_unix,
-            not_after_unix,
-            now_unix,
-        )
+        crate::plugins::mtls_auth::cert_is_valid_at_unix(not_before_unix, not_after_unix, now_unix)
     }
 
     /// Parse a client-certificate DER into the Unix `notBefore`/`notAfter`
