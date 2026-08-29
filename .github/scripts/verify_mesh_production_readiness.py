@@ -194,9 +194,33 @@ def validate_serving_podspecs(results_dir: Path) -> None:
     ambient = resource_document(rendered, "ferrum-mesh-ambient", "DaemonSet")
     require_text(
         ambient,
-        '- "NET_ADMIN"',
+        "- NET_ADMIN",
         "Ambient NET_ADMIN missing",
-        "ambient must retain quoted NET_ADMIN for datapath capture",
+        "ambient must retain unquoted NET_ADMIN for datapath capture",
+    )
+    require_text(
+        ambient,
+        "- NET_RAW",
+        "Ambient NET_RAW missing",
+        "ambient must retain unquoted NET_RAW for datapath capture",
+    )
+    require_text(
+        ambient,
+        "- ALL",
+        "Ambient capabilities.drop ALL missing",
+        "ambient must drop unquoted ALL so the add list is the complete privilege surface",
+    )
+    forbid_text(
+        ambient,
+        "allowPrivilegeEscalation",
+        "Ambient proxy inherited preflight privilege-escalation",
+        "the steady-state ambient proxy must not emit allowPrivilegeEscalation; that field is the UDP preflight init container's privilege surface",
+    )
+    forbid_text(
+        ambient,
+        '- "NET_ADMIN"',
+        "Ambient NET_ADMIN quoted",
+        "quoting datapath capabilities breaks NodeWaypoint eBPF live and Helm Chart greps",
     )
     require_text(
         ambient,
@@ -295,6 +319,22 @@ def validate_refusals(results_dir: Path) -> None:
         fail(
             "Empty resources refusal missing",
             "empty serving requests.cpu/memory must fail closed (BestEffort QoS)",
+        )
+    esc = require_capture(
+        results_dir, "mesh-prod-ambient-privilege-escalation.err"
+    ).read_text(encoding="utf-8")
+    if "allowPrivilegeEscalation" not in esc:
+        fail(
+            "Ambient privilege-escalation schema refusal missing",
+            "ambient.securityContext.allowPrivilegeEscalation must be rejected as an unknown proxy key",
+        )
+    esc_skip = require_capture(
+        results_dir, "mesh-prod-ambient-privilege-escalation-skip-schema.err"
+    ).read_text(encoding="utf-8")
+    if "not a steady-state proxy field" not in esc_skip:
+        fail(
+            "Ambient privilege-escalation template refusal missing",
+            "--skip-schema-validation must still fail closed so the proxy cannot inherit the preflight field",
         )
     print("mesh shutdown/resource refusals ok")
 
@@ -599,7 +639,7 @@ def validate_narrow_ipv6_render(results_dir: Path) -> None:
         "shutdownPreStopSeconds=0 must omit lifecycle.preStop entirely",
     )
     ambient = resource_document(rendered, "ferrum-mesh-ambient", "DaemonSet")
-    for cap in ('- "NET_ADMIN"', '- "NET_RAW"', '- "SYS_RESOURCE"'):
+    for cap in ("- NET_ADMIN", "- NET_RAW", "- SYS_RESOURCE"):
         require_text(
             ambient,
             cap,
@@ -608,9 +648,9 @@ def validate_narrow_ipv6_render(results_dir: Path) -> None:
         )
     require_text(
         ambient,
-        '- "ALL"',
+        "- ALL",
         "Ambient capability drop missing",
-        "ambient must keep dropping quoted ALL even when extra capabilities are added",
+        "ambient must keep dropping unquoted ALL even when extra capabilities are added",
     )
     print("mesh narrow-IPv6 / pre-drain / capability-merge render ok")
 
@@ -665,6 +705,64 @@ def validate_mapped_admin_and_probe_source(results_dir: Path) -> None:
     print("mesh mapped-admin / ambient-port0-disabled render ok")
 
 
+def _unquoted_cap(doc: str, cap: str, workload: str) -> None:
+    require_text(
+        doc,
+        f"- {cap}",
+        f"{workload} {cap} missing",
+        f"{workload} must render unquoted - {cap}",
+    )
+    forbid_text(
+        doc,
+        f'- "{cap}"',
+        f"{workload} {cap} quoted",
+        f"quoting {cap} breaks NodeWaypoint eBPF live and Helm Chart greps",
+    )
+
+
+def validate_node_waypoint_ebpf_caps(results_dir: Path) -> None:
+    rendered = require_capture(results_dir, "mesh-probes-node-waypoint.yaml").read_text(
+        encoding="utf-8"
+    )
+    ambient = resource_document(rendered, "ferrum-mesh-ambient", "DaemonSet")
+    node_agent = resource_document(rendered, "ferrum-mesh-node-agent", "DaemonSet")
+    for name, doc in (("ambient", ambient), ("node-agent", node_agent)):
+        for cap in ("BPF", "PERFMON", "SYS_ADMIN"):
+            _unquoted_cap(doc, cap, name)
+    _unquoted_cap(ambient, "SYS_PTRACE", "ambient")
+    forbid_text(
+        ambient,
+        "allowPrivilegeEscalation",
+        "NodeWaypoint proxy inherited preflight privilege-escalation",
+        "NodeWaypoint does not run the UDP preflight; the proxy must not emit allowPrivilegeEscalation",
+    )
+    print("mesh node-waypoint eBPF capabilities ok")
+
+
+def validate_udp_cleanup_upgrade(results_dir: Path) -> None:
+    rendered = require_capture(
+        results_dir, "udp-placement-pod-host-cleanup.yaml"
+    ).read_text(encoding="utf-8")
+    require_text(
+        rendered,
+        "- SYS_ADMIN",
+        "UDP cleanup SYS_ADMIN missing",
+        "pre-contract Ambient UDP cleanup must keep unquoted SYS_ADMIN for setns predecessor retirement",
+    )
+    require_text(
+        rendered,
+        "- SYS_PTRACE",
+        "UDP cleanup SYS_PTRACE missing",
+        "pre-contract Ambient UDP cleanup must keep unquoted SYS_PTRACE for setns predecessor retirement",
+    )
+    if 'phase: "cleanup"' not in rendered and "phase: cleanup" not in rendered:
+        fail(
+            "UDP cleanup contract phase missing",
+            "the positive --is-upgrade cleanup fixture must stamp phase=cleanup",
+        )
+    print("mesh UDP cleanup upgrade capabilities ok")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -686,6 +784,8 @@ def main() -> int:
     validate_strict_admin_validation(results_dir)
     validate_narrow_ipv6_render(results_dir)
     validate_mapped_admin_and_probe_source(results_dir)
+    validate_node_waypoint_ebpf_caps(results_dir)
+    validate_udp_cleanup_upgrade(results_dir)
     print("mesh production-readiness ok")
     return 0
 

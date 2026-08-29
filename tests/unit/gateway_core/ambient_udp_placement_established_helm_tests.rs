@@ -350,7 +350,7 @@ fn the_steady_state_proxy_container_carries_no_preflight_surface() {
     // producer enters pod netns; they must never be reachable through the
     // preflight gate.
     let setns_gate = proxy
-        .find("{{- if $ambientSetnsCapture }}")
+        .find("{{- if $ambientSetnsCapture")
         .expect("steady-state setns capability gate");
     for privilege in ["SYS_ADMIN", "SYS_PTRACE"] {
         assert_eq!(
@@ -364,6 +364,79 @@ fn the_steady_state_proxy_container_carries_no_preflight_surface() {
             "{privilege} must sit inside the setns-capture gate, not the preflight one"
         );
     }
+
+    // Datapath capability names must stay unquoted (`- BPF`, not `- "BPF"`):
+    // NodeWaypoint eBPF live and Helm Chart greps match the unquoted form on
+    // both the proxy and the node-agent.
+    assert!(
+        proxy.contains("- {{ $cap }}")
+            && !proxy.contains("$cap | quote")
+            && !proxy.contains("ambientDropNormalized 0 | quote"),
+        "steady-state capability names must render unquoted so topology greps keep matching"
+    );
+    let bpf_gate = proxy
+        .find("{{- if $nodeWaypointRegistryEnabled -}}")
+        .expect("NodeWaypoint BPF/PERFMON gate");
+    for cap in ["BPF", "PERFMON"] {
+        assert_eq!(
+            proxy.matches(&format!("\"{cap}\"")).count(),
+            1,
+            "{cap} must appear once as a required NodeWaypoint capability token"
+        );
+        let at = proxy.find(&format!("\"{cap}\"")).expect("cap position");
+        assert!(
+            bpf_gate < at && at < setns_gate,
+            "{cap} must sit inside the NodeWaypoint registry gate"
+        );
+    }
+}
+
+#[test]
+fn ambient_proxy_security_context_does_not_admit_preflight_privilege_fields() {
+    let ambient = read("templates/ambient-daemonset.yaml");
+    let values = read("values.yaml");
+    let schema = read("values.schema.json");
+
+    assert!(
+        ambient.contains(
+            "ambient.securityContext.allowPrivilegeEscalation is not a steady-state proxy field"
+        ),
+        "setting the preflight privilege-escalation field on ambient.securityContext must fail rendering"
+    );
+
+    let ambient_sc = schema
+        .split("\"ambientSecurityContext\"")
+        .nth(1)
+        .expect("ambientSecurityContext schema");
+    let ambient_sc = ambient_sc
+        .split("\"workloadResources\"")
+        .next()
+        .unwrap_or(ambient_sc);
+    assert!(
+        !ambient_sc.contains("allowPrivilegeEscalation"),
+        "ambient.securityContext schema must not admit the preflight privilege-escalation field"
+    );
+    assert!(
+        ambient_sc.contains("readOnlyRootFilesystem")
+            && ambient_sc.contains("capabilities"),
+        "ambient.securityContext must still admit readOnlyRootFilesystem and capabilities"
+    );
+
+    let marker = "Privilege-escalation is NOT a proxy key";
+    assert!(
+        values.contains(marker),
+        "values must document that privilege-escalation is not a steady-state proxy field"
+    );
+    let sc_at = values.find(marker).expect("ambient securityContext comment");
+    let sc_window = &values[sc_at..sc_at.saturating_add(1600).min(values.len())];
+    assert!(
+        !sc_window.contains("allowPrivilegeEscalation"),
+        "ambient values must not copy the preflight privilege-escalation field onto the proxy"
+    );
+    assert!(
+        sc_window.contains("readOnlyRootFilesystem: true") && sc_window.contains("- ALL"),
+        "ambient values must keep read-only root and drop ALL"
+    );
 }
 
 #[test]

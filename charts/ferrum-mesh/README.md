@@ -137,15 +137,17 @@ capabilities (`NET_ADMIN` / `NET_RAW`, plus `SYS_ADMIN`/`SYS_PTRACE` only for
 in-netns capture and `BPF`/`PERFMON` for NodeWaypoint) after dropping ALL, and it
 assembles its container `securityContext` field by field rather than rendering
 the operator's map verbatim. `ambient.securityContext` therefore accepts only the
-keys the template actually reads — `allowPrivilegeEscalation`,
-`readOnlyRootFilesystem`, `capabilities.drop`, `capabilities.add` — and rejects
-anything else at lint time rather than silently ignoring it (`runAsUser` /
-`runAsGroup` are decided by the capture mode). `capabilities.drop` must stay
+keys the template actually reads — `readOnlyRootFilesystem`, `capabilities.drop`,
+`capabilities.add` — and rejects anything else at lint time rather than silently
+ignoring it (`runAsUser` / `runAsGroup` are decided by the capture mode; the
+privileged UDP preflight init container hard-codes no-escalation and that
+field is not a steady-state proxy key). `capabilities.drop` must stay
 `["ALL"]`, and `capabilities.add` **merges on top of** the datapath minimum: it
 can add named capabilities but can never remove a required one. `ALL` and
 `CAP_ALL` are rejected in `capabilities.add` — they would re-grant the complete
 Linux capability set after `drop: ["ALL"]`. Capability names are validated
-against `^(CAP_)?[A-Z][A-Z0-9_]*$` and rendered quoted. An explicit `drop: []`
+against `^(CAP_)?[A-Z][A-Z0-9_]*$` and rendered unquoted so NodeWaypoint and
+Ambient UDP live/CI greps keep matching the datapath set. An explicit `drop: []`
 is rejected — it is not silently rewritten to `[ALL]`; omit the key to keep the
 default.
 

@@ -422,18 +422,19 @@ ambient:
       type: RuntimeDefault
   # Unlike the Deployment workloads this is NOT rendered verbatim: ambient
   # assembles its container SecurityContext field by field, so the schema admits
-  # only the four keys below and rejects anything else rather than accepting a
+  # only the keys below and rejects anything else rather than accepting a
   # supported-looking key the template never reads. runAsUser/runAsGroup are
-  # decided by the capture mode. `capabilities.drop` must stay ["ALL"] (omit the
-  # key for that default; an explicit empty list is rejected rather than
-  # rewritten). `capabilities.add` MERGES on top of the datapath minimum
-  # (NET_ADMIN, NET_RAW, plus BPF/PERFMON for NodeWaypoint and SYS_ADMIN/
+  # decided by the capture mode. Privilege-escalation is NOT a proxy key: the
+  # privileged UDP preflight init container hard-codes it, and the steady-state
+  # container must not inherit that preflight surface. `capabilities.drop` must
+  # stay ["ALL"] (omit the key for that default; an explicit empty list is rejected
+  # rather than rewritten). `capabilities.add` MERGES on top of the datapath
+  # minimum (NET_ADMIN, NET_RAW, plus BPF/PERFMON for NodeWaypoint and SYS_ADMIN/
   # SYS_PTRACE for in-netns capture) and can never remove one. `ALL` and
   # `CAP_ALL` are rejected in add: they would re-grant the complete Linux
   # capability set after drop ALL. Capability names must match
-  # `^(CAP_)?[A-Z][A-Z0-9_]*$`.
+  # `^(CAP_)?[A-Z][A-Z0-9_]*$` and are rendered unquoted.
   securityContext:
-    allowPrivilegeEscalation: false
     readOnlyRootFilesystem: true
     capabilities:
       drop:

@@ -382,6 +382,28 @@ render_chart_assertions() {
     grep -nE 'kind: DaemonSet|name: ferrum-mesh-(ambient|node-agent)|hostPID:|hostNetwork:' <<<"$rendered" >&2 || true
     exit 1
   fi
+  local ambient_ds node_agent_ds
+  ambient_ds="$(awk '
+    /name: ferrum-mesh-ambient/ { in_ambient = 1 }
+    in_ambient { print }
+    /name: ferrum-mesh-node-agent/ && in_ambient { exit }
+  ' <<<"$rendered")"
+  node_agent_ds="$(awk '
+    /name: ferrum-mesh-node-agent/ { in_agent = 1 }
+    in_agent { print }
+  ' <<<"$rendered")"
+  for cap in BPF PERFMON SYS_ADMIN; do
+    if ! grep -q -- "- ${cap}" <<<"$ambient_ds" || ! grep -q -- "- ${cap}" <<<"$node_agent_ds"; then
+      echo "NodeWaypoint eBPF render did not grant ${cap} to both proxy and node-agent" >&2
+      grep -nE "kind: DaemonSet|name: ferrum-mesh-(ambient|node-agent)|capabilities:|add:|- ${cap}" <<<"$rendered" >&2 || true
+      exit 1
+    fi
+    if grep -q -- "- \"${cap}\"" <<<"$rendered"; then
+      echo "NodeWaypoint eBPF render quoted ${cap}; live greps require the unquoted datapath form" >&2
+      grep -nE "capabilities:|add:|- ${cap}" <<<"$rendered" >&2 || true
+      exit 1
+    fi
+  done
   if [[ "$(grep -c -- '- BPF' <<<"$rendered" || true)" -lt 2 ]] ||
     [[ "$(grep -c -- '- PERFMON' <<<"$rendered" || true)" -lt 2 ]] ||
     [[ "$(grep -c -- '- SYS_ADMIN' <<<"$rendered" || true)" -lt 2 ]]; then
