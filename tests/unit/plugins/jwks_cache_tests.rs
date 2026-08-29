@@ -1,3 +1,8 @@
+//! Remote JWKS stores and refresh task handles live in the process-global
+//! `jwks_cache`. Tests that call `clear_jwks_cache()` or hold live refresh
+//! tasks must serialize on `jwks_remote_global_cache` so a parallel reset
+//! cannot abort another test's background fetch.
+
 use ferrum_edge::_test_support::jwks_discovery_candidate_for_test;
 use ferrum_edge::plugins::PluginHttpClient;
 use ferrum_edge::plugins::utils::jwks_cache::{
@@ -41,6 +46,7 @@ pub(super) fn cache_test_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn test_same_jwks_uri_reuses_cached_store() {
     let server = wiremock::MockServer::start().await;
@@ -55,6 +61,7 @@ async fn test_same_jwks_uri_reuses_cached_store() {
     clear_jwks_cache();
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn shared_store_uses_minimum_interval_and_reconciles_removals() {
     let server = wiremock::MockServer::start().await;
@@ -99,6 +106,7 @@ async fn shared_store_uses_minimum_interval_and_reconciles_removals() {
     clear_jwks_cache();
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn shared_store_uses_strictest_max_stale_and_relaxes_only_on_reconcile() {
     let server = wiremock::MockServer::start().await;
@@ -162,6 +170,7 @@ async fn shared_store_uses_strictest_max_stale_and_relaxes_only_on_reconcile() {
     clear_jwks_cache();
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn policy_reconfiguration_forces_refresh_without_resetting_retained_key_age() {
     let (server, uri) = super::jwks_auth_tests::start_jwks_server(RSA_PUBLIC_PEM).await;
@@ -267,6 +276,7 @@ async fn policy_reconfiguration_forces_refresh_without_resetting_retained_key_ag
     clear_jwks_cache();
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn test_different_jwks_uris_get_distinct_store_entries() {
     let server = wiremock::MockServer::start().await;
@@ -282,6 +292,7 @@ async fn test_different_jwks_uris_get_distinct_store_entries() {
     clear_jwks_cache();
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn test_clear_jwks_cache_forces_store_recreation() {
     let server = wiremock::MockServer::start().await;
@@ -297,6 +308,7 @@ async fn test_clear_jwks_cache_forces_store_recreation() {
     clear_jwks_cache();
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn test_retain_active_uris_removes_stale_entries() {
     let server = wiremock::MockServer::start().await;
@@ -337,6 +349,7 @@ async fn test_retain_active_uris_removes_stale_entries() {
     clear_jwks_cache();
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn test_retain_active_uris_empty_set_clears_all() {
     let server = wiremock::MockServer::start().await;
@@ -364,6 +377,7 @@ async fn test_retain_active_uris_empty_set_clears_all() {
     clear_jwks_cache();
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn test_retired_store_revival_cancels_pending_reaper() {
     let server = wiremock::MockServer::start().await;
@@ -384,6 +398,7 @@ async fn test_retired_store_revival_cancels_pending_reaper() {
     clear_jwks_cache();
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn superseded_store_is_reaped_after_transient_owner_drops() {
     let server = wiremock::MockServer::start().await;
@@ -406,6 +421,7 @@ async fn superseded_store_is_reaped_after_transient_owner_drops() {
     clear_jwks_cache();
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn cancelled_discovery_candidate_retires_cache_entry_at_acquisition_boundary() {
     let server = wiremock::MockServer::start().await;
@@ -430,6 +446,7 @@ async fn cancelled_discovery_candidate_retires_cache_entry_at_acquisition_bounda
     clear_jwks_cache();
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn discarded_candidate_does_not_reap_or_poll_active_shared_store() {
     let server = wiremock::MockServer::start().await;
@@ -458,6 +475,7 @@ async fn discarded_candidate_does_not_reap_or_poll_active_shared_store() {
     clear_jwks_cache();
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn active_remote_trust_health_transitions_and_excludes_inactive() {
     use ferrum_edge::plugins::utils::jwks_cache::{
@@ -583,6 +601,7 @@ async fn active_remote_trust_health_transitions_and_excludes_inactive() {
     clear_jwks_cache();
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn shared_cache_trust_publish_stays_outside_dashmap_guards() {
     // Contract: create / tighten / retain / relax must not invoke
@@ -691,6 +710,7 @@ async fn shared_cache_trust_publish_stays_outside_dashmap_guards() {
 // Asynchronously discovered stores (issue #3739 direct/discovery parity)
 // ---------------------------------------------------------------------------
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn late_registered_store_is_active_immediately_and_expires_without_another_reload() {
     use ferrum_edge::plugins::utils::jwks_cache::{
@@ -770,6 +790,7 @@ async fn late_registered_store_is_active_immediately_and_expires_without_another
     clear_jwks_cache();
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn shared_uri_strictest_arbitration_spans_committed_and_late_consumers() {
     use ferrum_edge::plugins::utils::jwks_cache::LateActiveRequirement;

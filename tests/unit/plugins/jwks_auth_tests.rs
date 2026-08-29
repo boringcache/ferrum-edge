@@ -296,6 +296,11 @@ fn start_background_tasks(plugin: &JwksAuth) {
     plugin.commit_background_tasks();
 }
 
+// Remote JWKS background tasks register in the process-global `jwks_cache`.
+// Any test that starts those tasks or calls `clear_jwks_cache()` must use
+// `#[serial_test::serial(jwks_remote_global_cache)]` so parallel cache resets
+// cannot abort a live refresh fetch.
+
 // ─── Basic Plugin Tests ────────────────────────────────────────────────
 
 #[tokio::test]
@@ -703,6 +708,7 @@ async fn test_jwks_auth_warmup_hostnames_includes_discovery_url_before_resolutio
     assert!(plugin.active_jwks_uris().is_empty());
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn test_jwks_auth_oidc_discovery_eager_fetches_without_duplicate_jwks_call() {
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
@@ -750,6 +756,7 @@ async fn test_jwks_auth_oidc_discovery_eager_fetches_without_duplicate_jwks_call
     assert_eq!(final_count, 2);
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn oversized_discovery_document_is_rejected_before_deserialization() {
     let server = wiremock::MockServer::start().await;
@@ -778,6 +785,7 @@ async fn oversized_discovery_document_is_rejected_before_deserialization() {
     assert!(plugin.active_jwks_uris().is_empty());
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn equivalent_discovery_generation_reuses_last_good_store_during_outage() {
     let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
@@ -847,6 +855,7 @@ async fn equivalent_discovery_generation_reuses_last_good_store_during_outage() 
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("still-valid"));
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn failed_discovery_replacement_retires_unpublished_candidate_store() {
     use ferrum_edge::plugins::utils::jwks_cache::cached_refresh_state;
@@ -969,6 +978,7 @@ async fn start_oidc_discovery_server(jwks_uri: &str) -> (wiremock::MockServer, S
 /// compromised, or tampered discovery document must not be able to steer the
 /// gateway into a server-side request to an attacker-chosen host inside the
 /// trust boundary. The provider's JWKS store must never be populated from it.
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn test_jwks_auth_oidc_discovery_rejects_metadata_endpoint_jwks_uri() {
     // Different host than the loopback discovery server -> blocked by the
@@ -1004,6 +1014,7 @@ async fn test_jwks_auth_oidc_discovery_rejects_metadata_endpoint_jwks_uri() {
 /// check parses the authority host (`169.254.169.254`) rather than substring-
 /// matching, so the userinfo cannot smuggle a spurious same-host match. The
 /// discovery server binds 127.0.0.1, so its host equals the userinfo here.
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn test_jwks_auth_oidc_discovery_rejects_userinfo_host_confusion_jwks_uri() {
     let malicious_jwks_uri = "http://127.0.0.1@169.254.169.254/latest/meta-data/jwks.json";
@@ -1031,6 +1042,7 @@ async fn test_jwks_auth_oidc_discovery_rejects_userinfo_host_confusion_jwks_uri(
 
 /// Regression test for finding #5 (SSRF): an OIDC discovery document whose
 /// `jwks_uri` uses a non-URL scheme (`file:`) must be rejected.
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn test_jwks_auth_oidc_discovery_rejects_non_http_scheme_jwks_uri() {
     let malicious_jwks_uri = "file:///etc/passwd";
@@ -1060,6 +1072,7 @@ async fn test_jwks_auth_oidc_discovery_rejects_non_http_scheme_jwks_uri() {
 /// sufficient if the discovery document pivots to a different port on that
 /// host. The OIDC-discovered JWKS URL must match scheme, host, and effective
 /// port with the discovery URL.
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn test_jwks_auth_oidc_discovery_rejects_same_host_different_port_jwks_uri() {
     let jwks_server = wiremock::MockServer::start().await;
@@ -1099,6 +1112,7 @@ async fn test_jwks_auth_oidc_discovery_rejects_same_host_different_port_jwks_uri
 /// discovered JWKS URL that responds with a 3xx must not be followed to a
 /// different target. The JWKS fetch sees the 302 as the final response and
 /// fails closed without contacting the Location endpoint.
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn test_jwks_auth_oidc_discovery_does_not_follow_jwks_redirects() {
     let discovery_server = wiremock::MockServer::start().await;
@@ -1169,6 +1183,7 @@ async fn test_jwks_auth_oidc_discovery_does_not_follow_jwks_redirects() {
 /// the SSRF hardening does not break legitimate same-host discovery. Both the
 /// discovery document and the JWKS are served by the same wiremock server, so
 /// they share host:port — the discovered jwks_uri passes the same-host check.
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn test_jwks_auth_oidc_discovery_accepts_same_host_jwks_uri() {
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
@@ -1219,6 +1234,7 @@ async fn test_jwks_auth_oidc_discovery_accepts_same_host_jwks_uri() {
     }
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn test_jwks_auth_does_not_fetch_jwks_on_auth_hot_path_when_cache_empty() {
     let mock_server = wiremock::MockServer::start().await;
@@ -3262,6 +3278,7 @@ async fn wait_for_active_remote_stores(expected: u64) -> u64 {
     }
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn discovery_resolved_after_publication_becomes_active_without_another_reload() {
     use ferrum_edge::plugins::utils::jwks_cache::{cached_requirement, clear_jwks_cache};
@@ -3318,6 +3335,7 @@ async fn discovery_resolved_after_publication_becomes_active_without_another_rel
     clear_jwks_cache();
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn staged_discovery_is_withheld_until_commit_and_a_rejected_generation_leaves_nothing() {
     use ferrum_edge::plugins::utils::jwks_cache::{clear_jwks_cache, trust_health_snapshot};
@@ -3401,6 +3419,7 @@ async fn wait_for_cached_max_stale(jwks_uri: &str, expected_secs: u64) {
     }
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn shared_discovery_uri_relaxes_only_after_the_stricter_generation_retires() {
     use ferrum_edge::plugins::utils::jwks_cache::clear_jwks_cache;

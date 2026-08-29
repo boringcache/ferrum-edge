@@ -5717,6 +5717,7 @@ fn test_apply_delta_rejects_unknown_jwt_auth_key_and_keeps_last_known_good() {
     assert_eq!(plugins[0].name(), "stdout_logging");
 }
 
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn rejected_staged_jwks_candidate_cannot_leave_stricter_policy_on_live_store() {
     use ferrum_edge::_test_support::{
