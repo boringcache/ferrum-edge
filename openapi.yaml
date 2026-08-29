@@ -6178,7 +6178,7 @@ paths:
         "501":
           $ref: "#/components/responses/NamespaceRegistryAtomicityUnsupported"
         "503":
-          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionPreCommitUnavailable"
 
   /namespaces/{name}:
     parameters:
@@ -7457,6 +7457,35 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    NamespaceAdmissionPreCommitUnavailable:
+      description: >-
+        Nothing was applied. The admin write gate may have refused the
+        mutation because the database was unavailable, failover writes were
+        disabled, or fail-closed audit preparation failed. Otherwise the
+        namespace may be fenced by another mutation (including an
+        intentionally retained uncertain operation), the namespace-registry
+        admission lease was not held at the commit boundary, or the database
+        aborted the transaction as a serialization failure or deadlock
+        victim. The response has no `applied` field and never carries
+        `X-Ferrum-Config-Cursor`. Admission/transaction aborts carry
+        `rollback: not_needed` and a fixed redacted message; uniqueness and
+        name conflicts are `409` instead.
+      headers:
+        Retry-After:
+          required: false
+          description: >-
+            Minimum delay in seconds before retrying; present for
+            namespace-admission contention.
+          schema:
+            type: integer
+            minimum: 1
+            example: 1
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: Namespace mutation is temporarily unavailable; retry later
     NamespaceAdmissionUnavailable:
       description: >-
         Two distinct fail-closed families share this response, and the body

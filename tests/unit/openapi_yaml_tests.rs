@@ -8346,7 +8346,6 @@ fn namespace_admission_contention_is_documented_as_retryable() {
         "/paths/~1api-specs~1{id}/put/responses/503",
         "/paths/~1api-specs~1{id}/delete/responses/503",
         // Registry CRUD takes the same namespace-admission lease (issue #3955).
-        "/paths/~1namespaces/post/responses/503",
         "/paths/~1namespaces~1{name}/put/responses/503",
         "/paths/~1namespaces~1{name}/delete/responses/503",
     ] {
@@ -8358,6 +8357,13 @@ fn namespace_admission_contention_is_documented_as_retryable() {
             "namespace mutation is missing retryable 503 response: {pointer}"
         );
     }
+
+    assert_eq!(
+        spec.pointer("/paths/~1namespaces/post/responses/503/$ref")
+            .and_then(serde_json::Value::as_str),
+        Some("#/components/responses/NamespaceAdmissionPreCommitUnavailable"),
+        "namespace create must use the cursor-free admission response"
+    );
 
     let response = spec
         .pointer("/components/responses/NamespaceAdmissionUnavailable")
@@ -10647,8 +10653,8 @@ fn operation_references_live_apply_mode(operation: &serde_json::Value) -> bool {
 /// Generated clients must see the optional covering cursor on every response
 /// that `complete_live_config_mutation_after_commit` can return: synchronous
 /// 2xx, deferred 202, and the committed-but-not-live 503. Pre-commit 503
-/// families stay optional via the shared component description; unrelated
-/// 503 routes must not claim the header.
+/// families use cursor-free response components; unrelated 503 routes must
+/// not claim the header.
 #[test]
 fn live_applied_mutations_declare_config_cursor_on_success_deferred_and_committed_503() {
     let spec: serde_json::Value =
@@ -10752,6 +10758,10 @@ fn live_applied_mutations_declare_config_cursor_on_success_deferred_and_committe
     assert!(
         !response_declares_config_cursor_header(&spec, &create_namespace["responses"]["201"]),
         "POST /namespaces does not wait on live-apply and must not declare the cursor on 201"
+    );
+    assert!(
+        !response_declares_config_cursor_header(&spec, &create_namespace["responses"]["503"]),
+        "POST /namespaces cannot commit a live-applied generation and must not declare the cursor on 503"
     );
 
     for operation_id in ["listProxies", "getProxy", "listApiSpecs", "getHealth"] {
