@@ -65,6 +65,16 @@ struct CertValidityWindow {
 }
 
 impl CertValidityWindow {
+    fn from_unix_bounds(not_before_unix: i64, not_after_unix: i64) -> Option<Self> {
+        if not_after_unix < not_before_unix {
+            return None;
+        }
+        Some(Self {
+            not_before_unix,
+            not_after_unix,
+        })
+    }
+
     /// Parse the leaf's validity interval, failing closed on anything that
     /// cannot be represented as a coherent window.
     ///
@@ -75,15 +85,10 @@ impl CertValidityWindow {
     /// per-request check depend on which bound is compared first.
     fn from_certificate(cert: &X509Certificate<'_>) -> Option<Self> {
         let validity = cert.validity();
-        let not_before_unix = validity.not_before.timestamp();
-        let not_after_unix = validity.not_after.timestamp();
-        if not_after_unix < not_before_unix {
-            return None;
-        }
-        Some(Self {
-            not_before_unix,
-            not_after_unix,
-        })
+        Self::from_unix_bounds(
+            validity.not_before.timestamp(),
+            validity.not_after.timestamp(),
+        )
     }
 
     /// Whether `now_unix` lies inside the closed interval. Both boundaries are
@@ -92,6 +97,18 @@ impl CertValidityWindow {
     fn contains(&self, now_unix: i64) -> bool {
         now_unix >= self.not_before_unix && now_unix <= self.not_after_unix
     }
+}
+
+/// Narrow crate-internal seam for deterministic external coverage of the exact
+/// closed-interval predicate. The binary target has no `_test_support` caller.
+#[allow(dead_code)]
+pub(crate) fn cert_validity_window_contains_for_test(
+    not_before_unix: i64,
+    not_after_unix: i64,
+    now_unix: i64,
+) -> Option<bool> {
+    CertValidityWindow::from_unix_bounds(not_before_unix, not_after_unix)
+        .map(|window| window.contains(now_unix))
 }
 
 #[derive(Debug)]

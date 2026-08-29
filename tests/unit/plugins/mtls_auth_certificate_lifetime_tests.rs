@@ -8,6 +8,7 @@
 //! every request while performing the expensive parse exactly once.
 
 use ferrum_edge::_test_support::{
+    mtls_cert_validity_window_contains_for_test,
     request_credential_deadline_at, request_credential_deadline_remaining,
     try_credential_deadline_from_unix_seconds_at_for_test,
 };
@@ -135,33 +136,30 @@ async fn default_configuration_accepts_a_currently_valid_leaf() {
 
 // --- Exact boundaries ------------------------------------------------------
 
-#[tokio::test]
-async fn the_not_before_and_not_after_instants_are_themselves_inside_the_window() {
-    // A certificate whose window is [now, now] — both boundaries collapse onto
-    // the current second. RFC 5280 "valid at" semantics make this valid.
-    let cert = cert_with_validity("client.example.com", 0, 0);
-    let index = ConsumerIndex::new(&[mtls_consumer("alice", "client.example.com")]);
-    let mut ctx = ctx_with_cert(cert);
-
-    assert_continue(default_plugin().authenticate(&mut ctx, &index).await);
+#[test]
+fn the_not_before_and_not_after_instants_are_themselves_inside_the_window() {
+    const BOUNDARY: i64 = 1_700_000_000;
+    assert_eq!(
+        mtls_cert_validity_window_contains_for_test(BOUNDARY, BOUNDARY, BOUNDARY),
+        Some(true),
+        "RFC 5280 validity is a closed interval"
+    );
 }
 
-#[tokio::test]
-async fn one_second_past_not_after_is_outside_the_window() {
-    let cert = cert_with_validity("client.example.com", -600, -1);
-    let index = ConsumerIndex::new(&[mtls_consumer("alice", "client.example.com")]);
-    let mut ctx = ctx_with_cert(cert);
-
-    assert_fixed_401(default_plugin().authenticate(&mut ctx, &index).await);
+#[test]
+fn one_second_past_not_after_is_outside_the_window() {
+    assert_eq!(
+        mtls_cert_validity_window_contains_for_test(100, 200, 201),
+        Some(false)
+    );
 }
 
-#[tokio::test]
-async fn one_second_before_not_before_is_outside_the_window() {
-    let cert = cert_with_validity("client.example.com", 1, 600);
-    let index = ConsumerIndex::new(&[mtls_consumer("alice", "client.example.com")]);
-    let mut ctx = ctx_with_cert(cert);
-
-    assert_fixed_401(default_plugin().authenticate(&mut ctx, &index).await);
+#[test]
+fn one_second_before_not_before_is_outside_the_window() {
+    assert_eq!(
+        mtls_cert_validity_window_contains_for_test(100, 200, 99),
+        Some(false)
+    );
 }
 
 #[tokio::test]

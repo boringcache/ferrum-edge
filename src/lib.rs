@@ -7769,6 +7769,20 @@ pub mod _test_support {
         )
     }
 
+    /// Evaluate the production mTLS leaf-validity closed interval against an
+    /// injected Unix timestamp. `None` means the interval is inverted.
+    pub fn mtls_cert_validity_window_contains_for_test(
+        not_before_unix: i64,
+        not_after_unix: i64,
+        now_unix: i64,
+    ) -> Option<bool> {
+        crate::plugins::mtls_auth::cert_validity_window_contains_for_test(
+            not_before_unix,
+            not_after_unix,
+            now_unix,
+        )
+    }
+
     /// Set a request's credential deadline directly so external tests can drive
     /// the protocol-neutral authorization-lifetime arbiter without minting a
     /// real token. Carries no credential material.
