@@ -71,8 +71,16 @@ fn enumerated(value: u8) -> Vec<u8> {
     tlv(0x0a, &[value])
 }
 
+fn der_null() -> Vec<u8> {
+    tlv(0x05, &[])
+}
+
 fn bit_string(content: &[u8]) -> Vec<u8> {
-    let mut body = vec![0u8];
+    bit_string_with_unused(0, content)
+}
+
+fn bit_string_with_unused(unused_bits: u8, content: &[u8]) -> Vec<u8> {
+    let mut body = vec![unused_bits];
     body.extend_from_slice(content);
     tlv(0x03, &body)
 }
@@ -140,7 +148,14 @@ fn parse_certificate(der: &[u8]) -> X509Certificate<'_> {
 }
 
 fn algorithm_identifier(oid_bytes: &[u8]) -> Vec<u8> {
-    sequence(&[oid(oid_bytes)])
+    algorithm_identifier_with_params(oid_bytes, None)
+}
+
+fn algorithm_identifier_with_params(oid_bytes: &[u8], params: Option<&[u8]>) -> Vec<u8> {
+    match params {
+        Some(params) => sequence(&[oid(oid_bytes), params.to_vec()]),
+        None => sequence(&[oid(oid_bytes)]),
+    }
 }
 
 fn sha1(data: &[u8]) -> Vec<u8> {
@@ -468,6 +483,19 @@ struct ResponseBuilder<'a> {
     /// Tag byte of the `responses` container. `0x30` is the universal
     /// constructed SEQUENCE; `0x10` is the primitive form DER forbids.
     responses_tag: u8,
+    /// Unused-bit count in the signature BIT STRING. Canonical DER uses 0.
+    signature_unused_bits: u8,
+    /// Raw INTEGER content for every `CertID` `serialNumber`. `None` uses the
+    /// canonical encoding of `serial`.
+    serial_content: Option<Vec<u8>>,
+    /// Raw ENUMERATED content for `responseStatus`. `None` uses
+    /// `response_status` as a single content octet.
+    response_status_content: Option<Vec<u8>>,
+    /// Raw `AlgorithmIdentifier` parameters TLV for each `CertID` hash
+    /// algorithm. `None` omits parameters, the usual encoding.
+    hash_algorithm_parameters: Option<Vec<u8>>,
+    /// Raw `AlgorithmIdentifier` parameters TLV for `signatureAlgorithm`.
+    signature_algorithm_parameters: Option<Vec<u8>>,
 }
 
 impl<'a> ResponseBuilder<'a> {
@@ -496,6 +524,11 @@ impl<'a> ResponseBuilder<'a> {
             serial_tag: 0x02,
             constructed_name_hash: false,
             responses_tag: 0x30,
+            signature_unused_bits: 0,
+            serial_content: None,
+            response_status_content: None,
+            hash_algorithm_parameters: None,
+            signature_algorithm_parameters: None,
         }
     }
 
@@ -517,11 +550,18 @@ impl<'a> ResponseBuilder<'a> {
         } else {
             octet_string(&name_hash)
         };
+        let serial_content = self
+            .serial_content
+            .clone()
+            .unwrap_or_else(|| serial_bytes(serial));
         let cert_id = sequence(&[
-            algorithm_identifier(hash_oid),
+            algorithm_identifier_with_params(
+                hash_oid,
+                self.hash_algorithm_parameters.as_deref(),
+            ),
             encoded_name_hash,
             octet_string(&key_hash),
-            tlv(self.serial_tag, &serial_bytes(serial)),
+            tlv(self.serial_tag, &serial_content),
         ]);
 
         let default_status = match self.status {
@@ -584,8 +624,11 @@ impl<'a> ResponseBuilder<'a> {
 
         let mut basic_parts = vec![
             response_data,
-            algorithm_identifier(OID_ECDSA_SHA256),
-            bit_string(&signature),
+            algorithm_identifier_with_params(
+                OID_ECDSA_SHA256,
+                self.signature_algorithm_parameters.as_deref(),
+            ),
+            bit_string_with_unused(self.signature_unused_bits, &signature),
         ];
         if !self.embedded_certs.is_empty() {
             let certs: Vec<Vec<u8>> = self.embedded_certs.iter().map(|d| d.to_vec()).collect();
@@ -593,12 +636,16 @@ impl<'a> ResponseBuilder<'a> {
         }
         let basic = sequence(&basic_parts);
 
+        let status_element = match &self.response_status_content {
+            Some(content) => tlv(0x0a, content),
+            None => enumerated(self.response_status),
+        };
         if self.response_status != 0 {
-            return sequence(&[enumerated(self.response_status)]);
+            return sequence(&[status_element]);
         }
 
         sequence(&[
-            enumerated(0),
+            status_element,
             explicit(
                 0,
                 &sequence(&[oid(self.response_type_oid), octet_string(&basic)]),
@@ -1347,6 +1394,169 @@ fn an_explicitly_encoded_default_version_is_rejected() {
     builder.version_field = Some(explicit(0, &tlv(0x02, &[0x01])));
     let error = validate_structure(&builder.build()).expect_err("must reject");
     assert!(error.contains("unsupported version 1"), "{error}");
+}
+
+// ── Primitive DER type constraints ─────────────────────────────────────────
+
+#[test]
+fn a_valid_signature_with_nonzero_unused_bits_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    // Cryptographically valid payload bytes; only the unused-bit count differs
+    // from the canonical octet-aligned BIT STRING. x509-parser's verifier
+    // ignores unused_bits, so this is the encoding that would still verify.
+    builder.signature_unused_bits = 1;
+
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("unused_bits=1"), "{error}");
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("unused_bits=1"), "{error}");
+}
+
+#[test]
+fn a_signature_bit_string_with_an_invalid_unused_bit_count_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.signature_unused_bits = 8;
+
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("unused_bits=8"), "{error}");
+}
+
+#[test]
+fn empty_nonminimal_and_negative_cert_id_serials_are_rejected() {
+    let pki = build_pki();
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.serial_content = Some(Vec::new());
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("serialNumber"), "{error}");
+    assert!(error.contains("empty"), "{error}");
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    let mut padded = vec![0x00];
+    padded.extend_from_slice(&serial_bytes(LEAF_SERIAL));
+    builder.serial_content = Some(padded);
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("serialNumber"), "{error}");
+    assert!(error.contains("minimal"), "{error}");
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("serialNumber"), "{error}");
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.serial_content = Some(vec![0x80]);
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("serialNumber"), "{error}");
+    assert!(error.contains("negative"), "{error}");
+}
+
+#[test]
+fn malformed_and_noncanonical_extension_oids_are_rejected() {
+    let pki = build_pki();
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.response_data_tail = vec![extensions_field(1, &[extension(&[], false, b"nonce")])];
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("extnID"), "{error}");
+    assert!(error.contains("empty"), "{error}");
+
+    let mut unterminated = OID_OCSP_NONCE.to_vec();
+    let last = unterminated.len() - 1;
+    unterminated[last] |= 0x80;
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.response_data_tail = vec![extensions_field(
+        1,
+        &[extension(&unterminated, false, b"nonce")],
+    )];
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("extnID"), "{error}");
+    assert!(error.contains("terminated"), "{error}");
+
+    let mut redundant = vec![OID_OCSP_NONCE[0], 0x80];
+    redundant.extend_from_slice(&OID_OCSP_NONCE[1..]);
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.response_data_tail = vec![extensions_field(
+        1,
+        &[extension(&redundant, false, b"nonce")],
+    )];
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("extnID"), "{error}");
+    assert!(error.contains("0x80"), "{error}");
+}
+
+#[test]
+fn noncanonical_successful_response_status_encodings_are_rejected() {
+    let pki = build_pki();
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.response_status_content = Some(Vec::new());
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("responseStatus"), "{error}");
+    assert!(error.contains("empty"), "{error}");
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.response_status_content = Some(vec![0x00, 0x00]);
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("responseStatus"), "{error}");
+    assert!(error.contains("minimal"), "{error}");
+}
+
+#[test]
+fn noncanonical_revocation_reason_encodings_are_rejected() {
+    let pki = build_pki();
+
+    let mut revoked = generalized_time(now() - 60);
+    revoked.extend_from_slice(&explicit(0, &tlv(0x0a, &[])));
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.cert_status = Some(tlv(0xa1, &revoked));
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("revocationReason"), "{error}");
+    assert!(error.contains("empty"), "{error}");
+
+    let mut revoked = generalized_time(now() - 60);
+    revoked.extend_from_slice(&explicit(0, &tlv(0x0a, &[0x00, 0x01])));
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.cert_status = Some(tlv(0xa1, &revoked));
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("revocationReason"), "{error}");
+    assert!(error.contains("minimal"), "{error}");
+}
+
+#[test]
+fn a_cert_id_hash_algorithm_with_null_parameters_is_still_accepted() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.hash_algorithm_parameters = Some(der_null());
+    builder.signature_algorithm_parameters = Some(der_null());
+
+    validate_structure(&builder.build()).expect("structurally valid");
+    validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect("absent-vs-NULL AlgorithmIdentifier parameters are both canonical");
+}
+
+#[test]
+fn algorithm_identifier_parameters_that_are_not_absent_or_null_are_rejected() {
+    let pki = build_pki();
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.hash_algorithm_parameters = Some(tlv(0x02, &[0x00]));
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("hashAlgorithm"), "{error}");
+    assert!(error.contains("parameters"), "{error}");
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.hash_algorithm_parameters = Some(tlv(0x05, &[0x00]));
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("hashAlgorithm"), "{error}");
+    assert!(error.contains("parameters"), "{error}");
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.signature_algorithm_parameters = Some(tlv(0x02, &[0x00]));
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("signatureAlgorithm"), "{error}");
+    assert!(error.contains("parameters"), "{error}");
 }
 
 // ── Embedded responder certificates ────────────────────────────────────────

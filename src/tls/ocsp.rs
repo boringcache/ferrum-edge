@@ -34,12 +34,26 @@
 //!    well as the tag number, so a context-specific element that reuses a
 //!    universal tag number, a primitive "SEQUENCE", or a constructed OCTET
 //!    STRING is refused instead of being decoded as the field it imitates.
-//!    `ResponseData.version` must be absent: DER omits a `DEFAULT` value, so an
-//!    explicit `[0] INTEGER 0` would be a second encoding of one signed object,
-//!    and any other version is unsupported. Every certificate carried in
-//!    `certs` must parse as one complete X.509 `Certificate` with nothing left
-//!    over — a malformed entry is refused even when a *different* carried
-//!    certificate would have authorized the response.
+//!    Each primitive is then checked against its type-specific DER rules, not
+//!    merely the generic definite-length header `Any::from_der` validates:
+//!    OBJECT IDENTIFIER content must be a complete canonical encoding
+//!    (nonempty, terminated base-128 subidentifiers, no redundant leading
+//!    `0x80` group); INTEGER and ENUMERATED content must be nonempty and
+//!    minimal (one sign-protection `0x00` only when the next byte has its high
+//!    bit set); a CertID serial must additionally be nonnegative; `successful(0)`
+//!    and every `revocationReason` use that one canonical ENUMERATED encoding;
+//!    the `BasicOCSPResponse` signature BIT STRING must be octet-aligned
+//!    (`unused_bits == 0`) and nonempty, because the verifier hashes only the
+//!    payload bytes and would otherwise accept a second encoding of the same
+//!    signature; and `AlgorithmIdentifier` parameters are either absent or the
+//!    canonical NULL real OCSP responders emit, except `rsassa-pss`, whose
+//!    RFC profile carries a SEQUENCE. `ResponseData.version` must be absent:
+//!    DER omits a `DEFAULT` value, so an explicit `[0] INTEGER 0` would be a
+//!    second encoding of one signed object, and any other version is
+//!    unsupported. Every certificate carried in `certs` must parse as one
+//!    complete X.509 `Certificate` with nothing left over — a malformed entry
+//!    is refused even when a *different* carried certificate would have
+//!    authorized the response.
 //! 5. **A proven issuer.** The issuer is the chain member whose key actually
 //!    signed the leaf, not merely one whose subject name matches the leaf's
 //!    issuer name; same-name candidates are scanned until one verifies, and a
@@ -88,10 +102,11 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustls::pki_types::CertificateDer;
-use x509_parser::asn1_rs::{Any, BitString, Class, Enumerated, FromDer, GeneralizedTime, Oid, Tag};
+use x509_parser::asn1_rs::{Any, BitString, Class, FromDer, GeneralizedTime, Oid, Tag};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::oid_registry::{
     OID_HASH_SHA1, OID_NIST_HASH_SHA256, OID_NIST_HASH_SHA384, OID_NIST_HASH_SHA512,
+    OID_PKCS1_RSASSAPSS,
 };
 use x509_parser::x509::{AlgorithmIdentifier, SubjectPublicKeyInfo};
 
@@ -238,6 +253,186 @@ fn expect_primitive<'a>(any: &Any<'a>, tag: Tag, field: &str) -> Result<&'a [u8]
     Ok(any.data)
 }
 
+/// Require a universal, primitive OBJECT IDENTIFIER whose content is a
+/// complete canonical DER encoding.
+fn expect_oid<'a>(any: &Any<'a>, field: &str) -> Result<Oid<'a>, String> {
+    let content = expect_primitive(any, Tag::Oid, field)?;
+    validate_oid_content(content, field)?;
+    any.as_oid()
+        .map_err(|_| format!("OCSP {field} is not an OBJECT IDENTIFIER"))
+}
+
+/// X.690 §8.19: one or more base-128 subidentifiers, each terminated by an
+/// octet with bit 8 clear, and no group using a redundant leading `0x80`.
+fn validate_oid_content(content: &[u8], field: &str) -> Result<(), String> {
+    let Some(&last) = content.last() else {
+        return Err(format!("OCSP {field} OBJECT IDENTIFIER is empty"));
+    };
+    if last & 0x80 != 0 {
+        return Err(format!(
+            "OCSP {field} OBJECT IDENTIFIER is not a terminated base-128 encoding"
+        ));
+    }
+    let mut index = 0usize;
+    while index < content.len() {
+        if content[index] == 0x80 {
+            return Err(format!(
+                "OCSP {field} OBJECT IDENTIFIER uses a redundant leading 0x80 continuation group"
+            ));
+        }
+        loop {
+            let byte = content[index];
+            index += 1;
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Require a universal, primitive INTEGER with canonical DER content.
+///
+/// A DER INTEGER is nonempty. The only legal leading `0x00` is the one-byte
+/// sign-protection prefix used when the next byte has its high bit set; a
+/// leading `0xFF` is likewise only legal when the next byte has its high bit
+/// clear. `nonnegative` additionally refuses a high bit on the first content
+/// byte, which is the rule for `CertificateSerialNumber` and the ENUMERATED
+/// values this grammar uses.
+fn expect_der_integer<'a>(
+    any: &Any<'a>,
+    field: &str,
+    nonnegative: bool,
+) -> Result<&'a [u8], String> {
+    let content = expect_primitive(any, Tag::Integer, field)?;
+    validate_der_integer_content(content, field, nonnegative)?;
+    Ok(content)
+}
+
+fn validate_der_integer_content(
+    content: &[u8],
+    field: &str,
+    nonnegative: bool,
+) -> Result<(), String> {
+    if content.is_empty() {
+        return Err(format!("OCSP {field} is empty"));
+    }
+    if content.len() >= 2 {
+        if content[0] == 0x00 && content[1] < 0x80 {
+            return Err(format!("OCSP {field} is not a minimal DER encoding"));
+        }
+        if content[0] == 0xff && content[1] >= 0x80 {
+            return Err(format!("OCSP {field} is not a minimal DER encoding"));
+        }
+    }
+    if nonnegative && content[0] & 0x80 != 0 {
+        return Err(format!("OCSP {field} is negative"));
+    }
+    Ok(())
+}
+
+fn decode_nonnegative_integer(content: &[u8], field: &str) -> Result<u32, String> {
+    if content.len() > 4 {
+        return Err(format!("OCSP {field} does not fit in a u32"));
+    }
+    let mut value = 0u32;
+    for &byte in content {
+        value = (value << 8) | u32::from(byte);
+    }
+    Ok(value)
+}
+
+/// Require a universal, primitive ENUMERATED with the same canonical content
+/// encoding DER uses for INTEGER, then decode it as a nonnegative value.
+fn expect_enumerated(any: &Any<'_>, field: &str) -> Result<u32, String> {
+    let content = expect_primitive(any, Tag::Enumerated, field)?;
+    validate_der_integer_content(content, field, true)?;
+    decode_nonnegative_integer(content, field)
+}
+
+/// Require a universal, primitive BIT STRING that is octet-aligned and
+/// nonempty.
+///
+/// `BitString::try_from` accepts any `unused_bits` byte, and
+/// `x509_parser::verify::verify_signature` hashes only `signature.data`. A
+/// responder could keep the exact valid signature bytes, set a nonzero unused
+/// count, and still verify here while a strict client refused the staple.
+fn expect_octet_aligned_bit_string<'a>(
+    any: &Any<'a>,
+    field: &str,
+) -> Result<BitString<'a>, String> {
+    let content = expect_primitive(any, Tag::BitString, field)?;
+    if content.is_empty() {
+        return Err(format!("OCSP {field} BIT STRING is empty"));
+    }
+    let unused_bits = content[0];
+    let data = &content[1..];
+    if unused_bits != 0 {
+        return Err(format!(
+            "OCSP {field} BIT STRING is not octet-aligned (unused_bits={unused_bits})"
+        ));
+    }
+    if data.is_empty() {
+        return Err(format!("OCSP {field} BIT STRING carries no bits"));
+    }
+    Ok(BitString::new(0, data))
+}
+
+fn is_canonical_null(any: &Any<'_>) -> bool {
+    any.class() == Class::Universal
+        && any.tag() == Tag::Null
+        && !any.header.constructed()
+        && any.data.is_empty()
+}
+
+/// Parse one `AlgorithmIdentifier`, validating the OID encoding and applying
+/// the RFC parameter profile for algorithms this grammar actually uses.
+fn parse_algorithm_identifier<'a>(
+    input: &'a [u8],
+    field: &str,
+) -> Result<(AlgorithmIdentifier<'a>, &'a [u8]), String> {
+    let (any, _, rest) = take_tlv(input)?;
+    let content = expect_sequence(&any, field)?;
+    Ok((parse_algorithm_identifier_content(content, field)?, rest))
+}
+
+fn parse_algorithm_identifier_content<'a>(
+    content: &'a [u8],
+    field: &str,
+) -> Result<AlgorithmIdentifier<'a>, String> {
+    let (oid_any, _, rest) = take_tlv(content)?;
+    let algorithm = expect_oid(&oid_any, field)?;
+    let parameters = if rest.is_empty() {
+        None
+    } else {
+        let (params_any, _, trailing) = take_tlv(rest)?;
+        if !trailing.is_empty() {
+            return Err(format!("OCSP {field} has trailing fields after parameters"));
+        }
+        validate_algorithm_parameters(&algorithm, &params_any, field)?;
+        Some(params_any)
+    };
+    Ok(AlgorithmIdentifier::new(algorithm, parameters))
+}
+
+/// Supported hash and signature algorithms take absent or canonical NULL
+/// parameters — both encodings appear on real OCSP responders. `rsassa-pss`
+/// is the exception: its RFC 4055 profile carries a SEQUENCE, not NULL.
+fn validate_algorithm_parameters(
+    oid: &Oid<'_>,
+    params: &Any<'_>,
+    field: &str,
+) -> Result<(), String> {
+    if *oid == OID_PKCS1_RSASSAPSS {
+        expect_sequence(params, &format!("{field} parameters"))?;
+        return Ok(());
+    }
+    if is_canonical_null(params) {
+        return Ok(());
+    }
+    Err(format!("OCSP {field} parameters are not absent or NULL"))
+}
+
 /// Require a universal, primitive `GeneralizedTime` and decode it.
 ///
 /// Every instant in this grammar is both tag-checked and *decoded*: an
@@ -319,13 +514,11 @@ fn basic_response_der(der: &[u8]) -> Result<&[u8], String> {
     let outer_content = expect_sequence(&outer, "response")?;
 
     let (status_any, _, rest) = take_tlv(outer_content)?;
-    expect_primitive(&status_any, Tag::Enumerated, "responseStatus")?;
-    let status = Enumerated::try_from(&status_any)
-        .map_err(|_| "OCSP responseStatus is not an ENUMERATED".to_string())?;
-    if status.0 != 0 {
+    let status = expect_enumerated(&status_any, "responseStatus")?;
+    if status != 0 {
         return Err(format!(
             "OCSP responseStatus is {}, not successful(0)",
-            response_status_name(status.0)
+            response_status_name(status)
         ));
     }
 
@@ -343,10 +536,7 @@ fn basic_response_der(der: &[u8]) -> Result<&[u8], String> {
     let bytes_seq_content = expect_sequence(&bytes_seq, "responseBytes")?;
 
     let (type_any, _, rest) = take_tlv(bytes_seq_content)?;
-    expect_primitive(&type_any, Tag::Oid, "responseType")?;
-    let response_type = type_any
-        .as_oid()
-        .map_err(|_| "OCSP responseType is not an OBJECT IDENTIFIER".to_string())?;
+    let response_type = expect_oid(&type_any, "responseType")?;
     if response_type.as_bytes() != OID_PKIX_OCSP_BASIC_BYTES {
         return Err("OCSP responseType is not id-pkix-ocsp-basic".to_string());
     }
@@ -380,13 +570,10 @@ fn parse_basic_response(der: &[u8]) -> Result<BasicResponse<'_>, String> {
     let tbs_content = expect_sequence(&tbs_any, "tbsResponseData")?;
     let response_data = parse_response_data(tbs_content)?;
 
-    let (rest, signature_algorithm) = AlgorithmIdentifier::from_der(rest)
-        .map_err(|_| "OCSP signatureAlgorithm is malformed".to_string())?;
+    let (signature_algorithm, rest) = parse_algorithm_identifier(rest, "signatureAlgorithm")?;
 
     let (signature_any, _, rest) = take_tlv(rest)?;
-    expect_primitive(&signature_any, Tag::BitString, "signature")?;
-    let signature = BitString::try_from(&signature_any)
-        .map_err(|_| "OCSP signature is not a BIT STRING".to_string())?;
+    let signature = expect_octet_aligned_bit_string(&signature_any, "signature")?;
 
     let mut certs = Vec::new();
     if !rest.is_empty() {
@@ -461,10 +648,8 @@ fn parse_response_data(input: &[u8]) -> Result<ResponseData<'_>, String> {
         if !trailing.is_empty() {
             return Err("OCSP version has trailing bytes".to_string());
         }
-        expect_primitive(&version_any, Tag::Integer, "version")?;
-        let version = version_any
-            .as_u32()
-            .map_err(|_| "OCSP version is not an INTEGER".to_string())?;
+        let version_content = expect_der_integer(&version_any, "version", true)?;
+        let version = decode_nonnegative_integer(version_content, "version")?;
         if version == 0 {
             return Err(
                 "OCSP ResponseData encodes version v1 explicitly, but DER omits a DEFAULT value"
@@ -672,17 +857,12 @@ fn parse_revoked_info(input: &[u8]) -> Result<(), String> {
     if !trailing.is_empty() {
         return Err("OCSP revocationReason has trailing bytes".to_string());
     }
-    expect_primitive(&value_any, Tag::Enumerated, "revocationReason")?;
+    expect_enumerated(&value_any, "revocationReason")?;
     Ok(())
 }
 
 /// Bound on the entries one `Extensions` container may carry.
 const MAX_EXTENSIONS: usize = 32;
-
-/// Diagnostic for an `Extension` whose `extnID` is not an OID.
-fn oid_error(field: &str) -> String {
-    format!("OCSP {field} extnID is not an OBJECT IDENTIFIER")
-}
 
 /// Decode the `critical` flag of an `Extension`.
 ///
@@ -752,13 +932,7 @@ fn validate_extensions(content: &[u8], field: &str) -> Result<(), String> {
         }
 
         let (id_any, _, rest) = take_tlv(extension.data)?;
-        if id_any.class() != Class::Universal
-            || id_any.tag() != Tag::Oid
-            || id_any.header.constructed()
-        {
-            return Err(oid_error(field));
-        }
-        id_any.as_oid().map_err(|_| oid_error(field))?;
+        expect_oid(&id_any, &format!("{field} extnID"))?;
         let id_bytes = id_any.data;
         if seen_ids[..seen - 1].contains(&id_bytes) {
             return Err(format!(
@@ -799,15 +973,14 @@ fn validate_extensions(content: &[u8], field: &str) -> Result<(), String> {
 }
 
 fn parse_cert_id(input: &[u8]) -> Result<CertId<'_>, String> {
-    let (rest, hash_algorithm) = AlgorithmIdentifier::from_der(input)
-        .map_err(|_| "OCSP CertID hashAlgorithm is malformed".to_string())?;
+    let (hash_algorithm, rest) = parse_algorithm_identifier(input, "CertID hashAlgorithm")?;
 
     let (name_hash_any, _, rest) = take_tlv(rest)?;
     let issuer_name_hash = expect_primitive(&name_hash_any, Tag::OctetString, "issuerNameHash")?;
     let (key_hash_any, _, rest) = take_tlv(rest)?;
     let issuer_key_hash = expect_primitive(&key_hash_any, Tag::OctetString, "issuerKeyHash")?;
     let (serial_any, _, trailing) = take_tlv(rest)?;
-    let serial_number = expect_primitive(&serial_any, Tag::Integer, "serialNumber")?;
+    let serial_number = expect_der_integer(&serial_any, "serialNumber", true)?;
     if !trailing.is_empty() {
         return Err("OCSP CertID has trailing fields".to_string());
     }
@@ -988,14 +1161,14 @@ fn match_single_response<'a, 'b>(
     leaf: &X509Certificate<'_>,
     issuer: &X509Certificate<'_>,
 ) -> Result<&'a SingleResponse<'b>, String> {
-    let leaf_serial = normalize_serial(leaf.raw_serial());
+    let leaf_serial = leaf.raw_serial();
     let issuer_name = issuer.subject().as_raw();
     let issuer_key = issuer.public_key().subject_public_key.data.as_ref();
 
     let mut serial_matched = false;
     let mut matched: Option<&'a SingleResponse<'b>> = None;
     for single in &basic.response_data.single_responses {
-        if normalize_serial(single.cert_id.serial_number) != leaf_serial {
+        if single.cert_id.serial_number != leaf_serial {
             continue;
         }
         serial_matched = true;
@@ -1024,16 +1197,6 @@ fn match_single_response<'a, 'b>(
         "OCSP response contains no entry for the configured certificate's serial number"
     };
     Err(message.to_string())
-}
-
-/// Strip the leading zero padding DER uses to keep an INTEGER positive, so two
-/// encodings of the same serial compare equal.
-fn normalize_serial(raw: &[u8]) -> &[u8] {
-    let mut trimmed = raw;
-    while trimmed.len() > 1 && trimmed[0] == 0 {
-        trimmed = &trimmed[1..];
-    }
-    trimmed
 }
 
 fn cert_id_digest(oid: &Oid<'_>) -> Result<&'static digest::Algorithm, String> {
