@@ -3790,6 +3790,268 @@ async fn test_restore_rejects_invalid_plugin_config_before_delete() {
     );
 }
 
+/// Duplicate proxy/upstream names are refused by `POST /batch`, file mode, and
+/// a unique `(namespace, name)` index in every backend. Restore must refuse
+/// them too, before the namespace clear, or the payload wipes the namespace and
+/// only then fails inside persistence (issue #4265).
+#[tokio::test]
+async fn restore_rejects_duplicate_proxy_and_upstream_names_before_delete() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let seed = json!({
+        "proxies": [
+            {"id": "dupname-keep", "listen_path": "/dupname-keep", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+        ]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201, "Seed failed: {body:?}");
+
+    let restore_payload = json!({
+        "upstreams": [
+            {"id": "dupname-u1", "name": "shared_upstream", "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]},
+            {"id": "dupname-u2", "name": "shared_upstream", "targets": [{"host": "10.0.0.2", "port": 8080, "weight": 100}]}
+        ],
+        "proxies": [
+            {"id": "dupname-p1", "name": "shared_proxy", "listen_path": "/dupname-1", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true},
+            {"id": "dupname-p2", "name": "shared_proxy", "listen_path": "/dupname-2", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+        ]
+    });
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
+    assert_eq!(status, 400, "duplicate names were admitted: {body:?}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("existing config was NOT deleted"),
+        "restore must refuse before the clear: {body:?}"
+    );
+    let errors = body["validation_errors"].to_string();
+    assert!(
+        errors.contains("Duplicate proxy name 'shared_proxy'"),
+        "expected the duplicate proxy-name diagnostic: {body:?}"
+    );
+    assert!(
+        errors.contains("Duplicate upstream name 'shared_upstream'"),
+        "expected the duplicate upstream-name diagnostic: {body:?}"
+    );
+
+    // The same payload is refused by batch, so the two admission paths stay pinned.
+    let (status, body) = admin_post(&base_url, "/batch", &token, &restore_payload).await;
+    assert_eq!(
+        status, 400,
+        "batch must refuse duplicate names too: {body:?}"
+    );
+
+    let (status, _, _) = admin_get(&base_url, "/proxies/dupname-keep", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "duplicate-name refusal must leave the namespace intact"
+    );
+}
+
+/// An enabled `mtls_auth` instance on a stream proxy that terminates no TLS can
+/// never receive a client certificate, so it rejects every connection with 401.
+/// Restore was the only write path that could persist that shape (issue #4282).
+#[tokio::test]
+async fn restore_rejects_incompatible_stream_mtls_auth_before_delete() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let seed = json!({
+        "proxies": [
+            {"id": "mtls-compat-keep", "listen_path": "/mtls-compat-keep", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+        ]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201, "Seed failed: {body:?}");
+
+    let incompatible = json!({
+        "proxies": [{
+            "id": "mtls-compat-stream",
+            "backend_scheme": "tcp",
+            "backend_host": "localhost",
+            "backend_port": 5432,
+            "listen_port": 19071,
+            "frontend_tls": false,
+            "plugins": [{"plugin_config_id": "mtls-compat-policy"}]
+        }],
+        "plugin_configs": [{
+            "id": "mtls-compat-policy",
+            "plugin_name": "mtls_auth",
+            "scope": "proxy",
+            "proxy_id": "mtls-compat-stream",
+            "enabled": true,
+            "config": {"cert_field": "san_dns"}
+        }]
+    });
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &incompatible).await;
+    assert_eq!(
+        status, 400,
+        "incompatible stream mTLS was admitted: {body:?}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("existing config was NOT deleted"),
+        "restore must refuse before the clear: {body:?}"
+    );
+    assert!(
+        body["validation_errors"]
+            .to_string()
+            .contains("cannot use mtls_auth PluginConfig"),
+        "expected the mTLS transport-compatibility diagnostic: {body:?}"
+    );
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &incompatible).await;
+    assert_eq!(status, 400, "batch must refuse the same shape: {body:?}");
+    assert!(
+        body.to_string()
+            .contains("cannot use mtls_auth PluginConfig"),
+        "batch and restore must share the mTLS compatibility contract: {body:?}"
+    );
+
+    let (status, _, _) = admin_get(&base_url, "/proxies/mtls-compat-keep", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "mTLS compatibility refusal must leave the namespace intact"
+    );
+}
+
+/// A disabled plugin row skips the pipeline's `PluginConfigs` step, so restore
+/// could persist a plugin_config the admin API can neither create nor ever
+/// enable. Name and definition admission must be unconditional (issue #4283).
+#[tokio::test]
+async fn restore_rejects_disabled_plugin_config_with_unknown_name_before_delete() {
+    let tc = TestConfig::default();
+    let (mut state, _dir) = create_db_admin_state(&tc).await;
+    state.backend_allow_ips = ferrum_edge::config::BackendEgressPolicy::from_env(
+        ferrum_edge::config::BackendAllowIps::Both,
+        "",
+        "",
+        true,
+    )
+    .expect("default deny policy is valid");
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let seed = json!({
+        "proxies": [
+            {"id": "disabled-plugin-keep", "listen_path": "/disabled-plugin-keep", "backend_scheme": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+        ]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201, "Seed failed: {body:?}");
+
+    let unknown_disabled = json!({
+        "plugin_configs": [{
+            "id": "restore-unknown-disabled",
+            "plugin_name": "does_not_exist",
+            "scope": "global",
+            "enabled": false,
+            "config": {"staged": true}
+        }]
+    });
+    let (status, body) = admin_post(
+        &base_url,
+        "/restore?confirm=true",
+        &token,
+        &unknown_disabled,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "unknown disabled plugin was admitted: {body:?}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("existing config was NOT deleted"),
+        "restore must refuse before the clear: {body:?}"
+    );
+    assert!(
+        body["validation_errors"]
+            .to_string()
+            .contains("unknown plugin name 'does_not_exist'"),
+        "expected the unknown plugin-name diagnostic: {body:?}"
+    );
+
+    // Batch already refuses this payload; the assertion keeps the two pinned.
+    let (status, body) = admin_post(&base_url, "/batch", &token, &unknown_disabled).await;
+    assert_eq!(
+        status, 400,
+        "batch must refuse the unknown disabled plugin: {body:?}"
+    );
+
+    // A disabled config-graph participant keeps its policy screening on both
+    // paths: the definition is admitted or refused identically.
+    let denied_disabled = json!({
+        "plugin_configs": [
+            {
+                "id": "restore-disabled-schema",
+                "plugin_name": "transaction_log_schema",
+                "scope": "global",
+                "enabled": true,
+                "config": {"schemas": {"staged": {}}}
+            },
+            {
+                "id": "restore-disabled-denied",
+                "plugin_name": "rate_limiting",
+                "scope": "global",
+                "enabled": false,
+                "config": {
+                    "window_seconds": 60,
+                    "max_requests": 10,
+                    "sync_mode": "redis",
+                    "redis_url": "redis://169.254.169.254:6379/0",
+                    "schema_ref": "staged"
+                }
+            }
+        ]
+    });
+    let (restore_status, restore_body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &denied_disabled).await;
+    let (batch_status, batch_body) =
+        admin_post(&base_url, "/batch", &token, &denied_disabled).await;
+    assert_eq!(
+        batch_status, 400,
+        "batch must screen a disabled graph participant: {batch_body:?}"
+    );
+    assert!(
+        batch_body
+            .to_string()
+            .contains("redis_url IP 169.254.169.254 denied"),
+        "expected batch egress denial diagnostic: {batch_body:?}"
+    );
+    assert_eq!(
+        restore_status, 400,
+        "restore must screen a disabled graph participant like batch does: {restore_body:?}"
+    );
+    assert!(
+        restore_body
+            .to_string()
+            .contains("redis_url IP 169.254.169.254 denied"),
+        "expected restore egress denial diagnostic: {restore_body:?}"
+    );
+
+    let (status, _, _) = admin_get(&base_url, "/proxies/disabled-plugin-keep", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "plugin admission refusal must leave the namespace intact"
+    );
+}
+
 #[tokio::test]
 async fn plugin_delete_rejects_revealing_global_body_transformer_beside_hmac() {
     let tc = TestConfig::default();
