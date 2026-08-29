@@ -239,12 +239,18 @@ that run's conclusion `failure`, so `main-publish-gate` refuses and neither
 
 The two halves are not independent lists. `.github/scripts/verify_publication_gate.py`
 parses the frozen array out of `ci.yml` and proves it is **set-equal** to the
-`ci_main_publish_gate` entries, proves the hosted job exists, is scoped to
-`push` on `refs/heads/main`, holds the least-privilege pair `contents: read`
-(checkout) and `actions: read` (run conclusions), and runs the shared
-gate bound to `github.sha`, and proves `release.yml`'s `validate-release-sha`
-runs the same gate over the complete inventory with no hard-coded wait list.
-`.github/scripts/verify_required_ci.py` runs those proofs, plus set-equality
+`ci_main_publish_gate` entries, and proves the hosted
+`main-publication-required-checks` job **structurally**: the exact main-push
+`if`, `ubuntu-latest`, bounded `timeout-minutes`, the least-privilege
+permissions mapping `contents: read` + `actions: read` with no extra or write
+scopes, a pinned checkout, and the one named proof step that owns
+`set -euo pipefail` plus both Python invocations. Comments, unrelated steps,
+flow/duplicate/opaque spellings, `continue-on-error`, and extra job controls
+do not count. It also proves `release.yml`'s `validate-release-sha` the same
+way: exact `actions: read` / `contents: read` mapping, no failure-weakening
+fields, and the named tag-target step owning tag resolution, ancestry proof,
+SHA export, self-test, and `--enforce release`. A hard-coded wait list is
+still rejected. `.github/scripts/verify_required_ci.py` runs those proofs, plus set-equality
 between the inventory and `REQUIRED_MERGE_GROUP_WORKFLOWS`, on every pull
 request. **Adding a required context without publication coverage fails policy
 CI**, and an adversarial fixture in that verifier proves it.

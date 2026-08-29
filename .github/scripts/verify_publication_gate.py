@@ -55,6 +55,101 @@ PUBLICATION_GATE_WORKFLOW_PATH = ".github/workflows/gateway-api-conformance.yml"
 PUBLICATION_GATE_JOB = "main-publication-required-checks"
 RELEASE_WORKFLOW_PATH = ".github/workflows/release.yml"
 RELEASE_GATE_JOB = "validate-release-sha"
+CHECKOUT_USES = (
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+)
+
+# Direct fields of the hosted publication gate. Comments are ignored; extra,
+# missing, duplicate, reordered, flow-spelled, or opaque fields fail closed.
+PUBLICATION_GATE_FIELDS = (
+    "name",
+    "if",
+    "runs-on",
+    "timeout-minutes",
+    "permissions",
+    "steps",
+)
+PUBLICATION_GATE_NAME = "Main Publication Required Checks"
+PUBLICATION_GATE_IF = (
+    "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+)
+PUBLICATION_GATE_RUNS_ON = "ubuntu-latest"
+PUBLICATION_GATE_TIMEOUT = "110"
+PUBLICATION_GATE_PERMISSIONS = (("contents", "read"), ("actions", "read"))
+PUBLICATION_GATE_STEP_NAME = (
+    "Prove every publish-blocking required check passed for this SHA"
+)
+PUBLICATION_GATE_CHECKOUT_FIELDS = ("uses",)
+PUBLICATION_GATE_PROOF_FIELDS = ("name", "env", "run")
+PUBLICATION_GATE_ENV = (
+    ("GH_TOKEN", "${{ secrets.GITHUB_TOKEN }}"),
+    ("PUBLICATION_GATE_REPOSITORY", "${{ github.repository }}"),
+    ("PUBLICATION_GATE_SHA", "${{ github.sha }}"),
+)
+PUBLICATION_GATE_ACTIVE_COMMANDS = (
+    "set -euo pipefail",
+    "python3 .github/scripts/verify_publication_gate.py --self-test",
+    "python3 .github/scripts/verify_publication_gate.py --enforce main "
+    "--deadline-seconds 6000",
+)
+
+# Direct fields of the version-release SHA gate. Same closed-set rule: a
+# write permission, `continue-on-error`, or other control beside this list
+# cannot hide behind a substring match.
+RELEASE_GATE_FIELDS = (
+    "name",
+    "needs",
+    "runs-on",
+    "timeout-minutes",
+    "permissions",
+    "steps",
+)
+RELEASE_GATE_NAME = "Validate release SHA"
+RELEASE_GATE_NEEDS = "validate-release-version"
+RELEASE_GATE_RUNS_ON = "ubuntu-latest"
+RELEASE_GATE_TIMEOUT = "350"
+RELEASE_GATE_PERMISSIONS = (("actions", "read"), ("contents", "read"))
+RELEASE_GATE_STEP_NAME = (
+    "Require every publish-blocking check for the tag target"
+)
+RELEASE_GATE_CHECKOUT_FIELDS = ("uses", "with")
+RELEASE_GATE_CHECKOUT_WITH = (("fetch-depth", "0"),)
+RELEASE_GATE_PROOF_FIELDS = ("name", "env", "run")
+RELEASE_GATE_ENV = (
+    ("GH_TOKEN", "${{ github.token }}"),
+    ("PUBLICATION_GATE_REPOSITORY", "${{ github.repository }}"),
+    ("TAG_NAME", "${{ github.ref_name }}"),
+)
+RELEASE_GATE_ACTIVE_COMMANDS = (
+    "set -euo pipefail",
+    'if [[ ! "$TAG_NAME" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then',
+    'echo "Invalid release tag format: $TAG_NAME" >&2',
+    "exit 1",
+    "fi",
+    'release_sha="$(git rev-list -n 1 "$TAG_NAME")"',
+    'if [[ ! "$release_sha" =~ ^[0-9a-f]{40}$ ]]; then',
+    'echo "::error::release tag ${TAG_NAME} did not resolve to a commit" >&2',
+    "exit 1",
+    "fi",
+    'echo "Release tag ${TAG_NAME} resolves to ${release_sha}"',
+    "git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main",
+    'if ! git merge-base --is-ancestor "$release_sha" refs/remotes/origin/main; then',
+    'echo "::error title=Release target is not on main::${release_sha} is not an ancestor of origin/main" >&2',
+    "exit 1",
+    "fi",
+    "{",
+    'echo "## Release Validation"',
+    'echo ""',
+    'echo "Tag: \\`${TAG_NAME}\\`"',
+    'echo ""',
+    'echo "Commit: \\`${release_sha}\\`"',
+    'echo ""',
+    '} >> "$GITHUB_STEP_SUMMARY"',
+    'export PUBLICATION_GATE_SHA="$release_sha"',
+    "python3 .github/scripts/verify_publication_gate.py --self-test",
+    "python3 .github/scripts/verify_publication_gate.py --enforce release "
+    "--deadline-seconds 9600",
+)
 
 # `main_publication` says which publication control carries a context on the
 # `main` publishing path. The three values partition the inventory.
@@ -216,6 +311,335 @@ def job_body(contents: str, job: str) -> str | None:
     return None if match is None else match.group("body")
 
 
+def job_header_count(contents: str, job: str) -> int:
+    return len(re.findall(rf"(?m)^  {re.escape(job)}:\n", contents))
+
+
+class StructuralError(RuntimeError):
+    """Non-canonical YAML that the static contract refuses to guess at."""
+
+
+_MAPPING_KEY = re.compile(r"^([A-Za-z0-9_-]+):(.*)$")
+_SEQUENCE_ITEM = re.compile(r"^- ([A-Za-z0-9_-]+):(.*)$")
+
+
+def _is_comment_line(line: str) -> bool:
+    return line.lstrip(" ").startswith("#")
+
+
+def _indent_spaces(line: str) -> int:
+    indent = 0
+    for character in line:
+        if character == " ":
+            indent += 1
+            continue
+        if character == "\t":
+            raise StructuralError("tab indentation is opaque")
+        break
+    return indent
+
+
+def _strip_inline_comment(raw: str) -> str:
+    """Remove a plain-scalar YAML comment without cutting quoted `#` data."""
+
+    quote: str | None = None
+    index = 0
+    while index < len(raw):
+        character = raw[index]
+        if quote == '"' and character == "\\" and index + 1 < len(raw):
+            index += 2
+            continue
+        if quote is not None:
+            if character == quote:
+                if quote == "'" and index + 1 < len(raw) and raw[index + 1] == "'":
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        if character in "'\"":
+            quote = character
+        elif character == "#" and (index == 0 or raw[index - 1].isspace()):
+            return raw[:index].strip()
+        index += 1
+    return raw.strip()
+
+
+def _classify_value(rest: str) -> tuple[str, str]:
+    without_comment = _strip_inline_comment(rest)
+    if not without_comment:
+        return ("nested", "")
+    if without_comment[0] in "{[":
+        return ("flow", without_comment)
+    if without_comment[0] in "&*":
+        return ("opaque", without_comment)
+    if without_comment == "|":
+        return ("block", "|")
+    if without_comment[0] in "|>":
+        return ("opaque", without_comment)
+    return ("scalar", without_comment)
+
+
+def _collect_children(
+    lines: list[str], start: int, parent_indent: int
+) -> tuple[list[str], int]:
+    collected: list[str] = []
+    index = start
+    while index < len(lines):
+        line = lines[index]
+        if not line.strip():
+            collected.append(line)
+            index += 1
+            continue
+        if _indent_spaces(line) <= parent_indent:
+            break
+        collected.append(line)
+        index += 1
+    return collected, index
+
+
+def _dedent_block(lines: list[str], parent_indent: int) -> str:
+    nonblank = [line for line in lines if line.strip()]
+    if not nonblank:
+        return ""
+    indents = [_indent_spaces(line) for line in nonblank]
+    if any(indent <= parent_indent for indent in indents):
+        raise StructuralError("block scalar is not indented under its key")
+    strip = min(indents)
+    body: list[str] = []
+    for line in lines:
+        if not line.strip():
+            body.append("")
+            continue
+        indent = _indent_spaces(line)
+        if indent < strip:
+            raise StructuralError("block scalar indent is inconsistent")
+        body.append(line[strip:])
+    return "\n".join(body)
+
+
+def _parse_mapping(
+    lines: list[str], key_indent: int
+) -> dict[str, tuple[str, object]]:
+    result: dict[str, tuple[str, object]] = {}
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not line.strip() or _is_comment_line(line):
+            index += 1
+            continue
+        indent = _indent_spaces(line)
+        if indent < key_indent:
+            break
+        if indent > key_indent:
+            raise StructuralError("orphaned content is opaque")
+        match = _MAPPING_KEY.match(line[key_indent:])
+        if match is None:
+            raise StructuralError("direct fields must be canonical block keys")
+        key, rest = match.group(1), match.group(2)
+        if key in result:
+            raise StructuralError(f"duplicate key {key!r}")
+        kind, payload = _classify_value(rest)
+        if kind in {"flow", "opaque"}:
+            raise StructuralError(
+                f"{key!r} uses a flow, duplicate, or opaque spelling"
+            )
+        if kind == "scalar":
+            result[key] = ("scalar", payload)
+            index += 1
+            continue
+        children, index = _collect_children(lines, index + 1, key_indent)
+        if kind == "block":
+            result[key] = ("block", _dedent_block(children, key_indent))
+            continue
+        result[key] = _parse_nested(children, key_indent + 2)
+    return result
+
+
+def _parse_nested(children: list[str], child_indent: int) -> tuple[str, object]:
+    for line in children:
+        if not line.strip() or _is_comment_line(line):
+            continue
+        indent = _indent_spaces(line)
+        if indent != child_indent:
+            raise StructuralError("nested value uses a non-canonical indent")
+        content = line[child_indent:]
+        if content.startswith("- "):
+            return ("sequence", _parse_sequence(children, child_indent))
+        if _MAPPING_KEY.match(content):
+            return ("mapping", _parse_mapping(children, child_indent))
+        raise StructuralError("nested value is opaque")
+    raise StructuralError("nested value is empty")
+
+
+def _parse_sequence(
+    lines: list[str], item_indent: int
+) -> list[dict[str, tuple[str, object]]]:
+    items: list[dict[str, tuple[str, object]]] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if not line.strip() or _is_comment_line(line):
+            index += 1
+            continue
+        indent = _indent_spaces(line)
+        if indent != item_indent:
+            raise StructuralError("sequence item indent is opaque")
+        match = _SEQUENCE_ITEM.match(line[item_indent:])
+        if match is None:
+            raise StructuralError(
+                "sequence items must start with a same-line `- key:` scalar"
+            )
+        first_key, rest = match.group(1), match.group(2)
+        kind, payload = _classify_value(rest)
+        if kind != "scalar":
+            raise StructuralError(
+                f"sequence item {first_key!r} must be a same-line scalar"
+            )
+        item: dict[str, tuple[str, object]] = {first_key: ("scalar", payload)}
+        children, index = _collect_children(lines, index + 1, item_indent)
+        rest_mapping = (
+            _parse_mapping(children, item_indent + 2) if children else {}
+        )
+        for rest_key, rest_value in rest_mapping.items():
+            if rest_key in item:
+                raise StructuralError(f"duplicate key {rest_key!r}")
+            item[rest_key] = rest_value
+        items.append(item)
+    if not items:
+        raise StructuralError("sequence is empty")
+    return items
+
+
+def _parse_job(body: str) -> dict[str, tuple[str, object]]:
+    return _parse_mapping(body.splitlines(), 4)
+
+
+def _scalar(mapping: dict[str, tuple[str, object]], key: str) -> str | None:
+    value = mapping.get(key)
+    if value is None or value[0] != "scalar":
+        return None
+    return str(value[1])
+
+
+def _mapping(
+    mapping: dict[str, tuple[str, object]], key: str
+) -> dict[str, tuple[str, object]] | None:
+    value = mapping.get(key)
+    if value is None or value[0] != "mapping":
+        return None
+    payload = value[1]
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _sequence(
+    mapping: dict[str, tuple[str, object]], key: str
+) -> list[dict[str, tuple[str, object]]] | None:
+    value = mapping.get(key)
+    if value is None or value[0] != "sequence":
+        return None
+    payload = value[1]
+    if not isinstance(payload, list):
+        return None
+    return payload
+
+
+def _block(mapping: dict[str, tuple[str, object]], key: str) -> str | None:
+    value = mapping.get(key)
+    if value is None or value[0] != "block":
+        return None
+    return str(value[1])
+
+
+def _mapping_pairs(
+    mapping: dict[str, tuple[str, object]]
+) -> tuple[tuple[str, str], ...] | None:
+    pairs: list[tuple[str, str]] = []
+    for key, (kind, payload) in mapping.items():
+        if kind != "scalar":
+            return None
+        pairs.append((key, str(payload)))
+    return tuple(pairs)
+
+
+def _active_shell_lines(script: str) -> list[str]:
+    active: list[str] = []
+    for raw in script.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        active.append(stripped)
+    return active
+
+
+def _checkout_step_errors(
+    step: dict[str, tuple[str, object]],
+    located: str,
+    expected_fields: tuple[str, ...],
+    expected_with: tuple[tuple[str, str], ...] | None,
+) -> list[str]:
+    errors: list[str] = []
+    if tuple(step) != expected_fields:
+        errors.append(
+            f"{located} pinned checkout step fields must be exactly "
+            f"{expected_fields!r} in order, found {tuple(step)!r}"
+        )
+    if _scalar(step, "uses") != CHECKOUT_USES:
+        errors.append(
+            f"{located} checkout must pin `{CHECKOUT_USES}` as an active "
+            "`uses:` value, not a comment or a different action"
+        )
+    if expected_with is None:
+        return errors
+    with_mapping = _mapping(step, "with")
+    if with_mapping is None or _mapping_pairs(with_mapping) != expected_with:
+        errors.append(
+            f"{located} checkout `with:` must be exactly {expected_with!r}"
+        )
+    return errors
+
+
+def _proof_step_errors(
+    step: dict[str, tuple[str, object]],
+    located: str,
+    expected_name: str,
+    expected_fields: tuple[str, ...],
+    expected_env: tuple[tuple[str, str], ...],
+    expected_commands: tuple[str, ...],
+) -> list[str]:
+    errors: list[str] = []
+    if tuple(step) != expected_fields:
+        errors.append(
+            f"{located} named proof step fields must be exactly "
+            f"{expected_fields!r} in order, found {tuple(step)!r}"
+        )
+    if _scalar(step, "name") != expected_name:
+        errors.append(
+            f"{located} proof step must be the active named step "
+            f"{expected_name!r}"
+        )
+    env = _mapping(step, "env")
+    if env is None or _mapping_pairs(env) != expected_env:
+        errors.append(
+            f"{located} proof step must own the exact env mapping "
+            f"{expected_env!r}"
+        )
+    script = _block(step, "run")
+    if script is None:
+        errors.append(
+            f"{located} proof step must use a literal `run: |` block"
+        )
+    elif tuple(_active_shell_lines(script)) != expected_commands:
+        errors.append(
+            f"{located} proof step active command sequence must be exactly "
+            "the required gate invocations; comments and other steps do not "
+            "count"
+        )
+    return errors
+
+
 def parse_main_publish_gate_specs(ci_yml: str) -> tuple[tuple[str, str, str], ...]:
     """Return the frozen `main-publish-gate` polling array as parsed records."""
 
@@ -358,9 +782,13 @@ def ci_job_dependency_errors(ci_yml: str, inventory: dict) -> list[str]:
 
 
 def publication_gate_job_errors(gateway_yml: str, inventory: dict) -> list[str]:
-    """Prove the hosted publication gate exists, is main-scoped, and fails closed."""
+    """Prove the hosted publication gate by exact active structure."""
 
     errors: list[str] = []
+    located = f"{PUBLICATION_GATE_WORKFLOW_PATH} jobs.{PUBLICATION_GATE_JOB}"
+    if job_header_count(gateway_yml, PUBLICATION_GATE_JOB) != 1:
+        errors.append(f"{located} must be defined exactly once")
+        return errors
     body = job_body(gateway_yml, PUBLICATION_GATE_JOB)
     if body is None:
         errors.append(
@@ -369,35 +797,61 @@ def publication_gate_job_errors(gateway_yml: str, inventory: dict) -> list[str]:
             "`publication_gate_job` required context"
         )
         return errors
-    for marker in (
-        "github.event_name == 'push'",
-        "github.ref == 'refs/heads/main'",
-    ):
-        if marker not in body:
-            errors.append(
-                f"{PUBLICATION_GATE_WORKFLOW_PATH} jobs.{PUBLICATION_GATE_JOB} "
-                f"must stay scoped by `{marker}`"
-            )
-    if "contents: read" not in body or "actions: read" not in body:
+    try:
+        job = _parse_job(body)
+    except StructuralError as error:
+        errors.append(f"{located} {error}")
+        return errors
+    if tuple(job) != PUBLICATION_GATE_FIELDS:
         errors.append(
-            f"{PUBLICATION_GATE_WORKFLOW_PATH} jobs.{PUBLICATION_GATE_JOB} must "
-            "request the least-privilege pair `contents: read` (checkout) and "
-            "`actions: read` (run conclusions)"
+            f"{located} direct fields must be exactly "
+            f"{PUBLICATION_GATE_FIELDS!r} in order, found {tuple(job)!r}"
         )
-    for argument in (
-        "python3 .github/scripts/verify_publication_gate.py --self-test",
-        "python3 .github/scripts/verify_publication_gate.py --enforce main",
-        "PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}",
-    ):
-        if argument not in body:
-            errors.append(
-                f"{PUBLICATION_GATE_WORKFLOW_PATH} jobs.{PUBLICATION_GATE_JOB} "
-                f"must run the shared gate with `{argument}`"
-            )
-    if "PUBLICATION_GATE_SHA: ${{ github.sha }}" not in body:
+    if _scalar(job, "name") != PUBLICATION_GATE_NAME:
+        errors.append(f"{located} must keep name {PUBLICATION_GATE_NAME!r}")
+    if _scalar(job, "if") != PUBLICATION_GATE_IF:
+        errors.append(f"{located} must stay scoped by `{PUBLICATION_GATE_IF}`")
+    if _scalar(job, "runs-on") != PUBLICATION_GATE_RUNS_ON:
+        errors.append(f"{located} must run on `{PUBLICATION_GATE_RUNS_ON}`")
+    if _scalar(job, "timeout-minutes") != PUBLICATION_GATE_TIMEOUT:
         errors.append(
-            f"{PUBLICATION_GATE_WORKFLOW_PATH} jobs.{PUBLICATION_GATE_JOB} must "
-            "bind the gate to `github.sha`, the exact product commit"
+            f"{located} must keep the bounded timeout-minutes "
+            f"{PUBLICATION_GATE_TIMEOUT}"
+        )
+    permissions = _mapping(job, "permissions")
+    if (
+        permissions is None
+        or _mapping_pairs(permissions) != PUBLICATION_GATE_PERMISSIONS
+    ):
+        errors.append(
+            f"{located} permissions must be the exact least-privilege mapping "
+            f"{PUBLICATION_GATE_PERMISSIONS!r}; write scopes, extra keys, "
+            "duplicates, and flow spellings do not count"
+        )
+    steps = _sequence(job, "steps")
+    if steps is None or len(steps) != 2:
+        errors.append(
+            f"{located} must have exactly two active steps: the pinned "
+            "checkout, then the named publication proof"
+        )
+    else:
+        errors.extend(
+            _checkout_step_errors(
+                steps[0],
+                located,
+                PUBLICATION_GATE_CHECKOUT_FIELDS,
+                None,
+            )
+        )
+        errors.extend(
+            _proof_step_errors(
+                steps[1],
+                located,
+                PUBLICATION_GATE_STEP_NAME,
+                PUBLICATION_GATE_PROOF_FIELDS,
+                PUBLICATION_GATE_ENV,
+                PUBLICATION_GATE_ACTIVE_COMMANDS,
+            )
         )
     if not by_mode(inventory, "publication_gate_job"):
         errors.append(
@@ -420,41 +874,79 @@ def publication_gate_job_errors(gateway_yml: str, inventory: dict) -> list[str]:
 
 
 def release_gate_errors(release_yml: str, inventory: dict) -> list[str]:
-    """Prove the version-release verifier consumes the same inventory."""
+    """Prove the version-release verifier by exact active structure."""
 
     errors: list[str] = []
+    located = f"{RELEASE_WORKFLOW_PATH} jobs.{RELEASE_GATE_JOB}"
+    if job_header_count(release_yml, RELEASE_GATE_JOB) != 1:
+        return [f"{RELEASE_WORKFLOW_PATH} must define `{RELEASE_GATE_JOB}` exactly once"]
     body = job_body(release_yml, RELEASE_GATE_JOB)
     if body is None:
         return [f"{RELEASE_WORKFLOW_PATH} must define `{RELEASE_GATE_JOB}`"]
-    for argument in (
-        "python3 .github/scripts/verify_publication_gate.py --self-test",
-        "python3 .github/scripts/verify_publication_gate.py --enforce release",
-        'export PUBLICATION_GATE_SHA="$release_sha"',
-        "PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}",
+    try:
+        job = _parse_job(body)
+    except StructuralError as error:
+        return [f"{located} {error}"]
+    if tuple(job) != RELEASE_GATE_FIELDS:
+        errors.append(
+            f"{located} direct fields must be exactly "
+            f"{RELEASE_GATE_FIELDS!r} in order, found {tuple(job)!r}"
+        )
+    if _scalar(job, "name") != RELEASE_GATE_NAME:
+        errors.append(f"{located} must keep name {RELEASE_GATE_NAME!r}")
+    if _scalar(job, "needs") != RELEASE_GATE_NEEDS:
+        errors.append(f"{located} must keep `needs: {RELEASE_GATE_NEEDS}`")
+    if _scalar(job, "runs-on") != RELEASE_GATE_RUNS_ON:
+        errors.append(f"{located} must run on `{RELEASE_GATE_RUNS_ON}`")
+    if _scalar(job, "timeout-minutes") != RELEASE_GATE_TIMEOUT:
+        errors.append(
+            f"{located} must keep the bounded timeout-minutes "
+            f"{RELEASE_GATE_TIMEOUT}"
+        )
+    permissions = _mapping(job, "permissions")
+    if (
+        permissions is None
+        or _mapping_pairs(permissions) != RELEASE_GATE_PERMISSIONS
     ):
-        if argument not in body:
-            errors.append(
-                f"{RELEASE_WORKFLOW_PATH} jobs.{RELEASE_GATE_JOB} must run the "
-                f"shared publication gate with `{argument}`"
+        errors.append(
+            f"{located} permissions must be the exact least-privilege mapping "
+            f"{RELEASE_GATE_PERMISSIONS!r}; write scopes, extra keys, "
+            "duplicates, and flow spellings do not count"
+        )
+    steps = _sequence(job, "steps")
+    if steps is None or len(steps) != 2:
+        errors.append(
+            f"{located} must have exactly two active steps: the pinned "
+            f"checkout, then {RELEASE_GATE_STEP_NAME!r}"
+        )
+    else:
+        errors.extend(
+            _checkout_step_errors(
+                steps[0],
+                located,
+                RELEASE_GATE_CHECKOUT_FIELDS,
+                RELEASE_GATE_CHECKOUT_WITH,
             )
-    if "git merge-base --is-ancestor" not in body:
-        errors.append(
-            f"{RELEASE_WORKFLOW_PATH} jobs.{RELEASE_GATE_JOB} must prove the tag "
-            "target is an ancestor of `main` before trusting any evidence"
         )
-    if "contents: read" not in body or "actions: read" not in body:
-        errors.append(
-            f"{RELEASE_WORKFLOW_PATH} jobs.{RELEASE_GATE_JOB} must keep the "
-            "least-privilege pair `contents: read` (checkout) and "
-            "`actions: read` (run conclusions)"
+        errors.extend(
+            _proof_step_errors(
+                steps[1],
+                located,
+                RELEASE_GATE_STEP_NAME,
+                RELEASE_GATE_PROOF_FIELDS,
+                RELEASE_GATE_ENV,
+                RELEASE_GATE_ACTIVE_COMMANDS,
+            )
         )
-    # Nothing may re-introduce an independent hard-coded subset next to the
-    # inventory-driven gate.
-    if "wait_for_success" in body:
-        errors.append(
-            f"{RELEASE_WORKFLOW_PATH} jobs.{RELEASE_GATE_JOB} must not keep a "
-            "hard-coded per-workflow wait list beside the canonical inventory"
+        proof_script = _block(steps[1], "run") if len(steps) > 1 else None
+        active = (
+            _active_shell_lines(proof_script) if proof_script is not None else []
         )
+        if any("wait_for_success" in line for line in active):
+            errors.append(
+                f"{located} must not keep a hard-coded per-workflow wait list "
+                "beside the canonical inventory"
+            )
     if not entries(inventory):
         errors.append(f"{INVENTORY_PATH} carries no publish-blocking context")
     return errors
@@ -1008,6 +1500,141 @@ def _complete_runs() -> dict[str, list[dict]]:
     return {"alpha.yml": [_run()], "beta.yml": [_beta_run()]}
 
 
+def _gate_inventory() -> dict:
+    inventory = _fixture_inventory()
+    inventory["required_checks"] = [
+        *inventory["required_checks"],
+        {
+            "context": "Gateway API Conformance",
+            "workflow_file": "gateway-api-conformance.yml",
+            "workflow_path": PUBLICATION_GATE_WORKFLOW_PATH,
+            "workflow_name": "Gateway API Conformance",
+            "job": "gate",
+            "main_publication": "ci_main_publish_gate",
+            "evidence": "push_main",
+            "rationale": "self-test hosting workflow",
+        },
+    ]
+    return inventory
+
+
+def _wrap_publication_job(body: str) -> str:
+    if not body.endswith("\n"):
+        body += "\n"
+    return f"jobs:\n  {PUBLICATION_GATE_JOB}:\n{body}"
+
+
+def _wrap_release_job(body: str) -> str:
+    if not body.endswith("\n"):
+        body += "\n"
+    return f"jobs:\n  {RELEASE_GATE_JOB}:\n{body}  next-job:\n    runs-on: ubuntu-latest\n"
+
+
+_CONFORMING_PUBLICATION_JOB = """    name: Main Publication Required Checks
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # The gate stops at its own deadline below, so this ceiling is only a
+    # backstop against a wedged runner.
+    timeout-minutes: 110
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Prove every publish-blocking required check passed for this SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}
+          PUBLICATION_GATE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # The commit and repository travel in the environment so this argv
+          # stays fully literal: a trusted-policy scan can read exactly what
+          # this step executes without resolving a shell expansion.
+          python3 .github/scripts/verify_publication_gate.py --self-test
+          python3 .github/scripts/verify_publication_gate.py --enforce main --deadline-seconds 6000
+"""
+
+_CONFORMING_RELEASE_JOB = """    name: Validate release SHA
+    needs: validate-release-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+
+      # Issue #4302. The complete, repository-required product check set --
+      # `.github/required-publication-checks.json`, the one canonical inventory
+      # the `main` publisher is also proven set-equal to -- must be successful
+      # for the EXACT tag target under trusted workflow identity before any
+      # immutable version-tag artifact is built. The previous implementation
+      # kept an independent hard-coded subset here that omitted Gateway API
+      # Conformance, Ambient Host UDP, and the trusted build policy, and
+      # accepted "some successful push run" rather than requiring every matching
+      # run to have concluded successfully.
+      - name: Require every publish-blocking check for the tag target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "Invalid release tag format: $TAG_NAME" >&2
+            exit 1
+          fi
+
+          release_sha="$(git rev-list -n 1 "$TAG_NAME")"
+          if [[ ! "$release_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::release tag ${TAG_NAME} did not resolve to a commit" >&2
+            exit 1
+          fi
+          echo "Release tag ${TAG_NAME} resolves to ${release_sha}"
+
+          # A tag may point anywhere. Publication evidence is only meaningful
+          # for a commit that is on `main`, so prove ancestry from the trusted
+          # remote branch before any check result is trusted. The shared gate
+          # re-proves this through the compare API as well.
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$release_sha" refs/remotes/origin/main; then
+            echo "::error title=Release target is not on main::${release_sha} is not an ancestor of origin/main" >&2
+            exit 1
+          fi
+
+          {
+            echo "## Release Validation"
+            echo ""
+            echo "Tag: \\`${TAG_NAME}\\`"
+            echo ""
+            echo "Commit: \\`${release_sha}\\`"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # The tag target travels in the environment so this argv stays fully
+          # literal for the trusted-policy scanners.
+          export PUBLICATION_GATE_SHA="$release_sha"
+          python3 .github/scripts/verify_publication_gate.py --self-test
+          python3 .github/scripts/verify_publication_gate.py --enforce release --deadline-seconds 9600
+"""
+
+
+def _publication_errors(body: str) -> list[str]:
+    return publication_gate_job_errors(
+        _wrap_publication_job(body), _gate_inventory()
+    )
+
+
+def _release_errors(body: str) -> list[str]:
+    return release_gate_errors(_wrap_release_job(body), _gate_inventory())
+
+
 def self_test() -> list[str]:
     """Adversarial proofs. Returns a list of failure descriptions."""
 
@@ -1405,6 +2032,309 @@ def self_test() -> list[str]:
     duplicated["required_checks"].append(dict(duplicated["required_checks"][0]))
     expect(inventory_errors(duplicated) != [], "a duplicate context must fail")
     expect(inventory_errors(_fixture_inventory()) == [], "the fixture must be valid")
+
+    # Static contract: hosted publication-gate and release-gate jobs are
+    # proven by exact active structure, not raw substring search.
+    expect(
+        _publication_errors(_CONFORMING_PUBLICATION_JOB) == [],
+        "the exact hosted publication-gate job must pass",
+    )
+    expect(
+        _release_errors(_CONFORMING_RELEASE_JOB) == [],
+        "the exact validate-release-sha job must pass",
+    )
+
+    commented_enforce = _CONFORMING_PUBLICATION_JOB.replace(
+        "          python3 .github/scripts/verify_publication_gate.py --enforce main --deadline-seconds 6000\n",
+        "          # python3 .github/scripts/verify_publication_gate.py --enforce main --deadline-seconds 6000\n",
+    )
+    expect(
+        _publication_errors(commented_enforce) != [],
+        "a comment-only enforce command must fail the publication-gate job",
+    )
+    commented_scope = _CONFORMING_PUBLICATION_JOB.replace(
+        "    if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n",
+        "    # if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n"
+        "    if: always()\n",
+    )
+    expect(
+        _publication_errors(commented_scope) != [],
+        "a comment-only main-push scope must fail the publication-gate job",
+    )
+    commented_permissions = _CONFORMING_PUBLICATION_JOB.replace(
+        "    permissions:\n      contents: read\n      actions: read\n",
+        "    permissions:\n      contents: write\n      actions: write\n"
+        "      # contents: read\n      # actions: read\n",
+    )
+    expect(
+        _publication_errors(commented_permissions) != [],
+        "comment-only read permissions must fail the publication-gate job",
+    )
+    unrelated_step = _CONFORMING_PUBLICATION_JOB.replace(
+        "      - name: Prove every publish-blocking required check passed for this SHA\n"
+        "        env:\n"
+        "          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n"
+        "          PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}\n"
+        "          PUBLICATION_GATE_SHA: ${{ github.sha }}\n"
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        "\n"
+        "          # The commit and repository travel in the environment so this argv\n"
+        "          # stays fully literal: a trusted-policy scan can read exactly what\n"
+        "          # this step executes without resolving a shell expansion.\n"
+        "          python3 .github/scripts/verify_publication_gate.py --self-test\n"
+        "          python3 .github/scripts/verify_publication_gate.py --enforce main --deadline-seconds 6000\n",
+        "      - name: Unrelated decoy\n"
+        "        run: |\n"
+        "          python3 .github/scripts/verify_publication_gate.py --self-test\n"
+        "          python3 .github/scripts/verify_publication_gate.py --enforce main --deadline-seconds 6000\n"
+        "      - name: Prove every publish-blocking required check passed for this SHA\n"
+        "        env:\n"
+        "          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n"
+        "          PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}\n"
+        "          PUBLICATION_GATE_SHA: ${{ github.sha }}\n"
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        "          echo skipped\n",
+    )
+    expect(
+        _publication_errors(unrelated_step) != [],
+        "a required command in an unrelated step must fail the publication-gate job",
+    )
+    missing_enforce = _CONFORMING_PUBLICATION_JOB.replace(
+        "          python3 .github/scripts/verify_publication_gate.py --enforce main --deadline-seconds 6000\n",
+        "",
+    )
+    expect(
+        _publication_errors(missing_enforce) != [],
+        "a missing active enforce command must fail the publication-gate job",
+    )
+    altered_deadline = _CONFORMING_PUBLICATION_JOB.replace(
+        "--deadline-seconds 6000",
+        "--deadline-seconds 1",
+    )
+    expect(
+        _publication_errors(altered_deadline) != [],
+        "an altered enforce deadline must fail the publication-gate job",
+    )
+    extra_write = _CONFORMING_PUBLICATION_JOB.replace(
+        "      contents: read\n      actions: read\n",
+        "      contents: read\n      actions: read\n      packages: write\n",
+    )
+    expect(
+        _publication_errors(extra_write) != [],
+        "an extra write permission must fail the publication-gate job",
+    )
+    continue_on_error = _CONFORMING_PUBLICATION_JOB.replace(
+        "    timeout-minutes: 110\n",
+        "    timeout-minutes: 110\n    continue-on-error: true\n",
+    )
+    expect(
+        _publication_errors(continue_on_error) != [],
+        "continue-on-error on the publication-gate job must fail",
+    )
+    duplicate_permissions = _CONFORMING_PUBLICATION_JOB.replace(
+        "    permissions:\n      contents: read\n      actions: read\n",
+        "    permissions:\n      contents: read\n      actions: read\n"
+        "    permissions:\n      contents: write\n      actions: write\n",
+    )
+    expect(
+        _publication_errors(duplicate_permissions) != [],
+        "duplicate permissions mappings must fail the publication-gate job",
+    )
+    flow_permissions = _CONFORMING_PUBLICATION_JOB.replace(
+        "    permissions:\n      contents: read\n      actions: read\n",
+        "    permissions: { contents: read, actions: read }\n",
+    )
+    expect(
+        _publication_errors(flow_permissions) != [],
+        "flow-spelled permissions must fail the publication-gate job",
+    )
+    opaque_permissions = _CONFORMING_PUBLICATION_JOB.replace(
+        "    permissions:\n      contents: read\n      actions: read\n",
+        "    permissions: read-all\n",
+    )
+    expect(
+        _publication_errors(opaque_permissions) != [],
+        "opaque permissions: read-all must fail the publication-gate job",
+    )
+    reordered_permissions = _CONFORMING_PUBLICATION_JOB.replace(
+        "      contents: read\n      actions: read\n",
+        "      actions: read\n      contents: read\n",
+    )
+    expect(
+        _publication_errors(reordered_permissions) != [],
+        "reordered permission keys must fail the publication-gate job",
+    )
+    job_level_env = _CONFORMING_PUBLICATION_JOB.replace(
+        "    timeout-minutes: 110\n",
+        "    timeout-minutes: 110\n"
+        "    env:\n"
+        "      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n"
+        "      PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}\n"
+        "      PUBLICATION_GATE_SHA: ${{ github.sha }}\n",
+    ).replace(
+        "        env:\n"
+        "          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n"
+        "          PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}\n"
+        "          PUBLICATION_GATE_SHA: ${{ github.sha }}\n",
+        "",
+    )
+    expect(
+        _publication_errors(job_level_env) != [],
+        "env owned by the job instead of the named proof step must fail",
+    )
+    wrong_sha_env = _CONFORMING_PUBLICATION_JOB.replace(
+        "PUBLICATION_GATE_SHA: ${{ github.sha }}",
+        "PUBLICATION_GATE_SHA: ${{ github.event.pull_request.head.sha }}",
+    )
+    expect(
+        _publication_errors(wrong_sha_env) != [],
+        "a wrong proof-step env value must fail the publication-gate job",
+    )
+    missing_checkout = _CONFORMING_PUBLICATION_JOB.replace(
+        "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6\n\n",
+        "",
+    )
+    expect(
+        _publication_errors(missing_checkout) != [],
+        "a missing checkout step must fail the publication-gate job",
+    )
+    wrong_pin = _CONFORMING_PUBLICATION_JOB.replace(
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/checkout@v6",
+    )
+    expect(
+        _publication_errors(wrong_pin) != [],
+        "a wrong checkout pin must fail the publication-gate job",
+    )
+    folded_run = _CONFORMING_PUBLICATION_JOB.replace("        run: |\n", "        run: >\n")
+    expect(
+        _publication_errors(folded_run) != [],
+        "a folded run block must fail the publication-gate job",
+    )
+
+    release_commented_enforce = _CONFORMING_RELEASE_JOB.replace(
+        "          python3 .github/scripts/verify_publication_gate.py --enforce release --deadline-seconds 9600\n",
+        "          # python3 .github/scripts/verify_publication_gate.py --enforce release --deadline-seconds 9600\n",
+    )
+    expect(
+        _release_errors(release_commented_enforce) != [],
+        "a comment-only release enforce command must fail",
+    )
+    release_unrelated = _CONFORMING_RELEASE_JOB.replace(
+        "      - name: Require every publish-blocking check for the tag target\n",
+        "      - name: Unrelated decoy\n"
+        "        run: |\n"
+        "          python3 .github/scripts/verify_publication_gate.py --self-test\n"
+        "          python3 .github/scripts/verify_publication_gate.py --enforce release --deadline-seconds 9600\n"
+        "      - name: Require every publish-blocking check for the tag target\n",
+    )
+    expect(
+        _release_errors(release_unrelated) != [],
+        "a required release command in an unrelated step must fail",
+    )
+    release_missing_export = _CONFORMING_RELEASE_JOB.replace(
+        '          export PUBLICATION_GATE_SHA="$release_sha"\n',
+        "",
+    )
+    expect(
+        _release_errors(release_missing_export) != [],
+        "a missing active SHA export must fail the release gate",
+    )
+    release_extra_write = _CONFORMING_RELEASE_JOB.replace(
+        "      actions: read\n      contents: read\n",
+        "      actions: read\n      contents: read\n      packages: write\n",
+    )
+    expect(
+        _release_errors(release_extra_write) != [],
+        "an extra write permission must fail the release gate",
+    )
+    release_continue = _CONFORMING_RELEASE_JOB.replace(
+        "    timeout-minutes: 350\n",
+        "    timeout-minutes: 350\n    continue-on-error: true\n",
+    )
+    expect(
+        _release_errors(release_continue) != [],
+        "continue-on-error on validate-release-sha must fail",
+    )
+    release_flow_permissions = _CONFORMING_RELEASE_JOB.replace(
+        "    permissions:\n      actions: read\n      contents: read\n",
+        "    permissions: { actions: read, contents: read }\n",
+    )
+    expect(
+        _release_errors(release_flow_permissions) != [],
+        "flow-spelled release permissions must fail",
+    )
+    release_duplicate = _CONFORMING_RELEASE_JOB.replace(
+        "    permissions:\n      actions: read\n      contents: read\n",
+        "    permissions:\n      actions: read\n      contents: read\n"
+        "    permissions:\n      contents: write\n",
+    )
+    expect(
+        _release_errors(release_duplicate) != [],
+        "duplicate release permission mappings must fail",
+    )
+    release_wrong_env = _CONFORMING_RELEASE_JOB.replace(
+        "PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}",
+        "PUBLICATION_GATE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}",
+    )
+    expect(
+        _release_errors(release_wrong_env) != [],
+        "a wrong release proof-step env value must fail",
+    )
+    release_job_env = _CONFORMING_RELEASE_JOB.replace(
+        "    timeout-minutes: 350\n",
+        "    timeout-minutes: 350\n"
+        "    env:\n"
+        "      GH_TOKEN: ${{ github.token }}\n"
+        "      PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}\n"
+        "      TAG_NAME: ${{ github.ref_name }}\n",
+    ).replace(
+        "        env:\n"
+        "          GH_TOKEN: ${{ github.token }}\n"
+        "          PUBLICATION_GATE_REPOSITORY: ${{ github.repository }}\n"
+        "          TAG_NAME: ${{ github.ref_name }}\n",
+        "",
+    )
+    expect(
+        _release_errors(release_job_env) != [],
+        "release env owned by the job instead of the named step must fail",
+    )
+    release_missing_checkout = _CONFORMING_RELEASE_JOB.replace(
+        "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6\n"
+        "        with:\n"
+        "          fetch-depth: 0\n\n",
+        "",
+    )
+    expect(
+        _release_errors(release_missing_checkout) != [],
+        "a missing release checkout must fail",
+    )
+    release_wrong_pin = _CONFORMING_RELEASE_JOB.replace(
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/checkout@0000000000000000000000000000000000000000",
+    )
+    expect(
+        _release_errors(release_wrong_pin) != [],
+        "a wrong release checkout pin must fail",
+    )
+    release_opaque_timeout = _CONFORMING_RELEASE_JOB.replace(
+        "    timeout-minutes: 350\n",
+        "    timeout-minutes: |\n      350\n",
+    )
+    expect(
+        _release_errors(release_opaque_timeout) != [],
+        "an opaque release timeout spelling must fail",
+    )
+    missing_ancestry = _CONFORMING_RELEASE_JOB.replace(
+        '          if ! git merge-base --is-ancestor "$release_sha" refs/remotes/origin/main; then\n',
+        '          if ! true; then\n',
+    )
+    expect(
+        _release_errors(missing_ancestry) != [],
+        "a missing active ancestry proof must fail the release gate",
+    )
 
     return failures
 
