@@ -289,6 +289,10 @@ impl RecentFailureRing {
 struct TargetHealth {
     consecutive_successes: AtomicU32,
     consecutive_failures: AtomicU32,
+    /// Consecutive-mode publication epoch. A success (or timer recovery)
+    /// increments this after zeroing the streak so a stale threshold failure
+    /// cannot insert an ejection that a later success already invalidated.
+    consecutive_publish_epoch: AtomicU32,
     /// Recent failure timestamps (epoch ms) for passive windowed counting.
     /// Bounded to MAX_RECENT_FAILURES_PER_TARGET entries.
     recent_failures: Mutex<RecentFailureRing>,
@@ -299,6 +303,7 @@ impl TargetHealth {
         Self {
             consecutive_successes: AtomicU32::new(0),
             consecutive_failures: AtomicU32::new(0),
+            consecutive_publish_epoch: AtomicU32::new(0),
             recent_failures: Mutex::new(RecentFailureRing::new()),
         }
     }
@@ -1368,17 +1373,71 @@ impl HealthChecker {
         connection_error: bool,
         passive_config: Option<&PassiveHealthCheck>,
     ) {
+        self.report_response_inner(
+            namespace,
+            proxy_id,
+            upstream_id,
+            target,
+            status_code,
+            connection_error,
+            passive_config,
+            None,
+        );
+    }
+
+    /// Test-only consecutive-mode interleaving hook: `hook` runs after the
+    /// streak `fetch_add` and before ejection publication, so a later success
+    /// can be applied in a deterministic order without a timing sleep.
+    #[doc(hidden)]
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn report_response_with_after_consecutive_failure_count_hook_for_test(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        upstream_id: &str,
+        target: &UpstreamTarget,
+        status_code: u16,
+        connection_error: bool,
+        passive_config: Option<&PassiveHealthCheck>,
+        hook: &mut dyn FnMut(),
+    ) {
+        self.report_response_inner(
+            namespace,
+            proxy_id,
+            upstream_id,
+            target,
+            status_code,
+            connection_error,
+            passive_config,
+            Some(hook),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn report_response_inner(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        upstream_id: &str,
+        target: &UpstreamTarget,
+        status_code: u16,
+        connection_error: bool,
+        passive_config: Option<&PassiveHealthCheck>,
+        mut after_consecutive_failure_count: Option<&mut dyn FnMut()>,
+    ) {
         let config = match passive_config {
             Some(c) => c,
             None => return,
         };
 
-        // Istio `consecutive5xxErrors: 0` disables only the HTTP-5xx detector.
-        // Connection-error accounting and success-reset invariants stay on their
-        // own paths; native windowed policies never set this sentinel.
-        if !connection_error
-            && config.consecutive_5xx_ejection_disabled
-            && config.unhealthy_status_codes.contains(&status_code)
+        // Istio `consecutive5xxErrors: 0` disables the consecutive-5xx
+        // detector. With default `splitExternalLocalOriginErrors=false`
+        // (the split mode is deferred and unused), Envoy counts locally
+        // originated connection failures in that same bucket, so this
+        // sentinel must fail closed for both matching HTTP status codes
+        // and `connection_error`. Native windowed policies never set it.
+        if config.consecutive_5xx_ejection_disabled
+            && (connection_error || config.unhealthy_status_codes.contains(&status_code))
         {
             return;
         }
@@ -1388,8 +1447,8 @@ impl HealthChecker {
         // Format "host:port" into a thread-local buffer to avoid a String
         // allocation on every proxied response. DashMap lookups use &str
         // (zero-alloc hot path); only DashMap inserts (rare cold path) clone.
-        HP_KEY_BUF.with(|buf| {
-            let mut buf = buf.borrow_mut();
+        HP_KEY_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
             buf.clear();
             write_target_host_port_key(&mut buf, target);
 
@@ -1408,8 +1467,30 @@ impl HealthChecker {
 
             if connection_error || config.unhealthy_status_codes.contains(&status_code) {
                 state.consecutive_successes.store(0, Ordering::Relaxed);
+                let epoch = if config.consecutive_error_mode {
+                    state.consecutive_publish_epoch.load(Ordering::Acquire)
+                } else {
+                    0
+                };
+                let failure_order = if config.consecutive_error_mode {
+                    Ordering::AcqRel
+                } else {
+                    Ordering::Relaxed
+                };
                 let consecutive_failures =
-                    state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                    state.consecutive_failures.fetch_add(1, failure_order) + 1;
+
+                if config.consecutive_error_mode
+                    && let Some(hook) = after_consecutive_failure_count.as_mut()
+                {
+                    // Release the thread-local key buffer so a test hook that
+                    // re-enters `report_response` cannot panic on RefCell borrow.
+                    drop(buf);
+                    hook();
+                    buf = cell.borrow_mut();
+                    buf.clear();
+                    write_target_host_port_key(&mut buf, target);
+                }
 
                 let now_ms = now_epoch_ms();
                 // Istio `consecutive5xxErrors` semantics (issue #4292): the
@@ -1430,20 +1511,19 @@ impl HealthChecker {
                     ring.record(now_ms, window_start) as u32
                 };
 
-                if failures_observed >= config.unhealthy_threshold
-                    && !proxy_state.unhealthy.contains_key(buf.as_str())
-                {
-                    if config.consecutive_error_mode {
-                        warn!(
-                            "Passive health check: marking target {} as unhealthy for proxy {} ({} consecutive failures)",
-                            buf.as_str(), proxy_id, failures_observed
-                        );
-                    } else {
-                        warn!(
-                            "Passive health check: marking target {} as unhealthy for proxy {} ({} failures in {}s window)",
-                            buf.as_str(), proxy_id, failures_observed, config.unhealthy_window_seconds
-                        );
-                    }
+                let threshold_reached = if config.consecutive_error_mode {
+                    // Live streak + publish epoch are authoritative. A
+                    // concurrent success may have stored zero (and advanced
+                    // the epoch) after our fetch_add; do not eject from the
+                    // cached increment.
+                    state.consecutive_publish_epoch.load(Ordering::Acquire) == epoch
+                        && state.consecutive_failures.load(Ordering::Acquire)
+                            >= config.unhealthy_threshold
+                } else {
+                    failures_observed >= config.unhealthy_threshold
+                };
+
+                if threshold_reached && !proxy_state.unhealthy.contains_key(buf.as_str()) {
                     // Cold path: threshold breach — allocate key for insert.
                     // Capture the effective policy's recovery deadline on the
                     // entry itself so reloads / other proxies cannot change it.
@@ -1456,17 +1536,45 @@ impl HealthChecker {
                             now_epoch_ms(),
                         ),
                     );
+                    let stale_consecutive_insert = config.consecutive_error_mode
+                        && (state.consecutive_publish_epoch.load(Ordering::Acquire) != epoch
+                            || state.consecutive_failures.load(Ordering::Acquire)
+                                < config.unhealthy_threshold);
+                    if stale_consecutive_insert {
+                        // A later success already reset the streak. Retract
+                        // this publication so the endpoint does not stay
+                        // ejected after that success.
+                        if let Some((_, ejection)) = proxy_state.unhealthy.remove(buf.as_str()) {
+                            self.reset_latency_after_passive_recovery(
+                                namespace,
+                                &ejection.upstream_id,
+                                target,
+                            );
+                        }
+                    } else if config.consecutive_error_mode {
+                        warn!(
+                            "Passive health check: marking target {} as unhealthy for proxy {} ({} consecutive failures)",
+                            buf.as_str(), proxy_id, failures_observed
+                        );
+                    } else {
+                        warn!(
+                            "Passive health check: marking target {} as unhealthy for proxy {} ({} failures in {}s window)",
+                            buf.as_str(), proxy_id, failures_observed, config.unhealthy_window_seconds
+                        );
+                    }
                 }
             } else {
                 state.consecutive_successes.fetch_add(1, Ordering::Relaxed);
                 if config.consecutive_error_mode {
-                    // This write is unconditional in streak mode. A preceding
+                    // Zero the streak before advancing the publish epoch so a
+                    // concurrent failure that observed the previous epoch
+                    // cannot publish after this reset. Unconditional: a
                     // load-and-conditional-store can miss a concurrently
-                    // reported failure between those operations, leaving a
-                    // nonzero streak after a success. The atomic modification
-                    // order now gives concurrent completions one coherent
-                    // success-reset/failure-increment order.
-                    state.consecutive_failures.store(0, Ordering::Relaxed);
+                    // reported failure between those operations.
+                    state.consecutive_failures.store(0, Ordering::Release);
+                    state
+                        .consecutive_publish_epoch
+                        .fetch_add(1, Ordering::AcqRel);
                 } else if state.consecutive_failures.load(Ordering::Relaxed) > 0 {
                     // Preserve the no-write common success path for native
                     // windowed policy, where this counter is not the ejection
@@ -1476,12 +1584,26 @@ impl HealthChecker {
 
                 if proxy_state.unhealthy.contains_key(buf.as_str()) {
                     let successes = state.consecutive_successes.load(Ordering::Relaxed);
-                    if successes >= 1 {
+                    let recover = successes >= 1
+                        && (!config.consecutive_error_mode
+                            || state.consecutive_failures.load(Ordering::Acquire)
+                                < config.unhealthy_threshold);
+                    if recover {
                         info!(
                             "Passive health check: marking target {} as healthy again for proxy {}",
                             buf.as_str(), proxy_id
                         );
-                        if let Some((_, ejection)) = proxy_state.unhealthy.remove(buf.as_str()) {
+                        // Recheck the live streak at removal time so a newer
+                        // threshold breach published after our reset is kept.
+                        let removed = if config.consecutive_error_mode {
+                            proxy_state.unhealthy.remove_if(buf.as_str(), |_, _| {
+                                state.consecutive_failures.load(Ordering::Acquire)
+                                    < config.unhealthy_threshold
+                            })
+                        } else {
+                            proxy_state.unhealthy.remove(buf.as_str())
+                        };
+                        if let Some((_, ejection)) = removed {
                             state.lock_recent_failures().clear();
                             self.reset_latency_after_passive_recovery(
                                 namespace,
@@ -1653,6 +1775,24 @@ impl HealthChecker {
             return 0;
         };
         state.lock_recent_failures().slot_capacity()
+    }
+
+    /// Test-only consecutive-failure streak for one passive target.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn consecutive_failures_for_test(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        host_port: &str,
+    ) -> u32 {
+        let Some(proxy_state) = self.passive_state(namespace, proxy_id) else {
+            return 0;
+        };
+        let Some(state) = proxy_state.states.get(host_port) else {
+            return 0;
+        };
+        state.consecutive_failures.load(Ordering::Acquire)
     }
 
     /// Run one passive-recovery pass: clear every auto-recoverable ejection
@@ -3721,7 +3861,10 @@ fn recover_due_passive_ejections_inner(
                 hp, proxy_key, current.upstream_id
             );
             if let Some(state) = proxy_state.states.get(hp) {
-                state.consecutive_failures.store(0, Ordering::Relaxed);
+                state.consecutive_failures.store(0, Ordering::Release);
+                state
+                    .consecutive_publish_epoch
+                    .fetch_add(1, Ordering::AcqRel);
                 state.consecutive_successes.store(0, Ordering::Relaxed);
                 state.lock_recent_failures().clear();
             }

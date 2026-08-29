@@ -443,6 +443,103 @@ fn port_level_positive_outlier_overlay_clears_top_level_disable_sentinel() {
 }
 
 #[test]
+fn port_level_zero_outlier_overlay_disables_top_level_positive_threshold() {
+    let mut port_level_settings = HashMap::new();
+    port_level_settings.insert(
+        8080,
+        MeshTrafficPolicy {
+            outlier_detection: Some(MeshOutlierDetection {
+                consecutive_errors: Some(0),
+                interval_seconds: None,
+                base_ejection_seconds: None,
+                max_ejection_percent: None,
+            }),
+            ..MeshTrafficPolicy::default()
+        },
+    );
+    let mut config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    outlier_detection: Some(MeshOutlierDetection {
+                        consecutive_errors: Some(5),
+                        interval_seconds: None,
+                        base_ejection_seconds: None,
+                        max_ejection_percent: None,
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings,
+                subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let port_passive = prepared.upstreams[0]
+        .port_overrides
+        .get(&8080)
+        .and_then(|override_slot| override_slot.passive_health_check.as_ref())
+        .expect("port-level outlier projected");
+    assert!(
+        port_passive.consecutive_5xx_ejection_disabled,
+        "per-port consecutive5xxErrors: 0 must disable a top-level positive threshold"
+    );
+
+    let checker = HealthChecker::new();
+    let target = UpstreamTarget {
+        host: "reviews.default.svc.cluster.local".to_string(),
+        port: 8080,
+        service_port_policy_key: None,
+        weight: 1,
+        tags: HashMap::new(),
+        locality: None,
+        path: None,
+    };
+    for _ in 0..20 {
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            "reviews-p",
+            "reviews-u",
+            &target,
+            500,
+            false,
+            Some(port_passive),
+        );
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            "reviews-p",
+            "reviews-u",
+            &target,
+            0,
+            true,
+            Some(port_passive),
+        );
+    }
+    assert!(
+        !checker
+            .passive_health
+            .get(&ferrum_edge::config::db_backend::namespaced_runtime_key(
+                "ferrum",
+                "reviews-p"
+            ))
+            .is_some_and(|ps| ps
+                .unhealthy
+                .contains_key("reviews.default.svc.cluster.local:8080")),
+        "port-level consecutive5xxErrors: 0 must not eject on HTTP 5xx or connection errors"
+    );
+}
+
+#[test]
 fn destination_rule_top_level_max_connections_fans_out_to_all_target_ports() {
     use ferrum_edge::config::types::TcpKeepaliveCfg;
 

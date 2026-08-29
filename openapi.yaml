@@ -12887,11 +12887,14 @@ components:
           type: boolean
           default: false
           description: |
-            When true, HTTP 5xx responses in `unhealthy_status_codes` are
-            ignored by passive ejection (Istio `consecutive5xxErrors: 0`).
-            Set automatically for translated Istio DestinationRules that
-            explicitly disable the 5xx detector. Native windowed policies never
-            enable this sentinel.
+            When true, the Istio consecutive-5xx detector is disabled
+            (`consecutive5xxErrors: 0`). Matching `unhealthy_status_codes` and
+            locally originated connection failures are ignored — Envoy's
+            default `splitExternalLocalOriginErrors=false` puts those
+            connection failures in the same 5xx bucket, and Ferrum's split
+            mode is deferred and unused. Set automatically for translated
+            Istio DestinationRules that explicitly disable the 5xx detector.
+            Native windowed policies never enable this sentinel.
 
     # ── Service Discovery ──────────────────────────────────────────
     ServiceDiscoveryConfig:

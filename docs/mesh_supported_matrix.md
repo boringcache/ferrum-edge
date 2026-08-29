@@ -459,7 +459,9 @@ need them, or because they are blocked upstream / architecturally:
   `maxEjectionPercent` alone. `consecutive5xxErrors` IS applied with Istio's
   consecutive-streak semantics; a translated `outlierDetection` that omits both
   `consecutive5xxErrors` and `consecutiveErrors` inherits Istio's default of 5
-  (not Ferrum's native threshold of 3), explicit `0` disables 5xx ejection, and
+  (not Ferrum's native threshold of 3), explicit `0` disables the consecutive-5xx
+  detector (HTTP 5xx and locally originated connection failures; split mode is
+  deferred), and
   a translated block that omits `maxEjectionPercent` inherits Istio's own 10%
   default rather than Ferrum's uncapped native default.
 - **`RequestAuthentication` / `Telemetry` `targetRefs`** — rejected

@@ -1485,9 +1485,13 @@ pub struct PassiveHealthCheck {
     /// `interval` is an analysis sweep period, not a failure window.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub consecutive_error_mode: bool,
-    /// When true, HTTP 5xx responses in `unhealthy_status_codes` are ignored
-    /// by passive ejection (Istio `consecutive5xxErrors: 0`). Set only by
-    /// translated DestinationRules; native windowed policies never enable this.
+    /// When true, the Istio consecutive-5xx detector is disabled
+    /// (`consecutive5xxErrors: 0`). Matching `unhealthy_status_codes` and
+    /// locally originated `connection_error` values are ignored (Envoy's
+    /// default `splitExternalLocalOriginErrors=false` puts those connection
+    /// failures in the same 5xx bucket; Ferrum's split mode is deferred and
+    /// unused). Set only by translated DestinationRules; native windowed
+    /// policies never enable this.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub consecutive_5xx_ejection_disabled: bool,
 }

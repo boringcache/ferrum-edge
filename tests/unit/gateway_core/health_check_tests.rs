@@ -2347,20 +2347,136 @@ fn windowed_mode_still_ejects_on_alternating_failures() {
     );
 }
 
-/// Istio `consecutive5xxErrors: 0` disables only the HTTP-5xx detector.
+/// Istio `consecutive5xxErrors: 0` disables the consecutive-5xx detector.
+/// Matching HTTP 5xx and locally originated connection failures (the Envoy
+/// 5xx bucket when split mode is off) must not eject. Native windowed
+/// policies never set this sentinel.
 #[test]
 fn disabled_consecutive_5xx_detector_never_ejects_on_status_errors() {
     let checker = HealthChecker::new();
     let target = make_target("backend1", 8080);
     let config = PassiveHealthCheck {
+        consecutive_error_mode: true,
         consecutive_5xx_ejection_disabled: true,
-        ..PassiveHealthCheck::default()
+        unhealthy_threshold: 1,
+        ..consecutive_policy(1)
     };
 
     report_failures(&checker, TEST_PROXY, &target, &config, 100);
     assert!(
         !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
         "consecutive5xxErrors: 0 must not eject on HTTP 5xx"
+    );
+}
+
+#[test]
+fn disabled_consecutive_5xx_detector_never_ejects_on_connection_errors() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        consecutive_error_mode: true,
+        consecutive_5xx_ejection_disabled: true,
+        unhealthy_threshold: 1,
+        ..consecutive_policy(1)
+    };
+
+    for _ in 0..100 {
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            0,
+            true,
+            Some(&config),
+        );
+    }
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "consecutive5xxErrors: 0 must not eject on locally originated connection errors"
+    );
+    assert_eq!(
+        checker.consecutive_failures_for_test(DEFAULT_NAMESPACE, TEST_PROXY, "backend1:8080"),
+        0,
+        "a disabled 5xx detector must not increment the consecutive streak"
+    );
+}
+
+#[test]
+fn native_windowed_connection_errors_still_eject_when_5xx_detector_is_enabled() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_threshold: 2,
+        ..PassiveHealthCheck::default()
+    };
+    assert!(!config.consecutive_error_mode);
+    assert!(!config.consecutive_5xx_ejection_disabled);
+
+    checker.report_response(
+        DEFAULT_NAMESPACE,
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        0,
+        true,
+        Some(&config),
+    );
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "native windowed policy must not eject below threshold"
+    );
+    checker.report_response(
+        DEFAULT_NAMESPACE,
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        0,
+        true,
+        Some(&config),
+    );
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "native windowed policy still counts connection errors when the Istio disable sentinel is unset"
+    );
+}
+
+/// Top-level `consecutive5xxErrors: 0` sets the disable sentinel without
+/// flipping `consecutive_error_mode`. Connection errors must still be ignored.
+#[test]
+fn disabled_5xx_detector_without_consecutive_mode_still_ignores_connection_errors() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        consecutive_5xx_ejection_disabled: true,
+        unhealthy_threshold: 1,
+        ..PassiveHealthCheck::default()
+    };
+    assert!(!config.consecutive_error_mode);
+
+    for _ in 0..50 {
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            0,
+            true,
+            Some(&config),
+        );
+    }
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "explicit 0 must disable the 5xx bucket even when consecutive_error_mode is unset"
     );
 }
 
@@ -2381,5 +2497,70 @@ fn explicit_nonzero_consecutive_threshold_still_wins_over_disable_sentinel() {
     assert!(
         is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
         "the seventh consecutive failure must eject"
+    );
+}
+
+/// Deterministic consecutive-mode stale-insert proof: a threshold failure
+/// increments the streak, a later success resets it and observes no ejection,
+/// then the older failure would have inserted from its cached count. The
+/// live epoch/streak must win so the endpoint is not left ejected.
+#[test]
+fn consecutive_mode_success_wins_over_stale_threshold_insert() {
+    let checker = Arc::new(HealthChecker::new());
+    let target = make_target("backend1", 8080);
+    let config = consecutive_policy(5);
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 4);
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "must not eject below the consecutive threshold"
+    );
+
+    let checker_for_success = Arc::clone(&checker);
+    let target_for_success = target.clone();
+    let config_for_success = config.clone();
+    let mut success_observed_ejection = false;
+    let mut hook = || {
+        checker_for_success.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target_for_success,
+            200,
+            false,
+            Some(&config_for_success),
+        );
+        success_observed_ejection =
+            is_passive_unhealthy(&checker_for_success, TEST_PROXY, "backend1:8080");
+    };
+    checker.report_response_with_after_consecutive_failure_count_hook_for_test(
+        DEFAULT_NAMESPACE,
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+        &mut hook,
+    );
+
+    assert!(
+        !success_observed_ejection,
+        "the later success must observe no ejection (insert has not happened yet)"
+    );
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "a stale threshold insert must not leave the endpoint ejected after the later success"
+    );
+    assert_eq!(
+        checker.consecutive_failures_for_test(DEFAULT_NAMESPACE, TEST_PROXY, "backend1:8080"),
+        0,
+        "the later success must own the live streak"
+    );
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 5);
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "a fresh consecutive streak after the interleaved success must still eject"
     );
 }
