@@ -7565,9 +7565,8 @@ fn batch_reference_lookup<T>(
         Some(error) => Err(error),
         None => result,
     };
-    result.map_err(|error| {
-        json_response(StatusCode::SERVICE_UNAVAILABLE, &db_error_response(&error))
-    })
+    result
+        .map_err(|error| json_response(StatusCode::SERVICE_UNAVAILABLE, &db_error_response(&error)))
 }
 
 /// Point uniqueness checks against already-persisted resources.
