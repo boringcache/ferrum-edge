@@ -1547,7 +1547,13 @@ fn rr_counters_insert_before_and_after_retire_for_h2() {
         !pool.contains_rr_counter(&key),
         "insert-before-retire must be reclaimed by the unconditional drain"
     );
-    assert_eq!(inserted.fetch_add(1, Ordering::Relaxed), 0);
+    let inserted_before = inserted.load(Ordering::Relaxed);
+    let _ = inserted.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(
+        inserted.load(Ordering::Relaxed),
+        inserted_before.wrapping_add(1),
+        "the detached in-flight counter Arc must remain usable after map retirement"
+    );
 
     live.store(4, Ordering::Release);
     pool.drain_backend_tls_config_cache_svid_generation(captured);
@@ -1556,7 +1562,13 @@ fn rr_counters_insert_before_and_after_retire_for_h2() {
         !pool.contains_rr_counter(&key),
         "retire-before-insert must drop the exact captured key"
     );
-    assert_eq!(late.fetch_add(1, Ordering::Relaxed), 0);
+    let late_before = late.load(Ordering::Relaxed);
+    let _ = late.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(
+        late.load(Ordering::Relaxed),
+        late_before.wrapping_add(1),
+        "the late retired-generation counter Arc must remain usable without being cached"
+    );
 
     let current = Http2ConnectionPool::pool_key_with_global(&proxy, Some(4), &global);
     let _ = pool.get_or_seed_rr_counter_for_tests(&current, Some(4));
@@ -1586,7 +1598,13 @@ fn rr_counters_insert_before_and_after_retire_for_grpc() {
     assert!(pool.contains_rr_counter(&key));
     pool.drain_backend_tls_config_cache_svid_generation(captured);
     assert!(!pool.contains_rr_counter(&key));
-    assert_eq!(inserted.fetch_add(1, Ordering::Relaxed), 0);
+    let inserted_before = inserted.load(Ordering::Relaxed);
+    let _ = inserted.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(
+        inserted.load(Ordering::Relaxed),
+        inserted_before.wrapping_add(1),
+        "the detached gRPC counter Arc must remain usable after map retirement"
+    );
 
     live.store(4, Ordering::Release);
     pool.drain_backend_tls_config_cache_svid_generation(captured);
@@ -1595,7 +1613,13 @@ fn rr_counters_insert_before_and_after_retire_for_grpc() {
         !pool.contains_rr_counter(&key),
         "gRPC retire-before-insert must drop the exact captured key"
     );
-    assert_eq!(late.fetch_add(1, Ordering::Relaxed), 0);
+    let late_before = late.load(Ordering::Relaxed);
+    let _ = late.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(
+        late.load(Ordering::Relaxed),
+        late_before.wrapping_add(1),
+        "the late retired-generation gRPC counter Arc must remain usable without being cached"
+    );
 
     let current = GrpcConnectionPool::pool_key_with_global(&proxy, Some(4), &global);
     let _ = pool.get_or_seed_rr_counter_for_tests(&current, Some(4));
