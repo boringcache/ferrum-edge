@@ -277,6 +277,12 @@ impl Plugin for RewriteContentLength {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // HashMap keys are case-sensitive. A rewrite must drop every
+        // Content-Length case variant first; inserting `"Content-Length"`
+        // beside an existing `"content-length"` leaves two fields, and
+        // `preserved_response_content_length` fail-closes to None (the
+        // wire/completeness contract, not a successful rewrite).
+        response_headers.retain(|name, _| !name.eq_ignore_ascii_case("content-length"));
         response_headers.insert("Content-Length".to_string(), self.value.to_string());
         PluginResult::Continue
     }
