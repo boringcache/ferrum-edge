@@ -2163,13 +2163,48 @@ baggage would reach dashboards while authz correctly rejected it. Only the
 redacted reason code is emitted; the rejected identity is attacker-controlled
 and never reaches metadata, logs, or metric labels.
 
+**Telemetry mirrors every effective authorization gate, not the first one.**
+PluginCache executes every enabled global `mesh_authz` instance. Transparent
+inbound capture force-injects reserved `__mesh_authz` even when an operator
+global exists, so both run; outside capture, several operator globals can
+likewise be effective. Mesh injection therefore stamps an internal
+`_effective_mesh_authz_baggage_gates` list on `__mesh_workload_metrics` from
+those enabled configs *after* the ensure/force step:
+
+- Disabled operator rows do not constrain or select the telemetry gate.
+- Telemetry honors baggage only if **every** compiled gate would honor that
+  peer/asserted pair and trust-domain relation. Construction compiles each
+  gate with the same `TrustedAssertorIndex` / `hbone_assertion_verdict` logic
+  as `mesh_authz`. Request-time evaluation allocates nothing, takes no locks,
+  and scales only with the bounded number of effective gates (at most 16;
+  malformed or over-bound lists fail plugin construction).
+- Each gate keeps its own `trusted_hbone_assertors` absent/null/default
+  contract, explicit `[]` deny, `legacy_mesh_wide_hbone_assertion`, and
+  `trust_domain_aliases`. A sibling's aliases or legacy flag cannot silently
+  widen another gate.
+- A `when:` / trigger that makes request applicability unknowable is still
+  included — requiring that gate is the fail-closed direction.
+- Direct or user-created `workload_metrics` without the internal field keep
+  their existing single-gate config.
+- When one of several gates refuses, the redacted reason uses the same
+  precedence as a single gate (`untrusted_assertor` →
+  `trust_domain_mismatch` → `assertion_out_of_scope`). Trust-domain mismatch
+  stays distinct. The forged identity is never logged or labeled.
+
 **Identity-backed `NodeWaypoint` needs no operator configuration for this.** A
 node waypoint legitimately fronts pods in namespaces other than its own, so the
 CP-derived `node_waypoint_assertors` inventory carries, per assertor, the exact
 workload identities that NodeWaypoint fronts (derived from the same
-scope-authorized `Workload.node_waypoint` bindings that admitted the assertor,
-including identity-only source pods that are not Service backends).
-Mesh injection projects each entry as
+`Workload.node_waypoint` bindings that admitted the assertor, including
+identity-only source pods that are not Service backends).
+The CP intersects that derivation with destination/cross-namespace visibility,
+the CP namespace scope, **and** the subscriber's bearer `ns` claim. A
+contributing workload namespace is admitted only when every applicable gate
+allows it; an assertor with no remaining asserted identities is dropped rather
+than serialized empty (empty would skip `asserts` and widen to same-namespace).
+A beta-restricted bearer on an `{alpha,beta}` CP therefore receives neither
+alpha identities nor an alpha-only assertor. Full-scope / no-bearer
+publication is unchanged. Mesh injection projects each entry as
 `{"assertor": "<nodewaypoint svid>", "asserts": [...]}`, so cross-namespace
 source-node assertion keeps working while an assertor that fronts nothing
 authorizes nothing.
@@ -2187,7 +2222,7 @@ Operators with Gateway-managed waypoints often run with SA names like `<gateway-
 FERRUM_MESH_TRUSTED_HBONE_ASSERTORS="ztunnel,default-waypoint,spiffe://cluster.local/ns/team-a/sa/team-a-waypoint"
 ```
 
-When the env var is unset or empty, mesh injection usually uses the defaults. The exception is identity-backed `NodeWaypoint`: when the runtime has file SVID material or a mesh CA backend, Ferrum derives the trusted assertor allow-list from the CP-derived `node_waypoint_assertors` inventory, built from scope-authorized `Workload.node_waypoint.spiffe_id` values before namespace/service slice narrowing, each entry carrying the exact workload identities that NodeWaypoint fronts. If no NodeWaypoint assertor metadata is present, the generated allow-list is empty so HBONE baggage rewrites fail closed instead of falling back to the bare `waypoint` service-account default. To lock down baggage rewriting entirely (no peer can rewrite the authz principal), configure a `mesh_authz` global plugin override with an explicit empty list (`trusted_hbone_assertors: []`).
+When the env var is unset or empty, mesh injection usually uses the defaults. The exception is identity-backed `NodeWaypoint`: when the runtime has file SVID material or a mesh CA backend, Ferrum derives the trusted assertor allow-list from the CP-derived `node_waypoint_assertors` inventory, built from destination-visible, CP-scope-authorized, and bearer-`ns`-authorized `Workload.node_waypoint.spiffe_id` values before namespace/service slice narrowing, each entry carrying the exact workload identities that NodeWaypoint fronts. If no NodeWaypoint assertor metadata is present, the generated allow-list is empty so HBONE baggage rewrites fail closed instead of falling back to the bare `waypoint` service-account default. To lock down baggage rewriting entirely (no peer can rewrite the authz principal), configure a `mesh_authz` global plugin override with an explicit empty list (`trusted_hbone_assertors: []`).
 
 `FERRUM_MESH_TRUST_DOMAIN_ALIASES` continues to gate the baggage identity's trust domain — both checks apply to a baggage rewrite.
 
@@ -6284,7 +6319,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_WORKLOAD_SPIFFE_ID` | (none) | SPIFFE ID of this mesh workload |
 | `FERRUM_MESH_WORKLOAD_LABELS` | (none) | Comma-separated `key=value` workload labels for PolicyScope matching |
 | `FERRUM_MESH_TRUST_DOMAIN_ALIASES` | (none) | Additional trust domains for HBONE baggage validation |
-| `FERRUM_MESH_TRUSTED_HBONE_ASSERTORS` | (none) | HBONE peers trusted to assert baggage `source.principal`. Comma-separated SA names and/or full SPIFFE ids. Empty/unset uses defaults `[ztunnel, waypoint]`, except identity-backed `NodeWaypoint` derives exact assertor SPIFFE IDs from the scope-authorized CP-derived `node_waypoint_assertors` inventory and uses an empty list when none exists |
+| `FERRUM_MESH_TRUSTED_HBONE_ASSERTORS` | (none) | HBONE peers trusted to assert baggage `source.principal`. Comma-separated SA names and/or full SPIFFE ids. Empty/unset uses defaults `[ztunnel, waypoint]`, except identity-backed `NodeWaypoint` derives exact assertor SPIFFE IDs from the destination-visible, CP-scope-authorized, and bearer-`ns`-authorized CP-derived `node_waypoint_assertors` inventory and uses an empty list when none exists |
 | `FERRUM_MESH_SIDECAR_ENFORCED` | `false` | When `true`, applies Istio `Sidecar` egress scope narrowing to `services` / `service_entries` / `destination_rules` / projected VirtualService L4 route proxies per workload. Sidecars are always parsed; this flag gates only the slice-narrowing pass. Opt in after vetting your `Sidecar` resources |
 | `FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN` | `false` | Computes and reports the applicable `Sidecar` egress scope while leaving the slice unchanged. Use with `/mesh/egress-scope` before enabling enforcement |
 | `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING` | `false` | When `true` and `FERRUM_MESH_SIDECAR_ENFORCED=true`, filters `workloads` to SPIFFE identities referenced by services admitted by the applicable Sidecar. Default-off for rollout; trust-bundle mTLS validation and HBONE trust-domain aliasing do not depend on this list |

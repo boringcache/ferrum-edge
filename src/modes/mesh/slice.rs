@@ -1168,6 +1168,10 @@ impl MeshSlice {
             request.waypoint_name.as_deref(),
             &namespace,
         );
+        // Prefer the CP-resolved inventory: `filter_mesh_config_to_request`
+        // derives it from destination-visibility + CP-scope + bearer `ns`
+        // before narrowing `workloads`. The empty fallback is file/local only
+        // and can only ever yield a SUBSET of that authorized inventory.
         let node_waypoint_assertors = if mesh.node_waypoint_assertors.is_empty() {
             node_waypoint_assertors_from_workloads(mesh.workloads.iter())
         } else {

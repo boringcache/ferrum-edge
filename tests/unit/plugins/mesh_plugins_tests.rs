@@ -12,7 +12,9 @@ use ferrum_edge::modes::mesh::config::{
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
-use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
+use ferrum_edge::plugins::mesh::workload_metrics::{
+    EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY, MAX_EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES, WorkloadMetrics,
+};
 use ferrum_edge::plugins::request_transformer::RequestTransformer;
 use ferrum_edge::plugins::{
     Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult, RequestContext,
@@ -3793,6 +3795,231 @@ fn workload_metrics_rejects_trusted_hbone_assertor_object_unknown_key() {
     assert!(
         err.contains("workload_metrics:"),
         "error should be prefixed by the plugin: {err}"
+    );
+}
+
+fn metrics_config_with_effective_gates(gates: serde_json::Value) -> serde_json::Value {
+    let mut config = json!({});
+    config[EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY] = gates;
+    config
+}
+
+fn metrics_with_effective_gates(gates: serde_json::Value) -> WorkloadMetrics {
+    WorkloadMetrics::new(&metrics_config_with_effective_gates(gates))
+        .expect("effective gate config")
+}
+
+async fn metrics_baggage_outcome(
+    plugin: &WorkloadMetrics,
+    peer: &str,
+    asserted: &str,
+) -> (String, Option<String>) {
+    let mut ctx = request_context(Some(peer));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        format!("source.principal={asserted}"),
+    )]);
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let principal = ctx
+        .metadata
+        .get("mesh.source.principal")
+        .cloned()
+        .expect("source principal");
+    let reason = ctx.metadata.get("mesh.ignored_baggage").cloned();
+    (principal, reason)
+}
+
+/// Capture-on: managed inventory is narrower than an operator mesh-wide
+/// override. Telemetry must refuse what the managed gate refuses.
+#[tokio::test]
+async fn workload_metrics_conjunctive_gates_refuse_what_managed_refuses() {
+    let plugin = metrics_with_effective_gates(json!([
+        {
+            "trusted_hbone_assertors": [{
+                "assertor": "waypoint",
+                "asserts": ["spiffe://cluster.local/ns/prod/sa/payments"]
+            }]
+        },
+        {
+            "trusted_hbone_assertors": [{
+                "assertor": "waypoint",
+                "scope": "mesh_wide"
+            }]
+        }
+    ]));
+    let (principal, reason) = metrics_baggage_outcome(
+        &plugin,
+        "spiffe://cluster.local/ns/prod/sa/waypoint",
+        "spiffe://cluster.local/ns/other/sa/victim",
+    )
+    .await;
+    assert_eq!(principal, "spiffe://cluster.local/ns/prod/sa/waypoint");
+    assert_eq!(reason.as_deref(), Some("assertion_out_of_scope"));
+}
+
+/// Capture-on: operator `[]` is narrower than the managed default. Telemetry
+/// must refuse what the operator gate refuses.
+#[tokio::test]
+async fn workload_metrics_conjunctive_gates_refuse_what_operator_empty_list_refuses() {
+    let plugin = metrics_with_effective_gates(json!([
+        {},
+        { "trusted_hbone_assertors": [] }
+    ]));
+    let (principal, reason) = metrics_baggage_outcome(
+        &plugin,
+        "spiffe://cluster.local/ns/prod/sa/waypoint",
+        "spiffe://cluster.local/ns/prod/sa/payments",
+    )
+    .await;
+    assert_eq!(principal, "spiffe://cluster.local/ns/prod/sa/waypoint");
+    assert_eq!(reason.as_deref(), Some("untrusted_assertor"));
+}
+
+/// Both enabled gates allow the same same-namespace assertion.
+#[tokio::test]
+async fn workload_metrics_conjunctive_gates_honor_when_every_gate_allows() {
+    let plugin = metrics_with_effective_gates(json!([
+        { "trusted_hbone_assertors": ["waypoint"] },
+        {}
+    ]));
+    let (principal, reason) = metrics_baggage_outcome(
+        &plugin,
+        "spiffe://cluster.local/ns/prod/sa/waypoint",
+        "spiffe://cluster.local/ns/prod/sa/payments",
+    )
+    .await;
+    assert_eq!(principal, "spiffe://cluster.local/ns/prod/sa/payments");
+    assert!(reason.is_none());
+}
+
+/// A disabled operator is not an effective gate: a single managed/default
+/// gate still honors same-namespace assertion.
+#[tokio::test]
+async fn workload_metrics_single_managed_gate_ignores_absent_disabled_operator() {
+    let plugin = metrics_with_effective_gates(json!([{}]));
+    let (principal, reason) = metrics_baggage_outcome(
+        &plugin,
+        "spiffe://cluster.local/ns/prod/sa/waypoint",
+        "spiffe://cluster.local/ns/prod/sa/payments",
+    )
+    .await;
+    assert_eq!(principal, "spiffe://cluster.local/ns/prod/sa/payments");
+    assert!(reason.is_none());
+}
+
+/// Multiple enabled operator gates outside capture are conjunctive.
+#[tokio::test]
+async fn workload_metrics_multiple_operator_gates_are_conjunctive() {
+    let plugin = metrics_with_effective_gates(json!([
+        { "trusted_hbone_assertors": ["waypoint"] },
+        { "trusted_hbone_assertors": ["ztunnel"] }
+    ]));
+    let (principal, reason) = metrics_baggage_outcome(
+        &plugin,
+        "spiffe://cluster.local/ns/prod/sa/waypoint",
+        "spiffe://cluster.local/ns/prod/sa/payments",
+    )
+    .await;
+    assert_eq!(principal, "spiffe://cluster.local/ns/prod/sa/waypoint");
+    assert_eq!(reason.as_deref(), Some("untrusted_assertor"));
+}
+
+/// One gate's trust-domain aliases must not silently widen another gate.
+#[tokio::test]
+async fn workload_metrics_per_gate_trust_domain_aliases_do_not_widen_sibling() {
+    let plugin = metrics_with_effective_gates(json!([
+        { "trusted_hbone_assertors": ["waypoint"] },
+        {
+            "trusted_hbone_assertors": ["waypoint"],
+            "trust_domain_aliases": ["partner.local"]
+        }
+    ]));
+    let (principal, reason) = metrics_baggage_outcome(
+        &plugin,
+        "spiffe://cluster.local/ns/prod/sa/waypoint",
+        "spiffe://partner.local/ns/prod/sa/payments",
+    )
+    .await;
+    assert_eq!(principal, "spiffe://cluster.local/ns/prod/sa/waypoint");
+    assert_eq!(reason.as_deref(), Some("trust_domain_mismatch"));
+}
+
+/// One gate's legacy mesh-wide flag must not silently widen a sibling that
+/// still grants same-namespace only.
+#[tokio::test]
+async fn workload_metrics_per_gate_legacy_flag_does_not_widen_sibling() {
+    let plugin = metrics_with_effective_gates(json!([
+        { "trusted_hbone_assertors": ["waypoint"] },
+        {
+            "trusted_hbone_assertors": ["waypoint"],
+            "legacy_mesh_wide_hbone_assertion": true
+        }
+    ]));
+    let (principal, reason) = metrics_baggage_outcome(
+        &plugin,
+        "spiffe://cluster.local/ns/attacker/sa/waypoint",
+        "spiffe://cluster.local/ns/prod/sa/payments",
+    )
+    .await;
+    assert_eq!(principal, "spiffe://cluster.local/ns/attacker/sa/waypoint");
+    assert_eq!(reason.as_deref(), Some("assertion_out_of_scope"));
+}
+
+/// Refusal precedence across gates is stable: untrusted_assertor wins over
+/// assertion_out_of_scope; trust-domain mismatch stays distinct.
+#[tokio::test]
+async fn workload_metrics_conjunctive_refusal_precedence_is_stable() {
+    let plugin = metrics_with_effective_gates(json!([
+        { "trusted_hbone_assertors": [] },
+        { "trusted_hbone_assertors": ["waypoint"] }
+    ]));
+    let (principal, reason) = metrics_baggage_outcome(
+        &plugin,
+        "spiffe://cluster.local/ns/attacker/sa/waypoint",
+        "spiffe://cluster.local/ns/prod/sa/payments",
+    )
+    .await;
+    assert_eq!(principal, "spiffe://cluster.local/ns/attacker/sa/waypoint");
+    assert_eq!(reason.as_deref(), Some("untrusted_assertor"));
+    assert_ne!(reason.as_deref(), Some("spiffe://cluster.local/ns/prod/sa/payments"));
+}
+
+#[test]
+fn workload_metrics_rejects_malformed_effective_authz_gates() {
+    let not_array = WorkloadMetrics::new(&metrics_config_with_effective_gates(json!({})));
+    let err = not_array.expect_err("non-array gates must fail construction");
+    assert!(err.contains(EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY), "{err}");
+
+    let not_object =
+        WorkloadMetrics::new(&metrics_config_with_effective_gates(json!(["waypoint"])));
+    let err = not_object.expect_err("non-object gate must fail construction");
+    assert!(err.contains("must be an object"), "{err}");
+
+    let unknown = WorkloadMetrics::new(&metrics_config_with_effective_gates(json!([{
+        "trusted_hbone_assertors": [],
+        "nope": true
+    }])));
+    let err = unknown.expect_err("unknown gate key must fail construction");
+    assert!(err.contains("nope"), "{err}");
+
+    let empty = WorkloadMetrics::new(&metrics_config_with_effective_gates(json!([])));
+    let err = empty.expect_err("empty gate list must fail construction");
+    assert!(err.contains("at least one gate"), "{err}");
+}
+
+#[test]
+fn workload_metrics_rejects_over_bound_effective_authz_gates() {
+    let gates = vec![json!({}); MAX_EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES + 1];
+    let err = WorkloadMetrics::new(&metrics_config_with_effective_gates(
+        serde_json::Value::Array(gates),
+    ))
+    .expect_err("over-bound gate list must fail construction");
+    assert!(
+        err.contains(&MAX_EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES.to_string()),
+        "{err}"
     );
 }
 

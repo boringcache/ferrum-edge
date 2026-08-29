@@ -3679,27 +3679,24 @@ impl MeshAuthz {
         // Single shared relation, evaluated once; the trust-domain gate is
         // interleaved in the historical order so `untrusted_assertor` still
         // wins over `trust_domain_mismatch` for a peer that is on neither.
-        let verdict = hbone_assertion_verdict(&self.trusted_hbone_assertors, peer, &baggage);
-        let trust_domain_ok =
-            self.trust_domain_allowed(peer.trust_domain(), baggage.trust_domain());
-        match verdict {
-            AssertionVerdict::UntrustedAssertor => {
+        let honor = hbone_baggage_honor(
+            &self.trusted_hbone_assertors,
+            &self.trust_domain_aliases,
+            peer,
+            &baggage,
+        );
+        match honor {
+            HboneBaggageHonor::UntrustedAssertor => {
                 (Some(peer.clone()), BaggageOutcome::UntrustedAssertor)
             }
-            _ if !trust_domain_ok => (Some(peer.clone()), BaggageOutcome::TrustDomainMismatch),
-            AssertionVerdict::OutOfScope => {
+            HboneBaggageHonor::TrustDomainMismatch => {
+                (Some(peer.clone()), BaggageOutcome::TrustDomainMismatch)
+            }
+            HboneBaggageHonor::AssertionOutOfScope => {
                 (Some(peer.clone()), BaggageOutcome::AssertionOutOfScope)
             }
-            AssertionVerdict::Allowed => (Some(baggage), BaggageOutcome::Honored),
+            HboneBaggageHonor::Honored => (Some(baggage), BaggageOutcome::Honored),
         }
-    }
-
-    fn trust_domain_allowed(&self, peer_td: &TrustDomain, baggage_td: &TrustDomain) -> bool {
-        peer_td == baggage_td
-            || self
-                .trust_domain_aliases
-                .iter()
-                .any(|alias| alias == baggage_td)
     }
 }
 
@@ -3755,6 +3752,68 @@ pub(crate) fn hbone_assertion_verdict(
                 AssertionVerdict::OutOfScope
             }
         }
+    }
+}
+
+/// Disposition of one compiled baggage trust gate (assertor index + aliases).
+///
+/// Shared by `mesh_authz` and `workload_metrics` so a telemetry-only copy of
+/// the trust-domain interleave cannot drift from authorization. Order is the
+/// documented gate sequence: untrusted assertor, then trust-domain mismatch,
+/// then assertion out of scope, then honored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HboneBaggageHonor {
+    Honored,
+    UntrustedAssertor,
+    TrustDomainMismatch,
+    AssertionOutOfScope,
+}
+
+pub(crate) fn hbone_trust_domain_allowed(
+    aliases: &[TrustDomain],
+    peer_td: &TrustDomain,
+    baggage_td: &TrustDomain,
+) -> bool {
+    peer_td == baggage_td || aliases.iter().any(|alias| alias == baggage_td)
+}
+
+/// Evaluate the assertor relation and trust-domain gate for one compiled
+/// allow-list. No allocation, no locks.
+pub(crate) fn hbone_baggage_honor(
+    assertors: &TrustedAssertorIndex,
+    trust_domain_aliases: &[TrustDomain],
+    peer: &SpiffeId,
+    asserted: &SpiffeId,
+) -> HboneBaggageHonor {
+    let verdict = hbone_assertion_verdict(assertors, peer, asserted);
+    let trust_ok = hbone_trust_domain_allowed(
+        trust_domain_aliases,
+        peer.trust_domain(),
+        asserted.trust_domain(),
+    );
+    match verdict {
+        AssertionVerdict::UntrustedAssertor => HboneBaggageHonor::UntrustedAssertor,
+        _ if !trust_ok => HboneBaggageHonor::TrustDomainMismatch,
+        AssertionVerdict::OutOfScope => HboneBaggageHonor::AssertionOutOfScope,
+        AssertionVerdict::Allowed => HboneBaggageHonor::Honored,
+    }
+}
+
+/// Fail-closed conjunction of two honor outcomes. Honor only if both honor;
+/// otherwise the earlier documented refusal category wins so a multi-gate
+/// telemetry refusal never relabels `untrusted_assertor` as
+/// `assertion_out_of_scope` or a trust-domain mismatch as either. The forged
+/// identity is never part of this result.
+pub(crate) fn merge_hbone_baggage_honor(
+    left: HboneBaggageHonor,
+    right: HboneBaggageHonor,
+) -> HboneBaggageHonor {
+    use HboneBaggageHonor::*;
+    match (left, right) {
+        (Honored, other) | (other, Honored) => other,
+        (UntrustedAssertor, _) | (_, UntrustedAssertor) => UntrustedAssertor,
+        (TrustDomainMismatch, _) | (_, TrustDomainMismatch) => TrustDomainMismatch,
+        (AssertionOutOfScope, AssertionOutOfScope) => AssertionOutOfScope,
     }
 }
 
