@@ -1458,9 +1458,19 @@ impl HealthChecker {
                     );
                 }
             } else {
-                let failures = state.consecutive_failures.load(Ordering::Relaxed);
                 state.consecutive_successes.fetch_add(1, Ordering::Relaxed);
-                if failures > 0 {
+                if config.consecutive_error_mode {
+                    // This write is unconditional in streak mode. A preceding
+                    // load-and-conditional-store can miss a concurrently
+                    // reported failure between those operations, leaving a
+                    // nonzero streak after a success. The atomic modification
+                    // order now gives concurrent completions one coherent
+                    // success-reset/failure-increment order.
+                    state.consecutive_failures.store(0, Ordering::Relaxed);
+                } else if state.consecutive_failures.load(Ordering::Relaxed) > 0 {
+                    // Preserve the no-write common success path for native
+                    // windowed policy, where this counter is not the ejection
+                    // decision and the failure ring remains authoritative.
                     state.consecutive_failures.store(0, Ordering::Relaxed);
                 }
 

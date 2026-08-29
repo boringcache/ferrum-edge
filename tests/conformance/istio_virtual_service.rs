@@ -1341,6 +1341,7 @@ fn vs_malformed_header_transform_fails_closed() {
         json!({"request": {"set": {"x-ok": "bad\r\nvalue"}}}),
         json!({"request": {"set": {"x-ok": 42}}}),
         json!({"request": {"set": {"transfer-encoding": "chunked"}}}),
+        json!({"response": {"set": {"proxy-authenticate": "Basic"}}}),
         json!({"request": {"remove": ["bad header"]}}),
         json!({"request": {"unknown": {}}}),
         json!({"unknown": {}}),

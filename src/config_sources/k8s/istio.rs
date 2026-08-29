@@ -3298,7 +3298,12 @@ fn validate_vs_header_block(
             for (name, value) in entries {
                 let field = format!("{path}.{direction}.{operation}");
                 let normalized = validate_vs_header_name(object, &field, name)?;
-                if VS_UNWRITABLE_HEADERS.contains(&normalized.as_str()) {
+                if VS_UNWRITABLE_HEADERS.contains(&normalized.as_str())
+                    || (direction == "response"
+                        && crate::proxy::headers::is_protocol_managed_plugin_response_destination(
+                            &normalized,
+                        ))
+                {
                     return Err(invalid_resource(
                         object,
                         format!(
