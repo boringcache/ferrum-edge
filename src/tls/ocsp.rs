@@ -284,11 +284,10 @@ fn expect_primitive<'a>(any: &Any<'a>, tag: Tag, field: &str) -> Result<&'a [u8]
 
 /// Require a universal, primitive OBJECT IDENTIFIER whose content is a
 /// complete canonical DER encoding.
-fn expect_oid<'a>(any: &'a Any<'a>, field: &str) -> Result<Oid<'a>, String> {
+fn expect_oid<'a>(any: &Any<'a>, field: &str) -> Result<Oid<'a>, String> {
     let content = expect_primitive(any, Tag::Oid, field)?;
     validate_oid_content(content, field)?;
-    any.as_oid()
-        .map_err(|_| format!("OCSP {field} is not an OBJECT IDENTIFIER"))
+    Ok(Oid::new(std::borrow::Cow::Borrowed(content)))
 }
 
 /// X.690 §8.19: one or more base-128 subidentifiers, each terminated by an
