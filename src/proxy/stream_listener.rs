@@ -720,6 +720,11 @@ struct StreamListenerKeyCandidate {
     passthrough: bool,
     has_hosts: bool,
     has_stream_match: bool,
+    /// Whether reconcile may represent this generated Service listener with
+    /// the shared `__nwudp_{port}` socket instead of its individual runtime
+    /// key. Readiness must recognize the reconciled shared handle or a healthy
+    /// same-port NodeWaypoint UDP group can never complete startup.
+    node_waypoint_udp_destination_member: bool,
 }
 
 /// Whether a stream proxy belongs to the **opaque-TLS SNI routing plane**: it
@@ -3926,6 +3931,8 @@ impl StreamListenerManager {
                         passthrough: p.passthrough,
                         has_hosts: !p.hosts.is_empty(),
                         has_stream_match: p.stream_match.as_ref().is_some_and(|m| !m.is_empty()),
+                        node_waypoint_udp_destination_member: p
+                            .joins_node_waypoint_udp_destination_plane(),
                     })
                 })
                 .collect();
@@ -3939,7 +3946,25 @@ impl StreamListenerManager {
             let all_started = {
                 let listeners = self.listeners.lock().await;
                 candidates.iter().all(|candidate| {
-                    let key = stream_listener_runtime_key(candidate, &sni_ports, &l4_ports);
+                    // `reconcile()` collapses two or more generated
+                    // NodeWaypoint UDP Service listeners onto one
+                    // `__nwudp_{port}` handle and deliberately retains that
+                    // handle when a VIP-backed group shrinks to one member.
+                    // The live listener map is authoritative for that sticky
+                    // decision; recomputing only the ordinary SNI/L4 key here
+                    // would wait forever on per-proxy handles that reconcile
+                    // intentionally did not create.
+                    let shared_node_waypoint_udp_key =
+                        node_waypoint_udp_listener_key(candidate.port);
+                    let key = if candidate.node_waypoint_udp_destination_member
+                        && listeners
+                            .get(&shared_node_waypoint_udp_key)
+                            .is_some_and(|handle| handle.node_waypoint_udp_owner)
+                    {
+                        shared_node_waypoint_udp_key
+                    } else {
+                        stream_listener_runtime_key(candidate, &sni_ports, &l4_ports)
+                    };
                     listeners.get(&key).is_some_and(|handle| {
                         handle.listen_port == candidate.port
                             && handle.scheme == candidate.scheme
