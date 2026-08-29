@@ -430,9 +430,7 @@ fn k8s_pod_discovery_rejects_noncanonical_node_waypoint_pod_shapes() {
             .expect("mesh config")
             .workloads
             .iter()
-            .find(|workload| {
-                workload.namespace == "default" && workload.service_name == "reviews"
-            })
+            .find(|workload| workload.namespace == "default" && workload.service_name == "reviews")
             .expect("reviews workload");
         assert!(
             workload.node_waypoint.is_none(),
@@ -480,9 +478,7 @@ fn k8s_pod_discovery_rejects_noncanonical_downward_api_field_path() {
         .expect("mesh config")
         .workloads
         .iter()
-        .find(|workload| {
-            workload.namespace == "default" && workload.service_name == "reviews"
-        })
+        .find(|workload| workload.namespace == "default" && workload.service_name == "reviews")
         .expect("reviews workload");
     assert!(
         workload.node_waypoint.is_none(),
