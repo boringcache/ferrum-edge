@@ -63,6 +63,17 @@ def require_text(doc: str, needle: str, title: str, detail: str) -> None:
         fail(title, detail)
 
 
+def require_scalar(
+    doc: str, key: str, expected: str, title: str, detail: str
+) -> None:
+    value = re.escape(expected)
+    if not re.search(
+        rf"(?m)^\s*{re.escape(key)}:\s*(?:{value}|'{value}'|\"{value}\")\s*$",
+        doc,
+    ):
+        fail(title, detail)
+
+
 def forbid_text(doc: str, needle: str, title: str, detail: str) -> None:
     if needle in doc:
         fail(title, detail)
@@ -222,9 +233,10 @@ def validate_serving_podspecs(results_dir: Path) -> None:
         "Ambient NET_ADMIN quoted",
         "quoting datapath capabilities breaks NodeWaypoint eBPF live and Helm Chart greps",
     )
-    require_text(
+    require_scalar(
         ambient,
-        "priorityClassName: system-node-critical",
+        "priorityClassName",
+        "system-node-critical",
         "Ambient priorityClass missing",
         "ambient must default to system-node-critical",
     )
@@ -236,9 +248,10 @@ def validate_serving_podspecs(results_dir: Path) -> None:
     )
 
     node_agent = resource_document(rendered, "ferrum-mesh-node-agent", "DaemonSet")
-    require_text(
+    require_scalar(
         node_agent,
-        "priorityClassName: system-node-critical",
+        "priorityClassName",
+        "system-node-critical",
         "Node-agent priorityClass missing",
         "nodeAgent must default to system-node-critical",
     )

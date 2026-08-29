@@ -29,25 +29,26 @@ const FAMILIES: [&str; 9] = [
     "ferrum_dp_config_snapshot_apply_failures_total",
 ];
 
-/// Two scrapes taken while a cached body would still be valid must observe the
+/// Two scrapes taken while the registry cache is still valid must observe the
 /// live state — a growing age, and the admission state flipping at the bound.
 #[test]
-fn two_scrapes_observe_live_dp_config_state_while_the_cached_body_is_unchanged() {
+fn two_scrapes_observe_live_dp_config_state_within_the_cache_ttl() {
     let registry = MetricsRegistry::new();
     // A long TTL: any body `render()` memoizes stays valid across both scrapes.
     registry.configure(300, 300, 0, 64, "");
-    let cached_body_first = registry.render();
-    let cached_body_second = registry.render();
-    assert_eq!(
-        cached_body_first, cached_body_second,
-        "the cacheable body is unchanged across the two scrapes"
-    );
+    let scrape_body_first = registry.render();
+    let scrape_body_second = registry.render();
     for family in FAMILIES {
         assert!(
-            !cached_body_first.contains(family),
+            !scrape_body_first.contains(family) && !scrape_body_second.contains(family),
             "{family} must not appear outside data-plane mode"
         );
     }
+
+    // Do not compare the complete scrapes: other process-global metric
+    // families are intentionally appended outside this registry's cache and
+    // may move while the parallel unit suite is running. The static contract
+    // below separately proves that the DP families are not memoized.
 
     // The live append is what produces the DP families, and it reflects the
     // tracker at scrape time rather than at cache-fill time.
@@ -58,13 +59,13 @@ fn two_scrapes_observe_live_dp_config_state_while_the_cached_body_is_unchanged()
     freshness.record_snapshot_applied_at(epoch);
     freshness.record_cp_authority_lost_at(epoch);
 
-    let mut first = cached_body_first.clone();
+    let mut first = scrape_body_first.clone();
     render_dp_config_freshness_prometheus(
         &mut first,
         "",
         Some(&freshness.evaluate_at(epoch + Duration::from_secs(120))),
     );
-    let mut second = cached_body_second.clone();
+    let mut second = scrape_body_second.clone();
     render_dp_config_freshness_prometheus(
         &mut second,
         "",
