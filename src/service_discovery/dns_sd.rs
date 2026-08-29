@@ -80,9 +80,12 @@ impl DnsSdDiscoverer {
 /// (fail-closed) and the discovery manager's existing empty-after-filter
 /// policy applies.
 ///
-/// Returned targets are ordered by `(priority, first-seen)`, so the output is a
-/// deterministic function of the answer SET, not of the order the resolver
-/// happened to return records in.
+/// Returned targets are ordered by ascending priority; within each tier,
+/// first-seen resolver order is preserved. Dedup on `host:port` keeps the first
+/// equal-priority record and replaces it only for a lower numeric priority;
+/// equal-priority duplicates also keep the first record's weight. Output is
+/// deterministic for a given answer ordering but not invariant under permuting
+/// same-tier answers.
 pub(crate) fn targets_from_srv_records(
     records: impl IntoIterator<Item = SrvAnswer>,
     default_weight: u32,

@@ -217,7 +217,9 @@ pub struct SrvAnswer {
     pub port: u16,
     /// RFC 2782 weight. DNS-SD remaps `0` to `default_weight` on publish.
     pub weight: u16,
-    /// RFC 2782 priority. Lower values are preferred; DNS-SD publishes one tier.
+    /// RFC 2782 priority. Lower values are preferred; DNS-SD publishes every
+    /// retained tier up to `MAX_SRV_PRIORITY_TIERS`, and the load balancer
+    /// selects the lowest healthy tier.
     pub priority: u16,
 }
 
