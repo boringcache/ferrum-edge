@@ -92,12 +92,12 @@ fn build_validation(algorithm: Algorithm, params: &JwtVerifyParams<'_>) -> Valid
         validation.set_audience(params.audiences);
         required.insert("aud".to_string());
     }
-    // When no audiences are configured, keep jsonwebtoken's default
-    // `validate_aud = true`. Tokens without `aud` still pass; a token that
-    // carries `aud` is rejected because no acceptable audience is
-    // configured (RFC 7519 §4.1.3). Do not set `validate_aud = false` —
-    // that would let a token minted for another service authenticate
-    // whenever the JWKS kid matches.
     validation.required_spec_claims = required;
+    // When no audiences are configured, `validation.aud` stays `None` and
+    // jsonwebtoken's default `validate_aud = true` is kept. Tokens without
+    // `aud` still pass; a token that carries `aud` is rejected because no
+    // acceptable audience is configured (RFC 7519 §4.1.3). Do not set
+    // `validate_aud = false` — that would let a token minted for another
+    // service authenticate whenever the JWKS kid matches.
     validation
 }
