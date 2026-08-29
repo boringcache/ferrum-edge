@@ -1350,9 +1350,8 @@ pub(crate) enum AssertionGrant {
     /// fronts. An EMPTY set therefore authorizes nothing (fail closed).
     FrontedIdentities(Arc<HashSet<String>>),
     /// May assert any identity that clears the trust-domain gate. Reachable
-    /// only through an explicit per-entry `scope: mesh_wide` contract or the
-    /// deprecated `legacy_mesh_wide_hbone_assertion` opt-in, both of which log
-    /// a loud warning at construction.
+    /// only through an explicit per-entry `scope: mesh_wide` contract, which
+    /// logs a loud warning at construction.
     MeshWide,
 }
 
@@ -1520,9 +1519,6 @@ fn same_namespace_assertion(peer: &SpiffeId, asserted: &SpiffeId) -> bool {
 /// default; operators who need that must pin the exact assertor SVID with an
 /// explicit `asserts` inventory or `scope: mesh_wide` contract.
 const DEFAULT_TRUSTED_HBONE_ASSERTOR_SA_NAMES: &[&str] = &["ztunnel", "waypoint"];
-
-/// Plugin-config key enabling the pre-#4274 namespace-blind assertor behavior.
-pub(crate) const LEGACY_MESH_WIDE_ASSERTION_KEY: &str = "legacy_mesh_wide_hbone_assertion";
 
 fn ambient_udp_source_scope_index(
     slice: &MeshSlice,
@@ -3953,11 +3949,10 @@ fn has_baggage_header_from_request(ctx: &RequestContext) -> bool {
 pub(crate) fn parse_trusted_hbone_assertors(
     config: &Value,
 ) -> Result<TrustedAssertorIndex, String> {
-    let legacy_mesh_wide = parse_legacy_mesh_wide_hbone_assertion(config)?;
     let items = match config.get("trusted_hbone_assertors") {
         None | Some(Value::Null) => {
             return Ok(TrustedAssertorIndex::from_assertors(
-                default_trusted_hbone_assertors(legacy_mesh_wide),
+                default_trusted_hbone_assertors(),
             ));
         }
         Some(Value::Array(items)) => items,
@@ -3974,54 +3969,16 @@ pub(crate) fn parse_trusted_hbone_assertors(
     // mesh_authz plugin active.
     items
         .iter()
-        .map(|item| parse_trusted_hbone_assertor_entry(item, legacy_mesh_wide))
+        .map(parse_trusted_hbone_assertor_entry)
         .collect::<Result<Vec<_>, _>>()
         .map(TrustedAssertorIndex::from_assertors)
 }
 
-/// Read the deprecated namespace-blind opt-in and shout about it.
-///
-/// Warning (not error) because it is an operator escape hatch for meshes that
-/// genuinely relied on the old behavior while they pin their real assertors.
-/// It is logged on every construction — including every config reload — on
-/// purpose: a silent security downgrade is exactly what issue #4274 was.
-pub(crate) fn parse_legacy_mesh_wide_hbone_assertion(config: &Value) -> Result<bool, String> {
-    match config.get(LEGACY_MESH_WIDE_ASSERTION_KEY) {
-        None | Some(Value::Null) => Ok(false),
-        Some(Value::Bool(false)) => Ok(false),
-        Some(Value::Bool(true)) => {
-            tracing::warn!(
-                target: "mesh_authz",
-                "SECURITY: {LEGACY_MESH_WIDE_ASSERTION_KEY}=true restores the pre-#4274 \
-                 namespace-blind HBONE trusted-assertor behavior: ANY peer matching the \
-                 allow-list may assert ANY workload identity in an accepted trust domain, \
-                 including across namespaces. Replace it with exact assertor SVIDs plus an \
-                 'asserts' inventory or an explicit per-entry 'scope: mesh_wide' contract."
-            );
-            Ok(true)
-        }
-        Some(_) => Err(format!(
-            "{LEGACY_MESH_WIDE_ASSERTION_KEY} must be a boolean"
-        )),
-    }
-}
-
-fn default_assertion_grant(legacy_mesh_wide: bool) -> AssertionGrant {
-    if legacy_mesh_wide {
-        AssertionGrant::MeshWide
-    } else {
-        AssertionGrant::SameNamespace
-    }
-}
-
-fn parse_trusted_hbone_assertor_entry(
-    item: &Value,
-    legacy_mesh_wide: bool,
-) -> Result<TrustedAssertor, String> {
+fn parse_trusted_hbone_assertor_entry(item: &Value) -> Result<TrustedAssertor, String> {
     match item {
         Value::String(raw) => Ok(TrustedAssertor {
             matcher: parse_assertor_matcher(raw)?,
-            grant: default_assertion_grant(legacy_mesh_wide),
+            grant: AssertionGrant::SameNamespace,
         }),
         Value::Object(map) => {
             reject_unknown_keys(
@@ -4041,7 +3998,7 @@ fn parse_trusted_hbone_assertor_entry(
             let asserts = map.get("asserts").filter(|value| !value.is_null());
             let scope = map.get("scope").filter(|value| !value.is_null());
             let grant = match (asserts, scope) {
-                (None, None) => default_assertion_grant(legacy_mesh_wide),
+                (None, None) => AssertionGrant::SameNamespace,
                 (Some(_), Some(_)) => {
                     return Err(format!(
                         "trusted_hbone_assertors entry '{trimmed}' must not set both 'asserts' and 'scope'"
@@ -4125,12 +4082,12 @@ fn parse_assertor_matcher(raw: &str) -> Result<AssertorMatcher, String> {
     }
 }
 
-fn default_trusted_hbone_assertors(legacy_mesh_wide: bool) -> Vec<TrustedAssertor> {
+fn default_trusted_hbone_assertors() -> Vec<TrustedAssertor> {
     DEFAULT_TRUSTED_HBONE_ASSERTOR_SA_NAMES
         .iter()
         .map(|name| TrustedAssertor {
             matcher: AssertorMatcher::ServiceAccount((*name).to_string()),
-            grant: default_assertion_grant(legacy_mesh_wide),
+            grant: AssertionGrant::SameNamespace,
         })
         .collect()
 }

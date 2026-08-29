@@ -2179,9 +2179,8 @@ those enabled configs *after* the ensure/force step:
   and scales only with the bounded number of effective gates (at most 16;
   malformed or over-bound lists fail plugin construction).
 - Each gate keeps its own `trusted_hbone_assertors` absent/null/default
-  contract, explicit `[]` deny, `legacy_mesh_wide_hbone_assertion`, and
-  `trust_domain_aliases`. A sibling's aliases or legacy flag cannot silently
-  widen another gate.
+  contract, explicit `[]` deny, and `trust_domain_aliases`. A sibling's
+  aliases or per-entry `scope: mesh_wide` cannot silently widen another gate.
 - A `when:` / trigger that makes request applicability unknowable is still
   included — requiring that gate is the fail-closed direction.
 - Direct or user-created `workload_metrics` without the internal field keep
@@ -2208,13 +2207,6 @@ publication is unchanged. Mesh injection projects each entry as
 `{"assertor": "<nodewaypoint svid>", "asserts": [...]}`, so cross-namespace
 source-node assertion keeps working while an assertor that fronts nothing
 authorizes nothing.
-
-**Legacy escape hatch.** `FERRUM_MESH_LEGACY_MESH_WIDE_HBONE_ASSERTION=true`
-(default `false`) upgrades every entry without an explicit contract to
-`mesh_wide`, restoring the pre-#4274 behavior mesh-wide. It emits a loud
-startup warning and another on every plugin construction, and it is threaded
-into **both** `mesh_authz` and `workload_metrics` so the two can never diverge.
-Use it only as a temporary bridge while pinning real assertors.
 
 Operators with Gateway-managed waypoints often run with SA names like `<gateway-name>-istio` instead of `waypoint`; override the allow-list via `FERRUM_MESH_TRUSTED_HBONE_ASSERTORS` (comma-separated, mix-and-match SA names and full SPIFFE ids):
 

@@ -2178,9 +2178,6 @@ pub struct EnvConfig {
     /// (Gateway-managed waypoints often use `<gateway-name>` or
     /// `<gateway-name>-istio`) must set this to include their names.
     pub mesh_trusted_hbone_assertors: Vec<String>,
-    /// Deprecated: restore the pre-#4274 namespace-blind HBONE trusted-assertor
-    /// behavior. See `FERRUM_MESH_LEGACY_MESH_WIDE_HBONE_ASSERTION`.
-    pub mesh_legacy_mesh_wide_hbone_assertion: bool,
     /// Directories under which an Istio `Sidecar` ingress `defaultEndpoint:
     /// unix://…` socket may live (issue #3261). **No default: empty means the
     /// feature is OFF and every `unix://` endpoint is refused.** There is
@@ -3769,7 +3766,6 @@ impl Default for EnvConfig {
             mesh_file_config_path: None,
             mesh_trust_domain_aliases: Vec::new(),
             mesh_trusted_hbone_assertors: Vec::new(),
-            mesh_legacy_mesh_wide_hbone_assertion: false,
             mesh_unix_socket_allowed_roots: Vec::new(),
             mesh_unix_socket_allowed_uids: Vec::new(),
             mesh_unix_ingress_max_connections:
@@ -4354,7 +4350,6 @@ impl EnvConfig {
             mesh_file_config_path: Option<String> = "FERRUM_MESH_FILE_CONFIG_PATH";
             mesh_trust_domain_aliases: Vec<String> = "FERRUM_MESH_TRUST_DOMAIN_ALIASES" => Vec::new();
             mesh_trusted_hbone_assertors: Vec<String> = "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS" => Vec::new();
-            mesh_legacy_mesh_wide_hbone_assertion: bool = "FERRUM_MESH_LEGACY_MESH_WIDE_HBONE_ASSERTION" => false;
             mesh_unix_socket_allowed_roots: Vec<String> = "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS" => Vec::new();
             mesh_unix_socket_allowed_uids: Vec<u32> = "FERRUM_MESH_UNIX_SOCKET_ALLOWED_UIDS" => Vec::new();
             mesh_unix_ingress_max_connections: u32 = "FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS" => crate::proxy::unix_backend_pool::DEFAULT_UNIX_INGRESS_MAX_CONNECTIONS;
@@ -5184,7 +5179,6 @@ impl EnvConfig {
             mesh_file_config_path,
             mesh_trust_domain_aliases,
             mesh_trusted_hbone_assertors,
-            mesh_legacy_mesh_wide_hbone_assertion,
             mesh_unix_socket_allowed_roots,
             mesh_unix_socket_allowed_uids,
             mesh_unix_ingress_max_connections,

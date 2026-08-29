@@ -20449,15 +20449,6 @@ components:
             `ns/prod/sa/payments`. Baggage refused by the grant is dropped, the
             peer-cert identity is used instead, and the request is stamped
             `mesh_authz.ignored_baggage.assertion_out_of_scope=true`.
-        legacy_mesh_wide_hbone_assertion:
-          type: boolean
-          default: false
-          description: |
-            Deprecated escape hatch that restores the pre-#4274 namespace-blind
-            behavior: every entry without an explicit contract grants
-            `mesh_wide`. Logs a loud warning on every plugin construction. Pin
-            exact assertor SVIDs with `asserts` or `scope` instead.
-
     MeshOutboundRegistryConfig:
       type: object
       description: |
@@ -21140,11 +21131,6 @@ components:
             attribution can never grant what authorization refused (issue
             #4274). Refused baggage is stamped
             `mesh.ignored_baggage=assertion_out_of_scope`.
-        legacy_mesh_wide_hbone_assertion:
-          type: boolean
-          default: false
-          description: |
-            Mirrors the `mesh_authz` field of the same name; see there.
         sampling_percentage:
           type: number
           format: double

@@ -23,10 +23,9 @@ use crate::modes::mesh::metric_tag_cel::{
 };
 use crate::plugins::mesh::CUSTOM_TRACE_ATTRIBUTES_METADATA;
 use crate::plugins::mesh::authz::{
-    HboneBaggageHonor, IGNORED_UDP_SOURCE_SCOPE_METADATA, LEGACY_MESH_WIDE_ASSERTION_KEY,
-    TrustedAssertorIndex, hbone_baggage_honor, merge_hbone_baggage_honor,
-    mesh_authz_destination_port, mesh_stream_authz_destination_port, parse_trust_domain_aliases,
-    parse_trusted_hbone_assertors,
+    HboneBaggageHonor, IGNORED_UDP_SOURCE_SCOPE_METADATA, TrustedAssertorIndex,
+    hbone_baggage_honor, merge_hbone_baggage_honor, mesh_authz_destination_port,
+    mesh_stream_authz_destination_port, parse_trust_domain_aliases, parse_trusted_hbone_assertors,
 };
 use crate::plugins::mesh::prometheus_helpers::{
     MESH_METRICS_DISABLED_METADATA, MESH_WORKLOAD_METRICS_OBSERVED_METADATA, MeshMetricFamily,
@@ -167,7 +166,6 @@ pub const MAX_EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES: usize = 16;
 
 const EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATE_KEYS: &[&str] = &[
     "trusted_hbone_assertors",
-    LEGACY_MESH_WIDE_ASSERTION_KEY,
     "trust_domain_aliases",
 ];
 

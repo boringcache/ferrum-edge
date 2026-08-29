@@ -504,14 +504,6 @@ pub struct MeshRuntimeConfig {
     /// `FERRUM_MESH_TRUSTED_HBONE_ASSERTORS`. Each entry is either a bare
     /// Kubernetes service-account name or a full SPIFFE id.
     pub trusted_hbone_assertors: Vec<String>,
-    /// Deprecated escape hatch restoring the pre-#4274 namespace-blind
-    /// trusted-assertor behavior: every allow-list entry without an explicit
-    /// contract may assert ANY identity that clears the trust-domain gate.
-    /// Sourced from `FERRUM_MESH_LEGACY_MESH_WIDE_HBONE_ASSERTION`; default
-    /// `false`. Threaded into BOTH `mesh_authz` and `workload_metrics` so
-    /// authorization and telemetry attribution can never diverge, and
-    /// announced with a loud startup warning.
-    pub legacy_mesh_wide_hbone_assertion: bool,
     /// Containment roots admitted for a `Sidecar` ingress `defaultEndpoint:
     /// unix://…` socket (issue #3261). Sourced from
     /// `FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS`; **empty means the feature is
@@ -842,17 +834,6 @@ impl MeshRuntimeConfig {
             }
         }
         let trusted_hbone_assertors = env_config.mesh_trusted_hbone_assertors.clone();
-        let legacy_mesh_wide_hbone_assertion = env_config.mesh_legacy_mesh_wide_hbone_assertion;
-        if legacy_mesh_wide_hbone_assertion {
-            tracing::warn!(
-                "SECURITY: FERRUM_MESH_LEGACY_MESH_WIDE_HBONE_ASSERTION=true restores the \
-                 pre-#4274 namespace-blind HBONE trusted-assertor behavior. Any peer matching \
-                 FERRUM_MESH_TRUSTED_HBONE_ASSERTORS (default service accounts 'ztunnel' and \
-                 'waypoint', in ANY namespace) may assert ANY workload identity in an accepted \
-                 trust domain. Replace it with exact assertor SVIDs carrying an explicit \
-                 'asserts' inventory or 'scope: mesh_wide' contract."
-            );
-        }
 
         // Sidecar ingress Unix-socket containment (issue #3261). Validated here
         // so a typo in a security allowlist fails startup loudly instead of
@@ -954,7 +935,6 @@ impl MeshRuntimeConfig {
             xds_connect_timeout_seconds,
             trust_domain_aliases,
             trusted_hbone_assertors,
-            legacy_mesh_wide_hbone_assertion,
             unix_socket_allowed_roots,
             unix_socket_allowed_uids,
             workload_labels,
@@ -12495,11 +12475,7 @@ fn mesh_managed_trusted_hbone_assertors(
 /// the rest of the authz config (slice, policies, route upstreams).
 fn mesh_authz_baggage_gate_config(config: &serde_json::Value) -> serde_json::Value {
     let mut gate = serde_json::Map::new();
-    for key in [
-        "trusted_hbone_assertors",
-        crate::plugins::mesh::authz::LEGACY_MESH_WIDE_ASSERTION_KEY,
-        "trust_domain_aliases",
-    ] {
+    for key in ["trusted_hbone_assertors", "trust_domain_aliases"] {
         if let Some(value) = config.get(key) {
             gate.insert(key.to_string(), value.clone());
         }
@@ -12514,11 +12490,7 @@ fn mirror_mesh_authz_baggage_gate_fields(target: &mut serde_json::Value, gate: &
     let Some(target) = target.as_object_mut() else {
         return;
     };
-    for key in [
-        "trusted_hbone_assertors",
-        crate::plugins::mesh::authz::LEGACY_MESH_WIDE_ASSERTION_KEY,
-        "trust_domain_aliases",
-    ] {
+    for key in ["trusted_hbone_assertors", "trust_domain_aliases"] {
         if let Some(value) = gate.get(key) {
             target.insert(key.to_string(), value.clone());
         }
@@ -12599,10 +12571,6 @@ fn inject_mesh_global_plugins(
     // defaults or to namespace-scoped destination workload metadata.
     if let Some(assertors) = mesh_managed_trusted_assertors.as_ref() {
         mesh_authz_config["trusted_hbone_assertors"] = serde_json::Value::Array(assertors.clone());
-    }
-    if runtime.legacy_mesh_wide_hbone_assertion {
-        mesh_authz_config[crate::plugins::mesh::authz::LEGACY_MESH_WIDE_ASSERTION_KEY] =
-            serde_json::Value::Bool(true);
     }
     // Transparent inbound capture admits unauthenticated direct plaintext, so
     // the mesh-managed, slice-fed `__mesh_authz` instance must be present even
@@ -12722,10 +12690,6 @@ fn inject_mesh_global_plugins(
             if let Some(assertors) = mesh_managed_trusted_assertors.as_ref() {
                 workload_metrics_config["trusted_hbone_assertors"] =
                     serde_json::Value::Array(assertors.clone());
-            }
-            if runtime.legacy_mesh_wide_hbone_assertion {
-                let legacy_key = crate::plugins::mesh::authz::LEGACY_MESH_WIDE_ASSERTION_KEY;
-                workload_metrics_config[legacy_key] = serde_json::Value::Bool(true);
             }
         }
     }
@@ -19536,7 +19500,6 @@ pub mod startup_rollback_test_seams {
             xds_connect_timeout_seconds: 10,
             trust_domain_aliases: Vec::new(),
             trusted_hbone_assertors: Vec::new(),
-            legacy_mesh_wide_hbone_assertion: false,
             unix_socket_allowed_roots: Vec::new(),
             unix_socket_allowed_uids: Vec::new(),
             workload_labels: HashMap::new(),
@@ -21151,7 +21114,6 @@ mod tests {
             xds_connect_timeout_seconds: 10,
             trust_domain_aliases: Vec::new(),
             trusted_hbone_assertors: Vec::new(),
-            legacy_mesh_wide_hbone_assertion: false,
             unix_socket_allowed_roots: Vec::new(),
             unix_socket_allowed_uids: Vec::new(),
             workload_labels: HashMap::new(),
@@ -21277,7 +21239,6 @@ mod tests {
             xds_connect_timeout_seconds: 10,
             trust_domain_aliases: Vec::new(),
             trusted_hbone_assertors: Vec::new(),
-            legacy_mesh_wide_hbone_assertion: false,
             unix_socket_allowed_roots: Vec::new(),
             unix_socket_allowed_uids: Vec::new(),
             workload_labels: HashMap::new(),
@@ -29252,13 +29213,6 @@ mod tests {
                 authz.config.get("trusted_hbone_assertors").is_none(),
                 "{topology:?} must not thread an assertor list of its own"
             );
-            assert!(
-                authz
-                    .config
-                    .get(crate::plugins::mesh::authz::LEGACY_MESH_WIDE_ASSERTION_KEY)
-                    .is_none(),
-                "{topology:?} must not enable the legacy namespace-blind opt-in"
-            );
             let workload_metrics = config
                 .plugin_configs
                 .iter()
@@ -29270,32 +29224,6 @@ mod tests {
                     .get("trusted_hbone_assertors")
                     .is_none(),
                 "{topology:?} telemetry must mirror the authz allow-list exactly"
-            );
-        }
-    }
-
-    /// The deprecated opt-in reaches BOTH plugins so authorization and
-    /// telemetry attribution can never disagree about what a peer may assert.
-    #[test]
-    fn inject_mesh_global_plugins_threads_legacy_mesh_wide_assertion_to_both_plugins() {
-        let mut runtime = test_mesh_runtime_config();
-        runtime.legacy_mesh_wide_hbone_assertion = true;
-        let mut config = GatewayConfig::default();
-
-        inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
-
-        for id in [MESH_AUTHZ_PLUGIN_ID, MESH_WORKLOAD_METRICS_PLUGIN_ID] {
-            let plugin = config
-                .plugin_configs
-                .iter()
-                .find(|plugin| plugin.id == id)
-                .expect("plugin injected");
-            assert_eq!(
-                plugin
-                    .config
-                    .get(crate::plugins::mesh::authz::LEGACY_MESH_WIDE_ASSERTION_KEY),
-                Some(&serde_json::Value::Bool(true)),
-                "{id} must carry the legacy opt-in"
             );
         }
     }

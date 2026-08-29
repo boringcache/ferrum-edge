@@ -2138,27 +2138,6 @@ async fn mesh_authz_mesh_wide_scope_entry_grants_cross_namespace_assertion() {
     assert!(!ctx.metadata.contains_key("mesh_authz.ignored_baggage"));
 }
 
-/// The deprecated global opt-in restores the old namespace-blind behavior —
-/// including, deliberately, the bypass itself. Operators who set it are warned
-/// at startup and on every construction.
-#[tokio::test]
-async fn mesh_authz_legacy_opt_in_restores_namespace_blind_assertion() {
-    let plugin = MeshAuthz::new(&json!({
-        "mesh_policies": [allow_payments_policy()],
-        "legacy_mesh_wide_hbone_assertion": true,
-    }))
-    .expect("plugin config");
-    let mut ctx = hbone_baggage_context(
-        "spiffe://cluster.local/ns/attacker/sa/waypoint",
-        "source.principal=spiffe://cluster.local/ns/prod/sa/payments",
-    );
-
-    let result = plugin.authorize(&mut ctx).await;
-
-    assert!(matches!(result, PluginResult::Continue));
-    assert!(!ctx.metadata.contains_key("mesh_authz.ignored_baggage"));
-}
-
 /// The trust-domain gate still runs FIRST for a matched assertor, so a
 /// cross-trust-domain forgery keeps its own reason rather than being relabelled.
 #[tokio::test]
@@ -3947,15 +3926,17 @@ async fn workload_metrics_per_gate_trust_domain_aliases_do_not_widen_sibling() {
     assert_eq!(reason.as_deref(), Some("trust_domain_mismatch"));
 }
 
-/// One gate's legacy mesh-wide flag must not silently widen a sibling that
-/// still grants same-namespace only.
+/// One gate's per-entry `scope: mesh_wide` must not silently widen a sibling
+/// that still grants same-namespace only.
 #[tokio::test]
-async fn workload_metrics_per_gate_legacy_flag_does_not_widen_sibling() {
+async fn workload_metrics_per_gate_mesh_wide_scope_does_not_widen_sibling() {
     let plugin = metrics_with_effective_gates(json!([
         { "trusted_hbone_assertors": ["waypoint"] },
         {
-            "trusted_hbone_assertors": ["waypoint"],
-            "legacy_mesh_wide_hbone_assertion": true
+            "trusted_hbone_assertors": [{
+                "assertor": "waypoint",
+                "scope": "mesh_wide"
+            }]
         }
     ]));
     let (principal, reason) = metrics_baggage_outcome(
