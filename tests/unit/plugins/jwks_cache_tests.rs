@@ -41,6 +41,32 @@ pub(super) fn cache_test_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+#[test]
+fn initial_background_refresh_yields_without_registering_a_zero_deadline_timer() {
+    const SOURCE: &str = include_str!("../../../src/plugins/utils/jwks_store.rs");
+    let start = SOURCE
+        .find("fn start_background_refresh_task(")
+        .expect("background refresh task");
+    let end = SOURCE[start..]
+        .find("\n    /// Parse a single JWK")
+        .expect("background refresh task end")
+        + start;
+    let body = &SOURCE[start..end];
+
+    assert!(
+        body.contains("if first_refresh {")
+            && body.contains("tokio::task::yield_now().await;")
+            && body.contains(
+                "} else {\n                    tokio::time::sleep_until(next_refresh_at).await;",
+            ),
+        "the first refresh must yield once and bypass the timer wheel:\n{body}"
+    );
+    assert!(
+        !body.contains("if !(first_refresh && force_first_refresh)"),
+        "ordinary startup must not retain the zero-deadline sleep path:\n{body}"
+    );
+}
+
 #[tokio::test]
 async fn test_same_jwks_uri_reuses_cached_store() {
     let server = wiremock::MockServer::start().await;
