@@ -25,6 +25,7 @@ mod db_dns_tests;
 mod db_loader_tests;
 mod destination_rule_tests;
 mod docs_backlog_parity_tests;
+mod readme_license_tests;
 mod env_config_tests;
 mod env_docs_parity_tests;
 mod field_validation_tests;
