@@ -5014,8 +5014,10 @@ pub mod _test_support {
     }
 
     /// Whether two identityless (validation-only) `rate_limiting` instances
-    /// share local state. They must not: an isolated limiter can only refuse
-    /// work, never admit against another policy's accounting.
+    /// share local state. They must not: production
+    /// [`crate::plugin_cache::PluginCache`] paths always attach a validated
+    /// always attach a validated stable identity, and identityless instances
+    /// cannot share or mutate a live production policy's counters.
     pub fn standalone_rate_limiting_shares_state_for_test(
         config: &serde_json::Value,
     ) -> Result<bool, String> {

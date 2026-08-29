@@ -1089,7 +1089,7 @@ impl LocalStateSemantics {
         I: IntoIterator<Item = (&'a str, &'a [RateLimitWindowSpec])>,
     {
         let mut entries: Vec<(&str, &[RateLimitWindowSpec])> = entries.into_iter().collect();
-        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        entries.sort_by_key(|(key, _)| *key);
         let mut encoded = Vec::new();
         encoded.extend_from_slice(&(entries.len() as u64).to_le_bytes());
         for (key, specs) in entries {
@@ -1178,7 +1178,7 @@ fn local_limiter_fingerprint(
         .iter()
         .map(|(label, encoded)| (*label, encoded.as_slice()))
         .collect();
-    fields.sort_by(|(left, _), (right, _)| left.cmp(right));
+    fields.sort_by_key(|(label, _)| *label);
     for (label, encoded) in fields {
         absorb(label, encoded);
     }
@@ -1319,8 +1319,10 @@ where
     ///
     /// `namespace` is `None` for constructions that have no stable policy
     /// identity (config validation, direct/test construction). Those keep
-    /// private state, which is the conservative choice: isolated state can only
-    /// refuse work, never admit against another policy's accounting.
+    /// private state. Production [`crate::plugin_cache::PluginCache`] always
+    /// supplies a validated stable identity; identityless construction is limited to config
+    /// validation and direct tests and cannot share or mutate a live production
+    /// policy's counters.
     ///
     /// `semantics` carries this plugin's **effective** enforcement parameters —
     /// limit dimension, windows, maximums, algorithm parameters, and any
