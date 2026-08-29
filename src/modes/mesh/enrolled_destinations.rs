@@ -343,6 +343,17 @@ impl PartialEq for NodeLocalEnrolledDestinationsHandle {
 
 impl Eq for NodeLocalEnrolledDestinationsHandle {}
 
+/// One serving-cycle installation of the process-wide enrolled index slot.
+///
+/// Each install allocates a fresh `Arc` token even when it wraps the same
+/// [`NodeLocalEnrolledDestinations`] pointer as a prior cycle. Retraction
+/// compare-and-swaps this exact token to `None`, so a stale guard cannot clear
+/// a newer cycle's slot after that cycle has installed a different token.
+#[derive(Debug)]
+struct InstalledEnrolledDestinationsToken {
+    index: Arc<NodeLocalEnrolledDestinations>,
+}
+
 /// Process-wide installed index for the current mesh serving cycle.
 ///
 /// A process runs at most one mesh runtime against at most one node-agent
@@ -358,40 +369,42 @@ impl Eq for NodeLocalEnrolledDestinationsHandle {}
 /// `MeshConfig::inbound_relay_node_local_registry` on the built config instead
 /// of touching this slot, so no test can leak an index into another.
 static INSTALLED_ENROLLED_DESTINATIONS: std::sync::LazyLock<
-    ArcSwapOption<NodeLocalEnrolledDestinations>,
+    ArcSwapOption<InstalledEnrolledDestinationsToken>,
 > = std::sync::LazyLock::new(ArcSwapOption::empty);
 
 /// Install `index` as this serving cycle's authoritative node-local registry.
-pub fn install_node_local_enrolled_destinations(index: Arc<NodeLocalEnrolledDestinations>) {
-    INSTALLED_ENROLLED_DESTINATIONS.store(Some(index));
+fn install_node_local_enrolled_destinations(
+    index: Arc<NodeLocalEnrolledDestinations>,
+) -> Arc<InstalledEnrolledDestinationsToken> {
+    let token = Arc::new(InstalledEnrolledDestinationsToken { index });
+    INSTALLED_ENROLLED_DESTINATIONS.store(Some(Arc::clone(&token)));
+    token
 }
 
-/// Retract `index` if it is still the installed one.
+/// Retract `token` if it is still the installed one.
 ///
-/// Identity-checked rather than an unconditional `store(None)`: retraction runs
-/// from a `Drop`, and clearing a slot some OTHER serving cycle owns would leave
-/// that cycle's applies falling back to the identity bound — a FAIL-OPEN
-/// direction, and precisely the "retire what you do not own" the guard exists
-/// to prevent. A process runs one mesh runtime at a time, so this is
-/// belt-and-braces; it is not a lock, and it does not need to be, because the
-/// only writers are one cycle's install and that same cycle's retraction.
-fn retract_installed_index_if_ours(index: &Arc<NodeLocalEnrolledDestinations>) {
-    if let Some(current) = INSTALLED_ENROLLED_DESTINATIONS.load_full()
-        && Arc::ptr_eq(&current, index)
-    {
-        INSTALLED_ENROLLED_DESTINATIONS.store(None);
-    }
+/// Compare-and-swap rather than load-then-store: retraction runs from a `Drop`,
+/// and a newer serving cycle may install a different token between an observed
+/// load and an unconditional `store(None)`. Clearing that newer token would
+/// leave the live cycle's applies falling back to the identity bound — a
+/// FAIL-OPEN direction, and precisely the "retire what you do not own" the guard
+/// exists to prevent. A fresh token per install also covers the case where two
+/// cycles wrap the same underlying [`NodeLocalEnrolledDestinations`] `Arc`.
+fn retract_installed_index_if_ours(token: &Arc<InstalledEnrolledDestinationsToken>) {
+    let _previous = INSTALLED_ENROLLED_DESTINATIONS.compare_and_swap(token, None);
 }
 
 /// The installed index itself, for the serving runtime that owns its poller.
 pub fn installed_index() -> Option<Arc<NodeLocalEnrolledDestinations>> {
-    INSTALLED_ENROLLED_DESTINATIONS.load_full()
+    INSTALLED_ENROLLED_DESTINATIONS
+        .load_full()
+        .map(|token| Arc::clone(&token.index))
 }
 
 /// The handle to stamp onto a `MeshConfig` being prepared.
 pub fn installed_node_local_enrolled_destinations() -> NodeLocalEnrolledDestinationsHandle {
     match INSTALLED_ENROLLED_DESTINATIONS.load_full() {
-        Some(index) => NodeLocalEnrolledDestinationsHandle::new(index),
+        Some(token) => NodeLocalEnrolledDestinationsHandle::new(Arc::clone(&token.index)),
         None => NodeLocalEnrolledDestinationsHandle::default(),
     }
 }
@@ -400,15 +413,15 @@ pub fn installed_node_local_enrolled_destinations() -> NodeLocalEnrolledDestinat
 /// aborted or panicking runtime cannot leave a stale registry bound to a later
 /// cycle's config.
 pub struct InstalledEnrolledDestinationsGuard {
-    /// The index this guard installed, kept so retraction can prove the slot it
-    /// clears is still its own.
-    index: Arc<NodeLocalEnrolledDestinations>,
+    /// The installation token this guard published. Retraction CASes this exact
+    /// `Arc` to `None`, so a newer cycle's token survives a stale guard drop.
+    token: Arc<InstalledEnrolledDestinationsToken>,
 }
 
 impl InstalledEnrolledDestinationsGuard {
     pub fn install(index: Arc<NodeLocalEnrolledDestinations>) -> Self {
-        install_node_local_enrolled_destinations(index.clone());
-        Self { index }
+        let token = install_node_local_enrolled_destinations(index);
+        Self { token }
     }
 }
 
@@ -416,8 +429,8 @@ impl Drop for InstalledEnrolledDestinationsGuard {
     fn drop(&mut self) {
         // The index's own contents are retracted by the poller's
         // `EnrolledRetractionGuard`; this only gives up the shared installation,
-        // and only while it is still ours.
-        retract_installed_index_if_ours(&self.index);
+        // and only while this guard's token is still the installed one.
+        retract_installed_index_if_ours(&self.token);
     }
 }
 
@@ -526,5 +539,166 @@ impl NodeLocalEnrolledDestinationsManager {
         }
         drop(retraction);
         debug!("Node-local enrolled destination index retracted at shutdown");
+    }
+}
+
+#[cfg(test)]
+mod installation_ownership_tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_lock() -> MutexGuard<'static, ()> {
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn clear_installed_for_test() {
+        INSTALLED_ENROLLED_DESTINATIONS.store(None);
+    }
+
+    fn installed_token_ptr() -> Option<*const InstalledEnrolledDestinationsToken> {
+        INSTALLED_ENROLLED_DESTINATIONS
+            .load_full()
+            .map(|token| Arc::as_ptr(&token))
+    }
+
+    #[test]
+    fn sequential_replacement_survives_stale_guard_drop() {
+        let _lock = test_lock();
+        clear_installed_for_test();
+
+        let index_a = Arc::new(NodeLocalEnrolledDestinations::new());
+        let index_b = Arc::new(NodeLocalEnrolledDestinations::new());
+        let guard_a = InstalledEnrolledDestinationsGuard::install(Arc::clone(&index_a));
+        let token_a = Arc::as_ptr(&guard_a.token);
+        assert!(Arc::ptr_eq(
+            &installed_index().expect("first install publishes"),
+            &index_a
+        ));
+
+        let guard_b = InstalledEnrolledDestinationsGuard::install(Arc::clone(&index_b));
+        let token_b = Arc::as_ptr(&guard_b.token);
+        assert_ne!(token_a, token_b, "each install must allocate a fresh token");
+        assert!(Arc::ptr_eq(
+            &installed_index().expect("second install replaces"),
+            &index_b
+        ));
+
+        drop(guard_a);
+        assert_eq!(
+            installed_token_ptr(),
+            Some(token_b),
+            "stale guard drop must not clear the newer installation token"
+        );
+        assert!(Arc::ptr_eq(
+            &installed_index().expect("newer cycle still installed"),
+            &index_b
+        ));
+
+        drop(guard_b);
+        assert!(installed_index().is_none());
+        clear_installed_for_test();
+    }
+
+    #[test]
+    fn same_index_reinstallation_survives_stale_guard_drop() {
+        let _lock = test_lock();
+        clear_installed_for_test();
+
+        let shared_index = Arc::new(NodeLocalEnrolledDestinations::new());
+        let guard_a =
+            InstalledEnrolledDestinationsGuard::install(Arc::clone(&shared_index));
+        let token_a = Arc::as_ptr(&guard_a.token);
+
+        let guard_b =
+            InstalledEnrolledDestinationsGuard::install(Arc::clone(&shared_index));
+        let token_b = Arc::as_ptr(&guard_b.token);
+        assert_ne!(
+            token_a, token_b,
+            "reinstalling the same index Arc must still mint a new token"
+        );
+        assert!(Arc::ptr_eq(
+            &installed_index().expect("reinstall keeps the shared index"),
+            &shared_index
+        ));
+
+        drop(guard_a);
+        assert_eq!(
+            installed_token_ptr(),
+            Some(token_b),
+            "dropping the older token must not clear the newer reinstall"
+        );
+        assert!(Arc::ptr_eq(
+            &installed_index().expect("newer reinstall still authoritative"),
+            &shared_index
+        ));
+
+        drop(guard_b);
+        assert!(installed_index().is_none());
+        clear_installed_for_test();
+    }
+
+    #[test]
+    fn cas_survives_new_install_before_stale_retract() {
+        let _lock = test_lock();
+        clear_installed_for_test();
+
+        let index_a = Arc::new(NodeLocalEnrolledDestinations::new());
+        let index_b = Arc::new(NodeLocalEnrolledDestinations::new());
+        let guard_a = InstalledEnrolledDestinationsGuard::install(Arc::clone(&index_a));
+        let stale_token = Arc::clone(&guard_a.token);
+
+        let guard_b = InstalledEnrolledDestinationsGuard::install(Arc::clone(&index_b));
+        let live_token = Arc::as_ptr(&guard_b.token);
+
+        retract_installed_index_if_ours(&stale_token);
+        assert_eq!(
+            installed_token_ptr(),
+            Some(live_token),
+            "late retract of the superseded token must be a no-op"
+        );
+        assert!(Arc::ptr_eq(
+            &installed_index().expect("live install survives stale CAS"),
+            &index_b
+        ));
+
+        drop(guard_a);
+        assert_eq!(
+            installed_token_ptr(),
+            Some(live_token),
+            "stale guard drop after the late retract must still be a no-op"
+        );
+
+        drop(guard_b);
+        assert!(installed_index().is_none());
+        clear_installed_for_test();
+    }
+
+    #[test]
+    fn cas_allows_clean_handoff_when_retract_precedes_reinstall() {
+        let _lock = test_lock();
+        clear_installed_for_test();
+
+        let index_a = Arc::new(NodeLocalEnrolledDestinations::new());
+        let index_b = Arc::new(NodeLocalEnrolledDestinations::new());
+        let guard_a = InstalledEnrolledDestinationsGuard::install(Arc::clone(&index_a));
+        let token_a = Arc::clone(&guard_a.token);
+
+        drop(guard_a);
+        assert!(installed_index().is_none());
+
+        let guard_b = InstalledEnrolledDestinationsGuard::install(Arc::clone(&index_b));
+        retract_installed_index_if_ours(&token_a);
+        assert!(Arc::ptr_eq(
+            &installed_index().expect("prior retract must not touch the new token"),
+            &index_b
+        ));
+
+        drop(guard_b);
+        assert!(installed_index().is_none());
+        clear_installed_for_test();
     }
 }
