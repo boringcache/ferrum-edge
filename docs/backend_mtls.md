@@ -375,6 +375,12 @@ outbound:
 - **A candidate CRL outside its validity window is refused whole.** Startup
   fails; a live reload keeps the previously accepted CRL slot, backend pools, and
   health checks exactly as they were, and logs a redacted warning.
+- **Active health-check probes are outside this policy.** The probe server
+  verifier is built with an empty CRL list, so a revoked backend certificate
+  still passes a health probe and the destination stays in the pool. Proxied
+  traffic to that destination is still refused by the data-path verifier, so
+  the revocation surfaces as backend request failures rather than as an
+  unhealthy destination.
 - The same policy covers the rustls logging sinks (`tcp_logging` TLS,
   `ws_logging` wss, `udp_logging` DTLS) and `ldap_auth` over `ldaps://` /
   StartTLS. `kafka_logging` maps the source to librdkafka's `ssl.crl.location`

@@ -466,10 +466,12 @@ curl https://localhost:8443/api/v1
 `FERRUM_TLS_CRL_FILE_PATH` / `_SOURCE` supplies one PEM file that may hold many
 `-----BEGIN X509 CRL-----` blocks. One policy governs every verifier that
 consumes them — frontend and admin mTLS (HTTP/1.1, HTTP/2, HTTP/3, and TCP+TLS),
-frontend DTLS, the mesh operator-CA and SPIFFE peer verifiers, all rustls
-backend server verification, and the rustls LDAP / TCP / UDP / WebSocket
-logging sinks. There is no per-surface CRL setting and no way for one surface to
-run a weaker posture than another.
+frontend DTLS, the mesh operator-CA and SPIFFE peer verifiers, rustls backend
+server verification on the proxy data path, and the rustls LDAP / TCP / UDP /
+WebSocket logging sinks. Across those surfaces there is no per-surface CRL
+setting and no way for one of them to run a weaker posture than another. The
+surfaces the CRL source does not reach at all are listed at the end of this
+section.
 
 ### What the verifier enforces
 
@@ -527,8 +529,16 @@ timestamps, and secret source URIs are never logged.
 
 CRLs are not applied to DP-to-CP gRPC or to reqwest-based plugin egress; those
 stacks do not expose a compatible CRL configuration. `kafka_logging` uses
-librdkafka/OpenSSL and maps the CRL source to `ssl.crl.location` instead. See
-[backend_mtls.md](backend_mtls.md) for the backend-side reload contract.
+librdkafka/OpenSSL and maps the CRL source to `ssl.crl.location` instead.
+
+Active **health-check probes** are also outside the policy: the probe server
+verifier is built with an empty CRL list, so a backend whose certificate has
+been revoked can still answer a health probe successfully and stay in the
+load-balancer pool. This is not a bypass of the data path — the proxy's own
+backend connection to that destination still applies the CRL and refuses it —
+but it does mean revocation shows up as backend request failures rather than as
+an unhealthy destination. See [backend_mtls.md](backend_mtls.md) for the
+backend-side reload contract.
 
 ## Certificate Reload Behavior
 

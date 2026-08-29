@@ -855,13 +855,23 @@ fn the_spiffe_peer_verifier_enforces_the_same_policy() {
         &[INTERMEDIATE_A_SERIAL],
     )]));
     let enforcing = build_spiffe_client_cert_verifier(slot, true, crls);
-    enforcing
+    let error = enforcing
         .verify_client_cert(
             &pki.spiffe_leaf_a_der,
             std::slice::from_ref(&pki.intermediate_a_der),
             UnixTime::now(),
         )
-        .expect_err("a mesh peer chained through a revoked intermediate must be refused");
+        .expect_err("a mesh peer chained through a revoked intermediate must be refused")
+        .to_string();
+    // The SPIFFE verifier flattens rustls errors into `Error::General`, so match
+    // on the rendered cause rather than the variant. Asserting it names the
+    // revocation keeps the test from passing on an unrelated CRL-attributable
+    // failure (a rejected CRL signature, a non-cRLSign issuer) that would leave
+    // issue #4298 unproven on this surface.
+    assert!(
+        error.contains("Revoked"),
+        "expected a revocation refusal, got {error}"
+    );
 }
 
 #[test]
