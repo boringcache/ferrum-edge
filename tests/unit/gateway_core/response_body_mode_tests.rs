@@ -4,8 +4,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use ferrum_edge::_test_support::{
     canonical_header_content_length_from_map_for_test, preserved_response_content_length_for_test,
-    run_after_proxy_hooks_for_test,
-    should_bypass_h2_coalesce_for_large_response_for_test,
+    run_after_proxy_hooks_for_test, should_bypass_h2_coalesce_for_large_response_for_test,
     streaming_response_requires_size_limit_for_test,
 };
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy, ResponseBodyMode};
