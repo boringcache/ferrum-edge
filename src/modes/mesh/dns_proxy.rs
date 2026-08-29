@@ -37,6 +37,10 @@ const DNS_MAX_TCP_PACKET_SIZE: usize = u16::MAX as usize;
 const DNS_MAX_CACHEABLE_RESPONSE_SIZE: usize = DNS_MAX_UDP_PACKET_SIZE;
 const DNS_UPSTREAM_TIMEOUT_SECS: u64 = 5;
 const DNS_UPSTREAM_ID_SPACE: usize = u16::MAX as usize + 1;
+/// Bounded CSPRNG draws when the chosen ID is already in flight. At the
+/// default outstanding cap (1024) this is ample; fail closed rather than
+/// scanning IDs sequentially if retries cannot find a free random ID.
+const DNS_UPSTREAM_ID_ALLOC_ATTEMPTS: usize = 16;
 const DNS_TCP_QUERY_READ_TIMEOUT_SECS: u64 = 5;
 const DNS_TCP_WRITE_TIMEOUT_SECS: u64 = 5;
 const DNS_MAX_NAME_POINTER_JUMPS: u32 = 16;
@@ -1157,9 +1161,11 @@ struct PendingForward {
     abort: AbortHandle,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UpstreamIdAllocError {
     Exhausted,
     EntropyUnavailable,
+    CollisionRetryLimit,
 }
 
 enum UpstreamRecvOutcome {
@@ -1250,6 +1256,11 @@ async fn run_udp_forwarder_with_entropy(
                         send_udp_servfail(&client_socket, &request.query, request.src).await;
                         continue;
                     }
+                    Err(UpstreamIdAllocError::CollisionRetryLimit) => {
+                        warn!("DNS upstream transaction ID collision retry limit reached");
+                        send_udp_servfail(&client_socket, &request.query, request.src).await;
+                        continue;
+                    }
                     Err(UpstreamIdAllocError::Exhausted) => {
                         record_upstream_id_exhaustion();
                         warn!("DNS upstream transaction ID space exhausted");
@@ -1279,7 +1290,6 @@ async fn run_udp_forwarder_with_entropy(
                             socket,
                             upstream_id,
                             request.query.clone(),
-                            request.src,
                         ));
                         pending.insert(
                             upstream_id,
@@ -1383,32 +1393,19 @@ async fn wait_for_matching_upstream_response(
     socket: UdpSocket,
     upstream_id: u16,
     query: DnsQuery,
-    client: SocketAddr,
 ) -> UpstreamRecvOutcome {
     let mut buf = vec![0u8; DNS_MAX_UDP_PACKET_SIZE];
     loop {
         match socket.recv(&mut buf).await {
             Ok(len) if len < 2 => {
-                warn!("Ignoring short upstream DNS response");
+                trace!("Ignoring unmatched upstream DNS response");
             }
             Ok(len) => {
                 let packet_id = u16::from_be_bytes([buf[0], buf[1]]);
-                if packet_id != upstream_id {
-                    warn!(
-                        upstream_id = packet_id,
-                        "Ignoring upstream DNS response with unknown transaction ID"
-                    );
-                    continue;
-                }
-                if !upstream_response_matches_pending_query(&buf[..len], &query) {
-                    warn!(
-                        client = %client,
-                        upstream_id,
-                        qname = %query.name,
-                        qtype = query.qtype,
-                        qclass = query.qclass,
-                        "Ignoring upstream DNS response with mismatched question"
-                    );
+                if packet_id != upstream_id
+                    || !upstream_response_matches_pending_query(&buf[..len], &query)
+                {
+                    trace!("Ignoring unmatched upstream DNS response");
                     continue;
                 }
                 buf.truncate(len);
@@ -1433,7 +1430,7 @@ fn allocate_upstream_id(
         return Err(UpstreamIdAllocError::Exhausted);
     }
 
-    for _ in 0..=u16::MAX {
+    for _ in 0..DNS_UPSTREAM_ID_ALLOC_ATTEMPTS {
         let candidate = entropy
             .draw_u16()
             .map_err(|()| UpstreamIdAllocError::EntropyUnavailable)?;
@@ -1442,13 +1439,7 @@ fn allocate_upstream_id(
         }
     }
 
-    for candidate in 0..=u16::MAX {
-        if !is_occupied(candidate) {
-            return Ok(candidate);
-        }
-    }
-
-    Err(UpstreamIdAllocError::Exhausted)
+    Err(UpstreamIdAllocError::CollisionRetryLimit)
 }
 
 fn upstream_id_space_exhausted(pending_len: usize) -> bool {
@@ -2314,6 +2305,70 @@ mod tests {
     }
 
     #[test]
+    fn allocate_upstream_id_fails_closed_after_retry_bound_without_sequential_fallback() {
+        let entropy = ScriptedEntropy::new(std::iter::repeat_n(
+            Ok(0u16),
+            DNS_UPSTREAM_ID_ALLOC_ATTEMPTS,
+        ));
+        let (len, occupied_ids) = occupied(&[0]);
+        assert_eq!(
+            allocate_upstream_id(&entropy, len, |id| occupied_ids.contains(&id)),
+            Err(UpstreamIdAllocError::CollisionRetryLimit)
+        );
+    }
+
+    #[test]
+    fn allocate_upstream_id_retries_within_budget_at_default_outstanding_bound() {
+        let occupied_ids: HashSet<u16> = (0..1024).collect();
+        let entropy = ScriptedEntropy::new([Ok(0), Ok(1024)]);
+        let allocated = allocate_upstream_id(
+            &entropy,
+            occupied_ids.len(),
+            |id| occupied_ids.contains(&id),
+        )
+        .expect("default occupancy should allocate within the retry budget");
+        assert_eq!(allocated, 1024);
+    }
+
+    #[test]
+    fn wait_for_matching_upstream_response_discard_logs_are_static_and_low_cardinality() {
+        const SOURCE: &str = include_str!("dns_proxy.rs");
+        let start = SOURCE
+            .find("async fn wait_for_matching_upstream_response(")
+            .expect("wait_for_matching_upstream_response should exist");
+        let end = SOURCE[start..]
+            .find("\nfn allocate_upstream_id(")
+            .expect("allocate_upstream_id should follow the recv loop")
+            + start;
+        let src = &SOURCE[start..end];
+
+        assert!(
+            !src.contains("warn!"),
+            "forged or malformed discards must not warn per packet"
+        );
+        assert!(
+            !src.contains("qname"),
+            "discard diagnostics must not include query names"
+        );
+        assert!(
+            !src.contains("qtype"),
+            "discard diagnostics must not include query types"
+        );
+        assert!(
+            !src.contains("qclass"),
+            "discard diagnostics must not include query classes"
+        );
+        assert!(
+            !src.contains("client"),
+            "discard diagnostics must not include the pending client address"
+        );
+        assert!(
+            src.contains("trace!(\"Ignoring unmatched upstream DNS response\")"),
+            "discards should use a static trace-level message with no attacker or query fields"
+        );
+    }
+
+    #[test]
     fn upstream_id_space_exhaustion_is_only_full_16_bit_occupancy() {
         assert!(!upstream_id_space_exhausted(1024));
         assert!(!upstream_id_space_exhausted(DNS_UPSTREAM_ID_SPACE - 1));
@@ -2425,6 +2480,61 @@ mod tests {
             .try_recv(&mut buf)
             .expect_err("failed entropy must not send upstream");
         assert_eq!(err.kind(), ErrorKind::WouldBlock);
+
+        let _ = harness.shutdown.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), harness.task).await;
+    }
+
+    #[tokio::test]
+    async fn collision_retry_limit_servfails_without_a_deterministic_fallback_id() {
+        let harness = ForwarderHarness::start(
+            8,
+            ScriptedEntropy::new(std::iter::repeat_n(
+                Ok(0xBEEF),
+                1 + DNS_UPSTREAM_ID_ALLOC_ATTEMPTS,
+            )),
+        )
+        .await;
+        let second_client = UdpSocket::bind("127.0.0.1:0").await.expect("second client");
+        let second_addr = second_client.local_addr().expect("second addr");
+
+        harness.send_query(build_a_query("example.com"));
+        let (first_query, src) = harness.recv_stub().await;
+        assert_eq!(&first_query[0..2], &0xBEEFu16.to_be_bytes());
+
+        let mut second_packet = build_a_query("other.example.com");
+        second_packet[0..2].copy_from_slice(&0x2345u16.to_be_bytes());
+        let second_query = parse_dns_query(&second_packet).expect("second query");
+        harness
+            .requests
+            .try_send(UdpForwardRequest {
+                packet: second_packet,
+                src: second_addr,
+                query: second_query,
+            })
+            .expect("second query");
+
+        let mut buf = vec![0u8; DNS_MAX_UDP_PACKET_SIZE];
+        let len = tokio::time::timeout(Duration::from_secs(2), second_client.recv(&mut buf))
+            .await
+            .expect("collision-retry client should receive SERVFAIL")
+            .expect("second client recv");
+        buf.truncate(len);
+        assert_eq!(dns_rcode(&buf), RCODE_SERVFAIL);
+        assert_eq!(&buf[0..2], &0x2345u16.to_be_bytes());
+
+        let mut extra = [0u8; 32];
+        let err = harness
+            .stub
+            .try_recv(&mut extra)
+            .expect_err("collision retry must not send a sequential fallback ID");
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+
+        let answer = build_a_response("example.com", 0xBEEF, [1, 2, 3, 4]);
+        harness.stub.send_to(&answer, src).await.expect("answer");
+        let response = harness.recv_client().await;
+        assert_eq!(dns_rcode(&response), 0);
+        assert_eq!(&response[response.len() - 4..], &[1, 2, 3, 4]);
 
         let _ = harness.shutdown.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), harness.task).await;
