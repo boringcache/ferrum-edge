@@ -2117,6 +2117,16 @@ async fn eviction_trims_over_capacity_while_refreshes_are_blocked() {
     );
 
     tokio::time::advance(DnsCache::BACKGROUND_MAINTENANCE_INTERVAL).await;
+    // Paused time makes the sibling eviction timer ready but does not by
+    // itself poll that task through `evict_expired()`. Yield until the
+    // independent production loop trims, then keep the exact capacity
+    // assertion so a stuck eviction loop still fails.
+    for _ in 0..64 {
+        if cache.cache_len() <= 4 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
     assert!(
         cache.cache_len() <= 4,
         "eviction sibling must trim max_cache_size while refreshes hang, len={}",
@@ -2150,12 +2160,7 @@ async fn proactive_refresh_timeout_preserves_last_known_good() {
     let cache = cache;
 
     let original = testnet_addr(10);
-    seed_near_expiry(
-        &cache,
-        "timeout.test",
-        Duration::from_secs(2),
-        original,
-    );
+    seed_near_expiry(&cache, "timeout.test", Duration::from_secs(2), original);
     let resolved_at = cache
         .test_success_resolved_at("timeout.test")
         .expect("seeded");
@@ -2168,9 +2173,7 @@ async fn proactive_refresh_timeout_preserves_last_known_good() {
 
     tokio::time::advance(DnsCache::PROACTIVE_REFRESH_RESOLVE_TIMEOUT + Duration::from_millis(1))
         .await;
-    handle
-        .await
-        .expect("cycle must return after timeout");
+    handle.await.expect("cycle must return after timeout");
 
     assert_eq!(
         cache.test_success_addresses("timeout.test"),
@@ -2236,12 +2239,7 @@ async fn stale_proactive_result_cannot_overwrite_or_resurrect_generation() {
     let cache = cache;
 
     let original = testnet_addr(1);
-    seed_near_expiry(
-        &cache,
-        "gen.test",
-        Duration::from_secs(2),
-        original,
-    );
+    seed_near_expiry(&cache, "gen.test", Duration::from_secs(2), original);
     let overwrite = testnet_addr(2);
 
     let handle = tokio::spawn({
@@ -2277,12 +2275,7 @@ async fn stale_proactive_result_cannot_overwrite_or_resurrect_generation() {
         released2,
     );
     let cache = cache;
-    seed_near_expiry(
-        &cache,
-        "gone.test",
-        Duration::from_secs(2),
-        original,
-    );
+    seed_near_expiry(&cache, "gone.test", Duration::from_secs(2), original);
     let handle = tokio::spawn({
         let cache = cache.clone();
         async move { cache.test_run_proactive_refresh_cycle().await }
@@ -2336,6 +2329,12 @@ async fn stale_swr_result_cannot_overwrite_or_resurrect_generation() {
     );
     gate.add_permits(1);
     released.notified().await;
+    for _ in 0..64 {
+        if cache.test_refreshing_len() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
     assert_eq!(
         cache.test_success_addresses("swr-gen.test"),
         Some(vec![overwrite]),
@@ -2365,6 +2364,12 @@ async fn stale_swr_result_cannot_overwrite_or_resurrect_generation() {
     cache.test_remove_entry("swr-gone.test");
     gate2.add_permits(1);
     released2.notified().await;
+    for _ in 0..64 {
+        if cache.test_refreshing_len() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
     assert!(
         !cache.is_cached("swr-gone.test"),
         "a stale SWR result must not resurrect an evicted hostname"
