@@ -614,9 +614,7 @@ mod cni_main {
             CniError::IpcFailed(msg) if msg.starts_with("connect failed:") => {
                 "node-agent socket missing or connect refused"
             }
-            CniError::IpcFailed(msg)
-                if msg.contains("TimedOut") || msg.contains("timeout") =>
-            {
+            CniError::IpcFailed(msg) if msg.contains("TimedOut") || msg.contains("timeout") => {
                 "node-agent RPC timed out"
             }
             CniError::IpcFailed(_) => "node-agent IPC failed",
