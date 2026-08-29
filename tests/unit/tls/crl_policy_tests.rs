@@ -839,8 +839,8 @@ fn probe_verifier(
     let mut tls = BackendTlsConfig::default_verify();
     tls.server_ca_cert_path = Some(ca_path.to_str().expect("utf-8 path").to_string());
     tls.san_allow_list = san_allow_list;
-    let verifier = build_probe_server_verifier_for_test(&tls, None, crls)
-        .expect("probe server verifier");
+    let verifier =
+        build_probe_server_verifier_for_test(&tls, None, crls).expect("probe server verifier");
     (dir, verifier)
 }
 
@@ -1203,10 +1203,7 @@ fn health_probes_pass_the_admitted_crl_snapshot_not_an_empty_literal() {
         .split("fn build_probe_server_verifier(")
         .nth(1)
         .expect("build_probe_server_verifier must exist");
-    let probe_builder = probe_builder
-        .split("\nfn ")
-        .next()
-        .expect("function body");
+    let probe_builder = probe_builder.split("\nfn ").next().expect("function body");
     assert!(
         probe_builder.contains("build_server_verifier_with_crls"),
         "probe verifiers must reach the shared helper"
