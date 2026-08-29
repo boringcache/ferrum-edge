@@ -231,11 +231,13 @@ async fn one_claim_may_be_published_to_several_headers() {
 
 #[test]
 fn duplicate_destination_headers_are_rejected_at_config_load() {
-    let error = plugin_with(json!([
+    let error = match plugin_with(json!([
         {"header": "x-claim-sub", "claim": "sub"},
         {"header": "X-Claim-Sub", "claim": "email"},
-    ]))
-    .expect_err("a destination asserted from two claims is ambiguous");
+    ])) {
+        Ok(_) => panic!("a destination asserted from two claims must be rejected"),
+        Err(error) => error,
+    };
     assert!(
         error.contains("more than once"),
         "expected a duplicate-destination diagnostic, got: {error}"
