@@ -226,17 +226,23 @@ async fn start_counting_http_backend(
             let delay = response_delay;
             let release = release.clone();
             tokio::spawn(async move {
-                let service = service_fn(move |_req: Request<Incoming>| {
-                    let delay = delay;
-                    let mut release = release.clone();
-                    async move {
-                        if let Some(rx) = release.as_mut() {
-                            let _ = rx.wait_for(|released| *released).await;
-                        } else if !delay.is_zero() {
-                            tokio::time::sleep(delay).await;
-                        }
-                        Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from_static(b"ok"))))
-                    }
+                // HTTP-scheme capability probes are h2c pool handshakes
+                // (`grpc_pool.get_sender_for_capability_probe`). Hyper's
+                // client handshake completes after writing the *client*
+                // preface; establishment then waits for the peer SETTINGS
+                // frame. An HTTP/1.1 `serve_connection` rejects that
+                // preface with a protocol error *before* `service_fn`, so a
+                // hold or delay inside the request handler cannot keep the
+                // probe in flight. Park here — after TCP accept, before any
+                // server bytes — so `accepted > 0` happens-before
+                // `await_peer_settings` is blocked on a silent peer.
+                if let Some(mut rx) = release {
+                    let _ = rx.wait_for(|released| *released).await;
+                } else if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                let service = service_fn(|_req: Request<Incoming>| async {
+                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from_static(b"ok"))))
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
                     .keep_alive(true)
@@ -633,6 +639,11 @@ async fn aborted_coalesced_refresh_allows_a_later_refresh() {
         async move { proxy_state.refresh_backend_capabilities_coalesced().await }
     });
 
+    // TCP accept is published before the fixture starts serving, and the
+    // HTTP-scheme probe cannot finish h2c establishment without peer
+    // SETTINGS. `accepted > 0` therefore happens-before the detached
+    // runner is blocked in `await_peer_settings`, so aborting `first`
+    // cannot observe `Ok(Ran)`.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while accepted.load(Ordering::SeqCst) == 0 {
         if tokio::time::Instant::now() >= deadline {
@@ -640,6 +651,11 @@ async fn aborted_coalesced_refresh_allows_a_later_refresh() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+
+    assert!(
+        proxy_state.backend_capabilities_refresh.runner_is_active(),
+        "held h2c handshake must keep the detached runner active before abort"
+    );
 
     first.abort();
     assert!(
