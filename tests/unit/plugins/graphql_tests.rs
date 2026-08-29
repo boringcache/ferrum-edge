@@ -1446,10 +1446,7 @@ async fn test_top_level_operation_keywords_still_parse() {
         let mut headers = make_graphql_headers();
         let result = plugin.before_proxy(&mut ctx, &mut headers).await;
         assert_continue(result);
-        assert_eq!(
-            ctx.metadata.get("graphql_operation_type").unwrap(),
-            op_type
-        );
+        assert_eq!(ctx.metadata.get("graphql_operation_type").unwrap(), op_type);
         assert_eq!(ctx.metadata.get("graphql_complexity").unwrap(), "2");
     }
 }
