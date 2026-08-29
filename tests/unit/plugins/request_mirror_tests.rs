@@ -3210,6 +3210,47 @@ async fn sensitive_query_hostile_encoding_prefixed_credentials_and_benign_names(
 }
 
 #[tokio::test]
+async fn sensitive_query_unicode_control_names_fail_closed() {
+    let mut direct = make_ctx_with_proxy();
+    const DIRECT_RAW: &str = "keep=1&%C2%85=secret&signal=1";
+    direct.set_raw_query_string(DIRECT_RAW.to_string());
+
+    let direct_line = capture_mirror_request_line(&mut direct).await;
+    assert!(
+        direct_line.contains("keep=1&signal=1"),
+        "benign pairs must be retained: {direct_line}"
+    );
+    assert!(
+        !direct_line.contains("%C2%85") && !direct_line.contains("secret"),
+        "direct percent-encoded Unicode control name must be omitted: {direct_line}"
+    );
+    assert_eq!(
+        direct.raw_query_string(),
+        Some(DIRECT_RAW),
+        "primary raw query must stay byte-for-byte unchanged"
+    );
+
+    let mut nested = make_ctx_with_proxy();
+    const NESTED_RAW: &str = "keep=2&%25C2%2585=hidden";
+    nested.set_raw_query_string(NESTED_RAW.to_string());
+
+    let nested_line = capture_mirror_request_line(&mut nested).await;
+    assert!(
+        nested_line.contains("keep=2"),
+        "benign pair must be retained: {nested_line}"
+    );
+    assert!(
+        !nested_line.contains("%25C2%2585") && !nested_line.contains("hidden"),
+        "nested percent-encoded Unicode control name must be omitted: {nested_line}"
+    );
+    assert_eq!(
+        nested.raw_query_string(),
+        Some(NESTED_RAW),
+        "primary raw query must stay byte-for-byte unchanged"
+    );
+}
+
+#[tokio::test]
 async fn test_mirror_rejects_grpc_prefix_smuggling_for_te_resynthesis() {
     let mut ctx = make_ctx_with_proxy();
     let mut headers = HashMap::new();

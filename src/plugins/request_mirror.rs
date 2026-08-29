@@ -618,8 +618,8 @@ fn query_name_has_built_in_credential_segment(name_lower: &str) -> bool {
         })
 }
 
-fn name_has_ascii_control(name: &str) -> bool {
-    name.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+fn name_has_control_character(name: &str) -> bool {
+    name.chars().any(char::is_control)
 }
 
 fn name_has_valid_percent_escape(name: &str) -> bool {
@@ -681,7 +681,7 @@ fn classify_mirror_query_name(
     let mut depth = 0;
     loop {
         if current.len() > MAX_MIRROR_QUERY_NAME_CLASSIFY_BYTES
-            || name_has_ascii_control(current.as_ref())
+            || name_has_control_character(current.as_ref())
             || name_has_malformed_percent(current.as_ref())
         {
             return MirrorQueryNameDecision::FailClosed;
