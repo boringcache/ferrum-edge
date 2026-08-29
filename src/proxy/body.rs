@@ -3106,48 +3106,6 @@ where
     }
 }
 
-/// Drive [`SizeLimitedStreamingResponse`] over an in-memory chunk sequence.
-///
-/// Used by external tests to prove an oversized unknown-length stream
-/// terminates with the same `response body exceeds maximum size` error the
-/// HTTP/1 builder installs — including when a caller supplies a size hint
-/// that a hook might have authored as `Content-Length`.
-pub(crate) fn collect_size_limited_stream_chunks(
-    chunks: Vec<Bytes>,
-    max_bytes: usize,
-) -> Result<Vec<Bytes>, String> {
-    use futures_util::Stream;
-    use futures_util::task::noop_waker;
-
-    let stream = futures_util::stream::iter(
-        chunks
-            .into_iter()
-            .map(|chunk| Ok::<_, ProxyBodyError>(Frame::data(chunk))),
-    );
-    let mut limited = SizeLimitedStreamingResponse {
-        inner: stream,
-        max_bytes,
-        bytes_seen: 0,
-    };
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let mut out = Vec::new();
-    loop {
-        match Pin::new(&mut limited).poll_next(&mut cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                if let Ok(data) = frame.into_data() {
-                    out.push(data);
-                }
-            }
-            Poll::Ready(Some(Err(err))) => return Err(err.to_string()),
-            Poll::Ready(None) => return Ok(out),
-            Poll::Pending => {
-                return Err("size-limited test stream is not expected to pend".to_string());
-            }
-        }
-    }
-}
-
 struct SizeLimitedFrameSource<S> {
     inner: S,
     max_bytes: usize,

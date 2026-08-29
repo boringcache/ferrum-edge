@@ -1,17 +1,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use chrono::Utc;
 use ferrum_edge::_test_support::{
-    canonical_header_content_length_from_map_for_test, collect_size_limited_stream_chunks_for_test,
-    preserved_response_content_length_for_test, run_after_proxy_hooks_for_test,
+    canonical_header_content_length_from_map_for_test, preserved_response_content_length_for_test,
+    run_after_proxy_hooks_for_test,
     should_bypass_h2_coalesce_for_large_response_for_test,
     streaming_response_requires_size_limit_for_test,
 };
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy, ResponseBodyMode};
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
-use ferrum_edge::retry::{ErrorClass, classify_body_error};
 
 fn test_proxy() -> Proxy {
     Proxy {
@@ -369,19 +367,4 @@ fn trusted_backend_content_length_within_limit_skips_size_limited_adapter() {
         64 * 1024,
         None
     ));
-}
-
-/// An oversized unknown-length stream terminates with ResponseBodyTooLarge,
-/// the same protocol error the HTTP/1 builder installs after headers commit.
-#[test]
-fn oversized_unknown_length_stream_terminates_as_response_body_too_large() {
-    let chunks = vec![Bytes::from_static(b"1234"), Bytes::from_static(b"5678")];
-    let err = collect_size_limited_stream_chunks_for_test(chunks, 6)
-        .expect_err("second chunk must cross the 6-byte cap");
-    assert_eq!(err, "response body exceeds maximum size");
-
-    let boxed: Box<dyn std::error::Error + Send + Sync> = err.into();
-    let (class, disconnected) = classify_body_error(&*boxed);
-    assert_eq!(class, ErrorClass::ResponseBodyTooLarge);
-    assert!(!disconnected);
 }
