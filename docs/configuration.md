@@ -837,7 +837,7 @@ See [plugins.md](plugins.md) for the per-plugin enforcement points.
 | `FERRUM_DNS_TRY_TCP_ON_ERROR` | No | `true` | Retry over TCP when UDP DNS responses are truncated or fail |
 | `FERRUM_DNS_NUM_CONCURRENT_REQS` | No | `3` | Nameservers to query concurrently per lookup; clamped 1..10 |
 | `FERRUM_DNS_MAX_ACTIVE_REQUESTS` | No | `512` | Max in-flight queries per multiplexed DNS connection; clamped 1..4096 |
-| `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` | No | `64` | Max concurrent stale-while-revalidate refreshes, per-cycle proactive near-expiry refresh work (soonest-expiry selection + resolve concurrency), and per-cycle failed-DNS retry work. Range: 1-1000. Proactive lookups are also bounded by a 15s wall-clock timeout. SWR and proactive success publication share one generation check so a stale in-flight result cannot overwrite a newer winner or resurrect an evicted hostname. |
+| `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` | No | `64` | Max concurrent stale-while-revalidate refreshes, per-cycle proactive near-expiry refresh work (soonest-expiry selection + resolve concurrency), and per-cycle failed-DNS retry work. Range: 1-1000. SWR and proactive lookups are bounded by a 15s wall-clock timeout so a hung resolver cannot retain a shared permit. SWR and proactive success publication share one generation check so a stale in-flight result cannot overwrite a newer winner or resurrect an evicted hostname. |
 
 See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 
