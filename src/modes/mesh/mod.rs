@@ -12686,11 +12686,11 @@ fn inject_mesh_global_plugins(
                 && plugin.plugin_name == "mesh_authz"
                 && plugin.id != MESH_AUTHZ_PLUGIN_ID
         });
-        if !operator_mesh_authz_present {
-            if let Some(assertors) = mesh_managed_trusted_assertors.as_ref() {
-                workload_metrics_config["trusted_hbone_assertors"] =
-                    serde_json::Value::Array(assertors.clone());
-            }
+        if !operator_mesh_authz_present
+            && let Some(assertors) = mesh_managed_trusted_assertors.as_ref()
+        {
+            workload_metrics_config["trusted_hbone_assertors"] =
+                serde_json::Value::Array(assertors.clone());
         }
     }
     // Apply ProxyConfig sampling as a baseline. The more granular Telemetry
