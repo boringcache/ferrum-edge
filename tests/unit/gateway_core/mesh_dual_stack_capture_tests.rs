@@ -224,7 +224,10 @@ fn explicit_false_cannot_contradict_locally_configured_ipv6_rules() {
     let err = runtime
         .validate_capture_listener_families()
         .expect_err("a listener-only false override must not leave IPv6 REDIRECT rules live");
-    assert!(err.contains("FERRUM_MESH_CAPTURE_IPV6_ENABLED=false"), "{err}");
+    assert!(
+        err.contains("FERRUM_MESH_CAPTURE_IPV6_ENABLED=false"),
+        "{err}"
+    );
     assert!(err.contains("FERRUM_MESH_IP6TABLES_ENABLED=false"), "{err}");
 }
 
