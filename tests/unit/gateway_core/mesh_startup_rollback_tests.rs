@@ -6,8 +6,7 @@
 //! the original cause.
 
 use ferrum_edge::_test_support::{
-    MeshStartupRollbackProbe,
-    mesh_startup_failure_before_owner_probe_for_test,
+    MeshStartupRollbackProbe, mesh_startup_failure_before_owner_probe_for_test,
     mesh_startup_failure_before_startup_result_gate_probe_for_test,
     mesh_startup_failure_inside_startup_result_gate_probe_for_test,
     mesh_startup_failure_listener_join_bounded_probe_for_test,
