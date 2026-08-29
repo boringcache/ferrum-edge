@@ -75,10 +75,6 @@ fn der_null() -> Vec<u8> {
     tlv(0x05, &[])
 }
 
-fn bit_string(content: &[u8]) -> Vec<u8> {
-    bit_string_with_unused(0, content)
-}
-
 fn bit_string_with_unused(unused_bits: u8, content: &[u8]) -> Vec<u8> {
     let mut body = vec![unused_bits];
     body.extend_from_slice(content);
