@@ -142,10 +142,12 @@ keys the template actually reads — `allowPrivilegeEscalation`,
 anything else at lint time rather than silently ignoring it (`runAsUser` /
 `runAsGroup` are decided by the capture mode). `capabilities.drop` must stay
 `["ALL"]`, and `capabilities.add` **merges on top of** the datapath minimum: it
-can add capabilities but can never remove a required one. Capability names are
-validated against `^(CAP_)?[A-Z][A-Z0-9_]*$` and rendered quoted. An explicit
-`drop: []` is rejected — it is not silently rewritten to `[ALL]`; omit the key
-to keep the default.
+can add named capabilities but can never remove a required one. `ALL` and
+`CAP_ALL` are rejected in `capabilities.add` — they would re-grant the complete
+Linux capability set after `drop: ["ALL"]`. Capability names are validated
+against `^(CAP_)?[A-Z][A-Z0-9_]*$` and rendered quoted. An explicit `drop: []`
+is rejected — it is not silently rewritten to `[ALL]`; omit the key to keep the
+default.
 
 `priorityClassName` is optional; only ambient and node-agent default to
 `system-node-critical`. Empty `priorityClassName` omits the field.

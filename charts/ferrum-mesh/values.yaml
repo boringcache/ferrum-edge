@@ -428,8 +428,10 @@ ambient:
   # key for that default; an explicit empty list is rejected rather than
   # rewritten). `capabilities.add` MERGES on top of the datapath minimum
   # (NET_ADMIN, NET_RAW, plus BPF/PERFMON for NodeWaypoint and SYS_ADMIN/
-  # SYS_PTRACE for in-netns capture) and can never remove one. Capability names
-  # must match `^(CAP_)?[A-Z][A-Z0-9_]*$`.
+  # SYS_PTRACE for in-netns capture) and can never remove one. `ALL` and
+  # `CAP_ALL` are rejected in add: they would re-grant the complete Linux
+  # capability set after drop ALL. Capability names must match
+  # `^(CAP_)?[A-Z][A-Z0-9_]*$`.
   securityContext:
     allowPrivilegeEscalation: false
     readOnlyRootFilesystem: true

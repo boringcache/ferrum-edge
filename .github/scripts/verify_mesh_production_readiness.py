@@ -523,6 +523,18 @@ def validate_strict_admin_validation(results_dir: Path) -> None:
     )
     require_stderr(
         results_dir,
+        "mesh-prod-ambient-add-all.err",
+        ("values don't meet the specifications of the schema", "add"),
+        "Ambient capabilities.add ALL must fail schema validation",
+    )
+    require_stderr(
+        results_dir,
+        "mesh-prod-ambient-add-cap-all.err",
+        ("must not include ALL", "CAP_ALL"),
+        "Ambient capabilities.add CAP_ALL must fail the template guard when schema validation is skipped",
+    )
+    require_stderr(
+        results_dir,
         "mesh-prod-ambient-unknown-sc.err",
         ("runAsUser",),
         "Unsupported ambient securityContext key refusal missing",

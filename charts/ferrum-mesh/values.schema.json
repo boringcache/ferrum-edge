@@ -1140,7 +1140,7 @@
     },
     "ambientSecurityContext": {
       "type": "object",
-      "description": "Explicit ambient container SecurityContext. Only the keys listed here are read by the template, so unknown keys are REJECTED rather than silently ignored: runAsUser/runAsGroup are decided by the capture mode, and the capability set is a datapath requirement. capabilities.drop must stay [ALL] (omit the key for the default; an explicit empty list is rejected). capabilities.add merges on top of the required NET_ADMIN/NET_RAW (plus BPF/PERFMON for NodeWaypoint and SYS_ADMIN/SYS_PTRACE for in-netns capture) set and can never remove one.",
+      "description": "Explicit ambient container SecurityContext. Only the keys listed here are read by the template, so unknown keys are REJECTED rather than silently ignored: runAsUser/runAsGroup are decided by the capture mode, and the capability set is a datapath requirement. capabilities.drop must stay [ALL] (omit the key for the default; an explicit empty list is rejected). capabilities.add merges on top of the required NET_ADMIN/NET_RAW (plus BPF/PERFMON for NodeWaypoint and SYS_ADMIN/SYS_PTRACE for in-netns capture) set and can never remove one. ALL and CAP_ALL are rejected in add: they would re-grant the complete Linux capability set after drop ALL.",
       "additionalProperties": false,
       "properties": {
         "allowPrivilegeEscalation": {
@@ -1164,11 +1164,14 @@
             },
             "add": {
               "type": "array",
-              "description": "Extra capabilities merged on top of the datapath minimum. Required capabilities are always rendered regardless of this list. Names must match ^(CAP_)?[A-Z][A-Z0-9_]*$; empty strings and YAML punctuation are rejected.",
+              "description": "Extra named capabilities merged on top of the datapath minimum. Required capabilities are always rendered regardless of this list. Names must match ^(CAP_)?[A-Z][A-Z0-9_]*$; empty strings and YAML punctuation are rejected. ALL and CAP_ALL are rejected: they would re-grant the complete Linux capability set after drop ALL.",
               "items": {
                 "type": "string",
                 "pattern": "^(CAP_)?[A-Z][A-Z0-9_]*$",
-                "minLength": 1
+                "minLength": 1,
+                "not": {
+                  "enum": ["ALL", "CAP_ALL"]
+                }
               }
             }
           }

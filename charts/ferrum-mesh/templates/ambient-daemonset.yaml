@@ -482,7 +482,8 @@ spec:
                  (`allowPrivilegeEscalation`, `readOnlyRootFilesystem`,
                  `capabilities.drop`, `capabilities.add`) so a supported-looking key
                  cannot be silently ignored. `capabilities.add` MERGES on top of the
-                 required set; it can never remove one. */ -}}
+                 required set; it can never remove one. Normalized ALL (including
+                 CAP_ALL) is rejected in add so drop ALL is not undone. */ -}}
           {{- $ambientSc := .Values.ambient.securityContext | default dict -}}
           {{- $ambientScCaps := $ambientSc.capabilities | default dict -}}
           {{- /* Do not use Sprig `default` on drop: an explicit empty list is
@@ -525,6 +526,9 @@ spec:
           {{- $ambientExtraCaps := list -}}
           {{- range $cap := $ambientScCaps.add | default list -}}
           {{- $normalized := include "ferrum-mesh.normalizedLinuxCapability" $cap | trim -}}
+          {{- if eq $normalized "ALL" -}}
+          {{- fail "ambient.securityContext.capabilities.add must not include ALL (including the CAP_ALL spelling): that re-grants the complete Linux capability set after drop ALL. Add only named extra capabilities." -}}
+          {{- end -}}
           {{- if not (has $normalized $ambientRequiredCaps) -}}
           {{- $ambientExtraCaps = append $ambientExtraCaps $normalized -}}
           {{- end -}}

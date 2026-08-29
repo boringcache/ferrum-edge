@@ -3224,6 +3224,27 @@ jobs:
           if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
             --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set-string 'ambient.securityContext.capabilities.add[0]=ALL' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-add-all.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-add-all.err"; then
+            echo "::error title=Ambient capabilities.add ALL accepted::add ALL re-grants every capability after drop ALL"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --skip-schema-validation \
+            --set-string 'ambient.securityContext.capabilities.add[0]=CAP_ALL' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-add-cap-all.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-add-cap-all.err"; then
+            echo "::error title=Ambient capabilities.add CAP_ALL accepted::CAP_ALL normalizes to ALL and must fail closed even with --skip-schema-validation"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
             --set-string 'ambient.securityContext.runAsUser=1000' \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-unknown-sc.yaml" \
             2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-unknown-sc.err"; then

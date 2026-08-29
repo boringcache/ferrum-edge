@@ -894,6 +894,7 @@ Sane non-empty resource requests. Empty resources{} would restore BestEffort.
 Normalize one Linux capability name. Rejects empty strings, surrounding
 whitespace, and anything outside `^(CAP_)?[A-Z][A-Z0-9_]*$` (YAML punctuation
 included). Returns the unprefixed uppercase form (`NET_ADMIN`, `ALL`).
+Callers that render capabilities.add must still reject the ALL token.
 */}}
 {{- define "ferrum-mesh.normalizedLinuxCapability" -}}
 {{- $raw := . | toString -}}
