@@ -14,6 +14,7 @@ Tracks fixes we've drafted for [hyperium/h3](https://github.com/hyperium/h3) tha
 | [002](002-extended-connect-websocket-protocol/) | ext: add `Protocol::WEB_SOCKET` for RFC 9220 Extended CONNECT | `h3` | Applied (vendored at [`vendor/h3-0.0.8-ferrum-patched/`](../../vendor/h3-0.0.8-ferrum-patched/)) | Ferrum Edge WebSocket-over-HTTP/3 (RFC 9220) support |
 | [003](003-peek-buffered-trailers-before-fin/) | stream: peek already-buffered trailers before terminal FIN | `h3` | Applied (vendored at [`vendor/h3-0.0.8-ferrum-patched/`](../../vendor/h3-0.0.8-ferrum-patched/)) | Ferrum Edge delayed-FIN backend trailer preservation (#1948) |
 | [004](004-send-stream-stopped-watch/) | quic: observe peer STOP_SENDING without exclusive send-stream access | `h3` | Applied (vendored at [`vendor/h3-0.0.8-ferrum-patched/`](../../vendor/h3-0.0.8-ferrum-patched/)) | Ferrum Edge H3 destination-permit release on per-stream cancel (#3775) |
+| [005](005-max-buffered-frame-len/) | frame: bound the declared payload length of a buffered non-`DATA` frame | `h3` | Applied (vendored at [`vendor/h3-0.0.8-ferrum-patched/`](../../vendor/h3-0.0.8-ferrum-patched/)) | Ferrum Edge HTTP/3 unauthenticated declared-frame-length OOM (#4261) |
 
 ## Conventions
 
