@@ -7389,6 +7389,10 @@ pub(crate) fn collect_plugin_config_admission_errors(
     validation_errors: &mut Vec<String>,
 ) {
     let known_plugins = plugins::available_plugins();
+    // Built once: on a control plane (no `ProxyState`) this constructs a fresh
+    // validation client, and restore admits payloads with far more plugin rows
+    // than a batch write.
+    let http_client = plugin_validation_http_client(state);
     for plugin_config in plugin_configs {
         if !known_plugins.contains(&plugin_config.plugin_name.as_str()) {
             validation_errors.push(format!(
@@ -7408,7 +7412,7 @@ pub(crate) fn collect_plugin_config_admission_errors(
                 ));
             }
         } else if let Err(err) =
-            validate_plugin_config_definition(plugin_config, plugin_validation_http_client(state))
+            validate_plugin_config_definition(plugin_config, http_client.clone())
         {
             validation_errors.push(format!(
                 "PluginConfig '{}': invalid config: {}",
