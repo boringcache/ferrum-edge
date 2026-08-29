@@ -1208,14 +1208,15 @@ pub mod _test_support {
         records: Vec<(String, u16, u16, u16)>,
         default_weight: u32,
     ) -> Vec<crate::config::types::UpstreamTarget> {
-        let answers = records.into_iter().map(|(host, port, weight, priority)| {
-            crate::dns::SrvAnswer {
-                host,
-                port,
-                weight,
-                priority,
-            }
-        });
+        let answers =
+            records
+                .into_iter()
+                .map(|(host, port, weight, priority)| crate::dns::SrvAnswer {
+                    host,
+                    port,
+                    weight,
+                    priority,
+                });
         crate::service_discovery::dns_sd::targets_from_srv_records(answers, default_weight)
     }
 

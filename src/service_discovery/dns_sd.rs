@@ -67,10 +67,8 @@ pub(crate) fn targets_from_srv_records(
         .into_iter()
         .filter(|answer| !is_rfc2782_root_target(&answer.host))
         .filter_map(|answer| {
-            super::admit_registry_port(u64::from(answer.port)).map(|port| SrvAnswer {
-                port,
-                ..answer
-            })
+            super::admit_registry_port(u64::from(answer.port))
+                .map(|port| SrvAnswer { port, ..answer })
         })
         .collect();
 

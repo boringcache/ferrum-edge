@@ -6115,9 +6115,7 @@ fn dns_sd_from_srv(records: &[(&str, u16, u16, u16)], default_weight: u32) -> Ve
     ferrum_edge::_test_support::dns_sd_targets_from_srv_records_for_test(
         records
             .iter()
-            .map(|(host, port, weight, priority)| {
-                (host.to_string(), *port, *weight, *priority)
-            })
+            .map(|(host, port, weight, priority)| (host.to_string(), *port, *weight, *priority))
             .collect(),
         default_weight,
     )
