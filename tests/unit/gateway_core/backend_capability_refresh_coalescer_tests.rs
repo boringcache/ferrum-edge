@@ -103,7 +103,7 @@ fn wait_until_idle_cannot_lose_wakeup_between_register_and_recheck() {
     assert!(
         idle.as_mut().poll(&mut cx).is_ready(),
         "register-before-recheck must observe the idle transition that lands \
-         after enable() and before the Acquire loads"
+         after enable() and before the flag re-read"
     );
     assert!(
         !coalescer.runner_is_active() && !coalescer.has_pending_refresh(),
@@ -481,4 +481,62 @@ fn request_role_is_unambiguous() {
     guard.disarm();
     assert!(!coalescer.runner_is_active());
     assert!(!coalescer.has_pending_refresh());
+}
+
+/// Regression for the store-buffer strand between `try_finish` and a
+/// concurrent `request()`.
+///
+/// With Release/Acquire on the `running`/`pending` pair, this interleaving
+/// is architecturally permitted (and reachable on x86):
+///
+/// - runner: `running.store(false)` … `pending.load()` reads `false`
+/// - caller: `pending.store(true)` … `running.swap(true)` reads `true`
+///
+/// The runner then exits believing it is idle while the caller believes it
+/// coalesced onto a live runner, leaving `running=false, pending=true` with
+/// no owner. Every joiner parked in `wait_until_idle` stays parked until an
+/// unrelated later `request()` happens to drain the flag — up to the
+/// periodic refresh interval (default 24 h).
+///
+/// Both racers are joined before the assertion, and neither issues a second
+/// `request()`, so with a sequentially consistent state machine the only
+/// legal post-join state is fully idle: whichever racer exits last did so
+/// through a `try_finish` that either observed true idle or handed the role
+/// to the other racer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn finish_window_request_race_never_strands_a_pending_rerun() {
+    const ROUNDS: usize = 2000;
+
+    for round in 0..ROUNDS {
+        let coalescer = Arc::new(RefreshCoalescer::new());
+        let owner_guard = take_runner(&coalescer);
+
+        let owner = tokio::spawn({
+            let coalescer = Arc::clone(&coalescer);
+            async move { drain_with_guard(coalescer, owner_guard).await }
+        });
+        let racer = tokio::spawn({
+            let coalescer = Arc::clone(&coalescer);
+            async move {
+                let role = coalescer.request();
+                match role {
+                    RefreshRole::Runner(guard) => drain_with_guard(coalescer, guard).await,
+                    RefreshRole::Joined => {}
+                }
+            }
+        });
+
+        owner.await.expect("owner drain loop");
+        racer.await.expect("racing requester");
+
+        assert!(
+            !coalescer.runner_is_active(),
+            "round {round}: runner role leaked after both racers joined"
+        );
+        assert!(
+            !coalescer.has_pending_refresh(),
+            "round {round}: coalesced rerun stranded with no runner — a joiner \
+             would park in wait_until_idle until an unrelated later request()"
+        );
+    }
 }

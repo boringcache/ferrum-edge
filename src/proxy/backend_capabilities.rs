@@ -713,6 +713,12 @@ pub enum BackendCapabilityRefreshOutcome {
 ///   live owner, because that caller does not own the runner future.
 /// - Guard `Drop` cannot recursively spawn or re-arm across scheduler
 ///   threads during runtime teardown.
+/// - Every `running`/`pending` operation is `SeqCst`, so the pair moves in
+///   one total order. Release/Acquire would admit the store-buffer outcome
+///   where a coalescing `request()` still sees `running == true` while the
+///   finishing runner still sees `pending == false`, stranding
+///   `running=false, pending=true` with no owner and parking every joiner
+///   in `wait_until_idle`. See [`RefreshCoalescer::request`].
 #[derive(Debug)]
 pub struct RefreshCoalescer {
     running: AtomicBool,
@@ -796,11 +802,16 @@ impl Drop for RefreshRunnerGuard {
         tracing::debug!("backend capability refresh runner cancelled");
         // Last-resort release only. `try_finish` is sync on the owner task
         // and cannot be cancelled mid-function, so a live guard here still
-        // uniquely owns `running`. Store `Release` so a later `request()`
-        // can acquire. Leave `pending` set (and do not signal idle) when a
-        // coalesced rerun is queued so joiners cannot observe a false idle.
-        self.coalescer.running.store(false, Ordering::Release);
-        if !self.coalescer.pending.load(Ordering::Acquire) {
+        // uniquely owns `running`. `SeqCst` for the same store-buffer
+        // reason as `try_finish` (see `RefreshCoalescer::request`): under
+        // Release/Acquire a concurrent `request()` could coalesce onto this
+        // dying runner while this load still missed its `pending` store,
+        // leaving `running=false, pending=true` *and* signalling idle.
+        // Leave `pending` set (and do not signal idle) when a coalesced
+        // rerun is queued so joiners cannot observe a false idle; the next
+        // `request()` acquires the role and drains it.
+        self.coalescer.running.store(false, Ordering::SeqCst);
+        if !self.coalescer.pending.load(Ordering::SeqCst) {
             self.coalescer.signal_idle();
         }
     }
@@ -850,17 +861,30 @@ impl RefreshCoalescer {
 
     /// Mark refresh work as needed.
     ///
-    /// `pending` is published with `Release` before the `AcqRel` `running`
-    /// swap so a waiter that observes `running == false` with `Acquire`
-    /// cannot miss a concurrently queued rerun: either `pending` is already
-    /// visible, or the new runner's `running == true` is.
+    /// Both steps are `SeqCst`. Release/Acquire is *not* sufficient here:
+    /// this store-then-RMW pairs with `try_finish`'s store-then-load across
+    /// two different locations (the classic store-buffer shape), and under
+    /// Release/Acquire the outcome "requester's `running` swap still reads
+    /// `true`" *and* "finisher's `pending` load still reads `false`" is
+    /// permitted (and reachable on x86, where the finisher's plain
+    /// `running` store can sit in the store buffer while its `pending` load
+    /// issues early). That outcome strands `running == false, pending ==
+    /// true` with no owner: the requester coalesced onto a runner that has
+    /// already exited, and every joiner parks in [`Self::wait_until_idle`]
+    /// until some unrelated later `request()` happens to drain it. A single
+    /// total order over all four operations forbids it — if the swap reads
+    /// `true` it precedes the finisher's `running` store, so the requester's
+    /// `pending` store precedes the finisher's `pending` load.
+    ///
+    /// This path is cold (config reload, admin refresh, DP push, the
+    /// periodic tick), never per-request, so the fence is free.
     ///
     /// Returns [`RefreshRole::Runner`] if this caller now owns the exclusive
     /// runner role, or [`RefreshRole::Joined`] if an existing runner will
     /// absorb this request as the single coalesced pending rerun.
     pub fn request(self: &Arc<Self>) -> RefreshRole {
-        self.pending.store(true, Ordering::Release);
-        if !self.running.swap(true, Ordering::AcqRel) {
+        self.pending.store(true, Ordering::SeqCst);
+        if !self.running.swap(true, Ordering::SeqCst) {
             RefreshRole::Runner(RefreshRunnerGuard::new(Arc::clone(self)))
         } else {
             RefreshRole::Joined
@@ -870,10 +894,12 @@ impl RefreshCoalescer {
     /// Consume one pending flag. Returns `true` when a refresh should run,
     /// `false` when the inner drain loop has caught up.
     ///
-    /// `AcqRel` so the runner that takes the flag happens-after the
-    /// requester's `Release` store and happens-before a later finish.
+    /// `SeqCst` so this take joins the same total order as `request`,
+    /// `try_finish`, and the last-resort guard `Drop`; the whole
+    /// `running`/`pending` state machine is sequentially consistent and can
+    /// be reasoned about as a single interleaving.
     pub fn take_pending(&self) -> bool {
-        self.pending.swap(false, Ordering::AcqRel)
+        self.pending.swap(false, Ordering::SeqCst)
     }
 
     /// Attempt to release the runner role. Returns `true` if the caller is
@@ -883,18 +909,19 @@ impl RefreshCoalescer {
     ///
     /// Guarantees no orphaned `pending` flag: every path leaves either
     /// `running=false, pending=false` (truly idle), or `running=true` with
-    /// this detached runner still responsible for draining. `running` is
-    /// stored `Release` so idle waiters' `Acquire` loads observe the
-    /// release; the re-acquire `swap` is `AcqRel` to pair with a concurrent
-    /// `request()`.
+    /// this detached runner still responsible for draining. All three
+    /// operations are `SeqCst` — see [`Self::request`] for why the
+    /// store-then-load here cannot be Release/Acquire without admitting a
+    /// stranded `running=false, pending=true` state.
     pub fn try_finish(&self) -> bool {
         // Release the runner role. Any concurrent `request()` from here
         // onward sees `running=false` and becomes a fresh runner, so the
         // only race is with a caller that already passed its
         // `running.swap` *before* this store (i.e. coalesced while we
-        // were still running).
-        self.running.store(false, Ordering::Release);
-        if !self.pending.load(Ordering::Acquire) {
+        // were still running). The `SeqCst` total order guarantees such a
+        // caller's `pending` store is visible to the load below.
+        self.running.store(false, Ordering::SeqCst);
+        if !self.pending.load(Ordering::SeqCst) {
             return true;
         }
         // Pending is set and we just cleared `running`. Try to re-acquire
@@ -904,7 +931,7 @@ impl RefreshCoalescer {
         // - old was `true` (a fresh `request()` already became the new
         //   runner): they own the drain → return `true` so the caller
         //   exits cleanly.
-        self.running.swap(true, Ordering::AcqRel)
+        self.running.swap(true, Ordering::SeqCst)
     }
 
     /// Wake waiters blocked on [`Self::wait_until_idle`].
@@ -916,33 +943,33 @@ impl RefreshCoalescer {
         self.idle_notify.notify_waiters();
     }
 
-    /// True while a runner owns the refresh loop (`Acquire`).
+    /// True while a runner owns the refresh loop (`SeqCst`).
     pub fn runner_is_active(&self) -> bool {
-        self.running.load(Ordering::Acquire)
+        self.running.load(Ordering::SeqCst)
     }
 
-    /// True when a coalesced rerun is queued (`Acquire`).
+    /// True when a coalesced rerun is queued (`SeqCst`).
     pub fn has_pending_refresh(&self) -> bool {
-        self.pending.load(Ordering::Acquire)
+        self.pending.load(Ordering::SeqCst)
     }
 
     /// Block until no refresh runner is active and no pending work remains.
     ///
     /// Registers the `Notify` waiter (via `Notified::enable`)
-    /// *before* re-reading `running`/`pending` with `Acquire`. `signal_idle`
+    /// *before* re-reading `running`/`pending`. `signal_idle`
     /// uses `notify_waiters()`, which stores no permit; registering first
     /// makes an idle transition in that window wake this waiter instead of
-    /// stranding it. Those `Acquire` loads pair with runner acquisition
-    /// (`AcqRel` swap), pending take (`AcqRel`), finish (`Release` then
-    /// optional `AcqRel` re-acquire), and last-resort guard Drop
-    /// (`Release` on `running`).
+    /// stranding it. The re-read is `SeqCst`, joining the same total order
+    /// as runner acquisition, pending take, finish, and last-resort guard
+    /// `Drop`, so an observed `(running, pending) == (false, false)` is a
+    /// state that really occurred rather than a per-location coincidence.
     pub async fn wait_until_idle(&self) {
         loop {
             let notified = self.idle_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             observe_idle_wait_registered();
-            if !self.running.load(Ordering::Acquire) && !self.pending.load(Ordering::Acquire) {
+            if !self.running.load(Ordering::SeqCst) && !self.pending.load(Ordering::SeqCst) {
                 return;
             }
             notified.await;

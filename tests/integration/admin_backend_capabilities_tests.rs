@@ -671,6 +671,22 @@ async fn aborted_coalesced_refresh_allows_a_later_refresh() {
         let proxy_state = proxy_state.clone();
         async move { proxy_state.refresh_backend_capabilities_coalesced().await }
     });
+
+    // Do not release the probe until the joiner has actually queued its
+    // coalesced rerun. The detached runner consumed the first caller's
+    // `pending` before parking in the handshake, so `has_pending_refresh()`
+    // becoming true is a positive observation that `joined` ran `request()`
+    // and took `RefreshRole::Joined`. Releasing on spawn order alone would
+    // let a fast drain finish first, handing `joined` the runner role and a
+    // `Ran` outcome.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !proxy_state.backend_capabilities_refresh.has_pending_refresh() {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("joiner never queued a coalesced rerun behind the held probe");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
     release_tx.send(true).expect("release held probe");
 
     let joined_outcome = tokio::time::timeout(Duration::from_secs(10), joined)
