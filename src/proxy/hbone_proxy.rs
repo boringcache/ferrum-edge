@@ -71,6 +71,25 @@ pub(super) const MESH_RELAY_DENIAL_DESTINATION_METADATA_KEY: &str = "mesh.relay.
 /// resolved one; its ABSENCE is itself the diagnosis for an own-pod topology.
 pub(super) const MESH_RELAY_TERMINATOR_IP_METADATA_KEY: &str = "mesh.relay.terminator_ip";
 
+/// Settle the selected-target breaker after `connect_backend` returns.
+///
+/// A gateway-side DNS-screen 403 (`DispatchPolicyRejected`) is health-neutral:
+/// every HALF_OPEN probe `check_circuit_breaker` admitted must be settled, but
+/// this refusal is not evidence about the backend. Real connection failures
+/// still record a failure. Callers must invoke this at most once per connect
+/// attempt.
+pub(crate) fn settle_hbone_backend_connect_circuit_breaker_outcome(
+    cb: &crate::circuit_breaker::CircuitBreaker,
+    status: StatusCode,
+    is_half_open_probe: bool,
+) {
+    if status == StatusCode::FORBIDDEN {
+        cb.record_neutral(is_half_open_probe);
+    } else {
+        cb.record_failure(status.as_u16(), true, is_half_open_probe);
+    }
+}
+
 pub(super) fn tag_request_metadata(ctx: &mut RequestContext) {
     ctx.metadata
         .insert("request_protocol".to_string(), "hbone".to_string());
@@ -918,16 +937,18 @@ pub(super) async fn handle_hbone_request(
                     "HBONE backend connection failed"
                 );
             }
-            if err.status != StatusCode::FORBIDDEN
-                && let Some(cb_config) = &proxy.circuit_breaker
-            {
+            if let Some(cb_config) = &proxy.circuit_breaker {
                 let cb = state.circuit_breaker_cache.get_or_create(
                     &proxy.namespace,
                     &proxy.id,
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(err.status.as_u16(), true, cb_is_half_open_probe);
+                settle_hbone_backend_connect_circuit_breaker_outcome(
+                    &cb,
+                    err.status,
+                    cb_is_half_open_probe,
+                );
             }
             ctx.metadata
                 .insert("error_class".to_string(), err.class.to_string());

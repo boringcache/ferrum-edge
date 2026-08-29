@@ -429,6 +429,7 @@ impl ResolvedAddresses {
     }
 }
 
+#[derive(Clone)]
 pub struct ResolvedAddressesIter<'a> {
     addresses: &'a ResolvedAddresses,
     offset: usize,

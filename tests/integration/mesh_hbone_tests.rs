@@ -11,8 +11,8 @@ use tokio::sync::watch;
 use crate::common::{empty_digest_header, generate_hmac_signature};
 
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, PluginAssociation,
-    PluginConfig, PluginScope, Proxy,
+    AuthMode, BackendScheme, CircuitBreakerConfig, Consumer, DispatchKind, GatewayConfig,
+    PluginAssociation, PluginConfig, PluginScope, Proxy,
 };
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -2112,8 +2112,137 @@ fn inbound_relay_resolved_loopback_screen_is_wired_on_tcp_and_udp_dial_paths() {
     );
     assert!(
         collapsed.contains(
-            "if proxy . id != MESH_INBOUND_HBONE_RELAY_PROXY_ID { return Ok ( candidates ) ; }"
+            "if proxy.id != MESH_INBOUND_HBONE_RELAY_PROXY_ID { return Ok(candidates); }"
         ),
         "screening must stay on the ordinary inbound relay, not ingress remap or other HBONE backends"
+    );
+}
+
+/// A gateway-side HBONE DNS-screen 403 after `check_circuit_breaker` admitted a
+/// HALF_OPEN probe must release that slot without changing backend health.
+/// Real connection failures still trip the breaker.
+#[test]
+fn inbound_hbone_dns_screen_denial_releases_half_open_probe_without_tripping() {
+    use ferrum_edge::_test_support::settle_hbone_backend_connect_circuit_breaker_outcome_for_test;
+    use ferrum_edge::circuit_breaker::CircuitBreaker;
+
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 2,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500, 502, 503],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+    cb.record_failure(503, true, false);
+    assert!(cb.can_execute().is_ok());
+    assert_eq!(cb.state_name(), "half_open");
+    assert_eq!(cb.half_open_in_flight(), 1);
+
+    settle_hbone_backend_connect_circuit_breaker_outcome_for_test(
+        &cb,
+        StatusCode::FORBIDDEN,
+        true,
+    );
+    assert_eq!(
+        cb.state_name(),
+        "half_open",
+        "DNS-screen 403 must not reopen the breaker"
+    );
+    assert_eq!(
+        cb.half_open_in_flight(),
+        0,
+        "DNS-screen 403 must release the HALF_OPEN probe slot"
+    );
+    assert!(
+        cb.can_execute().is_ok(),
+        "after a health-neutral denial the next probe must still be admissible"
+    );
+    assert_eq!(cb.half_open_in_flight(), 1);
+
+    settle_hbone_backend_connect_circuit_breaker_outcome_for_test(
+        &cb,
+        StatusCode::BAD_GATEWAY,
+        true,
+    );
+    assert_eq!(
+        cb.state_name(),
+        "open",
+        "a real HBONE connect failure must still trip the breaker"
+    );
+    assert_eq!(cb.half_open_in_flight(), 0);
+}
+
+/// The byte-stream CONNECT error arm must settle the selected-target breaker
+/// through the production helper: FORBIDDEN (DNS-screen policy) is neutral,
+/// every other connect failure is a failure. Double-settlement is forbidden.
+#[test]
+fn inbound_hbone_dns_screen_denial_settles_half_open_via_production_helper() {
+    let src = include_str!("../../src/proxy/hbone_proxy.rs");
+    let collapsed: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        collapsed.contains(
+            "settle_hbone_backend_connect_circuit_breaker_outcome ( &cb , err.status , cb_is_half_open_probe )"
+        ),
+        "connect_backend error arm must settle the same selected-target breaker"
+    );
+    assert_eq!(
+        collapsed.matches("settle_hbone_backend_connect_circuit_breaker_outcome").count(),
+        2,
+        "helper definition plus the one connect_backend error-arm call site"
+    );
+    assert!(
+        collapsed.contains(
+            "if status == StatusCode::FORBIDDEN { cb.record_neutral(is_half_open_probe); } else { cb.record_failure(status.as_u16(), true, is_half_open_probe); }"
+        ),
+        "FORBIDDEN DNS-screen denials must record_neutral; other connect failures record_failure"
+    );
+    let connect_err_arm = collapsed
+        .split("\"HBONE backend connection failed\"")
+        .nth(1)
+        .expect("connect_backend error logging")
+        .split("ctx . metadata . insert ( \"error_class\"")
+        .next()
+        .expect("error_class metadata after breaker settlement");
+    assert!(
+        !connect_err_arm.contains("record_failure") && !connect_err_arm.contains("record_neutral"),
+        "the connect error arm must not double-settle beside the helper"
+    );
+}
+
+/// Mixed-answer filtering must keep the iterator's rotated dial order; an
+/// all-safe set must return `Ok(None)` so the caller dials the original
+/// answer set without allocating a filtered Vec.
+#[test]
+fn inbound_relay_resolved_candidates_all_safe_returns_none_without_filtering() {
+    let mesh = ambient_terminator_mesh();
+    assert_eq!(
+        screen_resolved(&mesh, &["10.244.2.9"]),
+        Ok(None),
+        "a single safe answer must be allocation-free Ok(None)"
+    );
+    assert_eq!(
+        screen_resolved(&mesh, &["::ffff:10.244.2.9", "192.0.2.10", "2001:db8::9"]),
+        Ok(None),
+        "canonical IPv4-mapped non-loopback answers are safe and must not allocate"
+    );
+    assert_eq!(
+        screen_resolved(
+            &mesh,
+            &[
+                "10.244.2.9",
+                "::ffff:127.0.0.1",
+                "192.0.2.10",
+                "127.1.2.3",
+                "2001:db8::9",
+            ],
+        ),
+        Ok(Some(vec![
+            ip("10.244.2.9"),
+            ip("192.0.2.10"),
+            ip("2001:db8::9"),
+        ])),
+        "mixed answers must retain only safe candidates in original dial order"
     );
 }

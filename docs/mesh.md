@@ -2094,7 +2094,7 @@ Rules that apply across all of them:
 - **Names are matched, never resolved, at the authority guard.** A `Workload` record may declare a non-IP address (a `ServiceEntry`/`WorkloadEntry` host, a VM address). Such a record admits an authority that matches that name verbatim, ASCII-case-insensitively, on the record's declared ports. The gateway does **not** resolve the name inside the guard — whatever a name resolved to could not be attributed to this terminator — so nothing is admitted that the terminator's own inventory does not already declare by name. An authority naming an IP never matches a name entry, and vice versa. A name no entry declares is refused as `unresolvable_authority`. After admission, DNS resolution of that hostname still cannot open a loopback socket on Ambient, NodeWaypoint, ServiceWaypoint, or gateway topologies: concrete answers in `127.0.0.0/8`, `::1`, and IPv4-mapped IPv6 loopback (`::ffff:127.0.0.1`) are dropped before TCP or UDP dial. Mixed answers keep only the non-loopback addresses; an all-loopback answer fails closed with the same `address_not_terminated_here` classification. Sidecar ordinary relay may still dial resolved loopback on a declared application port because it shares the pod network namespace. Sidecar `ingress[]` remaps to a validated loopback `defaultEndpoint` are a separate, narrower path and are not subjected to this local-termination screen.
 - **Ports come from the owning record.** A workload record that declares ports admits only those ports; one that declares none does not constrain its address. A port declared by some *other* workload never admits a destination.
 - **Fail closed.** No slice, an unresolvable authority, an empty inventory, or a missing accepted local address all refuse. The refusal is a `403` carrying `mesh_authz.deny_policy=hbone_relay_destination_denied` (or `hbone_udp_relay_destination_denied`) plus structured audit metadata: `mesh.relay.denial_reason` (`no_mesh_slice`, `unresolvable_authority`, `address_not_terminated_here`, `port_not_declared`, or `ingress_endpoint_mapping_mismatch`), `mesh.relay.denied_destination` (the effective `host:port`), and `mesh.relay.terminator_ip` when one was resolved.
-- **Re-checked after plugins.** The guard runs at relay synthesis on the original authority, and again on the *effective* destination after the `before_proxy` chain, so a `mesh_route_dispatch` route override cannot move the dial off the admitted set.
+- **Re-checked after plugins.** The guard runs at relay synthesis on the original authority, and again on the *effective* destination after the `before_proxy` chain, so a `mesh_route_dispatch` route override cannot move the dial off the admitted set. Both the authority decision and the post-DNS screen read the current `RequestEpoch` mesh snapshot.
 
 Two narrower boundaries sit beside this guard and are unaffected by it: a declared Sidecar `ingress[]` block replaces the ordinary surface with an exact `listener port → defaultEndpoint` mapping (see [Sidecar Ingress Listeners](#sidecar-ingress-listeners)), and an `EgressGateway` admits external UDP `ServiceEntry` destinations from its own precomputed dial-endpoint allowlist.
 
@@ -3907,8 +3907,10 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   the pod dialed** (without this the pod would drop every reply as coming from the
   wrong address). On the **destination** side, the peer's inbound HBONE terminator
   recognizes the `udp` marker, **unframes the tunnel into a local `UdpSocket`** to
-  the CONNECT `:authority` (the open-relay guard bounds the authority to a
-  loopback / slice-known workload addr+port exactly as for the byte-stream relay),
+  the CONNECT `:authority` (the open-relay guard admits only destinations this
+  terminator owns — ownership-scoped inventory, Sidecar-only loopback privilege —
+  and ordinary UDP then screens concrete DNS answers immediately before dial,
+  the same contract as the byte-stream relay),
   and frames replies back. The destination's inbound relay is **transport-agnostic**:
   `is_udp_hbone_connect` matches the `udp` marker regardless of which listener the
   CONNECT arrived on (Ambient `:15008` or Sidecar `:15006`), funnelling through the
@@ -4102,7 +4104,7 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   | **Pinned-peer SPIFFE** | egress dial | refuse dial on missing/corrupt pin | `mtls_expected_peer_is_required_and_fails_closed` |
   | **Transport selection** — materializer stamps exactly one of `mesh.hbone` / `mesh.mtls`; runtime precedence is HBONE → mesh-mTLS | egress session | end session if neither tag (a both-tags target — only reachable via a corrupted upstream, never the materializer — resolves to HBONE by precedence, which never relaxes a gate) | `egress_transport_branch_selects_by_tag` |
   | **Authenticated peer** (dest) — `peer_spiffe_id.is_some()` | dest handler, before any socket opens | 403 | predicate by `authenticated_hbone_*_without_peer_is_rejected` + inline handler reject (`ctx.peer_spiffe_id.is_none()`); the fail-closed OUTCOME is e2e-tested by `functional_mesh_udp_dest_untrusted_peer_fails_closed` (under STRICT inbound the unchained peer is rejected at the TLS layer; the handler's own 403 stays predicate-pinned) |
-  | **Open-relay guard** (dest) — loopback / slice-declared workload addr + port only, re-checked on the **post-route-override** effective destination | dest handler | 403 | `inbound_hbone_relay_guard_allows_only_local_destinations` |
+  | **Open-relay guard** (dest) — ownership-scoped termination inventory; Sidecar-only loopback namespace privilege; DNS answers screened immediately before ordinary TCP/UDP dial (mixed answers keep only safe candidates, all-loopback fails closed); re-checked on the **post-route-override** effective destination from the current RequestEpoch | dest handler | 403 | `inbound_hbone_relay_guard_allows_only_local_destinations` |
   | **Marker discipline** — `udp`/`hbone` predicates disjoint; an unknown / future / malformed (incl. non-UTF-8) marker → neither | dispatch | 405 — the non-WebSocket-CONNECT gate (`!is_hbone_connect_any`) rejects an unrecognized CONNECT before routing; both skew directions | `connect_marker_classification_is_exhaustive_and_fail_closed`, `udp_and_hbone_predicates_are_disjoint` |
   | **Session DoS bounds** — count + queued-bytes + idle sweep | source capture | shed / reap | `session_cap_sheds_new_flows_but_serves_existing`, `egress_enqueue_caps_queued_bytes_not_just_count` |
   | **Return-path isolation** — per-session transparent socket bound to orig-dst, send-only, reply only to the captured client | return path | structural (one socket ↔ one client) | `canonicalize_unmaps_v4_mapped_clients_only`, `teardown_does_not_clobber_replacement_session` |
@@ -4113,14 +4115,14 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   (slot/epoch TOCTOU, return-path cross-talk, route-override guard bypass, marker
   confusion, unauthenticated relay, capability drop→open, transport downgrade,
   teardown fail-open, codec desync, orig-dst spoofing) — no fail-open path was
-  found. One residual is noted for completeness: the inbound open-relay guard
-  validates the destination **string** before DNS resolution, so a workload that
-  declared a *hostname* (rather than a pod IP) as its address could in principle
-  resolve off-box. This is **not UDP-specific** — the byte-stream HBONE relay's
-  `connect_backend` has the byte-for-byte identical resolve-after-string-guard
-  pattern — and is inert in practice (workload addresses are pod IPs / loopback,
-  which resolve to themselves), so hardening it (validate the *resolved* IP in both
-  relays) is out of scope for this UDP stage.
+  found. The inbound open-relay guard still matches declared names without
+  resolving them, then both the byte-stream HBONE relay's `connect_backend` and
+  the UDP dest handler screen concrete DNS answers immediately before dial
+  (`screen_inbound_relay_resolved_ips` on the current RequestEpoch mesh
+  snapshot). Mixed answers retain only non-loopback candidates; all-loopback
+  answers fail closed. Sidecar retains own-namespace loopback privilege.
+  Sidecar `ingress[]` remaps and separately authorized EgressGateway external
+  UDP remain distinct and skip that local-termination screen.
 - **Locally-generated pod UDP egress: OUTPUT-MARK → lo-reroute → PREROUTING-TPROXY
   loop.** TPROXY runs **only in `PREROUTING`**, never for locally-generated (OUTPUT)
   packets — jumping into a `-j TPROXY` chain from `mangle OUTPUT` is invalid and can

@@ -55,6 +55,9 @@ pub mod grpc_proxy;
 pub(crate) mod h2c_preface;
 pub mod hbone_pool;
 mod hbone_proxy;
+#[allow(unused_imports)]
+// Used by external tests; unused in the separately compiled bin target.
+pub(crate) use hbone_proxy::settle_hbone_backend_connect_circuit_breaker_outcome;
 pub mod headers;
 pub mod host_udp_capture;
 /// Privileged live-kernel gate for Ambient host-network UDP capture (#3705).

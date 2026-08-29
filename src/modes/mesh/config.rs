@@ -5006,29 +5006,42 @@ impl MeshConfig {
     /// separately authorized EgressGateway external-UDP path.
     ///
     /// `Ok(None)` means dial the original answer set. `Ok(Some(ips))` means
-    /// dial only `ips`. No extra allocation when the flag admits loopback.
-    pub fn screen_inbound_relay_resolved_ips(
+    /// dial only `ips`. Sidecar (flag true) and an all-safe answer set allocate
+    /// nothing; a `Vec` is built only when mixed answers must be filtered.
+    pub fn screen_inbound_relay_resolved_ips<I>(
         &self,
-        ips: impl IntoIterator<Item = std::net::IpAddr>,
-    ) -> Result<Option<Vec<std::net::IpAddr>>, InboundRelayDenial> {
+        ips: I,
+    ) -> Result<Option<Vec<std::net::IpAddr>>, InboundRelayDenial>
+    where
+        I: IntoIterator<Item = std::net::IpAddr>,
+        I::IntoIter: Clone,
+    {
         if self.inbound_relay_admits_loopback_namespace {
             return Ok(None);
         }
-        let mut original_len = 0usize;
-        let mut retained = Vec::new();
-        for ip in ips {
-            original_len += 1;
-            if !inbound_relay_resolved_ip_is_loopback_namespace(ip) {
-                retained.push(ip);
+        let ips = ips.into_iter();
+        let mut any_safe = false;
+        let mut any_loopback = false;
+        for ip in ips.clone() {
+            if inbound_relay_resolved_ip_is_loopback_namespace(ip) {
+                any_loopback = true;
+            } else {
+                any_safe = true;
+            }
+            if any_safe && any_loopback {
+                break;
             }
         }
-        if retained.is_empty() {
-            Err(InboundRelayDenial::AddressNotTerminated)
-        } else if retained.len() == original_len {
-            Ok(None)
-        } else {
-            Ok(Some(retained))
+        if !any_safe {
+            return Err(InboundRelayDenial::AddressNotTerminated);
         }
+        if !any_loopback {
+            return Ok(None);
+        }
+        Ok(Some(
+            ips.filter(|ip| !inbound_relay_resolved_ip_is_loopback_namespace(*ip))
+                .collect(),
+        ))
     }
 
     /// Match `host` (already bracket-stripped; `address` is its canonical IP
