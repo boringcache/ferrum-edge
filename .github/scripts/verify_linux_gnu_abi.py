@@ -24,6 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_PATH = REPO_ROOT / ".github" / "linux-gnu-abi.toml"
 RELEASE_YML = REPO_ROOT / ".github" / "workflows" / "release.yml"
 CI_YML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+SMOKE_PY = REPO_ROOT / ".github" / "scripts" / "smoke_linux_gnu_baseline.py"
 README = REPO_ROOT / "README.md"
 CLI_MD = REPO_ROOT / "docs" / "cli.md"
 CI_CD_MD = REPO_ROOT / "docs" / "ci_cd.md"
@@ -181,13 +182,123 @@ def check_release_wiring(contract: dict[str, Any], release_yml: str, ci_yml: str
 
     for token, label in (
         (sysroot_image, "pinned GNU sysroot image"),
+        (smoke_floor, "oldest-baseline smoke image"),
+        (smoke_ubuntu, "Ubuntu 22.04 smoke image"),
+        (protoc_sha, "pinned protoc SHA-256"),
         ("build_linux_gnu_sysroot.sh", "sysroot build helper"),
         ("python3 -I .github/scripts/verify_linux_gnu_abi.py --self-test", "ABI self-test"),
+        ("python3 -I .github/scripts/verify_linux_gnu_abi.py --check-contract", "ABI contract check"),
+        ("python3 -I .github/scripts/smoke_linux_gnu_baseline.py --self-test", "baseline smoke self-test"),
+        ("python3 -I .github/scripts/smoke_linux_gnu_baseline.py", "baseline smoke invocation"),
         ("LIBZ_SYS_STATIC=1", "static zlib for the GNU sysroot build"),
+        ("ubuntu-24.04-arm", "ARM64 GNU ABI/smoke runner"),
+        (
+            "  verify-latest-linux-gnu-abi:\n"
+            "    name: Verify latest Linux GNU ABI\n",
+            "verify-latest-linux-gnu-abi job",
+        ),
+        (
+            "    needs: [build-binaries, build-arm64-cross]\n",
+            "verify-latest-linux-gnu-abi needs both GNU build jobs",
+        ),
+        (
+            "          name: binary-x86_64-unknown-linux-gnu\n",
+            "latest-path x86_64 GNU artifact name",
+        ),
+        (
+            "          name: binary-aarch64-unknown-linux-gnu\n",
+            "latest-path ARM64 GNU artifact name",
+        ),
+        (
+            "  linux-gnu-abi-latest-gate:\n"
+            "    name: Gate latest release on Linux GNU ABI\n",
+            "linux-gnu-abi-latest-gate job",
+        ),
+        (
+            "    needs: [latest-release, verify-latest-linux-gnu-abi]\n",
+            "linux-gnu-abi-latest-gate join after latest-release",
+        ),
+        (
+            "    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'\n",
+            "linux-gnu-abi-latest-gate main-push fail-closed if",
+        ),
+        ("targetCommitish", "latest retraction proves release target"),
+        ("$GITHUB_SHA", "latest retraction proves current SHA"),
+        (
+            'echo "::error::latest publication is blocked until verify-latest-linux-gnu-abi succeeds',
+            "latest ABI fail-closed error",
+        ),
+        (
+            'echo "::error::latest-release did not succeed',
+            "latest publication fail-closed error",
+        ),
     ):
         if not workflow_contains(ci_yml, token):
             errors.append(f"ci.yml is missing required {label} ({token})")
 
+    # Frozen latest-release cannot gain an ABI needs edge; the join gate is
+    # the admitted place to fail-close after that frozen publisher.
+    if (
+        "    needs: [test, build-binaries, build-arm64-cross, "
+        "main-publish-gate]\n"
+        not in ci_yml
+    ):
+        errors.append("ci.yml changed the frozen latest-release needs graph")
+    if "verify-latest-linux-gnu-abi" in _job_needs(ci_yml, "latest-release"):
+        errors.append("ci.yml must not add an ABI needs edge to frozen latest-release")
+    if "verify-linux-gnu-abi" in _job_needs(ci_yml, "main-publish-gate"):
+        errors.append("ci.yml must not add an ABI needs edge to frozen main-publish-gate")
+    if "verify-latest-linux-gnu-abi" in _job_needs(ci_yml, "build-arm64-cross"):
+        errors.append("ci.yml must not add an ABI needs edge to frozen build-arm64-cross")
+
+    return errors
+
+
+def _job_needs(workflow: str, job: str) -> set[str]:
+    match = re.search(
+        rf"(?ms)^  {re.escape(job)}:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+        workflow,
+    )
+    if not match:
+        return set()
+    body = match.group("body")
+    inline = re.search(
+        r"(?m)^    needs: \[(?P<needs>[A-Za-z0-9_-]+(?:, [A-Za-z0-9_-]+)*)\]$",
+        body,
+    )
+    if inline:
+        return set(inline.group("needs").split(", "))
+    listed = re.search(r"(?m)^    needs:\n(?P<needs>(?:^      - [^\n]+\n)+)", body)
+    if listed:
+        return {
+            line.strip().removeprefix("- ").strip()
+            for line in listed.group("needs").splitlines()
+            if line.strip().startswith("- ")
+        }
+    scalar = re.search(r"(?m)^    needs: ([A-Za-z0-9_-]+)$", body)
+    if scalar:
+        return {scalar.group(1)}
+    return set()
+
+
+def check_smoke_script(source: str) -> list[str]:
+    errors: list[str] = []
+    forbidden_ro_chmod = "chmod +x /" + "gnu"
+    if forbidden_ro_chmod in source:
+        errors.append(
+            "smoke_linux_gnu_baseline.py must not chmod binaries through the "
+            "read-only /gnu mount"
+        )
+    if '(str(edge.parent), "/gnu", "ro")' not in source:
+        errors.append(
+            "smoke_linux_gnu_baseline.py must bind-mount the GNU artifact "
+            "directory read-only at /gnu"
+        )
+    if "ensure_executable(edge)" not in source or "ensure_executable(cni)" not in source:
+        errors.append(
+            "smoke_linux_gnu_baseline.py must set +x on host artifact files "
+            "before mounting /gnu:ro"
+        )
     return errors
 
 
@@ -200,6 +311,12 @@ def check_operator_docs(readme: str, cli_md: str, ci_cd_md: str, contract: dict[
                 errors.append(f"{label} must document {token}")
         if "ferrum-edge-linux-x86_64" not in text:
             errors.append(f"{label} must keep the GNU x86_64 artifact name")
+    for token in ("verify-linux-gnu-abi", "linux-gnu-abi-release-gate"):
+        if token not in ci_cd_md:
+            errors.append(f"docs/ci_cd.md must document the versioned-release GNU ABI job {token}")
+    for token in ("verify-latest-linux-gnu-abi", "linux-gnu-abi-latest-gate"):
+        if token not in ci_cd_md:
+            errors.append(f"docs/ci_cd.md must document the moving-latest GNU ABI job {token}")
     return errors
 
 
@@ -223,6 +340,7 @@ def check_repository() -> list[str]:
             contract,
         )
     )
+    errors.extend(check_smoke_script(SMOKE_PY.read_text(encoding="utf-8")))
     return errors
 
 
@@ -330,6 +448,46 @@ def run_self_test() -> list[str]:
         contract,
     ):
         failures.append("README GLIBC floor regression was not rejected")
+
+    ci_yml = CI_YML.read_text(encoding="utf-8")
+    mutated_latest_job = ci_yml.replace(
+        "verify-latest-linux-gnu-abi:", "verify-latest-linux-gnu-abi-missing:", 1
+    )
+    if not check_release_wiring(contract, RELEASE_YML.read_text(encoding="utf-8"), mutated_latest_job):
+        failures.append("missing latest GNU ABI job in ci.yml was not rejected")
+
+    mutated_latest_gate = ci_yml.replace(
+        "linux-gnu-abi-latest-gate:", "linux-gnu-abi-latest-gate-missing:", 1
+    )
+    if not check_release_wiring(contract, RELEASE_YML.read_text(encoding="utf-8"), mutated_latest_gate):
+        failures.append("missing latest GNU ABI join gate in ci.yml was not rejected")
+
+    mutated_frozen_needs = ci_yml.replace(
+        "    needs: [test, build-binaries, build-arm64-cross, main-publish-gate]\n",
+        "    needs: [test, build-binaries, build-arm64-cross, main-publish-gate, verify-latest-linux-gnu-abi]\n",
+        1,
+    )
+    if not check_release_wiring(contract, RELEASE_YML.read_text(encoding="utf-8"), mutated_frozen_needs):
+        failures.append("ABI needs edge on frozen latest-release was not rejected")
+
+    mutated_ci_cd = CI_CD_MD.read_text(encoding="utf-8").replace(
+        "verify-latest-linux-gnu-abi", "verify-linux-gnu-abi-on-latest"
+    )
+    if not check_operator_docs(
+        README.read_text(encoding="utf-8"),
+        CLI_MD.read_text(encoding="utf-8"),
+        mutated_ci_cd,
+        contract,
+    ):
+        failures.append("docs/ci_cd.md latest GNU ABI job regression was not rejected")
+
+    mutated_smoke = SMOKE_PY.read_text(encoding="utf-8").replace(
+        '(str(edge.parent), "/gnu", "ro")',
+        '(str(edge.parent), "/gnu", "rw")',
+        1,
+    )
+    if not check_smoke_script(mutated_smoke):
+        failures.append("read-write /gnu smoke mount was not rejected")
 
     return failures
 

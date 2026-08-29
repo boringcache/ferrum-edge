@@ -146,6 +146,13 @@ class RpcServer:
             self._thread.join(timeout=5)
 
 
+def ensure_executable(path: Path) -> None:
+    """Set +x on the host file. The /gnu bind mount is read-only, so chmod
+    inside the container cannot repair a missing execute bit.
+    """
+    path.chmod(path.stat().st_mode | 0o111)
+
+
 def docker_bash(
     image: str,
     platform: str,
@@ -192,7 +199,7 @@ def smoke_image(
         image,
         platform,
         mounts,
-        f"chmod +x /gnu/{edge_name} /gnu/{cni_name} && /gnu/{edge_name} version --json",
+        f"/gnu/{edge_name} version --json",
     )
     payload = json.loads(version.stdout)
     if "version" not in payload:
@@ -202,7 +209,6 @@ def smoke_image(
         image,
         platform,
         mounts,
-        f"chmod +x /gnu/{edge_name} && "
         f"FERRUM_MODE=file FERRUM_FILE_CONFIG_PATH=/fixture/spec.yaml "
         f"/gnu/{edge_name} validate --mode file --spec /fixture/spec.yaml",
     )
@@ -213,7 +219,6 @@ def smoke_image(
         mounts,
         f"""
 set -euo pipefail
-chmod +x /gnu/{edge_name}
 export FERRUM_MODE=file
 export FERRUM_FILE_CONFIG_PATH=/fixture/spec.yaml
 export FERRUM_PROXY_HTTP_PORT=18000
@@ -249,7 +254,7 @@ wait "$pid" >/dev/null 2>&1 || true
         image,
         platform,
         mounts,
-        f"chmod +x /gnu/{cni_name} && CNI_COMMAND=VERSION /gnu/{cni_name}",
+        f"CNI_COMMAND=VERSION /gnu/{cni_name}",
     )
     cni_payload = json.loads(version_cni.stdout)
     if "supportedVersions" not in cni_payload:
@@ -265,7 +270,6 @@ wait "$pid" >/dev/null 2>&1 || true
         mounts,
         f"""
 set -euo pipefail
-chmod +x /gnu/{cni_name}
 export HOST_BIN_DIR=/fixture/cni-bin
 export HOST_CONF_DIR=/fixture/cni-conf
 export HOST_SOCKET_DIR=/fixture/cni-sock
@@ -296,7 +300,7 @@ test -x /fixture/cni-bin/ferrum-cni
             image,
             platform,
             mounts,
-            f"chmod +x /gnu/{cni_name} && /gnu/{cni_name}",
+            f"/gnu/{cni_name}",
             input_text=ADD_CONFIG,
             env=env,
         )
@@ -305,6 +309,10 @@ test -x /fixture/cni-bin/ferrum-cni
 def run_smoke(edge: Path, cni: Path, contract: dict[str, Any]) -> None:
     if not edge.is_file() or edge.is_symlink() or not cni.is_file() or cni.is_symlink():
         raise RuntimeError("GNU smoke requires regular ferrum-edge and ferrum-cni files")
+    if edge.parent != cni.parent:
+        raise RuntimeError("GNU smoke requires ferrum-edge and ferrum-cni in the same directory")
+    ensure_executable(edge)
+    ensure_executable(cni)
     platform = docker_platform()
     images = [
         contract["smoke"]["floor"]["image"],
@@ -344,6 +352,14 @@ def run_self_test() -> list[str]:
         failures.append("sysroot image is not digest-pinned")
     if len(contract["sysroot"]["protoc_sha256"]) != 64:
         failures.append("protoc SHA-256 is not 64 hex characters")
+    source = Path(__file__).read_text(encoding="utf-8")
+    forbidden_ro_chmod = "chmod +x /" + "gnu"
+    if forbidden_ro_chmod in source:
+        failures.append("smoke must not chmod binaries through the read-only /gnu mount")
+    if '(str(edge.parent), "/gnu", "ro")' not in source:
+        failures.append("smoke must keep the GNU artifact directory bind-mounted read-only at /gnu")
+    if "ensure_executable(edge)" not in source or "ensure_executable(cni)" not in source:
+        failures.append("smoke must set +x on the host artifact files before mounting /gnu:ro")
     return failures
 
 

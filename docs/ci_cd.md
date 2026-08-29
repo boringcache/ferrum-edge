@@ -1382,10 +1382,21 @@ queue binaries are never published. Pushes to `main` build optimized
 and Windows x86_64. Linux x86_64 GNU artifacts on that path are built in the
 same digest-pinned AlmaLinux 8.10 sysroot as versioned releases, then
 ABI-scanned against GLIBC_2.34 (`libgcc_s.so.1` / `libz.so.1` allowlist)
-before checksum upload so the moving `latest` prerelease cannot regain a
-`ubuntu-latest` glibc ceiling. Native targets share the ordinary matrix; Linux ARM64
-runs only after code reaches `main`, in the isolated `build-arm64-cross` job
-described below. rust-cache keys are split by profile lane
+before checksum upload. The protected `build-arm64-cross` job is byte-frozen
+and does not run that scanner; both GNU architectures are re-checked by
+`verify-latest-linux-gnu-abi`, which downloads the existing
+`binary-x86_64-unknown-linux-gnu` and `binary-aarch64-unknown-linux-gnu`
+artifacts, re-checks SHA-256 sidecars, ABI-scans `ferrum-edge` and
+`ferrum-cni` on native `ubuntu-latest` / `ubuntu-24.04-arm` runners, and
+smokes both binaries on digest-pinned AlmaLinux 9.4 and Ubuntu 22.04.
+`linux-gnu-abi-latest-gate` joins that job with frozen `latest-release`
+(`if: always()` on main pushes). Trusted Cross freezes `latest-release.needs`,
+so ABI cannot be added there; the join gate fails the workflow unless both
+verification and publication succeeded, and it deletes `latest` only when that
+prerelease is proven to target the current `GITHUB_SHA`. Native targets share
+the ordinary matrix; Linux ARM64 runs only after code reaches `main`, in the
+isolated `build-arm64-cross` job described below. rust-cache keys are split by
+profile lane
 (`build-<target>-prbuild` vs `build-<target>-release`) so queue check/pr-build
 trees cannot evict push-to-main release artifacts. Each native job installs
 the pinned repository `setup-sccache` action and reports `sccache --show-stats`
@@ -2711,8 +2722,13 @@ Depends on `Validate release SHA`, then builds optimized release binaries for al
 - Smokes both binaries and their operator commands (`ferrum-edge version --json` / `validate` / `run` + `health`; `ferrum-cni VERSION` / `install` / `uninstall` / ADD / CHECK / DEL) on digest-pinned AlmaLinux 9.4 (the GLIBC_2.34 floor) and Ubuntu 22.04
 - `linux-gnu-abi-release-gate` joins `create-release` with this job (`if: always()`). Trusted Cross freezes `create-release.needs`, so ABI cannot be added there; the join gate deletes the GitHub Release if the ABI job did not succeed. Checksums, Cosign signatures, and container publish jobs are unchanged.
 
+**GNU ABI gate** (`verify-latest-linux-gnu-abi`, required on the main-push `latest` path):
+- Downloads the trusted `binary-x86_64-unknown-linux-gnu` and `binary-aarch64-unknown-linux-gnu` artifacts (`ubuntu-latest` for x86_64, `ubuntu-24.04-arm` for ARM64)
+- Re-checks SHA-256 sidecars, ABI-scans both `ferrum-edge` and `ferrum-cni`, and runs the same digest-pinned AlmaLinux 9.4 / Ubuntu 22.04 smoke matrix as the versioned path
+- `linux-gnu-abi-latest-gate` joins frozen `latest-release` with this job (`if: always()` on main pushes). Trusted Cross freezes `latest-release.needs`, `build-arm64-cross`, and `main-publish-gate`, so ABI cannot be added there. On ABI failure the gate deletes `latest` only when that prerelease is proven to target the current `GITHUB_SHA`; it leaves an older known-good `latest` in place if the current publisher did not replace it. The workflow fails unless both verification and publication succeeded.
+
 **Cross-Compilation**:
-- Linux ARM64 uses checksum-verified `cross` 0.2.5 in the isolated protected invocation job; `cross` requires Docker on the build host. Those artifacts already target an older glibc than GLIBC_2.34 and still pass through the ABI/smoke job above.
+- Linux ARM64 uses checksum-verified `cross` 0.2.5 in the isolated protected invocation job; `cross` requires Docker on the build host. Those artifacts already target an older glibc than GLIBC_2.34 and still pass through the versioned `verify-linux-gnu-abi` job above and, on the main-push `latest` path, `verify-latest-linux-gnu-abi`.
 - Other targets use standard `cargo build`; macOS x86_64 builds on the `macos-latest` runner (currently ARM64) with the standard Apple/Rust target tooling — pin to a concrete runner image such as `macos-14` if the host architecture must be guaranteed.
 
 **Output**:
@@ -2730,10 +2746,14 @@ closed on attestation: `release-attestation-gate` requires
 `attest-release-images` to succeed and deletes the GitHub Release if
 attestation verification fails. Trusted Cross freezes `create-release.needs`,
 so attestation cannot be added there directly. The Linux GNU ABI contract is
-enforced the same way: `linux-gnu-abi-release-gate` requires
-`verify-linux-gnu-abi` to succeed (GLIBC_2.34 floor, AlmaLinux 8.10 sysroot,
-`libgcc_s.so.1` / `libz.so.1` allowlist) and deletes the GitHub Release if
-that job did not succeed.
+enforced the same way on the versioned path: `linux-gnu-abi-release-gate`
+requires `verify-linux-gnu-abi` to succeed (GLIBC_2.34 floor, AlmaLinux 8.10
+sysroot, `libgcc_s.so.1` / `libz.so.1` allowlist) and deletes the GitHub
+Release if that job did not succeed. The moving `latest` prerelease is gated
+separately by `linux-gnu-abi-latest-gate` after frozen `latest-release`: it
+requires `verify-latest-linux-gnu-abi` to succeed for both GNU architectures
+and deletes `latest` only when that prerelease is proven to target the current
+`GITHUB_SHA`.
 
 **Release Content**:
 1. Release title: Version tag (e.g., `v0.2.0`)

@@ -14,9 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   artifacts previously linked against whatever glibc `ubuntu-latest` shipped
   (observed GLIBC_2.39), so they failed on Ubuntu 22.04, RHEL 9, and Debian 12.
   x86_64 GNU binaries now build in a digest-pinned AlmaLinux 8.10 sysroot;
-  hosted release jobs ABI-scan both binaries, smoke them on AlmaLinux 9 and
-  Ubuntu 22.04, and fail closed on symbols above the floor. Artifact names,
-  checksums, signatures, and container publish behavior are unchanged.
+  hosted versioned-release and main-push `latest` jobs ABI-scan both binaries
+  on x86_64 and ARM64, smoke them on AlmaLinux 9 and Ubuntu 22.04, and fail
+  closed on symbols above the floor. Artifact names, checksums, signatures,
+  and container publish behavior are unchanged.
   Remaining dynamic libraries are `libgcc_s.so.1` and, if not static-linked,
   `libz.so.1`.
 
