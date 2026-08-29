@@ -3209,6 +3209,43 @@ async fn sensitive_query_hostile_encoding_prefixed_credentials_and_benign_names(
 }
 
 #[tokio::test]
+async fn sensitive_query_parser_differentials_fail_closed() {
+    let mut ctx = make_ctx_with_proxy();
+    const RAW: &str = concat!(
+        "keep=1&carrier=ok;access_token=semicolon-secret&",
+        "api+key=plus-secret&api%20key=space-secret&api.key=dot-secret&signal=1"
+    );
+    ctx.set_raw_query_string(RAW.to_string());
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        request_line.contains("keep=1&signal=1"),
+        "unambiguous benign pairs must retain their order: {request_line}"
+    );
+    for forbidden in [
+        "carrier=",
+        "access_token",
+        "api+key",
+        "api%20key",
+        "api.key",
+        "semicolon-secret",
+        "plus-secret",
+        "space-secret",
+        "dot-secret",
+    ] {
+        assert!(
+            !request_line.contains(forbidden),
+            "parser-differential credential shape must be omitted: {forbidden}: {request_line}"
+        );
+    }
+    assert_eq!(
+        ctx.raw_query_string(),
+        Some(RAW),
+        "primary raw query must remain byte-for-byte unchanged"
+    );
+}
+
+#[tokio::test]
 async fn sensitive_query_unicode_control_names_fail_closed() {
     let mut direct = make_ctx_with_proxy();
     const DIRECT_RAW: &str = "keep=1&%C2%85=secret&signal=1";

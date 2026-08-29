@@ -16,7 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operator `sensitive_query_patterns`) are dropped from the mirror
   request-target only. Classification checks every decode layer through a
   hard cap of 4 and fails closed on residual `%XX`. The primary backend
-  request-target is unchanged. Forwarding a denied name requires the
+  request-target is unchanged. Literal semicolon-bearing segments also fail
+  closed because mirror frameworks disagree on whether `;` separates query
+  pairs; delimiter variants of the `api_key` family are denied as well.
+  Forwarding a denied name requires the
   fail-closed pair `forward_sensitive_query=true` plus an exact decoded-name
   `forward_sensitive_query_allowlist`. Mirror logs still omit the entire query.
 

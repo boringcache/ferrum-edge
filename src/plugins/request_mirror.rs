@@ -528,12 +528,30 @@ fn is_mirror_sensitive_header(name_lower: &str, operator_patterns: &[String]) ->
 /// Never logs the name.
 fn is_mirror_sensitive_query_name(name_lower: &str, operator_patterns: &[String]) -> bool {
     query_name_has_built_in_credential_segment(name_lower)
+        || query_name_has_adjacent_segments(name_lower, "api", "key")
         || MIRROR_SENSITIVE_QUERY_SUBSTRINGS
             .iter()
             .any(|substr| name_lower.contains(substr))
         || operator_patterns
             .iter()
             .any(|pattern| name_lower.contains(pattern.as_str()))
+}
+
+/// Match credential families whose separator spelling is backend-dependent.
+/// For example, form decoders may expose `api+key` or `api%20key` as the same
+/// two decoded segments that `api_key` and `api-key` spell explicitly.
+fn query_name_has_adjacent_segments(name_lower: &str, first: &str, second: &str) -> bool {
+    let mut previous = None;
+    for segment in name_lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|segment| !segment.is_empty())
+    {
+        if previous == Some(first) && segment == second {
+            return true;
+        }
+        previous = Some(segment);
+    }
+    false
 }
 
 fn is_ascii_query_name_delimiter(byte: u8) -> bool {
@@ -833,13 +851,20 @@ fn apply_mirror_query_credential_policy<'a>(
             continue;
         }
         let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
-        let allowed = match classify_mirror_query_name(raw_name, operator_patterns) {
-            MirrorQueryNameDecision::NonSensitive => true,
-            MirrorQueryNameDecision::FailClosed => false,
-            MirrorQueryNameDecision::Sensitive { decoded_lower } => {
-                forward_sensitive_query && allowlist.iter().any(|allowed| allowed == &decoded_lower)
-            }
-        };
+        // Some application query parsers still accept `;` as a parameter
+        // separator. Ferrum's canonical query uses `&`, so forwarding a raw
+        // semicolon-bearing segment would let a mirror origin reinterpret a
+        // credential hidden after the first `=`. Drop the complete `&` segment
+        // rather than choosing a backend-specific parse convention.
+        let allowed = !pair.contains(';')
+            && match classify_mirror_query_name(raw_name, operator_patterns) {
+                MirrorQueryNameDecision::NonSensitive => true,
+                MirrorQueryNameDecision::FailClosed => false,
+                MirrorQueryNameDecision::Sensitive { decoded_lower } => {
+                    forward_sensitive_query
+                        && allowlist.iter().any(|allowed| allowed == &decoded_lower)
+                }
+            };
         if !allowed {
             removed_any = true;
             continue;

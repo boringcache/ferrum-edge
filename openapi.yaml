@@ -25170,8 +25170,11 @@ components:
         residual valid %XX, malformed, or control-bearing names fail closed).
         Built-in token/sig/signature matching is delimiter-bounded (oauth_token,
         x-amz-signature, x-goog-signature denied; continuation_token and signal
-        retained). Retained pairs keep raw encoding, order, flags, empty values,
-        +, percent escapes, and non-ASCII encoded bytes. The primary backend
+        retained). Delimiter variants of api_key are denied, and raw semicolon-
+        bearing segments fail closed because backend query parsers disagree on
+        whether they contain additional pairs. Retained pairs keep raw encoding,
+        order, flags, empty values, +, percent escapes, and non-ASCII encoded
+        bytes. The primary backend
         request-target is never rewritten. Forwarding a denied query name requires
         forward_sensitive_query=true plus a non-empty exact decoded-name
         forward_sensitive_query_allowlist.
