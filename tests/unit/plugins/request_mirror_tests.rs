@@ -3098,8 +3098,7 @@ async fn sensitive_query_strips_encoded_case_repeated_empty_and_all_sensitive_sh
 #[tokio::test]
 async fn sensitive_query_map_fallback_strips_without_form_encoder_rewrite() {
     let mut ctx = make_ctx_with_proxy();
-    ctx.query_params
-        .insert("q".to_string(), "a b".to_string());
+    ctx.query_params.insert("q".to_string(), "a b".to_string());
     ctx.query_params
         .insert("access_token".to_string(), "map-secret".to_string());
 
