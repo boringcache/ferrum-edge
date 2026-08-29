@@ -28,10 +28,10 @@ fn top_level_bullets(section: &str) -> Vec<&str> {
     for line in section.lines() {
         let line_start = offset;
         offset += line.len() + 1;
-        if line.starts_with("- ") {
-            if let Some(prev) = start.replace(line_start) {
-                bullets.push(section[prev..line_start].trim_end());
-            }
+        if line.starts_with("- ")
+            && let Some(prev) = start.replace(line_start)
+        {
+            bullets.push(section[prev..line_start].trim_end());
         }
     }
     if let Some(prev) = start {
