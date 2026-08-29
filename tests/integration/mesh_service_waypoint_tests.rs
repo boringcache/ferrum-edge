@@ -505,6 +505,20 @@ fn slice_filter_narrows_services_to_waypoint_binding() {
         "only the reviews workload SPIFFE identity is referenced by an admitted service"
     );
     assert_eq!(slice.waypoint_name.as_deref(), Some("api-waypoint"));
+    assert_eq!(
+        slice.service_waypoint_bound_services,
+        vec![
+            MeshWaypointServiceRef {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            },
+            MeshWaypointServiceRef {
+                namespace: "default".to_string(),
+                name: "ratings".to_string(),
+            },
+        ],
+        "the matching active binding must stamp exact bound-service refs for the inbound relay"
+    );
 }
 
 #[test]
@@ -855,6 +869,10 @@ fn slice_filter_unknown_waypoint_name_falls_open() {
     let slice = MeshSlice::from_gateway_config(&cfg, request);
     assert_eq!(slice.services.len(), 1);
     assert_eq!(slice.waypoint_name.as_deref(), Some("missing-binding"));
+    assert!(
+        slice.service_waypoint_bound_services.is_empty(),
+        "routing fail-open must not stamp inbound-relay binding evidence"
+    );
 }
 
 #[test]
@@ -888,5 +906,9 @@ fn slice_filter_honors_waypoint_for_none_as_opt_out() {
     assert!(
         slice.services.is_empty() && slice.workloads.is_empty(),
         "waypoint_for=none must produce an empty admitted set"
+    );
+    assert!(
+        slice.service_waypoint_bound_services.is_empty(),
+        "waypoint_for=none must not stamp inbound-relay binding evidence"
     );
 }

@@ -57,10 +57,10 @@ use ferrum_edge::identity::workload_api::proto::{
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, EastWestGateway, MeshConfig, MeshConsistentHash, MeshDestinationRule,
     MeshEndpoint, MeshLoadBalancer, MeshPolicy, MeshRule, MeshService, MeshSimpleLb,
-    MeshTrafficPolicy, MtlsMode, MultiClusterConfig, PeerAuthentication, PolicyAction, PolicyScope,
-    PolicyTargetAttachment, PrincipalMatch, Resolution, ServiceEntry, ServiceEntryLocation,
-    ServicePort, ServiceTargetPort, TrustBundle, TrustBundleSet, Workload, WorkloadPort,
-    WorkloadRef, WorkloadSelector,
+    MeshTrafficPolicy, MeshWaypointServiceRef, MtlsMode, MultiClusterConfig, PeerAuthentication,
+    PolicyAction, PolicyScope, PolicyTargetAttachment, PrincipalMatch, Resolution, ServiceEntry,
+    ServiceEntryLocation, ServicePort, ServiceTargetPort, TrustBundle, TrustBundleSet, Workload,
+    WorkloadPort, WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::proxy::ConfigApplyOutcome;
@@ -10918,7 +10918,18 @@ fn target_refs_waypoint_slice(
         // read only by GatewayClass ownership validation and DestinationRule
         // tier arbitration, and this slice carries no DestinationRules.
         istio_root_namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+        waypoint_name: Some(WAYPOINT_TARGET_REFS_NAME.to_string()),
         waypoint_gateway_class: Some("istio-waypoint".to_string()),
+        service_waypoint_bound_services: vec![
+            MeshWaypointServiceRef {
+                namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+                name: "reviews".to_string(),
+            },
+            MeshWaypointServiceRef {
+                namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+                name: "ratings".to_string(),
+            },
+        ],
         workloads: vec![
             waypoint_destination_workload("reviews", reviews_port),
             waypoint_destination_workload("ratings", ratings_port),

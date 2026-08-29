@@ -23,13 +23,14 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, InboundRelayDenial, MeshConfig, MeshEgressUdpDestination,
-    MeshEgressUdpDialEndpoint, MultiClusterConfig, Workload, WorkloadPort, WorkloadSelector,
-    inbound_relay_destinations_from_workloads, own_address_port_bounds_from_workloads,
+    MeshEgressUdpDialEndpoint, MeshWaypointBinding, MeshWaypointServiceRef, MultiClusterConfig,
+    Workload, WorkloadPort, WorkloadSelector, inbound_relay_destinations_from_workloads,
+    own_address_port_bounds_from_workloads,
 };
 use ferrum_edge::modes::mesh::enrolled_destinations::{
     EnrolledPodEntry, NodeLocalEnrolledDestinations, NodeLocalEnrolledDestinationsHandle,
 };
-use ferrum_edge::modes::mesh::slice::MeshSlice;
+use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use ferrum_edge::modes::mesh::{
     MeshRuntimeConfig, MeshTopology, MeshTrafficDirection, prepare_gateway_config_from_mesh_slice,
 };
@@ -2687,9 +2688,14 @@ fn inbound_relay_service_waypoint_admits_only_bound_service_backends() {
     let slice = MeshSlice {
         node_id: "mesh-test-node".to_string(),
         namespace: DEFAULT_NAMESPACE.to_string(),
+        waypoint_name: Some("reviews-waypoint".to_string()),
         version: "test".to_string(),
         workloads: vec![backing, unbound],
         services: vec![bound_service],
+        service_waypoint_bound_services: vec![MeshWaypointServiceRef {
+            namespace: DEFAULT_NAMESPACE.to_string(),
+            name: "reviews".to_string(),
+        }],
         ..MeshSlice::default()
     };
     let runtime = MeshRuntimeConfig {
@@ -2733,9 +2739,14 @@ fn inbound_relay_service_waypoint_without_backing_refs_terminates_for_nothing() 
     let slice = MeshSlice {
         node_id: "mesh-test-node".to_string(),
         namespace: DEFAULT_NAMESPACE.to_string(),
+        waypoint_name: Some("reviews-waypoint".to_string()),
         version: "test".to_string(),
         workloads: vec![visible],
         services: vec![bound_service],
+        service_waypoint_bound_services: vec![MeshWaypointServiceRef {
+            namespace: DEFAULT_NAMESPACE.to_string(),
+            name: "reviews".to_string(),
+        }],
         ..MeshSlice::default()
     };
     let runtime = MeshRuntimeConfig {
@@ -2752,6 +2763,177 @@ fn inbound_relay_service_waypoint_without_backing_refs_terminates_for_nothing() 
     );
     assert_eq!(
         mesh.inbound_relay_destination_decision("10.244.1.7", 8080, Some(ip("10.244.4.4"))),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+}
+
+fn prepared_service_waypoint_from_gateway_config(
+    mesh: MeshConfig,
+    waypoint_name: &str,
+) -> (MeshSlice, Box<MeshConfig>) {
+    let config = GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        ..GatewayConfig::default()
+    };
+    let request = MeshSliceRequest {
+        node_id: "mesh-test-node".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        ..MeshSliceRequest::default()
+    }
+    .with_waypoint_name(Some(waypoint_name.to_string()));
+    let slice = MeshSlice::from_gateway_config(&config, request);
+    let runtime = MeshRuntimeConfig {
+        topology: MeshTopology::ServiceWaypoint,
+        waypoint_name: Some(waypoint_name.to_string()),
+        ..default_mesh_runtime()
+    };
+    let prepared = prepared_mesh(&slice, &runtime);
+    (slice, prepared)
+}
+
+fn reviews_and_ratings_mesh(bindings: Vec<MeshWaypointBinding>) -> MeshConfig {
+    let reviews = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.244.1.7"],
+    );
+    let ratings = workload_for(
+        "ratings",
+        DEFAULT_NAMESPACE,
+        [("app", "ratings")],
+        ["10.244.2.9"],
+    );
+    MeshConfig {
+        services: vec![
+            service_for("reviews", DEFAULT_NAMESPACE, &[&reviews]),
+            service_for("ratings", DEFAULT_NAMESPACE, &[&ratings]),
+        ],
+        workloads: vec![reviews, ratings],
+        waypoint_bindings: bindings,
+        ..MeshConfig::default()
+    }
+}
+
+/// Issue #4251, production path: `narrow_for_service_waypoint` still fail-opens
+/// the routing view when the named binding is absent, so `MeshSlice.services`
+/// carries every namespace-visible Service. That view must NOT license the
+/// inbound HBONE relay — missing binding evidence yields an empty inventory.
+#[test]
+fn inbound_relay_service_waypoint_missing_binding_from_gateway_config_terminates_for_nothing() {
+    let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+        reviews_and_ratings_mesh(Vec::new()),
+        "reviews-waypoint",
+    );
+
+    assert_eq!(
+        slice.services.len(),
+        2,
+        "routing still fail-opens when the named Gateway has not landed"
+    );
+    assert!(
+        slice.service_waypoint_bound_services.is_empty(),
+        "a missing binding must not stamp relay evidence from namespace-visible Services"
+    );
+    assert!(
+        mesh.inbound_relay_destinations.is_empty(),
+        "no matching binding must leave the relay inventory empty"
+    );
+
+    let waypoint = Some(ip("10.244.4.4"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.2.9", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+}
+
+/// Issue #4251, production path: an exact matching active binding admits only
+/// the workloads that back that binding's exact `(namespace, service)` refs.
+#[test]
+fn inbound_relay_service_waypoint_exact_binding_from_gateway_config_admits_only_bound_backends() {
+    let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+        reviews_and_ratings_mesh(vec![MeshWaypointBinding {
+            name: "reviews-waypoint".to_string(),
+            namespace: DEFAULT_NAMESPACE.to_string(),
+            waypoint_for: "service".to_string(),
+            gateway_class_name: None,
+            services: vec![MeshWaypointServiceRef {
+                namespace: DEFAULT_NAMESPACE.to_string(),
+                name: "reviews".to_string(),
+            }],
+        }]),
+        "reviews-waypoint",
+    );
+
+    assert_eq!(
+        slice.service_waypoint_bound_services,
+        vec![MeshWaypointServiceRef {
+            namespace: DEFAULT_NAMESPACE.to_string(),
+            name: "reviews".to_string(),
+        }]
+    );
+    assert_eq!(
+        slice
+            .services
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["reviews"],
+        "the matching binding must narrow the routing view to the bound Service"
+    );
+
+    let waypoint = Some(ip("10.244.4.4"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, waypoint),
+        Ok(()),
+        "a bound service's backing workload is a destination this waypoint terminates for"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.2.9", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a namespace-visible workload that backs no bound service is not terminated here"
+    );
+}
+
+/// Issue #4251, production path: `waypoint_for=none` is an explicit opt-out and
+/// must produce an empty relay inventory even when the binding lists services.
+#[test]
+fn inbound_relay_service_waypoint_waypoint_for_none_from_gateway_config_terminates_for_nothing() {
+    let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+        reviews_and_ratings_mesh(vec![MeshWaypointBinding {
+            name: "reviews-waypoint".to_string(),
+            namespace: DEFAULT_NAMESPACE.to_string(),
+            waypoint_for: "none".to_string(),
+            gateway_class_name: None,
+            services: vec![MeshWaypointServiceRef {
+                namespace: DEFAULT_NAMESPACE.to_string(),
+                name: "reviews".to_string(),
+            }],
+        }]),
+        "reviews-waypoint",
+    );
+
+    assert!(
+        slice.services.is_empty() && slice.workloads.is_empty(),
+        "waypoint_for=none must produce an empty admitted routing set"
+    );
+    assert!(
+        slice.service_waypoint_bound_services.is_empty(),
+        "waypoint_for=none must not stamp relay evidence from the listed services"
+    );
+    assert!(mesh.inbound_relay_destinations.is_empty());
+
+    let waypoint = Some(ip("10.244.4.4"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.2.9", 8080, waypoint),
         Err(InboundRelayDenial::AddressNotTerminated)
     );
 }

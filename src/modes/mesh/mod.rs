@@ -1809,13 +1809,15 @@ fn prepare_normalized_gateway_config_for_mesh(
             // IS the L7 terminator for the services bound to it — and for
             // nothing else. The slice's own workload filter is NAMESPACE-level
             // (`service_waypoint_resource_namespaces` yields the waypoint's own
-            // namespace plus the namespaces of its bound services), so reading
-            // `mesh_slice.workloads` directly admitted every workload VISIBLE
-            // in those namespaces, backing a bound service or not (issue
-            // #4251). Re-derive the backing set here instead.
+            // namespace plus the namespaces of its bound services), and
+            // `narrow_for_service_waypoint` still fail-opens that routing view
+            // when the named binding is absent. Reading `mesh_slice.services`
+            // as the bound set would therefore admit every workload backing
+            // any namespace-visible Service (issue #4251). Re-derive the
+            // backing set from explicit binding evidence instead.
             MeshTopology::ServiceWaypoint => (
                 crate::modes::mesh::config::inbound_relay_destinations_from_workloads(
-                    service_waypoint_backing_workloads(mesh_slice),
+                    service_waypoint_backing_workloads(mesh_slice, runtime),
                 ),
                 false,
             ),
@@ -1889,29 +1891,53 @@ fn prepare_normalized_gateway_config_for_mesh(
 /// `ServiceWaypoint` (issue #4251).
 ///
 /// A `ServiceWaypoint` is the L7 terminator for the services bound to it and
-/// for nothing else, but the slice's workload filter is NAMESPACE-level:
-/// `service_waypoint_resource_namespaces` admits every workload visible in the
-/// waypoint's own namespace plus the namespaces of its bound services. A
-/// `ratings` pod sitting in the same namespace as a bound `reviews` Service
-/// therefore rode into the relay inventory on visibility alone.
+/// for nothing else. The slice's workload filter is NAMESPACE-level, and
+/// `narrow_for_service_waypoint` still fail-opens the routing view when the
+/// named binding is absent (rollout: flipping
+/// `FERRUM_MESH_TOPOLOGY=service_waypoint` before the Gateway lands must not
+/// empty outbound serving). `mesh_slice.services` is therefore NOT the bound
+/// set: with a `waypoint_name` but no matching `MeshWaypointBinding` it is
+/// the namespace-visible Service view, and treating it as a binding would
+/// admit every workload backing any visible Service — a plaintext inbound
+/// relay superset.
 ///
-/// `mesh_slice.services` is the already waypoint-narrowed Service view, so the
-/// per-binding set is exactly the workloads those Services authorize: the
-/// workload's ATTACHED Service identity must be one the slice carries, and that
-/// Service's `workloads[]` list must name the workload's SPIFFE — the same
-/// authorization `validate_mesh_config_internal` enforces for a
-/// cross-namespace attachment, so a bare `service_namespace` stamp cannot spoof
-/// membership.
+/// Fail closed unless ALL of:
+/// 1. this runtime's exact ServiceWaypoint identity (`waypoint_name` +
+///    namespace) matches the slice that carried the evidence;
+/// 2. that identity has a matching, active binding, carried as
+///    `mesh_slice.service_waypoint_bound_services` (missing / old / empty
+///    evidence, including `waypoint_for=none`, is empty);
+/// 3. the destination's ATTACHED Service identity is one of those exact
+///    `(namespace, service)` refs, the slice still carries that Service,
+///    and that Service's `workloads[]` list names the workload's SPIFFE —
+///    the same authorization `validate_mesh_config_internal` enforces for a
+///    cross-namespace attachment, so a bare `service_namespace` stamp
+///    cannot spoof membership.
 ///
-/// Fail closed: no bound Service, or bound Services that list no backing
-/// workload, yields an EMPTY inventory rather than falling back to the visible
-/// view. Cold path — one index build per mesh apply, then a hash-free ordered
-/// lookup per workload; the guard itself never runs this.
-fn service_waypoint_backing_workloads(
-    mesh_slice: &MeshSlice,
-) -> Vec<&crate::modes::mesh::config::Workload> {
+/// Never infer a binding from namespace visibility, Service names alone, or
+/// the mere presence of `mesh_slice.services`. Cold path — one index build
+/// per mesh apply, then a hash-free ordered lookup per workload; the guard
+/// itself never runs this.
+fn service_waypoint_backing_workloads<'a>(
+    mesh_slice: &'a MeshSlice,
+    runtime: &MeshRuntimeConfig,
+) -> Vec<&'a crate::modes::mesh::config::Workload> {
+    if !service_waypoint_runtime_identity_matches(mesh_slice, runtime) {
+        return Vec::new();
+    }
+    if mesh_slice.service_waypoint_bound_services.is_empty() {
+        return Vec::new();
+    }
+    let bound: BTreeSet<(&str, &str)> = mesh_slice
+        .service_waypoint_bound_services
+        .iter()
+        .map(|reference| (reference.namespace.as_str(), reference.name.as_str()))
+        .collect();
     let mut backed: BTreeSet<(&str, &str, &str)> = BTreeSet::new();
     for service in &mesh_slice.services {
+        if !bound.contains(&(service.namespace.as_str(), service.name.as_str())) {
+            continue;
+        }
         for reference in &service.workloads {
             backed.insert((
                 service.namespace.as_str(),
@@ -1944,6 +1970,32 @@ fn service_waypoint_backing_workloads(
         }
     }
     backing
+}
+
+/// Whether this runtime is the ServiceWaypoint whose slice carried the
+/// binding evidence. A slice built for a different waypoint name or
+/// namespace must not license this terminator's inbound relay inventory.
+fn service_waypoint_runtime_identity_matches(
+    mesh_slice: &MeshSlice,
+    runtime: &MeshRuntimeConfig,
+) -> bool {
+    let Some(runtime_name) = runtime
+        .waypoint_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return false;
+    };
+    let Some(slice_name) = mesh_slice
+        .waypoint_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return false;
+    };
+    runtime_name == slice_name && runtime.namespace == mesh_slice.namespace
 }
 
 /// Env switch that opts a NodeWaypoint into materializing UDP/DTLS service
@@ -28719,6 +28771,7 @@ mod tests {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
             waypoint_gateway_class: None,
+            service_waypoint_bound_services: Vec::new(),
             istio_root_namespace: "istio-system".to_string(),
             workload_spiffe_id: None,
             waypoint_name: None,
@@ -40584,7 +40637,9 @@ mod tests {
     /// terminates for.
     #[test]
     fn inbound_relay_termination_scope_is_back_projected_per_topology() {
-        use crate::modes::mesh::config::{InboundRelayDenial, MeshInboundRelayHost};
+        use crate::modes::mesh::config::{
+            InboundRelayDenial, MeshInboundRelayHost, MeshWaypointServiceRef,
+        };
 
         const REVIEWS_SPIFFE: &str = "spiffe://cluster.local/ns/default/sa/reviews";
 
@@ -40598,10 +40653,15 @@ mod tests {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
             version: "test".to_string(),
+            waypoint_name: Some("reviews-waypoint".to_string()),
             workloads: vec![peer, unbound],
             // Only `reviews` is bound to the waypoint, so only its Service
             // rides the narrowed slice; `payments` is namespace-visible only.
             services: vec![http_mesh_service("reviews", 80, REVIEWS_SPIFFE)],
+            service_waypoint_bound_services: vec![MeshWaypointServiceRef {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            }],
             node_waypoint_capture_destinations: vec![enrolled],
             ..MeshSlice::default()
         };

@@ -4629,11 +4629,16 @@ pub struct MeshConfig {
     /// * `NodeWaypoint` — the CP-authorized pods enrolled on THIS node, taken
     ///   from [`Self::node_waypoint_capture_destinations`].
     /// * `ServiceWaypoint` — the workloads that actually BACK one of the
-    ///   services bound to THIS waypoint (issue #4251): the workload's attached
-    ///   Service identity is one the slice carries, and that Service's
-    ///   `workloads[]` list authorizes the workload's SPIFFE. A workload merely
-    ///   VISIBLE in the waypoint's namespaces — the slice's namespace-level
-    ///   narrowing — is no longer admitted.
+    ///   services bound to THIS waypoint (issue #4251), and only when this
+    ///   runtime's exact ServiceWaypoint identity has a matching, active
+    ///   binding. Binding evidence is `MeshSlice.service_waypoint_bound_services`
+    ///   (the exact `(namespace, service)` refs from that binding); a
+    ///   destination is admitted only when its attached Service identity is
+    ///   one of those refs, the slice still carries that Service, and that
+    ///   Service's `workloads[]` list authorizes the workload's SPIFFE.
+    ///   Missing/old/empty evidence — including a missing Gateway during
+    ///   rollout and `waypoint_for=none` — yields an EMPTY inventory. The
+    ///   slice's namespace-visible `services` view is NOT a binding.
     ///
     /// `Sidecar` / `Ambient` set
     /// [`Self::inbound_relay_admits_accepted_local_address`], because the pod

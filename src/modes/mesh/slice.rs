@@ -9,11 +9,11 @@ use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::config::{
     DestinationRuleLookupTier, MeshConfig, MeshDestinationRule, MeshPolicy, MeshProxyConfig,
     MeshRequestAuthentication, MeshRuntimeOverlay, MeshService, MeshSidecar, MeshSidecarEgress,
-    MeshTelemetryResource, MeshVirtualServiceCorsPolicy, MtlsMode, MultiClusterConfig,
-    OutboundTrafficPolicy, PeerAuthentication, PolicyScope, ResolvedIngressListener, ServiceEntry,
-    SidecarHostPattern, TrustBundleSet, WaypointAttachment, Workload, WorkloadLabels,
-    destination_rule_exported_to_namespace, destination_rule_lookup_tier, is_false, is_zero_usize,
-    policy_scope_applies_to_workload, policy_scope_applies_with_waypoint,
+    MeshTelemetryResource, MeshVirtualServiceCorsPolicy, MeshWaypointServiceRef, MtlsMode,
+    MultiClusterConfig, OutboundTrafficPolicy, PeerAuthentication, PolicyScope,
+    ResolvedIngressListener, ServiceEntry, SidecarHostPattern, TrustBundleSet, WaypointAttachment,
+    Workload, WorkloadLabels, destination_rule_exported_to_namespace, destination_rule_lookup_tier,
+    is_false, is_zero_usize, policy_scope_applies_to_workload, policy_scope_applies_with_waypoint,
     policy_target_attachment_applies_to_service, proxy_config_applies_to_workload,
     scope_applies_to_workload, service_entry_applies_to_workload,
     virtual_service_cors_policy_exported_to_namespace, workload_selector_matches,
@@ -241,6 +241,28 @@ pub struct MeshSlice {
     /// when the binding has no class yet (Service-only shell).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waypoint_gateway_class: Option<String>,
+    /// Exact `(namespace, service)` refs this ServiceWaypoint is bound to
+    /// (issue #4251). Stamped from the matching active
+    /// [`crate::modes::mesh::config::MeshWaypointBinding`] at slice build.
+    ///
+    /// This is the inbound-HBONE relay's binding evidence: the terminator
+    /// admits a destination only when it backs one of these exact refs.
+    /// Empty (the default) means no matching active binding was present —
+    /// including a missing Gateway during rollout, `waypoint_for=none`, an
+    /// empty binding, or an older slice that never carried this field — and
+    /// the relay inventory is EMPTY. It is deliberately independent of
+    /// [`Self::services`]: `narrow_for_service_waypoint` still fail-opens the
+    /// routing view when the named binding is absent so flipping
+    /// `FERRUM_MESH_TOPOLOGY=service_waypoint` before the Gateway lands is not
+    /// a flag-day outage, but that namespace-visible Service view is NOT a
+    /// binding and must never license plaintext inbound relay.
+    ///
+    /// Compared by [`MeshSlice::content_eq`]: a binding appearing or
+    /// disappearing can leave `services` byte-identical (the fail-open
+    /// routing view already contained those Services) while the relay
+    /// inventory must rebuild.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_waypoint_bound_services: Vec<MeshWaypointServiceRef>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
     /// `labels` is an AMBIGUOUS intersection inferred from a shared-SPIFFE match
@@ -751,6 +773,12 @@ impl MeshSlice {
             && self.workload_spiffe_id == other.workload_spiffe_id
             && self.waypoint_name == other.waypoint_name
             && self.waypoint_gateway_class == other.waypoint_gateway_class
+            // Binding evidence can flip independently of `services`: the
+            // routing view still fail-opens when the named Gateway is absent,
+            // so a binding appearing or `waypoint_for=none` landing can leave
+            // the visible Service list unchanged while the inbound HBONE
+            // relay inventory must go from empty→bound or bound→empty.
+            && self.service_waypoint_bound_services == other.service_waypoint_bound_services
             && self.labels == other.labels
             // The ambiguous-labels marker can flip independently of `labels`
             // (e.g. the shared-SPIFFE candidate set shrinks from two workloads
@@ -1877,6 +1905,14 @@ impl MeshSlice {
                 .find(|binding| binding.name == name && binding.namespace == request_namespace)
                 .and_then(|binding| binding.gateway_class_name.clone())
         });
+        // Inbound-HBONE relay evidence (issue #4251). Empty unless this
+        // exact waypoint identity has a matching, active binding — never
+        // inferred from the (possibly fail-open) `services` view.
+        let service_waypoint_bound_services = service_waypoint_bound_service_refs(
+            &mesh.waypoint_bindings,
+            request.waypoint_name.as_deref(),
+            &request_namespace,
+        );
         Self {
             node_id: request.node_id,
             namespace: request_namespace.clone(),
@@ -1888,6 +1924,7 @@ impl MeshSlice {
             workload_spiffe_id: request.workload_spiffe_id,
             waypoint_name: request.waypoint_name,
             waypoint_gateway_class,
+            service_waypoint_bound_services,
             labels: effective_labels,
             labels_ambiguous,
             virtual_service_l4_proxies,
@@ -1938,17 +1975,50 @@ impl MeshSlice {
 ///
 /// Returns the input vectors unchanged when no binding for `waypoint_name`
 /// exists (the slice falls back to whatever the workload-scope filter
-/// already produced — fail-open is intentional for the rollout window, so
-/// an operator who flips `FERRUM_MESH_TOPOLOGY=service_waypoint` before
-/// the matching `Gateway` resource lands does not see immediate service
-/// loss). When at least one binding matches, services and dependent
+/// already produced — fail-open is intentional for the **routing** rollout
+/// window, so an operator who flips `FERRUM_MESH_TOPOLOGY=service_waypoint`
+/// before the matching `Gateway` resource lands does not see immediate
+/// service loss). When at least one binding matches, services and dependent
 /// resources are filtered to only those in the binding's `services` list.
+///
+/// This fail-open is NOT a binding and must never license the inbound HBONE
+/// relay. That inventory is derived from
+/// [`MeshSlice::service_waypoint_bound_services`], which stays empty unless
+/// this exact waypoint identity has a matching, active binding (issue #4251).
 struct ServiceWaypointNarrowingResources {
     services: Vec<MeshService>,
     service_entries: Vec<ServiceEntry>,
     destination_rules: Vec<MeshDestinationRule>,
     workloads: Vec<Workload>,
     mesh_policies: Vec<MeshPolicy>,
+}
+
+/// Exact `(namespace, service)` refs from the matching active GAMMA
+/// waypoint binding, or empty when there is no such binding.
+///
+/// Empty covers every fail-closed inbound-relay case: the named waypoint
+/// is absent from `waypoint_bindings`, `waypoint_for=none`, the binding
+/// lists no services, or the request carried no `waypoint_name`. This is
+/// the relay's binding evidence; it is independent of the routing-view
+/// fail-open in [`narrow_for_service_waypoint`].
+fn service_waypoint_bound_service_refs(
+    bindings: &[crate::modes::mesh::config::MeshWaypointBinding],
+    waypoint_name: Option<&str>,
+    waypoint_namespace: &str,
+) -> Vec<MeshWaypointServiceRef> {
+    let Some(waypoint_name) = waypoint_name else {
+        return Vec::new();
+    };
+    let Some(binding) = bindings
+        .iter()
+        .find(|binding| binding.name == waypoint_name && binding.namespace == waypoint_namespace)
+    else {
+        return Vec::new();
+    };
+    if binding.waypoint_for.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    binding.services.clone()
 }
 
 fn service_waypoint_resource_namespaces(
@@ -4801,6 +4871,7 @@ mod tests {
             node_id: "n1".into(),
             namespace: "ns".into(),
             waypoint_gateway_class: None,
+            service_waypoint_bound_services: Vec::new(),
             workload_spiffe_id: Some("spiffe://td/ns/x/sa/y".into()),
             labels: BTreeMap::from([("app".into(), "web".into())]),
             labels_ambiguous: false,
@@ -5204,6 +5275,24 @@ mod tests {
         };
         let b = MeshSlice::default();
         assert!(!a.content_eq(&b));
+    }
+
+    #[test]
+    fn content_eq_detects_service_waypoint_bound_services_change() {
+        let a = MeshSlice {
+            service_waypoint_bound_services: vec![MeshWaypointServiceRef {
+                namespace: "default".into(),
+                name: "reviews".into(),
+            }],
+            ..MeshSlice::default()
+        };
+        let b = MeshSlice::default();
+        assert!(
+            !a.content_eq(&b),
+            "a binding appearing must rebuild the slice even when services are unchanged"
+        );
+        assert!(!b.content_eq(&a));
+        assert!(a.content_eq(&a.clone()));
     }
 
     #[test]
