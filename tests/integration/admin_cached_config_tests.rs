@@ -3933,7 +3933,14 @@ async fn restore_rejects_incompatible_stream_mtls_auth_before_delete() {
 #[tokio::test]
 async fn restore_rejects_disabled_plugin_config_with_unknown_name_before_delete() {
     let tc = TestConfig::default();
-    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (mut state, _dir) = create_db_admin_state(&tc).await;
+    state.backend_allow_ips = ferrum_edge::config::BackendEgressPolicy::from_env(
+        ferrum_edge::config::BackendAllowIps::Both,
+        "",
+        "",
+        true,
+    )
+    .expect("default deny policy is valid");
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
 
@@ -4020,9 +4027,21 @@ async fn restore_rejects_disabled_plugin_config_with_unknown_name_before_delete(
         batch_status, 400,
         "batch must screen a disabled graph participant: {batch_body:?}"
     );
+    assert!(
+        batch_body
+            .to_string()
+            .contains("redis_url IP 169.254.169.254 denied"),
+        "expected batch egress denial diagnostic: {batch_body:?}"
+    );
     assert_eq!(
         restore_status, 400,
         "restore must screen a disabled graph participant like batch does: {restore_body:?}"
+    );
+    assert!(
+        restore_body
+            .to_string()
+            .contains("redis_url IP 169.254.169.254 denied"),
+        "expected restore egress denial diagnostic: {restore_body:?}"
     );
 
     let (status, _, _) = admin_get(&base_url, "/proxies/disabled-plugin-keep", &token).await;
