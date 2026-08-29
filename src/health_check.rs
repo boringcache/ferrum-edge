@@ -4348,15 +4348,13 @@ mod tests {
                 .await
                 .expect("fallback resolver connection timed out")
                 .expect("accept fallback resolver connection");
-            let mut request = [0u8; 1024];
-            let request_len = socket
-                .read(&mut request)
+            let mut method_prefix = [0u8; 4];
+            socket
+                .read_exact(&mut method_prefix)
                 .await
-                .expect("read fallback resolver request");
-            assert!(
-                request
-                    .get(..request_len)
-                    .is_some_and(|bytes| bytes.starts_with(b"GET ")),
+                .expect("read fallback resolver request method");
+            assert_eq!(
+                &method_prefix, b"GET ",
                 "fallback resolver listener did not receive an HTTP request"
             );
             socket
