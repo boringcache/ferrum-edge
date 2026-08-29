@@ -20427,10 +20427,11 @@ components:
                     description: |
                       Explicit grant contract. `same_namespace` (the default
                       for every entry) permits only identities in the
-                      assertor's own Kubernetes namespace; `mesh_wide` permits
-                      any identity that clears the trust-domain gate and logs a
-                      warning at construction. Mutually exclusive with
-                      `asserts`.
+                      assertor's own Kubernetes namespace; `mesh_wide` requires
+                      `assertor` to be a full, exactly matched `spiffe://` ID,
+                      permits any identity that clears the trust-domain gate,
+                      and logs a warning at construction. Mutually exclusive
+                      with `asserts`.
                 additionalProperties: false
           default: ["ztunnel", "waypoint"]
           description: |
@@ -21116,6 +21117,10 @@ components:
                   scope:
                     type: string
                     enum: [same_namespace, mesh_wide]
+                    description: |
+                      `mesh_wide` requires `assertor` to be a full, exactly
+                      matched `spiffe://` ID; bare service-account matchers are
+                      rejected.
                 additionalProperties: false
           default: ["ztunnel", "waypoint"]
           description: |

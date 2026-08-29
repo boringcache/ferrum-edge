@@ -2136,10 +2136,11 @@ Every allow-list entry now carries an **assertion grant**:
 | `"spiffe://td/ns/x/sa/y"` | `same_namespace` | Identities in namespace `x` |
 | `{"assertor": "<sa\|spiffe>", "asserts": ["spiffe://…", …]}` | inventory | Exactly the listed identities; `[]` authorizes nothing |
 | `{"assertor": "<sa\|spiffe>", "scope": "same_namespace"}` | `same_namespace` | Same as the string form, stated explicitly |
-| `{"assertor": "<sa\|spiffe>", "scope": "mesh_wide"}` | `mesh_wide` | Any identity that clears the trust-domain gate |
+| `{"assertor": "spiffe://…", "scope": "mesh_wide"}` | `mesh_wide` | Any identity that clears the trust-domain gate |
 
 `mesh_wide` is the only shape that restores the old power, it must be spelled
-out per entry, and it logs a warning at construction. Both identities must
+out per entry on a full, exactly pinned SPIFFE assertor (bare service-account
+matchers are rejected), and it logs a warning at construction. Both identities must
 expose an `/ns/<ns>/` segment for `same_namespace` to hold; a peer with no
 namespace segment may assert only itself.
 

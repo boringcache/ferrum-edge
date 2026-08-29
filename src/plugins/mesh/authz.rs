@@ -1350,8 +1350,8 @@ pub(crate) enum AssertionGrant {
     /// fronts. An EMPTY set therefore authorizes nothing (fail closed).
     FrontedIdentities(Arc<HashSet<String>>),
     /// May assert any identity that clears the trust-domain gate. Reachable
-    /// only through an explicit per-entry `scope: mesh_wide` contract, which
-    /// logs a loud warning at construction.
+    /// only through an explicit per-entry `scope: mesh_wide` contract on an
+    /// exact SPIFFE matcher, which logs a loud warning at construction.
     MeshWide,
 }
 
@@ -3940,9 +3940,10 @@ fn has_baggage_header_from_request(ctx: &RequestContext) -> bool {
 /// - `{"assertor": "<sa|spiffe>", "asserts": ["spiffe://…", …]}` — the
 ///   inventory form; authorizes exactly the listed identities. `[]` authorizes
 ///   nothing.
-/// - `{"assertor": "<sa|spiffe>", "scope": "same_namespace"|"mesh_wide"}` — the
-///   explicit contract form. `mesh_wide` restores pre-#4274 namespace-blind
-///   power for that one entry and is announced with a warning.
+/// - `{"assertor": "<sa|spiffe>", "scope": "same_namespace"}` — the explicit
+///   same-namespace contract form.
+/// - `{"assertor": "spiffe://…", "scope": "mesh_wide"}` — restores pre-#4274
+///   namespace-blind power for one exactly pinned peer and emits a warning.
 ///
 /// Duplicate matcher keys union their grants; the returned index is what the
 /// request hot path consults.
@@ -4032,6 +4033,13 @@ fn parse_trusted_hbone_assertor_entry(item: &Value) -> Result<TrustedAssertor, S
                 (None, Some(Value::String(scope))) => match scope.trim() {
                     "same_namespace" => AssertionGrant::SameNamespace,
                     "mesh_wide" => {
+                        if !matches!(&matcher, AssertorMatcher::Spiffe(_)) {
+                            return Err(format!(
+                                "trusted_hbone_assertors entry '{trimmed}' scope 'mesh_wide' \
+                                 requires an exact 'spiffe://' assertor; bare service-account \
+                                 matchers are namespace-blind"
+                            ));
+                        }
                         tracing::warn!(
                             target: "mesh_authz",
                             assertor = %trimmed,

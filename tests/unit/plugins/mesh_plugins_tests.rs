@@ -2648,6 +2648,21 @@ fn mesh_authz_rejects_assertor_entry_with_both_asserts_and_scope() {
 }
 
 #[test]
+fn mesh_authz_rejects_mesh_wide_scope_for_bare_service_account_matcher() {
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
+        "trusted_hbone_assertors": [{"assertor": "waypoint", "scope": "mesh_wide"}],
+    })) {
+        Ok(_) => panic!("namespace-blind matcher must not receive mesh-wide authority"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("requires an exact 'spiffe://' assertor"),
+        "error should require an exact identity pin: {err}"
+    );
+}
+
+#[test]
 fn mesh_authz_rejects_unknown_assertor_scope() {
     let err = match MeshAuthz::new(&json!({
         "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
@@ -3824,7 +3839,7 @@ async fn workload_metrics_conjunctive_gates_refuse_what_managed_refuses() {
         },
         {
             "trusted_hbone_assertors": [{
-                "assertor": "waypoint",
+                "assertor": "spiffe://cluster.local/ns/prod/sa/waypoint",
                 "scope": "mesh_wide"
             }]
         }
@@ -3934,7 +3949,7 @@ async fn workload_metrics_per_gate_mesh_wide_scope_does_not_widen_sibling() {
         { "trusted_hbone_assertors": ["waypoint"] },
         {
             "trusted_hbone_assertors": [{
-                "assertor": "waypoint",
+                "assertor": "spiffe://cluster.local/ns/attacker/sa/waypoint",
                 "scope": "mesh_wide"
             }]
         }
