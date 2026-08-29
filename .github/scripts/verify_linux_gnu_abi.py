@@ -676,6 +676,17 @@ def check_sysroot_builder(source: str) -> list[str]:
         errors.append("sysroot builder must not pass host CARGO_TARGET_DIR into the container")
     if re.search(r"(?m)^\s+/src/target\s*$", source):
         errors.append("sysroot builder must not chown or otherwise use the whole /src/target tree")
+    for token in (
+        'target_root="$work_root/target"',
+        '[[ -L "$target_root" ]]',
+        'mkdir -p -- "$target_root"',
+        '[[ ! -d "$target_root" || ! -w "$target_root" ]]',
+    ):
+        if token not in source:
+            errors.append(
+                "sysroot builder must create and validate the host-owned "
+                f"canonical target parent ({token})"
+            )
     chown_dedicated = (
         '    chown -R "${HOST_UID}:${HOST_GID}" \\\n'
         f"      {dedicated} \\\n"
@@ -1097,6 +1108,16 @@ def run_self_test() -> list[str]:
     )
     if not check_sysroot_builder(mutated_chown):
         failures.append("whole /src/target chown in sysroot builder was not rejected")
+
+    mutated_target_parent = builder.replace('mkdir -p -- "$target_root"\n', "", 1)
+    if not check_sysroot_builder(mutated_target_parent):
+        failures.append("missing host-owned target parent preparation was not rejected")
+
+    mutated_target_parent_symlink = builder.replace(
+        '[[ -L "$target_root" ]]', '[[ -d "$target_root" ]]', 1
+    )
+    if not check_sysroot_builder(mutated_target_parent_symlink):
+        failures.append("host target parent symlink acceptance was not rejected")
 
     mutated_symlink = builder.replace('[[ -L "$src" ]]', '[[ -d "$src" ]]', 1)
     if not check_sysroot_builder(mutated_symlink):

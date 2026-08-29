@@ -45,6 +45,21 @@ cargo_home="${CARGO_HOME:-$HOME/.cargo}"
 rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
 mkdir -p "$cargo_home" "$rustup_home"
 
+# Create the bind-mounted parent as the host user before the rootful container
+# creates the isolated build subtree. The container repairs ownership only on
+# that dedicated subtree; keeping the parent host-owned lets the controlled
+# post-build copy create the canonical target triple without broad chown.
+target_root="$work_root/target"
+if [[ -L "$target_root" ]]; then
+  echo "::error::host target root $target_root is a symlink" >&2
+  exit 1
+fi
+mkdir -p -- "$target_root"
+if [[ ! -d "$target_root" || ! -w "$target_root" ]]; then
+  echo "::error::host target root $target_root must be a writable directory" >&2
+  exit 1
+fi
+
 host_uid="$(id -u)"
 host_gid="$(id -g)"
 
