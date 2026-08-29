@@ -2813,9 +2813,9 @@ mod virtual_service_cors {
             credentialed.cors.allow_credentials = Some(true);
             let errors = validate(vec![credentialed]);
             assert!(
-                errors.iter().any(|error| error.contains(
-                    "effectively universal prefix/regex matcher"
-                )),
+                errors
+                    .iter()
+                    .any(|error| error.contains("effectively universal prefix/regex matcher")),
                 "credentialed {origin:?} must be refused: {errors:?}"
             );
 

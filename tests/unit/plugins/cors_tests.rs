@@ -2481,8 +2481,8 @@ fn cors_uses_strict_origin_policy_treats_universal_prefix_and_regex_as_non_stric
         json!([{"regex": ".*"}]),
         json!([{"regex": "https://.*"}]),
     ] {
-        let plugin = CorsPlugin::new(&json!({"allowed_origins": origins.clone()}))
-            .unwrap_or_else(|err| {
+        let plugin =
+            CorsPlugin::new(&json!({"allowed_origins": origins.clone()})).unwrap_or_else(|err| {
                 panic!("uncredentialed universal matcher must construct: {origins} ({err})")
             });
         assert!(
