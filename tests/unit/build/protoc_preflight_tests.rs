@@ -12,7 +12,10 @@ mod protoc_preflight {
 
 fn assert_actionable_protoc_diagnostic(message: &str) {
     let lower = message.to_ascii_lowercase();
-    assert!(lower.contains("protoc"), "diagnostic must mention protoc: {message}");
+    assert!(
+        lower.contains("protoc"),
+        "diagnostic must mention protoc: {message}"
+    );
     assert!(
         lower.contains("protobuf-compiler"),
         "diagnostic must mention protobuf-compiler: {message}"
@@ -22,7 +25,7 @@ fn assert_actionable_protoc_diagnostic(message: &str) {
 #[test]
 fn missing_protoc_on_path_returns_actionable_diagnostic() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let err = protoc_preflight::ensure_protoc_from(None, Some(dir.path().into_os_string()))
+    let err = protoc_preflight::ensure_protoc_from(None, Some(OsString::from(dir.path())))
         .expect_err("PATH without protoc must fail");
     assert_actionable_protoc_diagnostic(&err);
     assert!(err.contains("PATH"), "{err}");
@@ -40,11 +43,8 @@ fn empty_protoc_override_is_rejected() {
 fn nonexistent_protoc_override_is_rejected() {
     let dir = tempfile::tempdir().expect("tempdir");
     let missing = dir.path().join("missing-protoc");
-    let err = protoc_preflight::ensure_protoc_from(
-        Some(missing.into_os_string()),
-        None,
-    )
-    .expect_err("missing PROTOC path must fail");
+    let err = protoc_preflight::ensure_protoc_from(Some(missing.into_os_string()), None)
+        .expect_err("missing PROTOC path must fail");
     assert_actionable_protoc_diagnostic(&err);
     assert!(err.contains("PROTOC"), "{err}");
     assert!(err.contains("nonexistent"), "{err}");
@@ -82,7 +82,7 @@ fn executable_protoc_on_path_is_discovered() {
         fs::set_permissions(&path, perms).expect("chmod");
     }
 
-    let resolved = protoc_preflight::ensure_protoc_from(None, Some(dir.path().into_os_string()))
+    let resolved = protoc_preflight::ensure_protoc_from(None, Some(OsString::from(dir.path())))
         .expect("executable protoc on PATH must resolve");
     assert_eq!(resolved, PathBuf::from(path));
 }
@@ -99,7 +99,7 @@ fn command_style_protoc_override_is_discovered_on_path() {
 
     let resolved = protoc_preflight::ensure_protoc_from(
         Some(OsString::from("protoc-27.1")),
-        Some(dir.path().into_os_string()),
+        Some(OsString::from(dir.path())),
     )
     .expect("command-style PROTOC override on PATH must resolve");
     assert_eq!(resolved, path);
