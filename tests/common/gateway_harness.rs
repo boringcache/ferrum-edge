@@ -2155,8 +2155,7 @@ mod ownership_proof_tests {
                     let request = String::from_utf8_lossy(&request).into_owned();
                     let is_proxies = request.lines().next().unwrap_or("").contains(" /proxies");
                     #[cfg(unix)]
-                    if !is_proxies
-                        && let FakeAdminBehavior::KillChildThenHealth { pid } = &behavior
+                    if !is_proxies && let FakeAdminBehavior::KillChildThenHealth { pid } = &behavior
                     {
                         let _ = unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
                     }
@@ -2213,14 +2212,10 @@ mod ownership_proof_tests {
             .spawn()
             .expect("spawn live child");
 
-        let err = wait_for_owned_gateway_identity(
-            &mut child,
-            port,
-            &identity,
-            Duration::from_secs(2),
-        )
-        .await
-        .expect_err("CIDR-granted /health must not satisfy unique JWT /proxies");
+        let err =
+            wait_for_owned_gateway_identity(&mut child, port, &identity, Duration::from_secs(2))
+                .await
+                .expect_err("CIDR-granted /health must not satisfy unique JWT /proxies");
         let err = err.to_string();
         assert!(
             err.contains("GET /proxies") || err.contains("401") || err.contains("JWT"),
@@ -2248,14 +2243,10 @@ mod ownership_proof_tests {
             .expect("spawn exiting child");
         let _ = child.wait().expect("reap exited child");
 
-        let err = wait_for_owned_gateway_identity(
-            &mut child,
-            port,
-            &identity,
-            Duration::from_secs(2),
-        )
-        .await
-        .expect_err("an exited child must not attach to a foreign health responder");
+        let err =
+            wait_for_owned_gateway_identity(&mut child, port, &identity, Duration::from_secs(2))
+                .await
+                .expect_err("an exited child must not attach to a foreign health responder");
         let err = err.to_string();
         assert!(
             err.contains("exited"),
@@ -2280,14 +2271,10 @@ mod ownership_proof_tests {
             spawn_fake_admin(FakeAdminBehavior::KillChildThenHealth { pid }).await;
         let identity = SpawnedGatewayIdentity::mint("health-boundary");
 
-        let err = wait_for_owned_gateway_identity(
-            &mut child,
-            port,
-            &identity,
-            Duration::from_secs(2),
-        )
-        .await
-        .expect_err("child death at health success must fail ownership");
+        let err =
+            wait_for_owned_gateway_identity(&mut child, port, &identity, Duration::from_secs(2))
+                .await
+                .expect_err("child death at health success must fail ownership");
         let err = err.to_string();
         assert!(
             err.contains("exited"),

@@ -234,7 +234,8 @@ impl DbHarness {
 
         let admin_port = ephemeral_port().await;
         let proxy_port = ephemeral_port().await;
-        let identity = crate::common::SpawnedGatewayIdentity::from_admin_jwt(JWT_SECRET, JWT_ISSUER);
+        let identity =
+            crate::common::SpawnedGatewayIdentity::from_admin_jwt(JWT_SECRET, JWT_ISSUER);
 
         let db_url = format!(
             "sqlite:{}?mode=rwc",

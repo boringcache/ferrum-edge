@@ -147,10 +147,7 @@ where
 
         let identity = crate::common::SpawnedGatewayIdentity::mint("scripted-udp");
         let mut env = extra_env.clone();
-        env.push((
-            "FERRUM_ADMIN_JWT_SECRET",
-            identity.jwt_secret.clone(),
-        ));
+        env.push(("FERRUM_ADMIN_JWT_SECRET", identity.jwt_secret.clone()));
         env.push(("FERRUM_ADMIN_JWT_ISSUER", identity.jwt_issuer.clone()));
         env.push((
             "FERRUM_METRICS_BEARER_TOKEN",

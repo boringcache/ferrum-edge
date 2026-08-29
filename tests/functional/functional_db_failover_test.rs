@@ -227,10 +227,8 @@ async fn test_db_failover_urls_startup() {
 
         let jwt_secret = "failover-urls-test-jwt-secret-12345".to_string();
         let jwt_issuer = "ferrum-edge-failover-test".to_string();
-        let identity = crate::common::SpawnedGatewayIdentity::from_admin_jwt(
-            &jwt_secret,
-            &jwt_issuer,
-        );
+        let identity =
+            crate::common::SpawnedGatewayIdentity::from_admin_jwt(&jwt_secret, &jwt_issuer);
 
         let mut child = Command::new(binary_path())
             .env("FERRUM_MODE", "database")
@@ -393,10 +391,8 @@ async fn test_db_config_backup_bootstrap() {
 
         let jwt_secret = "backup-bootstrap-test-jwt-secret-12345".to_string();
         let jwt_issuer = "ferrum-edge-backup-test".to_string();
-        let identity = crate::common::SpawnedGatewayIdentity::from_admin_jwt(
-            &jwt_secret,
-            &jwt_issuer,
-        );
+        let identity =
+            crate::common::SpawnedGatewayIdentity::from_admin_jwt(&jwt_secret, &jwt_issuer);
 
         let mut child = Command::new(binary_path())
             .env("FERRUM_MODE", "database")
@@ -702,10 +698,8 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
 
         let jwt_secret = "recovery-test-jwt-secret-ferrum-edge-12345".to_string();
         let jwt_issuer = "ferrum-edge-recovery-test".to_string();
-        let identity = crate::common::SpawnedGatewayIdentity::from_admin_jwt(
-            &jwt_secret,
-            &jwt_issuer,
-        );
+        let identity =
+            crate::common::SpawnedGatewayIdentity::from_admin_jwt(&jwt_secret, &jwt_issuer);
 
         let mut child = Command::new(binary_path())
             .env("FERRUM_MODE", "database")
@@ -889,10 +883,8 @@ async fn test_db_read_replica_startup() {
 
         let jwt_secret = "replica-startup-test-jwt-secret-12345".to_string();
         let jwt_issuer = "ferrum-edge-replica-test".to_string();
-        let identity = crate::common::SpawnedGatewayIdentity::from_admin_jwt(
-            &jwt_secret,
-            &jwt_issuer,
-        );
+        let identity =
+            crate::common::SpawnedGatewayIdentity::from_admin_jwt(&jwt_secret, &jwt_issuer);
 
         let mut child = Command::new(binary_path())
             .env("FERRUM_MODE", "database")
@@ -1043,10 +1035,8 @@ async fn test_db_authoritative_startup_uses_primary_when_replica_is_stale() {
 
         let jwt_secret = "authoritative-primary-test-jwt-secret-12345".to_string();
         let jwt_issuer = "ferrum-edge-authoritative-primary-test".to_string();
-        let identity = crate::common::SpawnedGatewayIdentity::from_admin_jwt(
-            &jwt_secret,
-            &jwt_issuer,
-        );
+        let identity =
+            crate::common::SpawnedGatewayIdentity::from_admin_jwt(&jwt_secret, &jwt_issuer);
 
         let mut child = Command::new(binary_path())
             .env("FERRUM_MODE", "database")

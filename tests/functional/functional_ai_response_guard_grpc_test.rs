@@ -260,21 +260,19 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
         let admin_port = free_port().await;
         let identity = crate::common::SpawnedGatewayIdentity::mint("ai-response-guard-grpc");
         let mut child = match start_gateway(config_path, gateway_port, admin_port, &identity) {
-                Ok(child) => child,
-                Err(e) => {
-                    eprintln!(
-                        "Gateway spawn attempt {}/{} failed: {}",
-                        attempt, MAX_ATTEMPTS, e
-                    );
-                    if attempt < MAX_ATTEMPTS {
-                        sleep(Duration::from_secs(1)).await;
-                    }
-                    continue;
+            Ok(child) => child,
+            Err(e) => {
+                eprintln!(
+                    "Gateway spawn attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, e
+                );
+                if attempt < MAX_ATTEMPTS {
+                    sleep(Duration::from_secs(1)).await;
                 }
-            };
-        match wait_for_owned_gateway(&mut child, admin_port, gateway_port, &identity)
-            .await
-        {
+                continue;
+            }
+        };
+        match wait_for_owned_gateway(&mut child, admin_port, gateway_port, &identity).await {
             Ok(()) => return (child, gateway_port, admin_port),
             Err(e) => {
                 eprintln!(

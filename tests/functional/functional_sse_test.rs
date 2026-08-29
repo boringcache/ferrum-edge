@@ -165,9 +165,8 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
         drop(admin_listener);
 
         let identity = crate::common::SpawnedGatewayIdentity::mint("sse");
-        let mut child =
-            start_gateway_file_mode(config_path, proxy_port, admin_port, &identity)
-                .expect("Failed to start gateway");
+        let mut child = start_gateway_file_mode(config_path, proxy_port, admin_port, &identity)
+            .expect("Failed to start gateway");
 
         if wait_for_owned_gateway(&mut child, admin_port, &identity).await {
             return (child, proxy_port, admin_port);

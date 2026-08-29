@@ -149,13 +149,8 @@ async fn start_gateway_with_retry(
         let admin_port = ephemeral_port().await;
 
         let identity = crate::common::SpawnedGatewayIdentity::mint("router-cache");
-        let mut child = start_gateway_with_cache_cap(
-            config_path,
-            proxy_port,
-            admin_port,
-            cache_cap,
-            &identity,
-        );
+        let mut child =
+            start_gateway_with_cache_cap(config_path, proxy_port, admin_port, cache_cap, &identity);
 
         if wait_for_owned_gateway(&mut child, admin_port, &identity).await {
             return (child, proxy_port, admin_port);
