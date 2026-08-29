@@ -2737,7 +2737,9 @@ async fn gateway_status_apply_writes_advanced_observed_generation_with_resource_
     assert_eq!(state.patch_bodies.len(), 1);
     let patch = &state.patch_bodies[0];
     assert_eq!(patch["metadata"]["resourceVersion"].as_str(), Some("41"));
-    let conditions = patch["status"]["conditions"].as_array().expect("conditions");
+    let conditions = patch["status"]["conditions"]
+        .as_array()
+        .expect("conditions");
     assert!(
         conditions
             .iter()

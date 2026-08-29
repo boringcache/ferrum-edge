@@ -252,9 +252,11 @@ async fn patch_gateway_status_with_apply(
         // field) so a snapshot planned before `metadata.generation` advanced
         // cannot pin `observedGeneration` to the older spec.
         let params = gateway_api_status_apply_params();
-        match parent_status_io_timeout(
-            api.patch_status(&update.name, &params, &Patch::Apply(&patch)),
-        )
+        match parent_status_io_timeout(api.patch_status(
+            &update.name,
+            &params,
+            &Patch::Apply(&patch),
+        ))
         .await
         {
             ParentStatusIo::Succeeded(_) => return Ok(()),
@@ -426,16 +428,12 @@ fn planned_owned_observed_generation(update: &GatewayApiStatusUpdate) -> Option<
         return None;
     }
     let conditions = existing_conditions(&update.status)?;
-    let mut observed = None;
+    let mut observed: Option<i64> = None;
     for condition_type_name in owned_types {
         let Some(generation) = conditions
             .iter()
             .find(|condition| condition_type(condition) == Some(*condition_type_name))
-            .and_then(|condition| {
-                condition
-                    .get("observedGeneration")
-                    .and_then(Value::as_i64)
-            })
+            .and_then(|condition| condition.get("observedGeneration").and_then(Value::as_i64))
         else {
             continue;
         };

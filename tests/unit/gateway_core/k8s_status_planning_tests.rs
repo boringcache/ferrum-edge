@@ -252,7 +252,9 @@ fn gateway_parent_status_publication_is_generation_fenced_and_parent_io_bounded(
     let patch_updates = STATUS_SRC
         .split("pub async fn patch_updates(")
         .nth(1)
-        .and_then(|rest| rest.split("async fn patch_gateway_status_with_apply(").next())
+        .and_then(|rest| {
+            rest.split("async fn patch_gateway_status_with_apply(").next()
+        })
         .expect("GatewayApiStatusWriter::patch_updates body");
     assert!(
         !patch_updates.contains("tokio::time::timeout"),
