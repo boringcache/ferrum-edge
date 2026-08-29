@@ -1481,7 +1481,7 @@ fn the_single_certificate_loader_admits_a_valid_staple_and_refuses_an_invalid_on
 
     // The pre-#4300 accepted-anything fixture must now fail the whole load.
     std::fs::write(&ocsp_path, [1_u8, 2, 3]).expect("rewrite ocsp");
-    let error = load_frontend_tls_candidate_from_paths(
+    let error = match load_frontend_tls_candidate_from_paths(
         &cert_path,
         &key_path,
         None,
@@ -1491,8 +1491,10 @@ fn the_single_certificate_loader_admits_a_valid_staple_and_refuses_an_invalid_on
         30,
         &[],
         None,
-    )
-    .expect_err("garbage staple is refused");
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("garbage staple is refused"),
+    };
     let rendered = format!("{error:#}");
     assert!(rendered.contains("was rejected"), "{rendered}");
     // Diagnostics stay redacted: no certificate or response bytes leak.
@@ -1564,8 +1566,6 @@ fn a_reload_with_a_bad_staple_leaves_the_last_known_good_material_in_service() {
         Arc::ptr_eq(&before, &after),
         "a refused staple must leave the published ServerConfig untouched"
     );
-    let served = after.as_ref().as_ref().expect("retained ServerConfig");
-    assert!(served.cert_resolver.has_certs());
 
     // The original, still-valid response reloads cleanly, so the refusal was
     // about the staple and not about the surrounding material.

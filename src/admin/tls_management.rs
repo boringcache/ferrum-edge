@@ -2703,13 +2703,18 @@ mod tests {
     /// Encode one DER TLV, short or long form.
     fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
         let mut out = vec![tag];
-        if content.len() < 0x80 {
-            out.push(content.len() as u8);
+        let len = content.len();
+        if len < 0x80 {
+            out.push(len as u8);
         } else {
-            let be = content.len().to_be_bytes();
-            let first = be.iter().position(|byte| *byte != 0).unwrap_or(be.len() - 1);
-            out.push(0x80 | (be.len() - first) as u8);
-            out.extend_from_slice(&be[first..]);
+            let bytes = len.to_be_bytes();
+            let first = bytes
+                .iter()
+                .position(|byte| *byte != 0)
+                .unwrap_or(bytes.len() - 1);
+            let significant = &bytes[first..];
+            out.push(0x80 | significant.len() as u8);
+            out.extend_from_slice(significant);
         }
         out.extend_from_slice(content);
         out
