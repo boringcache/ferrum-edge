@@ -2419,7 +2419,8 @@ impl DnsCache {
     /// Apply the shared wall-clock bound to one background lookup.
     ///
     /// Timeout is a failed refresh: callers must not rewrite the last known
-    /// good success row. Dropping the caller’s [`RefreshInFlight`] after this
+    /// good success row and must emit the single operational warning from the
+    /// returned error. Dropping the caller’s [`RefreshInFlight`] after this
     /// returns releases the shared permit even when the resolver hung.
     async fn refresh_resolve_with_timeout(
         &self,
@@ -2432,18 +2433,11 @@ impl DnsCache {
         .await
         {
             Ok(result) => result,
-            Err(_) => {
-                warn!(
-                    "DNS background refresh timed out for {} after {:?}",
-                    hostname,
-                    Self::BACKGROUND_REFRESH_RESOLVE_TIMEOUT
-                );
-                anyhow::bail!(
-                    "DNS background refresh timed out for {} after {:?}",
-                    hostname,
-                    Self::BACKGROUND_REFRESH_RESOLVE_TIMEOUT
-                )
-            }
+            Err(_) => anyhow::bail!(
+                "DNS background refresh timed out for {} after {:?}",
+                hostname,
+                Self::BACKGROUND_REFRESH_RESOLVE_TIMEOUT
+            ),
         }
     }
 
