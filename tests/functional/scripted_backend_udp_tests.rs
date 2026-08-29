@@ -145,9 +145,17 @@ where
             None
         };
 
-        let observability_token = crate::common::mint_observability_token("scripted-udp");
+        let identity = crate::common::SpawnedGatewayIdentity::mint("scripted-udp");
         let mut env = extra_env.clone();
-        env.push(("FERRUM_METRICS_BEARER_TOKEN", observability_token.clone()));
+        env.push((
+            "FERRUM_ADMIN_JWT_SECRET",
+            identity.jwt_secret.clone(),
+        ));
+        env.push(("FERRUM_ADMIN_JWT_ISSUER", identity.jwt_issuer.clone()));
+        env.push((
+            "FERRUM_METRICS_BEARER_TOKEN",
+            identity.observability_token.clone(),
+        ));
 
         let mut child = match spawn_gateway(
             config_path.to_str().unwrap(),
@@ -165,7 +173,7 @@ where
         if crate::common::wait_for_owned_gateway_identity(
             &mut child,
             admin_port,
-            &observability_token,
+            &identity,
             Duration::from_secs(20),
         )
         .await

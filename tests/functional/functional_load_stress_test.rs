@@ -526,8 +526,10 @@ impl LoadTestHarness {
             .next()
             .ok_or("admin_base_url missing port")?
             .parse()?;
-        let token = self.generate_admin_token()?;
-        let auth = format!("Bearer {token}");
+        let identity = crate::common::SpawnedGatewayIdentity::from_admin_jwt(
+            self.jwt_secret.clone(),
+            self.jwt_issuer.clone(),
+        );
         let child = self
             .gateway_process
             .as_mut()
@@ -535,14 +537,11 @@ impl LoadTestHarness {
         crate::common::wait_for_owned_gateway_identity(
             child,
             admin_port,
-            &token,
+            &identity,
             Duration::from_secs(30),
         )
         .await
         .map_err(|e| e.to_string())?;
-        crate::common::wait_for_admin_jwt(admin_port, &auth, Duration::from_secs(30))
-            .await
-            .map_err(|e| e.to_string())?;
         Ok(())
     }
 

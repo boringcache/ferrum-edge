@@ -203,7 +203,7 @@ fn start_gateway_in_file_mode(
     config_path: &str,
     http_port: u16,
     admin_port: u16,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     // Build (or verify the prebuilt artifact) via the shared helper so this
     // file shares the `OnceLock` memoization and `FERRUM_SKIP_GATEWAY_BUILD=1`
@@ -218,33 +218,32 @@ fn start_gateway_in_file_mode(
         return Err("ferrum-edge binary not found in ./target/debug/ or ./target/release/".into());
     };
 
-    let child = std::process::Command::new(binary_path)
-        .env("FERRUM_MODE", "file")
+    let mut cmd = std::process::Command::new(binary_path);
+    cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-        .env("FERRUM_METRICS_BEARER_TOKEN", observability_token)
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-
-    Ok(child)
+        .stderr(std::process::Stdio::null());
+    identity.apply_to_command(&mut cmd);
+    Ok(cmd.spawn()?)
 }
 
 /// Poll until this child owns admin `/health` and the proxy listener accepts.
-/// Unauthenticated `/health` is not identity (issue #4253).
+/// Unauthenticated `/health` and CIDR-granted health detail are not identity
+/// (issue #4253).
 async fn wait_for_owned_gateway(
     child: &mut std::process::Child,
     admin_port: u16,
     proxy_port: u16,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> bool {
     if crate::common::wait_for_owned_gateway_identity(
         child,
         admin_port,
-        observability_token,
+        identity,
         Duration::from_secs(15),
     )
     .await
@@ -279,13 +278,10 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
 
-        let observability_token = crate::common::mint_observability_token("load-balancer");
-        match start_gateway_in_file_mode(config_path, proxy_port, admin_port, &observability_token)
-        {
+        let identity = crate::common::SpawnedGatewayIdentity::mint("load-balancer");
+        match start_gateway_in_file_mode(config_path, proxy_port, admin_port, &identity) {
             Ok(mut child) => {
-                if wait_for_owned_gateway(&mut child, admin_port, proxy_port, &observability_token)
-                    .await
-                {
+                if wait_for_owned_gateway(&mut child, admin_port, proxy_port, &identity).await {
                     return (child, proxy_port, admin_port);
                 }
                 eprintln!(

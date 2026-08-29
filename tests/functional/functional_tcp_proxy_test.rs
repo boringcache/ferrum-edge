@@ -207,6 +207,7 @@ fn start_gateway_with_extra_env(
     tls_cert_path: Option<&str>,
     tls_key_path: Option<&str>,
     extra_env: &[(&str, &str)],
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let mut cmd = std::process::Command::new(gateway_binary_path());
     cmd.env("FERRUM_MODE", "file")
@@ -229,22 +230,23 @@ fn start_gateway_with_extra_env(
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
+    identity.apply_to_command(&mut cmd);
 
     Ok(cmd.spawn()?)
 }
 
-/// Wait until `child` owns `admin_port`. Unauthenticated `/health` is not
-/// identity: a parallel test can steal the bind-drop port and answer 200
-/// after this child has already exited.
+/// Wait until `child` owns `admin_port`. Unauthenticated `/health` and
+/// CIDR-granted health detail are not identity: a parallel test can steal
+/// the bind-drop port and answer 200 after this child has already exited.
 async fn wait_for_owned_gateway(
     child: &mut std::process::Child,
     admin_port: u16,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> bool {
     crate::common::wait_for_owned_gateway_identity(
         child,
         admin_port,
-        observability_token,
+        identity,
         Duration::from_secs(30),
     )
     .await
@@ -332,9 +334,7 @@ where
         let config_content = make_config(proxy_listen_port);
         std::fs::write(&config_path, &config_content).unwrap();
 
-        let observability_token = crate::common::mint_observability_token("tcp-proxy");
-        let mut owned_env: Vec<(&str, &str)> = extra_env.to_vec();
-        owned_env.push(("FERRUM_METRICS_BEARER_TOKEN", observability_token.as_str()));
+        let identity = crate::common::SpawnedGatewayIdentity::mint("tcp-proxy");
 
         let mut child = match start_gateway_with_extra_env(
             config_path.to_str().unwrap(),
@@ -342,7 +342,8 @@ where
             admin_port,
             tls_cert_path,
             tls_key_path,
-            &owned_env,
+            extra_env,
+            &identity,
         ) {
             Ok(c) => c,
             Err(e) => {
@@ -357,7 +358,7 @@ where
             }
         };
 
-        if wait_for_owned_gateway(&mut child, admin_port, &observability_token).await {
+        if wait_for_owned_gateway(&mut child, admin_port, &identity).await {
             return (child, proxy_listen_port, admin_port, dir);
         }
 

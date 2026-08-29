@@ -454,8 +454,10 @@ impl MongoTestHarness {
     }
 
     async fn wait_for_health(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let token = self.generate_token()?;
-        let auth = format!("Bearer {token}");
+        let identity = crate::common::SpawnedGatewayIdentity::from_admin_jwt(
+            self.jwt_secret.clone(),
+            self.jwt_issuer.clone(),
+        );
         let child = self
             .gateway_process
             .as_mut()
@@ -463,14 +465,11 @@ impl MongoTestHarness {
         crate::common::wait_for_owned_gateway_identity(
             child,
             self.admin_port,
-            &token,
+            &identity,
             Duration::from_secs(30),
         )
         .await
         .map_err(|e| e.to_string())?;
-        crate::common::wait_for_admin_jwt(self.admin_port, &auth, Duration::from_secs(30))
-            .await
-            .map_err(|e| e.to_string())?;
         println!("  Gateway (mongodb) is ready!");
         Ok(())
     }

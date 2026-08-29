@@ -43,17 +43,17 @@ async fn ephemeral_port() -> u16 {
     port
 }
 
-/// Wait until `child` owns `admin_port`. Unauthenticated `/health` is not
-/// identity (issue #4253).
+/// Wait until `child` owns `admin_port`. Unauthenticated `/health` and
+/// CIDR-granted health detail are not identity (issue #4253).
 async fn wait_for_owned_health(
     child: &mut std::process::Child,
     admin_port: u16,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> bool {
     crate::common::wait_for_owned_gateway_identity(
         child,
         admin_port,
-        observability_token,
+        identity,
         Duration::from_secs(15),
     )
     .await
@@ -1998,11 +1998,11 @@ plugin_configs: []
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let observability_token = crate::common::mint_observability_token("cli-smart-path");
-        cmd.env("FERRUM_METRICS_BEARER_TOKEN", &observability_token);
+        let identity = crate::common::SpawnedGatewayIdentity::mint("cli-smart-path");
+        identity.apply_to_command(&mut cmd);
         let mut child = cmd.spawn().expect("Failed to spawn ferrum-edge");
 
-        let health_ok = wait_for_owned_health(&mut child, admin_port, &observability_token).await;
+        let health_ok = wait_for_owned_health(&mut child, admin_port, &identity).await;
         let mut route_ok = false;
         if health_ok {
             let client = reqwest::Client::builder()
@@ -2111,11 +2111,11 @@ plugin_configs: []
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let observability_token = crate::common::mint_observability_token("cli-spec-infer");
-        cmd.env("FERRUM_METRICS_BEARER_TOKEN", &observability_token);
+        let identity = crate::common::SpawnedGatewayIdentity::mint("cli-spec-infer");
+        identity.apply_to_command(&mut cmd);
         let mut child = cmd.spawn().expect("Failed to spawn ferrum-edge");
 
-        if wait_for_owned_health(&mut child, admin_port, &observability_token).await {
+        if wait_for_owned_health(&mut child, admin_port, &identity).await {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(3))
                 .build()
@@ -2219,11 +2219,11 @@ plugin_configs: []
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let observability_token = crate::common::mint_observability_token("cli-flag-wins");
-        cmd.env("FERRUM_METRICS_BEARER_TOKEN", &observability_token);
+        let identity = crate::common::SpawnedGatewayIdentity::mint("cli-flag-wins");
+        identity.apply_to_command(&mut cmd);
         let mut child = cmd.spawn().expect("Failed to spawn ferrum-edge");
 
-        if wait_for_owned_health(&mut child, admin_port, &observability_token).await {
+        if wait_for_owned_health(&mut child, admin_port, &identity).await {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(3))
                 .build()
@@ -2317,11 +2317,11 @@ async fn functional_cli_precedence_env_beats_conf_file() {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let observability_token = crate::common::mint_observability_token("cli-env-wins");
-        cmd.env("FERRUM_METRICS_BEARER_TOKEN", &observability_token);
+        let identity = crate::common::SpawnedGatewayIdentity::mint("cli-env-wins");
+        identity.apply_to_command(&mut cmd);
         let mut child = cmd.spawn().expect("Failed to spawn ferrum-edge");
 
-        if wait_for_owned_health(&mut child, env_admin_port, &observability_token).await {
+        if wait_for_owned_health(&mut child, env_admin_port, &identity).await {
             // The gateway started and its admin health is reachable on the
             // env-var port. Because the conf-file decoy ports are held by
             // our listeners, the gateway would have fatally failed to start

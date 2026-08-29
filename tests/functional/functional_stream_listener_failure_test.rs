@@ -155,34 +155,22 @@ async fn start_tcp_echo_server_on(listener: TcpListener) -> tokio::task::JoinHan
 
 /// Prove the process that answered on `admin_port` is `child`.
 ///
-/// Unauthenticated `/health` is only liveness: a parallel test can steal the
-/// bind-drop port, our child exits on `EADDRINUSE` (silently, with
-/// `Stdio::null()`), and `/health` still returns 200 from the thief. Polling
-/// `Child::try_wait` fails that attempt immediately so the outer retry can
-/// pick a fresh port. The authenticated `/health` detail tier (this child's
-/// `FERRUM_METRICS_BEARER_TOKEN`) rejects a live foreign gateway. When
-/// `admin_auth` is set, `GET /proxies` must also accept our JWT so a thief
-/// with a different `FERRUM_ADMIN_JWT_SECRET` cannot attach as a 401
-/// `InvalidSignature` on the first assertion (issue #4253).
+/// Unauthenticated `/health` is only liveness. Authenticated `/health` detail
+/// is still not ownership: `FERRUM_METRICS_ALLOWED_CIDRS` can grant the same
+/// body. JWT `GET /proxies` is the unique per-attempt proof (issue #4253).
 async fn prove_child_owns_admin(
     child: &mut Child,
     admin_port: u16,
-    observability_token: &str,
-    admin_auth: Option<&str>,
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::common::wait_for_owned_gateway_identity(
         child,
         admin_port,
-        observability_token,
+        identity,
         Duration::from_secs(30),
     )
     .await
     .map_err(|e| e.to_string())?;
-    if let Some(auth) = admin_auth {
-        crate::common::wait_for_admin_jwt(admin_port, auth, Duration::from_secs(30))
-            .await
-            .map_err(|e| e.to_string())?;
-    }
     Ok(())
 }
 
@@ -246,18 +234,15 @@ impl DbHarness {
 
         let admin_port = ephemeral_port().await;
         let proxy_port = ephemeral_port().await;
-        let observability_token = crate::common::mint_observability_token("stream-listener-db");
+        let identity = crate::common::SpawnedGatewayIdentity::from_admin_jwt(JWT_SECRET, JWT_ISSUER);
 
         let db_url = format!(
             "sqlite:{}?mode=rwc",
             temp_dir.path().join("test.db").to_string_lossy()
         );
 
-        let mut child = Command::new(gateway_binary_path())
-            .env("FERRUM_MODE", "database")
-            .env("FERRUM_ADMIN_JWT_SECRET", JWT_SECRET)
-            .env("FERRUM_ADMIN_JWT_ISSUER", JWT_ISSUER)
-            .env("FERRUM_METRICS_BEARER_TOKEN", &observability_token)
+        let mut cmd = Command::new(gateway_binary_path());
+        cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", &db_url)
             .env("FERRUM_DB_POLL_INTERVAL", "2")
@@ -266,13 +251,11 @@ impl DbHarness {
             .env("FERRUM_LOG_LEVEL", "warn")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        identity.apply_to_command(&mut cmd);
+        let mut child = cmd.spawn()?;
 
-        let auth = auth_header();
-        if let Err(e) =
-            prove_child_owns_admin(&mut child, admin_port, &observability_token, Some(&auth)).await
-        {
+        if let Err(e) = prove_child_owns_admin(&mut child, admin_port, &identity).await {
             kill_child(&mut child);
             return Err(e);
         }
@@ -493,12 +476,10 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
     for attempt in 1..=SEED_ATTEMPTS {
         admin_port_seed = ephemeral_port().await;
         let proxy_port_seed = ephemeral_port().await;
-        let observability_token = crate::common::mint_observability_token("stream-listener-seed");
-        let mut child = Command::new(gateway_binary_path())
-            .env("FERRUM_MODE", "database")
-            .env("FERRUM_ADMIN_JWT_SECRET", JWT_SECRET)
-            .env("FERRUM_ADMIN_JWT_ISSUER", JWT_ISSUER)
-            .env("FERRUM_METRICS_BEARER_TOKEN", &observability_token)
+        let identity =
+            crate::common::SpawnedGatewayIdentity::from_admin_jwt(JWT_SECRET, JWT_ISSUER);
+        let mut cmd = Command::new(gateway_binary_path());
+        cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", &db_url)
             .env("FERRUM_DB_POLL_INTERVAL", "2")
@@ -507,18 +488,12 @@ async fn functional_stream_listener_startup_bind_failure_fatal() {
             .env("FERRUM_LOG_LEVEL", "error")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn seed gateway");
-        let auth = auth_header();
-        if prove_child_owns_admin(
-            &mut child,
-            admin_port_seed,
-            &observability_token,
-            Some(&auth),
-        )
-        .await
-        .is_ok()
+            .stderr(Stdio::null());
+        identity.apply_to_command(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn seed gateway");
+        if prove_child_owns_admin(&mut child, admin_port_seed, &identity)
+            .await
+            .is_ok()
         {
             seed_gw = Some(child);
             break;
@@ -700,21 +675,20 @@ plugin_configs: []
         f.write_all(initial.as_bytes()).unwrap();
         drop(f);
 
-        let observability_token = crate::common::mint_observability_token("stream-listener-file");
-        let mut child = Command::new(gateway_binary_path())
-            .env("FERRUM_MODE", "file")
+        let identity = crate::common::SpawnedGatewayIdentity::mint("stream-listener-file");
+        let mut cmd = Command::new(gateway_binary_path());
+        cmd.env("FERRUM_MODE", "file")
             .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
             .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-            .env("FERRUM_METRICS_BEARER_TOKEN", &observability_token)
             .env("FERRUM_LOG_LEVEL", "warn")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn gateway");
+            .stderr(Stdio::null());
+        identity.apply_to_command(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn gateway");
 
-        if prove_child_owns_admin(&mut child, admin_port, &observability_token, None)
+        if prove_child_owns_admin(&mut child, admin_port, &identity)
             .await
             .is_ok()
         {

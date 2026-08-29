@@ -43,17 +43,23 @@
 //! proves only that *some* listener answers, and an unauthenticated `/health`
 //! is served identically by every gateway on the box.
 //!
-//! Every spawn attempt therefore mints an `InstanceIdentity` — a fresh admin JWT
-//! secret/issuer plus a fresh `FERRUM_METRICS_BEARER_TOKEN` — and startup only
-//! succeeds once the admin port answers `/health` in the **authenticated detail
-//! tier** for that per-attempt token *and* reports `ready: true`. Those two
-//! facts together are the ownership proof:
+//! Every spawn attempt therefore mints a [`SpawnedGatewayIdentity`] — a fresh
+//! admin JWT secret/issuer plus a fresh `FERRUM_METRICS_BEARER_TOKEN` — and
+//! startup only succeeds once **this child** is still alive and:
 //!
-//! - The detail tier is gated by `observability_detail_allowed` in
-//!   `src/admin/mod.rs`, so a foreign gateway (which has a different token)
-//!   answers with the minimal `status`+`ready` body and is rejected.
+//! 1. the admin port answers `/health` as `ready: true` (readiness), and
+//! 2. `GET /proxies` accepts a JWT minted from this attempt's secret/issuer
+//!    (ownership).
+//!
+//! Authenticated `/health` detail is **not** ownership by itself.
+//! `observability_detail_allowed` in `src/admin/mod.rs` also grants the full
+//! body to `FERRUM_METRICS_ALLOWED_CIDRS` (parallel functional tests do this for
+//! `127.0.0.1/32,::1`). A foreign gateway that won the admin port can therefore
+//! look ready even when the metrics bearer is wrong. `GET /proxies` is
+//! JWT-only and cannot be satisfied by that CIDR grant.
+//!
 //! - `ready` flips only after `wait_for_start_signals` observed *every*
-//!   listener bind — including the proxy HTTP listener — so an identified,
+//!   listener bind — including the proxy HTTP listener — so a live, JWT-owned,
 //!   ready child is proof that the child, not a squatter, owns the proxy port.
 //!   The child holds that socket for its whole lifetime, so the proof stays
 //!   valid while it runs.
@@ -65,9 +71,11 @@
 //!   colliding bind is a single-socket `EADDRINUSE` and the spawn retry picks
 //!   a fresh port.
 //!
-//! The spawn wait also polls `Child::try_wait`, so a child that dies after a
-//! partial bind fails fast instead of letting the retry loop burn the full
-//! health timeout against whatever else answers on the released port.
+//! Both waits poll `Child::try_wait` before probes, after a successful health
+//! response, while waiting on the JWT endpoint, and immediately before
+//! returning success. A child that dies after a partial bind — or after a
+//! foreign full-detail `/health` — fails fast instead of attaching to whatever
+//! else answers on the released port.
 //!
 //! Callers that pin `FERRUM_ADMIN_JWT_SECRET` / `FERRUM_METRICS_BEARER_TOKEN`
 //! (or open `FERRUM_METRICS_ALLOWED_CIDRS`) keep their explicit value; identity
@@ -148,9 +156,10 @@ pub struct TestGateway {
     pub admin_base_url: String,
     pub jwt_secret: String,
     pub jwt_issuer: String,
-    /// Per-spawn `FERRUM_METRICS_BEARER_TOKEN`. Used as the ownership proof for
-    /// this exact child process (see the module docs). Treat it as a secret:
-    /// never interpolate it into an assertion message or a log line.
+    /// Per-spawn `FERRUM_METRICS_BEARER_TOKEN`. Used for authenticated
+    /// `/health` readiness probes, not as the sole ownership proof (see the
+    /// module docs). Treat it as a secret: never interpolate it into an
+    /// assertion message or a log line.
     pub observability_token: String,
     pub basic_auth_hmac_secret: String,
     /// `FERRUM_DB_URL` the gateway was launched with (for DB-mode harnesses).
@@ -211,10 +220,9 @@ impl TestGateway {
     ///
     /// This is the identity-anchored probe described in the module docs: it
     /// requires the authenticated detail tier for this instance's
-    /// [`observability_token`](Self::observability_token) *and* `ready: true`,
-    /// so a parallel gateway that grabbed the released admin port cannot
-    /// satisfy it. `/health` already answered `503` until `ready`, so requiring
-    /// the flag is not a loosening or a tightening of the old 2xx contract.
+    /// [`observability_token`](Self::observability_token) *and* `ready: true`.
+    /// Spawn-time ownership still requires JWT `GET /proxies` on the same
+    /// `Child`; `/health` detail can be granted by allowed source CIDRs.
     pub async fn wait_for_health(
         &self,
         timeout: Duration,
@@ -250,14 +258,14 @@ impl TestGateway {
         }
     }
 
-    /// Poll an authenticated admin endpoint until the configured JWT is
-    /// accepted. This keeps parallel functional tests from mistaking another
-    /// gateway's unauthenticated `/health` response for this child process.
+    /// Poll `GET /proxies` until the configured JWT is accepted. Prefer
+    /// [`wait_for_owned_gateway_identity`] at spawn time so the JWT wait is
+    /// coupled to the same `Child` as readiness.
     pub async fn wait_for_admin_auth(
         &self,
         timeout: Duration,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        wait_for_admin_auth_inner(self.admin_port, &self.auth_header(), timeout).await
+        wait_for_admin_auth_inner(self.admin_port, &self.auth_header(), timeout, None).await
     }
 
     /// Poll the proxy port with a raw TCP connect until it accepts or the
@@ -488,8 +496,8 @@ pub struct TestGatewayBuilder {
     jwt_secret: Option<String>,
     /// `None` ⇒ mint a per-spawn-attempt issuer, for the same reason.
     jwt_issuer: Option<String>,
-    /// `None` ⇒ mint a per-spawn-attempt `FERRUM_METRICS_BEARER_TOKEN`, used as
-    /// the process-ownership proof on `/health`.
+    /// `None` ⇒ mint a per-spawn-attempt `FERRUM_METRICS_BEARER_TOKEN` for
+    /// authenticated `/health` readiness. Ownership still requires the JWT.
     observability_token: Option<String>,
     basic_auth_hmac_secret: String,
     log_level: String,
@@ -519,8 +527,8 @@ impl Default for TestGatewayBuilder {
     fn default() -> Self {
         Self {
             mode: GatewayMode::Database(DbType::Sqlite),
-            // Minted per spawn attempt by `InstanceIdentity::mint`. Secrets are
-            // ≥32 chars per the admin-JWT rule.
+            // Minted per spawn attempt by `SpawnedGatewayIdentity::mint_for_builder`.
+            // Secrets are ≥32 chars per the admin-JWT rule.
             jwt_secret: None,
             jwt_issuer: None,
             observability_token: None,
@@ -592,9 +600,9 @@ impl TestGatewayBuilder {
     /// Override the admin JWT HS256 secret. Must be ≥32 characters for
     /// database/CP modes (CLAUDE.md §Admin JWT secret handling).
     ///
-    /// Pinning a shared literal here weakens the JWT half of the spawn-time
-    /// identity proof; the per-instance `FERRUM_METRICS_BEARER_TOKEN` half is
-    /// unaffected.
+    /// Pinning a shared literal here weakens the JWT ownership proof; a unique
+    /// per-attempt secret is the credential a CIDR-granted foreign `/health`
+    /// cannot satisfy.
     pub fn jwt_secret(mut self, secret: impl Into<String>) -> Self {
         self.jwt_secret = Some(secret.into());
         self
@@ -608,7 +616,7 @@ impl TestGatewayBuilder {
 
     /// Override `FERRUM_METRICS_BEARER_TOKEN`. Only needed by tests that assert
     /// on the metrics auth policy itself — the harness otherwise mints a fresh
-    /// token per spawn attempt and uses it to prove admin-port ownership.
+    /// token per spawn attempt for authenticated `/health` readiness.
     pub fn observability_token(mut self, token: impl Into<String>) -> Self {
         self.observability_token = Some(token.into());
         self
@@ -820,7 +828,7 @@ impl TestGatewayBuilder {
         let proxy_port = ephemeral_port_excluding(&mut excluded_ports).await?;
         // Fresh per *attempt*, not per builder: a previous attempt's child may
         // still be winding down, and a retry must never be satisfiable by it.
-        let identity = InstanceIdentity::mint(self);
+        let identity = SpawnedGatewayIdentity::mint_for_builder(self);
 
         let binary = locate_binary(self.prefer_release)?;
 
@@ -930,37 +938,40 @@ impl TestGatewayBuilder {
             launch_env: env,
         };
 
-        // Ownership barrier. Watching the child while polling means a process
-        // that died after a partial bind fails immediately instead of letting
-        // whatever else answers on the released admin port look like success.
+        // Ownership barrier. Health proves readiness; JWT `GET /proxies`
+        // proves this child (not a CIDR-granted foreign listener) owns the
+        // port. `Child::try_wait` is coupled to both waits.
         let identity_result = {
-            let probe_token = gw.observability_token.clone();
-            let child_handle = gw.child.as_mut();
-            wait_for_gateway_identity(
-                effective_admin_port,
-                &probe_token,
-                self.health_timeout,
-                child_handle,
-            )
-            .await
+            let owned = SpawnedGatewayIdentity {
+                jwt_secret: gw.jwt_secret.clone(),
+                jwt_issuer: gw.jwt_issuer.clone(),
+                observability_token: gw.observability_token.clone(),
+            };
+            let child_handle = gw
+                .child
+                .as_mut()
+                .expect("spawned child must still be owned during identity wait");
+            if should_verify_admin_auth {
+                wait_for_owned_gateway_identity(
+                    child_handle,
+                    effective_admin_port,
+                    &owned,
+                    self.health_timeout,
+                )
+                .await
+            } else {
+                wait_for_gateway_identity(
+                    effective_admin_port,
+                    &owned.observability_token,
+                    self.health_timeout,
+                    Some(child_handle),
+                )
+                .await
+            }
         };
 
         match identity_result {
-            Ok(()) => {
-                if should_verify_admin_auth
-                    && let Err(e) = gw.wait_for_admin_auth(self.health_timeout).await
-                {
-                    let combined_logs = gw.diagnostic_captured_output();
-                    gw.shutdown();
-                    if combined_logs.is_empty() {
-                        return Err(e);
-                    }
-                    return Err(
-                        format!("{e}\n--- captured gateway output ---\n{combined_logs}").into(),
-                    );
-                }
-                Ok(gw)
-            }
+            Ok(()) => Ok(gw),
             Err(e) => {
                 let combined_logs = gw.diagnostic_captured_output();
                 // Clean up the failed child so the retry loop starts fresh.
@@ -982,7 +993,7 @@ impl TestGatewayBuilder {
         let mut excluded_ports = collect_builder_pinned_ports(self);
         let admin_port = ephemeral_port_excluding(&mut excluded_ports).await?;
         let proxy_port = ephemeral_port_excluding(&mut excluded_ports).await?;
-        let identity = InstanceIdentity::mint(self);
+        let identity = SpawnedGatewayIdentity::mint_for_builder(self);
         let binary = locate_binary(self.prefer_release)?;
         let (mut env, db_url, config_path) = build_env(
             self,
@@ -1223,32 +1234,89 @@ const SCRUB_DEFAULTS: &[&str] = &[
 /// two parallel tests can never be mistaken for each other — but the values
 /// are still handled like secrets: they are never printed, and identity
 /// failures report only *why* the probe failed, never the credential.
-struct InstanceIdentity {
-    jwt_secret: String,
-    jwt_issuer: String,
-    observability_token: String,
+///
+/// The admin JWT secret is always at least 32 characters (the repository
+/// minimum for `FERRUM_ADMIN_JWT_SECRET`).
+pub struct SpawnedGatewayIdentity {
+    pub jwt_secret: String,
+    pub jwt_issuer: String,
+    pub observability_token: String,
 }
 
-impl InstanceIdentity {
-    /// Mint fresh credentials, honouring any the caller pinned on the builder.
-    fn mint(b: &TestGatewayBuilder) -> Self {
+impl SpawnedGatewayIdentity {
+    /// Mint fresh credentials for a bespoke `Command` spawn that does not go
+    /// through [`TestGateway`]. `label` is a short test-local prefix.
+    pub fn mint(label: &str) -> Self {
+        let nonce = Uuid::new_v4().simple().to_string();
+        let jwt_secret = format!("ferrum-edge-{label}-admin-secret-{nonce}");
+        debug_assert!(
+            jwt_secret.len() >= 32,
+            "minted admin JWT secret must satisfy the repository minimum"
+        );
+        Self {
+            jwt_secret,
+            jwt_issuer: format!("ferrum-edge-{label}-{nonce}"),
+            observability_token: format!("ferrum-edge-{label}-probe-{nonce}"),
+        }
+    }
+
+    /// Reuse a harness that already has a per-instance admin JWT, and mint a
+    /// unique metrics bearer so `/health` readiness is still authenticated.
+    pub fn from_admin_jwt(secret: impl Into<String>, issuer: impl Into<String>) -> Self {
+        let jwt_secret = secret.into();
+        debug_assert!(
+            jwt_secret.len() >= 32,
+            "admin JWT secret must satisfy the repository minimum"
+        );
         let nonce = Uuid::new_v4().simple().to_string();
         Self {
-            // 33-char prefix + 32-char nonce clears the ≥32-char admin-JWT
-            // minimum for database/CP mode with room to spare.
-            jwt_secret: b
-                .jwt_secret
-                .clone()
-                .unwrap_or_else(|| format!("ferrum-edge-harness-admin-secret-{nonce}")),
-            jwt_issuer: b
-                .jwt_issuer
-                .clone()
-                .unwrap_or_else(|| format!("ferrum-edge-harness-{nonce}")),
+            jwt_secret,
+            jwt_issuer: issuer.into(),
+            observability_token: format!("ferrum-edge-harness-probe-{nonce}"),
+        }
+    }
+
+    /// Mint fresh credentials, honouring any the caller pinned on the builder.
+    fn mint_for_builder(b: &TestGatewayBuilder) -> Self {
+        let minted = Self::mint("harness");
+        Self {
+            jwt_secret: b.jwt_secret.clone().unwrap_or(minted.jwt_secret),
+            jwt_issuer: b.jwt_issuer.clone().unwrap_or(minted.jwt_issuer),
             observability_token: b
                 .observability_token
                 .clone()
-                .unwrap_or_else(|| format!("ferrum-edge-harness-probe-{nonce}")),
+                .unwrap_or(minted.observability_token),
         }
+    }
+
+    /// Configure this identity on a spawned-gateway `Command`. The same values
+    /// must be used by [`wait_for_owned_gateway_identity`].
+    pub fn apply_to_command(&self, cmd: &mut Command) {
+        cmd.env("FERRUM_ADMIN_JWT_SECRET", &self.jwt_secret)
+            .env("FERRUM_ADMIN_JWT_ISSUER", &self.jwt_issuer)
+            .env("FERRUM_METRICS_BEARER_TOKEN", &self.observability_token);
+    }
+
+    /// Mint an HS256 admin JWT (1-hour TTL, fresh `jti`).
+    pub fn admin_token(&self) -> String {
+        let now = Utc::now();
+        let claims = json!({
+            "iss": self.jwt_issuer,
+            "sub": "test-admin",
+            "role": "admin",
+            "iat": now.timestamp(),
+            "nbf": now.timestamp(),
+            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+            "jti": Uuid::new_v4().to_string(),
+        });
+        let header = Header::new(jsonwebtoken::Algorithm::HS256);
+        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes());
+        encode(&header, &claims, &key).expect("encode admin JWT")
+    }
+
+    /// `Authorization: Bearer <jwt>` header value.
+    pub fn auth_header(&self) -> String {
+        format!("Bearer {}", self.admin_token())
     }
 }
 
@@ -1258,7 +1326,7 @@ impl InstanceIdentity {
 /// mode) is written inside the temp dir so it outlives just the env build.
 async fn build_env(
     b: &TestGatewayBuilder,
-    identity: &InstanceIdentity,
+    identity: &SpawnedGatewayIdentity,
     temp: &TempDir,
     admin_port: u16,
     proxy_port: u16,
@@ -1286,11 +1354,9 @@ async fn build_env(
         "FERRUM_BASIC_AUTH_HMAC_SECRET".into(),
         b.basic_auth_hmac_secret.clone(),
     );
-    // Ownership proof for this exact child (issue #3428). Presenting this token
-    // unlocks the authenticated detail tier of `/health`, which no other
-    // gateway on the box can answer with. It is an *additional* credential:
-    // `/metrics` stays 401 without it, and the unauthenticated `/health` tier
-    // is unchanged, so observability-gating tests keep asserting what they did.
+    // Presenting this token unlocks the authenticated detail tier of `/health`
+    // for readiness. Ownership still requires the JWT on `GET /proxies`
+    // because allowed source CIDRs can grant the same health detail.
     env.insert(
         "FERRUM_METRICS_BEARER_TOKEN".into(),
         identity.observability_token.clone(),
@@ -1568,6 +1634,9 @@ async fn probe_gateway_identity_once(
 /// gateway that binds the admin listener and then dies during
 /// `wait_for_start_signals` releases the port, and without this check the loop
 /// would keep polling whatever claims it next until the full timeout elapses.
+/// A successful health response is re-checked against `Child::try_wait`
+/// before returning so a foreign full-detail responder cannot win while this
+/// child is concurrently exiting.
 async fn wait_for_gateway_identity(
     admin_port: u16,
     observability_token: &str,
@@ -1578,33 +1647,48 @@ async fn wait_for_gateway_identity(
     let deadline = Instant::now() + timeout;
     let mut last_observation = String::from("no response yet");
     loop {
-        if let Some(child) = child.as_deref_mut()
-            && let Ok(Some(status)) = child.try_wait()
-        {
-            return Err(format!(
-                "gateway process exited with {status} before proving ownership of admin \
-                 port {admin_port} (last observation: {last_observation})"
-            )
-            .into());
+        if let Some(child) = child.as_deref_mut() {
+            fail_if_child_exited(child, admin_port, &last_observation)?;
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "gateway did not prove ownership of admin port {admin_port} within {timeout:?} \
+                "gateway did not prove readiness on admin port {admin_port} within {timeout:?} \
                  (last observation: {last_observation})"
             )
             .into());
         }
         match probe_gateway_identity_once(&client, admin_port, observability_token).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                last_observation = "authenticated /health ready".to_string();
+                if let Some(child) = child.as_deref_mut() {
+                    fail_if_child_exited(child, admin_port, &last_observation)?;
+                }
+                return Ok(());
+            }
             Err(observation) => last_observation = observation,
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
+fn fail_if_child_exited(
+    child: &mut Child,
+    admin_port: u16,
+    last_observation: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Ok(Some(status)) = child.try_wait() {
+        return Err(format!(
+            "gateway process exited with {status} before proving ownership of admin \
+             port {admin_port} (last observation: {last_observation})"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Ownership probe without a child handle — for callers that only hold the
 /// admin port and the instance token (post-startup re-checks, and the
-/// foreign-listener regression tests).
+/// foreign-listener regression tests). This is readiness, not JWT ownership.
 pub async fn probe_gateway_identity(
     admin_port: u16,
     observability_token: &str,
@@ -1613,53 +1697,70 @@ pub async fn probe_gateway_identity(
     wait_for_gateway_identity(admin_port, observability_token, timeout, None).await
 }
 
-/// Fail-fast ownership barrier for a spawned child: `Child::try_wait` around
-/// every authenticated `/health` probe so a dead process cannot look ready
-/// just because something else answered on the released admin port.
+/// Fail-fast ownership barrier for a spawned child.
 ///
-/// Bespoke `Stdio::null()` harnesses should call this instead of polling
-/// unauthenticated `/health`. The `observability_token` must be this child's
-/// `FERRUM_METRICS_BEARER_TOKEN` or a JWT minted from its
-/// `FERRUM_ADMIN_JWT_SECRET`.
+/// Couples authenticated `/health` readiness and JWT-only `GET /proxies` to
+/// the same `Child`. A foreign gateway granted full `/health` detail by
+/// `FERRUM_METRICS_ALLOWED_CIDRS` cannot satisfy the unique per-attempt JWT.
+/// `Child::try_wait` runs before probes, after health success, while waiting on
+/// `/proxies`, and immediately before returning success.
 pub async fn wait_for_owned_gateway_identity(
     child: &mut Child,
     admin_port: u16,
-    observability_token: &str,
+    identity: &SpawnedGatewayIdentity,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    wait_for_gateway_identity(admin_port, observability_token, timeout, Some(child)).await
+    let deadline = Instant::now() + timeout;
+    let health_bearer = identity.admin_token();
+    wait_for_gateway_identity(admin_port, &health_bearer, timeout, Some(child)).await?;
+    fail_if_child_exited(
+        child,
+        admin_port,
+        "authenticated /health ready; waiting for JWT /proxies",
+    )?;
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(1));
+    wait_for_admin_auth_inner(admin_port, &identity.auth_header(), remaining, Some(child)).await?;
+    fail_if_child_exited(
+        child,
+        admin_port,
+        "authenticated /health ready; JWT /proxies accepted",
+    )
 }
 
-/// Poll `GET /proxies` until this instance's admin JWT is accepted.
-///
-/// Complements [`wait_for_owned_gateway_identity`]: a foreign gateway with a
-/// different `FERRUM_ADMIN_JWT_SECRET` answers `/health` as live but rejects
-/// the JWT with `401 InvalidSignature`. Requiring a non-401 here fails the
-/// attach attempt so the outer spawn retry can pick a fresh port.
+/// Poll `GET /proxies` until this instance's admin JWT is accepted, coupled to
+/// `child` so an exiting process cannot be replaced by a foreign listener.
 pub async fn wait_for_admin_jwt(
+    child: &mut Child,
     admin_port: u16,
     auth_header: &str,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    wait_for_admin_auth_inner(admin_port, auth_header, timeout).await
+    wait_for_admin_auth_inner(admin_port, auth_header, timeout, Some(child)).await
 }
 
-/// Per-spawn `FERRUM_METRICS_BEARER_TOKEN` for bespoke file-mode harnesses
-/// that do not go through [`TestGateway`].
+/// Per-spawn `FERRUM_METRICS_BEARER_TOKEN` for callers that do not need the
+/// full [`SpawnedGatewayIdentity`]. Prefer [`SpawnedGatewayIdentity::mint`]
+/// for spawned-gateway ownership.
 pub fn mint_observability_token(label: &str) -> String {
-    format!("{label}-{}", Uuid::new_v4().simple())
+    SpawnedGatewayIdentity::mint(label).observability_token
 }
 
 async fn wait_for_admin_auth_inner(
     admin_port: u16,
     auth_header: &str,
     timeout: Duration,
+    mut child: Option<&mut Child>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let auth_url = format!("http://127.0.0.1:{}/proxies", admin_port);
     let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
     let deadline = Instant::now() + timeout;
     let mut last_observation = String::from("no response yet");
     loop {
+        if let Some(child) = child.as_deref_mut() {
+            fail_if_child_exited(child, admin_port, &last_observation)?;
+        }
         if Instant::now() >= deadline {
             return Err(format!(
                 "gateway admin JWT did not validate on port {} within {:?} (last observation: {})",
@@ -1673,11 +1774,17 @@ async fn wait_for_admin_auth_inner(
             .send()
             .await
         {
-            Ok(r) if r.status().as_u16() != 401 => return Ok(()),
+            Ok(r) if r.status().as_u16() != 401 => {
+                last_observation = format!("HTTP {}", r.status());
+                if let Some(child) = child.as_deref_mut() {
+                    fail_if_child_exited(child, admin_port, &last_observation)?;
+                }
+                return Ok(());
+            }
             Ok(r) => {
                 let status = r.status();
-                let body = r.text().await.unwrap_or_default();
-                last_observation = format!("HTTP {}: {}", status, body);
+                let _ = r.text().await;
+                last_observation = format!("HTTP {status} on GET /proxies");
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
             Err(err) => {
@@ -2000,5 +2107,198 @@ mod port_allocation_tests {
             "Address already in use"
         ));
         assert!(!captured_output_reports_listener_addr_in_use(""));
+    }
+}
+
+#[cfg(test)]
+mod ownership_proof_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Clone)]
+    enum FakeAdminBehavior {
+        /// Full `/health` detail for every caller (CIDR grant) and 401 on
+        /// JWT-only `GET /proxies`.
+        CidrHealthJwtRejected,
+        /// Full `/health` detail after SIGKILL of `pid`, then 200 on `/proxies`.
+        #[cfg(unix)]
+        KillChildThenHealth { pid: u32 },
+    }
+
+    async fn spawn_fake_admin(behavior: FakeAdminBehavior) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake admin");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let behavior = behavior.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                request.extend_from_slice(&chunk[..n]);
+                                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request).into_owned();
+                    let is_proxies = request.lines().next().unwrap_or("").contains(" /proxies");
+                    #[cfg(unix)]
+                    if !is_proxies
+                        && let FakeAdminBehavior::KillChildThenHealth { pid } = &behavior
+                    {
+                        let _ = unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
+                    }
+                    let body = if is_proxies {
+                        match &behavior {
+                            FakeAdminBehavior::CidrHealthJwtRejected => {
+                                r#"{"error":"Token verification failed: InvalidSignature"}"#
+                            }
+                            #[cfg(unix)]
+                            FakeAdminBehavior::KillChildThenHealth { .. } => "[]",
+                        }
+                    } else {
+                        r#"{"status":"ok","ready":true,"cached_config":{"available":true}}"#
+                    };
+                    let status = if is_proxies {
+                        match &behavior {
+                            FakeAdminBehavior::CidrHealthJwtRejected => "401 Unauthorized",
+                            #[cfg(unix)]
+                            FakeAdminBehavior::KillChildThenHealth { .. } => "200 OK",
+                        }
+                    } else {
+                        "200 OK"
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn minted_admin_jwt_secret_meets_repository_minimum() {
+        let identity = SpawnedGatewayIdentity::mint("sse");
+        assert!(identity.jwt_secret.len() >= 32);
+        assert!(!identity.jwt_secret.is_empty());
+        assert!(!identity.jwt_issuer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn jwt_ownership_rejects_cidr_granted_foreign_health() {
+        let (port, listener) = spawn_fake_admin(FakeAdminBehavior::CidrHealthJwtRejected).await;
+        let identity = SpawnedGatewayIdentity::mint("cidr-foreign");
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn live child");
+
+        let err = wait_for_owned_gateway_identity(
+            &mut child,
+            port,
+            &identity,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect_err("CIDR-granted /health must not satisfy unique JWT /proxies");
+        let err = err.to_string();
+        assert!(
+            err.contains("GET /proxies") || err.contains("401") || err.contains("JWT"),
+            "error should name the JWT-only proof, got: {err}"
+        );
+        assert!(
+            !err.contains(&identity.jwt_secret) && !err.contains(&identity.observability_token),
+            "diagnostics must not echo credentials: {err}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        listener.abort();
+    }
+
+    #[tokio::test]
+    async fn ownership_wait_rejects_child_that_already_exited() {
+        let (port, listener) = spawn_fake_admin(FakeAdminBehavior::CidrHealthJwtRejected).await;
+        let identity = SpawnedGatewayIdentity::mint("dead-child");
+        let mut child = Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn exiting child");
+        let _ = child.wait().expect("reap exited child");
+
+        let err = wait_for_owned_gateway_identity(
+            &mut child,
+            port,
+            &identity,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect_err("an exited child must not attach to a foreign health responder");
+        let err = err.to_string();
+        assert!(
+            err.contains("exited"),
+            "error should report child exit, got: {err}"
+        );
+
+        listener.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ownership_wait_rejects_child_killed_at_health_success_boundary() {
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn live child");
+        let pid = child.id();
+        let (port, listener) =
+            spawn_fake_admin(FakeAdminBehavior::KillChildThenHealth { pid }).await;
+        let identity = SpawnedGatewayIdentity::mint("health-boundary");
+
+        let err = wait_for_owned_gateway_identity(
+            &mut child,
+            port,
+            &identity,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect_err("child death at health success must fail ownership");
+        let err = err.to_string();
+        assert!(
+            err.contains("exited"),
+            "post-health child check must reject, got: {err}"
+        );
+        assert!(
+            !err.contains(&identity.jwt_secret),
+            "diagnostics must not echo the JWT secret: {err}"
+        );
+
+        let _ = child.wait();
+        listener.abort();
     }
 }

@@ -104,25 +104,16 @@ fn ensure_built() -> Result<(), Box<dyn std::error::Error>> {
 async fn wait_for_owned_health(
     child: &mut Child,
     admin_port: u16,
-    jwt_secret: &str,
-    jwt_issuer: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> bool {
-    let auth = auth_header(jwt_secret, jwt_issuer);
-    let jwt = auth.strip_prefix("Bearer ").unwrap_or(auth.as_str());
-    if crate::common::wait_for_owned_gateway_identity(
+    crate::common::wait_for_owned_gateway_identity(
         child,
         admin_port,
-        jwt,
+        identity,
         Duration::from_secs(30),
     )
     .await
-    .is_err()
-    {
-        return false;
-    }
-    crate::common::wait_for_admin_jwt(admin_port, &auth, Duration::from_secs(30))
-        .await
-        .is_ok()
+    .is_ok()
 }
 
 /// Kill the child process and reap its zombie before any retry re-binds ports.
@@ -236,6 +227,10 @@ async fn test_db_failover_urls_startup() {
 
         let jwt_secret = "failover-urls-test-jwt-secret-12345".to_string();
         let jwt_issuer = "ferrum-edge-failover-test".to_string();
+        let identity = crate::common::SpawnedGatewayIdentity::from_admin_jwt(
+            &jwt_secret,
+            &jwt_issuer,
+        );
 
         let mut child = Command::new(binary_path())
             .env("FERRUM_MODE", "database")
@@ -255,7 +250,7 @@ async fn test_db_failover_urls_startup() {
             .spawn()
             .expect("spawn gateway");
 
-        if !wait_for_owned_health(&mut child, admin_port, &jwt_secret, &jwt_issuer).await {
+        if !wait_for_owned_health(&mut child, admin_port, &identity).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
             kill_child(child);
@@ -398,6 +393,10 @@ async fn test_db_config_backup_bootstrap() {
 
         let jwt_secret = "backup-bootstrap-test-jwt-secret-12345".to_string();
         let jwt_issuer = "ferrum-edge-backup-test".to_string();
+        let identity = crate::common::SpawnedGatewayIdentity::from_admin_jwt(
+            &jwt_secret,
+            &jwt_issuer,
+        );
 
         let mut child = Command::new(binary_path())
             .env("FERRUM_MODE", "database")
@@ -423,7 +422,7 @@ async fn test_db_config_backup_bootstrap() {
         // Note: connecting to the primary DB fails with a short pool timeout,
         // but the backup loader still needs to read and parse the JSON file.
         // Budget plenty of time to avoid timing-out on a slow CI runner.
-        if !wait_for_owned_health(&mut child, admin_port, &jwt_secret, &jwt_issuer).await {
+        if !wait_for_owned_health(&mut child, admin_port, &identity).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
             kill_child(child);
@@ -703,6 +702,10 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
 
         let jwt_secret = "recovery-test-jwt-secret-ferrum-edge-12345".to_string();
         let jwt_issuer = "ferrum-edge-recovery-test".to_string();
+        let identity = crate::common::SpawnedGatewayIdentity::from_admin_jwt(
+            &jwt_secret,
+            &jwt_issuer,
+        );
 
         let mut child = Command::new(binary_path())
             .env("FERRUM_MODE", "database")
@@ -726,7 +729,7 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
             .spawn()
             .expect("spawn gateway");
 
-        if !wait_for_owned_health(&mut child, admin_port, &jwt_secret, &jwt_issuer).await {
+        if !wait_for_owned_health(&mut child, admin_port, &identity).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
             kill_child(child);
@@ -886,6 +889,10 @@ async fn test_db_read_replica_startup() {
 
         let jwt_secret = "replica-startup-test-jwt-secret-12345".to_string();
         let jwt_issuer = "ferrum-edge-replica-test".to_string();
+        let identity = crate::common::SpawnedGatewayIdentity::from_admin_jwt(
+            &jwt_secret,
+            &jwt_issuer,
+        );
 
         let mut child = Command::new(binary_path())
             .env("FERRUM_MODE", "database")
@@ -905,7 +912,7 @@ async fn test_db_read_replica_startup() {
             .spawn()
             .expect("spawn gateway");
 
-        if !wait_for_owned_health(&mut child, admin_port, &jwt_secret, &jwt_issuer).await {
+        if !wait_for_owned_health(&mut child, admin_port, &identity).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
             kill_child(child);
@@ -1036,6 +1043,10 @@ async fn test_db_authoritative_startup_uses_primary_when_replica_is_stale() {
 
         let jwt_secret = "authoritative-primary-test-jwt-secret-12345".to_string();
         let jwt_issuer = "ferrum-edge-authoritative-primary-test".to_string();
+        let identity = crate::common::SpawnedGatewayIdentity::from_admin_jwt(
+            &jwt_secret,
+            &jwt_issuer,
+        );
 
         let mut child = Command::new(binary_path())
             .env("FERRUM_MODE", "database")
@@ -1055,7 +1066,7 @@ async fn test_db_authoritative_startup_uses_primary_when_replica_is_stale() {
             .spawn()
             .expect("spawn gateway");
 
-        if !wait_for_owned_health(&mut child, admin_port, &jwt_secret, &jwt_issuer).await {
+        if !wait_for_owned_health(&mut child, admin_port, &identity).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
             kill_child(child);

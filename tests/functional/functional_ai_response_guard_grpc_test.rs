@@ -208,33 +208,32 @@ fn start_gateway(
     config_path: &str,
     http_port: u16,
     admin_port: u16,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    let child = std::process::Command::new(gateway_binary_path())
-        .env("FERRUM_MODE", "file")
+    let mut cmd = std::process::Command::new(gateway_binary_path());
+    cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-        .env("FERRUM_METRICS_BEARER_TOKEN", observability_token)
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    Ok(child)
+        .stderr(std::process::Stdio::null());
+    identity.apply_to_command(&mut cmd);
+    Ok(cmd.spawn()?)
 }
 
 async fn wait_for_owned_gateway(
     child: &mut std::process::Child,
     admin_port: u16,
     gateway_port: u16,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::common::wait_for_owned_gateway_identity(
         child,
         admin_port,
-        observability_token,
+        identity,
         Duration::from_secs(15),
     )
     .await
@@ -259,9 +258,8 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_port = free_port().await;
         let admin_port = free_port().await;
-        let observability_token = crate::common::mint_observability_token("ai-response-guard-grpc");
-        let mut child =
-            match start_gateway(config_path, gateway_port, admin_port, &observability_token) {
+        let identity = crate::common::SpawnedGatewayIdentity::mint("ai-response-guard-grpc");
+        let mut child = match start_gateway(config_path, gateway_port, admin_port, &identity) {
                 Ok(child) => child,
                 Err(e) => {
                     eprintln!(
@@ -274,7 +272,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
                     continue;
                 }
             };
-        match wait_for_owned_gateway(&mut child, admin_port, gateway_port, &observability_token)
+        match wait_for_owned_gateway(&mut child, admin_port, gateway_port, &identity)
             .await
         {
             Ok(()) => return (child, gateway_port, admin_port),

@@ -78,39 +78,39 @@ fn start_gateway_in_file_mode(
     config_path: &str,
     http_port: u16,
     admin_port: u16,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> std::process::Child {
     let binary_path = gateway_binary_path();
 
-    std::process::Command::new(binary_path)
-        .env("FERRUM_MODE", "file")
+    let mut cmd = std::process::Command::new(binary_path);
+    cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-        .env("FERRUM_METRICS_BEARER_TOKEN", observability_token)
         .env("FERRUM_LOG_LEVEL", "warn")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("Failed to start gateway binary")
+        .stderr(std::process::Stdio::null());
+    identity.apply_to_command(&mut cmd);
+    cmd.spawn().expect("Failed to start gateway binary")
 }
 
 /// Readiness requires this child to own admin `/health` *and* a reachable
 /// proxy listener. Unauthenticated `/health` is not identity (issue #4253);
-/// `Child::try_wait` plus the authenticated detail tier prove the responder
-/// is ours. The proxy TCP accept is still required because a loaded runner
-/// can surface the proxy socket after `ready`.
+/// CIDR-granted health detail is not either. JWT `GET /proxies` plus
+/// `Child::try_wait` prove the responder is ours. The proxy TCP accept is
+/// still required because a loaded runner can surface the proxy socket after
+/// `ready`.
 async fn wait_for_gateway(
     admin_port: u16,
     proxy_port: u16,
     child: &mut std::process::Child,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> bool {
     if crate::common::wait_for_owned_gateway_identity(
         child,
         admin_port,
-        observability_token,
+        identity,
         Duration::from_secs(15),
     )
     .await
@@ -152,11 +152,10 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
         let proxy_port = ephemeral_port().await;
         let admin_port = ephemeral_port().await;
 
-        let observability_token = crate::common::mint_observability_token("regex-routing");
-        let mut child =
-            start_gateway_in_file_mode(config_path, proxy_port, admin_port, &observability_token);
+        let identity = crate::common::SpawnedGatewayIdentity::mint("regex-routing");
+        let mut child = start_gateway_in_file_mode(config_path, proxy_port, admin_port, &identity);
 
-        if wait_for_gateway(admin_port, proxy_port, &mut child, &observability_token).await {
+        if wait_for_gateway(admin_port, proxy_port, &mut child, &identity).await {
             return (child, proxy_port, admin_port);
         }
 
