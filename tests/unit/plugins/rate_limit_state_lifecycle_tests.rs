@@ -13,7 +13,6 @@
 //! windows, no sleeps.
 
 use chrono::Utc;
-use ferrum_edge::PluginCache;
 use ferrum_edge::_test_support::{
     ai_rate_limiter_shares_local_state_for_test, graphql_shares_local_state_for_test,
     grpc_method_router_shares_local_state_for_test, plugin_cache_full_reload_for_test,
@@ -22,6 +21,7 @@ use ferrum_edge::_test_support::{
     ws_rate_limiting_charge_frame_for_test, ws_rate_limiting_contains_connection_for_test,
     ws_rate_limiting_shares_local_state_for_test, ws_rate_limiting_with_policy_identity_for_test,
 };
+use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope, Proxy};
 use ferrum_edge::config_delta::ConfigDelta;
 use ferrum_edge::plugins::graphql::GraphqlPlugin;
@@ -407,8 +407,14 @@ fn every_local_rate_limit_constructor_binds_its_policy_identity() {
         "limit_by": "ip",
         "type_rate_limits": {"query": {"max_requests": 11, "window_seconds": 60}},
     });
-    assert!(gql_shares((NS, "ch-gql", &graphql), (NS, "ch-gql", &graphql)));
-    assert!(!gql_shares((NS, "ch-gql", &graphql), (NS, "ch-gql", &graphql_changed)));
+    assert!(gql_shares(
+        (NS, "ch-gql", &graphql),
+        (NS, "ch-gql", &graphql)
+    ));
+    assert!(!gql_shares(
+        (NS, "ch-gql", &graphql),
+        (NS, "ch-gql", &graphql_changed)
+    ));
 
     let grpc = json!({
         "method_rate_limits": {"/pkg.Svc/M": {"max_requests": 10, "window_seconds": 60}},
@@ -417,7 +423,10 @@ fn every_local_rate_limit_constructor_binds_its_policy_identity() {
         "method_rate_limits": {"/pkg.Svc/M": {"max_requests": 11, "window_seconds": 60}},
     });
     assert!(grpc_shares((NS, "ch-grpc", &grpc), (NS, "ch-grpc", &grpc)));
-    assert!(!grpc_shares((NS, "ch-grpc", &grpc), (NS, "ch-grpc", &grpc_changed)));
+    assert!(!grpc_shares(
+        (NS, "ch-grpc", &grpc),
+        (NS, "ch-grpc", &grpc_changed)
+    ));
 
     let ai = json!({"token_limit": 1000, "window_seconds": 60});
     let ai_changed = json!({"token_limit": 2000, "window_seconds": 60});
@@ -427,8 +436,14 @@ fn every_local_rate_limit_constructor_binds_its_policy_identity() {
     let udp = json!({"datagrams_per_second": 10, "window_seconds": 1});
     let udp_changed = json!({"datagrams_per_second": 11, "window_seconds": 1});
     assert!(udp_shares((NS, "ch-udp", &udp), (NS, "ch-udp", &udp)));
-    assert!(!udp_shares((NS, "ch-udp", &udp), (NS, "ch-udp", &udp_changed)));
-    assert!(!udp_shares(("tenant-a", "ch-udp-ns", &udp), ("tenant-b", "ch-udp-ns", &udp)));
+    assert!(!udp_shares(
+        (NS, "ch-udp", &udp),
+        (NS, "ch-udp", &udp_changed)
+    ));
+    assert!(!udp_shares(
+        ("tenant-a", "ch-udp-ns", &udp),
+        ("tenant-b", "ch-udp-ns", &udp)
+    ));
 }
 
 #[test]

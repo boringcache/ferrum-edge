@@ -2304,50 +2304,32 @@ fn create_local_rate_limit_plugin(
     let plugin: Arc<dyn Plugin> = match pc.plugin_name.as_str() {
         "rate_limiting" => Arc::new(
             crate::plugins::rate_limiting::RateLimiting::new_with_policy_identity(
-                config,
-                client,
-                namespace,
-                id,
+                config, client, namespace, id,
             )?,
         ),
         "graphql" => Arc::new(
             crate::plugins::graphql::GraphqlPlugin::new_with_policy_identity(
-                config,
-                client,
-                namespace,
-                id,
+                config, client, namespace, id,
             )?,
         ),
         "grpc_method_router" => Arc::new(
             crate::plugins::grpc_method_router::GrpcMethodRouter::new_with_policy_identity(
-                config,
-                client,
-                namespace,
-                id,
+                config, client, namespace, id,
             )?,
         ),
         "ai_rate_limiter" => Arc::new(
             crate::plugins::ai_rate_limiter::AiRateLimiter::new_with_policy_identity(
-                config,
-                client,
-                namespace,
-                id,
+                config, client, namespace, id,
             )?,
         ),
         "ws_rate_limiting" => Arc::new(
             crate::plugins::ws_rate_limiting::WsRateLimiting::new_with_policy_identity(
-                config,
-                client,
-                namespace,
-                id,
+                config, client, namespace, id,
             )?,
         ),
         "udp_rate_limiting" => Arc::new(
             crate::plugins::udp_rate_limiting::UdpRateLimiting::new_with_policy_identity(
-                config,
-                client,
-                namespace,
-                id,
+                config, client, namespace, id,
             )?,
         ),
         // Unreachable: the caller matches exactly the six names above. Return

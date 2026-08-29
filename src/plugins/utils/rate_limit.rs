@@ -893,7 +893,8 @@ where
 {
     /// Policy identity -> every still-live semantic generation for it, as
     /// `(compatibility fingerprint, weak limiter)`.
-    #[allow(clippy::type_complexity)] // the shape is the contract; naming it needs a bounded alias
+    #[allow(clippy::type_complexity)]
+    // the shape is the contract; naming it needs a bounded alias
     generations: OnceLock<Mutex<HashMap<String, Vec<(String, Weak<LocalLimiter<K, A>>)>>>>,
 }
 
@@ -1165,7 +1166,10 @@ fn local_limiter_fingerprint(
                 RedisFailurePolicy::LocalFallback => b"local_fallback".as_slice(),
             },
         );
-        absorb("redis_key_prefix", redis_key_prefix.unwrap_or("").as_bytes());
+        absorb(
+            "redis_key_prefix",
+            redis_key_prefix.unwrap_or("").as_bytes(),
+        );
     }
     // Sorted by label so the order a plugin records its semantics in is not
     // itself a compatibility input.

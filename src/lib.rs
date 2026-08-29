@@ -4966,33 +4966,26 @@ pub mod _test_support {
             AiTokenRateAlgorithm, DynamicHttpRateLimitAlgorithm, UdpRateLimitAlgorithm,
             WsFrameRateAlgorithm, shared_local_limiter_generations_for_test,
         };
-        let count = match plugin_name {
-            "rate_limiting" | "graphql" | "grpc_method_router" => {
-                shared_local_limiter_generations_for_test::<DynamicHttpRateLimitAlgorithm>(
-                    namespace,
-                    plugin_name,
-                    config_id,
-                )
-            }
-            "ai_rate_limiter" => shared_local_limiter_generations_for_test::<AiTokenRateAlgorithm>(
-                namespace,
-                plugin_name,
-                config_id,
-            ),
-            "ws_rate_limiting" => shared_local_limiter_generations_for_test::<WsFrameRateAlgorithm>(
-                namespace,
-                plugin_name,
-                config_id,
-            ),
-            "udp_rate_limiting" => {
-                shared_local_limiter_generations_for_test::<UdpRateLimitAlgorithm>(
-                    namespace,
-                    plugin_name,
-                    config_id,
-                )
-            }
-            _ => return None,
-        };
+        let count =
+            match plugin_name {
+                "rate_limiting" | "graphql" | "grpc_method_router" => {
+                    shared_local_limiter_generations_for_test::<DynamicHttpRateLimitAlgorithm>(
+                        namespace,
+                        plugin_name,
+                        config_id,
+                    )
+                }
+                "ai_rate_limiter" => shared_local_limiter_generations_for_test::<
+                    AiTokenRateAlgorithm,
+                >(namespace, plugin_name, config_id),
+                "ws_rate_limiting" => shared_local_limiter_generations_for_test::<
+                    WsFrameRateAlgorithm,
+                >(namespace, plugin_name, config_id),
+                "udp_rate_limiting" => shared_local_limiter_generations_for_test::<
+                    UdpRateLimitAlgorithm,
+                >(namespace, plugin_name, config_id),
+                _ => return None,
+            };
         Some(count)
     }
 
