@@ -435,7 +435,9 @@ fn ambient_proxy_security_context_defaults_allow_privilege_escalation_false() {
         values.contains(marker),
         "values must document that ambient.securityContext is assembled field by field"
     );
-    let sc_at = values.find(marker).expect("ambient securityContext comment");
+    let sc_at = values
+        .find(marker)
+        .expect("ambient securityContext comment");
     let sc_window = &values[sc_at..sc_at.saturating_add(1600).min(values.len())];
     assert!(
         sc_window.contains("allowPrivilegeEscalation: false"),
