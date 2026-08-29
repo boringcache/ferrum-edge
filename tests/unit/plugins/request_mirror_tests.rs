@@ -3199,9 +3199,8 @@ async fn sensitive_query_hostile_encoding_prefixed_credentials_and_benign_names(
     );
 
     let mut all_sensitive = make_ctx_with_proxy();
-    all_sensitive.set_raw_query_string(
-        "oauth_token=a&x-amz-signature=b&x-goog-signature=c".to_string(),
-    );
+    all_sensitive
+        .set_raw_query_string("oauth_token=a&x-amz-signature=b&x-goog-signature=c".to_string());
     let all_line = capture_mirror_request_line(&mut all_sensitive).await;
     assert!(
         !all_line.contains('?') && !all_line.contains('&') && all_line.contains("/api/users "),
