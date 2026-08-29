@@ -850,9 +850,7 @@ where
         Err(()) => {
             let termination = auth_deadline
                 .map(|plan| plan.termination)
-                .unwrap_or(
-                    crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
-                );
+                .unwrap_or(crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired);
             auth_latch.record_once(
                 termination,
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
