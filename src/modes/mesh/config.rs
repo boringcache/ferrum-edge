@@ -2185,7 +2185,8 @@ pub struct MeshJwtClaimHeader {
 /// K8s-translation and native/file/xDS boundaries. Every entry costs one
 /// gateway-owned destination that is stripped from EVERY inbound request, so
 /// the set stays small and bounded.
-pub const MAX_MESH_JWT_OUTPUT_CLAIM_HEADERS: usize = 16;
+pub const MAX_MESH_JWT_OUTPUT_CLAIM_HEADERS: usize =
+    crate::plugins::utils::claim_header_fanout::MAX_OUTPUT_CLAIM_HEADERS;
 
 /// Upper bound on one `outputClaimToHeaders[].claim` dot path.
 pub const MAX_MESH_JWT_CLAIM_PATH_LEN: usize = 256;
@@ -2212,9 +2213,7 @@ pub fn validate_mesh_jwt_claim_header(
         ));
     }
     let lowercase = header.to_ascii_lowercase();
-    if mesh_ext_authz_header_is_reserved(&lowercase)
-        || crate::plugins::utils::claim_header_fanout::is_reserved_header(&lowercase)
-    {
+    if crate::plugins::utils::claim_header_fanout::is_output_claim_reserved_header(&lowercase) {
         return Err(format!(
             "outputClaimToHeaders header '{lowercase}' is hop-by-hop, framing, routing, credential-bearing, or gateway-reserved and cannot carry a JWT claim"
         ));

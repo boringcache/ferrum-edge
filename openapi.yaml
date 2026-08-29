@@ -19251,6 +19251,7 @@ components:
                 description: Separator for array claim header values
               output_claim_headers:
                 type: array
+                maxItems: 16
                 items:
                   type: object
                   required: [header, claim]
@@ -19258,9 +19259,11 @@ components:
                   properties:
                     header:
                       type: string
+                      maxLength: 128
                       description: Backend-visible request header the claim is published to
                     claim:
                       type: string
+                      maxLength: 256
                       description: Dot-path claim to publish
                 description: >-
                   Istio RequestAuthentication jwtRules[].outputClaimToHeaders

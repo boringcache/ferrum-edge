@@ -249,6 +249,11 @@ fn reserved_and_malformed_destinations_are_rejected_at_config_load() {
     for entry in [
         json!([{"header": "Authorization", "claim": "sub"}]),
         json!([{"header": "Host", "claim": "sub"}]),
+        json!([{"header": "Content-Length", "claim": "sub"}]),
+        json!([{"header": "Cookie", "claim": "sub"}]),
+        json!([{"header": "Forwarded", "claim": "sub"}]),
+        json!([{"header": "X-Forwarded-For", "claim": "sub"}]),
+        json!([{"header": "X-Ferrum-Identity", "claim": "sub"}]),
         json!([{"header": "bad header", "claim": "sub"}]),
         json!([{"header": "", "claim": "sub"}]),
         json!([{"header": "x-ok", "claim": ""}]),
@@ -261,6 +266,50 @@ fn reserved_and_malformed_destinations_are_rejected_at_config_load() {
         assert!(
             plugin_with(entry.clone()).is_err(),
             "output_claim_headers {entry} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn output_claim_headers_are_bounded_at_config_load() {
+    let entries: Vec<_> = (0..17)
+        .map(|index| json!({"header": format!("x-claim-{index}"), "claim": "sub"}))
+        .collect();
+    let error = match plugin_with(json!(entries)) {
+        Ok(_) => panic!("an oversized mapping list must reject"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("at most 16"),
+        "expected a bounded-list diagnostic, got: {error}"
+    );
+}
+
+#[test]
+fn effective_claim_header_family_collisions_are_rejected() {
+    for config in [
+        json!({
+            "claim_headers": {"email": "x-identity"},
+            "providers": [{
+                "jwks": build_rsa_jwks_from_pem(PUBLIC_KEY),
+                "output_claim_headers": [{"header": "X-Identity", "claim": "sub"}],
+            }],
+        }),
+        json!({
+            "providers": [{
+                "jwks": build_rsa_jwks_from_pem(PUBLIC_KEY),
+                "claim_headers": {"email": "x-identity"},
+                "output_claim_headers": [{"header": "X-Identity", "claim": "sub"}],
+            }],
+        }),
+    ] {
+        let error = match JwksAuth::new(&config, default_client()) {
+            Ok(_) => panic!("one destination cannot use both mapping families"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("both 'claim_headers' and 'output_claim_headers'"),
+            "expected a cross-family collision diagnostic, got: {error}"
         );
     }
 }

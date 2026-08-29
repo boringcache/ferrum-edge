@@ -8,6 +8,12 @@ use crate::plugins::RequestContext;
 use super::auth_attempt::AuthenticationAttempt;
 use super::claim_resolver::{parse_claim_path_value, resolve_claim_path};
 
+/// Keep direct plugin configuration on the same bounded surface as Istio
+/// `outputClaimToHeaders` translation.
+pub const MAX_OUTPUT_CLAIM_HEADERS: usize = 16;
+pub const MAX_OUTPUT_CLAIM_HEADER_NAME_LEN: usize = 128;
+pub const MAX_OUTPUT_CLAIM_PATH_LEN: usize = 256;
+
 #[derive(Clone, Debug)]
 pub struct ClaimHeaderMapping {
     pub claim_path: String,
@@ -135,6 +141,11 @@ pub fn parse_claim_header_list(
     let entries = value
         .as_array()
         .ok_or_else(|| format!("{plugin}: '{field}' must be an array, got: {value}"))?;
+    if entries.len() > MAX_OUTPUT_CLAIM_HEADERS {
+        return Err(format!(
+            "{plugin}: '{field}' supports at most {MAX_OUTPUT_CLAIM_HEADERS} entries"
+        ));
+    }
     let mut mappings: Vec<ClaimHeaderMapping> = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let object = entry
@@ -152,11 +163,33 @@ pub fn parse_claim_header_list(
             .ok_or_else(|| format!("{plugin}: '{field}[{index}].claim' is required"))?;
         let claim_path =
             parse_claim_path_value(&format!("{field}[{index}].claim"), claim_value, plugin)?;
+        if claim_path.len() > MAX_OUTPUT_CLAIM_PATH_LEN
+            || claim_path
+                .chars()
+                .any(|character| character.is_control() || character.is_whitespace())
+        {
+            return Err(format!(
+                "{plugin}: '{field}[{index}].claim' must be at most \
+                 {MAX_OUTPUT_CLAIM_PATH_LEN} bytes and contain no whitespace or control characters"
+            ));
+        }
         let raw_header = object
             .get("header")
             .and_then(Value::as_str)
             .ok_or_else(|| format!("{plugin}: '{field}[{index}].header' must be a string"))?;
         let header_name = normalize_allowed_header(raw_header, plugin, field)?;
+        if header_name.len() > MAX_OUTPUT_CLAIM_HEADER_NAME_LEN {
+            return Err(format!(
+                "{plugin}: '{field}[{index}].header' must be at most \
+                 {MAX_OUTPUT_CLAIM_HEADER_NAME_LEN} bytes"
+            ));
+        }
+        if is_output_claim_reserved_header(&header_name) {
+            return Err(format!(
+                "{plugin}: '{field}' cannot target framing, provenance, credential-bearing, \
+                 or gateway-reserved header '{header_name}'"
+            ));
+        }
         if mappings
             .iter()
             .any(|mapping| mapping.destination_header == header_name)
@@ -402,6 +435,32 @@ pub fn is_reserved_header(name: &str) -> bool {
             | "proxy-authorization"
             | "authorization"
     )
+}
+
+/// Headers that a validated JWT claim must never be allowed to synthesize.
+///
+/// This is intentionally stricter than the legacy `claim_headers` predicate:
+/// `outputClaimToHeaders` is a new Istio-facing surface, so direct plugin
+/// configuration and mesh translation can share one fail-closed contract
+/// without changing established `claim_headers` configurations.
+pub fn is_output_claim_reserved_header(name: &str) -> bool {
+    let lowercase = name.to_ascii_lowercase();
+    is_reserved_header(&lowercase)
+        || matches!(
+            lowercase.as_str(),
+            "baggage"
+                | "content-length"
+                | "cookie"
+                | "expect"
+                | "forwarded"
+                | "proxy-authenticate"
+                | "proxy-connection"
+                | "trailer"
+                | "via"
+                | "x-real-ip"
+        )
+        || lowercase.starts_with("x-ferrum-")
+        || lowercase.starts_with("x-forwarded-")
 }
 
 #[cfg(test)]

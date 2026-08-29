@@ -564,6 +564,23 @@ impl JwksAuth {
                 "jwks_auth",
                 CLAIM_HEADER_METADATA_PREFIX,
             )?;
+            let effective_claim_headers = if provider_claim_headers.is_empty() {
+                claim_headers.as_slice()
+            } else {
+                provider_claim_headers.as_slice()
+            };
+            if let Some(duplicate) = provider_output_claim_headers.iter().find(|output| {
+                effective_claim_headers.iter().any(|mapping| {
+                    mapping.destination_header == output.destination_header
+                })
+            }) {
+                return Err(format!(
+                    "jwks_auth: provider[{idx}] maps header '{}' through both \
+                     'claim_headers' and 'output_claim_headers'; a destination may be asserted \
+                     from exactly one claim mapping family",
+                    duplicate.destination_header
+                ));
+            }
             let require_mtls_binding =
                 optional_provider_bool(prov_obj, "require_mtls_binding", idx)?.unwrap_or(false);
             let require_dpop =
