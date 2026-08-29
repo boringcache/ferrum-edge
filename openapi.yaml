@@ -8111,6 +8111,12 @@ components:
           type: string
         crl_pem:
           type: string
+          description: >
+            PEM bundle of one or more X509 CRLs. Every record must parse and be
+            inside its own validity window: a future thisUpdate, a missing
+            nextUpdate, or a nextUpdate that has been reached is rejected, and a
+            single unusable record rejects the whole bundle rather than storing
+            the usable subset. allow_expired does not apply to CRLs.
         allow_overwrite:
           type: boolean
           default: false
@@ -8327,11 +8333,17 @@ components:
           description: PEM CA bundle to parse and expiry-check.
         crl_pem:
           type: string
-          description: PEM CRL bundle to parse.
+          description: >
+            PEM CRL bundle to parse and validity-window check. A future
+            thisUpdate, a missing nextUpdate, or a nextUpdate that has been
+            reached is rejected, and one unusable record rejects the whole
+            bundle.
         allow_expired:
           type: boolean
           default: false
-          description: Skip notBefore/notAfter checks for submitted certificates.
+          description: >
+            Skip notBefore/notAfter checks for submitted certificates. Does not
+            apply to crl_pem: an expired revocation list is always rejected.
         cert_expiry_warning_days:
           type: integer
           format: int64

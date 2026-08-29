@@ -2038,11 +2038,16 @@ When `FERRUM_TLS_CRL_FILE_PATH` is configured, Ferrum applies that CRL set
 symmetrically to mesh SPIFFE peer verification: inbound mTLS/HBONE handshakes
 reject revoked client SVIDs, and outbound/backend mesh dials reject revoked
 server SVIDs. A peer listed in an applicable configured CRL is rejected
-fail-closed even when its SVID is otherwise trusted and unexpired. If the
+fail-closed even when its SVID is otherwise trusted and unexpired. Revocation is
+checked on **every non-trust-anchor certificate in the built chain**, so
+revoking an intermediate SVID-issuing CA also stops the SVIDs it signed. If the
 bundle has no CRL from the peer certificate's issuing CA, its revocation status
 is undeterminable and Ferrum accepts it, matching the shared inbound mesh CRL
 model. With no CRLs configured, revocation checking is skipped and handshake
-behavior is unchanged.
+behavior is unchanged. A configured CRL that has reached its own `nextUpdate` is
+an error rather than a fallback to "no revocation data", so mesh handshakes it
+would police stop succeeding until the CRL is refreshed; see
+[frontend_tls.md → CRL Policy](frontend_tls.md#crl-policy).
 
 The CRL set follows the same lifecycle as Ferrum's other rustls backend pools.
 When backend TLS live reload is enabled, `reload_backend_tls_material` reloads
