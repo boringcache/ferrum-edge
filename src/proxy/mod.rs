@@ -37901,9 +37901,10 @@ async fn handle_proxy_request_inner(
     // describe the backend stream. An attached inspector still strips the
     // client-visible field below so completeness of the *transformed* body
     // does not judge against this length.
-    let streaming_h3_backend_content_length = matches!(&response_body, ResponseBody::StreamingH3(_))
-        .then_some(trusted_backend_content_length)
-        .flatten();
+    let streaming_h3_backend_content_length =
+        matches!(&response_body, ResponseBody::StreamingH3(_))
+            .then_some(trusted_backend_content_length)
+            .flatten();
     // Resolve the inspector before cloning the context into the deferred
     // logger. The resolver stamps a private stream id only when an inspector
     // actually attaches; the terminal hook uses that id to drain plugin-owned

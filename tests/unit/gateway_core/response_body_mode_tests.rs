@@ -4,9 +4,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use chrono::Utc;
 use ferrum_edge::_test_support::{
-    canonical_header_content_length_from_map_for_test,
-    collect_size_limited_stream_chunks_for_test, preserved_response_content_length_for_test,
-    run_after_proxy_hooks_for_test, should_bypass_h2_coalesce_for_large_response_for_test,
+    canonical_header_content_length_from_map_for_test, collect_size_limited_stream_chunks_for_test,
+    preserved_response_content_length_for_test, run_after_proxy_hooks_for_test,
+    should_bypass_h2_coalesce_for_large_response_for_test,
     streaming_response_requires_size_limit_for_test,
 };
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy, ResponseBodyMode};
@@ -349,7 +349,9 @@ async fn rewritten_content_length_cannot_select_h2_passthrough() {
         should_bypass_h2_coalesce_for_large_response_for_test(declared, max),
         "using the inserted 1 MiB length would wrongly passthrough — that is the bug"
     );
-    assert!(streaming_response_requires_size_limit_for_test(max, trusted));
+    assert!(streaming_response_requires_size_limit_for_test(
+        max, trusted
+    ));
 }
 
 /// A genuine backend Content-Length within the cap still skips the
