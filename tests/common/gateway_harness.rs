@@ -239,9 +239,10 @@ impl TestGateway {
     /// barrier, which is also why it doubles as the proxy-listener bind proof
     /// (see the module docs).
     ///
-    /// Identical to [`wait_for_health`](Self::wait_for_health); both are
-    /// ownership + readiness barriers. Kept as a distinct name because callers
-    /// use it to express "I depend on full startup", not just liveness.
+    /// Identical to [`wait_for_health`](Self::wait_for_health); both re-check
+    /// authenticated-detail readiness after the spawn-time JWT ownership
+    /// barrier. Kept as a distinct name because callers use it to express
+    /// "I depend on full startup", not just liveness.
     pub async fn wait_for_ready(
         &self,
         timeout: Duration,
