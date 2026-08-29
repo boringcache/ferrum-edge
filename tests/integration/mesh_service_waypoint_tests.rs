@@ -517,7 +517,7 @@ fn slice_filter_narrows_services_to_waypoint_binding() {
                 name: "ratings".to_string(),
             },
         ],
-        "the matching active binding must stamp exact bound-service refs for the inbound relay"
+        "the matching service-terminating binding must stamp exact bound-service refs for the inbound relay"
     );
 }
 
@@ -910,5 +910,82 @@ fn slice_filter_honors_waypoint_for_none_as_opt_out() {
     assert!(
         slice.service_waypoint_bound_services.is_empty(),
         "waypoint_for=none must not stamp inbound-relay binding evidence"
+    );
+}
+
+fn waypoint_slice_for(waypoint_for: &str) -> MeshSlice {
+    let mesh = MeshConfig {
+        services: vec![service(
+            "reviews",
+            8080,
+            vec!["spiffe://cluster.local/ns/default/sa/r"],
+        )],
+        waypoint_bindings: vec![MeshWaypointBinding {
+            name: "api-waypoint".to_string(),
+            namespace: "default".to_string(),
+            waypoint_for: waypoint_for.to_string(),
+            gateway_class_name: None,
+            services: vec![MeshWaypointServiceRef {
+                namespace: "default".to_string(),
+                name: "reviews".to_string(),
+            }],
+        }],
+        ..MeshConfig::default()
+    };
+    let cfg = config_with_mesh(mesh);
+    let request = MeshSliceRequest {
+        namespace: "default".to_string(),
+        ..Default::default()
+    }
+    .with_waypoint_name(Some("api-waypoint".to_string()));
+    MeshSlice::from_gateway_config(&cfg, request)
+}
+
+#[test]
+fn slice_filter_stamps_service_binding_evidence_for_waypoint_for_all() {
+    let slice = waypoint_slice_for("all");
+    assert_eq!(
+        slice
+            .services
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["reviews"],
+        "waypoint_for=all must keep the bound Service on the routing view"
+    );
+    assert_eq!(
+        slice.service_waypoint_bound_services,
+        vec![MeshWaypointServiceRef {
+            namespace: "default".to_string(),
+            name: "reviews".to_string(),
+        }],
+        "waypoint_for=all must stamp exact bound-service refs for the inbound relay"
+    );
+}
+
+#[test]
+fn slice_filter_does_not_stamp_service_binding_evidence_for_waypoint_for_workload() {
+    let slice = waypoint_slice_for("workload");
+    assert_eq!(
+        slice
+            .services
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["reviews"],
+        "waypoint_for=workload must keep the existing routing-view narrowing"
+    );
+    assert!(
+        slice.service_waypoint_bound_services.is_empty(),
+        "waypoint_for=workload must not stamp inbound-relay service binding evidence"
+    );
+}
+
+#[test]
+fn slice_filter_does_not_stamp_service_binding_evidence_for_unknown_waypoint_for() {
+    let slice = waypoint_slice_for("direct");
+    assert!(
+        slice.service_waypoint_bound_services.is_empty(),
+        "unknown waypoint_for must not stamp inbound-relay service binding evidence"
     );
 }

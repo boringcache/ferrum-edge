@@ -3322,6 +3322,26 @@ fn reviews_and_ratings_mesh(bindings: Vec<MeshWaypointBinding>) -> MeshConfig {
     }
 }
 
+fn reviews_only_waypoint_binding(waypoint_for: &str) -> MeshWaypointBinding {
+    MeshWaypointBinding {
+        name: "reviews-waypoint".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        waypoint_for: waypoint_for.to_string(),
+        gateway_class_name: None,
+        services: vec![MeshWaypointServiceRef {
+            namespace: DEFAULT_NAMESPACE.to_string(),
+            name: "reviews".to_string(),
+        }],
+    }
+}
+
+fn reviews_bound_service_ref() -> MeshWaypointServiceRef {
+    MeshWaypointServiceRef {
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        name: "reviews".to_string(),
+    }
+}
+
 /// Issue #4251, production path: `narrow_for_service_waypoint` still fail-opens
 /// the routing view when the named binding is absent, so `MeshSlice.services`
 /// carries every namespace-visible Service. That view must NOT license the
@@ -3358,30 +3378,11 @@ fn inbound_relay_service_waypoint_missing_binding_from_gateway_config_terminates
     );
 }
 
-/// Issue #4251, production path: an exact matching active binding admits only
-/// the workloads that back that binding's exact `(namespace, service)` refs.
-#[test]
-fn inbound_relay_service_waypoint_exact_binding_from_gateway_config_admits_only_bound_backends() {
-    let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
-        reviews_and_ratings_mesh(vec![MeshWaypointBinding {
-            name: "reviews-waypoint".to_string(),
-            namespace: DEFAULT_NAMESPACE.to_string(),
-            waypoint_for: "service".to_string(),
-            gateway_class_name: None,
-            services: vec![MeshWaypointServiceRef {
-                namespace: DEFAULT_NAMESPACE.to_string(),
-                name: "reviews".to_string(),
-            }],
-        }]),
-        "reviews-waypoint",
-    );
-
+fn assert_reviews_service_relay_from_gateway_config(slice: &MeshSlice, mesh: &MeshConfig) {
     assert_eq!(
         slice.service_waypoint_bound_services,
-        vec![MeshWaypointServiceRef {
-            namespace: DEFAULT_NAMESPACE.to_string(),
-            name: "reviews".to_string(),
-        }]
+        vec![reviews_bound_service_ref()],
+        "service-terminating waypoint_for must stamp exact bound-service refs"
     );
     assert_eq!(
         slice
@@ -3406,33 +3407,15 @@ fn inbound_relay_service_waypoint_exact_binding_from_gateway_config_admits_only_
     );
 }
 
-/// Issue #4251, production path: `waypoint_for=none` is an explicit opt-out and
-/// must produce an empty relay inventory even when the binding lists services.
-#[test]
-fn inbound_relay_service_waypoint_waypoint_for_none_from_gateway_config_terminates_for_nothing() {
-    let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
-        reviews_and_ratings_mesh(vec![MeshWaypointBinding {
-            name: "reviews-waypoint".to_string(),
-            namespace: DEFAULT_NAMESPACE.to_string(),
-            waypoint_for: "none".to_string(),
-            gateway_class_name: None,
-            services: vec![MeshWaypointServiceRef {
-                namespace: DEFAULT_NAMESPACE.to_string(),
-                name: "reviews".to_string(),
-            }],
-        }]),
-        "reviews-waypoint",
-    );
-
-    assert!(
-        slice.services.is_empty() && slice.workloads.is_empty(),
-        "waypoint_for=none must produce an empty admitted routing set"
-    );
+fn assert_no_service_relay_from_gateway_config(slice: &MeshSlice, mesh: &MeshConfig) {
     assert!(
         slice.service_waypoint_bound_services.is_empty(),
-        "waypoint_for=none must not stamp relay evidence from the listed services"
+        "non-service-terminating waypoint_for must not stamp inbound-relay binding evidence"
     );
-    assert!(mesh.inbound_relay_destinations.is_empty());
+    assert!(
+        mesh.inbound_relay_destinations.is_empty(),
+        "no service-terminating binding evidence must leave the relay inventory empty"
+    );
 
     let waypoint = Some(ip("10.244.4.4"));
     assert_eq!(
@@ -3443,4 +3426,84 @@ fn inbound_relay_service_waypoint_waypoint_for_none_from_gateway_config_terminat
         mesh.inbound_relay_destination_decision("10.244.2.9", 8080, waypoint),
         Err(InboundRelayDenial::AddressNotTerminated)
     );
+}
+
+/// Issue #4251, production path: `waypoint_for=service` (and mixed-case) retains
+/// exact service binding evidence and admits only those bound backends.
+#[test]
+fn inbound_relay_service_waypoint_exact_binding_from_gateway_config_admits_only_bound_backends() {
+    for waypoint_for in ["service", "SERVICE"] {
+        let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+            reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding(waypoint_for)]),
+            "reviews-waypoint",
+        );
+        assert_reviews_service_relay_from_gateway_config(&slice, &mesh);
+    }
+}
+
+/// Issue #4251, production path: `waypoint_for=all` is also service-terminating
+/// and must stamp the same exact bound-service refs as `service`.
+#[test]
+fn inbound_relay_service_waypoint_waypoint_for_all_from_gateway_config_admits_only_bound_backends()
+ {
+    for waypoint_for in ["all", "All"] {
+        let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+            reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding(waypoint_for)]),
+            "reviews-waypoint",
+        );
+        assert_reviews_service_relay_from_gateway_config(&slice, &mesh);
+    }
+}
+
+/// Issue #4251, production path: `waypoint_for=none` is an explicit opt-out and
+/// must produce an empty relay inventory even when the binding lists services.
+#[test]
+fn inbound_relay_service_waypoint_waypoint_for_none_from_gateway_config_terminates_for_nothing() {
+    let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+        reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding("none")]),
+        "reviews-waypoint",
+    );
+
+    assert!(
+        slice.services.is_empty() && slice.workloads.is_empty(),
+        "waypoint_for=none must produce an empty admitted routing set"
+    );
+    assert_no_service_relay_from_gateway_config(&slice, &mesh);
+}
+
+/// Issue #4251, production path: `waypoint_for=workload` still lists Service
+/// refs on the routing view (the K8s translator appends them) but does not
+/// claim service traffic, so inbound service relay must terminate for nothing.
+#[test]
+fn inbound_relay_service_waypoint_waypoint_for_workload_from_gateway_config_terminates_for_nothing()
+ {
+    let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+        reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding("workload")]),
+        "reviews-waypoint",
+    );
+
+    assert_eq!(
+        slice
+            .services
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["reviews"],
+        "waypoint_for=workload must keep the existing routing-view narrowing"
+    );
+    assert_no_service_relay_from_gateway_config(&slice, &mesh);
+}
+
+/// Issue #4251, production path: blank and unknown/forward `waypoint_for`
+/// values fail closed for inbound service-relay evidence.
+#[test]
+fn inbound_relay_service_waypoint_unknown_waypoint_for_from_gateway_config_terminates_for_nothing()
+ {
+    for waypoint_for in ["", "direct"] {
+        let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+            reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding(waypoint_for)]),
+            "reviews-waypoint",
+        );
+        assert_no_service_relay_from_gateway_config(&slice, &mesh);
+    }
 }

@@ -949,8 +949,9 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
         carriers.push(MeshSliceCarrier::WaypointGatewayClass(class.to_string()));
     }
     // Exact ServiceWaypoint bound-service refs (issue #4251). Emitted only
-    // when the slice stamped a nonempty active binding; absence leaves the
-    // DP with no evidence so the inbound HBONE relay inventory is empty.
+    // when the slice stamped a nonempty service-terminating binding
+    // (`waypoint_for=service` or `all`); absence leaves the DP with no
+    // evidence so the inbound HBONE relay inventory is empty.
     // Missing/old producers that never emitted this carrier therefore fail
     // closed rather than treating the (possibly fail-open) services view as
     // a binding.

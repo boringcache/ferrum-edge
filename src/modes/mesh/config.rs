@@ -4630,15 +4630,17 @@ pub struct MeshConfig {
     ///   from [`Self::node_waypoint_capture_destinations`].
     /// * `ServiceWaypoint` — the workloads that actually BACK one of the
     ///   services bound to THIS waypoint (issue #4251), and only when this
-    ///   runtime's exact ServiceWaypoint identity has a matching, active
-    ///   binding. Binding evidence is `MeshSlice.service_waypoint_bound_services`
+    ///   runtime's exact ServiceWaypoint identity has a matching binding
+    ///   that claims service traffic (`waypoint_for=service` or `all`).
+    ///   Binding evidence is `MeshSlice.service_waypoint_bound_services`
     ///   (the exact `(namespace, service)` refs from that binding); a
     ///   destination is admitted only when its attached Service identity is
     ///   one of those refs, the slice still carries that Service, and that
     ///   Service's `workloads[]` list authorizes the workload's SPIFFE.
     ///   Missing/old/empty evidence — including a missing Gateway during
-    ///   rollout and `waypoint_for=none` — yields an EMPTY inventory. The
-    ///   slice's namespace-visible `services` view is NOT a binding.
+    ///   rollout and `waypoint_for=workload` / `none` / blank / unknown —
+    ///   yields an EMPTY inventory. The slice's namespace-visible `services`
+    ///   view is NOT a binding.
     ///
     /// `Sidecar` / `Ambient` set
     /// [`Self::inbound_relay_admits_accepted_local_address`], because the pod
@@ -5597,10 +5599,15 @@ impl MeshConfig {
 /// waypoint terminates traffic targeted at the listed services;
 /// `workload` means it terminates traffic addressed directly to the
 /// workload IPs; `all` means both. `none` opts out and yields no binding.
+/// Inbound service-relay evidence
+/// (`MeshSlice.service_waypoint_bound_services`) is stamped only for
+/// `service`/`all`; `workload`, `none`, blank, and unknown values leave
+/// that inventory empty. Direct-workload relay is not derived from this
+/// list.
 ///
 /// `services` is the list of `MeshService` references (namespace + name)
 /// the operator has bound to this waypoint. The slice builder uses the
-/// list as the authoritative narrowing key when
+/// list as the authoritative routing-view narrowing key when
 /// `MeshSliceRequest.waypoint_name == Some(name)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshWaypointBinding {
@@ -5615,7 +5622,8 @@ pub struct MeshWaypointBinding {
     pub namespace: String,
     /// `service` (default), `workload`, `all`, or `none`. Persisted as a
     /// string to keep the schema forward-compatible with future Istio
-    /// enum values without requiring a Ferrum-side migration.
+    /// enum values without requiring a Ferrum-side migration. Unknown
+    /// values fail closed for inbound service-relay evidence.
     #[serde(default = "default_waypoint_for")]
     pub waypoint_for: String,
     /// Gateway API `spec.gatewayClassName` when this binding came from a

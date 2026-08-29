@@ -242,15 +242,18 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waypoint_gateway_class: Option<String>,
     /// Exact `(namespace, service)` refs this ServiceWaypoint is bound to
-    /// (issue #4251). Stamped from the matching active
-    /// [`crate::modes::mesh::config::MeshWaypointBinding`] at slice build.
+    /// (issue #4251). Stamped from the matching
+    /// [`crate::modes::mesh::config::MeshWaypointBinding`] only when that
+    /// binding explicitly claims service traffic (`waypoint_for=service` or
+    /// `all`, ASCII-case-insensitive).
     ///
     /// This is the inbound-HBONE relay's binding evidence: the terminator
     /// admits a destination only when it backs one of these exact refs.
-    /// Empty (the default) means no matching active binding was present —
-    /// including a missing Gateway during rollout, `waypoint_for=none`, an
-    /// empty binding, or an older slice that never carried this field — and
-    /// the relay inventory is EMPTY. It is deliberately independent of
+    /// Empty (the default) means no matching service-terminating binding
+    /// was present — including a missing Gateway during rollout,
+    /// `waypoint_for=workload` / `none` / blank / unknown, an empty binding,
+    /// or an older slice that never carried this field — and the relay
+    /// inventory is EMPTY. It is deliberately independent of
     /// [`Self::services`]: `narrow_for_service_waypoint` still fail-opens the
     /// routing view when the named binding is absent so flipping
     /// `FERRUM_MESH_TOPOLOGY=service_waypoint` before the Gateway lands is not
@@ -775,7 +778,9 @@ impl MeshSlice {
             && self.waypoint_gateway_class == other.waypoint_gateway_class
             // Binding evidence can flip independently of `services`: the
             // routing view still fail-opens when the named Gateway is absent,
-            // so a binding appearing or `waypoint_for=none` landing can leave
+            // and a `waypoint_for` that is not `service`/`all` still keeps
+            // listed Service refs on the routing view, so a binding appearing
+            // or a non-service-terminating `waypoint_for` landing can leave
             // the visible Service list unchanged while the inbound HBONE
             // relay inventory must go from empty→bound or bound→empty.
             && self.service_waypoint_bound_services == other.service_waypoint_bound_services
@@ -1906,7 +1911,8 @@ impl MeshSlice {
                 .and_then(|binding| binding.gateway_class_name.clone())
         });
         // Inbound-HBONE relay evidence (issue #4251). Empty unless this
-        // exact waypoint identity has a matching, active binding — never
+        // exact waypoint identity has a matching binding that claims
+        // service traffic (`waypoint_for=service` or `all`) — never
         // inferred from the (possibly fail-open) `services` view.
         let service_waypoint_bound_services = service_waypoint_bound_service_refs(
             &mesh.waypoint_bindings,
@@ -1984,7 +1990,8 @@ impl MeshSlice {
 /// This fail-open is NOT a binding and must never license the inbound HBONE
 /// relay. That inventory is derived from
 /// [`MeshSlice::service_waypoint_bound_services`], which stays empty unless
-/// this exact waypoint identity has a matching, active binding (issue #4251).
+/// this exact waypoint identity has a matching binding that claims service
+/// traffic (`waypoint_for=service` or `all`; issue #4251).
 struct ServiceWaypointNarrowingResources {
     services: Vec<MeshService>,
     service_entries: Vec<ServiceEntry>,
@@ -1993,14 +2000,15 @@ struct ServiceWaypointNarrowingResources {
     mesh_policies: Vec<MeshPolicy>,
 }
 
-/// Exact `(namespace, service)` refs from the matching active GAMMA
-/// waypoint binding, or empty when there is no such binding.
+/// Exact `(namespace, service)` refs from the matching GAMMA waypoint
+/// binding when that binding claims service traffic, or empty.
 ///
 /// Empty covers every fail-closed inbound-relay case: the named waypoint
-/// is absent from `waypoint_bindings`, `waypoint_for=none`, the binding
-/// lists no services, or the request carried no `waypoint_name`. This is
-/// the relay's binding evidence; it is independent of the routing-view
-/// fail-open in [`narrow_for_service_waypoint`].
+/// is absent from `waypoint_bindings`, `waypoint_for` is not an explicit
+/// `service`/`all` (`workload`, `none`, blank, and unknown/forward values),
+/// the binding lists no services, or the request carried no `waypoint_name`.
+/// This is the relay's binding evidence; it is independent of the
+/// routing-view fail-open in [`narrow_for_service_waypoint`].
 fn service_waypoint_bound_service_refs(
     bindings: &[crate::modes::mesh::config::MeshWaypointBinding],
     waypoint_name: Option<&str>,
@@ -2015,10 +2023,18 @@ fn service_waypoint_bound_service_refs(
     else {
         return Vec::new();
     };
-    if binding.waypoint_for.eq_ignore_ascii_case("none") {
+    if !waypoint_for_claims_service_traffic(&binding.waypoint_for) {
         return Vec::new();
     }
     binding.services.clone()
+}
+
+/// Inbound service-relay evidence is stamped only when `waypoint_for`
+/// explicitly claims service-targeted traffic. `workload` terminates
+/// direct workload-IP traffic and has no service-relay lane here;
+/// `none`, blank, and unknown/forward values fail closed.
+fn waypoint_for_claims_service_traffic(waypoint_for: &str) -> bool {
+    waypoint_for.eq_ignore_ascii_case("service") || waypoint_for.eq_ignore_ascii_case("all")
 }
 
 fn service_waypoint_resource_namespaces(

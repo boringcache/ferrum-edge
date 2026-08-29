@@ -1904,9 +1904,11 @@ fn prepare_normalized_gateway_config_for_mesh(
 /// Fail closed unless ALL of:
 /// 1. this runtime's exact ServiceWaypoint identity (`waypoint_name` +
 ///    namespace) matches the slice that carried the evidence;
-/// 2. that identity has a matching, active binding, carried as
+/// 2. that identity has a matching binding that claims service traffic
+///    (`waypoint_for=service` or `all`), carried as
 ///    `mesh_slice.service_waypoint_bound_services` (missing / old / empty
-///    evidence, including `waypoint_for=none`, is empty);
+///    evidence, including `waypoint_for=workload` / `none` / blank /
+///    unknown, is empty);
 /// 3. the destination's ATTACHED Service identity is one of those exact
 ///    `(namespace, service)` refs, the slice still carries that Service,
 ///    and that Service's `workloads[]` list names the workload's SPIFFE —
