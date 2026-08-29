@@ -381,7 +381,11 @@ fn weighted_round_robin_respects_weights_inside_the_selected_tier_only() {
         *counts.entry(sel.target.host.clone()).or_default() += 1;
     }
 
-    assert_eq!(counts.get("dr"), None, "the DR tier must receive no traffic");
+    assert_eq!(
+        counts.get("dr"),
+        None,
+        "the DR tier must receive no traffic"
+    );
     let heavy = *counts.get("heavy").unwrap_or(&0);
     let light = *counts.get("light").unwrap_or(&0);
     assert_eq!(heavy + light, 1000);
@@ -550,8 +554,8 @@ fn sticky_session_eligibility_follows_the_tier_filter() {
         .select("ctx", Some(&health_ctx(&active)))
         .expect("DR tier serves while the primary tier is down")
         .target;
-    let token = sticky_session_token(UPSTREAM, &dr)
-        .expect("a selected target must mint a sticky token");
+    let token =
+        sticky_session_token(UPSTREAM, &dr).expect("a selected target must mint a sticky token");
 
     assert!(
         lb.select_sticky(&token, None, None, Some(&health_ctx(&active)))
