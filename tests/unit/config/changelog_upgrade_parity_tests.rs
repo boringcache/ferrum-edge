@@ -116,7 +116,10 @@ fn upgrade_guide_cites_issue(guide: &str, number: u32) -> bool {
 fn upgrade_guide_issue_reference_matcher_is_token_exact() {
     let pass_cases = [
         ("issue #3297", 3297),
-        ("(issue [#3297](https://github.com/ferrum-edge/ferrum-edge/issues/3297))", 3297),
+        (
+            "(issue [#3297](https://github.com/ferrum-edge/ferrum-edge/issues/3297))",
+            3297,
+        ),
         ("see #3297.", 3297),
         ("prefix #3297", 3297),
     ];
