@@ -17,8 +17,10 @@ fn read(rel: &str) -> String {
 }
 
 fn read_ci() -> String {
-    std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml"))
-        .expect("read .github/workflows/ci.yml")
+    std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml"),
+    )
+    .expect("read .github/workflows/ci.yml")
 }
 
 #[test]
@@ -82,7 +84,10 @@ fn values_and_schema_expose_datapath_alert_thresholds() {
         );
     }
     let schema = read("values.schema.json");
-    for needle in ["upstreamUnhealthyRatio", "frontendTlsHandshakeErrorsPerSecond"] {
+    for needle in [
+        "upstreamUnhealthyRatio",
+        "frontendTlsHandshakeErrorsPerSecond",
+    ] {
         assert!(
             schema.contains(needle),
             "values.schema.json must expose alert threshold {needle}"
