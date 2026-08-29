@@ -2956,6 +2956,18 @@ fn forward_sensitive_query_opt_in_is_fail_closed() {
         .is_ok(),
         "a query name denied only by a configured pattern must be allowlistable"
     );
+    assert!(
+        RequestMirror::new(
+            &json!({
+                "mirror_host": "mirror.local",
+                "forward_sensitive_query": true,
+                "forward_sensitive_query_allowlist": ["x-amz-signature", "oauth_token"]
+            }),
+            PluginHttpClient::default(),
+        )
+        .is_ok(),
+        "delimiter-bounded built-in credential names must be allowlistable"
+    );
 }
 
 #[test]
@@ -3114,6 +3126,86 @@ async fn sensitive_query_map_fallback_strips_without_form_encoder_rewrite() {
     assert!(
         ctx.query_params.get("access_token").is_some(),
         "primary query_params must remain unchanged"
+    );
+}
+
+#[tokio::test]
+async fn sensitive_query_hostile_encoding_prefixed_credentials_and_benign_names() {
+    let mut ctx = make_ctx_with_proxy();
+    const RAW: &str = concat!(
+        "keep=1&%61ccess_token=s1&%2561ccess_token=s2&",
+        "oauth_token=s3&x-amz-signature=s4&x-goog-signature=s5&",
+        "continuation_token=ok&signal=1&foo%GG=bad&tok%00en=nul"
+    );
+    ctx.set_raw_query_string(RAW.to_string());
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        request_line.contains("keep=1&continuation_token=ok&signal=1"),
+        "benign continuation_token/signal and order must be retained: {request_line}"
+    );
+    for forbidden in [
+        "%61ccess_token",
+        "%2561ccess_token",
+        "oauth_token",
+        "x-amz-signature",
+        "x-goog-signature",
+        "foo%GG",
+        "tok%00en",
+        "=s1",
+        "=s2",
+        "=s3",
+        "=s4",
+        "=s5",
+        "=bad",
+        "=nul",
+    ] {
+        assert!(
+            !request_line.contains(forbidden),
+            "must omit hostile/prefixed credential `{forbidden}`: {request_line}"
+        );
+    }
+    assert_eq!(
+        ctx.raw_query_string(),
+        Some(RAW),
+        "primary/raw query snapshot must stay byte-for-byte unchanged"
+    );
+
+    let mut residual = make_ctx_with_proxy();
+    const RESIDUAL: &str = "keep=2&%2525252561ccess_token=hidden";
+    residual.set_raw_query_string(RESIDUAL.to_string());
+    let residual_line = capture_mirror_request_line(&mut residual).await;
+    assert!(
+        residual_line.contains("keep=2")
+            && !residual_line.contains("%2525252561")
+            && !residual_line.contains("hidden"),
+        "decode-depth residual %XX must fail closed: {residual_line}"
+    );
+    assert_eq!(residual.raw_query_string(), Some(RESIDUAL));
+
+    let mut allow = make_ctx_with_proxy();
+    allow.set_raw_query_string("%2561ccess_token=allow-me&x=1".to_string());
+    let allow_line = capture_mirror_request_line_with_config(
+        &mut allow,
+        json!({
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["access_token"]
+        }),
+    )
+    .await;
+    assert!(
+        allow_line.contains("%2561ccess_token=allow-me&x=1"),
+        "allowlist must match the decoded name and keep the raw encoded pair: {allow_line}"
+    );
+
+    let mut all_sensitive = make_ctx_with_proxy();
+    all_sensitive.set_raw_query_string(
+        "oauth_token=a&x-amz-signature=b&x-goog-signature=c".to_string(),
+    );
+    let all_line = capture_mirror_request_line(&mut all_sensitive).await;
+    assert!(
+        !all_line.contains('?') && !all_line.contains('&') && all_line.contains("/api/users "),
+        "all-sensitive prefixed credentials must drop leftover delimiters: {all_line}"
     );
 }
 

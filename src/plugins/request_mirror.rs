@@ -67,9 +67,16 @@
 //! match that funnel. Cross-origin **query** credential forwarding is the same
 //! deny-by-default posture as headers: built-in credential names/substrings
 //! (plus operator `sensitive_query_patterns`) are dropped from the mirror
-//! request-target only. The primary backend target is never rewritten. Forwarding
-//! a denied query name requires `forward_sensitive_query=true` plus an exact
-//! decoded-name `forward_sensitive_query_allowlist`.
+//! request-target only. Classification percent-decodes the name in bounded
+//! stages (every layer through a hard cap of 4) and
+//! fails closed on residual valid `%XX` escapes, malformed percents, or
+//! control-bearing/invalid-UTF-8 forms; the retained pair is never rewritten.
+//! Built-in `token`/`sig`/`signature` matching is delimiter-bounded so
+//! `oauth_token` and `x-amz-signature` / `x-goog-signature` are denied without
+//! stripping `continuation_token` or `signal`. The primary backend target is
+//! never rewritten. Forwarding a denied query name requires
+//! `forward_sensitive_query=true` plus an exact decoded-name
+//! `forward_sensitive_query_allowlist`.
 //!
 //! Path selection precedence when building the mirror URL:
 //! 1. explicit plugin `mirror_path` (operator override; wins)
@@ -211,8 +218,8 @@
 //! | `forward_sensitive_header_allowlist` | string[] | `[]` | Lowercased exact allowlist of denied sensitive header names to forward when `forward_sensitive_headers` is `true`. Each entry must be a valid HTTP header name (≤256 chars) that the deny-by-default policy actually strips (a built-in credential or a `sensitive_header_patterns` match); at most 64 entries; non-sensitive names are rejected at construction. |
 //! | `sensitive_header_patterns` | string[] | `[]` | Additional lowercased substrings (matched against the header name; each ≤128 chars, at most 64 entries) that extend the built-in deny-by-default credential set. Covers HTTP headers and native gRPC metadata. |
 //! | `forward_sensitive_query` | bool | `false` | Dangerous opt-in. When `true`, selected origin-bound credential query names may cross to the mirror origin, but only exact decoded names listed in `forward_sensitive_query_allowlist` (fail-closed: both fields required together, allowlist must be non-empty). Does not change the primary backend request-target. |
-//! | `forward_sensitive_query_allowlist` | string[] | `[]` | Lowercased exact allowlist of denied sensitive query parameter names to forward when `forward_sensitive_query` is `true`. Each entry is matched against the percent-decoded, ASCII-lowercased name (≤256 chars) that the deny-by-default policy actually strips (a built-in credential or a `sensitive_query_patterns` match); at most 64 entries; non-sensitive names are rejected at construction. |
-//! | `sensitive_query_patterns` | string[] | `[]` | Additional lowercased substrings (matched against the percent-decoded query parameter name; each ≤128 chars, at most 64 entries) that extend the built-in deny-by-default query credential set. |
+//! | `forward_sensitive_query_allowlist` | string[] | `[]` | Lowercased exact allowlist of denied sensitive query parameter names to forward when `forward_sensitive_query` is `true`. Each entry is matched against the fully percent-decoded (bounded staged decode), ASCII-lowercased name (≤256 chars) that the deny-by-default policy actually strips (a built-in credential or a `sensitive_query_patterns` match); at most 64 entries; non-sensitive names are rejected at construction. |
+//! | `sensitive_query_patterns` | string[] | `[]` | Additional lowercased substrings (matched against each staged percent-decoded query parameter name; each ≤128 chars, at most 64 entries) that extend the built-in deny-by-default query credential set. |
 //!
 //! ## Percentage sampling
 //!
@@ -367,6 +374,14 @@ const MAX_SENSITIVE_QUERY_PATTERN_LEN: usize = 128;
 const MAX_FORWARD_SENSITIVE_QUERY_ALLOWLIST: usize = 64;
 /// Maximum UTF-8 byte length of one query-name allowlist entry.
 const MAX_FORWARD_SENSITIVE_QUERY_ALLOWLIST_ITEM_LEN: usize = 256;
+/// Hard cap on percent-decode layers applied while *classifying* a query
+/// parameter name. Each layer is one `percent_decode_str` pass. The retained
+/// pair is never decoded or rewritten. A name that still contains a valid
+/// `%XX` escape after this cap is denied (fail closed).
+const MAX_MIRROR_QUERY_NAME_DECODE_LAYERS: usize = 4;
+/// Classification refuses (fail closed) a raw or decoded name longer than this
+/// rather than spending unbounded decode/scan work.
+const MAX_MIRROR_QUERY_NAME_CLASSIFY_BYTES: usize = 256;
 
 /// Well-known origin-bound credential / session header names stripped from
 /// cross-origin mirror requests unless an explicit fail-closed allowlist opts
@@ -418,16 +433,20 @@ const MIRROR_SENSITIVE_HEADER_SUBSTRINGS: &[&str] = &[
     "credential",
 ];
 
-/// Exact lowercased decoded query names that are credentials but must not be
-/// substring-matched. Bare `token`/`sig` as substrings would over-strip
-/// pagination cursors (`continuation_token`) and benign names (`signal`).
-const MIRROR_SENSITIVE_QUERY_EXACT_NAMES: &[&str] = &["token", "sig", "signature"];
+/// Built-in credential *segments* matched with alphanumeric boundaries on the
+/// lowercased decoded query name. Exact `token`/`sig`/`signature` plus vendor
+/// prefixes (`oauth_token`, `x-amz-signature`, `x-goog-signature`) are denied.
+/// A naive substring would over-strip pagination cursors (`continuation_token`)
+/// and benign names (`signal`); `token` therefore ignores a segment immediately
+/// preceded by `continuation`, and `sig` requires a complete segment.
+const MIRROR_SENSITIVE_QUERY_CREDENTIAL_SEGMENTS: &[&str] = &["token", "sig", "signature"];
 
 /// Built-in credential substrings applied to percent-decoded, ASCII-lowercased
 /// query parameter names. Seeded from [`MIRROR_SENSITIVE_HEADER_SUBSTRINGS`]
 /// with `_` variants of hyphenated families so `access_token` / `api_key`
 /// match the same secret classes the header policy already denies. Bare
-/// `token`/`key`/`session`/`auth`/`sig` substrings are excluded.
+/// `token`/`key`/`session`/`auth`/`sig` substrings are excluded; those families
+/// are handled by [`query_name_has_built_in_credential_segment`].
 const MIRROR_SENSITIVE_QUERY_SUBSTRINGS: &[&str] = &[
     "authorization",
     "cookie",
@@ -504,16 +523,198 @@ fn is_mirror_sensitive_header(name_lower: &str, operator_patterns: &[String]) ->
 }
 
 /// Deny-by-default sensitivity test for a percent-decoded, ASCII-lowercased
-/// query parameter name. Exact built-in credential names, built-in substrings,
-/// and operator `sensitive_query_patterns` all deny. Never logs the name.
+/// query parameter name. Built-in delimiter-bounded credential segments,
+/// built-in substrings, and operator `sensitive_query_patterns` all deny.
+/// Never logs the name.
 fn is_mirror_sensitive_query_name(name_lower: &str, operator_patterns: &[String]) -> bool {
-    MIRROR_SENSITIVE_QUERY_EXACT_NAMES.contains(&name_lower)
+    query_name_has_built_in_credential_segment(name_lower)
         || MIRROR_SENSITIVE_QUERY_SUBSTRINGS
             .iter()
             .any(|substr| name_lower.contains(substr))
         || operator_patterns
             .iter()
             .any(|pattern| name_lower.contains(pattern.as_str()))
+}
+
+fn is_ascii_query_name_delimiter(byte: u8) -> bool {
+    !byte.is_ascii_alphanumeric()
+}
+
+/// True when `needle` appears as a complete alphanumeric-bounded segment of
+/// `name_lower` (start/end of the name or a non-alphanumeric delimiter).
+fn query_name_has_bounded_segment(name_lower: &str, needle: &str) -> bool {
+    let bytes = name_lower.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    if needle_bytes.is_empty() || needle_bytes.len() > bytes.len() {
+        return false;
+    }
+    let last_start = bytes.len() - needle_bytes.len();
+    let mut start = 0;
+    while start <= last_start {
+        if bytes[start..].starts_with(needle_bytes) {
+            let before_ok = start == 0 || is_ascii_query_name_delimiter(bytes[start - 1]);
+            let after = start + needle_bytes.len();
+            let after_ok = after == bytes.len() || is_ascii_query_name_delimiter(bytes[after]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        start += 1;
+    }
+    false
+}
+
+/// `token` as a bounded segment, except when the previous segment is
+/// `continuation` (`continuation_token`, `x-continuation-token`).
+fn query_name_has_token_credential_segment(name_lower: &str) -> bool {
+    let bytes = name_lower.as_bytes();
+    let needle = b"token";
+    if bytes.len() < needle.len() {
+        return false;
+    }
+    let last_start = bytes.len() - needle.len();
+    let mut start = 0;
+    while start <= last_start {
+        if &bytes[start..start + needle.len()] == needle {
+            let before_ok = start == 0 || is_ascii_query_name_delimiter(bytes[start - 1]);
+            let after = start + needle.len();
+            let after_ok = after == bytes.len() || is_ascii_query_name_delimiter(bytes[after]);
+            if before_ok && after_ok && !preceding_segment_is(bytes, start, b"continuation") {
+                return true;
+            }
+        }
+        start += 1;
+    }
+    false
+}
+
+fn preceding_segment_is(bytes: &[u8], segment_start: usize, expected: &[u8]) -> bool {
+    if segment_start == 0 {
+        return false;
+    }
+    let mut idx = segment_start - 1;
+    while is_ascii_query_name_delimiter(bytes[idx]) {
+        if idx == 0 {
+            return false;
+        }
+        idx -= 1;
+    }
+    let segment_end = idx + 1;
+    while idx > 0 && !is_ascii_query_name_delimiter(bytes[idx - 1]) {
+        idx -= 1;
+    }
+    &bytes[idx..segment_end] == expected
+}
+
+fn query_name_has_built_in_credential_segment(name_lower: &str) -> bool {
+    MIRROR_SENSITIVE_QUERY_CREDENTIAL_SEGMENTS
+        .iter()
+        .any(|segment| {
+            if *segment == "token" {
+                query_name_has_token_credential_segment(name_lower)
+            } else {
+                query_name_has_bounded_segment(name_lower, segment)
+            }
+        })
+}
+
+fn name_has_ascii_control(name: &str) -> bool {
+    name.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+}
+
+fn name_has_valid_percent_escape(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let mut idx = 0;
+    while idx + 2 < bytes.len() {
+        if bytes[idx] == b'%'
+            && bytes[idx + 1].is_ascii_hexdigit()
+            && bytes[idx + 2].is_ascii_hexdigit()
+        {
+            return true;
+        }
+        idx += 1;
+    }
+    false
+}
+
+fn name_has_malformed_percent(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' {
+            if idx + 2 >= bytes.len()
+                || !bytes[idx + 1].is_ascii_hexdigit()
+                || !bytes[idx + 2].is_ascii_hexdigit()
+            {
+                return true;
+            }
+            idx += 3;
+        } else {
+            idx += 1;
+        }
+    }
+    false
+}
+
+enum MirrorQueryNameDecision {
+    NonSensitive,
+    Sensitive { decoded_lower: String },
+    FailClosed,
+}
+
+/// Classify a query *name* for the deny-by-default mirror policy.
+///
+/// Percent-decoding is classification-only: every layer through
+/// [`MAX_MIRROR_QUERY_NAME_DECODE_LAYERS`] is checked, residual valid `%XX`
+/// after the cap fails closed, and malformed / control-bearing / invalid-UTF-8
+/// / oversized names fail closed. The caller must keep the original pair bytes.
+fn classify_mirror_query_name(
+    raw_name: &str,
+    operator_patterns: &[String],
+) -> MirrorQueryNameDecision {
+    if raw_name.len() > MAX_MIRROR_QUERY_NAME_CLASSIFY_BYTES {
+        return MirrorQueryNameDecision::FailClosed;
+    }
+
+    let mut current = Cow::Borrowed(raw_name);
+    let mut sensitive = false;
+    let mut depth = 0;
+    loop {
+        if current.len() > MAX_MIRROR_QUERY_NAME_CLASSIFY_BYTES
+            || name_has_ascii_control(current.as_ref())
+            || name_has_malformed_percent(current.as_ref())
+        {
+            return MirrorQueryNameDecision::FailClosed;
+        }
+
+        let lower = current.to_ascii_lowercase();
+        if is_mirror_sensitive_query_name(lower.as_ref(), operator_patterns) {
+            sensitive = true;
+        }
+
+        if !name_has_valid_percent_escape(current.as_ref()) {
+            return if sensitive {
+                MirrorQueryNameDecision::Sensitive {
+                    decoded_lower: lower.into_owned(),
+                }
+            } else {
+                MirrorQueryNameDecision::NonSensitive
+            };
+        }
+
+        if depth == MAX_MIRROR_QUERY_NAME_DECODE_LAYERS {
+            return MirrorQueryNameDecision::FailClosed;
+        }
+
+        match percent_decode_str(current.as_ref()).decode_utf8() {
+            Ok(decoded) if decoded.as_ref() == current.as_ref() => {
+                return MirrorQueryNameDecision::FailClosed;
+            }
+            Ok(decoded) => current = Cow::Owned(decoded.into_owned()),
+            Err(_) => return MirrorQueryNameDecision::FailClosed,
+        }
+        depth += 1;
+    }
 }
 
 /// Append Envoy/Istio's `-shadow` suffix to a Host/:authority value when the
@@ -610,10 +811,11 @@ fn apply_mirror_credential_policy(
 }
 
 /// Drop deny-by-default credential query pairs from an owned snapshot of the
-/// canonical backend-visible query. Retained pairs keep their original wire
-/// encoding, order, empty values, flags, and repeats. When nothing is stripped
-/// the original string is borrowed so empty separators are not rewritten.
-/// Stripped names and values are never logged.
+/// canonical backend-visible query. Names are classified with bounded staged
+/// percent-decode; retained pairs keep their original wire encoding, order,
+/// empty values, flags, and repeats. When nothing is stripped the original
+/// string is borrowed so empty separators are not rewritten. Stripped names
+/// and values are never logged.
 fn apply_mirror_query_credential_policy<'a>(
     query: &'a str,
     forward_sensitive_query: bool,
@@ -631,20 +833,16 @@ fn apply_mirror_query_credential_policy<'a>(
             continue;
         }
         let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
-        let decoded_name = percent_decode_str(raw_name).decode_utf8_lossy();
-        let decoded_lower = decoded_name.to_ascii_lowercase();
-        let raw_lower = raw_name.to_ascii_lowercase();
-        let sensitive = is_mirror_sensitive_query_name(&decoded_lower, operator_patterns)
-            || (raw_lower != decoded_lower
-                && is_mirror_sensitive_query_name(&raw_lower, operator_patterns));
-        if sensitive {
-            let allowed = forward_sensitive_query
-                && (allowlist.iter().any(|allowed| allowed == &decoded_lower)
-                    || allowlist.iter().any(|allowed| allowed == &raw_lower));
-            if !allowed {
-                removed_any = true;
-                continue;
+        let allowed = match classify_mirror_query_name(raw_name, operator_patterns) {
+            MirrorQueryNameDecision::NonSensitive => true,
+            MirrorQueryNameDecision::FailClosed => false,
+            MirrorQueryNameDecision::Sensitive { decoded_lower } => {
+                forward_sensitive_query && allowlist.iter().any(|allowed| allowed == &decoded_lower)
             }
+        };
+        if !allowed {
+            removed_any = true;
+            continue;
         }
         if !kept.is_empty() {
             kept.push('&');
