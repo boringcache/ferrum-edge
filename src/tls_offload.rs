@@ -25,8 +25,8 @@ pub struct TlsOffloadConfig {
 
 impl Default for TlsOffloadConfig {
     fn default() -> Self {
-        // Default: 2 shards x 1 thread = 2 offload threads.
-        // Conservative for most deployments; increase for TLS-heavy workloads.
+        // Future wiring defaults: 2 shards x 1 thread = 2 offload threads.
+        // The current startup path never constructs this configuration.
         Self {
             shards: 2,
             threads_per_shard: 1,
