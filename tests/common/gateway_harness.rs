@@ -1701,8 +1701,13 @@ pub async fn wait_for_owned_gateway_identity(
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let deadline = Instant::now() + timeout;
-    let health_bearer = identity.admin_token();
-    wait_for_gateway_identity(admin_port, &health_bearer, timeout, Some(child)).await?;
+    wait_for_gateway_identity(
+        admin_port,
+        &identity.observability_token,
+        timeout,
+        Some(child),
+    )
+    .await?;
     fail_if_child_exited(
         child,
         admin_port,
