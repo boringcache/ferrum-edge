@@ -78,8 +78,8 @@ fn bit_string(content: &[u8]) -> Vec<u8> {
 }
 
 fn generalized_time(unix: i64) -> Vec<u8> {
-    let datetime = time::OffsetDateTime::from_unix_timestamp(unix)
-        .expect("representable GeneralizedTime");
+    let datetime =
+        time::OffsetDateTime::from_unix_timestamp(unix).expect("representable GeneralizedTime");
     let rendered = format!(
         "{:04}{:02}{:02}{:02}{:02}{:02}Z",
         datetime.year(),
@@ -96,6 +96,43 @@ const OID_SHA1: &[u8] = &[0x2b, 0x0e, 0x03, 0x02, 0x1a];
 const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
 const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
 const OID_OCSP_BASIC: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01];
+/// `id-pkix-ocsp-nonce` (1.3.6.1.5.5.7.48.1.2): a real OCSP extension Ferrum
+/// does not implement, used here as the stand-in unknown extension.
+const OID_OCSP_NONCE: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02];
+
+/// One `Extension`. DER omits `critical` when it is FALSE.
+fn extension(oid_bytes: &[u8], critical: bool, value: &[u8]) -> Vec<u8> {
+    let mut parts = vec![oid(oid_bytes)];
+    if critical {
+        parts.push(tlv(0x01, &[0xff]));
+    }
+    parts.push(octet_string(value));
+    sequence(&parts)
+}
+
+/// `[n] EXPLICIT Extensions`, the shape both `responseExtensions` and
+/// `singleExtensions` use.
+fn extensions_field(number: u8, entries: &[Vec<u8>]) -> Vec<u8> {
+    explicit(number, &sequence(entries))
+}
+
+/// A `responseExtensions` / `singleExtensions` field holding one unimplemented
+/// extension, critical or not.
+fn one_extension_field(number: u8, critical: bool) -> Vec<u8> {
+    extensions_field(number, &[extension(OID_OCSP_NONCE, critical, b"nonce")])
+}
+
+/// Minimal positive-INTEGER content bytes for a serial number.
+fn serial_bytes(serial: u64) -> Vec<u8> {
+    let mut bytes = serial.to_be_bytes().to_vec();
+    while bytes.len() > 1 && bytes[0] == 0 {
+        bytes.remove(0);
+    }
+    if bytes[0] & 0x80 != 0 {
+        bytes.insert(0, 0);
+    }
+    bytes
+}
 
 fn parse_certificate(der: &[u8]) -> X509Certificate<'_> {
     let (_, parsed) = X509Certificate::from_der(der).expect("parseable certificate");
@@ -174,8 +211,23 @@ struct TestPki {
     /// A certificate issued by the CA that lacks `id-kp-OCSPSigning`.
     no_eku_key: SigningKey,
     no_eku_der: Vec<u8>,
+    /// A delegated responder carrying an explicit `KeyUsage` that includes
+    /// `digitalSignature`.
+    signing_ku_key: SigningKey,
+    signing_ku_der: Vec<u8>,
+    /// A delegated responder whose present `KeyUsage` withholds
+    /// `digitalSignature`.
+    no_digital_signature_key: SigningKey,
+    no_digital_signature_der: Vec<u8>,
     /// A second, unrelated CA and a leaf beneath it.
     other_issuer_der: Vec<u8>,
+    /// A certificate carrying the CA's exact subject name over a different key.
+    /// It never signed the leaf.
+    impostor_issuer_der: Vec<u8>,
+    /// A certificate whose subject equals its issuer name but whose signature
+    /// was made by a *different* key of that name: self-issued, not
+    /// self-signed.
+    self_issued_not_self_signed_der: Vec<u8>,
 }
 
 fn build_pki() -> TestPki {
@@ -198,8 +250,8 @@ fn build_pki() -> TestPki {
     let issuer_handle = rcgen::Issuer::new(issuer_params, issuer_pair);
 
     let (leaf_pair, _leaf_key) = new_key();
-    let mut leaf_params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
-        .expect("leaf params");
+    let mut leaf_params =
+        rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("leaf params");
     leaf_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "ferrum-ocsp-leaf");
@@ -214,8 +266,8 @@ fn build_pki() -> TestPki {
 
     // A delegated responder: issued by the CA and carrying id-kp-OCSPSigning.
     let (delegate_pair, delegate_key) = new_key();
-    let mut delegate_params = rcgen::CertificateParams::new(Vec::<String>::new())
-        .expect("delegate params");
+    let mut delegate_params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("delegate params");
     delegate_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "Ferrum OCSP Responder");
@@ -228,8 +280,8 @@ fn build_pki() -> TestPki {
 
     // Issued by the same CA, but without the OCSP-signing EKU.
     let (no_eku_pair, no_eku_key) = new_key();
-    let mut no_eku_params = rcgen::CertificateParams::new(Vec::<String>::new())
-        .expect("no-eku params");
+    let mut no_eku_params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("no-eku params");
     no_eku_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "Ferrum Non-Responder");
@@ -247,6 +299,85 @@ fn build_pki() -> TestPki {
         .extended_key_usages
         .push(rcgen::ExtendedKeyUsagePurpose::OcspSigning);
     let rogue_cert = rogue_params.self_signed(&rogue_pair).expect("rogue cert");
+
+    // Issued by the CA with id-kp-OCSPSigning and a KeyUsage that permits a
+    // digital signature.
+    let (signing_ku_pair, signing_ku_key) = new_key();
+    let mut signing_ku_params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("signing-ku params");
+    signing_ku_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Ferrum OCSP Responder KU");
+    signing_ku_params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::OcspSigning);
+    signing_ku_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::DigitalSignature);
+    let signing_ku_cert = signing_ku_params
+        .signed_by(&signing_ku_pair, &issuer_handle)
+        .expect("signing-ku cert");
+
+    // Same, but the present KeyUsage withholds digitalSignature.
+    let (no_ds_pair, no_digital_signature_key) = new_key();
+    let mut no_ds_params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("no-ds params");
+    no_ds_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Ferrum OCSP Responder No DS");
+    no_ds_params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::OcspSigning);
+    no_ds_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::KeyEncipherment);
+    let no_ds_cert = no_ds_params
+        .signed_by(&no_ds_pair, &issuer_handle)
+        .expect("no-ds cert");
+
+    // The CA's exact subject name over a foreign key. Nothing it holds signed
+    // the leaf, so it must never be selected as the issuer.
+    let (impostor_pair, _impostor_key) = new_key();
+    let mut impostor_params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("impostor params");
+    impostor_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    impostor_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Ferrum OCSP Test CA");
+    impostor_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::KeyCertSign);
+    let impostor_cert = impostor_params
+        .self_signed(&impostor_pair)
+        .expect("impostor CA cert");
+
+    // A CA named "Ferrum Self Issued" issuing a certificate that carries the
+    // same subject name but its own, different key: subject == issuer, yet the
+    // signature is not verifiable under the certificate's own key.
+    let (masquerade_pair, _masquerade_key) = new_key();
+    let mut masquerade_params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("masquerade params");
+    masquerade_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    masquerade_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Ferrum Self Issued");
+    masquerade_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::KeyCertSign);
+    let _masquerade_cert = masquerade_params
+        .self_signed(&masquerade_pair)
+        .expect("masquerade CA cert");
+    let masquerade_handle = rcgen::Issuer::new(masquerade_params, masquerade_pair);
+
+    let (self_issued_pair, _self_issued_key) = new_key();
+    let mut self_issued_params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("self-issued params");
+    self_issued_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Ferrum Self Issued");
+    let self_issued_cert = self_issued_params
+        .signed_by(&self_issued_pair, &masquerade_handle)
+        .expect("self-issued cert");
 
     let (other_pair, _other_key) = new_key();
     let mut other_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("other CA");
@@ -271,7 +402,13 @@ fn build_pki() -> TestPki {
         rogue_der: rogue_cert.der().to_vec(),
         no_eku_key,
         no_eku_der: no_eku_cert.der().to_vec(),
+        signing_ku_key,
+        signing_ku_der: signing_ku_cert.der().to_vec(),
+        no_digital_signature_key,
+        no_digital_signature_der: no_ds_cert.der().to_vec(),
         other_issuer_der: other_cert.der().to_vec(),
+        impostor_issuer_der: impostor_cert.der().to_vec(),
+        self_issued_not_self_signed_der: self_issued_cert.der().to_vec(),
     }
 }
 
@@ -307,6 +444,19 @@ struct ResponseBuilder<'a> {
     corrupt_signature: bool,
     response_status: u8,
     response_type_oid: &'static [u8],
+    /// Raw replacement for the `producedAt` element.
+    produced_at: Option<Vec<u8>>,
+    /// Raw elements appended to `ResponseData` after `responses`.
+    response_data_tail: Vec<Vec<u8>>,
+    /// Raw replacement for everything after `thisUpdate` in each
+    /// `SingleResponse`. `None` emits the default optional `nextUpdate`.
+    single_tail: Option<Vec<Vec<u8>>>,
+    /// Raw replacement for the `certStatus` element.
+    cert_status: Option<Vec<u8>>,
+    /// Emit a second entry for the same serial under this `CertID` hash OID.
+    duplicate_hash_oid: Option<&'static [u8]>,
+    /// Emit a leading entry for an unrelated serial.
+    leading_serial: Option<u64>,
 }
 
 impl<'a> ResponseBuilder<'a> {
@@ -325,7 +475,55 @@ impl<'a> ResponseBuilder<'a> {
             corrupt_signature: false,
             response_status: 0,
             response_type_oid: OID_OCSP_BASIC,
+            produced_at: None,
+            response_data_tail: Vec::new(),
+            single_tail: None,
+            cert_status: None,
+            duplicate_hash_oid: None,
+            leading_serial: None,
         }
+    }
+
+    /// One `SingleResponse` for `serial`, with the `CertID` hashed under
+    /// `hash_oid`.
+    fn single_response(&self, serial: u64, hash_oid: &[u8]) -> Vec<u8> {
+        let cert_id_issuer = parse_certificate(self.cert_id_issuer);
+        let hash = |data: &[u8]| -> Vec<u8> {
+            if hash_oid == OID_SHA256 {
+                sha256(data)
+            } else {
+                sha1(data)
+            }
+        };
+        let name_hash = hash(cert_id_issuer.subject().as_raw());
+        let key_hash = hash(cert_id_issuer.public_key().subject_public_key.data.as_ref());
+        let cert_id = sequence(&[
+            algorithm_identifier(hash_oid),
+            octet_string(&name_hash),
+            octet_string(&key_hash),
+            tlv(0x02, &serial_bytes(serial)),
+        ]);
+
+        let default_status = match self.status {
+            // good [0] IMPLICIT NULL
+            Status::Good => tlv(0x80, &[]),
+            // revoked [1] IMPLICIT RevokedInfo { revocationTime GeneralizedTime }
+            Status::Revoked => tlv(0xa1, &generalized_time(self.this_update)),
+            // unknown [2] IMPLICIT UnknownInfo (NULL)
+            Status::Unknown => tlv(0x82, &[]),
+        };
+        let cert_status = self.cert_status.clone().unwrap_or(default_status);
+
+        let mut parts = vec![cert_id, cert_status, generalized_time(self.this_update)];
+        match &self.single_tail {
+            Some(tail) => parts.extend(tail.iter().cloned()),
+            None => {
+                if let Some(next_update) = self.next_update {
+                    parts.push(explicit(0, &generalized_time(next_update)));
+                }
+            }
+        }
+        sequence(&parts)
     }
 
     fn build(&self) -> Vec<u8> {
@@ -338,52 +536,21 @@ impl<'a> ResponseBuilder<'a> {
             }
         };
 
-        let cert_id_issuer = parse_certificate(self.cert_id_issuer);
-        let hash = |data: &[u8]| -> Vec<u8> {
-            if self.hash_oid == OID_SHA256 {
-                sha256(data)
-            } else {
-                sha1(data)
-            }
-        };
-        let name_hash = hash(cert_id_issuer.subject().as_raw());
-        let key_hash = hash(cert_id_issuer.public_key().subject_public_key.data.as_ref());
-
-        let mut serial_bytes = self.serial.to_be_bytes().to_vec();
-        while serial_bytes.len() > 1 && serial_bytes[0] == 0 {
-            serial_bytes.remove(0);
+        let mut singles = Vec::new();
+        if let Some(serial) = self.leading_serial {
+            singles.push(self.single_response(serial, self.hash_oid));
         }
-        if serial_bytes[0] & 0x80 != 0 {
-            serial_bytes.insert(0, 0);
+        singles.push(self.single_response(self.serial, self.hash_oid));
+        if let Some(hash_oid) = self.duplicate_hash_oid {
+            singles.push(self.single_response(self.serial, hash_oid));
         }
 
-        let cert_id = sequence(&[
-            algorithm_identifier(self.hash_oid),
-            octet_string(&name_hash),
-            octet_string(&key_hash),
-            tlv(0x02, &serial_bytes),
-        ]);
+        let default_produced_at = generalized_time(self.this_update);
+        let produced_at = self.produced_at.clone().unwrap_or(default_produced_at);
 
-        let cert_status = match self.status {
-            // good [0] IMPLICIT NULL
-            Status::Good => tlv(0x80, &[]),
-            // revoked [1] IMPLICIT RevokedInfo { revocationTime GeneralizedTime }
-            Status::Revoked => tlv(0xa1, &generalized_time(self.this_update)),
-            // unknown [2] IMPLICIT UnknownInfo (NULL)
-            Status::Unknown => tlv(0x82, &[]),
-        };
-
-        let mut single_parts = vec![cert_id, cert_status, generalized_time(self.this_update)];
-        if let Some(next_update) = self.next_update {
-            single_parts.push(explicit(0, &generalized_time(next_update)));
-        }
-        let single = sequence(&single_parts);
-
-        let response_data = sequence(&[
-            responder_id,
-            generalized_time(self.this_update),
-            sequence(&[single]),
-        ]);
+        let mut response_data_parts = vec![responder_id, produced_at, sequence(&singles)];
+        response_data_parts.extend(self.response_data_tail.iter().cloned());
+        let response_data = sequence(&response_data_parts);
 
         let mut signature = self.signing_key.sign(&response_data);
         if self.corrupt_signature {
@@ -462,7 +629,10 @@ fn structural_validation_accepts_a_well_formed_basic_response() {
 fn structural_validation_rejects_arbitrary_bytes() {
     // The exact fixture the pre-#4300 unit test called a valid OCSP response.
     let error = validate_structure(&[1, 2, 3]).expect_err("must reject");
-    assert!(error.contains("malformed DER") || error.contains("SEQUENCE"), "{error}");
+    assert!(
+        error.contains("malformed DER") || error.contains("SEQUENCE"),
+        "{error}"
+    );
 
     let empty = validate_structure(&[]).expect_err("empty response");
     assert!(empty.contains("empty"), "{empty}");
@@ -493,8 +663,8 @@ fn size_bound_is_enforced_before_parsing() {
     assert!(error.contains("exceeds"), "{error}");
 
     let pki = build_pki();
-    let error = validate_stapled_response_at(&oversized, &chain(&pki), now())
-        .expect_err("must reject");
+    let error =
+        validate_stapled_response_at(&oversized, &chain(&pki), now()).expect_err("must reject");
     assert!(error.contains("exceeds"), "{error}");
 }
 
@@ -505,8 +675,8 @@ fn a_fresh_issuer_signed_response_for_the_configured_leaf_is_accepted() {
     let pki = build_pki();
     let der = ResponseBuilder::new(&pki, now()).build();
 
-    let acceptance = validate_stapled_response_at(&der, &chain(&pki), now())
-        .expect("accepted staple");
+    let acceptance =
+        validate_stapled_response_at(&der, &chain(&pki), now()).expect("accepted staple");
     assert_eq!(acceptance.der_len, der.len());
     assert_eq!(acceptance.this_update, now() - 3_600);
     assert_eq!(acceptance.next_update, now() + 3_600);
@@ -551,7 +721,10 @@ fn a_response_signed_by_an_unrelated_key_is_rejected() {
 
     let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
         .expect_err("must reject");
-    assert!(error.contains("signature") || error.contains("responder"), "{error}");
+    assert!(
+        error.contains("signature") || error.contains("responder"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -601,7 +774,10 @@ fn a_response_for_a_different_serial_is_rejected() {
 
     let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
         .expect_err("must reject");
-    assert!(error.contains("no entry for the configured certificate"), "{error}");
+    assert!(
+        error.contains("no entry for the configured certificate"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -688,7 +864,393 @@ fn a_chain_without_the_issuer_cannot_bind_a_staple() {
     let leaf_only = vec![CertificateDer::from(pki.leaf_der.clone())];
 
     let error = validate_stapled_response_at(&der, &leaf_only, now()).expect_err("must reject");
-    assert!(error.contains("does not contain the leaf's issuer"), "{error}");
+    assert!(
+        error.contains("does not contain the leaf's issuer"),
+        "{error}"
+    );
+}
+
+// ── ResponseData grammar ───────────────────────────────────────────────────
+
+#[test]
+fn a_malformed_produced_at_value_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    // Correctly tagged GeneralizedTime, but the value is not a time.
+    builder.produced_at = Some(tlv(0x18, b"not-a-timestamp"));
+
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("producedAt"), "{error}");
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("producedAt"), "{error}");
+}
+
+#[test]
+fn a_produced_at_with_the_wrong_tag_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.produced_at = Some(octet_string(b"20260101000000Z"));
+
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(
+        error.contains("producedAt is not a GeneralizedTime"),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_unknown_trailing_field_in_response_data_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    // [3] is not a field of ResponseData at all.
+    builder.response_data_tail = vec![explicit(3, &octet_string(b"surprise"))];
+
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(
+        error.contains("unexpected field after responses"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_duplicate_response_extensions_field_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    let entry = one_extension_field(1, false);
+    builder.response_data_tail = vec![entry.clone(), entry];
+
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(
+        error.contains("trailing fields after responseExtensions"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_non_critical_response_extension_is_parsed_and_ignored() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.response_data_tail = vec![one_extension_field(1, false)];
+
+    validate_structure(&builder.build()).expect("structurally valid");
+    validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect("a non-critical extension is ignored");
+}
+
+#[test]
+fn a_critical_response_extension_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.response_data_tail = vec![one_extension_field(1, true)];
+
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("critical extension"), "{error}");
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("critical extension"), "{error}");
+}
+
+#[test]
+fn a_malformed_extensions_container_is_rejected() {
+    let pki = build_pki();
+
+    // Not a SEQUENCE OF Extension: an OCTET STRING where the container belongs.
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.response_data_tail = vec![explicit(1, &octet_string(b"not-extensions"))];
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(
+        error.contains("responseExtensions is not a SEQUENCE"),
+        "{error}"
+    );
+
+    // An Extension whose extnValue is not an OCTET STRING.
+    let mut builder = ResponseBuilder::new(&pki, now());
+    let malformed = sequence(&[oid(OID_OCSP_NONCE), tlv(0x02, &[0x01])]);
+    builder.response_data_tail = vec![extensions_field(1, &[malformed])];
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("extnValue"), "{error}");
+
+    // DER omits `critical` when FALSE, so an encoded FALSE is not DER.
+    let mut builder = ResponseBuilder::new(&pki, now());
+    let explicit_false = sequence(&[
+        oid(OID_OCSP_NONCE),
+        tlv(0x01, &[0x00]),
+        octet_string(b"nonce"),
+    ]);
+    builder.response_data_tail = vec![extensions_field(1, &[explicit_false])];
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("DEFAULT FALSE"), "{error}");
+
+    // An empty Extensions container is not `SIZE (1..MAX)`.
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.response_data_tail = vec![extensions_field(1, &[])];
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("empty SEQUENCE"), "{error}");
+}
+
+// ── SingleResponse grammar ─────────────────────────────────────────────────
+
+#[test]
+fn a_duplicate_next_update_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    // The second [0] used to silently overwrite the first, so a responder could
+    // sign one window and have Ferrum enforce another.
+    builder.single_tail = Some(vec![
+        explicit(0, &generalized_time(now() + 3_600)),
+        explicit(0, &generalized_time(now() + 86_400)),
+    ]);
+
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(
+        error.contains("unexpected field after thisUpdate"),
+        "{error}"
+    );
+}
+
+#[test]
+fn misordered_single_response_fields_are_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    // singleExtensions [1] before nextUpdate [0].
+    builder.single_tail = Some(vec![
+        one_extension_field(1, false),
+        explicit(0, &generalized_time(now() + 3_600)),
+    ]);
+
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(
+        error.contains("trailing fields after singleExtensions"),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_unknown_trailing_field_in_a_single_response_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.single_tail = Some(vec![
+        explicit(0, &generalized_time(now() + 3_600)),
+        explicit(2, &octet_string(b"surprise")),
+    ]);
+
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(
+        error.contains("unexpected field after thisUpdate"),
+        "{error}"
+    );
+}
+
+#[test]
+fn single_extensions_follow_the_same_criticality_rule() {
+    let pki = build_pki();
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.single_tail = Some(vec![
+        explicit(0, &generalized_time(now() + 3_600)),
+        one_extension_field(1, false),
+    ]);
+    validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect("a non-critical singleExtension is ignored");
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.single_tail = Some(vec![
+        explicit(0, &generalized_time(now() + 3_600)),
+        one_extension_field(1, true),
+    ]);
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("singleExtensions"), "{error}");
+    assert!(error.contains("critical extension"), "{error}");
+}
+
+// ── CertStatus CHOICE encoding ─────────────────────────────────────────────
+
+#[test]
+fn a_constructed_or_non_empty_good_status_is_rejected() {
+    let pki = build_pki();
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    // Constructed [0] instead of the primitive IMPLICIT NULL.
+    builder.cert_status = Some(tlv(0xa0, &[]));
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("certStatus good"), "{error}");
+
+    let mut builder = ResponseBuilder::new(&pki, now());
+    // Primitive, but carrying content an IMPLICIT NULL cannot have.
+    builder.cert_status = Some(tlv(0x80, &[0x00]));
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("certStatus good"), "{error}");
+}
+
+#[test]
+fn a_malformed_unknown_status_is_rejected_structurally() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.cert_status = Some(tlv(0x82, &[0x05, 0x00]));
+
+    // Structurally malformed before serving policy ever sees `unknown`.
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("certStatus unknown"), "{error}");
+    assert!(error.contains("IMPLICIT NULL"), "{error}");
+}
+
+#[test]
+fn a_malformed_revoked_status_is_rejected_structurally() {
+    let pki = build_pki();
+
+    // revoked encoded as a primitive, but RevokedInfo is a SEQUENCE.
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.cert_status = Some(tlv(0x81, &generalized_time(now())));
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("revoked is primitive"), "{error}");
+
+    // Constructed, but revocationTime is missing its GeneralizedTime.
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.cert_status = Some(tlv(0xa1, &octet_string(b"20260101000000Z")));
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("revocationTime"), "{error}");
+
+    // A revocationReason that is not an ENUMERATED.
+    let mut builder = ResponseBuilder::new(&pki, now());
+    let mut revoked = generalized_time(now() - 60);
+    revoked.extend_from_slice(&explicit(0, &octet_string(b"keyCompromise")));
+    builder.cert_status = Some(tlv(0xa1, &revoked));
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("revocationReason"), "{error}");
+
+    // A well-formed RevokedInfo still fails closed on serving policy, and does
+    // so with the status reason rather than a structural one.
+    let mut builder = ResponseBuilder::new(&pki, now());
+    let mut revoked = generalized_time(now() - 60);
+    revoked.extend_from_slice(&explicit(0, &enumerated(1)));
+    builder.cert_status = Some(tlv(0xa1, &revoked));
+    validate_structure(&builder.build()).expect("structurally well formed");
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("certStatus revoked"), "{error}");
+}
+
+#[test]
+fn an_unrecognized_cert_status_alternative_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.cert_status = Some(tlv(0x83, &[]));
+
+    let error = validate_structure(&builder.build()).expect_err("must reject");
+    assert!(error.contains("unrecognized alternative"), "{error}");
+}
+
+// ── CertID ambiguity ───────────────────────────────────────────────────────
+
+#[test]
+fn duplicate_matching_cert_ids_are_rejected_as_ambiguous() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.duplicate_hash_oid = Some(OID_SHA1);
+
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("more than one SingleResponse"), "{error}");
+}
+
+#[test]
+fn a_second_matching_cert_id_under_another_hash_algorithm_is_also_ambiguous() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    // A strict client that derives SHA-256 CertIDs would select this second
+    // entry, so Ferrum must not silently serve the first.
+    builder.duplicate_hash_oid = Some(OID_SHA256);
+
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("more than one SingleResponse"), "{error}");
+}
+
+#[test]
+fn a_leading_entry_for_another_certificate_still_resolves_the_configured_one() {
+    let pki = build_pki();
+    let at = now();
+    let mut builder = ResponseBuilder::new(&pki, at);
+    builder.leading_serial = Some(OTHER_SERIAL);
+
+    let acceptance = validate_stapled_response_at(&builder.build(), &chain(&pki), at)
+        .expect("one unambiguous match");
+    assert_eq!(acceptance.next_update, at + 3_600);
+}
+
+// ── Issuer selection ───────────────────────────────────────────────────────
+
+#[test]
+fn a_same_subject_non_issuer_chain_candidate_cannot_stand_in_for_the_issuer() {
+    let pki = build_pki();
+    let der = ResponseBuilder::new(&pki, now()).build();
+    let impostor = vec![
+        CertificateDer::from(pki.leaf_der.clone()),
+        CertificateDer::from(pki.impostor_issuer_der.clone()),
+    ];
+
+    let error = validate_stapled_response_at(&der, &impostor, now()).expect_err("must reject");
+    assert!(
+        error.contains("no certificate whose key signed the leaf"),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_scan_continues_past_a_same_subject_impostor_to_the_real_issuer() {
+    let pki = build_pki();
+    let der = ResponseBuilder::new(&pki, now()).build();
+    let with_impostor = vec![
+        CertificateDer::from(pki.leaf_der.clone()),
+        CertificateDer::from(pki.impostor_issuer_der.clone()),
+        CertificateDer::from(pki.issuer_der.clone()),
+    ];
+
+    validate_stapled_response_at(&der, &with_impostor, now())
+        .expect("the real issuer is still found behind a same-name impostor");
+}
+
+#[test]
+fn a_self_issued_leaf_that_is_not_self_signed_cannot_bind_a_staple() {
+    let pki = build_pki();
+    let der = ResponseBuilder::new(&pki, now()).build();
+    let masquerade = pki.self_issued_not_self_signed_der.clone();
+    let self_issued = vec![CertificateDer::from(masquerade)];
+
+    let error = validate_stapled_response_at(&der, &self_issued, now()).expect_err("must reject");
+    assert!(
+        error.contains("no certificate whose key signed the leaf"),
+        "{error}"
+    );
+}
+
+// ── Delegated responder key usage ──────────────────────────────────────────
+
+#[test]
+fn a_delegated_responder_with_digital_signature_key_usage_is_accepted() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.responder_cert = pki.signing_ku_der.as_slice();
+    builder.signing_key = &pki.signing_ku_key;
+    builder.embedded_certs = vec![pki.signing_ku_der.as_slice()];
+
+    let acceptance = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect("accepted staple");
+    assert!(acceptance.delegated_responder);
+}
+
+#[test]
+fn a_delegated_responder_whose_key_usage_excludes_digital_signature_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.responder_cert = pki.no_digital_signature_der.as_slice();
+    builder.signing_key = &pki.no_digital_signature_key;
+    builder.embedded_certs = vec![pki.no_digital_signature_der.as_slice()];
+
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("must reject");
+    assert!(error.contains("not authorized"), "{error}");
 }
 
 // ── Load-path integration ──────────────────────────────────────────────────
@@ -806,7 +1368,10 @@ fn a_reload_with_a_bad_staple_leaves_the_last_known_good_material_in_service() {
     ] {
         std::fs::write(&ocsp_path, builder.build()).expect("rewrite ocsp");
         let rebuilt = rebuild();
-        assert!(rebuilt.is_err(), "an invalid staple must not produce a candidate");
+        assert!(
+            rebuilt.is_err(),
+            "an invalid staple must not produce a candidate"
+        );
         if let Ok(candidate) = rebuilt {
             published.store(Arc::new(Some(candidate.config)));
         }

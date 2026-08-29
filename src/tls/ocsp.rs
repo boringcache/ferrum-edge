@@ -19,24 +19,41 @@
 //! 2. **A successful envelope.** `OCSPResponse.responseStatus` must be
 //!    `successful(0)` and `responseBytes.responseType` must be
 //!    `id-pkix-ocsp-basic`, carrying a `BasicOCSPResponse` (RFC 6960 §4.2.1).
-//! 3. **`CertID` binding.** The single response for the configured leaf must
+//! 3. **A fully consumed grammar.** `ResponseData` and each `SingleResponse`
+//!    are parsed to their last byte. Every optional field must appear at most
+//!    once, in its defined position; unknown, duplicate, misordered, or
+//!    trailing elements are refused rather than skipped, because a field this
+//!    parser ignores is still inside the bytes the responder signed. Every
+//!    `GeneralizedTime` is decoded, not merely tagged. An `Extensions`
+//!    container is parsed structurally, and because Ferrum implements no OCSP
+//!    response extension, a *critical* one is refused (RFC 6960 §4.4); a
+//!    non-critical one is ignored after that strict parse.
+//! 4. **A proven issuer.** The issuer is the chain member whose key actually
+//!    signed the leaf, not merely one whose subject name matches the leaf's
+//!    issuer name; same-name candidates are scanned until one verifies, and a
+//!    self-issued leaf must be genuinely self-signed. This is what makes RFC
+//!    6960's "CA that issued the certificate" explicit, and it is the same key
+//!    a delegated responder must chain to.
+//! 5. **`CertID` binding.** The single response for the configured leaf must
 //!    match the leaf serial number and the `issuerNameHash` / `issuerKeyHash`
 //!    of the configured issuer, recomputed under the `CertID` hash algorithm.
 //!    A response that carries only *other* certificates' entries is rejected as
-//!    wrong-certificate data rather than stapled.
-//! 4. **Signature and responder authorization.** The `tbsResponseData`
+//!    wrong-certificate data rather than stapled, and a response carrying more
+//!    than one entry for that certificate is rejected as ambiguous: a strict
+//!    client re-derives the `CertID` itself and might select the other one.
+//! 6. **Signature and responder authorization.** The `tbsResponseData`
 //!    signature is verified against a responder that is either the issuer
 //!    itself or a certificate carried in the response that is signed by the
-//!    issuer, currently time-valid, and carries the `id-kp-OCSPSigning`
-//!    extended key usage (RFC 6960 §4.2.2.2). Delegation to anything else is
-//!    refused.
-//! 5. **Time bounds.** `thisUpdate` must not be in the future and `nextUpdate`
+//!    issuer, currently time-valid, carries the `id-kp-OCSPSigning` extended
+//!    key usage (RFC 6960 §4.2.2.2), and — when it carries a `KeyUsage` at all
+//!    — permits `digitalSignature`. Delegation to anything else is refused.
+//! 7. **Time bounds.** `thisUpdate` must not be in the future and `nextUpdate`
 //!    must not be in the past, each widened by [`OCSP_CLOCK_SKEW`]. A response
 //!    without `nextUpdate` has no defined validity window and is refused: RFC
 //!    6960 §2.4 makes an absent `nextUpdate` mean "newer information is
 //!    available at all times", which is precisely the property a *stapled*
 //!    (cached, re-served) response cannot have.
-//! 6. **Status.** Only `good` is stapled. `revoked` and `unknown` fail closed:
+//! 8. **Status.** Only `good` is stapled. `revoked` and `unknown` fail closed:
 //!    serving them is strictly worse than serving no staple at all, because a
 //!    client that honours the staple will refuse the connection, and a reload
 //!    must not be able to publish that state silently.
@@ -153,7 +170,7 @@ fn context_tag(any: &Any<'_>) -> Option<u32> {
 
 /// Parse a context-specific `[n] EXPLICIT` wrapper and return its content.
 fn explicit_context<'a>(any: &Any<'a>, tag: u32, field: &str) -> Result<&'a [u8], String> {
-    if any.class() != Class::ContextSpecific || any.tag() != Tag(tag) || !any.header.constructed {
+    if any.class() != Class::ContextSpecific || any.tag() != Tag(tag) || !any.header.constructed() {
         return Err(format!("OCSP {field} is not a constructed [{tag}] element"));
     }
     Ok(any.data)
@@ -263,7 +280,7 @@ fn basic_response_der(der: &[u8]) -> Result<&[u8], String> {
     if !rest.is_empty() {
         return Err("OCSP responseBytes has trailing fields after response".to_string());
     }
-    if response_any.tag() != Tag::OctetString || response_any.header.constructed {
+    if response_any.tag() != Tag::OctetString || response_any.header.constructed() {
         return Err("OCSP response field is not a primitive OCTET STRING".to_string());
     }
     Ok(response_any.data)
@@ -397,15 +414,23 @@ fn parse_response_data(input: &[u8]) -> Result<ResponseData<'_>, String> {
         }
     };
 
-    // producedAt GeneralizedTime — parsed for well-formedness only; the serving
-    // decision is made from thisUpdate/nextUpdate.
-    let (produced_any, _, rest) = take_tlv(rest)?;
-    if produced_any.tag() != Tag::GeneralizedTime {
+    // producedAt GeneralizedTime. The value is decoded, not merely tagged: an
+    // unparseable instant is a malformed response even though the serving
+    // decision itself is made from thisUpdate/nextUpdate.
+    let (produced_any, produced_raw, rest) = take_tlv(rest)?;
+    if produced_any.tag() != Tag::GeneralizedTime
+        || produced_any.class() != Class::Universal
+        || produced_any.header.constructed()
+    {
         return Err("OCSP producedAt is not a GeneralizedTime".to_string());
     }
+    generalized_time_unix(produced_raw, "producedAt")?;
 
-    let (responses_any, _, _rest) = take_tlv(rest)?;
-    if responses_any.tag() != Tag::Sequence {
+    let (responses_any, _, rest) = take_tlv(rest)?;
+    if responses_any.tag() != Tag::Sequence
+        || responses_any.class() != Class::Universal
+        || !responses_any.header.constructed()
+    {
         return Err("OCSP responses is not a SEQUENCE".to_string());
     }
 
@@ -428,6 +453,27 @@ fn parse_response_data(input: &[u8]) -> Result<ResponseData<'_>, String> {
         return Err("OCSP response carries no SingleResponse entries".to_string());
     }
 
+    // responseExtensions [1] EXPLICIT Extensions OPTIONAL is the only field the
+    // grammar allows after `responses`, at most once. Anything else — an
+    // unknown context tag, a second [1], or a stray universal element — means
+    // the encoder and this parser disagree about what was signed, so it is
+    // refused rather than skipped.
+    if !rest.is_empty() {
+        let (extensions_any, _, trailing) = take_tlv(rest)?;
+        if context_tag(&extensions_any) != Some(1) {
+            return Err(
+                "OCSP tbsResponseData carries an unexpected field after responses".to_string(),
+            );
+        }
+        if !trailing.is_empty() {
+            return Err(
+                "OCSP tbsResponseData has trailing fields after responseExtensions".to_string(),
+            );
+        }
+        let content = explicit_context(&extensions_any, 1, "responseExtensions")?;
+        validate_extensions(content, "responseExtensions")?;
+    }
+
     Ok(ResponseData {
         responder_id,
         single_responses,
@@ -442,27 +488,24 @@ fn parse_single_response(input: &[u8]) -> Result<SingleResponse<'_>, String> {
     let cert_id = parse_cert_id(cert_id_any.data)?;
 
     let (status_any, _, rest) = take_tlv(rest)?;
-    let status = match context_tag(&status_any) {
-        Some(0) => CertStatus::Good,
-        Some(1) => CertStatus::Revoked,
-        Some(2) => CertStatus::Unknown,
-        Some(_) => {
-            return Err("OCSP certStatus uses an unrecognized alternative".to_string());
-        }
-        None => {
-            return Err("OCSP certStatus is not a context-specific CHOICE".to_string());
-        }
-    };
+    let status = parse_cert_status(&status_any)?;
 
     let (this_update_any, this_update_raw, rest) = take_tlv(rest)?;
-    if this_update_any.tag() != Tag::GeneralizedTime {
+    if this_update_any.tag() != Tag::GeneralizedTime
+        || this_update_any.class() != Class::Universal
+        || this_update_any.header.constructed()
+    {
         return Err("OCSP thisUpdate is not a GeneralizedTime".to_string());
     }
     let this_update = generalized_time_unix(this_update_raw, "thisUpdate")?;
 
+    // The remaining grammar is exactly `[0] nextUpdate OPTIONAL` followed by
+    // `[1] singleExtensions OPTIONAL`, each at most once and in that order. A
+    // permissive loop here would let a second `[0]` silently overwrite the
+    // validity window the signature was meant to bind.
     let mut next_update = None;
     let mut cursor = rest;
-    while !cursor.is_empty() {
+    if !cursor.is_empty() {
         let (field, _, next) = take_tlv(cursor)?;
         if context_tag(&field) == Some(0) {
             let content = explicit_context(&field, 0, "nextUpdate")?;
@@ -470,12 +513,29 @@ fn parse_single_response(input: &[u8]) -> Result<SingleResponse<'_>, String> {
             if !trailing.is_empty() {
                 return Err("OCSP nextUpdate has trailing bytes".to_string());
             }
-            if time_any.tag() != Tag::GeneralizedTime {
+            if time_any.tag() != Tag::GeneralizedTime
+                || time_any.class() != Class::Universal
+                || time_any.header.constructed()
+            {
                 return Err("OCSP nextUpdate is not a GeneralizedTime".to_string());
             }
             next_update = Some(generalized_time_unix(time_raw, "nextUpdate")?);
+            cursor = next;
         }
+    }
+    if !cursor.is_empty() {
+        let (field, _, next) = take_tlv(cursor)?;
+        if context_tag(&field) != Some(1) {
+            return Err(
+                "OCSP SingleResponse carries an unexpected field after thisUpdate".to_string(),
+            );
+        }
+        let content = explicit_context(&field, 1, "singleExtensions")?;
+        validate_extensions(content, "singleExtensions")?;
         cursor = next;
+    }
+    if !cursor.is_empty() {
+        return Err("OCSP SingleResponse has trailing fields after singleExtensions".to_string());
     }
 
     Ok(SingleResponse {
@@ -484,6 +544,194 @@ fn parse_single_response(input: &[u8]) -> Result<SingleResponse<'_>, String> {
         this_update,
         next_update,
     })
+}
+
+/// Validate the `CertStatus` CHOICE encoding, not merely its context tag.
+///
+/// ```text
+/// CertStatus ::= CHOICE {
+///     good    [0] IMPLICIT NULL,
+///     revoked [1] IMPLICIT RevokedInfo,
+///     unknown [2] IMPLICIT UnknownInfo }
+/// ```
+///
+/// `UnknownInfo` is `NULL`, so both `good` and `unknown` are primitive and
+/// empty. `revoked` is a constructed `RevokedInfo`. `revoked` and `unknown` are
+/// refused later by serving policy, but a malformed encoding of either is a
+/// structural failure that must be reported as such: a strict client parses the
+/// same bytes, and Ferrum must not admit an entry it cannot fully account for.
+fn parse_cert_status(any: &Any<'_>) -> Result<CertStatus, String> {
+    let Some(tag) = context_tag(any) else {
+        return Err("OCSP certStatus is not a context-specific CHOICE".to_string());
+    };
+    match tag {
+        0 | 2 => {
+            let (name, status) = if tag == 0 {
+                ("good", CertStatus::Good)
+            } else {
+                ("unknown", CertStatus::Unknown)
+            };
+            if any.header.constructed() {
+                return Err(format!(
+                    "OCSP certStatus {name} is constructed, but it is an IMPLICIT NULL"
+                ));
+            }
+            if !any.data.is_empty() {
+                return Err(format!(
+                    "OCSP certStatus {name} carries content, but it is an IMPLICIT NULL"
+                ));
+            }
+            Ok(status)
+        }
+        1 => {
+            if !any.header.constructed() {
+                return Err("OCSP certStatus revoked is primitive, not a SEQUENCE".to_string());
+            }
+            parse_revoked_info(any.data)?;
+            Ok(CertStatus::Revoked)
+        }
+        _ => Err("OCSP certStatus uses an unrecognized alternative".to_string()),
+    }
+}
+
+/// Validate `RevokedInfo ::= SEQUENCE { revocationTime GeneralizedTime,
+/// revocationReason [0] EXPLICIT CRLReason OPTIONAL }`.
+fn parse_revoked_info(input: &[u8]) -> Result<(), String> {
+    let (time_any, time_raw, rest) = take_tlv(input)?;
+    if time_any.tag() != Tag::GeneralizedTime
+        || time_any.class() != Class::Universal
+        || time_any.header.constructed()
+    {
+        return Err("OCSP revocationTime is not a GeneralizedTime".to_string());
+    }
+    generalized_time_unix(time_raw, "revocationTime")?;
+
+    if rest.is_empty() {
+        return Ok(());
+    }
+    let (reason_any, _, trailing) = take_tlv(rest)?;
+    if !trailing.is_empty() {
+        return Err("OCSP RevokedInfo has trailing fields after revocationReason".to_string());
+    }
+    let content = explicit_context(&reason_any, 0, "revocationReason")?;
+    let (value_any, _, trailing) = take_tlv(content)?;
+    if !trailing.is_empty() {
+        return Err("OCSP revocationReason has trailing bytes".to_string());
+    }
+    if value_any.tag() != Tag::Enumerated
+        || value_any.class() != Class::Universal
+        || value_any.header.constructed()
+    {
+        return Err("OCSP revocationReason is not an ENUMERATED".to_string());
+    }
+    Ok(())
+}
+
+/// Bound on the entries one `Extensions` container may carry.
+const MAX_EXTENSIONS: usize = 32;
+
+/// Diagnostic for an `Extension` whose `extnID` is not an OID.
+fn oid_error(field: &str) -> String {
+    format!("OCSP {field} extnID is not an OBJECT IDENTIFIER")
+}
+
+/// Decode the `critical` flag of an `Extension`.
+///
+/// DER omits a `DEFAULT` value, so an encoded `FALSE` is not DER at all: it
+/// would let the same extension be encoded two ways under one signature.
+fn der_critical_flag(any: &Any<'_>, field: &str) -> Result<bool, String> {
+    if any.header.constructed() || any.data.len() != 1 {
+        return Err(format!("OCSP {field} critical flag is not a DER BOOLEAN"));
+    }
+    match any.data[0] {
+        0xff => Ok(true),
+        0x00 => Err(format!(
+            "OCSP {field} encodes critical DEFAULT FALSE, which DER omits"
+        )),
+        _ => Err(format!("OCSP {field} critical flag is not a DER BOOLEAN")),
+    }
+}
+
+/// Structurally validate an `Extensions` container and enforce RFC 6960 §4.4
+/// criticality.
+///
+/// ```text
+/// Extensions ::= SEQUENCE SIZE (1..MAX) OF Extension
+/// Extension  ::= SEQUENCE { extnID OBJECT IDENTIFIER,
+///                           critical BOOLEAN DEFAULT FALSE,
+///                           extnValue OCTET STRING }
+/// ```
+///
+/// Ferrum implements no OCSP response extension, so a *critical* extension is
+/// by definition one it cannot process and must not admit; a non-critical one
+/// is ignored, but only after it has been parsed strictly enough to prove the
+/// container really is an `Extensions` and nothing else is hiding inside the
+/// signed bytes.
+fn validate_extensions(content: &[u8], field: &str) -> Result<(), String> {
+    let (container, _, trailing) = take_tlv(content)?;
+    if !trailing.is_empty() {
+        return Err(format!("OCSP {field} has trailing bytes"));
+    }
+    if container.tag() != Tag::Sequence
+        || container.class() != Class::Universal
+        || !container.header.constructed()
+    {
+        return Err(format!("OCSP {field} is not a SEQUENCE"));
+    }
+    if container.data.is_empty() {
+        return Err(format!("OCSP {field} is an empty SEQUENCE"));
+    }
+
+    let mut cursor = container.data;
+    let mut seen = 0usize;
+    while !cursor.is_empty() {
+        let (extension, _, next) = take_tlv(cursor)?;
+        cursor = next;
+        seen += 1;
+        if seen > MAX_EXTENSIONS {
+            return Err(format!(
+                "OCSP {field} carries more than {MAX_EXTENSIONS} extensions"
+            ));
+        }
+        if extension.tag() != Tag::Sequence
+            || extension.class() != Class::Universal
+            || !extension.header.constructed()
+        {
+            return Err(format!("OCSP {field} contains a non-SEQUENCE Extension"));
+        }
+
+        let (id_any, _, rest) = take_tlv(extension.data)?;
+        id_any.as_oid().map_err(|_| oid_error(field))?;
+
+        let (second_any, _, tail) = take_tlv(rest)?;
+        let mut critical = false;
+        let mut value_any = second_any;
+        let mut rest = tail;
+        if value_any.tag() == Tag::Boolean && value_any.class() == Class::Universal {
+            critical = der_critical_flag(&value_any, field)?;
+            let (parsed, _, next) = take_tlv(rest)?;
+            value_any = parsed;
+            rest = next;
+        }
+
+        if !rest.is_empty() {
+            return Err(format!("OCSP {field} Extension has trailing fields"));
+        }
+        if value_any.tag() != Tag::OctetString
+            || value_any.class() != Class::Universal
+            || value_any.header.constructed()
+        {
+            return Err(format!(
+                "OCSP {field} extnValue is not a primitive OCTET STRING"
+            ));
+        }
+        if critical {
+            return Err(format!(
+                "OCSP {field} contains a critical extension Ferrum does not implement"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_cert_id(input: &[u8]) -> Result<CertId<'_>, String> {
@@ -544,8 +792,8 @@ pub fn validate_structure(der: &[u8]) -> Result<OcspStructure, String> {
 /// Full, certificate-bound validation against the chain that will be served.
 ///
 /// `chain` is leaf-first, exactly as it is handed to rustls. The issuer is the
-/// chain member whose subject matches the leaf's issuer; a self-issued leaf is
-/// its own issuer. When neither holds, the response cannot be bound to anything
+/// chain member whose key is proven to have signed the leaf; a self-signed leaf
+/// is its own issuer. When neither holds, the response cannot be bound to anything
 /// and is refused — an operator stapling a response must publish the issuer in
 /// the served chain, which is what an OCSP-checking client needs anyway.
 pub fn validate_stapled_response(
@@ -620,30 +868,63 @@ pub fn validate_stapled_response_at(
 }
 
 /// Locate the issuer of `leaf` inside the served chain.
+///
+/// A matching subject name is *not* enough. RFC 6960 binds a `CertID` to "the
+/// CA that issued the certificate", and the same binding is what authorizes a
+/// delegated responder, so the selected certificate must be proven to hold the
+/// key that actually signed the leaf. A name match alone would let any
+/// same-named certificate in the served bundle — an old CA generation, a
+/// cross-signed sibling, or an operator-supplied impostor — decide which
+/// issuer key hash a `CertID` is compared against. Same-name candidates are
+/// therefore scanned until one verifies, and a self-issued leaf is accepted as
+/// its own issuer only when it is genuinely self-*signed*.
 fn select_issuer_der<'a>(
     leaf: &X509Certificate<'_>,
     chain: &'a [CertificateDer<'_>],
 ) -> Result<&'a [u8], String> {
     let leaf_issuer = leaf.issuer().as_raw();
+    let mut saw_name_match = false;
     for candidate in chain.iter().skip(1) {
         let Ok((_, parsed)) = X509Certificate::from_der(candidate.as_ref()) else {
             continue;
         };
-        if parsed.subject().as_raw() == leaf_issuer {
-            return Ok(candidate.as_ref());
+        if parsed.subject().as_raw() != leaf_issuer {
+            continue;
         }
+        saw_name_match = true;
+        if leaf.verify_signature(Some(parsed.public_key())).is_err() {
+            continue;
+        }
+        return Ok(candidate.as_ref());
     }
     // A self-issued leaf is its own issuer; this is the ordinary shape for the
-    // self-signed certificates used in tests and single-node deployments.
+    // self-signed certificates used in tests and single-node deployments. It
+    // still has to verify under its own key: self-issued is a name property,
+    // self-signed is the key property the binding actually needs.
     if leaf.subject().as_raw() == leaf_issuer {
-        return Ok(chain[0].as_ref());
+        saw_name_match = true;
+        if leaf.verify_signature(None).is_ok() {
+            return Ok(chain[0].as_ref());
+        }
     }
-    let message = "the served certificate chain does not contain the leaf's issuer, so a stapled \
-                   OCSP response cannot be bound to it";
+    let message = if saw_name_match {
+        "the served certificate chain carries the leaf's issuer name but no certificate whose key \
+         signed the leaf, so a stapled OCSP response cannot be bound to it"
+    } else {
+        "the served certificate chain does not contain the leaf's issuer, so a stapled OCSP \
+         response cannot be bound to it"
+    };
     Err(message.to_string())
 }
 
-/// Find the `SingleResponse` whose `CertID` names the configured leaf.
+/// Find the one `SingleResponse` whose `CertID` names the configured leaf.
+///
+/// More than one match is an ambiguity, not a preference. A strict client
+/// re-derives the `CertID` itself and may pick a different entry than Ferrum
+/// did — including an entry that reuses another supported hash algorithm — so
+/// admitting the first `good` while a second entry says `revoked` would staple
+/// exactly the response that makes the handshake fail. The whole response is
+/// refused instead.
 fn match_single_response<'a, 'b>(
     basic: &'a BasicResponse<'b>,
     leaf: &X509Certificate<'_>,
@@ -654,6 +935,7 @@ fn match_single_response<'a, 'b>(
     let issuer_key = issuer.public_key().subject_public_key.data.as_ref();
 
     let mut serial_matched = false;
+    let mut matched: Option<&'a SingleResponse<'b>> = None;
     for single in &basic.response_data.single_responses {
         if normalize_serial(single.cert_id.serial_number) != leaf_serial {
             continue;
@@ -666,6 +948,14 @@ fn match_single_response<'a, 'b>(
         if digest::digest(algorithm, issuer_key).as_ref() != single.cert_id.issuer_key_hash {
             continue;
         }
+        if matched.is_some() {
+            let message = "OCSP response carries more than one SingleResponse for the configured \
+                           certificate, so the status a strict client would select is ambiguous";
+            return Err(message.to_string());
+        }
+        matched = Some(single);
+    }
+    if let Some(single) = matched {
         return Ok(single);
     }
 
@@ -749,6 +1039,15 @@ fn verify_signature_and_authorization(
         if !has_ocsp_signing {
             continue;
         }
+        // A responder that is allowed to sign OCSP responses still has to be
+        // allowed to produce a digital signature at all. KeyUsage is optional,
+        // but a present one that withholds digitalSignature contradicts the EKU
+        // and fails closed; an unparseable KeyUsage is likewise not proof.
+        match candidate.key_usage() {
+            Ok(Some(key_usage)) if !key_usage.value.digital_signature() => continue,
+            Ok(_) => {}
+            Err(_) => continue,
+        }
         if candidate.verify_signature(Some(issuer_key)).is_err() {
             continue;
         }
@@ -766,7 +1065,7 @@ fn verify_signature_and_authorization(
     let message = if saw_named_delegate {
         "OCSP response was signed by a responder that is not authorized for this issuer: it is \
          not the issuing CA and no carried certificate is an issuer-signed, currently valid \
-         id-kp-OCSPSigning delegate whose signature verifies"
+         id-kp-OCSPSigning delegate permitting digitalSignature whose signature verifies"
     } else {
         "OCSP response signature could not be verified against the configured issuer and the \
          response carries no matching authorized responder certificate"
