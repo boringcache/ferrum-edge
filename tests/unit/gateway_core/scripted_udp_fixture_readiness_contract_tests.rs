@@ -104,6 +104,21 @@ fn scripted_udp_amplification_assertion_is_not_retried() {
         1,
         "the cumulative budget test must make one receive observation"
     );
+    assert_eq!(
+        compact.matches("ScriptedUdpBackend::builder").count(),
+        1,
+        "the cumulative budget test must spawn the scripted backend once"
+    );
+    let gateway_at = compact
+        .find("start_gateway_with_retry(")
+        .expect("start_gateway_with_retry must appear");
+    let backend_at = compact
+        .find("ScriptedUdpBackend::builder")
+        .expect("ScriptedUdpBackend::builder must appear");
+    assert!(
+        gateway_at < backend_at,
+        "gateway readiness must complete before the scripted backend expect deadline starts"
+    );
     assert!(
         compact.contains("assert_eq!(received.len(),2,"),
         "the cumulative budget assertion must remain a single authoritative check"

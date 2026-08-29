@@ -648,17 +648,14 @@ plugin_configs: []
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn udp_amplification_cumulative_multi_datagram_budget() {
+    // Keep the backend socket bound while the gateway starts, but do not start
+    // its script yet: `start_gateway_with_retry` may spend up to 30 seconds on
+    // a failed identity-probe attempt, which would expire the backend's
+    // 10-second `ExpectDatagram` deadline before the client ever sends and
+    // drop the socket. Same ordering as `udp_amplification_bound_enforced`.
     let reservation = reserve_udp_port().await.expect("reserve");
     let backend_port = reservation.port;
     let reply_payload = vec![b'x'; 80];
-    let backend = ScriptedUdpBackend::builder(reservation.into_socket())
-        .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
-        .step(UdpStep::ReplyN {
-            payload: reply_payload.clone(),
-            count: 3,
-        })
-        .spawn()
-        .expect("spawn backend");
 
     let build_yaml = move |listen_port: u16| {
         format!(
@@ -680,6 +677,18 @@ plugin_configs: []
         )
     };
     let fx = start_gateway_with_retry(build_yaml, Vec::new(), false).await;
+
+    // Start the script only once the gateway is healthy, so the expect
+    // deadline covers the client's datagram rather than gateway startup.
+    let backend = ScriptedUdpBackend::builder(reservation.into_socket())
+        .step(UdpStep::ExpectDatagram(DatagramMatcher::any()))
+        .step(UdpStep::ReplyN {
+            payload: reply_payload.clone(),
+            count: 3,
+        })
+        .spawn()
+        .expect("spawn backend");
+
     let gateway_addr: SocketAddr = format!("127.0.0.1:{}", fx.udp_port).parse().unwrap();
     let client = UdpClient::connect(gateway_addr).await.expect("client");
 
