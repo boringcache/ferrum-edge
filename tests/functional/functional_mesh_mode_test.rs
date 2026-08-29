@@ -513,10 +513,6 @@ fn fixture_non_loopback_local_v4() -> Ipv4Addr {
     }
 }
 
-fn ambient_relay_ephemeral() -> SocketAddr {
-    SocketAddr::from((fixture_non_loopback_local_v4(), 0))
-}
-
 fn topology_relay_workload_v4(topology: &str) -> Ipv4Addr {
     if topology == "sidecar" {
         Ipv4Addr::LOCALHOST
@@ -9044,10 +9040,6 @@ async fn start_websocket_echo_backend_on(addr: SocketAddr) -> u16 {
 /// exact non-root path arrived at the backend.
 // The `accept_hdr_async` callback returns tungstenite's large `ErrorResponse`
 // in its `Err` arm — the same accepted shape as `functional_websocket_test.rs`.
-async fn start_websocket_path_echo_backend() -> u16 {
-    start_websocket_path_echo_backend_on(loopback_ephemeral()).await
-}
-
 #[allow(clippy::result_large_err)]
 async fn start_websocket_path_echo_backend_on(addr: SocketAddr) -> u16 {
     use futures_util::{SinkExt, StreamExt};
