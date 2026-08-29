@@ -46,6 +46,13 @@
 //!   registry directory, and a retracted (shutdown) index are all
 //!   indistinguishable from "this node enrolls no pods", which is the correct
 //!   refusal, not a reason to fall back to the identity view.
+//! * The poller consumes a **strict, bounded, all-or-nothing** registry
+//!   snapshot ([`PodCaptureSource::list_complete_targets`]), never the
+//!   best-effort [`PodCaptureSource::list_targets`] scan. Any missing
+//!   directory, enumeration/read/metadata/ownership/parse error, unsafe name,
+//!   symlink, oversized or non-regular file, or too many entries retracts the
+//!   index immediately: last-good is not retained and a partial snapshot is
+//!   never published. A later complete snapshot may republish.
 //! * An address claimed by two DIFFERENT pod UIDs is ambiguous and refused for
 //!   BOTH claimants, mirroring the contested-interface rule
 //!   `plan_host_udp_bindings` already applies to ingress interfaces.
@@ -403,7 +410,10 @@ impl Drop for InstalledEnrolledDestinationsGuard {
 /// the relay guard's bound must hold for every Ambient proxy. It shares their
 /// `PodCaptureSource` abstraction and their 2s cadence, so the enrolled set the
 /// guard admits and the set the capture managers act on cannot drift by more
-/// than one poll.
+/// than one poll — but it reads [`PodCaptureSource::list_complete_targets`],
+/// not the best-effort [`PodCaptureSource::list_targets`] scan those reconcilers
+/// use. The relay index is an authoritative security attestation; a partial
+/// or unsafe snapshot must not publish.
 pub struct NodeLocalEnrolledDestinationsManager {
     source: Arc<dyn PodCaptureSource>,
     index: Arc<NodeLocalEnrolledDestinations>,
@@ -437,17 +447,34 @@ impl NodeLocalEnrolledDestinationsManager {
         }
     }
 
-    /// One reconcile pass. Returns the entries published so a caller can log or
-    /// assert them without touching the datapath.
+    /// One reconcile pass. A complete snapshot is published wholesale; any
+    /// incomplete, unsafe, or malformed registry snapshot retracts the index
+    /// immediately so the guard admits nothing. Last-good is never retained
+    /// and a partial snapshot is never published.
+    ///
+    /// Returns the entries that were published (empty after a retraction).
+    /// Diagnostics are a fixed-shape debug line; the error payload is discarded
+    /// so registry contents, identities, pod UIDs, and attacker-controlled
+    /// names never reach a log.
     pub fn reconcile_once(&self) -> Vec<EnrolledPodEntry> {
-        let entries: Vec<EnrolledPodEntry> = self
-            .source
-            .list_targets()
-            .iter()
-            .filter_map(EnrolledPodEntry::from_capture_target)
-            .collect();
-        self.index.publish(&entries);
-        entries
+        match self.source.list_complete_targets() {
+            Ok(targets) => {
+                let entries: Vec<EnrolledPodEntry> = targets
+                    .iter()
+                    .filter_map(EnrolledPodEntry::from_capture_target)
+                    .collect();
+                self.index.publish(&entries);
+                entries
+            }
+            Err(_) => {
+                self.index.clear();
+                debug!(
+                    "Node-local enrolled destination index retracted; \
+                     registry snapshot was not complete"
+                );
+                Vec::new()
+            }
+        }
     }
 
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) {

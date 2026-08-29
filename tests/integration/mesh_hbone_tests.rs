@@ -29,10 +29,14 @@ use ferrum_edge::modes::mesh::config::{
 };
 use ferrum_edge::modes::mesh::enrolled_destinations::{
     EnrolledPodEntry, NodeLocalEnrolledDestinations, NodeLocalEnrolledDestinationsHandle,
+    NodeLocalEnrolledDestinationsManager,
 };
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use ferrum_edge::modes::mesh::{
     MeshRuntimeConfig, MeshTopology, MeshTrafficDirection, prepare_gateway_config_from_mesh_slice,
+};
+use ferrum_edge::proxy::netns_capture::{
+    DirectoryCaptureSource, PodCaptureSource, PodCaptureSourceIps, PodCaptureTarget,
 };
 use ferrum_edge::proxy::{
     ProxyState, start_proxy_listener_with_bound_listener,
@@ -1983,6 +1987,21 @@ fn enrolled(pod_uid: &str, identity: &str, address: &str) -> EnrolledPodEntry {
     }
 }
 
+fn write_strict_registry_entry(dir: &std::path::Path, pod_uid: &str, ipv4: &str, spiffe: &str) {
+    std::fs::write(
+        dir.join(pod_uid),
+        format!("/sys/fs/cgroup/kubepods/{pod_uid}\nspiffe_id={spiffe}\nipv4={ipv4}\n"),
+    )
+    .expect("strict registry entry");
+}
+
+fn strict_registry_manager(
+    source: Arc<dyn PodCaptureSource>,
+    index: Arc<NodeLocalEnrolledDestinations>,
+) -> NodeLocalEnrolledDestinationsManager {
+    NodeLocalEnrolledDestinationsManager::new(source, index, std::time::Duration::from_secs(2))
+}
+
 fn reviews_spiffe() -> String {
     format!("spiffe://{DEFAULT_TRUST_DOMAIN}/ns/{DEFAULT_NAMESPACE}/sa/reviews")
 }
@@ -2294,6 +2313,226 @@ fn inbound_relay_ambient_registry_does_not_union_shared_address_ports() {
         Err(InboundRelayDenial::PortNotDeclared),
         "a co-located pod this node does not enrol must not union its port into \
          the enrolled pod's admission"
+    );
+}
+
+struct StaticCaptureSource(Vec<PodCaptureTarget>);
+
+impl PodCaptureSource for StaticCaptureSource {
+    fn list_targets(&self) -> Vec<PodCaptureTarget> {
+        self.0.clone()
+    }
+}
+
+struct IncompleteCaptureSource;
+
+impl PodCaptureSource for IncompleteCaptureSource {
+    fn list_targets(&self) -> Vec<PodCaptureTarget> {
+        panic!("the relay-guard manager must not use the permissive list_targets scan");
+    }
+
+    fn list_complete_targets(&self) -> Result<Vec<PodCaptureTarget>, String> {
+        Err("registry snapshot was not complete".to_string())
+    }
+}
+
+fn capture_target(pod_uid: &str, ipv4: &str) -> PodCaptureTarget {
+    PodCaptureTarget {
+        pod_uid: pod_uid.to_string(),
+        cgroup_path: format!("/sys/fs/cgroup/kubepods/{pod_uid}"),
+        source_identity: None,
+        source_ips: PodCaptureSourceIps {
+            ipv4: Some(ipv4.parse().expect("fixture ipv4")),
+            ipv6: None,
+        },
+    }
+}
+
+/// In-memory sources stay testable through the default complete-snapshot
+/// implementation (`Ok(list_targets())`). An `Err` from that method must
+/// retract last-good immediately rather than retain or partially publish.
+#[test]
+fn inbound_relay_registry_manager_publishes_complete_snapshots_and_retracts_on_error() {
+    let local = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    let (slice, runtime) = ambient_relay_fixture(vec![local]);
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+    let index = Arc::new(NodeLocalEnrolledDestinations::new());
+    mesh.inbound_relay_node_local_registry =
+        NodeLocalEnrolledDestinationsHandle::new(index.clone());
+
+    let publisher = strict_registry_manager(
+        Arc::new(StaticCaptureSource(vec![capture_target(
+            LOCAL_POD_UID,
+            "10.244.5.5",
+        )])),
+        index.clone(),
+    );
+    let published = publisher.reconcile_once();
+    assert_eq!(published.len(), 1);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(()),
+        "a complete in-memory snapshot must publish"
+    );
+
+    let retractor = strict_registry_manager(Arc::new(IncompleteCaptureSource), index);
+    assert!(retractor.reconcile_once().is_empty());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "an incomplete snapshot must retract last-good rather than retain it"
+    );
+}
+
+/// Production `DirectoryCaptureSource` is the strict reader the relay guard
+/// must consume. A valid snapshot publishes; a malformed sibling entry is not
+/// skipped — the whole index retracts, including previously admitted pods —
+/// and a later complete snapshot recovers.
+#[test]
+fn inbound_relay_registry_malformed_production_entry_retracts_then_recovers() {
+    let own_spiffe = reviews_spiffe();
+    let local = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    let other = reviews_replica("10.244.5.6", OTHER_POD_UID);
+    let (slice, runtime) = ambient_relay_fixture(vec![local, other]);
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+    let index = Arc::new(NodeLocalEnrolledDestinations::new());
+    mesh.inbound_relay_node_local_registry =
+        NodeLocalEnrolledDestinationsHandle::new(index.clone());
+
+    let dir = tempfile::tempdir().expect("registry");
+    write_strict_registry_entry(dir.path(), LOCAL_POD_UID, "10.244.5.5", &own_spiffe);
+    write_strict_registry_entry(dir.path(), OTHER_POD_UID, "10.244.5.6", &own_spiffe);
+    let manager = strict_registry_manager(
+        Arc::new(DirectoryCaptureSource::new(dir.path())),
+        index,
+    );
+
+    assert_eq!(manager.reconcile_once().len(), 2);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 8080, node),
+        Ok(())
+    );
+
+    std::fs::write(dir.path().join(OTHER_POD_UID), b"").expect("malformed registry entry");
+    assert!(manager.reconcile_once().is_empty());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a malformed sibling must retract the whole index, not skip the bad file \
+         and keep last-good or the remaining valid entry"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+
+    write_strict_registry_entry(dir.path(), OTHER_POD_UID, "10.244.5.6", &own_spiffe);
+    assert_eq!(manager.reconcile_once().len(), 2);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(()),
+        "a later complete snapshot must be allowed to republish"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.6", 8080, node),
+        Ok(())
+    );
+}
+
+/// Unsafe names, oversized files, and Unix symlinks are the production
+/// filesystem shapes the strict reader refuses. Each must retract a
+/// previously valid publish; repairing the directory recovers.
+#[test]
+fn inbound_relay_registry_unsafe_oversized_or_symlinked_entry_retracts_then_recovers() {
+    let own_spiffe = reviews_spiffe();
+    let local = reviews_replica("10.244.5.5", LOCAL_POD_UID);
+    let (slice, runtime) = ambient_relay_fixture(vec![local]);
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+    let index = Arc::new(NodeLocalEnrolledDestinations::new());
+    mesh.inbound_relay_node_local_registry =
+        NodeLocalEnrolledDestinationsHandle::new(index.clone());
+
+    let dir = tempfile::tempdir().expect("registry");
+    write_strict_registry_entry(dir.path(), LOCAL_POD_UID, "10.244.5.5", &own_spiffe);
+    let manager = strict_registry_manager(
+        Arc::new(DirectoryCaptureSource::new(dir.path())),
+        index.clone(),
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "the index admits nothing before the first complete publish"
+    );
+    assert_eq!(manager.reconcile_once().len(), 1);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+
+    std::fs::write(dir.path().join("pod..unsafe"), b"/sys/fs/cgroup/x\nipv4=10.0.0.9\n")
+        .expect("unsafe name");
+    assert!(manager.reconcile_once().is_empty());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "an unsafe registry name must retract the previously valid publish"
+    );
+    std::fs::remove_file(dir.path().join("pod..unsafe")).expect("remove unsafe name");
+    assert_eq!(manager.reconcile_once().len(), 1);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+
+    std::fs::write(dir.path().join("oversized"), vec![b'x'; 16 * 1024 + 1])
+        .expect("oversized entry");
+    assert!(manager.reconcile_once().is_empty());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "an oversized registry entry must retract the previously valid publish"
+    );
+    std::fs::remove_file(dir.path().join("oversized")).expect("remove oversized");
+    assert_eq!(manager.reconcile_once().len(), 1);
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("/etc/hosts", dir.path().join("symlink-pod"))
+            .expect("symlink entry");
+        assert!(manager.reconcile_once().is_empty());
+        assert_eq!(
+            mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "a symlinked registry entry must retract the previously valid publish"
+        );
+        std::fs::remove_file(dir.path().join("symlink-pod")).expect("remove symlink");
+        assert_eq!(manager.reconcile_once().len(), 1);
+        assert_eq!(
+            mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+            Ok(())
+        );
+    }
+
+    let missing = strict_registry_manager(
+        Arc::new(DirectoryCaptureSource::new("/definitely/not-a-registry")),
+        index,
+    );
+    assert!(missing.reconcile_once().is_empty());
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a missing registry directory must retract rather than retain last-good"
     );
 }
 

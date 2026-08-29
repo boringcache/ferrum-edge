@@ -110,18 +110,29 @@ impl PodCaptureSourceIps {
 /// Source of the current enrolled-pod set. Production reads a directory the
 /// node-agent publishes; tests inject a fake.
 pub trait PodCaptureSource: Send + Sync {
+    /// Best-effort enrolled-pod set. Production filesystem sources skip
+    /// unreadable or malformed entries so capture/steering reconcilers can
+    /// keep working around a bad file. Security-sensitive consumers must use
+    /// [`Self::list_complete_targets`].
     fn list_targets(&self) -> Vec<PodCaptureTarget>;
 
-    /// Return one complete registry snapshot suitable for a durable migration
-    /// proof. Production filesystem sources override this to fail closed on
-    /// any omitted or malformed entry; in-memory sources are already atomic.
-    fn list_targets_for_migration(&self) -> Result<Vec<PodCaptureTarget>, String> {
+    /// Return one complete registry snapshot, or an error.
+    ///
+    /// Production filesystem sources fail closed on any omitted, unsafe, or
+    /// malformed entry (entry-count cap, per-entry size cap, Unix `O_NOFOLLOW`,
+    /// regular file, single link, process-owned, safe UTF-8 name). In-memory
+    /// sources are already atomic and default to `Ok(self.list_targets())`.
+    ///
+    /// Shared by durable UDP migration proofs and the inbound HBONE relay
+    /// destination guard: both need an all-or-nothing snapshot, not a partial
+    /// best-effort scan.
+    fn list_complete_targets(&self) -> Result<Vec<PodCaptureTarget>, String> {
         Ok(self.list_targets())
     }
 }
 
-const MAX_MIGRATION_REGISTRY_ENTRIES: usize = 100_000;
-const MAX_MIGRATION_REGISTRY_ENTRY_BYTES: u64 = 16 * 1024;
+const MAX_COMPLETE_REGISTRY_ENTRIES: usize = 100_000;
+const MAX_COMPLETE_REGISTRY_ENTRY_BYTES: u64 = 16 * 1024;
 
 /// Filesystem registry source: the node-agent writes one file per enrolled pod,
 /// named `<pod_uid>`, whose first line is the pod cgroup path and whose
@@ -171,7 +182,7 @@ fn parse_capture_target(pod_uid: String, contents: &str) -> Result<PodCaptureTar
     })
 }
 
-fn read_migration_registry_entry(path: &Path) -> Result<String, String> {
+fn read_complete_registry_entry(path: &Path) -> Result<String, String> {
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -186,7 +197,7 @@ fn read_migration_registry_entry(path: &Path) -> Result<String, String> {
     let metadata = file
         .metadata()
         .map_err(|_| "could not inspect Ambient capture registry entry")?;
-    if !metadata.is_file() || metadata.len() > MAX_MIGRATION_REGISTRY_ENTRY_BYTES {
+    if !metadata.is_file() || metadata.len() > MAX_COMPLETE_REGISTRY_ENTRY_BYTES {
         return Err("Ambient capture registry entry is not a bounded regular file".to_string());
     }
     #[cfg(unix)]
@@ -201,10 +212,10 @@ fn read_migration_registry_entry(path: &Path) -> Result<String, String> {
         }
     }
     let mut contents = String::new();
-    file.take(MAX_MIGRATION_REGISTRY_ENTRY_BYTES + 1)
+    file.take(MAX_COMPLETE_REGISTRY_ENTRY_BYTES + 1)
         .read_to_string(&mut contents)
         .map_err(|_| "could not read Ambient capture registry entry as UTF-8")?;
-    if contents.len() as u64 > MAX_MIGRATION_REGISTRY_ENTRY_BYTES {
+    if contents.len() as u64 > MAX_COMPLETE_REGISTRY_ENTRY_BYTES {
         return Err("Ambient capture registry entry exceeds its size limit".to_string());
     }
     Ok(contents)
@@ -233,18 +244,15 @@ impl PodCaptureSource for DirectoryCaptureSource {
         targets
     }
 
-    fn list_targets_for_migration(&self) -> Result<Vec<PodCaptureTarget>, String> {
+    fn list_complete_targets(&self) -> Result<Vec<PodCaptureTarget>, String> {
         let entries = std::fs::read_dir(&self.dir)
-            .map_err(|_| "could not scan Ambient capture registry for migration")?;
+            .map_err(|_| "could not scan Ambient capture registry")?;
         let mut targets = Vec::new();
         for (index, entry) in entries.enumerate() {
-            if index >= MAX_MIGRATION_REGISTRY_ENTRIES {
-                return Err(
-                    "Ambient capture registry exceeds its migration entry limit".to_string()
-                );
+            if index >= MAX_COMPLETE_REGISTRY_ENTRIES {
+                return Err("Ambient capture registry exceeds its entry limit".to_string());
             }
-            let entry =
-                entry.map_err(|_| "could not enumerate Ambient capture registry for migration")?;
+            let entry = entry.map_err(|_| "could not enumerate Ambient capture registry")?;
             let pod_uid = entry
                 .file_name()
                 .into_string()
@@ -259,7 +267,7 @@ impl PodCaptureSource for DirectoryCaptureSource {
             {
                 return Err("Ambient capture registry entry name is unsafe".to_string());
             }
-            let contents = read_migration_registry_entry(&entry.path())?;
+            let contents = read_complete_registry_entry(&entry.path())?;
             targets.push(parse_capture_target(pod_uid, &contents)?);
         }
         Ok(targets)
