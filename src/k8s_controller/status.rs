@@ -3,6 +3,7 @@ use kube::Client;
 use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
@@ -45,11 +46,12 @@ const GATEWAY_API_STATUS_FIELD_MANAGER: &str = FERRUM_GATEWAY_CONTROLLER_NAME;
 const GATEWAY_API_STATUS_PATCH_PARALLELISM: usize = 32;
 const ROUTE_STATUS_PATCH_MAX_ATTEMPTS: usize = 5;
 const ROUTE_STATUS_PATCH_RETRY_BASE_MS: u64 = 10;
-/// Per-object status GET/PATCH bound. The 60s batch ceiling equals the
-/// upstream Gateway API conformance wait, so one stalled SSA apply would
-/// otherwise consume the entire `observedGeneration` convergence window
-/// (`GatewayModifyListeners`).
-const GATEWAY_API_STATUS_PATCH_UPDATE_TIMEOUT: Duration = Duration::from_secs(8);
+/// Per parent-status GET/PATCH I/O bound. The 60s batch ceiling equals the
+/// upstream Gateway API conformance wait (`GatewayModifyListeners`), so a
+/// stalled apiserver call must not hold the whole SSA retry loop — or a
+/// sibling route merge-patch — for that entire window. Expiry is a
+/// non-error deferral: the next serialized reconcile retries.
+const GATEWAY_API_STATUS_PARENT_IO_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GatewayApiStatusUpdate {
@@ -129,33 +131,15 @@ impl GatewayApiStatusWriter {
             let namespace = update.namespace.clone();
             let metrics = metrics.clone();
             Some(async move {
-                let patch = if route_status_kind(&update.kind) || policy_status_kind(&update.kind)
+                let result = if route_status_kind(&update.kind) || policy_status_kind(&update.kind)
                 {
                     // `status.parents` / `status.ancestors` are atomic arrays in
                     // the upstream CRDs: they cannot be split by server-side
                     // apply ownership, so both follow the Gateway API
                     // read-modify-write mandate with a resourceVersion guard.
-                    patch_route_status_with_retry(&api, &update, metrics.as_deref())
+                    patch_route_status_with_retry(&api, &update, metrics.as_deref()).await
                 } else {
-                    patch_gateway_status_with_apply(&api, &update)
-                };
-                let result = match tokio::time::timeout(
-                    GATEWAY_API_STATUS_PATCH_UPDATE_TIMEOUT,
-                    patch,
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        warn!(
-                            %kind,
-                            %namespace,
-                            %name,
-                            timeout_secs = GATEWAY_API_STATUS_PATCH_UPDATE_TIMEOUT.as_secs(),
-                            "Gateway API status patch exceeded the per-update bound; leaving resource for the next reconcile"
-                        );
-                        Err(status_patch_timeout_error())
-                    }
+                    patch_gateway_status_with_apply(&api, &update).await
                 };
                 (kind, namespace, name, result)
             })
@@ -191,9 +175,33 @@ async fn patch_gateway_status_with_apply(
     update: &GatewayApiStatusUpdate,
 ) -> Result<(), kube::Error> {
     for attempt in 1..=ROUTE_STATUS_PATCH_MAX_ATTEMPTS {
-        let live = match api.get_status(&update.name).await {
-            Ok(live) => live,
-            Err(error) => {
+        let live = match parent_status_io_timeout(api.get_status(&update.name)).await {
+            ParentStatusIo::Succeeded(live) => live,
+            ParentStatusIo::TimedOut if attempt < ROUTE_STATUS_PATCH_MAX_ATTEMPTS => {
+                warn!(
+                    api_version = %update.api_version,
+                    kind = %update.kind,
+                    namespace = %update.namespace,
+                    name = %update.name,
+                    attempt,
+                    timeout_secs = GATEWAY_API_STATUS_PARENT_IO_TIMEOUT.as_secs(),
+                    "Gateway API parent status read exceeded the per-call bound; retrying"
+                );
+                tokio::time::sleep(route_status_retry_delay(attempt)).await;
+                continue;
+            }
+            ParentStatusIo::TimedOut => {
+                warn!(
+                    api_version = %update.api_version,
+                    kind = %update.kind,
+                    namespace = %update.namespace,
+                    name = %update.name,
+                    timeout_secs = GATEWAY_API_STATUS_PARENT_IO_TIMEOUT.as_secs(),
+                    "Gateway API parent status read exceeded the per-call bound; leaving resource for the next reconcile"
+                );
+                return Ok(());
+            }
+            ParentStatusIo::Failed(error) => {
                 warn!(
                     api_version = %update.api_version,
                     kind = %update.kind,
@@ -213,34 +221,72 @@ async fn patch_gateway_status_with_apply(
                 name = %update.name,
                 "Refusing stale Gateway status plan whose observedGeneration lags live metadata.generation"
             );
+            // Fail closed on the write. The live GET already observed a newer
+            // spec generation; the reflector stores that object independently
+            // and `change_rx` is marked if the event arrived during this
+            // reconcile, so the next loop iteration replans from it. `Ok(())`
+            // must not be mistaken for a requeue by itself.
             return Ok(());
         }
-        let resource_version = live.metadata.resource_version.as_deref();
+        let Some(resource_version) = live.metadata.resource_version.clone() else {
+            warn!(
+                api_version = %update.api_version,
+                kind = %update.kind,
+                namespace = %update.namespace,
+                name = %update.name,
+                "Gateway API parent status read returned no resourceVersion; leaving resource for the next reconcile"
+            );
+            return Ok(());
+        };
         let patch = gateway_status_apply_patch_for_update(
             update,
             live.data.get("status"),
-            resource_version,
+            Some(&resource_version),
         );
 
         // Gateway/GatewayClass condition and listener arrays are structural
         // list-maps, so SSA can own Ferrum's keyed entries without copying fields
         // owned by another manager. Force adopts Ferrum's legacy merge-patch fields;
         // the apply document remains limited to the status fields Ferrum reconciles.
-        // `metadata.resourceVersion` is an optimistic generation fence so a
-        // snapshot planned before `metadata.generation` advanced cannot pin
-        // `observedGeneration` to the older spec.
+        // `metadata.resourceVersion` is an apply *precondition* (not an SSA-managed
+        // field) so a snapshot planned before `metadata.generation` advanced
+        // cannot pin `observedGeneration` to the older spec.
         let params = gateway_api_status_apply_params();
-        match api
-            .patch_status(&update.name, &params, &Patch::Apply(&patch))
-            .await
+        match parent_status_io_timeout(
+            api.patch_status(&update.name, &params, &Patch::Apply(&patch)),
+        )
+        .await
         {
-            Ok(_) => return Ok(()),
-            Err(error)
+            ParentStatusIo::Succeeded(_) => return Ok(()),
+            ParentStatusIo::TimedOut if attempt < ROUTE_STATUS_PATCH_MAX_ATTEMPTS => {
+                warn!(
+                    api_version = %update.api_version,
+                    kind = %update.kind,
+                    namespace = %update.namespace,
+                    name = %update.name,
+                    attempt,
+                    timeout_secs = GATEWAY_API_STATUS_PARENT_IO_TIMEOUT.as_secs(),
+                    "Gateway API parent status apply exceeded the per-call bound; retrying"
+                );
+                tokio::time::sleep(route_status_retry_delay(attempt)).await;
+            }
+            ParentStatusIo::TimedOut => {
+                warn!(
+                    api_version = %update.api_version,
+                    kind = %update.kind,
+                    namespace = %update.namespace,
+                    name = %update.name,
+                    timeout_secs = GATEWAY_API_STATUS_PARENT_IO_TIMEOUT.as_secs(),
+                    "Gateway API parent status apply exceeded the per-call bound; leaving resource for the next reconcile"
+                );
+                return Ok(());
+            }
+            ParentStatusIo::Failed(error)
                 if kube_error_is_conflict(&error) && attempt < ROUTE_STATUS_PATCH_MAX_ATTEMPTS =>
             {
                 tokio::time::sleep(route_status_retry_delay(attempt)).await;
             }
-            Err(error) if kube_error_is_conflict(&error) => {
+            ParentStatusIo::Failed(error) if kube_error_is_conflict(&error) => {
                 warn!(
                     api_version = %update.api_version,
                     kind = %update.kind,
@@ -252,7 +298,7 @@ async fn patch_gateway_status_with_apply(
                 );
                 return Ok(());
             }
-            Err(error) => return Err(error),
+            ParentStatusIo::Failed(error) => return Err(error),
         }
     }
     Ok(())
@@ -347,12 +393,21 @@ fn kube_error_is_conflict(error: &kube::Error) -> bool {
     matches!(error, kube::Error::Api(response) if response.code == 409)
 }
 
-fn status_patch_timeout_error() -> kube::Error {
-    kube::Error::Api(
-        kube::core::Status::failure("status patch exceeded per-update bound", "Timeout")
-            .with_code(504)
-            .boxed(),
-    )
+enum ParentStatusIo<T> {
+    Succeeded(T),
+    TimedOut,
+    Failed(kube::Error),
+}
+
+async fn parent_status_io_timeout<F, T>(future: F) -> ParentStatusIo<T>
+where
+    F: Future<Output = Result<T, kube::Error>>,
+{
+    match tokio::time::timeout(GATEWAY_API_STATUS_PARENT_IO_TIMEOUT, future).await {
+        Ok(Ok(value)) => ParentStatusIo::Succeeded(value),
+        Ok(Err(error)) => ParentStatusIo::Failed(error),
+        Err(_) => ParentStatusIo::TimedOut,
+    }
 }
 
 /// True when a snapshot-planned parent status would pin `observedGeneration`
@@ -373,10 +428,17 @@ fn planned_owned_observed_generation(update: &GatewayApiStatusUpdate) -> Option<
     let conditions = existing_conditions(&update.status)?;
     let mut observed = None;
     for condition_type_name in owned_types {
-        let generation = conditions
+        let Some(generation) = conditions
             .iter()
             .find(|condition| condition_type(condition) == Some(*condition_type_name))
-            .and_then(|condition| condition.get("observedGeneration").and_then(Value::as_i64))?;
+            .and_then(|condition| {
+                condition
+                    .get("observedGeneration")
+                    .and_then(Value::as_i64)
+            })
+        else {
+            continue;
+        };
         observed = Some(observed.map_or(generation, |current| current.min(generation)));
     }
     observed
@@ -6857,105 +6919,10 @@ mod tests {
         assert_eq!(patch["metadata"]["name"].as_str(), Some("ferrum"));
         assert!(patch["metadata"].get("namespace").is_none());
         assert!(patch["metadata"].get("resourceVersion").is_none());
-    }
 
-    #[test]
-    fn gateway_apply_patch_advances_stale_observed_generation_and_guards_resource_version() {
-        let update = GatewayApiStatusUpdate {
-            api_version: "gateway.networking.k8s.io/v1".to_string(),
-            kind: "Gateway".to_string(),
-            namespace: "gateway-conformance-infra".to_string(),
-            name: "gateway-remove-listener".to_string(),
-            status: json!({
-                "conditions": [{
-                    "type": "Accepted",
-                    "status": "True",
-                    "observedGeneration": 2,
-                    "reason": "Accepted",
-                    "message": "Ferrum accepted this Gateway",
-                    "lastTransitionTime": "2026-02-01T00:00:00Z"
-                }]
-            }),
-            patch_gateway_addresses: false,
-            patch_gateway_listeners: false,
-        };
-        let live_status = json!({
-            "conditions": [{
-                "type": "Accepted",
-                "status": "True",
-                "observedGeneration": 1,
-                "reason": "Accepted",
-                "message": "Ferrum accepted this Gateway",
-                "lastTransitionTime": "2026-01-01T00:00:00Z"
-            }]
-        });
-
-        let patch = gateway_status_apply_patch_for_update(&update, Some(&live_status), Some("77"));
-        let conditions = patch["status"]["conditions"].as_array().unwrap();
-        assert_eq!(conditions.len(), 1);
-        assert_eq!(conditions[0]["observedGeneration"].as_i64(), Some(2));
-        assert_eq!(
-            conditions[0]["lastTransitionTime"].as_str(),
-            Some("2026-01-01T00:00:00Z")
-        );
-        assert_eq!(patch["metadata"]["resourceVersion"].as_str(), Some("77"));
-    }
-
-    #[test]
-    fn gateway_status_plan_is_stale_when_live_generation_is_newer() {
-        let update = GatewayApiStatusUpdate {
-            api_version: "gateway.networking.k8s.io/v1".to_string(),
-            kind: "Gateway".to_string(),
-            namespace: "gateway-conformance-infra".to_string(),
-            name: "gateway-remove-listener".to_string(),
-            status: json!({
-                "conditions": [
-                    {
-                        "type": "Accepted",
-                        "status": "True",
-                        "observedGeneration": 1,
-                        "reason": "Accepted",
-                        "message": "Ferrum accepted this Gateway"
-                    },
-                    {
-                        "type": "ResolvedRefs",
-                        "status": "True",
-                        "observedGeneration": 1,
-                        "reason": "ResolvedRefs",
-                        "message": "All Gateway references accepted by Ferrum"
-                    },
-                    {
-                        "type": "Programmed",
-                        "status": "True",
-                        "observedGeneration": 1,
-                        "reason": "Programmed",
-                        "message": "Ferrum programmed this Gateway"
-                    },
-                    {
-                        "type": "Conflicted",
-                        "status": "False",
-                        "observedGeneration": 1,
-                        "reason": "NoConflicts",
-                        "message": "No Gateway API conflicts detected by Ferrum"
-                    }
-                ]
-            }),
-            patch_gateway_addresses: false,
-            patch_gateway_listeners: false,
-        };
-        let mut live = DynamicObject {
-            types: None,
-            metadata: Default::default(),
-            data: json!({}),
-        };
-        live.metadata.generation = Some(2);
-        assert!(gateway_status_plan_is_stale(&update, &live));
-
-        live.metadata.generation = Some(1);
-        assert!(!gateway_status_plan_is_stale(&update, &live));
-
-        live.metadata.generation = None;
-        assert!(!gateway_status_plan_is_stale(&update, &live));
+        let fenced = gateway_status_apply_patch_for_update(&update, None, Some("9"));
+        assert!(fenced["metadata"].get("namespace").is_none());
+        assert_eq!(fenced["metadata"]["resourceVersion"].as_str(), Some("9"));
     }
 
     fn assert_condition(conditions: &[Value], condition_type: &str, status: &str) {

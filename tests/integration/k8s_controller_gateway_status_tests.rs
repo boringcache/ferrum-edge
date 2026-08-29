@@ -2696,6 +2696,11 @@ fn mock_gateway_kube_client(state: Arc<Mutex<MockGatewayKubeState>>) -> Client {
                     let mut state = state.lock().expect("lock mock Kubernetes state");
                     state.patch_bodies.push(patch);
                     if state.conflict_first_patch && state.patch_bodies.len() == 1 {
+                        if let Some(resource_version) =
+                            state.live.pointer_mut("/metadata/resourceVersion")
+                        {
+                            *resource_version = json!("42");
+                        }
                         conflict_response()
                     } else {
                         json_response(StatusCode::OK, json!({"kind": "Gateway"}))
@@ -2767,5 +2772,199 @@ async fn gateway_status_apply_refuses_stale_observed_generation_plan() {
     assert!(
         state.patch_bodies.is_empty(),
         "a plan that lags live metadata.generation must not pin observedGeneration"
+    );
+}
+
+#[tokio::test]
+async fn gateway_status_apply_retries_conflict_with_fresh_resource_version() {
+    let state = Arc::new(Mutex::new(MockGatewayKubeState {
+        get_count: 0,
+        patch_bodies: Vec::new(),
+        live: live_gateway(2, "41", 1),
+        conflict_first_patch: true,
+    }));
+    let writer = GatewayApiStatusWriter::new(mock_gateway_kube_client(state.clone()));
+
+    writer
+        .patch_updates(vec![gateway_status_update(2)])
+        .await
+        .expect("a 409 must refetch and apply rather than fail the batch");
+
+    let state = state.lock().expect("lock mock Kubernetes state");
+    assert_eq!(state.get_count, 2, "a 409 must trigger a fresh status read");
+    assert_eq!(state.patch_bodies.len(), 2);
+    assert_eq!(
+        state.patch_bodies[0]["metadata"]["resourceVersion"].as_str(),
+        Some("41")
+    );
+    assert_eq!(
+        state.patch_bodies[1]["metadata"]["resourceVersion"].as_str(),
+        Some("42")
+    );
+    assert!(state.patch_bodies.iter().all(|patch| {
+        patch["status"]["conditions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|condition| condition["observedGeneration"].as_i64() == Some(2))
+    }));
+}
+
+#[tokio::test]
+async fn gateway_status_apply_publishes_when_live_generation_is_absent() {
+    let mut live = live_gateway(2, "41", 1);
+    live["metadata"]
+        .as_object_mut()
+        .expect("gateway metadata")
+        .remove("generation");
+    let state = Arc::new(Mutex::new(MockGatewayKubeState {
+        get_count: 0,
+        patch_bodies: Vec::new(),
+        live,
+        conflict_first_patch: false,
+    }));
+    let writer = GatewayApiStatusWriter::new(mock_gateway_kube_client(state.clone()));
+
+    writer
+        .patch_updates(vec![gateway_status_update(1)])
+        .await
+        .expect("missing live generation must not look like a newer spec");
+
+    let state = state.lock().expect("lock mock Kubernetes state");
+    assert_eq!(state.patch_bodies.len(), 1);
+    assert_eq!(
+        state.patch_bodies[0]["metadata"]["resourceVersion"].as_str(),
+        Some("41")
+    );
+}
+
+fn live_gateway_class(generation: i64, resource_version: &str, observed_generation: i64) -> Value {
+    json!({
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "GatewayClass",
+        "metadata": {
+            "name": "ferrum",
+            "generation": generation,
+            "resourceVersion": resource_version
+        },
+        "status": {
+            "conditions": [{
+                "type": "Accepted",
+                "status": "True",
+                "observedGeneration": observed_generation,
+                "reason": "Accepted",
+                "message": "Ferrum accepted this GatewayClass",
+                "lastTransitionTime": "2026-01-01T00:00:00Z"
+            }]
+        }
+    })
+}
+
+fn gateway_class_status_update(observed_generation: i64) -> GatewayApiStatusUpdate {
+    GatewayApiStatusUpdate {
+        api_version: "gateway.networking.k8s.io/v1".to_string(),
+        kind: "GatewayClass".to_string(),
+        namespace: String::new(),
+        name: "ferrum".to_string(),
+        status: json!({
+            "conditions": [{
+                "type": "Accepted",
+                "status": "True",
+                "observedGeneration": observed_generation,
+                "reason": "Accepted",
+                "message": "Ferrum accepted this GatewayClass",
+                "lastTransitionTime": "2026-01-01T00:00:00Z"
+            }]
+        }),
+        patch_gateway_addresses: false,
+        patch_gateway_listeners: false,
+    }
+}
+
+fn mock_gateway_class_kube_client(state: Arc<Mutex<MockGatewayKubeState>>) -> Client {
+    let service = service_fn(move |request: Request<Body>| {
+        let state = state.clone();
+        async move {
+            let method = request.method().clone();
+            let path = request.uri().path().to_string();
+            assert!(
+                path.ends_with("/gatewayclasses/ferrum/status"),
+                "GatewayClass status writes must target the cluster-scoped status subresource, got {path}"
+            );
+            assert!(
+                !path.contains("/namespaces/"),
+                "GatewayClass must not be patched as a namespaced resource, got {path}"
+            );
+            let body = request
+                .into_body()
+                .collect_bytes()
+                .await
+                .expect("read mock Kubernetes request body");
+            let response = match method {
+                Method::GET => {
+                    let mut state = state.lock().expect("lock mock Kubernetes state");
+                    state.get_count += 1;
+                    json_response(StatusCode::OK, state.live.clone())
+                }
+                Method::PATCH => {
+                    let patch: Value =
+                        serde_json::from_slice(&body).expect("parse status patch body");
+                    let mut state = state.lock().expect("lock mock Kubernetes state");
+                    state.patch_bodies.push(patch);
+                    json_response(StatusCode::OK, json!({"kind": "GatewayClass"}))
+                }
+                _ => json_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    json!({"apiVersion": "v1", "kind": "Status", "code": 405}),
+                ),
+            };
+            Ok::<_, Infallible>(response)
+        }
+    });
+    Client::new(service, "default")
+}
+
+#[tokio::test]
+async fn gateway_class_status_apply_is_cluster_scoped_and_generation_fenced() {
+    let state = Arc::new(Mutex::new(MockGatewayKubeState {
+        get_count: 0,
+        patch_bodies: Vec::new(),
+        live: live_gateway_class(2, "8", 1),
+        conflict_first_patch: false,
+    }));
+    let writer = GatewayApiStatusWriter::new(mock_gateway_class_kube_client(state.clone()));
+
+    writer
+        .patch_updates(vec![gateway_class_status_update(2)])
+        .await
+        .expect("generation-current GatewayClass status must publish");
+
+    let state = state.lock().expect("lock mock Kubernetes state");
+    assert_eq!(state.get_count, 1);
+    assert_eq!(state.patch_bodies.len(), 1);
+    let patch = &state.patch_bodies[0];
+    assert!(patch["metadata"].get("namespace").is_none());
+    assert_eq!(patch["metadata"]["resourceVersion"].as_str(), Some("8"));
+    assert_eq!(
+        patch["status"]["conditions"][0]["observedGeneration"].as_i64(),
+        Some(2)
+    );
+
+    let stale_state = Arc::new(Mutex::new(MockGatewayKubeState {
+        get_count: 0,
+        patch_bodies: Vec::new(),
+        live: live_gateway_class(2, "8", 1),
+        conflict_first_patch: false,
+    }));
+    let stale_writer =
+        GatewayApiStatusWriter::new(mock_gateway_class_kube_client(stale_state.clone()));
+    stale_writer
+        .patch_updates(vec![gateway_class_status_update(1)])
+        .await
+        .expect("stale GatewayClass plans must fail closed without erroring the batch");
+    let stale_state = stale_state.lock().expect("lock mock Kubernetes state");
+    assert!(
+        stale_state.patch_bodies.is_empty(),
+        "a GatewayClass plan that lags live metadata.generation must not pin observedGeneration"
     );
 }

@@ -227,18 +227,27 @@ fn gateway_api_status_plan_cursor_retries_same_window_after_patch_failure() {
 }
 
 #[test]
-fn gateway_parent_status_publication_is_generation_fenced_and_per_update_bounded() {
+fn gateway_parent_status_publication_is_generation_fenced_and_parent_io_bounded() {
     assert!(
-        STATUS_SRC.contains("GATEWAY_API_STATUS_PATCH_UPDATE_TIMEOUT"),
-        "each Gateway API status GET/PATCH must have a bound below the suite wait"
+        STATUS_SRC.contains("GATEWAY_API_STATUS_PARENT_IO_TIMEOUT"),
+        "each Gateway/GatewayClass/ListenerSet status GET/PATCH must have a bound below the suite wait"
     );
     assert!(
-        STATUS_SRC.contains("gateway_status_plan_is_stale"),
-        "Gateway SSA must refuse a plan whose observedGeneration lags live metadata.generation"
+        !STATUS_SRC.contains("status_patch_timeout_error")
+            && !STATUS_SRC.contains("with_code(504)"),
+        "a bounded parent-status deferral must not be accounted as a 504 patch failure"
     );
+    let apply = STATUS_SRC
+        .split("async fn patch_gateway_status_with_apply(")
+        .nth(1)
+        .and_then(|rest| rest.split("async fn patch_route_status_with_retry(").next())
+        .expect("patch_gateway_status_with_apply body");
     assert!(
-        STATUS_SRC.contains("\"resourceVersion\""),
-        "Gateway SSA apply documents must carry metadata.resourceVersion"
+        apply.contains("parent_status_io_timeout")
+            && apply.contains("GATEWAY_API_STATUS_PARENT_IO_TIMEOUT")
+            && apply.contains("gateway_status_plan_is_stale")
+            && apply.contains("resourceVersion"),
+        "parent SSA GET/PATCH must be generation-fenced, RV-preconditioned, and independently bounded"
     );
     let patch_updates = STATUS_SRC
         .split("pub async fn patch_updates(")
@@ -246,9 +255,8 @@ fn gateway_parent_status_publication_is_generation_fenced_and_per_update_bounded
         .and_then(|rest| rest.split("async fn patch_gateway_status_with_apply(").next())
         .expect("GatewayApiStatusWriter::patch_updates body");
     assert!(
-        patch_updates.contains("tokio::time::timeout")
-            && patch_updates.contains("GATEWAY_API_STATUS_PATCH_UPDATE_TIMEOUT"),
-        "every status patch future must be bounded independently of the batch ceiling"
+        !patch_updates.contains("tokio::time::timeout"),
+        "route/policy merge-patch retries must not share the parent SSA I/O bound"
     );
     assert!(
         RECONCILER_SRC.contains("STATUS_PATCH_BATCH_TIMEOUT")
