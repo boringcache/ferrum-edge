@@ -17,10 +17,17 @@
 //! cannot diverge; the tests below assert that parity directly rather than
 //! per protocol.
 
+use chrono::Utc;
 use dashmap::DashMap;
-use ferrum_edge::config::types::{LoadBalancerAlgorithm, SubsetDefinition, UpstreamTarget};
-use ferrum_edge::load_balancer::{HealthContext, LoadBalancer, sticky_session_token, target_key};
+use ferrum_edge::config::types::{
+    GatewayConfig, LoadBalancerAlgorithm, SubsetDefinition, Upstream, UpstreamPortOverride,
+    UpstreamTarget,
+};
+use ferrum_edge::load_balancer::{
+    HealthContext, LoadBalancer, LoadBalancerCache, sticky_session_token, target_key,
+};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 const UPSTREAM: &str = "srv-priority-upstream";
 
@@ -595,5 +602,245 @@ fn no_health_context_still_prefers_the_best_tier() {
         selected_hosts(&lb, None, 200),
         vec!["p1".to_string(), "p2".to_string()],
         "an upstream with no health checks configured must still honor RFC 2782 priority"
+    );
+}
+
+// ── Indexed candidate-pool paths under a PRESENT, EMPTY health context ──
+//
+// `select_from_subset` and the per-port-override arm of `select_for_port` do
+// not reuse the whole-upstream health bitset: they compute an index-scoped one
+// so a passive max-ejection cap is sized against the actual candidate pool.
+// That helper has its own "both health maps are empty, so every candidate is
+// healthy" fast return, which is exactly the state a healthy pool is in almost
+// all of the time. Tier selection is NOT a health filter and must run there
+// too, or an all-healthy subset / per-port dispatch would silently round-robin
+// a DR tier alongside its primary tier — the one case these entry points are
+// most likely to be in. The tests below pin that fast return specifically: the
+// health context is present (`Some`) and its maps are empty, so no target is
+// ever ejected and no other branch of the helper can be reached.
+
+/// Multi-member subset, present-but-empty health: only the best healthy tier
+/// plus unprioritized targets are eligible, and the DR tier is never drawn.
+#[test]
+fn subset_indexed_path_filters_tiers_with_a_present_empty_health_context() {
+    let mut labels = HashMap::new();
+    labels.insert("app".to_string(), "checkout".to_string());
+
+    let with_label = |mut t: UpstreamTarget| {
+        t.tags.insert("app".to_string(), "checkout".to_string());
+        t
+    };
+    // Two primaries and two DRs so a leak cannot be masked by round-robin
+    // landing on the same host, plus an untagged static member that must stay
+    // eligible, plus an out-of-subset primary that must never be drawn.
+    let targets = vec![
+        with_label(tiered("p1", 1, "10")),
+        with_label(tiered("p2", 1, "10")),
+        with_label(tiered("dr1", 1, "20")),
+        with_label(tiered("dr2", 1, "20")),
+        with_label(untiered("static1", 1)),
+        tiered("outside", 1, "10"),
+    ];
+    let subsets = vec![SubsetDefinition {
+        name: "checkout".to_string(),
+        labels,
+        traffic_policy: None,
+    }];
+    let lb = LoadBalancer::with_subsets(
+        UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+        Some(&subsets),
+    );
+
+    // Present health context whose active map is empty and whose passive map is
+    // absent: the indexed helper's all-healthy fast return.
+    let active = DashMap::new();
+    assert!(
+        active.is_empty(),
+        "this test must exercise the empty-health fast return, not the ejection path"
+    );
+
+    let mut seen: Vec<String> = Vec::new();
+    for i in 0..300 {
+        let sel = lb
+            .select_from_subset(&format!("c{i}"), "checkout", Some(&health_ctx(&active)))
+            .expect("subset selection must resolve while the subset has healthy members");
+        if !seen.contains(&sel.target.host) {
+            seen.push(sel.target.host.clone());
+        }
+    }
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec!["p1".to_string(), "p2".to_string(), "static1".to_string()],
+        "an all-healthy subset must serve only the best SRV tier plus unprioritized targets"
+    );
+
+    // Health semantics are unchanged: the DR tier is still reachable, and only
+    // once every primary in the subset is unhealthy.
+    mark_unhealthy(&active, &targets, &["p1"]);
+    let mut partial: Vec<String> = Vec::new();
+    for i in 0..300 {
+        let sel = lb
+            .select_from_subset(&format!("d{i}"), "checkout", Some(&health_ctx(&active)))
+            .expect("subset selection must resolve");
+        if !partial.contains(&sel.target.host) {
+            partial.push(sel.target.host.clone());
+        }
+    }
+    partial.sort();
+    assert_eq!(
+        partial,
+        vec!["p2".to_string(), "static1".to_string()],
+        "one surviving primary must keep the DR tier out of the subset pool"
+    );
+
+    mark_unhealthy(&active, &targets, &["p1", "p2"]);
+    let mut failed_over: Vec<String> = Vec::new();
+    for i in 0..300 {
+        let sel = lb
+            .select_from_subset(&format!("e{i}"), "checkout", Some(&health_ctx(&active)))
+            .expect("subset selection must fail over inside the subset");
+        if !failed_over.contains(&sel.target.host) {
+            failed_over.push(sel.target.host.clone());
+        }
+    }
+    failed_over.sort();
+    assert_eq!(
+        failed_over,
+        vec!["dr1".to_string(), "dr2".to_string(), "static1".to_string()],
+        "the DR tier becomes eligible only after every primary in the subset is unhealthy"
+    );
+}
+
+/// Build a real per-port override so `select_for_port` takes its indexed
+/// candidate-pool arm instead of delegating to `select`. `UpstreamPortOverride`
+/// is only wired through the config-driven `LoadBalancerCache`, so the balancer
+/// is built the way production builds it.
+fn lb_with_port_override(targets: Vec<UpstreamTarget>, port: u16) -> Arc<LoadBalancer> {
+    let now = Utc::now();
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        port,
+        UpstreamPortOverride {
+            algorithm: Some(LoadBalancerAlgorithm::RoundRobin),
+            ..Default::default()
+        },
+    );
+    let upstream = Upstream {
+        id: "u1".to_string(),
+        namespace: "ferrum".to_string(),
+        name: Some("u1".to_string()),
+        targets,
+        algorithm: LoadBalancerAlgorithm::RoundRobin,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        subsets: None,
+        port_overrides,
+        source_locality: None,
+        source_labels: HashMap::new(),
+        locality_lb_strict: false,
+        locality_lb_setting: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
+        resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+        k8s_service_uid: None,
+        pending_limit_scope: None,
+    };
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    cache
+        .load()
+        .get_balancer("ferrum", "u1")
+        .expect("configured upstream must be in the LB cache")
+}
+
+/// Registered per-port override, present-but-empty health: the port's indexed
+/// candidate pool is tier-filtered exactly like the whole-upstream pool.
+#[test]
+fn per_port_indexed_path_filters_tiers_with_a_present_empty_health_context() {
+    let on_port = |host: &str, priority: &str, port: u16| {
+        let mut t = tiered(host, 1, priority);
+        t.port = port;
+        t
+    };
+    let mut static_on_9000 = untiered("static1", 1);
+    static_on_9000.port = 9000;
+
+    // Port 9000 carries two primaries, two DRs and one untagged target; the
+    // 9001 targets exist only to prove the override's pool is index-scoped.
+    let targets = vec![
+        on_port("p1", "10", 9000),
+        on_port("p2", "10", 9000),
+        on_port("dr1", "20", 9000),
+        on_port("dr2", "20", 9000),
+        static_on_9000,
+        on_port("other-port", "10", 9001),
+    ];
+    let lb = lb_with_port_override(targets.clone(), 9000);
+
+    // `other-port` is a healthy priority-10 target, so it would be drawn if
+    // `select_for_port` had fallen through to whole-upstream `select`. Its
+    // absence below is the proof that the registered override's indexed
+    // candidate-pool arm — the one being pinned here — actually ran.
+    let active = DashMap::new();
+    let mut seen: Vec<String> = Vec::new();
+    for i in 0..300 {
+        let sel = lb
+            .select_for_port(&format!("c{i}"), 9000, Some(&health_ctx(&active)))
+            .expect("per-port selection must resolve while the port has healthy members");
+        if !seen.contains(&sel.target.host) {
+            seen.push(sel.target.host.clone());
+        }
+    }
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec!["p1".to_string(), "p2".to_string(), "static1".to_string()],
+        "an all-healthy per-port pool must serve only the best SRV tier plus unprioritized targets"
+    );
+
+    // Active-health keys are scoped to the runtime upstream key the cache built
+    // this balancer with, not the bare upstream id.
+    let lb_key = ferrum_edge::config::db_backend::namespaced_runtime_key("ferrum", "u1");
+    let mark_port_unhealthy = |hosts: &[&str]| {
+        active.clear();
+        for target in &targets {
+            if hosts.contains(&target.host.as_str()) {
+                active.insert(target_key(&lb_key, target), 1);
+            }
+        }
+    };
+
+    mark_port_unhealthy(&["p1", "p2"]);
+    let mut failed_over: Vec<String> = Vec::new();
+    for i in 0..300 {
+        let sel = lb
+            .select_for_port(&format!("d{i}"), 9000, Some(&health_ctx(&active)))
+            .expect("per-port selection must fail over inside the port pool");
+        if !failed_over.contains(&sel.target.host) {
+            failed_over.push(sel.target.host.clone());
+        }
+    }
+    failed_over.sort();
+    assert_eq!(
+        failed_over,
+        vec!["dr1".to_string(), "dr2".to_string(), "static1".to_string()],
+        "the per-port DR tier becomes eligible only after every primary on the port is unhealthy"
     );
 }

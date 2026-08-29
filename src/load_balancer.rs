@@ -4176,7 +4176,12 @@ impl LoadBalancer {
                 .as_ref()
                 .is_none_or(|ps| ps.unhealthy.is_empty())
         {
-            return bitset_for_indices(indices);
+            // Every candidate is healthy, but RFC 2782 tier selection is not a
+            // health filter: it must still run, exactly as on the `None`-health
+            // and post-ejection paths below, or an all-healthy subset /
+            // per-port dispatch would round-robin a DR tier alongside its
+            // primary tier.
+            return self.filter_srv_priority_bitset(bitset_for_indices(indices));
         }
 
         let mut bitset = HealthBitset::empty();
