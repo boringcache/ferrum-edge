@@ -8180,11 +8180,8 @@ mod inner {
                     GATEWAY_TRUST_BUNDLE_RESOURCE_TYPE => {
                         gateway_trust_bundle_changed = true;
                     }
-                    other => {
-                        warn!(
-                            "Ignoring config_changes row with unknown resource_type '{}'",
-                            other
-                        );
+                    _ => {
+                        warn!("Ignoring config_changes row with unknown resource_type");
                     }
                 }
             }
