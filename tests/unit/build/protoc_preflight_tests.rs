@@ -4,8 +4,8 @@ use std::ffi::OsString;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
 
+#[allow(dead_code)]
 mod protoc_preflight {
     include!("../../../build/protoc_preflight.rs");
 }
@@ -84,7 +84,7 @@ fn executable_protoc_on_path_is_discovered() {
 
     let resolved = protoc_preflight::ensure_protoc_from(None, Some(OsString::from(dir.path())))
         .expect("executable protoc on PATH must resolve");
-    assert_eq!(resolved, PathBuf::from(path));
+    assert_eq!(resolved, path);
 }
 
 #[test]
