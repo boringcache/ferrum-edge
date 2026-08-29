@@ -4330,7 +4330,7 @@ async fn replace_metadata_only_shortcut_fails_when_api_specs_row_missing() {
     sqlx::query("DELETE FROM api_specs WHERE namespace = ? AND id = ?")
         .bind(ns)
         .bind(&spec_id)
-        .execute(store.pool())
+        .execute(&store.pool())
         .await
         .expect("delete api_specs row for dangling fixture");
 
