@@ -6313,11 +6313,7 @@ fn dns_sd_poisoned_tier_does_not_become_a_tier() {
 #[test]
 fn dns_sd_poisoned_intermediate_tier_falls_through() {
     let targets = dns_sd_from_srv(
-        &[
-            (".", 8080, 1, 10),
-            ("mid", 0, 1, 20),
-            ("far", 9090, 8, 30),
-        ],
+        &[(".", 8080, 1, 10), ("mid", 0, 1, 20), ("far", 9090, 8, 30)],
         1,
     );
     assert_eq!(

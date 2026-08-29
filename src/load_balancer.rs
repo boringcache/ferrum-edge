@@ -4101,10 +4101,7 @@ impl LoadBalancer {
     /// target out of every tier.
     #[inline]
     fn srv_priority(&self, idx: usize) -> u32 {
-        self.srv_priorities
-            .get(idx)
-            .copied()
-            .unwrap_or(SRV_PRIORITY_NONE)
+        self.srv_priorities.get(idx).copied().unwrap_or(SRV_PRIORITY_NONE)
     }
 
     /// Compute a stack-allocated bitset of healthy target indices in a single
