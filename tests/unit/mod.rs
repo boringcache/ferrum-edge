@@ -1,4 +1,5 @@
 mod admin;
+mod build;
 mod cli;
 mod config;
 mod env_lock;

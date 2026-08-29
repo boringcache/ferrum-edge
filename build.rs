@@ -2,13 +2,20 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod protoc_preflight {
+    include!("build/protoc_preflight.rs");
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-env-changed=PROTOC");
     println!("cargo:rerun-if-changed=proto/ferrum.proto");
     println!("cargo:rerun-if-changed=proto/envoy/service/discovery/v3/discovery.proto");
     println!("cargo:rerun-if-changed=proto/envoy/service/runtime/v3/rtds.proto");
     println!("cargo:rerun-if-changed=proto/envoy/stock/v3/stock_xds.proto");
     println!("cargo:rerun-if-changed=proto/health.proto");
     println!("cargo:rerun-if-changed=proto/workload_api.proto");
+
+    protoc_preflight::ensure_protoc().map_err(|msg| -> Box<dyn std::error::Error> { msg.into() })?;
 
     tonic_prost_build::configure()
         .build_server(true)

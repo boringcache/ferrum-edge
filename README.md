@@ -51,7 +51,7 @@ On Kubernetes, map each mode to its chart or external contract in
 ## Prerequisites
 
 - **Rust** toolchain — latest stable (the repo pins `channel = "stable"` via `rust-toolchain.toml`; rustup will auto-install on first `cargo` invocation). CI runs clippy with `-D warnings` against the current stable, so local toolchains MUST be at parity.
-- **protoc** (Protocol Buffers compiler) for gRPC code generation
+- **protoc** (Protocol Buffers compiler) for gRPC code generation — install `protobuf-compiler` or set `PROTOC` to the executable path
 - **Database** (optional): PostgreSQL, MySQL, SQLite, or MongoDB (for database and CP modes)
 
 ## Installation
