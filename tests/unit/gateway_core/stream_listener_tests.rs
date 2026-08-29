@@ -2989,13 +2989,12 @@ async fn node_waypoint_udp_retract_a_keeps_shared_listener_and_b_route() {
         "retracting A must not unbind B: {failures:?}"
     );
     assert!(
-        wait_until_shared_nw_udp_listener_started(
-            &runtime.manager,
-            &shared_key,
-            Duration::from_secs(5),
-        )
-        .await,
-        "surviving shared listener must stay started"
+        runtime
+            .manager
+            .wait_until_started(Duration::from_secs(5))
+            .await
+            .is_ok(),
+        "a retained one-member shared listener must satisfy startup readiness"
     );
 
     let owners_after = runtime
