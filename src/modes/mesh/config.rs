@@ -4205,8 +4205,9 @@ pub struct MeshCorsPolicy {
     /// Preflight cache lifetime (Istio `maxAge`, seconds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_age_seconds: Option<u64>,
-    /// Credentialed CORS is unrepresentable with an exact `*` origin because
-    /// the native plugin's wildcard response cannot safely retain credentials.
+    /// Credentialed CORS is unrepresentable with exact `*`, opaque exact
+    /// `null`, or an effectively universal prefix/regex because that would
+    /// reflect an arbitrary origin with credentials (issue #4269).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_credentials: Option<bool>,
     /// Preserve the Istio source field's presence and value. Omission and
@@ -5831,14 +5832,29 @@ fn validate_virtual_service_cors_policies(
             errors.push(format!("{context}: {err}"));
         }
         if policy.cors.allow_credentials == Some(true)
-            && policy
-                .cors
-                .allowed_origins
-                .iter()
-                .any(|origin| matches!(origin, MeshCorsOriginMatch::Exact(value) if value == "*"))
+            && policy.cors.allowed_origins.iter().any(|origin| {
+                let spec = match origin {
+                    MeshCorsOriginMatch::Exact(value) if value == "*" => {
+                        crate::plugins::cors::OriginMatcherSpec::AllowAll
+                    }
+                    MeshCorsOriginMatch::Exact(value) => {
+                        crate::plugins::cors::OriginMatcherSpec::Exact(value)
+                    }
+                    MeshCorsOriginMatch::Prefix(value) => {
+                        crate::plugins::cors::OriginMatcherSpec::Prefix(value)
+                    }
+                    MeshCorsOriginMatch::Regex(pattern) => {
+                        crate::plugins::cors::OriginMatcherSpec::RegexPattern(pattern)
+                    }
+                };
+                crate::plugins::cors::origin_matcher_breadth(spec)
+                    != crate::plugins::cors::OriginPolicyBreadth::Strict
+            })
         {
             errors.push(format!(
-                "{context}: cors.allow_credentials must not be true with an exact `*` origin because credentialed wildcard CORS cannot be represented safely"
+                "{context}: cors.allow_credentials must not be true with exact `*`, opaque exact \
+                 `null`, or an effectively universal prefix/regex matcher because credentialed \
+                 wildcard CORS cannot be represented safely"
             ));
         }
         for (index, origin) in policy.cors.allowed_origins.iter().enumerate() {

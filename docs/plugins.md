@@ -3785,7 +3785,7 @@ Handles Cross-Origin Resource Sharing at the gateway level.
 | `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Preflight-only allowed methods; not evaluated on actual requests |
 | `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Preflight-only allowed request headers; not evaluated on actual requests |
 | `exposed_headers` | String[] | `[]` | Response headers exposed to browser JavaScript |
-| `allow_credentials` | bool | `false` | Send `Access-Control-Allow-Credentials: true` |
+| `allow_credentials` | bool | `false` | Send `Access-Control-Allow-Credentials: true`. Exact `*` drops credentials; opaque exact `null` and an effectively universal prefix or regex are refused. |
 | `max_age` | u64 | `86400` | Preflight cache duration in seconds |
 | `preflight_continue` | bool | `false` | Pass allowed preflights to the backend while replacing its CORS fields with the complete gateway-authoritative policy. |
 | `unmatched_preflights` | `forward` \| `ignore` | — | Istio projection marker preserving unmatched and omitted-field semantics; mutually exclusive with `preflight_continue`. |

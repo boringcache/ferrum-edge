@@ -5525,7 +5525,12 @@ fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
 /// `allowMethods`/`allowHeaders`/`exposeHeaders` entry passes the plugin's own
 /// method/header-name admission. Credentialed exact `*` is deferred because the
 /// native wildcard representation cannot emit the concrete request origin
-/// required for credentialed CORS. A malformed/unknown origin matcher, an
+/// required for credentialed CORS. Credentialed opaque exact `null` and
+/// effectively universal prefix/regex matchers are likewise deferred (issue
+/// #4269): they would
+/// reflect an arbitrary origin with credentials, and plugin construction
+/// refuses that combination rather than silently dropping credentials. A
+/// malformed/unknown origin matcher, an
 /// un-compilable or over-complex `regex`, an over-budget matcher list, or an
 /// invalid method/header token likewise makes the policy non-translatable so it
 /// is left unprojected (deferred) rather than silently approximated or failing
@@ -5545,33 +5550,24 @@ pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
         cors.get("allowCredentials"),
         None | Some(Value::Null) | Some(Value::Bool(_))
     );
-    // Exacts are emitted as `{"exact": ...}` matcher objects (issue #3254), so
-    // the allow-all screen must inspect that shape — a bare-string check would
-    // silently stop firing and let credentialed allow-all project, where the
-    // plugin would then drop credentials.
+    // Exact `*`, opaque exact `null`, AND effectively universal prefix/regex
+    // matchers share one
+    // breadth classifier with plugin construction (issue #4269). Credentialed
+    // exact `*` stays deferred because projecting it would drop credentials;
+    // credentialed opaque/universal matcher is refused at construction, so it
+    // must be deferred here rather than failing plugin construction later.
     let credentialed_wildcard_ok = !matches!(cors.get("allowCredentials"), Some(Value::Bool(true)))
-        || !allowed_origins
-            .as_ref()
-            .is_some_and(|origins| origins.iter().any(cors_origin_value_is_allow_all));
+        || !allowed_origins.as_ref().is_some_and(|origins| {
+            origins
+                .iter()
+                .any(crate::plugins::cors::allowed_origin_entry_is_non_strict)
+        });
     origins_ok
         && max_age_ok
         && allow_credentials_ok
         && credentialed_wildcard_ok
         && cors_unmatched_preflights(cors).is_ok()
         && cors_string_arrays_plugin_valid(cors)
-}
-
-/// Whether one PROJECTED `allowed_origins` entry carries Istio's documented
-/// allow-all value. Covers both emitted shapes so the screen cannot go inert
-/// when the projection changes: the `{"exact": "*"}` matcher object this
-/// translator emits, and a bare `"*"` string (the plugin's native allow-all
-/// form, which the mesh carrier may still produce).
-fn cors_origin_value_is_allow_all(origin: &Value) -> bool {
-    match origin {
-        Value::String(value) => value == "*",
-        Value::Object(map) => map.get("exact").and_then(Value::as_str) == Some("*"),
-        _ => false,
-    }
 }
 
 /// Whether the projected `allowMethods`/`allowHeaders`/`exposeHeaders` lists
@@ -5784,7 +5780,8 @@ fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option
              must be exact/prefix/regex StringMatch, or the legacy allowOrigin exact list, \
              within the bounded matcher count/size and with a compilable, bounded-complexity \
              regex, plus well-typed methods, headers, credentials, unmatched-preflight mode, \
-             and maxAge; credentialed exact '*' cannot be represented safely); leaving it \
+             and maxAge; credentialed exact '*' / opaque exact 'null' or an \
+             effectively universal prefix/regex cannot be represented safely); leaving it \
              unprojected. Configure the `cors` plugin directly."
         );
         return None;
