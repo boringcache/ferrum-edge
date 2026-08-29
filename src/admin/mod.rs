@@ -7398,7 +7398,7 @@ pub(crate) fn validate_plugin_config_definition(
 
 // ---- Metrics ----
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// Process-global cache for the metrics JSON response.
 static METRICS_CACHE: OnceLock<arc_swap::ArcSwap<Option<(Instant, Bytes)>>> = OnceLock::new();
@@ -7515,6 +7515,60 @@ async fn handle_metrics_runtime(state: &AdminState) -> Result<Response<Full<Byte
 }
 
 // ---- Batch Create ----
+
+/// Per-namespace test override for batch reference lookups. Empty in
+/// production; the relaxed load is a no-op unless a test installs a fault.
+type BatchRefFaultMap = std::collections::HashMap<String, String>;
+static ANY_BATCH_REF_FAULT: AtomicBool = AtomicBool::new(false);
+static BATCH_REF_FAULTS: OnceLock<Mutex<BatchRefFaultMap>> = OnceLock::new();
+
+fn batch_ref_faults() -> std::sync::MutexGuard<'static, BatchRefFaultMap> {
+    BATCH_REF_FAULTS
+        .get_or_init(|| Mutex::new(BatchRefFaultMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Install (or clear, with `None`) a deterministic reference-check failure
+/// for `namespace`. Keyed per namespace so tests sharing a process cannot
+/// perturb each other. Always clear the fault when the test finishes.
+pub(crate) fn set_batch_reference_check_fault(namespace: &str, detail: Option<&str>) {
+    let mut faults = batch_ref_faults();
+    match detail {
+        Some(detail) => {
+            faults.insert(namespace.to_string(), detail.to_string());
+        }
+        None => {
+            faults.remove(namespace);
+        }
+    }
+    ANY_BATCH_REF_FAULT.store(!faults.is_empty(), Ordering::Release);
+}
+
+fn injected_batch_reference_check_error(namespace: &str) -> Option<anyhow::Error> {
+    if !ANY_BATCH_REF_FAULT.load(Ordering::Acquire) {
+        return None;
+    }
+    batch_ref_faults()
+        .get(namespace)
+        .map(|detail| anyhow::anyhow!("{detail}"))
+}
+
+/// Map a batch reference-check `Err` onto the same 503 body used by
+/// `batch_existing_resource_conflict`. A genuine miss (`Ok(false)`) stays
+/// on the 400 `validation_errors` path (issue #4377).
+fn batch_reference_lookup<T>(
+    namespace: &str,
+    result: Result<T, anyhow::Error>,
+) -> Result<T, Response<Full<Bytes>>> {
+    let result = match injected_batch_reference_check_error(namespace) {
+        Some(error) => Err(error),
+        None => result,
+    };
+    result.map_err(|error| {
+        json_response(StatusCode::SERVICE_UNAVAILABLE, &db_error_response(&error))
+    })
+}
 
 /// Point uniqueness checks against already-persisted resources.
 ///
@@ -7829,20 +7883,16 @@ async fn handle_batch_create(
             enabled_prometheus_configs.join(", ")
         ));
     } else if let Some(submitted_id) = enabled_prometheus_configs.first() {
-        match crud::enabled_prometheus_metrics_owner_exists(db.as_ref(), namespace, None).await {
+        match batch_reference_lookup(
+            namespace,
+            crud::enabled_prometheus_metrics_owner_exists(db.as_ref(), namespace, None).await,
+        ) {
             Ok(true) => validation_errors.push(format!(
                 "PluginConfig '{}': prometheus_metrics permits at most one enabled global instance; another config already owns the process registry",
                 submitted_id
             )),
             Ok(false) => {}
-            Err(err) => validation_errors.push(format!(
-                "PluginConfig '{}': prometheus_metrics uniqueness check failed: {}",
-                submitted_id,
-                redacted_persistence_error_message(
-                    "batch_prometheus_metrics_uniqueness_check",
-                    &err,
-                )
-            )),
+            Err(response) => return Ok(response),
         }
     }
 
@@ -7980,7 +8030,10 @@ async fn handle_batch_create(
         if let Some(upstream_id) = proxy.upstream_id.as_deref()
             && !batch_upstream_ids.contains(upstream_id)
         {
-            match db.check_upstream_exists(upstream_id, namespace).await {
+            match batch_reference_lookup(
+                namespace,
+                db.check_upstream_exists(upstream_id, namespace).await,
+            ) {
                 Ok(true) => {}
                 Ok(false) => {
                     // Upstream reads are namespace-predicated (issue #2122
@@ -7992,11 +8045,7 @@ async fn handle_batch_create(
                         proxy.id, upstream_id, namespace
                     ));
                 }
-                Err(err) => validation_errors.push(format!(
-                    "Proxy '{}' upstream reference check failed: {}",
-                    proxy.id,
-                    redacted_persistence_error_message("batch_upstream_reference_check", &err)
-                )),
+                Err(response) => return Ok(response),
             }
         }
         if let (Some(upstream_id), Some(subset_name)) = (
@@ -8009,23 +8058,16 @@ async fn handle_batch_create(
                     .as_ref()
                     .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name))
             } else {
-                match db.get_upstream(namespace, upstream_id).await {
+                match batch_reference_lookup(
+                    namespace,
+                    db.get_upstream(namespace, upstream_id).await,
+                ) {
                     Ok(Some(upstream)) => upstream
                         .subsets
                         .as_ref()
                         .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name)),
                     Ok(None) => false,
-                    Err(err) => {
-                        validation_errors.push(format!(
-                            "Proxy '{}' upstream subset reference check failed: {}",
-                            proxy.id,
-                            redacted_persistence_error_message(
-                                "batch_upstream_subset_reference_check",
-                                &err,
-                            )
-                        ));
-                        false
-                    }
+                    Err(response) => return Ok(response),
                 }
             };
             if !subset_exists {
@@ -8074,19 +8116,13 @@ async fn handle_batch_create(
         }
 
         if !unresolved.is_empty() {
-            match db
-                .validate_proxy_plugin_associations(&proxy.id, namespace, &unresolved)
-                .await
-            {
+            match batch_reference_lookup(
+                namespace,
+                db.validate_proxy_plugin_associations(&proxy.id, namespace, &unresolved)
+                    .await,
+            ) {
                 Ok(errs) => validation_errors.extend(errs),
-                Err(err) => validation_errors.push(format!(
-                    "Proxy '{}' plugin association check failed: {}",
-                    proxy.id,
-                    redacted_persistence_error_message(
-                        "batch_proxy_plugin_association_check",
-                        &err,
-                    )
-                )),
+                Err(response) => return Ok(response),
             }
         }
     }
@@ -8095,7 +8131,10 @@ async fn handle_batch_create(
         if let Some(proxy_id) = plugin_config.proxy_id.as_deref()
             && !batch_proxy_ids.contains(proxy_id)
         {
-            match db.check_proxy_exists(proxy_id, namespace).await {
+            match batch_reference_lookup(
+                namespace,
+                db.check_proxy_exists(proxy_id, namespace).await,
+            ) {
                 Ok(true) => {}
                 Ok(false) => {
                     // Proxy reads are namespace-predicated (issue #2122
@@ -8107,31 +8146,22 @@ async fn handle_batch_create(
                         plugin_config.id, proxy_id, namespace
                     ));
                 }
-                Err(err) => validation_errors.push(format!(
-                    "PluginConfig '{}' proxy reference check failed: {}",
-                    plugin_config.id,
-                    redacted_persistence_error_message("batch_proxy_reference_check", &err)
-                )),
+                Err(response) => return Ok(response),
             }
         }
 
-        match crud::validate_mesh_route_dispatch_plugin_upstream_references(
-            db.as_ref(),
+        match batch_reference_lookup(
             namespace,
-            plugin_config,
-            Some(&batch_upstream_ids),
-        )
-        .await
-        {
+            crud::validate_mesh_route_dispatch_plugin_upstream_references(
+                db.as_ref(),
+                namespace,
+                plugin_config,
+                Some(&batch_upstream_ids),
+            )
+            .await,
+        ) {
             Ok(errs) => validation_errors.extend(errs),
-            Err(err) => validation_errors.push(format!(
-                "PluginConfig '{}' mesh_route_dispatch upstream reference check failed: {}",
-                plugin_config.id,
-                redacted_persistence_error_message(
-                    "batch_mesh_route_dispatch_upstream_reference_check",
-                    &err,
-                )
-            )),
+            Err(response) => return Ok(response),
         }
     }
 
