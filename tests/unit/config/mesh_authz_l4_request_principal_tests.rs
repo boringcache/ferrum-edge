@@ -136,6 +136,40 @@ fn an_l4_deny_with_not_request_principals_still_denies() {
     );
 }
 
+// ── CUSTOM ────────────────────────────────────────────────────────────────
+//
+// Istio documents HTTP-only fields on a TCP port as always matched for DENY
+// AND CUSTOM. Treating CUSTOM like ALLOW here would make a CUSTOM rule that
+// carries requestPrincipals / notRequestPrincipals silently inert on an L4
+// session — a fail-open hole, because an unexecutable L4 delegation denies.
+
+#[test]
+fn an_l4_custom_with_principal_fields_still_denies() {
+    for rule in [
+        MeshRule {
+            request_principals: vec![ISSUER_PATTERN.to_string()],
+            ..MeshRule::default()
+        },
+        MeshRule {
+            not_request_principals: vec!["*".to_string()],
+            ..MeshRule::default()
+        },
+    ] {
+        let policies = vec![policy(
+            "delegate-jwt",
+            PolicyAction::Custom {
+                provider: "ext-authz".to_string(),
+            },
+            rule.clone(),
+        )];
+        assert_eq!(
+            evaluate(policies, &l4_request()),
+            deny("custom:delegate-jwt"),
+            "an HTTP-only principal field must not disarm an L4 CUSTOM delegation: {rule:?}"
+        );
+    }
+}
+
 // ── ALLOW ─────────────────────────────────────────────────────────────────
 
 #[test]
