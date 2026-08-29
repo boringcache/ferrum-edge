@@ -2091,32 +2091,116 @@ fn inbound_relay_ingress_remap_loopback_endpoint_is_still_the_declared_mapping()
     );
 }
 
-/// TCP (`connect_backend`) and UDP (`resolve_local_udp_dest` call site) must
-/// both invoke the shared candidate screen; the EgressGateway external-UDP
-/// path must skip it. Live DNS is nondeterministic, so this is a source
-/// contract over the concrete helper.
+/// Brace-match one item from `src` starting at `signature`. Strings are skipped
+/// so a `{` inside a format/error body cannot close the function early.
+fn rust_fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+    let start = src
+        .find(signature)
+        .unwrap_or_else(|| panic!("missing `{signature}`"));
+    let after_sig = &src[start..];
+    let brace_off = after_sig
+        .find('{')
+        .unwrap_or_else(|| panic!("`{signature}` has no opening brace"));
+    let body = &after_sig[brace_off..];
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut prev = '\0';
+    for (i, ch) in body.char_indices() {
+        if in_string {
+            if ch == '"' && prev != '\\' {
+                in_string = false;
+            }
+            prev = ch;
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &body[..=i];
+                }
+            }
+            _ => {}
+        }
+        prev = ch;
+    }
+    panic!("unclosed `{signature}`");
+}
+
+fn collapsed_tokens(src: &str) -> String {
+    src.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Match `callee(arg, …)` after whitespace collapsing, with or without a
+/// rustfmt trailing comma. Do not require a particular line break shape.
+fn contains_call(collapsed: &str, callee: &str, args: &[&str]) -> bool {
+    let joined = args.join(", ");
+    [
+        format!("{callee}( {joined} )"),
+        format!("{callee}( {joined}, )"),
+        format!("{callee}({joined})"),
+        format!("{callee}({joined},)"),
+    ]
+    .into_iter()
+    .any(|pattern| collapsed.contains(&pattern))
+}
+
+/// TCP (`connect_backend`) and UDP (`handle_hbone_udp_request`) must both
+/// invoke the shared candidate screen; the EgressGateway external-UDP path
+/// must skip it. Live DNS is nondeterministic, so this is a source contract
+/// over the concrete helper rather than a live resolver.
 #[test]
 fn inbound_relay_resolved_loopback_screen_is_wired_on_tcp_and_udp_dial_paths() {
     let src = include_str!("../../src/proxy/hbone_proxy.rs");
-    let collapsed: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
     let helper = "screen_ordinary_inbound_hbone_relay_dns_candidates";
+    let file = collapsed_tokens(src);
     assert_eq!(
-        collapsed.matches(helper).count(),
+        file.matches(helper).count(),
         3,
         "helper definition plus TCP and UDP call sites"
     );
+
+    let tcp = collapsed_tokens(rust_fn_body(src, "async fn connect_backend("));
     assert!(
-        collapsed.contains(
-            "screen_ordinary_inbound_hbone_relay_dns_candidates( proxy, mesh, candidates,"
-        ),
+        contains_call(&tcp, helper, &["proxy", "mesh", "candidates"]),
         "byte-stream connect_backend must screen resolved candidates before dial"
     );
+    let tcp_screen = tcp
+        .find(helper)
+        .expect("connect_backend must name the shared screen");
+    let tcp_dial = tcp
+        .find("connect_candidates")
+        .expect("connect_backend must still dial screened candidates");
     assert!(
-        collapsed.contains("if external_egress_allowed { dest_candidates } else { match screen_ordinary_inbound_hbone_relay_dns_candidates( proxy, mesh_config, dest_candidates,"),
+        tcp_screen < tcp_dial,
+        "loopback screening must run before the TCP candidate dial"
+    );
+
+    let udp = collapsed_tokens(rust_fn_body(
+        src,
+        "pub(super) async fn handle_hbone_udp_request(",
+    ));
+    assert!(
+        udp.contains("if external_egress_allowed { dest_candidates } else { match"),
         "local UDP relay must screen resolved candidates; external UDP egress must not"
     );
     assert!(
-        collapsed.contains(
+        contains_call(
+            &udp,
+            helper,
+            &["proxy", "mesh_config", "dest_candidates"],
+        ),
+        "datagram CONNECT must screen dest_candidates on the ordinary local-relay path"
+    );
+
+    let helper_body = collapsed_tokens(rust_fn_body(
+        src,
+        "fn screen_ordinary_inbound_hbone_relay_dns_candidates(",
+    ));
+    assert!(
+        helper_body.contains(
             "if proxy.id != MESH_INBOUND_HBONE_RELAY_PROXY_ID { return Ok(candidates); }"
         ),
         "screening must stay on the ordinary inbound relay, not ingress remap or other HBONE backends"
