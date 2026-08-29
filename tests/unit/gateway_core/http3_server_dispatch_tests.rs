@@ -5059,12 +5059,15 @@ fn h3_listener_builder_binds_frame_bounds_to_the_header_policy() {
     );
 }
 
-/// Production pooled H3 backend constructors opt into BOTH receive-side
-/// bounds from the same header policy the frontend listener uses, so a hostile
-/// or compromised upstream cannot accumulate an over-declared HEADERS,
-/// CONTROL, PUSH, or unknown frame. `h3::client::new` is the unbounded default.
+/// Production pooled H3 backend constructors opt into the declared-frame
+/// ceiling, so a hostile or compromised upstream cannot accumulate an
+/// over-declared HEADERS, CONTROL, PUSH, or unknown frame.
+///
+/// `FERRUM_MAX_HEADER_SIZE_BYTES` is documented as a request-header policy, so
+/// the backend client must not also turn it into an H3-only decoded response
+/// header limit. `h3::client::new` is the unbounded frame-decoder default.
 #[test]
-fn h3_backend_client_builder_binds_frame_bounds_to_the_header_policy() {
+fn h3_backend_client_builder_binds_frame_ceiling_without_response_policy_drift() {
     let src = include_str!("../../../src/http3/client.rs");
     let pool_impl = src
         .split("impl Http3ConnectionPool {")
@@ -5097,12 +5100,6 @@ fn h3_backend_client_builder_binds_frame_bounds_to_the_header_policy() {
         let collapsed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
 
         assert!(
-            collapsed.contains("crate::http3::config::h3_max_field_section_size(")
-                && collapsed.contains("self.env_config.max_header_size_bytes"),
-            "{fn_name} must advertise SETTINGS_MAX_FIELD_SECTION_SIZE from \
-             FERRUM_MAX_HEADER_SIZE_BYTES: {body}"
-        );
-        assert!(
             collapsed.contains("crate::http3::config::h3_max_buffered_frame_len(")
                 && collapsed.contains("self.env_config.max_header_size_bytes"),
             "{fn_name} must bound the buffered non-DATA frame payload from \
@@ -5110,9 +5107,13 @@ fn h3_backend_client_builder_binds_frame_bounds_to_the_header_policy() {
         );
         assert!(
             collapsed.contains("h3::client::builder()")
-                && collapsed.contains(".max_field_section_size(h3_max_field_section_size)")
                 && collapsed.contains(".max_buffered_frame_len(h3_max_buffered_frame_len)"),
             "{fn_name} must opt into the bounded client builder: {body}"
+        );
+        assert!(
+            !collapsed.contains(".max_field_section_size("),
+            "{fn_name} must not repurpose the request-header policy as an \
+             H3-only backend response-header limit: {body}"
         );
         assert!(
             !collapsed.contains("h3::client::new("),

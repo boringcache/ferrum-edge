@@ -103,11 +103,11 @@ Once such a release exists:
 4. Move this directory under
    `docs/upstream-h3-patches/_retired/005-max-buffered-frame-len/` with a
    `STATUS.md` noting the upstream merge and release.
-5. **Behaviour that must survive retirement.** Re-point the builder calls in
-   `src/http3/server.rs` and `src/http3/client.rs` at the upstream setters and
-   keep these tests green:
+5. **Behaviour that must survive retirement.** Re-point the frontend builder
+   calls in `src/http3/server.rs` and the backend frame-ceiling builder calls in
+   `src/http3/client.rs` at the upstream setters and keep these tests green:
    - `tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_listener_builder_binds_frame_bounds_to_the_header_policy`
-   - `tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_backend_client_builder_binds_frame_bounds_to_the_header_policy`
+   - `tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_backend_client_builder_binds_frame_ceiling_without_response_policy_drift`
    - `tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_vendored_frame_decoder_refuses_oversized_declared_non_data_length`
    - `tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_vendored_frame_ceiling_maps_to_excessive_load_on_every_decoder`
    - `tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_vendored_frame_ceiling_behavioural_regressions_are_present`

@@ -81,11 +81,10 @@ pub const H3_MIN_FIELD_SECTION_SIZE: usize = 16 * 1024;
 /// while still bounding what one stream can buffer.
 const H3_BUFFERED_FRAME_LEN_HEADROOM: u64 = 2;
 
-/// The `SETTINGS_MAX_FIELD_SECTION_SIZE` HTTP/3 connections advertise, in
+/// The `SETTINGS_MAX_FIELD_SECTION_SIZE` the HTTP/3 frontend advertises, in
 /// bytes, derived from `FERRUM_MAX_HEADER_SIZE_BYTES` (issue #4261).
 ///
-/// Used by the H3 frontend listener and by pooled H3 backend clients. Mirrors
-/// what the H1 and H2 frontends already do with the same policy value
+/// Mirrors what the H1 and H2 frontends already do with the same policy value
 /// (`http1_parser_max_buf_size` / `h2_parser_max_header_list_size`). Before
 /// this, H3 advertised `VarInt::MAX` while enforcing the configured limit only
 /// after a complete QPACK decode.
@@ -105,7 +104,7 @@ pub fn h3_max_field_section_size(max_header_size_bytes: usize) -> u64 {
 /// buffered non-`DATA` HTTP/3 frame (issue #4261).
 ///
 /// Handed to the vendored h3 `server::builder().max_buffered_frame_len(...)`
-/// and `client::builder().max_buffered_frame_len(...)`.
+/// and to every production pooled H3 backend-client builder.
 /// A HEADERS, SETTINGS, GOAWAY, PUSH_PROMISE, or unknown frame declaring more
 /// than this is refused with `H3_EXCESSIVE_LOAD` as soon as its length varint
 /// is decoded, before any payload byte is buffered. `DATA` frames are never
@@ -116,9 +115,8 @@ pub fn h3_max_buffered_frame_len(max_header_size_bytes: usize) -> u64 {
         .min(QUIC_VARINT_MAX_U64)
 }
 
-/// Refuse a `FERRUM_MAX_HEADER_SIZE_BYTES` HTTP/3 could not enforce as
-/// configured on either the frontend listener or a pooled backend client
-/// (issue #4261).
+/// Refuse a `FERRUM_MAX_HEADER_SIZE_BYTES` the HTTP/3 frontend could not
+/// enforce as configured (issue #4261).
 ///
 /// Both derived values are QUIC varints. A configured header limit above the
 /// varint range would be silently clamped, so the advertised SETTINGS and the
