@@ -55,8 +55,7 @@ fn tls_offload_threads_zero_is_accepted() {
     let mut vars = FILE_MODE.to_vec();
     vars.push(("FERRUM_TLS_OFFLOAD_THREADS", "0"));
     with_env_vars(&vars, || {
-        let config =
-            EnvConfig::from_env().expect("FERRUM_TLS_OFFLOAD_THREADS=0 must be accepted");
+        let config = EnvConfig::from_env().expect("FERRUM_TLS_OFFLOAD_THREADS=0 must be accepted");
         assert_eq!(config.tls_offload_threads, 0);
     });
 }
@@ -66,8 +65,8 @@ fn tls_offload_threads_nonzero_is_rejected() {
     let mut vars = FILE_MODE.to_vec();
     vars.push(("FERRUM_TLS_OFFLOAD_THREADS", "8"));
     with_env_vars(&vars, || {
-        let error = EnvConfig::from_env()
-            .expect_err("nonzero FERRUM_TLS_OFFLOAD_THREADS must fail closed");
+        let error =
+            EnvConfig::from_env().expect_err("nonzero FERRUM_TLS_OFFLOAD_THREADS must fail closed");
         assert_eq!(error, TLS_OFFLOAD_NOT_IMPLEMENTED);
     });
 }
