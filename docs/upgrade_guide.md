@@ -64,6 +64,24 @@ The previous 204 left live plugin configs authorizing an identity that no longer
 
 **Operator action:** remove or edit the username in those plugin configs, then retry.
 
+### DP last-known-good configuration has a bounded age (issue [#3726](https://github.com/ferrum-edge/ferrum-edge/issues/3726))
+
+In `dp` mode, a data plane that has applied one CP snapshot keeps serving it while every control plane is unreachable. That window is now bounded by `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` (default **`3600`**). Age is measured on a **monotonic clock** from the last snapshot or delta that was validated and successfully applied; wall-clock or NTP steps cannot extend or shorten the window. Heartbeats, reconnect attempts, CP transport success, fenced or rejected snapshots, rejected deltas, and snapshots that fail to apply do **not** reset the age — only an applied snapshot does. The configured maximum is the boundary itself; nothing is added to it.
+
+Staleness additionally requires the DP to have actually lost its authoritative CP source: an intentional primary-retry or TLS-rotation reconnect, and a successful failover to an alternate CP, leave the DP `reconnecting` and never latch, while a failed connect/subscribe attempt latches the moment the applied snapshot reaches the bound. At the bound, `/health` reports `ready: false` with `status: "unavailable"`. Under the default `FERRUM_DP_CONFIG_STALE_ACTION=fail_closed`, new HTTP/1.1, HTTP/2, HTTP/3, TCP, UDP-session, and DTLS-session admissions are refused while already-accepted connections, established sessions, and in-flight requests drain normally. `readiness_only` is the named compatibility mode that degrades readiness only and keeps admitting traffic.
+
+`FERRUM_DP_CONFIG_MAX_STALE_SECONDS=0` restores the previous unbounded behavior as an explicit, deliberately unsafe production opt-in and logs a startup warning. Recovery requires a snapshot that passes every normal validation and freshness check **and applies successfully** — reconnecting alone does not restore readiness or admission. Authenticated `/health` adds a fixed-cardinality `dp_config` diagnostic (`cp_disconnected`, `snapshot_stale`, `snapshot_rejected`, `snapshot_apply_failed`, and related counters). See [cp_dp_mode.md](cp_dp_mode.md#bounded-last-known-good-configuration-age).
+
+**Operator action:** set `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` and `FERRUM_DP_CONFIG_STALE_ACTION` before cutover so orchestrators and load balancers honor degraded readiness at the bound; do not rely on `0` except as a deliberate unsafe opt-in. After a CP outage, restore an authoritative CP and confirm an applied snapshot before steering new traffic back.
+
+### `a2a_gateway` `endpoint.grpc_services` default and declared Agent Card wire layouts (issue [#3297](https://github.com/ferrum-edge/ferrum-edge/issues/3297))
+
+`endpoint.grpc_services` now defaults to the canonical A2A **0.3** service `a2a.v1.A2AService` (package `a2a.v1`, from `a2aproject/A2A` at tag `v0.3.0`) and A2A **1.0**'s `lf.a2a.v1.A2AService`. Every configured entry carries a declared Agent Card wire layout. The default 0.3 identity matches the card layout that default `endpoint.protocol_versions` (`0.3.0`) actually describes; retaining the 1.0 identity preserves method-policy enforcement for deployments that relied on the former default, while its schema prevents the 0.3 decoder from interpreting its renumbered card.
+
+Entries may be plain service-name strings — a published A2A name resolves to the layout the specification gives it (`a2a.v1.A2AService` → `a2a-0.3`, `lf.a2a.v1.A2AService` → `a2a-1.0`) and any custom name resolves to `none` — or the explicit `{service, card_schema}` object form a custom deployment uses to declare which published layout its own service serves. Declaring a `card_schema` that contradicts a published A2A service name is rejected at admission. Detection, method policy, and `a2a.*` metadata are unchanged for every schema, but Agent Card protobuf rewriting is implemented only for `a2a-0.3` and fails closed with `agent_card_grpc_schema_unsupported` (`a2a-1.0`) or `agent_card_grpc_schema_undeclared` (`none`) before a byte of the reply is decoded — a 1.0 card is never interpreted with 0.3 field numbers.
+
+**Operator action:** for deployments fronting A2A 1.0 or a custom gRPC service whose cards must pass through untouched, set `discovery.rewrite_agent_card_urls: false`, or declare an explicit `{service, card_schema}` pair that truthfully matches the service you publish (for example `card_schema: a2a-0.3` only when the backend actually serves the 0.3 card layout). Do not pair a published A2A service name with a contradicting `card_schema`. See [plugins.md](plugins.md#a2a_gateway).
+
 ## Database Mode (`FERRUM_MODE=database`)
 
 This is the most involved upgrade because schema migrations may alter your database. The strategy is: clone the database, migrate the clone, validate with the new binary, then cut over.

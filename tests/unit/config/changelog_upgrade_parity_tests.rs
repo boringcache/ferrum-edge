@@ -96,6 +96,51 @@ fn breaking_issue_numbers(bullet: &str) -> Result<Vec<u32>, String> {
     Ok(numbers)
 }
 
+/// True when `guide` contains an exact `#NNNN` issue reference, not a longer
+/// digit prefix such as `#32970` satisfying a search for `#3297`.
+fn upgrade_guide_cites_issue(guide: &str, number: u32) -> bool {
+    let needle = format!("#{number}");
+    let mut start = 0;
+    while let Some(rel) = guide[start..].find(&needle) {
+        let at = start + rel;
+        let after = at + needle.len();
+        if after >= guide.len() || !guide.as_bytes()[after].is_ascii_digit() {
+            return true;
+        }
+        start = at + 1;
+    }
+    false
+}
+
+#[test]
+fn upgrade_guide_issue_reference_matcher_is_token_exact() {
+    let pass_cases = [
+        ("issue #3297", 3297),
+        ("(issue [#3297](https://github.com/ferrum-edge/ferrum-edge/issues/3297))", 3297),
+        ("see #3297.", 3297),
+        ("prefix #3297", 3297),
+    ];
+    for (guide, number) in pass_cases {
+        assert!(
+            upgrade_guide_cites_issue(guide, number),
+            "expected #{number} in {guide:?}"
+        );
+    }
+
+    let fail_cases = [
+        ("issue #32970", 3297),
+        ("#32970", 3297),
+        ("digits3297suffix", 3297),
+        ("no issue reference here", 3297),
+    ];
+    for (guide, number) in fail_cases {
+        assert!(
+            !upgrade_guide_cites_issue(guide, number),
+            "did not expect exact #{number} in {guide:?}"
+        );
+    }
+}
+
 #[test]
 fn unreleased_breaking_changelog_issues_appear_in_upgrade_guide() {
     let unreleased = unreleased_section(CHANGELOG);
@@ -107,10 +152,9 @@ fn unreleased_breaking_changelog_issues_appear_in_upgrade_guide() {
         }
         let numbers = breaking_issue_numbers(bullet).unwrap_or_else(|err| panic!("{err}"));
         for number in numbers {
-            let needle = format!("#{number}");
-            if !UPGRADE_GUIDE.contains(&needle) {
+            if !upgrade_guide_cites_issue(UPGRADE_GUIDE, number) {
                 let title = bullet.lines().next().unwrap_or(bullet);
-                missing_guidance.push(format!("{needle} ({title})"));
+                missing_guidance.push(format!("#{number} ({title})"));
             }
         }
     }
