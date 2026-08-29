@@ -412,9 +412,14 @@ the admin port. `metrics.bearerToken.value` wires the pod env for development;
 `metrics.bearerToken.existingSecret` is required for ServiceMonitor Bearer
 authorization when `metrics.allowedCidrs` is empty.
 
-`/metrics` also requires a globally scoped `prometheus_metrics` plugin instance or
-the scrape succeeds with an empty exposition. Add it to your gateway config
-(`file.inlineConfig`, database `plugin_configs`, or CP-pushed config):
+Authenticated `/metrics` always includes core data-path families (overload shedding,
+upstream health, circuit breakers, frontend TLS handshake failures, TLS inventory,
+and other runtime families) without the plugin. The optional globally scoped
+`prometheus_metrics` plugin adds traffic/request families such as
+`ferrum_requests_total` and `ferrum_request_duration_ms_bucket`, which the
+5xx-rate and P99-latency alerts require. Add it to your gateway config when you
+need those traffic metrics or alerts (`file.inlineConfig`, database
+`plugin_configs`, or CP-pushed config):
 
 ```yaml
 plugin_configs:

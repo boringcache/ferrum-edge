@@ -3855,7 +3855,7 @@
     ],
     "subsystem": "overload",
     "export_surface": "/metrics",
-    "bundled": "alert",
+    "bundled": "documented_only",
     "emission": "conditional"
   },
   {

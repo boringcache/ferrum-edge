@@ -565,9 +565,10 @@ podDisruptionBudget:
 # the scraper originates from `metrics.allowedCidrs` or presents
 # `metrics.bearerToken`. Enabling the ServiceMonitor does NOT change
 # `admin.bindAddress`; pair it with `admin.service.enabled=true` and a
-# non-loopback admin bind plus a NetworkPolicy. Also enable the globally scoped
-# `prometheus_metrics` plugin in your gateway config or the scrape returns an
-# empty exposition. See charts/ferrum-gateway/README.md#metrics-and-prometheus.
+# non-loopback admin bind plus a NetworkPolicy. Authenticated scrapes expose
+# core/runtime data-path families without the plugin; enable the globally scoped
+# `prometheus_metrics` plugin only for traffic/request families (and the 5xx/P99
+# alerts). See charts/ferrum-gateway/README.md#metrics-and-prometheus.
 # -----------------------------------------------------------------------------
 metrics:
   enabled: false
