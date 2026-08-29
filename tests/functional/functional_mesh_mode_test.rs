@@ -10,7 +10,7 @@
 //!   cargo test --test functional_tests functional_mesh_mode -- --ignored --nocapture
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -508,6 +508,31 @@ pub(crate) fn loopback_ephemeral() -> SocketAddr {
 /// can see.
 pub(crate) async fn bind_fixture_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     bind_fixture_listener_where(addr, |port| !mesh_port_is_reserved(port)).await
+}
+
+/// UDP counterpart of [`bind_fixture_listener`] (issue #2132): re-roll past
+/// ports already promised to a mesh gateway subprocess. Rejected sockets are
+/// held so the kernel cannot re-offer the same port.
+async fn bind_fixture_udp_socket(addr: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+    if addr.port() != 0 {
+        return tokio::net::UdpSocket::bind(addr).await;
+    }
+    let mut rejected = Vec::new();
+    for _ in 0..FIXTURE_BIND_ATTEMPTS {
+        let socket = tokio::net::UdpSocket::bind(addr).await?;
+        let port = socket.local_addr()?.port();
+        if !mesh_port_is_reserved(port) {
+            return Ok(socket);
+        }
+        rejected.push(socket);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        format!(
+            "no acceptable ephemeral UDP port for a fixture socket after \
+             {FIXTURE_BIND_ATTEMPTS} attempts"
+        ),
+    ))
 }
 
 /// [`bind_fixture_listener`] with an injectable acceptance predicate, so the
@@ -1089,14 +1114,80 @@ fn fixture_servers_bind_through_the_mesh_port_aware_helper() {
         "start_tagged_tcp_backend",
         "start_loopback_tcp_echo",
         "start_counting_tcp_echo_on",
+        "start_counting_udp_echo_on",
     ] {
         let body = mesh_test_fn_body(name);
+        let through_helper = body.contains("bind_fixture_listener(")
+            || body.contains("bind_fixture_udp_socket(");
         assert!(
-            body.contains("bind_fixture_listener("),
-            "`{name}` must bind through `bind_fixture_listener` so it can never take a port \
-             already handed to a mesh gateway subprocess (issue #2132)"
+            through_helper,
+            "`{name}` must bind through `bind_fixture_listener` or \
+             `bind_fixture_udp_socket` so it can never take a port already \
+             handed to a mesh gateway subprocess (issue #2132)"
         );
     }
+}
+
+/// Issue #4252: the third-workload cases must CONNECT to a dest B terminates
+/// for, then retarget via production `mesh_route_dispatch`, and refuse with
+/// the handler 403 — not a synthesis 404, and not a loopback-namespace C.
+#[test]
+fn third_workload_refusal_exercises_post_plugin_effective_destination_guard() {
+    let drive = mesh_test_fn_body("drive_inbound_relay_third_workload_refusal");
+    assert!(
+        drive.contains("discover_bindable_non_loopback_local_ip("),
+        "C must be a discovered non-loopback interface address so PR #4315's \
+         loopback-namespace guard cannot stand in for the ownership re-check"
+    );
+    assert!(
+        drive.contains("127.0.0.1:{b_local_port}"),
+        "the peer CONNECT authority must name B (own-pod dest B terminates for) \
+         so synthesis reaches the handlers"
+    );
+    assert!(
+        drive.contains("third_workload_route_override_plugin("),
+        "the effective destination must move to C through the production \
+         mesh_route_dispatch override, not a test-only bypass"
+    );
+
+    let slice_header = "\nfn third_workload_refusal_slice(";
+    let slice_start = MESH_MODE_TEST_SOURCE
+        .find(slice_header)
+        .expect("`fn third_workload_refusal_slice(` not found");
+    let slice_rest = &MESH_MODE_TEST_SOURCE[slice_start + 1..];
+    let slice_end = slice_rest
+        .find("\n}\n")
+        .expect("no top-level closing brace for third_workload_refusal_slice");
+    let slice = &slice_rest[..slice_end];
+    assert!(
+        slice.contains("mesh_route_dispatch"),
+        "the native slice must carry a global mesh_route_dispatch plugin so \
+         the synthesized inbound relay inherits the production override path"
+    );
+    assert!(
+        slice.contains("plugin_configs"),
+        "operator plugin_configs on the native MeshSlice are how the child \
+         loads that override"
+    );
+
+    let assert_header = "\nfn assert_third_workload_connect_refused(";
+    let assert_start = MESH_MODE_TEST_SOURCE
+        .find(assert_header)
+        .expect("`fn assert_third_workload_connect_refused(` not found");
+    let assert_rest = &MESH_MODE_TEST_SOURCE[assert_start + 1..];
+    let assert_end = assert_rest
+        .find("\n}\n")
+        .expect("no top-level closing brace for assert_third_workload_connect_refused");
+    let assertion = &assert_rest[..assert_end];
+    assert!(
+        assertion.contains("outcome.status, 403"),
+        "both flavors must require the handler 403; a synthesis-time 404 is a \
+         setup miss, not the post-plugin re-check"
+    );
+    assert!(
+        !assertion.contains("403 | 404"),
+        "accepting 404 lets the tests stay green if the handler re-check is deleted"
+    );
 }
 
 /// [`bind_fixture_listener_where`] must re-roll past a rejected port rather than
@@ -4402,8 +4493,9 @@ async fn functional_mesh_ambient_egress_routes_a_to_b_over_hbone() {
 }
 
 // The #4150 / #4252 negative of this keystone — an authenticated peer CONNECTs
-// to B naming a slice-declared third workload B does not terminate for — is
-// `functional_mesh_ambient_hbone_refuses_third_workload_{byte_stream,datagram}`
+// to B naming a destination B terminates for, then a global mesh_route_dispatch
+// rewrites the effective destination onto a third slice-declared workload —
+// is `functional_mesh_ambient_hbone_refuses_third_workload_{byte_stream,datagram}`
 // next to the UDP-dest CONNECT helpers it reuses.
 
 /// Egress keystone (Sidecar): a captured plaintext request at gateway A reaches
@@ -9877,31 +9969,136 @@ async fn functional_mesh_udp_dest_untrusted_peer_fails_closed() {
 //
 // The unit tests pin `MeshConfig::inbound_relay_destination_decision`. They do
 // not prove the guard is still *wired* into `handle_hbone_request` /
-// `handle_hbone_udp_request`. This is the end-to-end negative #4150 asked for
-// beside `functional_mesh_ambient_egress_routes_a_to_b_over_hbone`: an
-// authenticated peer CONNECTs to B naming a workload B does not terminate for.
+// `handle_hbone_udp_request` *after* `apply_route_overrides_with_upstreams` +
+// `select_upstream_target`. This is the end-to-end negative #4150 asked for
+// beside `functional_mesh_ambient_egress_routes_a_to_b_over_hbone`.
 //
-// A Sidecar/Ambient terminator admits its accepted local address plus slice
-// records carrying its own `FERRUM_MESH_WORKLOAD_SPIFFE_ID` (and not marked
-// `remote_provenance`). Workload C is slice-declared under a different SPIFFE,
-// so the CONNECT must be refused — and C's backend must record zero dials. A
-// guard that refuses after dialling would still pass a status-only assertion.
+// Synthesis (`build_inbound_hbone_relay_proxy`) 404s if the peer's CONNECT
+// authority is not a dest B terminates for. A test that CONNECTs straight at
+// C never reaches the handlers, so deleting either post-plugin re-check
+// would stay green if 404 were accepted. The peer therefore CONNECTs to B's
+// own-pod address:port (a dest synthesis admits). A global
+// `mesh_route_dispatch` then rewrites the effective destination onto
+// slice-declared workload C. Only the handler re-check can then 403.
 //
-// C listens on 127.0.0.2, not 127.0.0.1: the own-address loopback shortcut
-// would admit a sibling port declared on the terminator's own IP. 127.0.0.2 is
-// still loopback, so the live decision is `PortNotDeclared` rather than the
-// unit-test `AddressNotTerminated` (10.244.9.9) arm; either way a regression
-// that admits any slice-declared address would dial this backend.
-
-/// Loopback alias used as workload C's address. Distinct from B's accepted
-/// local address (`127.0.0.1`) so the own-pod shortcut cannot stand in for C.
-const THIRD_WORKLOAD_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(127, 0, 0, 2);
+// C is a bindable non-loopback local interface address: PR #4315 can refuse
+// the whole loopback namespace for Ambient/waypoint terminators before
+// inventory fall-through, which would keep a 127.0.0.2 fixture green even if
+// the ownership guard regressed to accepting the full slice inventory.
 
 /// After a CONNECT result, wait this long for C's backend task to report a
 /// TCP accept or UDP datagram that was already queued while that task had not
 /// yet been polled. An immediate atomic load can miss that race and treat an
 /// admission as a refusal. The wait is a bounded channel recv, not a sleep.
 const THIRD_WORKLOAD_BACKEND_OBSERVE: Duration = Duration::from_secs(2);
+
+fn is_usable_non_loopback_unicast(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !v4.is_loopback()
+                && !v4.is_unspecified()
+                && !v4.is_link_local()
+                && !v4.is_multicast()
+                && !v4.is_broadcast()
+        }
+        IpAddr::V6(v6) => {
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+                && (v6.segments()[0] & 0xffc0) != 0xfe80
+        }
+    }
+}
+
+/// UDP-connect probe: the kernel picks the local address it would use to
+/// reach `dest`. The socket is dropped immediately; this is discovery, not a
+/// fixture listener.
+async fn probe_udp_egress_local_ip(dest: SocketAddr) -> Result<IpAddr, String> {
+    let bind = if dest.is_ipv4() {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+    };
+    let socket = tokio::net::UdpSocket::bind(bind)
+        .await
+        .map_err(|e| format!("probe bind {bind}: {e}"))?;
+    socket
+        .connect(dest)
+        .await
+        .map_err(|e| format!("probe connect {dest}: {e}"))?;
+    socket
+        .local_addr()
+        .map(|addr| addr.ip())
+        .map_err(|e| format!("probe local_addr: {e}"))
+}
+
+/// Discover a host-namespace address the gateway child can also bind (it
+/// shares the network namespace). Fail with probe/bind evidence when the
+/// runner has only loopback.
+async fn discover_bindable_non_loopback_local_ip() -> Result<IpAddr, String> {
+    let probes = [
+        SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 53)),
+        SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53)),
+        SocketAddr::from((
+            std::net::Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
+            53,
+        )),
+    ];
+    let mut evidence = Vec::new();
+    let mut seen = HashSet::new();
+    for dest in probes {
+        match probe_udp_egress_local_ip(dest).await {
+            Ok(ip) => {
+                if !seen.insert(ip) {
+                    continue;
+                }
+                if !is_usable_non_loopback_unicast(ip) {
+                    evidence.push(format!(
+                        "probe {dest} → {ip}: rejected (loopback/unspecified/link-local/multicast/broadcast)"
+                    ));
+                    continue;
+                }
+                match bind_fixture_listener(SocketAddr::new(ip, 0)).await {
+                    Ok(listener) => {
+                        drop(listener);
+                        return Ok(ip);
+                    }
+                    Err(e) => evidence.push(format!("probe {dest} → {ip}: TCP bind failed: {e}")),
+                }
+            }
+            Err(e) => evidence.push(format!("probe {dest}: {e}")),
+        }
+    }
+    Err(format!(
+        "no usable non-loopback local interface address for workload C \
+         (the gateway child shares this host network namespace). Evidence:\n{}",
+        evidence.join("\n")
+    ))
+}
+
+/// Production `mesh_route_dispatch` carried on native [`MeshSlice::plugin_configs`].
+/// The synthesized inbound HBONE relay is not in `config.proxies`, so it
+/// inherits the global chain; matching CONNECT rewrites the effective
+/// destination onto C after synthesis.
+fn third_workload_route_override_plugin(c_host: &str, c_port: u16) -> serde_json::Value {
+    serde_json::json!({
+        "id": "third-workload-route-override",
+        "plugin_name": "mesh_route_dispatch",
+        "namespace": "ferrum",
+        "scope": "global",
+        "enabled": true,
+        "config": {
+            "rules": [{
+                "match": { "methods": ["CONNECT"] },
+                "destination": {
+                    "backend_host": c_host,
+                    "backend_port": c_port
+                }
+            }],
+            "reject_unmatched": false
+        }
+    })
+}
 
 /// CONNECT flavor under test. Each flavor takes a different handler with its
 /// own post-plugin re-check (`handle_hbone_request` vs
@@ -9925,7 +10122,7 @@ async fn start_counting_tcp_echo_on(
 ) {
     let listener = bind_fixture_listener(SocketAddr::new(ip, 0))
         .await
-        .expect("bind third-workload TCP echo on 127.0.0.2 — 127.0.0.0/8 must be loopback");
+        .unwrap_or_else(|e| panic!("bind third-workload TCP echo on {ip}: {e}"));
     let addr = listener.local_addr().expect("third-workload TCP echo addr");
     let (hit_tx, hit_rx) = mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -9961,25 +10158,9 @@ async fn start_counting_udp_echo_on(
     mpsc::UnboundedReceiver<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    // Re-roll past ports already promised to a mesh gateway subprocess — the
-    // UDP counterpart of [`bind_fixture_listener`] (issue #2132). Rejected
-    // sockets are held so the kernel cannot re-offer the same port.
-    let mut rejected = Vec::new();
-    let mut chosen = None;
-    for _ in 0..FIXTURE_BIND_ATTEMPTS {
-        let candidate = tokio::net::UdpSocket::bind(SocketAddr::new(ip, 0))
-            .await
-            .expect("bind third-workload UDP echo on 127.0.0.2 — 127.0.0.0/8 must be loopback");
-        let port = candidate.local_addr().expect("udp echo addr").port();
-        if !mesh_port_is_reserved(port) {
-            chosen = Some(candidate);
-            break;
-        }
-        rejected.push(candidate);
-    }
-    let socket =
-        chosen.expect("no acceptable ephemeral UDP port for a third-workload fixture socket");
-    drop(rejected);
+    let socket = bind_fixture_udp_socket(SocketAddr::new(ip, 0))
+        .await
+        .unwrap_or_else(|e| panic!("bind third-workload UDP echo on {ip}: {e}"));
     let addr = socket.local_addr().expect("third-workload UDP echo addr");
     let (hit_tx, hit_rx) = mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -10024,13 +10205,14 @@ async fn abort_third_workload_backend(task: tokio::task::JoinHandle<()>) {
 }
 
 /// Slice consumed by terminator B: B's own-identity record at 127.0.0.1 plus
-/// workload C — a different SPIFFE, a different address — whose addr+port is
-/// what the authenticated peer will name in the CONNECT.
+/// workload C — a different SPIFFE, a discovered non-loopback address — and a
+/// global `mesh_route_dispatch` that retargets CONNECT onto C after synthesis.
 fn third_workload_refusal_slice(
     node_id: &str,
     b_spiffe: &str,
     c_spiffe: &str,
     b_local_port: u16,
+    c_ip: IpAddr,
     c_port: u16,
     protocol: AppProtocol,
 ) -> MeshSlice {
@@ -10079,7 +10261,7 @@ fn third_workload_refusal_slice(
                 },
                 service_name: "svc-c".to_string(),
                 service_namespace: None,
-                addresses: vec![THIRD_WORKLOAD_IP.to_string()],
+                addresses: vec![c_ip.to_string()],
                 ports: vec![WorkloadPort {
                     port: c_port,
                     protocol,
@@ -10135,6 +10317,10 @@ fn third_workload_refusal_slice(
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
+        plugin_configs: vec![third_workload_route_override_plugin(
+            &c_ip.to_string(),
+            c_port,
+        )],
         ..MeshSlice::default()
     }
 }
@@ -10147,9 +10333,10 @@ struct ThirdWorkloadRefusalOutcome {
 }
 
 /// Spawn Ambient terminator B over a slice that also declares workload C, then
-/// drive one authenticated CONNECT at B's HBONE port naming C's address.
-/// Setup failures retry; the CONNECT observation is made exactly once against
-/// a live child.
+/// drive one authenticated CONNECT at B's HBONE port naming a dest B
+/// terminates for. Global `mesh_route_dispatch` retargets the effective
+/// destination onto C. Setup failures retry; the CONNECT observation is made
+/// exactly once against a live child.
 async fn drive_inbound_relay_third_workload_refusal(
     flavor: ThirdWorkloadConnectFlavor,
 ) -> Result<ThirdWorkloadRefusalOutcome, String> {
@@ -10165,8 +10352,7 @@ async fn drive_inbound_relay_third_workload_refusal(
         ThirdWorkloadConnectFlavor::ByteStream => AppProtocol::Tcp,
         ThirdWorkloadConnectFlavor::Datagram => AppProtocol::Udp,
     };
-    let third_ip = std::net::IpAddr::V4(THIRD_WORKLOAD_IP);
-    let third_ip_str = THIRD_WORKLOAD_IP.to_string();
+    let c_ip = discover_bindable_non_loopback_local_ip().await?;
 
     let mut last_failure = String::new();
     for attempt in 1..=RETRY_ATTEMPTS {
@@ -10175,13 +10361,13 @@ async fn drive_inbound_relay_third_workload_refusal(
         let svids = generate_two_gateway_svids(temp_b.path(), a_spiffe, b_spiffe);
 
         let (c_addr, mut hit_rx, echo) = match flavor {
-            ThirdWorkloadConnectFlavor::ByteStream => start_counting_tcp_echo_on(third_ip).await,
-            ThirdWorkloadConnectFlavor::Datagram => start_counting_udp_echo_on(third_ip).await,
+            ThirdWorkloadConnectFlavor::ByteStream => start_counting_tcp_echo_on(c_ip).await,
+            ThirdWorkloadConnectFlavor::Datagram => start_counting_udp_echo_on(c_ip).await,
         };
         let c_port = c_addr.port();
         // B's own-identity record must declare a port, otherwise the loopback
-        // arm treats the own address as unconstrained and would admit C's port
-        // (and then dial 127.0.0.2). Keep it distinct from C's ephemeral port.
+        // arm treats the own address as unconstrained. Keep it distinct from
+        // C's ephemeral port so a missed override cannot be confused with C.
         let b_local_port = if c_port == 18080 { 18081 } else { 18080 };
 
         let cp_b = start_static_mesh_cp(third_workload_refusal_slice(
@@ -10189,6 +10375,7 @@ async fn drive_inbound_relay_third_workload_refusal(
             b_spiffe,
             c_spiffe,
             b_local_port,
+            c_ip,
             c_port,
             protocol,
         ))
@@ -10233,7 +10420,9 @@ async fn drive_inbound_relay_third_workload_refusal(
             continue;
         }
 
-        let authority = format!("{third_ip_str}:{c_port}");
+        // CONNECT names B so synthesis + the plugin chain run. The global
+        // mesh_route_dispatch then moves the effective dest onto C.
+        let authority = format!("127.0.0.1:{b_local_port}");
         let connect = match flavor {
             ThirdWorkloadConnectFlavor::ByteStream => drive_one_waypoint_byte_connect(
                 hbone_port,
@@ -10280,8 +10469,8 @@ async fn drive_inbound_relay_third_workload_refusal(
                 logs,
             }),
             Err(e) => Err(format!(
-                "trusted CONNECT naming workload C failed against a healthy \
-                 terminator: {e}\n--- gateway B ---\n{logs}"
+                "trusted CONNECT to B (effective dest rewritten onto C) failed \
+                 against a healthy terminator: {e}\n--- gateway B ---\n{logs}"
             )),
         };
     }
@@ -10293,16 +10482,11 @@ async fn drive_inbound_relay_third_workload_refusal(
 }
 
 fn assert_third_workload_connect_refused(outcome: ThirdWorkloadRefusalOutcome, flavor: &str) {
-    assert_ne!(
-        outcome.status, 200,
-        "{flavor}: authenticated CONNECT naming a third workload must be refused\n{}",
-        outcome.logs
-    );
-    assert!(
-        matches!(outcome.status, 403 | 404),
-        "{flavor}: refusal is 403 (handler re-check) or 404 (synthesis-time \
-         guard), got {}\n{}",
-        outcome.status,
+    assert_eq!(
+        outcome.status, 403,
+        "{flavor}: authenticated CONNECT to B must be rewritten onto C and \
+         refused by the handler re-check with 403; 404 is synthesis-time \
+         (setup miss), 200/502 means the override or guard did not fire\n{}",
         outcome.logs
     );
     assert_eq!(
@@ -10315,9 +10499,10 @@ fn assert_third_workload_connect_refused(outcome: ThirdWorkloadRefusalOutcome, f
 }
 
 /// Issue #4252 (byte-stream): an authenticated HBONE CONNECT to terminator B
-/// naming slice-declared workload C is refused, and C's TCP echo records zero
-/// accepts — proving `handle_hbone_request`'s relay guard is still on the
-/// request path before `connect_backend`.
+/// naming a dest B terminates for is rewritten onto slice-declared workload C
+/// and refused with 403, and C's TCP echo records zero accepts — proving
+/// `handle_hbone_request`'s post-plugin re-check is still on the request path
+/// before `connect_backend`.
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_ambient_hbone_refuses_third_workload_byte_stream() {
@@ -10328,10 +10513,10 @@ async fn functional_mesh_ambient_hbone_refuses_third_workload_byte_stream() {
     assert_third_workload_connect_refused(outcome, "byte-stream HBONE CONNECT");
 }
 
-/// Issue #4252 (datagram-over-CONNECT): the same third-workload CONNECT over
-/// the UDP-marked flavor, asserting C's UDP echo records zero datagrams —
-/// proving `handle_hbone_udp_request`'s independently placed re-check is still
-/// wired before `resolve_local_udp_dest`.
+/// Issue #4252 (datagram-over-CONNECT): the same B→C rewrite over the
+/// UDP-marked flavor, asserting handler 403 and C's UDP echo records zero
+/// datagrams — proving `handle_hbone_udp_request`'s independently placed
+/// re-check is still wired before `resolve_local_udp_dest`.
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_ambient_hbone_refuses_third_workload_datagram() {

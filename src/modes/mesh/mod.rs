@@ -3543,9 +3543,11 @@ fn gateway_config_from_mesh_slice_with_federation(
 
     let proxies = decode_virtual_service_l4_proxies(slice)?;
     let upstreams = decode_virtual_service_l4_upstreams(slice)?;
+    let plugin_configs = decode_operator_plugin_configs(slice)?;
     let config = GatewayConfig {
         proxies,
         upstreams,
+        plugin_configs,
         mesh: Some(Box::new(MeshConfig {
             workloads,
             services,
@@ -3648,6 +3650,32 @@ fn decode_virtual_service_l4_upstreams(
                 ));
             }
             Ok(upstream)
+        })
+        .collect()
+}
+
+/// Decode operator [`PluginConfig`] JSON carried on [`MeshSlice::plugin_configs`].
+///
+/// The synthesized inbound HBONE relay is not in `config.proxies`, so it
+/// inherits the global plugin chain. A global `mesh_route_dispatch` on this
+/// surface is the production route-override path those handlers re-check.
+fn decode_operator_plugin_configs(slice: &MeshSlice) -> Result<Vec<PluginConfig>, anyhow::Error> {
+    slice
+        .plugin_configs
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let plugin: PluginConfig = serde_json::from_value(value.clone()).map_err(|error| {
+                anyhow::anyhow!("Mesh slice plugin_configs[{index}] is malformed: {error}")
+            })?;
+            if plugin.namespace != slice.namespace {
+                return Err(anyhow::anyhow!(
+                    "Mesh slice plugin_configs[{index}] namespace '{}' does not match slice namespace '{}'",
+                    plugin.namespace,
+                    slice.namespace
+                ));
+            }
+            Ok(plugin)
         })
         .collect()
 }
@@ -13107,8 +13135,8 @@ fn ensure_global_plugin_inner(
     {
         // A user-managed global plugin of the same type is an explicit
         // operator override when plugin_configs are already present in the
-        // GatewayConfig handed to mesh preparation. Native/xDS MeshSlice feeds
-        // do not currently carry operator plugin_configs. Reserved
+        // GatewayConfig handed to mesh preparation — including native
+        // MeshSlice.plugin_configs decoded before this injection. Reserved
         // mesh-managed IDs still update above. Callers that require the
         // mesh-managed instance (NodeWaypoint transparent capture) pass
         // `force` so a disabled or capture-unaware override cannot suppress it.
@@ -28519,6 +28547,7 @@ mod tests {
             sidecar_outbound_traffic_policy: None,
             sidecar_egress_scope: None,
             extension_configs: Vec::new(),
+            plugin_configs: Vec::new(),
             runtime_overlay: crate::modes::mesh::config::MeshRuntimeOverlay::default(),
         };
 
