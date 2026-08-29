@@ -3044,6 +3044,24 @@ async fn sensitive_query_pairs_stripped_by_default_primary_unchanged() {
 }
 
 #[tokio::test]
+async fn sensitive_query_retain_all_keeps_empty_segments_byte_for_byte() {
+    let mut ctx = make_ctx_with_proxy();
+    const RAW: &str = "keep=1&&flag&x=";
+    ctx.set_raw_query_string(RAW.to_string());
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        request_line.contains(&format!("?{RAW} ")),
+        "retain-all must borrow original empty segments and trailing flags: {request_line}"
+    );
+    assert_eq!(
+        ctx.raw_query_string(),
+        Some(RAW),
+        "primary/raw query snapshot must stay byte-for-byte unchanged"
+    );
+}
+
+#[tokio::test]
 async fn sensitive_query_allowlist_forwards_only_listed_decoded_names() {
     let mut ctx = make_ctx_with_proxy();
     ctx.set_raw_query_string("access_token=allow-me&api_key=nope&x=1".to_string());

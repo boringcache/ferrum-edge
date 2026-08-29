@@ -705,15 +705,29 @@ fn classify_mirror_query_name(
             return MirrorQueryNameDecision::FailClosed;
         }
 
-        let lower = current.to_ascii_lowercase();
-        if is_mirror_sensitive_query_name(lower.as_ref(), operator_patterns) {
-            sensitive = true;
+        // Classification compares ASCII-lowercased names. Skip the owned
+        // lowercase copy when the staged form is already lowercase ASCII.
+        // Drop that borrow before any later decode reassignment of `current`.
+        {
+            let already_lower = current.bytes().all(|byte| !byte.is_ascii_uppercase());
+            let lower: Cow<'_, str> = if already_lower {
+                Cow::Borrowed(current.as_ref())
+            } else {
+                Cow::Owned(current.to_ascii_lowercase())
+            };
+            if is_mirror_sensitive_query_name(lower.as_ref(), operator_patterns) {
+                sensitive = true;
+            }
         }
 
         if !name_has_valid_percent_escape(current.as_ref()) {
             return if sensitive {
                 MirrorQueryNameDecision::Sensitive {
-                    decoded_lower: lower,
+                    decoded_lower: if current.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                        current.to_ascii_lowercase()
+                    } else {
+                        current.into_owned()
+                    },
                 }
             } else {
                 MirrorQueryNameDecision::NonSensitive
@@ -828,8 +842,35 @@ fn apply_mirror_credential_policy(
     });
 }
 
-/// Drop deny-by-default credential query pairs from an owned snapshot of the
-/// canonical backend-visible query. Names are classified with bounded staged
+/// Whether one `&`-delimited query segment may appear on the mirror
+/// request-target. Classification compares decoded names only; the caller keeps
+/// the original pair bytes when this returns true.
+fn mirror_query_pair_allowed(
+    pair: &str,
+    forward_sensitive_query: bool,
+    allowlist: &[String],
+    operator_patterns: &[String],
+) -> bool {
+    // Some application query parsers still accept `;` as a parameter
+    // separator. Ferrum's canonical query uses `&`, so forwarding a raw
+    // semicolon-bearing segment would let a mirror origin reinterpret a
+    // credential hidden after the first `=`. Drop the complete `&` segment
+    // rather than choosing a backend-specific parse convention.
+    if pair.contains(';') {
+        return false;
+    }
+    let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
+    match classify_mirror_query_name(raw_name, operator_patterns) {
+        MirrorQueryNameDecision::NonSensitive => true,
+        MirrorQueryNameDecision::FailClosed => false,
+        MirrorQueryNameDecision::Sensitive { decoded_lower } => {
+            forward_sensitive_query && allowlist.iter().any(|allowed| allowed == &decoded_lower)
+        }
+    }
+}
+
+/// Drop deny-by-default credential query pairs from the canonical
+/// backend-visible query. Names are classified with bounded staged
 /// percent-decode; retained pairs keep their original wire encoding, order,
 /// empty values, flags, and repeats. When nothing is stripped the original
 /// string is borrowed so empty separators are not rewritten. Stripped names
@@ -844,29 +885,32 @@ fn apply_mirror_query_credential_policy<'a>(
         return Cow::Borrowed(query);
     }
 
-    let mut kept = String::new();
-    let mut removed_any = false;
+    // Retain-all is the common path: classify names in place and borrow the
+    // original bytes so a query with no sensitive pairs is not copied, decoded,
+    // or re-encoded. Rebuild only after a pair is actually dropped.
+    let needs_strip = query.split('&').any(|pair| {
+        !pair.is_empty()
+            && !mirror_query_pair_allowed(
+                pair,
+                forward_sensitive_query,
+                allowlist,
+                operator_patterns,
+            )
+    });
+    if !needs_strip {
+        return Cow::Borrowed(query);
+    }
+
+    let mut kept = String::with_capacity(query.len());
     for pair in query.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
-        // Some application query parsers still accept `;` as a parameter
-        // separator. Ferrum's canonical query uses `&`, so forwarding a raw
-        // semicolon-bearing segment would let a mirror origin reinterpret a
-        // credential hidden after the first `=`. Drop the complete `&` segment
-        // rather than choosing a backend-specific parse convention.
-        let allowed = !pair.contains(';')
-            && match classify_mirror_query_name(raw_name, operator_patterns) {
-                MirrorQueryNameDecision::NonSensitive => true,
-                MirrorQueryNameDecision::FailClosed => false,
-                MirrorQueryNameDecision::Sensitive { decoded_lower } => {
-                    forward_sensitive_query
-                        && allowlist.iter().any(|allowed| allowed == &decoded_lower)
-                }
-            };
-        if !allowed {
-            removed_any = true;
+        if pair.is_empty()
+            || !mirror_query_pair_allowed(
+                pair,
+                forward_sensitive_query,
+                allowlist,
+                operator_patterns,
+            )
+        {
             continue;
         }
         if !kept.is_empty() {
@@ -874,12 +918,7 @@ fn apply_mirror_query_credential_policy<'a>(
         }
         kept.push_str(pair);
     }
-
-    if removed_any {
-        Cow::Owned(kept)
-    } else {
-        Cow::Borrowed(query)
-    }
+    Cow::Owned(kept)
 }
 
 #[derive(Debug)]
@@ -2480,13 +2519,15 @@ impl Plugin for RequestMirror {
         // remains authoritative.
         let mirror_path = self.select_mirror_path(ctx);
         // Snapshot the canonical backend-visible query through the same
-        // funnel as primary dispatch, then own that snapshot so later plugin
-        // mutation of `ctx` cannot change the mirror request-target. Sensitive
-        // pairs are dropped from this copy only (`build_mirror_url`); the
-        // primary backend target is never rewritten.
+        // funnel as primary dispatch. `build_mirror_url` copies retained pair
+        // bytes into the owned mirror URL immediately, before any later plugin
+        // mutation of `ctx` can change the request-target. Sensitive pairs are
+        // dropped from this URL only; the primary backend target is never
+        // rewritten. Borrow the funnel `Cow` so a query that needs no strip is
+        // not cloned before that copy.
         let effective_query =
             if ctx.outbound_query_string().is_some() || ctx.raw_query_string().is_some() {
-                Some(crate::proxy::effective_backend_query_string(ctx).into_owned())
+                Some(crate::proxy::effective_backend_query_string(ctx))
             } else {
                 None
             };
@@ -2919,6 +2960,8 @@ mod tests {
             "flag",
             "empty=",
             "q=a+b",
+            "a=1&&b=2",
+            "flag&",
             "path=%2Froot&k=a%26b",
             "key=a%2Fb",
             "name=%E2%9C%93&q=%C3%A9",
