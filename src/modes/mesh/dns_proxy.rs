@@ -2321,11 +2321,9 @@ mod tests {
     fn allocate_upstream_id_retries_within_budget_at_default_outstanding_bound() {
         let occupied_ids: HashSet<u16> = (0..1024).collect();
         let entropy = ScriptedEntropy::new([Ok(0), Ok(1024)]);
-        let allocated = allocate_upstream_id(
-            &entropy,
-            occupied_ids.len(),
-            |id| occupied_ids.contains(&id),
-        )
+        let allocated = allocate_upstream_id(&entropy, occupied_ids.len(), |id| {
+            occupied_ids.contains(&id)
+        })
         .expect("default occupancy should allocate within the retry budget");
         assert_eq!(allocated, 1024);
     }
