@@ -21,8 +21,9 @@ fn assert_actionable_protoc_diagnostic(message: &str) {
 
 #[test]
 fn missing_protoc_on_path_returns_actionable_diagnostic() {
-    let err = protoc_preflight::ensure_protoc_from(None, Some(OsString::from("/var/empty")))
-        .expect_err("empty PATH must fail");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let err = protoc_preflight::ensure_protoc_from(None, Some(dir.path().into_os_string()))
+        .expect_err("PATH without protoc must fail");
     assert_actionable_protoc_diagnostic(&err);
     assert!(err.contains("PATH"), "{err}");
 }
@@ -37,8 +38,10 @@ fn empty_protoc_override_is_rejected() {
 
 #[test]
 fn nonexistent_protoc_override_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("missing-protoc");
     let err = protoc_preflight::ensure_protoc_from(
-        Some(OsString::from("/tmp/ferrum-edge-missing-protoc-override")),
+        Some(missing.into_os_string()),
         None,
     )
     .expect_err("missing PROTOC path must fail");
@@ -82,6 +85,24 @@ fn executable_protoc_on_path_is_discovered() {
     let resolved = protoc_preflight::ensure_protoc_from(None, Some(dir.path().into_os_string()))
         .expect("executable protoc on PATH must resolve");
     assert_eq!(resolved, PathBuf::from(path));
+}
+
+#[test]
+#[cfg(unix)]
+fn command_style_protoc_override_is_discovered_on_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("protoc-27.1");
+    fs::write(&path, b"#!/bin/sh\n").expect("write fake protoc");
+    let mut perms = fs::metadata(&path).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms).expect("chmod");
+
+    let resolved = protoc_preflight::ensure_protoc_from(
+        Some(OsString::from("protoc-27.1")),
+        Some(dir.path().into_os_string()),
+    )
+    .expect("command-style PROTOC override on PATH must resolve");
+    assert_eq!(resolved, path);
 }
 
 #[test]

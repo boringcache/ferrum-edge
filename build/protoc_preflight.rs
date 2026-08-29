@@ -17,53 +17,70 @@ pub fn ensure_protoc_from(
     path_env: Option<OsString>,
 ) -> Result<PathBuf, String> {
     if let Some(raw) = protoc_env {
-        return validate_protoc_override(raw);
+        return validate_protoc_override(raw, path_env.as_ref());
     }
     find_protoc_on_path(path_env.as_ref()).ok_or_else(protoc_missing_diagnostic)
 }
 
-fn validate_protoc_override(raw: OsString) -> Result<PathBuf, String> {
-    let path_str = match raw.into_string() {
-        Ok(s) => s,
-        Err(_) => {
-            return Err(protoc_override_diagnostic(
-                "PROTOC contains non-UTF-8 bytes",
-            ));
-        }
-    };
-    if path_str.is_empty() {
+fn validate_protoc_override(
+    raw: OsString,
+    path_env: Option<&OsString>,
+) -> Result<PathBuf, String> {
+    if raw.is_empty() {
         return Err(protoc_override_diagnostic("PROTOC is set but empty"));
     }
-    let path = PathBuf::from(&path_str);
-    validate_protoc_path(&path, &path_str)
+    let path = PathBuf::from(raw);
+    if path.components().count() == 1 {
+        if let Some(resolved) = find_named_executable_on_path(&path, path_env) {
+            return Ok(resolved);
+        }
+    }
+    validate_protoc_path(&path)
 }
 
-fn validate_protoc_path(path: &Path, display: &str) -> Result<PathBuf, String> {
+fn validate_protoc_path(path: &Path) -> Result<PathBuf, String> {
     if !path.exists() {
         return Err(protoc_override_diagnostic(&format!(
-            "PROTOC points to a nonexistent path: {display}"
+            "PROTOC points to a nonexistent path or command: {}",
+            path.display()
         )));
     }
     if !path.is_file() {
         return Err(protoc_override_diagnostic(&format!(
-            "PROTOC is not a regular file: {display}"
+            "PROTOC is not a regular file: {}",
+            path.display()
         )));
     }
     if !is_executable(path) {
         return Err(protoc_override_diagnostic(&format!(
-            "PROTOC is not executable: {display}"
+            "PROTOC is not executable: {}",
+            path.display()
         )));
     }
     Ok(path.to_path_buf())
 }
 
 fn find_protoc_on_path(path_env: Option<&OsString>) -> Option<PathBuf> {
+    for name in protoc_executable_names() {
+        if let Some(candidate) = find_named_executable_on_path(Path::new(name), path_env) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn find_named_executable_on_path(name: &Path, path_env: Option<&OsString>) -> Option<PathBuf> {
     let path_env = path_env?;
     for dir in env::split_paths(path_env) {
-        for name in protoc_executable_names() {
-            let candidate = dir.join(name);
-            if candidate.is_file() && is_executable(&candidate) {
-                return Some(candidate);
+        let candidate = dir.join(name);
+        if candidate.is_file() && is_executable(&candidate) {
+            return Some(candidate);
+        }
+        if cfg!(windows) && name.extension().is_none() {
+            let mut executable = candidate;
+            executable.set_extension("exe");
+            if executable.is_file() && is_executable(&executable) {
+                return Some(executable);
             }
         }
     }
