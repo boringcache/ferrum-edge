@@ -300,6 +300,7 @@
       },
       "regression_tests": [
         "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_listener_builder_binds_frame_bounds_to_the_header_policy",
+        "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_backend_client_builder_binds_frame_bounds_to_the_header_policy",
         "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_vendored_frame_decoder_refuses_oversized_declared_non_data_length",
         "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_vendored_frame_ceiling_maps_to_excessive_load_on_every_decoder",
         "tests/unit/gateway_core/http3_server_dispatch_tests.rs::h3_vendored_frame_ceiling_behavioural_regressions_are_present",

@@ -5059,6 +5059,68 @@ fn h3_listener_builder_binds_frame_bounds_to_the_header_policy() {
     );
 }
 
+/// Production pooled H3 backend constructors opt into BOTH receive-side
+/// bounds from the same header policy the frontend listener uses, so a hostile
+/// or compromised upstream cannot accumulate an over-declared HEADERS,
+/// CONTROL, PUSH, or unknown frame. `h3::client::new` is the unbounded default.
+#[test]
+fn h3_backend_client_builder_binds_frame_bounds_to_the_header_policy() {
+    let src = include_str!("../../../src/http3/client.rs");
+    let pool_impl = src
+        .split("impl Http3ConnectionPool {")
+        .nth(1)
+        .expect("Http3ConnectionPool impl must remain present")
+        .split("\npub struct Http3Client {")
+        .next()
+        .expect("pool impl must end before the standalone Http3Client");
+
+    assert!(
+        !pool_impl.contains("h3::client::new("),
+        "no production pooled H3 backend constructor may use unbounded \
+         h3::client::new: {pool_impl}"
+    );
+    assert_eq!(
+        pool_impl.matches("h3::client::builder()").count(),
+        2,
+        "both production H3 backend constructors must use the bounded client \
+         builder"
+    );
+
+    for fn_name in ["create_connection", "create_connection_to_target"] {
+        let body = src
+            .split(&format!("async fn {fn_name}("))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{fn_name} must remain present"))
+            .split("\n    async fn ")
+            .next()
+            .unwrap_or_else(|| panic!("{fn_name} body must remain present"));
+        let collapsed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(
+            collapsed.contains("crate::http3::config::h3_max_field_section_size(")
+                && collapsed.contains("self.env_config.max_header_size_bytes"),
+            "{fn_name} must advertise SETTINGS_MAX_FIELD_SECTION_SIZE from \
+             FERRUM_MAX_HEADER_SIZE_BYTES: {body}"
+        );
+        assert!(
+            collapsed.contains("crate::http3::config::h3_max_buffered_frame_len(")
+                && collapsed.contains("self.env_config.max_header_size_bytes"),
+            "{fn_name} must bound the buffered non-DATA frame payload from \
+             FERRUM_MAX_HEADER_SIZE_BYTES: {body}"
+        );
+        assert!(
+            collapsed.contains("h3::client::builder()")
+                && collapsed.contains(".max_field_section_size(h3_max_field_section_size)")
+                && collapsed.contains(".max_buffered_frame_len(h3_max_buffered_frame_len)"),
+            "{fn_name} must opt into the bounded client builder: {body}"
+        );
+        assert!(
+            !collapsed.contains("h3::client::new("),
+            "{fn_name} must not regress to unbounded h3::client::new: {body}"
+        );
+    }
+}
+
 /// The vendored refusal must fire on the DECLARED length, before any payload
 /// byte is buffered and before an accumulation target is armed.
 ///
@@ -5178,6 +5240,16 @@ fn h3_vendored_frame_ceiling_maps_to_excessive_load_on_every_decoder() {
         builder.contains("pub fn max_buffered_frame_len(&mut self, value: u64) -> &mut Self {")
             && builder.contains("self.config.max_buffered_frame_len = value;"),
         "server::builder() must expose the receive-side ceiling setter"
+    );
+
+    let client_builder =
+        include_str!("../../../vendor/h3-0.0.8-ferrum-patched/src/client/builder.rs");
+    assert!(
+        client_builder
+            .contains("pub fn max_buffered_frame_len(&mut self, value: u64) -> &mut Self {")
+            && client_builder.contains("self.config.max_buffered_frame_len = value;"),
+        "client::builder() must expose the receive-side ceiling setter so pooled \
+         backend connections can fail closed too"
     );
 
     let config = include_str!("../../../vendor/h3-0.0.8-ferrum-patched/src/config.rs");

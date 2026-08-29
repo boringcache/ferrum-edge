@@ -1311,8 +1311,9 @@ These are enforced separately from hyper's built-in validation because the H3 li
 
 ### Declared frame-length bound and SETTINGS alignment (issue #4261)
 
-Header size limits are also the H3 frontend's *receive-side* bound on what one
-QUIC stream can make the frame decoder buffer.
+Header size limits are also the HTTP/3 *receive-side* bound on what one QUIC
+stream can make the frame decoder buffer, on both untrusted frontend clients and
+untrusted H3 backend peers.
 
 Every HTTP/3 frame other than `DATA` — HEADERS, SETTINGS, GOAWAY, PUSH_PROMISE,
 and every unknown type, which RFC 9114 §7.2.8 says to ignore but which still has
@@ -1327,9 +1328,15 @@ consumes from the stream on every poll, which re-grants credit. `max_idle_timeou
 does not help either — a peer streaming payload for a frame it over-declared is
 active, not idle.
 
-The listener therefore derives two values from `FERRUM_MAX_HEADER_SIZE_BYTES`,
+The gateway therefore derives two values from `FERRUM_MAX_HEADER_SIZE_BYTES`,
 the same policy the HTTP/1.1 and HTTP/2 frontends derive their parser limits
-from, and installs both at `h3::server::builder()`:
+from, and installs both at `h3::server::builder()` (untrusted frontend clients)
+and at `h3::client::builder()` on every production pooled H3 backend connection
+(untrusted upstream peers). `h3::client::new` keeps the unbounded upstream
+default and is not used on those production constructors. A malicious or
+compromised H3 backend can declare an enormous HEADERS, unknown, CONTROL, or
+PUSH frame the same way a frontend client can; QUIC flow control does not
+bound accumulation on either side.
 
 | Value | Source | Effect |
 |---|---|---|
@@ -1362,7 +1369,9 @@ a request that merely overshoots `FERRUM_MAX_HEADER_SIZE_BYTES` still decodes
 and is answered with a graceful `431 Request Header Fields Too Large` rather
 than a connection abort. Only a declaration far beyond the policy — the attack
 shape — reaches the connection-level refusal. The listener's own post-decode
-total-header check remains in place as defence in depth.
+total-header check remains in place as defence in depth. On the backend client,
+the same 2x ceiling is the receive-side bound on response HEADERS and on the
+peer's unidirectional control and push streams.
 
 **Configuration admission.** Both derived values travel the wire as QUIC
 varints. `EnvConfig::validate` refuses a `FERRUM_MAX_HEADER_SIZE_BYTES` whose
@@ -1376,7 +1385,7 @@ for the upstream retirement plan.
 
 ## Flow-control window tuning
 
-The default QUIC flow-control windows are conservative because the H3 listener serves untrusted clients: 256 KiB per stream, 2 MiB receive budget per connection, and 2 MiB send budget per connection. The connection-level receive window is the aggregate governor, so active per-stream receive windows cannot exceed the connection receive budget in total. Memory budget per QUIC connection scales with `FERRUM_HTTP3_RECEIVE_WINDOW + FERRUM_HTTP3_SEND_WINDOW`; raise these values only after benchmarking a workload that benefits from larger windows. Explicit env values continue to override these defaults. Note: the H3 *backend* pool (gateway-to-upstream) uses larger windows internally (8 MiB stream / 32 MiB connection / 8 MiB send) — these are not exposed as env vars because the backend pool talks to trusted upstreams.
+The default QUIC flow-control windows are conservative because the H3 listener serves untrusted clients: 256 KiB per stream, 2 MiB receive budget per connection, and 2 MiB send budget per connection. The connection-level receive window is the aggregate governor, so active per-stream receive windows cannot exceed the connection receive budget in total. Memory budget per QUIC connection scales with `FERRUM_HTTP3_RECEIVE_WINDOW + FERRUM_HTTP3_SEND_WINDOW`; raise these values only after benchmarking a workload that benefits from larger windows. Explicit env values continue to override these defaults. Note: the H3 *backend* pool (gateway-to-upstream) uses larger windows internally (8 MiB stream / 32 MiB connection / 8 MiB send) — these are not exposed as env vars. Larger windows do **not** replace the declared-frame-length bound: pooled backend connections still install `max_field_section_size` and `max_buffered_frame_len` from `FERRUM_MAX_HEADER_SIZE_BYTES`, because an H3 backend is a hostile network boundary.
 
 The frontend HTTP/2 listener applies the same conservative-by-default philosophy via `FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE` (256 KiB), `FERRUM_FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE` (2 MiB), and `FERRUM_FRONTEND_H2_MAX_FRAME_SIZE` (16 KiB). These are independent of the backend pool `FERRUM_POOL_HTTP2_*` env vars. For benchmarking or trusted-network deployments, raise the frontend H2 values to match the backend pool defaults (8 MiB stream / 32 MiB connection / 1 MiB frame).
 

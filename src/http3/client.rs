@@ -2231,6 +2231,17 @@ impl Http3ConnectionPool {
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(transport_config));
 
+        // Hostile H3 backends can over-declare HEADERS/CONTROL/PUSH the same
+        // way an unauthenticated frontend client can. Opt into the same
+        // receive-side bounds the H3 listener uses, derived from
+        // FERRUM_MAX_HEADER_SIZE_BYTES. Computed once per connection setup from
+        // already-validated config: plain integer reads, no request-path lock
+        // or allocation. `h3::client::new` keeps the unbounded upstream default.
+        let h3_max_field_section_size =
+            crate::http3::config::h3_max_field_section_size(self.env_config.max_header_size_bytes);
+        let h3_max_buffered_frame_len =
+            crate::http3::config::h3_max_buffered_frame_len(self.env_config.max_header_size_bytes);
+
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
         // DestinationRule `connectionPool.tcp.maxConnections`. A QUIC
@@ -2291,10 +2302,12 @@ impl Http3ConnectionPool {
                     // QUIC-successful peer that cannot speak HTTP/3 cannot pin
                     // this pool and suppress failover to a later DNS address.
                     let quic_conn = connection.clone();
-                    let (mut driver, send_request) =
-                        h3::client::new(h3_quinn::Connection::new(connection))
-                            .await
-                            .map_err(|e| anyhow::anyhow!("HTTP/3 handshake failed: {}", e))?;
+                    let (mut driver, send_request) = h3::client::builder()
+                        .max_field_section_size(h3_max_field_section_size)
+                        .max_buffered_frame_len(h3_max_buffered_frame_len)
+                        .build(h3_quinn::Connection::new(connection))
+                        .await
+                        .map_err(|e| anyhow::anyhow!("HTTP/3 handshake failed: {}", e))?;
 
                     tokio::spawn(async move {
                         // The `maxConnections` slot lives exactly as long as
@@ -2378,6 +2391,14 @@ impl Http3ConnectionPool {
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(transport_config));
 
+        // Same receive-side bounds as `create_connection`: a load-balanced or
+        // retried target is still an untrusted H3 peer. Computed once per
+        // connection setup; see that constructor for the rationale.
+        let h3_max_field_section_size =
+            crate::http3::config::h3_max_field_section_size(self.env_config.max_header_size_bytes);
+        let h3_max_buffered_frame_len =
+            crate::http3::config::h3_max_buffered_frame_len(self.env_config.max_header_size_bytes);
+
         // DestinationRule `connectionPool.tcp.maxConnections`. A QUIC
         // connection is a physical backend connection, so reserve the slot
         // BEFORE dialing and hand it to the spawned h3 DRIVER: the slot retires
@@ -2438,10 +2459,12 @@ impl Http3ConnectionPool {
                     // QUIC-successful peer that cannot speak HTTP/3 cannot pin
                     // this pool and suppress failover to a later DNS address.
                     let quic_conn = connection.clone();
-                    let (mut driver, send_request) =
-                        h3::client::new(h3_quinn::Connection::new(connection))
-                            .await
-                            .map_err(|e| anyhow::anyhow!("HTTP/3 handshake failed: {}", e))?;
+                    let (mut driver, send_request) = h3::client::builder()
+                        .max_field_section_size(h3_max_field_section_size)
+                        .max_buffered_frame_len(h3_max_buffered_frame_len)
+                        .build(h3_quinn::Connection::new(connection))
+                        .await
+                        .map_err(|e| anyhow::anyhow!("HTTP/3 handshake failed: {}", e))?;
 
                     tokio::spawn(async move {
                         // The `maxConnections` slot lives exactly as long as
@@ -4080,7 +4103,9 @@ impl Http3Client {
             .await
             .map_err(|e| anyhow::anyhow!("QUIC connection failed: {}", e))?;
 
-        // Create HTTP/3 connection
+        // Integration-test / standalone client: no EnvConfig, not a
+        // production pooled backend path. Keep stock `h3::client::new`
+        // defaults here rather than widening this API for symmetry.
         let (mut driver, mut send_request) =
             h3::client::new(h3_quinn::Connection::new(connection)).await?;
 
