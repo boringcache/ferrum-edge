@@ -2174,7 +2174,10 @@ async fn scoped_caller_cannot_file_global_tls_mutation_under_another_tenant() {
 
     let (tenant_b_status, tenant_b_body) =
         get_json_ns(&base, &audit_path, &tenant_b, "tenant-b").await;
-    assert_eq!(tenant_b_status, 200, "tenant-b audit body: {tenant_b_body:?}");
+    assert_eq!(
+        tenant_b_status, 200,
+        "tenant-b audit body: {tenant_b_body:?}"
+    );
     assert_eq!(
         tenant_b_body["total"].as_u64(),
         Some(0),
@@ -2183,7 +2186,10 @@ async fn scoped_caller_cannot_file_global_tls_mutation_under_another_tenant() {
 
     let (tenant_a_status, tenant_a_body) =
         get_json_ns(&base, &audit_path, &tenant_a, "tenant-a").await;
-    assert_eq!(tenant_a_status, 200, "tenant-a audit body: {tenant_a_body:?}");
+    assert_eq!(
+        tenant_a_status, 200,
+        "tenant-a audit body: {tenant_a_body:?}"
+    );
     assert_eq!(
         tenant_a_body["total"].as_u64(),
         Some(0),
@@ -2230,7 +2236,10 @@ async fn namespace_claim_denied_backup_is_filed_under_canonical_global_namespace
 
     let (tenant_b_status, tenant_b_body) =
         get_json_ns(&base, audit_path, &tenant_b, "tenant-b").await;
-    assert_eq!(tenant_b_status, 200, "tenant-b audit body: {tenant_b_body:?}");
+    assert_eq!(
+        tenant_b_status, 200,
+        "tenant-b audit body: {tenant_b_body:?}"
+    );
     assert_eq!(
         tenant_b_body["total"].as_u64(),
         Some(0),
@@ -2269,7 +2278,10 @@ async fn mesh_config_revision_reset_audit_ignores_request_namespace_header() {
 
     let (tenant_b_status, tenant_b_body) =
         get_json_ns(&base, audit_path, &tenant_b, "tenant-b").await;
-    assert_eq!(tenant_b_status, 200, "tenant-b audit body: {tenant_b_body:?}");
+    assert_eq!(
+        tenant_b_status, 200,
+        "tenant-b audit body: {tenant_b_body:?}"
+    );
     assert_eq!(
         tenant_b_body["total"].as_u64(),
         Some(0),

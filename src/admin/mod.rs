@@ -4262,13 +4262,8 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            handle_mesh_config_revision_reset(
-                &state,
-                &auth,
-                query.as_deref(),
-                &audit_request_ctx,
-            )
-            .await
+            handle_mesh_config_revision_reset(&state, &auth, query.as_deref(), &audit_request_ctx)
+                .await
         }
 
         // F7.2: remote-cluster discovery introspection. Read-only operator
