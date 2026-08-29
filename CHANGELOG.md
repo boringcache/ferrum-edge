@@ -13,18 +13,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ferrum-edge-linux-{x86_64,aarch64}` and `ferrum-cni-linux-{x86_64,aarch64}`
   artifacts previously linked against whatever glibc `ubuntu-latest` shipped
   (observed GLIBC_2.39), so they failed on Ubuntu 22.04, RHEL 9, and Debian 12.
-  Additive hosted jobs independently build x86_64 GNU binaries in a
-  digest-pinned AlmaLinux 8.10 sysroot under an isolated `CARGO_TARGET_DIR`
+  The x86_64 GNU cell of the release and `latest` producer jobs no longer
+  compiles on the runner: it builds both binaries in a digest-pinned
+  AlmaLinux 8.10 sysroot under an isolated `CARGO_TARGET_DIR`
   (`target/linux-gnu-sysroot`) so native runner caches cannot contaminate the
-  pinned link; full-mode pull requests, main-push `latest`, and versioned
-  releases ABI-scan both binaries, smoke them on AlmaLinux 9 and Ubuntu 22.04,
-  and fail closed on symbols above the floor. Frozen producer jobs still
-  native-compile `ubuntu-latest` x86_64 GNU artifacts; replacing that cargo
-  step requires a later trusted-policy generation. ARM64 GNU artifacts from
-  the protected ARM64 job already target an older glibc and are scanned as
-  published. Artifact names, checksums, signatures, and container publish
-  behavior are unchanged. Remaining dynamic libraries are `libgcc_s.so.1`
-  and, if not static-linked, `libz.so.1`.
+  pinned link, and the same job then stages, checksums, ABI-scans, and
+  oldest-baseline-smokes those exact bytes before uploading them. The GitHub
+  Release, its `.sha256` sidecars, the `latest` prerelease, the default
+  multi-arch container images, and the signing/attestation jobs therefore all
+  consume the bytes that were verified; a floor violation means the artifact
+  is never published. ARM64 GNU artifacts still come from the isolated Cross
+  build, already target an older glibc, and are re-checked as published on an
+  ARM64 runner. Full-mode pull requests run the same sysroot builder as a
+  pre-merge regression signal. Artifact names, checksums, signatures, and
+  container publish behavior are unchanged. Remaining dynamic libraries are
+  `libgcc_s.so.1` and, if not static-linked, `libz.so.1`.
 
 ### Changed
 

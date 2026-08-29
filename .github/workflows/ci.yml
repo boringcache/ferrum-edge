@@ -5841,9 +5841,33 @@ jobs:
         if: github.event_name == 'pull_request' || (github.event_name == 'merge_group' && runner.os != 'macOS')
         run: cargo build --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
 
+      # Every target except x86_64 GNU is compiled natively on its runner.
+      # The x86_64 GNU cell is deliberately excluded: `ubuntu-latest` is a
+      # moving image whose glibc would define the published runtime floor,
+      # which is exactly the defect issue #4301 fixes.
       - name: Build release binary
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && matrix.target != 'x86_64-unknown-linux-gnu'
         run: cargo build --features cloud-secrets --release --target ${{ matrix.target }}
+
+      # Canonical x86_64 GNU producer for the moving `latest` prerelease. The
+      # digest-pinned AlmaLinux 8.10 sysroot links against glibc 2.28, below
+      # the declared GLIBC_2.34 floor, and writes into an isolated
+      # CARGO_TARGET_DIR before copying the two regular files to
+      # `target/x86_64-unknown-linux-gnu/release/`. `Prepare release assets`
+      # below therefore publishes these exact bytes as
+      # `binary-x86_64-unknown-linux-gnu`; there is no second build.
+      - name: Build x86_64 GNU release binaries in the pinned sysroot
+        if: github.event_name == 'push' && matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          LINUX_GNU_TARGET: x86_64-unknown-linux-gnu
+          LINUX_GNU_FEATURES: cloud-secrets
+          LINUX_GNU_PROFILE: release
+        run: |
+          set -euo pipefail
+          python3 -I .github/scripts/verify_linux_gnu_abi.py --self-test
+          python3 -I .github/scripts/verify_linux_gnu_abi.py --check-contract
+          python3 -I .github/scripts/smoke_linux_gnu_baseline.py --self-test
+          bash .github/scripts/build_linux_gnu_sysroot.sh
 
       - name: Report sccache stats
         if: always()
@@ -5885,6 +5909,30 @@ jobs:
             fi
             cat "$asset.sha256"
           done
+
+      # Fail closed on the exact bytes that are about to be uploaded. The
+      # checksum re-verification proves the scanned and smoked files are the
+      # same bytes the `.sha256` sidecars and the `latest` prerelease
+      # advertise. This step runs before `Upload artifacts`, so a floor
+      # violation means the canonical artifact never exists and every
+      # downstream consumer (`latest-release`, `docker`, `docker-manifest`)
+      # fails closed with it.
+      - name: Verify published x86_64 GNU ABI floor and oldest baselines
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd release-assets
+            sha256sum -c ferrum-edge-linux-x86_64.sha256
+            sha256sum -c ferrum-cni-linux-x86_64.sha256
+          )
+          python3 -I .github/scripts/verify_linux_gnu_abi.py \
+            release-assets/ferrum-edge-linux-x86_64 \
+            release-assets/ferrum-cni-linux-x86_64
+          bash .github/scripts/smoke_linux_gnu_baseline.sh \
+            --edge release-assets/ferrum-edge-linux-x86_64 \
+            --cni release-assets/ferrum-cni-linux-x86_64
 
       - name: Upload artifacts
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -6245,96 +6293,42 @@ jobs:
             --target "${{ github.sha }}" \
             release-assets/*
 
-  verify-latest-linux-gnu-abi:
-    name: Verify latest Linux GNU ABI
-    # Hosted GNU ABI + oldest-baseline smoke for the moving `latest` prerelease
-    # (issue #4301). Frozen `build-binaries` still native-compiles ubuntu-latest
-    # x86_64 GNU artifacts; replacing that cargo step needs a later trusted
-    # policy generation. This additive job independently sysroot-builds and
-    # scans x86_64, and ABI-scans the frozen ARM64 artifacts. It must not edit
-    # latest-release.needs; the join gate below fail-closes publication after
-    # that frozen job.
-    needs: [build-binaries, build-arm64-cross]
+  verify-latest-linux-gnu-abi-aarch64:
+    name: Verify latest Linux GNU ABI (aarch64)
+    # x86_64 GNU is scanned and smoked inside its producer job
+    # (`build-binaries`) on the exact bytes it uploads, so it is NOT rebuilt
+    # here. ARM64 is produced by the trusted-policy-frozen Cross job, whose
+    # text no pull request may change, so its actual uploaded artifact is
+    # downloaded, checksum-verified, and scanned here instead.
+    needs: build-arm64-cross
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-          - os: ubuntu-24.04-arm
-    env:
-      LINUX_GNU_SYSROOT_IMAGE: almalinux@sha256:4a87d2615a770506e204c27d6248ac97f4df67f4e41e2e9c47c81f0ed0be98cb
-      LINUX_GNU_SMOKE_FLOOR_IMAGE: almalinux@sha256:1c718a4cd7bab3bdb069ddbbd1eb593a390e6932d51d0048a2f6556303bafba7
-      LINUX_GNU_SMOKE_UBUNTU2204_IMAGE: ubuntu@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc
-      LINUX_GNU_PROTOC_SHA256: ed8fca87a11c888fed329d6a59c34c7d436165f662a2c875246ddb1ac2b6dd50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-
-      - name: Install Rust
-        if: matrix.os == 'ubuntu-latest'
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
-          toolchain: stable
-          targets: x86_64-unknown-linux-gnu
-
-      - name: Download x86_64 GNU artifacts
-        if: matrix.os == 'ubuntu-latest'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: binary-x86_64-unknown-linux-gnu
-          path: gnu-artifacts
+          persist-credentials: false
 
       - name: Download ARM64 GNU artifacts
-        if: matrix.os == 'ubuntu-24.04-arm'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: binary-aarch64-unknown-linux-gnu
           path: gnu-artifacts
 
-      - name: Build x86_64 GNU binaries in the pinned sysroot
-        if: matrix.os == 'ubuntu-latest'
-        env:
-          LINUX_GNU_TARGET: x86_64-unknown-linux-gnu
-          LINUX_GNU_FEATURES: cloud-secrets
-          LINUX_GNU_PROFILE: release
-          LIBZ_SYS_STATIC: "1"
-          LINUX_GNU_SYSROOT_IMAGE: almalinux@sha256:4a87d2615a770506e204c27d6248ac97f4df67f4e41e2e9c47c81f0ed0be98cb
-          LINUX_GNU_PROTOC_SHA256: ed8fca87a11c888fed329d6a59c34c7d436165f662a2c875246ddb1ac2b6dd50
-        run: |
-          set -euo pipefail
-          export LIBZ_SYS_STATIC=1
-          python3 -I .github/scripts/verify_linux_gnu_abi.py --self-test
-          python3 -I .github/scripts/verify_linux_gnu_abi.py --check-contract
-          python3 -I .github/scripts/smoke_linux_gnu_baseline.py --self-test
-          bash .github/scripts/build_linux_gnu_sysroot.sh
-
-      - name: Scan and smoke x86_64 GNU sysroot outputs
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          set -euo pipefail
-          python3 -I .github/scripts/verify_linux_gnu_abi.py \
-            target/x86_64-unknown-linux-gnu/release/ferrum-edge \
-            target/x86_64-unknown-linux-gnu/release/ferrum-cni
-          bash .github/scripts/smoke_linux_gnu_baseline.sh \
-            --edge target/x86_64-unknown-linux-gnu/release/ferrum-edge \
-            --cni target/x86_64-unknown-linux-gnu/release/ferrum-cni
-
       - name: Verify checksums, ABI floor, and oldest-baseline smoke
-        if: matrix.os == 'ubuntu-24.04-arm'
         run: |
           set -euo pipefail
           python3 -I .github/scripts/verify_linux_gnu_abi.py --self-test
           python3 -I .github/scripts/verify_linux_gnu_abi.py --check-contract
           python3 -I .github/scripts/smoke_linux_gnu_baseline.py --self-test
-          cd gnu-artifacts
-          sha256sum -c ferrum-edge-linux-aarch64.sha256
-          sha256sum -c ferrum-cni-linux-aarch64.sha256
-          chmod +x ferrum-edge-linux-aarch64 ferrum-cni-linux-aarch64
-          cd ..
+          (
+            cd gnu-artifacts
+            sha256sum -c ferrum-edge-linux-aarch64.sha256
+            sha256sum -c ferrum-cni-linux-aarch64.sha256
+            chmod +x ferrum-edge-linux-aarch64 ferrum-cni-linux-aarch64
+          )
           python3 -I .github/scripts/verify_linux_gnu_abi.py \
             gnu-artifacts/ferrum-edge-linux-aarch64 \
             gnu-artifacts/ferrum-cni-linux-aarch64
@@ -6344,13 +6338,15 @@ jobs:
 
   linux-gnu-abi-latest-gate:
     name: Gate latest release on Linux GNU ABI
-    # Trusted Cross freezes latest-release.needs, so the ABI gate cannot be
-    # added there. This join gate keeps the moving `latest` prerelease
-    # fail-closed: the CI workflow cannot succeed unless both publication and
-    # GNU ABI/smoke succeeded. A `latest` release is deleted only when it is
-    # proven to target the current GITHUB_SHA, so a failed publisher cannot
-    # retract an older known-good `latest`.
-    needs: [latest-release, verify-latest-linux-gnu-abi]
+    # ARM64 ONLY. The x86_64 GNU floor is enforced inside the producer job
+    # before its artifact exists, so no post-publication step is involved in
+    # it. ARM64 is built by the trusted-policy-frozen Cross job and consumed
+    # by frozen `latest-release`/`docker` needs, neither of which a pull
+    # request may edit, so its actual-artifact scan can only join after
+    # publication. A `latest` release is deleted only when it is proven to
+    # target the current GITHUB_SHA, so a failed publisher cannot retract an
+    # older known-good `latest`.
+    needs: [latest-release, verify-latest-linux-gnu-abi-aarch64]
     if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
@@ -6360,7 +6356,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           LATEST_RESULT: ${{ needs.latest-release.result }}
-          ABI_RESULT: ${{ needs.verify-latest-linux-gnu-abi.result }}
+          ABI_RESULT: ${{ needs.verify-latest-linux-gnu-abi-aarch64.result }}
         run: |
           set -euo pipefail
 
@@ -6389,12 +6385,12 @@ jobs:
             if gh release view latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
               if latest_targets_current_sha; then
                 gh release delete latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
-                echo "Deleted latest prerelease because it targeted ${GITHUB_SHA} and verify-latest-linux-gnu-abi did not succeed (result=${ABI_RESULT})"
+                echo "Deleted latest prerelease because it targeted ${GITHUB_SHA} and verify-latest-linux-gnu-abi-aarch64 did not succeed (result=${ABI_RESULT})"
               else
                 echo "Leaving latest in place; it does not target current ${GITHUB_SHA}"
               fi
             fi
-            echo "::error::latest publication is blocked until verify-latest-linux-gnu-abi succeeds (result=${ABI_RESULT})"
+            echo "::error::latest publication is blocked until verify-latest-linux-gnu-abi-aarch64 succeeds (result=${ABI_RESULT})"
             exit 1
           fi
 
@@ -6407,11 +6403,12 @@ jobs:
 
   verify-pr-linux-gnu-abi:
     name: Verify PR Linux GNU ABI
-    # Full-mode pull requests must compile the pinned AlmaLinux 8.10 sysroot
-    # builder and ABI-scan/smoke its x86_64 GNU outputs (issue #4301). The
-    # ordinary build-binaries PR cell only produces a host pr-build binary;
-    # versioned-release and main-push run this builder in additive ABI jobs.
-    # Additive: not wired into frozen publisher jobs.
+    # Pre-merge regression signal for the GNU runtime floor (issue #4301).
+    # Pull requests publish nothing, so no producer artifact exists to scan;
+    # this job runs the SAME pinned sysroot builder the publishing producers
+    # (`build-binaries` on main-push, `build-release-binaries` on tags) run,
+    # and scans its outputs. It is a check, not a publication input: nothing
+    # downstream consumes it.
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && github.event_name == 'pull_request'
     runs-on: ubuntu-latest

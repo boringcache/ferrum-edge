@@ -1376,39 +1376,46 @@ Full-mode PRs compile the native Linux x86_64 verification binary with
 both x86_64 GNU release binaries (`ferrum-edge` and `ferrum-cni`) through
 the digest-pinned AlmaLinux 8.10 sysroot builder, ABI-scans them against
 GLIBC_2.34, and smokes them on digest-pinned AlmaLinux 9.4 and Ubuntu 22.04.
-That job is additive (not wired into frozen publisher jobs) so GitHub
-compiles and scans this builder on the pull request, not only after merge.
-`merge_group` keeps all four native
+A pull request publishes nothing, so that job runs the same builder the
+publishing producers run and scans its outputs as a pre-merge regression
+signal; nothing downstream consumes it. `merge_group` keeps all four native
 targets as fail-closed compile gates whose outputs are discarded: Linux
 x86_64 and Windows x86_64 still `cargo build --profile pr-build` (Windows
 MSVC/NASM linkage is the platform-specific failure mode `cargo check`
 cannot see); macOS x86_64 and macOS ARM64 run `cargo check --profile
 pr-build` because queue binaries are never published. Pushes to `main`
 build optimized `release` binaries for Linux x86_64, Linux ARM64, macOS
-x86_64, macOS ARM64, and Windows x86_64. Frozen `build-binaries` still
-native-compiles `ubuntu-latest` x86_64 GNU artifacts; replacing that cargo
-step requires a later trusted-policy generation. Additive
-`verify-latest-linux-gnu-abi` independently sysroot-builds and ABI-scans
-x86_64 GNU binaries, then ABI-scans the frozen ARM64 artifacts
-(`binary-x86_64-unknown-linux-gnu` / `binary-aarch64-unknown-linux-gnu`)
-against GLIBC_2.34 (`libgcc_s.so.1` / `libz.so.1` allowlist) and smokes both
-architectures on digest-pinned AlmaLinux 9.4 and Ubuntu 22.04. The sysroot
-builder compiles exclusively under `CARGO_TARGET_DIR=/src/target/linux-gnu-sysroot`
-so a restored native `target/<triple>/release` cache cannot contaminate the
-pinned link, then copies only the two regular, non-symlink binaries into
-the canonical scan paths. The protected `build-arm64-cross` job is
-byte-frozen
-and does not run that scanner; both GNU architectures are re-checked by
-`verify-latest-linux-gnu-abi` as described above.
-`linux-gnu-abi-latest-gate` joins that job with frozen `latest-release`
-(`if: always()` on main pushes). The protected ARM64 policy freezes
-`latest-release.needs`,
-so ABI cannot be added there; the join gate fails the workflow unless both
-verification and publication succeeded, and it deletes `latest` only when that
-prerelease is proven to target the current `GITHUB_SHA`. Native targets share
-the ordinary matrix; Linux ARM64 runs only after code reaches `main`, in the
-isolated `build-arm64-cross` job described below. rust-cache keys are split by
-profile lane
+x86_64, macOS ARM64, and Windows x86_64.
+
+The x86_64 GNU cell of `build-binaries` does NOT compile on the runner. It
+runs `.github/scripts/build_linux_gnu_sysroot.sh`, which builds inside the
+digest-pinned AlmaLinux 8.10 sysroot (glibc 2.28) under an isolated
+`CARGO_TARGET_DIR=/src/target/linux-gnu-sysroot` so a restored native
+`target/<triple>/release` cache cannot contaminate the pinned link, then
+copies only the two regular, non-symlink binaries to
+`target/x86_64-unknown-linux-gnu/release/`. The job's own `Prepare release
+assets` step stages and checksums exactly those files, and before
+`Upload artifacts` it re-verifies the `.sha256` sidecars and ABI-scans and
+smokes `release-assets/ferrum-edge-linux-x86_64` and
+`release-assets/ferrum-cni-linux-x86_64` against GLIBC_2.34 (`libgcc_s.so.1`
+/ `libz.so.1` allowlist) on digest-pinned AlmaLinux 9.4 and Ubuntu 22.04.
+The bytes that are scanned are therefore the bytes uploaded as
+`binary-x86_64-unknown-linux-gnu` and consumed by `latest-release` and the
+`docker` images; a floor violation means that artifact never exists.
+
+The protected `build-arm64-cross` job is byte-frozen by trusted Cross
+policy, so its ARM64 artifacts cannot be gated from inside it.
+`verify-latest-linux-gnu-abi-aarch64` downloads
+`binary-aarch64-unknown-linux-gnu`, re-verifies its checksums, and ABI-scans
+and smokes the published bytes on `ubuntu-24.04-arm`; it never rebuilds
+them. `linux-gnu-abi-latest-gate` joins that job with frozen
+`latest-release` (`if: always()` on main pushes) because
+`latest-release.needs` is frozen too: the gate fails the workflow unless
+both verification and publication succeeded, and it deletes `latest` only
+when that prerelease is proven to target the current `GITHUB_SHA`. Native
+targets share the ordinary matrix; Linux ARM64 runs only after code reaches
+`main`, in the isolated `build-arm64-cross` job described below. rust-cache
+keys are split by profile lane
 (`build-<target>-prbuild` vs `build-<target>-release`) so queue check/pr-build
 trees cannot evict push-to-main release artifacts. Each native job installs
 the pinned repository `setup-sccache` action and reports `sccache --show-stats`
@@ -2538,7 +2545,8 @@ relaxing the scan, the trusted policy admits exact retired→adopted pairs
 | `ebpf-live` | `b7596b48641c850f797c84710dd5646013414d6ba01c30f4d4b2805737c8c26c` | `9aa3332bff5c4538f797f31133be0ef7dfc9767a72e7212b39be33ed58dcca87` | PR #3915 / issue #3900 |
 | `netns-capture-live` | `db543d5c35bfbd4a7b987a52635b359ea6268669257cd313146324f5ca79f598` | `b71296ba5929c78cd786301cc8ed677905cca82cd605be46880021b88c243e32` | PR #3915 / issue #3900 |
 | `two-cluster-mesh-live` | `0586ab0b5b8b803f2ee3663b608c40caca06f9c92e58d4cb28c2080d68f23f27` | `9c3d5b4dfbc6a209e801a47bceabd31fe8aa7df033d49989ad8f88a3e4ed73e7` | PR #3915 / issue #3900 |
-| `build-binaries` | `3bc9e7da00d7033b550df36db00048373b959aea437506ac28e494947422eaec` | `14b0890e2693cd0825fcf25ba7f48810b5ae9a33f2cbb5751bdaaf60186b83b1` | PR #3916 / issue #3905 |
+| `build-binaries` | `14b0890e2693cd0825fcf25ba7f48810b5ae9a33f2cbb5751bdaaf60186b83b1` | `e5a4f2ac007c1c26201ed59ec481e46c9c7a21160f250cdcfc4c5f212eb40426` | PR #4355 / issue #4301 |
+| `build-release-binaries` (`release.yml`) | `678699fb04a2319c5b7b706c8fdf05f0d4b58a30d07e023091499d27a88bbb9f` | `ec52e9b32bbdd1def962e2fe02acc8d1daf9404df853c9ca9d2c17cad5c35776` | PR #4355 / issue #4301 |
 
 The three `#3915` pairs admit the per-suite planner-gate split (the union
 `run_ebpf_live` output becomes `run_ebpf_kernel_live` /
@@ -2547,6 +2555,37 @@ pinned against #3915's branch after merging latest `main`
 (`grok/issue-3900-ebpf-gates`, merged text `d95ea4796`). #3915's `ci-plan` /
 `test` changes are planner-body and aggregate-summary edits that today's scan
 does not read as Cross-sensitive, so those need no pair here.
+
+PR #3916's `build-binaries` pair is retired: its destination is main's live
+value, so the tuple admitted a transition between two states `main` is not in
+and only widened what a pull request could claim.
+
+The two #4355 pairs are the published GNU runtime-floor repair (issue #4301).
+`release.yml` has no separate table: `compare_pr_workflow_job` consults
+`CI_JOB_GENERATION_TRANSITIONS` for both protected workflows, and the binding
+includes the job name, so a `release.yml` job is admitted here by name. Each
+pair moves the ONE matrix cell that produces
+`binary-x86_64-unknown-linux-gnu` / `release-binaries-x86_64-unknown-linux-gnu`
+from a native `ubuntu-latest` `cargo build` — whose moving glibc defined the
+published runtime floor — to the digest-pinned AlmaLinux 8.10 sysroot builder,
+and adds an ABI/oldest-baseline gate over the staged, checksummed assets the
+job is about to upload. No `needs` edge, artifact name, publishing job, or
+other matrix cell moves.
+
+Withholding a digest surface is not enough on its own, so the destination is
+additionally held to `linux_gnu_producer_contract_errors`, an absolute check
+on the proposed revision. Once the repository references
+`.github/scripts/build_linux_gnu_sysroot.sh`, that check requires the producer
+job to run the pinned builder under
+`matrix.target == 'x86_64-unknown-linux-gnu'`, to exclude that target from
+every publishing native compile, to ABI-scan and smoke
+`release-assets/ferrum-{edge,cni}-linux-x86_64` before `Upload artifacts`,
+never to hand the scanner a `target/x86_64-unknown-linux-gnu/...` build-tree
+path, and to be the only job that uploads the canonical artifact name. A
+revision that predates the builder is unaffected, so the trusted-policy
+predecessor can land before the workflow change. Returning either producer to
+its retired native text is refused outright by
+`ci_job_generation_transition_errors`, which is what makes the move one-way.
 
 Each digest is the SHA-256 of `extract_job_block` text. Both ends are exact, the
 binding includes the job name, the move is one-way, and only that job's
@@ -2563,7 +2602,7 @@ Jobs omitted because a single predecessor cannot name a unique merged text:
 - `ci-plan` / `test` for #3915 (issue #3900) — different destination hashes from
   #3913. After #3913 is the trusted base, #3915 needs a follow-up predecessor.
 
-Lint (`#3909`), `build-binaries` (`#3916`), and optional live-suite `changes`
+Lint (`#3909`) and optional live-suite `changes`
 jobs (`#3919`) are not admitted here. They are not folded into this
 predecessor; if hosted Cross disagrees after a latest-`main` merge, they need
 their own exact pair rather than a wildcard. Coverage planning (`#3917`) is
@@ -2723,19 +2762,31 @@ Depends on `Validate release SHA`, then builds optimized release binaries for al
 **Build Process**:
 1. Checkout code at tag commit
 2. Install Rust toolchain with target
-3. Frozen native jobs: install protobuf compiler plus platform prerequisites (Windows NASM) and `cargo build --release --features cloud-secrets` on the runner. Linux x86_64 GNU producers stay native `ubuntu-latest` until a later trusted-policy generation can replace that cargo step. Additive `verify-linux-gnu-abi` independently builds x86_64 GNU binaries inside a digest-pinned AlmaLinux 8.10 sysroot (glibc 2.28) with `LIBZ_SYS_STATIC=1`, a checksum-pinned `protoc`, and `CARGO_TARGET_DIR=/src/target/linux-gnu-sysroot` so native runner caches cannot contaminate the pinned link. After a successful container build, only the two regular, non-symlink `ferrum-edge` and `ferrum-cni` binaries are copied to the canonical `target/<triple>/release/` paths, then fail-closed ABI-scanned. The declared runtime floor is GLIBC_2.34; `libgcc_s.so.1` and `libz.so.1` are the only non-glibc dynamic libraries the gate allows.
+3. macOS and Windows: install protobuf compiler plus platform prerequisites (Windows NASM) and `cargo build --release --features cloud-secrets` on the runner. The x86_64 GNU cell is excluded from that step (`matrix.target != 'x86_64-unknown-linux-gnu'`) and instead runs `.github/scripts/build_linux_gnu_sysroot.sh`, which builds `ferrum-edge` and `ferrum-cni` inside a digest-pinned AlmaLinux 8.10 sysroot (glibc 2.28) with `LIBZ_SYS_STATIC=1`, a checksum-pinned `protoc`, and `CARGO_TARGET_DIR=/src/target/linux-gnu-sysroot` so native runner caches cannot contaminate the pinned link. Only the two regular, non-symlink binaries are then copied to the canonical `target/x86_64-unknown-linux-gnu/release/` paths. The declared runtime floor is GLIBC_2.34; `libgcc_s.so.1` and `libz.so.1` are the only non-glibc dynamic libraries the gate allows.
 4. Generate SHA256 checksum
-5. Upload artifact
+5. x86_64 GNU only: re-verify the `.sha256` sidecars, then ABI-scan and smoke `release-assets/ferrum-edge-linux-x86_64` and `release-assets/ferrum-cni-linux-x86_64` — the exact staged bytes, before they are uploaded
+6. Upload artifact
 
-**GNU ABI gate** (`verify-linux-gnu-abi`, required on the versioned release path):
-- Independently sysroot-builds x86_64 GNU binaries on `ubuntu-latest`, and downloads the trusted `release-binaries-*` ARM64 artifacts on `ubuntu-24.04-arm`
-- Rejects GLIBC symbols above 2.34 and unexpected `DT_NEEDED` entries; re-checks SHA-256 sidecars on the frozen ARM64 artifacts
+**One producer, one artifact identity.** The sysroot bytes are copied by the
+job's own `Copy binary` step into `release-assets/`, checksummed there,
+scanned and smoked there, and uploaded from there as
+`release-binaries-x86_64-unknown-linux-gnu`. `create-release`, the `.sha256`
+sidecars published in the release notes, the `docker` image build context,
+`docker-manifest`, and the Cosign/attestation jobs all consume that same
+artifact. There is no second build, so nothing can be verified that was not
+published. If the ABI gate fails, the artifact is never uploaded and every
+downstream job fails closed with it.
+
+**GNU ABI gate** (`verify-linux-gnu-abi-aarch64`, versioned release path):
+- ARM64 only. The x86_64 GNU floor is enforced inside `build-release-binaries` before its artifact exists.
+- Downloads the trusted `release-binaries-aarch64-unknown-linux-gnu` artifact on `ubuntu-24.04-arm`, re-checks its SHA-256 sidecars, and scans the published bytes — it never rebuilds them
+- Rejects GLIBC symbols above 2.34 and unexpected `DT_NEEDED` entries
 - Smokes both binaries and their operator commands (`ferrum-edge version --json` / `validate` / `run` + `health`; `ferrum-cni VERSION` / `install` / `uninstall` / ADD / CHECK / DEL) on digest-pinned AlmaLinux 9.4 (the GLIBC_2.34 floor) and Ubuntu 22.04 via `bash .github/scripts/smoke_linux_gnu_baseline.sh`
-- `linux-gnu-abi-release-gate` joins `create-release` with this job (`if: always()`). The protected ARM64 policy freezes `create-release.needs`, so ABI cannot be added there; the join gate deletes the GitHub Release if the ABI job did not succeed. Checksums, Cosign signatures, and container publish jobs are unchanged.
+- `linux-gnu-abi-release-gate` joins `create-release` with this job (`if: always()`). The ARM64 producer and `create-release.needs` are both frozen by trusted Cross policy, so the ARM64 scan can only join after publication; the gate fails the workflow and deletes the GitHub Release if that job did not succeed. Checksums, Cosign signatures, and container publish jobs are unchanged.
 
-**GNU ABI gate** (`verify-latest-linux-gnu-abi`, required on the main-push `latest` path):
-- Independently sysroot-builds x86_64 GNU binaries, and downloads the trusted `binary-aarch64-unknown-linux-gnu` artifacts (`ubuntu-latest` for x86_64, `ubuntu-24.04-arm` for ARM64)
-- ABI-scans both `ferrum-edge` and `ferrum-cni`, and runs the same digest-pinned AlmaLinux 9.4 / Ubuntu 22.04 smoke matrix as the versioned path
+**GNU ABI gate** (`verify-latest-linux-gnu-abi-aarch64`, main-push `latest` path):
+- ARM64 only, for the same reason. The x86_64 GNU floor is enforced inside `build-binaries` before `binary-x86_64-unknown-linux-gnu` exists.
+- Downloads `binary-aarch64-unknown-linux-gnu` on `ubuntu-24.04-arm`, re-checks its checksums, ABI-scans both `ferrum-edge` and `ferrum-cni`, and runs the same digest-pinned AlmaLinux 9.4 / Ubuntu 22.04 smoke matrix as the versioned path
 - `linux-gnu-abi-latest-gate` joins frozen `latest-release` with this job (`if: always()` on main pushes). The protected ARM64 policy freezes `latest-release.needs`, `build-arm64-cross`, and `main-publish-gate`, so ABI cannot be added there. On ABI failure the gate deletes `latest` only when that prerelease is proven to target the current `GITHUB_SHA`; it leaves an older known-good `latest` in place if the current publisher did not replace it. The workflow fails unless both verification and publication succeeded.
 
 **GNU ABI gate** (`verify-pr-linux-gnu-abi`, full-mode pull requests):
@@ -2744,7 +2795,7 @@ Depends on `Validate release SHA`, then builds optimized release binaries for al
 - Contents-read-only, pinned checkout/toolchain/images, exact output paths, not added to frozen publisher `needs`
 
 **Cross-Compilation**:
-- Linux ARM64 uses checksum-verified `cross` 0.2.5 in the isolated protected invocation job; `cross` requires Docker on the build host. Those artifacts already target an older glibc than GLIBC_2.34 and still pass through the versioned `verify-linux-gnu-abi` job above and, on the main-push `latest` path, `verify-latest-linux-gnu-abi`.
+- Linux ARM64 uses checksum-verified `cross` 0.2.5 in the isolated protected invocation job; `cross` requires Docker on the build host. Those artifacts already target an older glibc than GLIBC_2.34 and are re-checked as published by `verify-linux-gnu-abi-aarch64` and, on the main-push `latest` path, `verify-latest-linux-gnu-abi-aarch64`.
 - Other targets use standard `cargo build`; macOS x86_64 builds on the `macos-latest` runner (currently ARM64) with the standard Apple/Rust target tooling — pin to a concrete runner image such as `macos-14` if the host architecture must be guaranteed.
 
 **Output**:
@@ -2761,15 +2812,17 @@ Docker manifests have been pushed. Durable release publication still fails
 closed on attestation: `release-attestation-gate` requires
 `attest-release-images` to succeed and deletes the GitHub Release if
 attestation verification fails. Trusted Cross freezes `create-release.needs`,
-so attestation cannot be added there directly. The Linux GNU ABI contract is
-enforced the same way on the versioned path: `linux-gnu-abi-release-gate`
-requires `verify-linux-gnu-abi` to succeed (GLIBC_2.34 floor, AlmaLinux 8.10
-sysroot, `libgcc_s.so.1` / `libz.so.1` allowlist) and deletes the GitHub
-Release if that job did not succeed. The moving `latest` prerelease is gated
-separately by `linux-gnu-abi-latest-gate` after frozen `latest-release`: it
-requires `verify-latest-linux-gnu-abi` to succeed for both GNU architectures
-and deletes `latest` only when that prerelease is proven to target the current
-`GITHUB_SHA`.
+so attestation cannot be added there directly. The Linux GNU ABI contract
+does not need that shape for x86_64: the GLIBC_2.34 floor (AlmaLinux 8.10
+sysroot, `libgcc_s.so.1` / `libz.so.1` allowlist) is proven inside
+`build-release-binaries` on the staged, checksummed assets before they are
+uploaded, so an unverified x86_64 artifact never reaches publication at all.
+Only ARM64, whose producer and consumer `needs` are both frozen, is joined
+after the fact: `linux-gnu-abi-release-gate` requires
+`verify-linux-gnu-abi-aarch64` and deletes the GitHub Release if it did not
+succeed, and `linux-gnu-abi-latest-gate` does the same for the moving
+`latest` prerelease, deleting it only when it is proven to target the
+current `GITHUB_SHA`.
 
 **Release Content**:
 1. Release title: Version tag (e.g., `v0.2.0`)

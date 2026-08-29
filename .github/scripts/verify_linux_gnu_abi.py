@@ -294,8 +294,117 @@ def scan_assets(paths: list[Path], contract: dict[str, Any]) -> list[str]:
     return errors
 
 
-def workflow_contains(workflow: str, token: str) -> bool:
-    return token in workflow
+def _producer_job_errors(
+    workflow: str,
+    label: str,
+    job: str,
+    upload_name: str,
+) -> list[str]:
+    """Prove the published x86_64 GNU bytes are the pinned sysroot bytes.
+
+    One job per workflow compiles, checksums, and uploads the canonical
+    x86_64 GNU assets. The pinned AlmaLinux sysroot build, the ABI scan, and
+    the oldest-baseline smoke all live inside it and read the staged
+    `release-assets/` files, so the bytes that are scanned are the bytes that
+    are uploaded. There is no second build to disagree with.
+    """
+
+    errors: list[str] = []
+    body = _job_body(workflow, job)
+    if not body:
+        return [f"{label} is missing the x86_64 GNU producer job {job}"]
+
+    if "bash .github/scripts/build_linux_gnu_sysroot.sh" not in body:
+        errors.append(
+            f"{label} {job} must build the published x86_64 GNU binaries in "
+            "the pinned sysroot"
+        )
+    if "matrix.target == 'x86_64-unknown-linux-gnu'" not in body:
+        errors.append(
+            f"{label} {job} must select the pinned sysroot build with "
+            "matrix.target == 'x86_64-unknown-linux-gnu'"
+        )
+    if "matrix.target != 'x86_64-unknown-linux-gnu'" not in body:
+        errors.append(
+            f"{label} {job} must exclude the x86_64 GNU target from the "
+            "native runner compile"
+        )
+    for token in (
+        "python3 -I .github/scripts/verify_linux_gnu_abi.py --self-test",
+        "python3 -I .github/scripts/verify_linux_gnu_abi.py --check-contract",
+        "python3 -I .github/scripts/smoke_linux_gnu_baseline.py --self-test",
+        "sha256sum -c ferrum-edge-linux-x86_64.sha256",
+        "sha256sum -c ferrum-cni-linux-x86_64.sha256",
+        "release-assets/ferrum-edge-linux-x86_64",
+        "release-assets/ferrum-cni-linux-x86_64",
+        "bash .github/scripts/smoke_linux_gnu_baseline.sh",
+        "--edge release-assets/ferrum-edge-linux-x86_64",
+        "--cni release-assets/ferrum-cni-linux-x86_64",
+    ):
+        if token not in body:
+            errors.append(f"{label} {job} is missing required {token}")
+
+    if re.search(r"target/x86_64-unknown-linux-gnu/[^\s\\]*ferrum-(?:edge|cni)", body):
+        errors.append(
+            f"{label} {job} must gate the staged published assets, not a path "
+            "in a build tree"
+        )
+
+    scan_at = body.find("release-assets/ferrum-edge-linux-x86_64")
+    upload_at = body.find(f"name: {upload_name}")
+    if scan_at < 0 or upload_at < 0:
+        errors.append(
+            f"{label} {job} must scan the staged assets and upload {upload_name}"
+        )
+    elif scan_at > upload_at:
+        errors.append(
+            f"{label} {job} must gate the staged published assets before "
+            f"uploading {upload_name}"
+        )
+    return errors
+
+
+def _aarch64_verifier_errors(
+    workflow: str,
+    label: str,
+    job: str,
+    producer: str,
+    artifact: str,
+) -> list[str]:
+    """Prove the ARM64 gate reads the artifact the frozen Cross job published.
+
+    The ARM64 producer is frozen by trusted Cross policy, so its bytes cannot
+    be gated from inside it. They are downloaded, checksum-verified, and
+    scanned as published instead — never rebuilt.
+    """
+
+    errors: list[str] = []
+    body = _job_body(workflow, job)
+    if not body:
+        return [f"{label} is missing the ARM64 GNU ABI job {job}"]
+    if _job_needs(workflow, job) != {producer}:
+        errors.append(f"{label} {job} must need exactly {producer}")
+    if "runs-on: ubuntu-24.04-arm" not in body:
+        errors.append(f"{label} {job} must run on an ARM64 runner")
+    for token in (
+        f"name: {artifact}",
+        "sha256sum -c ferrum-edge-linux-aarch64.sha256",
+        "sha256sum -c ferrum-cni-linux-aarch64.sha256",
+        "gnu-artifacts/ferrum-edge-linux-aarch64",
+        "gnu-artifacts/ferrum-cni-linux-aarch64",
+        "python3 -I .github/scripts/verify_linux_gnu_abi.py --self-test",
+        "python3 -I .github/scripts/verify_linux_gnu_abi.py --check-contract",
+        "python3 -I .github/scripts/smoke_linux_gnu_baseline.py --self-test",
+        "bash .github/scripts/smoke_linux_gnu_baseline.sh",
+    ):
+        if token not in body:
+            errors.append(f"{label} {job} is missing required {token}")
+    if "build_linux_gnu_sysroot.sh" in body:
+        errors.append(
+            f"{label} {job} must scan the published ARM64 artifact, not a "
+            "rebuilt binary"
+        )
+    return errors
 
 
 def check_release_wiring(contract: dict[str, Any], release_yml: str, ci_yml: str) -> list[str]:
@@ -305,42 +414,56 @@ def check_release_wiring(contract: dict[str, Any], release_yml: str, ci_yml: str
     smoke_ubuntu = contract["smoke"]["ubuntu2204"]["image"]
     protoc_sha = contract["sysroot"]["protoc_sha256"]
 
+    # The pinned inputs live in .github/linux-gnu-abi.toml, which both hosted
+    # helpers read, so the workflows do not restate them. The contract itself
+    # is what must stay digest-pinned.
     for token, label in (
         (sysroot_image, "pinned GNU sysroot image"),
         (smoke_floor, "oldest-baseline smoke image"),
         (smoke_ubuntu, "Ubuntu 22.04 smoke image"),
-        (protoc_sha, "pinned protoc SHA-256"),
-        ("verify-linux-gnu-abi:", "verify-linux-gnu-abi job"),
-        (
-            "  verify-linux-gnu-abi:\n"
-            "    name: Verify Linux GNU ABI\n"
-            "    needs: [build-release-binaries, build-release-arm64-cross]\n",
-            "verify-linux-gnu-abi needs both GNU build jobs",
-        ),
-        ("linux-gnu-abi-release-gate:", "linux-gnu-abi-release-gate job"),
-        (
-            "    needs: [create-release, verify-linux-gnu-abi]\n",
-            "ABI join-gate needs",
-        ),
-        ("    needs: [create-release, attest-release-images]\n", "frozen attestation-gate needs"),
-        ("ubuntu-24.04-arm", "ARM64 GNU ABI/smoke runner"),
-        ("python3 -I .github/scripts/verify_linux_gnu_abi.py --self-test", "ABI self-test"),
-        ("python3 -I .github/scripts/verify_linux_gnu_abi.py --check-contract", "ABI contract check"),
-        ("python3 -I .github/scripts/smoke_linux_gnu_baseline.py --self-test", "baseline smoke self-test"),
-        ("bash .github/scripts/smoke_linux_gnu_baseline.sh", "baseline smoke invocation"),
-        ("build_linux_gnu_sysroot.sh", "sysroot build helper"),
-        ("LIBZ_SYS_STATIC=1", "static zlib for the GNU sysroot build"),
     ):
-        if not workflow_contains(release_yml, token):
-            errors.append(f"release.yml is missing required {label} ({token})")
+        if "@sha256:" not in token:
+            errors.append(f"{label} must be digest-pinned ({token})")
+    if len(protoc_sha) != 64 or any(c not in "0123456789abcdef" for c in protoc_sha):
+        errors.append("pinned protoc SHA-256 must be a 64-character hex digest")
+
+    errors.extend(
+        _producer_job_errors(
+            release_yml,
+            "release.yml",
+            "build-release-binaries",
+            "release-binaries-${{ matrix.target }}",
+        )
+    )
+    errors.extend(
+        _aarch64_verifier_errors(
+            release_yml,
+            "release.yml",
+            "verify-linux-gnu-abi-aarch64",
+            "build-release-arm64-cross",
+            "release-binaries-aarch64-unknown-linux-gnu",
+        )
+    )
+    if "  linux-gnu-abi-release-gate:\n" not in release_yml:
+        errors.append("release.yml is missing the linux-gnu-abi-release-gate job")
+    if _job_needs(release_yml, "linux-gnu-abi-release-gate") != {
+        "create-release",
+        "verify-linux-gnu-abi-aarch64",
+    }:
+        errors.append(
+            "release.yml linux-gnu-abi-release-gate must join create-release "
+            "and verify-linux-gnu-abi-aarch64"
+        )
+    if "    needs: [create-release, attest-release-images]\n" not in release_yml:
+        errors.append("release.yml changed the frozen attestation-gate needs")
 
     # Publication still consumes the historical GNU asset names.
     for asset in LINUX_GNU_ASSETS:
         if asset not in release_yml:
             errors.append(f"release.yml must keep publishing {asset}")
 
-    # Frozen create-release needs must not grow an ABI edge; the join gate is
-    # the admitted place to fail-close after those frozen jobs.
+    # Frozen create-release needs must not grow an ABI edge; the ARM64 join
+    # gate is the admitted place to fail-close after those frozen jobs.
     if (
         "needs: [build-release-binaries, build-release-arm64-cross, "
         "docker-manifest, docker-ebpf-manifest, docker-ebpf-tools-manifest]"
@@ -348,84 +471,66 @@ def check_release_wiring(contract: dict[str, Any], release_yml: str, ci_yml: str
     ):
         errors.append("release.yml changed the frozen create-release needs graph")
 
+    errors.extend(
+        _producer_job_errors(
+            ci_yml,
+            "ci.yml",
+            "build-binaries",
+            "binary-${{ matrix.target }}",
+        )
+    )
+    errors.extend(
+        _aarch64_verifier_errors(
+            ci_yml,
+            "ci.yml",
+            "verify-latest-linux-gnu-abi-aarch64",
+            "build-arm64-cross",
+            "binary-aarch64-unknown-linux-gnu",
+        )
+    )
+    if "  linux-gnu-abi-latest-gate:\n" not in ci_yml:
+        errors.append("ci.yml is missing the linux-gnu-abi-latest-gate job")
+    if _job_needs(ci_yml, "linux-gnu-abi-latest-gate") != {
+        "latest-release",
+        "verify-latest-linux-gnu-abi-aarch64",
+    }:
+        errors.append(
+            "ci.yml linux-gnu-abi-latest-gate must join latest-release and "
+            "verify-latest-linux-gnu-abi-aarch64"
+        )
     for token, label in (
-        (sysroot_image, "pinned GNU sysroot image"),
-        (smoke_floor, "oldest-baseline smoke image"),
-        (smoke_ubuntu, "Ubuntu 22.04 smoke image"),
-        (protoc_sha, "pinned protoc SHA-256"),
-        ("build_linux_gnu_sysroot.sh", "sysroot build helper"),
-        ("python3 -I .github/scripts/verify_linux_gnu_abi.py --self-test", "ABI self-test"),
-        ("python3 -I .github/scripts/verify_linux_gnu_abi.py --check-contract", "ABI contract check"),
-        ("python3 -I .github/scripts/smoke_linux_gnu_baseline.py --self-test", "baseline smoke self-test"),
-        ("bash .github/scripts/smoke_linux_gnu_baseline.sh", "baseline smoke invocation"),
-        ("LIBZ_SYS_STATIC=1", "static zlib for the GNU sysroot build"),
-        ("ubuntu-24.04-arm", "ARM64 GNU ABI/smoke runner"),
-        (
-            "  verify-latest-linux-gnu-abi:\n"
-            "    name: Verify latest Linux GNU ABI\n",
-            "verify-latest-linux-gnu-abi job",
-        ),
-        (
-            "    needs: [build-binaries, build-arm64-cross]\n",
-            "verify-latest-linux-gnu-abi needs both GNU build jobs",
-        ),
-        (
-            "          name: binary-x86_64-unknown-linux-gnu\n",
-            "latest-path x86_64 GNU artifact name",
-        ),
-        (
-            "          name: binary-aarch64-unknown-linux-gnu\n",
-            "latest-path ARM64 GNU artifact name",
-        ),
-        (
-            "  linux-gnu-abi-latest-gate:\n"
-            "    name: Gate latest release on Linux GNU ABI\n",
-            "linux-gnu-abi-latest-gate job",
-        ),
-        (
-            "    needs: [latest-release, verify-latest-linux-gnu-abi]\n",
-            "linux-gnu-abi-latest-gate join after latest-release",
-        ),
-        (
-            "    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'\n",
-            "linux-gnu-abi-latest-gate main-push fail-closed if",
-        ),
         ("targetCommitish", "latest retraction proves release target"),
         ("$GITHUB_SHA", "latest retraction proves current SHA"),
         (
-            'echo "::error::latest publication is blocked until verify-latest-linux-gnu-abi succeeds',
+            'echo "::error::latest publication is blocked until '
+            'verify-latest-linux-gnu-abi-aarch64 succeeds',
             "latest ABI fail-closed error",
         ),
         (
             'echo "::error::latest-release did not succeed',
             "latest publication fail-closed error",
         ),
-        (PR_LINUX_GNU_JOB_HEADER, "verify-pr-linux-gnu-abi job"),
-        ("build_linux_gnu_sysroot.sh", "sysroot build helper on the PR path"),
     ):
-        if not workflow_contains(ci_yml, token):
+        if token not in ci_yml:
             errors.append(f"ci.yml is missing required {label} ({token})")
 
-    # Frozen latest-release cannot gain an ABI needs edge; the join gate is
-    # the admitted place to fail-close after that frozen publisher.
+    # Frozen latest-release cannot gain an ABI needs edge; the ARM64 join gate
+    # is the admitted place to fail-close after that frozen publisher.
     if (
         "    needs: [test, build-binaries, build-arm64-cross, "
         "main-publish-gate]\n"
         not in ci_yml
     ):
         errors.append("ci.yml changed the frozen latest-release needs graph")
-    if "verify-latest-linux-gnu-abi" in _job_needs(ci_yml, "latest-release"):
-        errors.append("ci.yml must not add an ABI needs edge to frozen latest-release")
-    if "verify-linux-gnu-abi" in _job_needs(ci_yml, "main-publish-gate"):
-        errors.append("ci.yml must not add an ABI needs edge to frozen main-publish-gate")
-    if "verify-latest-linux-gnu-abi" in _job_needs(ci_yml, "build-arm64-cross"):
-        errors.append("ci.yml must not add an ABI needs edge to frozen build-arm64-cross")
-    if PR_LINUX_GNU_JOB in _job_needs(ci_yml, "latest-release"):
-        errors.append("ci.yml must not add the PR GNU ABI job to frozen latest-release")
-    if PR_LINUX_GNU_JOB in _job_needs(ci_yml, "main-publish-gate"):
-        errors.append("ci.yml must not add the PR GNU ABI job to frozen main-publish-gate")
-    if PR_LINUX_GNU_JOB in _job_needs(ci_yml, "build-arm64-cross"):
-        errors.append("ci.yml must not add the PR GNU ABI job to frozen build-arm64-cross")
+    for frozen_job in ("latest-release", "main-publish-gate", "build-arm64-cross"):
+        for additive in (
+            "verify-latest-linux-gnu-abi-aarch64",
+            PR_LINUX_GNU_JOB,
+        ):
+            if additive in _job_needs(ci_yml, frozen_job):
+                errors.append(
+                    f"ci.yml must not add {additive} to frozen {frozen_job}"
+                )
 
     errors.extend(check_pr_linux_gnu_job(ci_yml))
     return errors
@@ -504,10 +609,10 @@ def check_operator_docs(readme: str, cli_md: str, ci_cd_md: str, contract: dict[
                 errors.append(f"{label} must document {token}")
         if "ferrum-edge-linux-x86_64" not in text:
             errors.append(f"{label} must keep the GNU x86_64 artifact name")
-    for token in ("verify-linux-gnu-abi", "linux-gnu-abi-release-gate"):
+    for token in ("verify-linux-gnu-abi-aarch64", "linux-gnu-abi-release-gate"):
         if token not in ci_cd_md:
             errors.append(f"docs/ci_cd.md must document the versioned-release GNU ABI job {token}")
-    for token in ("verify-latest-linux-gnu-abi", "linux-gnu-abi-latest-gate"):
+    for token in ("verify-latest-linux-gnu-abi-aarch64", "linux-gnu-abi-latest-gate"):
         if token not in ci_cd_md:
             errors.append(f"docs/ci_cd.md must document the moving-latest GNU ABI job {token}")
     if "verify-pr-linux-gnu-abi" not in ci_cd_md:
@@ -827,13 +932,30 @@ def run_self_test() -> list[str]:
     ):
         failures.append("subprocess import in smoke self-test was not rejected")
 
-    mutated_release = RELEASE_YML.read_text(encoding="utf-8").replace(
-        contract["sysroot"]["image"], "almalinux:latest", 1
-    )
+    # The pinned build and smoke images live in .github/linux-gnu-abi.toml,
+    # which every hosted helper reads, so an unpinned tag is rejected there
+    # rather than by restating the digest in each workflow.
+    unpinned_contract = {
+        **contract,
+        "sysroot": {**contract["sysroot"], "image": "almalinux:latest"},
+    }
     if not check_release_wiring(
-        contract, mutated_release, CI_YML.read_text(encoding="utf-8")
+        unpinned_contract,
+        RELEASE_YML.read_text(encoding="utf-8"),
+        CI_YML.read_text(encoding="utf-8"),
     ):
-        failures.append("unpinned sysroot image in release.yml was not rejected")
+        failures.append("an unpinned GNU sysroot image was not rejected")
+
+    short_protoc_contract = {
+        **contract,
+        "sysroot": {**contract["sysroot"], "protoc_sha256": "deadbeef"},
+    }
+    if not check_release_wiring(
+        short_protoc_contract,
+        RELEASE_YML.read_text(encoding="utf-8"),
+        CI_YML.read_text(encoding="utf-8"),
+    ):
+        failures.append("an unpinned protoc checksum was not rejected")
 
     mutated_docs = README.read_text(encoding="utf-8").replace("GLIBC_2.34", "GLIBC_2.39", 1)
     if not check_operator_docs(
@@ -846,7 +968,9 @@ def run_self_test() -> list[str]:
 
     ci_yml = CI_YML.read_text(encoding="utf-8")
     mutated_latest_job = ci_yml.replace(
-        "verify-latest-linux-gnu-abi:", "verify-latest-linux-gnu-abi-missing:", 1
+        "verify-latest-linux-gnu-abi-aarch64:",
+        "verify-latest-linux-gnu-abi-missing:",
+        1,
     )
     if not check_release_wiring(contract, RELEASE_YML.read_text(encoding="utf-8"), mutated_latest_job):
         failures.append("missing latest GNU ABI job in ci.yml was not rejected")
@@ -866,7 +990,7 @@ def run_self_test() -> list[str]:
         failures.append("ABI needs edge on frozen latest-release was not rejected")
 
     mutated_ci_cd = CI_CD_MD.read_text(encoding="utf-8").replace(
-        "verify-latest-linux-gnu-abi", "verify-linux-gnu-abi-on-latest"
+        "verify-latest-linux-gnu-abi-aarch64", "verify-linux-gnu-abi-on-latest"
     )
     if not check_operator_docs(
         README.read_text(encoding="utf-8"),
@@ -958,6 +1082,48 @@ def run_self_test() -> list[str]:
     )
     if not check_pr_linux_gnu_job(mutated_pr_native):
         failures.append("PR GNU ABI job native cargo build fallback was not rejected")
+
+    release_yml = RELEASE_YML.read_text(encoding="utf-8")
+    producer_body = _job_body(release_yml, "build-release-binaries")
+    if not producer_body:
+        failures.append("release.yml x86_64 GNU producer job body is missing")
+    else:
+        mutated_native = release_yml.replace(
+            producer_body,
+            producer_body.replace(
+                "bash .github/scripts/build_linux_gnu_sysroot.sh",
+                "cargo build --features cloud-secrets --release "
+                "--target x86_64-unknown-linux-gnu",
+                1,
+            ),
+            1,
+        )
+        if not check_release_wiring(contract, mutated_native, ci_yml):
+            failures.append(
+                "a native x86_64 GNU release producer was not rejected"
+            )
+
+        mutated_rebuilt = release_yml.replace(
+            producer_body,
+            producer_body.replace(
+                "release-assets/ferrum-edge-linux-x86_64 \\\n",
+                "target/x86_64-unknown-linux-gnu/release/ferrum-edge \\\n",
+                1,
+            ),
+            1,
+        )
+        if not check_release_wiring(contract, mutated_rebuilt, ci_yml):
+            failures.append(
+                "a release producer that gates a rebuilt binary was not rejected"
+            )
+
+    mutated_arm_rebuild = release_yml.replace(
+        "  verify-linux-gnu-abi-aarch64:\n",
+        "  verify-linux-gnu-abi-aarch64-missing:\n",
+        1,
+    )
+    if not check_release_wiring(contract, mutated_arm_rebuild, ci_yml):
+        failures.append("a missing ARM64 GNU ABI job was not rejected")
 
     mutated_pr_docs = CI_CD_MD.read_text(encoding="utf-8").replace(
         "verify-pr-linux-gnu-abi", "verify-linux-gnu-abi-on-pr"

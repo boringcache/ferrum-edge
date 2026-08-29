@@ -12634,13 +12634,33 @@ CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
         "0586ab0b5b8b803f2ee3663b608c40caca06f9c92e58d4cb28c2080d68f23f27",
         "9c3d5b4dfbc6a209e801a47bceabd31fe8aa7df033d49989ad8f88a3e4ed73e7",
     ),
-    # `build-binaries` on the trusted base → PR #3916 (issue #3905), the
-    # merge-queue macOS compile-gate cost reduction, pinned against its
-    # latest-main-merged branch grok/issue-3905-merge-builds-r1.
+    # PR #3916's `build-binaries` pair is retired: its destination
+    # 14b0890e... is main's live value, so the tuple admitted a transition
+    # between two states main is not in and only widened what a pull request
+    # could claim.
+    #
+    # The two published x86_64 GNU producers on the trusted base → PR #4355
+    # (issue #4301). The moving `ubuntu-latest` image defined the runtime
+    # floor of every published generic Linux x86_64 binary, so the ONE cell
+    # that produces `binary-x86_64-unknown-linux-gnu` /
+    # `release-binaries-x86_64-unknown-linux-gnu` moves from a native
+    # `cargo build` to the digest-pinned AlmaLinux 8.10 sysroot builder and
+    # gains an ABI/oldest-baseline gate over the staged, checksummed assets it
+    # is about to upload. No other matrix cell, no `needs` edge, no artifact
+    # name, and no publishing job changes. The destination is additionally
+    # held to `linux_gnu_producer_contract_errors`, so the withheld surface
+    # cannot be spent on a producer that native-compiles x86_64 GNU or scans a
+    # separately rebuilt binary; the reverse pair is refused outright, which
+    # is what makes the move to the pinned sysroot one-way.
     (
         "build-binaries",
-        "3bc9e7da00d7033b550df36db00048373b959aea437506ac28e494947422eaec",
         "14b0890e2693cd0825fcf25ba7f48810b5ae9a33f2cbb5751bdaaf60186b83b1",
+        "e5a4f2ac007c1c26201ed59ec481e46c9c7a21160f250cdcfc4c5f212eb40426",
+    ),
+    (
+        "build-release-binaries",
+        "678699fb04a2319c5b7b706c8fdf05f0d4b58a30d07e023091499d27a88bbb9f",
+        "ec52e9b32bbdd1def962e2fe02acc8d1daf9404df853c9ca9d2c17cad5c35776",
     ),
 )
 
@@ -17263,6 +17283,257 @@ def pr_workflow_job_surfaces(
     return surfaces, failures
 
 
+# ---------------------------------------------------------------------------
+# Published GNU runtime-floor producer contract (issue #4301)
+# ---------------------------------------------------------------------------
+# The x86_64 GNU `ferrum-edge`/`ferrum-cni` assets the GitHub Release, the
+# `.sha256` sidecars, the moving `latest` prerelease, and the default
+# multi-arch container images all consume are produced by exactly one job per
+# workflow. Compiling that cell natively on the moving `ubuntu-latest` image
+# is what let the published runtime floor rise to GLIBC_2.39; scanning a
+# SEPARATELY rebuilt binary afterwards proves nothing about the bytes that
+# were published. Both failure modes are refused here, statically, from the
+# trusted base.
+#
+# The contract binds only once the repository references the pinned sysroot
+# builder, so the revision that predates adoption is unaffected and no
+# unrelated pull request is blocked while the two landings are in flight.
+# After adoption it is not escapable by deleting the builder reference: the
+# producer job would then have to return to text the surface comparison
+# already rejects, and returning to the exact retired generation is refused
+# outright by `ci_job_generation_transition_errors`.
+LINUX_GNU_SYSROOT_BUILDER = ".github/scripts/build_linux_gnu_sysroot.sh"
+LINUX_GNU_ABI_SCANNER = ".github/scripts/verify_linux_gnu_abi.py"
+LINUX_GNU_BASELINE_SMOKE = ".github/scripts/smoke_linux_gnu_baseline.sh"
+LINUX_GNU_X86_TARGET = "x86_64-unknown-linux-gnu"
+LINUX_GNU_X86_SELECTOR = f"matrix.target == '{LINUX_GNU_X86_TARGET}'"
+LINUX_GNU_X86_EXCLUSION = f"matrix.target != '{LINUX_GNU_X86_TARGET}'"
+LINUX_GNU_PUBLISHED_EDGE = "release-assets/ferrum-edge-linux-x86_64"
+LINUX_GNU_PUBLISHED_CNI = "release-assets/ferrum-cni-linux-x86_64"
+# The canonical artifact identity each workflow's producer owns. No other job
+# may name it on an upload step, so the scanned bytes and the published bytes
+# cannot be made to differ by a second uploader.
+LINUX_GNU_X86_PRODUCERS = {
+    "CI workflow": ("build-binaries", "binary-x86_64-unknown-linux-gnu"),
+    "release workflow": (
+        "build-release-binaries",
+        "release-binaries-x86_64-unknown-linux-gnu",
+    ),
+}
+# A native compile in the producer job. `cargo build`/`check`/`rustc` is the
+# whole vocabulary the guarded jobs use; anything else in an executable slot
+# is already a Cross surface and cannot be added at all.
+LINUX_GNU_NATIVE_COMPILE = re.compile(
+    r"(?<![A-Za-z0-9_-])cargo(?:\s+\+[^\s]+)?\s+(?:build|check|rustc)(?![A-Za-z0-9_-])"
+)
+# A binary handed to the ABI scanner or the baseline smoke from a build tree
+# instead of from the staged, checksummed publication directory.
+LINUX_GNU_REBUILT_OPERAND = re.compile(
+    r"(?<![\w/-])target/x86_64-unknown-linux-gnu/[^\s\\]*ferrum-(?:edge|cni)"
+)
+# The artifact upload inside a step's own text. `UPLOAD_ARTIFACT_ACTION` is
+# anchored at the start of a bare reference value, so it cannot be searched
+# against a whole step block.
+LINUX_GNU_UPLOAD_STEP = re.compile(r"uses:\s*actions/upload-artifact", re.IGNORECASE)
+# Event guards that keep a compile off every publishing path. A cell selected
+# by one of these builds a verification binary that is discarded, so it may
+# use the host toolchain for the x86_64 GNU target. This is a defence-in-depth
+# reading of the guard text, not the primary control: the producer job is
+# additionally held byte-for-byte to an admitted generation, so any other
+# spelling is a different job digest and is refused outright.
+LINUX_GNU_NON_PUBLISHING_EVENTS = (
+    "github.event_name == 'pull_request'",
+    "github.event_name == 'merge_group'",
+)
+
+
+def workflow_job_steps(
+    contents: str,
+    source: str,
+    job_name: str,
+) -> tuple[tuple[tuple[str, str], ...], list[str]]:
+    """Split one job's `steps:` list into `(name, text)` pairs, in order.
+
+    The step name is the `- name:` scalar when present and the empty string
+    otherwise, so an unnamed `- uses:` step is still returned in position.
+    """
+
+    steps_block, failures = extract_job_field_block(
+        contents,
+        source,
+        job_name,
+        "steps",
+        required=True,
+    )
+    if failures or steps_block is None:
+        return (), failures
+
+    lines = steps_block.splitlines(keepends=True)
+    starts = [index for index, line in enumerate(lines) if re.match(r"^      - ", line)]
+    steps: list[tuple[str, str]] = []
+    for position, start in enumerate(starts):
+        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
+        text = "".join(lines[start:end])
+        name = ""
+        for line in lines[start:end]:
+            match = re.match(r"^      (?:- )?name:(?P<value>.*)$", line)
+            if match is not None:
+                name = decode_yaml_scalar(match.group("value"))
+                break
+        steps.append((name, text))
+    return tuple(steps), []
+
+
+def step_condition(step_text: str) -> str:
+    """Return a step's `if:` expression text, or the empty string."""
+
+    match = re.search(r"(?m)^        if:(?P<value>.*)$", step_text)
+    return match.group("value").strip() if match is not None else ""
+
+
+def linux_gnu_producer_contract_errors(
+    contents: str,
+    source: str,
+    label: str,
+    *,
+    producers: dict[str, tuple[str, str]] | None = None,
+) -> list[str]:
+    """Require the published x86_64 GNU bytes to be the pinned sysroot bytes.
+
+    `producers` is a keyword parameter so the self-test can drive the
+    production checks with fixtures it can construct. Production always passes
+    the module binding, and no repository input reaches it.
+    """
+
+    table = LINUX_GNU_X86_PRODUCERS if producers is None else producers
+    entry = table.get(source)
+    if entry is None:
+        return []
+    if LINUX_GNU_SYSROOT_BUILDER not in contents:
+        # Pre-adoption revision. Nothing claims the floor yet, so there is no
+        # producer contract to hold this revision to.
+        return []
+    job_name, artifact_name = entry
+    steps, failures = workflow_job_steps(contents, label, job_name)
+    if failures:
+        return failures
+
+    errors: list[str] = []
+    sysroot_steps = [
+        (index, name, text)
+        for index, (name, text) in enumerate(steps)
+        if LINUX_GNU_SYSROOT_BUILDER in text
+    ]
+    if len(sysroot_steps) != 1:
+        errors.append(
+            f"{label} job {job_name!r} must build the published x86_64 GNU "
+            "binaries in the pinned sysroot exactly once"
+        )
+    else:
+        _, _, sysroot_text = sysroot_steps[0]
+        if LINUX_GNU_X86_SELECTOR not in step_condition(sysroot_text):
+            errors.append(
+                f"{label} job {job_name!r} must run the pinned sysroot builder "
+                f"under {LINUX_GNU_X86_SELECTOR!r}"
+            )
+
+    for name, text in steps:
+        if LINUX_GNU_NATIVE_COMPILE.search(text) is None:
+            continue
+        condition = step_condition(text)
+        if LINUX_GNU_X86_EXCLUSION in condition:
+            continue
+        if any(event in condition for event in LINUX_GNU_NON_PUBLISHING_EVENTS):
+            # A verification-only cell. It publishes nothing, so its host
+            # toolchain cannot reach a released artifact.
+            continue
+        errors.append(
+            f"{label} job {job_name!r} step {name!r} may not compile the "
+            f"x86_64 GNU target on the runner; guard it with "
+            f"{LINUX_GNU_X86_EXCLUSION!r}"
+        )
+
+    scan_steps = [
+        (index, name, text)
+        for index, (name, text) in enumerate(steps)
+        if LINUX_GNU_ABI_SCANNER in text and LINUX_GNU_PUBLISHED_EDGE in text
+    ]
+    if len(scan_steps) != 1:
+        errors.append(
+            f"{label} job {job_name!r} must ABI-scan the staged published "
+            f"assets ({LINUX_GNU_PUBLISHED_EDGE}) exactly once"
+        )
+    else:
+        scan_index, _, scan_text = scan_steps[0]
+        for required in (
+            LINUX_GNU_PUBLISHED_CNI,
+            LINUX_GNU_BASELINE_SMOKE,
+            f"--edge {LINUX_GNU_PUBLISHED_EDGE}",
+            f"--cni {LINUX_GNU_PUBLISHED_CNI}",
+        ):
+            if required not in scan_text:
+                errors.append(
+                    f"{label} job {job_name!r} must scan and smoke the staged "
+                    f"published assets ({required} is missing)"
+                )
+        if LINUX_GNU_X86_SELECTOR not in step_condition(scan_text):
+            errors.append(
+                f"{label} job {job_name!r} must run the published-asset ABI "
+                f"gate under {LINUX_GNU_X86_SELECTOR!r}"
+            )
+        upload_indexes = [
+            index
+            for index, (_, text) in enumerate(steps)
+            if LINUX_GNU_UPLOAD_STEP.search(text) is not None
+        ]
+        if not upload_indexes:
+            errors.append(
+                f"{label} job {job_name!r} must upload the canonical "
+                f"{artifact_name} artifact"
+            )
+        elif scan_index > min(upload_indexes):
+            errors.append(
+                f"{label} job {job_name!r} must scan the staged published "
+                "assets before uploading them"
+            )
+
+    producer_block, block_failures = extract_job_block(
+        contents,
+        label,
+        job_name,
+        required=True,
+    )
+    if block_failures:
+        return [*errors, *block_failures]
+    assert producer_block is not None
+    if LINUX_GNU_REBUILT_OPERAND.search(producer_block) is not None:
+        errors.append(
+            f"{label} job {job_name!r} must scan the staged published assets, "
+            "not a path in a build tree"
+        )
+
+    # One artifact identity. A second uploader could publish bytes the
+    # producer's gate never read, so the canonical artifact name is refused
+    # everywhere outside the producer job.
+    block_start = contents.find(producer_block)
+    if block_start < 0:
+        return [
+            *errors,
+            f"{label} producer job {job_name!r} cannot be isolated",
+        ]
+    outside = (
+        contents[:block_start] + contents[block_start + len(producer_block) :]
+    )
+    outside_lines = outside.splitlines()
+    for index, uploaded in upload_artifact_steps(outside_lines, 0, len(outside_lines)):
+        if artifact_name in uploaded:
+            errors.append(
+                f"{label} line {index + 1} may not upload the canonical "
+                f"{artifact_name} artifact outside job {job_name!r}"
+            )
+    return errors
+
+
 def compare_pr_workflow_job(
     merge_base_contents: str,
     proposed_contents: str,
@@ -17482,6 +17753,16 @@ def compare_pr_workflow_job(
             merge_base_contents,
             proposed_contents,
             source,
+        )
+    )
+    # Absolute, not comparative: once the repository claims a GNU runtime
+    # floor, the proposed revision itself must show that the published x86_64
+    # GNU bytes are the pinned sysroot bytes its own gate read.
+    errors.extend(
+        linux_gnu_producer_contract_errors(
+            proposed_contents,
+            source,
+            f"proposed {source}",
         )
     )
     return errors
@@ -29186,6 +29467,151 @@ pre_build = []
             failures.append(
                 f"nested Cargo configuration {nested_config!r} was not rejected"
             )
+
+    # ------------------------------------------------------------------
+    # Published GNU runtime-floor producer contract (issue #4301)
+    # ------------------------------------------------------------------
+    gnu_producers = {"CI workflow": ("build-binaries", "binary-x86_64-unknown-linux-gnu")}
+    gnu_pre_adoption = (
+        "jobs:\n"
+        "  build-binaries:\n"
+        "    name: Build\n"
+        "    steps:\n"
+        "      - name: Build release binary\n"
+        "        if: github.event_name == 'push'\n"
+        "        run: cargo build --release --target ${{ matrix.target }}\n"
+        "\n"
+        "      - name: Upload artifacts\n"
+        "        uses: actions/upload-artifact"
+        "@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7\n"
+        "        with:\n"
+        "          name: binary-${{ matrix.target }}\n"
+        "          path: release-assets/\n"
+    )
+    if linux_gnu_producer_contract_errors(
+        gnu_pre_adoption,
+        "CI workflow",
+        "self-test/ci.yml",
+        producers=gnu_producers,
+    ):
+        failures.append(
+            "a revision that predates the GNU runtime floor was rejected"
+        )
+    if linux_gnu_producer_contract_errors(
+        gnu_pre_adoption,
+        "workflow directory",
+        "self-test/other.yml",
+        producers=gnu_producers,
+    ):
+        failures.append("an unguarded workflow source was held to the GNU floor")
+
+    gnu_scan_step = (
+        "      - name: Verify published x86_64 GNU ABI floor\n"
+        "        if: matrix.target == 'x86_64-unknown-linux-gnu'\n"
+        "        run: |\n"
+        "          python3 -I .github/scripts/verify_linux_gnu_abi.py \\\n"
+        "            release-assets/ferrum-edge-linux-x86_64 \\\n"
+        "            release-assets/ferrum-cni-linux-x86_64\n"
+        "          bash .github/scripts/smoke_linux_gnu_baseline.sh \\\n"
+        "            --edge release-assets/ferrum-edge-linux-x86_64 \\\n"
+        "            --cni release-assets/ferrum-cni-linux-x86_64\n"
+    )
+    gnu_upload_step = (
+        "      - name: Upload artifacts\n"
+        "        uses: actions/upload-artifact"
+        "@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7\n"
+        "        with:\n"
+        "          name: binary-${{ matrix.target }}\n"
+        "          path: release-assets/\n"
+    )
+    gnu_adopted = (
+        "jobs:\n"
+        "  build-binaries:\n"
+        "    name: Build\n"
+        "    steps:\n"
+        "      - name: Build PR verification binary\n"
+        "        if: github.event_name == 'pull_request'\n"
+        "        run: cargo build --profile pr-build --target ${{ matrix.target }}\n"
+        "\n"
+        "      - name: Build release binary\n"
+        "        if: github.event_name == 'push' && matrix.target != "
+        "'x86_64-unknown-linux-gnu'\n"
+        "        run: cargo build --release --target ${{ matrix.target }}\n"
+        "\n"
+        "      - name: Build x86_64 GNU release binaries in the pinned sysroot\n"
+        "        if: github.event_name == 'push' && matrix.target == "
+        "'x86_64-unknown-linux-gnu'\n"
+        "        run: bash .github/scripts/build_linux_gnu_sysroot.sh\n"
+        "\n" + gnu_scan_step + "\n" + gnu_upload_step
+    )
+    if linux_gnu_producer_contract_errors(
+        gnu_adopted,
+        "CI workflow",
+        "self-test/ci.yml",
+        producers=gnu_producers,
+    ):
+        failures.append("the pinned-sysroot GNU producer contract was rejected")
+
+    gnu_tampering = {
+        "native x86_64 GNU compile": (
+            "        if: github.event_name == 'push' && matrix.target != "
+            "'x86_64-unknown-linux-gnu'\n"
+            "        run: cargo build --release --target ${{ matrix.target }}\n",
+            "        if: github.event_name == 'push'\n"
+            "        run: cargo build --release --target ${{ matrix.target }}\n",
+        ),
+        "unselected sysroot build": (
+            "        if: github.event_name == 'push' && matrix.target == "
+            "'x86_64-unknown-linux-gnu'\n"
+            "        run: bash .github/scripts/build_linux_gnu_sysroot.sh\n",
+            "        if: github.event_name == 'push'\n"
+            "        run: bash .github/scripts/build_linux_gnu_sysroot.sh\n",
+        ),
+        "scan of a separately rebuilt binary": (
+            "            release-assets/ferrum-edge-linux-x86_64 \\\n"
+            "            release-assets/ferrum-cni-linux-x86_64\n",
+            "            target/x86_64-unknown-linux-gnu/release/ferrum-edge \\\n"
+            "            target/x86_64-unknown-linux-gnu/release/ferrum-cni\n",
+        ),
+        "publication before the ABI gate": (
+            gnu_scan_step + "\n" + gnu_upload_step,
+            gnu_upload_step + "\n" + gnu_scan_step,
+        ),
+        "second canonical uploader": (
+            gnu_upload_step,
+            gnu_upload_step
+            + "\n"
+            + "  republish:\n"
+            + "    name: Republish\n"
+            + "    steps:\n"
+            + "      - name: Upload artifacts\n"
+            + "        uses: actions/upload-artifact"
+            + "@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7\n"
+            + "        with:\n"
+            + "          name: binary-x86_64-unknown-linux-gnu\n"
+            + "          path: elsewhere/\n",
+        ),
+        "unguarded published-asset gate": (
+            "      - name: Verify published x86_64 GNU ABI floor\n"
+            "        if: matrix.target == 'x86_64-unknown-linux-gnu'\n",
+            "      - name: Verify published x86_64 GNU ABI floor\n"
+            "        if: always()\n",
+        ),
+    }
+    for tamper_name, (original, replacement) in gnu_tampering.items():
+        tampered = gnu_adopted.replace(original, replacement)
+        if tampered == gnu_adopted:
+            failures.append(
+                f"the {tamper_name} GNU producer self-test mutation is stale"
+            )
+            continue
+        if not linux_gnu_producer_contract_errors(
+            tampered,
+            "CI workflow",
+            "self-test/ci.yml",
+            producers=gnu_producers,
+        ):
+            failures.append(f"a GNU producer with {tamper_name} was not rejected")
 
     return failures
 
