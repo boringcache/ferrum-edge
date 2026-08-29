@@ -609,12 +609,10 @@ mod installation_ownership_tests {
         clear_installed_for_test();
 
         let shared_index = Arc::new(NodeLocalEnrolledDestinations::new());
-        let guard_a =
-            InstalledEnrolledDestinationsGuard::install(Arc::clone(&shared_index));
+        let guard_a = InstalledEnrolledDestinationsGuard::install(Arc::clone(&shared_index));
         let token_a = Arc::as_ptr(&guard_a.token);
 
-        let guard_b =
-            InstalledEnrolledDestinationsGuard::install(Arc::clone(&shared_index));
+        let guard_b = InstalledEnrolledDestinationsGuard::install(Arc::clone(&shared_index));
         let token_b = Arc::as_ptr(&guard_b.token);
         assert_ne!(
             token_a, token_b,

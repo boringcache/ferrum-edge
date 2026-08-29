@@ -1727,7 +1727,9 @@ mod tests {
         let leaf = dir.path().join("8ba7b810-9dad-11d1-80b4-00c04fd430c8");
         std::os::unix::fs::symlink(dir.path().join("absent"), &leaf).unwrap();
         assert!(
-            DirectoryCaptureSource::new(dir.path()).list_complete_targets().is_err(),
+            DirectoryCaptureSource::new(dir.path())
+                .list_complete_targets()
+                .is_err(),
             "a symlinked entry is refused, never mistaken for a withdrawn pod"
         );
     }
