@@ -7606,6 +7606,7 @@ fn injected_batch_reference_check_error(namespace: &str) -> Option<anyhow::Error
 /// Map a batch reference-check `Err` onto the same 503 body used by
 /// `batch_existing_resource_conflict`. A genuine miss (`Ok(false)`) stays
 /// on the 400 `validation_errors` path (issue #4377).
+#[allow(clippy::result_large_err)]
 fn batch_reference_lookup<T>(
     namespace: &str,
     result: Result<T, anyhow::Error>,
