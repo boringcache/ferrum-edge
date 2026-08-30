@@ -214,7 +214,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   precedence before Ferrum's header-map guard ran; the same fields in CL-first
   order returned `400`. Plaintext and TLS proxy HTTP/1 frontends now observe
   bounded raw request heads before parsing and carry the CL+TE fact into the
-  existing `400` rejection path. The observer is case-insensitive, survives
+  existing `400` rejection path, which closes the client connection as required
+  by RFC 9112 §6.1. The observer is case-insensitive, survives
   leading empty lines, split reads, and keep-alive bodies, allocates only once
   per connection, and disables itself for HTTP/2 and after an HTTP/1 `101`
   upgrade.

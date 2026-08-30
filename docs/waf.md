@@ -24,13 +24,14 @@ concerns are handled by dedicated layers and the WAF does not duplicate them:
 | Response security headers | `security_headers` |
 
 On plaintext and TLS proxy frontends, HTTP/1 requests that carry both
-`Content-Length` and `Transfer-Encoding` are rejected with `400` independently
-of field order or casing. Enforcement starts in the proxy frontend I/O adapter,
-which observes each bounded raw request head before Hyper applies
-transfer-coding precedence, and finishes in the shared
-`check_protocol_headers()` rejection path before routing. The admin and injector
-HTTP listeners do not use this adapter. HTTP/2 and HTTP/3 do not use this wire
-observer; their existing protocol-specific TE validation is unchanged.
+`Content-Length` and `Transfer-Encoding` are rejected with `400` and the client
+connection is closed, independently of field order or casing. Enforcement
+starts in the proxy frontend I/O adapter, which observes each bounded raw
+request head before Hyper applies transfer-coding precedence, and finishes in
+the shared `check_protocol_headers()` rejection path before routing. The admin
+and injector HTTP listeners do not use this adapter. HTTP/2 and HTTP/3 do not
+use this wire observer; their existing protocol-specific TE validation is
+unchanged.
 
 The WAF focuses on injection and disclosure signatures: SQLi, NoSQLi, command
 injection, XSS, SSTI, JNDI/Log4Shell, path traversal, LFI, RFI, SSRF, XXE,

@@ -978,6 +978,38 @@ mod tests {
     }
 
     #[test]
+    fn rejected_nonempty_chunk_keeps_pipelined_signal_counters_aligned() {
+        let wire = b"POST /first HTTP/1.1\r\n\
+                     Host: a\r\n\
+                     Transfer-Encoding: chunked\r\n\
+                     Content-Length: 6\r\n\
+                     \r\n\
+                     6\r\nhello!\r\n0\r\n\r\n\
+                     GET /second HTTP/1.1\r\n\
+                     Host: a\r\n\
+                     \r\n";
+        let signals = H1FramingSignals::new();
+        let mut scanner = WireScanner::new(TEST_MAX_HEAD_BYTES);
+        scanner.observe(wire, &signals);
+
+        // The observer advances over the raw body independently of whether the
+        // service polls Hyper's Incoming body. It publishes both heads before
+        // either service invocation consumes its connection-local signal.
+        assert_eq!(signals.produced.load(Ordering::Acquire), 2);
+        assert_eq!(signals.consumed.load(Ordering::Acquire), 0);
+        assert_eq!(signals.next_conflict(), H1FramingResult::Conflict);
+        assert_eq!(signals.produced.load(Ordering::Acquire), 2);
+        assert_eq!(signals.consumed.load(Ordering::Acquire), 1);
+        assert_eq!(signals.next_conflict(), H1FramingResult::Clear);
+        assert_eq!(
+            signals.produced.load(Ordering::Acquire),
+            signals.consumed.load(Ordering::Acquire)
+        );
+        assert!(!signals.overflowed.load(Ordering::Acquire));
+        assert!(!signals.unknown.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn trailer_budget_matches_hyper_when_head_limit_is_smaller() {
         let mut wire =
             b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: ".to_vec();

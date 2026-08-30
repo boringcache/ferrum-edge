@@ -759,6 +759,18 @@ async fn functional_protocol_validation_te_then_cl_rejected_across_wire_shapes()
     let te_then_cl_resp = send_raw_h1(h.proxy_port, te_then_cl).await;
     assert_eq!(te_then_cl_resp.status_code, 400);
     assert_eq!(te_then_cl_resp.body, ERROR_BODY);
+    assert_eq!(raw_header(&te_then_cl_resp, "connection"), Some("close"));
+
+    let cl_then_te = b"POST / HTTP/1.1\r\n\
+                       Host: app.example\r\n\
+                       Content-Length: 6\r\n\
+                       Transfer-Encoding: chunked\r\n\
+                       \r\n\
+                       0\r\n\r\n";
+    let cl_then_te_resp = send_raw_h1(h.proxy_port, cl_then_te).await;
+    assert_eq!(cl_then_te_resp.status_code, 400);
+    assert_eq!(cl_then_te_resp.body, ERROR_BODY);
+    assert_eq!(raw_header(&cl_then_te_resp, "connection"), Some("close"));
 
     let lowercase_te = b"POST / HTTP/1.1\r\n\
                          Host: app.example\r\n\
@@ -870,10 +882,12 @@ async fn functional_protocol_validation_nonempty_rejected_chunk_closes_pipeline(
     let first = read_raw_h1_response(&mut reader).await;
     assert_eq!(first.status_code, 400);
     assert_eq!(first.body, ERROR_BODY);
+    assert_eq!(raw_header(&first, "connection"), Some("close"));
 
-    // Hyper polls an unread body decoder once before deciding whether to keep
-    // the connection alive. A non-empty first chunk is returned by that poll,
-    // so Hyper closes instead of dispatching the buffered second request.
+    // Hyper can buffer the non-empty DATA frame before the service rejects the
+    // request, then drain the terminating chunk and preserve keep-alive after
+    // the service drops the unread body. RFC 9112 §6.1 requires the explicit
+    // close so the buffered second request is never dispatched.
     let mut trailing = [0u8; 1];
     let close_result =
         tokio::time::timeout(Duration::from_secs(2), reader.read(&mut trailing)).await;

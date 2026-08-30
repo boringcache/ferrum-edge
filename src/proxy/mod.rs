@@ -6676,6 +6676,30 @@ struct RequestConnectionMetadata {
         Option<crate::proxy::auth_lifetime::AuthorizationConnectionCloser>,
 }
 
+/// RFC 9112 §6.1 requires closing after any HTTP/1 CL+TE response, even
+/// when Hyper drained the body according to Transfer-Encoding. A peer honoring
+/// Content-Length could place the next request boundary elsewhere, so no
+/// response path may leave a known-conflicting connection reusable.
+#[inline]
+fn apply_h1_framing_connection_close(
+    response: &mut Result<Response<ProxyBody>, hyper::Error>,
+    framing_result: h1_framing_guard::H1FramingResult,
+) {
+    if !matches!(
+        framing_result,
+        h1_framing_guard::H1FramingResult::Conflict
+    ) {
+        return;
+    }
+    let Ok(response) = response else {
+        return;
+    };
+    response.headers_mut().insert(
+        hyper::header::CONNECTION,
+        hyper::header::HeaderValue::from_static("close"),
+    );
+}
+
 fn empty_svid_bundle_slot() -> SharedSvidBundle {
     Arc::new(ArcSwap::new(Arc::new(None)))
 }
@@ -13531,7 +13555,7 @@ async fn handle_connection(
             authorization_connection_closer: Some(authorization_closer.clone()),
         };
         async move {
-            let response = handle_proxy_request_on_frontend_port(
+            let mut response = handle_proxy_request_on_frontend_port(
                 req,
                 state,
                 addr,
@@ -13542,6 +13566,7 @@ async fn handle_connection(
                 connection_metadata,
             )
             .await;
+            apply_h1_framing_connection_close(&mut response, http1_framing_result);
             let switched_protocols = response
                 .as_ref()
                 .is_ok_and(|response| response.status() == StatusCode::SWITCHING_PROTOCOLS);
@@ -21505,7 +21530,7 @@ async fn handle_tls_connection(
             authorization_connection_closer: Some(authorization_closer.clone()),
         };
         async move {
-            let response = handle_proxy_request_on_frontend_port(
+            let mut response = handle_proxy_request_on_frontend_port(
                 req,
                 state,
                 addr,
@@ -21516,6 +21541,7 @@ async fn handle_tls_connection(
                 connection_metadata,
             )
             .await;
+            apply_h1_framing_connection_close(&mut response, http1_framing_result);
             let switched_protocols = response
                 .as_ref()
                 .is_ok_and(|response| response.status() == StatusCode::SWITCHING_PROTOCOLS);
