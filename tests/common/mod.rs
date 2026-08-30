@@ -82,10 +82,11 @@ pub use echo_servers::{
     spawn_udp_echo,
 };
 pub use gateway_harness::{
-    DbType, GatewayMode, GatewaySpawnFailure, TestGateway, TestGatewayBuilder,
-    captured_output_reports_listener_addr_in_use, configure_coverage_gateway_command,
-    ensure_gateway_built, ephemeral_port, explicit_test_binary, probe_gateway_identity,
-    scrub_gateway_capture_for_diagnostics, shutdown_gateway_child,
+    DbType, GatewayMode, GatewaySpawnFailure, SpawnedGatewayIdentity, TestGateway,
+    TestGatewayBuilder, captured_output_reports_listener_addr_in_use,
+    configure_coverage_gateway_command, ensure_gateway_built, ephemeral_port, explicit_test_binary,
+    probe_gateway_identity, scrub_gateway_capture_for_diagnostics, shutdown_gateway_child,
+    wait_for_owned_gateway_identity,
 };
 pub use hmac_helpers::{
     HmacV2Request, content_digest_sha256_header, empty_digest_header, generate_hmac_signature,

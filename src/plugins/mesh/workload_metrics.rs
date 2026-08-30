@@ -23,9 +23,9 @@ use crate::modes::mesh::metric_tag_cel::{
 };
 use crate::plugins::mesh::CUSTOM_TRACE_ATTRIBUTES_METADATA;
 use crate::plugins::mesh::authz::{
-    IGNORED_UDP_SOURCE_SCOPE_METADATA, TrustedAssertor, is_trusted_hbone_assertor,
-    mesh_authz_destination_port, mesh_stream_authz_destination_port, parse_trust_domain_aliases,
-    parse_trusted_hbone_assertors,
+    HboneBaggageHonor, IGNORED_UDP_SOURCE_SCOPE_METADATA, TrustedAssertorIndex,
+    hbone_baggage_honor, merge_hbone_baggage_honor, mesh_authz_destination_port,
+    mesh_stream_authz_destination_port, parse_trust_domain_aliases, parse_trusted_hbone_assertors,
 };
 use crate::plugins::mesh::prometheus_helpers::{
     MESH_METRICS_DISABLED_METADATA, MESH_WORKLOAD_METRICS_OBSERVED_METADATA, MeshMetricFamily,
@@ -152,6 +152,128 @@ impl Default for DirectionEmit {
     }
 }
 
+/// Internal injection field: exact copy of every enabled global `mesh_authz`
+/// baggage gate PluginCache will execute. Absent = the plugin's own
+/// single-gate `trusted_hbone_assertors` / `trust_domain_aliases` config
+/// (direct / user-created instances). Present = fail-closed conjunction of
+/// those compiled gates. Not an operator-facing schema field.
+pub const EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY: &str = "_effective_mesh_authz_baggage_gates";
+
+/// Hard cap on injected/configured effective authz gates. Construction fails
+/// closed above this; request-time evaluation scales only with this bound,
+/// never with unrelated assertor inventory.
+pub const MAX_EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES: usize = 16;
+
+const EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATE_KEYS: &[&str] =
+    &["trusted_hbone_assertors", "trust_domain_aliases"];
+
+/// One compiled `mesh_authz` baggage gate: the same
+/// [`TrustedAssertorIndex`] + alias list authorization uses.
+#[derive(Default)]
+struct BaggageTrustGate {
+    trusted_hbone_assertors: TrustedAssertorIndex,
+    trust_domain_aliases: Vec<TrustDomain>,
+}
+
+impl BaggageTrustGate {
+    fn from_config(config: &Value) -> Result<Self, String> {
+        Ok(Self {
+            trusted_hbone_assertors: parse_trusted_hbone_assertors(config)?,
+            trust_domain_aliases: parse_trust_domain_aliases(config)?,
+        })
+    }
+
+    fn honor(&self, peer: &SpiffeId, asserted: &SpiffeId) -> HboneBaggageHonor {
+        hbone_baggage_honor(
+            &self.trusted_hbone_assertors,
+            &self.trust_domain_aliases,
+            peer,
+            asserted,
+        )
+    }
+}
+
+/// Compiled telemetry baggage policy. `Single` is the backward-compatible
+/// direct-plugin path. `Conjunctive` mirrors every enabled global mesh_authz
+/// gate; honor requires every gate to honor.
+enum BaggageTrustPolicy {
+    Single(BaggageTrustGate),
+    Conjunctive(Box<[BaggageTrustGate]>),
+}
+
+impl Default for BaggageTrustPolicy {
+    fn default() -> Self {
+        Self::Single(BaggageTrustGate::default())
+    }
+}
+
+impl BaggageTrustPolicy {
+    fn from_config(config: &Value) -> Result<Self, String> {
+        match config.get(EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY) {
+            None => Ok(Self::Single(BaggageTrustGate::from_config(config)?)),
+            Some(Value::Array(gates)) => {
+                if gates.is_empty() {
+                    return Err(format!(
+                        "{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY} must contain at least one gate"
+                    ));
+                }
+                if gates.len() > MAX_EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES {
+                    return Err(format!(
+                        "{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY} exceeds \
+                         {MAX_EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES} gates"
+                    ));
+                }
+                let compiled: Result<Vec<BaggageTrustGate>, String> = gates
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, gate)| parse_effective_authz_baggage_gate(idx, gate))
+                    .collect();
+                Ok(Self::Conjunctive(compiled?.into_boxed_slice()))
+            }
+            Some(_) => Err(format!(
+                "{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY} must be an array of objects"
+            )),
+        }
+    }
+
+    fn honor(&self, peer: &SpiffeId, asserted: &SpiffeId) -> HboneBaggageHonor {
+        match self {
+            Self::Single(gate) => gate.honor(peer, asserted),
+            Self::Conjunctive(gates) => {
+                let mut outcome = HboneBaggageHonor::Honored;
+                for gate in gates.iter() {
+                    outcome = merge_hbone_baggage_honor(outcome, gate.honor(peer, asserted));
+                }
+                if gates.is_empty() {
+                    HboneBaggageHonor::UntrustedAssertor
+                } else {
+                    outcome
+                }
+            }
+        }
+    }
+}
+
+fn parse_effective_authz_baggage_gate(
+    idx: usize,
+    gate: &Value,
+) -> Result<BaggageTrustGate, String> {
+    let Some(object) = gate.as_object() else {
+        return Err(format!(
+            "{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY}[{idx}] must be an object"
+        ));
+    };
+    crate::util::unknown_keys::reject_unknown_keys(
+        object,
+        &format!("{EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY}[{idx}]"),
+        EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATE_KEYS,
+        "workload_metrics: ",
+    )?;
+    BaggageTrustGate::from_config(gate).map_err(|e| {
+        format!("workload_metrics: {EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY}[{idx}]: {e}")
+    })
+}
+
 #[derive(Default)]
 pub struct WorkloadMetrics {
     node_id: Option<String>,
@@ -159,13 +281,10 @@ pub struct WorkloadMetrics {
     namespace: Option<String>,
     workload_spiffe_id: Option<SpiffeId>,
     labels: HashMap<String, String>,
-    trust_domain_aliases: Vec<TrustDomain>,
-    /// HBONE trusted-assertor allow-list. Baggage `source.principal` is honored
-    /// only when the authenticated peer matches this list (default
-    /// ztunnel/waypoint), mirroring `mesh_authz` so telemetry attribution can
-    /// never diverge from the authorization decision. Empty = no peer may
-    /// assert baggage (fail closed).
-    trusted_hbone_assertors: Vec<TrustedAssertor>,
+    /// Compiled HBONE baggage trust policy. Direct instances use a single
+    /// gate from this plugin's own config; mesh injection supplies a
+    /// conjunctive set mirroring every enabled global `mesh_authz`.
+    baggage_trust: BaggageTrustPolicy,
     /// Tracing sampling percentage 0.0–100.0 (from Telemetry CRD).
     sampling_percentage: Option<f64>,
     /// Custom tags injected into every transaction's metadata.
@@ -246,10 +365,13 @@ impl WorkloadMetrics {
                     .collect()
             })
             .unwrap_or_default();
-        let trust_domain_aliases =
-            parse_trust_domain_aliases(config).map_err(|e| format!("workload_metrics: {e}"))?;
-        let trusted_hbone_assertors =
-            parse_trusted_hbone_assertors(config).map_err(|e| format!("workload_metrics: {e}"))?;
+        let baggage_trust = BaggageTrustPolicy::from_config(config).map_err(|e| {
+            if e.starts_with("workload_metrics:") {
+                e
+            } else {
+                format!("workload_metrics: {e}")
+            }
+        })?;
         let sampling_percentage = match config.get("sampling_percentage") {
             Some(value) => {
                 let Some(percentage) = value.as_f64() else {
@@ -349,8 +471,7 @@ impl WorkloadMetrics {
             namespace: string_config(config, "namespace"),
             workload_spiffe_id,
             labels,
-            trust_domain_aliases,
-            trusted_hbone_assertors,
+            baggage_trust,
             sampling_percentage,
             custom_tags,
             custom_header_tags,
@@ -606,19 +727,14 @@ impl WorkloadMetrics {
         ctx: &mut RequestContext,
         hbone_identity: Option<&HboneIdentity>,
     ) -> Option<SpiffeId> {
-        // Resolve the source identity using the SAME baggage trust gate as
-        // `mesh_authz` (shared `is_trusted_hbone_assertor` predicate) so the
-        // telemetry attribution can never diverge from the authorization
-        // decision. On authenticated ambient HBONE the peer cert identifies the
-        // assertor (ztunnel/waypoint, by default) while baggage carries the
-        // originating workload. Baggage `source.principal` is honored ONLY when
-        // the peer is a trusted assertor AND the baggage trust domain matches
-        // the peer's (or an alias). Otherwise the baggage is dropped, we fall
-        // back to the peer-cert identity, and we stamp `mesh.ignored_baggage`
-        // with the reason (mirroring `mesh_authz.ignored_baggage.*`). Without
-        // the assertor gate any authenticated workload pod could forge a baggage
-        // `source.principal` and mis-attribute its own traffic to a victim
-        // workload across metrics, the service graph, spans, and access logs.
+        // Resolve the source identity using the SAME baggage trust relation as
+        // `mesh_authz` (shared `hbone_baggage_honor`) so the telemetry
+        // attribution can never diverge from the authorization decision. When
+        // mesh injection supplied `_effective_mesh_authz_baggage_gates`, every
+        // enabled global mesh_authz gate is evaluated conjunctively: telemetry
+        // honors baggage only if every effective authorization gate would.
+        // Direct / user-created instances keep a single gate from this
+        // plugin's own config. The forged identity is never echoed.
         let rejected_udp_source_scope =
             ctx.metadata.get(IGNORED_UDP_SOURCE_SCOPE_METADATA).cloned();
         if let Some(reason) = rejected_udp_source_scope.as_ref() {
@@ -631,23 +747,30 @@ impl WorkloadMetrics {
             hbone_identity.and_then(|identity| identity.source_principal.clone())
         };
         match (ctx.peer_spiffe_id.as_ref(), baggage_source_principal) {
-            (Some(peer), Some(baggage)) => {
-                if !is_trusted_hbone_assertor(&self.trusted_hbone_assertors, peer) {
+            (Some(peer), Some(baggage)) => match self.baggage_trust.honor(peer, &baggage) {
+                HboneBaggageHonor::UntrustedAssertor => {
                     ctx.metadata.insert(
                         "mesh.ignored_baggage".to_string(),
                         "untrusted_assertor".to_string(),
                     );
                     Some(peer.clone())
-                } else if !self.trust_domain_allowed(peer.trust_domain(), baggage.trust_domain()) {
+                }
+                HboneBaggageHonor::TrustDomainMismatch => {
                     ctx.metadata.insert(
                         "mesh.ignored_baggage".to_string(),
                         "trust_domain_mismatch".to_string(),
                     );
                     Some(peer.clone())
-                } else {
-                    Some(baggage)
                 }
-            }
+                HboneBaggageHonor::AssertionOutOfScope => {
+                    ctx.metadata.insert(
+                        "mesh.ignored_baggage".to_string(),
+                        "assertion_out_of_scope".to_string(),
+                    );
+                    Some(peer.clone())
+                }
+                HboneBaggageHonor::Honored => Some(baggage),
+            },
             // An unauthenticated request must never have its source identity
             // rewritten by baggage; fall back to the workload hint below.
             (None, Some(_)) => {
@@ -671,14 +794,6 @@ impl WorkloadMetrics {
             && (trace_is_sampled(metadata)
                 || has_valid_traceparent(headers)
                 || has_b3_trace_context(headers))
-    }
-
-    fn trust_domain_allowed(&self, peer_td: &TrustDomain, baggage_td: &TrustDomain) -> bool {
-        peer_td == baggage_td
-            || self
-                .trust_domain_aliases
-                .iter()
-                .any(|alias| alias == baggage_td)
     }
 
     fn insert_common_metadata(&self, metadata: &mut HashMap<String, String>) {
@@ -2903,13 +3018,18 @@ mod tests {
 
     #[test]
     fn trusted_hbone_baggage_is_the_inbound_source() {
+        // Bare exact SPIFFE pins grant SameNamespace only (issue #4274). This
+        // test is about honoring trusted baggage, so pin the storefront
+        // identity with an exact-inventory object rather than relying on the
+        // pre-fix namespace-blind reading of a ztunnel SVID in istio-system.
         let metrics = WorkloadMetrics::new(&json!({
             "namespace": "payments",
             "workload_spiffe_id": "spiffe://cluster.local/ns/payments/sa/checkout",
             "labels": {"app": "checkout"},
-            "trusted_hbone_assertors": [
-                "spiffe://cluster.local/ns/istio-system/sa/ztunnel"
-            ]
+            "trusted_hbone_assertors": [{
+                "assertor": "spiffe://cluster.local/ns/istio-system/sa/ztunnel",
+                "asserts": ["spiffe://cluster.local/ns/storefront/sa/frontend"]
+            }]
         }))
         .expect("metrics config");
         let mut ctx = RequestContext::new(
@@ -2936,6 +3056,10 @@ mod tests {
             ctx.metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str),
             Some("spiffe://cluster.local/ns/storefront/sa/frontend")
         );
+        assert!(
+            !ctx.metadata.contains_key("mesh.ignored_baggage"),
+            "trusted inventory must honor baggage rather than dropping it out of scope"
+        );
         assert_eq!(
             ctx.metadata.get("mesh.source.workload").map(String::as_str),
             Some("frontend")
@@ -2950,13 +3074,18 @@ mod tests {
 
     #[tokio::test]
     async fn udp_source_scope_reject_restamps_source_to_attesting_peer() {
+        // Exact inventory so request-received attribution honors the baggage
+        // (the intended starting state). A bare ztunnel pin would fail closed
+        // as assertion_out_of_scope first and never exercise the UDP
+        // pod-UID/source-scope restamp this test is about.
         let metrics = WorkloadMetrics::new(&json!({
             "namespace": "payments",
             "workload_spiffe_id": "spiffe://cluster.local/ns/payments/sa/checkout",
             "labels": {"app": "checkout"},
-            "trusted_hbone_assertors": [
-                "spiffe://cluster.local/ns/istio-system/sa/ztunnel"
-            ]
+            "trusted_hbone_assertors": [{
+                "assertor": "spiffe://cluster.local/ns/istio-system/sa/ztunnel",
+                "asserts": ["spiffe://cluster.local/ns/storefront/sa/frontend"]
+            }]
         }))
         .expect("metrics config");
         let mut ctx = RequestContext::new(
@@ -2984,6 +3113,10 @@ mod tests {
             ctx.metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str),
             Some("spiffe://cluster.local/ns/storefront/sa/frontend")
         );
+        assert!(
+            !ctx.metadata.contains_key("mesh.ignored_baggage"),
+            "UDP restamp coverage must start from honored baggage, not assertion_out_of_scope"
+        );
 
         // mesh_authz then discards the UDP pod-UID/source-scope evidence
         // bundle, falls back to the attesting peer, and rejects before
@@ -3009,6 +3142,11 @@ mod tests {
         assert_eq!(
             ctx.metadata.get(MESH_SOURCE_NAMESPACE).map(String::as_str),
             Some("istio-system")
+        );
+        assert_eq!(
+            ctx.metadata.get("mesh.ignored_baggage").map(String::as_str),
+            Some("pod_uid_not_bound"),
+            "restamp must be the UDP source-scope refusal, not assertion_out_of_scope"
         );
     }
 
