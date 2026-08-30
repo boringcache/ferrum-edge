@@ -5261,24 +5261,26 @@ impl MeshConfig {
         }
 
         if inbound_relay_host_is_loopback_namespace(candidate) {
-            // The own-address port bound remains the first gate for an own-pod
-            // terminator. That preserves the observable ambiguity denial from
-            // issue #4249 before the topology capability added by #4315: a
-            // shared own address declares no attributable port, while a valid
-            // Ambient port proceeds to the namespace refusal below.
-            let Some(own_address) = own_address else {
-                return Err(InboundRelayDenial::AddressNotTerminated);
-            };
-            if !self.workload_declares_address_port(own_address, port) {
-                return Err(InboundRelayDenial::PortNotDeclared);
-            }
-            // Sidecar alone shares the application pod's network namespace.
-            // Ambient dials from a different netns, so loopback — including
-            // IPv4-mapped `::ffff:127.0.0.1`, which canonicalizes to
-            // `127.0.0.1` — would hit the terminator/host. Waypoints and
-            // gateways have no own-address privilege and returned above.
-            if self.inbound_relay_admits_loopback_namespace {
-                return Ok(());
+            // Sidecar alone shares the application pod's network namespace, so
+            // only there is the own-address port bound the operative gate.
+            // Ambient, waypoints, and gateways dial from a different netns, so
+            // loopback — including IPv4-mapped `::ffff:127.0.0.1`, which
+            // canonicalizes to `127.0.0.1` — would hit the terminator/host.
+            // That refusal is CATEGORICAL: no declared port could admit
+            // loopback there, so the port bound must not preempt it. Letting it
+            // run first would report `PortNotDeclared`, which reads as "declare
+            // the port and this works" and is false for those topologies. The
+            // issue #4249 ambiguity signal stays observable where it is
+            // actionable — the Sidecar arm below and the non-loopback
+            // own-address arm, which is where a shared address is disambiguated.
+            if self.inbound_relay_admits_loopback_namespace
+                && let Some(own_address) = own_address
+            {
+                return if self.workload_declares_address_port(own_address, port) {
+                    Ok(())
+                } else {
+                    Err(InboundRelayDenial::PortNotDeclared)
+                };
             }
             return Err(InboundRelayDenial::AddressNotTerminated);
         }

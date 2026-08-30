@@ -3575,8 +3575,10 @@ fn inbound_relay_ambient_own_address_fails_closed_on_two_pods_sharing_an_address
     );
     assert_eq!(
         mesh.inbound_relay_destination_decision("localhost", 8080, own_ip),
-        Err(InboundRelayDenial::PortNotDeclared),
-        "the ambiguous own-address port bound precedes the Ambient loopback capability denial"
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "Ambient refuses the loopback namespace categorically, so the ambiguous \
+         own-address port bound never becomes the reported reason — declaring \
+         the port could not admit it either"
     );
 
     // The registry-bounded general inventory is unchanged and still admits the
