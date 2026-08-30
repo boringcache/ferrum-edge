@@ -11,12 +11,11 @@ use crate::modes::mesh::config::{
     MeshRequestAuthentication, MeshRuntimeOverlay, MeshService, MeshSidecar, MeshSidecarEgress,
     MeshTelemetryResource, MeshVirtualServiceCorsPolicy, MeshWaypointServiceRef, MtlsMode,
     MultiClusterConfig, NodeWaypointAssertor, OutboundTrafficPolicy, PeerAuthentication,
-    PolicyScope,
-    ResolvedIngressListener, ServiceEntry, SidecarHostPattern, TrustBundleSet, WaypointAttachment,
-    Workload, WorkloadLabels, destination_rule_exported_to_namespace, destination_rule_lookup_tier,
-    is_false, is_zero_usize, policy_scope_applies_to_workload, policy_scope_applies_with_waypoint,
-    policy_target_attachment_applies_to_service, proxy_config_applies_to_workload,
-    scope_applies_to_workload, service_entry_applies_to_workload,
+    PolicyScope, ResolvedIngressListener, ServiceEntry, SidecarHostPattern, TrustBundleSet,
+    WaypointAttachment, Workload, WorkloadLabels, destination_rule_exported_to_namespace,
+    destination_rule_lookup_tier, is_false, is_zero_usize, policy_scope_applies_to_workload,
+    policy_scope_applies_with_waypoint, policy_target_attachment_applies_to_service,
+    proxy_config_applies_to_workload, scope_applies_to_workload, service_entry_applies_to_workload,
     virtual_service_cors_policy_exported_to_namespace, workload_selector_matches,
 };
 use crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN;
