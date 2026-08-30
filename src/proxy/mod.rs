@@ -6685,10 +6685,7 @@ fn apply_h1_framing_connection_close(
     response: &mut Result<Response<ProxyBody>, hyper::Error>,
     framing_result: h1_framing_guard::H1FramingResult,
 ) {
-    if !matches!(
-        framing_result,
-        h1_framing_guard::H1FramingResult::Conflict
-    ) {
+    if !matches!(framing_result, h1_framing_guard::H1FramingResult::Conflict) {
         return;
     }
     let Ok(response) = response else {
