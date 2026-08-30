@@ -4011,6 +4011,14 @@ fn post_plugin_refusal_mesh(b_port: u16, c_ip: IpAddr, c_port: u16) -> MeshConfi
         ],
         inbound_relay_admits_accepted_local_address: true,
         inbound_relay_admits_loopback_namespace: true,
+        // Issue #4249 bound the loopback arm to the per-address port the
+        // terminator actually owns, so the Sidecar-shaped fixture must project
+        // B's own-address ports the way the apply path does. Without this the
+        // control CONNECT to 127.0.0.1 is refused `PortNotDeclared` and the
+        // test sees a 404 instead of C's ownership 403.
+        inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
+            relay_guard_workload("svc-b", &["127.0.0.1"], &[b_port]),
+        ]),
         ..MeshConfig::default()
     }
 }
