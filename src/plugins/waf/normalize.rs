@@ -156,9 +156,11 @@ fn decode_utf16(payload: &[u8], endian: Utf16Endian) -> Option<String> {
     }
     // UTF-8 output is at most 3/2 of the UTF-16 wire length.
     let mut output = String::with_capacity(payload.len().saturating_mul(3) / 2);
-    let units = payload.chunks_exact(2).map(|pair| match endian {
-        Utf16Endian::Little => u16::from_le_bytes([pair[0], pair[1]]),
-        Utf16Endian::Big => u16::from_be_bytes([pair[0], pair[1]]),
+    // The even-length guard above leaves no remainder, so `.0` is the whole body.
+    let (pairs, _) = payload.as_chunks::<2>();
+    let units = pairs.iter().map(|pair| match endian {
+        Utf16Endian::Little => u16::from_le_bytes(*pair),
+        Utf16Endian::Big => u16::from_be_bytes(*pair),
     });
     for decoded in char::decode_utf16(units) {
         output.push(decoded.ok()?);
