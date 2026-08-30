@@ -22,6 +22,7 @@ use tracing::warn;
 use url::Url;
 
 use crate::config::types::{BackendScheme, BackendTlsConfig};
+use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::mcp_aggregate_sse::{
     AggregateSseBounds, AggregateSseBroker, AggregateSseError, StreamIdentity,
@@ -76,6 +77,87 @@ const MCP_SSE_SESSION_UNAVAILABLE: i64 = -32013;
 const MAX_OUTPUT_SCHEMA_DEPTH: usize = 32;
 /// Maximum JSON nodes admitted while auditing a discovered tool `outputSchema`.
 const MAX_OUTPUT_SCHEMA_NODES: usize = 20_000;
+
+/// Authoritative closed sets of `mcp_gateway` configuration keys.
+const MCP_CONFIG_KEYS: &[&str] = &[
+    "capabilities",
+    "discovery",
+    "enabled",
+    "endpoint",
+    "mode",
+    "observability",
+    "policy",
+    "servers",
+    "sessions",
+    "validation",
+];
+const MCP_ENDPOINT_KEYS: &[&str] = &["path", "protocol_versions"];
+const MCP_DISCOVERY_KEYS: &[&str] = &[
+    "aggregate_prompts",
+    "aggregate_resources",
+    "aggregate_tools",
+    "cache_ttl_seconds",
+    "hide_denied_items",
+    "namespace_separator",
+    "on_new_tool",
+    "on_schema_change",
+];
+const MCP_SESSIONS_KEYS: &[&str] = &[
+    "downstream_session_header",
+    "initialize_upstreams",
+    "max_sessions",
+    "session_ttl_seconds",
+    "sse_keepalive_seconds",
+    "sse_listener_max_lifetime_seconds",
+    "sse_max_event_bytes",
+    "sse_max_last_event_id_bytes",
+    "sse_max_replay_events",
+    "sse_max_retained_bytes",
+    "sse_max_retained_events",
+    "sse_max_stream_id_bytes",
+    "sse_max_streams_per_session",
+    "sse_multiplexing",
+    "upstream_session_header",
+];
+const MCP_CAPABILITIES_KEYS: &[&str] = &[
+    "advertise_completions",
+    "advertise_logging",
+    "advertise_prompts",
+    "advertise_resources",
+    "advertise_tasks",
+    "advertise_tools",
+    "passthrough_unknown_methods",
+];
+const MCP_POLICY_KEYS: &[&str] = &["default_action", "hide_denied_tools", "tools"];
+const MCP_POLICY_TOOL_KEYS: &[&str] = &["action"];
+const MCP_VALIDATION_KEYS: &[&str] = &[
+    "max_batch_bytes",
+    "max_batch_item_bytes",
+    "max_batch_items",
+    "max_batch_response_bytes",
+    "max_catalog_bytes_per_list",
+    "max_catalog_items_per_list",
+    "max_upstream_response_bytes",
+    "validate_tool_arguments",
+    "validate_tool_results",
+];
+const MCP_OBSERVABILITY_KEYS: &[&str] = &[
+    "emit_metadata",
+    "log_argument_hash",
+    "log_raw_arguments",
+    "log_raw_results",
+    "log_result_hash",
+];
+const MCP_SERVER_KEYS: &[&str] = &[
+    "enabled",
+    "expose_prompts",
+    "expose_resources",
+    "expose_tools",
+    "initialize_strategy",
+    "namespace",
+    "upstream_url",
+];
+const MCP_STDIO_TRANSPORT_KEYS: &[&str] = &["args", "command", "stdio"];
 /// Maximum recursion depth admitted for the *schema* walk that resolves local
 /// `$ref` / `$dynamicRef` targets.
 ///
@@ -652,6 +734,7 @@ impl McpGateway {
         let object = config
             .as_object()
             .ok_or_else(|| "mcp_gateway: config must be an object".to_string())?;
+        reject_unknown_mcp_keys(object, "config", MCP_CONFIG_KEYS)?;
 
         let enabled = optional_bool(object, "enabled")?.unwrap_or(true);
         let mode = McpGatewayMode::parse(
@@ -660,6 +743,9 @@ impl McpGateway {
         )?;
 
         let endpoint = optional_object(object, "endpoint")?;
+        if let Some(endpoint) = endpoint {
+            reject_unknown_mcp_keys(endpoint, "config.endpoint", MCP_ENDPOINT_KEYS)?;
+        }
         let endpoint_path = optional_string_from_object(endpoint, "path")?
             .ok_or_else(|| "mcp_gateway: 'endpoint.path' is required".to_string())?;
         validate_path(&endpoint_path, "endpoint.path")?;
@@ -7159,8 +7245,42 @@ fn optional_string_vec_from_object(
     Ok(Some(values))
 }
 
+/// Reject unknown keys after calling out Claude-Desktop-style stdio spawn fields.
+fn reject_unknown_mcp_keys(
+    object: &Map<String, Value>,
+    path: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    reject_stdio_transport_keys(object, path)?;
+    reject_unknown_keys(object, path, allowed, "mcp_gateway: ")
+}
+
+/// `command` / `args` / `stdio` look like a stdio MCP spawn. The plugin is HTTP-only.
+fn reject_stdio_transport_keys(object: &Map<String, Value>, path: &str) -> Result<(), String> {
+    let mut found: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| MCP_STDIO_TRANSPORT_KEYS.contains(key))
+        .collect();
+    if found.is_empty() {
+        return Ok(());
+    }
+    found.sort_unstable();
+    let names = found
+        .iter()
+        .map(|key| format!("'{key}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "mcp_gateway: {path} field(s) {names} are not supported because mcp_gateway is HTTP-only and does not spawn stdio MCP processes; set servers.*.upstream_url to an http:// or https:// MCP endpoint instead"
+    ))
+}
+
 fn parse_discovery(object: &Map<String, Value>) -> Result<McpDiscoveryConfig, String> {
     let discovery = optional_object(object, "discovery")?;
+    if let Some(discovery) = discovery {
+        reject_unknown_mcp_keys(discovery, "config.discovery", MCP_DISCOVERY_KEYS)?;
+    }
     let namespace_separator = optional_string_from_object(discovery, "namespace_separator")?
         .unwrap_or_else(|| ".".to_string());
     if namespace_separator.is_empty() {
@@ -7202,6 +7322,9 @@ fn parse_discovery(object: &Map<String, Value>) -> Result<McpDiscoveryConfig, St
 
 fn parse_sessions(object: &Map<String, Value>) -> Result<McpSessionConfig, String> {
     let sessions = optional_object(object, "sessions")?;
+    if let Some(sessions) = sessions {
+        reject_unknown_mcp_keys(sessions, "config.sessions", MCP_SESSIONS_KEYS)?;
+    }
     let initialize_upstreams = InitializeStrategy::parse(
         optional_string_from_object(sessions, "initialize_upstreams")?
             .as_deref()
@@ -7314,6 +7437,9 @@ fn sse_usize(value: u64, key: &str) -> Result<usize, String> {
 
 fn parse_capabilities(object: &Map<String, Value>) -> Result<McpCapabilitiesConfig, String> {
     let capabilities = optional_object(object, "capabilities")?;
+    if let Some(capabilities) = capabilities {
+        reject_unknown_mcp_keys(capabilities, "config.capabilities", MCP_CAPABILITIES_KEYS)?;
+    }
     Ok(McpCapabilitiesConfig {
         advertise_tools: optional_bool_from_object(capabilities, "advertise_tools")?
             .unwrap_or(true),
@@ -7337,6 +7463,9 @@ fn parse_capabilities(object: &Map<String, Value>) -> Result<McpCapabilitiesConf
 
 fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
     let policy = optional_object(object, "policy")?;
+    if let Some(policy) = policy {
+        reject_unknown_mcp_keys(policy, "config.policy", MCP_POLICY_KEYS)?;
+    }
     let default_action = match optional_string_from_object(policy, "default_action")?
         .as_deref()
         .unwrap_or("deny")
@@ -7359,6 +7488,11 @@ fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
             let object = tool_policy.as_object().ok_or_else(|| {
                 format!("mcp_gateway: policy.tools[{tool_name:?}] must be an object")
             })?;
+            reject_unknown_mcp_keys(
+                object,
+                &format!("config.policy.tools.{tool_name}"),
+                MCP_POLICY_TOOL_KEYS,
+            )?;
             let action = PolicyAction::parse(
                 optional_string(object, "action")?.ok_or_else(|| {
                     format!("mcp_gateway: policy.tools[{tool_name:?}].action is required")
@@ -7382,6 +7516,9 @@ fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
 
 fn parse_validation(object: &Map<String, Value>) -> Result<McpValidationConfig, String> {
     let validation = optional_object(object, "validation")?;
+    if let Some(validation) = validation {
+        reject_unknown_mcp_keys(validation, "config.validation", MCP_VALIDATION_KEYS)?;
+    }
     let validate_tool_results =
         optional_bool_from_object(validation, "validate_tool_results")?.unwrap_or(false);
     let max_upstream_response_bytes =
@@ -7465,6 +7602,13 @@ fn parse_validation(object: &Map<String, Value>) -> Result<McpValidationConfig, 
 
 fn parse_observability(object: &Map<String, Value>) -> Result<McpObservabilityConfig, String> {
     let observability = optional_object(object, "observability")?;
+    if let Some(observability) = observability {
+        reject_unknown_mcp_keys(
+            observability,
+            "config.observability",
+            MCP_OBSERVABILITY_KEYS,
+        )?;
+    }
     Ok(McpObservabilityConfig {
         emit_metadata: optional_bool_from_object(observability, "emit_metadata")?.unwrap_or(true),
         log_raw_arguments: optional_bool_from_object(observability, "log_raw_arguments")?
@@ -7501,6 +7645,11 @@ fn parse_servers(
         let object = value
             .as_object()
             .ok_or_else(|| format!("mcp_gateway: server {server_id:?} must be an object"))?;
+        reject_unknown_mcp_keys(
+            object,
+            &format!("config.servers.{server_id}"),
+            MCP_SERVER_KEYS,
+        )?;
         let upstream_url = optional_string(object, "upstream_url")?
             .ok_or_else(|| format!("mcp_gateway: server {server_id:?} requires 'upstream_url'"))?
             .to_string();

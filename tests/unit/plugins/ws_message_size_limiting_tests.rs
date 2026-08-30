@@ -99,6 +99,19 @@ fn test_invalid_configuration_is_rejected() {
 }
 
 #[test]
+fn test_unknown_config_key_max_frame_bytez_is_rejected() {
+    let err = WsMessageSizeLimiting::new(&json!({
+        "max_frame_bytes": 1024,
+        "max_frame_bytez": 2048
+    }))
+    .err()
+    .expect("typo max_frame_bytez must be rejected");
+    assert!(err.contains("unknown configuration key"), "{err}");
+    assert!(err.contains("max_frame_bytez"), "{err}");
+    assert!(err.contains("did you mean 'max_frame_bytes'?"), "{err}");
+}
+
+#[test]
 fn test_close_reason_is_truncated_on_utf8_boundary() {
     let plugin = WsMessageSizeLimiting::new(&json!({
         "max_frame_bytes": 5,

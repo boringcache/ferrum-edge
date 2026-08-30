@@ -368,6 +368,8 @@ Sends transaction summaries as JSON to an external HTTP endpoint. Entries are bu
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Hot-path admission reserves a queue slot and a provisional `max_entry_bytes` lease before serializing attacker-shaped summary fields, then shrinks that lease to the exact retained JSON size.
 
+Unknown top-level keys are rejected at construction (for example a misspelled `endpont_url` cannot silently leave logs undelivered). Registration is `OptionalFailOpen`: Admin create/update still returns HTTP 400 for an invalid enabled config, while file-mode `validate`/load and plugin-cache rebuild warn, naming the unknown key, and omit this instance rather than failing the gateway.
+
 Retries fire on transport errors and 5xx responses. A **4xx response other than 408 or 429 aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, authorization header, or field schema rather than waiting through `max_retries × retry_delay_ms`. 408 (Request Timeout) and 429 (Too Many Requests) are transient throttling signals and are retried within the configured budget.
 
 Response bodies are never logged or retained. After reading the status, each batch response is asynchronously drained and discarded under a 1 MiB hard cap and a one-second drain timeout so HTTP/1.1 keep-alive connections can be reused. Oversized, stalled, or malformed acknowledgement bodies abort the drain without changing the status classification (2xx remains success; non-retryable 4xx remains a discard).
@@ -729,6 +731,10 @@ Sends transaction summaries as JSON to an external WebSocket endpoint. Like `htt
 **Failure policy:** `KeepLastKnownGood` — construction/validation failures,
 including an incomplete or unusable custom TLS CA bundle, reject the candidate
 plugin generation and keep the last-known-good logger instance.
+
+Unknown top-level keys are rejected at admission with path-qualified diagnostics
+and spelling suggestions (for example a misspelled `endpont_url` cannot silently
+leave the sink disconnected).
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -1677,6 +1683,8 @@ labelled by `proxy_id`, relay `direction`, and `error_class`.
 | `stale_entry_ttl_seconds` | Integer | `3600` | How long idle metric entries live before eviction (prevents unbounded memory growth from deleted/recreated proxies) |
 | `mesh_series_budget_per_family` | Integer | `10000` | Hard ceiling (`1`–`1000000`) on live `MeshRequestKey` series retained **per mesh metric family**. Shared by ordinary mesh identity dimensions and CEL-derived dimensions: newly observed keys beyond the budget are dropped for that family until `stale_entry_ttl_seconds` eviction frees capacity, and counted on `ferrum_mesh_metric_series_overflow_total{family}`. `0` is rejected — there is no unlimited mode. See [mesh.md](mesh.md#telemetry-api) |
 | `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it. Under extreme load this prevents an allocation per request — the render TTL is the real freshness guarantee |
+
+Unknown top-level keys are rejected at construction (for example a misspelled `render_cache_ttl_secnds` cannot silently leave the default TTL). Registration is `OptionalFailOpen`: Admin create/update still returns HTTP 400 for an invalid enabled config, while file-mode `validate`/load and plugin-cache rebuild warn, naming the unknown key, and omit this instance rather than failing the gateway. `schema` / `schema_ref` remain unsupported and fail with an explicit diagnostic.
 
 `ferrum_requests_total` labels standard HTTP methods individually and maps every
 extension/unknown method to `method="OTHER"`, keeping request-controlled method
@@ -4999,6 +5007,8 @@ Enforces per-proxy request body size limits. Rejects with HTTP 413.
 |---|---|---|---|
 | `max_bytes` | u64 | — (required, > 0) | Maximum allowed request body size in bytes. The plugin errors at construction if absent or zero. |
 
+Configuration must be a top-level object. The only accepted key is `max_bytes`. Unknown keys are rejected with path-qualified diagnostics and spelling suggestions instead of falling back to defaults, so a typo such as `max_bytez` cannot silently leave the route unbounded. Registration is `FailClosed`.
+
 Enforcement happens in four places:
 - **The effective streaming/buffering ceiling.** The configured `max_bytes` is published to the proxy core and folded into the bound of every request path *before any byte is forwarded or retained* — H1/H2 (reqwest and direct-H2), native H3 and the H3 cross-protocol bridge, unary and streaming gRPC, retry replays, early prebuffering phases, mesh mTLS, and HBONE. A chunked or unknown-length upload is therefore bounded at the route limit, not merely at the global one.
 - `on_request_received` rejects oversized `Content-Length` headers without reading the body.
@@ -6927,6 +6937,8 @@ HTTP-only Model Context Protocol gateway for AI agent tool traffic. `transparent
 
 The plugin deliberately does not implement generic auth, rate limiting, retry, timeout, WAF, tracing, DLP, or semantic safety behavior.
 
+The plugin is HTTP-only: each `servers.*.upstream_url` must be `http://` or `https://`. Unknown keys at the root, in nested fixed-shape objects, and inside each `servers.*` object fail closed. Claude-Desktop-style `command` / `args` / `stdio` fields are rejected with an HTTP-only diagnostic rather than a generic unknown-key error — stdio spawn is not implemented, and a typo of this kind must not pass `validate`.
+
 **Cannot be composed with `request_deduplication` on the same proxy.** Config admission rejects the pair. The public URI/name rewrite is resolved against a per-session catalog re-listed from upstream on `discovery.cache_ttl`, so a deduplicated replay — served before this plugin runs, and without re-applying its rewrite — cannot be proven to match the live mapping. See the `request_deduplication` section for the full reasoning and the remedy.
 
 **Priority:** 2992
@@ -7025,6 +7037,8 @@ Transparent Agent-to-Agent gateway for standardized A2A traffic over HTTP/HTTPS 
 The implemented A2A protocol version is **0.3.x**, whose canonical gRPC service is **`a2a.v1.A2AService`**. A2A 1.0 (`lf.a2a.v1.A2AService`) is a distinct identity with a renumbered `AgentCard`; it can be detected and policed, but its cards are never decoded as 0.3 — see *gRPC service identity and Agent Card schema* below.
 
 The plugin deliberately does not manage task state, aggregate multiple agents, or implement generic auth, rate limiting, retry, timeout, WAF, tracing, DLP, or semantic safety behavior. Use the existing Ferrum plugins for those concerns.
+
+Unknown keys at the root and in nested fixed-shape objects (`endpoint`, `detection`, `discovery`, `observability`, `policy`, each `policy.methods` entry, and `endpoint.grpc_services` object entries) are rejected at construction. A typo such as `not_a_real_a2a_key` fails closed instead of becoming a silent no-op. Registration is `FailClosed`.
 
 **Priority:** 2993
 
@@ -7200,6 +7214,8 @@ and H3 WebSocket frontends.
 | `max_frame_bytes` | u64 | *(required)* | Maximum allowed frame payload in bytes. Must be greater than 0 — configs with `max_frame_bytes` of 0 (or missing) are rejected at config load time. |
 | `max_message_bytes` | u64 | `4 × max_frame_bytes` | Maximum reassembled Text/Binary message payload. Must be greater than or equal to `max_frame_bytes`. This separately bounds continuation accumulation without treating the whole message as one frame. |
 | `close_reason` | String | `"Message too large"` | Close-frame reason text (truncated to 123 UTF-8 bytes — the RFC 6455 §5.5 control-frame payload limit) |
+
+Configuration must be a top-level object. The only accepted keys are `max_frame_bytes`, `max_message_bytes`, and `close_reason`. Unknown keys are rejected with path-qualified diagnostics and spelling suggestions, so a typo such as `max_frame_bytez` cannot silently leave frames unbounded. Registration is `FailClosed`.
 
 ```yaml
 plugin_name: ws_message_size_limiting

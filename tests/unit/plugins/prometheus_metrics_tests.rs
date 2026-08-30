@@ -201,6 +201,25 @@ async fn test_prometheus_plugin_accepts_null_config_as_defaults() {
     assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
 }
 
+#[test]
+fn test_prometheus_plugin_rejects_unknown_render_cache_ttl_secnds_key() {
+    let err = PrometheusMetrics::new(
+        &json!({
+            "render_cache_ttl_seconds": 5,
+            "render_cache_ttl_secnds": 10
+        }),
+        "ferrum",
+    )
+    .err()
+    .expect("typo render_cache_ttl_secnds must fail construction");
+    assert!(err.contains("unknown configuration key"), "{err}");
+    assert!(err.contains("render_cache_ttl_secnds"), "{err}");
+    assert!(
+        err.contains("did you mean 'render_cache_ttl_seconds'?"),
+        "{err}"
+    );
+}
+
 #[tokio::test]
 async fn test_registry_records_request_counter() {
     let registry = MetricsRegistry::new();

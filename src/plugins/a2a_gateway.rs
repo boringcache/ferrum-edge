@@ -19,6 +19,7 @@ use super::{
     A2aGrpcCardRewriteState, A2aGrpcCardSchema, HTTP_GRPC_PROTOCOLS, Plugin, PluginResult,
     RequestContext, ResponseStreamAction, ResponseStreamInspector,
 };
+use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Domain separator and schema version for [`A2aGateway`] replay provenance.
 /// Bumping the version invalidates every previously persisted representation
@@ -64,6 +65,39 @@ const CARD_SCHEMA_A2A_03: &str = "a2a-0.3";
 const CARD_SCHEMA_A2A_10: &str = "a2a-1.0";
 /// Config spelling of [`A2aGrpcCardSchema::Undeclared`].
 const CARD_SCHEMA_NONE: &str = "none";
+
+/// Authoritative closed set of top-level `a2a_gateway` configuration keys.
+const A2A_CONFIG_KEYS: &[&str] = &[
+    "detection",
+    "discovery",
+    "enabled",
+    "endpoint",
+    "mode",
+    "observability",
+    "policy",
+];
+const A2A_ENDPOINT_KEYS: &[&str] = &[
+    "agent_card_path",
+    "grpc_services",
+    "path",
+    "protocol_versions",
+];
+const A2A_GRPC_SERVICE_ENTRY_KEYS: &[&str] = &["card_schema", "service"];
+const A2A_DETECTION_KEYS: &[&str] = &[
+    "allow_unknown_methods_with_version_header",
+    "bindings",
+    "max_request_body_size",
+    "strip_accept_encoding",
+    "version_header",
+];
+const A2A_DISCOVERY_KEYS: &[&str] = &[
+    "public_base_url",
+    "rewrite_agent_card_urls",
+    "trust_forwarded_headers",
+];
+const A2A_OBSERVABILITY_KEYS: &[&str] = &["emit_metadata", "log_payloads", "max_payload_size"];
+const A2A_POLICY_KEYS: &[&str] = &["default_action", "methods"];
+const A2A_POLICY_METHOD_KEYS: &[&str] = &["action"];
 
 /// The complete A2A 0.3.x `AgentCard` top-level field table (`a2aproject/A2A`
 /// at tag `v0.3.0`, `specification/grpc/a2a.proto`, "Next ID: 18"). Wire surgery
@@ -466,6 +500,7 @@ impl A2aGateway {
         let object = config
             .as_object()
             .ok_or_else(|| "a2a_gateway: config must be an object".to_string())?;
+        reject_unknown_keys(object, "config", A2A_CONFIG_KEYS, "a2a_gateway: ")?;
         let enabled = optional_bool(object, "enabled")?.unwrap_or(true);
         let mode = optional_string(object, "mode")?.unwrap_or("transparent_proxy");
         if mode != "transparent_proxy" {
@@ -1382,6 +1417,14 @@ impl Plugin for A2aGateway {
 
 fn parse_endpoint(object: &Map<String, Value>) -> Result<A2aEndpointConfig, String> {
     let endpoint = optional_object(object, "endpoint")?;
+    if let Some(endpoint) = endpoint {
+        reject_unknown_keys(
+            endpoint,
+            "config.endpoint",
+            A2A_ENDPOINT_KEYS,
+            "a2a_gateway: ",
+        )?;
+    }
     let path = optional_string_from_object(endpoint, "path")?
         .unwrap_or_else(|| DEFAULT_ENDPOINT_PATH.to_string());
     validate_path(&path, "endpoint.path")?;
@@ -1495,6 +1538,12 @@ fn parse_grpc_service_entry(item: &Value) -> Result<(&str, Option<A2aGrpcCardSch
     match item {
         Value::String(service) => Ok((service.as_str(), None)),
         Value::Object(entry) => {
+            reject_unknown_keys(
+                entry,
+                "config.endpoint.grpc_services[]",
+                A2A_GRPC_SERVICE_ENTRY_KEYS,
+                "a2a_gateway: ",
+            )?;
             let service = match optional_string(entry, "service")? {
                 Some(service) => service,
                 None => return Err(GRPC_SERVICE_ENTRY_NEEDS_SERVICE.to_string()),
@@ -1537,6 +1586,14 @@ fn card_schema_name(schema: A2aGrpcCardSchema) -> &'static str {
 
 fn parse_detection(object: &Map<String, Value>) -> Result<A2aDetectionConfig, String> {
     let detection = optional_object(object, "detection")?;
+    if let Some(detection) = detection {
+        reject_unknown_keys(
+            detection,
+            "config.detection",
+            A2A_DETECTION_KEYS,
+            "a2a_gateway: ",
+        )?;
+    }
     let bindings = optional_string_vec_from_object(detection, "bindings")?.unwrap_or_else(|| {
         vec![
             "jsonrpc".to_string(),
@@ -1572,6 +1629,14 @@ fn parse_detection(object: &Map<String, Value>) -> Result<A2aDetectionConfig, St
 
 fn parse_discovery(object: &Map<String, Value>) -> Result<A2aDiscoveryConfig, String> {
     let discovery = optional_object(object, "discovery")?;
+    if let Some(discovery) = discovery {
+        reject_unknown_keys(
+            discovery,
+            "config.discovery",
+            A2A_DISCOVERY_KEYS,
+            "a2a_gateway: ",
+        )?;
+    }
     let public_base_url = optional_string_from_object(discovery, "public_base_url")?;
     if let Some(url) = public_base_url.as_deref() {
         validate_public_base_url(url)?;
@@ -1630,6 +1695,14 @@ pub fn presentation_policy_is_request_derived(config: &Value) -> bool {
 
 fn parse_observability(object: &Map<String, Value>) -> Result<A2aObservabilityConfig, String> {
     let observability = optional_object(object, "observability")?;
+    if let Some(observability) = observability {
+        reject_unknown_keys(
+            observability,
+            "config.observability",
+            A2A_OBSERVABILITY_KEYS,
+            "a2a_gateway: ",
+        )?;
+    }
     let max_payload_size = optional_u64_from_object(observability, "max_payload_size")?
         .unwrap_or(DEFAULT_MAX_DETECTION_BODY_BYTES);
     let max_payload_size = usize::try_from(max_payload_size)
@@ -1648,6 +1721,9 @@ fn parse_observability(object: &Map<String, Value>) -> Result<A2aObservabilityCo
 
 fn parse_policy(object: &Map<String, Value>) -> Result<A2aPolicyConfig, String> {
     let policy = optional_object(object, "policy")?;
+    if let Some(policy) = policy {
+        reject_unknown_keys(policy, "config.policy", A2A_POLICY_KEYS, "a2a_gateway: ")?;
+    }
     let default_action = PolicyAction::parse(
         optional_string_from_object(policy, "default_action")?
             .as_deref()
@@ -1671,6 +1747,12 @@ fn parse_policy(object: &Map<String, Value>) -> Result<A2aPolicyConfig, String> 
             let object = value.as_object().ok_or_else(|| {
                 format!("a2a_gateway: policy.methods[{method:?}] must be an object")
             })?;
+            reject_unknown_keys(
+                object,
+                &format!("config.policy.methods.{method}"),
+                A2A_POLICY_METHOD_KEYS,
+                "a2a_gateway: ",
+            )?;
             let action = PolicyAction::parse(
                 optional_string(object, "action")?.ok_or_else(|| {
                     format!("a2a_gateway: policy.methods[{method:?}].action is required")

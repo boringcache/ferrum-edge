@@ -75,6 +75,29 @@ fn a2a_gateway_registers_with_http_and_grpc_protocols() {
     assert!(ferrum_edge::plugins::available_plugins().contains(&"a2a_gateway"));
 }
 
+#[test]
+fn a2a_gateway_valid_transparent_config_constructs() {
+    let plugin = create_plugin("a2a_gateway", &json!({ "mode": "transparent_proxy" }))
+        .expect("valid a2a_gateway config should construct")
+        .expect("a2a_gateway should be registered");
+    assert_eq!(plugin.name(), "a2a_gateway");
+}
+
+#[test]
+fn a2a_gateway_rejects_unknown_root_key() {
+    let error = create_plugin(
+        "a2a_gateway",
+        &json!({
+            "mode": "transparent_proxy",
+            "not_a_real_a2a_key": true
+        }),
+    )
+    .err()
+    .expect("unknown root key must fail closed");
+    assert!(error.contains("unknown configuration key"), "{error}");
+    assert!(error.contains("not_a_real_a2a_key"), "{error}");
+}
+
 #[tokio::test]
 async fn jsonrpc_request_emits_metadata_and_strips_accept_encoding() {
     let plugin = plugin(json!({}));

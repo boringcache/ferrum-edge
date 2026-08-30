@@ -63,6 +63,24 @@ use crate::config::BackendEgressPolicy;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::observability_delivery::DeliveryWorkerControl;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
+use crate::util::unknown_keys::reject_unknown_keys;
+
+/// Authoritative closed set of top-level `ws_logging` configuration keys.
+const WS_LOGGING_CONFIG_KEYS: &[&str] = &[
+    "batch_size",
+    "buffer_capacity",
+    "buffer_max_bytes",
+    "connect_timeout_ms",
+    "endpoint_url",
+    "flush_interval_ms",
+    "max_entry_bytes",
+    "max_retries",
+    "reconnect_delay_ms",
+    "retry_delay_ms",
+    "schema",
+    "schema_ref",
+    "write_timeout_ms",
+];
 
 /// Default / hard maxima for per-entry serialization and aggregate queued,
 /// batch-assembly, and retry bytes.
@@ -477,9 +495,15 @@ pub struct WsLogging {
 
 impl WsLogging {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        if !config.is_object() {
+        let Some(config_obj) = config.as_object() else {
             return Err("ws_logging: config must be a JSON object".to_string());
-        }
+        };
+        reject_unknown_keys(
+            config_obj,
+            "config",
+            WS_LOGGING_CONFIG_KEYS,
+            "ws_logging: ",
+        )?;
 
         let endpoint_url = config
             .get("endpoint_url")

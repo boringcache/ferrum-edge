@@ -99,6 +99,22 @@ async fn test_http_logging_plugin_creation() {
     assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
 }
 
+#[test]
+fn test_http_logging_rejects_unknown_endpont_url_key() {
+    let err = HttpLogging::new(
+        &json!({
+            "endpoint_url": "http://localhost:9200/logs",
+            "endpont_url": "http://localhost:9200/typo"
+        }),
+        default_client(),
+    )
+    .err()
+    .expect("typo endpont_url must fail construction");
+    assert!(err.contains("unknown configuration key"), "{err}");
+    assert!(err.contains("endpont_url"), "{err}");
+    assert!(err.contains("did you mean 'endpoint_url'?"), "{err}");
+}
+
 #[tokio::test]
 async fn test_http_logging_plugin_creation_empty_config() {
     let result = HttpLogging::new(&json!({}), default_client());

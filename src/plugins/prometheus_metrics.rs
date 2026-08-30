@@ -22,6 +22,17 @@ use super::{
 use crate::ebpf::NodeAgentMetrics;
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::retry::ErrorClass;
+use crate::util::unknown_keys::reject_unknown_keys;
+
+/// Authoritative closed set of top-level `prometheus_metrics` configuration keys.
+const PROMETHEUS_METRICS_CONFIG_KEYS: &[&str] = &[
+    "cache_invalidation_min_age_ms",
+    "mesh_series_budget_per_family",
+    "render_cache_ttl_seconds",
+    "schema",
+    "schema_ref",
+    "stale_entry_ttl_seconds",
+];
 
 /// Global metrics registry (singleton per process).
 static METRICS_REGISTRY: OnceLock<Arc<MetricsRegistry>> = OnceLock::new();
@@ -5699,6 +5710,14 @@ impl PrometheusMetrics {
     ) -> Result<Self, String> {
         if !(config.is_object() || config.is_null()) {
             return Err("prometheus_metrics: config must be an object".to_string());
+        }
+        if let Some(config_obj) = config.as_object() {
+            reject_unknown_keys(
+                config_obj,
+                "config",
+                PROMETHEUS_METRICS_CONFIG_KEYS,
+                "prometheus_metrics: ",
+            )?;
         }
         if config.get("schema").is_some() || config.get("schema_ref").is_some() {
             return Err(

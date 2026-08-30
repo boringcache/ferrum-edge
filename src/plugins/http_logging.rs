@@ -29,6 +29,22 @@ use super::utils::{
     parse_custom_headers, parse_http_endpoint, redacted_endpoint_url_str, validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
+use crate::util::unknown_keys::reject_unknown_keys;
+
+/// Authoritative closed set of top-level `http_logging` configuration keys.
+const HTTP_LOGGING_CONFIG_KEYS: &[&str] = &[
+    "batch_size",
+    "buffer_capacity",
+    "buffer_max_bytes",
+    "custom_headers",
+    "endpoint_url",
+    "flush_interval_ms",
+    "max_entry_bytes",
+    "max_retries",
+    "retry_delay_ms",
+    "schema",
+    "schema_ref",
+];
 
 #[derive(Clone)]
 struct HttpFlushConfig {
@@ -56,9 +72,15 @@ pub struct HttpLogging {
 
 impl HttpLogging {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        if !config.is_object() {
+        let Some(config_obj) = config.as_object() else {
             return Err("http_logging: config must be an object".to_string());
-        }
+        };
+        reject_unknown_keys(
+            config_obj,
+            "config",
+            HTTP_LOGGING_CONFIG_KEYS,
+            "http_logging: ",
+        )?;
 
         let (endpoint_url, endpoint_hostname) =
             parse_http_endpoint(config, "http_logging", http_client.backend_allow_ips())?;

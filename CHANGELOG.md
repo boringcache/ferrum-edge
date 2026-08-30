@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — seven plugin constructors reject unknown config keys**
+  (issues #4405, #4409). `request_size_limiting`, `ws_message_size_limiting`,
+  `a2a_gateway`, `ws_logging`, and `mcp_gateway` fail closed at construction
+  (file-mode `validate` exit 1). `http_logging` and `prometheus_metrics`
+  remain `OptionalFailOpen`: construction still returns `Err` naming the
+  unknown key, and `validate`/reload warn and omit the instance instead of
+  failing the gateway. `mcp_gateway` also rejects `command` / `args` /
+  `stdio` (root or `servers.*`) with an HTTP-only diagnostic; stdio spawn is
+  not implemented. **Operator action**: rename typos (`max_bytez`,
+  `max_frame_bytez`, `endpont_url`, `render_cache_ttl_secnds`, …) and replace
+  Claude-Desktop `command` with `servers.*.upstream_url` `http://`/`https://`.
+
 - **BREAKING — `POST /batch` rejects unknown top-level envelope keys**
   (issue #4042). The request is create-only (`consumers`, `upstreams`,
   `proxies`, `plugin_configs`). Sending `updates`, `deletes`, or `dry_run`
