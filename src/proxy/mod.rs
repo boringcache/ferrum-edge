@@ -53,6 +53,7 @@ pub mod grpc_proxy;
 /// Hyper's client handshake proves only the client half, so both h2c transports
 /// — the pooled gRPC path and the Unix-socket path — establish through here.
 pub(crate) mod h2c_preface;
+mod h1_framing_guard;
 pub mod hbone_pool;
 mod hbone_proxy;
 pub mod headers;
@@ -6614,6 +6615,9 @@ fn via_header_for_backend_response_body<'a>(
 #[derive(Clone, Default)]
 struct RequestConnectionMetadata {
     frontend_listen_port: Option<u16>,
+    /// Raw HTTP/1 request head contained both `Content-Length` and
+    /// `Transfer-Encoding` before Hyper applied framing precedence.
+    http1_te_cl_conflict_on_wire: bool,
     /// Concrete local address of the accepted TCP connection. Unlike the
     /// listener's wildcard bind address, this identifies the pod IP the peer
     /// actually reached — it binds a Sidecar ingress CONNECT to this replica
@@ -13435,7 +13439,12 @@ async fn handle_connection(
     // Set TCP keepalive on inbound connection to detect stale clients
     set_tcp_keepalive(&stream);
 
-    // Use TokioIo to adapt the TCP stream for hyper
+    // Observe raw H1 framing before Hyper normalizes TE-first CL+TE requests.
+    // The adapter disables itself for the H2 prior-knowledge preface.
+    let (stream, h1_framing_signals) = h1_framing_guard::H1FramingGuardIo::new(
+        stream,
+        http1_parser_max_buf_size(state.max_header_size_bytes),
+    );
     let io = TokioIo::new(stream);
 
     // Use auto builder to support both HTTP/1.1 and HTTP/2 cleartext (h2c).
@@ -13489,12 +13498,17 @@ async fn handle_connection(
     let header_read_timeout_seconds = state.env_config.http_header_read_timeout_seconds;
     let admission = frontend_admission::FrontendAdmission::new();
     let service_admission = Arc::clone(&admission);
+    let service_h1_framing_signals = Arc::clone(&h1_framing_signals);
     let svc = service_fn(move |req: Request<Incoming>| {
         service_admission.mark();
         let state = Arc::clone(&state);
         let addr = remote_addr;
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port,
+            http1_te_cl_conflict_on_wire: matches!(
+                req.version(),
+                hyper::Version::HTTP_10 | hyper::Version::HTTP_11
+            ) && service_h1_framing_signals.next_conflict(),
             accepted_local_addr,
             frontend_sni_hostname: None,
             node_waypoint_identity: node_waypoint_identity.clone(),
@@ -21384,7 +21398,12 @@ async fn handle_tls_connection(
         .server_name()
         .map(str::to_ascii_lowercase);
 
-    // Convert TLS stream to TokioIo for hyper
+    // Observe decrypted H1 framing before Hyper normalizes TE-first CL+TE
+    // requests. The adapter disables itself for negotiated HTTP/2.
+    let (tls_stream, h1_framing_signals) = h1_framing_guard::H1FramingGuardIo::new(
+        tls_stream,
+        http1_parser_max_buf_size(state.max_header_size_bytes),
+    );
     let io = hyper_util::rt::TokioIo::new(tls_stream);
 
     // Use hyper-util's auto builder which negotiates HTTP/1.1 or HTTP/2 via ALPN.
@@ -21438,6 +21457,7 @@ async fn handle_tls_connection(
     let header_read_timeout_seconds = state.env_config.http_header_read_timeout_seconds;
     let admission = frontend_admission::FrontendAdmission::new();
     let service_admission = Arc::clone(&admission);
+    let service_h1_framing_signals = Arc::clone(&h1_framing_signals);
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         service_admission.mark();
         let state = Arc::clone(&state);
@@ -21448,6 +21468,10 @@ async fn handle_tls_connection(
         let frontend_sni_hostname = frontend_sni_hostname.clone();
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port: tls_connection_metadata.frontend_listen_port,
+            http1_te_cl_conflict_on_wire: matches!(
+                req.version(),
+                hyper::Version::HTTP_10 | hyper::Version::HTTP_11
+            ) && service_h1_framing_signals.next_conflict(),
             accepted_local_addr: tls_connection_metadata.accepted_local_addr,
             frontend_sni_hostname,
             node_waypoint_identity: tls_connection_metadata.node_waypoint_identity.clone(),
@@ -28960,6 +28984,7 @@ async fn handle_proxy_request_inner(
     connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
+    let http1_te_cl_conflict_on_wire = connection_metadata.http1_te_cl_conflict_on_wire;
     let accepted_local_ip = connection_metadata
         .accepted_local_addr
         .map(|addr| addr.ip());
@@ -29147,7 +29172,11 @@ async fn handle_proxy_request_inner(
     // Protocol-level header validation to prevent request smuggling and desync attacks.
     // Must run before routing because these are transport-level violations that apply
     // regardless of which backend the request would be forwarded to.
-    if let Some(error_body) = check_protocol_headers(req.headers(), req.version()) {
+    if let Some(error_body) = check_protocol_headers_with_wire_framing(
+        req.headers(),
+        req.version(),
+        http1_te_cl_conflict_on_wire,
+    ) {
         warn!("Rejected request: {}", error_body);
         record_request(&state, 400);
         return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
@@ -45534,6 +45563,14 @@ pub fn check_protocol_headers(
     headers: &hyper::HeaderMap,
     version: hyper::Version,
 ) -> Option<&'static str> {
+    check_protocol_headers_with_wire_framing(headers, version, false)
+}
+
+fn check_protocol_headers_with_wire_framing(
+    headers: &hyper::HeaderMap,
+    version: hyper::Version,
+    http1_te_cl_conflict_on_wire: bool,
+) -> Option<&'static str> {
     let is_http1 = version == hyper::Version::HTTP_10 || version == hyper::Version::HTTP_11;
 
     // 1a. HTTP/1.0 must not use Transfer-Encoding (RFC 9112 §6.2 — HTTP/1.0 has no chunked encoding)
@@ -45544,8 +45581,9 @@ pub fn check_protocol_headers(
     // 1b. Content-Length + Transfer-Encoding conflict (HTTP/1.x request smuggling)
     // HTTP/2 and HTTP/3 don't use Transfer-Encoding (framing is at the protocol layer).
     if is_http1
-        && headers.contains_key("transfer-encoding")
-        && headers.contains_key("content-length")
+        && (http1_te_cl_conflict_on_wire
+            || headers.contains_key("transfer-encoding")
+                && headers.contains_key("content-length"))
     {
         return Some(
             r#"{"error":"Request contains both Content-Length and Transfer-Encoding headers"}"#,

@@ -4,7 +4,8 @@
 //! that reflects headers as JSON, then exercises:
 //!
 //! - HTTP/1.0 + `Transfer-Encoding` rejection (RFC 9112 §6.2)
-//! - `Content-Length` + `Transfer-Encoding` smuggling conflict (RFC 9112 §6.1)
+//! - Wire-order-independent `Content-Length` + `Transfer-Encoding` smuggling
+//!   conflict rejection (RFC 9112 §6.1)
 //! - Multiple `Content-Length` with conflicting values
 //! - Non-numeric `Content-Length` (negative, decimal, hex, alpha)
 //! - Multiple `Host` headers (HTTP/1.1)
@@ -217,19 +218,40 @@ fn header_ci<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str>
 /// status line, headers, and body. Used when the request itself must violate
 /// HTTP framing (CL+TE, multi-Host, etc.) — `reqwest` refuses to emit these.
 async fn send_raw_h1(proxy_port: u16, raw: &[u8]) -> RawResponse {
+    send_raw_h1_parts(proxy_port, &[raw]).await
+}
+
+/// Variant of [`send_raw_h1`] that preserves separate client writes. A short
+/// pause between parts makes the gateway observe a partial request head instead
+/// of relying on the kernel to keep adjacent writes separate.
+async fn send_raw_h1_parts(proxy_port: u16, parts: &[&[u8]]) -> RawResponse {
     let stream = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .expect("connect to gateway");
     let _ = stream.set_nodelay(true);
     let (read_half, mut write_half) = stream.into_split();
-    write_half.write_all(raw).await.expect("send raw request");
-    write_half.flush().await.expect("flush");
+    for (index, part) in parts.iter().enumerate() {
+        write_half
+            .write_all(part)
+            .await
+            .expect("send raw request part");
+        write_half.flush().await.expect("flush raw request part");
+        if index + 1 < parts.len() {
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
     // NOTE: intentionally NOT calling write_half.shutdown() — a half-close can
     // cause hyper to drop the connection before writing the error response.
     // Reading with a timeout is enough to keep the test bounded.
 
     let mut reader = BufReader::new(read_half);
+    read_raw_h1_response(&mut reader).await
+}
 
+async fn read_raw_h1_response<R>(reader: &mut BufReader<R>) -> RawResponse
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     // Status line (with timeout so malformed requests that the gateway silently
     // drops still fail fast instead of hanging)
     let mut status_line = Vec::new();
@@ -722,23 +744,114 @@ async fn functional_protocol_validation_http10_plus_te_rejected() {
 
 #[ignore]
 #[tokio::test]
-async fn functional_protocol_validation_cl_and_te_rejected() {
+async fn functional_protocol_validation_cl_and_te_rejected_in_both_wire_orders() {
     let h = Harness::new(false).await;
 
-    let req = b"POST / HTTP/1.1\r\n\
-                Host: example.com\r\n\
-                Content-Length: 5\r\n\
-                Transfer-Encoding: chunked\r\n\
-                \r\n\
-                0\r\n\r\n";
-    let resp = send_raw_h1(h.proxy_port, req).await;
+    const ERROR_BODY: &str =
+        r#"{"error":"Request contains both Content-Length and Transfer-Encoding headers"}"#;
+    let te_then_cl = b"POST / HTTP/1.1\r\n\
+                       Host: app.example\r\n\
+                       Transfer-Encoding: chunked\r\n\
+                       Content-Length: 6\r\n\
+                       \r\n\
+                       0\r\n\r\n";
+    let cl_then_te = b"POST / HTTP/1.1\r\n\
+                       Host: app.example\r\n\
+                       Content-Length: 6\r\n\
+                       Transfer-Encoding: chunked\r\n\
+                       \r\n\
+                       0\r\n\r\n";
 
-    assert_eq!(resp.status_code, 400, "body={}", resp.body);
-    assert!(
-        resp.body
-            .contains("Request contains both Content-Length and Transfer-Encoding"),
-        "unexpected body: {}",
-        resp.body
+    let te_then_cl_resp = send_raw_h1(h.proxy_port, te_then_cl).await;
+    let cl_then_te_resp = send_raw_h1(h.proxy_port, cl_then_te).await;
+    assert_eq!(te_then_cl_resp.status_code, 400);
+    assert_eq!(cl_then_te_resp.status_code, 400);
+    assert_eq!(te_then_cl_resp.body, ERROR_BODY);
+    assert_eq!(cl_then_te_resp.body, ERROR_BODY);
+
+    let lowercase_te = b"POST / HTTP/1.1\r\n\
+                         Host: app.example\r\n\
+                         transfer-encoding: chunked\r\n\
+                         Content-Length: 6\r\n\
+                         \r\n\
+                         0\r\n\r\n";
+    let lowercase_resp = send_raw_h1(h.proxy_port, lowercase_te).await;
+    assert_eq!(lowercase_resp.status_code, 400);
+    assert_eq!(lowercase_resp.body, ERROR_BODY);
+
+    let obs_fold_te = b"POST / HTTP/1.1\r\n\
+                        Host: app.example\r\n\
+                        Transfer-Encoding:\r\n\
+                         chunked\r\n\
+                        Content-Length: 6\r\n\
+                        \r\n\
+                        0\r\n\r\n";
+    let obs_fold_resp = send_raw_h1(h.proxy_port, obs_fold_te).await;
+    assert_eq!(obs_fold_resp.status_code, 400, "body={}", obs_fold_resp.body);
+
+    let split_one = b"POST / HTTP/1.1\r\nHost: app.example\r\n\
+                      Transfer-Encoding: chunked\r\nContent-Len";
+    let split_two = b"gth: 6\r\n\r\n0\r\n\r\n";
+    let split_resp = send_raw_h1_parts(h.proxy_port, &[split_one, split_two]).await;
+    assert_eq!(split_resp.status_code, 400);
+    assert_eq!(split_resp.body, ERROR_BODY);
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_single_h1_framing_header_still_works() {
+    let h = Harness::new(false).await;
+
+    let te_only = b"POST / HTTP/1.1\r\n\
+                    Host: app.example\r\n\
+                    Transfer-Encoding: chunked\r\n\
+                    \r\n\
+                    0\r\n\r\n";
+    let cl_only = b"POST / HTTP/1.1\r\n\
+                    Host: app.example\r\n\
+                    Content-Length: 6\r\n\
+                    \r\n\
+                    hello!";
+
+    let te_only_resp = send_raw_h1(h.proxy_port, te_only).await;
+    let cl_only_resp = send_raw_h1(h.proxy_port, cl_only).await;
+    assert_eq!(te_only_resp.status_code, 200, "body={}", te_only_resp.body);
+    assert_eq!(cl_only_resp.status_code, 200, "body={}", cl_only_resp.body);
+
+    // The observer must realign after a fixed-length body; otherwise a
+    // keep-alive TE.CL request could still bypass after an ordinary request.
+    let stream = TcpStream::connect(("127.0.0.1", h.proxy_port))
+        .await
+        .expect("connect to gateway");
+    let _ = stream.set_nodelay(true);
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    write_half
+        .write_all(cl_only)
+        .await
+        .expect("send keep-alive CL-only request");
+    write_half.flush().await.expect("flush CL-only request");
+    let first = read_raw_h1_response(&mut reader).await;
+    assert_eq!(first.status_code, 200, "body={}", first.body);
+
+    let te_then_cl = b"POST / HTTP/1.1\r\n\
+                       Host: app.example\r\n\
+                       Transfer-Encoding: chunked\r\n\
+                       Content-Length: 6\r\n\
+                       \r\n\
+                       0\r\n\r\n";
+    write_half
+        .write_all(te_then_cl)
+        .await
+        .expect("send keep-alive TE.CL request");
+    write_half.flush().await.expect("flush TE.CL request");
+    let second = read_raw_h1_response(&mut reader).await;
+    assert_eq!(second.status_code, 400);
+    assert_eq!(
+        second.body,
+        r#"{"error":"Request contains both Content-Length and Transfer-Encoding headers"}"#
     );
 
     h.cleanup();
