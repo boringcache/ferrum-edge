@@ -20,6 +20,7 @@ mod config_validation_tests;
 mod cp_grpc_conn_limit_tests;
 mod cp_overlay_poll_isolation_tests;
 mod cp_poll_interval_tests;
+mod database_parity_recovery_tests;
 mod db_backend_tests;
 mod db_dns_tests;
 mod db_loader_tests;

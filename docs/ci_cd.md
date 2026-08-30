@@ -2469,7 +2469,7 @@ universal-newline-decoded text. RETIREMENT IS MANDATORY once the mitigation
 lands, exactly as #3943 retired the #3889 pair. Any other `fips-build.yml` edit
 is still compared by the normal fail-closed Cross surface scan.
 
-##### Coverage-shard compile-memory knobs (issue #4099)
+##### Coverage-shard compile-memory knobs (issues #4099 / #4368)
 
 `Coverage Shard (lib-unit)` can be killed with `exit code 143` and "The runner
 has received a shutdown signal" **during the instrumented compile**, before any
@@ -2482,20 +2482,30 @@ merge-group load — exactly when the queue is trying to drain. Coverage adds
 `test`), so the per-thread LLVM module is even larger than the FIPS
 test-binary tail.
 
+Issue #4368 is that recurrence after the `#4099` mitigation: jobs=3, line-table
+debug info, additive swap, and `timeout-minutes: 75` still sat on both hosted
+ceilings. The repair lowers peak compile concurrency and raises the job
+deadline; it does not drop `--lib` or `--test unit_tests`, and it does not split
+the combined llvm-cov invocation.
+
 The `coverage-shard` job therefore mirrors the **safe** FIPS knobs that do not
 require a Cross generation transition. Only `coverage-merge` is digest-frozen
 by `WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS`; this subsection does not
 admit any new pair, and `coverage-merge` stays byte-identical.
 
-| Knob | FIPS `fips-test-build` (#4018) | Coverage `coverage-shard` (#4099) |
+| Knob | FIPS `fips-test-build` (#4018) | Coverage `coverage-shard` (#4099 / #4368) |
 |---|---|---|
-| `CARGO_BUILD_JOBS=3` | Job-level env; caps rustc codegen threads inside the large crates | Already present on `coverage-shard`; kept |
-| `line-tables-only` on `dev` **and** `test` | `CARGO_PROFILE_{DEV,TEST}_DEBUG` | Added. Drops variable-level DWARF only. Line/region attribution comes from `-C instrument-coverage` mapping, not DWARF locals, so `cargo llvm-cov` reports stay equivalent |
+| `CARGO_BUILD_JOBS` | Job-level env `3`; caps rustc codegen threads inside the large crates | Job-level env **`2`**. `#4099` kept `3`; `#4368` lowered it after PR #4336 run `33219849557` job `99020110238` reproduced the compile-phase exit-143 stall at `Compiling testcontainers v0.27.3` with jobs=3, line-tables, and additive swap already on |
+| `timeout-minutes` | Job-specific (FIPS compile/test budget) | **`timeout-minutes: 120`**. The `#4099` comment claimed the combined lib+`unit_tests` invocation fit 75 minutes; PR #4347 run `33223661366` attempt 1 job `99027333486` was still passing tests when that deadline canceled it. GitHub cannot set per-matrix-row timeouts, so the shared `coverage-shard` job carries the lib-unit budget; integration shards still finish far earlier |
+| `line-tables-only` on `dev` **and** `test` | `CARGO_PROFILE_{DEV,TEST}_DEBUG` | Added in `#4099`. Drops variable-level DWARF only. Line/region attribution comes from `-C instrument-coverage` mapping, not DWARF locals, so `cargo llvm-cov` reports stay equivalent |
 | Additive swapfile | Best-effort 8 GiB `/mnt/ferrum-fips-swapfile` (workflow is digest-frozen, so the step must not fail-close) | **Not added.** `coverage-shard` already enlarges swap with a fail-closed 12 GiB `/mnt/ferrum-swapfile` (same pattern as `ci.yml` `test-unit`). A second Ferrum swapfile would be redundant; converting the existing step to best-effort would not lower compile memory |
 
 Instrumentation, shard matrix, test filters, and `cargo llvm-cov` /
 nextest invocation flags are unchanged. No coverage shard is removed or
-narrowed. Action pins and tool installs are unchanged.
+narrowed. Action pins and tool installs are unchanged. `.github/scripts/verify_coverage_workflow.py`
+pins `CARGO_BUILD_JOBS=2`, `timeout-minutes: 120`, and the combined `--lib` /
+`--test unit_tests` invocation so those knobs cannot drift without failing
+Coverage Plan.
 
 ##### Admitted CI job SHA-256 generation transitions (temporary)
 

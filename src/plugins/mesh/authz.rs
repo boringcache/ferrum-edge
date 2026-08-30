@@ -77,6 +77,7 @@ use crate::plugins::{
     ALL_PROTOCOLS, JwtAuthAttributeValue, Plugin, PluginResult, ProxyProtocol, RequestContext,
     StreamConnectionContext, priority,
 };
+use crate::util::unknown_keys::reject_unknown_keys;
 
 pub(crate) const IGNORED_UDP_SOURCE_SCOPE_METADATA: &str = "mesh_authz.ignored_udp_source_scope";
 
@@ -137,12 +138,15 @@ pub struct MeshAuthz {
     /// Default empty: strict same-trust-domain match.
     trust_domain_aliases: Vec<TrustDomain>,
     /// Identity-asserting infrastructure SVIDs that are trusted to rewrite the
-    /// authz principal via HBONE baggage `source.principal`. Any
+    /// authz principal via HBONE baggage `source.principal`. Compiled at
+    /// construction into exact-SPIFFE and service-account maps so request-time
+    /// lookup does not scan unrelated NodeWaypoint inventory entries. Any
     /// authenticated HBONE peer outside this set has its baggage identity
     /// dropped and is authorised under its own peer SPIFFE ID. Default
-    /// `["ztunnel", "waypoint"]` (Istio ambient convention). See the
-    /// `TrustedAssertor` variants for matching semantics.
-    trusted_hbone_assertors: Vec<TrustedAssertor>,
+    /// `["ztunnel", "waypoint"]` (Istio ambient convention). See
+    /// [`TrustedAssertorIndex`] and [`AssertionGrant`] for matching and grant
+    /// semantics.
+    trusted_hbone_assertors: TrustedAssertorIndex,
     /// When `true`, the construction-time slice-level scope filter is
     /// skipped and policies are filtered per-request using
     /// [`RequestContext::node_waypoint_policy_scope`] instead. Used in
@@ -1310,13 +1314,16 @@ fn jwt_scalar_attribute_to_mesh_attribute(
     }
 }
 
-/// Matching rule for the [`MeshAuthz::trusted_hbone_assertors`] allow-list.
+/// Peer-matching half of a [`TrustedAssertor`] entry.
 ///
 /// Operators may supply either a bare service-account name (the Istio default
 /// for ztunnel and waypoints), or a full SPIFFE ID to pin a specific
 /// assertor identity, trust domain, and namespace.
-#[derive(Debug, Clone)]
-pub(crate) enum TrustedAssertor {
+///
+/// Matching a peer is NECESSARY but not SUFFICIENT to accept an assertion —
+/// see [`AssertionGrant`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AssertorMatcher {
     /// Match any peer whose SPIFFE-ID path encodes this Kubernetes service
     /// account per the Istio convention `ns/<ns>/sa/<sa>`.
     ServiceAccount(String),
@@ -1324,12 +1331,180 @@ pub(crate) enum TrustedAssertor {
     Spiffe(SpiffeId),
 }
 
-impl TrustedAssertor {
-    fn matches(&self, peer: &SpiffeId) -> bool {
-        match self {
-            Self::ServiceAccount(name) => peer.service_account() == Some(name.as_str()),
-            Self::Spiffe(id) => id == peer,
+/// WHICH identities a matched assertor is authorized to assert (issue #4274).
+///
+/// Before this existed, matching the allow-list was the whole check, so any
+/// authenticated pod running under a service account named `waypoint` (or
+/// `ztunnel`) — in ANY namespace — could assert ANY identity in the trust
+/// domain. `ns/attacker/sa/waypoint` asserting `ns/prod/sa/payments` was a
+/// complete authorization bypass, and the same forged baggage also
+/// mis-attributed metrics, the service graph, spans, and access logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AssertionGrant {
+    /// Fail-closed default: may assert only identities in the assertor's OWN
+    /// Kubernetes namespace. Applied to bare service-account names and to
+    /// exact SPIFFE pins that declare no wider contract.
+    SameNamespace,
+    /// May assert exactly the listed identities and nothing else — the set of
+    /// workloads a live slice / waypoint inventory says this assertor actually
+    /// fronts. An EMPTY set therefore authorizes nothing (fail closed).
+    FrontedIdentities(Arc<HashSet<String>>),
+    /// May assert any identity that clears the trust-domain gate. Reachable
+    /// only through an explicit per-entry `scope: mesh_wide` contract on an
+    /// exact SPIFFE matcher, which logs a loud warning at construction.
+    MeshWide,
+}
+
+/// One parsed allow-list entry: who may assert, and what they may assert.
+///
+/// Plugin construction compiles these into a [`TrustedAssertorIndex`]. The
+/// request path never walks this form.
+struct TrustedAssertor {
+    matcher: AssertorMatcher,
+    grant: AssertionGrant,
+}
+
+/// Construction-time compilation of [`TrustedAssertor`] entries.
+///
+/// Request-time evaluation looks up the peer's exact SPIFFE id and at most one
+/// service-account name. Duplicate matchers merge their [`AssertionGrant`]s at
+/// construction so insertion order cannot replace, narrow, or widen
+/// incorrectly. A peer matching both an exact entry and a service-account
+/// entry receives the union of those two compiled aggregates — not a scan of
+/// unrelated inventory.
+#[derive(Debug, Default)]
+pub(crate) struct TrustedAssertorIndex {
+    exact: HashMap<SpiffeId, CompiledGrant>,
+    service_account: HashMap<String, CompiledGrant>,
+}
+
+/// Merged grant for one matcher key. `MeshWide` dominates; otherwise
+/// `SameNamespace` and inventory sets are OR-ed.
+#[derive(Debug)]
+enum CompiledGrant {
+    MeshWide,
+    Restricted {
+        same_namespace: bool,
+        /// Union of `FrontedIdentities` sets for this matcher. `None` means no
+        /// inventory grant was present — not the same as an empty inventory,
+        /// which is `Some` of an empty set and authorizes nothing by itself.
+        fronted: Option<Arc<HashSet<String>>>,
+    },
+}
+
+impl TrustedAssertorIndex {
+    fn from_assertors(assertors: Vec<TrustedAssertor>) -> Self {
+        let mut index = Self::default();
+        for entry in assertors {
+            match entry.matcher {
+                AssertorMatcher::Spiffe(id) => {
+                    insert_compiled_grant(&mut index.exact, id, entry.grant);
+                }
+                AssertorMatcher::ServiceAccount(name) => {
+                    insert_compiled_grant(&mut index.service_account, name, entry.grant);
+                }
+            }
         }
+        index
+    }
+}
+
+fn insert_compiled_grant<K: Eq + std::hash::Hash>(
+    map: &mut HashMap<K, CompiledGrant>,
+    key: K,
+    grant: AssertionGrant,
+) {
+    match map.entry(key) {
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(CompiledGrant::from_grant(grant));
+        }
+        std::collections::hash_map::Entry::Occupied(mut slot) => {
+            slot.get_mut().union_grant(grant);
+        }
+    }
+}
+
+impl CompiledGrant {
+    fn from_grant(grant: AssertionGrant) -> Self {
+        match grant {
+            AssertionGrant::MeshWide => Self::MeshWide,
+            AssertionGrant::SameNamespace => Self::Restricted {
+                same_namespace: true,
+                fronted: None,
+            },
+            AssertionGrant::FrontedIdentities(ids) => Self::Restricted {
+                same_namespace: false,
+                fronted: Some(ids),
+            },
+        }
+    }
+
+    fn union_grant(&mut self, grant: AssertionGrant) {
+        if matches!(self, Self::MeshWide) {
+            return;
+        }
+        match grant {
+            AssertionGrant::MeshWide => *self = Self::MeshWide,
+            AssertionGrant::SameNamespace => {
+                if let Self::Restricted { same_namespace, .. } = self {
+                    *same_namespace = true;
+                }
+            }
+            AssertionGrant::FrontedIdentities(ids) => {
+                if let Self::Restricted { fronted, .. } = self {
+                    union_fronted_identities(fronted, ids);
+                }
+            }
+        }
+    }
+
+    fn permits(&self, peer: &SpiffeId, asserted: &SpiffeId) -> bool {
+        match self {
+            Self::MeshWide => true,
+            Self::Restricted {
+                same_namespace,
+                fronted,
+            } => {
+                (*same_namespace && same_namespace_assertion(peer, asserted))
+                    || fronted
+                        .as_ref()
+                        .is_some_and(|ids| ids.contains(asserted.as_str()))
+            }
+        }
+    }
+}
+
+fn union_fronted_identities(
+    existing: &mut Option<Arc<HashSet<String>>>,
+    incoming: Arc<HashSet<String>>,
+) {
+    match existing {
+        None => *existing = Some(incoming),
+        Some(current) => {
+            if incoming.is_empty() || Arc::ptr_eq(current, &incoming) {
+                return;
+            }
+            if current.is_empty() {
+                *current = incoming;
+                return;
+            }
+            Arc::make_mut(current).extend(incoming.iter().cloned());
+        }
+    }
+}
+
+/// Same-namespace relation backing [`AssertionGrant::SameNamespace`].
+///
+/// Both identities must expose a Kubernetes namespace segment (`/ns/<ns>/`)
+/// and those segments must be byte-equal. A peer whose SPIFFE path carries no
+/// namespace has nothing to be "the same" as, so it may only ever assert
+/// itself. Trust-domain equivalence is deliberately NOT decided here: the
+/// caller has already run the alias-aware trust-domain gate and re-deciding it
+/// would fork that policy.
+fn same_namespace_assertion(peer: &SpiffeId, asserted: &SpiffeId) -> bool {
+    match (peer.namespace(), asserted.namespace()) {
+        (Some(peer_ns), Some(asserted_ns)) => peer_ns == asserted_ns,
+        _ => peer == asserted,
     }
 }
 
@@ -1338,6 +1513,11 @@ impl TrustedAssertor {
 /// accounts. Operators with custom waypoint SA names (Gateway-managed
 /// waypoints often use `<gateway-name>` or `<gateway-name>-istio`) must
 /// override this list to add their names.
+///
+/// Since issue #4274 these bare names carry only the same-namespace grant, so
+/// an `istio-system` ztunnel no longer asserts application identities by
+/// default; operators who need that must pin the exact assertor SVID with an
+/// explicit `asserts` inventory or `scope: mesh_wide` contract.
 const DEFAULT_TRUSTED_HBONE_ASSERTOR_SA_NAMES: &[&str] = &["ztunnel", "waypoint"];
 
 fn ambient_udp_source_scope_index(
@@ -2598,8 +2778,11 @@ impl Plugin for MeshAuthz {
         let source_for_log = source_principal.as_ref().map(|id| id.as_str().to_string());
         let trust_domain_mismatch = baggage_outcome == BaggageOutcome::TrustDomainMismatch;
         let untrusted_assertor = baggage_outcome == BaggageOutcome::UntrustedAssertor;
-        let asserted_identity_rejected =
-            unauthenticated_hbone_baggage || untrusted_assertor || trust_domain_mismatch;
+        let assertion_out_of_scope = baggage_outcome == BaggageOutcome::AssertionOutOfScope;
+        let asserted_identity_rejected = unauthenticated_hbone_baggage
+            || untrusted_assertor
+            || assertion_out_of_scope
+            || trust_domain_mismatch;
         if trust_domain_mismatch {
             record_ignored_baggage_reason(&mut ctx.metadata, "trust_domain_mismatch");
             ctx.metadata.insert(
@@ -2614,6 +2797,15 @@ impl Plugin for MeshAuthz {
                 "true".to_string(),
             );
         }
+        // Redacted reason code only — the rejected identity is
+        // attacker-controlled and is never echoed into metadata or logs.
+        if assertion_out_of_scope {
+            record_ignored_baggage_reason(&mut ctx.metadata, "assertion_out_of_scope");
+            ctx.metadata.insert(
+                "mesh_authz.ignored_baggage.assertion_out_of_scope".to_string(),
+                "true".to_string(),
+            );
+        }
         if self.per_pod_policy_scoping {
             if unauthenticated_hbone_baggage {
                 crate::modes::mesh::node_waypoint_observability::record_asserted_identity_rejected(
@@ -2622,6 +2814,10 @@ impl Plugin for MeshAuthz {
             } else if untrusted_assertor {
                 crate::modes::mesh::node_waypoint_observability::record_asserted_identity_rejected(
                     crate::modes::mesh::node_waypoint_observability::NodeWaypointAssertedIdentityRejectReason::UntrustedAssertor,
+                );
+            } else if assertion_out_of_scope {
+                crate::modes::mesh::node_waypoint_observability::record_asserted_identity_rejected(
+                    crate::modes::mesh::node_waypoint_observability::NodeWaypointAssertedIdentityRejectReason::AssertionOutOfScope,
                 );
             } else if trust_domain_mismatch {
                 crate::modes::mesh::node_waypoint_observability::record_asserted_identity_rejected(
@@ -3115,6 +3311,11 @@ impl Plugin for MeshAuthz {
                     "mesh_authz.deny_policy".to_string(),
                     "untrusted_assertor".to_string(),
                 );
+            } else if assertion_out_of_scope {
+                ctx.metadata.insert(
+                    "mesh_authz.deny_policy".to_string(),
+                    "assertion_out_of_scope".to_string(),
+                );
             } else if self.per_pod_policy_scoping {
                 // Identity accept/reject already recorded above; AuthorizationPolicy
                 // denies are a distinct ADR signal.
@@ -3127,8 +3328,9 @@ impl Plugin for MeshAuthz {
             // trusted assertors record the workload identity that authz
             // evaluated, not the ztunnel/waypoint peer cert. The
             // synthesised-deny branches (untrusted_assertor /
-            // trust_domain_mismatch / unauthenticated_baggage) carry the
-            // peer cert identity or `None`, matching the authz request.
+            // assertion_out_of_scope / trust_domain_mismatch /
+            // unauthenticated_baggage) carry the peer cert identity or `None`,
+            // matching the authz request.
             self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
         }
         result
@@ -3442,6 +3644,11 @@ impl MeshAuthz {
     ///   in [`MeshAuthz::trust_domain_aliases`]. Baggage is dropped; the
     ///   returned principal is the peer cert identity (typically the
     ///   ztunnel's own SPIFFE id).
+    /// - `AssertionOutOfScope` — the peer is on the allow-list and the trust
+    ///   domain matched, but no matched entry's [`AssertionGrant`] authorizes
+    ///   THIS identity (issue #4274 — e.g. `ns/attacker/sa/waypoint` asserting
+    ///   `ns/prod/sa/payments`). Baggage is dropped; the returned principal is
+    ///   the peer cert identity.
     /// - `NoBaggageOrNonHbone` — non-HBONE request, no baggage, or no
     ///   authenticated peer to begin with. No diagnostic stamped.
     fn resolve_source_principal(&self, ctx: &RequestContext) -> (Option<SpiffeId>, BaggageOutcome) {
@@ -3459,45 +3666,151 @@ impl MeshAuthz {
                 .chain(ctx.headers.get(BAGGAGE_HEADER).map(String::as_str)),
         )
         .source_principal;
-        if !is_trusted_hbone_assertor(&self.trusted_hbone_assertors, peer) {
-            // Stamp `UntrustedAssertor` only when the request actually carried
-            // a baggage source identity that we suppressed. Without that
-            // signal there's nothing observable for operators to triage and
-            // the metadata would just be noise on every non-assertor HBONE
-            // flow.
-            let outcome = if baggage_principal.is_some() {
-                BaggageOutcome::UntrustedAssertor
-            } else {
-                BaggageOutcome::NoBaggageOrNonHbone
-            };
-            return (Some(peer.clone()), outcome);
-        }
-        match baggage_principal {
-            Some(b) if self.trust_domain_allowed(peer.trust_domain(), b.trust_domain()) => {
-                (Some(b), BaggageOutcome::Honored)
+        // No asserted identity means there is nothing to authorize and nothing
+        // observable for operators to triage — the assertor relation is not
+        // consulted at all, so ordinary non-assertor HBONE flows stay quiet.
+        let Some(baggage) = baggage_principal else {
+            return (Some(peer.clone()), BaggageOutcome::NoBaggageOrNonHbone);
+        };
+        // Single shared relation, evaluated once; the trust-domain gate is
+        // interleaved in the historical order so `untrusted_assertor` still
+        // wins over `trust_domain_mismatch` for a peer that is on neither.
+        let honor = hbone_baggage_honor(
+            &self.trusted_hbone_assertors,
+            &self.trust_domain_aliases,
+            peer,
+            &baggage,
+        );
+        match honor {
+            HboneBaggageHonor::UntrustedAssertor => {
+                (Some(peer.clone()), BaggageOutcome::UntrustedAssertor)
             }
-            Some(_) => (Some(peer.clone()), BaggageOutcome::TrustDomainMismatch),
-            None => (Some(peer.clone()), BaggageOutcome::NoBaggageOrNonHbone),
+            HboneBaggageHonor::TrustDomainMismatch => {
+                (Some(peer.clone()), BaggageOutcome::TrustDomainMismatch)
+            }
+            HboneBaggageHonor::AssertionOutOfScope => {
+                (Some(peer.clone()), BaggageOutcome::AssertionOutOfScope)
+            }
+            HboneBaggageHonor::Honored => (Some(baggage), BaggageOutcome::Honored),
         }
-    }
-
-    fn trust_domain_allowed(&self, peer_td: &TrustDomain, baggage_td: &TrustDomain) -> bool {
-        peer_td == baggage_td
-            || self
-                .trust_domain_aliases
-                .iter()
-                .any(|alias| alias == baggage_td)
     }
 }
 
-/// Whether `peer` is on the trusted-assertor allow-list.
+/// Disposition of a baggage assertion against the trusted-assertor relation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssertionVerdict {
+    /// The peer matched an entry whose grant covers the asserted identity.
+    Allowed,
+    /// The peer matched no entry at all.
+    UntrustedAssertor,
+    /// The peer matched at least one entry, but no matched entry's grant
+    /// covers this asserted identity (e.g. a bare service-account default
+    /// asked to cross a namespace boundary).
+    OutOfScope,
+}
+
+/// Whether `peer` is authorized to assert `asserted` over HBONE baggage.
 ///
 /// Shared by `mesh_authz` and `workload_metrics` so the authorization decision
 /// and the telemetry attribution always apply the SAME baggage trust gate — a
 /// forked copy is exactly how a workload-to-workload baggage spoof could slip
 /// into dashboards / the service graph while authz still correctly rejects it.
-pub(crate) fn is_trusted_hbone_assertor(assertors: &[TrustedAssertor], peer: &SpiffeId) -> bool {
-    assertors.iter().any(|entry| entry.matches(peer))
+/// Both callers consume the SAME three-way verdict rather than re-deriving a
+/// second predicate.
+///
+/// This is a RELATION between the assertor and the asserted identity, not a
+/// peer-only predicate (issue #4274). An entry is consulted only if it matches
+/// the peer, and it authorizes only what its [`AssertionGrant`] permits; a
+/// peer that matches several entries is authorized by the union of the matched
+/// grants. An empty allow-list authorizes nothing.
+///
+/// Hot path: two construction-time maps (`exact` SPIFFE, `service_account`),
+/// no locks, no allocation. Lookup is the peer's exact identity plus at most
+/// one service-account key — independent of unrelated NodeWaypoint inventory
+/// size. Duplicate matcher grants are already merged into those aggregates.
+pub(crate) fn hbone_assertion_verdict(
+    assertors: &TrustedAssertorIndex,
+    peer: &SpiffeId,
+    asserted: &SpiffeId,
+) -> AssertionVerdict {
+    let exact = assertors.exact.get(peer);
+    let service_account = peer
+        .service_account()
+        .and_then(|name| assertors.service_account.get(name));
+    match (exact, service_account) {
+        (None, None) => AssertionVerdict::UntrustedAssertor,
+        (exact, service_account) => {
+            if exact.is_some_and(|grant| grant.permits(peer, asserted))
+                || service_account.is_some_and(|grant| grant.permits(peer, asserted))
+            {
+                AssertionVerdict::Allowed
+            } else {
+                AssertionVerdict::OutOfScope
+            }
+        }
+    }
+}
+
+/// Disposition of one compiled baggage trust gate (assertor index + aliases).
+///
+/// Shared by `mesh_authz` and `workload_metrics` so a telemetry-only copy of
+/// the trust-domain interleave cannot drift from authorization. Order is the
+/// documented gate sequence: untrusted assertor, then trust-domain mismatch,
+/// then assertion out of scope, then honored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HboneBaggageHonor {
+    Honored,
+    UntrustedAssertor,
+    TrustDomainMismatch,
+    AssertionOutOfScope,
+}
+
+pub(crate) fn hbone_trust_domain_allowed(
+    aliases: &[TrustDomain],
+    peer_td: &TrustDomain,
+    baggage_td: &TrustDomain,
+) -> bool {
+    peer_td == baggage_td || aliases.iter().any(|alias| alias == baggage_td)
+}
+
+/// Evaluate the assertor relation and trust-domain gate for one compiled
+/// allow-list. No allocation, no locks.
+pub(crate) fn hbone_baggage_honor(
+    assertors: &TrustedAssertorIndex,
+    trust_domain_aliases: &[TrustDomain],
+    peer: &SpiffeId,
+    asserted: &SpiffeId,
+) -> HboneBaggageHonor {
+    let verdict = hbone_assertion_verdict(assertors, peer, asserted);
+    let trust_ok = hbone_trust_domain_allowed(
+        trust_domain_aliases,
+        peer.trust_domain(),
+        asserted.trust_domain(),
+    );
+    match verdict {
+        AssertionVerdict::UntrustedAssertor => HboneBaggageHonor::UntrustedAssertor,
+        _ if !trust_ok => HboneBaggageHonor::TrustDomainMismatch,
+        AssertionVerdict::OutOfScope => HboneBaggageHonor::AssertionOutOfScope,
+        AssertionVerdict::Allowed => HboneBaggageHonor::Honored,
+    }
+}
+
+/// Fail-closed conjunction of two honor outcomes. Honor only if both honor;
+/// otherwise the earlier documented refusal category wins so a multi-gate
+/// telemetry refusal never relabels `untrusted_assertor` as
+/// `assertion_out_of_scope` or a trust-domain mismatch as either. The forged
+/// identity is never part of this result.
+pub(crate) fn merge_hbone_baggage_honor(
+    left: HboneBaggageHonor,
+    right: HboneBaggageHonor,
+) -> HboneBaggageHonor {
+    use HboneBaggageHonor::*;
+    match (left, right) {
+        (Honored, other) | (other, Honored) => other,
+        (UntrustedAssertor, _) | (_, UntrustedAssertor) => UntrustedAssertor,
+        (TrustDomainMismatch, _) | (_, TrustDomainMismatch) => TrustDomainMismatch,
+        (AssertionOutOfScope, AssertionOutOfScope) => AssertionOutOfScope,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3507,6 +3820,9 @@ enum BaggageOutcome {
     /// Peer is not a trusted assertor and baggage carried a source identity
     /// that we dropped; returned principal is the peer cert identity.
     UntrustedAssertor,
+    /// Peer is a trusted assertor but is not authorized to assert THIS
+    /// identity (issue #4274); returned principal is the peer cert identity.
+    AssertionOutOfScope,
     /// Baggage's trust domain did not match the peer's or an alias; returned
     /// principal is the peer cert identity.
     TrustDomainMismatch,
@@ -3614,16 +3930,37 @@ fn has_baggage_header_from_request(ctx: &RequestContext) -> bool {
     ctx.raw_header_get(BAGGAGE_HEADER).is_some() || ctx.headers.contains_key(BAGGAGE_HEADER)
 }
 
+/// Parse the trusted-assertor allow-list, resolving each entry's grant and
+/// compiling the request-time index.
+///
+/// Entry shapes:
+///
+/// - `"waypoint"` / `"spiffe://td/ns/x/sa/y"` — matcher with the fail-closed
+///   [`AssertionGrant::SameNamespace`] grant.
+/// - `{"assertor": "<sa|spiffe>", "asserts": ["spiffe://…", …]}` — the
+///   inventory form; authorizes exactly the listed identities. `[]` authorizes
+///   nothing.
+/// - `{"assertor": "<sa|spiffe>", "scope": "same_namespace"}` — the explicit
+///   same-namespace contract form.
+/// - `{"assertor": "spiffe://…", "scope": "mesh_wide"}` — restores pre-#4274
+///   namespace-blind power for one exactly pinned peer and emits a warning.
+///
+/// Duplicate matcher keys union their grants; the returned index is what the
+/// request hot path consults.
 pub(crate) fn parse_trusted_hbone_assertors(
     config: &Value,
-) -> Result<Vec<TrustedAssertor>, String> {
+) -> Result<TrustedAssertorIndex, String> {
     let items = match config.get("trusted_hbone_assertors") {
         None | Some(Value::Null) => {
-            return Ok(default_trusted_hbone_assertors());
+            return Ok(TrustedAssertorIndex::from_assertors(
+                default_trusted_hbone_assertors(),
+            ));
         }
         Some(Value::Array(items)) => items,
         Some(_) => {
-            return Err("trusted_hbone_assertors must be an array of strings".to_string());
+            return Err(
+                "trusted_hbone_assertors must be an array of strings or objects".to_string(),
+            );
         }
     };
 
@@ -3633,23 +3970,112 @@ pub(crate) fn parse_trusted_hbone_assertors(
     // mesh_authz plugin active.
     items
         .iter()
-        .map(|item| {
-            let raw = item
-                .as_str()
-                .ok_or_else(|| "trusted_hbone_assertors entries must be strings".to_string())?;
-            parse_trusted_hbone_assertor(raw)
-        })
-        .collect()
+        .map(parse_trusted_hbone_assertor_entry)
+        .collect::<Result<Vec<_>, _>>()
+        .map(TrustedAssertorIndex::from_assertors)
 }
 
-fn parse_trusted_hbone_assertor(raw: &str) -> Result<TrustedAssertor, String> {
+fn parse_trusted_hbone_assertor_entry(item: &Value) -> Result<TrustedAssertor, String> {
+    match item {
+        Value::String(raw) => Ok(TrustedAssertor {
+            matcher: parse_assertor_matcher(raw)?,
+            grant: AssertionGrant::SameNamespace,
+        }),
+        Value::Object(map) => {
+            reject_unknown_keys(
+                map,
+                "trusted_hbone_assertors",
+                &["assertor", "asserts", "scope"],
+                "",
+            )?;
+            let Some(raw) = map.get("assertor").and_then(Value::as_str) else {
+                return Err(
+                    "trusted_hbone_assertors object entries must carry a string 'assertor'"
+                        .to_string(),
+                );
+            };
+            let matcher = parse_assertor_matcher(raw)?;
+            let trimmed = raw.trim();
+            let asserts = map.get("asserts").filter(|value| !value.is_null());
+            let scope = map.get("scope").filter(|value| !value.is_null());
+            let grant = match (asserts, scope) {
+                (None, None) => AssertionGrant::SameNamespace,
+                (Some(_), Some(_)) => {
+                    return Err(format!(
+                        "trusted_hbone_assertors entry '{trimmed}' must not set both 'asserts' and 'scope'"
+                    ));
+                }
+                (Some(Value::Array(ids)), None) => {
+                    let mut set = HashSet::with_capacity(ids.len());
+                    for id in ids {
+                        let Some(raw_id) = id.as_str() else {
+                            return Err(
+                                "trusted_hbone_assertors 'asserts' entries must be SPIFFE id \
+                                 strings"
+                                    .to_string(),
+                            );
+                        };
+                        let raw_id = raw_id.trim();
+                        let parsed = SpiffeId::new(raw_id).map_err(|e| {
+                            format!(
+                                "invalid trusted_hbone_assertors 'asserts' SPIFFE id '{raw_id}': {e}"
+                            )
+                        })?;
+                        set.insert(parsed.as_str().to_string());
+                    }
+                    AssertionGrant::FrontedIdentities(Arc::new(set))
+                }
+                (Some(_), None) => {
+                    return Err(format!(
+                        "trusted_hbone_assertors entry '{trimmed}' field 'asserts' must be an array of SPIFFE id strings"
+                    ));
+                }
+                (None, Some(Value::String(scope))) => match scope.trim() {
+                    "same_namespace" => AssertionGrant::SameNamespace,
+                    "mesh_wide" => {
+                        if !matches!(&matcher, AssertorMatcher::Spiffe(_)) {
+                            return Err(format!(
+                                "trusted_hbone_assertors entry '{trimmed}' scope 'mesh_wide' \
+                                 requires an exact 'spiffe://' assertor; bare service-account \
+                                 matchers are namespace-blind"
+                            ));
+                        }
+                        tracing::warn!(
+                            target: "mesh_authz",
+                            assertor = %trimmed,
+                            "SECURITY: trusted_hbone_assertors entry declares scope 'mesh_wide' \
+                             and may assert ANY workload identity in an accepted trust domain, \
+                             across namespaces. Prefer an explicit 'asserts' inventory."
+                        );
+                        AssertionGrant::MeshWide
+                    }
+                    other => {
+                        return Err(format!(
+                            "trusted_hbone_assertors entry '{trimmed}' has unknown scope '{other}' \
+                             (expected 'same_namespace' or 'mesh_wide')"
+                        ));
+                    }
+                },
+                (None, Some(_)) => {
+                    return Err(format!(
+                        "trusted_hbone_assertors entry '{trimmed}' field 'scope' must be a string"
+                    ));
+                }
+            };
+            Ok(TrustedAssertor { matcher, grant })
+        }
+        _ => Err("trusted_hbone_assertors entries must be strings or objects".to_string()),
+    }
+}
+
+fn parse_assertor_matcher(raw: &str) -> Result<AssertorMatcher, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("trusted_hbone_assertors entries must not be empty".to_string());
     }
     if trimmed.starts_with("spiffe://") {
         SpiffeId::new(trimmed)
-            .map(TrustedAssertor::Spiffe)
+            .map(AssertorMatcher::Spiffe)
             .map_err(|e| format!("invalid trusted_hbone_assertors SPIFFE id '{trimmed}': {e}"))
     } else {
         // Reject anything that looks like an attempted URI but isn't a SPIFFE
@@ -3660,14 +4086,17 @@ fn parse_trusted_hbone_assertor(raw: &str) -> Result<TrustedAssertor, String> {
                 "trusted_hbone_assertors entry '{trimmed}' looks like a URI but is not a 'spiffe://' SPIFFE id"
             ));
         }
-        Ok(TrustedAssertor::ServiceAccount(trimmed.to_string()))
+        Ok(AssertorMatcher::ServiceAccount(trimmed.to_string()))
     }
 }
 
 fn default_trusted_hbone_assertors() -> Vec<TrustedAssertor> {
     DEFAULT_TRUSTED_HBONE_ASSERTOR_SA_NAMES
         .iter()
-        .map(|name| TrustedAssertor::ServiceAccount((*name).to_string()))
+        .map(|name| TrustedAssertor {
+            matcher: AssertorMatcher::ServiceAccount((*name).to_string()),
+            grant: AssertionGrant::SameNamespace,
+        })
         .collect()
 }
 
