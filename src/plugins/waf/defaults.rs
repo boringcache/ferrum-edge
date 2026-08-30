@@ -11,8 +11,7 @@ const EVENT_HANDLER: &str = r"(?i)\bon(?:error|load|click|dblclick|mouseover|mou
 /// per attack shape prevents the body mirrors from drifting broader than the
 /// established query-side false-positive posture.
 const SQLI_UNION_SELECT: &str = r"(?i)\bunion\s+(?:all\s+)?select\b";
-const SQLI_BOOLEAN_TAUTOLOGY: &str =
-    r#"(?i)(?:\bor\b|\|\|)\s+['"]?\d+['"]?\s*=\s*['"]?\d+"#;
+const SQLI_BOOLEAN_TAUTOLOGY: &str = r#"(?i)(?:\bor\b|\|\|)\s+['"]?\d+['"]?\s*=\s*['"]?\d+"#;
 const SQLI_STACKED_STATEMENT: &str = r"(?i);\s*(?:drop|insert|update|delete|alter)\b";
 
 /// High-confidence query prototype-pollution tokens. Query keys and values

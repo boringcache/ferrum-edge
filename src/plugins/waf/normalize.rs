@@ -123,20 +123,19 @@ fn declared_utf16_endian(
             return None;
         }
         let value = raw_value.trim().trim_matches('"');
-        declared = if value.eq_ignore_ascii_case("utf-16le")
-            || value.eq_ignore_ascii_case("utf16le")
-        {
-            Some(Utf16Endian::Little)
-        } else if value.eq_ignore_ascii_case("utf-16be")
-            || value.eq_ignore_ascii_case("utf16be")
-            || value.eq_ignore_ascii_case("unicodefffe")
-        {
-            Some(Utf16Endian::Big)
-        } else if value.eq_ignore_ascii_case("utf-16") || value.eq_ignore_ascii_case("utf16") {
-            bom_endian
-        } else {
-            None
-        };
+        declared =
+            if value.eq_ignore_ascii_case("utf-16le") || value.eq_ignore_ascii_case("utf16le") {
+                Some(Utf16Endian::Little)
+            } else if value.eq_ignore_ascii_case("utf-16be")
+                || value.eq_ignore_ascii_case("utf16be")
+                || value.eq_ignore_ascii_case("unicodefffe")
+            {
+                Some(Utf16Endian::Big)
+            } else if value.eq_ignore_ascii_case("utf-16") || value.eq_ignore_ascii_case("utf16") {
+                bom_endian
+            } else {
+                None
+            };
     }
     declared
 }
