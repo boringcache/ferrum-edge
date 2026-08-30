@@ -2511,15 +2511,9 @@ impl DnsCache {
             }
             Ok(_) => {
                 if noisy {
-                    warn!(
-                        "DNS background refresh: {} returned no addresses",
-                        hostname
-                    );
+                    warn!("DNS background refresh: {} returned no addresses", hostname);
                 } else {
-                    debug!(
-                        "DNS background refresh: {} returned no addresses",
-                        hostname
-                    );
+                    debug!("DNS background refresh: {} returned no addresses", hostname);
                 }
                 self.note_preserved_success_refresh_failure(hostname, &candidate.generation);
             }
@@ -6172,12 +6166,7 @@ mod tests {
 
             let soonest_addr = testnet_addr(1);
             let later_addr = testnet_addr(2);
-            seed_near_expiry(
-                &cache,
-                "soonest.test",
-                Duration::from_secs(1),
-                soonest_addr,
-            );
+            seed_near_expiry(&cache, "soonest.test", Duration::from_secs(1), soonest_addr);
             seed_near_expiry(&cache, "later.test", Duration::from_secs(3), later_addr);
 
             cache.run_proactive_refresh_cycle().await;
