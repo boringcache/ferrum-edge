@@ -2672,7 +2672,10 @@ async fn prototype_pollution_blocks_decoded_query_keys_values_and_json_body() {
     let mut constructor_key_ctx = ctx("GET", "/waf");
     constructor_key_ctx.set_raw_query_string("constructor[prototype][x]=1".into());
     let constructor_key_result = plugin.authorize(&mut constructor_key_ctx).await;
-    assert!(matches!(constructor_key_result, PluginResult::Reject { .. }));
+    assert!(matches!(
+        constructor_key_result,
+        PluginResult::Reject { .. }
+    ));
     assert!(monitored(&constructor_key_ctx, "FE-PROTO-002-Q"));
 
     let mut proto_value_ctx = ctx("GET", "/waf");
@@ -2681,12 +2684,8 @@ async fn prototype_pollution_blocks_decoded_query_keys_values_and_json_body() {
     assert!(matches!(proto_value_result, PluginResult::Reject { .. }));
     assert!(monitored(&proto_value_ctx, "FE-PROTO-001-QV"));
 
-    let (body_result, body_ctx) = scan_body_with_content_type(
-        &plugin,
-        "application/json",
-        br#"{"__proto__":{"x":1}}"#,
-    )
-    .await;
+    let (body_result, body_ctx) =
+        scan_body_with_content_type(&plugin, "application/json", br#"{"__proto__":{"x":1}}"#).await;
     assert!(matches!(body_result, PluginResult::Reject { .. }));
     assert!(monitored(&body_ctx, "FE-PROTO-001"));
 
@@ -2730,12 +2729,8 @@ async fn utf16_body_rules_block_declared_endianness_and_keep_utf8_coverage() {
 
     let mut truncated = encode_utf16(payload, false);
     truncated.pop();
-    let (truncated_result, truncated_ctx) = scan_body_with_content_type(
-        &plugin,
-        "text/plain; charset=utf-16le",
-        &truncated,
-    )
-    .await;
+    let (truncated_result, truncated_ctx) =
+        scan_body_with_content_type(&plugin, "text/plain; charset=utf-16le", &truncated).await;
     assert!(matches!(truncated_result, PluginResult::Continue));
     assert!(!monitored(&truncated_ctx, "FE-SSRF-001"));
 }
@@ -2745,12 +2740,9 @@ async fn utf16_transcoding_does_not_widen_binary_or_multipart_body_gates() {
     let plugin = recommended_enforcing_waf();
     let body = encode_utf16("http://169.254.169.254/", false);
 
-    let (binary_result, binary_ctx) = scan_body_with_content_type(
-        &plugin,
-        "application/octet-stream; charset=utf-16le",
-        &body,
-    )
-    .await;
+    let (binary_result, binary_ctx) =
+        scan_body_with_content_type(&plugin, "application/octet-stream; charset=utf-16le", &body)
+            .await;
     assert!(matches!(binary_result, PluginResult::Continue));
     assert!(!monitored(&binary_ctx, "FE-SSRF-001"));
 
