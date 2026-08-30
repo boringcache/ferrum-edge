@@ -618,6 +618,13 @@ metrics:
     certExpiringSeconds: 604800
     databasePollStaleSeconds: 300
     upstreamUnhealthyRatio: 0.5
+    # Frontend TLS handshake error rate (failures/s) that fires
+    # FerrumGatewayFrontendTlsHandshakeErrors. `reason="error"` is the
+    # catch-all rustls accept failure, so it counts mid-handshake client
+    # disconnects, scanners, cipher mismatches, and plain HTTP sent to a TLS
+    # port. A threshold of 0 would therefore fire permanently on any
+    # internet-facing listener, so 0 disables the alert. Set a rate that is
+    # abnormal for your exposure to enable it.
     frontendTlsHandshakeErrorsPerSecond: 0
 
 # Optional NetworkPolicy. Default off. When enabled, proxy and stream listener

@@ -390,7 +390,11 @@ a Prometheus Operator `ServiceMonitor` plus a `PrometheusRule` with core gateway
 alerts. Data-path alerts (overload shedding, upstream health, circuit breakers,
 frontend TLS handshake failures) work without the optional `prometheus_metrics`
 plugin; traffic alerts (5xx rate, P99 latency) require it. Database poll
-freshness alerts render only in `database` and `cp` modes. Enabling metrics does **not** change `admin.bindAddress`; you must
+freshness alerts render only in `database` and `cp` modes. The frontend TLS
+handshake alert renders only when `metrics.alerts.frontendTlsHandshakeErrorsPerSecond`
+is set above `0`: `reason="error"` counts every rustls accept failure, including
+mid-handshake client disconnects and scanners, so a `0` threshold would fire
+permanently on an internet-facing listener. Enabling metrics does **not** change `admin.bindAddress`; you must
 explicitly expose admin for cluster scraping:
 
 ```yaml

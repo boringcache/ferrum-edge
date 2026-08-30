@@ -55,14 +55,16 @@ spec:
           annotations:
             summary: Ferrum gateway circuit breaker is open
             description: "Proxy {{ "{{ $labels.proxy_id }}" }}/{{ "{{ $labels.proxy_namespace }}" }} in namespace {{ "{{ $labels.namespace }}" }} has at least one upstream circuit breaker in the open state."
+{{- if $alerts.frontendTlsHandshakeErrorsPerSecond }}
         - alert: FerrumGatewayFrontendTlsHandshakeErrors
-          expr: sum(rate(ferrum_frontend_tls_handshake_failures_total{reason="error"}[5m])) > {{ $alerts.frontendTlsHandshakeErrorsPerSecond | default 0 }}
+          expr: sum(rate(ferrum_frontend_tls_handshake_failures_total{reason="error"}[5m])) > {{ $alerts.frontendTlsHandshakeErrorsPerSecond }}
           for: 10m
           labels:
             severity: warning
           annotations:
             summary: Ferrum gateway frontend TLS handshake errors are elevated
-            description: "Frontend TLS handshakes are being refused with reason=error at {{ "{{ $value }}" }} failures/s (threshold {{ $alerts.frontendTlsHandshakeErrorsPerSecond | default 0 }})."
+            description: "Frontend TLS handshakes are being refused with reason=error at {{ "{{ $value }}" }} failures/s (threshold {{ $alerts.frontendTlsHandshakeErrorsPerSecond }})."
+{{- end }}
     - name: ferrum.gateway.tls
       rules:
         - alert: FerrumGatewayTlsCertExpiringSoon
