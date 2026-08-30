@@ -1087,7 +1087,9 @@ async fn functional_protocol_validation_http3_extended_connect_websocket_authori
     };
 
     assert!(
-        !resp.body_text().contains("missing both :authority and Host"),
+        !resp
+            .body_text()
+            .contains("missing both :authority and Host"),
         "H3 Extended CONNECT with :authority must not trip the both-absent reject; status={} body={}",
         resp.status.as_u16(),
         resp.body_text()

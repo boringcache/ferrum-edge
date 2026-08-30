@@ -157,11 +157,7 @@ fn insecure_h3_endpoint() -> Result<Endpoint, Box<dyn std::error::Error + Send +
     Ok(endpoint)
 }
 
-fn encode_qpack_h3_get_headers(
-    authority: Option<&str>,
-    path: &str,
-    host: Option<&str>,
-) -> Vec<u8> {
+fn encode_qpack_h3_get_headers(authority: Option<&str>, path: &str, host: Option<&str>) -> Vec<u8> {
     let mut block = vec![0x00, 0x00]; // Required Insert Count = 0, Delta Base = 0.
     encode_qpack_literal(&mut block, b":method", b"GET");
     encode_qpack_literal(&mut block, b":scheme", b"https");
