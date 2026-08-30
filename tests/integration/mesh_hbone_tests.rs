@@ -2363,138 +2363,6 @@ fn inbound_relay_resolved_candidates_all_safe_returns_none_without_filtering() {
     );
 }
 
-// ── Issue #4252 — post-plugin effective-destination handler re-check ────────
-//
-// Mesh-mode has no deployed source that puts `mesh_route_dispatch` on the
-// synthesized inbound HBONE relay (`MeshSlice::from_gateway_config` does not
-// project `GatewayConfig.plugin_configs`; file source accepts only MeshConfig;
-// xDS reverse translation does not carry operator plugins). The functional
-// cases therefore prove synthesis-time 404. These in-process tests invoke the
-// real dispatcher → `handle_hbone_request` / `handle_hbone_udp_request` path
-// with a normal GatewayConfig plugin cache: CONNECT names a dest B terminates
-// for, a global `mesh_route_dispatch` rewrites onto C, and each handler must
-// 403 with zero backend hits. Deleting either re-check fails these tests;
-// a synthesis 404 would mean this setup never reached the handlers.
-
-fn is_usable_non_loopback_unicast(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            !v4.is_loopback()
-                && !v4.is_unspecified()
-                && !v4.is_link_local()
-                && !v4.is_multicast()
-                && !v4.is_broadcast()
-        }
-        IpAddr::V6(v6) => {
-            !v6.is_loopback()
-                && !v6.is_unspecified()
-                && !v6.is_multicast()
-                && (v6.segments()[0] & 0xffc0) != 0xfe80
-        }
-    }
-}
-
-async fn probe_udp_egress_local_ip(dest: SocketAddr) -> Result<IpAddr, String> {
-    let bind = if dest.is_ipv4() {
-        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
-    } else {
-        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
-    };
-    let socket = tokio::net::UdpSocket::bind(bind)
-        .await
-        .map_err(|e| format!("probe bind {bind}: {e}"))?;
-    socket
-        .connect(dest)
-        .await
-        .map_err(|e| format!("probe connect {dest}: {e}"))?;
-    socket
-        .local_addr()
-        .map(|addr| addr.ip())
-        .map_err(|e| format!("probe local_addr: {e}"))
-}
-
-/// Fail closed when the runner has only loopback: a 127.0.0.2 C can be
-/// refused by PR #4315's loopback-namespace guard instead of ownership.
-async fn discover_bindable_non_loopback_local_ip() -> IpAddr {
-    let probes = [
-        SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 53)),
-        SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53)),
-        SocketAddr::from((
-            std::net::Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
-            53,
-        )),
-    ];
-    let mut evidence = Vec::new();
-    let mut seen = HashSet::new();
-    for dest in probes {
-        match probe_udp_egress_local_ip(dest).await {
-            Ok(ip) => {
-                if !seen.insert(ip) {
-                    continue;
-                }
-                if !is_usable_non_loopback_unicast(ip) {
-                    evidence.push(format!(
-                        "probe {dest} → {ip}: rejected (loopback/unspecified/link-local/multicast/broadcast)"
-                    ));
-                    continue;
-                }
-                match TcpListener::bind(SocketAddr::new(ip, 0)).await {
-                    Ok(listener) => {
-                        drop(listener);
-                        return ip;
-                    }
-                    Err(e) => evidence.push(format!("probe {dest} → {ip}: TCP bind failed: {e}")),
-                }
-            }
-            Err(e) => evidence.push(format!("probe {dest}: {e}")),
-        }
-    }
-    panic!(
-        "no usable non-loopback local interface address for workload C. Evidence:\n{}",
-        evidence.join("\n")
-    );
-}
-
-fn global_mesh_route_dispatch_to(host: &str, port: u16) -> PluginConfig {
-    PluginConfig {
-        id: "third-workload-route-override".to_string(),
-        plugin_name: "mesh_route_dispatch".to_string(),
-        namespace: ferrum_edge::config::types::default_namespace(),
-        config: json!({
-            "rules": [{
-                "match": { "methods": ["CONNECT"] },
-                "destination": {
-                    "backend_host": host,
-                    "backend_port": port
-                }
-            }],
-            "reject_unmatched": false
-        }),
-        scope: PluginScope::Global,
-        proxy_id: None,
-        enabled: true,
-        priority_override: None,
-        trigger: None,
-        api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    }
-}
-
-/// Sidecar-shaped: CONNECT names loopback B, which #4315 admits only when this
-/// terminator shares the destination pod netns. C is a non-loopback third
-/// workload this terminator does not own, so the handler re-check refuses it
-/// for ownership rather than the loopback-namespace guard.
-fn post_plugin_refusal_mesh(b_port: u16, c_ip: IpAddr, c_port: u16) -> MeshConfig {
-    let c_addr = c_ip.to_string();
-    MeshConfig {
-        workloads: vec![
-            relay_guard_workload("svc-b", &["127.0.0.1"], &[b_port]),
-            relay_guard_workload("svc-c", &[&c_addr], &[c_port]),
-        ],
-        inbound_relay_admits_accepted_local_address: true,
-        inbound_relay_admits_loopback_namespace: true,
-
 // ── Termination inventory is per-OWNER, not per-identity (issues #4249/#4251) ─
 
 /// Prepare a serving snapshot from `slice` and hand back its mesh block.
@@ -4012,6 +3880,327 @@ fn reviews_and_ratings_mesh(bindings: Vec<MeshWaypointBinding>) -> MeshConfig {
     }
 }
 
+// ── Issue #4252 — post-plugin effective-destination handler re-check ────────
+//
+// Mesh-mode has no deployed source that puts `mesh_route_dispatch` on the
+// synthesized inbound HBONE relay (`MeshSlice::from_gateway_config` does not
+// project `GatewayConfig.plugin_configs`; file source accepts only MeshConfig;
+// xDS reverse translation does not carry operator plugins). The functional
+// cases therefore prove synthesis-time 404. These in-process tests invoke the
+// real dispatcher → `handle_hbone_request` / `handle_hbone_udp_request` path
+// with a normal GatewayConfig plugin cache: CONNECT names a dest B terminates
+// for, a global `mesh_route_dispatch` rewrites onto C, and each handler must
+// 403 with zero backend hits. Deleting either re-check fails these tests;
+// a synthesis 404 would mean this setup never reached the handlers.
+
+fn is_usable_non_loopback_unicast(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !v4.is_loopback()
+                && !v4.is_unspecified()
+                && !v4.is_link_local()
+                && !v4.is_multicast()
+                && !v4.is_broadcast()
+        }
+        IpAddr::V6(v6) => {
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+                && (v6.segments()[0] & 0xffc0) != 0xfe80
+        }
+    }
+}
+
+async fn probe_udp_egress_local_ip(dest: SocketAddr) -> Result<IpAddr, String> {
+    let bind = if dest.is_ipv4() {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+    };
+    let socket = tokio::net::UdpSocket::bind(bind)
+        .await
+        .map_err(|e| format!("probe bind {bind}: {e}"))?;
+    socket
+        .connect(dest)
+        .await
+        .map_err(|e| format!("probe connect {dest}: {e}"))?;
+    socket
+        .local_addr()
+        .map(|addr| addr.ip())
+        .map_err(|e| format!("probe local_addr: {e}"))
+}
+
+/// Fail closed when the runner has only loopback: a 127.0.0.2 C can be
+/// refused by PR #4315's loopback-namespace guard instead of ownership.
+async fn discover_bindable_non_loopback_local_ip() -> IpAddr {
+    let probes = [
+        SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 53)),
+        SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53)),
+        SocketAddr::from((
+            std::net::Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
+            53,
+        )),
+    ];
+    let mut evidence = Vec::new();
+    let mut seen = HashSet::new();
+    for dest in probes {
+        match probe_udp_egress_local_ip(dest).await {
+            Ok(ip) => {
+                if !seen.insert(ip) {
+                    continue;
+                }
+                if !is_usable_non_loopback_unicast(ip) {
+                    evidence.push(format!(
+                        "probe {dest} → {ip}: rejected (loopback/unspecified/link-local/multicast/broadcast)"
+                    ));
+                    continue;
+                }
+                match TcpListener::bind(SocketAddr::new(ip, 0)).await {
+                    Ok(listener) => {
+                        drop(listener);
+                        return ip;
+                    }
+                    Err(e) => evidence.push(format!("probe {dest} → {ip}: TCP bind failed: {e}")),
+                }
+            }
+            Err(e) => evidence.push(format!("probe {dest}: {e}")),
+        }
+    }
+    panic!(
+        "no usable non-loopback local interface address for workload C. Evidence:\n{}",
+        evidence.join("\n")
+    );
+}
+
+fn global_mesh_route_dispatch_to(host: &str, port: u16) -> PluginConfig {
+    PluginConfig {
+        id: "third-workload-route-override".to_string(),
+        plugin_name: "mesh_route_dispatch".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        config: json!({
+            "rules": [{
+                "match": { "methods": ["CONNECT"] },
+                "destination": {
+                    "backend_host": host,
+                    "backend_port": port
+                }
+            }],
+            "reject_unmatched": false
+        }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+/// Sidecar-shaped: CONNECT names loopback B, which #4315 admits only when this
+/// terminator shares the destination pod netns. C is a non-loopback third
+/// workload this terminator does not own, so the handler re-check refuses it
+/// for ownership rather than the loopback-namespace guard.
+fn post_plugin_refusal_mesh(b_port: u16, c_ip: IpAddr, c_port: u16) -> MeshConfig {
+    let c_addr = c_ip.to_string();
+    MeshConfig {
+        workloads: vec![
+            relay_guard_workload("svc-b", &["127.0.0.1"], &[b_port]),
+            relay_guard_workload("svc-c", &[&c_addr], &[c_port]),
+        ],
+        inbound_relay_admits_accepted_local_address: true,
+        inbound_relay_admits_loopback_namespace: true,
+        ..MeshConfig::default()
+    }
+}
+
+fn reviews_only_waypoint_binding(waypoint_for: &str) -> MeshWaypointBinding {
+    MeshWaypointBinding {
+        name: "reviews-waypoint".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        waypoint_for: waypoint_for.to_string(),
+        gateway_class_name: None,
+        services: vec![MeshWaypointServiceRef {
+            namespace: DEFAULT_NAMESPACE.to_string(),
+            name: "reviews".to_string(),
+        }],
+    }
+}
+
+fn reviews_bound_service_ref() -> MeshWaypointServiceRef {
+    MeshWaypointServiceRef {
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        name: "reviews".to_string(),
+    }
+}
+
+/// Issue #4251, production path: `narrow_for_service_waypoint` still fail-opens
+/// the routing view when the named binding is absent, so `MeshSlice.services`
+/// carries every namespace-visible Service. That view must NOT license the
+/// inbound HBONE relay — missing binding evidence yields an empty inventory.
+#[test]
+fn inbound_relay_service_waypoint_missing_binding_from_gateway_config_terminates_for_nothing() {
+    let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+        reviews_and_ratings_mesh(Vec::new()),
+        "reviews-waypoint",
+    );
+
+    assert_eq!(
+        slice.services.len(),
+        2,
+        "routing still fail-opens when the named Gateway has not landed"
+    );
+    assert!(
+        slice.service_waypoint_bound_services.is_empty(),
+        "a missing binding must not stamp relay evidence from namespace-visible Services"
+    );
+    assert!(
+        mesh.inbound_relay_destinations.is_empty(),
+        "no matching binding must leave the relay inventory empty"
+    );
+
+    let waypoint = Some(ip("10.244.4.4"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.2.9", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+}
+
+fn assert_reviews_service_relay_from_gateway_config(slice: &MeshSlice, mesh: &MeshConfig) {
+    assert_eq!(
+        slice.service_waypoint_bound_services,
+        vec![reviews_bound_service_ref()],
+        "service-terminating waypoint_for must stamp exact bound-service refs"
+    );
+    assert_eq!(
+        slice
+            .services
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["reviews"],
+        "the matching binding must narrow the routing view to the bound Service"
+    );
+
+    let waypoint = Some(ip("10.244.4.4"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, waypoint),
+        Ok(()),
+        "a bound service's backing workload is a destination this waypoint terminates for"
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.2.9", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a namespace-visible workload that backs no bound service is not terminated here"
+    );
+}
+
+fn assert_no_service_relay_from_gateway_config(slice: &MeshSlice, mesh: &MeshConfig) {
+    assert!(
+        slice.service_waypoint_bound_services.is_empty(),
+        "non-service-terminating waypoint_for must not stamp inbound-relay binding evidence"
+    );
+    assert!(
+        mesh.inbound_relay_destinations.is_empty(),
+        "no service-terminating binding evidence must leave the relay inventory empty"
+    );
+
+    let waypoint = Some(ip("10.244.4.4"));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.2.9", 8080, waypoint),
+        Err(InboundRelayDenial::AddressNotTerminated)
+    );
+}
+
+/// Issue #4251, production path: `waypoint_for=service` (and mixed-case) retains
+/// exact service binding evidence and admits only those bound backends.
+#[test]
+fn inbound_relay_service_waypoint_exact_binding_from_gateway_config_admits_only_bound_backends() {
+    for waypoint_for in ["service", "SERVICE"] {
+        let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+            reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding(waypoint_for)]),
+            "reviews-waypoint",
+        );
+        assert_reviews_service_relay_from_gateway_config(&slice, &mesh);
+    }
+}
+
+/// Issue #4251, production path: `waypoint_for=all` is also service-terminating
+/// and must stamp the same exact bound-service refs as `service`.
+#[test]
+fn inbound_relay_service_waypoint_waypoint_for_all_from_gateway_config_admits_only_bound_backends()
+{
+    for waypoint_for in ["all", "All"] {
+        let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+            reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding(waypoint_for)]),
+            "reviews-waypoint",
+        );
+        assert_reviews_service_relay_from_gateway_config(&slice, &mesh);
+    }
+}
+
+/// Issue #4251, production path: `waypoint_for=none` is an explicit opt-out and
+/// must produce an empty relay inventory even when the binding lists services.
+#[test]
+fn inbound_relay_service_waypoint_waypoint_for_none_from_gateway_config_terminates_for_nothing() {
+    let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+        reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding("none")]),
+        "reviews-waypoint",
+    );
+
+    assert!(
+        slice.services.is_empty() && slice.workloads.is_empty(),
+        "waypoint_for=none must produce an empty admitted routing set"
+    );
+    assert_no_service_relay_from_gateway_config(&slice, &mesh);
+}
+
+/// Issue #4251, production path: `waypoint_for=workload` still lists Service
+/// refs on the routing view (the K8s translator appends them) but does not
+/// claim service traffic, so inbound service relay must terminate for nothing.
+#[test]
+fn inbound_relay_service_waypoint_waypoint_for_workload_from_gateway_config_terminates_for_nothing()
+{
+    let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+        reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding("workload")]),
+        "reviews-waypoint",
+    );
+
+    assert_eq!(
+        slice
+            .services
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["reviews"],
+        "waypoint_for=workload must keep the existing routing-view narrowing"
+    );
+    assert_no_service_relay_from_gateway_config(&slice, &mesh);
+}
+
+/// Issue #4251, production path: blank and unknown/forward `waypoint_for`
+/// values fail closed for inbound service-relay evidence.
+#[test]
+fn inbound_relay_service_waypoint_unknown_waypoint_for_from_gateway_config_terminates_for_nothing()
+{
+    for waypoint_for in ["", "direct"] {
+        let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
+            reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding(waypoint_for)]),
+            "reviews-waypoint",
+        );
+        assert_no_service_relay_from_gateway_config(&slice, &mesh);
+    }
+}
+
 fn create_post_plugin_third_workload_state(
     mesh: MeshConfig,
     route_override: PluginConfig,
@@ -4266,189 +4455,4 @@ async fn inbound_hbone_relay_refuses_post_plugin_third_workload_byte_stream() {
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_hbone_relay_refuses_post_plugin_third_workload_datagram() {
     drive_post_plugin_third_workload_refusal(PostPluginConnectFlavor::Datagram).await;
-
-fn reviews_only_waypoint_binding(waypoint_for: &str) -> MeshWaypointBinding {
-    MeshWaypointBinding {
-        name: "reviews-waypoint".to_string(),
-        namespace: DEFAULT_NAMESPACE.to_string(),
-        waypoint_for: waypoint_for.to_string(),
-        gateway_class_name: None,
-        services: vec![MeshWaypointServiceRef {
-            namespace: DEFAULT_NAMESPACE.to_string(),
-            name: "reviews".to_string(),
-        }],
-    }
-}
-
-fn reviews_bound_service_ref() -> MeshWaypointServiceRef {
-    MeshWaypointServiceRef {
-        namespace: DEFAULT_NAMESPACE.to_string(),
-        name: "reviews".to_string(),
-    }
-}
-
-/// Issue #4251, production path: `narrow_for_service_waypoint` still fail-opens
-/// the routing view when the named binding is absent, so `MeshSlice.services`
-/// carries every namespace-visible Service. That view must NOT license the
-/// inbound HBONE relay — missing binding evidence yields an empty inventory.
-#[test]
-fn inbound_relay_service_waypoint_missing_binding_from_gateway_config_terminates_for_nothing() {
-    let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
-        reviews_and_ratings_mesh(Vec::new()),
-        "reviews-waypoint",
-    );
-
-    assert_eq!(
-        slice.services.len(),
-        2,
-        "routing still fail-opens when the named Gateway has not landed"
-    );
-    assert!(
-        slice.service_waypoint_bound_services.is_empty(),
-        "a missing binding must not stamp relay evidence from namespace-visible Services"
-    );
-    assert!(
-        mesh.inbound_relay_destinations.is_empty(),
-        "no matching binding must leave the relay inventory empty"
-    );
-
-    let waypoint = Some(ip("10.244.4.4"));
-    assert_eq!(
-        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, waypoint),
-        Err(InboundRelayDenial::AddressNotTerminated)
-    );
-    assert_eq!(
-        mesh.inbound_relay_destination_decision("10.244.2.9", 8080, waypoint),
-        Err(InboundRelayDenial::AddressNotTerminated)
-    );
-}
-
-fn assert_reviews_service_relay_from_gateway_config(slice: &MeshSlice, mesh: &MeshConfig) {
-    assert_eq!(
-        slice.service_waypoint_bound_services,
-        vec![reviews_bound_service_ref()],
-        "service-terminating waypoint_for must stamp exact bound-service refs"
-    );
-    assert_eq!(
-        slice
-            .services
-            .iter()
-            .map(|s| s.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["reviews"],
-        "the matching binding must narrow the routing view to the bound Service"
-    );
-
-    let waypoint = Some(ip("10.244.4.4"));
-    assert_eq!(
-        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, waypoint),
-        Ok(()),
-        "a bound service's backing workload is a destination this waypoint terminates for"
-    );
-    assert_eq!(
-        mesh.inbound_relay_destination_decision("10.244.2.9", 8080, waypoint),
-        Err(InboundRelayDenial::AddressNotTerminated),
-        "a namespace-visible workload that backs no bound service is not terminated here"
-    );
-}
-
-fn assert_no_service_relay_from_gateway_config(slice: &MeshSlice, mesh: &MeshConfig) {
-    assert!(
-        slice.service_waypoint_bound_services.is_empty(),
-        "non-service-terminating waypoint_for must not stamp inbound-relay binding evidence"
-    );
-    assert!(
-        mesh.inbound_relay_destinations.is_empty(),
-        "no service-terminating binding evidence must leave the relay inventory empty"
-    );
-
-    let waypoint = Some(ip("10.244.4.4"));
-    assert_eq!(
-        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, waypoint),
-        Err(InboundRelayDenial::AddressNotTerminated)
-    );
-    assert_eq!(
-        mesh.inbound_relay_destination_decision("10.244.2.9", 8080, waypoint),
-        Err(InboundRelayDenial::AddressNotTerminated)
-    );
-}
-
-/// Issue #4251, production path: `waypoint_for=service` (and mixed-case) retains
-/// exact service binding evidence and admits only those bound backends.
-#[test]
-fn inbound_relay_service_waypoint_exact_binding_from_gateway_config_admits_only_bound_backends() {
-    for waypoint_for in ["service", "SERVICE"] {
-        let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
-            reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding(waypoint_for)]),
-            "reviews-waypoint",
-        );
-        assert_reviews_service_relay_from_gateway_config(&slice, &mesh);
-    }
-}
-
-/// Issue #4251, production path: `waypoint_for=all` is also service-terminating
-/// and must stamp the same exact bound-service refs as `service`.
-#[test]
-fn inbound_relay_service_waypoint_waypoint_for_all_from_gateway_config_admits_only_bound_backends()
-{
-    for waypoint_for in ["all", "All"] {
-        let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
-            reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding(waypoint_for)]),
-            "reviews-waypoint",
-        );
-        assert_reviews_service_relay_from_gateway_config(&slice, &mesh);
-    }
-}
-
-/// Issue #4251, production path: `waypoint_for=none` is an explicit opt-out and
-/// must produce an empty relay inventory even when the binding lists services.
-#[test]
-fn inbound_relay_service_waypoint_waypoint_for_none_from_gateway_config_terminates_for_nothing() {
-    let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
-        reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding("none")]),
-        "reviews-waypoint",
-    );
-
-    assert!(
-        slice.services.is_empty() && slice.workloads.is_empty(),
-        "waypoint_for=none must produce an empty admitted routing set"
-    );
-    assert_no_service_relay_from_gateway_config(&slice, &mesh);
-}
-
-/// Issue #4251, production path: `waypoint_for=workload` still lists Service
-/// refs on the routing view (the K8s translator appends them) but does not
-/// claim service traffic, so inbound service relay must terminate for nothing.
-#[test]
-fn inbound_relay_service_waypoint_waypoint_for_workload_from_gateway_config_terminates_for_nothing()
-{
-    let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
-        reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding("workload")]),
-        "reviews-waypoint",
-    );
-
-    assert_eq!(
-        slice
-            .services
-            .iter()
-            .map(|s| s.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["reviews"],
-        "waypoint_for=workload must keep the existing routing-view narrowing"
-    );
-    assert_no_service_relay_from_gateway_config(&slice, &mesh);
-}
-
-/// Issue #4251, production path: blank and unknown/forward `waypoint_for`
-/// values fail closed for inbound service-relay evidence.
-#[test]
-fn inbound_relay_service_waypoint_unknown_waypoint_for_from_gateway_config_terminates_for_nothing()
-{
-    for waypoint_for in ["", "direct"] {
-        let (slice, mesh) = prepared_service_waypoint_from_gateway_config(
-            reviews_and_ratings_mesh(vec![reviews_only_waypoint_binding(waypoint_for)]),
-            "reviews-waypoint",
-        );
-        assert_no_service_relay_from_gateway_config(&slice, &mesh);
-    }
 }
