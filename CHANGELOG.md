@@ -349,6 +349,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Operator action**: none; the existing concurrency env var now also caps
   proactive refresh per cycle.
 
+- **Security — HTTP/1 CL+TE smuggling rejection is now wire-order-independent**
+  (issue #4391). A TE-first request previously reached Hyper's application
+  service without `Content-Length`, because Hyper applied transfer-coding
+  precedence before Ferrum's header-map guard ran; the same fields in CL-first
+  order returned `400`. Plaintext and TLS proxy HTTP/1 frontends now observe
+  bounded raw request heads before parsing and carry the CL+TE fact into the
+  existing `400` rejection path, which closes the client connection as required
+  by RFC 9112 §6.1. The observer is case-insensitive, survives
+  leading empty lines, split reads, and keep-alive bodies, and disables itself
+  for HTTP/2 (TLS ALPN `h2` is never wrapped; h2c defers the signal ring until
+  the connection classifies as HTTP/1) and after an HTTP/1 `101` upgrade or
+  successful CONNECT, matching Hyper's `is_last` cases. An HTTP/1 request that
+  was never observed is tracked distinctly from a completed no-conflict
+  observation so a missing observer cannot be mistaken for a verified-clear
+  wire. Observer-failure warnings are rate-limited like the accept loop.
+  Body-boundary reads can include an 8 KiB observation suffix instead of being
+  shortened to the current chunk remainder. If observation loses alignment or
+  exhausts its fixed signal ring, the current request is rejected with a
+  distinct error and the connection is closed. This applies only to plaintext
+  and TLS **proxy** HTTP/1 frontends; the admin and injector HTTP listeners are
+  outside this observer boundary. TE-only, CL-only, HTTP/2, and HTTP/3 behavior
+  is unchanged.
+
 - **Security — client-asserted `X-Real-IP` no longer reaches mirror or
   load-test targets** (issue #4164). The primary backend builders drop an
   untrusted peer's `X-Real-IP`, but the shared secondary-request boundary took
