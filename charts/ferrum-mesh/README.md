@@ -17,6 +17,39 @@ naming, labelling, secret, and validation conventions.
 
 Example value overlays live under [`examples/`](examples/).
 
+## Gateway API CRDs (required)
+
+When `controlPlane.enabled=true` and `controlPlane.rbac.gatewayApi=true` (the
+default), this chart renders a cluster-scoped `GatewayClass` and Gateway API
+RBAC over `HTTPRoute`, `GRPCRoute`, `TCPRoute`, `TLSRoute`, `UDPRoute`,
+`ListenerSet`, and `XBackendTrafficPolicy`. Those upstream CRDs are **not**
+shipped in this chart's `crds/` directory (only Ferrum-owned CRDs such as
+`UDPResponseAmplificationPolicy` live there).
+
+Install the **experimental** Gateway API channel at Ferrum's pinned version
+**before** `helm install`:
+
+```bash
+kubectl apply --server-side=true \
+  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/experimental-install.yaml
+```
+
+Ferrum requires the experimental channel, not `standard-install.yaml`. The mesh
+control plane watches L4 route kinds (`TCPRoute`, `UDPRoute`) and
+`XBackendTrafficPolicy` (`gateway.networking.x-k8s.io`) that the standard
+channel does not install at v1.5.1. Upstream rejects mixing channels — do not
+apply `standard-install.yaml` and then add standalone experimental CRDs.
+
+**Opt out.** Set `controlPlane.rbac.gatewayApi=false` to skip the `GatewayClass`
+and Gateway API RBAC. For an Istio-only control plane, also set
+`controlPlane.env.FERRUM_K8S_WATCH_GATEWAY_API_CRDS: "false"` and skip the CRD
+install. To keep Gateway API watching but supply your own `GatewayClass`, leave
+`controlPlane.rbac.gatewayApi=true`, install the experimental bundle, and set
+`gatewayClass.create=false`.
+
+See [`docs/kubernetes_deployment.md`](../../docs/kubernetes_deployment.md#gateway-api-crds-required)
+for the full deployment guide section.
+
 ## Sidecar injector webhook self-exclusion
 
 The mutating webhook uses `failurePolicy: Fail` so a broken admission path

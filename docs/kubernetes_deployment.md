@@ -228,9 +228,51 @@ does not infer controller ownership from the class name spelling; disable
 independent `ferrum-mesh` release in the same cluster must set a unique
 `gatewayClass.name`; Helm ownership of the cluster-scoped object is
 intentional, and a later release must not force-import or skip-create to share
-another release's class. Do not put the reserved DB/JWT variables under
-`controlPlane.env`; use the first-class chart values so the rendered Deployment
-has a clear secret contract:
+another release's class.
+
+### Gateway API CRDs (required)
+
+Ferrum does **not** ship upstream Gateway API CRDs in the Helm chart. The chart
+`crds/` directory contains only Ferrum-owned CRDs (for example
+`UDPResponseAmplificationPolicy`). Upstream Gateway API definitions are large,
+versioned independently, and must not live in Helm `crds/` — that directory is
+not upgraded on `helm upgrade` and cannot be removed on uninstall.
+
+When `controlPlane.enabled=true` and `controlPlane.rbac.gatewayApi=true` (the
+default), the chart renders a cluster-scoped `GatewayClass` and a `ClusterRole`
+that watches `HTTPRoute`, `GRPCRoute`, `TCPRoute`, `TLSRoute`, `UDPRoute`,
+`ListenerSet`, and `XBackendTrafficPolicy` (`gateway.networking.x-k8s.io`).
+Those kinds require the **experimental** Gateway API channel at the pin Ferrum
+CI and conformance labs use — **`v1.5.1`** (`GATEWAY_API_VERSION` in
+`.github/workflows/ci.yml` and `scripts/gateway_api_conformance_lab_setup.sh`).
+
+Install the experimental bundle **once per cluster** before `helm install`:
+
+```bash
+kubectl apply --server-side=true \
+  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/experimental-install.yaml
+```
+
+Do **not** install `standard-install.yaml` for Ferrum mesh control planes. The
+standard channel at v1.5.1 does not include `TCPRoute`, `UDPRoute`, or
+`XBackendTrafficPolicy`, yet Ferrum's control-plane RBAC and reconciler expect
+them. Upstream rejects mixing channels — applying `standard-install.yaml` and
+then adding a standalone experimental L4 CRD fails with
+`multiple gateway API CRDs channels detected` (see
+`scripts/gateway_api_conformance_lab_setup.sh`).
+
+**Opt out of Gateway API entirely.** Set `controlPlane.rbac.gatewayApi=false`
+so the chart does not render the `GatewayClass` or Gateway API RBAC. For an
+Istio-only control plane that should not watch Gateway API resources at all,
+also set `controlPlane.env.FERRUM_K8S_WATCH_GATEWAY_API_CRDS: "false"`. You do
+not need to install the Gateway API CRD bundle in that posture.
+
+**Keep Gateway API watching but manage `GatewayClass` yourself.** Leave
+`controlPlane.rbac.gatewayApi=true`, install the experimental CRD bundle above,
+and set `gatewayClass.create=false`.
+
+Do not put the reserved DB/JWT variables under `controlPlane.env`; use the
+first-class chart values so the rendered Deployment has a clear secret contract:
 
 ```yaml
 controlPlane:
@@ -255,6 +297,9 @@ Development installs can use SQLite with operator-generated random JWT
 secrets:
 
 ```bash
+kubectl apply --server-side=true \
+  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/experimental-install.yaml
+
 kubectl create namespace ferrum --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n ferrum create secret generic ferrum-mesh-dev-credentials \
   --from-literal=admin-jwt-secret="$(openssl rand -hex 32)" \
@@ -268,6 +313,9 @@ Production-style installs should use existing Secrets for both JWT material and
 the database URL:
 
 ```bash
+kubectl apply --server-side=true \
+  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/experimental-install.yaml
+
 kubectl create namespace ferrum --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n ferrum create secret generic ferrum-mesh-production-db \
   --from-literal=url='postgres://ferrum:<percent-encoded-password>@postgres.ferrum.svc:5432/ferrum'

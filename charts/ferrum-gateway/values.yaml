@@ -565,9 +565,10 @@ podDisruptionBudget:
 # the scraper originates from `metrics.allowedCidrs` or presents
 # `metrics.bearerToken`. Enabling the ServiceMonitor does NOT change
 # `admin.bindAddress`; pair it with `admin.service.enabled=true` and a
-# non-loopback admin bind plus a NetworkPolicy. Also enable the globally scoped
-# `prometheus_metrics` plugin in your gateway config or the scrape returns an
-# empty exposition. See charts/ferrum-gateway/README.md#metrics-and-prometheus.
+# non-loopback admin bind plus a NetworkPolicy. Authenticated scrapes expose
+# core/runtime data-path families without the plugin; enable the globally scoped
+# `prometheus_metrics` plugin only for traffic/request families (and the 5xx/P99
+# alerts). See charts/ferrum-gateway/README.md#metrics-and-prometheus.
 # -----------------------------------------------------------------------------
 metrics:
   enabled: false
@@ -607,13 +608,24 @@ metrics:
     tlsConfig: {}
   alerts:
     # When `metrics.enabled` is true, render a PrometheusRule with core gateway
-    # alerts (5xx rate, P99 latency, TLS cert expiry, config poll freshness,
-    # DP config staleness, ConfigSync divergence).
+    # alerts. Data-path alerts (overload shedding, upstream health, circuit
+    # breakers, frontend TLS handshake failures) work without the optional
+    # prometheus_metrics plugin. Traffic alerts (5xx rate, P99 latency) require
+    # that plugin. Database poll freshness renders only in database/cp modes.
     enabled: true
     high5xxRatePerSecond: 1
     p99LatencyMs: 2000
     certExpiringSeconds: 604800
     databasePollStaleSeconds: 300
+    upstreamUnhealthyRatio: 0.5
+    # Frontend TLS handshake error rate (failures/s) that fires
+    # FerrumGatewayFrontendTlsHandshakeErrors. `reason="error"` is the
+    # catch-all rustls accept failure, so it counts mid-handshake client
+    # disconnects, scanners, cipher mismatches, and plain HTTP sent to a TLS
+    # port. A threshold of 0 would therefore fire permanently on any
+    # internet-facing listener, so 0 disables the alert. Set a rate that is
+    # abnormal for your exposure to enable it.
+    frontendTlsHandshakeErrorsPerSecond: 0
 
 # Optional NetworkPolicy. Default off. When enabled, proxy and stream listener
 # ports stay reachable from any source while admin HTTP/HTTPS and CP gRPC ingress
