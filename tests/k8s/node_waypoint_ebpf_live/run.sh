@@ -1964,13 +1964,13 @@ spec:
 # HOST-NETWORK forger for the UDP relay sender-proof check (issues #3956,
 # #3957). This is the actual threat model, and it is deliberately NOT the
 # pod-netns prober above: a datagram leaving a pod netns crosses a veth, where
-# `skb_scrub_packet` clears `skb->mark`, so a pod cannot deliver a forged mark
+# skb_scrub_packet clears skb->mark, so a pod cannot deliver a forged mark
 # into the host namespace at all. A host-network workload with NET_ADMIN and
-# NET_RAW can: its socket IS in the host netns, so `SO_MARK` reaches the enrolled
+# NET_RAW can: its socket IS in the host netns, so SO_MARK reaches the enrolled
 # pod's veth egress hook intact, and a raw datagram can carry a Service ClusterIP
 # and the occupied listener source port. That combination presents every packet
 # attribute the tc UDP guard used to accept. What it cannot present is
-# `bpf_skb_cgroup_id()`: its socket carries its OWN cgroup, not the NodeWaypoint
+# bpf_skb_cgroup_id(): its socket carries its OWN cgroup, not the NodeWaypoint
 # relay's.
 apiVersion: apps/v1
 kind: Deployment

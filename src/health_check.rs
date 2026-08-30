@@ -33,7 +33,9 @@ use crate::load_balancer::{
 };
 use crate::tls::backend::SanAllowListVerifier;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
-use crate::tls::{backend_client_config_builder, build_server_verifier_with_crls};
+use crate::tls::{
+    CrlList, SharedCrlList, backend_client_config_builder, build_server_verifier_with_crls,
+};
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -619,6 +621,14 @@ pub struct HealthChecker {
     /// Host:port identity set last spawned per upstream; used to skip a
     /// no-op SD restart when the live set did not change.
     upstream_probe_target_keys: DashMap<String, HashSet<String>>,
+    /// Same admitted CRL generation backend data-path pools consume.
+    ///
+    /// Probe tasks snapshot this at spawn/restart (`load_full`) so a backend
+    /// TLS/CRL live reload that stores a new generation first, then restarts
+    /// probes, hands replacement tasks that exact snapshot. A refused reload
+    /// never stores, so the previous generation and its tasks stay in service.
+    /// Test constructors keep an empty list.
+    shared_crls: SharedCrlList,
 }
 
 /// Per-upstream active-probe configuration captured at start/reload.
@@ -627,16 +637,19 @@ struct ActiveProbeSpec {
     tls: BackendTlsConfig,
 }
 
-/// Probe TLS server verifier: plain webpki, or the same SAN-pinning wrapper
-/// the data path uses (`SanAllowListVerifier`).
+/// Probe TLS server verifier: the same wrapping the data path uses.
+///
+/// Both variants carry the rustls verifier built through
+/// [`build_server_verifier_with_crls`], so verified HTTP and gRPC probes
+/// apply the shared CRL policy whether or not a SAN allow-list is set.
 #[derive(Debug)]
 enum ProbeServerVerifier {
-    /// No SAN allow-list was configured, so probes use the plain webpki
-    /// verifier the builder installs by default. Carries no payload: every
-    /// consumer treats this variant as "not SAN-pinned" and installs nothing,
-    /// unlike `SanAllowList`, whose verifier IS installed.
-    WebPki,
+    WebPki(Arc<rustls::client::WebPkiServerVerifier>),
     SanAllowList(Arc<SanAllowListVerifier>),
+}
+
+fn empty_shared_crl_list() -> SharedCrlList {
+    crate::tls::shared_crl_list(Arc::new(Vec::new()))
 }
 
 /// Per-active-check identity and lifecycle inputs for `start_active_check`.
@@ -659,9 +672,10 @@ impl Default for HealthChecker {
 impl HealthChecker {
     /// Create a health checker using default pool settings and no DNS cache.
     ///
-    /// Prefer [`with_pool_config`] in production to inherit the gateway's
-    /// tuned connection pool settings and DNS cache. Kept for tests and
-    /// integration code that constructs `HealthChecker` without a full config.
+    /// Prefer [`Self::with_pool_config_and_shared_crls`] in production so
+    /// probes inherit the gateway's pool settings, DNS cache, and admitted
+    /// CRL generation. Kept for tests and integration code that constructs
+    /// `HealthChecker` without a full config. Uses an empty shared CRL list.
     #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
@@ -673,7 +687,25 @@ impl HealthChecker {
     /// The default client is built with TLS verification ENABLED. If the
     /// operator has set `FERRUM_TLS_NO_VERIFY=true`, the default client is
     /// rebuilt by [`set_global_tls_config`] before traffic flows.
+    ///
+    /// Test-safe: uses an empty shared CRL list. Production startup must call
+    /// [`Self::with_pool_config_and_shared_crls`] with the admitted generation
+    /// already published to backend pools.
+    // This module is compiled into both the library and binary targets. The
+    // constructor is exercised by external integration tests through the
+    // library, but is intentionally unused by the production binary.
+    #[allow(dead_code)]
     pub fn with_pool_config(pool_config: &PoolConfig, dns_cache: DnsCache) -> Self {
+        Self::with_pool_config_and_shared_crls(pool_config, dns_cache, empty_shared_crl_list())
+    }
+
+    /// Production constructor: inherit pool settings, DNS cache, and the
+    /// same [`SharedCrlList`] backend data-path pools already hold.
+    pub fn with_pool_config_and_shared_crls(
+        pool_config: &PoolConfig,
+        dns_cache: DnsCache,
+        shared_crls: SharedCrlList,
+    ) -> Self {
         let client = accept_health_check_client(
             build_health_check_client(pool_config, Some(dns_cache.clone()), false)
                 .map_err(HealthCheckClientError::from),
@@ -702,6 +734,7 @@ impl HealthChecker {
             active_probe_upstreams: DashMap::new(),
             active_probe_specs: DashMap::new(),
             upstream_probe_target_keys: DashMap::new(),
+            shared_crls,
         }
     }
 
@@ -764,6 +797,7 @@ impl HealthChecker {
             active_probe_upstreams: DashMap::new(),
             active_probe_specs: DashMap::new(),
             upstream_probe_target_keys: DashMap::new(),
+            shared_crls: empty_shared_crl_list(),
         }
     }
 
@@ -1757,6 +1791,7 @@ impl HealthChecker {
                 },
                 self.global_tls_no_verify,
                 dial_host_pin,
+                self.shared_crls.load_full().as_slice(),
             ),
             "upstream TLS health-check HTTP client",
         )
@@ -1849,6 +1884,7 @@ impl HealthChecker {
         let probe_global_cert = self.global_backend_tls_client_cert_path.clone();
         let probe_global_key = self.global_backend_tls_client_key_path.clone();
         let probe_no_verify = self.global_tls_no_verify;
+        let probe_crls = self.shared_crls.load_full();
         // Screen the probe target against the backend egress policy so active
         // health checks never dial a denied address (an SSRF/port-scan vector via
         // the health probe). reqwest skips the resolver for IP literals and the
@@ -1992,6 +2028,7 @@ impl HealthChecker {
                                                     probe_global_cert.as_deref(),
                                                     probe_global_key.as_deref(),
                                                     probe_no_verify,
+                                                    probe_crls.clone(),
                                                 )
                                                 .await
                                             }
@@ -2030,6 +2067,7 @@ impl HealthChecker {
                                             probe_global_cert.as_deref(),
                                             probe_global_key.as_deref(),
                                             probe_no_verify,
+                                            probe_crls.as_slice(),
                                         )
                                         .await
                                     }
@@ -2414,9 +2452,11 @@ async fn grpc_probe_candidates(
     global_cert_path: Option<&str>,
     global_key_path: Option<&str>,
     global_no_verify: bool,
+    crls: CrlList,
 ) -> ProbeOutcome {
     match crate::dns::connect_candidates(candidates, port, timeout, |addr| {
         let dial_addr = addr.ip().to_string();
+        let crls = crls.clone();
         async move {
             let outcome = grpc_probe(
                 host,
@@ -2430,6 +2470,7 @@ async fn grpc_probe_candidates(
                 global_cert_path,
                 global_key_path,
                 global_no_verify,
+                crls.as_slice(),
             )
             .await;
             if outcome.success {
@@ -2471,6 +2512,7 @@ async fn grpc_probe(
     global_cert_path: Option<&str>,
     global_key_path: Option<&str>,
     global_no_verify: bool,
+    crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
 ) -> ProbeOutcome {
     let scheme = if use_tls { "https" } else { "http" };
     // Dial the pre-screened address (`dial_addr` = the resolved IP from the
@@ -2512,11 +2554,10 @@ async fn grpc_probe(
         );
     }
 
-    // When skip_verify is true, tonic's ClientTlsConfig doesn't support disabling
-    // cert verification. Build a rustls ClientConfig directly with NoVerifier
-    // (same pattern as grpc_proxy.rs) and use connect_with_connector.
-    // Identity-pinned backends (`backend_tls_san_allow_list`) take the same
-    // rustls connector path so the probe reuses `SanAllowListVerifier`.
+    // Skip-verify uses rustls `NoVerifier` because tonic's ClientTlsConfig
+    // has no skip-verify API. Verified TLS (with or without a SAN allow-list)
+    // uses the same rustls connector so probes share the data-path CRL policy;
+    // tonic's ClientTlsConfig cannot attach Ferrum's shared CRL snapshot.
     let channel = if skip_verify {
         match build_grpc_probe_channel_no_verify(
             &endpoint,
@@ -2549,8 +2590,8 @@ async fn grpc_probe(
                 return ProbeOutcome::failure(format!("grpc connect failed: {e}"));
             }
         }
-    } else if use_tls && !tls_config.san_allow_list.is_empty() {
-        match build_grpc_probe_channel_san_pinned(
+    } else if use_tls {
+        match build_grpc_probe_channel_verified(
             &endpoint,
             host,
             timeout,
@@ -2558,6 +2599,7 @@ async fn grpc_probe(
             global_ca_path,
             global_cert_path,
             global_key_path,
+            crls,
         )
         .await
         {
@@ -2574,125 +2616,11 @@ async fn grpc_probe(
                     );
                 } else {
                     debug!(
-                        "gRPC health probe: SAN-pinned connect failed for {}:{}: {}",
+                        "gRPC health probe: TLS connect failed for {}:{}: {}",
                         host, port, e
                     );
                 }
                 return ProbeOutcome::failure(format!("grpc connect failed: {e}"));
-            }
-        }
-    } else if use_tls {
-        // SNI / cert hostname is the EFFECTIVE backend TLS identity — the
-        // configured `backend_tls_sni` override when present, else the original
-        // `host` — even though we dial the pre-screened IP via `dial_addr`. The
-        // `origin`/authority above deliberately keeps the real target so the
-        // backend still sees its own `:authority`, exactly as for proxy traffic.
-        // rustls/tonic want a BARE SNI host, not a URI-bracketed IPv6 literal
-        // (`[fd00::1]`), which `probe_tls_server_name` strips.
-        let sni_host = probe_tls_server_name(tls_config, host);
-        let mut tonic_tls = tonic::transport::ClientTlsConfig::new().domain_name(sni_host);
-
-        // Load CA certs (upstream → global → system roots). `system://` resolves
-        // to `None` here so the probe pins the built-in roots and deliberately
-        // skips the cluster-global bundle.
-        if let Some(ca_path) = tls_config.effective_ca_source(global_ca_path) {
-            match load_probe_tls_material(ca_path, MaterialKind::CaBundle, "gRPC health probe CA") {
-                Ok(pem) => {
-                    let cert = tonic::transport::Certificate::from_pem(pem);
-                    tonic_tls = tonic_tls.ca_certificate(cert);
-                }
-                Err(e) => {
-                    // The configured CA is the sole trust anchor. Proceeding
-                    // without it leaves tonic on its default roots, so a
-                    // publicly-trusted certificate would pass a probe for a
-                    // backend pinned to a private CA. Fail the probe instead.
-                    return ProbeOutcome::failure(format!(
-                        "gRPC health probe: configured backend CA is the sole trust anchor but could not be loaded ({e})"
-                    ));
-                }
-            }
-        } else {
-            tonic_tls = tonic_tls.with_enabled_roots();
-        }
-
-        // Load mTLS client identity. Fail-closed, matching the no-verify gRPC
-        // branch (`build_grpc_probe_channel_no_verify`) and the HTTP probe: a
-        // configured identity that cannot be loaded must fail the probe rather
-        // than silently downgrade it to an anonymous handshake the backend
-        // answers differently than it answers proxy traffic. Errors carry the
-        // loader's source identifier and failure class, never key material.
-        let cert_path = tls_config.client_cert_path.as_deref().or(global_cert_path);
-        let key_path = tls_config.client_key_path.as_deref().or(global_key_path);
-        match (cert_path, key_path) {
-            (Some(cert_path), Some(key_path)) => {
-                let pair = load_probe_tls_material(
-                    cert_path,
-                    MaterialKind::Cert,
-                    "gRPC health probe client cert",
-                )
-                .and_then(|cert_pem| {
-                    load_probe_tls_material(
-                        key_path,
-                        MaterialKind::Key,
-                        "gRPC health probe client key",
-                    )
-                    .map(|key_pem| (cert_pem, key_pem))
-                });
-                match pair {
-                    Ok((cert_pem, key_pem)) => {
-                        let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
-                        tonic_tls = tonic_tls.identity(identity);
-                    }
-                    Err(e) => {
-                        return ProbeOutcome::failure(format!(
-                            "gRPC health probe: configured backend mTLS client identity could not be loaded ({e})"
-                        ));
-                    }
-                }
-            }
-            (Some(_), None) | (None, Some(_)) => {
-                return ProbeOutcome::failure(
-                    "gRPC health probe: backend mTLS client certificate and private key must be configured together"
-                        .to_string(),
-                );
-            }
-            (None, None) => {}
-        }
-
-        let endpoint = match endpoint.tls_config(tonic_tls) {
-            Ok(ep) => ep,
-            Err(e) => {
-                debug!(
-                    "gRPC health probe: TLS config error for {}:{}: {}",
-                    host, port, e
-                );
-                return ProbeOutcome::failure(format!("grpc tls config failed: {e}"));
-            }
-        };
-        match tokio::time::timeout(timeout, endpoint.connect()).await {
-            Ok(Ok(ch)) => ch,
-            Ok(Err(e)) => {
-                let err_ref: &(dyn std::error::Error + 'static) = &e;
-                let is_exhaustion = crate::retry::is_port_exhaustion(err_ref)
-                    || crate::retry::is_port_exhaustion_message(&e.to_string());
-                if is_exhaustion {
-                    tracing::error!(
-                        "gRPC health probe: PORT EXHAUSTION connecting to {}:{}: {}",
-                        host,
-                        port,
-                        e
-                    );
-                } else {
-                    debug!(
-                        "gRPC health probe: connect failed for {}:{}: {}",
-                        host, port, e
-                    );
-                }
-                return ProbeOutcome::failure(format!("grpc connect failed: {e}"));
-            }
-            Err(_) => {
-                debug!("gRPC health probe: connect timed out for {}:{}", host, port);
-                return ProbeOutcome::failure("grpc connect timed out");
             }
         }
     } else {
@@ -2845,10 +2773,11 @@ async fn build_grpc_probe_channel_no_verify(
     Ok(channel)
 }
 
-/// Build a tonic gRPC channel that verifies the peer with the same
-/// [`SanAllowListVerifier`] the data path uses.
+/// Build a tonic gRPC channel that verifies the peer with the same rustls
+/// server verifier the data path uses (shared CRL policy, SAN wrapping when
+/// configured). Tonic's `ClientTlsConfig` cannot attach that snapshot.
 #[allow(clippy::too_many_arguments)]
-async fn build_grpc_probe_channel_san_pinned(
+async fn build_grpc_probe_channel_verified(
     endpoint: &tonic::transport::Endpoint,
     host: &str,
     timeout: Duration,
@@ -2856,57 +2785,25 @@ async fn build_grpc_probe_channel_san_pinned(
     global_ca_path: Option<&str>,
     global_cert_path: Option<&str>,
     global_key_path: Option<&str>,
+    crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
 ) -> Result<tonic::transport::Channel, Box<dyn std::error::Error + Send + Sync>> {
     use rustls::pki_types::ServerName;
     use tokio_rustls::TlsConnector;
 
-    let verifier = match build_probe_server_verifier(tls_config, global_ca_path) {
-        Ok(ProbeServerVerifier::SanAllowList(verifier)) => verifier,
-        Ok(ProbeServerVerifier::WebPki) => {
-            return Err(std::io::Error::other(
-                "gRPC health probe SAN allow-list was empty after verifier build",
-            )
-            .into());
-        }
-        Err(error) => return Err(std::io::Error::other(error.to_string()).into()),
-    };
-
-    let cert_path = tls_config.client_cert_path.as_deref().or(global_cert_path);
-    let key_path = tls_config.client_key_path.as_deref().or(global_key_path);
-    let builder =
-        backend_client_config_builder(None).map_err(|e| std::io::Error::other(e.to_string()))?;
-    let builder = builder
-        .dangerous()
-        .with_custom_certificate_verifier(verifier);
-    let mut client_config = match (cert_path, key_path) {
-        (Some(cert_path), Some(key_path)) => {
-            let certs = load_probe_tls_certificates(
-                cert_path,
-                MaterialKind::Cert,
-                "gRPC health probe client cert",
-            )
-            .map_err(std::io::Error::other)?;
-            let key_source = CertSource::parse(key_path, MaterialKind::Key);
-            let key_material =
-                load_material_blocking(&key_source, MaterialKind::Key).map_err(|error| {
-                    std::io::Error::other(format!("gRPC health probe client key: {error}"))
-                })?;
-            let key = crate::tls::parse_pem_private_key(
-                key_material.bytes.expose_secret(),
-                "gRPC health probe client key",
-                &key_material.display_source_id,
-            )
-            .map_err(std::io::Error::other)?;
-            builder.with_client_auth_cert(certs, key)?
-        }
-        (None, None) => builder.with_no_client_auth(),
-        _ => {
-            return Err(std::io::Error::other(
-                "gRPC health probe mTLS client certificate and private key must be configured together",
-            )
-            .into());
-        }
-    };
+    let verifier = build_probe_server_verifier(tls_config, global_ca_path, crls)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let cert_owned = global_cert_path.map(str::to_string);
+    let key_owned = global_key_path.map(str::to_string);
+    let client_auth = load_probe_rustls_client_auth(
+        tls_config,
+        HealthCheckClientIdentityPaths {
+            cert: &cert_owned,
+            key: &key_owned,
+        },
+    )
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let mut client_config = probe_rustls_client_config(verifier, client_auth)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
     client_config.alpn_protocols = vec![b"h2".to_vec()];
     crate::tls::apply_client_session_resumption(&mut client_config, None);
 
@@ -3195,6 +3092,7 @@ struct HealthCheckClientIdentityPaths<'a> {
 fn build_probe_server_verifier(
     tls_config: &BackendTlsConfig,
     global_ca_path: Option<&str>,
+    crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
 ) -> Result<ProbeServerVerifier, HealthCheckClientError> {
     let root_store = if let Some(ca_path) = tls_config.effective_ca_source(global_ca_path) {
         load_probe_tls_root_store(ca_path, "Health check CA")
@@ -3202,17 +3100,69 @@ fn build_probe_server_verifier(
     } else {
         rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
     };
-    let inner = build_server_verifier_with_crls(root_store, &[]).map_err(|e| {
+    let inner = build_server_verifier_with_crls(root_store, crls).map_err(|e| {
         HealthCheckClientError::SanPinningUnavailable(format!(
             "failed to build probe server verifier: {e}"
         ))
     })?;
     if tls_config.san_allow_list.is_empty() {
-        Ok(ProbeServerVerifier::WebPki)
+        Ok(ProbeServerVerifier::WebPki(inner))
     } else {
         let wrapped = SanAllowListVerifier::new(inner, tls_config.san_allow_list.clone())
             .map_err(|e| HealthCheckClientError::SanPinningUnavailable(e.to_string()))?;
         Ok(ProbeServerVerifier::SanAllowList(Arc::new(wrapped)))
+    }
+}
+
+/// Test helper: build the probe server verifier with an explicit CRL snapshot.
+#[doc(hidden)]
+// External integration tests reach this through the library target; the same
+// source module is also compiled into the binary where that export is unused.
+#[allow(dead_code)]
+pub fn build_probe_server_verifier_for_test(
+    tls_config: &BackendTlsConfig,
+    global_ca_path: Option<&str>,
+    crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, String> {
+    match build_probe_server_verifier(tls_config, global_ca_path, crls) {
+        Ok(ProbeServerVerifier::WebPki(verifier)) => Ok(verifier),
+        Ok(ProbeServerVerifier::SanAllowList(verifier)) => Ok(verifier),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn finish_probe_client_auth(
+    builder: rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert>,
+    client_auth: ProbeRustlsClientAuth,
+) -> Result<rustls::ClientConfig, HealthCheckClientError> {
+    match client_auth {
+        ProbeRustlsClientAuth::None => Ok(builder.with_no_client_auth()),
+        ProbeRustlsClientAuth::Materialized { certs, key } => {
+            builder.with_client_auth_cert(certs, key).map_err(|e| {
+                HealthCheckClientError::ClientIdentityUnavailable(format!(
+                    "invalid client certificate/key pair: {e}"
+                ))
+            })
+        }
+    }
+}
+
+fn probe_rustls_client_config(
+    verifier: ProbeServerVerifier,
+    client_auth: ProbeRustlsClientAuth,
+) -> Result<rustls::ClientConfig, HealthCheckClientError> {
+    let builder = backend_client_config_builder(None)
+        .map_err(|e| HealthCheckClientError::SanPinningUnavailable(e.to_string()))?;
+    match verifier {
+        ProbeServerVerifier::WebPki(verifier) => {
+            finish_probe_client_auth(builder.with_webpki_verifier(verifier), client_auth)
+        }
+        ProbeServerVerifier::SanAllowList(verifier) => finish_probe_client_auth(
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(verifier),
+            client_auth,
+        ),
     }
 }
 
@@ -3269,40 +3219,20 @@ enum ProbeRustlsClientAuth {
     },
 }
 
-/// HTTP probe client that installs [`SanAllowListVerifier`] via preconfigured
-/// rustls. Empty-list probes keep the reqwest `tls_certs_only` path.
-fn build_health_check_client_with_san_pinning(
+/// HTTP probe client that installs the shared rustls server verifier
+/// (CRL policy, and SAN wrapping when configured) via preconfigured rustls.
+fn build_health_check_client_with_rustls_verifier(
     pool_config: &PoolConfig,
     dns_cache: Option<DnsCache>,
     tls_config: &BackendTlsConfig,
     global_ca_path: &Option<String>,
     global_identity: HealthCheckClientIdentityPaths<'_>,
     dial_host_pin: Option<&str>,
+    crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
 ) -> Result<reqwest::Client, HealthCheckClientError> {
-    let verifier = match build_probe_server_verifier(tls_config, global_ca_path.as_deref())? {
-        ProbeServerVerifier::SanAllowList(verifier) => verifier,
-        ProbeServerVerifier::WebPki => {
-            return Err(HealthCheckClientError::SanPinningUnavailable(
-                "SAN allow-list was empty after verifier build".to_string(),
-            ));
-        }
-    };
+    let verifier = build_probe_server_verifier(tls_config, global_ca_path.as_deref(), crls)?;
     let client_auth = load_probe_rustls_client_auth(tls_config, global_identity)?;
-    let builder = backend_client_config_builder(None)
-        .map_err(|e| HealthCheckClientError::SanPinningUnavailable(e.to_string()))?;
-    let builder = builder
-        .dangerous()
-        .with_custom_certificate_verifier(verifier);
-    let mut rustls_config = match client_auth {
-        ProbeRustlsClientAuth::None => builder.with_no_client_auth(),
-        ProbeRustlsClientAuth::Materialized { certs, key } => {
-            builder.with_client_auth_cert(certs, key).map_err(|e| {
-                HealthCheckClientError::ClientIdentityUnavailable(format!(
-                    "invalid client certificate/key pair: {e}"
-                ))
-            })?
-        }
-    };
+    let mut rustls_config = probe_rustls_client_config(verifier, client_auth)?;
     if dial_host_pin.is_some() || !pool_config.enable_http2 {
         rustls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
     } else {
@@ -3331,7 +3261,7 @@ fn build_health_check_client_with_san_pinning(
     }
     builder.build().map_err(|e| {
         HealthCheckClientError::SanPinningUnavailable(format!(
-            "SAN-pinned health-check HTTP client could not be built: {e}"
+            "verified health-check HTTP client could not be built: {e}"
         ))
     })
 }
@@ -3355,18 +3285,17 @@ fn build_health_check_client_with_san_pinning(
 /// HTTP/2 derives `:authority` from the URI, i.e. from the server name, so an
 /// h2-negotiated probe would present the OVERRIDE as its authority and measure
 /// a request the backend never receives from proxy traffic. `http1_only()` is
-/// load-bearing here rather than a hint: the empty-SAN builder does not use
-/// `use_preconfigured_tls`, so reqwest itself derives the client's ALPN from
-/// the version preference and advertises `http/1.1` alone (see
-/// `vendor/reqwest-0.13.3-ferrum-patched/src/async_impl/client.rs`), which means
-/// an h2-capable backend cannot select h2 on this connection. Identity-pinned
-/// probes (`backend_tls_san_allow_list`) take the preconfigured-rustls path so
-/// they can install [`SanAllowListVerifier`]; their ALPN is set on that config.
+/// load-bearing here rather than a hint. Verified probes take the preconfigured
+/// rustls path so they can install the shared CRL policy (and
+/// [`SanAllowListVerifier`] when an allow-list is set); their ALPN is set on
+/// that config. Skip-verify probes keep the reqwest `danger_accept_invalid_certs`
+/// path, which cannot attach Ferrum's shared CRL snapshot.
 /// Probes without an override keep the default h2-capable client: their URL
 /// already names the real target, so there is no authority to lose.
 ///
 /// The resolver + ALPN half of that contract lives in
 /// [`apply_probe_dial_identity`] so it can be asserted directly.
+#[allow(clippy::too_many_arguments)]
 fn build_health_check_client_with_tls(
     pool_config: &PoolConfig,
     dns_cache: Option<DnsCache>,
@@ -3375,6 +3304,7 @@ fn build_health_check_client_with_tls(
     global_identity: HealthCheckClientIdentityPaths<'_>,
     global_no_verify: bool,
     dial_host_pin: Option<&str>,
+    crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
 ) -> Result<reqwest::Client, HealthCheckClientError> {
     let skip_verify = !tls_config.verify_server_cert
         || (global_no_verify && tls_config.allows_global_no_verify());
@@ -3386,14 +3316,15 @@ fn build_health_check_client_with_tls(
              certificate verification is disabled; SAN allow-list will not be enforced"
         );
     }
-    if !skip_verify && !tls_config.san_allow_list.is_empty() {
-        return build_health_check_client_with_san_pinning(
+    if !skip_verify {
+        return build_health_check_client_with_rustls_verifier(
             pool_config,
             dns_cache,
             tls_config,
             global_ca_path,
             global_identity,
             dial_host_pin,
+            crls,
         );
     }
 
@@ -3742,6 +3673,7 @@ pub async fn grpc_probe_for_test(
         None,
         None,
         false,
+        &[],
     )
     .await
     .success
@@ -4153,6 +4085,7 @@ mod tests {
                 },
                 false,
                 None,
+                &[],
             )
             .expect("TLS health-check client should build")
         };
@@ -4395,6 +4328,7 @@ mod tests {
             },
             global_no_verify,
             None,
+            &[],
         )
     }
 
@@ -4416,6 +4350,7 @@ mod tests {
             },
             false,
             Some("pod-a.internal"),
+            &[],
         );
         let pin_missing = matches!(built, Err(HealthCheckClientError::DialPinUnavailable));
         assert!(
@@ -4665,9 +4600,9 @@ mod tests {
     #[test]
     fn probe_server_verifier_uses_plain_webpki_when_san_allow_list_empty() {
         ensure_crypto_provider();
-        let verifier = build_probe_server_verifier(&BackendTlsConfig::default_verify(), None)
+        let verifier = build_probe_server_verifier(&BackendTlsConfig::default_verify(), None, &[])
             .expect("empty SAN list must still build a verifier");
-        assert!(matches!(verifier, ProbeServerVerifier::WebPki));
+        assert!(matches!(verifier, ProbeServerVerifier::WebPki(_)));
     }
 
     #[test]
@@ -4676,7 +4611,7 @@ mod tests {
         let mut tls = BackendTlsConfig::default_verify();
         tls.san_allow_list = vec!["localhost".to_string()];
         let verifier =
-            build_probe_server_verifier(&tls, None).expect("configured SAN list must wrap");
+            build_probe_server_verifier(&tls, None, &[]).expect("configured SAN list must wrap");
         assert!(matches!(verifier, ProbeServerVerifier::SanAllowList(_)));
     }
 
@@ -4712,7 +4647,7 @@ mod tests {
         tls.server_ca_cert_path = Some(ca_path.display().to_string());
         tls.san_allow_list = vec!["localhost".to_string()];
         let verifier =
-            build_probe_server_verifier(&tls, None).expect("SAN-pinned verifier must build");
+            build_probe_server_verifier(&tls, None, &[]).expect("SAN-pinned verifier must build");
         let ProbeServerVerifier::SanAllowList(verifier) = verifier else {
             panic!("configured SAN list must wrap SanAllowListVerifier");
         };

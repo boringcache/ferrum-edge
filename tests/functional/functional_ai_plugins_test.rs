@@ -82,36 +82,42 @@ fn gateway_binary_path() -> &'static str {
 }
 
 /// Start the gateway in file mode with the given config and ports.
-fn start_gateway(config_path: &str, proxy_port: u16, admin_port: u16) -> std::process::Child {
+fn start_gateway(
+    config_path: &str,
+    proxy_port: u16,
+    admin_port: u16,
+    identity: &crate::common::SpawnedGatewayIdentity,
+) -> std::process::Child {
     let binary_path = gateway_binary_path();
 
-    std::process::Command::new(binary_path)
-        .env("FERRUM_MODE", "file")
+    let mut cmd = std::process::Command::new(binary_path);
+    cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_LOG_LEVEL", "debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("Failed to start gateway binary")
+        .stderr(std::process::Stdio::null());
+    identity.apply_to_command(&mut cmd);
+    cmd.spawn().expect("Failed to start gateway binary")
 }
 
-/// Wait for the gateway admin health endpoint to respond.
-async fn wait_for_gateway(admin_port: u16) -> bool {
-    let client = reqwest::Client::new();
-    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
-
-    for _ in 0..60 {
-        if let Ok(resp) = client.get(&health_url).send().await
-            && resp.status().is_success()
-        {
-            return true;
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
-    false
+/// Wait until `child` owns `admin_port`. Unauthenticated `/health` and
+/// CIDR-granted health detail are not identity (issue #4253).
+async fn wait_for_owned_gateway(
+    child: &mut std::process::Child,
+    admin_port: u16,
+    identity: &crate::common::SpawnedGatewayIdentity,
+) -> bool {
+    crate::common::wait_for_owned_gateway_identity(
+        child,
+        admin_port,
+        identity,
+        Duration::from_secs(15),
+    )
+    .await
+    .is_ok()
 }
 
 /// Start the gateway with retry on port-binding failures.
@@ -130,9 +136,10 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
 
-        let mut child = start_gateway(config_path, proxy_port, admin_port);
+        let identity = crate::common::SpawnedGatewayIdentity::mint("ai-plugins");
+        let mut child = start_gateway(config_path, proxy_port, admin_port, &identity);
 
-        if wait_for_gateway(admin_port).await {
+        if wait_for_owned_gateway(&mut child, admin_port, &identity).await {
             return (child, proxy_port, admin_port);
         }
 

@@ -1041,7 +1041,14 @@ reconciliation under contention from (b) a watch that stopped delivering.
   is emitted only on an actual config change.
 - `controller-metrics-k8s.txt`: `ferrum_k8s_controller_*` families from
   authenticated `/metrics` (reconciliations, full_syncs, errors, last
-  reconcile duration, watch_idle_relists, route-status publication latency).
+  reconcile duration, watch_idle_relists, route-status publication latency,
+  and the issue #4239 status budget counters `status_request_timeouts_total` /
+  `status_batch_timeouts_total`).
+- `status-budget-warnings.txt`: every controller line about a status operation
+  that exceeded its budget or a batch that held the reconcile loop. A reconcile
+  whose `elapsed_ms` dwarfs its neighbours next to one of these lines is the
+  #4239 shape (one stalled status write blocking every other publication), not
+  a wedged watch.
 - `httproutes-status.txt`: compact parent-status digest. Empty Ferrum
   `parents[]` with a live HTTPRoute is the suite's 60s wait.
 - `httproutes.yaml` / `gateways.describe.txt`: cluster objects at failure.
@@ -1053,6 +1060,18 @@ EOF
     --all-containers --tail=4000 > "$dest/controller.log" 2>&1
   kubectl -n "$CP_NAMESPACE" logs deployment/ferrum-mesh-control-plane \
     --all-containers --previous --tail=2000 > "$dest/controller-previous.log" 2>&1
+
+  # Surface the status-budget evidence in the JOB LOG too. The #4239 root cause
+  # was already in this artifact, but nothing in the log pointed at it, so
+  # triage needed an artifact download first.
+  grep -E 'exceeded its budget|held the reconcile loop|defensive backstop' \
+    "$dest/controller.log" "$dest/controller-previous.log" \
+    | tail -n 40 > "$dest/status-budget-warnings.txt" 2>/dev/null \
+    || echo "no status-budget warnings in the captured controller logs" \
+      > "$dest/status-budget-warnings.txt"
+  echo "--- controller status-budget warnings ---"
+  cat "$dest/status-budget-warnings.txt"
+  echo "--- end controller status-budget warnings ---"
 
   kubectl get httproutes.gateway.networking.k8s.io -A -o json \
     2>"$dest/httproutes.err" | head -c 1048576 > "$dest/httproutes.json"

@@ -3785,7 +3785,7 @@ Handles Cross-Origin Resource Sharing at the gateway level.
 | `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Preflight-only allowed methods; not evaluated on actual requests |
 | `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Preflight-only allowed request headers; not evaluated on actual requests |
 | `exposed_headers` | String[] | `[]` | Response headers exposed to browser JavaScript |
-| `allow_credentials` | bool | `false` | Send `Access-Control-Allow-Credentials: true` |
+| `allow_credentials` | bool | `false` | Send `Access-Control-Allow-Credentials: true`. Exact `*` drops credentials; opaque exact `null` and an effectively universal prefix or regex are refused. |
 | `max_age` | u64 | `86400` | Preflight cache duration in seconds |
 | `preflight_continue` | bool | `false` | Pass allowed preflights to the backend while replacing its CORS fields with the complete gateway-authoritative policy. |
 | `unmatched_preflights` | `forward` \| `ignore` | — | Istio projection marker preserving unmatched and omitted-field semantics; mutually exclusive with `preflight_continue`. |
@@ -7377,6 +7377,8 @@ See [Proxy Alerts](proxy_alerts.md) for rule types, channel configuration, templ
 ### `workload_metrics`
 
 Adds Istio/GAMMA workload identity labels to request, stream, and log metadata, and can emit mesh telemetry spans when mesh Telemetry providers are configured. Mesh mode auto-injects this plugin when workload metrics are needed, but standalone use is supported for non-mesh gateway deployments that want the same identity labels.
+
+HBONE `source.principal` attribution uses the same trusted-assertor relation as `mesh_authz`. Direct / user-created instances honor that relation from this plugin's own `trusted_hbone_assertors` / `trust_domain_aliases` config. Mesh injection additionally stamps an internal `_effective_mesh_authz_baggage_gates` list that is an exact, fail-closed conjunction of every enabled global `mesh_authz` baggage gate PluginCache will execute (including a force-injected reserved `__mesh_authz` under transparent inbound capture). Disabled operator rows are omitted; each gate keeps its own absent/null/default, explicit `[]`, and alias contract; a sibling cannot silently widen another gate. Malformed or over-bound internal lists fail construction. See [Trusted HBONE Assertors](mesh.md#trusted-hbone-assertors).
 
 See [Mesh Observability](mesh.md#observability) for metric names, service graph aggregation, and tracing behavior.
 

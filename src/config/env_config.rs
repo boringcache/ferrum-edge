@@ -6450,6 +6450,14 @@ impl EnvConfig {
 
         self.validate_h3_connect_udp_limits()?;
 
+        // Issue #4261: the HTTP/3 frontend derives BOTH its advertised
+        // SETTINGS_MAX_FIELD_SECTION_SIZE and its receive-side buffered
+        // non-DATA frame ceiling from FERRUM_MAX_HEADER_SIZE_BYTES. Both
+        // travel the wire as QUIC variable-length integers, so a header
+        // policy that cannot be represented as one is refused here rather
+        // than clamped into a limit the operator never configured.
+        crate::http3::config::validate_h3_field_section_limits(self.max_header_size_bytes)?;
+
         // Mesh config ordering domains (issues #2473 / #3611). Both are
         // validated here, at the single configuration boundary, and neither
         // error echoes the operator-supplied value: an authority that reaches
