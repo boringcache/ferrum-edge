@@ -1078,6 +1078,11 @@ fn identity_only_workload_from_pod(
         .map_err(|e| invalid_resource_for_core_pod(pod, format!("invalid pod SPIFFE ID: {e}")))?;
     let node_name = nonempty_node_name(pod.node_name.as_deref());
     let locality = node_name.and_then(|node| acc.core.node_localities.get(node).cloned());
+    // Same node-local NodeWaypoint binding as service-backed workloads. These
+    // pods are the SOURCE identities a NodeWaypoint asserts over HBONE (the
+    // live harness src-a shape: ServiceAccount + capture, no Service). Without
+    // this, `node_waypoint_assertors_from_workloads` would omit them and the
+    // destination's fail-closed grant would 403 legitimate same-node traffic.
     let node_waypoint = node_name.and_then(|node| node_waypoint_for_node(acc, node));
 
     Ok(Workload {
@@ -1088,9 +1093,9 @@ fn identity_only_workload_from_pod(
         },
         service_name: pod.name.clone(),
         service_namespace: None,
-        // Identity-only pods feed node-waypoint source identity and scoped
-        // authz. They are not Service backends, so keep them out of direct
-        // Pod-IP routing and outbound registries.
+        // Identity-only pods feed node-waypoint source identity, scoped authz,
+        // and the per-assertor HBONE inventory. They are not Service backends,
+        // so keep them out of direct Pod-IP routing and outbound registries.
         addresses: Vec::new(),
         ports: Vec::new(),
         trust_domain: acc.options.trust_domain.clone(),

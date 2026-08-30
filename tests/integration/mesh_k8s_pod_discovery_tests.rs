@@ -141,10 +141,8 @@ fn push_pod_env_field_ref(pod: &mut K8sObject, name: &str, field_path: &str) {
         .expect("env array")
         .push(json!({
             "name": name,
-            "value": "",
             "valueFrom": {
                 "fieldRef": {
-                    "apiVersion": "v1",
                     "fieldPath": field_path
                 }
             }
@@ -379,86 +377,34 @@ fn k8s_pod_discovery_resolves_node_waypoint_downward_api_spiffe_id() {
 }
 
 #[test]
-fn k8s_pod_discovery_rejects_noncanonical_node_waypoint_pod_shapes() {
-    let mut string_host_network = node_waypoint_pod_with_spiffe(
-        "node-a",
-        "192.0.2.10",
-        true,
-        15008,
-        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint",
+fn k8s_pod_discovery_attaches_node_waypoint_metadata_to_identity_only_sources() {
+    // Live NodeWaypoint same-node Service allow: src-a is a captured client
+    // with a ServiceAccount and no Service. Issue #4274's per-assertor grant
+    // is derived from Workload.node_waypoint bindings, so identity-only
+    // sources must carry the same per-node SVID as service-backed destinations.
+    let waypoint_spiffe = "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/node-a";
+    let source_spiffe = "spiffe://cluster.local/ns/default/sa/frontend";
+    let dest_spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+    let mut source = object(
+        "Pod",
+        "default",
+        "frontend-v1",
+        json!({
+            "serviceAccountName": "frontend",
+            "nodeName": "node-a",
+            "containers": [{"name": "curl"}]
+        }),
     );
-    string_host_network.spec["hostNetwork"] = json!("true");
-
-    let mut snake_case_node_name = node_waypoint_pod_with_spiffe(
-        "node-a",
-        "192.0.2.10",
-        true,
-        15008,
-        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint",
-    );
-    let node_name = snake_case_node_name
-        .spec
-        .as_object_mut()
-        .expect("pod spec object")
-        .remove("nodeName")
-        .expect("canonical nodeName");
-    snake_case_node_name
-        .spec
-        .as_object_mut()
-        .expect("pod spec object")
-        .insert("node_name".to_string(), node_name);
-
-    for (shape, waypoint) in [
-        ("string hostNetwork", string_host_network),
-        ("snake-case node_name", snake_case_node_name),
-    ] {
-        let translation = translate_k8s_objects(
-            &[
-                node("node-a", "node-uid-a"),
-                service(),
-                ready_pod(),
-                endpoint_slice(),
-                waypoint,
-            ],
-            options(),
-        )
-        .expect("K8s core translation succeeds");
-        let workload = translation
-            .config
-            .mesh
-            .as_ref()
-            .expect("mesh config")
-            .workloads
-            .iter()
-            .find(|workload| workload.namespace == "default" && workload.service_name == "reviews")
-            .expect("reviews workload");
-        assert!(
-            workload.node_waypoint.is_none(),
-            "{shape} must not classify a pod as a trusted NodeWaypoint"
-        );
-    }
-}
-
-#[test]
-fn k8s_pod_discovery_rejects_noncanonical_downward_api_field_path() {
-    let mut waypoint = node_waypoint_pod("node-a", "192.0.2.10", true, 15008);
-    waypoint.spec["containers"][0]["env"]
-        .as_array_mut()
-        .expect("env array")
-        .push(json!({
-            "name": "FERRUM_K8S_NODE_NAME",
-            "value": "",
-            "valueFrom": {
-                "fieldRef": {
-                    "field_path": "spec.node_name"
-                }
-            }
-        }));
-    push_pod_env(
-        &mut waypoint,
-        "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
-        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)",
-    );
+    source.metadata.uid = "frontend-pod-uid".to_string();
+    source
+        .metadata
+        .labels
+        .insert("app".to_string(), "frontend".to_string());
+    source.status = json!({
+        "phase": "Running",
+        "podIP": "10.1.0.20",
+        "conditions": [{"type": "Ready", "status": "True"}]
+    });
 
     let translation = translate_k8s_objects(
         &[
@@ -466,23 +412,71 @@ fn k8s_pod_discovery_rejects_noncanonical_downward_api_field_path() {
             service(),
             ready_pod(),
             endpoint_slice(),
-            waypoint,
+            source,
+            node_waypoint_pod_with_spiffe("node-a", "192.0.2.10", true, 15008, waypoint_spiffe),
         ],
         options(),
     )
     .expect("K8s core translation succeeds");
-    let workload = translation
-        .config
-        .mesh
+
+    let mesh = translation.config.mesh.as_ref().expect("mesh config");
+    let source_workload = mesh
+        .workloads
+        .iter()
+        .find(|workload| {
+            workload.namespace == "default"
+                && workload.service_account.as_deref() == Some("frontend")
+                && workload.addresses.is_empty()
+        })
+        .expect("identity-only frontend source");
+    assert_eq!(source_workload.spiffe_id.as_str(), source_spiffe);
+    let source_node_waypoint = source_workload
+        .node_waypoint
         .as_ref()
-        .expect("mesh config")
+        .expect("identity-only source must carry NodeWaypoint metadata");
+    assert_eq!(source_node_waypoint.spiffe_id.as_str(), waypoint_spiffe);
+    assert_eq!(source_node_waypoint.node_name.as_deref(), Some("node-a"));
+
+    let dest_workload = mesh
         .workloads
         .iter()
         .find(|workload| workload.namespace == "default" && workload.service_name == "reviews")
         .expect("reviews workload");
+    assert_eq!(
+        dest_workload
+            .node_waypoint
+            .as_ref()
+            .map(|endpoint| endpoint.spiffe_id.as_str()),
+        Some(waypoint_spiffe)
+    );
+
+    // NodeWaypoint subscribes in its own mesh namespace; assertor inventory
+    // is derived before that narrowing so the destination still trusts the
+    // source identities this NodeWaypoint fronts.
+    let slice = MeshSlice::from_gateway_config(
+        &translation.config,
+        MeshSliceRequest {
+            node_id: waypoint_spiffe.to_string(),
+            namespace: "ferrum-system".to_string(),
+            workload_spiffe_id: Some(waypoint_spiffe.to_string()),
+            ..MeshSliceRequest::default()
+        },
+    );
     assert!(
-        workload.node_waypoint.is_none(),
-        "noncanonical field_path/spec.node_name must not resolve trusted NodeWaypoint identity"
+        slice
+            .workloads
+            .iter()
+            .all(|workload| workload.namespace == "ferrum-system"),
+        "visible routing workloads remain the NodeWaypoint subscription namespace"
+    );
+    assert_eq!(slice.node_waypoint_assertors.len(), 1);
+    let assertor = &slice.node_waypoint_assertors[0];
+    assert_eq!(assertor.spiffe_id.as_str(), waypoint_spiffe);
+    let asserted: Vec<&str> = assertor.asserts.iter().map(|id| id.as_str()).collect();
+    assert_eq!(
+        asserted,
+        vec![source_spiffe, dest_spiffe],
+        "per-assertor inventory must include identity-only sources and service-backed destinations"
     );
 }
 
@@ -805,300 +799,110 @@ fn k8s_pod_discovery_keeps_istio_root_pods_out_of_pod_sources() {
     );
 }
 
-fn live_controller_options() -> K8sTranslationOptions {
-    options_for_namespace("ferrum-ebpf-live")
-        .with_source_namespaces(vec![
-            "ferrum-ebpf-live".to_string(),
-            "istio-system".to_string(),
-        ])
-        .with_pod_source_namespaces(vec!["ferrum-ebpf-live".to_string()])
-        .with_node_waypoint_namespace("ferrum".to_string())
-}
-
-fn live_dest_service() -> K8sObject {
-    let mut service = object(
-        "Service",
-        "ferrum-ebpf-live",
-        "dst-a",
-        json!({
-            "clusterIP": "10.96.173.217",
-            "ports": [{
-                "name": "http",
-                "port": 8080,
-                "targetPort": 8080,
-                "appProtocol": "http"
-            }]
-        }),
-    );
-    service
-        .metadata
-        .labels
-        .insert("app".to_string(), "dst-a".to_string());
-    service
-}
-
-fn live_dest_pod() -> K8sObject {
-    let mut pod = object(
-        "Pod",
-        "ferrum-ebpf-live",
-        "dst-a-gptfd",
-        json!({
-            "serviceAccountName": "dst-a",
-            "nodeName": "ferrum-ebpf-live-worker",
-            "containers": [{
-                "ports": [{"name": "http", "containerPort": 8080, "protocol": "TCP"}]
-            }]
-        }),
-    );
-    pod.metadata.uid = "dst-a-uid".to_string();
-    pod.metadata
-        .labels
-        .insert("app".to_string(), "dst-a".to_string());
-    pod.status = json!({
-        "phase": "Running",
-        "podIP": "10.244.2.5",
-        "podIPs": [
-            {"ip": "10.244.2.5"},
-            {"ip": "fd00:10:244:2::5"}
-        ],
-        "conditions": [{"type": "Ready", "status": "True"}]
-    });
-    pod
-}
-
-fn live_dest_endpoint_slice(address_type: &str, ip: &str, node_name: &str) -> K8sObject {
-    let mut slice = object(
-        "EndpointSlice",
-        "ferrum-ebpf-live",
-        &format!("dst-a-{address_type}"),
-        json!({
-            "addressType": address_type,
-            "endpoints": [{
-                "addresses": [ip],
-                "targetRef": {
-                    "kind": "Pod",
-                    "name": "dst-a-gptfd",
-                    "namespace": "ferrum-ebpf-live"
-                },
-                "conditions": {"ready": true},
-                "nodeName": node_name
-            }],
-            "ports": [{"name": "http", "port": 8080}]
-        }),
-    );
-    slice.metadata.labels.insert(
-        "kubernetes.io/service-name".to_string(),
-        "dst-a".to_string(),
-    );
-    slice
-}
-
-fn live_ambient_waypoint(node_name: &str, ip: &str, ipv6: &str) -> K8sObject {
-    let mut pod = object(
-        "Pod",
-        "ferrum",
-        &format!("ferrum-mesh-ambient-{node_name}"),
-        json!({
-            "serviceAccountName": "ferrum-mesh",
-            "serviceAccount": "ferrum-mesh",
-            "nodeName": node_name,
-            "hostNetwork": true,
-            "containers": [{
-                "name": "ferrum-edge",
-                "env": [
-                    {"name": "FERRUM_MESH_CAPTURE_MODE", "value": "ebpf"},
-                    {
-                        "name": "FERRUM_K8S_NODE_NAME",
-                        "value": "",
-                        "valueFrom": {
-                            "fieldRef": {
-                                "apiVersion": "v1",
-                                "fieldPath": "spec.nodeName"
-                            }
-                        }
-                    },
-                    {
-                        "name": "FERRUM_MESH_NODE_WAYPOINT_RELAY_POD_UID",
-                        "value": "",
-                        "valueFrom": {
-                            "fieldRef": {
-                                "apiVersion": "v1",
-                                "fieldPath": "metadata.uid"
-                            }
-                        }
-                    },
-                    {
-                        "name": "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
-                        "value": "spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)"
-                    },
-                    {"name": "FERRUM_MESH_TOPOLOGY", "value": "node_waypoint"}
-                ],
-                "ports": [
-                    {"name": "outbound", "containerPort": 15001, "hostPort": 15001, "protocol": "TCP"},
-                    {"name": "inbound", "containerPort": 15006, "hostPort": 15006, "protocol": "TCP"},
-                    {"name": "hbone", "containerPort": 15008, "hostPort": 15008, "protocol": "TCP"}
-                ]
-            }]
-        }),
-    );
-    pod.metadata.uid = format!("ambient-uid-{node_name}");
-    pod.metadata.labels.insert(
-        "app.kubernetes.io/name".to_string(),
-        "ferrum-mesh-ambient".to_string(),
-    );
-    pod.metadata.labels.insert(
-        "app.kubernetes.io/instance".to_string(),
-        "ferrum-live".to_string(),
-    );
-    pod.status = json!({
-        "phase": "Running",
-        "podIP": ip,
-        "podIPs": [{"ip": ip}, {"ip": ipv6}],
-        "conditions": [
-            {"type": "Ready", "status": "True", "lastProbeTime": null},
-            {"type": "ContainersReady", "status": "True"}
-        ]
-    });
-    pod
-}
-
-fn live_controller_pod() -> K8sObject {
-    let mut pod = object(
-        "Pod",
-        "ferrum",
-        "ferrum-mesh-control-plane",
-        json!({
-            "serviceAccountName": "ferrum-mesh",
-            "nodeName": "ferrum-ebpf-live-worker",
-            "containers": [{"name": "ferrum-edge"}]
-        }),
-    );
-    pod.metadata.uid = "cp-uid".to_string();
-    pod.metadata.labels.insert(
-        "app.kubernetes.io/name".to_string(),
-        "ferrum-mesh-control-plane".to_string(),
-    );
-    pod.status = json!({
-        "phase": "Running",
-        "podIP": "10.244.2.3",
-        "conditions": [{"type": "Ready", "status": "True"}]
-    });
-    pod
-}
-
 #[test]
-fn k8s_pod_discovery_stamps_live_controller_namespace_downward_api_node_waypoint() {
-    let translation = translate_k8s_objects(
-        &[
-            node("ferrum-ebpf-live-worker", "node-uid-worker"),
-            live_dest_service(),
-            live_dest_pod(),
-            live_dest_endpoint_slice("IPv6", "fd00:10:244:2::5", ""),
-            live_dest_endpoint_slice("IPv4", "10.244.2.5", "ferrum-ebpf-live-worker"),
-            live_ambient_waypoint(
-                "ferrum-ebpf-live-worker",
-                "172.18.0.2",
-                "fc00:f853:ccd:e793::2",
-            ),
-            live_controller_pod(),
-        ],
-        live_controller_options(),
-    )
-    .expect("K8s core translation succeeds");
+fn k8s_pod_discovery_rejects_noncanonical_node_waypoint_pod_shapes() {
+    let mut string_host_network = node_waypoint_pod_with_spiffe(
+        "node-a",
+        "192.0.2.10",
+        true,
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint",
+    );
+    string_host_network.spec["hostNetwork"] = json!("true");
 
-    assert_eq!(
-        translation.config.known_namespaces,
-        vec!["ferrum-ebpf-live"]
+    let mut snake_case_node_name = node_waypoint_pod_with_spiffe(
+        "node-a",
+        "192.0.2.10",
+        true,
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint",
     );
-    let mesh = translation.config.mesh.as_ref().expect("mesh config");
-    assert!(
-        mesh.workloads
-            .iter()
-            .all(|workload| workload.namespace == "ferrum-ebpf-live"),
-        "controller-namespace CP/ambient pods must stay out of identity and service inventories"
-    );
+    let node_name = snake_case_node_name
+        .spec
+        .as_object_mut()
+        .expect("pod spec object")
+        .remove("nodeName")
+        .expect("canonical nodeName");
+    snake_case_node_name
+        .spec
+        .as_object_mut()
+        .expect("pod spec object")
+        .insert("node_name".to_string(), node_name);
 
-    let dest = mesh
-        .workloads
-        .iter()
-        .find(|workload| {
-            workload.namespace == "ferrum-ebpf-live" && workload.service_name == "dst-a"
-        })
-        .expect("dst-a service-backed workload");
-    let node_waypoint = dest
-        .node_waypoint
-        .as_ref()
-        .expect("dst-a must keep destination NodeWaypoint metadata");
-    assert_eq!(node_waypoint.address, "172.18.0.2");
-    assert_eq!(node_waypoint.hbone_port, 15008);
-    assert_eq!(
-        node_waypoint.spiffe_id.as_str(),
-        "spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh/node/ferrum-ebpf-live-worker"
-    );
-    assert_eq!(
-        node_waypoint.node_name.as_deref(),
-        Some("ferrum-ebpf-live-worker")
-    );
-
-    let slice = MeshSlice::from_gateway_config(
-        &translation.config,
-        MeshSliceRequest {
-            node_id: "ferrum-ebpf-live-worker".to_string(),
-            namespace: "ferrum-ebpf-live".to_string(),
-            workload_spiffe_id: Some(
-                "spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh/node/ferrum-ebpf-live-worker"
-                    .to_string(),
-            ),
-            node_waypoint_capture_scoping: true,
-            ..MeshSliceRequest::default()
-        },
-    );
-    let sliced = slice
-        .workloads
-        .iter()
-        .find(|workload| workload.service_name == "dst-a")
-        .expect("MeshSlice keeps dst-a");
-    assert_eq!(
-        sliced
-            .node_waypoint
+    for (shape, waypoint) in [
+        ("string hostNetwork", string_host_network),
+        ("snake-case node_name", snake_case_node_name),
+    ] {
+        let translation = translate_k8s_objects(
+            &[
+                node("node-a", "node-uid-a"),
+                service(),
+                ready_pod(),
+                endpoint_slice(),
+                waypoint,
+            ],
+            options(),
+        )
+        .expect("K8s core translation succeeds");
+        let workload = translation
+            .config
+            .mesh
             .as_ref()
-            .map(|endpoint| endpoint.spiffe_id.as_str()),
-        Some("spiffe://cluster.local/ns/ferrum/sa/ferrum-mesh/node/ferrum-ebpf-live-worker"),
-        "MeshSlice must not drop Workload.node_waypoint after K8s translation"
-    );
+            .expect("mesh config")
+            .workloads
+            .iter()
+            .find(|workload| workload.namespace == "default" && workload.service_name == "reviews")
+            .expect("reviews workload");
+        assert!(
+            workload.node_waypoint.is_none(),
+            "{shape} must not classify a pod as a trusted NodeWaypoint"
+        );
+    }
 }
 
 #[test]
-fn k8s_pod_discovery_stamps_identity_only_workloads_with_node_waypoint() {
-    let mut source = ready_pod();
-    source.metadata.name = "src-a".to_string();
-    source.metadata.uid = "src-a-uid".to_string();
-    source.spec["serviceAccountName"] = json!("src-a");
+fn k8s_pod_discovery_rejects_noncanonical_downward_api_field_path() {
     let mut waypoint = node_waypoint_pod("node-a", "192.0.2.10", true, 15008);
-    push_pod_env_field_ref(&mut waypoint, "FERRUM_K8S_NODE_NAME", "spec.nodeName");
+    waypoint.spec["containers"][0]["env"]
+        .as_array_mut()
+        .expect("env array")
+        .push(json!({
+            "name": "FERRUM_K8S_NODE_NAME",
+            "value": "",
+            "valueFrom": {
+                "fieldRef": {
+                    "field_path": "spec.node_name"
+                }
+            }
+        }));
     push_pod_env(
         &mut waypoint,
         "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
         "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)",
     );
 
-    let translation =
-        translate_k8s_objects(&[node("node-a", "node-uid-a"), source, waypoint], options())
-            .expect("K8s core translation succeeds");
-
-    let mesh = translation.config.mesh.as_ref().expect("mesh config");
-    let workload = mesh
+    let translation = translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            waypoint,
+        ],
+        options(),
+    )
+    .expect("K8s core translation succeeds");
+    let workload = translation
+        .config
+        .mesh
+        .as_ref()
+        .expect("mesh config")
         .workloads
         .iter()
-        .find(|workload| workload.namespace == "default" && workload.service_name == "src-a")
-        .expect("identity-only src-a");
-    assert!(workload.addresses.is_empty());
-    let node_waypoint = workload
-        .node_waypoint
-        .as_ref()
-        .expect("identity-only pods still need destination node_waypoint metadata");
-    assert_eq!(
-        node_waypoint.spiffe_id.as_str(),
-        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/node-a"
+        .find(|workload| workload.namespace == "default" && workload.service_name == "reviews")
+        .expect("reviews workload");
+    assert!(
+        workload.node_waypoint.is_none(),
+        "noncanonical field_path/spec.node_name must not resolve trusted NodeWaypoint identity"
     );
 }

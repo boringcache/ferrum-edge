@@ -19,9 +19,14 @@ fn gateway_binary_path() -> &'static str {
     }
 }
 
-fn start_gateway(config_path: &str, proxy_port: u16, admin_port: u16) -> std::process::Child {
-    std::process::Command::new(gateway_binary_path())
-        .env("FERRUM_MODE", "file")
+fn start_gateway(
+    config_path: &str,
+    proxy_port: u16,
+    admin_port: u16,
+    identity: &crate::common::SpawnedGatewayIdentity,
+) -> std::process::Child {
+    let mut cmd = std::process::Command::new(gateway_binary_path());
+    cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
@@ -29,23 +34,24 @@ fn start_gateway(config_path: &str, proxy_port: u16, admin_port: u16) -> std::pr
         .env("FERRUM_LOG_LEVEL", "warn")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("start ferrum-edge")
+        .stderr(std::process::Stdio::null());
+    identity.apply_to_command(&mut cmd);
+    cmd.spawn().expect("start ferrum-edge")
 }
 
-async fn wait_for_gateway(admin_port: u16) -> bool {
-    let client = reqwest::Client::new();
-    let health_url = format!("http://127.0.0.1:{admin_port}/health");
-    for _ in 0..60 {
-        if let Ok(resp) = client.get(&health_url).send().await
-            && resp.status().is_success()
-        {
-            return true;
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
-    false
+async fn wait_for_owned_gateway(
+    child: &mut std::process::Child,
+    admin_port: u16,
+    identity: &crate::common::SpawnedGatewayIdentity,
+) -> bool {
+    crate::common::wait_for_owned_gateway_identity(
+        child,
+        admin_port,
+        identity,
+        Duration::from_secs(15),
+    )
+    .await
+    .is_ok()
 }
 
 async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
@@ -57,8 +63,9 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
         let admin_port = admin_listener.local_addr().unwrap().port();
         drop(admin_listener);
 
-        let mut child = start_gateway(config_path, proxy_port, admin_port);
-        if wait_for_gateway(admin_port).await {
+        let identity = crate::common::SpawnedGatewayIdentity::mint("ai-stream-router");
+        let mut child = start_gateway(config_path, proxy_port, admin_port, &identity);
+        if wait_for_owned_gateway(&mut child, admin_port, &identity).await {
             return (child, proxy_port, admin_port);
         }
         let _ = child.kill();
