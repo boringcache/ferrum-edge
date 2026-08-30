@@ -212,11 +212,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (issue #4391). A TE-first request previously reached Hyper's application
   service without `Content-Length`, because Hyper applied transfer-coding
   precedence before Ferrum's header-map guard ran; the same fields in CL-first
-  order returned `400`. Plaintext and TLS HTTP/1 frontends now observe bounded
-  raw request heads before parsing and carry the CL+TE fact into the existing
-  `400` rejection path. The observer is case-insensitive, survives split reads
-  and keep-alive bodies, allocates only once per connection, and disables
-  itself for HTTP/2. TE-only, CL-only, HTTP/2, and HTTP/3 behavior is unchanged.
+  order returned `400`. Plaintext and TLS proxy HTTP/1 frontends now observe
+  bounded raw request heads before parsing and carry the CL+TE fact into the
+  existing `400` rejection path. The observer is case-insensitive, survives
+  leading empty lines, split reads, and keep-alive bodies, allocates only once
+  per connection, and disables itself for HTTP/2 and after an HTTP/1 `101`
+  upgrade.
+  Body-boundary reads can include an 8 KiB observation suffix instead of being
+  shortened to the current chunk remainder. If observation loses alignment or
+  exhausts its fixed signal ring, the current request is rejected with a
+  distinct error and the connection is closed. This applies only to plaintext
+  and TLS **proxy** HTTP/1 frontends; the admin and injector HTTP listeners are
+  outside this observer boundary. TE-only, CL-only, HTTP/2, and HTTP/3 behavior
+  is unchanged.
 
 - **Security — client-asserted `X-Real-IP` no longer reaches mirror or
   load-test targets** (issue #4164). The primary backend builders drop an

@@ -14,7 +14,7 @@ concerns are handled by dedicated layers and the WAF does not duplicate them:
 
 | Concern | Handled by |
 | --- | --- |
-| Request smuggling (CL/TE conflicts, duplicate Content-Length) | bounded HTTP/1 wire framing guard + core proxy `check_protocol_headers()` + Hyper parsing |
+| Request smuggling (CL/TE conflicts, duplicate Content-Length) | bounded proxy-frontend HTTP/1 wire framing guard + core proxy `check_protocol_headers()` + Hyper parsing |
 | Header/URI/body size limits | `FERRUM_MAX_*` env vars, `request_size_limiting` |
 | Authentication / authorization | auth plugins, `access_control`, `mesh_authz`, `opa` |
 | Rate limiting / flooding | `rate_limiting`, `*_rate_limiting` |
@@ -23,13 +23,14 @@ concerns are handled by dedicated layers and the WAF does not duplicate them:
 | Backend SSRF allow/deny | `FERRUM_BACKEND_ALLOW_IPS` + `FERRUM_BACKEND_ALLOW_CIDRS` / `FERRUM_BACKEND_DENY_CIDRS` (metadata/link-local/multicast blocked by default) |
 | Response security headers | `security_headers` |
 
-HTTP/1 requests that carry both `Content-Length` and `Transfer-Encoding` are
-rejected with `400` independently of field order or casing. Enforcement starts
-in the frontend I/O adapter, which observes each bounded raw request head before
-Hyper applies transfer-coding precedence, and finishes in the shared
-`check_protocol_headers()` rejection path before routing. HTTP/2 and HTTP/3 do
-not use this wire observer; their existing protocol-specific TE validation is
-unchanged.
+On plaintext and TLS proxy frontends, HTTP/1 requests that carry both
+`Content-Length` and `Transfer-Encoding` are rejected with `400` independently
+of field order or casing. Enforcement starts in the proxy frontend I/O adapter,
+which observes each bounded raw request head before Hyper applies
+transfer-coding precedence, and finishes in the shared
+`check_protocol_headers()` rejection path before routing. The admin and injector
+HTTP listeners do not use this adapter. HTTP/2 and HTTP/3 do not use this wire
+observer; their existing protocol-specific TE validation is unchanged.
 
 The WAF focuses on injection and disclosure signatures: SQLi, NoSQLi, command
 injection, XSS, SSTI, JNDI/Log4Shell, path traversal, LFI, RFI, SSRF, XXE,

@@ -6615,9 +6615,9 @@ fn via_header_for_backend_response_body<'a>(
 #[derive(Clone, Default)]
 struct RequestConnectionMetadata {
     frontend_listen_port: Option<u16>,
-    /// Raw HTTP/1 request head contained both `Content-Length` and
-    /// `Transfer-Encoding` before Hyper applied framing precedence.
-    http1_te_cl_conflict_on_wire: bool,
+    /// Raw HTTP/1 framing result captured before Hyper applied framing
+    /// precedence.
+    http1_framing_result: h1_framing_guard::H1FramingResult,
     /// Concrete local address of the accepted TCP connection. Unlike the
     /// listener's wildcard bind address, this identifies the pod IP the peer
     /// actually reached — it binds a Sidecar ingress CONNECT to this replica
@@ -13503,12 +13503,18 @@ async fn handle_connection(
         service_admission.mark();
         let state = Arc::clone(&state);
         let addr = remote_addr;
+        let http1_framing_result = if matches!(
+            req.version(),
+            hyper::Version::HTTP_10 | hyper::Version::HTTP_11
+        ) {
+            service_h1_framing_signals.next_conflict()
+        } else {
+            h1_framing_guard::H1FramingResult::Clear
+        };
+        let response_h1_framing_signals = Arc::clone(&service_h1_framing_signals);
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port,
-            http1_te_cl_conflict_on_wire: matches!(
-                req.version(),
-                hyper::Version::HTTP_10 | hyper::Version::HTTP_11
-            ) && service_h1_framing_signals.next_conflict(),
+            http1_framing_result,
             accepted_local_addr,
             frontend_sni_hostname: None,
             node_waypoint_identity: node_waypoint_identity.clone(),
@@ -13525,7 +13531,7 @@ async fn handle_connection(
             authorization_connection_closer: Some(authorization_closer.clone()),
         };
         async move {
-            handle_proxy_request_on_frontend_port(
+            let response = handle_proxy_request_on_frontend_port(
                 req,
                 state,
                 addr,
@@ -13535,7 +13541,14 @@ async fn handle_connection(
                 None,
                 connection_metadata,
             )
-            .await
+            .await;
+            let switched_protocols = response
+                .as_ref()
+                .is_ok_and(|response| response.status() == StatusCode::SWITCHING_PROTOCOLS);
+            if switched_protocols {
+                response_h1_framing_signals.disable_observation();
+            }
+            response
         }
     });
 
@@ -21466,12 +21479,18 @@ async fn handle_tls_connection(
         let chain = client_cert_chain_der.clone();
         let mtls_auth_connection_cache = mtls_auth_connection_cache.clone();
         let frontend_sni_hostname = frontend_sni_hostname.clone();
+        let http1_framing_result = if matches!(
+            req.version(),
+            hyper::Version::HTTP_10 | hyper::Version::HTTP_11
+        ) {
+            service_h1_framing_signals.next_conflict()
+        } else {
+            h1_framing_guard::H1FramingResult::Clear
+        };
+        let response_h1_framing_signals = Arc::clone(&service_h1_framing_signals);
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port: tls_connection_metadata.frontend_listen_port,
-            http1_te_cl_conflict_on_wire: matches!(
-                req.version(),
-                hyper::Version::HTTP_10 | hyper::Version::HTTP_11
-            ) && service_h1_framing_signals.next_conflict(),
+            http1_framing_result,
             accepted_local_addr: tls_connection_metadata.accepted_local_addr,
             frontend_sni_hostname,
             node_waypoint_identity: tls_connection_metadata.node_waypoint_identity.clone(),
@@ -21486,7 +21505,7 @@ async fn handle_tls_connection(
             authorization_connection_closer: Some(authorization_closer.clone()),
         };
         async move {
-            handle_proxy_request_on_frontend_port(
+            let response = handle_proxy_request_on_frontend_port(
                 req,
                 state,
                 addr,
@@ -21496,7 +21515,14 @@ async fn handle_tls_connection(
                 mtls_auth_connection_cache,
                 connection_metadata,
             )
-            .await
+            .await;
+            let switched_protocols = response
+                .as_ref()
+                .is_ok_and(|response| response.status() == StatusCode::SWITCHING_PROTOCOLS);
+            if switched_protocols {
+                response_h1_framing_signals.disable_observation();
+            }
+            response
         }
     });
 
@@ -28834,6 +28860,29 @@ async fn handle_proxy_request_on_frontend_port(
     mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
+    // An observer failure is connection-scoped and must outrank every
+    // request-level early return below. Otherwise a stale-config, trust,
+    // ACME, or overload response could leave the unverified H1 connection
+    // reusable and turn a fail-closed state back into an unbounded stream.
+    if matches!(
+        connection_metadata.http1_framing_result,
+        h1_framing_guard::H1FramingResult::ObserverFailed
+    ) {
+        let error_body =
+            r#"{"error":"HTTP/1 request framing could not be verified; connection will be closed"}"#;
+        warn!(
+            framing_observer_state = "unknown_or_overflowed",
+            "Rejected HTTP/1 request because wire framing could not be verified; closing connection"
+        );
+        record_request(&state, 400);
+        let mut response = build_response(StatusCode::BAD_REQUEST, error_body);
+        response.headers_mut().insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("close"),
+        );
+        return Ok(response);
+    }
+
     // Stale-configuration admission fence (issue #3726). One relaxed atomic
     // load on a process-global word that only a data plane whose applied CP
     // snapshot aged past `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` — with no CP
@@ -28984,7 +29033,7 @@ async fn handle_proxy_request_inner(
     connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
-    let http1_te_cl_conflict_on_wire = connection_metadata.http1_te_cl_conflict_on_wire;
+    let http1_framing_result = connection_metadata.http1_framing_result;
     let accepted_local_ip = connection_metadata
         .accepted_local_addr
         .map(|addr| addr.ip());
@@ -29175,7 +29224,10 @@ async fn handle_proxy_request_inner(
     if let Some(error_body) = check_protocol_headers_with_wire_framing(
         req.headers(),
         req.version(),
-        http1_te_cl_conflict_on_wire,
+        matches!(
+            http1_framing_result,
+            h1_framing_guard::H1FramingResult::Conflict
+        ),
     ) {
         warn!("Rejected request: {}", error_body);
         record_request(&state, 400);

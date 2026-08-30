@@ -9,10 +9,10 @@
 //! publishes one bit per complete HTTP/1 request head. It does not retain a
 //! head, allocate per request, or inspect body payloads. A small framing state
 //! machine skips fixed and chunked bodies so keep-alive and pipelined requests
-//! remain aligned. Reads that can contain request heads are capped at 8 KiB;
-//! this hard-bounds the fixed signal ring's producer lead without limiting
-//! body reads. The configured Hyper head-buffer limit bounds work on an
-//! unterminated head.
+//! remain aligned. Reads that can contain request heads expose at most 8 KiB
+//! beyond a known body boundary; this hard-bounds the fixed signal ring's
+//! producer lead without limiting reads wholly inside a body. The configured
+//! Hyper head-buffer limit bounds work on an unterminated head.
 
 use std::io;
 use std::pin::Pin;
@@ -27,19 +27,35 @@ const OBSERVED_READ_CAP: usize = 8 * 1024;
 const SIGNAL_WORDS: usize = 16;
 const SIGNAL_CAPACITY: u64 = (SIGNAL_WORDS * u64::BITS as usize) as u64;
 const CHUNK_EXTENSION_LIMIT: usize = 16 * 1024;
+// Hyper's fixed `proto::h1::decode::TRAILER_LIMIT`; its server connection
+// leaves `h1_max_header_size` unset, so this is independent of the head limit.
+const HYPER_TRAILER_LIMIT: usize = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum H1FramingResult {
+    #[default]
+    Clear,
+    Conflict,
+    ObserverFailed,
+}
 
 /// Connection-local queue of wire-level CL+TE decisions.
 ///
-/// A read that can contain request heads is capped at 8 KiB. Even the shortest
-/// parseable HTTP/1 head is far larger than eight bytes, so 1,024 bits cannot
-/// wrap before Hyper consumes the corresponding service entries. Overflow is
-/// nevertheless fail-closed: all later H1 requests on that connection are
-/// reported as conflicts.
+/// Leading empty lines produce no entries, matching httparse. The shortest
+/// request head Hyper can dispatch is `A / HTTP/1.1\n\n` (14 bytes). Hyper
+/// returns after parsing the first head instead of issuing another read, and a
+/// boundary-crossing read exposes at most 8 KiB after the body, so one prior
+/// partial head plus `8192 / 14` complete heads can lead the consumer: at most
+/// 586 entries. The 1,024-entry ring therefore cannot wrap while the observer
+/// remains congruent. Capacity exhaustion, an observer/parser divergence, and
+/// a consumer underflow are nevertheless sticky fail-closed states.
 pub(super) struct H1FramingSignals {
     produced: AtomicU64,
     consumed: AtomicU64,
     conflicts: [AtomicU64; SIGNAL_WORDS],
     overflowed: AtomicBool,
+    unknown: AtomicBool,
+    observation_disabled: AtomicBool,
 }
 
 impl H1FramingSignals {
@@ -49,14 +65,37 @@ impl H1FramingSignals {
             consumed: AtomicU64::new(0),
             conflicts: std::array::from_fn(|_| AtomicU64::new(0)),
             overflowed: AtomicBool::new(false),
+            unknown: AtomicBool::new(false),
+            observation_disabled: AtomicBool::new(false),
         }
     }
 
+    fn mark_unknown(&self) {
+        self.unknown.store(true, Ordering::Release);
+        self.observation_disabled.store(true, Ordering::Release);
+    }
+
+    fn mark_overflowed(&self) {
+        self.overflowed.store(true, Ordering::Release);
+        self.observation_disabled.store(true, Ordering::Release);
+    }
+
+    pub(super) fn disable_observation(&self) {
+        self.observation_disabled.store(true, Ordering::Release);
+    }
+
+    fn observation_disabled(&self) -> bool {
+        self.observation_disabled.load(Ordering::Acquire)
+    }
+
     fn push(&self, conflict: bool) -> bool {
+        if self.observation_disabled() {
+            return false;
+        }
         let sequence = self.produced.load(Ordering::Relaxed);
         let consumed = self.consumed.load(Ordering::Acquire);
         if sequence.saturating_sub(consumed) >= SIGNAL_CAPACITY {
-            self.overflowed.store(true, Ordering::Release);
+            self.mark_overflowed();
             return false;
         }
 
@@ -65,7 +104,7 @@ impl H1FramingSignals {
             .conflicts
             .get((slot / u64::BITS as u64) as usize)
         else {
-            self.overflowed.store(true, Ordering::Release);
+            self.mark_unknown();
             return false;
         };
         let mask = 1u64 << (slot % u64::BITS as u64);
@@ -75,21 +114,22 @@ impl H1FramingSignals {
             word.fetch_and(!mask, Ordering::Relaxed);
         }
         let Some(next_sequence) = sequence.checked_add(1) else {
-            self.overflowed.store(true, Ordering::Release);
+            self.mark_overflowed();
             return false;
         };
         self.produced.store(next_sequence, Ordering::Release);
         true
     }
 
-    pub(super) fn next_conflict(&self) -> bool {
-        if self.overflowed.load(Ordering::Acquire) {
-            return true;
+    pub(super) fn next_conflict(&self) -> H1FramingResult {
+        if self.overflowed.load(Ordering::Acquire) || self.unknown.load(Ordering::Acquire) {
+            return H1FramingResult::ObserverFailed;
         }
 
         let sequence = self.consumed.load(Ordering::Relaxed);
         if sequence >= self.produced.load(Ordering::Acquire) {
-            return false;
+            self.mark_unknown();
+            return H1FramingResult::ObserverFailed;
         }
 
         let slot = sequence % SIGNAL_CAPACITY;
@@ -97,17 +137,21 @@ impl H1FramingSignals {
             .conflicts
             .get((slot / u64::BITS as u64) as usize)
         else {
-            self.overflowed.store(true, Ordering::Release);
-            return true;
+            self.mark_unknown();
+            return H1FramingResult::ObserverFailed;
         };
         let mask = 1u64 << (slot % u64::BITS as u64);
         let conflict = word.load(Ordering::Relaxed) & mask != 0;
         let Some(next_sequence) = sequence.checked_add(1) else {
-            self.overflowed.store(true, Ordering::Release);
-            return true;
+            self.mark_overflowed();
+            return H1FramingResult::ObserverFailed;
         };
         self.consumed.store(next_sequence, Ordering::Release);
-        conflict
+        if conflict {
+            H1FramingResult::Conflict
+        } else {
+            H1FramingResult::Clear
+        }
     }
 }
 
@@ -139,6 +183,7 @@ impl<T: AsyncRead + Unpin> AsyncRead for H1FramingGuardIo<T> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        this.scanner.disable_if_requested(&this.signals);
         let filled_before = buf.filled().len();
         let cap = this.scanner.read_cap(buf.remaining());
 
@@ -162,8 +207,11 @@ impl<T: AsyncRead + Unpin> AsyncRead for H1FramingGuardIo<T> {
         };
 
         if let Poll::Ready(Ok(())) = &result {
-            this.scanner
-                .observe(&buf.filled()[filled_before..], &this.signals);
+            this.scanner.disable_if_requested(&this.signals);
+            if this.scanner.observation_active() {
+                this.scanner
+                    .observe(&buf.filled()[filled_before..], &this.signals);
+            }
         }
         result
     }
@@ -235,16 +283,28 @@ impl WireScanner {
         }
     }
 
+    fn observation_active(&self) -> bool {
+        matches!(self.protocol, Protocol::Detect | Protocol::Http1)
+    }
+
+    fn disable_if_requested(&mut self, signals: &H1FramingSignals) {
+        if self.observation_active() && signals.observation_disabled() {
+            self.protocol = Protocol::Disabled;
+        }
+    }
+
     fn observe(&mut self, mut bytes: &[u8], signals: &H1FramingSignals) {
         if self.protocol == Protocol::Detect {
             let mut consumed = 0;
             while consumed < bytes.len() && self.protocol == Protocol::Detect {
                 let byte = bytes[consumed];
                 let Some(expected) = H2_PREFACE.get(self.preface_len).copied() else {
+                    signals.mark_unknown();
                     self.protocol = Protocol::Disabled;
                     return;
                 };
                 let Some(slot) = self.preface.get_mut(self.preface_len) else {
+                    signals.mark_unknown();
                     self.protocol = Protocol::Disabled;
                     return;
                 };
@@ -255,6 +315,7 @@ impl WireScanner {
                 if byte != expected {
                     self.protocol = Protocol::Http1;
                     if !self.h1.observe(&self.preface[..self.preface_len], signals) {
+                        signals.mark_unknown();
                         self.protocol = Protocol::Disabled;
                         return;
                     }
@@ -267,6 +328,7 @@ impl WireScanner {
         }
 
         if self.protocol == Protocol::Http1 && !self.h1.observe(bytes, signals) {
+            signals.mark_unknown();
             self.protocol = Protocol::Disabled;
         }
     }
@@ -294,11 +356,11 @@ impl H1StreamScanner {
 
     fn read_cap(&self, requested: usize) -> usize {
         match &self.state {
-            H1State::FixedBody(remaining) => requested.min(u64_to_usize(*remaining)),
+            H1State::FixedBody(remaining) => body_boundary_read_cap(requested, *remaining),
             H1State::Chunked(ChunkedScanner {
                 state: ChunkState::Data(remaining),
                 ..
-            }) => requested.min(u64_to_usize(*remaining)),
+            }) => body_boundary_read_cap(requested, *remaining),
             H1State::Head(_) | H1State::Chunked(_) => requested.min(OBSERVED_READ_CAP),
             H1State::Disabled => requested,
         }
@@ -322,9 +384,7 @@ impl H1StreamScanner {
                                         H1State::Head(HeadScanner::new(self.max_head_bytes))
                                     }
                                     BodyFraming::Fixed(length) => H1State::FixedBody(length),
-                                    BodyFraming::Chunked => H1State::Chunked(ChunkedScanner::new(
-                                        self.max_head_bytes,
-                                    )),
+                                    BodyFraming::Chunked => H1State::Chunked(ChunkedScanner::new()),
                                     BodyFraming::Invalid => H1State::Disabled,
                                 })
                             }
@@ -365,6 +425,10 @@ impl H1StreamScanner {
         }
         !matches!(&self.state, H1State::Disabled)
     }
+}
+
+fn body_boundary_read_cap(requested: usize, remaining: u64) -> usize {
+    requested.min(u64_to_usize(remaining).saturating_add(OBSERVED_READ_CAP))
 }
 
 fn u64_to_usize(value: u64) -> usize {
@@ -534,6 +598,11 @@ impl HeadScanner {
 
     fn finish_line(&mut self) -> HeadStep {
         if !self.line_has_data {
+            if self.request_line {
+                // httparse skips any run of CRLF or bare LF before the request
+                // line, so an empty leading line is not a request head.
+                return HeadStep::Continue;
+            }
             let framing = if self.seen_transfer_encoding {
                 BodyFraming::Chunked
             } else if !self.content_length_valid {
@@ -621,17 +690,15 @@ struct ChunkedScanner {
     chunk_size: u64,
     extension_bytes: usize,
     trailer_bytes: usize,
-    max_trailer_bytes: usize,
 }
 
 impl ChunkedScanner {
-    fn new(max_trailer_bytes: usize) -> Self {
+    fn new() -> Self {
         Self {
             state: ChunkState::SizeStart,
             chunk_size: 0,
             extension_bytes: 0,
             trailer_bytes: 0,
-            max_trailer_bytes,
         }
     }
 
@@ -736,7 +803,7 @@ impl ChunkedScanner {
                 }
                 ChunkState::Trailer => {
                     self.trailer_bytes = self.trailer_bytes.saturating_add(1);
-                    if self.trailer_bytes > self.max_trailer_bytes {
+                    if self.trailer_bytes >= HYPER_TRAILER_LIMIT {
                         return (offset, ChunkStep::Disable);
                     }
                     if byte == b'\r' {
@@ -780,4 +847,216 @@ enum ChunkStep {
     Continue,
     Complete,
     Disable,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_MAX_HEAD_BYTES: usize = 32 * 1024;
+
+    struct ScanOutcome {
+        results: Vec<H1FramingResult>,
+        overflowed: bool,
+        unknown: bool,
+    }
+
+    fn scan(parts: &[&[u8]]) -> ScanOutcome {
+        scan_with_max_head(TEST_MAX_HEAD_BYTES, parts)
+    }
+
+    fn scan_with_max_head(max_head_bytes: usize, parts: &[&[u8]]) -> ScanOutcome {
+        let signals = H1FramingSignals::new();
+        let mut scanner = WireScanner::new(max_head_bytes);
+        for part in parts {
+            scanner.observe(part, &signals);
+        }
+
+        let produced = signals.produced.load(Ordering::Acquire);
+        let mut results = Vec::with_capacity(produced as usize);
+        for _ in 0..produced {
+            results.push(signals.next_conflict());
+        }
+        ScanOutcome {
+            results,
+            overflowed: signals.overflowed.load(Ordering::Acquire),
+            unknown: signals.unknown.load(Ordering::Acquire),
+        }
+    }
+
+    #[test]
+    fn classifies_basic_request_heads() {
+        let cases: &[(&[u8], &[H1FramingResult])] = &[
+            (b"GET / HTTP/1.1\r\nHost: a\r\n\r\n", &[H1FramingResult::Clear]),
+            (
+                b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n0\r\n\r\n",
+                &[H1FramingResult::Conflict],
+            ),
+            (
+                b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+                &[H1FramingResult::Conflict],
+            ),
+            (
+                b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+                &[H1FramingResult::Clear],
+            ),
+            (
+                b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 6\r\n\r\nhello!",
+                &[H1FramingResult::Clear],
+            ),
+        ];
+
+        for (wire, expected) in cases {
+            let outcome = scan(&[*wire]);
+            assert_eq!(outcome.results.as_slice(), *expected);
+            assert!(!outcome.overflowed);
+            assert!(!outcome.unknown);
+        }
+    }
+
+    #[test]
+    fn skips_leading_empty_lines_without_publishing_signals() {
+        let request = b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n0\r\n\r\n";
+        for prefix in [b"\r\n".as_slice(), b"\n", b"\r\n\n\r\n"] {
+            let outcome = scan(&[prefix, request]);
+            assert_eq!(outcome.results, [H1FramingResult::Conflict]);
+            assert!(!outcome.overflowed);
+            assert!(!outcome.unknown);
+        }
+    }
+
+    #[test]
+    fn leading_empty_line_run_cannot_exhaust_signal_ring() {
+        let mut wire = vec![b'\n'; SIGNAL_CAPACITY as usize];
+        wire.extend_from_slice(
+            b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n0\r\n\r\n",
+        );
+        let outcome = scan(&[&wire]);
+        assert_eq!(outcome.results, [H1FramingResult::Conflict]);
+        assert!(!outcome.overflowed);
+        assert!(!outcome.unknown);
+    }
+
+    #[test]
+    fn preserves_classification_across_every_split_boundary() {
+        let request = b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n6\r\nhello!\r\n0\r\n\r\n";
+        for split in 0..=request.len() {
+            let outcome = scan(&[&request[..split], &request[split..]]);
+            assert_eq!(
+                outcome.results,
+                [H1FramingResult::Conflict],
+                "split boundary {split}"
+            );
+            assert!(!outcome.overflowed, "split boundary {split}");
+            assert!(!outcome.unknown, "split boundary {split}");
+        }
+    }
+
+    #[test]
+    fn classifies_pipelined_heads_in_order() {
+        let wire = b"GET /one HTTP/1.1\r\nHost: a\r\n\r\nPOST /two HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n0\r\n\r\n";
+        let outcome = scan(&[wire]);
+        assert_eq!(
+            outcome.results,
+            [H1FramingResult::Clear, H1FramingResult::Conflict]
+        );
+        assert!(!outcome.overflowed);
+        assert!(!outcome.unknown);
+    }
+
+    #[test]
+    fn tracks_chunked_body_with_trailers() {
+        let wire = b"POST /one HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Trace: done\r\n\r\n";
+        let outcome = scan(&[wire]);
+        assert_eq!(outcome.results, [H1FramingResult::Clear]);
+        assert!(!outcome.overflowed);
+        assert!(!outcome.unknown);
+    }
+
+    #[test]
+    fn tracks_chunked_body_before_pipelined_request() {
+        let wire = b"POST /one HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello!\r\n0\r\nX-Trace: done\r\n\r\nPOST /two HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n0\r\n\r\n";
+        let outcome = scan(&[wire]);
+        assert_eq!(
+            outcome.results,
+            [H1FramingResult::Clear, H1FramingResult::Conflict]
+        );
+        assert!(!outcome.overflowed);
+        assert!(!outcome.unknown);
+    }
+
+    #[test]
+    fn trailer_budget_matches_hyper_when_head_limit_is_smaller() {
+        let mut wire =
+            b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: ".to_vec();
+        wire.extend(std::iter::repeat_n(b'a', 9 * 1024));
+        wire.extend_from_slice(b"\r\n\r\n");
+
+        let outcome = scan_with_max_head(8 * 1024, &[&wire]);
+        assert_eq!(outcome.results, [H1FramingResult::Clear]);
+        assert!(!outcome.overflowed);
+        assert!(!outcome.unknown);
+    }
+
+    #[test]
+    fn body_boundary_reads_avoid_remainder_sized_short_reads() {
+        let wholly_inside_body = body_boundary_read_cap(64 * 1024, 64 * 1024);
+        assert_eq!(wholly_inside_body, 64 * 1024);
+
+        let crossing_boundary = body_boundary_read_cap(64 * 1024, 1);
+        assert_eq!(crossing_boundary, OBSERVED_READ_CAP + 1);
+    }
+
+    #[test]
+    fn signal_overflow_and_consumer_underflow_fail_closed() {
+        let overflowed = H1FramingSignals::new();
+        for _ in 0..SIGNAL_CAPACITY {
+            assert!(overflowed.push(false));
+        }
+        assert!(!overflowed.push(false));
+        assert_eq!(overflowed.next_conflict(), H1FramingResult::ObserverFailed);
+
+        let underflowed = H1FramingSignals::new();
+        assert_eq!(underflowed.next_conflict(), H1FramingResult::ObserverFailed);
+        assert!(underflowed.unknown.load(Ordering::Acquire));
+        assert_eq!(underflowed.next_conflict(), H1FramingResult::ObserverFailed);
+    }
+
+    #[test]
+    fn scanner_disable_marks_observation_unknown() {
+        let signals = H1FramingSignals::new();
+        let mut scanner = WireScanner::new(TEST_MAX_HEAD_BYTES);
+        scanner.observe(
+            b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\nZ",
+            &signals,
+        );
+        assert!(matches!(scanner.protocol, Protocol::Disabled));
+        assert!(signals.unknown.load(Ordering::Acquire));
+        assert_eq!(signals.next_conflict(), H1FramingResult::ObserverFailed);
+    }
+
+    #[test]
+    fn requested_upgrade_disable_is_not_an_observer_failure() {
+        let signals = H1FramingSignals::new();
+        let mut scanner = WireScanner::new(TEST_MAX_HEAD_BYTES);
+        scanner.observe(
+            b"GET /chat HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
+            &signals,
+        );
+        assert!(matches!(scanner.protocol, Protocol::Http1));
+        assert_eq!(signals.next_conflict(), H1FramingResult::Clear);
+
+        signals.disable_observation();
+        scanner.disable_if_requested(&signals);
+        scanner.observe(
+            b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 6\r\n\r\n",
+            &signals,
+        );
+        assert!(matches!(scanner.protocol, Protocol::Disabled));
+        assert_eq!(scanner.read_cap(64 * 1024), 64 * 1024);
+        assert_eq!(signals.produced.load(Ordering::Acquire), 1);
+        assert_eq!(signals.consumed.load(Ordering::Acquire), 1);
+        assert!(!signals.overflowed.load(Ordering::Acquire));
+        assert!(!signals.unknown.load(Ordering::Acquire));
+    }
 }
