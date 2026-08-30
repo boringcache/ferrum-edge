@@ -97,6 +97,19 @@ fn generalized_time(unix: i64) -> Vec<u8> {
     tlv(0x18, rendered.as_bytes())
 }
 
+/// Re-encode the outer TLV with one redundant long-form length octet while
+/// preserving its tag and content exactly.
+fn redundant_outer_length(mut der: Vec<u8>) -> Vec<u8> {
+    assert_eq!(der.first(), Some(&0x30));
+    if der[1] & 0x80 == 0 {
+        der.insert(1, 0x81);
+    } else {
+        der[1] += 1;
+        der.insert(2, 0x00);
+    }
+    der
+}
+
 const OID_SHA1: &[u8] = &[0x2b, 0x0e, 0x03, 0x02, 0x1a];
 const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
 /// id-sha224 (2.16.840.1.101.3.4.2.4): a real digest OID Ferrum does not use
@@ -248,6 +261,15 @@ struct TestPki {
     /// A certificate issued by the CA that lacks `id-kp-OCSPSigning`.
     no_eku_key: SigningKey,
     no_eku_der: Vec<u8>,
+    /// A certificate issued by the CA that carries only
+    /// `anyExtendedKeyUsage`, not `id-kp-OCSPSigning`.
+    any_eku_key: SigningKey,
+    any_eku_der: Vec<u8>,
+    /// Issuer-signed OCSP delegates outside their certificate validity window.
+    expired_delegate_key: SigningKey,
+    expired_delegate_der: Vec<u8>,
+    future_delegate_key: SigningKey,
+    future_delegate_der: Vec<u8>,
     /// A delegated responder carrying an explicit `KeyUsage` that includes
     /// `digitalSignature`.
     signing_ku_key: SigningKey,
@@ -325,6 +347,52 @@ fn build_pki() -> TestPki {
     let no_eku_cert = no_eku_params
         .signed_by(&no_eku_pair, &issuer_handle)
         .expect("no-eku cert");
+
+    // `anyExtendedKeyUsage` is not the explicit id-kp-OCSPSigning delegation
+    // RFC 6960 requires.
+    let (any_eku_pair, any_eku_key) = new_key();
+    let mut any_eku_params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("any-eku params");
+    any_eku_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Ferrum Any-EKU Responder");
+    any_eku_params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::Any);
+    let any_eku_cert = any_eku_params
+        .signed_by(&any_eku_pair, &issuer_handle)
+        .expect("any-eku cert");
+
+    let cert_now = time::OffsetDateTime::now_utc();
+    let (expired_delegate_pair, expired_delegate_key) = new_key();
+    let mut expired_delegate_params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("expired delegate params");
+    expired_delegate_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Ferrum Expired OCSP Responder");
+    expired_delegate_params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::OcspSigning);
+    expired_delegate_params.not_before = cert_now - time::Duration::days(2);
+    expired_delegate_params.not_after = cert_now - time::Duration::days(1);
+    let expired_delegate_cert = expired_delegate_params
+        .signed_by(&expired_delegate_pair, &issuer_handle)
+        .expect("expired delegate cert");
+
+    let (future_delegate_pair, future_delegate_key) = new_key();
+    let mut future_delegate_params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("future delegate params");
+    future_delegate_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Ferrum Future OCSP Responder");
+    future_delegate_params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::OcspSigning);
+    future_delegate_params.not_before = cert_now + time::Duration::days(1);
+    future_delegate_params.not_after = cert_now + time::Duration::days(2);
+    let future_delegate_cert = future_delegate_params
+        .signed_by(&future_delegate_pair, &issuer_handle)
+        .expect("future delegate cert");
 
     // Self-signed with the OCSP-signing EKU, but never issued by the CA.
     let (rogue_pair, rogue_key) = new_key();
@@ -439,6 +507,12 @@ fn build_pki() -> TestPki {
         rogue_der: rogue_cert.der().to_vec(),
         no_eku_key,
         no_eku_der: no_eku_cert.der().to_vec(),
+        any_eku_key,
+        any_eku_der: any_eku_cert.der().to_vec(),
+        expired_delegate_key,
+        expired_delegate_der: expired_delegate_cert.der().to_vec(),
+        future_delegate_key,
+        future_delegate_der: future_delegate_cert.der().to_vec(),
         signing_ku_key,
         signing_ku_der: signing_ku_cert.der().to_vec(),
         no_digital_signature_key,
@@ -494,6 +568,9 @@ struct ResponseBuilder<'a> {
     duplicate_hash_oid: Option<&'static [u8]>,
     /// Emit a leading entry for an unrelated serial.
     leading_serial: Option<u64>,
+    /// Emit additional entries for unrelated serials after the configured
+    /// certificate's entry.
+    additional_serials: Vec<u64>,
     /// Raw element prepended to `ResponseData`, for `version [0]` fixtures.
     version_field: Option<Vec<u8>>,
     /// Tag byte of the `CertID` `serialNumber`. `0x02` is the universal
@@ -545,6 +622,7 @@ impl<'a> ResponseBuilder<'a> {
             cert_status: None,
             duplicate_hash_oid: None,
             leading_serial: None,
+            additional_serials: Vec::new(),
             version_field: None,
             serial_tag: 0x02,
             constructed_name_hash: false,
@@ -627,6 +705,11 @@ impl<'a> ResponseBuilder<'a> {
         if let Some(hash_oid) = self.duplicate_hash_oid {
             singles.push(self.single_response(self.serial, hash_oid));
         }
+        singles.extend(
+            self.additional_serials
+                .iter()
+                .map(|serial| self.single_response(*serial, self.hash_oid)),
+        );
 
         let default_produced_at = generalized_time(self.this_update);
         let produced_at = self.produced_at.clone().unwrap_or(default_produced_at);
@@ -720,6 +803,15 @@ fn structural_validation_accepts_a_well_formed_basic_response() {
 }
 
 #[test]
+fn a_redundant_long_form_length_is_rejected() {
+    let pki = build_pki();
+    let der = redundant_outer_length(ResponseBuilder::new(&pki, now()).build());
+
+    let error = validate_structure(&der).expect_err("must reject non-minimal DER length");
+    assert!(error.contains("non-minimal length"), "{error}");
+}
+
+#[test]
 fn structural_validation_rejects_arbitrary_bytes() {
     // The exact fixture the pre-#4300 unit test called a valid OCSP response.
     let error = validate_structure(&[1, 2, 3]).expect_err("must reject");
@@ -760,6 +852,54 @@ fn size_bound_is_enforced_before_parsing() {
     let error =
         validate_stapled_response_at(&oversized, &chain(&pki), now()).expect_err("must reject");
     assert!(error.contains("exceeds"), "{error}");
+}
+
+#[test]
+fn responder_certificate_count_is_bounded_at_sixteen() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.embedded_certs = vec![pki.delegate_der.as_slice(); 16];
+    validate_structure(&builder.build()).expect("sixteen responder certificates are allowed");
+
+    builder.embedded_certs.push(pki.delegate_der.as_slice());
+    let error = validate_structure(&builder.build()).expect_err("seventeen must be rejected");
+    assert!(error.contains("more than 16 responder certificates"), "{error}");
+}
+
+#[test]
+fn single_response_count_is_bounded_at_sixty_four() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.additional_serials = (0_u64..63).map(|offset| 0x5000 + offset).collect();
+    let structure =
+        validate_structure(&builder.build()).expect("sixty-four SingleResponses are allowed");
+    assert_eq!(structure.single_responses, 64);
+
+    builder.additional_serials.push(0x6000);
+    let error = validate_structure(&builder.build()).expect_err("sixty-five must be rejected");
+    assert!(error.contains("more than 64 SingleResponse"), "{error}");
+}
+
+#[test]
+fn extension_count_is_bounded_at_thirty_two() {
+    let pki = build_pki();
+    let mut entries: Vec<Vec<u8>> = (1_u8..=32)
+        .map(|suffix| {
+            let mut extension_oid = OID_OCSP_NONCE.to_vec();
+            extension_oid.push(suffix);
+            extension(&extension_oid, false, b"value")
+        })
+        .collect();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.response_data_tail = vec![extensions_field(1, &entries)];
+    validate_structure(&builder.build()).expect("thirty-two extensions are allowed");
+
+    let mut extension_oid = OID_OCSP_NONCE.to_vec();
+    extension_oid.push(33);
+    entries.push(extension(&extension_oid, false, b"value"));
+    builder.response_data_tail = vec![extensions_field(1, &entries)];
+    let error = validate_structure(&builder.build()).expect_err("thirty-three must be rejected");
+    assert!(error.contains("more than 32 extensions"), "{error}");
 }
 
 // ── Certificate-bound validation ───────────────────────────────────────────
@@ -844,6 +984,45 @@ fn a_delegated_responder_without_the_ocsp_signing_eku_is_rejected() {
 
     let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
         .expect_err("must reject");
+    assert!(error.contains("not authorized"), "{error}");
+}
+
+#[test]
+fn any_extended_key_usage_does_not_authorize_a_delegated_responder() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.responder_cert = pki.any_eku_der.as_slice();
+    builder.signing_key = &pki.any_eku_key;
+    builder.embedded_certs = vec![pki.any_eku_der.as_slice()];
+
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("anyExtendedKeyUsage must not authorize OCSP signing");
+    assert!(error.contains("not authorized"), "{error}");
+}
+
+#[test]
+fn an_expired_delegated_responder_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.responder_cert = pki.expired_delegate_der.as_slice();
+    builder.signing_key = &pki.expired_delegate_key;
+    builder.embedded_certs = vec![pki.expired_delegate_der.as_slice()];
+
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("an expired OCSP delegate must be rejected");
+    assert!(error.contains("not authorized"), "{error}");
+}
+
+#[test]
+fn a_not_yet_valid_delegated_responder_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.responder_cert = pki.future_delegate_der.as_slice();
+    builder.signing_key = &pki.future_delegate_key;
+    builder.embedded_certs = vec![pki.future_delegate_der.as_slice()];
+
+    let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
+        .expect_err("a not-yet-valid OCSP delegate must be rejected");
     assert!(error.contains("not authorized"), "{error}");
 }
 
@@ -1016,6 +1195,36 @@ fn a_malformed_produced_at_value_is_rejected() {
     let error = validate_stapled_response_at(&builder.build(), &chain(&pki), now())
         .expect_err("must reject");
     assert!(error.contains("producedAt"), "{error}");
+}
+
+#[test]
+fn a_generalized_time_without_a_timezone_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.produced_at = Some(tlv(0x18, b"20260101000000"));
+
+    let error = validate_structure(&builder.build()).expect_err("must reject missing timezone");
+    assert!(error.contains("DER GeneralizedTime"), "{error}");
+}
+
+#[test]
+fn a_generalized_time_with_an_explicit_offset_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.produced_at = Some(tlv(0x18, b"20260101000000+0000"));
+
+    let error = validate_structure(&builder.build()).expect_err("must reject explicit offset");
+    assert!(error.contains("DER GeneralizedTime"), "{error}");
+}
+
+#[test]
+fn a_generalized_time_with_fractional_seconds_is_rejected() {
+    let pki = build_pki();
+    let mut builder = ResponseBuilder::new(&pki, now());
+    builder.produced_at = Some(tlv(0x18, b"20260101000000.1Z"));
+
+    let error = validate_structure(&builder.build()).expect_err("must reject fractional seconds");
+    assert!(error.contains("DER GeneralizedTime"), "{error}");
 }
 
 #[test]

@@ -24,18 +24,20 @@
 //!    once, in its defined position; unknown, duplicate, misordered, or
 //!    trailing elements are refused rather than skipped, because a field this
 //!    parser ignores is still inside the bytes the responder signed. Every
-//!    `GeneralizedTime` is decoded, not merely tagged. An `Extensions`
-//!    container is parsed structurally and must not repeat an extension OID,
-//!    and because Ferrum implements no OCSP response extension, a *critical*
-//!    one is refused (RFC 6960 §4.4); a non-critical one is ignored after that
-//!    strict parse.
+//!    `GeneralizedTime` is restricted to DER's `YYYYMMDDHHMMSSZ` profile and
+//!    decoded, not merely tagged. An `Extensions` container is parsed
+//!    structurally and must not repeat an extension OID, and because Ferrum
+//!    implements no OCSP response extension, a *critical* one is refused (RFC
+//!    6960 §4.4); a non-critical one is ignored after that strict parse.
 //! 4. **A strict DER encoding, not merely a plausible one.** Every field
 //!    boundary checks the ASN.1 *class* and the primitive/constructed bit as
 //!    well as the tag number, so a context-specific element that reuses a
 //!    universal tag number, a primitive "SEQUENCE", or a constructed OCTET
 //!    STRING is refused instead of being decoded as the field it imitates.
-//!    Each primitive is then checked against its type-specific DER rules, not
-//!    merely the generic definite-length header `Any::from_der` validates:
+//!    `Any::from_der` enforces definite lengths but not their minimal DER
+//!    encoding, so every TLV this grammar walks is also checked for the shortest
+//!    possible length octets. Each primitive is then checked against its
+//!    type-specific DER rules:
 //!    OBJECT IDENTIFIER content must be a complete canonical encoding
 //!    (nonempty, terminated base-128 subidentifiers, no redundant leading
 //!    `0x80` group); INTEGER and ENUMERATED content must be nonempty and
@@ -359,9 +361,42 @@ fn enforce_size_bound(der: &[u8]) -> Result<(), String> {
 
 /// Parse exactly one DER TLV, returning the object, its complete encoding, and
 /// the remaining input.
+///
+/// `asn1-rs` enforces definite lengths but does not enforce DER's minimal
+/// length-octet encoding. Recompute the shortest length field for the decoded
+/// content here so every grammar boundary inherits the missing constraint.
 fn take_tlv(input: &[u8]) -> Result<(Any<'_>, &[u8], &[u8]), String> {
     let (rest, any) = Any::from_der(input).map_err(|error| format!("malformed DER: {error}"))?;
     let consumed = input.len() - rest.len();
+    let first_identifier = input
+        .first()
+        .copied()
+        .ok_or_else(|| "malformed DER: missing identifier octet".to_string())?;
+    let identifier_octets = if first_identifier & 0x1f == 0x1f {
+        input
+            .get(1..)
+            .ok_or_else(|| "malformed DER: missing identifier continuation".to_string())?
+            .iter()
+            .position(|octet| *octet & 0x80 == 0)
+            .map(|position| position + 2)
+            .ok_or_else(|| "malformed DER: unterminated identifier octets".to_string())?
+    } else {
+        1
+    };
+    let mut content_len = any.data.len();
+    let mut minimal_length_octets = 1;
+    if content_len >= 0x80 {
+        while content_len != 0 {
+            minimal_length_octets += 1;
+            content_len >>= 8;
+        }
+    }
+    let actual_header_len = consumed
+        .checked_sub(any.data.len())
+        .ok_or_else(|| "malformed DER: invalid header length".to_string())?;
+    if actual_header_len > identifier_octets + minimal_length_octets {
+        return Err("malformed DER: non-minimal length encoding".to_string());
+    }
     Ok((any, &input[..consumed], rest))
 }
 
@@ -799,10 +834,11 @@ fn validate_rsassa_pss_parameters(params: &Any<'_>, field: &str) -> Result<(), S
     Ok(())
 }
 
-/// Require a universal, primitive `GeneralizedTime` and decode it.
+/// Require a universal, primitive DER `GeneralizedTime` and decode it.
 ///
-/// Every instant in this grammar is both tag-checked and *decoded*: an
-/// unparseable instant is a malformed response even when the serving decision
+/// DER permits exactly `YYYYMMDDHHMMSSZ` here: seconds and the trailing `Z` are
+/// mandatory, while offsets, an absent timezone, and fractional seconds are
+/// forbidden. Every instant is then decoded, even when the serving decision
 /// does not read that particular field.
 fn expect_generalized_time(any: &Any<'_>, raw: &[u8], field: &str) -> Result<i64, String> {
     if any.class() != Class::Universal
@@ -810,6 +846,9 @@ fn expect_generalized_time(any: &Any<'_>, raw: &[u8], field: &str) -> Result<i64
         || any.header.constructed()
     {
         return Err(format!("OCSP {field} is not a GeneralizedTime"));
+    }
+    if any.data.len() != 15 || !any.data.ends_with(b"Z") {
+        return Err(format!("OCSP {field} is not a DER GeneralizedTime"));
     }
     generalized_time_unix(raw, field)
 }
@@ -1088,15 +1127,15 @@ fn parse_response_data(input: &[u8]) -> Result<ResponseData<'_>, String> {
     let mut single_responses = Vec::new();
     let mut cursor = responses_content;
     while !cursor.is_empty() {
-        let (single_any, _, next) = take_tlv(cursor)?;
-        let single_content = expect_sequence(&single_any, "SingleResponse")?;
-        single_responses.push(parse_single_response(single_content)?);
-        cursor = next;
-        if single_responses.len() > MAX_SINGLE_RESPONSES {
+        if single_responses.len() == MAX_SINGLE_RESPONSES {
             return Err(format!(
                 "OCSP response carries more than {MAX_SINGLE_RESPONSES} SingleResponse entries"
             ));
         }
+        let (single_any, _, next) = take_tlv(cursor)?;
+        let single_content = expect_sequence(&single_any, "SingleResponse")?;
+        single_responses.push(parse_single_response(single_content)?);
+        cursor = next;
     }
     if single_responses.is_empty() {
         return Err("OCSP response carries no SingleResponse entries".to_string());
@@ -1594,7 +1633,10 @@ fn select_issuer_der<'a>(
     if leaf.subject().as_raw() == leaf_issuer {
         saw_name_match = true;
         if leaf.verify_signature(None).is_ok() {
-            return Ok(chain[0].as_ref());
+            return chain
+                .first()
+                .map(|certificate| certificate.as_ref())
+                .ok_or_else(|| "cannot select an OCSP issuer from an empty chain".to_string());
         }
     }
     let message = if saw_name_match {
@@ -1631,6 +1673,8 @@ fn match_single_response<'a, 'b>(
             continue;
         }
         serial_matched = true;
+        // Unsupported CertID digests fail the whole response closed even when
+        // another entry would match, rather than silently changing its meaning.
         let algorithm = cert_id_digest(&single.cert_id.hash_algorithm)?;
         if digest::digest(algorithm, issuer_name).as_ref() != single.cert_id.issuer_name_hash {
             continue;
@@ -1722,11 +1766,14 @@ fn verify_signature_and_authorization(
         }
         saw_named_delegate = true;
 
-        // RFC 6960 §4.2.2.2: a delegated responder must be issued by the same
-        // CA as the certificate being checked and must carry id-kp-OCSPSigning.
+        // This byte-exact Name check is deliberately stricter than RFC 5280
+        // name matching. `verify_signature` below is the cryptographic proof
+        // that the configured issuer actually issued the delegate.
         if candidate.issuer().as_raw() != issuer.subject().as_raw() {
             continue;
         }
+        // RFC 6960 §4.2.2.2: a delegated responder must be issued by the same
+        // CA as the certificate being checked and must carry id-kp-OCSPSigning.
         let has_ocsp_signing = candidate
             .extended_key_usage()
             .ok()
