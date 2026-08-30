@@ -26,11 +26,10 @@ use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, K8sTranslationOptions,
     MeshRouteDispatchDestination, MeshRouteDispatchPolicy, RouteBackend, RouteProxySpec,
     SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
-    is_vs_authority_header,
-    mesh_route_dispatch_can_emit_rule, mesh_route_dispatch_has_unsupported_predicate,
-    mesh_route_dispatch_plugin_from_rules, mesh_route_dispatch_rules_for_proxy,
-    optional_port_field, optional_target_weight_field, parse_istio_duration_ms, port_from_u64,
-    proxy_for_route, request_termination_plugin_for_proxy,
+    is_vs_authority_header, mesh_route_dispatch_can_emit_rule,
+    mesh_route_dispatch_has_unsupported_predicate, mesh_route_dispatch_plugin_from_rules,
+    mesh_route_dispatch_rules_for_proxy, optional_port_field, optional_target_weight_field,
+    parse_istio_duration_ms, port_from_u64, proxy_for_route, request_termination_plugin_for_proxy,
     resolve_workload_entry_service_attachment, resource_id,
     route_backends_require_node_waypoint_authz, route_local_fault_delay_for_rule,
     route_local_fault_value_for_rule, route_request_transformer_plugin_for_proxy,
@@ -1568,8 +1567,7 @@ fn reject_unenforceable_target_refs(
     // Surface structural/ownership problems with the exact same diagnostics an
     // AuthorizationPolicy would produce.
     resolve_authorization_policy_target_refs(acc, object, kind)?;
-    let field = if object.spec.get("targetRef").is_some()
-        && object.spec.get("targetRefs").is_none()
+    let field = if object.spec.get("targetRef").is_some() && object.spec.get("targetRefs").is_none()
     {
         "targetRef"
     } else {
@@ -2791,15 +2789,12 @@ fn translate_outlier_detection(
 
     let max_ejection_percent = match value.get("maxEjectionPercent") {
         Some(raw) => {
-            let percent = raw
-                .as_u64()
-                .filter(|value| *value <= 100)
-                .ok_or_else(|| {
-                    invalid_resource(
-                        object,
-                        "outlierDetection.maxEjectionPercent must be an integer from 0 through 100",
-                    )
-                })?;
+            let percent = raw.as_u64().filter(|value| *value <= 100).ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    "outlierDetection.maxEjectionPercent must be an integer from 0 through 100",
+                )
+            })?;
             Some(percent as u8)
         }
         None => None,
@@ -3400,8 +3395,7 @@ fn validate_vs_header_block(
                         ),
                     ));
                 }
-                if authority_header
-                    && (value.is_empty() || value.chars().any(char::is_whitespace))
+                if authority_header && (value.is_empty() || value.chars().any(char::is_whitespace))
                 {
                     return Err(invalid_resource(
                         object,
@@ -18339,9 +18333,9 @@ extensionProviders:
         )
         .expect_err("zero outlier interval must fail closed");
         assert!(
-            zero_error.to_string().contains(
-                "outlierDetection.interval must be a positive duration string"
-            )
+            zero_error
+                .to_string()
+                .contains("outlierDetection.interval must be a positive duration string")
         );
 
         let subsecond_interval = translate_k8s_objects(

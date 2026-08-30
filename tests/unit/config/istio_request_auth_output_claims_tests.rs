@@ -398,8 +398,7 @@ fn translated_outlier_detection_preserves_an_omitted_cap_for_overlay_time() {
         .expect("outlierDetection translated");
     assert_eq!(outlier.consecutive_errors, Some(5));
     assert_eq!(
-        outlier.max_ejection_percent,
-        None,
+        outlier.max_ejection_percent, None,
         "translation must not synthesize a per-block default that overwrites a lower tier"
     );
 }
@@ -490,8 +489,7 @@ fn translated_outlier_detection_preserves_an_omitted_threshold_for_overlay_time(
         .and_then(|policy| policy.outlier_detection.as_ref())
         .expect("outlierDetection translated");
     assert_eq!(
-        outlier.consecutive_errors,
-        None,
+        outlier.consecutive_errors, None,
         "translation must preserve omission so a lower tier can supply the threshold"
     );
     assert_eq!(outlier.max_ejection_percent, None);
