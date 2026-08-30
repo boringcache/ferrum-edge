@@ -3,13 +3,16 @@
 //! Intercepts DNS queries (typically redirected from port 53 via iptables/eBPF)
 //! and resolves mesh-internal hostnames from a pre-built resolution table.
 //! Non-mesh queries are forwarded transparently to the upstream system resolver.
+//! Upstream UDP forwards use FIPS-compatible CSPRNG transaction IDs and a fresh
+//! connected ephemeral-port socket per in-flight query; a response is accepted
+//! only when both the ID and the full question match the pending lookup.
 //!
 //! The resolution table is rebuilt atomically (via `ArcSwap`) whenever the
 //! `MeshSlice` is updated, so there are no locks on the query hot path.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -19,8 +22,10 @@ use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
-use tracing::{debug, error, info, trace, warn};
+use tokio::task::{AbortHandle, JoinSet};
+use tracing::{debug, info, trace, warn};
 
+use crate::fips::backend::rand::{SecureRandom, SystemRandom};
 use crate::modes::mesh::slice::MeshSlice;
 
 // ── DNS wire-format constants ────────────────────────────────────────────
@@ -32,6 +37,10 @@ const DNS_MAX_TCP_PACKET_SIZE: usize = u16::MAX as usize;
 const DNS_MAX_CACHEABLE_RESPONSE_SIZE: usize = DNS_MAX_UDP_PACKET_SIZE;
 const DNS_UPSTREAM_TIMEOUT_SECS: u64 = 5;
 const DNS_UPSTREAM_ID_SPACE: usize = u16::MAX as usize + 1;
+/// Bounded CSPRNG draws when the chosen ID is already in flight. At the
+/// default outstanding cap (1024) this is ample; fail closed rather than
+/// scanning IDs sequentially if retries cannot find a free random ID.
+const DNS_UPSTREAM_ID_ALLOC_ATTEMPTS: usize = 16;
 const DNS_TCP_QUERY_READ_TIMEOUT_SECS: u64 = 5;
 const DNS_TCP_WRITE_TIMEOUT_SECS: u64 = 5;
 const DNS_MAX_NAME_POINTER_JUMPS: u32 = 16;
@@ -1149,41 +1158,77 @@ struct PendingForward {
     original_id: u16,
     query: DnsQuery,
     expires_at: Instant,
+    abort: AbortHandle,
+    /// Monotonic token identifying this exact forward. A timed-out entry frees
+    /// its 16-bit upstream ID immediately, so a later forward can be allocated
+    /// the same ID while the earlier recv task's already-queued outcome has not
+    /// been drained yet. The token is what refuses that stale outcome.
+    forward_seq: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpstreamIdAllocError {
+    Exhausted,
+    EntropyUnavailable,
+    CollisionRetryLimit,
+}
+
+enum UpstreamRecvOutcome {
+    Matched {
+        upstream_id: u16,
+        forward_seq: u64,
+        packet: Vec<u8>,
+    },
+    RecvFailed {
+        upstream_id: u16,
+        forward_seq: u64,
+        error: std::io::Error,
+    },
+}
+
+trait UpstreamIdEntropy {
+    fn draw_u16(&self) -> Result<u16, ()>;
+}
+
+impl UpstreamIdEntropy for SystemRandom {
+    fn draw_u16(&self) -> Result<u16, ()> {
+        let mut bytes = [0u8; 2];
+        self.fill(&mut bytes).map_err(|_| ())?;
+        Ok(u16::from_be_bytes(bytes))
+    }
 }
 
 async fn run_udp_forwarder(
+    requests: mpsc::Receiver<UdpForwardRequest>,
+    client_socket: Arc<UdpSocket>,
+    upstream: SocketAddr,
+    max_outstanding: usize,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    run_udp_forwarder_with_entropy(
+        requests,
+        client_socket,
+        upstream,
+        max_outstanding,
+        shutdown_rx,
+        SystemRandom::new(),
+    )
+    .await
+}
+
+/// UDP upstream forwarder: CSPRNG transaction IDs, one connected ephemeral-port
+/// socket per in-flight query, and ID+question validation before retirement.
+async fn run_udp_forwarder_with_entropy(
     mut requests: mpsc::Receiver<UdpForwardRequest>,
     client_socket: Arc<UdpSocket>,
     upstream: SocketAddr,
     max_outstanding: usize,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    entropy: impl UpstreamIdEntropy + Send + 'static,
 ) {
-    let bind_addr = if upstream.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    };
-    let upstream_socket = match UdpSocket::bind(bind_addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!(error = %e, upstream = %upstream, "Failed to bind shared upstream DNS socket");
-            while let Some(request) = requests.recv().await {
-                send_udp_servfail(&client_socket, &request.query, request.src).await;
-            }
-            return;
-        }
-    };
-    if let Err(e) = upstream_socket.connect(upstream).await {
-        error!(error = %e, upstream = %upstream, "Failed to connect shared upstream DNS socket");
-        while let Some(request) = requests.recv().await {
-            send_udp_servfail(&client_socket, &request.query, request.src).await;
-        }
-        return;
-    }
-
     let mut pending: HashMap<u16, PendingForward> = HashMap::new();
-    let mut next_id = 0u16;
-    let mut response_buf = vec![0u8; DNS_MAX_UDP_PACKET_SIZE];
+    let mut upstream_recvs: JoinSet<UpstreamRecvOutcome> = JoinSet::new();
+    let mut next_forward_seq: u64 = 0;
     let mut expired_ids = Vec::new();
     let mut cleanup = tokio::time::interval(Duration::from_secs(1));
 
@@ -1198,59 +1243,120 @@ async fn run_udp_forwarder(
                         record_upstream_id_exhaustion();
                         warn!("DNS upstream transaction ID space exhausted");
                     } else {
-                        warn!(client = %request.src, outstanding = pending.len(), "DNS upstream forward limit reached");
+                        warn!(
+                            client = %request.src,
+                            outstanding = pending.len(),
+                            "DNS upstream forward limit reached"
+                        );
                     }
                     send_udp_servfail(&client_socket, &request.query, request.src).await;
                     continue;
                 }
 
-                let Some(upstream_id) = allocate_upstream_id(&mut next_id, &pending) else {
-                    record_upstream_id_exhaustion();
-                    warn!("DNS upstream transaction ID space exhausted");
-                    send_udp_servfail(&client_socket, &request.query, request.src).await;
-                    continue;
+                let upstream_id = match allocate_upstream_id(
+                    &entropy,
+                    pending.len(),
+                    |id| pending.contains_key(&id),
+                ) {
+                    Ok(upstream_id) => upstream_id,
+                    Err(UpstreamIdAllocError::EntropyUnavailable) => {
+                        warn!("DNS upstream transaction ID entropy unavailable");
+                        send_udp_servfail(&client_socket, &request.query, request.src).await;
+                        continue;
+                    }
+                    Err(UpstreamIdAllocError::CollisionRetryLimit) => {
+                        warn!("DNS upstream transaction ID collision retry limit reached");
+                        send_udp_servfail(&client_socket, &request.query, request.src).await;
+                        continue;
+                    }
+                    Err(UpstreamIdAllocError::Exhausted) => {
+                        record_upstream_id_exhaustion();
+                        warn!("DNS upstream transaction ID space exhausted");
+                        send_udp_servfail(&client_socket, &request.query, request.src).await;
+                        continue;
+                    }
+                };
+
+                let socket = match bind_connected_upstream_socket(upstream).await {
+                    Ok(socket) => socket,
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            upstream = %upstream,
+                            "Failed to bind connected upstream DNS socket"
+                        );
+                        send_udp_servfail(&client_socket, &request.query, request.src).await;
+                        continue;
+                    }
                 };
 
                 let mut upstream_packet = request.packet;
                 upstream_packet[..2].copy_from_slice(&upstream_id.to_be_bytes());
-                match upstream_socket.send(&upstream_packet).await {
+                match socket.send(&upstream_packet).await {
                     Ok(_) => {
-                        pending.insert(upstream_id, PendingForward {
-                            client: request.src,
-                            original_id: request.query.id,
-                            query: request.query,
-                            expires_at: Instant::now() + Duration::from_secs(DNS_UPSTREAM_TIMEOUT_SECS),
-                        });
+                        let forward_seq = next_forward_seq;
+                        next_forward_seq = next_forward_seq.wrapping_add(1);
+                        let abort = upstream_recvs.spawn(wait_for_matching_upstream_response(
+                            socket,
+                            upstream_id,
+                            forward_seq,
+                            request.query.clone(),
+                        ));
+                        pending.insert(
+                            upstream_id,
+                            PendingForward {
+                                client: request.src,
+                                original_id: request.query.id,
+                                query: request.query,
+                                expires_at: Instant::now()
+                                    + Duration::from_secs(DNS_UPSTREAM_TIMEOUT_SECS),
+                                abort,
+                                forward_seq,
+                            },
+                        );
                     }
                     Err(e) => {
-                        warn!(error = %e, upstream = %upstream, "Failed to send DNS query to upstream");
+                        warn!(
+                            error = %e,
+                            upstream = %upstream,
+                            "Failed to send DNS query to upstream"
+                        );
                         send_udp_servfail(&client_socket, &request.query, request.src).await;
                     }
                 }
             }
-            result = upstream_socket.recv(&mut response_buf), if !pending.is_empty() => {
-                match result {
-                    Ok(len) => {
-                        if len < 2 {
-                            warn!("Ignoring short upstream DNS response");
-                            continue;
-                        }
-                        let upstream_id = u16::from_be_bytes([response_buf[0], response_buf[1]]);
-                        let Some(pending_request) = pending.remove(&upstream_id) else {
-                            warn!(upstream_id, "Ignoring upstream DNS response with unknown transaction ID");
+            completed = upstream_recvs.join_next(), if !upstream_recvs.is_empty() => {
+                match completed {
+                    Some(Ok(UpstreamRecvOutcome::Matched {
+                        upstream_id,
+                        forward_seq,
+                        mut packet,
+                    })) => {
+                        let Some(pending_request) =
+                            take_pending_forward(&mut pending, upstream_id, forward_seq)
+                        else {
                             continue;
                         };
-                        if !upstream_response_matches_pending_query(
-                            &response_buf[..len],
-                            &pending_request.query,
-                        ) {
+                        packet[..2].copy_from_slice(&pending_request.original_id.to_be_bytes());
+                        let _ = client_socket.send_to(&packet, pending_request.client).await;
+                        trace!(
+                            client = %pending_request.client,
+                            bytes = packet.len(),
+                            "Forwarded DNS response from upstream"
+                        );
+                    }
+                    Some(Ok(UpstreamRecvOutcome::RecvFailed {
+                        upstream_id,
+                        forward_seq,
+                        error,
+                    })) => {
+                        if let Some(pending_request) =
+                            take_pending_forward(&mut pending, upstream_id, forward_seq)
+                        {
                             warn!(
-                                client = %pending_request.client,
-                                upstream_id,
-                                qname = %pending_request.query.name,
-                                qtype = pending_request.query.qtype,
-                                qclass = pending_request.query.qclass,
-                                "Ignoring upstream DNS response with mismatched question"
+                                error = %error,
+                                upstream = %upstream,
+                                "Upstream DNS recv error"
                             );
                             send_udp_servfail(
                                 &client_socket,
@@ -1258,27 +1364,26 @@ async fn run_udp_forwarder(
                                 pending_request.client,
                             )
                             .await;
-                            continue;
                         }
-                        let mut response = response_buf[..len].to_vec();
-                        response[..2].copy_from_slice(&pending_request.original_id.to_be_bytes());
-                        let _ = client_socket.send_to(&response, pending_request.client).await;
-                        trace!(client = %pending_request.client, bytes = response.len(), "Forwarded DNS response from upstream");
                     }
-                    Err(e) => {
-                        warn!(error = %e, upstream = %upstream, "Upstream DNS recv error");
-                    }
+                    Some(Err(_)) => {}
+                    None => {}
                 }
             }
             _ = cleanup.tick() => {
                 let now = Instant::now();
                 expired_ids.clear();
-                expired_ids.extend(pending
-                    .iter()
-                    .filter_map(|(id, request)| (request.expires_at <= now).then_some(*id)));
+                expired_ids.extend(pending.iter().filter_map(|(id, request)| {
+                    (request.expires_at <= now).then_some(*id)
+                }));
                 for id in expired_ids.drain(..) {
                     if let Some(request) = pending.remove(&id) {
-                        warn!(client = %request.client, upstream = %upstream, "Upstream DNS query timed out");
+                        request.abort.abort();
+                        warn!(
+                            client = %request.client,
+                            upstream = %upstream,
+                            "Upstream DNS query timed out"
+                        );
                         send_udp_servfail(&client_socket, &request.query, request.client).await;
                     }
                 }
@@ -1290,17 +1395,99 @@ async fn run_udp_forwarder(
             }
         }
     }
+
+    upstream_recvs.abort_all();
 }
 
-fn allocate_upstream_id(next_id: &mut u16, pending: &HashMap<u16, PendingForward>) -> Option<u16> {
-    for _ in 0..=u16::MAX {
-        let candidate = *next_id;
-        *next_id = next_id.wrapping_add(1);
-        if !pending.contains_key(&candidate) {
-            return Some(candidate);
+/// Retire a pending forward only when the completed recv task belongs to it.
+///
+/// `join_next` drains outcomes after they are produced, so a task that matched
+/// an upstream response at the same instant its entry timed out can surface its
+/// result once the freed upstream ID has already been re-allocated to a newer
+/// query. Matching on the ID alone would then hand one client another client's
+/// answer, or SERVFAIL a healthy lookup.
+fn take_pending_forward(
+    pending: &mut HashMap<u16, PendingForward>,
+    upstream_id: u16,
+    forward_seq: u64,
+) -> Option<PendingForward> {
+    if !pending
+        .get(&upstream_id)
+        .is_some_and(|entry| entry.forward_seq == forward_seq)
+    {
+        return None;
+    }
+    pending.remove(&upstream_id)
+}
+
+async fn bind_connected_upstream_socket(upstream: SocketAddr) -> std::io::Result<UdpSocket> {
+    let bind_addr = if upstream.is_ipv6() {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+    };
+    let socket = UdpSocket::bind(bind_addr).await?;
+    socket.connect(upstream).await?;
+    Ok(socket)
+}
+
+async fn wait_for_matching_upstream_response(
+    socket: UdpSocket,
+    upstream_id: u16,
+    forward_seq: u64,
+    query: DnsQuery,
+) -> UpstreamRecvOutcome {
+    let mut buf = vec![0u8; DNS_MAX_UDP_PACKET_SIZE];
+    loop {
+        match socket.recv(&mut buf).await {
+            Ok(len) if len < 2 => {
+                trace!("Ignoring unmatched upstream DNS response");
+            }
+            Ok(len) => {
+                let packet_id = u16::from_be_bytes([buf[0], buf[1]]);
+                if packet_id != upstream_id
+                    || !upstream_response_matches_pending_query(&buf[..len], &query)
+                {
+                    trace!("Ignoring unmatched upstream DNS response");
+                    continue;
+                }
+                buf.truncate(len);
+                return UpstreamRecvOutcome::Matched {
+                    upstream_id,
+                    forward_seq,
+                    packet: buf,
+                };
+            }
+            Err(error) => {
+                return UpstreamRecvOutcome::RecvFailed {
+                    upstream_id,
+                    forward_seq,
+                    error,
+                };
+            }
         }
     }
-    None
+}
+
+fn allocate_upstream_id(
+    entropy: &impl UpstreamIdEntropy,
+    occupied_len: usize,
+    is_occupied: impl Fn(u16) -> bool,
+) -> Result<u16, UpstreamIdAllocError> {
+    if occupied_len >= DNS_UPSTREAM_ID_SPACE {
+        return Err(UpstreamIdAllocError::Exhausted);
+    }
+
+    for _ in 0..DNS_UPSTREAM_ID_ALLOC_ATTEMPTS {
+        let candidate = entropy
+            .draw_u16()
+            .map_err(|()| UpstreamIdAllocError::EntropyUnavailable)?;
+        if !is_occupied(candidate) {
+            return Ok(candidate);
+        }
+    }
+
+    Err(UpstreamIdAllocError::CollisionRetryLimit)
 }
 
 fn upstream_id_space_exhausted(pending_len: usize) -> bool {
@@ -1872,8 +2059,11 @@ mod tests {
         MeshEndpoint, MeshService, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
         WorkloadRef,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::io::ErrorKind;
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::Mutex;
+    use tokio::sync::watch;
 
     // ── DNS wire format tests ────────────────────────────────────────────
 
@@ -1979,27 +2169,249 @@ mod tests {
         ));
     }
 
+    struct ScriptedEntropy {
+        draws: Mutex<VecDeque<Result<u16, ()>>>,
+    }
+
+    impl ScriptedEntropy {
+        fn new(draws: impl IntoIterator<Item = Result<u16, ()>>) -> Self {
+            Self {
+                draws: Mutex::new(draws.into_iter().collect()),
+            }
+        }
+    }
+
+    impl UpstreamIdEntropy for ScriptedEntropy {
+        fn draw_u16(&self) -> Result<u16, ()> {
+            self.draws
+                .lock()
+                .expect("scripted entropy mutex")
+                .pop_front()
+                .unwrap_or(Err(()))
+        }
+    }
+
+    fn dns_rcode(packet: &[u8]) -> u16 {
+        u16::from_be_bytes([packet[2], packet[3]]) & 0x000F
+    }
+
+    fn build_a_response(name: &str, id: u16, ip: [u8; 4]) -> Vec<u8> {
+        let mut packet = build_query_packet(name, QTYPE_A);
+        packet[0..2].copy_from_slice(&id.to_be_bytes());
+        packet[2..4].copy_from_slice(&(FLAGS_QR | FLAGS_RA | FLAGS_RD).to_be_bytes());
+        packet[6..8].copy_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&0xC00Cu16.to_be_bytes());
+        packet.extend_from_slice(&QTYPE_A.to_be_bytes());
+        packet.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        packet.extend_from_slice(&60u32.to_be_bytes());
+        packet.extend_from_slice(&4u16.to_be_bytes());
+        packet.extend_from_slice(&ip);
+        packet
+    }
+
+    fn occupied(ids: &[u16]) -> (usize, HashSet<u16>) {
+        let set: HashSet<u16> = ids.iter().copied().collect();
+        (set.len(), set)
+    }
+
+    struct ForwarderHarness {
+        requests: mpsc::Sender<UdpForwardRequest>,
+        client: UdpSocket,
+        client_addr: SocketAddr,
+        stub: UdpSocket,
+        shutdown: watch::Sender<bool>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl ForwarderHarness {
+        async fn start(
+            max_outstanding: usize,
+            entropy: impl UpstreamIdEntropy + Send + 'static,
+        ) -> Self {
+            let reply_socket =
+                Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("reply socket"));
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+            let client_addr = client.local_addr().expect("client addr");
+            let stub = UdpSocket::bind("127.0.0.1:0").await.expect("stub socket");
+            let upstream = stub.local_addr().expect("stub addr");
+            let (tx, rx) = mpsc::channel(8);
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let task = tokio::spawn(run_udp_forwarder_with_entropy(
+                rx,
+                reply_socket,
+                upstream,
+                max_outstanding,
+                shutdown_rx,
+                entropy,
+            ));
+            Self {
+                requests: tx,
+                client,
+                client_addr,
+                stub,
+                shutdown,
+                task,
+            }
+        }
+
+        fn forward_request(&self, packet: Vec<u8>) -> UdpForwardRequest {
+            let query = parse_dns_query(&packet).expect("query parses");
+            UdpForwardRequest {
+                packet,
+                src: self.client_addr,
+                query,
+            }
+        }
+
+        fn send_query(&self, packet: Vec<u8>) {
+            self.requests
+                .try_send(self.forward_request(packet))
+                .expect("forwarder should accept the query");
+        }
+
+        async fn recv_stub(&self) -> (Vec<u8>, SocketAddr) {
+            let mut buf = vec![0u8; DNS_MAX_UDP_PACKET_SIZE];
+            let (len, src) =
+                tokio::time::timeout(Duration::from_secs(2), self.stub.recv_from(&mut buf))
+                    .await
+                    .expect("upstream should receive the forwarded query")
+                    .expect("stub recv");
+            buf.truncate(len);
+            (buf, src)
+        }
+
+        async fn recv_client(&self) -> Vec<u8> {
+            let mut buf = vec![0u8; DNS_MAX_UDP_PACKET_SIZE];
+            let len = tokio::time::timeout(Duration::from_secs(2), self.client.recv(&mut buf))
+                .await
+                .expect("client should receive a DNS response")
+                .expect("client recv");
+            buf.truncate(len);
+            buf
+        }
+
+        fn assert_no_extra_client_packet(&self) {
+            let mut extra = [0u8; DNS_MAX_UDP_PACKET_SIZE];
+            let err = self
+                .client
+                .try_recv(&mut extra)
+                .expect_err("no extra client datagram");
+            assert_eq!(err.kind(), ErrorKind::WouldBlock);
+        }
+    }
+
+    #[test]
+    fn allocate_upstream_id_is_not_sequential_across_fresh_forwarders() {
+        let entropy = ScriptedEntropy::new([Ok(0x9f3a), Ok(0x02e1)]);
+        let first =
+            allocate_upstream_id(&entropy, 0, |_| false).expect("first draw should succeed");
+        let second =
+            allocate_upstream_id(&entropy, 0, |_| false).expect("second draw should succeed");
+
+        assert_eq!(first, 0x9f3a);
+        assert_eq!(second, 0x02e1);
+        assert_ne!(second, first.wrapping_add(1));
+        assert_ne!(first, 0);
+        assert_ne!(second, 1);
+    }
+
+    #[test]
+    fn allocate_upstream_id_retries_on_collision() {
+        let entropy = ScriptedEntropy::new([Ok(0x1111), Ok(0x1111), Ok(0x2222)]);
+        let (len, occupied_ids) = occupied(&[0x1111]);
+        let allocated = allocate_upstream_id(&entropy, len, |id| occupied_ids.contains(&id))
+            .expect("collision should retry");
+        assert_eq!(allocated, 0x2222);
+    }
+
+    #[test]
+    fn allocate_upstream_id_fails_closed_when_entropy_unavailable() {
+        let entropy = ScriptedEntropy::new([Err(())]);
+        assert!(matches!(
+            allocate_upstream_id(&entropy, 0, |_| false),
+            Err(UpstreamIdAllocError::EntropyUnavailable)
+        ));
+    }
+
+    #[test]
+    fn allocate_upstream_id_fails_closed_when_entropy_fails_after_collision() {
+        let entropy = ScriptedEntropy::new([Ok(0x1111), Err(())]);
+        let (len, occupied_ids) = occupied(&[0x1111]);
+        assert!(matches!(
+            allocate_upstream_id(&entropy, len, |id| occupied_ids.contains(&id)),
+            Err(UpstreamIdAllocError::EntropyUnavailable)
+        ));
+    }
+
     #[test]
     fn allocate_upstream_id_reports_exhaustion_when_all_ids_pending() {
-        let query_packet = build_a_query("example.com");
-        let query = parse_dns_query(&query_packet).expect("query parses");
-        let mut pending = HashMap::with_capacity(u16::MAX as usize + 1);
-        let client = "127.0.0.1:53000".parse().expect("client addr");
-        let expires_at = Instant::now() + Duration::from_secs(1);
-        for id in 0..=u16::MAX {
-            pending.insert(
-                id,
-                PendingForward {
-                    client,
-                    original_id: id,
-                    query: query.clone(),
-                    expires_at,
-                },
-            );
-        }
-        let mut next_id = 0u16;
+        let entropy = ScriptedEntropy::new([Ok(0)]);
+        assert!(matches!(
+            allocate_upstream_id(&entropy, DNS_UPSTREAM_ID_SPACE, |_| true),
+            Err(UpstreamIdAllocError::Exhausted)
+        ));
+    }
 
-        assert!(allocate_upstream_id(&mut next_id, &pending).is_none());
+    #[test]
+    fn allocate_upstream_id_fails_closed_after_retry_bound_without_sequential_fallback() {
+        let entropy = ScriptedEntropy::new(std::iter::repeat_n(
+            Ok(0u16),
+            DNS_UPSTREAM_ID_ALLOC_ATTEMPTS,
+        ));
+        let (len, occupied_ids) = occupied(&[0]);
+        assert_eq!(
+            allocate_upstream_id(&entropy, len, |id| occupied_ids.contains(&id)),
+            Err(UpstreamIdAllocError::CollisionRetryLimit)
+        );
+    }
+
+    #[test]
+    fn allocate_upstream_id_retries_within_budget_at_default_outstanding_bound() {
+        let occupied_ids: HashSet<u16> = (0..1024).collect();
+        let entropy = ScriptedEntropy::new([Ok(0), Ok(1024)]);
+        let allocated = allocate_upstream_id(&entropy, occupied_ids.len(), |id| {
+            occupied_ids.contains(&id)
+        })
+        .expect("default occupancy should allocate within the retry budget");
+        assert_eq!(allocated, 1024);
+    }
+
+    #[test]
+    fn wait_for_matching_upstream_response_discard_logs_are_static_and_low_cardinality() {
+        const SOURCE: &str = include_str!("dns_proxy.rs");
+        let start = SOURCE
+            .find("async fn wait_for_matching_upstream_response(")
+            .expect("wait_for_matching_upstream_response should exist");
+        let end = SOURCE[start..]
+            .find("\nfn allocate_upstream_id(")
+            .expect("allocate_upstream_id should follow the recv loop")
+            + start;
+        let src = &SOURCE[start..end];
+
+        assert!(
+            !src.contains("warn!"),
+            "forged or malformed discards must not warn per packet"
+        );
+        assert!(
+            !src.contains("qname"),
+            "discard diagnostics must not include query names"
+        );
+        assert!(
+            !src.contains("qtype"),
+            "discard diagnostics must not include query types"
+        );
+        assert!(
+            !src.contains("qclass"),
+            "discard diagnostics must not include query classes"
+        );
+        assert!(
+            !src.contains("client"),
+            "discard diagnostics must not include the pending client address"
+        );
+        assert!(
+            src.contains("trace!(\"Ignoring unmatched upstream DNS response\")"),
+            "discards should use a static trace-level message with no attacker or query fields"
+        );
     }
 
     #[test]
@@ -2007,6 +2419,310 @@ mod tests {
         assert!(!upstream_id_space_exhausted(1024));
         assert!(!upstream_id_space_exhausted(DNS_UPSTREAM_ID_SPACE - 1));
         assert!(upstream_id_space_exhausted(DNS_UPSTREAM_ID_SPACE));
+    }
+
+    #[tokio::test]
+    async fn bind_connected_upstream_socket_uses_ephemeral_port() {
+        let stub = UdpSocket::bind("127.0.0.1:0").await.expect("stub");
+        let upstream = stub.local_addr().expect("stub addr");
+        let socket = bind_connected_upstream_socket(upstream)
+            .await
+            .expect("connected upstream socket");
+        let local = socket.local_addr().expect("local addr");
+        assert_ne!(local.port(), 0);
+        assert_eq!(socket.peer_addr().expect("peer addr"), upstream);
+    }
+
+    #[tokio::test]
+    async fn a_reused_upstream_id_does_not_retire_the_replacement_forward() {
+        let query = parse_dns_query(&build_a_query("example.com")).expect("query parses");
+        let client: SocketAddr = "127.0.0.1:53000".parse().expect("client addr");
+        let mut idle: JoinSet<()> = JoinSet::new();
+        let abort = idle.spawn(std::future::pending::<()>());
+
+        let mut pending: HashMap<u16, PendingForward> = HashMap::new();
+        // The replacement forward that was allocated the freed upstream ID.
+        pending.insert(
+            0xBEEF,
+            PendingForward {
+                client,
+                original_id: query.id,
+                query: query.clone(),
+                expires_at: Instant::now() + Duration::from_secs(DNS_UPSTREAM_TIMEOUT_SECS),
+                abort,
+                forward_seq: 7,
+            },
+        );
+
+        // The timed-out predecessor's queued outcome names the same ID.
+        assert!(
+            take_pending_forward(&mut pending, 0xBEEF, 6).is_none(),
+            "a stale outcome must not retire the forward that reused its upstream ID"
+        );
+        assert!(
+            pending.contains_key(&0xBEEF),
+            "the replacement lookup must still be pending"
+        );
+
+        let retired =
+            take_pending_forward(&mut pending, 0xBEEF, 7).expect("its own outcome must retire it");
+        assert_eq!(retired.forward_seq, 7);
+        assert!(pending.is_empty());
+
+        idle.abort_all();
+    }
+
+    #[tokio::test]
+    async fn concurrent_upstream_sockets_use_distinct_ephemeral_ports() {
+        let stub = UdpSocket::bind("127.0.0.1:0").await.expect("stub");
+        let upstream = stub.local_addr().expect("stub addr");
+        let first = bind_connected_upstream_socket(upstream)
+            .await
+            .expect("first socket");
+        let second = bind_connected_upstream_socket(upstream)
+            .await
+            .expect("second socket");
+        assert_ne!(
+            first.local_addr().expect("first local"),
+            second.local_addr().expect("second local"),
+            "two live connected sockets cannot share a local address"
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_question_response_does_not_retire_the_pending_query() {
+        let harness = ForwarderHarness::start(8, ScriptedEntropy::new([Ok(0xBEEF)])).await;
+        harness.send_query(build_a_query("example.com"));
+
+        let (query, src) = harness.recv_stub().await;
+        assert_eq!(&query[0..2], &0xBEEFu16.to_be_bytes());
+
+        let spoof = build_a_response("other.example.com", 0xBEEF, [9, 9, 9, 9]);
+        harness.stub.send_to(&spoof, src).await.expect("spoof send");
+        let answer = build_a_response("example.com", 0xBEEF, [1, 2, 3, 4]);
+        harness
+            .stub
+            .send_to(&answer, src)
+            .await
+            .expect("answer send");
+
+        let response = harness.recv_client().await;
+        assert_eq!(&response[0..2], &0x1234u16.to_be_bytes());
+        assert_eq!(dns_rcode(&response), 0);
+        assert_eq!(&response[response.len() - 4..], &[1, 2, 3, 4]);
+        harness.assert_no_extra_client_packet();
+
+        let _ = harness.shutdown.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), harness.task).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_id_and_short_packets_are_discard_only() {
+        let harness = ForwarderHarness::start(8, ScriptedEntropy::new([Ok(0xBEEF)])).await;
+        harness.send_query(build_a_query("example.com"));
+
+        let (_query, src) = harness.recv_stub().await;
+        harness
+            .stub
+            .send_to(&[0x00], src)
+            .await
+            .expect("short packet");
+        let unknown = build_a_response("example.com", 0x0001, [8, 8, 8, 8]);
+        harness
+            .stub
+            .send_to(&unknown, src)
+            .await
+            .expect("unknown id");
+        let answer = build_a_response("example.com", 0xBEEF, [1, 2, 3, 4]);
+        harness
+            .stub
+            .send_to(&answer, src)
+            .await
+            .expect("answer send");
+
+        let response = harness.recv_client().await;
+        assert_eq!(&response[0..2], &0x1234u16.to_be_bytes());
+        assert_eq!(dns_rcode(&response), 0);
+        assert_eq!(&response[response.len() - 4..], &[1, 2, 3, 4]);
+        harness.assert_no_extra_client_packet();
+
+        let _ = harness.shutdown.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), harness.task).await;
+    }
+
+    #[tokio::test]
+    async fn entropy_failure_servfails_without_forwarding() {
+        let harness = ForwarderHarness::start(8, ScriptedEntropy::new([Err(())])).await;
+        harness.send_query(build_a_query("example.com"));
+
+        let response = harness.recv_client().await;
+        assert_eq!(dns_rcode(&response), RCODE_SERVFAIL);
+        assert_eq!(&response[0..2], &0x1234u16.to_be_bytes());
+
+        let mut buf = [0u8; 32];
+        let err = harness
+            .stub
+            .try_recv(&mut buf)
+            .expect_err("failed entropy must not send upstream");
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+
+        let _ = harness.shutdown.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), harness.task).await;
+    }
+
+    #[tokio::test]
+    async fn collision_retry_limit_servfails_without_a_deterministic_fallback_id() {
+        let harness = ForwarderHarness::start(
+            8,
+            ScriptedEntropy::new(std::iter::repeat_n(
+                Ok(0xBEEF),
+                1 + DNS_UPSTREAM_ID_ALLOC_ATTEMPTS,
+            )),
+        )
+        .await;
+        let second_client = UdpSocket::bind("127.0.0.1:0").await.expect("second client");
+        let second_addr = second_client.local_addr().expect("second addr");
+
+        harness.send_query(build_a_query("example.com"));
+        let (first_query, src) = harness.recv_stub().await;
+        assert_eq!(&first_query[0..2], &0xBEEFu16.to_be_bytes());
+
+        let mut second_packet = build_a_query("other.example.com");
+        second_packet[0..2].copy_from_slice(&0x2345u16.to_be_bytes());
+        let second_query = parse_dns_query(&second_packet).expect("second query");
+        harness
+            .requests
+            .try_send(UdpForwardRequest {
+                packet: second_packet,
+                src: second_addr,
+                query: second_query,
+            })
+            .expect("second query");
+
+        let mut buf = vec![0u8; DNS_MAX_UDP_PACKET_SIZE];
+        let len = tokio::time::timeout(Duration::from_secs(2), second_client.recv(&mut buf))
+            .await
+            .expect("collision-retry client should receive SERVFAIL")
+            .expect("second client recv");
+        buf.truncate(len);
+        assert_eq!(dns_rcode(&buf), RCODE_SERVFAIL);
+        assert_eq!(&buf[0..2], &0x2345u16.to_be_bytes());
+
+        let mut extra = [0u8; 32];
+        let err = harness
+            .stub
+            .try_recv(&mut extra)
+            .expect_err("collision retry must not send a sequential fallback ID");
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+
+        let answer = build_a_response("example.com", 0xBEEF, [1, 2, 3, 4]);
+        harness.stub.send_to(&answer, src).await.expect("answer");
+        let response = harness.recv_client().await;
+        assert_eq!(dns_rcode(&response), 0);
+        assert_eq!(&response[response.len() - 4..], &[1, 2, 3, 4]);
+
+        let _ = harness.shutdown.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), harness.task).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_forwarded_queries_use_distinct_upstream_source_ports() {
+        let harness =
+            ForwarderHarness::start(8, ScriptedEntropy::new([Ok(0xAAA1), Ok(0xAAA2)])).await;
+        let second_client = UdpSocket::bind("127.0.0.1:0").await.expect("second client");
+        let second_addr = second_client.local_addr().expect("second addr");
+
+        harness.send_query(build_a_query("one.example.com"));
+        let mut second_packet = build_a_query("two.example.com");
+        second_packet[0..2].copy_from_slice(&0x2345u16.to_be_bytes());
+        let second_query = parse_dns_query(&second_packet).expect("second query");
+        harness
+            .requests
+            .try_send(UdpForwardRequest {
+                packet: second_packet,
+                src: second_addr,
+                query: second_query,
+            })
+            .expect("second query");
+
+        let (first_query, first_src) = harness.recv_stub().await;
+        let (second_query_bytes, second_src) = harness.recv_stub().await;
+        let (src_a, src_b) = if first_query[0..2] == 0xAAA1u16.to_be_bytes() {
+            assert_eq!(&second_query_bytes[0..2], &0xAAA2u16.to_be_bytes());
+            (first_src, second_src)
+        } else {
+            assert_eq!(&first_query[0..2], &0xAAA2u16.to_be_bytes());
+            assert_eq!(&second_query_bytes[0..2], &0xAAA1u16.to_be_bytes());
+            (second_src, first_src)
+        };
+        assert_ne!(src_a, src_b);
+        assert_ne!(src_a.port(), 0);
+        assert_ne!(src_b.port(), 0);
+
+        let _ = harness.shutdown.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), harness.task).await;
+    }
+
+    #[tokio::test]
+    async fn max_outstanding_servfails_without_a_second_upstream_send() {
+        let harness =
+            ForwarderHarness::start(1, ScriptedEntropy::new([Ok(0xBEEF), Ok(0xAA01)])).await;
+        let second_client = UdpSocket::bind("127.0.0.1:0").await.expect("second client");
+        let second_addr = second_client.local_addr().expect("second addr");
+
+        harness.send_query(build_a_query("example.com"));
+        let (first_query, src) = harness.recv_stub().await;
+        assert_eq!(&first_query[0..2], &0xBEEFu16.to_be_bytes());
+
+        let mut second_packet = build_a_query("other.example.com");
+        second_packet[0..2].copy_from_slice(&0x2345u16.to_be_bytes());
+        let second_query = parse_dns_query(&second_packet).expect("second query");
+        harness
+            .requests
+            .try_send(UdpForwardRequest {
+                packet: second_packet,
+                src: second_addr,
+                query: second_query,
+            })
+            .expect("second query");
+
+        let mut buf = vec![0u8; DNS_MAX_UDP_PACKET_SIZE];
+        let len = tokio::time::timeout(Duration::from_secs(2), second_client.recv(&mut buf))
+            .await
+            .expect("over-limit client should receive SERVFAIL")
+            .expect("second client recv");
+        buf.truncate(len);
+        assert_eq!(dns_rcode(&buf), RCODE_SERVFAIL);
+        assert_eq!(&buf[0..2], &0x2345u16.to_be_bytes());
+
+        let mut extra = [0u8; 32];
+        let err = harness
+            .stub
+            .try_recv(&mut extra)
+            .expect_err("over-limit query must not be forwarded");
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+
+        let answer = build_a_response("example.com", 0xBEEF, [1, 2, 3, 4]);
+        harness.stub.send_to(&answer, src).await.expect("answer");
+        let response = harness.recv_client().await;
+        assert_eq!(dns_rcode(&response), 0);
+        assert_eq!(&response[response.len() - 4..], &[1, 2, 3, 4]);
+
+        let _ = harness.shutdown.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), harness.task).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_in_flight_upstream_recv_without_waiting_for_timeout() {
+        let harness = ForwarderHarness::start(8, ScriptedEntropy::new([Ok(0xBEEF)])).await;
+        harness.send_query(build_a_query("example.com"));
+        let _ = harness.recv_stub().await;
+
+        harness.shutdown.send(true).expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(2), harness.task)
+            .await
+            .expect("forwarder should exit on shutdown")
+            .expect("forwarder task");
     }
 
     #[test]

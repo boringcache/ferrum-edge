@@ -9,8 +9,8 @@ use tracing::warn;
 
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, ENFORCEMENT_UNAVAILABLE_BODY,
-    ENFORCEMENT_UNAVAILABLE_STATUS, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
-    RateLimitOutcome, RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID,
+    ENFORCEMENT_UNAVAILABLE_STATUS, LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS,
+    RateLimitBackend, RateLimitOutcome, RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID,
     apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
     validate_max_requests, validate_window_seconds,
 };
@@ -62,6 +62,20 @@ enum LimitBy {
     SpiffeIdentity,
 }
 
+impl LimitBy {
+    /// Canonical rendering of the parsed dimension. `parse_limit_by` accepts
+    /// mixed case and the `spiffe` / `spiffe_identity` spellings, all of which
+    /// enforce identically, so the *parsed* value is what local-state
+    /// compatibility is decided on.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ip => "ip",
+            Self::Consumer => "consumer",
+            Self::SpiffeIdentity => "spiffe_identity",
+        }
+    }
+}
+
 pub struct RateLimiting {
     limit_by: LimitBy,
     expose_headers: bool,
@@ -86,6 +100,31 @@ impl RateLimiting {
     pub fn new_with_config_id(
         config: &Value,
         http_client: PluginHttpClient,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, None, config_id)
+    }
+
+    /// Construct with local enforcement state shared across compatible
+    /// plugin-cache generations for the stable `(namespace, plugin kind,
+    /// plugin-config id)` policy identity.
+    ///
+    /// A reload that does not change this policy's enforcement semantics keeps
+    /// the live counters, so a co-tenant churning unrelated configuration can
+    /// no longer hand every caller a fresh budget.
+    pub fn new_with_policy_identity(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, Some(namespace), config_id)
+    }
+
+    fn from_parts(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: Option<&str>,
         config_id: &str,
     ) -> Result<Self, String> {
         let object = config
@@ -119,12 +158,29 @@ impl RateLimiting {
             );
         }
 
-        let limiter = RateLimitBackend::from_plugin_config_with_config_id(
+        // Effective enforcement semantics, not raw syntax: the parsed dimension
+        // and the parsed window/consumer budgets. `expose_headers` is response
+        // presentation only and never resets a live budget, and the shared
+        // Redis posture is added by the backend.
+        let mut semantics = LocalStateSemantics::new();
+        semantics.text("limit_by", limit_by.as_str());
+        semantics.windows("default_limit", parsed_limits.default_limit.specs());
+        semantics.window_map(
+            "consumer_limits",
+            parsed_limits
+                .consumer_overrides
+                .iter()
+                .map(|(consumer, limit)| (consumer.as_str(), limit.specs())),
+        );
+
+        let limiter = RateLimitBackend::from_plugin_config_with_policy_identity(
             "rate_limiting",
+            namespace,
             config_id,
             config,
             &http_client,
             DynamicHttpRateLimitAlgorithm::new(),
+            &semantics,
         )?;
 
         Ok(Self {
@@ -137,6 +193,16 @@ impl RateLimiting {
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
         })
+    }
+
+    /// Whether this instance enforces on the same live local state as `other`.
+    ///
+    /// A compatible reload generation for one policy identity must share; an
+    /// unrelated policy, tenant, plugin kind, or semantically changed policy
+    /// must not. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn shares_local_state_with(&self, other: &Self) -> bool {
+        self.limiter.shares_local_state_with(&other.limiter)
     }
 
     /// Local/fallback DashMap shard count. Test-only; not a production API.

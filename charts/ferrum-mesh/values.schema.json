@@ -269,6 +269,40 @@
         "probes": {
           "$ref": "#/definitions/workloadProbes"
         },
+        "admin": {
+          "$ref": "#/definitions/workloadAdmin"
+        },
+        "shutdownDrainSeconds": {
+          "$ref": "#/definitions/shutdownSeconds"
+        },
+        "shutdownPreStopSeconds": {
+          "$ref": "#/definitions/shutdownSeconds",
+          "description": "Seconds of native lifecycle.preStop.sleep before SIGTERM. Requires Kubernetes 1.29+; 0 omits the hook. Counts against terminationGracePeriodSeconds."
+        },
+        "shutdownPreDrainSeconds": {
+          "$ref": "#/definitions/shutdownSeconds",
+          "description": "FERRUM_SHUTDOWN_PREDRAIN_SECONDS. Counts against terminationGracePeriodSeconds."
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "podSecurityContext": {
+          "type": "object",
+          "description": "Free-form Kubernetes PodSecurityContext, rendered verbatim.",
+          "additionalProperties": true
+        },
+        "securityContext": {
+          "type": "object",
+          "description": "Free-form Kubernetes container SecurityContext, rendered verbatim.",
+          "additionalProperties": true
+        },
+        "resources": {
+          "$ref": "#/definitions/workloadResources"
+        },
+        "priorityClassName": {
+          "type": "string"
+        },
         "extraVolumes": {
           "type": "array",
           "description": "Free-form extra control-plane pod volumes (Kubernetes Volume objects). A multi-namespace CP (FERRUM_CP_NAMESPACES=* or a CSV set) must mount a real file at FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH (advisory GHSA-3f2j-wwqw-grmg).",
@@ -333,12 +367,12 @@
         },
         "podSecurityContext": {
           "type": "object",
-          "description": "Free-form Kubernetes PodSecurityContext.",
+          "description": "Free-form Kubernetes PodSecurityContext, rendered verbatim.",
           "additionalProperties": true
         },
         "securityContext": {
           "type": "object",
-          "description": "Free-form Kubernetes SecurityContext.",
+          "description": "Free-form Kubernetes container SecurityContext, rendered verbatim.",
           "additionalProperties": true
         },
         "resources": {
@@ -476,6 +510,36 @@
         },
         "probes": {
           "$ref": "#/definitions/workloadProbes"
+        },
+        "admin": {
+          "$ref": "#/definitions/workloadAdmin"
+        },
+        "shutdownDrainSeconds": {
+          "$ref": "#/definitions/shutdownSeconds"
+        },
+        "shutdownPreStopSeconds": {
+          "$ref": "#/definitions/shutdownSeconds"
+        },
+        "shutdownPreDrainSeconds": {
+          "$ref": "#/definitions/shutdownSeconds"
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "podSecurityContext": {
+          "type": "object",
+          "description": "Free-form Kubernetes PodSecurityContext, rendered verbatim. hostNetwork and the container capability set are decided by the datapath, not here.",
+          "additionalProperties": true
+        },
+        "securityContext": {
+          "$ref": "#/definitions/ambientSecurityContext"
+        },
+        "resources": {
+          "$ref": "#/definitions/workloadResources"
+        },
+        "priorityClassName": {
+          "type": "string"
         }
       }
     },
@@ -511,6 +575,38 @@
         "probes": {
           "$ref": "#/definitions/workloadProbes"
         },
+        "admin": {
+          "$ref": "#/definitions/workloadAdmin"
+        },
+        "shutdownDrainSeconds": {
+          "$ref": "#/definitions/shutdownSeconds"
+        },
+        "shutdownPreStopSeconds": {
+          "$ref": "#/definitions/shutdownSeconds"
+        },
+        "shutdownPreDrainSeconds": {
+          "$ref": "#/definitions/shutdownSeconds"
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "podSecurityContext": {
+          "type": "object",
+          "description": "Free-form Kubernetes PodSecurityContext, rendered verbatim.",
+          "additionalProperties": true
+        },
+        "securityContext": {
+          "type": "object",
+          "description": "Free-form Kubernetes container SecurityContext, rendered verbatim.",
+          "additionalProperties": true
+        },
+        "resources": {
+          "$ref": "#/definitions/workloadResources"
+        },
+        "priorityClassName": {
+          "type": "string"
+        },
         "topologySpreadConstraints": {
           "type": "array",
           "description": "Optional Kubernetes TopologySpreadConstraint list. When unset and replicas >= 2, the chart spreads pods across kubernetes.io/hostname. An explicit empty list disables the default.",
@@ -543,6 +639,38 @@
         },
         "probes": {
           "$ref": "#/definitions/workloadProbes"
+        },
+        "admin": {
+          "$ref": "#/definitions/workloadAdmin"
+        },
+        "shutdownDrainSeconds": {
+          "$ref": "#/definitions/shutdownSeconds"
+        },
+        "shutdownPreStopSeconds": {
+          "$ref": "#/definitions/shutdownSeconds"
+        },
+        "shutdownPreDrainSeconds": {
+          "$ref": "#/definitions/shutdownSeconds"
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "podSecurityContext": {
+          "type": "object",
+          "description": "Free-form Kubernetes PodSecurityContext, rendered verbatim.",
+          "additionalProperties": true
+        },
+        "securityContext": {
+          "type": "object",
+          "description": "Free-form Kubernetes container SecurityContext, rendered verbatim.",
+          "additionalProperties": true
+        },
+        "resources": {
+          "$ref": "#/definitions/workloadResources"
+        },
+        "priorityClassName": {
+          "type": "string"
         }
       }
     },
@@ -552,6 +680,24 @@
       "properties": {
         "enabled": {
           "type": "boolean"
+        },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "allowedCidrs": {
+              "type": "string"
+            },
+            "bearerToken": {
+              "$ref": "#/definitions/secretSource"
+            },
+            "serviceMonitor": {
+              "$ref": "#/definitions/prometheusMonitor"
+            },
+            "podMonitor": {
+              "$ref": "#/definitions/prometheusMonitor"
+            }
+          }
         },
         "dashboards": {
           "type": "object",
@@ -891,6 +1037,9 @@
             }
           }
         },
+        "priorityClassName": {
+          "type": "string"
+        },
         "probes": {
           "$ref": "#/definitions/workloadProbes"
         }
@@ -962,9 +1111,122 @@
         }
       }
     },
+    "shutdownSeconds": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "workloadAdmin": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bindAddress": {
+          "type": "string"
+        },
+        "httpPort": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "allowInsecureHttp": {
+          "type": "boolean"
+        },
+        "allowedCidrs": {
+          "type": "string"
+        }
+      }
+    },
+    "ambientSecurityContext": {
+      "type": "object",
+      "description": "Explicit ambient container SecurityContext. Only the keys listed here are read by the template, so unknown keys are REJECTED rather than silently ignored: runAsUser/runAsGroup are decided by the capture mode, allowPrivilegeEscalation defaults to false for Restricted (an explicit true is an operator override), and the capability set is a datapath requirement. capabilities.drop must stay [ALL] (omit the key for the default; an explicit empty list is rejected). capabilities.add merges on top of the required NET_ADMIN/NET_RAW (plus BPF/PERFMON for NodeWaypoint and SYS_ADMIN/SYS_PTRACE for in-netns capture) set and can never remove one. ALL and CAP_ALL are rejected in add: they would re-grant the complete Linux capability set after drop ALL. Required capability names are rendered unquoted.",
+      "additionalProperties": false,
+      "properties": {
+        "allowPrivilegeEscalation": {
+          "type": "boolean"
+        },
+        "readOnlyRootFilesystem": {
+          "type": "boolean"
+        },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "drop": {
+              "type": "array",
+              "description": "Must remain [\"ALL\"] (omit the key for that default). An explicit empty list is rejected rather than rewritten. The rendered add list is the complete privilege surface.",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "pattern": "^(CAP_)?[A-Z][A-Z0-9_]*$"
+              }
+            },
+            "add": {
+              "type": "array",
+              "description": "Extra named capabilities merged on top of the datapath minimum. Required capabilities are always rendered regardless of this list. Names must match ^(CAP_)?[A-Z][A-Z0-9_]*$; empty strings and YAML punctuation are rejected. ALL and CAP_ALL are rejected: they would re-grant the complete Linux capability set after drop ALL.",
+              "items": {
+                "type": "string",
+                "pattern": "^(CAP_)?[A-Z][A-Z0-9_]*$",
+                "minLength": 1,
+                "not": {
+                  "enum": ["ALL", "CAP_ALL"]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "workloadResources": {
+      "type": "object",
+      "description": "Kubernetes ResourceRequirements. Serving workloads require non-empty requests.cpu and requests.memory.",
+      "additionalProperties": true
+    },
+    "prometheusMonitor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "interval": {
+          "type": "string"
+        },
+        "scrapeTimeout": {
+          "type": "string"
+        },
+        "labels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "number",
+              "integer",
+              "boolean"
+            ]
+          }
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "number",
+              "integer",
+              "boolean"
+            ]
+          }
+        },
+        "tlsConfig": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
     "workloadProbes": {
       "type": "object",
-      "description": "Per-workload health probes. Where an admin listener exists, liveness/startup use `ferrum-edge health --live` (GET /live) and readiness uses `ferrum-edge health` (GET /health). Injector/east-west defaults use a TCP probe on their listen port. Overrides are per-probe (startup/liveness/readiness) so handlers cannot be silently coupled; when startup.override is unset, templates may still fall back to the liveness handler for backward compatibility.",
+      "description": "Per-workload health probes. Where an admin listener exists, liveness/startup use `ferrum-edge health --live` (GET /live) and readiness uses `ferrum-edge health` (GET /health). East-west uses the same drain-aware admin health pair. Injector defaults use a TCP probe on the webhook port. Overrides are per-probe (startup/liveness/readiness) so handlers cannot be silently coupled; when startup.override is unset, templates may still fall back to the liveness handler for backward compatibility.",
       "additionalProperties": false,
       "properties": {
         "startup": {
@@ -1021,6 +1283,10 @@
               "minimum": 0
             },
             "periodSeconds": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "failureThreshold": {
               "type": "integer",
               "minimum": 1
             },

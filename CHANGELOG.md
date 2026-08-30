@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`request_mirror` denies cross-origin query credentials by default**
+  (issue #4295). Sensitive query pairs (`access_token`, `api_key`,
+  delimiter-bounded `token`/`sig`/`signature` including `oauth_token` and
+  `x-amz-signature` / `x-goog-signature`, nested percent-encoded names, and
+  operator `sensitive_query_patterns`) are dropped from the mirror
+  request-target only. Classification checks every decode layer through a
+  hard cap of 4 and fails closed on residual `%XX`. The primary backend
+  request-target is unchanged. Literal semicolon-bearing segments also fail
+  closed because mirror frameworks disagree on whether `;` separates query
+  pairs; delimiter variants of the `api_key` family are denied as well.
+  Forwarding a denied name requires the
+  fail-closed pair `forward_sensitive_query=true` plus an exact decoded-name
+  `forward_sensitive_query_allowlist`. Mirror logs still omit the entire query.
+
 ### Changed
+
+- **BREAKING — `FERRUM_TLS_OFFLOAD_THREADS` nonzero values fail startup**
+  (issue #4294). TLS handshake offload is not implemented; a nonzero setting
+  was previously parsed and then silently ignored. `EnvConfig::validate()`
+  now rejects any value other than `0` before mode dispatch. **Operator
+  action**: leave the variable unset or set it to `0`.
 
 - **BREAKING — `POST /batch` rejects unknown top-level envelope keys**
   (issue #4042). The request is create-only (`consumers`, `upstreams`,
@@ -207,6 +229,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   half-configured identity validate clean.
 
 ### Fixed
+
+- Gateway API `TLSRoute` is watched at `v1` as well as `v1alpha2` (issue #4383).
+  Gateway API v1.5.1 `standard-install.yaml` serves TLSRoute at `v1` only
+  (`v1alpha2`/`v1alpha3` remain on the CRD with `served: false`), so a
+  standard-channel cluster previously skipped the reflector and never
+  programmed passthrough listeners or route status. Experimental-install still
+  serves `v1alpha2`; both versions are dual-watched and de-duplicated the same
+  way as HTTPRoute `v1`/`v1beta1`.
 
 - **DNS background refresh no longer stalls cache eviction** (issue #4270). The
   proactive refresh task scanned every near-expiry hostname sequentially with

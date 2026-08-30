@@ -15,8 +15,8 @@ use tracing::{debug, warn};
 
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, ENFORCEMENT_UNAVAILABLE_MESSAGE,
-    ENFORCEMENT_UNAVAILABLE_STATUS, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
-    RateLimitOutcome, RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID,
+    ENFORCEMENT_UNAVAILABLE_STATUS, LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS,
+    RateLimitBackend, RateLimitOutcome, RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID,
     apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
     validate_max_requests, validate_window_seconds,
 };
@@ -102,6 +102,28 @@ impl GrpcMethodRouter {
     pub fn new_with_config_id(
         config: &Value,
         http_client: PluginHttpClient,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, None, config_id)
+    }
+
+    /// Construct with local enforcement state shared across compatible
+    /// plugin-cache generations for the stable `(namespace, plugin kind,
+    /// plugin-config id)` policy identity. See
+    /// [`super::utils::rate_limit::RateLimitBackend::from_plugin_config_with_policy_identity`].
+    pub fn new_with_policy_identity(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, Some(namespace), config_id)
+    }
+
+    fn from_parts(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: Option<&str>,
         config_id: &str,
     ) -> Result<Self, String> {
         let object = config.as_object().ok_or_else(|| {
@@ -215,22 +237,48 @@ impl GrpcMethodRouter {
             );
         }
 
+        // Effective enforcement semantics, not raw syntax: the lower-cased limit
+        // dimension and the path-normalized per-method budgets, so a spelling
+        // the parser normalizes keeps one budget. `allow_methods` /
+        // `deny_methods` are stateless admission lists that never consult a
+        // counter; the shared Redis posture is added by the backend.
+        let mut semantics = LocalStateSemantics::new();
+        semantics.text("limit_by", &limit_by);
+        semantics.window_map(
+            "method_rate_limits",
+            method_rate_limits
+                .iter()
+                .map(|(method, spec)| (method.as_str(), spec.op.specs())),
+        );
+
         Ok(Self {
             allow_methods,
             deny_methods,
             method_rate_limits,
             limit_by,
-            limiter: RateLimitBackend::from_plugin_config_with_config_id(
+            limiter: RateLimitBackend::from_plugin_config_with_policy_identity(
                 "grpc_method_router",
+                namespace,
                 config_id,
                 config,
                 &http_client,
                 DynamicHttpRateLimitAlgorithm::new(),
+                &semantics,
             )?,
             request_counter: AtomicU64::new(0),
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
         })
+    }
+
+    /// Whether this instance enforces on the same live local state as `other`.
+    ///
+    /// A compatible reload generation for one policy identity must share; an
+    /// unrelated policy, tenant, plugin kind, or semantically changed policy
+    /// must not. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn shares_local_state_with(&self, other: &Self) -> bool {
+        self.limiter.shares_local_state_with(&other.limiter)
     }
 
     /// Local/fallback DashMap shard count. Test-only; not a production API.

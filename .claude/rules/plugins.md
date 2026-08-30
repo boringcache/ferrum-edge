@@ -113,7 +113,42 @@ paths:
   local-mode `request_deduplication` state use per-plugin weak registries
   (`SHARED_STATES`, `SHARED_LOCAL_STATES`) whose entries are pruned on insert,
   so retention is bounded by the currently configured policies plus in-flight
-  holders. A compatible reload inherits live state; a semantic change isolates
+  holders. The six local rate limiters (`rate_limiting`, `ai_rate_limiter`,
+  `graphql`, `grpc_method_router`, `ws_rate_limiting`, `udp_rate_limiting`) use
+  the same weak-registry pattern inside `RateLimitBackend`
+  (`SharedLocalLimiterState` / `LocalLimiterRegistry` in
+  `src/plugins/utils/rate_limit.rs`, reached from `try_create_plugin` ->
+  `create_local_rate_limit_plugin`, issue #4268). Their identity is
+  `namespace` + plugin KIND + plugin-config id — the kind is load-bearing
+  because three of them share one algorithm type — and each registry is
+  statically typed per `(key, algorithm)` pair, so there is no downcast to get
+  wrong. Compatibility is a SHA-256 fingerprint over the plugin's EFFECTIVE
+  enforcement semantics — a `LocalStateSemantics` the constructor fills in
+  AFTER its own parsing, defaulting, and normalization (limit dimension,
+  window lists, algorithm parameters, plugin-specific shaping) — plus the
+  shared posture. Never fingerprint raw JSON: an omitted optional field and
+  its explicit effective default, a spelling the parser normalizes, and an
+  omitted rate map vs an explicit empty one are the same enforcement, so
+  hashing syntax would let config churn alone mint a fresh budget. The shared
+  posture is `sync_mode`, and ONLY when Redis is enabled the effective
+  `redis_failure_policy` and an EXPLICIT key prefix — the default prefix is
+  already determined by the stable policy identity, so it is not hashed and a
+  validation client's namespace cannot perturb compatibility. With
+  `sync_mode: local` there is no store to lose, the posture changes nothing
+  enforced, and toggling it must not reset the budget. Never record a
+  credential, URL, username, password, or TLS material in
+  `LocalStateSemantics` (a debug assertion refuses the shared Redis config
+  keys), and never log the fingerprint. Presentation-only fields
+  (`expose_headers`, `close_reason`) and stateless checks (GraphQL
+  depth/complexity, gRPC allow/deny lists) are
+  deliberately outside the set so they cannot reset a live budget. Sharing the
+  limiter is only half of it: `DynamicHttpRateLimitAlgorithm::check_local`
+  compares window VALUES, not `Arc` identity, because a compatible rebuild
+  always constructs a new `DynamicRateLimitOp`. Direct/legacy test construction
+  without a stable identity keeps private state. Security-composition config
+  validation constructs candidates with their real identity; those candidates
+  can resolve retained state but never run traffic or mutate counters. A
+  compatible reload inherits live state; a semantic change isolates
   onto fresh state so a retired generation's late release/completion cannot
   corrupt the replacement. For deduplication the semantic set is deliberately
   narrow — `header_name`, `local` vs `redis`, and `on_redis_unavailable` —
@@ -122,8 +157,10 @@ paths:
   their admission-time protection windows across reloads; never evaluate an
   existing lease with a replacement generation's shorter timeout. Weak
   registries keep every still-live semantic generation for an identity, not
-  just the last one, so A → B → A recovers A's active protection state. Do not
-  reintroduce per-instance ownership for any of these.
+  just the last one, so while A and B are concurrently live another A
+  construction recovers A's active protection state. After A's last owner
+  drops, a later A construction starts fresh. Do not reintroduce per-instance
+  ownership for any of these.
 - `proxy_group` is one shared instance for its associated proxies; stateful plugins share counters and are cascade-deleted when no proxies remain.
 
 ## Lifecycle Order
@@ -251,7 +288,11 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     implies no mirror, function, or provider was contacted; backend admission
     and transport checks still occur later. Runs at most once per request
     (`RequestContext.finalized_request_egress_dispatched`), so retries never
-    re-fire it. `pre_proxy` header injection goes through the backend header
+    re-fire it. `request_mirror` snapshots the canonical backend-visible query
+    through `effective_backend_query_string` and drops deny-by-default sensitive
+    query pairs from the mirror request-target only; later mutation of the live
+    context cannot change that owned snapshot, and the primary backend target is
+    never rewritten. `pre_proxy` header injection goes through the backend header
     overlay, which the proxy merges only after re-stripping reserved gateway
     assertions and re-applying the egress baggage policy. None of these plugins
     has a `before_proxy` egress hook — do not add one back.
