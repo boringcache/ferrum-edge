@@ -6,6 +6,12 @@ This document describes how to safely upgrade Ferrum Edge between versions with 
 
 Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
 
+### HTTP/1.1 requests without a Host header are rejected with 400 (issue [#4390](https://github.com/ferrum-edge/ferrum-edge/issues/4390))
+
+RFC 9112 §3.2.2 requires a 400 when an HTTP/1.1 request lacks a Host field. Ferrum previously only rejected multiple Host fields, so a Host-less origin-form request skipped exact/wildcard host tiers and could fall through to a catch-all (empty `hosts`) route. `check_protocol_headers()` now rejects HTTP/1.1 when both the Host field and the URI authority are absent. HTTP/1.0 still does not require Host. Absolute-form request-targets that already carry an authority are accepted without a Host field. An empty Host value (`Host:` with no tokens) is treated as present-but-invalid and also returns 400 on HTTP/1.1. HTTP/2 and HTTP/3 are unchanged.
+
+**Operator action:** any HTTP/1.1 client that omitted Host (non-conformant scanners, some raw sockets, misconfigured health probes) will start seeing `400` `{"error":"HTTP/1.1 request is missing a Host header"}` instead of being routed. Send a Host field, or use HTTP/1.0 / absolute-form if that is the intended protocol.
+
 ### `hmac_auth` v2 nonce / client rollout and DPoP replay protection (issues [#3834](https://github.com/ferrum-edge/ferrum-edge/issues/3834) / [#3837](https://github.com/ferrum-edge/ferrum-edge/issues/3837))
 
 **Silent HMAC outage.** `hmac_auth` now defaults to **`ferrum-hmac-v2`**. Version 2 requires a client-generated `nonce` in the `Authorization: hmac …` parameters and binds it into the signing base:
@@ -45,6 +51,16 @@ With the default empty `FERRUM_TRUSTED_PROXIES`, Ferrum already ignored a client
 This changes what every backend observes, with no error surface.
 
 **Operator action:** if a backend depended on seeing client-supplied XFF hops in front of an untrusted Ferrum, add the connecting peer to `FERRUM_TRUSTED_PROXIES` so Ferrum will honor and append that chain; otherwise configure the backend to trust only the rightmost hop (Ferrum's socket peer).
+
+### Seven plugin constructors reject unknown config keys (issues [#4405](https://github.com/ferrum-edge/ferrum-edge/issues/4405) / [#4409](https://github.com/ferrum-edge/ferrum-edge/issues/4409))
+
+A typo in a plugin's `config` object was previously admitted and silently ignored, so a misspelled key became a no-op that still passed `validate` with exit 0. Unknown keys are now rejected, matching `PluginConfig`'s `deny_unknown_fields` and the behavior `jwt_auth`, `cors`, `ai_federation`, and `ai_stream_router` already had.
+
+`request_size_limiting`, `ws_message_size_limiting`, `a2a_gateway`, `ws_logging`, and `mcp_gateway` fail closed at construction, so file-mode `validate` exits 1. `http_logging` and `prometheus_metrics` keep their `OptionalFailOpen` policy: construction returns an error naming the unknown key, and `validate` / reload warn and omit that instance rather than failing the gateway — the same shape `stdout_logging` already had.
+
+`mcp_gateway` additionally rejects `command`, `args`, and `stdio` at the root and inside `servers.*` with an HTTP-only diagnostic. The gateway speaks HTTP to MCP upstreams and never spawned a stdio child, so a Claude-Desktop-style `command` field was previously accepted and ignored. Diagnostics include a spelling suggestion when the typo is close to a valid key. See [plugins.md](plugins.md).
+
+**Operator action:** run `ferrum-edge validate` before upgrading and fix any key it now names — typos such as `max_bytez`, `max_frame_bytez`, `endpont_url`, or `render_cache_ttl_secnds`. Replace any `servers.*.command` with an `upstream_url` using `http://` or `https://`.
 
 ### `POST /batch` rejects unknown top-level envelope keys (issue [#4042](https://github.com/ferrum-edge/ferrum-edge/issues/4042))
 

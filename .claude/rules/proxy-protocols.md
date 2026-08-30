@@ -50,6 +50,8 @@ paths:
 
 ## Protocol Validation
 
+- `check_protocol_headers()` runs on every inbound request. Preserve rejects for HTTP/1.0+TE, CL+TE smuggling, duplicate/mismatched/empty Content-Length, duplicate Host, HTTP/1.1 missing Host (RFC 9112 §3.2.2; empty Host is present-but-invalid and also 400; HTTP/1.0 and absolute-form URI authority are not rejected), bad H2/H3 TE, non-numeric Content-Length, TRACE, and unsupported CONNECT.
+
 - `check_protocol_headers()` runs on every inbound request. The bounded proxy-frontend `h1_framing_guard` records CL+TE from raw HTTP/1 heads before Hyper can discard `Content-Length`; preserve its order-independent handoff, the RFC 9112 §6.1 connection close after a CL+TE rejection, and the rejects for HTTP/1.0+TE, CL+TE smuggling, duplicate/mismatched/empty Content-Length, duplicate Host, bad H2/H3 TE, non-numeric Content-Length, TRACE, and unsupported CONNECT.
 - `check_host_authority_consistency()` rejects H2/H3 Host vs `:authority` disagreement before routing after default-port normalization.
 - Host/authority normalization strips valid ports, preserves bracketed IPv6, rejects unbracketed IPv6, strips trailing dots, and lowercases ASCII.

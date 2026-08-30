@@ -29336,6 +29336,7 @@ async fn handle_proxy_request_inner(
     if let Some(error_body) = check_protocol_headers_with_wire_framing(
         req.headers(),
         req.version(),
+        req.uri(),
         matches!(
             http1_framing_result,
             h1_framing_guard::H1FramingResult::Conflict
@@ -45712,9 +45713,15 @@ pub fn check_host_authority_consistency(
 /// 2. **Multiple Content-Length with mismatched values** (all HTTP versions): RFC 9110 §8.6
 ///    — different CL values in the same message indicate tampering or a broken intermediary.
 ///
-/// 3. **Multiple Host headers** (HTTP/1.1 only): RFC 9112 §3.2 — a request with
-///    duplicate Host headers MUST be rejected with 400 to prevent host-header routing
-///    confusion between the proxy and backend.
+/// 3. **Host header constraints** (HTTP/1.x): RFC 9112 §3.2.2 —
+///    duplicate Host headers MUST be rejected with 400 (HTTP/1.0 and 1.1).
+///    HTTP/1.1 origin-form requests that lack a Host field MUST be rejected
+///    with 400; HTTP/1.0 does not require Host. Absolute-form request-targets
+///    (`GET http://host/path HTTP/1.1`) carry the authority on the URI
+///    (`uri.authority()`) and are accepted without a Host field. An empty
+///    Host value (`Host:` with no tokens) is present but invalid and MUST 400
+///    on HTTP/1.1. HTTP/2 and HTTP/3 are not checked here; they use
+///    `:authority`, governed by `check_host_authority_consistency()`.
 ///
 /// 4. **Transfer-Encoding rejection** (HTTP/2 and HTTP/3): RFC 9113 §8.2.2 and
 ///    RFC 9114 §4.2 forbid this HTTP/1.x framing header on multiplexed protocols.
@@ -45726,13 +45733,15 @@ pub fn check_host_authority_consistency(
 pub fn check_protocol_headers(
     headers: &hyper::HeaderMap,
     version: hyper::Version,
+    uri: &hyper::Uri,
 ) -> Option<&'static str> {
-    check_protocol_headers_with_wire_framing(headers, version, false)
+    check_protocol_headers_with_wire_framing(headers, version, uri, false)
 }
 
 fn check_protocol_headers_with_wire_framing(
     headers: &hyper::HeaderMap,
     version: hyper::Version,
+    uri: &hyper::Uri,
     http1_te_cl_conflict_on_wire: bool,
 ) -> Option<&'static str> {
     let is_http1 = version == hyper::Version::HTTP_10 || version == hyper::Version::HTTP_11;
@@ -45803,12 +45812,41 @@ fn check_protocol_headers_with_wire_framing(
         }
     }
 
-    // 3. Multiple Host headers (HTTP/1.1 only)
-    // HTTP/2 and HTTP/3 use the :authority pseudo-header (exposed via URI), not Host.
+    // 3. Host header constraints (HTTP/1.x).
+    // Reuse `headers.get_all("host")` so the missing-Host check cannot
+    // disagree with the multiple-Host check about what counts as present.
+    // HTTP/2 and HTTP/3 use the :authority pseudo-header (exposed via URI),
+    // not Host; their Host/:authority agreement is
+    // `check_host_authority_consistency()` and must not change here.
     if is_http1 {
         let mut host_iter = headers.get_all("host").iter();
-        if host_iter.next().is_some() && host_iter.next().is_some() {
+        let first_host = host_iter.next();
+        if host_iter.next().is_some() {
             return Some(r#"{"error":"Request contains multiple Host headers"}"#);
+        }
+        // RFC 9112 §3.2.2: HTTP/1.1 MUST have a Host field. HTTP/1.0 does not
+        // require Host — do not reject 1.0 here.
+        if version == hyper::Version::HTTP_11 {
+            match first_host {
+                None => {
+                    // Absolute-form (`GET http://host/path HTTP/1.1`) surfaces
+                    // as `uri.authority()`. Reject only when BOTH the Host
+                    // field and the URI authority are absent.
+                    if uri.authority().is_none() {
+                        return Some(r#"{"error":"HTTP/1.1 request is missing a Host header"}"#);
+                    }
+                }
+                Some(value) => {
+                    // A Host field line is present even when the value is
+                    // empty (`Host:` with no tokens). That is not "missing";
+                    // it is an invalid field value. RFC 9112 §3.2.2 also MUST
+                    // 400 invalid Host values, and an empty Host cannot select
+                    // a vhost (it would otherwise fall through to catch-all).
+                    if trim_ows(value.as_bytes()).is_empty() {
+                        return Some(r#"{"error":"Host header contains invalid empty value"}"#);
+                    }
+                }
+            }
         }
     }
 
