@@ -347,6 +347,22 @@ CI Unit Tests plus a live UDP data-path integration suite, including the finite
 response-amplification default and Ferrum `UDPResponseAmplificationPolicy` —
 see [`docs/gateway_api_conformance.md`](../../docs/gateway_api_conformance.md).
 
+Gateway API CRDs are a **cluster prerequisite** for any install that attaches
+routes to a `Gateway` (including paired `ferrum-mesh` control-plane +
+`ferrum-gateway` data-plane labs). This chart does not install them. Apply the
+experimental v1.5.1 bundle before the control plane creates `Gateway` /
+`GatewayClass` objects:
+
+```bash
+kubectl apply --server-side=true \
+  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/experimental-install.yaml
+```
+
+Ferrum requires the experimental channel because L4 routes and
+`XBackendTrafficPolicy` are not in `standard-install.yaml` at this pin, and
+upstream rejects mixing channels. See
+[`docs/kubernetes_deployment.md`](../../docs/kubernetes_deployment.md#gateway-api-crds-required).
+
 Gateway API `GRPCRoute` attaches to HTTP/HTTPS listeners and is release-gated by
 the upstream `GATEWAY-GRPC` profile (same doc).
 
