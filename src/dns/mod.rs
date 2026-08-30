@@ -32,7 +32,7 @@ use std::net::{IpAddr, SocketAddr};
 #[cfg(test)]
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
@@ -557,6 +557,7 @@ struct ProactiveRefreshCandidate {
     per_proxy_ttl: Option<u64>,
     generation: SuccessRefreshGeneration,
     expires_at: Instant,
+    consecutive_failures: u32,
 }
 
 /// RAII ownership of one in-flight refresh (proactive or stale-while-revalidate).
@@ -581,6 +582,19 @@ enum RefreshStart {
     Started(RefreshInFlight),
     AlreadyInProgress,
     ConcurrencyLimited,
+}
+
+/// Outcome of a generation-gated background success publish.
+enum RefreshApply {
+    /// The selected generation was still live and the success row was replaced.
+    Published,
+    /// Generation changed or the key was vacant. The last known good row is
+    /// left untouched.
+    Abandoned,
+    /// `hostname` parsed as an IP literal. Any leftover success row was
+    /// removed, matching [`DnsCache::cache_success_entry`] (issue #4293).
+    /// Literals are never published as success entries.
+    IpLiteral,
 }
 
 #[cfg(test)]
@@ -675,8 +689,8 @@ impl DnsCache {
     /// preventing a sequential `FERRUM_DNS_ORDER` walk (default
     /// `CACHE,SRV,A,CNAME`) from stalling a hostname for ~30s. A timeout is a
     /// failed refresh: the last known good success row is preserved and never
-    /// rewritten or TTL-extended. The shared `refresh_semaphore` permit is
-    /// released when the timed-out lookup returns.
+    /// rewritten or TTL-extended. The permit is released when the timeout
+    /// elapses; `tokio::time::timeout` cancels the hung lookup future.
     pub const BACKGROUND_REFRESH_RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
 
     /// Expose the configured backend egress policy for non-DNS backend target
@@ -1123,11 +1137,13 @@ impl DnsCache {
                         next_start: entry.next_start.clone(),
                         resolved_at: entry.resolved_at,
                     };
-                    match self.try_begin_refresh(host.clone()) {
+                    match self.try_begin_refresh(host) {
                         RefreshStart::Started(guard) => {
                             let cache = self.clone();
                             tokio::spawn(async move {
-                                cache.refresh_entry(&host, refresh_ttl, generation).await;
+                                cache
+                                    .refresh_entry(&guard.hostname, refresh_ttl, generation)
+                                    .await;
                                 drop(guard);
                             });
                             debug!(
@@ -1382,15 +1398,21 @@ impl DnsCache {
                     native_ttl,
                     per_proxy_ttl,
                 ) {
-                    Ok(true) => {
+                    Ok(RefreshApply::Published) => {
                         debug!(
                             "DNS background refresh: {} refreshed (native_ttl={:?}, per_proxy_ttl={:?})",
                             hostname, native_ttl, per_proxy_ttl
                         );
                     }
-                    Ok(false) => {
+                    Ok(RefreshApply::Abandoned) => {
                         debug!(
                             "DNS stale refresh: abandoning stale success for '{}' (cache generation changed during resolve)",
+                            hostname
+                        );
+                    }
+                    Ok(RefreshApply::IpLiteral) => {
+                        debug!(
+                            "DNS stale refresh: dropping leftover IP-literal row for '{}'",
                             hostname
                         );
                     }
@@ -2250,24 +2272,26 @@ impl DnsCache {
 
     /// Claim one system-wide refresh slot for `hostname`.
     ///
-    /// Inserts the dedup marker before taking a semaphore permit so a failed
-    /// acquire cannot leak a marker, and both are owned by [`RefreshInFlight`]
-    /// so abort/cancellation cannot leak either. Sync: never called while
-    /// holding a cache-map guard across `.await`.
+    /// The hostname is claimed first so two racers for the same name cannot
+    /// both consume a scarce semaphore permit before discovering they are
+    /// duplicates. The permit is taken only after that claim; both are owned
+    /// by [`RefreshInFlight`] so abort/cancellation cannot leak either.
+    /// Sync: never called while holding a cache-map guard across `.await`.
     fn try_begin_refresh(&self, hostname: String) -> RefreshStart {
-        if self.refreshing.insert(hostname.clone(), ()).is_some() {
-            return RefreshStart::AlreadyInProgress;
-        }
-        match self.refresh_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => RefreshStart::Started(RefreshInFlight {
-                hostname,
-                refreshing: Arc::clone(&self.refreshing),
-                _permit: permit,
-            }),
-            Err(_) => {
-                self.refreshing.remove(&hostname);
-                RefreshStart::ConcurrencyLimited
-            }
+        match self.refreshing.entry(hostname) {
+            Entry::Occupied(_) => RefreshStart::AlreadyInProgress,
+            Entry::Vacant(vacant) => match self.refresh_semaphore.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    let hostname = vacant.key().clone();
+                    vacant.insert(());
+                    RefreshStart::Started(RefreshInFlight {
+                        hostname,
+                        refreshing: Arc::clone(&self.refreshing),
+                        _permit: permit,
+                    })
+                }
+                Err(_) => RefreshStart::ConcurrencyLimited,
+            },
         }
     }
 
@@ -2311,6 +2335,7 @@ impl DnsCache {
                         resolved_at: entry.resolved_at,
                     },
                     expires_at,
+                    consecutive_failures: entry.consecutive_failures,
                 });
             }
         }
@@ -2326,9 +2351,11 @@ impl DnsCache {
     /// are not resurrected. The DashMap entry guard is never held across
     /// await — callers resolve DNS before invoking this.
     ///
-    /// Returns `Ok(true)` when published, `Ok(false)` when the generation
-    /// changed or the key was removed, and `Err` when addresses are denied by
-    /// IP policy (nothing is written).
+    /// Returns `Ok(RefreshApply::Published)` when published,
+    /// `Ok(RefreshApply::Abandoned)` when the generation changed or the key
+    /// was removed, `Ok(RefreshApply::IpLiteral)` after dropping a leftover
+    /// IP-literal row (issue #4293; not a live success generation), and `Err`
+    /// when addresses are denied by IP policy (nothing is written).
     fn apply_refresh_success(
         &self,
         hostname: &str,
@@ -2337,19 +2364,20 @@ impl DnsCache {
         record_type: Option<CachedRecordType>,
         native_ttl: Duration,
         per_proxy_ttl: Option<u64>,
-    ) -> Result<bool, anyhow::Error> {
+    ) -> Result<RefreshApply, anyhow::Error> {
         let native_ttl = native_ttl.min(Self::MAX_TTL);
         let addresses = self.screen_backend_addresses_policy(addresses, hostname)?;
         let cache_key = dns_hostname_key(hostname);
         if parse_ip_literal(cache_key.as_ref()).is_some() {
-            return Ok(false);
+            self.cache.remove(cache_key.as_ref());
+            return Ok(RefreshApply::IpLiteral);
         }
         let now = Instant::now();
 
         match self.cache.entry(cache_key.into_owned()) {
             Entry::Occupied(mut occupied) => {
                 if !Self::matches_success_refresh_generation(occupied.get(), generation) {
-                    return Ok(false);
+                    return Ok(RefreshApply::Abandoned);
                 }
                 occupied.get().note_per_proxy_ttl(per_proxy_ttl);
                 let shortest = occupied.get().shortest_per_proxy_ttl_secs.clone();
@@ -2395,9 +2423,9 @@ impl DnsCache {
                     consecutive_failures: 0,
                     first_failed_at: None,
                 });
-                Ok(true)
+                Ok(RefreshApply::Published)
             }
-            Entry::Vacant(_) => Ok(false),
+            Entry::Vacant(_) => Ok(RefreshApply::Abandoned),
         }
     }
 
@@ -2444,6 +2472,7 @@ impl DnsCache {
     async fn refresh_proactive_candidate(&self, candidate: ProactiveRefreshCandidate) {
         let hostname = &candidate.hostname;
         let per_proxy_ttl = candidate.per_proxy_ttl;
+        let noisy = candidate.consecutive_failures < Self::FAILED_RETRY_WARN_FAILURES;
         match self.refresh_resolve_with_timeout(hostname).await {
             Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
                 match self.apply_refresh_success(
@@ -2454,15 +2483,21 @@ impl DnsCache {
                     native_ttl,
                     per_proxy_ttl,
                 ) {
-                    Ok(true) => {
+                    Ok(RefreshApply::Published) => {
                         debug!(
                             "DNS background refresh: {} refreshed (native_ttl={:?}, per_proxy_ttl={:?})",
                             hostname, native_ttl, per_proxy_ttl
                         );
                     }
-                    Ok(false) => {
+                    Ok(RefreshApply::Abandoned) => {
                         debug!(
                             "DNS background refresh: abandoning stale success for '{}' (cache generation changed during resolve)",
+                            hostname
+                        );
+                    }
+                    Ok(RefreshApply::IpLiteral) => {
+                        debug!(
+                            "DNS background refresh: dropping leftover IP-literal row for '{}'",
                             hostname
                         );
                     }
@@ -2475,10 +2510,43 @@ impl DnsCache {
                 }
             }
             Ok(_) => {
-                warn!("DNS background refresh: {} returned no addresses", hostname);
+                if noisy {
+                    warn!(
+                        "DNS background refresh: {} returned no addresses",
+                        hostname
+                    );
+                } else {
+                    debug!(
+                        "DNS background refresh: {} returned no addresses",
+                        hostname
+                    );
+                }
+                self.note_preserved_success_refresh_failure(hostname, &candidate.generation);
             }
             Err(e) => {
-                warn!("DNS background refresh failed for {}: {}", hostname, e);
+                if noisy {
+                    warn!("DNS background refresh failed for {}: {}", hostname, e);
+                } else {
+                    debug!("DNS background refresh failed for {}: {}", hostname, e);
+                }
+                self.note_preserved_success_refresh_failure(hostname, &candidate.generation);
+            }
+        }
+    }
+
+    /// Count a failed proactive refresh against a still-live success row
+    /// without converting it to an error, so later cycles can demote `warn`
+    /// to `debug` after [`Self::FAILED_RETRY_WARN_FAILURES`]. DashMap guard
+    /// is dropped before return; never called across `.await`.
+    fn note_preserved_success_refresh_failure(
+        &self,
+        hostname: &str,
+        generation: &SuccessRefreshGeneration,
+    ) {
+        let cache_key = dns_hostname_key(hostname);
+        if let Some(mut entry) = self.cache.get_mut(cache_key.as_ref()) {
+            if Self::matches_success_refresh_generation(&entry, generation) {
+                entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
             }
         }
     }
@@ -2486,7 +2554,10 @@ impl DnsCache {
     /// Run one proactive refresh cycle: select soonest-expiry success entries
     /// up to `max_concurrent_refreshes`, resolve them concurrently through the
     /// shared `refresh_semaphore` + `refreshing` dedup map, and publish only
-    /// when the selected generation is still current.
+    /// when the selected generation is still current. A candidate whose
+    /// generation died after selection is skipped before the upstream query.
+    /// Skipped starts (already in progress, concurrency limited, or dead
+    /// generation) emit one `debug!` per cycle when non-zero.
     async fn run_proactive_refresh_cycle(&self) {
         let now = Instant::now();
         let to_refresh = self.select_proactive_refresh_candidates(now);
@@ -2494,22 +2565,43 @@ impl DnsCache {
             return;
         }
 
+        let skipped = Arc::new(AtomicUsize::new(0));
         let concurrency = self.max_concurrent_refreshes;
         stream::iter(to_refresh)
             .for_each_concurrent(concurrency, |candidate| {
                 let cache = self.clone();
+                let skipped = Arc::clone(&skipped);
                 async move {
-                    let hostname = candidate.hostname.clone();
-                    match cache.try_begin_refresh(hostname) {
+                    match cache.try_begin_refresh(candidate.hostname.clone()) {
                         RefreshStart::Started(guard) => {
-                            cache.refresh_proactive_candidate(candidate).await;
+                            let generation_live = cache
+                                .cache
+                                .get(guard.hostname.as_str())
+                                .is_some_and(|entry| {
+                                    Self::matches_success_refresh_generation(
+                                        entry.value(),
+                                        &candidate.generation,
+                                    )
+                                });
+                            if generation_live {
+                                cache.refresh_proactive_candidate(candidate).await;
+                            } else {
+                                skipped.fetch_add(1, Ordering::Relaxed);
+                            }
                             drop(guard);
                         }
-                        RefreshStart::AlreadyInProgress | RefreshStart::ConcurrencyLimited => {}
+                        RefreshStart::AlreadyInProgress | RefreshStart::ConcurrencyLimited => {
+                            skipped.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             })
             .await;
+
+        let skipped = skipped.load(Ordering::Relaxed);
+        if skipped > 0 {
+            debug!("DNS proactive refresh: skipped {skipped} selected hostname(s)");
+        }
     }
 
     async fn proactive_refresh_loop(self) {
@@ -2549,8 +2641,11 @@ impl DnsCache {
     ///
     /// Proactive refresh and `evict_expired` run as sibling loops on the same
     /// 5s `Delay` cadence so resolver latency cannot starve capacity
-    /// enforcement. The entire refresh phase is cancelled by the shutdown
-    /// watch; RAII releases semaphore permits and `refreshing` markers.
+    /// enforcement. The proactive/eviction task is cancelled by the shutdown
+    /// watch; RAII releases that task's semaphore permits and `refreshing`
+    /// markers. Detached stale-while-revalidate `tokio::spawn` tasks are not
+    /// joined here; they release their own permits on lookup completion,
+    /// timeout, or runtime teardown.
     /// SWR and proactive success publication share one generation token so a
     /// stale in-flight result cannot overwrite a newer winner or resurrect an
     /// evicted hostname.
@@ -3104,7 +3199,11 @@ mod tests {
     //! proactive background refresh and failed-retry re-resolution. Issue
     //! #4270 concurrency, timeout, and generation-fence coverage lives in
     //! [`background_refresh_hardening`] so the resolve hook is not a
-    //! production-visible API.
+    //! production-visible API. The hook is `#[cfg(test)]` and therefore
+    //! invisible to the external `tests/` crate (which compiles the library
+    //! without `cfg(test)`); a `test-hooks` cargo feature or a `pub` seam
+    //! would be worse, so that module is the intentional exception to the
+    //! usual "no new inline source tests" policy.
     use super::*;
     use crate::config::{BackendAllowIps, BackendEgressPolicy};
     use std::collections::HashMap;
@@ -5422,6 +5521,24 @@ mod tests {
             }));
         }
 
+        fn install_immediate_refresh_hook(
+            cache: &mut DnsCache,
+            addr: IpAddr,
+            queries: Arc<AtomicUsize>,
+        ) {
+            cache.refresh_resolve_hook = Some(Arc::new(move |_hostname: String| {
+                let queries = queries.clone();
+                Box::pin(async move {
+                    queries.fetch_add(1, Ordering::SeqCst);
+                    Ok((
+                        vec![addr],
+                        Some(CachedRecordType::A),
+                        Duration::from_secs(30),
+                    ))
+                }) as Pin<Box<dyn Future<Output = BackgroundResolveOutput> + Send>>
+            }));
+        }
+
         async fn wait_until_refresh_idle(cache: &DnsCache) {
             for _ in 0..64 {
                 if cache.refreshing.is_empty() {
@@ -5878,6 +5995,257 @@ mod tests {
             );
             assert_eq!(cache.refreshing.len(), 0);
             assert_eq!(cache.refresh_semaphore.available_permits(), 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn proactive_skips_dead_generation_before_resolve() {
+            let first_entered = Arc::new(Notify::new());
+            let second_queries = Arc::new(AtomicUsize::new(0));
+            let mut cache = near_expiry_cache(1, 10_000);
+            let first_entered_hook = first_entered.clone();
+            let second_queries_hook = second_queries.clone();
+            let refreshed_addr = testnet_addr(50);
+            cache.refresh_resolve_hook = Some(Arc::new(move |hostname: String| {
+                let first_entered_hook = first_entered_hook.clone();
+                let second_queries_hook = second_queries_hook.clone();
+                Box::pin(async move {
+                    if hostname == "first.test" {
+                        first_entered_hook.notify_one();
+                        std::future::pending::<BackgroundTestResolve>().await
+                    } else {
+                        second_queries_hook.fetch_add(1, Ordering::SeqCst);
+                        Ok((
+                            vec![refreshed_addr],
+                            Some(CachedRecordType::A),
+                            Duration::from_secs(30),
+                        ))
+                    }
+                }) as Pin<Box<dyn Future<Output = BackgroundResolveOutput> + Send>>
+            }));
+            let cache = cache;
+
+            let first_addr = testnet_addr(1);
+            let second_addr = testnet_addr(2);
+            let overwrite = testnet_addr(3);
+            seed_near_expiry(&cache, "first.test", Duration::from_secs(1), first_addr);
+            seed_near_expiry(&cache, "second.test", Duration::from_secs(3), second_addr);
+
+            let handle = tokio::spawn({
+                let cache = cache.clone();
+                async move { cache.run_proactive_refresh_cycle().await }
+            });
+            first_entered.notified().await;
+
+            seed_success_entry(
+                &cache,
+                "second.test",
+                vec![overwrite],
+                Instant::now(),
+                Duration::from_secs(100),
+                None,
+            );
+
+            tokio::time::advance(
+                DnsCache::BACKGROUND_REFRESH_RESOLVE_TIMEOUT + Duration::from_millis(1),
+            )
+            .await;
+            handle.await.expect("cycle must return after timeout");
+
+            assert_eq!(
+                second_queries.load(Ordering::SeqCst),
+                0,
+                "a candidate whose generation died after selection must not issue an upstream query"
+            );
+            assert_eq!(
+                success_addresses(&cache, "second.test"),
+                Some(vec![overwrite]),
+                "the republished generation must be left untouched"
+            );
+            assert_eq!(cache.refreshing.len(), 0);
+            assert_eq!(cache.refresh_semaphore.available_permits(), 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn proactive_skips_when_hostname_already_in_progress() {
+            let queries = Arc::new(AtomicUsize::new(0));
+            let mut cache = near_expiry_cache(1, 10_000);
+            install_immediate_refresh_hook(&mut cache, testnet_addr(9), queries.clone());
+            let cache = cache;
+
+            let original = testnet_addr(1);
+            seed_near_expiry(&cache, "busy.test", Duration::from_secs(2), original);
+            let _guard = match cache.try_begin_refresh("busy.test".to_string()) {
+                RefreshStart::Started(guard) => guard,
+                RefreshStart::AlreadyInProgress => {
+                    panic!("test setup must claim a free hostname")
+                }
+                RefreshStart::ConcurrencyLimited => {
+                    panic!("test setup must have a free permit")
+                }
+            };
+
+            cache.run_proactive_refresh_cycle().await;
+            assert_eq!(
+                queries.load(Ordering::SeqCst),
+                0,
+                "AlreadyInProgress must skip the upstream query"
+            );
+            assert_eq!(
+                success_addresses(&cache, "busy.test"),
+                Some(vec![original]),
+                "a skipped proactive start must not rewrite the success row"
+            );
+            assert_eq!(cache.refreshing.len(), 1);
+            assert_eq!(cache.refresh_semaphore.available_permits(), 0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn proactive_skips_when_swr_saturates_the_refresh_pool() {
+            let started = Arc::new(Notify::new());
+            let swr_queries = Arc::new(AtomicUsize::new(0));
+            let proactive_queries = Arc::new(AtomicUsize::new(0));
+            let mut cache = near_expiry_cache(1, 10_000);
+            let started_hook = started.clone();
+            let swr_queries_hook = swr_queries.clone();
+            let proactive_queries_hook = proactive_queries.clone();
+            let fallback_addr = testnet_addr(9);
+            cache.refresh_resolve_hook = Some(Arc::new(move |hostname: String| {
+                let started_hook = started_hook.clone();
+                let swr_queries_hook = swr_queries_hook.clone();
+                let proactive_queries_hook = proactive_queries_hook.clone();
+                Box::pin(async move {
+                    if hostname == "swr-busy.test" {
+                        swr_queries_hook.fetch_add(1, Ordering::SeqCst);
+                        started_hook.notify_one();
+                        std::future::pending::<BackgroundTestResolve>().await
+                    } else {
+                        proactive_queries_hook.fetch_add(1, Ordering::SeqCst);
+                        Ok((
+                            vec![fallback_addr],
+                            Some(CachedRecordType::A),
+                            Duration::from_secs(30),
+                        ))
+                    }
+                }) as Pin<Box<dyn Future<Output = BackgroundResolveOutput> + Send>>
+            }));
+            let cache = cache;
+
+            let swr_addr = testnet_addr(1);
+            let proactive_addr = testnet_addr(2);
+            seed_stale_swr(&cache, "swr-busy.test", swr_addr);
+            seed_near_expiry(
+                &cache,
+                "proactive.test",
+                Duration::from_secs(2),
+                proactive_addr,
+            );
+
+            let served = cache
+                .resolve("swr-busy.test", None, Some(5))
+                .await
+                .expect("SWR must serve the stale row");
+            assert_eq!(served, swr_addr);
+            started.notified().await;
+            assert_eq!(cache.refresh_semaphore.available_permits(), 0);
+
+            cache.run_proactive_refresh_cycle().await;
+            assert_eq!(swr_queries.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                proactive_queries.load(Ordering::SeqCst),
+                0,
+                "a saturated SWR pool must not let the proactive cycle issue another query"
+            );
+            assert_eq!(
+                success_addresses(&cache, "proactive.test"),
+                Some(vec![proactive_addr])
+            );
+            assert_eq!(cache.refreshing.len(), 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn proactive_picks_up_hostname_skipped_by_per_cycle_cap() {
+            let queries = Arc::new(AtomicUsize::new(0));
+            let refreshed = testnet_addr(9);
+            let mut cache = near_expiry_cache(1, 10_000);
+            install_immediate_refresh_hook(&mut cache, refreshed, queries.clone());
+            let cache = cache;
+
+            let soonest_addr = testnet_addr(1);
+            let later_addr = testnet_addr(2);
+            seed_near_expiry(
+                &cache,
+                "soonest.test",
+                Duration::from_secs(1),
+                soonest_addr,
+            );
+            seed_near_expiry(&cache, "later.test", Duration::from_secs(3), later_addr);
+
+            cache.run_proactive_refresh_cycle().await;
+            assert_eq!(queries.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                success_addresses(&cache, "soonest.test"),
+                Some(vec![refreshed]),
+                "the soonest-expiry hostname must be refreshed in the first cycle"
+            );
+            assert_eq!(
+                success_addresses(&cache, "later.test"),
+                Some(vec![later_addr]),
+                "the per-cycle cap must leave the later hostname for a subsequent cycle"
+            );
+
+            cache.run_proactive_refresh_cycle().await;
+            assert_eq!(queries.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                success_addresses(&cache, "later.test"),
+                Some(vec![refreshed]),
+                "a hostname skipped by the per-cycle cap must be picked up later"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn slow_proactive_cycle_does_not_burst_catch_up_ticks() {
+            let first = Arc::new(Notify::new());
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let mut cache = near_expiry_cache(1, 10_000);
+            let first_hook = first.clone();
+            let invocations_hook = invocations.clone();
+            cache.refresh_resolve_hook = Some(Arc::new(move |_hostname: String| {
+                let n = invocations_hook.fetch_add(1, Ordering::SeqCst) + 1;
+                let first_hook = first_hook.clone();
+                Box::pin(async move {
+                    if n == 1 {
+                        first_hook.notify_one();
+                    }
+                    std::future::pending::<BackgroundTestResolve>().await
+                }) as Pin<Box<dyn Future<Output = BackgroundResolveOutput> + Send>>
+            }));
+            let cache = cache;
+            seed_near_expiry(
+                &cache,
+                "delay.test",
+                Duration::from_secs(2),
+                testnet_addr(1),
+            );
+
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let handle = cache.start_background_refresh_with_shutdown(Some(shutdown_rx));
+            first.notified().await;
+            assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+            tokio::time::advance(
+                DnsCache::BACKGROUND_REFRESH_RESOLVE_TIMEOUT + Duration::from_millis(1),
+            )
+            .await;
+            assert_eq!(
+                invocations.load(Ordering::SeqCst),
+                1,
+                "Delay must not Burst catch-up ticks after a slow cycle"
+            );
+
+            shutdown_tx.send(true).expect("shutdown watch");
+            handle
+                .await
+                .expect("shutdown must complete the refresh task");
         }
     }
 }
