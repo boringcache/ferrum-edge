@@ -12,7 +12,9 @@ use ferrum_edge::modes::mesh::config::{
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
-use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
+use ferrum_edge::plugins::mesh::workload_metrics::{
+    EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY, MAX_EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES, WorkloadMetrics,
+};
 use ferrum_edge::plugins::request_transformer::RequestTransformer;
 use ferrum_edge::plugins::{
     Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult, RequestContext,
@@ -127,6 +129,22 @@ fn hbone_relay_request_context(
         .expect("relay proxy"),
     ));
     ctx
+}
+
+/// Assertor allow-list used by the Ambient / ServiceWaypoint fixtures below.
+///
+/// Issue #4274 made a bare `ztunnel` entry grant SAME-NAMESPACE assertion only,
+/// so an `ferrum-system` ztunnel asserting an application-namespace workload
+/// must now be pinned with an explicit contract. These fixtures are about pod
+/// UID binding and destination-scope resolution, not about the assertor
+/// relation, so they pin it; the unpinned cross-namespace refusal has its own
+/// regressions (`mesh_authz_bare_service_account_assertor_cannot_cross_namespaces`
+/// and friends).
+fn ambient_ztunnel_assertors() -> serde_json::Value {
+    json!([{
+        "assertor": "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        "scope": "mesh_wide",
+    }])
 }
 
 fn ambient_udp_request_context(peer: &str, baggage: Option<&str>) -> RequestContext {
@@ -608,6 +626,7 @@ async fn mesh_authz_ambient_udp_applies_scope_for_validated_source_pod() {
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": ambient_udp_source_scoping_slice(),
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": ambient_ztunnel_assertors(),
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -646,6 +665,7 @@ async fn mesh_authz_ambient_udp_retains_identical_duplicate_pod_scopes() {
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": ambient_ztunnel_assertors(),
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -688,6 +708,7 @@ async fn mesh_authz_ambient_udp_suppresses_conflicting_duplicate_pod_scopes() {
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": ambient_ztunnel_assertors(),
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -721,6 +742,7 @@ async fn mesh_authz_ambient_udp_missing_or_invalid_pod_evidence_uses_gateway_pri
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": ambient_ztunnel_assertors(),
     }))
     .expect("plugin config");
     for baggage in [
@@ -752,6 +774,7 @@ async fn mesh_authz_ambient_udp_untrusted_stamp_cannot_activate_scoped_policy() 
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": ambient_udp_source_scoping_slice(),
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": ambient_ztunnel_assertors(),
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -787,6 +810,7 @@ async fn mesh_authz_ambient_udp_rejects_principal_pod_mismatch_as_scope_evidence
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": ambient_ztunnel_assertors(),
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -996,6 +1020,7 @@ async fn mesh_authz_service_waypoint_byte_stream_resolves_destination_namespace_
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": ambient_ztunnel_assertors(),
     }))
     .expect("plugin config");
     let mut ctx = service_waypoint_byte_stream_request_context(
@@ -1040,6 +1065,7 @@ async fn mesh_authz_service_waypoint_byte_stream_enforces_destination_allow() {
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": ambient_ztunnel_assertors(),
     }))
     .expect("plugin config");
 
@@ -1114,6 +1140,7 @@ async fn mesh_authz_service_waypoint_byte_stream_uses_exact_destination_workload
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": ambient_ztunnel_assertors(),
     }))
     .expect("plugin config");
 
@@ -1163,6 +1190,7 @@ async fn mesh_authz_service_waypoint_byte_stream_missing_destination_scope_fails
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": ambient_ztunnel_assertors(),
     }))
     .expect("plugin config");
     let mut ctx = service_waypoint_byte_stream_request_context(
@@ -1216,6 +1244,7 @@ async fn mesh_authz_service_waypoint_byte_stream_materializes_destination_condit
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": ambient_ztunnel_assertors(),
     }))
     .expect("plugin config");
     let mut ctx = service_waypoint_byte_stream_request_context(
@@ -1276,6 +1305,7 @@ async fn mesh_authz_ambient_udp_destination_namespace_deny_blocks_source_allowed
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": ambient_ztunnel_assertors(),
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -1328,6 +1358,7 @@ async fn mesh_authz_service_waypoint_udp_resolves_destination_service_scope() {
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": ambient_ztunnel_assertors(),
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -1394,6 +1425,7 @@ async fn mesh_authz_service_waypoint_udp_uses_exact_destination_workload_scope()
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": ambient_ztunnel_assertors(),
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -1440,6 +1472,7 @@ async fn mesh_authz_service_waypoint_udp_missing_destination_scope_fails_closed(
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": ambient_ztunnel_assertors(),
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -1489,6 +1522,7 @@ async fn mesh_authz_ambient_udp_source_scoped_deny_still_blocks_after_union() {
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": ambient_ztunnel_assertors(),
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -1549,6 +1583,7 @@ async fn mesh_authz_ambient_udp_allow_aggregation_spans_union() {
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": ambient_ztunnel_assertors(),
     }))
     .expect("plugin config");
     let mut ctx = ambient_udp_request_context(
@@ -1579,6 +1614,7 @@ async fn mesh_authz_ambient_udp_absent_source_evidence_still_applies_destination
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
+        "trusted_hbone_assertors": ambient_ztunnel_assertors(),
     }))
     .expect("plugin config");
     // Principal present but no pod_uid → source scope unresolved, evidence falls
@@ -1645,13 +1681,16 @@ async fn mesh_authz_default_trusts_waypoint_service_account() {
 async fn mesh_authz_trusted_hbone_assertors_accepts_custom_service_account() {
     // Operators with Gateway-managed waypoints (SA names like
     // "default-waypoint") configure the allow-list to cover their custom
-    // names. The configured SA must be treated as a trusted assertor.
+    // names. The configured SA must be treated as a trusted assertor — for
+    // identities in its OWN namespace (issue #4274).
     let plugin = MeshAuthz::new(&json!({
         "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
         "trusted_hbone_assertors": ["default-waypoint"],
     }))
     .expect("plugin config");
-    let mut ctx = request_context(Some("spiffe://cluster.local/ns/team-a/sa/default-waypoint"));
+    let mut ctx = request_context(Some(
+        "spiffe://cluster.local/ns/default/sa/default-waypoint",
+    ));
     ctx.metadata
         .insert("request_protocol".to_string(), "hbone".to_string());
     let mut headers = http::HeaderMap::new();
@@ -1672,12 +1711,15 @@ async fn mesh_authz_trusted_hbone_assertors_accepts_custom_service_account() {
 #[tokio::test]
 async fn mesh_authz_trusted_hbone_assertors_accepts_exact_spiffe_id() {
     // Operators pinning a specific assertor identity supply the full SPIFFE
-    // id. Matching is exact — bare SA-name semantics do not apply.
+    // id. Matching is exact — bare SA-name semantics do not apply. Since issue
+    // #4274 an exact pin still only grants what its contract states, so an
+    // `istio-system` ztunnel fronting a `default` workload declares it.
     let plugin = MeshAuthz::new(&json!({
         "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
-        "trusted_hbone_assertors": [
-            "spiffe://cluster.local/ns/istio-system/sa/ztunnel",
-        ],
+        "trusted_hbone_assertors": [{
+            "assertor": "spiffe://cluster.local/ns/istio-system/sa/ztunnel",
+            "asserts": ["spiffe://cluster.local/ns/default/sa/client"],
+        }],
     }))
     .expect("plugin config");
     let mut ctx = request_context(Some("spiffe://cluster.local/ns/istio-system/sa/ztunnel"));
@@ -1837,6 +1879,873 @@ async fn mesh_authz_untrusted_assertor_without_baggage_is_silent() {
     assert!(
         !ctx.metadata
             .contains_key("mesh_authz.ignored_baggage.untrusted_assertor")
+    );
+}
+
+// ── Issue #4274: the trusted-assertor authorization relation ────────────────
+
+/// Build an ALLOW policy for one exact SPIFFE id in the `prod` namespace.
+fn allow_payments_policy() -> MeshPolicy {
+    allow_spiffe_policy(
+        "payments-policy",
+        "spiffe://cluster.local/ns/prod/sa/payments",
+    )
+}
+
+fn allow_spiffe_policy(name: &str, spiffe: &str) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector::default(),
+        },
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some(spiffe.to_string()),
+                namespace_pattern: None,
+                trust_domain: Some(TrustDomain::new("cluster.local").expect("trust domain")),
+                trust_domain_pattern: None,
+            }],
+            to: Vec::new(),
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Allow,
+        }],
+    }
+}
+
+fn hbone_baggage_context(peer: &str, baggage: &str) -> RequestContext {
+    let mut ctx = request_context(Some(peer));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = http::HeaderMap::new();
+    headers.insert("baggage", baggage.parse().expect("header value"));
+    ctx.set_raw_headers(headers);
+    ctx
+}
+
+/// THE bypass this issue closes. `ns/attacker/sa/waypoint` matches the default
+/// bare service-account allow-list and shares the trust domain, so before the
+/// assertion relation existed it could rewrite the authz principal to any
+/// workload in the mesh — here the `prod` payments identity an ALLOW policy
+/// admits. It must be refused, and refused as a DISTINCT reason from
+/// "not an assertor at all".
+#[tokio::test]
+async fn mesh_authz_bare_service_account_assertor_cannot_cross_namespaces() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_payments_policy()]
+    }))
+    .expect("plugin config");
+    let mut ctx = hbone_baggage_context(
+        "spiffe://cluster.local/ns/attacker/sa/waypoint",
+        "source.principal=spiffe://cluster.local/ns/prod/sa/payments",
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("cross-namespace assertion must be refused, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_baggage.assertion_out_of_scope")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("assertion_out_of_scope")
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("mesh_authz.ignored_baggage.untrusted_assertor"),
+        "an admitted assertor exceeding its grant is not an untrusted peer"
+    );
+    // Redaction: the forged identity is attacker-controlled and must never be
+    // echoed back into metadata.
+    for (key, value) in &ctx.metadata {
+        assert!(
+            !value.contains("ns/prod/sa/payments"),
+            "metadata key {key} leaked the forged identity: {value}"
+        );
+    }
+}
+
+/// The same forged header, with the attacker's own service account: this is the
+/// pre-existing `untrusted_assertor` path and must keep its own reason code.
+#[tokio::test]
+async fn mesh_authz_non_assertor_peer_still_reports_untrusted_assertor() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_payments_policy()]
+    }))
+    .expect("plugin config");
+    let mut ctx = hbone_baggage_context(
+        "spiffe://cluster.local/ns/attacker/sa/attacker",
+        "source.principal=spiffe://cluster.local/ns/prod/sa/payments",
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("untrusted_assertor")
+    );
+}
+
+/// Positive control: the SAME default allow-list still honors a waypoint
+/// asserting an identity in its OWN namespace, so the fix does not break
+/// legitimate same-namespace ambient/waypoint behavior.
+#[tokio::test]
+async fn mesh_authz_bare_service_account_assertor_keeps_same_namespace_assertion() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)]
+    }))
+    .expect("plugin config");
+    let mut ctx = hbone_baggage_context(
+        "spiffe://cluster.local/ns/default/sa/waypoint",
+        "source.principal=spiffe://cluster.local/ns/default/sa/client",
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("mesh_authz.ignored_baggage"));
+}
+
+/// An exact SPIFFE pin is not a blank cheque either: without an explicit
+/// contract it grants only its own namespace.
+#[tokio::test]
+async fn mesh_authz_exact_spiffe_assertor_defaults_to_same_namespace() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_payments_policy()],
+        "trusted_hbone_assertors": ["spiffe://cluster.local/ns/istio-system/sa/ztunnel"],
+    }))
+    .expect("plugin config");
+    let mut ctx = hbone_baggage_context(
+        "spiffe://cluster.local/ns/istio-system/sa/ztunnel",
+        "source.principal=spiffe://cluster.local/ns/prod/sa/payments",
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("assertion_out_of_scope")
+    );
+}
+
+/// The inventory form is exhaustive: a listed identity is honored, an unlisted
+/// one in the same namespace is not.
+#[tokio::test]
+async fn mesh_authz_assertor_inventory_admits_only_listed_identities() {
+    let config = json!({
+        "mesh_policies": [allow_payments_policy()],
+        "trusted_hbone_assertors": [{
+            "assertor": "spiffe://cluster.local/ns/istio-system/sa/ztunnel",
+            "asserts": ["spiffe://cluster.local/ns/prod/sa/payments"],
+        }],
+    });
+    let plugin = MeshAuthz::new(&config).expect("plugin config");
+
+    let mut listed = hbone_baggage_context(
+        "spiffe://cluster.local/ns/istio-system/sa/ztunnel",
+        "source.principal=spiffe://cluster.local/ns/prod/sa/payments",
+    );
+    assert!(matches!(
+        plugin.authorize(&mut listed).await,
+        PluginResult::Continue
+    ));
+    assert!(!listed.metadata.contains_key("mesh_authz.ignored_baggage"));
+
+    let mut unlisted = hbone_baggage_context(
+        "spiffe://cluster.local/ns/istio-system/sa/ztunnel",
+        "source.principal=spiffe://cluster.local/ns/prod/sa/ledger",
+    );
+    assert!(matches!(
+        plugin.authorize(&mut unlisted).await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(
+        unlisted
+            .metadata
+            .get("mesh_authz.ignored_baggage.assertion_out_of_scope")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+/// An empty inventory is the fail-closed shape an identity-backed NodeWaypoint
+/// gets when the CP authorized it for no workload. It must authorize NOTHING —
+/// not even the assertor's own namespace.
+#[tokio::test]
+async fn mesh_authz_empty_assertor_inventory_fails_closed() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
+        "trusted_hbone_assertors": [{
+            "assertor": "spiffe://cluster.local/ns/default/sa/waypoint",
+            "asserts": [],
+        }],
+    }))
+    .expect("plugin config");
+    let mut ctx = hbone_baggage_context(
+        "spiffe://cluster.local/ns/default/sa/waypoint",
+        "source.principal=spiffe://cluster.local/ns/default/sa/client",
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("assertion_out_of_scope")
+    );
+}
+
+/// The explicit per-entry `mesh_wide` contract is the sanctioned way to grant
+/// cross-namespace assertion.
+#[tokio::test]
+async fn mesh_authz_mesh_wide_scope_entry_grants_cross_namespace_assertion() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_payments_policy()],
+        "trusted_hbone_assertors": [{
+            "assertor": "spiffe://cluster.local/ns/istio-system/sa/ztunnel",
+            "scope": "mesh_wide",
+        }],
+    }))
+    .expect("plugin config");
+    let mut ctx = hbone_baggage_context(
+        "spiffe://cluster.local/ns/istio-system/sa/ztunnel",
+        "source.principal=spiffe://cluster.local/ns/prod/sa/payments",
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("mesh_authz.ignored_baggage"));
+}
+
+/// The trust-domain gate still runs FIRST for a matched assertor, so a
+/// cross-trust-domain forgery keeps its own reason rather than being relabelled.
+#[tokio::test]
+async fn mesh_authz_trust_domain_gate_precedes_the_assertion_grant() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_payments_policy()],
+    }))
+    .expect("plugin config");
+    let mut ctx = hbone_baggage_context(
+        "spiffe://cluster.local/ns/attacker/sa/waypoint",
+        "source.principal=spiffe://attacker.local/ns/prod/sa/payments",
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("trust_domain_mismatch")
+    );
+}
+
+/// Telemetry attribution consumes the SAME relation. A forged cross-namespace
+/// baggage must not reach metrics, the service graph, spans or access logs even
+/// though `workload_metrics` never denies a request.
+#[tokio::test]
+async fn workload_metrics_bare_service_account_assertor_cannot_cross_namespaces() {
+    let plugin = WorkloadMetrics::new(&json!({})).expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/attacker/sa/waypoint"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        "source.principal=spiffe://cluster.local/ns/prod/sa/payments".to_string(),
+    )]);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/attacker/sa/waypoint"),
+        "attribution must fall back to the peer cert, never the forged identity"
+    );
+    assert_eq!(
+        ctx.metadata.get("mesh.ignored_baggage").map(String::as_str),
+        Some("assertion_out_of_scope")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.namespace")
+            .map(String::as_str),
+        Some("attacker")
+    );
+}
+
+/// Positive control on the telemetry side: same-namespace assertion still
+/// attributes to the asserted workload.
+#[tokio::test]
+async fn workload_metrics_keeps_same_namespace_assertion() {
+    let plugin = WorkloadMetrics::new(&json!({})).expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/prod/sa/waypoint"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        "source.principal=spiffe://cluster.local/ns/prod/sa/payments".to_string(),
+    )]);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/prod/sa/payments")
+    );
+    assert!(!ctx.metadata.contains_key("mesh.ignored_baggage"));
+}
+
+/// An empty inventory fails closed for telemetry too.
+#[tokio::test]
+async fn workload_metrics_empty_assertor_inventory_fails_closed() {
+    let plugin = WorkloadMetrics::new(&json!({
+        "trusted_hbone_assertors": [{
+            "assertor": "spiffe://cluster.local/ns/prod/sa/waypoint",
+            "asserts": [],
+        }]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/prod/sa/waypoint"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        "source.principal=spiffe://cluster.local/ns/prod/sa/payments".to_string(),
+    )]);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/prod/sa/waypoint")
+    );
+    assert_eq!(
+        ctx.metadata.get("mesh.ignored_baggage").map(String::as_str),
+        Some("assertion_out_of_scope")
+    );
+}
+
+const NODE_WAYPOINT_A: &str = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-a";
+const NODE_WAYPOINT_B: &str = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-b";
+const NODE_WAYPOINT_C: &str = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-c";
+const ZTUNNEL_EXACT: &str = "spiffe://cluster.local/ns/istio-system/sa/ztunnel";
+const PAYMENTS_ID: &str = "spiffe://cluster.local/ns/prod/sa/payments";
+const LEDGER_ID: &str = "spiffe://cluster.local/ns/prod/sa/ledger";
+const ISTIO_SIDECAR_ID: &str = "spiffe://cluster.local/ns/istio-system/sa/sidecar";
+
+/// Duplicate exact-matcher entries union their inventories. Last-write-wins
+/// would drop whichever grant was inserted first; both insertion orders must
+/// honor both identities.
+#[tokio::test]
+async fn mesh_authz_duplicate_exact_assertor_entries_union_grants() {
+    let orders = [
+        json!([
+            {"assertor": ZTUNNEL_EXACT, "asserts": [PAYMENTS_ID]},
+            {"assertor": ZTUNNEL_EXACT, "asserts": [LEDGER_ID]},
+        ]),
+        json!([
+            {"assertor": ZTUNNEL_EXACT, "asserts": [LEDGER_ID]},
+            {"assertor": ZTUNNEL_EXACT, "asserts": [PAYMENTS_ID]},
+        ]),
+    ];
+    for assertors in orders {
+        let plugin = MeshAuthz::new(&json!({
+            "mesh_policies": [
+                allow_payments_policy(),
+                allow_spiffe_policy("ledger-policy", LEDGER_ID),
+            ],
+            "trusted_hbone_assertors": assertors,
+        }))
+        .expect("plugin config");
+
+        let mut payments =
+            hbone_baggage_context(ZTUNNEL_EXACT, &format!("source.principal={PAYMENTS_ID}"));
+        assert!(matches!(
+            plugin.authorize(&mut payments).await,
+            PluginResult::Continue
+        ));
+        assert!(!payments.metadata.contains_key("mesh_authz.ignored_baggage"));
+
+        let mut ledger =
+            hbone_baggage_context(ZTUNNEL_EXACT, &format!("source.principal={LEDGER_ID}"));
+        assert!(matches!(
+            plugin.authorize(&mut ledger).await,
+            PluginResult::Continue
+        ));
+        assert!(!ledger.metadata.contains_key("mesh_authz.ignored_baggage"));
+
+        let mut unlisted = hbone_baggage_context(
+            ZTUNNEL_EXACT,
+            "source.principal=spiffe://cluster.local/ns/prod/sa/other",
+        );
+        assert!(matches!(
+            plugin.authorize(&mut unlisted).await,
+            PluginResult::Reject { .. }
+        ));
+        assert_eq!(
+            unlisted
+                .metadata
+                .get("mesh_authz.deny_policy")
+                .map(String::as_str),
+            Some("assertion_out_of_scope")
+        );
+    }
+}
+
+/// A peer matching both an exact inventory pin and a bare service-account
+/// matcher receives the union: listed identities plus same-namespace.
+#[tokio::test]
+async fn mesh_authz_exact_and_service_account_assertor_entries_union_grants() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [
+            allow_payments_policy(),
+            allow_spiffe_policy("sidecar-policy", ISTIO_SIDECAR_ID),
+        ],
+        "trusted_hbone_assertors": [
+            {
+                "assertor": ZTUNNEL_EXACT,
+                "asserts": [PAYMENTS_ID],
+            },
+            "ztunnel",
+        ],
+    }))
+    .expect("plugin config");
+
+    let mut listed =
+        hbone_baggage_context(ZTUNNEL_EXACT, &format!("source.principal={PAYMENTS_ID}"));
+    assert!(matches!(
+        plugin.authorize(&mut listed).await,
+        PluginResult::Continue
+    ));
+    assert!(!listed.metadata.contains_key("mesh_authz.ignored_baggage"));
+
+    let mut same_ns = hbone_baggage_context(
+        ZTUNNEL_EXACT,
+        &format!("source.principal={ISTIO_SIDECAR_ID}"),
+    );
+    assert!(matches!(
+        plugin.authorize(&mut same_ns).await,
+        PluginResult::Continue
+    ));
+    assert!(!same_ns.metadata.contains_key("mesh_authz.ignored_baggage"));
+
+    let mut other_ns =
+        hbone_baggage_context(ZTUNNEL_EXACT, &format!("source.principal={LEDGER_ID}"));
+    assert!(matches!(
+        plugin.authorize(&mut other_ns).await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(
+        other_ns
+            .metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("assertion_out_of_scope")
+    );
+}
+
+/// Empty inventory on the same exact matcher as a SameNamespace grant still
+/// unions: empty does not wipe the other grant.
+#[tokio::test]
+async fn mesh_authz_duplicate_exact_empty_inventory_unions_with_same_namespace() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_spiffe_policy("sidecar-policy", ISTIO_SIDECAR_ID)],
+        "trusted_hbone_assertors": [
+            {"assertor": ZTUNNEL_EXACT, "asserts": []},
+            {"assertor": ZTUNNEL_EXACT, "scope": "same_namespace"},
+        ],
+    }))
+    .expect("plugin config");
+    let mut ctx = hbone_baggage_context(
+        ZTUNNEL_EXACT,
+        &format!("source.principal={ISTIO_SIDECAR_ID}"),
+    );
+
+    assert!(matches!(
+        plugin.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(!ctx.metadata.contains_key("mesh_authz.ignored_baggage"));
+}
+
+/// Unrelated NodeWaypoint-shaped exact entries do not match a peer that is
+/// not among them — fail closed as untrusted, not as out-of-scope on a
+/// sibling's inventory.
+#[tokio::test]
+async fn mesh_authz_unrelated_exact_assertors_fail_closed_as_untrusted() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_payments_policy()],
+        "trusted_hbone_assertors": [
+            {"assertor": NODE_WAYPOINT_A, "asserts": [PAYMENTS_ID]},
+            {"assertor": NODE_WAYPOINT_B, "asserts": [LEDGER_ID]},
+            {"assertor": NODE_WAYPOINT_C, "asserts": []},
+        ],
+    }))
+    .expect("plugin config");
+    let mut ctx = hbone_baggage_context(
+        "spiffe://cluster.local/ns/attacker/sa/waypoint",
+        &format!("source.principal={PAYMENTS_ID}"),
+    );
+
+    assert!(matches!(
+        plugin.authorize(&mut ctx).await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("untrusted_assertor")
+    );
+}
+
+/// An empty inventory on this node does not inherit a sibling node's grants.
+#[tokio::test]
+async fn mesh_authz_empty_inventory_does_not_inherit_sibling_node_grants() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_payments_policy()],
+        "trusted_hbone_assertors": [
+            {"assertor": NODE_WAYPOINT_A, "asserts": [PAYMENTS_ID]},
+            {"assertor": NODE_WAYPOINT_B, "asserts": []},
+        ],
+    }))
+    .expect("plugin config");
+    let mut ctx =
+        hbone_baggage_context(NODE_WAYPOINT_B, &format!("source.principal={PAYMENTS_ID}"));
+
+    assert!(matches!(
+        plugin.authorize(&mut ctx).await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("assertion_out_of_scope")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_duplicate_exact_assertor_entries_union_grants() {
+    let plugin = WorkloadMetrics::new(&json!({
+        "trusted_hbone_assertors": [
+            {"assertor": ZTUNNEL_EXACT, "asserts": [PAYMENTS_ID]},
+            {"assertor": ZTUNNEL_EXACT, "asserts": [LEDGER_ID]},
+        ],
+    }))
+    .expect("plugin config");
+
+    for asserted in [PAYMENTS_ID, LEDGER_ID] {
+        let mut ctx = request_context(Some(ZTUNNEL_EXACT));
+        ctx.metadata
+            .insert("request_protocol".to_string(), "hbone".to_string());
+        let mut headers = HashMap::from([(
+            "baggage".to_string(),
+            format!("source.principal={asserted}"),
+        )]);
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            ctx.metadata
+                .get("mesh.source.principal")
+                .map(String::as_str),
+            Some(asserted)
+        );
+        assert!(!ctx.metadata.contains_key("mesh.ignored_baggage"));
+    }
+
+    let mut unlisted = request_context(Some(ZTUNNEL_EXACT));
+    unlisted
+        .metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        "source.principal=spiffe://cluster.local/ns/prod/sa/other".to_string(),
+    )]);
+    assert!(matches!(
+        plugin.before_proxy(&mut unlisted, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        unlisted
+            .metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some(ZTUNNEL_EXACT)
+    );
+    assert_eq!(
+        unlisted
+            .metadata
+            .get("mesh.ignored_baggage")
+            .map(String::as_str),
+        Some("assertion_out_of_scope")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_exact_and_service_account_assertor_entries_union_grants() {
+    let plugin = WorkloadMetrics::new(&json!({
+        "trusted_hbone_assertors": [
+            {"assertor": ZTUNNEL_EXACT, "asserts": [PAYMENTS_ID]},
+            "ztunnel",
+        ],
+    }))
+    .expect("plugin config");
+
+    let mut listed = request_context(Some(ZTUNNEL_EXACT));
+    listed
+        .metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        format!("source.principal={PAYMENTS_ID}"),
+    )]);
+    assert!(matches!(
+        plugin.before_proxy(&mut listed, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        listed
+            .metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some(PAYMENTS_ID)
+    );
+    assert!(!listed.metadata.contains_key("mesh.ignored_baggage"));
+
+    let mut same_ns = request_context(Some(ZTUNNEL_EXACT));
+    same_ns
+        .metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        format!("source.principal={ISTIO_SIDECAR_ID}"),
+    )]);
+    assert!(matches!(
+        plugin.before_proxy(&mut same_ns, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        same_ns
+            .metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some(ISTIO_SIDECAR_ID)
+    );
+    assert!(!same_ns.metadata.contains_key("mesh.ignored_baggage"));
+
+    let mut other_ns = request_context(Some(ZTUNNEL_EXACT));
+    other_ns
+        .metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        format!("source.principal={LEDGER_ID}"),
+    )]);
+    assert!(matches!(
+        plugin.before_proxy(&mut other_ns, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        other_ns
+            .metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some(ZTUNNEL_EXACT)
+    );
+    assert_eq!(
+        other_ns
+            .metadata
+            .get("mesh.ignored_baggage")
+            .map(String::as_str),
+        Some("assertion_out_of_scope")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_unrelated_exact_assertors_fail_closed_as_untrusted() {
+    let plugin = WorkloadMetrics::new(&json!({
+        "trusted_hbone_assertors": [
+            {"assertor": NODE_WAYPOINT_A, "asserts": [PAYMENTS_ID]},
+            {"assertor": NODE_WAYPOINT_B, "asserts": []},
+        ],
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/attacker/sa/waypoint"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        format!("source.principal={PAYMENTS_ID}"),
+    )]);
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/attacker/sa/waypoint")
+    );
+    assert_eq!(
+        ctx.metadata.get("mesh.ignored_baggage").map(String::as_str),
+        Some("untrusted_assertor")
+    );
+}
+
+#[test]
+fn mesh_authz_rejects_assertor_entry_with_both_asserts_and_scope() {
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
+        "trusted_hbone_assertors": [{
+            "assertor": "waypoint",
+            "asserts": ["spiffe://cluster.local/ns/prod/sa/payments"],
+            "scope": "mesh_wide",
+        }],
+    })) {
+        Ok(_) => panic!("ambiguous grant should fail construction"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("must not set both"),
+        "error should explain the conflict: {err}"
+    );
+}
+
+#[test]
+fn mesh_authz_rejects_mesh_wide_scope_for_bare_service_account_matcher() {
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
+        "trusted_hbone_assertors": [{"assertor": "waypoint", "scope": "mesh_wide"}],
+    })) {
+        Ok(_) => panic!("namespace-blind matcher must not receive mesh-wide authority"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("requires an exact 'spiffe://' assertor"),
+        "error should require an exact identity pin: {err}"
+    );
+}
+
+#[test]
+fn mesh_authz_rejects_unknown_assertor_scope() {
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
+        "trusted_hbone_assertors": [{"assertor": "waypoint", "scope": "everything"}],
+    })) {
+        Ok(_) => panic!("unknown scope should fail construction"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("everything"),
+        "error should name the bad scope: {err}"
+    );
+}
+
+#[test]
+fn mesh_authz_rejects_trusted_hbone_assertor_object_misspelled_key() {
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
+        "trusted_hbone_assertors": [{"assertor": "waypoint", "scpoe": "mesh_wide"}],
+    })) {
+        Ok(_) => panic!("misspelled object key should fail construction"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("scpoe"),
+        "error should name the unknown field: {err}"
+    );
+    assert!(
+        err.contains("scope"),
+        "error should suggest the intended field: {err}"
+    );
+}
+
+#[test]
+fn mesh_authz_rejects_trusted_hbone_assertor_object_with_extra_key() {
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
+        "trusted_hbone_assertors": [{
+            "assertor": "waypoint",
+            "scope": "same_namespace",
+            "extra": true,
+        }],
+    })) {
+        Ok(_) => panic!("extra object key should fail construction"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("extra"),
+        "error should name the unknown field: {err}"
+    );
+    assert!(
+        !err.contains("same_namespace"),
+        "error should not treat the valid scope as the problem: {err}"
+    );
+}
+
+#[test]
+fn mesh_authz_rejects_assertor_entry_without_assertor_field() {
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
+        "trusted_hbone_assertors": [{"asserts": []}],
+    })) {
+        Ok(_) => panic!("missing assertor should fail construction"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("assertor"),
+        "error should mention the missing field: {err}"
+    );
+}
+
+#[test]
+fn mesh_authz_rejects_non_spiffe_asserts_entry() {
+    let err = match MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)],
+        "trusted_hbone_assertors": [{"assertor": "waypoint", "asserts": ["payments"]}],
+    })) {
+        Ok(_) => panic!("non-SPIFFE asserts entry should fail construction"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("asserts"),
+        "error should mention the field: {err}"
     );
 }
 
@@ -2739,7 +3648,10 @@ async fn workload_metrics_ignores_baggage_from_untrusted_assertor() {
 #[tokio::test]
 async fn workload_metrics_honors_baggage_from_configured_assertor() {
     let plugin = WorkloadMetrics::new(&json!({
-        "trusted_hbone_assertors": ["client"]
+        "trusted_hbone_assertors": [{
+            "assertor": "client",
+            "asserts": ["spiffe://cluster.local/ns/web/sa/frontend"],
+        }]
     }))
     .expect("plugin config");
     let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
@@ -2860,6 +3772,264 @@ async fn workload_metrics_accepts_baggage_in_aliased_trust_domain() {
         Some("spiffe://cluster.local/ns/default/sa/client")
     );
     assert!(!ctx.metadata.contains_key("mesh.ignored_baggage"));
+}
+
+#[test]
+fn workload_metrics_rejects_trusted_hbone_assertor_object_unknown_key() {
+    let err = match WorkloadMetrics::new(&json!({
+        "trusted_hbone_assertors": [{"assertor": "waypoint", "scpoe": "mesh_wide"}],
+    })) {
+        Ok(_) => panic!("misspelled object key should fail construction"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("scpoe"),
+        "error should name the unknown field: {err}"
+    );
+    assert!(
+        err.contains("workload_metrics:"),
+        "error should be prefixed by the plugin: {err}"
+    );
+}
+
+fn metrics_config_with_effective_gates(gates: serde_json::Value) -> serde_json::Value {
+    let mut config = json!({});
+    config[EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY] = gates;
+    config
+}
+
+fn metrics_with_effective_gates(gates: serde_json::Value) -> WorkloadMetrics {
+    WorkloadMetrics::new(&metrics_config_with_effective_gates(gates))
+        .expect("effective gate config")
+}
+
+async fn metrics_baggage_outcome(
+    plugin: &WorkloadMetrics,
+    peer: &str,
+    asserted: &str,
+) -> (String, Option<String>) {
+    let mut ctx = request_context(Some(peer));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        format!("source.principal={asserted}"),
+    )]);
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let principal = ctx
+        .metadata
+        .get("mesh.source.principal")
+        .cloned()
+        .expect("source principal");
+    let reason = ctx.metadata.get("mesh.ignored_baggage").cloned();
+    (principal, reason)
+}
+
+/// Capture-on: managed inventory is narrower than an operator mesh-wide
+/// override. Telemetry must refuse what the managed gate refuses.
+#[tokio::test]
+async fn workload_metrics_conjunctive_gates_refuse_what_managed_refuses() {
+    let plugin = metrics_with_effective_gates(json!([
+        {
+            "trusted_hbone_assertors": [{
+                "assertor": "waypoint",
+                "asserts": ["spiffe://cluster.local/ns/prod/sa/payments"]
+            }]
+        },
+        {
+            "trusted_hbone_assertors": [{
+                "assertor": "spiffe://cluster.local/ns/prod/sa/waypoint",
+                "scope": "mesh_wide"
+            }]
+        }
+    ]));
+    let (principal, reason) = metrics_baggage_outcome(
+        &plugin,
+        "spiffe://cluster.local/ns/prod/sa/waypoint",
+        "spiffe://cluster.local/ns/other/sa/victim",
+    )
+    .await;
+    assert_eq!(principal, "spiffe://cluster.local/ns/prod/sa/waypoint");
+    assert_eq!(reason.as_deref(), Some("assertion_out_of_scope"));
+}
+
+/// Capture-on: operator `[]` is narrower than the managed default. Telemetry
+/// must refuse what the operator gate refuses.
+#[tokio::test]
+async fn workload_metrics_conjunctive_gates_refuse_what_operator_empty_list_refuses() {
+    let plugin = metrics_with_effective_gates(json!([
+        {},
+        { "trusted_hbone_assertors": [] }
+    ]));
+    let (principal, reason) = metrics_baggage_outcome(
+        &plugin,
+        "spiffe://cluster.local/ns/prod/sa/waypoint",
+        "spiffe://cluster.local/ns/prod/sa/payments",
+    )
+    .await;
+    assert_eq!(principal, "spiffe://cluster.local/ns/prod/sa/waypoint");
+    assert_eq!(reason.as_deref(), Some("untrusted_assertor"));
+}
+
+/// Both enabled gates allow the same same-namespace assertion.
+#[tokio::test]
+async fn workload_metrics_conjunctive_gates_honor_when_every_gate_allows() {
+    let plugin = metrics_with_effective_gates(json!([
+        { "trusted_hbone_assertors": ["waypoint"] },
+        {}
+    ]));
+    let (principal, reason) = metrics_baggage_outcome(
+        &plugin,
+        "spiffe://cluster.local/ns/prod/sa/waypoint",
+        "spiffe://cluster.local/ns/prod/sa/payments",
+    )
+    .await;
+    assert_eq!(principal, "spiffe://cluster.local/ns/prod/sa/payments");
+    assert!(reason.is_none());
+}
+
+/// A disabled operator is not an effective gate: a single managed/default
+/// gate still honors same-namespace assertion.
+#[tokio::test]
+async fn workload_metrics_single_managed_gate_ignores_absent_disabled_operator() {
+    let plugin = metrics_with_effective_gates(json!([{}]));
+    let (principal, reason) = metrics_baggage_outcome(
+        &plugin,
+        "spiffe://cluster.local/ns/prod/sa/waypoint",
+        "spiffe://cluster.local/ns/prod/sa/payments",
+    )
+    .await;
+    assert_eq!(principal, "spiffe://cluster.local/ns/prod/sa/payments");
+    assert!(reason.is_none());
+}
+
+/// Multiple enabled operator gates outside capture are conjunctive.
+#[tokio::test]
+async fn workload_metrics_multiple_operator_gates_are_conjunctive() {
+    let plugin = metrics_with_effective_gates(json!([
+        { "trusted_hbone_assertors": ["waypoint"] },
+        { "trusted_hbone_assertors": ["ztunnel"] }
+    ]));
+    let (principal, reason) = metrics_baggage_outcome(
+        &plugin,
+        "spiffe://cluster.local/ns/prod/sa/waypoint",
+        "spiffe://cluster.local/ns/prod/sa/payments",
+    )
+    .await;
+    assert_eq!(principal, "spiffe://cluster.local/ns/prod/sa/waypoint");
+    assert_eq!(reason.as_deref(), Some("untrusted_assertor"));
+}
+
+/// One gate's trust-domain aliases must not silently widen another gate.
+#[tokio::test]
+async fn workload_metrics_per_gate_trust_domain_aliases_do_not_widen_sibling() {
+    let plugin = metrics_with_effective_gates(json!([
+        { "trusted_hbone_assertors": ["waypoint"] },
+        {
+            "trusted_hbone_assertors": ["waypoint"],
+            "trust_domain_aliases": ["partner.local"]
+        }
+    ]));
+    let (principal, reason) = metrics_baggage_outcome(
+        &plugin,
+        "spiffe://cluster.local/ns/prod/sa/waypoint",
+        "spiffe://partner.local/ns/prod/sa/payments",
+    )
+    .await;
+    assert_eq!(principal, "spiffe://cluster.local/ns/prod/sa/waypoint");
+    assert_eq!(reason.as_deref(), Some("trust_domain_mismatch"));
+}
+
+/// One gate's per-entry `scope: mesh_wide` must not silently widen a sibling
+/// that still grants same-namespace only.
+#[tokio::test]
+async fn workload_metrics_per_gate_mesh_wide_scope_does_not_widen_sibling() {
+    let plugin = metrics_with_effective_gates(json!([
+        { "trusted_hbone_assertors": ["waypoint"] },
+        {
+            "trusted_hbone_assertors": [{
+                "assertor": "spiffe://cluster.local/ns/attacker/sa/waypoint",
+                "scope": "mesh_wide"
+            }]
+        }
+    ]));
+    let (principal, reason) = metrics_baggage_outcome(
+        &plugin,
+        "spiffe://cluster.local/ns/attacker/sa/waypoint",
+        "spiffe://cluster.local/ns/prod/sa/payments",
+    )
+    .await;
+    assert_eq!(principal, "spiffe://cluster.local/ns/attacker/sa/waypoint");
+    assert_eq!(reason.as_deref(), Some("assertion_out_of_scope"));
+}
+
+/// Refusal precedence across gates is stable: untrusted_assertor wins over
+/// assertion_out_of_scope; trust-domain mismatch stays distinct.
+#[tokio::test]
+async fn workload_metrics_conjunctive_refusal_precedence_is_stable() {
+    let plugin = metrics_with_effective_gates(json!([
+        { "trusted_hbone_assertors": [] },
+        { "trusted_hbone_assertors": ["waypoint"] }
+    ]));
+    let (principal, reason) = metrics_baggage_outcome(
+        &plugin,
+        "spiffe://cluster.local/ns/attacker/sa/waypoint",
+        "spiffe://cluster.local/ns/prod/sa/payments",
+    )
+    .await;
+    assert_eq!(principal, "spiffe://cluster.local/ns/attacker/sa/waypoint");
+    assert_eq!(reason.as_deref(), Some("untrusted_assertor"));
+    assert_ne!(
+        reason.as_deref(),
+        Some("spiffe://cluster.local/ns/prod/sa/payments")
+    );
+}
+
+#[test]
+fn workload_metrics_rejects_malformed_effective_authz_gates() {
+    let not_array = WorkloadMetrics::new(&metrics_config_with_effective_gates(json!({})));
+    let err = not_array
+        .err()
+        .expect("non-array gates must fail construction");
+    assert!(
+        err.contains(EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY),
+        "{err}"
+    );
+
+    let not_object =
+        WorkloadMetrics::new(&metrics_config_with_effective_gates(json!(["waypoint"])));
+    let err = not_object
+        .err()
+        .expect("non-object gate must fail construction");
+    assert!(err.contains("must be an object"), "{err}");
+
+    let unknown = WorkloadMetrics::new(&metrics_config_with_effective_gates(json!([{
+        "trusted_hbone_assertors": [],
+        "nope": true
+    }])));
+    let err = unknown
+        .err()
+        .expect("unknown gate key must fail construction");
+    assert!(err.contains("nope"), "{err}");
+
+    let empty = WorkloadMetrics::new(&metrics_config_with_effective_gates(json!([])));
+    let err = empty.err().expect("empty gate list must fail construction");
+    assert!(err.contains("at least one gate"), "{err}");
+}
+
+#[test]
+fn workload_metrics_rejects_over_bound_effective_authz_gates() {
+    let gates = vec![json!({}); MAX_EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES + 1];
+    let err = WorkloadMetrics::new(&metrics_config_with_effective_gates(
+        serde_json::Value::Array(gates),
+    ))
+    .err()
+    .expect("over-bound gate list must fail construction");
+    assert!(
+        err.contains(&MAX_EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES.to_string()),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -4621,7 +5791,10 @@ async fn mesh_authz_node_waypoint_hbone_relay_uses_destination_scope_without_sou
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": node_waypoint_endpoint_route_slice(),
         "per_pod_policy_scoping": true,
-        "trusted_hbone_assertors": [source_waypoint],
+        "trusted_hbone_assertors": [{
+            "assertor": source_waypoint,
+            "asserts": ["spiffe://cluster.local/ns/default/sa/trusted"],
+        }],
     }))
     .expect("plugin config");
     let relay_proxy = Arc::new(
@@ -4671,7 +5844,10 @@ async fn mesh_authz_node_waypoint_hbone_relay_without_trusted_baggage_fails_clos
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": node_waypoint_endpoint_route_slice(),
         "per_pod_policy_scoping": true,
-        "trusted_hbone_assertors": [source_waypoint],
+        "trusted_hbone_assertors": [{
+            "assertor": source_waypoint,
+            "asserts": ["spiffe://cluster.local/ns/default/sa/trusted"],
+        }],
     }))
     .expect("plugin config");
     let relay_proxy = Arc::new(
@@ -4733,7 +5909,10 @@ async fn mesh_authz_node_waypoint_source_side_hbone_still_requires_source_scope(
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": node_waypoint_endpoint_route_slice(),
         "per_pod_policy_scoping": true,
-        "trusted_hbone_assertors": [source_waypoint],
+        "trusted_hbone_assertors": [{
+            "assertor": source_waypoint,
+            "asserts": ["spiffe://cluster.local/ns/default/sa/trusted"],
+        }],
     }))
     .expect("plugin config");
     let direct_endpoint_proxy = Arc::new(
@@ -6278,7 +7457,10 @@ async fn workload_metrics_rebuilds_source_identity_after_baggage_transform() {
         "namespace": "payments",
         "workload_spiffe_id": "spiffe://cluster.local/ns/payments/sa/checkout",
         "labels": {"app": "checkout"},
-        "trusted_hbone_assertors": ["spiffe://cluster.local/assertor"]
+        "trusted_hbone_assertors": [{
+            "assertor": "spiffe://cluster.local/assertor",
+            "asserts": ["spiffe://cluster.local/ns/storefront/sa/frontend"],
+        }]
     }))
     .expect("workload metrics config");
     let transformer = trace_header_remover("baggage");

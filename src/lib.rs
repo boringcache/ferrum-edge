@@ -460,7 +460,7 @@ pub mod _test_support {
             backlog,
             None,
             accept_threads,
-            false,
+            crate::proxy::ProxyListenerBind::default(),
         )
     }
 
@@ -7817,6 +7817,25 @@ pub mod _test_support {
             now_unix,
             now_mono,
         )
+    }
+
+    /// Production inclusive mTLS leaf-validity predicate at an explicit Unix
+    /// instant (issue #4359). `None` is the fail-closed inverted-interval case.
+    /// Does not sample the wall clock and carries no certificate material.
+    pub fn mtls_client_cert_is_valid_at_unix_for_test(
+        not_before_unix: i64,
+        not_after_unix: i64,
+        now_unix: i64,
+    ) -> Option<bool> {
+        crate::plugins::mtls_auth::cert_is_valid_at_unix(not_before_unix, not_after_unix, now_unix)
+    }
+
+    /// Parse a client-certificate DER into the Unix `notBefore`/`notAfter`
+    /// bounds retained beside a cached mTLS identity. Used to prove the
+    /// inclusive predicate against the timestamps the authentication path
+    /// actually stores, without consulting live wall-clock time.
+    pub fn mtls_cert_validity_unix_bounds_from_der_for_test(der: &[u8]) -> Option<(i64, i64)> {
+        crate::plugins::mtls_auth::cert_validity_unix_bounds_from_der(der)
     }
 
     /// Set a request's credential deadline directly so external tests can drive
