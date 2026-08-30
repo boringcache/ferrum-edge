@@ -460,7 +460,7 @@ pub mod _test_support {
             backlog,
             None,
             accept_threads,
-            false,
+            crate::proxy::ProxyListenerBind::default(),
         )
     }
 
