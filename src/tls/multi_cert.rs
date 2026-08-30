@@ -227,12 +227,22 @@ pub(crate) fn load_gateway_multi_cert_tls_config_with_handshake_scope(
                 MaterialKind::Ocsp,
             )?;
             let bytes = material.bytes.expose_secret().to_vec();
-            if bytes.is_empty() {
-                anyhow::bail!(
-                    "OCSP response source '{}' was empty",
+            // Bounded structural admission here; the certificate-bound half
+            // runs in `load_certified_key` against the chain that will serve
+            // the response (issue #4300).
+            let structure = crate::tls::ocsp::validate_structure(&bytes).map_err(|error| {
+                anyhow::anyhow!(
+                    "OCSP response source '{}' was rejected: {error}",
                     material.display_source_id
-                );
-            }
+                )
+            })?;
+            debug!(
+                ocsp_source = %material.display_source_id,
+                ocsp_der_bytes = structure.der_len,
+                ocsp_single_responses = structure.single_responses,
+                "Admitted the structure of a stapled OCSP response; certificate binding is \
+                 checked against the served leaf and issuer before it is attached"
+            );
             bytes
         }
         (Some(_), _) => {
@@ -491,6 +501,29 @@ fn load_certified_key(
         "Gateway server TLS private key",
         &key_material.display_source_id,
     )?;
+
+    // Issue #4300: bind the staple to this exact leaf/issuer before it can be
+    // served. `ocsp_response` is only non-empty when the data plane serves a
+    // single certificate, so the response and the chain below are the pair the
+    // client will actually see.
+    if !ocsp_response.is_empty() {
+        let acceptance = crate::tls::ocsp::validate_stapled_response(ocsp_response, &cert_chain)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Gateway certificate {} was configured with a stapled OCSP response that was \
+                     rejected: {error}",
+                    input.identity
+                )
+            })?;
+        info!(
+            gateway_certificate = %input.identity,
+            ocsp_der_bytes = acceptance.der_len,
+            ocsp_this_update = acceptance.this_update,
+            ocsp_next_update = acceptance.next_update,
+            ocsp_delegated_responder = acceptance.delegated_responder,
+            "Validated and stapled OCSP response for Gateway certificate"
+        );
+    }
 
     let mut certified_key =
         CertifiedKey::from_der(cert_chain, key, tls_policy.crypto_provider.as_ref()).map_err(
