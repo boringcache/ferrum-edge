@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — `FERRUM_TLS_OFFLOAD_THREADS` nonzero values fail startup**
+  (issue #4294). TLS handshake offload is not implemented; a nonzero setting
+  was previously parsed and then silently ignored. `EnvConfig::validate()`
+  now rejects any value other than `0` before mode dispatch. **Operator
+  action**: leave the variable unset or set it to `0`.
+
 - **BREAKING — `POST /batch` rejects unknown top-level envelope keys**
   (issue #4042). The request is create-only (`consumers`, `upstreams`,
   `proxies`, `plugin_configs`). Sending `updates`, `deletes`, or `dry_run`

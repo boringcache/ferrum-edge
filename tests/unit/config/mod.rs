@@ -68,6 +68,7 @@ mod sql_dialect_tests;
 mod stable_file_tests;
 mod stream_proxy_config_tests;
 mod test_db_fault_tests;
+mod tls_offload_threads_tests;
 mod workload_entry_cross_namespace_tests;
 mod workload_entry_local_inbound_slice_tests;
 mod yaml_alias_budget_tests;

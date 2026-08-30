@@ -142,4 +142,5 @@ paths:
 - Avoid `Proxy.clone()` in gRPC/TCP hot paths; extract fields into parameter structs.
 - Preserve H2 flow control budgets for gRPC, UDP `recvmmsg` frontend receive, QUIC 8-32 KiB coalescing with 2 ms flush, and Linux splice for plain-to-plain TCP.
 - Never splice TLS without kTLS.
-- Keep active optimizations unless tests prove removal is safe: router cache eviction CMS, `IP_BIND_ADDRESS_NO_PORT`, `TCP_FASTOPEN`, Date cache, TLS offload runtime, RED shedding, adaptive UDP buffers, `lazy_timeout`, cacheability predictor, `TCP_INFO`, kTLS, io_uring splice, UDP GSO, PKTINFO reply-source selection, `SO_BUSY_POLL`, and `HealthBitset`.
+- Keep active optimizations unless tests prove removal is safe: router cache eviction CMS, `IP_BIND_ADDRESS_NO_PORT`, `TCP_FASTOPEN`, Date cache, RED shedding, adaptive UDP buffers, `lazy_timeout`, cacheability predictor, `TCP_INFO`, kTLS, io_uring splice, UDP GSO, PKTINFO reply-source selection, `SO_BUSY_POLL`, and `HealthBitset`.
+- TLS handshake offload (`src/tls_offload.rs`) is reserved and not wired at startup; `FERRUM_TLS_OFFLOAD_THREADS` must remain `0` or `EnvConfig::validate()` fails.
