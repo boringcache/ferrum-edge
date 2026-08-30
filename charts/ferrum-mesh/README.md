@@ -70,6 +70,104 @@ spreads pods across `kubernetes.io/hostname` (`ScheduleAnyway`). Set
 Set any data-path workload to `replicas: 1` only as a deliberate lab choice; the
 PDB is omitted automatically.
 
+## Graceful shutdown
+
+Serving workloads (`controlPlane`, `ca`, `eastWest`, `ambient`) ship the same
+additive drain contract as `ferrum-gateway` (`docs/graceful_shutdown.md`):
+
+- `FERRUM_SHUTDOWN_DRAIN_SECONDS` / `FERRUM_SHUTDOWN_PREDRAIN_SECONDS`
+- native `lifecycle.preStop.sleep` (Kubernetes 1.29+ SleepAction; distroless has no shell)
+- `terminationGracePeriodSeconds: 110` covering preStop 30s + the 78s post-SIGTERM budget
+
+Render fails when the grace period is under budget. On Kubernetes &lt;1.29 set
+`shutdownPreStopSeconds: 0` and raise `shutdownPreDrainSeconds` to at least
+readiness `failureThreshold × periodSeconds`. That remediation is real for every
+serving workload here, `controlPlane` and `ca` included: `cp` mode honors
+`FERRUM_SHUTDOWN_PREDRAIN_SECONDS` (its admin and CP-gRPC accept loops close on
+the same broadcast the window delays, while `/health` already reports
+`ready: false`). One-shot hooks/jobs (CNI uninstall) and the injector/node-agent
+(not Ferrum serving modes) do not receive this contract. East-west readiness is
+drain-aware `ferrum-edge health` against the loopback admin listener — not
+`tcpSocket` on `tls-passthru`.
+
+Every **enabled** computed probe must have a usable handler. Setting a
+workload's `admin.httpPort: 0` while a computed probe stays enabled fails render
+instead of silently omitting the probe — including ambient, where a missing
+readiness probe would leave the host-network datapath unprobed. Supply
+`probes.<probe>.override` or set `probes.<probe>.enabled: false` instead.
+`probes.startup.override` is classified independently of liveness on every
+workload (controlPlane, ca, eastWest, ambient, injector, node-agent).
+
+## Admin listener validation
+
+`<workload>.admin.bindAddress` and `<workload>.admin.allowedCidrs` are validated
+against the same rules the binary applies, so a typo fails `helm template`
+instead of CrashLooping the pod:
+
+- `bindAddress` must be an IP literal. Hostnames (`localhost`, a Service name)
+  are rejected — `EnvConfig::validate()` exits on them.
+- `allowedCidrs` is parsed entry-for-entry like `CidrSet::parse_strict`: bare
+  IPv4/IPv6 addresses or CIDRs, no brackets, prefixes in family range.
+- For `controlPlane` and `ca` (which run `cp` mode and hard-fail on a
+  non-loopback plaintext admin listener), a **full-family** allowlist —
+  `0.0.0.0/0`, `::/0`, an IPv4-mapped `/96`, or a union that covers a whole
+  family — does not count as protection. Use a narrower allowlist, keep the
+  loopback default, or set `admin.allowInsecureHttp: true` (insecure development
+  only).
+- While the computed exec probes are enabled, a non-empty allowlist must cover
+  the **exact** source the admin accept loop observes: `127.0.0.1` for an IPv4
+  or `0.0.0.0` bind (including a concrete 127/8 or IPv4-mapped 127/8 dest such
+  as `::ffff:127.0.0.2`), `::1` for an IPv6 wildcard bind. An IPv4-only
+  allowlist in front of an IPv6 wildcard bind renders cleanly and then
+  restart-loops the pod, so the chart refuses it.
+
+`observability.metrics.allowedCidrs` is validated the same way; the runtime
+parses `FERRUM_METRICS_ALLOWED_CIDRS` with the same strict parser.
+
+## Pod security and resources
+
+`controlPlane`, `ca`, and `eastWest` default to restricted-compatible
+PodSecurity (non-root 65532, drop ALL, no privilege escalation, read-only root,
+RuntimeDefault seccomp, `/tmp` emptyDir) with non-empty CPU/memory requests and
+limits. Their `podSecurityContext` / `securityContext` are free-form and
+rendered verbatim.
+
+Ambient is different and its schema says so. It keeps `hostNetwork` and datapath
+capabilities (`NET_ADMIN` / `NET_RAW`, plus `SYS_ADMIN`/`SYS_PTRACE` only for
+in-netns capture and `BPF`/`PERFMON` for NodeWaypoint) after dropping ALL, and it
+assembles its container `securityContext` field by field rather than rendering
+the operator's map verbatim. `ambient.securityContext` therefore accepts only the
+keys the template actually reads — `allowPrivilegeEscalation`,
+`readOnlyRootFilesystem`, `capabilities.drop`, `capabilities.add` — and rejects
+anything else at lint time rather than silently ignoring it (`runAsUser` /
+`runAsGroup` are decided by the capture mode; `allowPrivilegeEscalation`
+defaults to `false` so the steady-state proxy satisfies Restricted).
+`capabilities.drop` must stay `["ALL"]`, and `capabilities.add` **merges on top of**
+the datapath minimum: it can add named capabilities but can never remove a required
+one. `ALL` and
+`CAP_ALL` are rejected in `capabilities.add` — they would re-grant the complete
+Linux capability set after `drop: ["ALL"]`. Capability names are validated
+against `^(CAP_)?[A-Z][A-Z0-9_]*$` and rendered unquoted so NodeWaypoint and
+Ambient UDP live/CI greps keep matching the datapath set. An explicit `drop: []`
+is rejected — it is not silently rewritten to `[ALL]`; omit the key to keep the
+default.
+
+`priorityClassName` is optional; only ambient and node-agent default to
+`system-node-critical`. Empty `priorityClassName` omits the field.
+
+## Metrics scrape
+
+`observability.enabled` (default `false`) does **not** change admin bind
+addresses. When enabled, the chart renders `FERRUM_METRICS_*` auth env,
+dedicated ClusterIP metrics Services for Deployments (the main CP/east-west
+Services stay gRPC / tls-passthru), a `ServiceMonitor`, and `PodMonitor`s for
+host-network DaemonSets. Alerts and monitors fail render without a scrape
+credential (`observability.metrics.allowedCidrs` or
+`bearerToken.existingSecret.name`). Inline `bearerToken.value` wires pod env
+only. Optional Prometheus Operator CRDs stay gated on `observability.enabled`.
+`FerrumMeshControlPlaneConfigStale` does not use `absent()` — it is silent
+no-data until a scraped data plane emits the freshness timestamp.
+
 See [`values.yaml`](values.yaml) for the fully commented value surface and
 [`docs/kubernetes_deployment.md`](../../docs/kubernetes_deployment.md) for the
 deployment guide.
