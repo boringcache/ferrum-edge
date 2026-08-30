@@ -863,7 +863,10 @@ fn responder_certificate_count_is_bounded_at_sixteen() {
 
     builder.embedded_certs.push(pki.delegate_der.as_slice());
     let error = validate_structure(&builder.build()).expect_err("seventeen must be rejected");
-    assert!(error.contains("more than 16 responder certificates"), "{error}");
+    assert!(
+        error.contains("more than 16 responder certificates"),
+        "{error}"
+    );
 }
 
 #[test]
