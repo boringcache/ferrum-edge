@@ -22,7 +22,7 @@ Concepts map directly to the Istio service mesh model: `Workload` corresponds to
 - [MeshSlice](#meshslice)
 - [Authorization](#authorization)
   - [PolicyScope Filtering](#policyscope-filtering)
-  - [AuthorizationPolicy targetRefs](#authorizationpolicy-targetrefs-issue-3226)
+  - [AuthorizationPolicy targetRefs](#authorizationpolicy-targetref--targetrefs-issue-3226)
   - [Evaluation Semantics](#evaluation-semantics)
   - [AuthorizationPolicy action: CUSTOM](#authorizationpolicy-action-custom-issue-3235)
   - [Rule Matching](#rule-matching)
