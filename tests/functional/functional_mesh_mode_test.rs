@@ -542,11 +542,12 @@ const AMBIENT_DEST_RELAY_POD_UID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 /// `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR` at an empty `node-waypoint-pods/`
 /// dir, so without this leaf `destination_is_node_local_enrolled` refuses every
 /// inventory destination (`AddressNotTerminated`) even though the slice
-/// declares the dest as local. Same-cluster and host-netns UDP-dest fixtures
-/// avoid this by dialing the workload IP on a `0.0.0.0` HBONE bind (own-address
-/// arm); cross-cluster fixtures dial `127.0.0.1` and therefore need enrollment.
-/// Write the leaf before spawning the dest gateway so the startup
-/// `reconcile_once` sees it. UDP dest must not enroll: a matching `ipv4=` makes
+/// declares the dest as local. Same-cluster, host-netns UDP-dest, and
+/// third-workload refusal fixtures avoid this by dialing the workload IP on a
+/// `0.0.0.0` HBONE bind (own-address arm); cross-cluster fixtures dial
+/// `127.0.0.1` and therefore need enrollment. Write the leaf before spawning
+/// the dest gateway so the startup `reconcile_once` sees it. UDP dest and the
+/// third-workload datagram sibling must not enroll: a matching `ipv4=` makes
 /// `open_hbone_udp_relay_socket` enter the enrolled pod netns, which a
 /// host-netns echo fixture does not have.
 fn publish_ambient_dest_relay_enrollment(temp: &TempDir, ipv4: &str, spiffe_id: &str) {
@@ -1256,6 +1257,24 @@ fn third_workload_refusal_exercises_synthesis_time_guard() {
         drive.contains("observe_third_workload_backend_hits("),
         "zero backend hits must come from the bounded observation helper, \
          which reports a dead backend as inconclusive rather than as zero"
+    );
+    // Own-address arm (issue #4249): HBONE on 0.0.0.0, dial B's advertised IP.
+    // Enrollment would take the inventory arm and then have the datagram
+    // sibling enter a pod netns the host-netns echo does not have.
+    assert!(
+        drive.contains("ambient_dest_hbone_listen_override("),
+        "B's HBONE must bind 0.0.0.0 so a CONNECT dialed at B's advertised IP \
+         takes the own-address arm"
+    );
+    assert!(
+        !drive.contains("Ipv4Addr::LOCALHOST"),
+        "HBONE must be dialed at B's advertised workload IP, not 127.0.0.1, so \
+         the accepted local address matches the CONNECT authority"
+    );
+    assert!(
+        !drive.contains("publish_ambient_dest_relay_enrollment("),
+        "do not enroll B — this is a host-netns fixture; enrollment would make \
+         the datagram sibling enter a pod netns the echo does not have"
     );
 
     let slice_header = "\nfn third_workload_refusal_slice(";
@@ -10631,8 +10650,11 @@ async fn drive_inbound_relay_third_workload_refusal(
     };
     // Ambient refuses the loopback namespace (#4315). B's own dest and C must
     // both be non-loopback so a control 200 and a C 404 are attributable to
-    // ownership, not to loopback-namespace denial.
-    let b_ip = IpAddr::V4(fixture_non_loopback_local_v4());
+    // ownership, not to loopback-namespace denial. `b_hbone_ip` is the address
+    // the client dials for B's HBONE so the accepted local address matches
+    // the CONNECT authority (own-address arm).
+    let b_hbone_ip = fixture_non_loopback_local_v4();
+    let b_ip = IpAddr::V4(b_hbone_ip);
     let c_ip = discover_bindable_non_loopback_local_ip().await?;
 
     let mut last_failure = String::new();
@@ -10675,6 +10697,13 @@ async fn drive_inbound_relay_third_workload_refusal(
         let ports_b = reserve_mesh_ports().await;
         let hbone_port = ports_b.hbone;
 
+        // Same-cluster Ambient dest shape (issue #4249): bind HBONE on 0.0.0.0
+        // and dial B's advertised workload IP so the own-destination control
+        // CONNECT takes the own-address arm. Do not enroll that IP — enrollment
+        // is what the inventory arm needs when HBONE is reached at 127.0.0.1,
+        // but `open_hbone_udp_relay_socket` then enters the enrolled pod netns,
+        // and this host-netns echo (shared by the datagram sibling) has none
+        // (502).
         let mut child_b = spawn_mesh_gateway(
             &temp_b,
             MeshGatewaySpawnOptions {
@@ -10694,6 +10723,7 @@ async fn drive_inbound_relay_third_workload_refusal(
                         "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
                         svids.b.trust_bundle_path.clone(),
                     ),
+                    ambient_dest_hbone_listen_override(hbone_port),
                 ],
             },
         );
@@ -10723,6 +10753,7 @@ async fn drive_inbound_relay_third_workload_refusal(
         let control = match flavor {
             ThirdWorkloadConnectFlavor::ByteStream => {
                 drive_one_waypoint_byte_connect(
+                    b_hbone_ip,
                     hbone_port,
                     &control_authority,
                     &svids.a,
@@ -10731,13 +10762,7 @@ async fn drive_inbound_relay_third_workload_refusal(
                 .await
             }
             ThirdWorkloadConnectFlavor::Datagram => {
-                drive_one_udp_connect(
-                    Ipv4Addr::LOCALHOST,
-                    hbone_port,
-                    &control_authority,
-                    &svids.a,
-                )
-                .await
+                drive_one_udp_connect(b_hbone_ip, hbone_port, &control_authority, &svids.a).await
             }
         };
 
@@ -10781,13 +10806,15 @@ async fn drive_inbound_relay_third_workload_refusal(
 
         // CONNECT names C, a dest B does not terminate for. Synthesis 404s
         // before either HBONE handler runs. When this host has only one
-        // non-loopback IPv4, B and C share that address and inventory refuses
-        // C as PortNotDeclared (C's port lives only on C's SPIFFE); distinct
-        // addresses refuse as AddressNotTerminated. Both are synthesis 404,
-        // and C is not loopback so the 404 is not the #4315 namespace refusal.
+        // non-loopback IPv4, B and C share that address and the own-address
+        // arm refuses C as PortNotDeclared (C's port lives only on C's
+        // SPIFFE); distinct addresses miss the own-address arm and inventory
+        // refuses as AddressNotTerminated. Both are synthesis 404, and C is
+        // not loopback so the 404 is not the #4315 namespace refusal.
         let authority = SocketAddr::new(c_ip, c_port).to_string();
         let connect = match flavor {
             ThirdWorkloadConnectFlavor::ByteStream => drive_one_waypoint_byte_connect(
+                b_hbone_ip,
                 hbone_port,
                 &authority,
                 &svids.a,
@@ -10796,7 +10823,7 @@ async fn drive_inbound_relay_third_workload_refusal(
             .await
             .map(|(status, _)| status),
             ThirdWorkloadConnectFlavor::Datagram => {
-                drive_one_udp_connect(Ipv4Addr::LOCALHOST, hbone_port, &authority, &svids.a)
+                drive_one_udp_connect(b_hbone_ip, hbone_port, &authority, &svids.a)
                     .await
                     .map(|(status, _)| status)
             }
@@ -12027,22 +12054,23 @@ async fn read_relayed_bytes(
     .map_err(|_| "timed out reading relayed bytes".to_string())?
 }
 
-/// Open mTLS H2 to the waypoint, send a MARKER-LESS (byte-stream) HBONE CONNECT
-/// to `authority`, write `payload`, and return (status, echoed bytes).
+/// Open mTLS H2 to `hbone_ip:hbone_port`, send a MARKER-LESS (byte-stream)
+/// HBONE CONNECT to `authority`, write `payload`, and return (status, echoed
+/// bytes).
 async fn drive_one_waypoint_byte_connect(
+    hbone_ip: Ipv4Addr,
     hbone_port: u16,
     authority: &str,
     client_svid: &GeneratedGatewaySvid,
     payload: &[u8],
 ) -> Result<(u16, Option<Vec<u8>>), String> {
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", hbone_port))
+    let tcp = tokio::net::TcpStream::connect((hbone_ip, hbone_port))
         .await
         .map_err(|e| format!("connect waypoint: {e}"))?;
     let _ = tcp.set_nodelay(true);
     let connector = tokio_rustls::TlsConnector::from(udp_dest_client_config(client_svid));
-    let server_name = rustls::pki_types::ServerName::IpAddress(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)).into(),
-    );
+    let server_name =
+        rustls::pki_types::ServerName::IpAddress(std::net::IpAddr::V4(hbone_ip).into());
     let tls = tokio::time::timeout(Duration::from_secs(10), connector.connect(server_name, tcp))
         .await
         .map_err(|_| "client TLS handshake timed out".to_string())?
@@ -12179,6 +12207,7 @@ async fn drive_waypoint_target_refs(
         }
 
         let reviews = drive_one_waypoint_byte_connect(
+            Ipv4Addr::LOCALHOST,
             hbone_port,
             &format!("{workload_address}:{reviews_port}"),
             &svids.a,
@@ -12186,6 +12215,7 @@ async fn drive_waypoint_target_refs(
         )
         .await;
         let ratings = drive_one_waypoint_byte_connect(
+            Ipv4Addr::LOCALHOST,
             hbone_port,
             &format!("{workload_address}:{ratings_port}"),
             &svids.a,
