@@ -16,6 +16,7 @@ use chrono::Utc;
 use ferrum_edge::_test_support::{
     ai_rate_limiter_shares_local_state_for_test, graphql_shares_local_state_for_test,
     grpc_method_router_shares_local_state_for_test, plugin_cache_full_reload_for_test,
+    rate_limiting_shares_across_client_namespaces_for_test,
     rate_limiting_shares_local_state_for_test, shared_local_rate_limit_generations_for_test,
     standalone_rate_limiting_shares_state_for_test, udp_rate_limiting_shares_local_state_for_test,
     ws_rate_limiting_charge_frame_for_test, ws_rate_limiting_contains_connection_for_test,
@@ -337,7 +338,36 @@ fn compatible_reloads_share_state_and_semantic_changes_do_not() {
 
     assert!(
         !standalone_rate_limiting_shares_state_for_test(&base).expect("construction"),
-        "validation-only construction has no policy identity and must stay isolated"
+        "standalone construction has no policy identity and must stay isolated"
+    );
+}
+
+#[test]
+fn redis_default_prefix_does_not_make_local_state_depend_on_the_constructing_client() {
+    let default_prefix = redis_backed_policy();
+    assert!(
+        rate_limiting_shares_across_client_namespaces_for_test(
+            &default_prefix,
+            NS,
+            "redis-default-prefix-client",
+            "validation-client",
+            "runtime-client",
+        )
+        .expect("rate_limiting constructs"),
+        "the identity-derived default prefix must not make the fingerprint client-dependent"
+    );
+
+    let mut explicit_left = default_prefix.clone();
+    explicit_left["redis_key_prefix"] = json!("shared-budget-a");
+    let mut explicit_right = default_prefix;
+    explicit_right["redis_key_prefix"] = json!("shared-budget-b");
+    assert!(
+        !rl_pair(
+            "redis-explicit-prefix-isolates",
+            &explicit_left,
+            &explicit_right,
+        ),
+        "different explicit Redis prefixes must still isolate local fallback budgets"
     );
 }
 
@@ -517,7 +547,8 @@ fn a_retired_generation_is_recovered_and_a_removed_policy_is_reclaimed() {
         "a semantic change retains the still-live retired generation alongside the new one"
     );
 
-    // A -> B -> A must recover A's live budget, not mint a third empty domain.
+    // With A and B both live, another A construction must recover A's budget,
+    // not mint a third empty domain.
     let a2 = ws_rate_limiting_with_policy_identity_for_test(&policy_a, NS, identity)
         .expect("ws_rate_limiting constructs");
     assert!(ws_rate_limiting_shares_local_state_for_test(&a1, &a2));

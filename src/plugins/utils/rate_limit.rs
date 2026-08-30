@@ -926,14 +926,18 @@ where
     /// limiter and registers a second generation for the identity, so a retired
     /// generation's still-installed instance keeps enforcing on the state it
     /// admitted against and can never corrupt the replacement policy. Every
-    /// live generation is retained (not just the last), so an A -> B -> A config
-    /// cycle recovers A's live budget rather than minting a third empty domain.
+    /// live generation is retained (not just the last), so while A and B are
+    /// concurrently live another A construction recovers A's budget rather
+    /// than minting a third empty domain.
     fn resolve(
         &self,
-        identity: String,
+        namespace: &str,
+        plugin_name: &str,
+        config_id: &str,
         fingerprint: String,
         build: impl FnOnce() -> LocalLimiter<K, A>,
     ) -> Arc<LocalLimiter<K, A>> {
+        let identity = local_limiter_policy_identity(namespace, plugin_name, config_id);
         let mut guard = self.locked();
         prune_dead_generations(&mut guard);
         if let Some(existing) = guard.get(&identity).and_then(|generations| {
@@ -944,7 +948,18 @@ where
         }) {
             return existing;
         }
+        let resets_live_budget = guard
+            .get(&identity)
+            .is_some_and(|generations| !generations.is_empty());
         let limiter = Arc::new(build());
+        if resets_live_budget {
+            info!(
+                namespace = %namespace,
+                plugin = %plugin_name,
+                config_id = %config_id,
+                "Rate-limit policy semantics changed; starting a fresh local budget"
+            );
+        }
         guard
             .entry(identity)
             .or_default()
@@ -1122,8 +1137,9 @@ fn encode_window_specs(specs: &[RateLimitWindowSpec]) -> Vec<u8> {
 /// ([`LocalStateSemantics`], built after validation) plus the shared posture
 /// resolved here: whether a centralized store is authoritative, and — only when
 /// it is — the outage policy that decides whether the local map is ever an
-/// admission domain and the effective Redis key prefix that names the counter
-/// domain.
+/// admission domain and any explicitly configured Redis key prefix that names
+/// the counter domain. The default prefix is already determined by the stable
+/// policy identity and is therefore not a separate input.
 ///
 /// `redis_failure_policy` is deliberately *conditional*. With `sync_mode: local`
 /// there is no centralized store to lose, the local map is the sole enforcement
@@ -1143,7 +1159,7 @@ fn local_limiter_fingerprint(
     semantics: &LocalStateSemantics,
     redis_enabled: bool,
     failure_policy: RedisFailurePolicy,
-    redis_key_prefix: Option<&str>,
+    explicit_redis_key_prefix: Option<&str>,
 ) -> String {
     use crate::fips::approved::Sha256;
 
@@ -1166,10 +1182,9 @@ fn local_limiter_fingerprint(
                 RedisFailurePolicy::LocalFallback => b"local_fallback".as_slice(),
             },
         );
-        absorb(
-            "redis_key_prefix",
-            redis_key_prefix.unwrap_or("").as_bytes(),
-        );
+        if let Some(redis_key_prefix) = explicit_redis_key_prefix {
+            absorb("redis_key_prefix", redis_key_prefix.as_bytes());
+        }
     }
     // Sorted by label so the order a plugin records its semantics in is not
     // itself a compatibility input.
@@ -1317,12 +1332,12 @@ where
     /// unbounded for anyone able to churn configuration. State is now owned by
     /// the policy, not by the instance the cache happened to construct.
     ///
-    /// `namespace` is `None` for constructions that have no stable policy
-    /// identity (config validation, direct/test construction). Those keep
-    /// private state. Production [`crate::plugin_cache::PluginCache`] always
-    /// supplies a validated stable identity; identityless construction is limited to config
-    /// validation and direct tests and cannot share or mutate a live production
-    /// policy's counters.
+    /// `namespace` is `None` only for construction entry points that have no
+    /// stable policy identity, including direct/test and standalone validation
+    /// helpers. Those keep private state. Security-composition candidate
+    /// validation and production [`crate::plugin_cache::PluginCache`] builds
+    /// supply the config's validated identity; candidates can resolve retained
+    /// state but never run traffic or mutate its counters.
     ///
     /// `semantics` carries this plugin's **effective** enforcement parameters —
     /// limit dimension, windows, maximums, algorithm parameters, and any
@@ -1331,11 +1346,11 @@ where
     /// two configurations that parse to the same enforcement keep one budget,
     /// so config churn alone cannot mint a fresh one. Together with the shared
     /// posture resolved here (`sync_mode`, and when Redis is enabled the
-    /// failure posture and effective key prefix) it forms the compatibility
-    /// fingerprint: a real enforcement change isolates immediately onto fresh
-    /// state, while an unrelated config, ordering, or HTTP-client rebuild
-    /// inherits the live budget. Never record a secret-bearing value there (see
-    /// [`local_limiter_fingerprint`]).
+    /// failure posture and any explicitly configured key prefix) it forms the
+    /// compatibility fingerprint: a real enforcement change isolates
+    /// immediately onto fresh state, while an unrelated config, ordering, or
+    /// HTTP-client rebuild inherits the live budget. Never record a
+    /// secret-bearing value there (see [`local_limiter_fingerprint`]).
     pub fn from_plugin_config_with_policy_identity(
         plugin_name: &'static str,
         namespace: Option<&str>,
@@ -1359,15 +1374,18 @@ where
             http_client,
             algorithm.clone(),
         )?;
+        let explicit_redis_key_prefix = config.get("redis_key_prefix").and_then(Value::as_str);
         let local = match namespace {
             Some(namespace) => A::registry().resolve(
-                local_limiter_policy_identity(namespace, plugin_name, config_id),
+                namespace,
+                plugin_name,
+                config_id,
                 local_limiter_fingerprint(
                     plugin_name,
                     semantics,
                     redis.is_some(),
                     failure_policy,
-                    redis.as_ref().map(|redis| redis.key_prefix()),
+                    explicit_redis_key_prefix,
                 ),
                 // Shard count is the process-wide FERRUM_POOL_SHARD_AMOUNT and
                 // is therefore identical for every generation in this process;
@@ -2178,11 +2196,6 @@ impl RateLimitAlgorithm for DynamicHttpRateLimitAlgorithm {
                 retained != requested
             };
             if specs_changed {
-                if !state.windows.is_empty() {
-                    warn!(
-                        "DynamicHttpRateLimitAlgorithm: spec change detected for in-progress key; counter state will be reset"
-                    );
-                }
                 state.windows = new_http_window_states(op.specs());
             }
             // Retarget onto the caller's `Arc` either way, so the steady state

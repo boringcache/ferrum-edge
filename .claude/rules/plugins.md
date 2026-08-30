@@ -131,18 +131,23 @@ paths:
   omitted rate map vs an explicit empty one are the same enforcement, so
   hashing syntax would let config churn alone mint a fresh budget. The shared
   posture is `sync_mode`, and ONLY when Redis is enabled the effective
-  `redis_failure_policy` and effective key prefix — with `sync_mode: local`
-  there is no store to lose, the posture changes nothing enforced, and
-  toggling it must not reset the budget. Never record a credential, URL,
-  username, password, or TLS material in `LocalStateSemantics` (a debug
-  assertion refuses the shared Redis config keys), and never log the
-  fingerprint. Presentation-only fields (`expose_headers`, `close_reason`) and
-  stateless checks (GraphQL depth/complexity, gRPC allow/deny lists) are
+  `redis_failure_policy` and an EXPLICIT key prefix — the default prefix is
+  already determined by the stable policy identity, so it is not hashed and a
+  validation client's namespace cannot perturb compatibility. With
+  `sync_mode: local` there is no store to lose, the posture changes nothing
+  enforced, and toggling it must not reset the budget. Never record a
+  credential, URL, username, password, or TLS material in
+  `LocalStateSemantics` (a debug assertion refuses the shared Redis config
+  keys), and never log the fingerprint. Presentation-only fields
+  (`expose_headers`, `close_reason`) and stateless checks (GraphQL
+  depth/complexity, gRPC allow/deny lists) are
   deliberately outside the set so they cannot reset a live budget. Sharing the
   limiter is only half of it: `DynamicHttpRateLimitAlgorithm::check_local`
   compares window VALUES, not `Arc` identity, because a compatible rebuild
-  always constructs a new `DynamicRateLimitOp`. A construction without a
-  stable identity (config validation, direct/test) keeps private state. A
+  always constructs a new `DynamicRateLimitOp`. Direct/legacy test construction
+  without a stable identity keeps private state. Security-composition config
+  validation constructs candidates with their real identity; those candidates
+  can resolve retained state but never run traffic or mutate counters. A
   compatible reload inherits live state; a semantic change isolates
   onto fresh state so a retired generation's late release/completion cannot
   corrupt the replacement. For deduplication the semantic set is deliberately
@@ -152,8 +157,10 @@ paths:
   their admission-time protection windows across reloads; never evaluate an
   existing lease with a replacement generation's shorter timeout. Weak
   registries keep every still-live semantic generation for an identity, not
-  just the last one, so A → B → A recovers A's active protection state. Do not
-  reintroduce per-instance ownership for any of these.
+  just the last one, so while A and B are concurrently live another A
+  construction recovers A's active protection state. After A's last owner
+  drops, a later A construction starts fresh. Do not reintroduce per-instance
+  ownership for any of these.
 - `proxy_group` is one shared instance for its associated proxies; stateful plugins share counters and are cascade-deleted when no proxies remain.
 
 ## Lifecycle Order

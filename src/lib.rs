@@ -5013,8 +5013,53 @@ pub mod _test_support {
         Ok(first.shares_local_state_with(&second))
     }
 
-    /// Whether two identityless (validation-only) `rate_limiting` instances
-    /// share local state. They must not: production
+    /// Whether one Redis-backed policy identity shares local fallback state
+    /// when constructed through HTTP clients carrying different namespaces.
+    pub fn rate_limiting_shares_across_client_namespaces_for_test(
+        config: &serde_json::Value,
+        policy_namespace: &str,
+        config_id: &str,
+        first_client_namespace: &str,
+        second_client_namespace: &str,
+    ) -> Result<bool, String> {
+        use crate::config::PoolConfig;
+        use crate::dns::{DnsCache, DnsConfig};
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::rate_limiting::RateLimiting;
+
+        let client = |namespace: &str| {
+            PluginHttpClient::new(
+                &PoolConfig::default(),
+                DnsCache::new(DnsConfig::default()),
+                1000,
+                0,
+                100,
+                false,
+                None,
+                std::sync::Arc::new(Vec::new()),
+                namespace,
+                crate::config::BackendEgressPolicy::unrestricted(),
+                std::sync::Arc::new(Vec::new()),
+                0,
+            )
+        };
+        let first = RateLimiting::new_with_policy_identity(
+            config,
+            client(first_client_namespace),
+            policy_namespace,
+            config_id,
+        )?;
+        let second = RateLimiting::new_with_policy_identity(
+            config,
+            client(second_client_namespace),
+            policy_namespace,
+            config_id,
+        )?;
+        Ok(first.shares_local_state_with(&second))
+    }
+
+    /// Whether two identityless standalone `rate_limiting` instances share
+    /// local state. They must not: production
     /// [`crate::plugin_cache::PluginCache`] paths always attach a validated
     /// stable identity, and identityless instances cannot share or mutate a live
     /// production policy's counters.
