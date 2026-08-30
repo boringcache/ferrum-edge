@@ -387,13 +387,10 @@ fn collect_pod(acc: &mut K8sAccumulator, object: &K8sObject) {
         name: object.metadata.name.clone(),
         uid: object.metadata.uid.clone(),
         labels: object.metadata.labels.clone(),
-        service_account: string_field(&object.spec, "serviceAccountName")
-            .filter(|value| !value.is_empty())
-            .unwrap_or("default")
-            .to_string(),
+        service_account: pod_service_account(object).to_string(),
         addresses,
         ports: pod_ports(object),
-        node_name: string_field(&object.spec, "nodeName").map(ToOwned::to_owned),
+        node_name: object_node_name(object).map(ToOwned::to_owned),
         ready: pod_is_ready(object),
         node_waypoint_proxy: false,
     };
@@ -483,7 +480,8 @@ fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
                 pod_key,
                 addresses: string_array_from_value(endpoint, "addresses"),
                 ready: crate::util::endpointslice::endpoint_slice_endpoint_is_ready(endpoint),
-                node_name: string_field(endpoint, "nodeName").map(ToOwned::to_owned),
+                node_name: nonempty_node_name(string_field(endpoint, "nodeName"))
+                    .map(ToOwned::to_owned),
             }
         })
         .collect();
@@ -976,8 +974,10 @@ fn auto_workloads_for_service(
                     merged.addresses.push(address.clone());
                 }
             }
-            if merged.node_name.is_none() {
-                merged.node_name = endpoint.node_name.clone();
+            if nonempty_node_name(merged.node_name.as_deref()).is_none()
+                && let Some(node_name) = nonempty_node_name(endpoint.node_name.as_deref())
+            {
+                merged.node_name = Some(node_name.to_string());
             }
         }
     }
@@ -1039,7 +1039,8 @@ fn workload_from_pod(
     };
     addresses.sort();
     addresses.dedup();
-    let node_name = endpoint.node_name.as_deref().or(pod.node_name.as_deref());
+    let node_name = nonempty_node_name(endpoint.node_name.as_deref())
+        .or_else(|| nonempty_node_name(pod.node_name.as_deref()));
     let locality = node_name.and_then(|node| acc.core.node_localities.get(node).cloned());
     let node_waypoint = node_name.and_then(|node| node_waypoint_for_node(acc, node));
 
@@ -1075,19 +1076,14 @@ fn identity_only_workload_from_pod(
     let path = format!("ns/{}/sa/{}", pod.namespace, pod.service_account);
     let spiffe_id = SpiffeId::from_parts(&acc.options.trust_domain, &path)
         .map_err(|e| invalid_resource_for_core_pod(pod, format!("invalid pod SPIFFE ID: {e}")))?;
-    let locality = pod
-        .node_name
-        .as_deref()
-        .and_then(|node| acc.core.node_localities.get(node).cloned());
+    let node_name = nonempty_node_name(pod.node_name.as_deref());
+    let locality = node_name.and_then(|node| acc.core.node_localities.get(node).cloned());
     // Same node-local NodeWaypoint binding as service-backed workloads. These
     // pods are the SOURCE identities a NodeWaypoint asserts over HBONE (the
     // live harness src-a shape: ServiceAccount + capture, no Service). Without
     // this, `node_waypoint_assertors_from_workloads` would omit them and the
     // destination's fail-closed grant would 403 legitimate same-node traffic.
-    let node_waypoint = pod
-        .node_name
-        .as_deref()
-        .and_then(|node| node_waypoint_for_node(acc, node));
+    let node_waypoint = node_name.and_then(|node| node_waypoint_for_node(acc, node));
 
     Ok(Workload {
         spiffe_id,
@@ -1130,10 +1126,7 @@ fn node_waypoint_pod_candidate(
     if !matches_node_waypoint_topology(topology) {
         return None;
     }
-    let node_name = pod.node_name.as_ref()?.trim();
-    if node_name.is_empty() {
-        return None;
-    }
+    let node_name = nonempty_node_name(pod.node_name.as_deref())?;
     let address = pod
         .addresses
         .iter()
@@ -1168,7 +1161,7 @@ pub(super) fn trusted_node_waypoint_pod_object(
             .labels
             .get("app.kubernetes.io/name")
             .is_some_and(|value| value == "ferrum-mesh-ambient")
-        && string_field(&object.spec, "serviceAccountName") == Some("ferrum-mesh")
+        && pod_service_account(object) == "ferrum-mesh"
         && pod_env_value(object, "FERRUM_MESH_TOPOLOGY").is_some_and(matches_node_waypoint_topology)
 }
 
@@ -1208,6 +1201,7 @@ fn node_waypoint_spiffe_id(object: &K8sObject) -> Option<SpiffeId> {
 }
 
 fn node_waypoint_for_node(acc: &K8sAccumulator, node_name: &str) -> Option<NodeWaypointEndpoint> {
+    let node_name = nonempty_node_name(Some(node_name))?;
     let waypoint = acc.core.node_waypoints_by_node.get(node_name)?;
     Some(NodeWaypointEndpoint {
         address: waypoint.address.clone(),
@@ -1231,6 +1225,21 @@ fn pod_host_network(object: &K8sObject) -> bool {
         .get("hostNetwork")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+fn pod_service_account(object: &K8sObject) -> &str {
+    string_field(&object.spec, "serviceAccountName")
+        .filter(|value| !value.is_empty())
+        .or_else(|| string_field(&object.spec, "serviceAccount").filter(|value| !value.is_empty()))
+        .unwrap_or("default")
+}
+
+fn object_node_name(object: &K8sObject) -> Option<&str> {
+    nonempty_node_name(string_field(&object.spec, "nodeName"))
+}
+
+fn nonempty_node_name(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|name| !name.is_empty())
 }
 
 fn pod_env_value<'a>(object: &'a K8sObject, name: &str) -> Option<&'a str> {
@@ -1272,20 +1281,23 @@ fn pod_env_value_resolved(object: &K8sObject, name: &str) -> Option<String> {
             let Some(env_name) = string_field(env, "name") else {
                 continue;
             };
-            if let Some(value) = string_field(env, "value") {
-                let resolved = expand_pod_env_refs(value, &values);
-                if env_name == name {
-                    return Some(resolved);
-                }
-                values.insert(env_name.to_string(), resolved);
+            // Kubernetes stores fieldRef env vars with an omitted or empty
+            // `value` beside `valueFrom`. An empty companion value must not
+            // win: kubelet uses valueFrom, and treating "" as resolved would
+            // expand `$(FERRUM_K8S_NODE_NAME)` to an empty SPIFFE path segment
+            // that SpiffeId rejects — publishing no NodeWaypoint metadata.
+            let field_ref = pod_env_field_ref_value(object, env);
+            let literal = string_field(env, "value")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| expand_pod_env_refs(value, &values));
+            let Some(resolved) = field_ref.or(literal) else {
                 continue;
+            };
+            if env_name == name {
+                return Some(resolved);
             }
-            if let Some(value) = pod_env_field_ref_value(object, env) {
-                if env_name == name {
-                    return Some(value);
-                }
-                values.insert(env_name.to_string(), value);
-            }
+            values.insert(env_name.to_string(), resolved);
         }
     }
     None
@@ -1316,16 +1328,13 @@ fn expand_pod_env_refs(value: &str, values: &HashMap<String, String>) -> String 
 }
 
 fn pod_env_field_ref_value(object: &K8sObject, env: &Value) -> Option<String> {
-    match env
-        .get("valueFrom")?
-        .get("fieldRef")?
-        .get("fieldPath")?
-        .as_str()?
-    {
+    let field_ref = env.get("valueFrom")?.get("fieldRef")?;
+    let field_path = field_ref.get("fieldPath")?.as_str()?;
+    match field_path {
         "metadata.name" => Some(object.metadata.name.clone()),
         "metadata.namespace" => Some(object.metadata.namespace.clone()),
         "metadata.uid" => Some(object.metadata.uid.clone()),
-        "spec.nodeName" => string_field(&object.spec, "nodeName").map(ToOwned::to_owned),
+        "spec.nodeName" => object_node_name(object).map(ToOwned::to_owned),
         _ => None,
     }
 }

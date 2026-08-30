@@ -759,6 +759,40 @@ fn live_contract_sidecar_run_sh_unquoted_yaml_heredocs_avoid_backticks() {
     );
 }
 
+/// Unquoted `<<EOF` heredocs in the NodeWaypoint eBPF live harness interpolate
+/// `$UNMANAGED_NS` / `$DTLS_CLIENT_IMAGE`. Markdown backticks in YAML comments
+/// inside that expandable body are command substitutions: hosted run
+/// 33219677886 failed with `skb_scrub_packet: command not found` before
+/// admission.
+#[test]
+fn live_contract_node_waypoint_ebpf_run_sh_unquoted_eof_heredocs_avoid_backticks() {
+    const RUN_SH: &str = include_str!("../k8s/node_waypoint_ebpf_live/run.sh");
+    let mut in_unquoted_eof_heredoc = false;
+    for (line_no, line) in RUN_SH.lines().enumerate() {
+        let trimmed = line.trim();
+        if !in_unquoted_eof_heredoc {
+            if line.contains("<<EOF") && !line.contains("<<'EOF'") && !line.contains("<<\"EOF\"") {
+                in_unquoted_eof_heredoc = true;
+            }
+            continue;
+        }
+        if trimmed == "EOF" || trimmed.starts_with("EOF)") {
+            in_unquoted_eof_heredoc = false;
+            continue;
+        }
+        assert!(
+            !line.contains('`'),
+            "run.sh:{}: backticks inside an unquoted EOF heredoc are executed \
+             as command substitution — keep shell metacharacters out of heredoc data",
+            line_no + 1
+        );
+    }
+    assert!(
+        !in_unquoted_eof_heredoc,
+        "run.sh ended while still inside an unquoted EOF heredoc — parse guard is broken"
+    );
+}
+
 /// Issue #3855: the release-blocking native MeshSubscribe deployments must
 /// keep the production mTLS + JWT + Service-DNS posture. A PR that silently
 /// restores plaintext h2c, TLS_NO_VERIFY, or drops client-CA/client-cert
