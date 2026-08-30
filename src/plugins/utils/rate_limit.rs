@@ -3,10 +3,10 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -635,7 +635,9 @@ where
 {
     plugin_name: &'static str,
     primary: RedisLimiter<A>,
-    fallback: LocalLimiter<K, A>,
+    /// Shared with every compatible plugin-cache generation for this policy
+    /// identity, so a reload cannot hand callers a fresh local budget.
+    fallback: Arc<LocalLimiter<K, A>>,
     /// What happens when the centralized store cannot be consulted. Under the
     /// default [`RedisFailurePolicy::FailClosed`] the `fallback` limiter is
     /// retained but never consulted for admission — the plugin's cleanup and
@@ -666,7 +668,7 @@ where
     pub fn new(
         plugin_name: &'static str,
         primary: RedisLimiter<A>,
-        fallback: LocalLimiter<K, A>,
+        fallback: Arc<LocalLimiter<K, A>>,
         failure_policy: RedisFailurePolicy,
     ) -> Self {
         let observed_available = Arc::new(AtomicBool::new(true));
@@ -869,12 +871,396 @@ where
     }
 }
 
+/// Process registry of live local rate-limit state for one `(key, algorithm)`
+/// pair, keyed by stable policy identity.
+///
+/// Entries are `Weak`, so a limiter survives only while a plugin instance still
+/// owns it. Every resolution prunes dead entries first, which bounds retention
+/// to the currently configured policies plus any retired semantic generation
+/// whose instance is still installed in a live plugin-cache generation. A
+/// removed policy therefore becomes reclaimable as soon as its last instance is
+/// dropped — nothing here keeps a strong reference.
+///
+/// The lock is taken at plugin construction/reload only. The request path holds
+/// the resolved `Arc` and never touches this map.
+///
+/// Public only because [`SharedLocalLimiterState::registry`] names it; every
+/// operation on it is module-private.
+pub struct LocalLimiterRegistry<K, A>
+where
+    K: Eq + Hash,
+    A: RateLimitAlgorithm,
+{
+    /// Policy identity -> every still-live semantic generation for it, as
+    /// `(compatibility fingerprint, weak limiter)`.
+    #[allow(clippy::type_complexity)]
+    // the shape is the contract; naming it needs a bounded alias
+    generations: OnceLock<Mutex<HashMap<String, Vec<(String, Weak<LocalLimiter<K, A>>)>>>>,
+}
+
+impl<K, A> LocalLimiterRegistry<K, A>
+where
+    K: Eq + Hash + Clone + Send + Sync + 'static,
+    A: RateLimitAlgorithm,
+{
+    const fn new() -> Self {
+        Self {
+            generations: OnceLock::new(),
+        }
+    }
+
+    #[allow(clippy::type_complexity)] // mirrors the `generations` field shape
+    fn locked(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, Vec<(String, Weak<LocalLimiter<K, A>>)>>> {
+        self.generations
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Resolve the limiter for one policy identity and semantic fingerprint.
+    ///
+    /// A compatible reload generation inherits the live limiter, so an already
+    /// consumed budget keeps rejecting. A semantic change resolves onto a fresh
+    /// limiter and registers a second generation for the identity, so a retired
+    /// generation's still-installed instance keeps enforcing on the state it
+    /// admitted against and can never corrupt the replacement policy. Every
+    /// live generation is retained (not just the last), so while A and B are
+    /// concurrently live another A construction recovers A's budget rather
+    /// than minting a third empty domain.
+    fn resolve(
+        &self,
+        namespace: &str,
+        plugin_name: &str,
+        config_id: &str,
+        fingerprint: String,
+        build: impl FnOnce() -> LocalLimiter<K, A>,
+    ) -> Arc<LocalLimiter<K, A>> {
+        let identity = local_limiter_policy_identity(namespace, plugin_name, config_id);
+        let mut guard = self.locked();
+        prune_dead_generations(&mut guard);
+        if let Some(existing) = guard.get(&identity).and_then(|generations| {
+            generations
+                .iter()
+                .find(|(known, _)| *known == fingerprint)
+                .and_then(|(_, weak)| weak.upgrade())
+        }) {
+            return existing;
+        }
+        let resets_live_budget = guard
+            .get(&identity)
+            .is_some_and(|generations| !generations.is_empty());
+        let limiter = Arc::new(build());
+        if resets_live_budget {
+            info!(
+                namespace = %namespace,
+                plugin = %plugin_name,
+                config_id = %config_id,
+                "Rate-limit policy semantics changed; starting a fresh local budget"
+            );
+        }
+        guard
+            .entry(identity)
+            .or_default()
+            .push((fingerprint, Arc::downgrade(&limiter)));
+        limiter
+    }
+
+    /// Number of still-live semantic generations retained for `identity`.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    fn live_generations(&self, identity: &str) -> usize {
+        let mut guard = self.locked();
+        prune_dead_generations(&mut guard);
+        guard
+            .get(identity)
+            .map(|generations| generations.len())
+            .unwrap_or(0)
+    }
+}
+
+/// Drop every generation whose limiter has no live owner, and every identity
+/// left with none.
+#[allow(clippy::type_complexity)] // mirrors the `LocalLimiterRegistry` field shape
+fn prune_dead_generations<K, A>(
+    generations: &mut HashMap<String, Vec<(String, Weak<LocalLimiter<K, A>>)>>,
+) where
+    K: Eq + Hash,
+    A: RateLimitAlgorithm,
+{
+    generations.retain(|_, entries| {
+        entries.retain(|(_, weak)| weak.strong_count() > 0);
+        !entries.is_empty()
+    });
+}
+
+/// A rate-limit algorithm whose local enforcement state can be inherited by a
+/// compatible plugin-cache generation.
+///
+/// Each implementation owns a *distinct, statically typed* registry, so two
+/// algorithms can never observe one another's state and no downcast is
+/// involved. Two plugin kinds that happen to share one algorithm type (the
+/// three `DynamicHttpRateLimitAlgorithm` consumers) are separated by the
+/// plugin name carried in the policy identity — see
+/// [`local_limiter_policy_identity`].
+pub trait SharedLocalLimiterState: RateLimitAlgorithm + Clone + Sized {
+    /// Local limiter key type this algorithm is enforced with.
+    type Key: Eq + Hash + Clone + Send + Sync + 'static;
+
+    /// The process registry for this exact `(Key, Self)` pair.
+    fn registry() -> &'static LocalLimiterRegistry<Self::Key, Self>;
+}
+
+/// Stable policy identity for local rate-limit state.
+///
+/// The components are trusted configuration — namespace, plugin kind, and the
+/// configured plugin-config resource id — never request-controlled data, an
+/// allocation address, or construction order. NUL cannot appear in any of them,
+/// so the joined form is unambiguous: two tenants that reuse a bare
+/// plugin-config id stay in separate enforcement domains, and two limiter
+/// plugin kinds that share one id never collide.
+fn local_limiter_policy_identity(namespace: &str, plugin_name: &str, config_id: &str) -> String {
+    format!("{namespace}\0{plugin_name}\0{config_id}")
+}
+
+/// Canonical description of one policy's **effective** local enforcement
+/// semantics, built by the plugin after its own parsing, defaulting, and
+/// normalization have already run.
+///
+/// Raw configuration syntax is deliberately not an input. Two configurations
+/// that parse to the same enforcement — an omitted optional field and its
+/// explicit effective default, a value the parser lower-cases or trims, an
+/// omitted rate map and an explicit empty one — describe the same budget and
+/// must keep the same counters, or config churn alone would mint a fresh
+/// budget without changing what is enforced. Conversely any value the parser
+/// keeps is encoded here, so a real enforcement change still isolates.
+///
+/// Fields are self-delimiting and sorted by label before hashing, so neither
+/// the order a plugin records them in nor a hash-map iteration order can change
+/// the result. Never record a credential, URL, username, password, or TLS
+/// material: this value feeds [`local_limiter_fingerprint`], and the shared
+/// Redis posture is added there rather than by a plugin.
+#[derive(Debug, Default)]
+pub struct LocalStateSemantics {
+    fields: Vec<(&'static str, Vec<u8>)>,
+}
+
+impl LocalStateSemantics {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn push(&mut self, label: &'static str, encoded: Vec<u8>) {
+        debug_assert!(
+            !RATE_LIMIT_REDIS_CONFIG_KEYS.contains(&label),
+            "local rate-limit compatibility must not record shared Redis config fields; the \
+             enforcement posture is added by local_limiter_fingerprint"
+        );
+        debug_assert!(
+            !self.fields.iter().any(|(known, _)| *known == label),
+            "duplicate local rate-limit semantic label"
+        );
+        self.fields.push((label, encoded));
+    }
+
+    /// Record an already-normalized effective string (a parsed enum rendered
+    /// canonically, not the operator's raw spelling).
+    pub fn text(&mut self, label: &'static str, value: &str) {
+        self.push(label, value.as_bytes().to_vec());
+    }
+
+    /// Record an effective integer parameter (the value after defaulting).
+    pub fn u64(&mut self, label: &'static str, value: u64) {
+        self.push(label, value.to_le_bytes().to_vec());
+    }
+
+    /// Record an effective optional integer parameter. Unset is a distinct
+    /// enforcement state from any set value (an unlimited axis is not a
+    /// bounded one), so it is encoded distinctly rather than as zero.
+    pub fn optional_u64(&mut self, label: &'static str, value: Option<u64>) {
+        let mut encoded = Vec::with_capacity(9);
+        match value {
+            Some(value) => {
+                encoded.push(1);
+                encoded.extend_from_slice(&value.to_le_bytes());
+            }
+            None => encoded.push(0),
+        }
+        self.push(label, encoded);
+    }
+
+    /// Record one window list (limit + duration per window, in the order the
+    /// limiter evaluates them).
+    pub fn windows(&mut self, label: &'static str, specs: &[RateLimitWindowSpec]) {
+        self.push(label, encode_window_specs(specs));
+    }
+
+    /// Record a keyed set of window lists (per consumer, per operation, per
+    /// method). Entries are sorted by key, so a hash-map iteration order can
+    /// never change the fingerprint, and an omitted map and an explicit empty
+    /// map both encode as zero entries.
+    pub fn window_map<'a, I>(&mut self, label: &'static str, entries: I)
+    where
+        I: IntoIterator<Item = (&'a str, &'a [RateLimitWindowSpec])>,
+    {
+        let mut entries: Vec<(&str, &[RateLimitWindowSpec])> = entries.into_iter().collect();
+        entries.sort_by_key(|(key, _)| *key);
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (key, specs) in entries {
+            encoded.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            encoded.extend_from_slice(key.as_bytes());
+            let specs = encode_window_specs(specs);
+            encoded.extend_from_slice(&(specs.len() as u64).to_le_bytes());
+            encoded.extend_from_slice(&specs);
+        }
+        self.push(label, encoded);
+    }
+}
+
+/// Self-delimiting encoding of one window list. Durations are encoded in
+/// nanoseconds so a sub-second window can never collide with a whole-second one.
+fn encode_window_specs(specs: &[RateLimitWindowSpec]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(8 + specs.len() * 24);
+    encoded.extend_from_slice(&(specs.len() as u64).to_le_bytes());
+    for spec in specs {
+        encoded.extend_from_slice(&spec.limit.to_le_bytes());
+        encoded.extend_from_slice(&spec.duration.as_nanos().to_le_bytes());
+    }
+    encoded
+}
+
+/// Canonical, non-reversible fingerprint of everything that changes what local
+/// enforcement state *means* for one policy.
+///
+/// Inputs are the plugin's effective enforcement semantics
+/// ([`LocalStateSemantics`], built after validation) plus the shared posture
+/// resolved here: whether a centralized store is authoritative, and — only when
+/// it is — the outage policy that decides whether the local map is ever an
+/// admission domain and any explicitly configured Redis key prefix that names
+/// the counter domain. The default prefix is already determined by the stable
+/// policy identity and is therefore not a separate input.
+///
+/// `redis_failure_policy` is deliberately *conditional*. With `sync_mode: local`
+/// there is no centralized store to lose, the local map is the sole enforcement
+/// domain under every posture, and the field changes nothing that is enforced —
+/// so toggling it must not discard a live budget. Once Redis is enabled it
+/// decides whether the local map can admit at all during an outage, which is a
+/// real change in what the retained counters mean, so it isolates.
+///
+/// Secret-bearing configuration is never an input: `redis_url`,
+/// `redis_username`, `redis_password`, and the TLS material keys are excluded
+/// by construction, and [`LocalStateSemantics::push`] debug-asserts that no
+/// plugin records a shared Redis config field. The output is a SHA-256 hex
+/// digest: it is compared for equality only, is never logged, and carries no
+/// configuration text.
+fn local_limiter_fingerprint(
+    plugin_name: &str,
+    semantics: &LocalStateSemantics,
+    redis_enabled: bool,
+    failure_policy: RedisFailurePolicy,
+    explicit_redis_key_prefix: Option<&str>,
+) -> String {
+    use crate::fips::approved::Sha256;
+
+    let mut hasher = Sha256::new();
+    // Length-prefixed framing: no component can be re-read as part of another.
+    let mut absorb = |label: &str, value: &[u8]| {
+        hasher.update((label.len() as u64).to_le_bytes());
+        hasher.update(label.as_bytes());
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value);
+    };
+    absorb("v", b"ferrum-edge/rate-limit/local-state/v2");
+    absorb("plugin", plugin_name.as_bytes());
+    absorb("redis", if redis_enabled { b"1" } else { b"0" });
+    if redis_enabled {
+        absorb(
+            "failure_policy",
+            match failure_policy {
+                RedisFailurePolicy::FailClosed => b"fail_closed".as_slice(),
+                RedisFailurePolicy::LocalFallback => b"local_fallback".as_slice(),
+            },
+        );
+        if let Some(redis_key_prefix) = explicit_redis_key_prefix {
+            absorb("redis_key_prefix", redis_key_prefix.as_bytes());
+        }
+    }
+    // Sorted by label so the order a plugin records its semantics in is not
+    // itself a compatibility input.
+    let mut fields: Vec<(&str, &[u8])> = semantics
+        .fields
+        .iter()
+        .map(|(label, encoded)| (*label, encoded.as_slice()))
+        .collect();
+    fields.sort_by_key(|(label, _)| *label);
+    for (label, encoded) in fields {
+        absorb(label, encoded);
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Number of retained live generations for one policy identity. Test-only
+/// lifecycle probe; production code never inspects the registry.
+#[allow(dead_code)] // used only by external tests; dead in binary test target
+pub(crate) fn shared_local_limiter_generations_for_test<A>(
+    namespace: &str,
+    plugin_name: &str,
+    config_id: &str,
+) -> usize
+where
+    A: SharedLocalLimiterState,
+{
+    let identity = local_limiter_policy_identity(namespace, plugin_name, config_id);
+    A::registry().live_generations(&identity)
+}
+
+impl SharedLocalLimiterState for DynamicHttpRateLimitAlgorithm {
+    type Key = String;
+
+    fn registry() -> &'static LocalLimiterRegistry<String, Self> {
+        static REGISTRY: LocalLimiterRegistry<String, DynamicHttpRateLimitAlgorithm> =
+            LocalLimiterRegistry::new();
+        &REGISTRY
+    }
+}
+
+impl SharedLocalLimiterState for AiTokenRateAlgorithm {
+    type Key = String;
+
+    fn registry() -> &'static LocalLimiterRegistry<String, Self> {
+        static REGISTRY: LocalLimiterRegistry<String, AiTokenRateAlgorithm> =
+            LocalLimiterRegistry::new();
+        &REGISTRY
+    }
+}
+
+impl SharedLocalLimiterState for WsFrameRateAlgorithm {
+    type Key = u64;
+
+    fn registry() -> &'static LocalLimiterRegistry<u64, Self> {
+        static REGISTRY: LocalLimiterRegistry<u64, WsFrameRateAlgorithm> =
+            LocalLimiterRegistry::new();
+        &REGISTRY
+    }
+}
+
+impl SharedLocalLimiterState for UdpRateLimitAlgorithm {
+    type Key = Arc<str>;
+
+    fn registry() -> &'static LocalLimiterRegistry<Arc<str>, Self> {
+        static REGISTRY: LocalLimiterRegistry<Arc<str>, UdpRateLimitAlgorithm> =
+            LocalLimiterRegistry::new();
+        &REGISTRY
+    }
+}
+
 pub enum RateLimitBackend<K, A>
 where
     K: Eq + Hash,
     A: RateLimitAlgorithm,
 {
-    Local(LocalLimiter<K, A>),
+    Local(Arc<LocalLimiter<K, A>>),
     Failover(FailoverLimiter<K, A>),
 }
 
@@ -915,7 +1301,7 @@ where
         // Validated regardless of sync_mode so a later toggle cannot activate an
         // unchecked value.
         let failure_policy = parse_redis_failure_policy(config)?;
-        let local = LocalLimiter::new(algorithm.clone(), shard_amount);
+        let local = Arc::new(LocalLimiter::new(algorithm.clone(), shard_amount));
         match RedisLimiter::new_with_config_id(
             plugin_name,
             config_id,
@@ -931,6 +1317,109 @@ where
             ))),
             Ok(None) => Ok(Self::Local(local)),
             Err(err) => Err(err),
+        }
+    }
+
+    /// [`Self::from_plugin_config_with_config_id`] that additionally inherits
+    /// live *local* enforcement state from a compatible plugin-cache
+    /// generation for the same stable policy identity.
+    ///
+    /// Every path that reconstructs a plugin instance — a full reload
+    /// (file-mode `SIGHUP`, a DP full CP snapshot, a rejected-delta fallback),
+    /// a global plugin-config change or deletion anywhere in the namespace, or
+    /// a change to the owning proxy's associations — used to hand every caller
+    /// a brand new empty budget. The configured ceiling then became effectively
+    /// unbounded for anyone able to churn configuration. State is now owned by
+    /// the policy, not by the instance the cache happened to construct.
+    ///
+    /// `namespace` is `None` only for construction entry points that have no
+    /// stable policy identity, including direct/test and standalone validation
+    /// helpers. Those keep private state. Security-composition candidate
+    /// validation and production [`crate::plugin_cache::PluginCache`] builds
+    /// supply the config's validated identity; candidates can resolve retained
+    /// state but never run traffic or mutate its counters.
+    ///
+    /// `semantics` carries this plugin's **effective** enforcement parameters —
+    /// limit dimension, windows, maximums, algorithm parameters, and any
+    /// plugin-specific shaping — as they are after the plugin's own parsing,
+    /// defaulting, and normalization. It is deliberately not raw config syntax:
+    /// two configurations that parse to the same enforcement keep one budget,
+    /// so config churn alone cannot mint a fresh one. Together with the shared
+    /// posture resolved here (`sync_mode`, and when Redis is enabled the
+    /// failure posture and any explicitly configured key prefix) it forms the
+    /// compatibility fingerprint: a real enforcement change isolates
+    /// immediately onto fresh state, while an unrelated config, ordering, or
+    /// HTTP-client rebuild inherits the live budget. Never record a
+    /// secret-bearing value there (see [`local_limiter_fingerprint`]).
+    pub fn from_plugin_config_with_policy_identity(
+        plugin_name: &'static str,
+        namespace: Option<&str>,
+        config_id: &str,
+        config: &Value,
+        http_client: &PluginHttpClient,
+        algorithm: A,
+        semantics: &LocalStateSemantics,
+    ) -> Result<Self, String>
+    where
+        A: SharedLocalLimiterState<Key = K>,
+    {
+        let shard_amount = http_client.pool_shard_amount();
+        let failure_policy = parse_redis_failure_policy(config)?;
+        // Resolved before any state is registered so a rejected Redis config
+        // cannot register a generation for this identity at all.
+        let redis = RedisLimiter::new_with_config_id(
+            plugin_name,
+            config_id,
+            config,
+            http_client,
+            algorithm.clone(),
+        )?;
+        let explicit_redis_key_prefix = config.get("redis_key_prefix").and_then(Value::as_str);
+        let local = match namespace {
+            Some(namespace) => A::registry().resolve(
+                namespace,
+                plugin_name,
+                config_id,
+                local_limiter_fingerprint(
+                    plugin_name,
+                    semantics,
+                    redis.is_some(),
+                    failure_policy,
+                    explicit_redis_key_prefix,
+                ),
+                // Shard count is the process-wide FERRUM_POOL_SHARD_AMOUNT and
+                // is therefore identical for every generation in this process;
+                // it is deliberately not a compatibility input, because
+                // resetting a live budget is the very failure being fixed.
+                || LocalLimiter::new(algorithm.clone(), shard_amount),
+            ),
+            None => Arc::new(LocalLimiter::new(algorithm.clone(), shard_amount)),
+        };
+        match redis {
+            Some(redis) => Ok(Self::Failover(FailoverLimiter::new(
+                plugin_name,
+                redis,
+                local,
+                failure_policy,
+            ))),
+            None => Ok(Self::Local(local)),
+        }
+    }
+
+    /// Whether this backend enforces on the same local state as `other`.
+    ///
+    /// A compatible reload generation for one policy identity must share; an
+    /// unrelated policy, tenant, plugin kind, or semantically changed policy
+    /// must not. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn shares_local_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(self.local_state_arc(), other.local_state_arc())
+    }
+
+    fn local_state_arc(&self) -> &Arc<LocalLimiter<K, A>> {
+        match self {
+            Self::Local(local) => local,
+            Self::Failover(failover) => &failover.fallback,
         }
     }
 
@@ -1693,13 +2182,29 @@ impl RateLimitAlgorithm for DynamicHttpRateLimitAlgorithm {
         now: Instant,
     ) -> RateLimitOutcome {
         if !Arc::ptr_eq(&state.specs, &op.specs) {
-            if !state.windows.is_empty() {
-                warn!(
-                    "DynamicHttpRateLimitAlgorithm: spec change detected for in-progress key; counter state will be reset"
-                );
+            // Pointer inequality alone is NOT a spec change. Every compatible
+            // plugin rebuild — a full reload, a global plugin-config change or
+            // deletion, a proxy-association edit — constructs a fresh
+            // `DynamicRateLimitOp` with the same window values, so keying the
+            // reset on identity would discard the retained counters on the
+            // first request through the rebuilt instance and defeat the
+            // policy-owned local state entirely (issue #4268). Compare the
+            // window values instead; only a genuinely different spec resets.
+            let specs_changed = {
+                let retained: &[RateLimitWindowSpec] = &state.specs;
+                let requested: &[RateLimitWindowSpec] = &op.specs;
+                retained != requested
+            };
+            if specs_changed {
+                state.windows = new_http_window_states(op.specs());
             }
+            // Retarget onto the caller's `Arc` either way, so the steady state
+            // after a rebuild is a pointer comparison again and the value
+            // compare is paid once per key. Two live cache generations that
+            // alternate equal-spec `Arc`s on one key keep retargeting, which is
+            // a short slice compare under the per-key write guard already held
+            // — never a reset, so neither generation can over-admit.
             state.specs = Arc::clone(&op.specs);
-            state.windows = new_http_window_states(op.specs());
         }
         check_http_windows(op.specs(), &mut state.windows, now)
     }
@@ -3686,7 +4191,10 @@ mod tests {
         let algorithm = TestAlgorithm {
             redis_ok: Arc::clone(&redis_ok),
         };
-        let local = LocalLimiter::new(algorithm.clone(), http_client.pool_shard_amount());
+        let local = Arc::new(LocalLimiter::new(
+            algorithm.clone(),
+            http_client.pool_shard_amount(),
+        ));
         let redis = test_redis_limiter(&http_client, algorithm);
         let limiter = FailoverLimiter::new(
             "rate_limiting",
@@ -3735,8 +4243,10 @@ mod tests {
         let algorithm = TestAlgorithm {
             redis_ok: Arc::new(AtomicBool::new(true)),
         };
-        let local: LocalLimiter<String, TestAlgorithm> =
-            LocalLimiter::new(algorithm.clone(), http_client.pool_shard_amount());
+        let local: Arc<LocalLimiter<String, TestAlgorithm>> = Arc::new(LocalLimiter::new(
+            algorithm.clone(),
+            http_client.pool_shard_amount(),
+        ));
         let redis = test_redis_limiter(&http_client, algorithm);
 
         let _limiter = FailoverLimiter::new(
@@ -3754,7 +4264,10 @@ mod tests {
         let algorithm = TestAlgorithm {
             redis_ok: Arc::clone(&redis_ok),
         };
-        let local = LocalLimiter::new(algorithm.clone(), http_client.pool_shard_amount());
+        let local = Arc::new(LocalLimiter::new(
+            algorithm.clone(),
+            http_client.pool_shard_amount(),
+        ));
         let redis = test_redis_limiter(&http_client, algorithm);
         let limiter = FailoverLimiter::new(
             "rate_limiting",

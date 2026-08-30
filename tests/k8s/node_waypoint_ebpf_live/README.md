@@ -53,7 +53,9 @@ destination HBONE CONNECT was rejected with 403; in both cases the destination
 policy-deny counter for the expected NodeWaypoint assertor must increase.
 The production SPIRE pass also restarts the SPIRE Agent DaemonSet and the
 NodeWaypoint ambient DaemonSet, then waits for fresh SPIRE Agent SVID metrics,
-registry/mesh-slice readiness, fresh source admission, allow/deny traffic, and
+registry/mesh-slice readiness including destination `node_waypoint` metadata
+(not just resource counts), fresh source admission, allow traffic, an HTTP 403
+policy deny (a Ferrum route-miss 404 is not a deny), and
 plaintext/no-client-SVID HBONE rejection before recording
 `node_waypoint.identity.spire_restart_recovery`. It also asserts ADR
 observability counter movement:

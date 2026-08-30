@@ -11,8 +11,8 @@ use tokio::sync::watch;
 use crate::common::{empty_digest_header, generate_hmac_signature};
 
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, PluginAssociation,
-    PluginConfig, PluginScope, Proxy,
+    AuthMode, BackendScheme, CircuitBreakerConfig, Consumer, DispatchKind, GatewayConfig,
+    PluginAssociation, PluginConfig, PluginScope, Proxy,
 };
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -20,8 +20,9 @@ use ferrum_edge::identity::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::MeshTrafficDirection;
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, InboundRelayDenial, MeshConfig, MeshEgressUdpDestination,
-    MeshEgressUdpDialEndpoint, Workload, WorkloadPort, WorkloadSelector,
-    inbound_relay_destinations_from_workloads,
+    MeshEgressUdpDialEndpoint, MeshInboundRelayDestination, MeshInboundRelayHost,
+    ResolvedIngressListener, Workload, WorkloadPort, WorkloadSelector,
+    inbound_relay_destinations_from_workloads, inbound_relay_resolved_ip_is_loopback_namespace,
 };
 use ferrum_edge::proxy::{
     ProxyState, start_proxy_listener_with_bound_listener,
@@ -1629,13 +1630,48 @@ fn relay_guard_workload(service: &str, addresses: &[&str], ports: &[u16]) -> Wor
     }
 }
 
-/// Slice shaped like an own-pod terminator (`Sidecar` / `Ambient`) that runs at
-/// `10.244.1.7` in a namespace where `10.244.9.9` is another pod entirely.
-fn own_pod_terminator_mesh() -> MeshConfig {
+/// Slice shaped like a Sidecar terminator that runs at `10.244.1.7` in a
+/// namespace where `10.244.9.9` is another pod entirely. Sidecar shares the
+/// application pod's network namespace, so loopback is an own-namespace shortcut.
+fn sidecar_terminator_mesh() -> MeshConfig {
     MeshConfig {
         workloads: vec![
             relay_guard_workload("app", &["10.244.1.7", "fd00:10:244:1::7"], &[8080]),
             relay_guard_workload("neighbour", &["10.244.9.9"], &[8080]),
+        ],
+        inbound_relay_admits_accepted_local_address: true,
+        inbound_relay_admits_loopback_namespace: true,
+        ..MeshConfig::default()
+    }
+}
+
+/// Ambient terminator at a non-loopback pod IP, with loopback/DNS-localhost
+/// also present in inventory. Ambient is node-shared and must not inherit
+/// Sidecar's loopback-namespace shortcut.
+fn ambient_terminator_mesh() -> MeshConfig {
+    MeshConfig {
+        workloads: vec![relay_guard_workload(
+            "app",
+            &["10.244.1.7", "127.0.0.1"],
+            &[8080],
+        )],
+        inbound_relay_destinations: vec![
+            MeshInboundRelayDestination {
+                host: MeshInboundRelayHost::Ip(ip("10.244.1.7")),
+                ports: vec![8080],
+            },
+            MeshInboundRelayDestination {
+                host: MeshInboundRelayHost::Ip(ip("127.0.0.1")),
+                ports: vec![8080],
+            },
+            MeshInboundRelayDestination {
+                host: MeshInboundRelayHost::Name("localhost".to_string()),
+                ports: vec![8080],
+            },
+            MeshInboundRelayDestination {
+                host: MeshInboundRelayHost::Name("app.localhost".to_string()),
+                ports: vec![8080],
+            },
         ],
         inbound_relay_admits_accepted_local_address: true,
         ..MeshConfig::default()
@@ -1650,7 +1686,7 @@ fn ip(literal: &str) -> std::net::IpAddr {
 /// terminator's own workload, so the transparent relay serves it.
 #[test]
 fn inbound_relay_admits_the_terminators_own_address() {
-    let mesh = own_pod_terminator_mesh();
+    let mesh = sidecar_terminator_mesh();
     let own = Some(ip("10.244.1.7"));
 
     assert_eq!(
@@ -1667,12 +1703,109 @@ fn inbound_relay_admits_the_terminators_own_address() {
         mesh.inbound_relay_destination_decision("localhost", 8080, own),
         Ok(())
     );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("localhost.", 8080, own),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("app.localhost", 8080, own),
+        Ok(())
+    );
+    // IPv4-mapped loopback is the same namespace: Sidecar admits it only on
+    // an owned declared port, never as a stray local listener.
+    for host in ["::ffff:127.0.0.1", "[::ffff:127.0.0.1]"] {
+        assert_eq!(
+            mesh.inbound_relay_destination_decision(host, 8080, own),
+            Ok(()),
+            "Sidecar must admit mapped-loopback authority {host} on a declared port"
+        );
+        assert_eq!(
+            mesh.inbound_relay_destination_decision(host, 15021, own),
+            Err(InboundRelayDenial::PortNotDeclared),
+            "Sidecar must still bound mapped-loopback authority {host} to declared ports"
+        );
+    }
     // A port this pod does not declare is still refused, so a stray local
     // listener is not reachable just because it shares the netns.
     assert_eq!(
         mesh.inbound_relay_destination_decision("127.0.0.1", 15021, own),
         Err(InboundRelayDenial::PortNotDeclared)
     );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("localhost", 15021, own),
+        Err(InboundRelayDenial::PortNotDeclared)
+    );
+}
+
+/// Ambient may admit the accepted socket's non-loopback local destination, but
+/// must not inherit Sidecar's own-network-namespace loopback shortcut.
+#[test]
+fn inbound_relay_ambient_refuses_loopback_namespace() {
+    let mesh = ambient_terminator_mesh();
+    let own = Some(ip("10.244.1.7"));
+
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.1.7", 8080, own),
+        Ok(())
+    );
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.1.7", 15021, own),
+        Err(InboundRelayDenial::PortNotDeclared)
+    );
+    for host in [
+        "127.0.0.1",
+        "::1",
+        "::ffff:127.0.0.1",
+        "[::ffff:127.0.0.1]",
+        "localhost",
+        "localhost.",
+        "app.localhost",
+    ] {
+        assert_eq!(
+            mesh.inbound_relay_destination_decision(host, 8080, own),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "Ambient must refuse loopback-namespace authority {host} even when inventory-listed"
+        );
+    }
+}
+
+/// IPv4-mapped IPv6 loopback (`::ffff:127.0.0.1`) must be classified as the
+/// loopback namespace before accepted-local-address or inventory matching.
+/// `IpAddr::is_loopback()` is false for that form; later `to_canonical()`
+/// would otherwise match a `127.0.0.1` inventory entry and bypass the
+/// Sidecar-only loopback refusal.
+#[test]
+fn inbound_relay_mapped_ipv4_loopback_does_not_fall_through_to_inventory() {
+    let mapped = ["::ffff:127.0.0.1", "[::ffff:127.0.0.1]"];
+    let own = Some(ip("10.244.1.7"));
+
+    let ambient = ambient_terminator_mesh();
+    for host in mapped {
+        assert_eq!(
+            ambient.inbound_relay_destination_decision(host, 8080, own),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "Ambient must refuse mapped-loopback {host} even when inventory lists 127.0.0.1"
+        );
+    }
+
+    // Waypoint / gateway topologies leave both privilege flags false (the
+    // MeshConfig default). Inventory listing canonical loopback still cannot
+    // admit the mapped spelling.
+    let gateway = MeshConfig {
+        inbound_relay_destinations: inbound_relay_destinations_from_workloads(&[
+            relay_guard_workload("loopback-app", &["127.0.0.1"], &[8080]),
+        ]),
+        ..MeshConfig::default()
+    };
+    assert!(!gateway.inbound_relay_admits_accepted_local_address);
+    assert!(!gateway.inbound_relay_admits_loopback_namespace);
+    for host in mapped {
+        assert_eq!(
+            gateway.inbound_relay_destination_decision(host, 8080, own),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "waypoint/gateway default-false must refuse mapped-loopback authority {host}"
+        );
+    }
 }
 
 /// The issue #4150 fix: another workload the SLICE declares is not a
@@ -1680,7 +1813,7 @@ fn inbound_relay_admits_the_terminators_own_address() {
 /// plaintext from this pod's IP and skip its own AuthorizationPolicy set.
 #[test]
 fn inbound_relay_refuses_a_different_slice_declared_workload() {
-    let mesh = own_pod_terminator_mesh();
+    let mesh = sidecar_terminator_mesh();
     let own = Some(ip("10.244.1.7"));
 
     assert_eq!(
@@ -1705,7 +1838,7 @@ fn inbound_relay_refuses_a_different_slice_declared_workload() {
 /// is a different destination.
 #[test]
 fn inbound_relay_folds_ipv4_mapped_ipv6_to_one_decision() {
-    let mesh = own_pod_terminator_mesh();
+    let mesh = sidecar_terminator_mesh();
     let own_v4 = Some(ip("10.244.1.7"));
     let own_mapped = Some(ip("::ffff:10.244.1.7"));
     let own_v6 = Some(ip("fd00:10:244:1::7"));
@@ -1773,16 +1906,426 @@ fn inbound_relay_admits_only_the_waypoint_termination_inventory() {
         Err(InboundRelayDenial::AddressNotTerminated)
     );
 
-    // Loopback in the inventory itself is a real termination target (the
-    // functional waypoint suite declares `127.0.0.1`).
+    // Inventory data cannot make the waypoint/host network namespace's
+    // loopback address into a workload termination target.
     let loopback_mesh = MeshConfig {
         inbound_relay_destinations: inbound_relay_destinations_from_workloads(&[
             relay_guard_workload("loopback-app", &["127.0.0.1"], &[8080]),
         ]),
         ..MeshConfig::default()
     };
+    for host in ["127.0.0.1", "::1", "::ffff:127.0.0.1", "[::ffff:127.0.0.1]"] {
+        assert_eq!(
+            loopback_mesh.inbound_relay_destination_decision(host, 8080, waypoint),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "waypoint must refuse loopback-namespace authority {host} even when inventory-listed"
+        );
+    }
+
+    let localhost_namespace_mesh = MeshConfig {
+        inbound_relay_destinations: vec![
+            MeshInboundRelayDestination {
+                host: MeshInboundRelayHost::Name("localhost.".to_string()),
+                ports: vec![8080],
+            },
+            MeshInboundRelayDestination {
+                host: MeshInboundRelayHost::Name("app.localhost".to_string()),
+                ports: vec![8080],
+            },
+        ],
+        ..MeshConfig::default()
+    };
+    for host in ["localhost.", "LocalHost", "app.localhost", "APP.Localhost"] {
+        assert_eq!(
+            localhost_namespace_mesh.inbound_relay_destination_decision(host, 8080, waypoint),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "waypoint must refuse loopback-namespace authority {host} even when inventory-listed"
+        );
+    }
+}
+
+fn screen_resolved(
+    mesh: &MeshConfig,
+    ips: &[&str],
+) -> Result<Option<Vec<std::net::IpAddr>>, InboundRelayDenial> {
+    mesh.screen_inbound_relay_resolved_ips(ips.iter().copied().map(ip))
+}
+
+#[test]
+fn inbound_relay_resolved_ip_loopback_namespace_uses_canonical_semantics() {
+    for loopback in [
+        "127.0.0.1",
+        "127.1.2.3",
+        "::1",
+        "::ffff:127.0.0.1",
+        "::ffff:127.255.255.255",
+    ] {
+        assert!(
+            inbound_relay_resolved_ip_is_loopback_namespace(ip(loopback)),
+            "{loopback} is in the loopback namespace after canonicalization"
+        );
+    }
+    for safe in [
+        "10.244.2.9",
+        "::ffff:10.244.2.9",
+        "192.0.2.10",
+        "2001:db8::9",
+    ] {
+        assert!(
+            !inbound_relay_resolved_ip_is_loopback_namespace(ip(safe)),
+            "{safe} must remain eligible"
+        );
+    }
+}
+
+/// After a declared hostname is admitted by name, DNS answers that land in the
+/// loopback namespace must still be refused on topologies that do not share the
+/// destination pod's network namespace.
+#[test]
+fn inbound_relay_resolved_candidates_refuse_loopback_outside_sidecar() {
+    let ambient = ambient_terminator_mesh();
+    let node_waypoint = MeshConfig {
+        inbound_relay_destinations: inbound_relay_destinations_from_workloads(&[
+            relay_guard_workload("enrolled-host", &["workload.internal.example"], &[8080]),
+        ]),
+        ..MeshConfig::default()
+    };
+    let service_waypoint = MeshConfig {
+        inbound_relay_destinations: inbound_relay_destinations_from_workloads(&[
+            relay_guard_workload("bound-host", &["reviews.default.svc"], &[9080]),
+        ]),
+        ..MeshConfig::default()
+    };
+    assert!(!ambient.inbound_relay_admits_loopback_namespace);
+    assert!(!node_waypoint.inbound_relay_admits_loopback_namespace);
+    assert!(!service_waypoint.inbound_relay_admits_loopback_namespace);
+
+    for (label, mesh) in [
+        ("Ambient", &ambient),
+        ("NodeWaypoint", &node_waypoint),
+        ("ServiceWaypoint", &service_waypoint),
+    ] {
+        for loopback in [
+            "127.0.0.1",
+            "127.1.2.3",
+            "::1",
+            "::ffff:127.0.0.1",
+            "::ffff:127.255.255.255",
+        ] {
+            assert_eq!(
+                screen_resolved(mesh, &[loopback]),
+                Err(InboundRelayDenial::AddressNotTerminated),
+                "{label} must refuse resolved loopback {loopback} before dial"
+            );
+        }
+        assert_eq!(
+            screen_resolved(mesh, &["10.244.2.9", "2001:db8::9"]),
+            Ok(None),
+            "{label} must leave an all-safe answer set unchanged"
+        );
+        assert_eq!(
+            screen_resolved(
+                mesh,
+                &[
+                    "127.0.0.1",
+                    "10.244.2.9",
+                    "::1",
+                    "::ffff:127.0.0.1",
+                    "192.0.2.10",
+                ],
+            ),
+            Ok(Some(vec![ip("10.244.2.9"), ip("192.0.2.10")])),
+            "{label} mixed DNS answers must retain only non-loopback candidates, in order"
+        );
+        assert_eq!(
+            screen_resolved(mesh, &["127.0.0.1", "::1", "::ffff:127.0.0.1"]),
+            Err(InboundRelayDenial::AddressNotTerminated),
+            "{label} all-loopback DNS answers must fail closed before dial"
+        );
+    }
+}
+
+/// Sidecar shares the pod network namespace, so ordinary relay may still dial
+/// resolved loopback on a declared application port.
+#[test]
+fn inbound_relay_resolved_candidates_sidecar_retains_loopback() {
+    let mesh = sidecar_terminator_mesh();
+    assert!(mesh.inbound_relay_admits_loopback_namespace);
     assert_eq!(
-        loopback_mesh.inbound_relay_destination_decision("127.0.0.1", 8080, waypoint),
-        Ok(())
+        screen_resolved(
+            &mesh,
+            &["127.0.0.1", "::1", "::ffff:127.0.0.1", "10.244.1.7"],
+        ),
+        Ok(None),
+        "Sidecar ordinary relay must not drop resolved loopback"
+    );
+}
+
+/// Sidecar `ingress[]` remaps to a validated loopback defaultEndpoint remain a
+/// distinct path from ordinary-relay candidate screening.
+#[test]
+fn inbound_relay_ingress_remap_loopback_endpoint_is_still_the_declared_mapping() {
+    let mesh = MeshConfig {
+        local_ingress_listeners: vec![ResolvedIngressListener {
+            port: 16379,
+            endpoint_host: "127.0.0.1".to_string(),
+            endpoint_port: 6379,
+            protocol: AppProtocol::Redis,
+            endpoint_unix_path: None,
+            endpoint_unix_h2c: false,
+            owner_namespace: "default".to_string(),
+            owner_service: "redis".to_string(),
+            bind: None,
+        }],
+        sidecar_ingress_declared: true,
+        local_workload_addresses: vec![ip("10.244.1.7")],
+        inbound_relay_admits_loopback_namespace: true,
+        ..MeshConfig::default()
+    };
+    assert!(mesh.sidecar_ingress_connect_relay_endpoint_matches(16379, "127.0.0.1", 6379));
+    assert!(!mesh.sidecar_ingress_connect_relay_endpoint_matches(16379, "127.0.0.1", 8080));
+    assert_eq!(
+        screen_resolved(&mesh, &["127.0.0.1"]),
+        Ok(None),
+        "ingress remap topologies keep Sidecar loopback privilege on ordinary answers"
+    );
+}
+
+/// Brace-match one item from `src` starting at `signature`. Strings are skipped
+/// so a `{` inside a format/error body cannot close the function early.
+fn rust_fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+    let start = src
+        .find(signature)
+        .unwrap_or_else(|| panic!("missing `{signature}`"));
+    let after_sig = &src[start..];
+    let brace_off = after_sig
+        .find('{')
+        .unwrap_or_else(|| panic!("`{signature}` has no opening brace"));
+    let body = &after_sig[brace_off..];
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut prev = '\0';
+    for (i, ch) in body.char_indices() {
+        if in_string {
+            if ch == '"' && prev != '\\' {
+                in_string = false;
+            }
+            prev = ch;
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &body[..=i];
+                }
+            }
+            _ => {}
+        }
+        prev = ch;
+    }
+    panic!("unclosed `{signature}`");
+}
+
+fn collapsed_tokens(src: &str) -> String {
+    src.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Match `callee(arg, …)` after whitespace collapsing, with or without a
+/// rustfmt trailing comma. Do not require a particular line break shape.
+fn contains_call(collapsed: &str, callee: &str, args: &[&str]) -> bool {
+    let joined = args.join(", ");
+    [
+        format!("{callee}( {joined} )"),
+        format!("{callee}( {joined}, )"),
+        format!("{callee}({joined})"),
+        format!("{callee}({joined},)"),
+    ]
+    .into_iter()
+    .any(|pattern| collapsed.contains(&pattern))
+}
+
+/// TCP (`connect_backend`) and UDP (`handle_hbone_udp_request`) must both
+/// invoke the shared candidate screen; the EgressGateway external-UDP path
+/// must skip it. Live DNS is nondeterministic, so this is a source contract
+/// over the concrete helper rather than a live resolver.
+#[test]
+fn inbound_relay_resolved_loopback_screen_is_wired_on_tcp_and_udp_dial_paths() {
+    let src = include_str!("../../src/proxy/hbone_proxy.rs");
+    let helper = "screen_ordinary_inbound_hbone_relay_dns_candidates";
+    let file = collapsed_tokens(src);
+    assert_eq!(
+        file.matches(helper).count(),
+        3,
+        "helper definition plus TCP and UDP call sites"
+    );
+
+    let tcp = collapsed_tokens(rust_fn_body(src, "async fn connect_backend("));
+    assert!(
+        contains_call(&tcp, helper, &["proxy", "mesh", "candidates"]),
+        "byte-stream connect_backend must screen resolved candidates before dial"
+    );
+    let tcp_screen = tcp
+        .find(helper)
+        .expect("connect_backend must name the shared screen");
+    let tcp_dial = tcp
+        .find("connect_candidates")
+        .expect("connect_backend must still dial screened candidates");
+    assert!(
+        tcp_screen < tcp_dial,
+        "loopback screening must run before the TCP candidate dial"
+    );
+
+    let udp = collapsed_tokens(rust_fn_body(
+        src,
+        "pub(super) async fn handle_hbone_udp_request(",
+    ));
+    assert!(
+        udp.contains("if external_egress_allowed { dest_candidates } else { match"),
+        "local UDP relay must screen resolved candidates; external UDP egress must not"
+    );
+    assert!(
+        contains_call(&udp, helper, &["proxy", "mesh_config", "dest_candidates"],),
+        "datagram CONNECT must screen dest_candidates on the ordinary local-relay path"
+    );
+
+    let helper_body = collapsed_tokens(rust_fn_body(
+        src,
+        "fn screen_ordinary_inbound_hbone_relay_dns_candidates(",
+    ));
+    assert!(
+        helper_body.contains(
+            "if proxy.id != MESH_INBOUND_HBONE_RELAY_PROXY_ID { return Ok(candidates); }"
+        ),
+        "screening must stay on the ordinary inbound relay, not ingress remap or other HBONE backends"
+    );
+}
+
+/// A gateway-side HBONE DNS-screen 403 after `check_circuit_breaker` admitted a
+/// HALF_OPEN probe must release that slot without changing backend health.
+/// Real connection failures still trip the breaker.
+#[test]
+fn inbound_hbone_dns_screen_denial_releases_half_open_probe_without_tripping() {
+    use ferrum_edge::_test_support::settle_hbone_backend_connect_circuit_breaker_outcome_for_test;
+    use ferrum_edge::circuit_breaker::CircuitBreaker;
+
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 2,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500, 502, 503],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+    cb.record_failure(503, true, false);
+    assert!(cb.can_execute().is_ok());
+    assert_eq!(cb.state_name(), "half_open");
+    assert_eq!(cb.half_open_in_flight(), 1);
+
+    settle_hbone_backend_connect_circuit_breaker_outcome_for_test(&cb, StatusCode::FORBIDDEN, true);
+    assert_eq!(
+        cb.state_name(),
+        "half_open",
+        "DNS-screen 403 must not reopen the breaker"
+    );
+    assert_eq!(
+        cb.half_open_in_flight(),
+        0,
+        "DNS-screen 403 must release the HALF_OPEN probe slot"
+    );
+    assert!(
+        cb.can_execute().is_ok(),
+        "after a health-neutral denial the next probe must still be admissible"
+    );
+    assert_eq!(cb.half_open_in_flight(), 1);
+
+    settle_hbone_backend_connect_circuit_breaker_outcome_for_test(
+        &cb,
+        StatusCode::BAD_GATEWAY,
+        true,
+    );
+    assert_eq!(
+        cb.state_name(),
+        "open",
+        "a real HBONE connect failure must still trip the breaker"
+    );
+    assert_eq!(cb.half_open_in_flight(), 0);
+}
+
+/// The byte-stream CONNECT error arm must settle the selected-target breaker
+/// through the production helper: FORBIDDEN (DNS-screen policy) is neutral,
+/// every other connect failure is a failure. Double-settlement is forbidden.
+#[test]
+fn inbound_hbone_dns_screen_denial_settles_half_open_via_production_helper() {
+    let src = include_str!("../../src/proxy/hbone_proxy.rs");
+    let collapsed: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        collapsed.contains(
+            "settle_hbone_backend_connect_circuit_breaker_outcome( &cb, err.status, cb_is_half_open_probe, );"
+        ),
+        "connect_backend error arm must settle the same selected-target breaker"
+    );
+    assert_eq!(
+        collapsed
+            .matches("settle_hbone_backend_connect_circuit_breaker_outcome")
+            .count(),
+        2,
+        "helper definition plus the one connect_backend error-arm call site"
+    );
+    assert!(
+        collapsed.contains(
+            "if status == StatusCode::FORBIDDEN { cb.record_neutral(is_half_open_probe); } else { cb.record_failure(status.as_u16(), true, is_half_open_probe); }"
+        ),
+        "FORBIDDEN DNS-screen denials must record_neutral; other connect failures record_failure"
+    );
+    let connect_err_arm = collapsed
+        .split("\"HBONE backend connection failed\"")
+        .nth(1)
+        .expect("connect_backend error logging")
+        .split("ctx.metadata.insert( \"error_class\"")
+        .next()
+        .expect("error_class metadata after breaker settlement");
+    assert!(
+        !connect_err_arm.contains("record_failure") && !connect_err_arm.contains("record_neutral"),
+        "the connect error arm must not double-settle beside the helper"
+    );
+}
+
+/// Mixed-answer filtering must keep the iterator's rotated dial order; an
+/// all-safe set must return `Ok(None)` so the caller dials the original
+/// answer set without allocating a filtered Vec.
+#[test]
+fn inbound_relay_resolved_candidates_all_safe_returns_none_without_filtering() {
+    let mesh = ambient_terminator_mesh();
+    assert_eq!(
+        screen_resolved(&mesh, &["10.244.2.9"]),
+        Ok(None),
+        "a single safe answer must be allocation-free Ok(None)"
+    );
+    assert_eq!(
+        screen_resolved(&mesh, &["::ffff:10.244.2.9", "192.0.2.10", "2001:db8::9"]),
+        Ok(None),
+        "canonical IPv4-mapped non-loopback answers are safe and must not allocate"
+    );
+    assert_eq!(
+        screen_resolved(
+            &mesh,
+            &[
+                "10.244.2.9",
+                "::ffff:127.0.0.1",
+                "192.0.2.10",
+                "127.1.2.3",
+                "2001:db8::9",
+            ],
+        ),
+        Ok(Some(vec![
+            ip("10.244.2.9"),
+            ip("192.0.2.10"),
+            ip("2001:db8::9"),
+        ])),
+        "mixed answers must retain only safe candidates in original dial order"
     );
 }

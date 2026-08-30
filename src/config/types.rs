@@ -1870,6 +1870,14 @@ pub enum SdProvider {
 }
 
 /// DNS-SD specific configuration (SRV record-based discovery).
+///
+/// The poller honors RFC 2782: undialable RRs (root target `.`, port 0) are
+/// dropped, remaining ports use the same `1..=65535` admission as Kubernetes
+/// and Consul, and every remaining priority tier is published with its priority
+/// stamped in the reserved `ferrum.srv.priority` tag. The load balancer then
+/// serves only from the lowest-numbered tier that still has a HEALTHY target,
+/// falling over to the next tier when a tier goes fully unhealthy and returning
+/// as soon as it recovers (see `docs/dns_resolver.md`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DnsSdConfig {
     /// The DNS name to query for SRV records (e.g., "_http._tcp.my-service.example.com").
@@ -9145,7 +9153,8 @@ impl Upstream {
 
     /// Reject mesh-PROJECTED fields that an OPERATOR must not set directly.
     ///
-    /// Reserved `mesh.*` target tags, `port_overrides`, `source_locality`,
+    /// Reserved `mesh.*` target tags, reserved `ferrum.srv.*` target tags and
+    /// subset labels, `port_overrides`, `source_locality`,
     /// `source_labels`, `locality_lb_strict`, `locality_lb_setting`, and the
     /// mesh-derived fields nested under `subsets[].traffic_policy` are
     /// all populated by the mesh slice-apply layer (from DestinationRules / the
@@ -9174,6 +9183,38 @@ impl Upstream {
                 errors.push(format!(
                     "targets[{target_index}].tags contains a key in the reserved mesh.* namespace \
                      and cannot be set directly via operator-provided config"
+                ));
+            }
+            // Issue #4291: `ferrum.srv.*` carries the internal RFC 2782 SRV
+            // priority-tier contract between the DNS-SD discoverer and the load
+            // balancer's candidate filter. Accepting one from operator config
+            // would let a static target claim (or shadow) a DNS tier it was
+            // never published in.
+            if target
+                .tags
+                .keys()
+                .any(|key| key.starts_with(crate::service_discovery::RESERVED_SRV_TAG_PREFIX))
+            {
+                errors.push(format!(
+                    "targets[{target_index}].tags contains a key in the reserved {prefix}* \
+                     namespace (RFC 2782 SRV discovery metadata) and cannot be set directly via \
+                     operator-provided config",
+                    prefix = crate::service_discovery::RESERVED_SRV_TAG_PREFIX
+                ));
+            }
+        }
+
+        for (subset_index, subset) in self.subsets.iter().flatten().enumerate() {
+            if subset
+                .labels
+                .keys()
+                .any(|key| key.starts_with(crate::service_discovery::RESERVED_SRV_TAG_PREFIX))
+            {
+                errors.push(format!(
+                    "subsets[{subset_index}].labels selects on the reserved {prefix}* namespace \
+                     (RFC 2782 SRV discovery metadata), which is internal load-balancer state \
+                     and not an addressable subset selector",
+                    prefix = crate::service_discovery::RESERVED_SRV_TAG_PREFIX
                 ));
             }
         }
@@ -10102,7 +10143,8 @@ impl GatewayConfig {
 
     /// Reject mesh-PROJECTED upstream fields on operator-PROVIDED config loads.
     ///
-    /// Reserved `mesh.*` target tags, `Upstream.{port_overrides, source_locality,
+    /// Reserved `mesh.*` and `ferrum.srv.*` target tags / subset labels,
+    /// `Upstream.{port_overrides, source_locality,
     /// source_labels, locality_lb_strict, locality_lb_setting}`, and mesh-only fields under
     /// `Upstream.subsets[].traffic_policy` are owned by the mesh slice-apply layer
     /// (Destination rules / workload locality /

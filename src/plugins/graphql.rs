@@ -39,8 +39,8 @@ use tracing::{debug, warn};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, ENFORCEMENT_UNAVAILABLE_BODY,
-    ENFORCEMENT_UNAVAILABLE_STATUS, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
-    RateLimitOutcome, RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID,
+    ENFORCEMENT_UNAVAILABLE_STATUS, LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS,
+    RateLimitBackend, RateLimitOutcome, RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID,
     apply_rate_limit_cleanup, debug_assert_rate_limit_redis_keys, validate_max_requests,
     validate_window_seconds,
 };
@@ -163,6 +163,28 @@ impl GraphqlPlugin {
         http_client: PluginHttpClient,
         config_id: &str,
     ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, None, config_id)
+    }
+
+    /// Construct with local enforcement state shared across compatible
+    /// plugin-cache generations for the stable `(namespace, plugin kind,
+    /// plugin-config id)` policy identity. See
+    /// [`super::utils::rate_limit::RateLimitBackend::from_plugin_config_with_policy_identity`].
+    pub fn new_with_policy_identity(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, Some(namespace), config_id)
+    }
+
+    fn from_parts(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: Option<&str>,
+        config_id: &str,
+    ) -> Result<Self, String> {
         let object = config
             .as_object()
             .ok_or_else(|| "graphql: config must be an object".to_string())?;
@@ -234,6 +256,27 @@ impl GraphqlPlugin {
             );
         }
 
+        // Effective enforcement semantics, not raw syntax: the parsed limit
+        // dimension and the parsed rate maps, so an omitted map and an explicit
+        // empty one describe the same budget. `max_depth` / `max_complexity` /
+        // `max_aliases` / `introspection_allowed` are stateless per-document
+        // checks that never consult a counter, so changing them must not reset
+        // a live budget; the shared Redis posture is added by the backend.
+        let mut semantics = LocalStateSemantics::new();
+        semantics.text("limit_by", &limit_by);
+        semantics.window_map(
+            "type_rate_limits",
+            type_rate_limits
+                .iter()
+                .map(|(op_type, spec)| (op_type.as_str(), spec.op.specs())),
+        );
+        semantics.window_map(
+            "operation_rate_limits",
+            operation_rate_limits
+                .iter()
+                .map(|(op_name, spec)| (op_name.as_str(), spec.op.specs())),
+        );
+
         Ok(Self {
             max_depth,
             max_complexity,
@@ -242,12 +285,14 @@ impl GraphqlPlugin {
             limit_by,
             type_rate_limits,
             operation_rate_limits,
-            limiter: RateLimitBackend::from_plugin_config_with_config_id(
+            limiter: RateLimitBackend::from_plugin_config_with_policy_identity(
                 "graphql",
+                namespace,
                 config_id,
                 config,
                 &http_client,
                 DynamicHttpRateLimitAlgorithm::new(),
+                &semantics,
             )?,
             request_counter: AtomicU64::new(0),
             epoch_base: Instant::now(),
@@ -255,6 +300,16 @@ impl GraphqlPlugin {
             has_any_config,
             instance_id: NEXT_GRAPHQL_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         })
+    }
+
+    /// Whether this instance enforces on the same live local state as `other`.
+    ///
+    /// A compatible reload generation for one policy identity must share; an
+    /// unrelated policy, tenant, plugin kind, or semantically changed policy
+    /// must not. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn shares_local_state_with(&self, other: &Self) -> bool {
+        self.limiter.shares_local_state_with(&other.limiter)
     }
 
     /// Local/fallback DashMap shard count. Test-only; not a production API.
@@ -1139,23 +1194,14 @@ fn analyze_selection_set<'a>(
         }
 
         if is_graphql_name_start(c) {
+            // Selection-set bodies only: identifiers here are field names (or
+            // aliases), including names that spell document/value keywords.
+            // Top-level `query`/`mutation`/`subscription`/`fragment` are
+            // consumed by `parse_document`; inline-fragment `on` is consumed
+            // by the `...` branch above; argument literals live inside
+            // `skip_parens`. The whole-document fallback scanner in
+            // `analyze_query` keeps a distinct keyword skip.
             let (ident, after_ident) = read_name(bytes, i);
-
-            // Skip keywords/literals that are not fields.
-            if matches!(
-                ident,
-                "query"
-                    | "mutation"
-                    | "subscription"
-                    | "fragment"
-                    | "on"
-                    | "true"
-                    | "false"
-                    | "null"
-            ) {
-                i = after_ident;
-                continue;
-            }
 
             // Look past whitespace for an alias `:`.
             let j = skip_ws_only(bytes, after_ident);
@@ -1364,7 +1410,10 @@ fn analyze_query(query: &str) -> (u32, u32, u32, bool) {
             }
             let ident = &query[start..i];
 
-            // Skip GraphQL keywords that aren't fields
+            // Whole-document fallback only: this scanner does not split
+            // operations from selection sets, so top-level keywords and the
+            // inline-fragment `on` Type condition would otherwise be counted
+            // as fields. `analyze_selection_set` must not share this skip.
             if matches!(
                 ident,
                 "query"
