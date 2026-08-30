@@ -413,10 +413,7 @@ mod tests {
         )));
 
         assert!(set.has_store("gateway.networking.k8s.io/v1", "TLSRoute"));
-        assert!(set.has_store(
-            "gateway.networking.k8s.io/v1alpha2",
-            "TLSRoute",
-        ));
+        assert!(set.has_store("gateway.networking.k8s.io/v1alpha2", "TLSRoute",));
 
         let objects = set.snapshot_all();
 

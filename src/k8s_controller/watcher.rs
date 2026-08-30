@@ -1753,9 +1753,7 @@ mod tests {
     fn tlsroute_versions_registered_for_served(served: &[&str]) -> Vec<&'static str> {
         GATEWAY_API_CRDS
             .iter()
-            .filter(|resource| {
-                resource.kind == "TLSRoute" && served.contains(&resource.version)
-            })
+            .filter(|resource| resource.kind == "TLSRoute" && served.contains(&resource.version))
             .map(|resource| resource.version)
             .collect()
     }
