@@ -3655,6 +3655,39 @@ jobs:
             echo "::error title=preStop seconds missing::preStop.sleep.seconds must render shutdownPreStopSeconds"
             exit 1
           fi
+          # Issue #4290: SleepAction is silently pruned on Kubernetes < 1.29, so the
+          # chart must fail render when shutdownPreStopSeconds > 0 targets an old API.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --kube-version 1.28.0 \
+            --set mode=file \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-kube128.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-kube128.err"; then
+            echo "::error title=preStop SleepAction accepted on Kubernetes 1.28::shutdownPreStopSeconds>0 must fail render on clusters without SleepAction"
+            exit 1
+          fi
+          grep -F 'requires Kubernetes 1.29+' "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-kube128.err"
+          grep -F 'shutdownPreStopSeconds: 0' "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-kube128.err"
+          grep -F 'shutdownPreDrainSeconds' "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-kube128.err"
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --kube-version 1.28.0 \
+            --set mode=file --set shutdownPreStopSeconds=0 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-kube128-zero.yaml"
+          if grep -Fq 'preStop:' "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-kube128-zero.yaml"; then
+            echo "::error title=preStop rendered at zero on Kubernetes 1.28::shutdownPreStopSeconds=0 must omit lifecycle.preStop"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --kube-version 1.30.0 \
+            --set mode=file \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-kube130.yaml"
+          if ! grep -Fq 'preStop:' "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-kube130.yaml"; then
+            echo "::error title=preStop missing on Kubernetes 1.30::shutdownPreStopSeconds must render lifecycle.preStop.sleep on 1.29+"
+            exit 1
+          fi
+          if ! grep -Eq 'seconds: 30' "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-kube130.yaml"; then
+            echo "::error title=preStop seconds missing on Kubernetes 1.30::preStop.sleep.seconds must render shutdownPreStopSeconds"
+            exit 1
+          fi
           if ! grep -Eq 'failureThreshold: 3$' "$RUNNER_TEMP/ferrum-gateway-helm-results/prestop-default.yaml"; then
             echo "::error title=Readiness failureThreshold implicit::render it explicitly; it is the endpoint-removal budget"
             exit 1
