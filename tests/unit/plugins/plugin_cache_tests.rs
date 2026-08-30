@@ -2163,6 +2163,75 @@ fn test_proxy_scoped_plugins_override_globals_of_same_name() {
 }
 
 #[test]
+fn istio_route_transform_consumers_preserve_same_name_global_rules() {
+    for (plugin_name, id_prefix) in [
+        ("request_transformer", "istio-vs-req-xform-"),
+        ("response_transformer", "istio-vs-resp-xform-"),
+    ] {
+        let auto_id = format!("{id_prefix}p1");
+        let config = make_config(
+            vec![make_proxy("p1", "/api", vec![auto_id.as_str()])],
+            vec![
+                make_plugin_config_with_json(
+                    "global-transform",
+                    plugin_name,
+                    minimal_plugin_config(plugin_name),
+                    PluginScope::Global,
+                    None,
+                ),
+                make_plugin_config_with_json(
+                    &auto_id,
+                    plugin_name,
+                    json!({"rules": [], "apply_route_overrides": true}),
+                    PluginScope::Proxy,
+                    Some("p1"),
+                ),
+            ],
+        );
+        let cache = PluginCache::new(&config).expect("additive route transform consumers");
+        let plugins = cache.get_plugins("ferrum", "p1");
+        assert_eq!(
+            plugins
+                .iter()
+                .filter(|plugin| plugin.name() == plugin_name)
+                .count(),
+            2,
+            "the translator-owned consumer must not drop global {plugin_name} rules"
+        );
+
+        let operator_config = make_config(
+            vec![make_proxy("p1", "/api", vec![auto_id.as_str()])],
+            vec![
+                make_plugin_config_with_json(
+                    "global-transform",
+                    plugin_name,
+                    minimal_plugin_config(plugin_name),
+                    PluginScope::Global,
+                    None,
+                ),
+                make_plugin_config_with_json(
+                    &auto_id,
+                    plugin_name,
+                    minimal_plugin_config(plugin_name),
+                    PluginScope::Proxy,
+                    Some("p1"),
+                ),
+            ],
+        );
+        let operator_cache = PluginCache::new(&operator_config).expect("scoped transformer");
+        assert_eq!(
+            operator_cache
+                .get_plugins("ferrum", "p1")
+                .iter()
+                .filter(|plugin| plugin.name() == plugin_name)
+                .count(),
+            1,
+            "a lookalike id with static rules must retain proxy-overrides-global semantics"
+        );
+    }
+}
+
+#[test]
 fn test_invalid_optional_proxy_scoped_plugin_still_shadows_global() {
     let config = make_config(
         vec![

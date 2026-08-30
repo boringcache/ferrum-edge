@@ -10045,6 +10045,14 @@ fn apply_destination_rules(
             if let Some(ref policy) = dr.traffic_policy {
                 apply_traffic_policy_to_upstream(upstream, policy, runtime)?;
             }
+            // Capture this DR's settled top-level passive tier before an
+            // owner-gated port policy is also projected onto the upstream for
+            // selection-time fallback. Per-port slots and subsets must inherit
+            // the top-level tier itself, not that later owner-only projection.
+            let top_level_passive = upstream
+                .health_checks
+                .as_ref()
+                .and_then(|health| health.passive.clone());
 
             let upstream_policy_ports: std::collections::HashSet<u16> = upstream
                 .targets
@@ -10199,24 +10207,18 @@ fn apply_destination_rules(
 
                 let is_owner_entry =
                     outbound_upstream_owner_port.get(&upstream_owner_key) == Some(port);
-                // Seed a FRESH fanned slot's passive health from the upstream
-                // level — which carries this DR's top-level outlierDetection,
-                // applied above — so a PARTIAL per-port outlier override
-                // layers over the top-level window/recovery fields instead of
-                // over defaults (`passive_health_for_target` prefers a
-                // per-port slot outright). Owner-gated entries only, and only
-                // when the entry actually carries outlierDetection; a slot an
-                // earlier rule already populated keeps its accumulated
-                // layering.
-                let upstream_passive_seed =
-                    if is_owner_entry && port_policy.outlier_detection.is_some() {
-                        upstream
-                            .health_checks
-                            .as_ref()
-                            .and_then(|h| h.passive.clone())
-                    } else {
-                        None
-                    };
+                // Seed every FRESH fanned slot's passive health from the
+                // upstream level, which already carries this DR's top-level
+                // outlierDetection. Ordinary upstreams need the same seed as
+                // owner-gated synthetic upstreams: `passive_health_for_target`
+                // prefers a per-port slot outright, so starting a partial port
+                // block from engine defaults would discard explicit top-level
+                // fields. Selected-subset projection later reapplies the raw
+                // port field mask over that subset's inherited policy.
+                let upstream_passive_seed = port_policy
+                    .outlier_detection
+                    .as_ref()
+                    .and_then(|_| top_level_passive.clone());
                 for store_port in store_ports {
                     let override_slot = upstream.port_overrides.entry(store_port).or_default();
                     if override_slot.passive_health_check.is_none()
@@ -10291,11 +10293,13 @@ fn apply_destination_rules(
                         name: subset.name.clone(),
                         labels: subset.labels.clone(),
                         traffic_policy: subset.traffic_policy.as_ref().map(|sp| {
-                            // Resolve the subset's outlierDetection into a
-                            // PassiveHealthCheck (ejection thresholds) up front,
-                            // the same projection the upstream-level path uses.
+                            // Resolve the subset's outlierDetection over this
+                            // DR's already-applied top-level passive policy.
+                            // A partial subset therefore inherits every omitted
+                            // represented field instead of synthesizing a fresh
+                            // per-block default.
                             let passive_health_check = sp.outlier_detection.as_ref().map(|od| {
-                                let mut passive = PassiveHealthCheck::default();
+                                let mut passive = top_level_passive.clone().unwrap_or_default();
                                 apply_outlier_detection_to_passive(&mut passive, od);
                                 passive
                             });
@@ -10619,21 +10623,18 @@ fn apply_traffic_policy_to_port_override(
         slot.hash_on = mesh_hash_on_to_ferrum(&policy.load_balancer);
     }
     if let Some(ref od) = policy.outlier_detection {
-        // A PARTIAL per-port `outlierDetection` (e.g. only `consecutiveErrors`)
-        // is overlaid field-by-field by `apply_outlier_detection_to_passive`, so
-        // the *base* it layers onto matters. The caller in `apply_destination_rules`
-        // seeds `slot.passive_health_check` from the UPSTREAM-level passive (which
-        // already carries this DR's TOP-LEVEL `outlierDetection`) before calling
-        // here for the owner-gated port, so a partial override correctly layers
-        // over the DR's top-level window/recovery fields rather than over engine
-        // defaults. The `unwrap_or_default()` base is therefore only reached when
-        // there is genuinely no top-level outlier to inherit (no seed) — the
-        // intended fallback, not a regression. NOTE: this is a per-field merge,
-        // not Istio's portLevelSettings "complete replacement"; that divergence
-        // is uniform across the per-port DR knobs and documented in `docs/mesh.md`.
+        // The caller seeds every fresh slot from upstream-level passive health.
+        // Retain the raw field mask as well: cold-path proxy projection reapplies
+        // it over the selected subset, preserving the documented field-level
+        // port > subset > top-level precedence for all represented fields.
         let mut passive = slot.passive_health_check.clone().unwrap_or_default();
         apply_outlier_detection_to_passive(&mut passive, od);
         slot.passive_health_check = Some(passive);
+        if let Some(accumulated) = slot.outlier_detection_overlay.as_mut() {
+            merge_outlier_detection_overlay(accumulated, od);
+        } else {
+            slot.outlier_detection_overlay = Some(od.clone());
+        }
     }
     // Per-port localityLbSetting projection. A later matching DR entry with no
     // localityLbSetting clears an earlier value, mirroring the upstream-level
@@ -11253,9 +11254,49 @@ fn mesh_hash_on_to_ferrum(lb: &Option<MeshLoadBalancer>) -> Option<String> {
     }
 }
 
-fn apply_outlier_detection_to_passive(passive: &mut PassiveHealthCheck, od: &MeshOutlierDetection) {
-    if let Some(consecutive) = od.consecutive_errors {
-        passive.unhealthy_threshold = consecutive;
+/// Overlay a translated Istio `outlierDetection` onto a passive health policy.
+///
+/// `consecutive5xxErrors` is a CONSECUTIVE-failure threshold in Istio, not a
+/// windowed count (issue #4292), so the overlay switches the policy into
+/// consecutive mode for explicit positive values. When no lower-precedence
+/// tier supplied the field, an omitted threshold/cap receives Istio's 5/10%
+/// defaults here; a partial higher-precedence block therefore inherits an
+/// explicit lower-tier value instead of replacing it with a synthesized
+/// per-block default. Explicit `0` disables the consecutive-5xx detector
+/// (HTTP 5xx and locally originated connection failures; split mode is
+/// deferred) via `consecutive_5xx_ejection_disabled`. Ferrum's native windowed
+/// semantics are untouched for policies this overlay never runs on. `interval`
+/// still lands on `unhealthy_window_seconds`: it is inert while consecutive
+/// mode is on (Istio's `interval` is an analysis sweep period), but keeping it
+/// recorded leaves the operator's declared value visible in the admin view and
+/// correct if a policy is later evaluated windowed.
+pub(crate) fn apply_outlier_detection_to_passive(
+    passive: &mut PassiveHealthCheck,
+    od: &MeshOutlierDetection,
+) {
+    match od.consecutive_errors {
+        Some(0) => {
+            // Istio `consecutive5xxErrors: 0` disables the 5xx detector,
+            // including locally originated connection failures that Envoy
+            // counts in that bucket when split mode is off (the default;
+            // Ferrum's split mode is deferred). It must not map to
+            // threshold 0 (which would eject on the first failure). The
+            // sentinel is normally Istio-translated, while direct native
+            // configuration may opt in explicitly.
+            passive.consecutive_5xx_ejection_disabled = true;
+        }
+        Some(consecutive) => {
+            // A higher-precedence overlay with an explicit positive threshold
+            // must clear a stale disable sentinel left by an earlier `Some(0)`.
+            passive.consecutive_5xx_ejection_disabled = false;
+            passive.unhealthy_threshold = consecutive;
+            passive.consecutive_error_mode = true;
+        }
+        None if !passive.consecutive_error_mode && !passive.consecutive_5xx_ejection_disabled => {
+            passive.unhealthy_threshold = 5;
+            passive.consecutive_error_mode = true;
+        }
+        None => {}
     }
     if let Some(interval) = od.interval_seconds {
         passive.unhealthy_window_seconds = interval;
@@ -11263,8 +11304,30 @@ fn apply_outlier_detection_to_passive(passive: &mut PassiveHealthCheck, od: &Mes
     if let Some(ejection) = od.base_ejection_seconds {
         passive.healthy_after_seconds = ejection;
     }
-    if let Some(max_pct) = od.max_ejection_percent {
-        passive.max_ejection_percent = Some(max_pct);
+    match od.max_ejection_percent {
+        Some(max_pct) => passive.max_ejection_percent = Some(max_pct),
+        None if passive.max_ejection_percent.is_none() => {
+            passive.max_ejection_percent = Some(10);
+        }
+        None => {}
+    }
+}
+
+fn merge_outlier_detection_overlay(
+    accumulated: &mut MeshOutlierDetection,
+    overlay: &MeshOutlierDetection,
+) {
+    if overlay.consecutive_errors.is_some() {
+        accumulated.consecutive_errors = overlay.consecutive_errors;
+    }
+    if overlay.interval_seconds.is_some() {
+        accumulated.interval_seconds = overlay.interval_seconds;
+    }
+    if overlay.base_ejection_seconds.is_some() {
+        accumulated.base_ejection_seconds = overlay.base_ejection_seconds;
+    }
+    if overlay.max_ejection_percent.is_some() {
+        accumulated.max_ejection_percent = overlay.max_ejection_percent;
     }
 }
 
@@ -13228,6 +13291,23 @@ fn build_jwks_provider_config(rule: &MeshJwtRule) -> Option<serde_json::Value> {
 
     if !rule.from_params.is_empty() {
         provider["from_params"] = serde_json::json!(rule.from_params);
+    }
+
+    // Istio `outputClaimToHeaders` (issue #4277). The array shape is preserved
+    // (not collapsed into a claim-keyed map) because Istio allows one claim to
+    // be published to several headers. `jwks_auth` owns every destination:
+    // each is stripped from the inbound request before validation and set only
+    // from a validated claim.
+    if !rule.output_claim_to_headers.is_empty() {
+        provider["output_claim_headers"] = serde_json::json!(
+            rule.output_claim_to_headers
+                .iter()
+                .map(|entry| serde_json::json!({
+                    "header": entry.header,
+                    "claim": entry.claim,
+                }))
+                .collect::<Vec<_>>()
+        );
     }
 
     Some(provider)
@@ -28218,6 +28298,12 @@ mod tests {
             .expect("v1 subset passive health resolved from outlierDetection");
         assert_eq!(passive.unhealthy_threshold, 5);
         assert_eq!(passive.unhealthy_window_seconds, 20);
+        // Istio `consecutive5xxErrors` is a consecutive streak, not a windowed
+        // count (issue #4292): the overlay must switch the policy's mode.
+        assert!(
+            passive.consecutive_error_mode,
+            "a translated consecutive5xxErrors must not be evaluated as a sliding-window count"
+        );
     }
 
     #[test]
@@ -33797,6 +33883,7 @@ mod tests {
                 from_headers: Vec::new(),
                 from_params: Vec::new(),
                 forward_original_token: false,
+                output_claim_to_headers: Vec::new(),
             }],
         }
     }
@@ -34118,6 +34205,7 @@ mod tests {
                         from_headers: Vec::new(),
                         from_params: Vec::new(),
                         forward_original_token: false,
+                        output_claim_to_headers: Vec::new(),
                     }],
                 }],
                 ..MeshConfig::default()
@@ -34174,6 +34262,7 @@ mod tests {
                         ],
                         from_params: vec!["access_token".to_string()],
                         forward_original_token: false,
+                        output_claim_to_headers: Vec::new(),
                     }],
                 }],
                 ..MeshConfig::default()
@@ -34227,6 +34316,7 @@ mod tests {
                         from_headers: Vec::new(),
                         from_params: Vec::new(),
                         forward_original_token: false,
+                        output_claim_to_headers: Vec::new(),
                     }],
                 }],
                 ..MeshConfig::default()

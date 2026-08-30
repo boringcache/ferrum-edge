@@ -23,6 +23,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail-closed pair `forward_sensitive_query=true` plus an exact decoded-name
   `forward_sensitive_query_allowlist`. Mirror logs still omit the entire query.
 
+### Fixed
+
+- **Linux GNU release ABI floor is now GLIBC_2.34** (issue #4301). Generic
+  `ferrum-edge-linux-{x86_64,aarch64}` and `ferrum-cni-linux-{x86_64,aarch64}`
+  artifacts previously linked against whatever glibc `ubuntu-latest` shipped
+  (observed GLIBC_2.39), so they failed on Ubuntu 22.04, RHEL 9, and Debian 12.
+  The x86_64 GNU cell of the release and `latest` producer jobs no longer
+  compiles on the runner: it builds both binaries in a digest-pinned
+  AlmaLinux 8.10 sysroot under an isolated `CARGO_TARGET_DIR`
+  (`target/linux-gnu-sysroot`) so native runner caches cannot contaminate the
+  pinned link, and the same job then stages, checksums, ABI-scans, and
+  oldest-baseline-smokes those exact bytes before uploading them. The GitHub
+  Release, its `.sha256` sidecars, the `latest` prerelease, the x86_64 layer
+  of the default multi-arch container images, and the signing/attestation
+  jobs therefore all consume the x86_64 bytes that were verified; a floor
+  violation means that artifact is never uploaded. ARM64 GNU artifacts still
+  come from the isolated Cross build, already target an older glibc, and are
+  re-checked as published on an ARM64 runner. The `docker` job needs
+  `[test, build-binaries, build-arm64-cross, main-publish-gate]` and does not
+  wait on that ARM64 ABI job, so the arm64 image layer is pushed before
+  verification; `linux-gnu-abi-latest-gate` / `linux-gnu-abi-release-gate`
+  delete only the GitHub Release (or `latest` prerelease), never the
+  `:latest` / `:vX.Y.Z` image tags. Full-mode pull requests run the same
+  sysroot builder as a pre-merge regression signal. Artifact names,
+  checksums, signatures, and container publish behavior are unchanged.
+  Remaining dynamic libraries are `libgcc_s.so.1` and, if not static-linked,
+  `libz.so.1`.
+
 ### Changed
 
 - **BREAKING — `FERRUM_TLS_OFFLOAD_THREADS` nonzero values fail startup**
@@ -60,6 +88,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `400` `{"error":"HTTP/1.1 request is missing a Host header"}` instead of
   being routed. Send a Host field, or use HTTP/1.0 / absolute-form if that
   is the intended protocol.
+
+- The recommended level-1 WAF enforcement posture now blocks SQL injection in
+  admitted request bodies as well as decoded query values, prototype-pollution
+  tokens in decoded query keys and values, and matching payloads carried in
+  declared UTF-16LE/UTF-16BE bodies (issues #4401, #4402, #4403). SQLi body
+  mirrors use the existing query patterns unchanged. UTF-16 transcoding runs
+  only after the existing body content-type, multipart, and binary inspection
+  gates admit the body; those gates are unchanged. **Operator action**: review
+  WAF monitor logs for the new body/query matches before using
+  `default_rule_action: enforce` if application payloads legitimately contain
+  these attack-shaped tokens.
+
+- **BREAKING — translator-owned route header consumers now compose with global
+  transformers** (issue #4304). The auto-emitted `istio-vs-req-xform-*` /
+  `istio-vs-resp-xform-*` instances consume matched
+  `mesh_route_dispatch` header rules without shadowing a same-name global
+  `request_transformer` / `response_transformer`. Before this change, a
+  Gateway API `HTTPRoute` with `RequestHeaderModifier` or
+  `ResponseHeaderModifier` accidentally suppressed the global transformer's
+  static rules on that proxy; those global rules now run first and the matched
+  route rules run last. Istio VirtualService header transforms use the same
+  composition contract. **Operator action**: audit HTTPRoute-backed proxies
+  that relied on the accidental suppression and scope or remove global static
+  rules that should not apply there.
 
 - **BREAKING — `POST /batch` rejects unknown top-level envelope keys**
   (issue #4042). The request is create-only (`consumers`, `upstreams`,
