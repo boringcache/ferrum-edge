@@ -432,7 +432,9 @@ fn partial_subset_and_port_outlier_overlays_share_field_level_precedence() {
     let mut selected_proxy = proxy();
     selected_proxy.upstream_subset = Some("v1".to_string());
     let mut selected_upstream = upstream();
-    selected_upstream.targets[0].tags.insert("version".to_string(), "v1".to_string());
+    selected_upstream.targets[0]
+        .tags
+        .insert("version".to_string(), "v1".to_string());
     let mut port_level_settings = HashMap::new();
     port_level_settings.insert(
         8080,

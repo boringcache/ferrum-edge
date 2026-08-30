@@ -1063,8 +1063,8 @@ pub(crate) fn dispatch_port_overrides_for_selected_subset(
         .port_overrides
         .iter()
         .filter_map(|(port, override_config)| {
-            let mut resolved = ResolvedPortOverride::from_upstream_override(override_config)
-                .unwrap_or_default();
+            let mut resolved =
+                ResolvedPortOverride::from_upstream_override(override_config).unwrap_or_default();
             if let Some(outlier) = override_config.outlier_detection_overlay.as_ref() {
                 let mut passive = inherited_passive.cloned().unwrap_or_default();
                 crate::modes::mesh::apply_outlier_detection_to_passive(&mut passive, outlier);
