@@ -8,8 +8,9 @@
 //! every request while performing the expensive parse exactly once.
 
 use ferrum_edge::_test_support::{
-    mtls_cert_validity_window_contains_for_test, request_credential_deadline_at,
-    request_credential_deadline_remaining, try_credential_deadline_from_unix_seconds_at_for_test,
+    mtls_cert_validity_unix_bounds_from_der_for_test, mtls_client_cert_is_valid_at_unix_for_test,
+    request_credential_deadline_at, request_credential_deadline_remaining,
+    try_credential_deadline_from_unix_seconds_at_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
@@ -36,6 +37,24 @@ fn cert_with_validity(
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now + time::Duration::seconds(not_before_offset_secs);
     params.not_after = now + time::Duration::seconds(not_after_offset_secs);
+
+    params
+        .self_signed(&rcgen::KeyPair::generate().unwrap())
+        .unwrap()
+        .der()
+        .to_vec()
+}
+
+/// Self-signed client certificate with absolute Unix-second validity bounds.
+/// Used so boundary proofs evaluate those encoded instants instead of `now`.
+fn cert_with_unix_validity(cn: &str, not_before_unix: i64, not_after_unix: i64) -> Vec<u8> {
+    let mut params = rcgen::CertificateParams::default();
+    let mut dn = rcgen::DistinguishedName::new();
+    dn.push(rcgen::DnType::CommonName, cn);
+    params.distinguished_name = dn;
+
+    params.not_before = time::OffsetDateTime::from_unix_timestamp(not_before_unix).unwrap();
+    params.not_after = time::OffsetDateTime::from_unix_timestamp(not_after_unix).unwrap();
 
     params
         .self_signed(&rcgen::KeyPair::generate().unwrap())
@@ -137,26 +156,129 @@ async fn default_configuration_accepts_a_currently_valid_leaf() {
 
 #[test]
 fn the_not_before_and_not_after_instants_are_themselves_inside_the_window() {
-    const BOUNDARY: i64 = 1_700_000_000;
+    // Evaluated at an explicit Unix instant so async setup cannot roll the
+    // wall clock past a zero-width `[T, T]` window (issue #4359). RFC 5280
+    // "valid at" semantics make both endpoints inclusive.
+    const T: i64 = 1_700_000_000;
     assert_eq!(
-        mtls_cert_validity_window_contains_for_test(BOUNDARY, BOUNDARY, BOUNDARY),
+        mtls_client_cert_is_valid_at_unix_for_test(T, T, T),
         Some(true),
-        "RFC 5280 validity is a closed interval"
+        "a zero-width window must admit its single enclosed second"
+    );
+    assert_eq!(
+        mtls_client_cert_is_valid_at_unix_for_test(T, T, T - 1),
+        Some(false),
+        "the second before notBefore is outside the window"
+    );
+    assert_eq!(
+        mtls_client_cert_is_valid_at_unix_for_test(T, T, T + 1),
+        Some(false),
+        "the second after notAfter is outside the window"
+    );
+
+    const NOT_BEFORE: i64 = 1_700_000_000;
+    const NOT_AFTER: i64 = 1_700_000_010;
+    assert_eq!(
+        mtls_client_cert_is_valid_at_unix_for_test(NOT_BEFORE, NOT_AFTER, NOT_BEFORE),
+        Some(true)
+    );
+    assert_eq!(
+        mtls_client_cert_is_valid_at_unix_for_test(NOT_BEFORE, NOT_AFTER, NOT_AFTER),
+        Some(true)
+    );
+    assert_eq!(
+        mtls_client_cert_is_valid_at_unix_for_test(NOT_BEFORE, NOT_AFTER, NOT_BEFORE + 5),
+        Some(true)
+    );
+    assert_eq!(
+        mtls_client_cert_is_valid_at_unix_for_test(NOT_BEFORE, NOT_AFTER, NOT_BEFORE - 1),
+        Some(false)
+    );
+    assert_eq!(
+        mtls_client_cert_is_valid_at_unix_for_test(NOT_BEFORE, NOT_AFTER, NOT_AFTER + 1),
+        Some(false)
+    );
+}
+
+#[test]
+fn an_inverted_unix_interval_is_unusable_rather_than_evaluated() {
+    assert_eq!(
+        mtls_client_cert_is_valid_at_unix_for_test(1_700_000_010, 1_700_000_000, 1_700_000_005),
+        None,
+        "an inverted interval must fail closed before any instant is compared"
+    );
+}
+
+#[test]
+fn parsed_leaf_bounds_are_inclusive_at_the_encoded_unix_instants() {
+    // Mint a leaf at absolute Unix bounds so the production parser's timestamps
+    // — not a separately sampled wall clock — are the instants under test.
+    const NOT_BEFORE: i64 = 1_700_000_000;
+    const NOT_AFTER: i64 = 1_700_000_010;
+    let cert = cert_with_unix_validity("client.example.com", NOT_BEFORE, NOT_AFTER);
+    let (parsed_not_before, parsed_not_after) =
+        mtls_cert_validity_unix_bounds_from_der_for_test(&cert)
+            .expect("a coherent leaf must yield a usable validity window");
+    assert_eq!(parsed_not_before, NOT_BEFORE);
+    assert_eq!(parsed_not_after, NOT_AFTER);
+    assert_eq!(
+        mtls_client_cert_is_valid_at_unix_for_test(
+            parsed_not_before,
+            parsed_not_after,
+            parsed_not_before,
+        ),
+        Some(true)
+    );
+    assert_eq!(
+        mtls_client_cert_is_valid_at_unix_for_test(
+            parsed_not_before,
+            parsed_not_after,
+            parsed_not_after,
+        ),
+        Some(true)
+    );
+    assert_eq!(
+        mtls_client_cert_is_valid_at_unix_for_test(
+            parsed_not_before,
+            parsed_not_after,
+            parsed_not_before - 1,
+        ),
+        Some(false)
+    );
+    assert_eq!(
+        mtls_client_cert_is_valid_at_unix_for_test(
+            parsed_not_before,
+            parsed_not_after,
+            parsed_not_after + 1,
+        ),
+        Some(false)
+    );
+}
+
+#[test]
+fn the_per_request_validity_check_uses_the_inclusive_unix_predicate() {
+    let source = include_str!("../../../src/plugins/mtls_auth.rs");
+    let outcome = source
+        .split("fn evaluation_outcome(")
+        .nth(1)
+        .expect("evaluation_outcome")
+        .split("\n    fn verify_client_cert(")
+        .next()
+        .expect("bounded evaluation_outcome");
+    assert!(
+        outcome.contains("let now_unix = x509_parser::time::ASN1Time::now().timestamp();"),
+        "the per-request check must sample wall-clock Unix time"
+    );
+    assert!(
+        outcome.contains("if !validity.contains(now_unix)"),
+        "the per-request check must use the inclusive CertValidityWindow predicate"
     );
 }
 
 #[test]
 fn one_second_past_not_after_is_outside_the_window() {
     assert_eq!(
-        mtls_cert_validity_window_contains_for_test(100, 200, 201),
-        Some(false)
-    );
-}
-
-#[test]
-fn one_second_before_not_before_is_outside_the_window() {
-    assert_eq!(
-        mtls_cert_validity_window_contains_for_test(100, 200, 99),
+        mtls_client_cert_is_valid_at_unix_for_test(100, 200, 201),
         Some(false)
     );
 }

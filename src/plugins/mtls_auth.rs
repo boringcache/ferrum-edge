@@ -65,16 +65,6 @@ struct CertValidityWindow {
 }
 
 impl CertValidityWindow {
-    fn from_unix_bounds(not_before_unix: i64, not_after_unix: i64) -> Option<Self> {
-        if not_after_unix < not_before_unix {
-            return None;
-        }
-        Some(Self {
-            not_before_unix,
-            not_after_unix,
-        })
-    }
-
     /// Parse the leaf's validity interval, failing closed on anything that
     /// cannot be represented as a coherent window.
     ///
@@ -91,6 +81,19 @@ impl CertValidityWindow {
         )
     }
 
+    /// Construct a window from canonical Unix seconds, failing closed on an
+    /// inverted interval. Shared by certificate parsing and the explicit-
+    /// instant test seam so both sides use the same bounds check.
+    fn from_unix_bounds(not_before_unix: i64, not_after_unix: i64) -> Option<Self> {
+        if not_after_unix < not_before_unix {
+            return None;
+        }
+        Some(Self {
+            not_before_unix,
+            not_after_unix,
+        })
+    }
+
     /// Whether `now_unix` lies inside the closed interval. Both boundaries are
     /// inclusive, matching RFC 5280's "valid at" semantics and
     /// `x509_parser`'s own `Validity::is_valid_at`.
@@ -99,16 +102,27 @@ impl CertValidityWindow {
     }
 }
 
-/// Narrow crate-internal seam for deterministic external coverage of the exact
-/// closed-interval predicate. The binary target has no `_test_support` caller.
+/// Production inclusive validity predicate at an explicit Unix instant
+/// (issue #4359). `None` is the fail-closed inverted-interval case used by
+/// `CertValidityWindow::from_certificate`. Reached through `_test_support`;
+/// the binary target has no consumer.
 #[allow(dead_code)]
-pub(crate) fn cert_validity_window_contains_for_test(
+pub(crate) fn cert_is_valid_at_unix(
     not_before_unix: i64,
     not_after_unix: i64,
     now_unix: i64,
 ) -> Option<bool> {
     CertValidityWindow::from_unix_bounds(not_before_unix, not_after_unix)
         .map(|window| window.contains(now_unix))
+}
+
+/// Parse a leaf DER into the same Unix bounds `evaluate_client_cert` retains.
+/// Reached through `_test_support`; the binary target has no consumer.
+#[allow(dead_code)]
+pub(crate) fn cert_validity_unix_bounds_from_der(der: &[u8]) -> Option<(i64, i64)> {
+    let (_, cert) = X509Certificate::from_der(der).ok()?;
+    let window = CertValidityWindow::from_certificate(&cert)?;
+    Some((window.not_before_unix, window.not_after_unix))
 }
 
 #[derive(Debug)]
