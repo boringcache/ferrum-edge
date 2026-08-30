@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Fail-closed GNU ABI gate for published ferrum-edge and ferrum-cni binaries.
 
-The scanner reads DT_NEEDED and GNU version-need records from an ELF, rejects
-GLIBC symbol versions above the declared floor, and rejects unexpected shared
-libraries. It is the hosted artifact gate for issue #4301: a moving
-ubuntu-latest glibc floor must not ship. Parsing stays in-process so trusted
-automation policy can inspect this file; computed process argv fails closed.
+The scanner reads DT_NEEDED, DT_RPATH/DT_RUNPATH, GNU version-need records,
+and e_machine from an ELF; it rejects GLIBC symbol versions above the
+declared floor, unexpected shared libraries, a runtime library search path,
+and an e_machine that does not match the advertised architecture. It is the
+hosted artifact gate for issue #4301: a moving ubuntu-latest glibc floor
+must not ship. Parsing stays in-process so trusted automation policy can
+inspect this file; computed process argv fails closed.
 """
 
 from __future__ import annotations
@@ -30,8 +32,12 @@ PT_LOAD = 1
 PT_DYNAMIC = 2
 DT_NEEDED = 1
 DT_STRTAB = 5
+DT_RPATH = 15
+DT_RUNPATH = 29
 DT_VERNEED = 0x6FFFFFFE
 DT_VERNEEDNUM = 0x6FFFFFFF
+EM_X86_64 = 62
+EM_AARCH64 = 183
 SYSROOT_BUILD_SH = REPO_ROOT / ".github" / "scripts" / "build_linux_gnu_sysroot.sh"
 PROCESS_API_TOKENS = (
     "import sub" + "process",
@@ -178,8 +184,10 @@ def _collect_verneed_versions(
     return versions
 
 
-def parse_elf_abi(data: bytes) -> tuple[list[str], list[str]]:
-    """Return GLIBC version-need names and DT_NEEDED SONAMEs from an ELF.
+def parse_elf_abi(
+    data: bytes,
+) -> tuple[list[str], list[str], list[tuple[str, str]], int]:
+    """Return GLIBC versions, DT_NEEDED SONAMEs, DT_RPATH/DT_RUNPATH, e_machine.
 
     The scanner stays in-process so trusted automation policy can statically
     inspect this file. Computed process argv fails closed.
@@ -199,6 +207,7 @@ def parse_elf_abi(data: bytes) -> tuple[list[str], list[str]]:
 
     elf64 = elf_class == 2
     endian = "<" if encoding == 1 else ">"
+    e_machine = _elf_unpack(f"{endian}H", data, 18)[0]
     u32 = f"{endian}I"
     u64 = f"{endian}Q"
 
@@ -234,6 +243,7 @@ def parse_elf_abi(data: bytes) -> tuple[list[str], list[str]]:
 
     dyn_entry = 16 if elf64 else 8
     needed_offsets: list[int] = []
+    rpath_offsets: list[tuple[str, int]] = []
     strtab_va = -1
     verneed_va = -1
     verneed_count = 0
@@ -251,6 +261,10 @@ def parse_elf_abi(data: bytes) -> tuple[list[str], list[str]]:
             needed_offsets.append(value)
         elif tag == DT_STRTAB:
             strtab_va = value
+        elif tag == DT_RPATH:
+            rpath_offsets.append(("DT_RPATH", value))
+        elif tag == DT_RUNPATH:
+            rpath_offsets.append(("DT_RUNPATH", value))
         elif tag == DT_VERNEED:
             verneed_va = value
         elif tag == DT_VERNEEDNUM:
@@ -263,6 +277,10 @@ def parse_elf_abi(data: bytes) -> tuple[list[str], list[str]]:
     needed = sorted(
         {_elf_read_cstring(data, strtab + offset) for offset in needed_offsets}
     )
+    search_paths = [
+        (tag, _elf_read_cstring(data, strtab + offset))
+        for tag, offset in rpath_offsets
+    ]
 
     versions: set[str] = set()
     if verneed_va >= 0 and verneed_count:
@@ -271,7 +289,26 @@ def parse_elf_abi(data: bytes) -> tuple[list[str], list[str]]:
             data, verneed_offset, verneed_count, strtab, endian
         )
 
-    return sorted(versions), needed
+    return sorted(versions), needed, search_paths, e_machine
+
+
+def advertised_e_machine(binary: Path) -> tuple[int | None, str | None]:
+    """Return the e_machine implied by a published asset name or sysroot path."""
+
+    name = binary.name
+    rendered = str(binary)
+    wants_x86 = name.endswith("-x86_64") or "x86_64-unknown-linux-gnu" in rendered
+    wants_arm = name.endswith("-aarch64") or "aarch64-unknown-linux-gnu" in rendered
+    if wants_x86 and wants_arm:
+        return None, (
+            f"{binary} advertises both x86_64 and aarch64; "
+            "refusing to choose an e_machine"
+        )
+    if wants_x86:
+        return EM_X86_64, None
+    if wants_arm:
+        return EM_AARCH64, None
+    return None, None
 
 
 def scan_binary(binary: Path, contract: dict[str, Any]) -> list[str]:
@@ -284,11 +321,34 @@ def scan_binary(binary: Path, contract: dict[str, Any]) -> list[str]:
         return [f"{binary} is not an ELF file"]
 
     try:
-        versions, needed = parse_elf_abi(payload)
+        versions, needed, search_paths, e_machine = parse_elf_abi(payload)
     except ValueError as error:
         return [f"{binary} {error}"]
     ceiling = parse_version(str(contract["glibc_max_version"]))
     allowed = set(contract["allowed_needed"])
+
+    expected_machine, advertised_error = advertised_e_machine(binary)
+    if advertised_error is not None:
+        errors.append(advertised_error)
+    elif expected_machine is not None and e_machine != expected_machine:
+        observed = {
+            EM_X86_64: "EM_X86_64",
+            EM_AARCH64: "EM_AARCH64",
+        }.get(e_machine, f"e_machine={e_machine}")
+        required = {
+            EM_X86_64: "EM_X86_64 (62)",
+            EM_AARCH64: "EM_AARCH64 (183)",
+        }[expected_machine]
+        errors.append(
+            f"{binary} is {observed} ({e_machine}); advertised architecture "
+            f"requires {required}"
+        )
+
+    for tag, value in search_paths:
+        errors.append(
+            f"{binary} embeds {tag}={value!r}; published GNU assets must not "
+            "set a runtime library search path"
+        )
 
     if not versions:
         errors.append(f"{binary} has no GLIBC version-need records")
@@ -314,7 +374,9 @@ def scan_binary(binary: Path, contract: dict[str, Any]) -> list[str]:
 
 
 def scan_assets(paths: list[Path], contract: dict[str, Any]) -> list[str]:
-    errors: list[str] = []
+    errors = check_contract_shape(contract)
+    if errors:
+        return errors
     if not paths:
         return ["no GNU binaries were supplied to the ABI gate"]
     for path in paths:
@@ -328,13 +390,18 @@ def _producer_job_errors(
     job: str,
     upload_name: str,
 ) -> list[str]:
-    """Prove the published x86_64 GNU bytes are the pinned sysroot bytes.
+    """Lint producer-job text for the expected sysroot / scan / upload shape.
 
-    One job per workflow compiles, checksums, and uploads the canonical
-    x86_64 GNU assets. The pinned AlmaLinux sysroot build, the ABI scan, and
-    the oldest-baseline smoke all live inside it and read the staged
-    `release-assets/` files, so the bytes that are scanned are the bytes that
-    are uploaded. There is no second build to disagree with.
+    This is a textual check of workflow YAML this pull request can still
+    edit. It is not the tamper control. It is defeated by templating (the
+    existing `Copy binary` step already writes
+    `target/${{ matrix.target }}/release/...`) and by any rewrite that keeps
+    the required substrings while changing behavior. The security boundary
+    is the trusted-base byte-freeze of `build-binaries` /
+    `build-release-binaries` plus `linux_gnu_producer_contract_errors` on
+    main, which holds the destination digest to one sysroot build, one
+    staged-asset scan before upload, and no rebuilt
+    `target/x86_64-unknown-linux-gnu/...` scanner operand.
     """
 
     errors: list[str] = []
@@ -372,12 +439,17 @@ def _producer_job_errors(
         if token not in body:
             errors.append(f"{label} {job} is missing required {token}")
 
+    # Literal-path lint only. Templated operands such as
+    # `target/${{ matrix.target }}/release/ferrum-edge` do not match, so this
+    # cannot be the tamper control — see the docstring.
     if re.search(r"target/x86_64-unknown-linux-gnu/[^\s\\]*ferrum-(?:edge|cni)", body):
         errors.append(
             f"{label} {job} must gate the staged published assets, not a path "
             "in a build tree"
         )
 
+    # String-offset ordering of the first occurrences. It is a shape lint,
+    # not a proof that the scanned bytes are the uploaded bytes.
     scan_at = body.find("release-assets/ferrum-edge-linux-x86_64")
     upload_at = body.find(f"name: {upload_name}")
     if scan_at < 0 or upload_at < 0:
@@ -630,6 +702,15 @@ def check_smoke_script(source: str) -> list[str]:
         errors.append(
             "smoke_linux_gnu_baseline.sh must keep docker argv0 a literal docker"
         )
+    if (
+        '"$LINUX_GNU_SMOKE_FLOOR_IMAGE" != "$floor_image"' not in source
+        or '"$LINUX_GNU_SMOKE_UBUNTU2204_IMAGE" != "$ubuntu_image"' not in source
+    ):
+        errors.append(
+            "smoke_linux_gnu_baseline.sh must cross-check "
+            "LINUX_GNU_SMOKE_FLOOR_IMAGE and LINUX_GNU_SMOKE_UBUNTU2204_IMAGE "
+            "against the contract when those env vars are set"
+        )
     return errors
 
 
@@ -716,6 +797,16 @@ def check_sysroot_builder(source: str) -> list[str]:
     if 'compgen -G "$LIBCLANG_PATH/libclang.so*"' not in source:
         errors.append(
             "sysroot builder must fail closed when libclang is absent from the pinned sysroot"
+        )
+    if "--env RUSTFLAGS=" not in source:
+        errors.append(
+            "sysroot builder must set empty RUSTFLAGS so workspace mold "
+            "rustflags cannot apply inside the sysroot"
+        )
+    if "--env CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=" not in source:
+        errors.append(
+            "sysroot builder must clear CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS "
+            "at the same precedence as the linker override"
         )
     return errors
 
@@ -849,10 +940,18 @@ def evaluate_readelf_fixture(text: str, contract: dict[str, Any], label: str) ->
     return errors
 
 
-def _synthetic_dynamic_elf64(needed: list[str], glibc_names: list[str]) -> bytes:
+def _synthetic_dynamic_elf64(
+    needed: list[str],
+    glibc_names: list[str],
+    *,
+    e_machine: int = EM_X86_64,
+    rpath: str | None = None,
+    runpath: str | None = None,
+) -> bytes:
     """Build a little-endian ELF64 with DT_NEEDED and GNU verneed records."""
 
-    strings = ["", *needed, *glibc_names]
+    extra_strings = [item for item in (rpath, runpath) if item is not None]
+    strings = ["", *needed, *glibc_names, *extra_strings]
     strtab = b"".join(item.encode("ascii") + b"\x00" for item in strings)
     offsets: dict[str, int] = {}
     cursor = 0
@@ -863,7 +962,8 @@ def _synthetic_dynamic_elf64(needed: list[str], glibc_names: list[str]) -> bytes
     ehdr_size = 64
     phdr_size = 56
     phnum = 2
-    dyn_count = len(needed) + 4  # STRTAB, VERNEED, VERNEEDNUM, NULL
+    extra_dyn = (1 if rpath is not None else 0) + (1 if runpath is not None else 0)
+    dyn_count = len(needed) + 4 + extra_dyn  # STRTAB, VERNEED, VERNEEDNUM, NULL
     dyn_size = dyn_count * 16
     verneed_size = 16 + 16 * len(glibc_names)
     phoff = ehdr_size
@@ -877,7 +977,7 @@ def _synthetic_dynamic_elf64(needed: list[str], glibc_names: list[str]) -> bytes
         "<16sHHIQQQIHHHHHH",
         ident,
         3,
-        62,
+        e_machine,
         1,
         0,
         phoff,
@@ -900,6 +1000,10 @@ def _synthetic_dynamic_elf64(needed: list[str], glibc_names: list[str]) -> bytes
     dyn_entries.extend(struct.pack("<qQ", DT_STRTAB, strtab_off))
     dyn_entries.extend(struct.pack("<qQ", DT_VERNEED, verneed_off))
     dyn_entries.extend(struct.pack("<qQ", DT_VERNEEDNUM, 1))
+    if rpath is not None:
+        dyn_entries.extend(struct.pack("<qQ", DT_RPATH, offsets[rpath]))
+    if runpath is not None:
+        dyn_entries.extend(struct.pack("<qQ", DT_RUNPATH, offsets[runpath]))
     dyn_entries.extend(struct.pack("<qQ", 0, 0))
 
     aux_offset = 16
@@ -992,6 +1096,88 @@ def run_self_test() -> list[str]:
         if not any("libssl.so.3" in item for item in unexpected_elf_errors):
             failures.append("synthetic unexpected SONAME ELF was not rejected")
 
+        named_x86 = Path(tmp) / "ferrum-edge-linux-x86_64"
+        named_x86.write_bytes(
+            _synthetic_dynamic_elf64(
+                ["libc.so.6", "libgcc_s.so.1"], ["GLIBC_2.2.5", "GLIBC_2.34"]
+            )
+        )
+        if scan_binary(named_x86, contract):
+            failures.append("in-floor x86_64 advertised ELF was rejected")
+
+        aarch_as_x86 = Path(tmp) / "mismatch-x86" / "ferrum-edge-linux-x86_64"
+        aarch_as_x86.parent.mkdir()
+        aarch_as_x86.write_bytes(
+            _synthetic_dynamic_elf64(
+                ["libc.so.6", "libgcc_s.so.1"],
+                ["GLIBC_2.2.5", "GLIBC_2.34"],
+                e_machine=EM_AARCH64,
+            )
+        )
+        aarch_as_x86_errors = scan_binary(aarch_as_x86, contract)
+        if not any("EM_AARCH64" in item and "EM_X86_64" in item for item in aarch_as_x86_errors):
+            failures.append("aarch64 ELF advertised as x86_64 was not rejected")
+
+        x86_as_aarch = Path(tmp) / "mismatch-arm" / "ferrum-edge-linux-aarch64"
+        x86_as_aarch.parent.mkdir()
+        x86_as_aarch.write_bytes(
+            _synthetic_dynamic_elf64(
+                ["libc.so.6", "libgcc_s.so.1"],
+                ["GLIBC_2.2.5", "GLIBC_2.34"],
+                e_machine=EM_X86_64,
+            )
+        )
+        x86_as_aarch_errors = scan_binary(x86_as_aarch, contract)
+        if not any("EM_X86_64" in item and "EM_AARCH64" in item for item in x86_as_aarch_errors):
+            failures.append("x86_64 ELF advertised as aarch64 was not rejected")
+
+        path_mismatch = (
+            Path(tmp) / "target" / "x86_64-unknown-linux-gnu" / "release" / "ferrum-edge"
+        )
+        path_mismatch.parent.mkdir(parents=True)
+        path_mismatch.write_bytes(
+            _synthetic_dynamic_elf64(
+                ["libc.so.6", "libgcc_s.so.1"],
+                ["GLIBC_2.2.5", "GLIBC_2.34"],
+                e_machine=EM_AARCH64,
+            )
+        )
+        path_mismatch_errors = scan_binary(path_mismatch, contract)
+        if not any("EM_AARCH64" in item for item in path_mismatch_errors):
+            failures.append(
+                "aarch64 ELF under x86_64-unknown-linux-gnu was not rejected"
+            )
+
+        rpath_elf = Path(tmp) / "rpath.elf"
+        rpath_elf.write_bytes(
+            _synthetic_dynamic_elf64(
+                ["libc.so.6", "libgcc_s.so.1"],
+                ["GLIBC_2.2.5", "GLIBC_2.34"],
+                rpath="/opt/build/lib",
+            )
+        )
+        rpath_errors = scan_binary(rpath_elf, contract)
+        if not any("DT_RPATH" in item and "/opt/build/lib" in item for item in rpath_errors):
+            failures.append("synthetic DT_RPATH ELF was not rejected")
+
+        runpath_elf = Path(tmp) / "runpath.elf"
+        runpath_elf.write_bytes(
+            _synthetic_dynamic_elf64(
+                ["libc.so.6", "libgcc_s.so.1"],
+                ["GLIBC_2.2.5", "GLIBC_2.34"],
+                runpath="/writable/lib",
+            )
+        )
+        runpath_errors = scan_binary(runpath_elf, contract)
+        if not any("DT_RUNPATH" in item and "/writable/lib" in item for item in runpath_errors):
+            failures.append("synthetic DT_RUNPATH ELF was not rejected")
+
+        mis_scoped = scan_assets([named_x86], {"smoke": {}})
+        if not any("must define top-level" in item for item in mis_scoped):
+            failures.append(
+                "a mis-scoped contract on the binaries scan path was not diagnosed"
+            )
+
     scanner_source = Path(__file__).read_text(encoding="utf-8")
     if not check_no_process_api(
         "import " + "subprocess\n" + scanner_source,
@@ -1080,6 +1266,14 @@ def run_self_test() -> list[str]:
     if not check_smoke_script(mutated_smoke):
         failures.append("read-write /gnu smoke mount was not rejected")
 
+    mutated_smoke_env = SMOKE_SH.read_text(encoding="utf-8").replace(
+        '"$LINUX_GNU_SMOKE_FLOOR_IMAGE" != "$floor_image"',
+        '"$LINUX_GNU_SMOKE_FLOOR_IMAGE" == "$floor_image"',
+        1,
+    )
+    if not check_smoke_script(mutated_smoke_env):
+        failures.append("smoke script without a floor-image contract cross-check was not rejected")
+
     builder = SYSROOT_BUILD_SH.read_text(encoding="utf-8")
     mutated_target_dir = builder.replace(
         "--env CARGO_TARGET_DIR=/src/target/linux-gnu-sysroot",
@@ -1148,6 +1342,16 @@ def run_self_test() -> list[str]:
     )
     if not check_sysroot_builder(mutated_libclang_guard):
         failures.append("sysroot builder without a libclang presence guard was not rejected")
+
+    mutated_target_rustflags = builder.replace(
+        "  --env CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS= \\\n",
+        "",
+        1,
+    )
+    if not check_sysroot_builder(mutated_target_rustflags):
+        failures.append(
+            "sysroot builder without cleared target rustflags was not rejected"
+        )
 
     mutated_pr_job = ci_yml.replace(
         "verify-pr-linux-gnu-abi:", "verify-pr-linux-gnu-abi-missing:", 1
@@ -1256,7 +1460,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.check_contract:
         failures.extend(check_repository())
     if args.binaries:
-        failures.extend(scan_assets(args.binaries, load_contract()))
+        contract = load_contract()
+        shape = check_contract_shape(contract)
+        failures.extend(shape)
+        if not shape:
+            failures.extend(scan_assets(args.binaries, contract))
     if not args.self_test and not args.check_contract and not args.binaries:
         parser.error("supply binaries, --self-test, and/or --check-contract")
 

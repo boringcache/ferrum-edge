@@ -35,15 +35,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`target/linux-gnu-sysroot`) so native runner caches cannot contaminate the
   pinned link, and the same job then stages, checksums, ABI-scans, and
   oldest-baseline-smokes those exact bytes before uploading them. The GitHub
-  Release, its `.sha256` sidecars, the `latest` prerelease, the default
-  multi-arch container images, and the signing/attestation jobs therefore all
-  consume the bytes that were verified; a floor violation means the artifact
-  is never published. ARM64 GNU artifacts still come from the isolated Cross
-  build, already target an older glibc, and are re-checked as published on an
-  ARM64 runner. Full-mode pull requests run the same sysroot builder as a
-  pre-merge regression signal. Artifact names, checksums, signatures, and
-  container publish behavior are unchanged. Remaining dynamic libraries are
-  `libgcc_s.so.1` and, if not static-linked, `libz.so.1`.
+  Release, its `.sha256` sidecars, the `latest` prerelease, the x86_64 layer
+  of the default multi-arch container images, and the signing/attestation
+  jobs therefore all consume the x86_64 bytes that were verified; a floor
+  violation means that artifact is never uploaded. ARM64 GNU artifacts still
+  come from the isolated Cross build, already target an older glibc, and are
+  re-checked as published on an ARM64 runner. The `docker` job needs
+  `[test, build-binaries, build-arm64-cross, main-publish-gate]` and does not
+  wait on that ARM64 ABI job, so the arm64 image layer is pushed before
+  verification; `linux-gnu-abi-latest-gate` / `linux-gnu-abi-release-gate`
+  delete only the GitHub Release (or `latest` prerelease), never the
+  `:latest` / `:vX.Y.Z` image tags. Full-mode pull requests run the same
+  sysroot builder as a pre-merge regression signal. Artifact names,
+  checksums, signatures, and container publish behavior are unchanged.
+  Remaining dynamic libraries are `libgcc_s.so.1` and, if not static-linked,
+  `libz.so.1`.
 
 ### Changed
 

@@ -54,6 +54,15 @@ esac
 floor_image="$(python3 -I -c 'import tomllib, pathlib, sys; c=tomllib.loads(pathlib.Path(sys.argv[1]).read_text()); print(c["smoke"]["floor"]["image"])' "$contract")"
 ubuntu_image="$(python3 -I -c 'import tomllib, pathlib, sys; c=tomllib.loads(pathlib.Path(sys.argv[1]).read_text()); print(c["smoke"]["ubuntu2204"]["image"])' "$contract")"
 
+if [[ -n "${LINUX_GNU_SMOKE_FLOOR_IMAGE:-}" && "$LINUX_GNU_SMOKE_FLOOR_IMAGE" != "$floor_image" ]]; then
+  echo "::error::LINUX_GNU_SMOKE_FLOOR_IMAGE does not match .github/linux-gnu-abi.toml" >&2
+  exit 1
+fi
+if [[ -n "${LINUX_GNU_SMOKE_UBUNTU2204_IMAGE:-}" && "$LINUX_GNU_SMOKE_UBUNTU2204_IMAGE" != "$ubuntu_image" ]]; then
+  echo "::error::LINUX_GNU_SMOKE_UBUNTU2204_IMAGE does not match .github/linux-gnu-abi.toml" >&2
+  exit 1
+fi
+
 require_digest() {
   local image="$1"
   if [[ "$image" != *"@sha256:"* ]]; then

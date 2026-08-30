@@ -63,6 +63,15 @@ fi
 host_uid="$(id -u)"
 host_gid="$(id -g)"
 
+# `.cargo/config.toml` sets linker=clang and -fuse-ld=mold. The sysroot has
+# neither mold nor a rustflags-safe clang as the GNU target linker.
+# RUSTFLAGS= (empty) is the override that replaces target rustflags; cargo
+# skips `[target.<triple>] rustflags` once RUSTFLAGS is set.
+# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS= is cleared at the same
+# precedence as the linker override so the x86_64 intent is explicit. It is
+# not a substitute: CARGO_TARGET_*_RUSTFLAGS merges with config when
+# RUSTFLAGS is unset. mold is not installed in the sysroot, so a regression
+# fails the link instead of silently changing the floor.
 docker run --rm \
   --platform "$sysroot_platform" \
   --volume "$work_root:/src:rw" \
@@ -78,6 +87,7 @@ docker run --rm \
   --env CARGO_BUILD_RUSTC_WRAPPER= \
   --env RUSTFLAGS= \
   --env CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc \
+  --env CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS= \
   --env CARGO_TARGET_DIR=/src/target/linux-gnu-sysroot \
   --env PROTOC_URL="$protoc_url" \
   --env PROTOC_SHA256="$protoc_sha256" \
@@ -94,6 +104,12 @@ docker run --rm \
       exit 1
     fi
     mkdir -p /src/target/linux-gnu-sysroot
+    # Compiler/linker packages are deliberately unpinned. The base image is
+    # digest-pinned and AlmaLinux repos are GPG-signed, but dnf still resolves
+    # gcc/binutils/clang against the live 8.10 repo, so NVRs can move between
+    # runs. Pinning exact NVRs would break the builder when security updates
+    # retire the old package. The ABI scanner is the fail-closed bound on the
+    # published DT_NEEDED / GLIBC version-need set.
     dnf -y install gcc gcc-c++ make cmake zlib-devel perl unzip curl ca-certificates libcurl-devel openssl-devel clang clang-devel
     export LIBCLANG_PATH=/usr/lib64
     if ! compgen -G "$LIBCLANG_PATH/libclang.so*" > /dev/null; then

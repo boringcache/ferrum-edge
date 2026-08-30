@@ -62,6 +62,15 @@ def check_smoke_script(source: str) -> list[str]:
             "smoke_linux_gnu_baseline.sh must keep docker argv0 a literal docker"
         )
     if (
+        '"$LINUX_GNU_SMOKE_FLOOR_IMAGE" != "$floor_image"' not in source
+        or '"$LINUX_GNU_SMOKE_UBUNTU2204_IMAGE" != "$ubuntu_image"' not in source
+    ):
+        errors.append(
+            "smoke_linux_gnu_baseline.sh must cross-check "
+            "LINUX_GNU_SMOKE_FLOOR_IMAGE and LINUX_GNU_SMOKE_UBUNTU2204_IMAGE "
+            "against the contract when those env vars are set"
+        )
+    if (
         'export FERRUM_GNU_SMOKE_READY="$rpc_dir/ready"' not in source
         or 'Path(os.environ["FERRUM_GNU_SMOKE_READY"]).write_text' not in source
         or 'if [[ -f "$FERRUM_GNU_SMOKE_READY" ]]' not in source
@@ -109,6 +118,15 @@ def run_self_test() -> list[str]:
     mutated = script.replace('--volume "$stage:/gnu:ro"', '--volume "$stage:/gnu:rw"', 1)
     if not check_smoke_script(mutated):
         failures.append("read-write /gnu smoke mount was not rejected")
+    mutated = script.replace(
+        '"$LINUX_GNU_SMOKE_FLOOR_IMAGE" != "$floor_image"',
+        '"$LINUX_GNU_SMOKE_FLOOR_IMAGE" == "$floor_image"',
+        1,
+    )
+    if not check_smoke_script(mutated):
+        failures.append(
+            "smoke script without a floor-image contract cross-check was not rejected"
+        )
     mutated = script.replace(
         'if [[ -f "$FERRUM_GNU_SMOKE_READY" ]]',
         'if [[ -S "$FERRUM_GNU_SMOKE_RPC" ]]',
