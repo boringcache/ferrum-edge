@@ -1931,3 +1931,17 @@ async fn public_policy_denies_literal_without_caching() {
     assert_eq!(cache.cache_len(), 0);
     assert!(!cache.is_cached("169.254.169.254"));
 }
+
+// ============================================================================
+// Proactive background refresh hardening (issue #4270)
+// ============================================================================
+
+#[test]
+fn proactive_refresh_and_eviction_intervals_use_missed_tick_delay() {
+    let source = include_str!("../../../src/dns/mod.rs");
+    let delay_hits = source.matches("MissedTickBehavior::Delay").count();
+    assert!(
+        delay_hits >= 3,
+        "proactive refresh, independent eviction, and failed-retry must Delay missed ticks, found {delay_hits}"
+    );
+}

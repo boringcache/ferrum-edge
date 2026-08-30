@@ -279,8 +279,10 @@ fn material_fixtures() -> MaterialFixtures {
         key_pem: leaf_key.serialize_pem(),
         ca_pem,
         crl_pem,
+        // Issue #4300: the admin boundary now parses the OCSP envelope, so this
+        // fixture must be a real signed response rather than a placeholder.
         ocsp_der_base64: base64::engine::general_purpose::STANDARD
-            .encode([0x30, 0x03, 0x0a, 0x01, 0x00]),
+            .encode(crate::unit::tls::signed_ocsp_response_fixture()),
         jwks_json: r#"{"keys":[{"kty":"oct","k":"dGVzdA","kid":"fixture"}]}"#.to_string(),
     }
 }

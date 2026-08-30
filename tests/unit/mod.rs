@@ -10,5 +10,5 @@ mod notifications;
 mod openapi_yaml_tests;
 mod plugins;
 mod secrets;
-mod tls;
+pub(crate) mod tls;
 mod util;

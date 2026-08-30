@@ -8,6 +8,9 @@
 //! - Multiple `Content-Length` with conflicting values
 //! - Non-numeric `Content-Length` (negative, decimal, hex, alpha)
 //! - Multiple `Host` headers (HTTP/1.1)
+//! - HTTP/1.1 missing `Host` (RFC 9112 §3.2.2) — catch-all and host-scoped routes
+//! - HTTP/1.0 missing `Host` is still served
+//! - HTTP/1.1 absolute-form request-target without a Host field is still served
 //! - `Host` trailing-dot normalization
 //! - `FERRUM_MAX_HEADER_SIZE_BYTES` total-header rejection on H1
 //! - Configured request header count limits and `0` disable semantics
@@ -817,6 +820,119 @@ async fn functional_protocol_validation_multiple_host_headers_rejected() {
         "unexpected body: {}",
         resp.body
     );
+
+    h.cleanup();
+}
+
+// --- 5b. HTTP/1.1 missing Host (RFC 9112 §3.2.2) ---------------------------
+//
+// These tests write literal request bytes over a raw TCP socket so they
+// exercise what hyper's HTTP/1 parser actually hands `check_protocol_headers`.
+// Building a HeaderMap in a unit test cannot reproduce a header that is
+// absent on the wire.
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http11_missing_host_catchall_rejected() {
+    // Catch-all (empty hosts) + `GET /catchall HTTP/1.1` with no Host is the
+    // reported bypass: routing used to skip host tiers and fall through to
+    // the catch-all for a 200. Must be 400 before routing.
+    let h = Harness::new(false).await;
+
+    let req = b"GET /catchall HTTP/1.1\r\n\r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(resp.status_code, 400, "body={}", resp.body);
+    assert!(
+        resp.body.contains("missing a Host"),
+        "unexpected body: {}",
+        resp.body
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http11_missing_host_host_scoped_rejected() {
+    // Host-scoped route. Previously this was 404 (no host match); after the
+    // guard it must be 400 so omitting Host cannot probe vhost isolation.
+    let h = Harness::new(true).await;
+
+    let req = b"GET / HTTP/1.1\r\n\r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(resp.status_code, 400, "body={}", resp.body);
+    assert!(
+        resp.body.contains("missing a Host"),
+        "unexpected body: {}",
+        resp.body
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http11_valid_host_still_routes() {
+    let h = Harness::new(true).await;
+
+    let req = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(resp.status_code, 200, "body={}", resp.body);
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http10_missing_host_not_rejected() {
+    // Host is not required in HTTP/1.0. Catch-all so a Host-less 1.0 request
+    // still has a route and is served rather than 404'd.
+    let h = Harness::new(false).await;
+
+    let req = b"GET / HTTP/1.0\r\n\r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(
+        resp.status_code, 200,
+        "HTTP/1.0 without Host must still be served; body={}",
+        resp.body
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http11_absolute_form_without_host_not_rejected() {
+    // Absolute-form request-target carries the authority. Must not be
+    // rejected as missing Host, and must still reach the host-scoped route.
+    let h = Harness::new(true).await;
+
+    let req = b"GET http://example.com/ HTTP/1.1\r\n\r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(
+        resp.status_code, 200,
+        "absolute-form without Host must still route; body={}",
+        resp.body
+    );
+
+    h.cleanup();
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_protocol_validation_http11_empty_host_rejected() {
+    // `Host:` with no tokens is present but empty — invalid field value.
+    let h = Harness::new(false).await;
+
+    let req = b"GET / HTTP/1.1\r\nHost:\r\n\r\n";
+    let resp = send_raw_h1(h.proxy_port, req).await;
+
+    assert_eq!(resp.status_code, 400, "body={}", resp.body);
 
     h.cleanup();
 }
