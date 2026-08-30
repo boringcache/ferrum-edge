@@ -212,7 +212,8 @@ use crate::util::http_headers::{
 use self::backend_capabilities::{
     BackendCapabilityProbeTarget, BackendCapabilityRecord, BackendCapabilityRefreshOutcome,
     BackendCapabilityRegistry, BackendCapabilitySnapshot, CapabilityCommitOutcome, ProtocolSupport,
-    RefreshCoalescer, SharedBackendCapabilityRegistry, SharedRefreshCoalescer,
+    RefreshCoalescer, RefreshRole, RefreshRunnerGuard, SharedBackendCapabilityRegistry,
+    SharedRefreshCoalescer,
 };
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{
@@ -10755,36 +10756,59 @@ impl ProxyState {
     /// still picked up without spawning N duplicate tasks or orphaning the
     /// queued request.
     pub(crate) fn spawn_backend_capability_refresh(&self) {
-        if !self.backend_capabilities_refresh.request() {
-            debug!("Backend capability refresh coalesced into in-flight task");
-            return;
+        match self.backend_capabilities_refresh.request() {
+            RefreshRole::Joined => {
+                debug!("Backend capability refresh coalesced into in-flight task");
+            }
+            RefreshRole::Runner(guard) => self.spawn_capability_refresh_runner(guard),
         }
+    }
+
+    fn spawn_capability_refresh_runner(&self, guard: RefreshRunnerGuard) {
         let state = self.clone();
+        // Detached from the caller future: aborting an admin/DP waiter
+        // cannot cancel the probe. Guard Drop is last-resort only, when
+        // this task itself is cancelled (runtime teardown).
         tokio::spawn(async move {
-            state.run_backend_capability_refresh_loop().await;
+            state.run_backend_capability_refresh_loop(guard).await;
         });
     }
 
     /// Synchronously refresh backend capabilities through the shared
     /// [`RefreshCoalescer`], preserving the admin endpoint's post-refresh
     /// snapshot contract while collapsing concurrent callers onto one pass.
+    ///
+    /// The exclusive drain loop always runs in a detached Tokio task so
+    /// dropping this caller (HTTP disconnect, DP task abort) cannot cancel
+    /// the runner. A caller that won the role spawns that task and then
+    /// joins through [`RefreshCoalescer::wait_until_idle`], returning
+    /// [`BackendCapabilityRefreshOutcome::Ran`]. A coalesced caller waits
+    /// the same way and returns
+    /// [`BackendCapabilityRefreshOutcome::Joined`]. `Ran` versus `Joined`
+    /// stays tied to who acquired the role, not to who happened to still
+    /// be awaiting when the probe finished.
     pub async fn refresh_backend_capabilities_coalesced(&self) -> BackendCapabilityRefreshOutcome {
-        if self.backend_capabilities_refresh.request() {
-            self.run_backend_capability_refresh_loop().await;
-            BackendCapabilityRefreshOutcome::Ran
-        } else {
-            self.backend_capabilities_refresh.wait_until_idle().await;
-            BackendCapabilityRefreshOutcome::Joined
+        match self.backend_capabilities_refresh.request() {
+            RefreshRole::Runner(guard) => {
+                self.spawn_capability_refresh_runner(guard);
+                self.backend_capabilities_refresh.wait_until_idle().await;
+                BackendCapabilityRefreshOutcome::Ran
+            }
+            RefreshRole::Joined => {
+                self.backend_capabilities_refresh.wait_until_idle().await;
+                BackendCapabilityRefreshOutcome::Joined
+            }
         }
     }
 
-    async fn run_backend_capability_refresh_loop(&self) {
+    async fn run_backend_capability_refresh_loop(&self, mut guard: RefreshRunnerGuard) {
         loop {
             while self.backend_capabilities_refresh.take_pending() {
                 self.refresh_backend_capabilities().await;
             }
             if self.backend_capabilities_refresh.try_finish() {
                 self.backend_capabilities_refresh.signal_idle();
+                guard.disarm();
                 break;
             }
         }
