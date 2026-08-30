@@ -5162,6 +5162,15 @@ pub mod _test_support {
         crate::config::batch_atomicity::set_atomic_batch_fault(namespace, fault);
     }
 
+    /// Install (or clear, with `None`) a deterministic `POST /batch`
+    /// reference-check failure for one namespace. The injected detail is
+    /// treated as a raw persistence error so tests can prove it is redacted
+    /// to the shared 503 `db_error_response` body. Always clear the fault when
+    /// the test finishes.
+    pub fn set_batch_reference_check_fault_for_test(namespace: &str, detail: Option<&str>) {
+        crate::admin::set_batch_reference_check_fault(namespace, detail);
+    }
+
     pub use crate::config::namespace_registry::NamespaceRegistryPhase;
 
     /// Install (or clear) one deterministic namespace-registry transaction
