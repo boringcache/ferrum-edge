@@ -19170,6 +19170,8 @@ components:
                 type: string
                 description: >-
                   Expected JWT iss claim — routes tokens to this provider.
+                  When set, the token MUST carry iss and it must match exactly;
+                  the issuer check alone rejects only a mismatching claim.
                   Required and must be nonblank when require_dpop is true: the
                   DPoP replay realm is this exact issuer, so key-set or JWKS
                   source rotation cannot reopen a proof. Issuers are compared
@@ -19181,12 +19183,17 @@ components:
                   issuer is refused as a bearer-only bypass.
               audience:
                 type: string
-                description: Expected JWT aud claim
+                description: Expected JWT aud claim; presence is required when set (same contract as audiences)
               audiences:
                 type: array
                 items:
                   type: string
-                description: Accepted JWT aud claims; OR matched
+                description: >-
+                  Accepted JWT aud claims; OR matched. When non-empty the token
+                  MUST carry aud and at least one value must match. When empty,
+                  tokens without aud are accepted and a token that carries aud is
+                  rejected because no acceptable audience is configured (RFC 7519
+                  4.1.3).
               from_headers:
                 type: array
                 items:
@@ -19212,7 +19219,11 @@ components:
                 description: Whether to forward the token-bearing header or query parameter upstream
               require_exp:
                 type: boolean
-                description: Per-provider override for requiring an exp claim
+                description: >-
+                  Per-provider override for requiring an exp claim. Expiry is
+                  always validated when present. A present nbf is always
+                  validated too (it is not required). JWT exp/nbf use zero
+                  clock leeway; DPoP skew is a separate proof contract.
               required_scopes:
                 type: array
                 items:
