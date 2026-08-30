@@ -1031,6 +1031,7 @@ fn request_authentication_accepts_inline_jwks_multi_audience_and_custom_location
             }],
             from_params: vec!["access_token".into()],
             forward_original_token: false,
+            output_claim_to_headers: Vec::new(),
         }],
     };
 

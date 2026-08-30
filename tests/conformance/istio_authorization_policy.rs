@@ -499,6 +499,49 @@ fn authz_target_refs_service_attachment_is_preserved() {
     );
 }
 
+#[test]
+fn authz_singular_target_ref_service_attachment_is_preserved() {
+    use ferrum_edge::modes::mesh::config::PolicyTargetAttachment;
+
+    let service = K8sObject {
+        api_version: "v1".to_string(),
+        kind: "Service".to_string(),
+        metadata: K8sMetadata {
+            name: "reviews".to_string(),
+            namespace: "default".to_string(),
+            ..K8sMetadata::default()
+        },
+        spec: json!({
+            "selector": {"app": "reviews"},
+            "ports": [{"port": 9080, "name": "http"}]
+        }),
+        status: Value::Object(serde_json::Map::new()),
+    };
+    let policy = authz_policy(json!({
+        "targetRef": {
+            "group": "",
+            "kind": "Service",
+            "name": "reviews"
+        },
+        "action": "DENY",
+        "rules": [{}]
+    }));
+
+    let result = translate_k8s_objects(&[service, policy], options())
+        .expect("singular targetRef Service translates");
+    let mesh = result.config.mesh.expect("mesh");
+    match &mesh.mesh_policies[0].scope {
+        PolicyScope::TargetRefs { attachments } => match &attachments[0] {
+            PolicyTargetAttachment::Service { namespace, name } => {
+                assert_eq!(namespace, "default");
+                assert_eq!(name, "reviews");
+            }
+            other => panic!("expected Service attachment, got {other:?}"),
+        },
+        other => panic!("singular targetRef must not widen scope, got {other:?}"),
+    }
+}
+
 /// Istio's contract lists `Gateway` / `Service` / `ServiceEntry` `targetRefs`
 /// as same-namespace only, and `GatewayClass` as root-namespace. Ferrum matches
 /// the namespace rules and declares `ServiceEntry` unsupported rather than
