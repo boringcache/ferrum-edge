@@ -164,6 +164,27 @@ impl Workload {
     }
 }
 
+/// A NodeWaypoint trusted to assert HBONE source workload identity, together
+/// with the exact identities it actually fronts (issue #4274).
+///
+/// The identity list is what makes a cross-namespace inventory entry safe: a
+/// source-node waypoint legitimately asserts pods in namespaces other than its
+/// own, but ONLY the pods enrolled on its node. Carrying the assertor SPIFFE ID
+/// alone forced the data plane back onto a namespace-blind "trusted peer may
+/// assert anything" rule.
+///
+/// An entry whose `asserts` set is empty authorizes NOTHING — the data plane
+/// fails closed rather than widening to the assertor's namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeWaypointAssertor {
+    /// Exact SPIFFE ID of the asserting NodeWaypoint.
+    pub spiffe_id: SpiffeId,
+    /// Exact workload SPIFFE IDs this NodeWaypoint fronts, derived from
+    /// scope-authorized `Workload.node_waypoint` bindings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asserts: Vec<SpiffeId>,
+}
+
 /// Destination NodeWaypoint transport endpoint for a workload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeWaypointEndpoint {
@@ -4429,7 +4450,7 @@ pub struct MeshConfig {
     /// narrowed `MeshSlice.node_waypoint_assertors` field carries it over the
     /// mesh subscription transports.
     #[serde(skip)]
-    pub node_waypoint_assertors: Vec<SpiffeId>,
+    pub node_waypoint_assertors: Vec<NodeWaypointAssertor>,
     /// Runtime-only NodeWaypoint transparent-inbound-capture destination
     /// inventory (issue #3287). CP-side this is resolved BEFORE the
     /// request-namespace retains, with CP scope and bearer-namespace

@@ -7378,6 +7378,8 @@ See [Proxy Alerts](proxy_alerts.md) for rule types, channel configuration, templ
 
 Adds Istio/GAMMA workload identity labels to request, stream, and log metadata, and can emit mesh telemetry spans when mesh Telemetry providers are configured. Mesh mode auto-injects this plugin when workload metrics are needed, but standalone use is supported for non-mesh gateway deployments that want the same identity labels.
 
+HBONE `source.principal` attribution uses the same trusted-assertor relation as `mesh_authz`. Direct / user-created instances honor that relation from this plugin's own `trusted_hbone_assertors` / `trust_domain_aliases` config. Mesh injection additionally stamps an internal `_effective_mesh_authz_baggage_gates` list that is an exact, fail-closed conjunction of every enabled global `mesh_authz` baggage gate PluginCache will execute (including a force-injected reserved `__mesh_authz` under transparent inbound capture). Disabled operator rows are omitted; each gate keeps its own absent/null/default, explicit `[]`, and alias contract; a sibling cannot silently widen another gate. Malformed or over-bound internal lists fail construction. See [Trusted HBONE Assertors](mesh.md#trusted-hbone-assertors).
+
 See [Mesh Observability](mesh.md#observability) for metric names, service graph aggregation, and tracing behavior.
 
 ### `__mesh_bpf_metrics`

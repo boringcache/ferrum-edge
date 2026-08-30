@@ -139,7 +139,7 @@ This section consolidates every known residual gap so operators do not have to r
 
 - **eBPF capture is a build feature** — the default published image lacks the aya loader, but enabled eBPF node-agent mode rejects that mock backend before readiness instead of silently no-op'ing. Helm selects the distroless `-ebpf` image tag for the enabled eBPF node-agent and TCP-only NodeWaypoint proxy, and promotes an enabled NodeWaypoint UDP/DTLS listener surface to tools-capable `-ebpf-tools` for Service-path steering. CI load/attach-tests the programs on a real ≥5.7 kernel (`ebpf-live`) and gates capture/identity/chart changes with the Docker/kind multi-pod `node-waypoint-ebpf-live` workflow.
 - **Node-waypoint identity: GAP-2M bridge implemented (IPv4 + IPv6), capture live-gated** — the accept-side socket-cookie bridge is implemented in the kernel `sock_ops` program (re-keys orig-dst by connection tuple, re-stamps under the accept-side cookie), so cookie resolution can succeed with `--features ebpf`. **IPv4 and IPv6**: the v6 ctx address words are read element-by-element with verifier-safe volatile loads (the per-element technique that sidesteps the verifier's rejection of a whole-`[u32;4]` ctx copy) and keyed by `FERRUM_ORIG_DST_BY_TUPLE6`, so the v6 accept-side bridge resolves on the same footing as IPv4. The in-netns manager binds both `127.0.0.1:<port>` and `[::1]:<port>` inside enrolled pod netns, and the `node-waypoint-ebpf-live` workflow validates both capture families; a tuple/byte-order mismatch fails closed (never misattributes).
-- **Node-waypoint destination metadata** — each mesh `Workload` can carry an optional `node_waypoint` object with `address`, `hbone_port` (default `15008`), expected NodeWaypoint `spiffe_id`, and optional `node_name`, `node_uid`, `network`, and `cluster`. Kubernetes pod discovery populates this object for service-backed workloads when their node has a ready host-network NodeWaypoint proxy pod in `FERRUM_K8S_CONTROLLER_NAMESPACE` with `app.kubernetes.io/name=ferrum-mesh-ambient`, service account `ferrum-mesh`, and `FERRUM_MESH_TOPOLOGY=node_waypoint`; scoped workload watches still include that trusted namespace for Pod discovery. The Helm chart sets `FERRUM_K8S_CONTROLLER_NAMESPACE` to the release namespace and requires the ambient NodeWaypoint admin health listener to stay enabled so the DaemonSet has a real readiness probe. The endpoint address comes from the proxy pod IP, `hbone_port` comes from `FERRUM_MESH_HBONE_LISTEN_ADDR` when present (then the named `hbone` container port, then default `15008`), and the expected peer identity comes from `FERRUM_MESH_WORKLOAD_SPIFFE_ID` when present (then the proxy pod's service account SPIFFE ID). Captured Service targets consume this metadata when present: they select the workload first, keep the workload app address and port as the inner CONNECT authority, dial the hosting node's NodeWaypoint endpoint via `mesh.hbone_dial_host`, and pin `mesh.hbone_peer_spiffe_id` instead of synthesizing `podIP:15008`. When the source NodeWaypoint runtime has file SVID material or a mesh CA backend (required by production mode), metadata-absent targets are skipped so the Service route fails closed instead of retaining a plaintext backend. Explicit no-CA/no-identity development runs keep the temporary plaintext fallback; the required live gate uses SPIRE-backed production mode instead.
+- **Node-waypoint destination metadata** — each mesh `Workload` can carry an optional `node_waypoint` object with `address`, `hbone_port` (default `15008`), expected NodeWaypoint `spiffe_id`, and optional `node_name`, `node_uid`, `network`, and `cluster`. Kubernetes pod discovery populates this object for service-backed workloads and identity-only source pods when their node has a ready host-network NodeWaypoint proxy pod in `FERRUM_K8S_CONTROLLER_NAMESPACE` with `app.kubernetes.io/name=ferrum-mesh-ambient`, service account `ferrum-mesh`, and `FERRUM_MESH_TOPOLOGY=node_waypoint`; scoped workload watches still include that trusted namespace for Pod discovery. The Helm chart sets `FERRUM_K8S_CONTROLLER_NAMESPACE` to the release namespace and requires the ambient NodeWaypoint admin health listener to stay enabled so the DaemonSet has a real readiness probe. The endpoint address comes from the proxy pod IP, `hbone_port` comes from `FERRUM_MESH_HBONE_LISTEN_ADDR` when present (then the named `hbone` container port, then default `15008`), and the expected peer identity comes from `FERRUM_MESH_WORKLOAD_SPIFFE_ID` when present (then the proxy pod's service account SPIFFE ID). Captured Service targets consume this metadata when present: they select the workload first, keep the workload app address and port as the inner CONNECT authority, dial the hosting node's NodeWaypoint endpoint via `mesh.hbone_dial_host`, and pin `mesh.hbone_peer_spiffe_id` instead of synthesizing `podIP:15008`. When the source NodeWaypoint runtime has file SVID material or a mesh CA backend (required by production mode), metadata-absent targets are skipped so the Service route fails closed instead of retaining a plaintext backend. Explicit no-CA/no-identity development runs keep the temporary plaintext fallback; the required live gate uses SPIRE-backed production mode instead.
 - **Node-waypoint UDP/DTLS stream authz is source-workload scoped** — TCP stream connections through a node-waypoint proxy now scope per source pod via `resolve_node_waypoint_stream_scope()` (socket-cookie → pod identity → `PolicyScopeCache`); when the connect-side resolver returns no identity, the connection fails closed with 403 if any namespace/selector-scoped `AuthorizationPolicy` exists in the mesh (else falls through to mesh-wide-only evaluation). **UDP/DTLS is now scoped per source pod too** (issue #3286). The socket-cookie channel genuinely cannot serve it — eBPF capture is `connect()`-hooked and TCP-only, and a UDP proxy demuxes every client off one shared frontend socket with a single cookie — so UDP/DTLS uses a different, equally exact channel: `src/proxy/node_waypoint_udp_identity.rs` attributes each datagram from two kernel-provided facts, the INGRESS INTERFACE index (`IP_PKTINFO` / `IPV6_PKTINFO`) and the datagram's source address, which must be one the node-agent registry publishes for the pod owning that interface. A NodeWaypoint proxy is host-network, so a local pod's egress is the only traffic entering the host namespace on that pod's interface; forging a source address cannot change which interface a packet arrived on, and an interface claimed by more than one enrolled pod is refused for BOTH claimants rather than guessed. The resolved pod's `PolicyScopeCache` and SPIFFE principal are stamped onto the session before `on_stream_connect`, so `mesh_authz` enforces namespace/selector-scoped policy exactly as it does for TCP. An unattributable session leaves the scope absent and `mesh_authz` rejects it while any scoped policy exists (never a plaintext or mesh-wide fallback), and every subsequent datagram of an admitted session is re-authorized against the current registry attribution and the exact accepted mesh-slice generation that supplied its plugin chain and scope. Any later accepted slice retires that session before another datagram or reply is forwarded—even if the pod identity is unchanged or the session was admitted unattributable under mesh-wide-only policy—so policy-only updates, pod churn, veth reuse, registry removal, and re-attestation cannot inherit an old authorization lifetime. Service ports and UDP/DTLS proxies therefore stay UP under enforcing scoped policy, and — with `FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED=true` — each in-mesh service port whose protocol is `udp` or `dtls` materializes a real datagram listener on that port number (`materialize_node_waypoint_udp_listeners`), which is the configuration surface that makes this channel reachable. `dtls` is the same L4 transport as `udp`; it only selects frontend DTLS termination on the listener, and it is sourced from an `appProtocol: dtls` / port-name hint on a `protocol: UDP` Kubernetes Service port or a `dtls` Istio port protocol (a `protocol: TCP` port can never become `dtls`). Because the whole decision rests on the kernel's ingress-interface cmsg, a scoped listener that cannot enable `IP_PKTINFO`/`IPV6_RECVPKTINFO` for **every family its bound socket serves** (a dual-stack `[::]` bind serves both, so a success on one family does not excuse a failure on the other) returns a typed startup error instead of binding — the listener is recorded as a bind failure in stream-listener health, rather than reporting itself started while denying every session. When a DTLS session terminates, both relay tasks are aborted **and joined** before the handler returns, so no relay can still be forwarding after the session's scope pin and accounting have been released. The original blanket suppression (slice preparation strips UDP/DTLS service ports, proxies, synthesized upstreams, and mesh-DNS visibility) remains in force only where the channel cannot exist at all — a non-Linux build, which has neither `IP_PKTINFO` attribution nor sysfs interface resolution. Mesh-wide policies still evaluate, and audit-only scoped policies never force suppression.
 - **Inbound TC ingress redirect implemented (IPv4 + IPv6), opt-in and live-gated** — `ferrum_tc_ingress_redirect` (`ebpf/ferrum-ebpf/src/tc_ingress_redirect.rs`) is a tc **ingress** classifier attached to the node capture interfaces named by `FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES` (unset = off, and the whole datapath stays inert). It steers inbound TCP for enrolled workloads into a dedicated **transparent inbound capture listener** with `bpf_sk_assign()` instead of a node-global `nat PREROUTING -j REDIRECT`. **The steer target is NOT the HBONE listener**: HBONE (`:15008`) terminates authenticated HTTP/2 CONNECT over verified mesh mTLS, while captured traffic is ordinary application bytes (possibly the app's own TLS), and `IP_TRANSPARENT` preserves addresses rather than transforming payloads. The capture listener is a separate protocol boundary bound on `FERRUM_MESH_INBOUND_LISTEN_ADDR` (default `0.0.0.0:15006`, unused by NodeWaypoint otherwise) — the single source of truth for the port on both the proxy and the node-agent — and it terminates nothing. **Scope is per workload and per port**: the destination must be in `FERRUM_POD_IPS`/`FERRUM_POD_IPS6` carrying `POD_CAPTURE_FLAG_INBOUND_REDIRECT`, *and* the exact `(pod address, destination port)` pair must be in `FERRUM_POD_INBOUND_PORTS`/`FERRUM_POD_INBOUND_PORTS6` (derived from the pod's declared `containerPorts`); anything else is returned untouched, so unenrolled traffic is never captured. **IPv4 fragments are declined before any port is read** (More-Fragments or non-zero offset), because a non-first fragment's payload bytes would otherwise be parsed as ports and could be made to match a declared pair; IPv6 extension/fragment chains likewise pass through unparsed. **Original destination metadata is preserved without NAT** — addresses are never rewritten, so the capture listener's accepted socket reports the workload's real `podIP:appPort` from `getsockname()` with no conntrack table and no reverse NAT; that one listener (and no other) binds `IP_TRANSPARENT`/`IPV6_TRANSPARENT` on a wildcard address so its replies may be sourced from the captured pod address. **Security posture on the capture path is DESTINATION-EXACT**, because one capture listener serves every enrolled pod on the node: the recovered destination must resolve to exactly one workload in a dedicated **NodeWaypoint capture destination inventory** (address match plus a port the workload declares — no match, an empty inventory, or two records claiming the address with divergent identity all close the connection), and both gates that follow are then properties of *that* workload rather than of the listener. Direct captured plaintext is admitted only where **that workload's own** effective PeerAuthentication posture on the captured app port permits it — resolved from its namespace/labels with the canonical resolver, deliberately not from the listener-wide per-port table, so a `PERMISSIVE` pod can never admit plaintext to a `STRICT` pod sharing the app port; `STRICT` still requires verified mesh transport and refuses direct plaintext.
 
@@ -2121,17 +2121,110 @@ Each entry is matched against the peer's SPIFFE id as follows:
 - **Bare service-account name** (e.g., `ztunnel`): matches any peer whose path is `<...>/sa/<name>` per the Istio convention `ns/<ns>/sa/<sa>`. Trust-domain-independent — `spiffe://cluster.local/.../sa/ztunnel` and `spiffe://partner.local/.../sa/ztunnel` both match.
 - **Full SPIFFE id** (e.g., `spiffe://cluster.local/ns/istio-system/sa/ztunnel`): exact-identity match including trust domain, namespace, and service account.
 
+#### Matching the allow-list is not sufficient (issue #4274)
+
+Matching an entry decides only WHETHER a peer may assert. A second, independent
+check decides WHAT it may assert. Before this split, a bare service-account
+entry made the whole check namespace-blind: any authenticated pod running under
+a service account named `waypoint` — in **any** namespace — could send
+`baggage: source.principal=spiffe://cluster.local/ns/prod/sa/payments` and both
+`mesh_authz` and `workload_metrics` would honor it. `ns/attacker/sa/waypoint`
+impersonating `ns/prod/sa/payments` was a complete authorization bypass, and the
+same forged header mis-attributed metrics, the service graph, spans, and access
+logs to the victim.
+
+Every allow-list entry now carries an **assertion grant**:
+
+| Entry shape | Grant | May assert |
+| --- | --- | --- |
+| `"waypoint"` (bare SA) | `same_namespace` | Identities in the peer's own Kubernetes namespace |
+| `"spiffe://td/ns/x/sa/y"` | `same_namespace` | Identities in namespace `x` |
+| `{"assertor": "<sa\|spiffe>", "asserts": ["spiffe://…", …]}` | inventory | Exactly the listed identities; `[]` authorizes nothing |
+| `{"assertor": "<sa\|spiffe>", "scope": "same_namespace"}` | `same_namespace` | Same as the string form, stated explicitly |
+| `{"assertor": "spiffe://…", "scope": "mesh_wide"}` | `mesh_wide` | Any identity that clears the trust-domain gate |
+
+`mesh_wide` is the only shape that restores the old power, it must be spelled
+out per entry on a full, exactly pinned SPIFFE assertor (bare service-account
+matchers are rejected), and it logs a warning at construction. Both identities must
+expose an `/ns/<ns>/` segment for `same_namespace` to hold; a peer with no
+namespace segment may assert only itself.
+
+The relation is evaluated in this order, and the first failing gate wins:
+
+1. Peer matches no entry → `untrusted_assertor`.
+2. Baggage trust domain is neither the peer's nor a `FERRUM_MESH_TRUST_DOMAIN_ALIASES` alias → `trust_domain_mismatch`.
+3. No matched entry's grant covers the asserted identity → `assertion_out_of_scope`.
+4. Otherwise the baggage identity is honored.
+
+A peer matching several entries is authorized by the **union** of the matched
+grants. An empty allow-list authorizes nothing. Plugin construction compiles
+the allow-list into an exact-SPIFFE map and a service-account map, merging
+duplicate matcher grants; request-time evaluation looks up the peer and at
+most one service-account key and does not scan unrelated NodeWaypoint
+inventory entries.
+
+`mesh_authz` and `workload_metrics` consume the **same** three-way verdict from
+one shared function — a second telemetry-only predicate is exactly how forged
+baggage would reach dashboards while authz correctly rejected it. Only the
+redacted reason code is emitted; the rejected identity is attacker-controlled
+and never reaches metadata, logs, or metric labels.
+
+**Telemetry mirrors every effective authorization gate, not the first one.**
+PluginCache executes every enabled global `mesh_authz` instance. Transparent
+inbound capture force-injects reserved `__mesh_authz` even when an operator
+global exists, so both run; outside capture, several operator globals can
+likewise be effective. Mesh injection therefore stamps an internal
+`_effective_mesh_authz_baggage_gates` list on `__mesh_workload_metrics` from
+those enabled configs *after* the ensure/force step:
+
+- Disabled operator rows do not constrain or select the telemetry gate.
+- Telemetry honors baggage only if **every** compiled gate would honor that
+  peer/asserted pair and trust-domain relation. Construction compiles each
+  gate with the same `TrustedAssertorIndex` / `hbone_assertion_verdict` logic
+  as `mesh_authz`. Request-time evaluation allocates nothing, takes no locks,
+  and scales only with the bounded number of effective gates (at most 16;
+  malformed or over-bound lists fail plugin construction).
+- Each gate keeps its own `trusted_hbone_assertors` absent/null/default
+  contract, explicit `[]` deny, and `trust_domain_aliases`. A sibling's
+  aliases or per-entry `scope: mesh_wide` cannot silently widen another gate.
+- A `when:` / trigger that makes request applicability unknowable is still
+  included — requiring that gate is the fail-closed direction.
+- Direct or user-created `workload_metrics` without the internal field keep
+  their existing single-gate config.
+- When one of several gates refuses, the redacted reason uses the same
+  precedence as a single gate (`untrusted_assertor` →
+  `trust_domain_mismatch` → `assertion_out_of_scope`). Trust-domain mismatch
+  stays distinct. The forged identity is never logged or labeled.
+
+**Identity-backed `NodeWaypoint` needs no operator configuration for this.** A
+node waypoint legitimately fronts pods in namespaces other than its own, so the
+CP-derived `node_waypoint_assertors` inventory carries, per assertor, the exact
+workload identities that NodeWaypoint fronts (derived from the same
+`Workload.node_waypoint` bindings that admitted the assertor, including
+identity-only source pods that are not Service backends).
+The CP intersects that derivation with destination/cross-namespace visibility,
+the CP namespace scope, **and** the subscriber's bearer `ns` claim. A
+contributing workload namespace is admitted only when every applicable gate
+allows it; an assertor with no remaining asserted identities is dropped rather
+than serialized empty (empty would skip `asserts` and widen to same-namespace).
+A beta-restricted bearer on an `{alpha,beta}` CP therefore receives neither
+alpha identities nor an alpha-only assertor. Full-scope / no-bearer
+publication is unchanged. Mesh injection projects each entry as
+`{"assertor": "<nodewaypoint svid>", "asserts": [...]}`, so cross-namespace
+source-node assertion keeps working while an assertor that fronts nothing
+authorizes nothing.
+
 Operators with Gateway-managed waypoints often run with SA names like `<gateway-name>-istio` instead of `waypoint`; override the allow-list via `FERRUM_MESH_TRUSTED_HBONE_ASSERTORS` (comma-separated, mix-and-match SA names and full SPIFFE ids):
 
 ```
 FERRUM_MESH_TRUSTED_HBONE_ASSERTORS="ztunnel,default-waypoint,spiffe://cluster.local/ns/team-a/sa/team-a-waypoint"
 ```
 
-When the env var is unset or empty, mesh injection usually uses the defaults. The exception is identity-backed `NodeWaypoint`: when the runtime has file SVID material or a mesh CA backend, Ferrum derives the trusted assertor allow-list from the CP-derived `node_waypoint_assertors` inventory, built from scope-authorized `Workload.node_waypoint.spiffe_id` values before namespace/service slice narrowing. If no NodeWaypoint assertor metadata is present, the generated allow-list is empty so HBONE baggage rewrites fail closed instead of falling back to the bare `waypoint` service-account default. To lock down baggage rewriting entirely (no peer can rewrite the authz principal), configure a `mesh_authz` global plugin override with an explicit empty list (`trusted_hbone_assertors: []`).
+When the env var is unset or empty, mesh injection usually uses the defaults. The exception is identity-backed `NodeWaypoint`: when the runtime has file SVID material or a mesh CA backend, Ferrum derives the trusted assertor allow-list from the CP-derived `node_waypoint_assertors` inventory, built from destination-visible, CP-scope-authorized, and bearer-`ns`-authorized `Workload.node_waypoint.spiffe_id` values before namespace/service slice narrowing, each entry carrying the exact workload identities that NodeWaypoint fronts. If no NodeWaypoint assertor metadata is present, the generated allow-list is empty so HBONE baggage rewrites fail closed instead of falling back to the bare `waypoint` service-account default. To lock down baggage rewriting entirely (no peer can rewrite the authz principal), configure a `mesh_authz` global plugin override with an explicit empty list (`trusted_hbone_assertors: []`).
 
 `FERRUM_MESH_TRUST_DOMAIN_ALIASES` continues to gate the baggage identity's trust domain — both checks apply to a baggage rewrite.
 
-**Observability**: when baggage is dropped because the peer is not a trusted assertor, transaction logs surface `mesh_authz.ignored_baggage=untrusted_assertor` and `mesh_authz.ignored_baggage.untrusted_assertor=true`. If the resulting authz decision is a DENY, `mesh_authz.deny_policy` is stamped as `untrusted_assertor`. Trust-domain-mismatch diagnostics retain their existing `trust_domain_mismatch` reason.
+**Observability**: when baggage is dropped because the peer is not a trusted assertor, transaction logs surface `mesh_authz.ignored_baggage=untrusted_assertor` and `mesh_authz.ignored_baggage.untrusted_assertor=true`. If the resulting authz decision is a DENY, `mesh_authz.deny_policy` is stamped as `untrusted_assertor`. Trust-domain-mismatch diagnostics retain their existing `trust_domain_mismatch` reason. Baggage dropped because a trusted assertor is not authorized for the claimed identity uses the parallel reason `assertion_out_of_scope` (`mesh_authz.ignored_baggage.assertion_out_of_scope=true`, `mesh_authz.deny_policy=assertion_out_of_scope`, `mesh.ignored_baggage=assertion_out_of_scope` on `workload_metrics`), and NodeWaypoint ADR counters gain the matching `reason="assertion_out_of_scope"` label plus the `rejected_assertion_out_of_scope` field on the authenticated `/health` snapshot.
 
 ## RequestAuthentication
 
@@ -6236,7 +6329,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_WORKLOAD_SPIFFE_ID` | (none) | SPIFFE ID of this mesh workload |
 | `FERRUM_MESH_WORKLOAD_LABELS` | (none) | Comma-separated `key=value` workload labels for PolicyScope matching |
 | `FERRUM_MESH_TRUST_DOMAIN_ALIASES` | (none) | Additional trust domains for HBONE baggage validation |
-| `FERRUM_MESH_TRUSTED_HBONE_ASSERTORS` | (none) | HBONE peers trusted to assert baggage `source.principal`. Comma-separated SA names and/or full SPIFFE ids. Empty/unset uses defaults `[ztunnel, waypoint]`, except identity-backed `NodeWaypoint` derives exact assertor SPIFFE IDs from the scope-authorized CP-derived `node_waypoint_assertors` inventory and uses an empty list when none exists |
+| `FERRUM_MESH_TRUSTED_HBONE_ASSERTORS` | (none) | HBONE peers trusted to assert baggage `source.principal`. Comma-separated SA names and/or full SPIFFE ids. Empty/unset uses defaults `[ztunnel, waypoint]`, except identity-backed `NodeWaypoint` derives exact assertor SPIFFE IDs from the destination-visible, CP-scope-authorized, and bearer-`ns`-authorized CP-derived `node_waypoint_assertors` inventory and uses an empty list when none exists |
 | `FERRUM_MESH_SIDECAR_ENFORCED` | `false` | When `true`, applies Istio `Sidecar` egress scope narrowing to `services` / `service_entries` / `destination_rules` / projected VirtualService L4 route proxies per workload. Sidecars are always parsed; this flag gates only the slice-narrowing pass. Opt in after vetting your `Sidecar` resources |
 | `FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN` | `false` | Computes and reports the applicable `Sidecar` egress scope while leaving the slice unchanged. Use with `/mesh/egress-scope` before enabling enforcement |
 | `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING` | `false` | When `true` and `FERRUM_MESH_SIDECAR_ENFORCED=true`, filters `workloads` to SPIFFE identities referenced by services admitted by the applicable Sidecar. Default-off for rollout; trust-bundle mTLS validation and HBONE trust-domain aliasing do not depend on this list |

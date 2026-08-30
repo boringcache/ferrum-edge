@@ -12543,25 +12543,78 @@ fn node_waypoint_authz_cluster_domains(primary_cluster_domain: &str) -> Vec<Stri
     domains
 }
 
-fn node_waypoint_assertor_spiffe_ids(mesh_slice: &MeshSlice) -> Vec<String> {
+/// Project the CP-derived NodeWaypoint assertor inventory into plugin config.
+///
+/// Each entry becomes an OBJECT carrying the assertor SVID plus the exact
+/// identities that assertor fronts, so a legitimately cross-namespace
+/// source-node waypoint keeps working while a NodeWaypoint that fronts nothing
+/// (or that the CP never authorized for a workload) authorizes nothing (issue
+/// #4274). Emitting the bare SPIFFE strings would fall back to the
+/// same-namespace default and break cross-node NodeWaypoint traffic.
+fn node_waypoint_assertor_entries(mesh_slice: &MeshSlice) -> Vec<serde_json::Value> {
     mesh_slice
         .node_waypoint_assertors
         .iter()
-        .map(|spiffe_id| spiffe_id.as_str().to_string())
+        .map(|assertor| {
+            serde_json::json!({
+                "assertor": assertor.spiffe_id.as_str(),
+                "asserts": assertor
+                    .asserts
+                    .iter()
+                    .map(|id| id.as_str())
+                    .collect::<Vec<_>>(),
+            })
+        })
         .collect()
 }
 
 fn mesh_managed_trusted_hbone_assertors(
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
-) -> Option<Vec<String>> {
+) -> Option<Vec<serde_json::Value>> {
     if !runtime.trusted_hbone_assertors.is_empty() {
-        return Some(runtime.trusted_hbone_assertors.clone());
+        // Operator-declared entries keep the plugin's own parsing contract:
+        // a bare service account or exact SVID grants same-namespace only, and
+        // a wider grant must be spelled out per entry.
+        return Some(
+            runtime
+                .trusted_hbone_assertors
+                .iter()
+                .map(|raw| serde_json::Value::String(raw.clone()))
+                .collect(),
+        );
     }
     if runtime.node_waypoint_secured_transport_required() {
-        return Some(node_waypoint_assertor_spiffe_ids(mesh_slice));
+        return Some(node_waypoint_assertor_entries(mesh_slice));
     }
     None
+}
+
+/// Extract only the baggage-trust fields from a `mesh_authz` plugin config so
+/// the injected telemetry gate list mirrors authorization without carrying
+/// the rest of the authz config (slice, policies, route upstreams).
+fn mesh_authz_baggage_gate_config(config: &serde_json::Value) -> serde_json::Value {
+    let mut gate = serde_json::Map::new();
+    for key in ["trusted_hbone_assertors", "trust_domain_aliases"] {
+        if let Some(value) = config.get(key) {
+            gate.insert(key.to_string(), value.clone());
+        }
+    }
+    serde_json::Value::Object(gate)
+}
+
+fn mirror_mesh_authz_baggage_gate_fields(target: &mut serde_json::Value, gate: &serde_json::Value) {
+    let Some(gate) = gate.as_object() else {
+        return;
+    };
+    let Some(target) = target.as_object_mut() else {
+        return;
+    };
+    for key in ["trusted_hbone_assertors", "trust_domain_aliases"] {
+        if let Some(value) = gate.get(key) {
+            target.insert(key.to_string(), value.clone());
+        }
+    }
 }
 
 fn inject_mesh_global_plugins(
@@ -12581,19 +12634,6 @@ fn inject_mesh_global_plugins(
         .iter()
         .map(|td| td.as_str().to_string())
         .collect();
-    let operator_mesh_authz_config = config
-        .plugin_configs
-        .iter()
-        .find(|plugin| {
-            plugin.scope == PluginScope::Global
-                && plugin.plugin_name == "mesh_authz"
-                && plugin.id != MESH_AUTHZ_PLUGIN_ID
-        })
-        .map(|plugin| plugin.config.clone());
-    let operator_mesh_authz_present = operator_mesh_authz_config.is_some();
-    let operator_mesh_authz_trusted_assertors = operator_mesh_authz_config
-        .as_ref()
-        .and_then(|cfg| cfg.get("trusted_hbone_assertors").cloned());
     let mesh_managed_trusted_assertors = mesh_managed_trusted_hbone_assertors(runtime, mesh_slice);
     let mut mesh_authz_config = serde_json::json!({
         "mesh_slice": mesh_slice,
@@ -12650,12 +12690,7 @@ fn inject_mesh_global_plugins(
     // so production NodeWaypoint does not fall back to the bare service-account
     // defaults or to namespace-scoped destination workload metadata.
     if let Some(assertors) = mesh_managed_trusted_assertors.as_ref() {
-        mesh_authz_config["trusted_hbone_assertors"] = serde_json::Value::Array(
-            assertors
-                .iter()
-                .map(|raw| serde_json::Value::String(raw.clone()))
-                .collect(),
-        );
+        mesh_authz_config["trusted_hbone_assertors"] = serde_json::Value::Array(assertors.clone());
     }
     // Transparent inbound capture admits unauthenticated direct plaintext, so
     // the mesh-managed, slice-fed `__mesh_authz` instance must be present even
@@ -12738,24 +12773,45 @@ fn inject_mesh_global_plugins(
         "labels": mesh_slice.labels.clone(),
         "trust_domain_aliases": trust_domain_aliases,
     });
-    // Mirror the EFFECTIVE mesh_authz assertor gate so telemetry source-identity
-    // attribution honors HBONE baggage only from the same trusted assertors.
-    // If an operator-managed global mesh_authz overrides the mesh-managed
-    // instance, copy its `trusted_hbone_assertors` field verbatim (including
-    // `[]`); if it omits the field, workload_metrics also omits it so both
-    // plugins fall back to their shared defaults. Without an override, thread
-    // the runtime/env list exactly as the mesh-managed mesh_authz config does.
-    if let Some(value) = operator_mesh_authz_trusted_assertors {
-        workload_metrics_config["trusted_hbone_assertors"] = value;
-    } else if !operator_mesh_authz_present
-        && let Some(assertors) = mesh_managed_trusted_assertors.as_ref()
-    {
-        workload_metrics_config["trusted_hbone_assertors"] = serde_json::Value::Array(
-            assertors
-                .iter()
-                .map(|raw| serde_json::Value::String(raw.clone()))
-                .collect(),
-        );
+    // Mirror EVERY enabled global mesh_authz baggage gate PluginCache will
+    // execute (issue #4274). Capture-on force-injects reserved `__mesh_authz`
+    // beside an operator global; multiple enabled operator globals are also
+    // conjunctive. Disabled rows must not constrain or select this set. A
+    // trigger makes request applicability unknowable, so requiring that gate
+    // is the fail-closed direction. Direct/user-created workload_metrics
+    // without this internal field keep their own single-gate config.
+    let effective_authz_gates: Vec<serde_json::Value> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| {
+            plugin.enabled
+                && plugin.scope == PluginScope::Global
+                && plugin.plugin_name == "mesh_authz"
+        })
+        .map(|plugin| mesh_authz_baggage_gate_config(&plugin.config))
+        .collect();
+    if !effective_authz_gates.is_empty() {
+        if let [single_gate] = effective_authz_gates.as_slice() {
+            mirror_mesh_authz_baggage_gate_fields(&mut workload_metrics_config, single_gate);
+        }
+        let gates_key =
+            crate::plugins::mesh::workload_metrics::EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY;
+        workload_metrics_config[gates_key] = serde_json::Value::Array(effective_authz_gates);
+    } else {
+        // No enabled global mesh_authz. Do not copy a disabled operator
+        // config. Thread the mesh-managed list only when no operator global
+        // mesh_authz row exists, matching the historical no-override path.
+        let operator_mesh_authz_present = config.plugin_configs.iter().any(|plugin| {
+            plugin.scope == PluginScope::Global
+                && plugin.plugin_name == "mesh_authz"
+                && plugin.id != MESH_AUTHZ_PLUGIN_ID
+        });
+        if !operator_mesh_authz_present
+            && let Some(assertors) = mesh_managed_trusted_assertors.as_ref()
+        {
+            workload_metrics_config["trusted_hbone_assertors"] =
+                serde_json::Value::Array(assertors.clone());
+        }
     }
     // Apply ProxyConfig sampling as a baseline. The more granular Telemetry
     // resource below may override on the `sampling_percentage` key.
@@ -29157,8 +29213,18 @@ mod tests {
             namespace: "default".to_string(),
             workloads: vec![reviews, ratings, duplicate],
             node_waypoint_assertors: vec![
-                SpiffeId::new(waypoint_a).unwrap(),
-                SpiffeId::new(waypoint_b).unwrap(),
+                crate::modes::mesh::config::NodeWaypointAssertor {
+                    spiffe_id: SpiffeId::new(waypoint_a).unwrap(),
+                    asserts: vec![
+                        SpiffeId::new("spiffe://cluster.local/ns/ratings/sa/ratings").unwrap(),
+                    ],
+                },
+                crate::modes::mesh::config::NodeWaypointAssertor {
+                    spiffe_id: SpiffeId::new(waypoint_b).unwrap(),
+                    asserts: vec![
+                        SpiffeId::new("spiffe://cluster.local/ns/reviews/sa/reviews").unwrap(),
+                    ],
+                },
             ],
             ..MeshSlice::default()
         };
@@ -29166,7 +29232,16 @@ mod tests {
 
         inject_mesh_global_plugins(&mut config, &runtime, &mesh_slice);
 
-        let expected = serde_json::json!([waypoint_a, waypoint_b]);
+        let expected = serde_json::json!([
+            {
+                "assertor": waypoint_a,
+                "asserts": ["spiffe://cluster.local/ns/ratings/sa/ratings"],
+            },
+            {
+                "assertor": waypoint_b,
+                "asserts": ["spiffe://cluster.local/ns/reviews/sa/reviews"],
+            },
+        ]);
         let authz = config
             .plugin_configs
             .iter()
@@ -29210,8 +29285,16 @@ mod tests {
             namespace: "default".to_string(),
             workloads: vec![reviews],
             node_waypoint_assertors: vec![
-                SpiffeId::new(destination_waypoint).unwrap(),
-                SpiffeId::new(source_waypoint).unwrap(),
+                crate::modes::mesh::config::NodeWaypointAssertor {
+                    spiffe_id: SpiffeId::new(destination_waypoint).unwrap(),
+                    asserts: vec![SpiffeId::new(destination_workload_spiffe).unwrap()],
+                },
+                crate::modes::mesh::config::NodeWaypointAssertor {
+                    spiffe_id: SpiffeId::new(source_waypoint).unwrap(),
+                    asserts: vec![
+                        SpiffeId::new("spiffe://cluster.local/ns/other/sa/client").unwrap(),
+                    ],
+                },
             ],
             services: vec![http_mesh_service(
                 "reviews",
@@ -29224,7 +29307,16 @@ mod tests {
 
         inject_mesh_global_plugins(&mut config, &runtime, &mesh_slice);
 
-        let expected = serde_json::json!([destination_waypoint, source_waypoint]);
+        let expected = serde_json::json!([
+            {
+                "assertor": destination_waypoint,
+                "asserts": [destination_workload_spiffe],
+            },
+            {
+                "assertor": source_waypoint,
+                "asserts": ["spiffe://cluster.local/ns/other/sa/client"],
+            },
+        ]);
         let authz = config
             .plugin_configs
             .iter()
@@ -29308,6 +29400,50 @@ mod tests {
             authz.config.get("trusted_hbone_assertors").is_none(),
             "explicit no-CA/no-identity development NodeWaypoint keeps mesh_authz defaults"
         );
+    }
+
+    /// Issue #4274 topology derivation: every mesh-managed topology OTHER than
+    /// identity-backed NodeWaypoint threads NO assertor list, so both plugins
+    /// fall back to the shared fail-closed defaults (bare `ztunnel`/`waypoint`
+    /// with a SAME-NAMESPACE grant). What must never happen is a topology
+    /// quietly emitting a namespace-blind list.
+    #[test]
+    fn inject_mesh_global_plugins_non_node_waypoint_topologies_keep_default_assertors() {
+        for topology in [
+            MeshTopology::Sidecar,
+            MeshTopology::Ambient,
+            MeshTopology::ServiceWaypoint,
+            MeshTopology::EastWestGateway,
+            MeshTopology::EgressGateway,
+        ] {
+            let mut runtime = test_mesh_runtime_config();
+            runtime.topology = topology;
+            let mut config = GatewayConfig::default();
+
+            inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
+
+            let authz = config
+                .plugin_configs
+                .iter()
+                .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
+                .expect("mesh_authz plugin injected");
+            assert!(
+                authz.config.get("trusted_hbone_assertors").is_none(),
+                "{topology:?} must not thread an assertor list of its own"
+            );
+            let workload_metrics = config
+                .plugin_configs
+                .iter()
+                .find(|plugin| plugin.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
+                .expect("workload_metrics plugin injected");
+            assert!(
+                workload_metrics
+                    .config
+                    .get("trusted_hbone_assertors")
+                    .is_none(),
+                "{topology:?} telemetry must mirror the authz allow-list exactly"
+            );
+        }
     }
 
     #[test]
@@ -29862,6 +29998,177 @@ mod tests {
                 .get("trusted_hbone_assertors")
                 .is_none(),
             "when operator mesh_authz omits trusted_hbone_assertors, workload_metrics must omit it too so both use shared defaults"
+        );
+    }
+
+    fn injected_workload_metrics_config(config: &GatewayConfig) -> &serde_json::Value {
+        &config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
+            .expect("workload_metrics plugin injected")
+            .config
+    }
+
+    fn injected_effective_authz_gates(config: &GatewayConfig) -> &[serde_json::Value] {
+        injected_workload_metrics_config(config)
+            .get(crate::plugins::mesh::workload_metrics::EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY)
+            .and_then(|value| value.as_array())
+            .map(Vec::as_slice)
+            .expect("injected workload_metrics must carry the effective authz gate list")
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_injects_single_enabled_authz_gate_into_workload_metrics() {
+        let mut config = GatewayConfig::default();
+        inject_mesh_global_plugins(
+            &mut config,
+            &test_mesh_runtime_config(),
+            &MeshSlice::default(),
+        );
+        let gates = injected_effective_authz_gates(&config);
+        assert_eq!(
+            gates.len(),
+            1,
+            "managed __mesh_authz is the only enabled gate"
+        );
+        assert!(
+            gates[0].get("trusted_hbone_assertors").is_none(),
+            "sidecar managed authz omits the allow-list so both plugins use shared defaults"
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_capture_on_metrics_gates_are_managed_and_enabled_operator() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "node_waypoint"),
+                ("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES", "eth0"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                assert!(runtime.transparent_inbound_capture_requested());
+
+                let mut config = GatewayConfig {
+                    plugin_configs: vec![global_mesh_authz_plugin(
+                        "operator-mesh-authz",
+                        serde_json::json!({ "trusted_hbone_assertors": [] }),
+                    )],
+                    ..GatewayConfig::default()
+                };
+                inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
+                let gates = injected_effective_authz_gates(&config);
+                assert_eq!(
+                    gates.len(),
+                    2,
+                    "capture-on must conjunct the managed gate with the enabled operator gate"
+                );
+                assert!(
+                    gates.iter().any(|gate| {
+                        gate.get("trusted_hbone_assertors") == Some(&serde_json::json!([]))
+                    }),
+                    "operator empty allow-list must be one of the effective gates"
+                );
+                assert!(
+                    injected_workload_metrics_config(&config)
+                        .get("trusted_hbone_assertors")
+                        .is_none(),
+                    "multiple gates must not pick a single winner for the top-level allow-list"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_disabled_operator_is_absent_from_metrics_gates() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "node_waypoint"),
+                ("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES", "eth0"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                let mut disabled = global_mesh_authz_plugin(
+                    "operator-mesh-authz-disabled",
+                    serde_json::json!({ "trusted_hbone_assertors": [] }),
+                );
+                disabled.enabled = false;
+                let mut config = GatewayConfig {
+                    plugin_configs: vec![disabled],
+                    ..GatewayConfig::default()
+                };
+                inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
+                let gates = injected_effective_authz_gates(&config);
+                assert_eq!(
+                    gates.len(),
+                    1,
+                    "disabled operator must not constrain or select the telemetry gate"
+                );
+                assert_ne!(
+                    gates[0].get("trusted_hbone_assertors"),
+                    Some(&serde_json::json!([])),
+                    "disabled operator empty list must not become the telemetry allow-list"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_multiple_operator_authz_gates_are_conjunctive() {
+        let mut config = GatewayConfig {
+            plugin_configs: vec![
+                global_mesh_authz_plugin(
+                    "operator-mesh-authz-a",
+                    serde_json::json!({
+                        "trusted_hbone_assertors": ["waypoint"],
+                    }),
+                ),
+                global_mesh_authz_plugin(
+                    "operator-mesh-authz-b",
+                    serde_json::json!({
+                        "trusted_hbone_assertors": [],
+                    }),
+                ),
+            ],
+            ..GatewayConfig::default()
+        };
+        inject_mesh_global_plugins(
+            &mut config,
+            &test_mesh_runtime_config(),
+            &MeshSlice::default(),
+        );
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != MESH_AUTHZ_PLUGIN_ID),
+            "operator globals suppress managed injection outside capture"
+        );
+        let gates = injected_effective_authz_gates(&config);
+        assert_eq!(gates.len(), 2);
+        assert_eq!(
+            gates[0].get("trusted_hbone_assertors"),
+            Some(&serde_json::json!(["waypoint"]))
+        );
+        assert_eq!(
+            gates[1].get("trusted_hbone_assertors"),
+            Some(&serde_json::json!([]))
         );
     }
 
