@@ -82,6 +82,12 @@ Entries may be plain service-name strings — a published A2A name resolves to t
 
 **Operator action:** for deployments fronting A2A 1.0 or a custom gRPC service whose cards must pass through untouched, set `discovery.rewrite_agent_card_urls: false`, or declare an explicit `{service, card_schema}` pair that truthfully matches the service you publish (for example `card_schema: a2a-0.3` only when the backend actually serves the 0.3 card layout). Do not pair a published A2A service name with a contradicting `card_schema`. See [plugins.md](plugins.md#a2a_gateway).
 
+### `FERRUM_TLS_OFFLOAD_THREADS` nonzero values fail startup (issue [#4294](https://github.com/ferrum-edge/ferrum-edge/issues/4294))
+
+TLS handshake offload is not implemented. A nonzero `FERRUM_TLS_OFFLOAD_THREADS` was parsed, documented in five places, and then silently ignored, so operators who set it believed handshakes were being offloaded when nothing had changed. `EnvConfig::validate()` now rejects any value other than `0` before mode dispatch, which turns a previously accepted configuration into a refused start.
+
+**Operator action:** leave `FERRUM_TLS_OFFLOAD_THREADS` unset, or set it to `0`. There is no configuration that enables offload; removing the variable is equivalent to the behaviour every prior release actually had.
+
 ## Database Mode (`FERRUM_MODE=database`)
 
 This is the most involved upgrade because schema migrations may alter your database. The strategy is: clone the database, migrate the clone, validate with the new binary, then cut over.
