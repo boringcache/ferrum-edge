@@ -94,6 +94,7 @@ mod proxy_alerts_tests;
 mod rate_limit_capacity_tests;
 mod rate_limit_cleanup_tests;
 mod rate_limit_policy_hardening_tests;
+mod rate_limit_state_lifecycle_tests;
 mod rate_limiting_tests;
 mod redis_rate_limiter_tests;
 mod rejection_logging_tests;
