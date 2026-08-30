@@ -10731,7 +10731,13 @@ async fn drive_inbound_relay_third_workload_refusal(
                 .await
             }
             ThirdWorkloadConnectFlavor::Datagram => {
-                drive_one_udp_connect(hbone_port, &control_authority, &svids.a).await
+                drive_one_udp_connect(
+                    Ipv4Addr::LOCALHOST,
+                    hbone_port,
+                    &control_authority,
+                    &svids.a,
+                )
+                .await
             }
         };
 
@@ -10790,7 +10796,7 @@ async fn drive_inbound_relay_third_workload_refusal(
             .await
             .map(|(status, _)| status),
             ThirdWorkloadConnectFlavor::Datagram => {
-                drive_one_udp_connect(hbone_port, &authority, &svids.a)
+                drive_one_udp_connect(Ipv4Addr::LOCALHOST, hbone_port, &authority, &svids.a)
                     .await
                     .map(|(status, _)| status)
             }
