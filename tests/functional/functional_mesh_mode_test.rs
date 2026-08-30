@@ -10420,6 +10420,7 @@ async fn abort_third_workload_backend(task: tokio::task::JoinHandle<()>) {
 /// Slice consumed by terminator B: B's own-identity record at a non-loopback
 /// local address plus workload C — a different SPIFFE, a discovered non-loopback
 /// address. No operator plugins: this is the production MeshSubscribe shape.
+#[allow(clippy::too_many_arguments)]
 fn third_workload_refusal_slice(
     node_id: &str,
     b_spiffe: &str,
