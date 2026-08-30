@@ -5,6 +5,17 @@ use ferrum_edge::proxy::{
 };
 use hyper::header::HeaderValue;
 
+/// Origin-form URI with no authority. HTTP/1.1 tests that expect success must
+/// include a Host header (or pass an absolute-form URI to
+/// `check_protocol_headers` directly).
+fn check_protocol(headers: &hyper::HeaderMap, version: hyper::Version) -> Option<&'static str> {
+    check_protocol_headers(
+        headers,
+        version,
+        &hyper::Uri::from_static("/"),
+    )
+}
+
 // ============================================================================
 // check_protocol_headers tests
 // ============================================================================
@@ -16,7 +27,7 @@ fn http11_rejects_cl_and_te_together() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static("42"));
     headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11);
+    let result = check_protocol(&headers, hyper::Version::HTTP_11);
     assert!(result.is_some());
     assert!(
         result
@@ -30,7 +41,7 @@ fn http10_rejects_te_alone() {
     // HTTP/1.0 does not support Transfer-Encoding (RFC 9112 §6.2)
     let mut headers = hyper::HeaderMap::new();
     headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_10);
+    let result = check_protocol(&headers, hyper::Version::HTTP_10);
     assert!(result.is_some());
     assert!(result.unwrap().contains("HTTP/1.0 does not support"));
 }
@@ -41,7 +52,7 @@ fn http10_rejects_cl_and_te_together() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static("42"));
     headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_10);
+    let result = check_protocol(&headers, hyper::Version::HTTP_10);
     assert!(result.is_some());
     // The HTTP/1.0 TE rejection fires first
     assert!(result.unwrap().contains("HTTP/1.0 does not support"));
@@ -52,14 +63,14 @@ fn http10_allows_cl_only() {
     // HTTP/1.0 with only Content-Length is fine
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static("42"));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_10).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_10).is_none());
 }
 
 #[test]
 fn http2_rejects_transfer_encoding_even_without_cl() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
+    let result = check_protocol(&headers, hyper::Version::HTTP_2);
     assert!(result.is_some());
     assert!(result.unwrap().contains("Transfer-Encoding"));
 }
@@ -69,7 +80,7 @@ fn http2_rejects_cl_and_transfer_encoding_together() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static("42"));
     headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
+    let result = check_protocol(&headers, hyper::Version::HTTP_2);
     assert!(result.is_some());
     assert!(result.unwrap().contains("Transfer-Encoding"));
 }
@@ -78,7 +89,7 @@ fn http2_rejects_cl_and_transfer_encoding_together() {
 fn http3_rejects_transfer_encoding() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_3);
+    let result = check_protocol(&headers, hyper::Version::HTTP_3);
     assert!(result.is_some());
     assert!(result.unwrap().contains("Transfer-Encoding"));
 }
@@ -86,15 +97,17 @@ fn http3_rejects_transfer_encoding() {
 #[test]
 fn http11_allows_cl_only() {
     let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("example.com"));
     headers.insert("content-length", HeaderValue::from_static("42"));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_11).is_none());
 }
 
 #[test]
 fn http11_allows_te_only() {
     let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("example.com"));
     headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_11).is_none());
 }
 
 // --- Multiple Content-Length with mismatched values ---
@@ -104,7 +117,7 @@ fn rejects_conflicting_content_length_values() {
     let mut headers = hyper::HeaderMap::new();
     headers.append("content-length", HeaderValue::from_static("42"));
     headers.append("content-length", HeaderValue::from_static("99"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11);
+    let result = check_protocol(&headers, hyper::Version::HTTP_11);
     assert!(result.is_some());
     assert!(result.unwrap().contains("conflicting values"));
 }
@@ -112,9 +125,10 @@ fn rejects_conflicting_content_length_values() {
 #[test]
 fn allows_duplicate_content_length_same_value() {
     let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("example.com"));
     headers.append("content-length", HeaderValue::from_static("42"));
     headers.append("content-length", HeaderValue::from_static("42"));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_11).is_none());
 }
 
 #[test]
@@ -122,7 +136,7 @@ fn conflicting_content_length_checked_on_http2() {
     let mut headers = hyper::HeaderMap::new();
     headers.append("content-length", HeaderValue::from_static("10"));
     headers.append("content-length", HeaderValue::from_static("20"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
+    let result = check_protocol(&headers, hyper::Version::HTTP_2);
     assert!(result.is_some());
     assert!(result.unwrap().contains("conflicting values"));
 }
@@ -132,7 +146,7 @@ fn conflicting_content_length_checked_on_http3() {
     let mut headers = hyper::HeaderMap::new();
     headers.append("content-length", HeaderValue::from_static("100"));
     headers.append("content-length", HeaderValue::from_static("200"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_3);
+    let result = check_protocol(&headers, hyper::Version::HTTP_3);
     assert!(result.is_some());
     assert!(result.unwrap().contains("conflicting values"));
 }
@@ -145,7 +159,7 @@ fn rejects_comma_separated_conflicting_content_length() {
     // into a single "Content-Length: 42, 0" field line.
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static("42, 0"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11);
+    let result = check_protocol(&headers, hyper::Version::HTTP_11);
     assert!(result.is_some());
     assert!(result.unwrap().contains("conflicting values"));
 }
@@ -153,8 +167,9 @@ fn rejects_comma_separated_conflicting_content_length() {
 #[test]
 fn allows_comma_separated_identical_content_length() {
     let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("example.com"));
     headers.insert("content-length", HeaderValue::from_static("42, 42"));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_11).is_none());
 }
 
 #[test]
@@ -163,7 +178,7 @@ fn rejects_mixed_header_and_comma_content_length() {
     let mut headers = hyper::HeaderMap::new();
     headers.append("content-length", HeaderValue::from_static("100"));
     headers.append("content-length", HeaderValue::from_static("100, 200"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11);
+    let result = check_protocol(&headers, hyper::Version::HTTP_11);
     assert!(result.is_some());
     assert!(result.unwrap().contains("conflicting values"));
 }
@@ -172,15 +187,16 @@ fn rejects_mixed_header_and_comma_content_length() {
 fn allows_comma_separated_with_ows() {
     // Whitespace around comma-separated values should be trimmed
     let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("example.com"));
     headers.insert("content-length", HeaderValue::from_static("42 , 42"));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_11).is_none());
 }
 
 #[test]
 fn rejects_empty_content_length_token_trailing_comma() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static("42,"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11);
+    let result = check_protocol(&headers, hyper::Version::HTTP_11);
     assert!(result.is_some());
     assert!(result.unwrap().contains("invalid empty value"));
 }
@@ -189,7 +205,7 @@ fn rejects_empty_content_length_token_trailing_comma() {
 fn rejects_empty_content_length_token_leading_comma_on_http2() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static(",42"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
+    let result = check_protocol(&headers, hyper::Version::HTTP_2);
     assert!(result.is_some());
     assert!(result.unwrap().contains("invalid empty value"));
 }
@@ -198,7 +214,7 @@ fn rejects_empty_content_length_token_leading_comma_on_http2() {
 fn rejects_empty_content_length_token_middle_comma_on_http3() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static("42,,42"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_3);
+    let result = check_protocol(&headers, hyper::Version::HTTP_3);
     assert!(result.is_some());
     assert!(result.unwrap().contains("invalid empty value"));
 }
@@ -210,7 +226,7 @@ fn http11_rejects_multiple_host_headers() {
     let mut headers = hyper::HeaderMap::new();
     headers.append("host", HeaderValue::from_static("evil.com"));
     headers.append("host", HeaderValue::from_static("real.com"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11);
+    let result = check_protocol(&headers, hyper::Version::HTTP_11);
     assert!(result.is_some());
     assert!(result.unwrap().contains("multiple Host"));
 }
@@ -219,7 +235,7 @@ fn http11_rejects_multiple_host_headers() {
 fn http11_allows_single_host() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("example.com"));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_11).is_none());
 }
 
 #[test]
@@ -229,7 +245,82 @@ fn http2_allows_multiple_host_headers() {
     let mut headers = hyper::HeaderMap::new();
     headers.append("host", HeaderValue::from_static("a.com"));
     headers.append("host", HeaderValue::from_static("b.com"));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_2).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_2).is_none());
+}
+
+// --- Missing / empty Host (RFC 9112 §3.2.2) ---
+
+#[test]
+fn http11_rejects_missing_host_without_uri_authority() {
+    let headers = hyper::HeaderMap::new();
+    let result = check_protocol(&headers, hyper::Version::HTTP_11);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("missing a Host"));
+}
+
+#[test]
+fn http10_allows_missing_host() {
+    let headers = hyper::HeaderMap::new();
+    assert!(check_protocol(&headers, hyper::Version::HTTP_10).is_none());
+}
+
+#[test]
+fn http2_and_http3_allow_missing_host() {
+    // :authority is governed by check_host_authority_consistency(), not here.
+    let headers = hyper::HeaderMap::new();
+    assert!(check_protocol(&headers, hyper::Version::HTTP_2).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_3).is_none());
+}
+
+#[test]
+fn http11_allows_absolute_form_without_host_header() {
+    // RFC 9112 absolute-form request-target carries the authority on the URI.
+    // Hyper surfaces that as uri.authority(); the request is well-formed
+    // even when the Host field line is absent.
+    let headers = hyper::HeaderMap::new();
+    let uri: hyper::Uri = "http://example.com/path".parse().unwrap();
+    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11, &uri).is_none());
+}
+
+#[test]
+fn http11_rejects_empty_host_value() {
+    // `Host:` with no tokens is present (get_all("host") yields a value) but
+    // empty. That is an invalid field value, not a missing field, and MUST 400.
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static(""));
+    let result = check_protocol(&headers, hyper::Version::HTTP_11);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("invalid empty value"));
+}
+
+#[test]
+fn http11_rejects_whitespace_only_host_value() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static(" \t "));
+    let result = check_protocol(&headers, hyper::Version::HTTP_11);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("invalid empty value"));
+}
+
+#[test]
+fn http10_allows_empty_host_value() {
+    // Empty Host is only an HTTP/1.1 invalid-value reject. HTTP/1.0 does not
+    // require Host and is left unchanged.
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static(""));
+    assert!(check_protocol(&headers, hyper::Version::HTTP_10).is_none());
+}
+
+#[test]
+fn http11_absolute_form_does_not_override_empty_host() {
+    // An empty Host field is present, so this is not the missing-Host case
+    // even when the URI carries an authority.
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static(""));
+    let uri: hyper::Uri = "http://example.com/path".parse().unwrap();
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11, &uri);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("invalid empty value"));
 }
 
 // --- TE header validation (HTTP/2) ---
@@ -238,21 +329,21 @@ fn http2_allows_multiple_host_headers() {
 fn http2_allows_te_trailers() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("te", HeaderValue::from_static("trailers"));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_2).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_2).is_none());
 }
 
 #[test]
 fn http2_allows_te_trailers_case_insensitive() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("te", HeaderValue::from_static("Trailers"));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_2).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_2).is_none());
 }
 
 #[test]
 fn http2_rejects_te_chunked() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("te", HeaderValue::from_static("chunked"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
+    let result = check_protocol(&headers, hyper::Version::HTTP_2);
     assert!(result.is_some());
     assert!(result.unwrap().contains("TE header"));
 }
@@ -261,7 +352,7 @@ fn http2_rejects_te_chunked() {
 fn http2_rejects_te_gzip() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("te", HeaderValue::from_static("gzip"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
+    let result = check_protocol(&headers, hyper::Version::HTTP_2);
     assert!(result.is_some());
     assert!(result.unwrap().contains("TE header"));
 }
@@ -270,7 +361,7 @@ fn http2_rejects_te_gzip() {
 fn http2_rejects_empty_te_token_trailing_comma() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("te", HeaderValue::from_static("trailers,"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
+    let result = check_protocol(&headers, hyper::Version::HTTP_2);
     assert!(result.is_some());
     assert!(result.unwrap().contains("invalid empty value"));
 }
@@ -279,7 +370,7 @@ fn http2_rejects_empty_te_token_trailing_comma() {
 fn http3_rejects_empty_te_token_leading_comma() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("te", HeaderValue::from_static(",trailers"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_3);
+    let result = check_protocol(&headers, hyper::Version::HTTP_3);
     assert!(result.is_some());
     assert!(result.unwrap().contains("invalid empty value"));
 }
@@ -287,7 +378,7 @@ fn http3_rejects_empty_te_token_leading_comma() {
 #[test]
 fn http2_allows_no_te() {
     let headers = hyper::HeaderMap::new();
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_2).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_2).is_none());
 }
 
 #[test]
@@ -295,7 +386,7 @@ fn http2_rejects_te_trailers_plus_invalid_in_same_field() {
     // "te: trailers, gzip" has a valid token + invalid token — must reject
     let mut headers = hyper::HeaderMap::new();
     headers.insert("te", HeaderValue::from_static("trailers, gzip"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
+    let result = check_protocol(&headers, hyper::Version::HTTP_2);
     assert!(result.is_some());
     assert!(result.unwrap().contains("TE header"));
 }
@@ -306,7 +397,7 @@ fn http2_rejects_second_te_header_entry_with_invalid_value() {
     let mut headers = hyper::HeaderMap::new();
     headers.append("te", HeaderValue::from_static("trailers"));
     headers.append("te", HeaderValue::from_static("gzip"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
+    let result = check_protocol(&headers, hyper::Version::HTTP_2);
     assert!(result.is_some());
     assert!(result.unwrap().contains("TE header"));
 }
@@ -315,8 +406,9 @@ fn http2_rejects_second_te_header_entry_with_invalid_value() {
 fn http11_allows_any_te_value() {
     // TE header restrictions only apply to HTTP/2
     let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("example.com"));
     headers.insert("te", HeaderValue::from_static("gzip, chunked"));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_11).is_none());
 }
 
 // --- Clean requests pass validation ---
@@ -327,7 +419,7 @@ fn clean_http11_request_passes() {
     headers.insert("host", HeaderValue::from_static("example.com"));
     headers.insert("content-length", HeaderValue::from_static("100"));
     headers.insert("content-type", HeaderValue::from_static("application/json"));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_11).is_none());
 }
 
 #[test]
@@ -335,7 +427,7 @@ fn clean_http2_request_passes() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static("100"));
     headers.insert("te", HeaderValue::from_static("trailers"));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_2).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_2).is_none());
 }
 
 // --- Host / :authority consistency (HTTP/2 and HTTP/3) ---
@@ -450,11 +542,11 @@ fn http11_ignores_authority_consistency_helper() {
 }
 
 #[test]
-fn empty_headers_pass() {
+fn empty_headers_http10_http2_http3_pass() {
     let headers = hyper::HeaderMap::new();
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11).is_none());
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_2).is_none());
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_3).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_10).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_2).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_3).is_none());
 }
 
 // --- Content-Length non-numeric value validation (RFC 9110 §8.6) ---
@@ -463,7 +555,7 @@ fn empty_headers_pass() {
 fn rejects_content_length_negative() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static("-1"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11);
+    let result = check_protocol(&headers, hyper::Version::HTTP_11);
     assert!(result.is_some());
     assert!(result.unwrap().contains("invalid non-numeric"));
 }
@@ -472,7 +564,7 @@ fn rejects_content_length_negative() {
 fn rejects_content_length_alphabetic() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static("abc"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11);
+    let result = check_protocol(&headers, hyper::Version::HTTP_11);
     assert!(result.is_some());
     assert!(result.unwrap().contains("invalid non-numeric"));
 }
@@ -481,7 +573,7 @@ fn rejects_content_length_alphabetic() {
 fn rejects_content_length_decimal() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static("1.5"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11);
+    let result = check_protocol(&headers, hyper::Version::HTTP_11);
     assert!(result.is_some());
     assert!(result.unwrap().contains("invalid non-numeric"));
 }
@@ -490,7 +582,7 @@ fn rejects_content_length_decimal() {
 fn rejects_content_length_hex_prefix() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static("0x10"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11);
+    let result = check_protocol(&headers, hyper::Version::HTTP_11);
     assert!(result.is_some());
     assert!(result.unwrap().contains("invalid non-numeric"));
 }
@@ -499,7 +591,7 @@ fn rejects_content_length_hex_prefix() {
 fn rejects_content_length_plus_sign() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static("+42"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11);
+    let result = check_protocol(&headers, hyper::Version::HTTP_11);
     assert!(result.is_some());
     assert!(result.unwrap().contains("invalid non-numeric"));
 }
@@ -507,15 +599,17 @@ fn rejects_content_length_plus_sign() {
 #[test]
 fn allows_content_length_zero() {
     let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("example.com"));
     headers.insert("content-length", HeaderValue::from_static("0"));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_11).is_none());
 }
 
 #[test]
 fn allows_content_length_large_valid() {
     let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("example.com"));
     headers.insert("content-length", HeaderValue::from_static("999999999999"));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_11).is_none());
 }
 
 #[test]
@@ -526,7 +620,7 @@ fn rejects_content_length_overflowing_usize() {
         "content-length",
         HeaderValue::from_str(&overflowing).unwrap(),
     );
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11);
+    let result = check_protocol(&headers, hyper::Version::HTTP_11);
     assert!(result.is_some());
     assert!(result.unwrap().contains("exceeds supported integer range"));
 }
@@ -535,15 +629,16 @@ fn rejects_content_length_overflowing_usize() {
 fn allows_content_length_with_ows_valid_digits() {
     // OWS is trimmed before digit validation
     let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("example.com"));
     headers.insert("content-length", HeaderValue::from_static(" 42 "));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_11).is_none());
 }
 
 #[test]
 fn rejects_content_length_non_numeric_on_http2() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static("abc"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
+    let result = check_protocol(&headers, hyper::Version::HTTP_2);
     assert!(result.is_some());
     assert!(result.unwrap().contains("invalid non-numeric"));
 }
@@ -552,7 +647,7 @@ fn rejects_content_length_non_numeric_on_http2() {
 fn rejects_content_length_non_numeric_on_http3() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static("-5"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_3);
+    let result = check_protocol(&headers, hyper::Version::HTTP_3);
     assert!(result.is_some());
     assert!(result.unwrap().contains("invalid non-numeric"));
 }
@@ -562,7 +657,7 @@ fn rejects_comma_separated_content_length_with_non_numeric() {
     // "42, abc" — the second token is not all-digits
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static("42, abc"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11);
+    let result = check_protocol(&headers, hyper::Version::HTTP_11);
     assert!(result.is_some());
     assert!(result.unwrap().contains("invalid non-numeric"));
 }
@@ -919,7 +1014,7 @@ fn h2_content_length_not_in_protocol_headers_check() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-length", HeaderValue::from_static("42"));
     // A valid single CL value should pass validation on HTTP/2
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_2).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_2).is_none());
 }
 
 #[test]
@@ -928,7 +1023,7 @@ fn h2_conflicting_content_length_still_rejected() {
     let mut headers = hyper::HeaderMap::new();
     headers.append("content-length", HeaderValue::from_static("42"));
     headers.append("content-length", HeaderValue::from_static("99"));
-    let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
+    let result = check_protocol(&headers, hyper::Version::HTTP_2);
     assert!(result.is_some());
     assert!(result.unwrap().contains("conflicting values"));
 }
@@ -944,27 +1039,30 @@ fn h2_conflicting_content_length_still_rejected() {
 fn te_obfuscation_capitalized_chunked_http11_passes_validation() {
     // HTTP/1.1 allows any TE value — it's stripped before forwarding
     let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("example.com"));
     headers.insert("transfer-encoding", HeaderValue::from_static("Chunked"));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_11).is_none());
 }
 
 #[test]
 fn te_obfuscation_leading_space_http11_passes_validation() {
     // Leading spaces in TE value — HTTP/1.1 allows any TE (stripped before forwarding)
     let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("example.com"));
     headers.insert("transfer-encoding", HeaderValue::from_static(" chunked"));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_11).is_none());
 }
 
 #[test]
 fn te_obfuscation_identity_http11_passes_validation() {
     // "identity" is a valid but unusual TE value — HTTP/1.1 allows it (stripped)
     let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("example.com"));
     headers.insert(
         "transfer-encoding",
         HeaderValue::from_static("chunked, identity"),
     );
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_11).is_none());
 }
 
 #[test]
@@ -974,7 +1072,7 @@ fn http2_te_trailers_case_variants_all_accepted() {
         let mut headers = hyper::HeaderMap::new();
         headers.insert("te", HeaderValue::from_static(val));
         assert!(
-            check_protocol_headers(&headers, hyper::Version::HTTP_2).is_none(),
+            check_protocol(&headers, hyper::Version::HTTP_2).is_none(),
             "TE value '{}' should be accepted on HTTP/2",
             val
         );
@@ -986,7 +1084,7 @@ fn http2_te_obfuscated_chunked_rejected() {
     // HTTP/2 must reject any TE value that isn't "trailers"
     let mut headers = hyper::HeaderMap::new();
     headers.insert("te", HeaderValue::from_static("chunked"));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_2).is_some());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_2).is_some());
 }
 
 #[test]
@@ -994,7 +1092,7 @@ fn http2_te_with_leading_space_trailers_accepted() {
     // "trailers" with leading space — trim() handles this
     let mut headers = hyper::HeaderMap::new();
     headers.insert("te", HeaderValue::from_static(" trailers "));
-    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_2).is_none());
+    assert!(check_protocol(&headers, hyper::Version::HTTP_2).is_none());
 }
 
 #[test]
@@ -1003,7 +1101,7 @@ fn http10_te_rejected_regardless_of_obfuscation() {
     for val in &["chunked", "Chunked", " chunked", "identity"] {
         let mut headers = hyper::HeaderMap::new();
         headers.insert("transfer-encoding", HeaderValue::from_static(val));
-        let result = check_protocol_headers(&headers, hyper::Version::HTTP_10);
+        let result = check_protocol(&headers, hyper::Version::HTTP_10);
         assert!(
             result.is_some(),
             "HTTP/1.0 should reject TE value '{}'",

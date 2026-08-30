@@ -275,6 +275,7 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
   - HTTP/1.0: Transfer-Encoding rejection (RFC 9112 §6.2 — no chunked in 1.0)
   - All versions: Content-Length non-numeric value rejection (RFC 9110 §8.6)
   - HTTP/1.x: Multiple Host header rejection
+  - HTTP/1.1: missing Host header rejection (RFC 9112 §3.2.2; empty `Host:` is invalid; HTTP/1.0 and absolute-form request-targets that already carry an authority are not rejected)
   - HTTP/2: TE header restricted to "trailers" only
   - All versions: TRACE method blocked (anti-XST)
   - gRPC: POST method enforcement

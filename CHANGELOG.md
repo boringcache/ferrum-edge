@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — HTTP/1.1 requests without a Host header are rejected with 400**
+  (issue #4390). RFC 9112 §3.2.2 requires a server to answer 400 when an
+  HTTP/1.1 request lacks a Host field. Ferrum previously only rejected
+  *multiple* Host fields, so a Host-less origin-form request skipped
+  exact/wildcard host tiers and fell through to a catch-all (empty `hosts`)
+  route. `check_protocol_headers()` now rejects HTTP/1.1 when both the Host
+  field and the URI authority are absent. HTTP/1.0 still does not require
+  Host. Absolute-form request-targets (`GET http://host/path HTTP/1.1`) that
+  already carry an authority are accepted without a Host field. An empty
+  Host value (`Host:` with no tokens) is treated as present-but-invalid and
+  also returns 400 on HTTP/1.1. HTTP/2 and HTTP/3 are unchanged
+  (`check_host_authority_consistency()` still governs `:authority`).
+  **Operator action**: any HTTP/1.1 client that omitted Host (non-conformant
+  scanners, some raw sockets, misconfigured health probes) will start seeing
+  `400` `{"error":"HTTP/1.1 request is missing a Host header"}` instead of
+  being routed. Send a Host field, or use HTTP/1.0 / absolute-form if that
+  is the intended protocol.
+
 - **BREAKING — `POST /batch` rejects unknown top-level envelope keys**
   (issue #4042). The request is create-only (`consumers`, `upstreams`,
   `proxies`, `plugin_configs`). Sending `updates`, `deletes`, or `dry_run`
