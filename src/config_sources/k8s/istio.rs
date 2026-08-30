@@ -498,7 +498,7 @@ fn resolve_one_authorization_policy_target_ref(
             ensure_authz_target_ref_same_namespace(
                 object,
                 kind_label,
-                &path,
+                path,
                 &target_namespace,
                 "Service",
                 name,
@@ -521,7 +521,7 @@ fn resolve_one_authorization_policy_target_ref(
             ensure_authz_target_ref_same_namespace(
                 object,
                 kind_label,
-                &path,
+                path,
                 &target_namespace,
                 "Gateway",
                 name,
