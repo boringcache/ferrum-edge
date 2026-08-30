@@ -49,6 +49,7 @@ pub(crate) mod frontend_admission;
 pub mod gateway_listener;
 pub mod gateway_listener_status;
 pub mod grpc_proxy;
+mod h1_framing_guard;
 /// Shared h2c (cleartext, prior-knowledge HTTP/2) peer-preface observation.
 /// Hyper's client handshake proves only the client half, so both h2c transports
 /// — the pooled gRPC path and the Unix-socket path — establish through here.
@@ -6620,6 +6621,11 @@ fn via_header_for_backend_response_body<'a>(
 #[derive(Clone, Default)]
 struct RequestConnectionMetadata {
     frontend_listen_port: Option<u16>,
+    /// Raw HTTP/1 framing result captured before Hyper applied framing
+    /// precedence. [`h1_framing_guard::H1FramingResult::NotObserved`] is the
+    /// default and means no observer ran (H2/H3/tests). Only a completed
+    /// observation may be [`h1_framing_guard::H1FramingResult::Clear`].
+    http1_framing_result: h1_framing_guard::H1FramingResult,
     /// Concrete local address of the accepted TCP connection. Unlike the
     /// listener's wildcard bind address, this identifies the pod IP the peer
     /// actually reached — it binds a Sidecar ingress CONNECT to this replica
@@ -6676,6 +6682,69 @@ struct RequestConnectionMetadata {
     /// own downstream writes (native HTTP/3).
     authorization_connection_closer:
         Option<crate::proxy::auth_lifetime::AuthorizationConnectionCloser>,
+}
+
+static H1_FRAMING_OBSERVER_FAILED_WARN: crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter =
+    crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::new();
+
+/// RFC 9112 §6.1 requires closing after any HTTP/1 CL+TE response, even
+/// when Hyper drained the body according to Transfer-Encoding. A peer honoring
+/// Content-Length could place the next request boundary elsewhere, so no
+/// response path may leave a known-conflicting connection reusable.
+/// [`h1_framing_guard::H1FramingResult::NotObserved`] and
+/// [`h1_framing_guard::H1FramingResult::Clear`] both skip this; only
+/// [`h1_framing_guard::H1FramingResult::Conflict`] forces `Connection: close`.
+#[inline]
+fn apply_h1_framing_connection_close(
+    response: &mut Result<Response<ProxyBody>, hyper::Error>,
+    framing_result: h1_framing_guard::H1FramingResult,
+) {
+    if !matches!(framing_result, h1_framing_guard::H1FramingResult::Conflict) {
+        return;
+    }
+    let Ok(response) = response else {
+        return;
+    };
+    response.headers_mut().insert(
+        hyper::header::CONNECTION,
+        hyper::header::HeaderValue::from_static("close"),
+    );
+}
+
+/// Consume the connection-local HTTP/1 framing signal, or record that this
+/// request was never observed.
+///
+/// HTTP/2 and HTTP/3 are [`h1_framing_guard::H1FramingResult::NotObserved`].
+/// An HTTP/1 request with no observer installed is
+/// [`h1_framing_guard::H1FramingResult::ObserverFailed`] (fail-closed), not a
+/// silent [`h1_framing_guard::H1FramingResult::Clear`].
+#[inline]
+fn consume_h1_framing_result(
+    version: hyper::Version,
+    signals: Option<&h1_framing_guard::H1FramingSignals>,
+) -> h1_framing_guard::H1FramingResult {
+    if !matches!(version, hyper::Version::HTTP_10 | hyper::Version::HTTP_11) {
+        return h1_framing_guard::H1FramingResult::NotObserved;
+    }
+    match signals {
+        Some(signals) => signals.next_conflict(),
+        None => h1_framing_guard::H1FramingResult::ObserverFailed,
+    }
+}
+
+/// Hyper's HTTP/1 role marks the connection `is_last` for `101 Switching
+/// Protocols` and for a successful CONNECT (`proto/h1/role.rs`). Ferrum
+/// returns 405 for non-WebSocket H1 CONNECT, so the second arm is unreachable
+/// today; key both so observation disable does not depend on that internal.
+#[inline]
+fn h1_response_ends_framing_observation(
+    method: &hyper::Method,
+    response: &Result<Response<ProxyBody>, hyper::Error>,
+) -> bool {
+    response.as_ref().is_ok_and(|response| {
+        response.status() == StatusCode::SWITCHING_PROTOCOLS
+            || (*method == hyper::Method::CONNECT && response.status().is_success())
+    })
 }
 
 fn empty_svid_bundle_slot() -> SharedSvidBundle {
@@ -13464,7 +13533,12 @@ async fn handle_connection(
     // Set TCP keepalive on inbound connection to detect stale clients
     set_tcp_keepalive(&stream);
 
-    // Use TokioIo to adapt the TCP stream for hyper
+    // Observe raw H1 framing before Hyper normalizes TE-first CL+TE requests.
+    // The adapter disables itself for the H2 prior-knowledge preface.
+    let (stream, h1_framing_signals) = h1_framing_guard::H1FramingGuardIo::new(
+        stream,
+        http1_parser_max_buf_size(state.max_header_size_bytes),
+    );
     let io = TokioIo::new(stream);
 
     // Use auto builder to support both HTTP/1.1 and HTTP/2 cleartext (h2c).
@@ -13518,12 +13592,25 @@ async fn handle_connection(
     let header_read_timeout_seconds = state.env_config.http_header_read_timeout_seconds;
     let admission = frontend_admission::FrontendAdmission::new();
     let service_admission = Arc::clone(&admission);
+    let service_h1_framing_signals = Arc::clone(&h1_framing_signals);
     let svc = service_fn(move |req: Request<Incoming>| {
         service_admission.mark();
         let state = Arc::clone(&state);
         let addr = remote_addr;
+        let http1_framing_result =
+            consume_h1_framing_result(req.version(), Some(service_h1_framing_signals.as_ref()));
+        let request_method = req.method().clone();
+        let response_h1_framing_signals = if matches!(
+            req.version(),
+            hyper::Version::HTTP_10 | hyper::Version::HTTP_11
+        ) {
+            Some(Arc::clone(&service_h1_framing_signals))
+        } else {
+            None
+        };
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port,
+            http1_framing_result,
             accepted_local_addr,
             frontend_sni_hostname: None,
             node_waypoint_identity: node_waypoint_identity.clone(),
@@ -13540,7 +13627,7 @@ async fn handle_connection(
             authorization_connection_closer: Some(authorization_closer.clone()),
         };
         async move {
-            handle_proxy_request_on_frontend_port(
+            let mut response = handle_proxy_request_on_frontend_port(
                 req,
                 state,
                 addr,
@@ -13550,7 +13637,14 @@ async fn handle_connection(
                 None,
                 connection_metadata,
             )
-            .await
+            .await;
+            apply_h1_framing_connection_close(&mut response, http1_framing_result);
+            if let Some(signals) = response_h1_framing_signals.as_ref()
+                && h1_response_ends_framing_observation(&request_method, &response)
+            {
+                signals.disable_observation();
+            }
+            response
         }
     });
 
@@ -21413,7 +21507,23 @@ async fn handle_tls_connection(
         .server_name()
         .map(str::to_ascii_lowercase);
 
-    // Convert TLS stream to TokioIo for hyper
+    // Observe decrypted H1 framing before Hyper normalizes TE-first CL+TE
+    // requests. ALPN `h2` is already HTTP/2: skip the observer so those
+    // connections do not allocate `H1FramingSignals`. Otherwise wrap; the
+    // adapter still disables itself if the bytes are an h2c-style preface.
+    let (tls_stream, h1_framing_signals) =
+        if matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
+            (
+                h1_framing_guard::MaybeH1FramingGuardIo::passthrough(tls_stream),
+                None,
+            )
+        } else {
+            let (io, signals) = h1_framing_guard::MaybeH1FramingGuardIo::observed(
+                tls_stream,
+                http1_parser_max_buf_size(state.max_header_size_bytes),
+            );
+            (io, Some(signals))
+        };
     let io = hyper_util::rt::TokioIo::new(tls_stream);
 
     // Use hyper-util's auto builder which negotiates HTTP/1.1 or HTTP/2 via ALPN.
@@ -21467,6 +21577,7 @@ async fn handle_tls_connection(
     let header_read_timeout_seconds = state.env_config.http_header_read_timeout_seconds;
     let admission = frontend_admission::FrontendAdmission::new();
     let service_admission = Arc::clone(&admission);
+    let service_h1_framing_signals = h1_framing_signals;
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         service_admission.mark();
         let state = Arc::clone(&state);
@@ -21475,8 +21586,20 @@ async fn handle_tls_connection(
         let chain = client_cert_chain_der.clone();
         let mtls_auth_connection_cache = mtls_auth_connection_cache.clone();
         let frontend_sni_hostname = frontend_sni_hostname.clone();
+        let http1_framing_result =
+            consume_h1_framing_result(req.version(), service_h1_framing_signals.as_deref());
+        let request_method = req.method().clone();
+        let response_h1_framing_signals = if matches!(
+            req.version(),
+            hyper::Version::HTTP_10 | hyper::Version::HTTP_11
+        ) {
+            service_h1_framing_signals.clone()
+        } else {
+            None
+        };
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port: tls_connection_metadata.frontend_listen_port,
+            http1_framing_result,
             accepted_local_addr: tls_connection_metadata.accepted_local_addr,
             frontend_sni_hostname,
             node_waypoint_identity: tls_connection_metadata.node_waypoint_identity.clone(),
@@ -21491,7 +21614,7 @@ async fn handle_tls_connection(
             authorization_connection_closer: Some(authorization_closer.clone()),
         };
         async move {
-            handle_proxy_request_on_frontend_port(
+            let mut response = handle_proxy_request_on_frontend_port(
                 req,
                 state,
                 addr,
@@ -21501,7 +21624,14 @@ async fn handle_tls_connection(
                 mtls_auth_connection_cache,
                 connection_metadata,
             )
-            .await
+            .await;
+            apply_h1_framing_connection_close(&mut response, http1_framing_result);
+            if let Some(signals) = response_h1_framing_signals.as_ref()
+                && h1_response_ends_framing_observation(&request_method, &response)
+            {
+                signals.disable_observation();
+            }
+            response
         }
     });
 
@@ -28822,6 +28952,7 @@ pub async fn handle_proxy_request(
         mtls_auth_connection_cache,
         RequestConnectionMetadata {
             peer_spiffe_extraction_cache,
+            http1_framing_result: h1_framing_guard::H1FramingResult::NotObserved,
             ..RequestConnectionMetadata::default()
         },
     )
@@ -28839,6 +28970,33 @@ async fn handle_proxy_request_on_frontend_port(
     mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
+    // An observer failure is connection-scoped and must outrank every
+    // request-level early return below. Otherwise a stale-config, trust,
+    // ACME, or overload response could leave the unverified H1 connection
+    // reusable and turn a fail-closed state back into an unbounded stream.
+    if matches!(
+        connection_metadata.http1_framing_result,
+        h1_framing_guard::H1FramingResult::ObserverFailed
+    ) {
+        let error_body = r#"{"error":"HTTP/1 request framing could not be verified; connection will be closed"}"#;
+        if let Some(suppressed) =
+            H1_FRAMING_OBSERVER_FAILED_WARN.on_event(crate::socket_opts::monotonic_now_ms())
+        {
+            warn!(
+                framing_observer_state = "unknown_or_overflowed",
+                suppressed,
+                "Rejected HTTP/1 request because wire framing could not be verified; closing connection"
+            );
+        }
+        record_request(&state, 400);
+        let mut response = build_response(StatusCode::BAD_REQUEST, error_body);
+        response.headers_mut().insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("close"),
+        );
+        return Ok(response);
+    }
+
     // Stale-configuration admission fence (issue #3726). One relaxed atomic
     // load on a process-global word that only a data plane whose applied CP
     // snapshot aged past `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` — with no CP
@@ -28989,6 +29147,7 @@ async fn handle_proxy_request_inner(
     connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
+    let http1_framing_result = connection_metadata.http1_framing_result;
     let accepted_local_ip = connection_metadata
         .accepted_local_addr
         .map(|addr| addr.ip());
@@ -29176,7 +29335,15 @@ async fn handle_proxy_request_inner(
     // Protocol-level header validation to prevent request smuggling and desync attacks.
     // Must run before routing because these are transport-level violations that apply
     // regardless of which backend the request would be forwarded to.
-    if let Some(error_body) = check_protocol_headers(req.headers(), req.version(), req.uri()) {
+    if let Some(error_body) = check_protocol_headers_with_wire_framing(
+        req.headers(),
+        req.version(),
+        req.uri(),
+        matches!(
+            http1_framing_result,
+            h1_framing_guard::H1FramingResult::Conflict
+        ),
+    ) {
         warn!("Rejected request: {}", error_body);
         record_request(&state, 400);
         return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
@@ -45570,6 +45737,15 @@ pub fn check_protocol_headers(
     version: hyper::Version,
     uri: &hyper::Uri,
 ) -> Option<&'static str> {
+    check_protocol_headers_with_wire_framing(headers, version, uri, false)
+}
+
+fn check_protocol_headers_with_wire_framing(
+    headers: &hyper::HeaderMap,
+    version: hyper::Version,
+    uri: &hyper::Uri,
+    http1_te_cl_conflict_on_wire: bool,
+) -> Option<&'static str> {
     let is_http1 = version == hyper::Version::HTTP_10 || version == hyper::Version::HTTP_11;
 
     // 1a. HTTP/1.0 must not use Transfer-Encoding (RFC 9112 §6.2 — HTTP/1.0 has no chunked encoding)
@@ -45580,8 +45756,8 @@ pub fn check_protocol_headers(
     // 1b. Content-Length + Transfer-Encoding conflict (HTTP/1.x request smuggling)
     // HTTP/2 and HTTP/3 don't use Transfer-Encoding (framing is at the protocol layer).
     if is_http1
-        && headers.contains_key("transfer-encoding")
-        && headers.contains_key("content-length")
+        && (http1_te_cl_conflict_on_wire
+            || headers.contains_key("transfer-encoding") && headers.contains_key("content-length"))
     {
         return Some(
             r#"{"error":"Request contains both Content-Length and Transfer-Encoding headers"}"#,
