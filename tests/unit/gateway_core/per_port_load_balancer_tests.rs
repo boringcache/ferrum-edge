@@ -1620,10 +1620,11 @@ fn port_subset_ejection_cap_denominator_is_subset_intersect_port() {
 
 #[test]
 fn upstream_retry_excludes_previous_target_before_ejection_cap() {
-    // No-subset retry path: all three targets are passive-ejected, cap = 34%,
-    // and the retry excludes the oldest ejected target. Capping before the
-    // exclusion spends the readmission on the excluded target and leaves no
-    // retry candidate; excluding first readmits host-b.
+    // No-subset retry path: all three targets are passive-ejected, cap = 67%,
+    // and the retry excludes the oldest ejected target. Envoy's prospective
+    // gate permits two ejections in the full three-host pool but only one in
+    // the remaining two-host pool. Capping before exclusion therefore spends
+    // the sole readmission on excluded host-a; excluding first readmits host-b.
     let targets = vec![
         target("host-a", 8080),
         target("host-b", 8080),
@@ -1638,7 +1639,7 @@ fn upstream_retry_excludes_previous_target_before_ejection_cap() {
         active: None,
         passive: Some(PassiveHealthCheck {
             unhealthy_threshold: 1,
-            max_ejection_percent: Some(34),
+            max_ejection_percent: Some(67),
             ..PassiveHealthCheck::default()
         }),
     });
@@ -1653,7 +1654,7 @@ fn upstream_retry_excludes_previous_target_before_ejection_cap() {
     let health = passive_ctx_ejecting(
         &active_unhealthy,
         &[&targets[0], &targets[1], &targets[2]],
-        Some(34),
+        Some(67),
     );
 
     let retry = LoadBalancerCache::select_next_target_from(
@@ -1680,7 +1681,7 @@ fn port_retry_excludes_previous_target_before_ejection_cap() {
         UpstreamPortOverride {
             passive_health_check: Some(PassiveHealthCheck {
                 unhealthy_threshold: 1,
-                max_ejection_percent: Some(34),
+                max_ejection_percent: Some(67),
                 ..PassiveHealthCheck::default()
             }),
             ..Default::default()
@@ -1709,7 +1710,7 @@ fn port_retry_excludes_previous_target_before_ejection_cap() {
     let health = passive_ctx_ejecting(
         &active_unhealthy,
         &[&targets[0], &targets[1], &targets[2]],
-        Some(34),
+        Some(67),
     );
 
     let retry = LoadBalancerCache::select_next_target_for_port_from(
@@ -1731,13 +1732,13 @@ fn port_retry_excludes_previous_target_before_ejection_cap() {
 #[test]
 fn subset_retry_excludes_previous_target_before_ejection_cap() {
     // Subset 'v1' = 3 tagged targets [a, b, c], ALL passive-ejected (a oldest,
-    // then b, then c), subset cap = 34%. The retry excludes 'v1-a' — the
+    // then b, then c), subset cap = 67%. The retry excludes 'v1-a' — the
     // earliest-ejected one, which the cap would re-admit first.
-    //   - BUGGY (cap over full subset, THEN clear excluded): ceil(3*0.34)=2 ⇒
-    //     re-admit 1 ⇒ that one is v1-a (oldest) ⇒ clearing v1-a afterwards
-    //     empties the candidate set ⇒ returns None even though v1-b/v1-c remain.
-    //   - FIXED (exclude v1-a FIRST, then cap over {v1-b, v1-c}): ceil(2*0.34)=1
-    //     ⇒ re-admit 1 ⇒ v1-b (oldest remaining) is returned.
+    //   - BUGGY (cap over full subset, THEN clear excluded): two ejections are
+    //     permitted, so only v1-a is re-admitted; clearing it empties the
+    //     candidate set even though v1-b/v1-c remain.
+    //   - FIXED (exclude v1-a FIRST, then cap over {v1-b, v1-c}): one ejection
+    //     is permitted, so v1-b (oldest remaining) is re-admitted.
     let targets = vec![
         tagged_target("v1-a", 8080, &[("version", "v1")]),
         tagged_target("v1-b", 8080, &[("version", "v1")]),
@@ -1750,7 +1751,7 @@ fn subset_retry_excludes_previous_target_before_ejection_cap() {
         "version",
         "v1",
         Some(100), // upstream cap (loose; not the live tier)
-        Some(34),  // subset cap under test
+        Some(67),  // subset cap under test
         HashMap::new(),
     );
     let config = GatewayConfig {
@@ -1766,7 +1767,7 @@ fn subset_retry_excludes_previous_target_before_ejection_cap() {
     let health = passive_ctx_ejecting(
         &active_unhealthy,
         &[&targets[0], &targets[1], &targets[2]],
-        Some(34),
+        Some(67),
     );
 
     let retry = LoadBalancerCache::select_next_target_subset_from(
@@ -1795,14 +1796,14 @@ fn subset_retry_excludes_previous_target_before_ejection_cap() {
 #[test]
 fn port_subset_retry_excludes_previous_target_before_ejection_cap() {
     // Same property on the port+subset retry path. subset∩port (3 on 8080) all
-    // ejected, subset cap = 34%, retry excludes the earliest-ejected one.
+    // ejected, port cap = 67%, retry excludes the earliest-ejected one.
     let mut port_overrides = HashMap::new();
     port_overrides.insert(
         8080,
         UpstreamPortOverride {
             passive_health_check: Some(PassiveHealthCheck {
                 unhealthy_threshold: 1,
-                max_ejection_percent: Some(34),
+                max_ejection_percent: Some(67),
                 ..PassiveHealthCheck::default()
             }),
             ..Default::default()
@@ -1825,7 +1826,7 @@ fn port_subset_retry_excludes_previous_target_before_ejection_cap() {
         "version",
         "v1",
         Some(100),
-        Some(100), // subset cap loose; the PORT cap (34%) is the live tier
+        Some(100), // subset cap loose; the PORT cap (67%) is the live tier
         port_overrides,
     );
     let mut config = GatewayConfig {
@@ -1842,7 +1843,7 @@ fn port_subset_retry_excludes_previous_target_before_ejection_cap() {
     let health = passive_ctx_ejecting(
         &active_unhealthy,
         &[&targets[0], &targets[1], &targets[2]],
-        Some(34),
+        Some(67),
     );
 
     let retry = LoadBalancerCache::select_next_target_for_port_subset_from(

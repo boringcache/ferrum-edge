@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **BREAKING — translator-owned route header consumers now compose with global
-  transformers.** The auto-emitted `istio-vs-req-xform-*` /
+  transformers** (issue #4304). The auto-emitted `istio-vs-req-xform-*` /
   `istio-vs-resp-xform-*` instances consume matched
   `mesh_route_dispatch` header rules without shadowing a same-name global
   `request_transformer` / `response_transformer`. Before this change, a

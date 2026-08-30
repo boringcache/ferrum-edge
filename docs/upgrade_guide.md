@@ -6,6 +6,19 @@ This document describes how to safely upgrade Ferrum Edge between versions with 
 
 Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
 
+### Route header transforms now compose with global transformers (issue [#4304](https://github.com/ferrum-edge/ferrum-edge/issues/4304))
+
+Auto-emitted `istio-vs-req-xform-*` / `istio-vs-resp-xform-*` consumers no
+longer shadow global `request_transformer` / `response_transformer` instances.
+Global static rules now run first, followed by the matched route rules. This
+changes existing Gateway API `HTTPRoute` deployments using
+`RequestHeaderModifier` or `ResponseHeaderModifier`; newly supported Istio
+VirtualService header transforms follow the same composition contract.
+
+**Operator action:** audit HTTPRoute-backed proxies that relied on the former
+accidental suppression, then scope or remove global static transformer rules
+that should not compose with those routes.
+
 ### `hmac_auth` v2 nonce / client rollout and DPoP replay protection (issues [#3834](https://github.com/ferrum-edge/ferrum-edge/issues/3834) / [#3837](https://github.com/ferrum-edge/ferrum-edge/issues/3837))
 
 **Silent HMAC outage.** `hmac_auth` now defaults to **`ferrum-hmac-v2`**. Version 2 requires a client-generated `nonce` in the `Authorization: hmac …` parameters and binds it into the signing base:
