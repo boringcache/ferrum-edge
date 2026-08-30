@@ -1829,10 +1829,11 @@ def main() -> int:
     # tags, and every immutable version-tag artifact must fail closed unless the
     # COMPLETE repository-required product check set succeeded for the exact
     # product SHA. `.github/required-publication-checks.json` is the one
-    # canonical, machine-consumed inventory; the frozen `main-publish-gate`
-    # array, the hosted `main-publication-required-checks` job, and release.yml's
-    # `validate-release-sha` are each proven set-equal to it here rather than
-    # carrying independent hard-coded subsets that can drift.
+    # canonical, machine-consumed inventory. These PR-mutable checks compare the
+    # frozen `main-publish-gate` array, the hosted
+    # `main-publication-required-checks` job, and release.yml's
+    # `validate-release-sha` with that inventory so independent subsets cannot
+    # drift. They do not protect their own hosted-gate enforcement surface.
     planner_errors.extend(
         f"publication gate self-test: {failure}"
         for failure in publication_gate_self_test()

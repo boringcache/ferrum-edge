@@ -46,6 +46,7 @@ jobs:
     timeout-minutes: 350
     permissions:
       actions: read
+      checks: read
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -54,7 +55,7 @@ jobs:
 
       # Issue #4302. The complete, repository-required product check set --
       # `.github/required-publication-checks.json`, the one canonical inventory
-      # the `main` publisher is also proven set-equal to -- must be successful
+      # consumed by the `main` publisher as well -- must be successful
       # for the EXACT tag target under trusted workflow identity before any
       # immutable version-tag artifact is built. The previous implementation
       # kept an independent hard-coded subset here that omitted Gateway API

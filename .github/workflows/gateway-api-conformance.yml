@@ -335,14 +335,17 @@ jobs:
   # byte-for-byte by the protected trusted-policy verifier
   # `.github/scripts/verify_cross_build_policy.py`, which no pull request may edit.
   #
-  # This job supplies the remainder. The frozen array already requires a
-  # SUCCESSFUL run of THIS workflow, for this exact SHA, on a `push` to `main`
-  # before anything publishes, and a failing job makes the run conclusion
+  # `Tests` is carried by the publishing jobs' direct in-run dependency. This
+  # job supplies the remaining four contexts. Before publishing, the frozen
+  # array already requires a SUCCESSFUL run of THIS workflow, for this exact
+  # SHA, on a `push` to `main` before anything publishes, and a failing job makes
+  # the run conclusion
   # `failure`, so a missing or unsuccessful required check here blocks
   # publication exactly as the frozen entries do. Which contexts belong to which
-  # half is not written here: both halves are proven set-equal to
-  # `.github/required-publication-checks.json` by `verify_publication_gate.py`,
-  # which `verify_required_ci.py` runs on every pull request.
+  # half is not written here: `verify_publication_gate.py` reads the partition
+  # from `.github/required-publication-checks.json`, and `verify_required_ci.py`
+  # checks parity on every pull request. Those files and this hosted job are
+  # PR-mutable; this is drift detection, not a trusted-policy freeze.
   #
   # It is scoped to pushes to `main`, so it never allocates a runner on a pull
   # request, merge-group, scheduled, or manual run, and it reports `skipped`

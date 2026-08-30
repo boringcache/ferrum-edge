@@ -9,33 +9,38 @@ published: the mutable `latest` GitHub prerelease, the mutable `latest` /
 
 This module is the only consumer of that inventory. It provides two things:
 
-* a STATIC contract (`contract_errors`) that proves, by construction, that the
+* a STATIC contract (`contract_errors`) that checks parity between the
   branch-protection required set, ci.yml's frozen `main-publish-gate` polling
-  array, the `main-publication-required-checks` job, and release.yml's
-  `validate-release-sha` step are set-equal to the inventory. Adding a required
-  context without publication coverage makes that contract fail, which is what
-  `.github/scripts/verify_required_ci.py` runs on every pull request.
+  array, the `main-publication-required-checks` job, release.yml's
+  `validate-release-sha` step, and the inventory. Adding a required context
+  without publication coverage makes that contract fail, which is what
+  `.github/scripts/verify_required_ci.py` runs on every pull request. The
+  inventory, this verifier, and the hosted gate are PR-mutable and therefore
+  provide drift detection at the same trust tier as `verify_required_ci.py`;
+  this static contract does not freeze or protect its own enforcement code.
 * a RUNTIME gate (`enforce`) that both publication paths execute. It resolves
-  each required workflow by its canonical file, workflow id, path, and name, and
-  then requires EVERY matching run to have completed successfully for the exact
-  SHA under the expected event and branch. Each polling sweep re-evaluates the
-  complete selected set; a success observed while another context is still
-  pending is never cached, and the permitting sweep revalidates workflow
-  identity before returning. Missing, queued, in-progress, waiting, failed,
-  cancelled, skipped, timed-out, stale, neutral, and unknown results are all
-  blocking, as are wrong-SHA, wrong-event, wrong-branch, wrong-path,
-  wrong-workflow-id, and fork/untrusted runs. A display name alone is never an
-  identity.
+  each required workflow by its canonical file, workflow id, path, and name,
+  then requires every matching run or bound check run to have completed
+  successfully under the evidence kind's exact SHA, event, and branch. Each
+  polling sweep re-evaluates the complete selected set; a success observed
+  while another context is still pending is never cached, and the permitting
+  sweep revalidates workflow identity and PR binding before returning. Missing,
+  queued, in-progress, waiting, failed, cancelled, skipped, timed-out, stale,
+  neutral, and unknown results are all blocking, as are wrong-SHA, wrong-event,
+  wrong-branch, wrong-path, wrong-workflow-id, and fork/untrusted runs. A
+  display name alone is never an identity.
 
 Why publication cannot simply be one gate: ci.yml's `main-publish-gate` job and
 the `needs`/`if` of `latest-release`, `docker`, and `docker-manifest` are frozen
 byte-for-byte by `.github/scripts/verify_cross_build_policy.py`, a protected
 trusted-policy file no pull request may modify. The frozen array therefore keeps
-carrying three of the eight contexts, and the remaining ones are carried by the
-`main-publication-required-checks` job hosted in `gateway-api-conformance.yml` --
-a workflow whose RUN CONCLUSION the frozen array already requires to be
-successful for the exact SHA. The static contract above is what proves the two
-halves partition the inventory exactly, with no drift and no independent
+carrying three of the eight contexts, while `Tests` is carried by the publishing
+jobs' in-run dependency. The remaining four are carried by the
+`main-publication-required-checks` job hosted in
+`gateway-api-conformance.yml` -- a workflow whose RUN CONCLUSION the frozen
+array already requires to be successful for the exact SHA. The single-valued
+`main_publication` field and the consumer-specific parity checks keep the two
+publisher sides an exhaustive, non-overlapping partition without an independent
 hard-coded subset.
 """
 
@@ -114,7 +119,11 @@ RELEASE_GATE_NAME = "Validate release SHA"
 RELEASE_GATE_NEEDS = "validate-release-version"
 RELEASE_GATE_RUNS_ON = "ubuntu-latest"
 RELEASE_GATE_TIMEOUT = "350"
-RELEASE_GATE_PERMISSIONS = (("actions", "read"), ("contents", "read"))
+RELEASE_GATE_PERMISSIONS = (
+    ("actions", "read"),
+    ("checks", "read"),
+    ("contents", "read"),
+)
 RELEASE_GATE_STEP_NAME = (
     "Require every publish-blocking check for the tag target"
 )
@@ -171,7 +180,7 @@ MAIN_PUBLICATION_MODES = (
 )
 
 # `evidence` says how a run is bound to the exact product SHA.
-EVIDENCE_MODES = ("push_main", "merge_group_head")
+EVIDENCE_MODES = ("push_main", "pr_head", "check_run")
 
 REQUIRED_ENTRY_FIELDS = (
     "context",
@@ -189,17 +198,25 @@ API_VERSION = "2022-11-28"
 PAGE_SIZE = 100
 MAX_PAGES = 20
 TRANSIENT_ATTEMPTS = 3
+GITHUB_ACTIONS_APP_ID = 15368
 # The Actions token is rate limited per repository, and these gates can poll for
-# well over an hour. Poll once a minute and reuse a workflow-identity lookup
-# while any selected context is still pending, so a long wait on one slow suite
-# cannot exhaust the budget the gate itself depends on. A completed success is
-# never cached across sweeps: GitHub permits rerunning a completed workflow, so
-# the run record can return to queued/in_progress and later fail while this
-# wait is still in progress. Every sweep re-lists every selected context under
-# the same bounded pagination; the sweep that would permit then re-resolves
-# canonical workflow id/path/name/active state and re-observes the complete set
-# before returning.
-POLL_SECONDS = 60
+# well over an hour. The hosted main gate polls four run listings once a minute
+# (240 requests/hour). The release gate polls once every three minutes and uses
+# nine listings per sweep because `Tests` needs both a workflow-run and a
+# check-run listing (180/hour). ci.yml's frozen gate uses three list calls every
+# 30 seconds (360/hour), for a 780/hour steady-state total. Workflow identity and
+# PR binding lookups are reused while pending and add only bounded startup/final
+# bursts. A completed success is never cached across sweeps: GitHub permits
+# rerunning a completed workflow, so the run record can return to queued /
+# in_progress and later fail while this wait is still in progress. The sweep
+# that would permit re-resolves canonical workflow identity and PR binding and
+# re-observes the complete set before returning.
+MAIN_POLL_SECONDS = 60
+RELEASE_POLL_SECONDS = 180
+POLL_SECONDS_BY_MODE = {
+    "main": MAIN_POLL_SECONDS,
+    "release": RELEASE_POLL_SECONDS,
+}
 
 # Anything that is not a completed success blocks. Statuses are listed only so
 # a diagnostic can say "still running" rather than "unknown"; an unrecognized
@@ -214,7 +231,19 @@ class ContractError(RuntimeError):
 
 
 class ApiFailure(RuntimeError):
-    """The Actions API could not be read; the gate fails closed."""
+    """API state or identity is invalid; the gate fails closed immediately."""
+
+
+class ApiPending(RuntimeError):
+    """The API is transiently unavailable; the gate remains pending."""
+
+    def __init__(self, message: str, retry_after: float) -> None:
+        super().__init__(message)
+        self.retry_after = max(1.0, retry_after)
+
+
+class EvidencePending(RuntimeError):
+    """Required publication evidence is not visible yet."""
 
 
 # ---------------------------------------------------------------------------
@@ -252,12 +281,6 @@ def inventory_errors(inventory: dict) -> list[str]:
         errors.append(f"{INVENTORY_PATH} must declare `version: 1`")
     if inventory.get("main_branch") != "main":
         errors.append(f"{INVENTORY_PATH} must declare `main_branch: main`")
-    prefix = inventory.get("merge_queue_branch_prefix")
-    if not isinstance(prefix, str) or not prefix.startswith("gh-readonly-queue/"):
-        errors.append(
-            f"{INVENTORY_PATH} must declare the `gh-readonly-queue/` merge-queue "
-            "branch prefix used to bind merge-group evidence"
-        )
     try:
         checks = entries(inventory)
     except ContractError as error:
@@ -693,6 +716,30 @@ def _active_shell_lines(script: str) -> list[str]:
     return active
 
 
+def _direct_job_scalar(body: str, key: str) -> str | None:
+    """Return one active canonical direct scalar, excluding comments."""
+
+    values: list[str] = []
+    for line in body.splitlines():
+        if not line.strip() or _is_comment_line(line):
+            continue
+        try:
+            if _indent_spaces(line) != 4:
+                continue
+        except StructuralError:
+            return None
+        match = _MAPPING_KEY.match(line[4:])
+        if match is None or match.group(1) != key:
+            continue
+        kind, payload = _classify_value(match.group(2))
+        if kind != "scalar":
+            return None
+        values.append(payload)
+    if len(values) != 1:
+        return None
+    return values[0]
+
+
 def _checkout_step_errors(
     step: dict[str, tuple[str, object]],
     located: str,
@@ -884,18 +931,23 @@ def ci_job_dependency_errors(ci_yml: str, inventory: dict) -> list[str]:
             if body is None:
                 errors.append(f"{CI_WORKFLOW_PATH} has no `{publisher}` job")
                 continue
-            if not re.search(rf"(?m)^    needs:(?:.*[\[, ])?{re.escape(job)}\b", body) and not re.search(
-                rf"(?m)^      - {re.escape(job)}$", body
-            ):
+            inline_need = re.search(
+                rf"(?m)^    needs:(?:.*[\[, ])?{re.escape(job)}\b",
+                body,
+            )
+            block_need = re.search(rf"(?m)^      - {re.escape(job)}$", body)
+            if inline_need is None and block_need is None:
                 errors.append(
                     f"{CI_WORKFLOW_PATH} jobs.{publisher} must declare "
                     f"`needs: {job}` for in-run required check "
                     f"{entry['context']!r}"
                 )
-            if f"needs.{job}.result == 'success'" not in body:
+            condition = _direct_job_scalar(body, "if")
+            success_predicate = f"needs.{job}.result == 'success'"
+            if condition is None or success_predicate not in condition:
                 errors.append(
                     f"{CI_WORKFLOW_PATH} jobs.{publisher} must require "
-                    f"`needs.{job}.result == 'success'`"
+                    f"`needs.{job}.result == 'success'` in its active direct `if:`"
                 )
     return errors
 
@@ -1083,7 +1135,7 @@ def workflow_identity_errors(inventory: dict, read: object) -> list[str]:
                 f"{entry['workflow_path']} must keep job `{entry['job']}`, which "
                 f"owns required check {entry['context']!r}"
             )
-        if entry["evidence"] == "push_main":
+        if entry["evidence"] in {"push_main", "check_run"}:
             if not re.search(
                 r"(?ms)^  push:\n(?:    #[^\n]*\n)*    branches:\n"
                 r"(?:      #[^\n]*\n)*      - main\n",
@@ -1094,17 +1146,21 @@ def workflow_identity_errors(inventory: dict, read: object) -> list[str]:
                     "`push:` trigger on `main` to yield exact-main-SHA "
                     "publication evidence"
                 )
-            if re.search(r"(?ms)^  push:\n(?:[ ]{4}[^\n]*\n)*?[ ]{4}paths", contents):
+            if re.search(
+                r"(?ms)^  push:\n(?:(?:[ ]{4}[^\n]*)?\n)*?[ ]{4}paths(?:-ignore)?:",
+                contents,
+            ):
                 errors.append(
                     f"{entry['workflow_path']} must not filter its `push:` "
                     "trigger by path; a filtered required gate can make "
                     "publication evidence absent"
                 )
-        elif entry["evidence"] == "merge_group_head":
-            if not re.search(r"(?m)^  merge_group:$", contents):
+        elif entry["evidence"] == "pr_head":
+            if not re.search(r"(?m)^  pull_request_target:$", contents):
                 errors.append(
-                    f"{entry['workflow_path']} must declare a `merge_group:` "
-                    "trigger to yield merge-queue publication evidence"
+                    f"{entry['workflow_path']} must declare a "
+                    "`pull_request_target:` trigger to yield PR-head "
+                    "publication evidence"
                 )
     return errors
 
@@ -1127,24 +1183,62 @@ def contract_errors(
         publication_gate_job_errors(read(PUBLICATION_GATE_WORKFLOW_PATH), inventory)
     )
     errors.extend(release_gate_errors(read(RELEASE_WORKFLOW_PATH), inventory))
-    # The three modes must partition the inventory: nothing uncovered, and no
-    # entry covered by a mode that does not exist.
-    covered = {
-        entry["context"]
-        for mode in MAIN_PUBLICATION_MODES
-        for entry in by_mode(inventory, mode)
-    }
-    everything = {entry["context"] for entry in entries(inventory)}
-    for context in sorted(everything - covered):
-        errors.append(
-            f"required context {context!r} has no publication coverage mode"
-        )
+    # `inventory_errors` proves every unique context has exactly one value from
+    # the closed MAIN_PUBLICATION_MODES enum. The consumer-specific checks above
+    # bind all three values, which is the exhaustive, non-overlapping partition;
+    # recomputing their union from the same single field would prove nothing.
     return list(dict.fromkeys(errors))
 
 
 # ---------------------------------------------------------------------------
 # Runtime evidence
 # ---------------------------------------------------------------------------
+
+
+def _header_value(headers: object, name: str) -> str | None:
+    if headers is None or not hasattr(headers, "items"):
+        return None
+    for key, value in headers.items():  # type: ignore[union-attr]
+        if str(key).lower() == name.lower():
+            return str(value)
+    return None
+
+
+def _transient_http_delay(
+    status: int,
+    headers: object,
+    body: str,
+    *,
+    now: float,
+) -> float | None:
+    """Return the API retry delay, or None for a hard HTTP failure."""
+
+    remaining = _header_value(headers, "X-RateLimit-Remaining")
+    reset = _header_value(headers, "X-RateLimit-Reset")
+    retry_after = _header_value(headers, "Retry-After")
+    lowered = body.lower()
+    rate_signature = (
+        status == 429
+        or remaining == "0"
+        or retry_after is not None
+        or "rate limit" in lowered
+        or "abuse detection" in lowered
+    )
+    if status != 429 and status != 403 and not 500 <= status <= 599:
+        return None
+    if status == 403 and not rate_signature:
+        return None
+    if reset is not None:
+        try:
+            return max(1.0, float(reset) - now)
+        except ValueError:
+            pass
+    if retry_after is not None:
+        try:
+            return max(1.0, float(retry_after))
+        except ValueError:
+            pass
+    return float(MAIN_POLL_SECONDS)
 
 
 def http_get(token: str):
@@ -1161,11 +1255,34 @@ def http_get(token: str):
             try:
                 with urllib.request.urlopen(request, timeout=60) as response:
                     return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as error:
+                try:
+                    body = error.read(4096).decode("utf-8", errors="replace")
+                except OSError:
+                    body = ""
+                delay = _transient_http_delay(
+                    error.code,
+                    error.headers,
+                    body,
+                    now=time.time(),
+                )
+                if delay is not None:
+                    raise ApiPending(
+                        f"GET {path} returned transient HTTP {error.code}",
+                        delay,
+                    ) from error
+                raise ApiFailure(
+                    f"GET {path} returned hard HTTP {error.code}"
+                ) from error
             except (urllib.error.URLError, OSError, ValueError) as error:
                 last = error
                 if attempt < TRANSIENT_ATTEMPTS:
                     time.sleep(attempt * 5)
-        raise ApiFailure(f"GET {path} failed after {TRANSIENT_ATTEMPTS} attempts: {last}")
+        raise ApiPending(
+            f"GET {path} remained unreadable after "
+            f"{TRANSIENT_ATTEMPTS} attempts: {last}",
+            float(MAIN_POLL_SECONDS),
+        )
 
     return get
 
@@ -1196,6 +1313,88 @@ def resolve_workflow(get, repository: str, entry: dict) -> dict:
             "disabled required gate can never produce publication evidence"
         )
     return {"id": identifier}
+
+
+def resolve_pr_head(
+    get,
+    repository: str,
+    product_sha: str,
+    main_branch: str,
+) -> dict:
+    """Bind a product merge commit to its unique merged PR head."""
+
+    commit_path = f"/repos/{repository}/commits/{product_sha}"
+    commit = get(commit_path)
+    if not isinstance(commit, dict) or commit.get("sha") != product_sha:
+        raise ApiFailure(
+            f"{commit_path} did not return the exact product commit"
+        )
+    parents = commit.get("parents")
+    if not isinstance(parents, list) or len(parents) < 2:
+        raise ApiFailure(
+            f"{product_sha} has no second parent and cannot be bound to a PR head"
+        )
+    second_parent = parents[1]
+    if not isinstance(second_parent, dict) or not re.fullmatch(
+        r"[0-9a-f]{40}", str(second_parent.get("sha"))
+    ):
+        raise ApiFailure(f"{product_sha} has a malformed second parent")
+    parent_sha = str(second_parent["sha"])
+
+    pulls_path = f"/repos/{repository}/commits/{product_sha}/pulls"
+    associated = get(pulls_path)
+    if not isinstance(associated, list):
+        raise ApiFailure(f"{pulls_path} did not return a pull-request list")
+    if not associated:
+        raise EvidencePending(
+            f"{product_sha} has no associated pull request; direct pushes do "
+            "not carry PR-head publication evidence"
+        )
+    if len(associated) != 1:
+        raise ApiFailure(
+            f"{product_sha} has {len(associated)} associated pull requests; "
+            "the producing pull request is ambiguous"
+        )
+    pull = associated[0]
+    if not isinstance(pull, dict):
+        raise ApiFailure(f"{pulls_path} returned a malformed pull request")
+    number = pull.get("number")
+    if not isinstance(number, int):
+        raise ApiFailure(f"{pulls_path} returned a pull request with no number")
+    merged_at = pull.get("merged_at")
+    if pull.get("state") != "closed" or not isinstance(merged_at, str) or not merged_at:
+        raise ApiFailure(
+            f"pull request #{number} associated with {product_sha} is not merged"
+        )
+    base = pull.get("base")
+    head = pull.get("head")
+    if not isinstance(base, dict) or not isinstance(head, dict):
+        raise ApiFailure(
+            f"pull request #{number} has malformed base/head identity"
+        )
+    base_repository = base.get("repo")
+    if (
+        base.get("ref") != main_branch
+        or not isinstance(base_repository, dict)
+        or base_repository.get("full_name") != repository
+    ):
+        raise ApiFailure(
+            f"pull request #{number} does not target {repository}:{main_branch}"
+        )
+    head_repository = head.get("repo")
+    head_ref = head.get("ref")
+    if (
+        head.get("sha") != parent_sha
+        or not isinstance(head_ref, str)
+        or not head_ref
+        or not isinstance(head_repository, dict)
+        or head_repository.get("full_name") != repository
+    ):
+        raise ApiFailure(
+            f"pull request #{number} head is not the trusted second parent "
+            f"{parent_sha} of {product_sha}"
+        )
+    return {"sha": parent_sha, "branch": head_ref, "number": number}
 
 
 def list_runs(
@@ -1253,6 +1452,61 @@ def list_runs(
     )
 
 
+def list_check_runs(
+    get,
+    repository: str,
+    sha: str,
+    context: str,
+    *,
+    page_size: int = PAGE_SIZE,
+    max_pages: int = MAX_PAGES,
+) -> list[dict]:
+    """Return every named check run for the exact SHA, or fail closed."""
+
+    checks: list[dict] = []
+    expected_total: int | None = None
+    for page in range(1, max_pages + 1):
+        query = urllib.parse.urlencode(
+            {
+                "check_name": context,
+                "filter": "all",
+                "per_page": page_size,
+                "page": page,
+            }
+        )
+        path = f"/repos/{repository}/commits/{sha}/check-runs?{query}"
+        payload = get(path)
+        if not isinstance(payload, dict):
+            raise ApiFailure(f"{path} did not return a check-run listing")
+        total = payload.get("total_count")
+        if not isinstance(total, int) or total < 0:
+            raise ApiFailure(f"{path} returned no valid `total_count`")
+        if expected_total is None:
+            expected_total = total
+        elif total != expected_total:
+            raise ApiFailure(f"{path} changed `total_count` during pagination")
+        page_checks = payload.get("check_runs")
+        if not isinstance(page_checks, list):
+            raise ApiFailure(f"{path} returned no `check_runs` array")
+        for index, check in enumerate(page_checks):
+            if not isinstance(check, dict):
+                raise ApiFailure(
+                    f"{path} check_runs[{index}] is not a check-run object"
+                )
+            checks.append(check)
+        if len(page_checks) < page_size:
+            if len(checks) != expected_total:
+                raise ApiFailure(
+                    f"{path} ended after {len(checks)} of {expected_total} "
+                    "reported check runs"
+                )
+            return checks
+    raise ApiFailure(
+        f"/repos/{repository}/commits/{sha}/check-runs exhausted "
+        f"{max_pages} pages of {page_size} runs without a short page"
+    )
+
+
 def run_identity_errors(
     run: dict,
     entry: dict,
@@ -1260,7 +1514,7 @@ def run_identity_errors(
     repository: str,
     sha: str,
     event: str,
-    queue_prefix: str,
+    expected_branch: str,
 ) -> list[str]:
     """Reject a run that is not the canonical workflow's run for this SHA."""
 
@@ -1289,15 +1543,123 @@ def run_identity_errors(
         if full_name != repository:
             problems.append(f"{field} {full_name!r} is not {repository!r}")
     branch = run.get("head_branch")
-    if event == "push":
-        if branch != "main":
-            problems.append(f"head_branch {branch!r} != 'main'")
-    else:
-        if not isinstance(branch, str) or not branch.startswith(queue_prefix):
-            problems.append(
-                f"head_branch {branch!r} is not a {queue_prefix!r} merge-queue branch"
-            )
+    if branch != expected_branch:
+        problems.append(f"head_branch {branch!r} != {expected_branch!r}")
     return problems
+
+
+def evaluate_check_run(
+    get,
+    repository: str,
+    sha: str,
+    entry: dict,
+    main_branch: str,
+    resolved_workflows: dict[str, dict],
+) -> tuple[str, str]:
+    """Evaluate a required check run bound to canonical workflow runs."""
+
+    workflow = resolved_workflows.get(entry["workflow_path"])
+    if workflow is None:
+        workflow = resolve_workflow(get, repository, entry)
+        resolved_workflows[entry["workflow_path"]] = workflow
+    workflow_runs = list_runs(get, repository, entry, sha, "push")
+    suite_ids: set[int] = set()
+    for run in workflow_runs:
+        problems = run_identity_errors(
+            run,
+            entry,
+            workflow["id"],
+            repository,
+            sha,
+            "push",
+            main_branch,
+        )
+        if problems:
+            return (
+                "blocked",
+                f"{entry['context']}: untrusted or mismatched workflow run "
+                f"{run.get('html_url') or run.get('id')}: "
+                f"{'; '.join(problems)}",
+            )
+        suite_id = run.get("check_suite_id")
+        if not isinstance(suite_id, int):
+            return (
+                "blocked",
+                f"{entry['context']}: canonical workflow run "
+                f"{run.get('html_url') or run.get('id')} has no check-suite id",
+            )
+        suite_ids.add(suite_id)
+    if not suite_ids:
+        return (
+            "pending",
+            f"{entry['context']}: no push run of {entry['workflow_path']} for "
+            f"{sha} yet",
+        )
+
+    checks_by_suite = {suite_id: [] for suite_id in suite_ids}
+    for check in list_check_runs(get, repository, sha, entry["context"]):
+        suite = check.get("check_suite")
+        suite_id = suite.get("id") if isinstance(suite, dict) else None
+        if not isinstance(suite_id, int) or suite_id not in checks_by_suite:
+            continue
+        problems: list[str] = []
+        if check.get("name") != entry["context"]:
+            problems.append(
+                f"name {check.get('name')!r} != {entry['context']!r}"
+            )
+        if check.get("head_sha") != sha:
+            problems.append(f"head_sha {check.get('head_sha')!r} != {sha!r}")
+        app = check.get("app")
+        if not isinstance(app, dict):
+            problems.append("app is missing or malformed")
+        elif (
+            app.get("id") != GITHUB_ACTIONS_APP_ID
+            or app.get("slug") != "github-actions"
+        ):
+            problems.append(
+                f"app identity {(app.get('id'), app.get('slug'))!r} is not "
+                "GitHub Actions"
+            )
+        if problems:
+            return (
+                "blocked",
+                f"{entry['context']}: untrusted check run "
+                f"{check.get('details_url') or check.get('id')}: "
+                f"{'; '.join(problems)}",
+            )
+        checks_by_suite[suite_id].append(check)
+
+    pending: list[str] = []
+    for suite_id, checks in checks_by_suite.items():
+        if not checks:
+            pending.append(f"no check run for canonical suite {suite_id}")
+            continue
+        for check in checks:
+            status = check.get("status")
+            conclusion = check.get("conclusion")
+            if status != "completed":
+                pending.append(
+                    str(status)
+                    if status in PENDING_STATUSES
+                    else f"unrecognized status {status!r}"
+                )
+                continue
+            if conclusion != "success":
+                return (
+                    "blocked",
+                    f"{entry['context']}: canonical check run "
+                    f"{check.get('details_url') or check.get('id')} concluded "
+                    f"{conclusion or 'unknown'} for {sha}",
+                )
+    if pending:
+        return (
+            "pending",
+            f"{entry['context']}: {', '.join(sorted(set(pending)))} for {sha}",
+        )
+    return (
+        "success",
+        f"{entry['context']}: every canonical check run passed for {sha}",
+    )
 
 
 def evaluate_entry(
@@ -1305,28 +1667,61 @@ def evaluate_entry(
     repository: str,
     sha: str,
     entry: dict,
-    queue_prefix: str,
-    resolved: dict[str, dict] | None = None,
+    main_branch: str,
+    resolved_workflows: dict[str, dict] | None = None,
+    resolved_evidence: dict[str, dict] | None = None,
 ) -> tuple[str, str]:
     """Return ("success" | "pending" | "blocked", diagnostic) for one context.
 
-    `resolved` caches canonical workflow id/path/name/active lookups so a long
-    pending wait does not re-GET identity every minute. That cache is not a
-    permitting proof: `enforce` drops it and re-observes the complete selected
-    set before returning success, because a record resolved at the start of the
-    wait can drift (rename, relocate, disable) during the same window a run
-    can be rerun.
+    The two caches avoid repeating immutable workflow/PR binding reads every
+    minute. They are not permitting proofs: `enforce` drops both and
+    re-observes the complete selected set before returning success.
     """
 
-    event = "push" if entry["evidence"] == "push_main" else "merge_group"
-    if resolved is None:
-        resolved = {}
-    workflow = resolved.get(entry["workflow_path"])
+    if resolved_workflows is None:
+        resolved_workflows = {}
+    if resolved_evidence is None:
+        resolved_evidence = {}
+    evidence = entry["evidence"]
+    if evidence == "check_run":
+        return evaluate_check_run(
+            get,
+            repository,
+            sha,
+            entry,
+            main_branch,
+            resolved_workflows,
+        )
+    if evidence == "push_main":
+        evidence_sha = sha
+        event = "push"
+        expected_branch = main_branch
+    elif evidence == "pr_head":
+        binding_key = f"pr_head:{sha}:{main_branch}"
+        binding = resolved_evidence.get(binding_key)
+        if binding is None:
+            try:
+                binding = resolve_pr_head(
+                    get,
+                    repository,
+                    sha,
+                    main_branch,
+                )
+            except EvidencePending as error:
+                return ("pending", f"{entry['context']}: {error}")
+            resolved_evidence[binding_key] = binding
+        evidence_sha = binding["sha"]
+        event = "pull_request_target"
+        expected_branch = binding["branch"]
+    else:  # pragma: no cover - inventory schema rejects this first
+        raise ContractError(f"unknown evidence mode {evidence!r}")
+
+    workflow = resolved_workflows.get(entry["workflow_path"])
     if workflow is None:
         workflow = resolve_workflow(get, repository, entry)
-        resolved[entry["workflow_path"]] = workflow
+        resolved_workflows[entry["workflow_path"]] = workflow
     workflow_id = workflow["id"]
-    runs = list_runs(get, repository, entry, sha, event)
+    runs = list_runs(get, repository, entry, evidence_sha, event)
 
     matching: list[dict] = []
     for run in runs:
@@ -1335,9 +1730,9 @@ def evaluate_entry(
             entry,
             workflow_id,
             repository,
-            sha,
+            evidence_sha,
             event,
-            queue_prefix,
+            expected_branch,
         )
         if problems:
             # A returned run that does not authenticate is never silently
@@ -1354,7 +1749,7 @@ def evaluate_entry(
         return (
             "pending",
             f"{entry['context']}: no {event} run of {entry['workflow_path']} for "
-            f"{sha} yet",
+            f"{evidence_sha} yet",
         )
 
     pending: list[str] = []
@@ -1371,30 +1766,38 @@ def evaluate_entry(
             return (
                 "blocked",
                 f"{entry['context']}: {entry['workflow_path']} concluded "
-                f"{conclusion or 'unknown'} for {sha} "
+                f"{conclusion or 'unknown'} for {evidence_sha} "
                 f"({run.get('html_url') or run.get('id')})",
             )
     if pending:
         return (
             "pending",
             f"{entry['context']}: {entry['workflow_path']} is "
-            f"{', '.join(sorted(set(pending)))} for {sha}",
+            f"{', '.join(sorted(set(pending)))} for {evidence_sha}",
         )
-    return ("success", f"{entry['context']}: {entry['workflow_path']} passed for {sha}")
+    return (
+        "success",
+        f"{entry['context']}: {entry['workflow_path']} passed for {evidence_sha}",
+    )
 
 
-def ancestry_errors(get, repository: str, sha: str) -> list[str]:
-    """Prove the product SHA is `main` itself or an ancestor of it."""
+def ancestry_errors(
+    get,
+    repository: str,
+    sha: str,
+    main_branch: str = "main",
+) -> list[str]:
+    """Prove the product SHA is the main branch or an ancestor of it."""
 
-    path = f"/repos/{repository}/compare/main...{sha}"
+    path = f"/repos/{repository}/compare/{main_branch}...{sha}"
     payload = get(path)
     if not isinstance(payload, dict):
         raise ApiFailure(f"{path} did not return a comparison")
     status = payload.get("status")
     if status not in {"identical", "behind"}:
         return [
-            f"{sha} is {status!r} relative to `main`; only a commit that is on "
-            "`main` may publish"
+            f"{sha} is {status!r} relative to `{main_branch}`; only a commit on "
+            f"`{main_branch}` may publish"
         ]
     return []
 
@@ -1407,6 +1810,7 @@ def enforce(
     selected: list[dict],
     deadline_seconds: int,
     *,
+    poll_seconds: float = MAIN_POLL_SECONDS,
     sleep=time.sleep,
     monotonic=time.monotonic,
     log=print,
@@ -1421,19 +1825,55 @@ def enforce(
     canonical workflow identity before returning.
     """
 
-    queue_prefix = str(inventory.get("merge_queue_branch_prefix"))
+    main_branch = inventory.get("main_branch")
+    if not isinstance(main_branch, str) or not main_branch:
+        log("::error::publication inventory has no canonical main branch")
+        return 1
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         log(f"::error::refusing to gate publication on non-canonical SHA {sha!r}")
-        return 1
-    for error in ancestry_errors(get, repository, sha):
-        log(f"::error::{error}")
         return 1
     if not selected:
         log("::error::no required contexts selected; the gate would prove nothing")
         return 1
 
     start = monotonic()
-    resolved: dict[str, dict] = {}
+    resolved_workflows: dict[str, dict] = {}
+    resolved_evidence: dict[str, dict] = {}
+
+    def wait_pending(messages: list[str], delay: float) -> bool:
+        """Sleep without crossing the overall deadline."""
+
+        elapsed = monotonic() - start
+        if elapsed >= deadline_seconds:
+            log(
+                "::error::timed out waiting for publish-blocking required checks "
+                f"for {sha}: {'; '.join(messages)}"
+            )
+            return False
+        remaining = deadline_seconds - elapsed
+        bounded_delay = min(max(1.0, delay), remaining)
+        sleep(bounded_delay)
+        if bounded_delay >= remaining:
+            log(
+                "::error::timed out waiting for publish-blocking required checks "
+                f"for {sha}: {'; '.join(messages)}"
+            )
+            return False
+        return True
+
+    while True:
+        try:
+            ancestry = ancestry_errors(get, repository, sha, main_branch)
+        except ApiPending as error:
+            messages = [f"API pending while proving main ancestry: {error}"]
+            log(f"Waiting: {messages[0]}")
+            if not wait_pending(messages, error.retry_after):
+                return 1
+            continue
+        for error in ancestry:
+            log(f"::error::{error}")
+            return 1
+        break
 
     def observe(*, refresh_identities: bool) -> tuple[str, list[str]]:
         """Re-evaluate every selected entry. Never skip a context.
@@ -1446,7 +1886,8 @@ def enforce(
         """
 
         if refresh_identities:
-            resolved.clear()
+            resolved_workflows.clear()
+            resolved_evidence.clear()
         pending_messages: list[str] = []
         success_messages: list[str] = []
         for entry in selected:
@@ -1455,8 +1896,9 @@ def enforce(
                 repository,
                 sha,
                 entry,
-                queue_prefix,
-                resolved,
+                main_branch,
+                resolved_workflows,
+                resolved_evidence,
             )
             if verdict == "blocked":
                 return ("blocked", [message])
@@ -1469,32 +1911,32 @@ def enforce(
         return ("success", success_messages)
 
     while True:
-        outcome, messages = observe(refresh_identities=False)
+        try:
+            outcome, messages = observe(refresh_identities=False)
+            if outcome == "success":
+                outcome, messages = observe(refresh_identities=True)
+        except ApiPending as error:
+            messages = [f"API pending during evidence sweep: {error}"]
+            for message in messages:
+                log(f"Waiting: {message}")
+            if not wait_pending(messages, error.retry_after):
+                return 1
+            continue
         if outcome == "blocked":
             log(f"::error::{messages[0]}")
             return 1
         if outcome == "success":
-            outcome, messages = observe(refresh_identities=True)
-            if outcome == "blocked":
-                log(f"::error::{messages[0]}")
-                return 1
-            if outcome == "success":
-                for message in messages:
-                    log(message)
-                log(
-                    f"All {len(selected)} publish-blocking required checks "
-                    f"passed for {sha}."
-                )
-                return 0
+            for message in messages:
+                log(message)
+            log(
+                f"All {len(selected)} publish-blocking required checks "
+                f"passed for {sha}."
+            )
+            return 0
         for message in messages:
             log(f"Waiting: {message}")
-        if monotonic() - start >= deadline_seconds:
-            log(
-                "::error::timed out waiting for publish-blocking required checks "
-                f"for {sha}: {'; '.join(messages)}"
-            )
+        if not wait_pending(messages, poll_seconds):
             return 1
-        sleep(POLL_SECONDS)
 
 
 def select_entries(inventory: dict, mode: str) -> list[dict]:
@@ -1522,7 +1964,6 @@ def _fixture_inventory() -> dict:
         "version": 1,
         "documentation": "self-test",
         "main_branch": "main",
-        "merge_queue_branch_prefix": "gh-readonly-queue/main/",
         "required_checks": [
             {
                 "context": "Alpha",
@@ -1541,7 +1982,7 @@ def _fixture_inventory() -> dict:
                 "workflow_name": "Beta Workflow",
                 "job": "verify",
                 "main_publication": "publication_gate_job",
-                "evidence": "merge_group_head",
+                "evidence": "pr_head",
                 "rationale": "self-test",
             },
         ],
@@ -1549,6 +1990,30 @@ def _fixture_inventory() -> dict:
 
 
 _SHA = "a" * 40
+_PR_HEAD_SHA = "b" * 40
+
+
+def _pull_request(
+    *,
+    number: int = 17,
+    state: str = "closed",
+    merged_at: str | None = "2026-08-30T00:00:00Z",
+    base_ref: str = "main",
+    head_sha: str = _PR_HEAD_SHA,
+    head_ref: str = "feature/beta",
+    repository: str = "ferrum-edge/ferrum-edge",
+) -> dict:
+    return {
+        "number": number,
+        "state": state,
+        "merged_at": merged_at,
+        "base": {"ref": base_ref, "repo": {"full_name": repository}},
+        "head": {
+            "sha": head_sha,
+            "ref": head_ref,
+            "repo": {"full_name": repository},
+        },
+    }
 
 
 def _run(
@@ -1563,6 +2028,7 @@ def _run(
     conclusion: str | None = "success",
     repository: str = "ferrum-edge/ferrum-edge",
     run_id: int = 1,
+    check_suite_id: int = 101,
 ) -> dict:
     return {
         "id": run_id,
@@ -1577,10 +2043,17 @@ def _run(
         "conclusion": conclusion,
         "repository": {"full_name": repository},
         "head_repository": {"full_name": repository},
+        "check_suite_id": check_suite_id,
     }
 
 
-def _transport(runs_by_file: dict[str, list[dict]], *, compare_status: str = "behind"):
+def _transport(
+    runs_by_file: dict[str, list[dict]],
+    *,
+    compare_status: str = "behind",
+    commit_payload: object | None = None,
+    pulls_payload: object | None = None,
+):
     workflows = {
         "alpha.yml": {
             "id": 11,
@@ -1595,10 +2068,22 @@ def _transport(runs_by_file: dict[str, list[dict]], *, compare_status: str = "be
             "state": "active",
         },
     }
+    if commit_payload is None:
+        commit_payload = {
+            "sha": _SHA,
+            "parents": [{"sha": "c" * 40}, {"sha": _PR_HEAD_SHA}],
+        }
+    if pulls_payload is None:
+        pulls_payload = [_pull_request()]
 
     def get(path: str) -> object:
         if "/compare/" in path:
             return {"status": compare_status}
+        api_path = urllib.parse.urlparse(path).path
+        if api_path == f"/repos/ferrum-edge/ferrum-edge/commits/{_SHA}":
+            return commit_payload
+        if api_path == f"/repos/ferrum-edge/ferrum-edge/commits/{_SHA}/pulls":
+            return pulls_payload
         match = re.search(r"/actions/workflows/([^/?]+)(/runs)?", path)
         if match is None:  # pragma: no cover - defensive
             raise ApiFailure(f"unexpected path {path}")
@@ -1617,17 +2102,20 @@ def _transport(runs_by_file: dict[str, list[dict]], *, compare_status: str = "be
 
 def _enforce(runs_by_file, **kwargs) -> int:
     inventory = _fixture_inventory()
-    return enforce(
-        _transport(runs_by_file, **kwargs),
-        "ferrum-edge/ferrum-edge",
-        _SHA,
-        inventory,
-        select_entries(inventory, "main"),
-        deadline_seconds=0,
-        sleep=lambda _seconds: None,
-        monotonic=lambda: 1.0,
-        log=lambda *_args, **_kwargs: None,
-    )
+    try:
+        return enforce(
+            _transport(runs_by_file, **kwargs),
+            "ferrum-edge/ferrum-edge",
+            _SHA,
+            inventory,
+            select_entries(inventory, "main"),
+            deadline_seconds=0,
+            sleep=lambda _seconds: None,
+            monotonic=lambda: 1.0,
+            log=lambda *_args, **_kwargs: None,
+        )
+    except (ApiFailure, ApiPending, ContractError):
+        return 1
 
 
 def _enforce_across_sweeps(
@@ -1668,6 +2156,14 @@ def _enforce_across_sweeps(
         index = min(state["sweep"], len(sweep_runs) - 1)
         if "/compare/" in path:
             return {"status": compare_status}
+        api_path = urllib.parse.urlparse(path).path
+        if api_path == f"/repos/ferrum-edge/ferrum-edge/commits/{_SHA}":
+            return {
+                "sha": _SHA,
+                "parents": [{"sha": "c" * 40}, {"sha": _PR_HEAD_SHA}],
+            }
+        if api_path == f"/repos/ferrum-edge/ferrum-edge/commits/{_SHA}/pulls":
+            return [_pull_request()]
         match = re.search(r"/actions/workflows/([^/?]+)(/runs)?", path)
         if match is None:  # pragma: no cover - defensive
             raise ApiFailure(f"unexpected path {path}")
@@ -1711,8 +2207,9 @@ def _beta_run(**overrides) -> dict:
         "workflow_id": 22,
         "path": ".github/workflows/beta.yml",
         "name": "Beta Workflow",
-        "event": "merge_group",
-        "branch": "gh-readonly-queue/main/pr-1-abc",
+        "head_sha": _PR_HEAD_SHA,
+        "event": "pull_request_target",
+        "branch": "feature/beta",
     }
     defaults.update(overrides)
     return _run(**defaults)
@@ -1720,6 +2217,116 @@ def _beta_run(**overrides) -> dict:
 
 def _complete_runs() -> dict[str, list[dict]]:
     return {"alpha.yml": [_run()], "beta.yml": [_beta_run()]}
+
+
+def _tests_entry() -> dict:
+    return {
+        "context": "Tests",
+        "workflow_file": "ci.yml",
+        "workflow_path": CI_WORKFLOW_PATH,
+        "workflow_name": "CI",
+        "job": "test",
+        "main_publication": "ci_job_dependency",
+        "evidence": "check_run",
+        "rationale": "self-test",
+    }
+
+
+def _ci_run(**overrides) -> dict:
+    defaults = {
+        "workflow_id": 33,
+        "path": CI_WORKFLOW_PATH,
+        "name": "CI",
+        "conclusion": "failure",
+        "run_id": 31,
+        "check_suite_id": 303,
+    }
+    defaults.update(overrides)
+    return _run(**defaults)
+
+
+def _check_run(
+    *,
+    check_id: int = 41,
+    suite_id: int = 303,
+    name: str = "Tests",
+    head_sha: str = _SHA,
+    status: str = "completed",
+    conclusion: str | None = "success",
+    app_id: int = GITHUB_ACTIONS_APP_ID,
+    app_slug: str = "github-actions",
+) -> dict:
+    return {
+        "id": check_id,
+        "details_url": f"https://example.invalid/check/{check_id}",
+        "name": name,
+        "head_sha": head_sha,
+        "status": status,
+        "conclusion": conclusion,
+        "app": {"id": app_id, "slug": app_slug},
+        "check_suite": {"id": suite_id},
+    }
+
+
+def _tests_transport(
+    workflow_runs: list[dict],
+    check_runs: list[dict],
+):
+    def get(path: str) -> object:
+        if "/compare/" in path:
+            return {"status": "behind"}
+        if "/actions/workflows/ci.yml/runs?" in path:
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+            page = int((query.get("page") or ["1"])[0])
+            per_page = int((query.get("per_page") or [str(PAGE_SIZE)])[0])
+            start = (page - 1) * per_page
+            return {"workflow_runs": workflow_runs[start : start + per_page]}
+        if path.endswith("/actions/workflows/ci.yml"):
+            return {
+                "id": 33,
+                "path": CI_WORKFLOW_PATH,
+                "name": "CI",
+                "state": "active",
+            }
+        if "/check-runs?" in path:
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+            page = int((query.get("page") or ["1"])[0])
+            per_page = int((query.get("per_page") or [str(PAGE_SIZE)])[0])
+            start = (page - 1) * per_page
+            return {
+                "total_count": len(check_runs),
+                "check_runs": check_runs[start : start + per_page],
+            }
+        raise ApiFailure(f"unexpected path {path}")
+
+    return get
+
+
+def _enforce_tests(
+    workflow_runs: list[dict],
+    check_runs: list[dict],
+) -> int:
+    inventory = {
+        "version": 1,
+        "documentation": "self-test",
+        "main_branch": "main",
+        "required_checks": [_tests_entry()],
+    }
+    try:
+        return enforce(
+            _tests_transport(workflow_runs, check_runs),
+            "ferrum-edge/ferrum-edge",
+            _SHA,
+            inventory,
+            list(entries(inventory)),
+            deadline_seconds=0,
+            poll_seconds=RELEASE_POLL_SECONDS,
+            sleep=lambda _seconds: None,
+            monotonic=lambda: 1.0,
+            log=lambda *_args, **_kwargs: None,
+        )
+    except (ApiFailure, ApiPending, ContractError):
+        return 1
 
 
 def _gate_inventory() -> dict:
@@ -1785,6 +2392,7 @@ _CONFORMING_RELEASE_JOB = """    name: Validate release SHA
     timeout-minutes: 350
     permissions:
       actions: read
+      checks: read
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -1793,7 +2401,7 @@ _CONFORMING_RELEASE_JOB = """    name: Validate release SHA
 
       # Issue #4302. The complete, repository-required product check set --
       # `.github/required-publication-checks.json`, the one canonical inventory
-      # the `main` publisher is also proven set-equal to -- must be successful
+      # consumed by the `main` publisher as well -- must be successful
       # for the EXACT tag target under trusted workflow identity before any
       # immutable version-tag artifact is built. The previous implementation
       # kept an independent hard-coded subset here that omitted Gateway API
@@ -1869,6 +2477,62 @@ def self_test() -> list[str]:
     # The complete, exact-SHA, trusted set is the ONLY permitting case.
     expect(_enforce(_complete_runs()) == 0, "the complete exact-SHA set must publish")
 
+    # Release-only `Tests` evidence is the Tests check run owned by each
+    # canonical ci.yml push run, not that workflow run's aggregate conclusion.
+    expect(
+        _enforce_tests([_ci_run(conclusion="failure")], [_check_run()]) == 0,
+        "a successful Tests check must not inherit an unrelated CI run failure",
+    )
+    expect(
+        _enforce_tests([_ci_run()], []) == 1,
+        "a missing Tests check run must block publication",
+    )
+    expect(
+        _enforce_tests(
+            [_ci_run()],
+            [_check_run(status="in_progress", conclusion=None)],
+        )
+        == 1,
+        "an in-progress Tests check run must block publication",
+    )
+    expect(
+        _enforce_tests([_ci_run()], [_check_run(conclusion="failure")]) == 1,
+        "a failed Tests check run must block publication",
+    )
+    expect(
+        _enforce_tests(
+            [_ci_run()],
+            [
+                _check_run(check_id=42, suite_id=999),
+                _check_run(check_id=43, conclusion="failure"),
+            ],
+        )
+        == 1,
+        "a passing display-name decoy must not mask a failed canonical Tests check",
+    )
+    expect(
+        _enforce_tests(
+            [
+                _ci_run(),
+                _ci_run(run_id=32, check_suite_id=304),
+            ],
+            [
+                _check_run(),
+                _check_run(check_id=44, suite_id=304, conclusion="failure"),
+            ],
+        )
+        == 1,
+        "every canonical CI suite's Tests check must succeed",
+    )
+    expect(
+        _enforce_tests(
+            [_ci_run()],
+            [_check_run(app_id=1, app_slug="attacker")],
+        )
+        == 1,
+        "a Tests check from the wrong app identity must block publication",
+    )
+
     # Every non-success run state blocks, for every required workflow.
     for state in (
         {"status": "queued", "conclusion": None},
@@ -1908,6 +2572,12 @@ def self_test() -> list[str]:
     runs = _complete_runs()
     runs["alpha.yml"] = [_run(), _run(conclusion="failure")]
     expect(_enforce(runs) == 1, "a failed duplicate run must block publication")
+    runs = _complete_runs()
+    runs["beta.yml"] = [_beta_run(), _beta_run(conclusion="failure")]
+    expect(
+        _enforce(runs) == 1,
+        "a failed duplicate PR-head run must block publication",
+    )
 
     # Time-of-check/time-of-use: a completed success observed while another
     # required context is still pending must not be cached. GitHub permits
@@ -1927,7 +2597,7 @@ def self_test() -> list[str]:
         "a later complete exact-SHA sweep must publish after a pending wait",
     )
     expect(
-        slept == [POLL_SECONDS],
+        slept == [MAIN_POLL_SECONDS],
         "a pending wait must keep the one-minute poll cadence",
     )
 
@@ -1942,8 +2612,10 @@ def self_test() -> list[str]:
         "succeeds must block publication",
     )
     expect(
-        slept and all(interval == POLL_SECONDS for interval in slept),
-        "a queued regression must keep waiting at the one-minute cadence",
+        slept
+        and slept[0] == MAIN_POLL_SECONDS
+        and all(interval <= MAIN_POLL_SECONDS for interval in slept),
+        "a queued regression must keep a bounded one-minute cadence",
     )
 
     failed_after_success = _complete_runs()
@@ -1957,8 +2629,112 @@ def self_test() -> list[str]:
         "must block publication",
     )
     expect(
-        slept == [POLL_SECONDS],
+        slept == [MAIN_POLL_SECONDS],
         "a failure regression must fail closed after one pending wait",
+    )
+
+    # HTTP rate limits and server failures are pending evidence, while hard
+    # identity/status failures remain immediate failures.
+    expect(
+        _transient_http_delay(
+            403,
+            {
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": "1120",
+            },
+            "rate limit exceeded",
+            now=1000,
+        )
+        == 120,
+        "a primary rate limit must wait until X-RateLimit-Reset",
+    )
+    expect(
+        _transient_http_delay(
+            429,
+            {"Retry-After": "45"},
+            "",
+            now=1000,
+        )
+        == 45,
+        "a 429 must honor Retry-After",
+    )
+    expect(
+        _transient_http_delay(503, {}, "", now=1000)
+        == MAIN_POLL_SECONDS,
+        "a 5xx without reset headers must remain pending for one poll interval",
+    )
+    expect(
+        _transient_http_delay(404, {}, "", now=1000) is None,
+        "a 404 identity failure must remain hard",
+    )
+    expect(
+        _transient_http_delay(403, {}, "forbidden", now=1000) is None,
+        "a non-rate-limit 403 must remain hard",
+    )
+
+    transient_state = {"failed": False, "t": 0.0}
+    transient_sleeps: list[float] = []
+    transient_base = _transport(_complete_runs())
+
+    def transient_get(path: str) -> object:
+        if not transient_state["failed"]:
+            transient_state["failed"] = True
+            raise ApiPending("rate limited", 30)
+        return transient_base(path)
+
+    def transient_sleep(seconds: float) -> None:
+        transient_sleeps.append(seconds)
+        transient_state["t"] += seconds
+
+    transient_inventory = _fixture_inventory()
+    expect(
+        enforce(
+            transient_get,
+            "ferrum-edge/ferrum-edge",
+            _SHA,
+            transient_inventory,
+            select_entries(transient_inventory, "main"),
+            deadline_seconds=90,
+            sleep=transient_sleep,
+            monotonic=lambda: transient_state["t"],
+            log=lambda *_args, **_kwargs: None,
+        )
+        == 0,
+        "a transient API failure must resume polling instead of aborting",
+    )
+    expect(
+        transient_sleeps == [30],
+        "a transient API failure must honor its reset delay",
+    )
+
+    bounded_state = {"t": 0.0}
+    bounded_sleeps: list[float] = []
+
+    def bounded_get(_path: str) -> object:
+        raise ApiPending("rate limited", 3600)
+
+    def bounded_sleep(seconds: float) -> None:
+        bounded_sleeps.append(seconds)
+        bounded_state["t"] += seconds
+
+    expect(
+        enforce(
+            bounded_get,
+            "ferrum-edge/ferrum-edge",
+            _SHA,
+            transient_inventory,
+            select_entries(transient_inventory, "main"),
+            deadline_seconds=20,
+            sleep=bounded_sleep,
+            monotonic=lambda: bounded_state["t"],
+            log=lambda *_args, **_kwargs: None,
+        )
+        == 1,
+        "a reset beyond the overall deadline must still fail closed",
+    )
+    expect(
+        bounded_sleeps == [20],
+        "rate-limit sleep must be bounded by the overall deadline",
     )
 
     duplicate_at_permit = _complete_runs()
@@ -2143,13 +2919,63 @@ def self_test() -> list[str]:
             code = 1
         expect(code == 1, f"a {label} workflow_runs member must block publication")
 
-    # Merge-group evidence must come from a merge-queue branch for main.
+    # PR-head evidence must bind the product merge commit to exactly one merged
+    # pull request targeting main, with its head as the second parent.
+    expect(
+        _enforce(_complete_runs(), pulls_payload=[]) == 1,
+        "a direct push with no associated pull request must not publish",
+    )
+    expect(
+        _enforce(
+            _complete_runs(),
+            pulls_payload=[_pull_request(), _pull_request(number=18)],
+        )
+        == 1,
+        "multiple associated pull requests must fail closed as ambiguous",
+    )
+    expect(
+        _enforce(
+            _complete_runs(),
+            pulls_payload=[
+                _pull_request(state="open", merged_at=None),
+            ],
+        )
+        == 1,
+        "an unmerged associated pull request must block publication",
+    )
+    expect(
+        _enforce(
+            _complete_runs(),
+            pulls_payload=[_pull_request(base_ref="release")],
+        )
+        == 1,
+        "an associated pull request targeting the wrong base must block",
+    )
+    expect(
+        _enforce(
+            _complete_runs(),
+            commit_payload={
+                "sha": _SHA,
+                "parents": [{"sha": "c" * 40}, {"sha": "d" * 40}],
+            },
+        )
+        == 1,
+        "a PR head that is not the product commit's second parent must block",
+    )
+    expect(
+        _enforce(
+            _complete_runs(),
+            commit_payload={"sha": _SHA, "parents": [{"sha": "c" * 40}]},
+        )
+        == 1,
+        "a non-merge commit with no second parent must block publication",
+    )
     runs = _complete_runs()
-    runs["beta.yml"] = [_beta_run(branch="gh-readonly-queue/release/pr-1-abc")]
-    expect(_enforce(runs) == 1, "a non-main merge-queue branch must block publication")
+    runs["beta.yml"] = [_beta_run(branch="feature/decoy")]
+    expect(_enforce(runs) == 1, "a wrong PR-head branch must block publication")
     runs = _complete_runs()
     runs["beta.yml"] = [_beta_run(branch="main", event="push")]
-    expect(_enforce(runs) == 1, "a push run must not satisfy merge-group evidence")
+    expect(_enforce(runs) == 1, "a push run must not satisfy PR-head evidence")
 
     # Ancestry: only a commit on `main` may publish.
     for status in ("ahead", "diverged", None):
@@ -2342,6 +3168,64 @@ def self_test() -> list[str]:
     duplicated["required_checks"].append(dict(duplicated["required_checks"][0]))
     expect(inventory_errors(duplicated) != [], "a duplicate context must fail")
     expect(inventory_errors(_fixture_inventory()) == [], "the fixture must be valid")
+
+    # Static workflow identity: a blank line cannot hide a push paths filter.
+    path_filter_inventory = {
+        "version": 1,
+        "documentation": "self-test",
+        "main_branch": "main",
+        "required_checks": [dict(_fixture_inventory()["required_checks"][0])],
+    }
+    filtered_workflow = (
+        "name: Alpha Workflow\n"
+        "on:\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+        "\n"
+        "    paths:\n"
+        "      - src/**\n"
+        "jobs:\n"
+        "  gate:\n"
+        "    runs-on: ubuntu-latest\n"
+    )
+    expect(
+        workflow_identity_errors(
+            path_filter_inventory,
+            lambda _path: filtered_workflow,
+        )
+        != [],
+        "a blank line before push paths must not evade the filter guard",
+    )
+
+    # In-run dependency proof reads the active direct `if:` scalar; a comment
+    # containing the success predicate cannot satisfy it.
+    dependency_inventory = {
+        "version": 1,
+        "documentation": "self-test",
+        "main_branch": "main",
+        "required_checks": [_tests_entry()],
+    }
+    dependency_ci = "jobs:\n" + "".join(
+        f"  {publisher}:\n"
+        "    needs: [test]\n"
+        "    if: always() && needs.test.result == 'success'\n"
+        "    runs-on: ubuntu-latest\n"
+        for publisher in ("main-publish-gate", "latest-release", "docker")
+    )
+    expect(
+        ci_job_dependency_errors(dependency_ci, dependency_inventory) == [],
+        "active in-run success predicates must satisfy the dependency proof",
+    )
+    commented_dependency = dependency_ci.replace(
+        "    if: always() && needs.test.result == 'success'\n",
+        "    if: always()\n"
+        "    # needs.test.result == 'success'\n",
+    )
+    expect(
+        ci_job_dependency_errors(commented_dependency, dependency_inventory) != [],
+        "a comment-only in-run success predicate must fail",
+    )
 
     # Static contract: hosted publication-gate and release-gate jobs are
     # proven by exact active structure, not raw substring search.
@@ -2553,8 +3437,9 @@ def self_test() -> list[str]:
         "a missing active SHA export must fail the release gate",
     )
     release_extra_write = _CONFORMING_RELEASE_JOB.replace(
-        "      actions: read\n      contents: read\n",
-        "      actions: read\n      contents: read\n      packages: write\n",
+        "      actions: read\n      checks: read\n      contents: read\n",
+        "      actions: read\n      checks: read\n      contents: read\n"
+        "      packages: write\n",
     )
     expect(
         _release_errors(release_extra_write) != [],
@@ -2569,16 +3454,25 @@ def self_test() -> list[str]:
         "continue-on-error on validate-release-sha must fail",
     )
     release_flow_permissions = _CONFORMING_RELEASE_JOB.replace(
-        "    permissions:\n      actions: read\n      contents: read\n",
-        "    permissions: { actions: read, contents: read }\n",
+        "    permissions:\n"
+        "      actions: read\n"
+        "      checks: read\n"
+        "      contents: read\n",
+        "    permissions: { actions: read, checks: read, contents: read }\n",
     )
     expect(
         _release_errors(release_flow_permissions) != [],
         "flow-spelled release permissions must fail",
     )
     release_duplicate = _CONFORMING_RELEASE_JOB.replace(
-        "    permissions:\n      actions: read\n      contents: read\n",
-        "    permissions:\n      actions: read\n      contents: read\n"
+        "    permissions:\n"
+        "      actions: read\n"
+        "      checks: read\n"
+        "      contents: read\n",
+        "    permissions:\n"
+        "      actions: read\n"
+        "      checks: read\n"
+        "      contents: read\n"
         "    permissions:\n      contents: write\n",
     )
     expect(
@@ -2843,8 +3737,9 @@ def main(argv: list[str] | None = None) -> int:
             inventory,
             selected,
             arguments.deadline_seconds,
+            poll_seconds=POLL_SECONDS_BY_MODE[arguments.enforce],
         )
-    except (ApiFailure, ContractError) as error:
+    except (ApiFailure, ApiPending, ContractError) as error:
         print(f"::error::{error}", file=sys.stderr)
         return 1
 
