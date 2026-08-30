@@ -16,6 +16,8 @@ concerns are handled by dedicated layers and the WAF does not duplicate them:
 | --- | --- |
 | Request smuggling (CL/TE conflicts, duplicate Content-Length) | core proxy `check_protocol_headers()` + hyper strict parsing |
 | Missing or empty HTTP/1.1 `Host` (RFC 9112 §3.2.2) | core proxy `check_protocol_headers()` (HTTP/1.0 and absolute-form URI authority are not rejected; HTTP/2/3 `:authority` is `check_host_authority_consistency()`) |
+
+| Request smuggling (CL/TE conflicts, duplicate Content-Length) | bounded proxy-frontend HTTP/1 wire framing guard + core proxy `check_protocol_headers()` + Hyper parsing |
 | Header/URI/body size limits | `FERRUM_MAX_*` env vars, `request_size_limiting` |
 | Authentication / authorization | auth plugins, `access_control`, `mesh_authz`, `opa` |
 | Rate limiting / flooding | `rate_limiting`, `*_rate_limiting` |
@@ -23,6 +25,16 @@ concerns are handled by dedicated layers and the WAF does not duplicate them:
 | Bot / IP / geo filtering | `bot_detection`, `ip_restriction`, `geo_restriction` |
 | Backend SSRF allow/deny | `FERRUM_BACKEND_ALLOW_IPS` + `FERRUM_BACKEND_ALLOW_CIDRS` / `FERRUM_BACKEND_DENY_CIDRS` (metadata/link-local/multicast blocked by default) |
 | Response security headers | `security_headers` |
+
+On plaintext and TLS proxy frontends, HTTP/1 requests that carry both
+`Content-Length` and `Transfer-Encoding` are rejected with `400` and the client
+connection is closed, independently of field order or casing. Enforcement
+starts in the proxy frontend I/O adapter, which observes each bounded raw
+request head before Hyper applies transfer-coding precedence, and finishes in
+the shared `check_protocol_headers()` rejection path before routing. The admin
+and injector HTTP listeners do not use this adapter. HTTP/2 and HTTP/3 do not
+use this wire observer; their existing protocol-specific TE validation is
+unchanged.
 
 The WAF focuses on injection and disclosure signatures: SQLi, NoSQLi, command
 injection, XSS, SSTI, JNDI/Log4Shell, path traversal, LFI, RFI, SSRF, XXE,
