@@ -2449,6 +2449,10 @@ fn global_mesh_route_dispatch_to(host: &str, port: u16) -> PluginConfig {
     }
 }
 
+/// Sidecar-shaped: CONNECT names loopback B, which #4315 admits only when this
+/// terminator shares the destination pod netns. C is a non-loopback third
+/// workload this terminator does not own, so the handler re-check refuses it
+/// for ownership rather than the loopback-namespace guard.
 fn post_plugin_refusal_mesh(b_port: u16, c_ip: IpAddr, c_port: u16) -> MeshConfig {
     let c_addr = c_ip.to_string();
     MeshConfig {
@@ -2457,6 +2461,7 @@ fn post_plugin_refusal_mesh(b_port: u16, c_ip: IpAddr, c_port: u16) -> MeshConfi
             relay_guard_workload("svc-c", &[&c_addr], &[c_port]),
         ],
         inbound_relay_admits_accepted_local_address: true,
+        inbound_relay_admits_loopback_namespace: true,
         ..MeshConfig::default()
     }
 }
