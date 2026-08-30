@@ -778,3 +778,107 @@ async fn per_namespace_poller_ordering_stays_strict_across_interleaved_writes() 
         "the tenant-a poller must observe both writes in that namespace"
     );
 }
+
+/// MongoDB incremental polling must fail closed on typed `config_changes`
+/// corruption the same way SQL `try_get` aborts the poll (issue #4286).
+/// These tests exercise the production decoder without a live MongoDB.
+mod mongo_incremental_poll_contract {
+    use ferrum_edge::_test_support::decode_mongo_config_change_record;
+    use mongodb::bson::{Bson, Document, doc};
+
+    const MONGO_STORE_SOURCE: &str = include_str!("../../src/config/mongo_store.rs");
+
+    fn well_formed_change_doc(sequence: i64, resource_id: &str, operation: &str) -> Document {
+        doc! {
+            "sequence": sequence,
+            "namespace": "ferrum",
+            "resource_type": "upstream",
+            "resource_id": resource_id,
+            "operation": operation,
+            "created_at": "2026-08-28T00:00:00Z",
+        }
+    }
+
+    fn poll_cursor(after_sequence: u64, docs: &[Document]) -> Result<u64, anyhow::Error> {
+        let mut sequence_cursor = after_sequence;
+        for doc in docs {
+            let change = decode_mongo_config_change_record(doc)?;
+            sequence_cursor = sequence_cursor.max(change.sequence);
+        }
+        Ok(sequence_cursor)
+    }
+
+    #[test]
+    fn wrong_bson_resource_id_aborts_before_a_later_well_formed_change() {
+        let mut malformed = well_formed_change_doc(5, "malformed-upstream", "delete");
+        malformed.insert("resource_id", Bson::Int32(7));
+        let later = well_formed_change_doc(6, "later-upstream", "upsert");
+
+        let error = poll_cursor(0, &[malformed, later]).expect_err(
+            "Int32 resource_id must abort the poll so the later change cannot skip it forever",
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("non-string field 'resource_id'"),
+            "typed decode error must name the field, got: {message}"
+        );
+        assert!(
+            !message.contains("malformed-upstream")
+                && !message.contains("later-upstream")
+                && !message.contains("7"),
+            "decode errors must not log record content: {message}"
+        );
+    }
+
+    #[test]
+    fn missing_operation_aborts_without_advancing_the_cursor() {
+        let mut missing = well_formed_change_doc(2, "upstream-a", "upsert");
+        missing.remove("operation");
+        let later = well_formed_change_doc(3, "upstream-b", "delete");
+        let error = poll_cursor(1, &[missing, later])
+            .expect_err("missing operation must abort before the cursor can move");
+        assert!(
+            error.to_string().contains("missing field 'operation'"),
+            "missing field must fail closed, got: {error}"
+        );
+    }
+
+    #[test]
+    fn invalid_operation_does_not_become_an_upsert() {
+        let invalid = well_formed_change_doc(4, "upstream-a", "patch");
+        let later = well_formed_change_doc(5, "upstream-b", "upsert");
+        let error = poll_cursor(0, &[invalid, later])
+            .expect_err("unsupported operation must abort the poll, not default to upsert");
+        assert!(
+            error.to_string().contains("unsupported operation"),
+            "invalid operation must fail closed, got: {error}"
+        );
+    }
+
+    #[test]
+    fn mongo_incremental_loader_uses_fail_closed_decoder_before_cursor_update() {
+        let marker = "        async fn load_incremental_config";
+        let start = MONGO_STORE_SOURCE
+            .find(marker)
+            .expect("Mongo load_incremental_config must exist");
+        let tail = &MONGO_STORE_SOURCE[start + marker.len()..];
+        let end = tail
+            .find("\n        async fn ")
+            .expect("Mongo load_incremental_config must be followed by another method");
+        let body = &MONGO_STORE_SOURCE[start..start + marker.len() + end];
+        let decode_at = body
+            .find("decode_mongo_config_change_record")
+            .expect("Mongo incremental poll must decode through the fail-closed helper");
+        let cursor_at = body
+            .find("sequence_cursor = sequence_cursor.max(")
+            .expect("Mongo incremental poll must update the cursor after accepting a record");
+        assert!(
+            decode_at < cursor_at,
+            "Mongo incremental poll must not advance the cursor past a rejected record:\n{body}"
+        );
+        assert!(
+            body[decode_at..cursor_at].contains('?'),
+            "typed decode failure must abort with ? before the cursor updates:\n{body}"
+        );
+    }
+}

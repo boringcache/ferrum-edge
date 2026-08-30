@@ -251,7 +251,11 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     implies no mirror, function, or provider was contacted; backend admission
     and transport checks still occur later. Runs at most once per request
     (`RequestContext.finalized_request_egress_dispatched`), so retries never
-    re-fire it. `pre_proxy` header injection goes through the backend header
+    re-fire it. `request_mirror` snapshots the canonical backend-visible query
+    through `effective_backend_query_string` and drops deny-by-default sensitive
+    query pairs from the mirror request-target only; later mutation of the live
+    context cannot change that owned snapshot, and the primary backend target is
+    never rewritten. `pre_proxy` header injection goes through the backend header
     overlay, which the proxy merges only after re-stripping reserved gateway
     assertions and re-applying the egress baggage policy. None of these plugins
     has a `before_proxy` egress hook — do not add one back.

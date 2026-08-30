@@ -13,7 +13,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -90,6 +90,7 @@ enum Http2CandidateOutcome {
 /// lookups are fine.
 fn with_http2_pool_key<R>(
     proxy: &Proxy,
+    global_pool_config: &PoolConfig,
     client_cert_path: Option<&str>,
     client_key_path: Option<&str>,
     svid_generation: Option<u64>,
@@ -102,6 +103,7 @@ fn with_http2_pool_key<R>(
             &proxy.backend_host,
             proxy.backend_port,
             proxy,
+            global_pool_config,
             client_cert_path,
             client_key_path,
             svid_generation,
@@ -110,11 +112,13 @@ fn with_http2_pool_key<R>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_http2_pool_key(
     buf: &mut String,
     host: &str,
     port: u16,
     proxy: &Proxy,
+    global_pool_config: &PoolConfig,
     client_cert_path: Option<&str>,
     client_key_path: Option<&str>,
     svid_generation: Option<u64>,
@@ -131,13 +135,19 @@ fn write_http2_pool_key(
     // byte-identical. Empty when the proxy has no `upstream_subset`.
     append_optional_pool_key_component(buf, proxy.upstream_subset.as_deref());
     buf.push('|');
-    // Effective `pool_http2_max_concurrent_streams` is baked into the hyper
-    // builder (`max_concurrent_streams` + `initial_max_send_streams`), so it
-    // must participate in pool identity. Placed after subset and before TLS
-    // fields so `SvidGenerationMatcher` still sees `|svidg=…` as the final
-    // (pre-shard) segment. `None` → `none` so update/delete of the cap cannot
-    // reuse a connection built under the prior limit.
-    append_http2_max_concurrent_streams_pool_key(buf, proxy.pool_http2_max_concurrent_streams);
+    // Effective `PoolConfig::for_proxy(...).http2_max_concurrent_streams` is
+    // baked into the hyper builder (`max_concurrent_streams` +
+    // `initial_max_send_streams`), so it must participate in pool identity.
+    // Resolved here without cloning `PoolConfig`. Placed after subset and
+    // before TLS fields so `SvidGenerationMatcher` still sees `|svidg=…` as
+    // the final (pre-shard) segment. Effective `None` → `none` (unlimited)
+    // so update/delete of a finite cap cannot reuse a connection built
+    // under the prior limit; inherit-global and an explicit equal value
+    // share a key.
+    append_http2_max_concurrent_streams_pool_key(
+        buf,
+        global_pool_config.effective_http2_max_concurrent_streams(proxy),
+    );
     buf.push('|');
     append_backend_tls_pool_key_fields(
         buf,
@@ -149,13 +159,18 @@ fn write_http2_pool_key(
     );
 }
 
-fn pool_key_owned(proxy: &Proxy, svid_generation: Option<u64>) -> String {
+fn pool_key_owned(
+    proxy: &Proxy,
+    svid_generation: Option<u64>,
+    global_pool_config: &PoolConfig,
+) -> String {
     let mut buf = String::with_capacity(128);
     write_http2_pool_key(
         &mut buf,
         &proxy.backend_host,
         proxy.backend_port,
         proxy,
+        global_pool_config,
         proxy.resolved_tls.client_cert_path.as_deref(),
         proxy.resolved_tls.client_key_path.as_deref(),
         svid_generation,
@@ -531,6 +546,7 @@ impl Http2PoolManager {
             host,
             port,
             proxy,
+            &self.global_pool_config,
             self.effective_client_cert_path(proxy),
             self.effective_client_key_path(proxy),
             svid_generation,
@@ -664,11 +680,29 @@ impl Http2ConnectionPool {
         self.pool.pool_size()
     }
 
+    /// Drain generation-keyed TLS configs **and** `rr_counters` for a
+    /// retired SVID generation.
+    ///
+    /// Called from the rotation consumer's unconditional retirement loop
+    /// (`BackendPoolFamily::drain_tls_config_cache`), including when
+    /// `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS=0`. This `retain` is a
+    /// release of already-unreachable entries, not a connection
+    /// withdrawal. Live pooled senders stay until idle prune or
+    /// `force_drain_*`.
+    ///
+    /// A cold `rr_counters` insert that captured generation `N` can still
+    /// race this sweep (insert after retain, drain window 0). That race is
+    /// closed on the cold-insert path by `get_or_seed_rr_counter`: after
+    /// inserting, it drops the exact key when the live SVID generation has
+    /// already moved on. The `Arc` counter already handed to the in-flight
+    /// request is kept.
     pub fn drain_backend_tls_config_cache_svid_generation(&self, generation: u64) {
         self.pool
             .manager()
             .tls_configs
             .drain_svid_generation(generation);
+        let matcher = SvidGenerationMatcher::new(generation);
+        self.rr_counters.retain(|key, _| !matcher.matches(key));
     }
 
     pub fn clear_backend_tls_config_cache(&self) {
@@ -688,7 +722,22 @@ impl Http2ConnectionPool {
 
     #[allow(dead_code)] // exercised from integration/unit tests
     pub fn pool_key_for_warmup(proxy: &Proxy) -> String {
-        pool_key_owned(proxy, None)
+        pool_key_owned(proxy, None, &PoolConfig::default())
+    }
+
+    /// Unsharded direct-H2 base key using `global` as the `PoolConfig` layer
+    /// `for_proxy` / `effective_http2_max_concurrent_streams` resolve against.
+    ///
+    /// `pool_key_for_warmup` is this with `svid_generation = None` and
+    /// `PoolConfig::default()`. Runtime `get_sender` uses the pool manager's
+    /// global instead of reconstructing `PoolConfig` a second time.
+    #[allow(dead_code)] // exercised from unit/integration tests
+    pub fn pool_key_with_global(
+        proxy: &Proxy,
+        svid_generation: Option<u64>,
+        global: &PoolConfig,
+    ) -> String {
+        pool_key_owned(proxy, svid_generation, global)
     }
 
     /// TLS-config cache key (no host/port). Used by unit tests to prove two
@@ -743,6 +792,24 @@ impl Http2ConnectionPool {
             .insert(key.into(), Arc::new(AtomicUsize::new(0)));
     }
 
+    /// Production cold-insert path for `rr_counters`, including the
+    /// post-insert stale-generation removal. Used by integration tests to
+    /// prove insert-before-retire and retire-before-insert without a live
+    /// backend handshake.
+    #[allow(dead_code)] // exercised from integration tests
+    pub fn get_or_seed_rr_counter_for_tests(
+        &self,
+        key: &str,
+        captured_svid_generation: Option<u64>,
+    ) -> Arc<AtomicUsize> {
+        get_or_seed_rr_counter(
+            &self.rr_counters,
+            key,
+            captured_svid_generation,
+            &self.pool.manager().backend_svid_generation,
+        )
+    }
+
     #[allow(dead_code)] // exercised from unit tests
     pub fn rr_counter_len(&self) -> usize {
         self.rr_counters.len()
@@ -784,6 +851,7 @@ impl Http2ConnectionPool {
         let manager = self.pool.manager();
         with_http2_pool_key(
             proxy,
+            &manager.global_pool_config,
             manager.effective_client_cert_path(proxy),
             manager.effective_client_key_path(proxy),
             svid_generation,
@@ -815,17 +883,12 @@ impl Http2ConnectionPool {
             // the atomic counter wraps around. `AtomicUsize::fetch_add(1,
             // Relaxed)` is wait-free after the seed — the seed only matters
             // for the first `shard_count` picks per host on this gateway.
-            let rr = match self.rr_counters.get(key_buf.as_str()) {
-                Some(existing) => existing.value().clone(),
-                // Cold-path allocation: `to_owned()` runs only on the first
-                // request to a given backend host — subsequent requests find
-                // the existing entry via the `get()` above.
-                None => self
-                    .rr_counters
-                    .entry(key_buf[..base_len].to_owned())
-                    .or_insert_with(|| Arc::new(AtomicUsize::new(rr_seed())))
-                    .clone(),
-            };
+            let rr = get_or_seed_rr_counter(
+                &self.rr_counters,
+                &key_buf[..base_len],
+                svid_generation,
+                &self.pool.manager().backend_svid_generation,
+            );
             let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
 
             // Cheap probe pass — any shard whose cached sender is
@@ -928,6 +991,35 @@ enum Phase1 {
         base_len: usize,
         start: usize,
     },
+}
+
+/// Look up or cold-insert a per-base-key round-robin counter.
+///
+/// The `Some` hit path is a DashMap get plus `Arc` clone — no live-generation
+/// load. On the `None` miss, the entry is inserted and then, only if this
+/// request captured a numeric SVID generation, compared against the live
+/// counter. If rotation already advanced, the exact key is removed so a
+/// post-sweep late insert cannot leak when the drain window is zero. The
+/// returned `Arc` still belongs to the in-flight request.
+pub(crate) fn get_or_seed_rr_counter(
+    rr_counters: &DashMap<String, Arc<AtomicUsize>>,
+    base_key: &str,
+    captured_svid_generation: Option<u64>,
+    live_generation: &AtomicU64,
+) -> Arc<AtomicUsize> {
+    if let Some(existing) = rr_counters.get(base_key) {
+        return existing.value().clone();
+    }
+    let rr = rr_counters
+        .entry(base_key.to_owned())
+        .or_insert_with(|| Arc::new(AtomicUsize::new(rr_seed())))
+        .clone();
+    if let Some(captured) = captured_svid_generation
+        && live_generation.load(Ordering::Acquire) != captured
+    {
+        rr_counters.remove(base_key);
+    }
+    rr
 }
 
 /// Thread-local PRNG used to seed per-host round-robin counters on first
@@ -1476,8 +1568,8 @@ impl std::fmt::Display for InternalSource {
 /// and key fields are credential paths (or inline-PEM digests). Pool-key
 /// components escape literal `|` as `%7C` (see `append_pool_key_component`), so
 /// splitting on `|` recovers exactly these fields without a separator ever
-/// bleeding across a boundary. `h2mcs` is the optional
-/// `pool_http2_max_concurrent_streams` segment (`none` or a decimal u32).
+/// bleeding across a boundary. `h2mcs` is the effective
+/// `PoolConfig::for_proxy` stream-cap segment (`none` or a decimal u32).
 const POOL_KEY_CLIENT_CERT_FIELD: usize = 6;
 const POOL_KEY_CLIENT_KEY_FIELD: usize = 7;
 
@@ -1953,7 +2045,7 @@ mod tests {
     #[test]
     fn http2_pool_key_can_partition_on_svid_generation() {
         let proxy = http2_pool_test_proxy();
-        let key = pool_key_owned(&proxy, Some(17));
+        let key = pool_key_owned(&proxy, Some(17), &PoolConfig::default());
 
         assert!(
             key.ends_with("|svidg=17"),
@@ -2074,6 +2166,7 @@ mod tests {
     ) -> R {
         with_http2_pool_key(
             proxy,
+            &PoolConfig::default(),
             proxy.resolved_tls.client_cert_path.as_deref(),
             proxy.resolved_tls.client_key_path.as_deref(),
             svid_generation,
@@ -2084,7 +2177,7 @@ mod tests {
     #[test]
     fn with_http2_pool_key_matches_pool_key_owned() {
         let proxy = http2_pool_test_proxy();
-        let owned = pool_key_owned(&proxy, None);
+        let owned = pool_key_owned(&proxy, None, &PoolConfig::default());
         let from_thread_local = with_http2_test_pool_key(&proxy, None, |buf| buf.clone());
         assert_eq!(
             owned, from_thread_local,

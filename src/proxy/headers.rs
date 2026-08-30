@@ -1278,13 +1278,16 @@ pub fn remove_content_length_header(headers: &mut std::collections::HashMap<Stri
 /// captured for the gateway's own accounting *before*
 /// [`ClientResponseFraming::Streaming`] removes the field.
 ///
-/// Streaming writers still need a backend-declared length internally — H3
-/// graceful-close completeness classification, the direct-H2 large-response
-/// coalescer bypass, response body preallocation. Those reads used to happen
-/// against the post-sanitization map, so this reproduces exactly what that map
-/// would have held: `None` unless there is exactly one `Content-Length` case
-/// variant whose trimmed value is a `1*DIGIT` decimal that fits `u64`, and
-/// `None` for any status that forbids a message body.
+/// Streaming writers still need a post-hook declared length internally — H3
+/// graceful-close completeness classification of the client-facing
+/// representation, and HEAD wire advertisement. Size-limit adapter selection
+/// and the direct-H2 large-response passthrough must **not** read this value:
+/// those decisions use the backend-observed canonical length captured before
+/// `after_proxy`. Those completeness reads used to happen against the
+/// post-sanitization map, so this reproduces exactly what that map would have
+/// held: `None` unless there is exactly one `Content-Length` case variant whose
+/// trimmed value is a `1*DIGIT` decimal that fits `u64`, and `None` for any
+/// status that forbids a message body.
 ///
 /// It is deliberately NOT [`content_length_header_value`], which returns the
 /// first `parse()`-able variant: that accepts a signed `+42` and silently picks

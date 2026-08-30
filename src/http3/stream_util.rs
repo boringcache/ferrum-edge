@@ -392,12 +392,35 @@ where
 /// backend body honestly (backend read error, response-size overflow, etc.).
 /// A graceful `finish()` would make unknown-length responses look complete; a
 /// reset lets H3 clients distinguish truncation from EOF.
+///
+/// `stop_stream` is idempotent at the Quinn layer. Callers that abort while an
+/// h3-quinn `send_data` future still holds `writing` may see this as a no-op
+/// (`h3-quinn`'s `reset` ignores Quinn errors and does not clear `writing`);
+/// [`CommittedH3ResponseStream::settle_committed_terminal`] therefore retries
+/// on drop after that future is gone (issue #4363).
 #[inline]
 pub(crate) fn abort_response_stream<S>(stream: &mut RequestStream<S, Bytes>)
 where
     S: SendStream<Bytes>,
 {
     stream.stop_stream(Code::H3_INTERNAL_ERROR);
+}
+
+/// Whether a captured authorization plan has already elapsed.
+///
+/// Checks the captured Instant; it does not re-derive a plan or choose between
+/// owners. Native plain-H3 relays call this at backend EOS so a `recv_data`
+/// `Ok(None)` cannot proceed to `finish()` after the credential is spent
+/// (issue #4363). `h3-quinn`'s `poll_finish` calls Quinn `finish()`
+/// synchronously and does not park on a stalled client, so reaching that call
+/// after expiry would present a clean FIN.
+#[inline]
+#[must_use]
+pub(crate) fn captured_authorization_elapsed(
+    plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+    plan.filter(|plan| tokio::time::Instant::now() >= plan.at)
+        .map(|plan| plan.termination)
 }
 
 /// A COMMITTED HTTP/3 streaming response's request stream, with a fail-closed
@@ -423,17 +446,24 @@ where
 /// still fail-closed. Same shape as `ConnectUdpSendHalf` (issue #4072).
 ///
 /// Wrap the stream once the relay is committed to writing a streaming response,
-/// deref it exactly as before, and call [`Self::record_clean_finish`] at each
-/// point a `finish()` toward the client actually returned `Ok`.
+/// deref it exactly as before, call [`Self::abort_committed`] on every non-clean
+/// exit, and call [`Self::record_clean_finish`] only where a `finish()` toward
+/// the client actually returned `Ok` *and* the stream was not already forced
+/// to reset (authorization-first: a later `finish()` `Ok` cannot disarm an
+/// expiry that already won).
 pub(crate) struct CommittedH3ResponseStream<S: SendStream<Bytes>> {
     stream: RequestStream<S, Bytes>,
-    /// Set ONLY where a downstream `finish()` returned `Ok`. The single thing
-    /// that disarms the reset.
+    /// Set ONLY where a downstream `finish()` returned `Ok` and
+    /// [`Self::abort_committed`] has not already latched a reset. The single
+    /// thing that disarms the reset, and only when `force_reset` is false.
     clean_finish: bool,
-    /// Keeps the explicit settle and the `Drop` backstop from both resetting.
-    /// `stop_stream` is idempotent at the quinn layer, but tracking it here
-    /// keeps the intent readable and the wire behaviour exactly one terminal.
-    reset_applied: bool,
+    /// Latched by [`Self::abort_committed`]. Authorization-first: once set,
+    /// [`Self::record_clean_finish`] is a no-op and settle always retries
+    /// `stop_stream`. Unlike the previous `reset_applied` flag, this does NOT
+    /// skip the Drop retry after a no-op abort (issue #4363). Same shape as
+    /// `ConnectUdpSendHalf` (issue #4072), which always `stop_stream`s on drop
+    /// while still armed.
+    force_reset: bool,
 }
 
 impl<S: SendStream<Bytes>> CommittedH3ResponseStream<S> {
@@ -442,26 +472,43 @@ impl<S: SendStream<Bytes>> CommittedH3ResponseStream<S> {
         Self {
             stream,
             clean_finish: false,
-            reset_applied: false,
+            force_reset: false,
         }
     }
 
     /// Record that a downstream `finish()` returned `Ok`, i.e. the relay landed
     /// a real clean end of body. Never call this for a finish that failed, was
-    /// cancelled, or was skipped.
+    /// cancelled, or was skipped. A no-op once [`Self::abort_committed`] has
+    /// latched, so a `finish()` that returns `Ok` after expiry cannot disarm
+    /// the reset (authorization-first).
     pub(crate) fn record_clean_finish(&mut self) {
+        if self.force_reset {
+            return;
+        }
         self.clean_finish = true;
+    }
+
+    /// Force a RESET terminal and apply it now. Authorization-first: a later
+    /// `finish()` `Ok` cannot disarm this, and Drop retries `stop_stream` if
+    /// the first abort was a no-op because an h3-quinn `send_data` still held
+    /// `writing` (issue #4363).
+    pub(crate) fn abort_committed(&mut self) {
+        self.force_reset = true;
+        self.clean_finish = false;
+        abort_response_stream(&mut self.stream);
     }
 
     /// Apply the terminal now rather than at drop, so the `RESET_STREAM`
     /// reaches the wire before the relay's response-termination hooks and
-    /// transaction logging await. Idempotent, and a no-op once a clean FIN was
-    /// recorded, so it can never clobber a successful `finish()`.
+    /// transaction logging await. Skipped only for a proven clean authorized
+    /// FIN (`clean_finish && !force_reset`). Otherwise always `stop_stream`s
+    /// — including on Drop after a no-op abort — because `stop_stream` is
+    /// idempotent and a skipped retry is how Quinn's implicit `finish()`
+    /// leaked a clean EOF (issue #4363).
     pub(crate) fn settle_committed_terminal(&mut self) {
-        if self.clean_finish || self.reset_applied {
+        if self.clean_finish && !self.force_reset {
             return;
         }
-        self.reset_applied = true;
         abort_response_stream(&mut self.stream);
     }
 }
@@ -499,20 +546,25 @@ impl<S: SendStream<Bytes>> Drop for CommittedH3ResponseStream<S> {
 /// `proxy_to_backend_h3_streaming` are those relays.
 ///
 /// The terminal is a RESET unless [`Self::record_clean_finish`] proved a
-/// downstream `finish()` returned `Ok` — never a re-assertion over accumulated
-/// `body_error_class` / `client_disconnected` bookkeeping. Keep the settle body
-/// byte-identical to the owning guard's: the source-shape guard in
+/// downstream `finish()` returned `Ok` *and* [`Self::abort_committed`] has not
+/// already latched — never a re-assertion over accumulated `body_error_class` /
+/// `client_disconnected` bookkeeping. Keep the settle body byte-identical to
+/// the owning guard's: the source-shape guard in
 /// `tests/unit/gateway_core/http3_server_dispatch_tests.rs` asserts both carry
 /// the same predicate so the two cannot drift apart.
 pub(crate) struct BorrowedCommittedH3ResponseStream<'a, S: SendStream<Bytes>> {
     stream: &'a mut RequestStream<S, Bytes>,
-    /// Set ONLY where a downstream `finish()` returned `Ok`. The single thing
-    /// that disarms the reset.
+    /// Set ONLY where a downstream `finish()` returned `Ok` and
+    /// [`Self::abort_committed`] has not already latched a reset. The single
+    /// thing that disarms the reset, and only when `force_reset` is false.
     clean_finish: bool,
-    /// Keeps the explicit settle and the `Drop` backstop from both resetting.
-    /// `stop_stream` is idempotent at the quinn layer, but tracking it here
-    /// keeps the intent readable and the wire behaviour exactly one terminal.
-    reset_applied: bool,
+    /// Latched by [`Self::abort_committed`]. Authorization-first: once set,
+    /// [`Self::record_clean_finish`] is a no-op and settle always retries
+    /// `stop_stream`. Unlike the previous `reset_applied` flag, this does NOT
+    /// skip the Drop retry after a no-op abort (issue #4363). Same shape as
+    /// `ConnectUdpSendHalf` (issue #4072), which always `stop_stream`s on drop
+    /// while still armed.
+    force_reset: bool,
 }
 
 impl<'a, S: SendStream<Bytes>> BorrowedCommittedH3ResponseStream<'a, S> {
@@ -521,26 +573,43 @@ impl<'a, S: SendStream<Bytes>> BorrowedCommittedH3ResponseStream<'a, S> {
         Self {
             stream,
             clean_finish: false,
-            reset_applied: false,
+            force_reset: false,
         }
     }
 
     /// Record that a downstream `finish()` returned `Ok`, i.e. the relay landed
     /// a real clean end of body. Never call this for a finish that failed, was
-    /// cancelled, or was skipped.
+    /// cancelled, or was skipped. A no-op once [`Self::abort_committed`] has
+    /// latched, so a `finish()` that returns `Ok` after expiry cannot disarm
+    /// the reset (authorization-first).
     pub(crate) fn record_clean_finish(&mut self) {
+        if self.force_reset {
+            return;
+        }
         self.clean_finish = true;
+    }
+
+    /// Force a RESET terminal and apply it now. Authorization-first: a later
+    /// `finish()` `Ok` cannot disarm this, and Drop retries `stop_stream` if
+    /// the first abort was a no-op because an h3-quinn `send_data` still held
+    /// `writing` (issue #4363).
+    pub(crate) fn abort_committed(&mut self) {
+        self.force_reset = true;
+        self.clean_finish = false;
+        abort_response_stream(&mut *self.stream);
     }
 
     /// Apply the terminal now rather than at drop, so the `RESET_STREAM`
     /// reaches the wire before the relay's response-termination hooks and
-    /// transaction logging await. Idempotent, and a no-op once a clean FIN was
-    /// recorded, so it can never clobber a successful `finish()`.
+    /// transaction logging await. Skipped only for a proven clean authorized
+    /// FIN (`clean_finish && !force_reset`). Otherwise always `stop_stream`s
+    /// — including on Drop after a no-op abort — because `stop_stream` is
+    /// idempotent and a skipped retry is how Quinn's implicit `finish()`
+    /// leaked a clean EOF (issue #4363).
     pub(crate) fn settle_committed_terminal(&mut self) {
-        if self.clean_finish || self.reset_applied {
+        if self.clean_finish && !self.force_reset {
             return;
         }
-        self.reset_applied = true;
         abort_response_stream(&mut *self.stream);
     }
 }

@@ -7406,3 +7406,126 @@ fn test_stream_lifetime_is_published_only_from_the_accepted_startup_config() {
          listener can start against an unpublished or rejected value"
     );
 }
+
+/// Issue #4266: the pre-drain window must be honored by `mode=cp`.
+///
+/// The `ferrum-mesh` chart renders `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` for its
+/// `controlPlane` and `ca` workloads and, on Kubernetes older than 1.29, tells
+/// operators to replace the `SleepAction` `preStop` with it. Both workloads run
+/// the binary in `cp` mode, so a mode gate that forces the window to zero there
+/// would silently budget grace-period seconds the runtime never spends and let
+/// the CP close its accept loops before endpoint withdrawal completes.
+#[test]
+fn shutdown_predrain_is_honored_by_every_listener_serving_mode() {
+    for mode in [
+        OperatingMode::Database,
+        OperatingMode::File,
+        OperatingMode::ControlPlane,
+        OperatingMode::DataPlane,
+        OperatingMode::Mesh,
+    ] {
+        let config = EnvConfig {
+            // `OperatingMode` is not `Copy`; clone so the loop variable stays
+            // available for the assertion messages below.
+            mode: mode.clone(),
+            shutdown_predrain_seconds: 25,
+            ..EnvConfig::default()
+        };
+        assert_eq!(
+            config.effective_shutdown_predrain_seconds(),
+            25,
+            "{mode:?} serves listeners behind a readiness-driven endpoint set, so it must honor \
+             the configured pre-drain window"
+        );
+    }
+}
+
+/// The non-serving modes keep the window at zero: burning grace-period budget
+/// there buys no endpoint withdrawal, and the chart deliberately does not render
+/// the drain contract for the injector, the node agent, or `migrate`.
+#[test]
+fn shutdown_predrain_stays_zero_for_non_serving_modes() {
+    for mode in [
+        OperatingMode::Injector,
+        OperatingMode::NodeAgent,
+        OperatingMode::Migrate,
+    ] {
+        let config = EnvConfig {
+            // `OperatingMode` is not `Copy`; clone so the loop variable stays
+            // available for the assertion messages below.
+            mode: mode.clone(),
+            shutdown_predrain_seconds: 25,
+            ..EnvConfig::default()
+        };
+        assert_eq!(
+            config.effective_shutdown_predrain_seconds(),
+            0,
+            "{mode:?} has no listener an orchestrator steers traffic at, so the pre-drain window \
+             must stay closed"
+        );
+    }
+}
+
+/// A zero configuration keeps the pre-change behavior in every mode: the
+/// shutdown broadcast fires immediately after the draining verdict.
+#[test]
+fn shutdown_predrain_default_is_zero_in_every_mode() {
+    for mode in [
+        OperatingMode::Database,
+        OperatingMode::File,
+        OperatingMode::ControlPlane,
+        OperatingMode::DataPlane,
+        OperatingMode::Mesh,
+        OperatingMode::Injector,
+        OperatingMode::NodeAgent,
+        OperatingMode::Migrate,
+    ] {
+        let config = EnvConfig {
+            // `OperatingMode` is not `Copy`; clone so the loop variable stays
+            // available for the assertion messages below.
+            mode: mode.clone(),
+            ..EnvConfig::default()
+        };
+        assert_eq!(
+            config.effective_shutdown_predrain_seconds(),
+            0,
+            "{mode:?} must keep the pre-change behavior when the window is unset"
+        );
+    }
+}
+
+/// `main.rs` must resolve the window through the mode gate above rather than
+/// re-deriving it, so the chart contract and the runtime cannot drift apart
+/// again. The signal handler must also publish the draining verdict BEFORE it
+/// sleeps: the whole point of the window is that readiness already reports
+/// `ready:false` while the accept loops stay open.
+#[test]
+fn main_resolves_predrain_through_the_shared_mode_gate() {
+    const MAIN_SOURCE: &str = include_str!("../../../src/main.rs");
+
+    assert!(
+        MAIN_SOURCE.contains("env_config.effective_shutdown_predrain_seconds()"),
+        "main.rs must resolve the pre-drain window through \
+         EnvConfig::effective_shutdown_predrain_seconds"
+    );
+    assert!(
+        !MAIN_SOURCE.contains("let predrain_seconds = match env_config.mode {"),
+        "the mode gate must live in the library (and be covered by these tests), not inline in \
+         the binary target"
+    );
+
+    let announce_at = MAIN_SOURCE
+        .find("overload::announce_shutdown_drain();")
+        .expect("the signal handler must publish the draining verdict");
+    let sleep_at = MAIN_SOURCE
+        .find("tokio::time::sleep(shutdown_predrain).await;")
+        .expect("the signal handler must hold the accept loops open for the window");
+    let broadcast_at = MAIN_SOURCE
+        .find("let _ = shutdown_tx_signal.send(true);")
+        .expect("the signal handler must close the accept loops afterwards");
+    assert!(
+        announce_at < sleep_at && sleep_at < broadcast_at,
+        "readiness must flip to not-ready, then the window elapses, and only then do the accept \
+         loops close"
+    );
+}

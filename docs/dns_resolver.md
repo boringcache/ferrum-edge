@@ -29,6 +29,8 @@ The DNS cache stores **one shared answer row per hostname** (addresses, native T
 
 **Shared-row age eviction:** the hostname row is retained until the longest effective TTL among **policies actually observed** for that hostname elapses, plus `FERRUM_DNS_STALE_TTL`, capped at one day. Explicit-only consumers retain for their longest override even when native TTL is longer; a default (`None`) consumer includes global/native effective policy in that maximum so a shorter explicit peer cannot age-evict data still fresh for the default consumer. Short global/native policies therefore remain reclaimable by `evict_expired` when they were actually observed, instead of pinning every success row to the one-day ceiling.
 
+**IP literals are never success-cache rows.** After per-proxy and global static overrides, a host that parses as `IpAddr` is screened against the backend IP policy and returned immediately. It does not create a cache entry, does not record a DNS hit/miss, and cannot displace a short-TTL FQDN when the cache is over `FERRUM_DNS_CACHE_MAX_SIZE`. Caching literals as 1-day rows inverted that eviction order: Kubernetes/Consul pod-IP churn filled the cache while the hostnames the cache exists to keep warm were trimmed (issue #4293). Warmup skips hosts that parse as IP addresses so publication of discovered pod IPs does not perform literal work; request-time resolve still applies the same egress policy, so skipping warmup is not a policy bypass.
+
 If a caller past its own stale window attempts a synchronous refresh and DNS fails, Ferrum keeps the shared success row for peers whose longer TTL is still fresh. The expired caller observes a bounded cached refresh error before retrying DNS; the failure never replaces a still-usable hostname-wide answer with an error row. That cooldown uses the same exponential backoff as error rows — `FERRUM_DNS_ERROR_TTL` doubling per consecutive refresh failure, capped at `FERRUM_DNS_STALE_TTL` (or 1 day when stale TTL is `0`) — so a hostname whose DNS is down cannot be re-queried at a fixed few-second cadence for the whole retention window of a long-TTL peer. A successful refresh resets the streak.
 
 ## Environment Variables
@@ -160,6 +162,8 @@ On startup, Ferrum Edge resolves all configured hostnames asynchronously before 
 
 Hostnames are **deduplicated** before resolution — if multiple proxies or plugins share the same hostname, only one DNS lookup is performed. When those peers advertise different `dns_cache_ttl_seconds`, warmup uses the **shortest** TTL for initial refresh scheduling and records the longest explicit plus default/global/native policies for shared-row retention. Each peer still evaluates freshness with its own TTL on later resolves (no first-writer-wins). Warmup remains parallel, but concurrency is bounded by `FERRUM_DNS_WARMUP_CONCURRENCY` to avoid unbounded task bursts on very large configs. This ensures no cold-cache DNS lookups on the first request, whether the proxy uses a single backend, a load-balanced upstream pool, or a plugin with an outbound endpoint.
 
+**IP literals are skipped during warmup.** A `backend_host`, upstream target, or discovered service-discovery address that parses as `IpAddr` is not resolved and does not occupy a cache row. Request-time `resolve` still screens the literal against `FERRUM_BACKEND_ALLOW_IPS`, matching per-proxy/global override precedence (overrides still win when present, and remain uncached).
+
 After DNS warmup completes, the gateway optionally **warms connection pools** for all HTTP-family backends (HTTP, HTTPS, gRPC, HTTP/2, HTTP/3) — pre-establishing TCP/TLS/QUIC connections so the first request to each backend avoids handshake latency. This is controlled by `FERRUM_POOL_WARMUP_ENABLED` (default: `true`). See [connection_pooling.md](connection_pooling.md#connection-pool-warmup) for details.
 
 ## Transparent DNS Cache for HTTP Clients
@@ -223,9 +227,10 @@ For each incoming request, DNS resolution follows this priority:
 
 1. **Per-proxy static override** (`dns_override` on the proxy config) — highest priority
 2. **Global static overrides** (`FERRUM_DNS_OVERRIDES`) — checked next
-3. **Cache** (fresh or stale-while-revalidate)
-4. **Hosts file** (system or custom via `FERRUM_DNS_RESOLVER_HOSTS_FILE`)
-5. **DNS query** via configured nameservers — lowest priority
+3. **IP literal** — if the host parses as `IpAddr`, screen it against the backend IP policy and return it without writing a cache row
+4. **Cache** (fresh or stale-while-revalidate)
+5. **Hosts file** (system or custom via `FERRUM_DNS_RESOLVER_HOSTS_FILE`)
+6. **DNS query** via configured nameservers — lowest priority
 
 ## Example Configurations
 

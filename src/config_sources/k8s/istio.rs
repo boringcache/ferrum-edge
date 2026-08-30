@@ -7634,7 +7634,7 @@ mod tests {
     use crate::modes::mesh::access_log_filter::AccessLogFilterExpr;
     use crate::modes::mesh::config::ParsedCidr;
     use crate::modes::mesh::policy::{
-        MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
+        MeshAuthzDecision, MeshAuthzProtocol, MeshAuthzRequest, evaluate_mesh_authorization,
     };
     use crate::modes::mesh::slice::MeshSlice;
 
@@ -18026,6 +18026,7 @@ extensionProviders:
 
         let jwt_only = MeshAuthzRequest {
             request_principal: Some("https://auth.example.com/admin".to_string()),
+            protocol: MeshAuthzProtocol::Http,
             ..MeshAuthzRequest::default()
         };
         assert_eq!(
@@ -18078,6 +18079,7 @@ extensionProviders:
                 SpiffeId::new("spiffe://cluster.local/ns/default/sa/web").expect("spiffe id"),
             ),
             request_principal: Some("https://auth.example.com/admin".to_string()),
+            protocol: MeshAuthzProtocol::Http,
             ..MeshAuthzRequest::default()
         };
         assert_eq!(
@@ -18279,7 +18281,13 @@ extensionProviders:
             ..MeshSlice::default()
         };
 
-        let anon = MeshAuthzRequest::default();
+        // `requestPrincipals` is HTTP-only, so this must be an HTTP-family
+        // request for "anonymous" to mean "no JWT presented" rather than
+        // "the attribute is unreadable on this path".
+        let anon = MeshAuthzRequest {
+            protocol: MeshAuthzProtocol::Http,
+            ..MeshAuthzRequest::default()
+        };
         assert_eq!(
             evaluate_mesh_authorization(&slice, &anon),
             MeshAuthzDecision::Deny {
@@ -18289,6 +18297,7 @@ extensionProviders:
 
         let authed = MeshAuthzRequest {
             request_principal: Some("https://auth.example.com/user".to_string()),
+            protocol: MeshAuthzProtocol::Http,
             ..MeshAuthzRequest::default()
         };
         assert_eq!(
