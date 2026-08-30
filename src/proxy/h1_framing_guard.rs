@@ -129,10 +129,7 @@ impl H1FramingSignals {
         }
 
         let slot = sequence % SIGNAL_CAPACITY;
-        let Some(word) = self
-            .conflict_ring()
-            .get((slot / u64::BITS as u64) as usize)
-        else {
+        let Some(word) = self.conflict_ring().get((slot / u64::BITS as u64) as usize) else {
             self.mark_unknown();
             return false;
         };

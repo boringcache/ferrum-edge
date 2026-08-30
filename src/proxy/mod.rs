@@ -6721,10 +6721,7 @@ fn consume_h1_framing_result(
     version: hyper::Version,
     signals: Option<&h1_framing_guard::H1FramingSignals>,
 ) -> h1_framing_guard::H1FramingResult {
-    if !matches!(
-        version,
-        hyper::Version::HTTP_10 | hyper::Version::HTTP_11
-    ) {
+    if !matches!(version, hyper::Version::HTTP_10 | hyper::Version::HTTP_11) {
         return h1_framing_guard::H1FramingResult::NotObserved;
     }
     match signals {
@@ -13598,10 +13595,8 @@ async fn handle_connection(
         service_admission.mark();
         let state = Arc::clone(&state);
         let addr = remote_addr;
-        let http1_framing_result = consume_h1_framing_result(
-            req.version(),
-            Some(service_h1_framing_signals.as_ref()),
-        );
+        let http1_framing_result =
+            consume_h1_framing_result(req.version(), Some(service_h1_framing_signals.as_ref()));
         let request_method = req.method().clone();
         let response_h1_framing_signals = if matches!(
             req.version(),
@@ -21514,21 +21509,19 @@ async fn handle_tls_connection(
     // requests. ALPN `h2` is already HTTP/2: skip the observer so those
     // connections do not allocate `H1FramingSignals`. Otherwise wrap; the
     // adapter still disables itself if the bytes are an h2c-style preface.
-    let (tls_stream, h1_framing_signals) = if matches!(
-        tls_stream.get_ref().1.alpn_protocol(),
-        Some(b"h2")
-    ) {
-        (
-            h1_framing_guard::MaybeH1FramingGuardIo::passthrough(tls_stream),
-            None,
-        )
-    } else {
-        let (io, signals) = h1_framing_guard::MaybeH1FramingGuardIo::observed(
-            tls_stream,
-            http1_parser_max_buf_size(state.max_header_size_bytes),
-        );
-        (io, Some(signals))
-    };
+    let (tls_stream, h1_framing_signals) =
+        if matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
+            (
+                h1_framing_guard::MaybeH1FramingGuardIo::passthrough(tls_stream),
+                None,
+            )
+        } else {
+            let (io, signals) = h1_framing_guard::MaybeH1FramingGuardIo::observed(
+                tls_stream,
+                http1_parser_max_buf_size(state.max_header_size_bytes),
+            );
+            (io, Some(signals))
+        };
     let io = hyper_util::rt::TokioIo::new(tls_stream);
 
     // Use hyper-util's auto builder which negotiates HTTP/1.1 or HTTP/2 via ALPN.
@@ -21591,10 +21584,8 @@ async fn handle_tls_connection(
         let chain = client_cert_chain_der.clone();
         let mtls_auth_connection_cache = mtls_auth_connection_cache.clone();
         let frontend_sni_hostname = frontend_sni_hostname.clone();
-        let http1_framing_result = consume_h1_framing_result(
-            req.version(),
-            service_h1_framing_signals.as_deref(),
-        );
+        let http1_framing_result =
+            consume_h1_framing_result(req.version(), service_h1_framing_signals.as_deref());
         let request_method = req.method().clone();
         let response_h1_framing_signals = if matches!(
             req.version(),
@@ -28986,8 +28977,8 @@ async fn handle_proxy_request_on_frontend_port(
         h1_framing_guard::H1FramingResult::ObserverFailed
     ) {
         let error_body = r#"{"error":"HTTP/1 request framing could not be verified; connection will be closed"}"#;
-        if let Some(suppressed) = H1_FRAMING_OBSERVER_FAILED_WARN
-            .on_event(crate::socket_opts::monotonic_now_ms())
+        if let Some(suppressed) =
+            H1_FRAMING_OBSERVER_FAILED_WARN.on_event(crate::socket_opts::monotonic_now_ms())
         {
             warn!(
                 framing_observer_state = "unknown_or_overflowed",
