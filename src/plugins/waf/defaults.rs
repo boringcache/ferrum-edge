@@ -7,6 +7,21 @@ use super::rules::{
 /// event handlers so the rule is safe to enforce.
 const EVENT_HANDLER: &str = r"(?i)\bon(?:error|load|click|dblclick|mouseover|mouseout|mousemove|mousedown|mouseup|focus|focusin|blur|submit|change|input|keydown|keyup|keypress|abort|beforeunload|contextmenu|drag|dragstart|dragend|dragover|drop|toggle|wheel|pointerdown|pointerup|pointermove|pointerover|touchstart|touchend|touchmove|animationstart|animationend|transitionend|hashchange|popstate|message|scroll|resize|select|reset|copy|cut|paste)\s*=";
 
+/// Level-1 SQLi signatures shared by query and body rules. Keeping one pattern
+/// per attack shape prevents the body mirrors from drifting broader than the
+/// established query-side false-positive posture.
+const SQLI_UNION_SELECT: &str = r"(?i)\bunion\s+(?:all\s+)?select\b";
+const SQLI_BOOLEAN_TAUTOLOGY: &str =
+    r#"(?i)(?:\bor\b|\|\|)\s+['"]?\d+['"]?\s*=\s*['"]?\d+"#;
+const SQLI_STACKED_STATEMENT: &str = r"(?i);\s*(?:drop|insert|update|delete|alter)\b";
+
+/// High-confidence query prototype-pollution tokens. Query keys and values
+/// each get a rule because they are separate WAF targets; every mirror runs
+/// after bounded query-component decoding.
+const PROTOTYPE_POLLUTION_PROTO: &str = r"(?i)__proto__";
+const PROTOTYPE_POLLUTION_CONSTRUCTOR: &str =
+    r"(?i)constructor\s*(?:\.\s*prototype|\[\s*prototype\s*\])";
+
 /// Cloud-metadata hostname and dotted IPv4 private/loopback/link-local forms
 /// claimed by `FE-SSRF-001` / `FE-SSRF-001-Q`. Body and query share this
 /// pattern so coverage stays in lockstep. IPv6 and alternative textual IP
@@ -19,9 +34,9 @@ const SSRF_DANGEROUS_SCHEME: &str = r"(?i)\b(?:file|gopher|dict|jar|ldap)://";
 
 pub fn default_rules() -> Vec<WafRule> {
     vec![
-        r("FE-SQLI-001", "UNION SELECT SQL injection", "sqli", Severity::High, RuleTarget::QueryValues, r"(?i)\bunion\s+(?:all\s+)?select\b"),
-        r("FE-SQLI-002", "Boolean tautology SQL injection", "sqli", Severity::High, RuleTarget::QueryValues, r#"(?i)(?:\bor\b|\|\|)\s+['"]?\d+['"]?\s*=\s*['"]?\d+"#),
-        r("FE-SQLI-003", "Stacked SQL statement", "sqli", Severity::High, RuleTarget::QueryValues, r"(?i);\s*(?:drop|insert|update|delete|alter)\b"),
+        r("FE-SQLI-001", "UNION SELECT SQL injection", "sqli", Severity::High, RuleTarget::QueryValues, SQLI_UNION_SELECT),
+        r("FE-SQLI-002", "Boolean tautology SQL injection", "sqli", Severity::High, RuleTarget::QueryValues, SQLI_BOOLEAN_TAUTOLOGY),
+        r("FE-SQLI-003", "Stacked SQL statement", "sqli", Severity::High, RuleTarget::QueryValues, SQLI_STACKED_STATEMENT),
         rp("FE-SQLI-004", "SQL comment token", "sqli", Severity::Medium, RuleTarget::QueryValues, r"(?i)(?:--[\s-]|/\*|\*/)", 2),
         r("FE-SQLI-005", "SQLSTATE token", "sqli", Severity::Medium, RuleTarget::BodyText, r"(?i)\bSQLSTATE(?:\[[0-9A-Z]{5}\]|[0-9A-Z]{5})\b"),
         r("FE-NOSQL-001", "NoSQL operator key", "nosqli", Severity::High, RuleTarget::BodyText, r#"(?i)"\$(?:ne|gt|where|regex|exists)"\s*:"#),
@@ -85,6 +100,10 @@ pub fn default_rules() -> Vec<WafRule> {
         // --- Prototype pollution (JS backends) ---
         rp("FE-PROTO-001", "Prototype pollution __proto__ key", "prototype_pollution", Severity::High, RuleTarget::BodyText, r"(?i)__proto__", 1),
         rp("FE-PROTO-002", "Prototype pollution constructor.prototype", "prototype_pollution", Severity::High, RuleTarget::BodyText, r#"(?i)(?:constructor\s*\.\s*prototype|"constructor"\s*:\s*\{)"#, 2),
+        rp("FE-PROTO-001-Q", "Prototype pollution __proto__ (query key)", "prototype_pollution", Severity::High, RuleTarget::QueryKeys, PROTOTYPE_POLLUTION_PROTO, 1),
+        rp("FE-PROTO-002-Q", "Prototype pollution constructor[prototype] (query key)", "prototype_pollution", Severity::High, RuleTarget::QueryKeys, PROTOTYPE_POLLUTION_CONSTRUCTOR, 1),
+        rp("FE-PROTO-001-QV", "Prototype pollution __proto__ (query value)", "prototype_pollution", Severity::High, RuleTarget::QueryValues, PROTOTYPE_POLLUTION_PROTO, 1),
+        rp("FE-PROTO-002-QV", "Prototype pollution constructor[prototype] (query value)", "prototype_pollution", Severity::High, RuleTarget::QueryValues, PROTOTYPE_POLLUTION_CONSTRUCTOR, 1),
         // --- NoSQL bracket-operator injection (form/query encoded) ---
         rp("FE-NOSQL-002", "NoSQL bracket operator", "nosqli", Severity::Medium, RuleTarget::QueryValues, r"(?i)\[\$(?:ne|gt|gte|lt|lte|in|nin|where|regex|exists|or|and)\]", 2),
         // --- Header-borne injection (strong, low-FP signatures only) ---
@@ -97,6 +116,11 @@ pub fn default_rules() -> Vec<WafRule> {
         rp("FE-XSS-002-B", "JavaScript URL (body)", "xss", Severity::High, RuleTarget::BodyText, r"(?i)javascript\s*:", 1),
         rp("FE-XSS-003-Q", "HTML event handler (query)", "xss", Severity::Medium, RuleTarget::QueryValues, EVENT_HANDLER, 1),
         rp("FE-XSS-005-B", "HTML data URL (body)", "xss", Severity::Medium, RuleTarget::BodyText, r"(?i)data\s*:\s*text/html", 1),
+        // --- Level-1 SQLi body/query symmetry. Body mirrors intentionally use
+        // the exact established query patterns above, without broadening. ---
+        rp("FE-SQLI-001-B", "UNION SELECT SQL injection (body)", "sqli", Severity::High, RuleTarget::BodyText, SQLI_UNION_SELECT, 1),
+        rp("FE-SQLI-002-B", "Boolean tautology SQL injection (body)", "sqli", Severity::High, RuleTarget::BodyText, SQLI_BOOLEAN_TAUTOLOGY, 1),
+        rp("FE-SQLI-003-B", "Stacked SQL statement (body)", "sqli", Severity::High, RuleTarget::BodyText, SQLI_STACKED_STATEMENT, 1),
         // --- Traversal / LFI / SSRF parity across body and query ---
         // SSRF query mirrors stay on QueryValues (decoded parameter values),
         // not FullUrl, so a path token like `/v10.1.2.3` is not a substring

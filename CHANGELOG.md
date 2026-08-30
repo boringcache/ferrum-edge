@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The recommended level-1 WAF enforcement posture now blocks SQL injection in
+  admitted request bodies as well as decoded query values, prototype-pollution
+  tokens in decoded query keys and values, and matching payloads carried in
+  declared UTF-16LE/UTF-16BE bodies (issues #4401, #4402, #4403). SQLi body
+  mirrors use the existing query patterns unchanged. UTF-16 transcoding runs
+  only after the existing body content-type, multipart, and binary inspection
+  gates admit the body; those gates are unchanged. **Operator action**: review
+  WAF monitor logs for the new body/query matches before using
+  `default_rule_action: enforce` if application payloads legitimately contain
+  these attack-shaped tokens.
+
 - **BREAKING — `POST /batch` rejects unknown top-level envelope keys**
   (issue #4042). The request is create-only (`consumers`, `upstreams`,
   `proxies`, `plugin_configs`). Sending `updates`, `deletes`, or `dry_run`

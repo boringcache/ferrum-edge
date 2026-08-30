@@ -484,7 +484,9 @@ impl Plugin for WafWsSession {
             .run_body_scan_with_budget(|| {
                 let subject = ScanSubject::WebSocketSession(&self.policy);
                 match governed {
-                    BodyDirection::Request => self.waf.scan_request_body_rules(subject, payload),
+                    BodyDirection::Request => {
+                        self.waf.scan_request_body_rules(subject, payload, None)
+                    }
                     BodyDirection::Response => self.waf.scan_response_body_rules(subject, payload),
                 }
             })

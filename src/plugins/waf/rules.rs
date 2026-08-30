@@ -411,6 +411,10 @@ pub(super) struct CompiledRules {
     pub(super) body_cidr_rules: Vec<usize>,
     pub(super) response_cidr_rules: Vec<usize>,
     pub(super) request_body_rules_active: bool,
+    /// Precomputed cold-path decision for charset transcoding. JSON-path-only
+    /// packs keep their semantic parser path and do not allocate a whole-body
+    /// UTF-8 view that no active rule would consume.
+    pub(super) request_body_text_rules_active: bool,
     pub(super) request_cheap_rules_active: bool,
     pub(super) response_header_rules_active: bool,
     pub(super) response_body_rules_active: bool,
@@ -718,6 +722,7 @@ struct RuleSetBuilders {
     body_cidr_rules: Vec<usize>,
     response_cidr_rules: Vec<usize>,
     request_body_rules_active: bool,
+    request_body_text_rules_active: bool,
     request_cheap_rules_active: bool,
     response_header_rules_active: bool,
     response_body_rules_active: bool,
@@ -726,6 +731,7 @@ struct RuleSetBuilders {
 impl RuleSetBuilders {
     fn add_rule(&mut self, rule_index: usize, rule: &WafRule) -> Result<(), String> {
         self.request_body_rules_active |= rule.target.is_request_body();
+        self.request_body_text_rules_active |= matches!(&rule.target, RuleTarget::BodyText);
         self.request_cheap_rules_active |= rule.target.is_request_cheap();
         self.response_header_rules_active |= rule.target.is_response_header();
         self.response_body_rules_active |= rule.target.is_response_body();
@@ -821,6 +827,7 @@ impl RuleSetBuilders {
             body_cidr_rules: self.body_cidr_rules,
             response_cidr_rules: self.response_cidr_rules,
             request_body_rules_active: self.request_body_rules_active,
+            request_body_text_rules_active: self.request_body_text_rules_active,
             request_cheap_rules_active: self.request_cheap_rules_active,
             response_header_rules_active: self.response_header_rules_active,
             response_body_rules_active: self.response_body_rules_active,

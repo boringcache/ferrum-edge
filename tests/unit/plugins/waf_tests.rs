@@ -11,6 +11,44 @@ fn ctx(method: &str, path: &str) -> RequestContext {
     RequestContext::new("203.0.113.10".into(), method.into(), path.into())
 }
 
+fn recommended_enforcing_waf() -> Waf {
+    Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "paranoia_level": 1
+    }))
+    .unwrap()
+}
+
+fn encode_utf16(text: &str, big_endian: bool) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(text.len().saturating_mul(2));
+    for unit in text.encode_utf16() {
+        let bytes = if big_endian {
+            unit.to_be_bytes()
+        } else {
+            unit.to_le_bytes()
+        };
+        encoded.extend_from_slice(&bytes);
+    }
+    encoded
+}
+
+async fn scan_body_with_content_type(
+    plugin: &Waf,
+    content_type: &str,
+    body: &[u8],
+) -> (PluginResult, RequestContext) {
+    let mut request = ctx("POST", "/waf");
+    request
+        .headers
+        .insert("content-type".into(), content_type.into());
+    let headers = request.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(&mut request, &headers, body)
+        .await;
+    (result, request)
+}
+
 #[tokio::test]
 async fn default_waf_monitors_sqli_query_without_blocking() {
     let plugin = Waf::new(&json!({ "mode": "monitor" })).unwrap();
@@ -2573,6 +2611,173 @@ async fn inspect_multipart_gates_body_scanning() {
         .await;
 
     assert!(matches!(result, PluginResult::Reject { .. }));
+}
+
+#[tokio::test]
+async fn level_one_sqli_blocks_query_and_body_mirrors_without_broadening_union() {
+    let plugin = recommended_enforcing_waf();
+
+    let (text_result, text_ctx) =
+        scan_body_with_content_type(&plugin, "text/plain", b"1 UNION SELECT password").await;
+    assert!(matches!(text_result, PluginResult::Reject { .. }));
+    assert_eq!(
+        text_ctx
+            .metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-SQLI-001-B")
+    );
+
+    let (json_result, json_ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/json",
+        br#"{"q":"1 UNION SELECT password"}"#,
+    )
+    .await;
+    assert!(matches!(json_result, PluginResult::Reject { .. }));
+    assert!(monitored(&json_ctx, "FE-SQLI-001-B"));
+
+    let mut query_ctx = ctx("GET", "/waf");
+    query_ctx.set_raw_query_string("q=1%20UNION%20SELECT%20password".into());
+    let query_result = plugin.authorize(&mut query_ctx).await;
+    assert!(matches!(query_result, PluginResult::Reject { .. }));
+    assert!(monitored(&query_ctx, "FE-SQLI-001"));
+
+    let (benign_result, benign_ctx) = scan_body_with_content_type(
+        &plugin,
+        "text/plain",
+        b"The labor union met yesterday to select its chair.",
+    )
+    .await;
+    assert!(matches!(benign_result, PluginResult::Continue));
+    assert!(!monitored(&benign_ctx, "FE-SQLI-001-B"));
+}
+
+#[tokio::test]
+async fn prototype_pollution_blocks_decoded_query_keys_values_and_json_body() {
+    let plugin = recommended_enforcing_waf();
+
+    let mut proto_key_ctx = ctx("GET", "/waf");
+    proto_key_ctx.set_raw_query_string("__proto__[admin]=true".into());
+    let proto_key_result = plugin.authorize(&mut proto_key_ctx).await;
+    assert!(matches!(proto_key_result, PluginResult::Reject { .. }));
+    assert!(monitored(&proto_key_ctx, "FE-PROTO-001-Q"));
+
+    let mut encoded_key_ctx = ctx("GET", "/waf");
+    encoded_key_ctx.set_raw_query_string("%5F%5Fproto%5F%5F%5Badmin%5D=true".into());
+    let encoded_key_result = plugin.authorize(&mut encoded_key_ctx).await;
+    assert!(matches!(encoded_key_result, PluginResult::Reject { .. }));
+    assert!(monitored(&encoded_key_ctx, "FE-PROTO-001-Q"));
+
+    let mut constructor_key_ctx = ctx("GET", "/waf");
+    constructor_key_ctx.set_raw_query_string("constructor[prototype][x]=1".into());
+    let constructor_key_result = plugin.authorize(&mut constructor_key_ctx).await;
+    assert!(matches!(constructor_key_result, PluginResult::Reject { .. }));
+    assert!(monitored(&constructor_key_ctx, "FE-PROTO-002-Q"));
+
+    let mut proto_value_ctx = ctx("GET", "/waf");
+    proto_value_ctx.set_raw_query_string("field=%5F%5Fproto%5F%5F".into());
+    let proto_value_result = plugin.authorize(&mut proto_value_ctx).await;
+    assert!(matches!(proto_value_result, PluginResult::Reject { .. }));
+    assert!(monitored(&proto_value_ctx, "FE-PROTO-001-QV"));
+
+    let (body_result, body_ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/json",
+        br#"{"__proto__":{"x":1}}"#,
+    )
+    .await;
+    assert!(matches!(body_result, PluginResult::Reject { .. }));
+    assert!(monitored(&body_ctx, "FE-PROTO-001"));
+
+    let mut benign_ctx = ctx("GET", "/waf");
+    benign_ctx.set_raw_query_string("prototype[admin]=true".into());
+    let benign_result = plugin.authorize(&mut benign_ctx).await;
+    assert!(matches!(benign_result, PluginResult::Continue));
+    assert!(!monitored(&benign_ctx, "FE-PROTO-001-Q"));
+}
+
+#[tokio::test]
+async fn utf16_body_rules_block_declared_endianness_and_keep_utf8_coverage() {
+    let plugin = recommended_enforcing_waf();
+    let payload = "http://169.254.169.254/";
+
+    let utf16le = encode_utf16(payload, false);
+    let (le_result, le_ctx) =
+        scan_body_with_content_type(&plugin, "text/plain; charset=utf-16le", &utf16le).await;
+    assert!(matches!(le_result, PluginResult::Reject { .. }));
+    assert!(monitored(&le_ctx, "FE-SSRF-001"));
+
+    let utf16be = encode_utf16(payload, true);
+    let (be_result, be_ctx) =
+        scan_body_with_content_type(&plugin, "text/plain; charset=utf-16be", &utf16be).await;
+    assert!(matches!(be_result, PluginResult::Reject { .. }));
+    assert!(monitored(&be_ctx, "FE-SSRF-001"));
+
+    let (utf8_result, utf8_ctx) =
+        scan_body_with_content_type(&plugin, "text/plain", payload.as_bytes()).await;
+    assert!(matches!(utf8_result, PluginResult::Reject { .. }));
+    assert!(monitored(&utf8_ctx, "FE-SSRF-001"));
+
+    let (benign_result, benign_ctx) = scan_body_with_content_type(
+        &plugin,
+        "text/plain; charset=utf-16le",
+        &encode_utf16("ordinary request body", false),
+    )
+    .await;
+    assert!(matches!(benign_result, PluginResult::Continue));
+    assert!(!monitored(&benign_ctx, "FE-SSRF-001"));
+
+    let mut truncated = encode_utf16(payload, false);
+    truncated.pop();
+    let (truncated_result, truncated_ctx) = scan_body_with_content_type(
+        &plugin,
+        "text/plain; charset=utf-16le",
+        &truncated,
+    )
+    .await;
+    assert!(matches!(truncated_result, PluginResult::Continue));
+    assert!(!monitored(&truncated_ctx, "FE-SSRF-001"));
+}
+
+#[tokio::test]
+async fn utf16_transcoding_does_not_widen_binary_or_multipart_body_gates() {
+    let plugin = recommended_enforcing_waf();
+    let body = encode_utf16("http://169.254.169.254/", false);
+
+    let (binary_result, binary_ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/octet-stream; charset=utf-16le",
+        &body,
+    )
+    .await;
+    assert!(matches!(binary_result, PluginResult::Continue));
+    assert!(!monitored(&binary_ctx, "FE-SSRF-001"));
+
+    let (multipart_result, multipart_ctx) = scan_body_with_content_type(
+        &plugin,
+        "multipart/form-data; boundary=abc; charset=utf-16le",
+        &body,
+    )
+    .await;
+    assert!(matches!(multipart_result, PluginResult::Continue));
+    assert!(!monitored(&multipart_ctx, "FE-SSRF-001"));
+
+    let multipart_plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "paranoia_level": 1,
+        "inspect_multipart": true
+    }))
+    .unwrap();
+    let (opted_in_result, opted_in_ctx) = scan_body_with_content_type(
+        &multipart_plugin,
+        "multipart/form-data; boundary=abc; charset=utf-16le",
+        &body,
+    )
+    .await;
+    assert!(matches!(opted_in_result, PluginResult::Reject { .. }));
+    assert!(monitored(&opted_in_ctx, "FE-SSRF-001"));
 }
 
 #[test]

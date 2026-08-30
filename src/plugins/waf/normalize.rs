@@ -17,6 +17,12 @@ use std::borrow::Cow;
 
 use percent_encoding::percent_decode_str;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Utf16Endian {
+    Little,
+    Big,
+}
+
 /// Maximum number of normalized variants produced per value (excluding the
 /// raw input). Bounds body-scan cost at `O(VARIANTS × bytes × rules)`; the
 /// underlying `RegexSet` matching is linear so this is a hard multiplier.
@@ -77,6 +83,88 @@ pub(super) fn decoded_variants_with_residual(text: &str) -> (Vec<String>, bool) 
         }
     }
     (out, !converged)
+}
+
+/// Decode an already-admitted request body when its representation is UTF-16.
+///
+/// This helper does not decide whether a body is eligible for WAF inspection;
+/// the request content-type/multipart/binary gates run before the scanner. It
+/// only creates the text view used by active request-body rules. Ordinary
+/// UTF-8 bodies return `None` without allocating. UTF-16 output is bounded by
+/// the caller's already-clamped body slice, and malformed/truncated input also
+/// returns `None` so the caller retains its existing lossy raw-byte scan.
+pub(super) fn decode_utf16_body(body: &[u8], content_type: Option<&str>) -> Option<String> {
+    let bom = utf16_bom(body);
+    let declared = declared_utf16_endian(content_type, bom.map(|(endian, _)| endian));
+    let (endian, skip) = match (declared, bom) {
+        (Some(declared), Some((bom_endian, skip))) if declared == bom_endian => (declared, skip),
+        (Some(_), Some(_)) => return None,
+        (Some(declared), None) => (declared, 0),
+        (None, Some((bom_endian, skip))) => (bom_endian, skip),
+        (None, None) => return None,
+    };
+    decode_utf16(&body[skip..], endian)
+}
+
+fn declared_utf16_endian(
+    content_type: Option<&str>,
+    bom_endian: Option<Utf16Endian>,
+) -> Option<Utf16Endian> {
+    let content_type = content_type?;
+    let mut declared = None;
+    for parameter in content_type.split(';').skip(1) {
+        let Some((name, raw_value)) = parameter.split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            continue;
+        }
+        if declared.is_some() {
+            return None;
+        }
+        let value = raw_value.trim().trim_matches('"');
+        declared = if value.eq_ignore_ascii_case("utf-16le")
+            || value.eq_ignore_ascii_case("utf16le")
+        {
+            Some(Utf16Endian::Little)
+        } else if value.eq_ignore_ascii_case("utf-16be")
+            || value.eq_ignore_ascii_case("utf16be")
+            || value.eq_ignore_ascii_case("unicodefffe")
+        {
+            Some(Utf16Endian::Big)
+        } else if value.eq_ignore_ascii_case("utf-16") || value.eq_ignore_ascii_case("utf16") {
+            bom_endian
+        } else {
+            None
+        };
+    }
+    declared
+}
+
+fn utf16_bom(body: &[u8]) -> Option<(Utf16Endian, usize)> {
+    if body.starts_with(&[0xFF, 0xFE]) {
+        Some((Utf16Endian::Little, 2))
+    } else if body.starts_with(&[0xFE, 0xFF]) {
+        Some((Utf16Endian::Big, 2))
+    } else {
+        None
+    }
+}
+
+fn decode_utf16(payload: &[u8], endian: Utf16Endian) -> Option<String> {
+    if !payload.len().is_multiple_of(2) {
+        return None;
+    }
+    // UTF-8 output is at most 3/2 of the UTF-16 wire length.
+    let mut output = String::with_capacity(payload.len().saturating_mul(3) / 2);
+    let units = payload.chunks_exact(2).map(|pair| match endian {
+        Utf16Endian::Little => u16::from_le_bytes([pair[0], pair[1]]),
+        Utf16Endian::Big => u16::from_be_bytes([pair[0], pair[1]]),
+    });
+    for decoded in char::decode_utf16(units) {
+        output.push(decoded.ok()?);
+    }
+    Some(output)
 }
 
 /// Canonical inspection views of one query name or value.
