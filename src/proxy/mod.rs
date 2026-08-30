@@ -29147,9 +29147,7 @@ async fn handle_proxy_request_inner(
     // Protocol-level header validation to prevent request smuggling and desync attacks.
     // Must run before routing because these are transport-level violations that apply
     // regardless of which backend the request would be forwarded to.
-    if let Some(error_body) =
-        check_protocol_headers(req.headers(), req.version(), req.uri())
-    {
+    if let Some(error_body) = check_protocol_headers(req.headers(), req.version(), req.uri()) {
         warn!("Rejected request: {}", error_body);
         record_request(&state, 400);
         return Ok(build_response(StatusCode::BAD_REQUEST, error_body));

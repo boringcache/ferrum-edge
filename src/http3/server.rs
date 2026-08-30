@@ -2264,11 +2264,9 @@ async fn handle_h3_request(
     // HTTP/3 carries authority in `:authority`, but a Host field can still be
     // present during translation. Validate both before routing so backend
     // dispatch cannot key on a different authority than route/plugin checks.
-    if let Some(error_body) = crate::proxy::check_protocol_headers(
-        req.headers(),
-        http::Version::HTTP_3,
-        req.uri(),
-    ) {
+    if let Some(error_body) =
+        crate::proxy::check_protocol_headers(req.headers(), http::Version::HTTP_3, req.uri())
+    {
         warn!("Rejected HTTP/3 request: {}", error_body);
         record_h3_flavor_aware_reject(&state, http_flavor, 400);
         send_h3_error_flavor_aware(
