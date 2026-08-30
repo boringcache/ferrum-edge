@@ -18,6 +18,7 @@
 pub mod acme;
 pub mod backend;
 pub mod client_trust;
+pub mod crl_policy;
 pub mod events;
 pub mod frontend_reload;
 pub mod inventory;
@@ -499,6 +500,14 @@ pub fn load_crls(path: Option<&str>) -> Result<CrlList, anyhow::Error> {
             material.display_source_id
         ));
     }
+
+    // Temporal admission (issue #4297). A record outside its own validity
+    // window refuses the WHOLE candidate: publishing the usable subset of a
+    // multi-CRL source would silently drop revocations the operator declared.
+    // On a live reload this `Err` is what keeps the last accepted generation,
+    // verifier, and sessions in service.
+    crl_policy::validate_crl_windows(&crls, &material.display_source_id)
+        .map_err(|error| anyhow::anyhow!("{}", error))?;
 
     info!(
         "Loaded {} CRL(s) from {} for certificate revocation checking",
@@ -1241,11 +1250,8 @@ pub(crate) fn finish_frontend_server_config_capturing_trust(
 
             let mut verifier_builder =
                 rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
+            verifier_builder = crl_policy::apply_client_crl_policy(verifier_builder, crls);
             if !crls.is_empty() {
-                verifier_builder = verifier_builder
-                    .with_crls(crls.iter().cloned())
-                    .allow_unknown_revocation_status()
-                    .only_check_end_entity_revocation();
                 info!(
                     "Client certificate CRL checking enabled ({} CRL(s))",
                     crls.len()
@@ -1893,12 +1899,7 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
                     verifier_builder = verifier_builder.allow_unauthenticated();
                 }
 
-                if !crls.is_empty() {
-                    verifier_builder = verifier_builder
-                        .with_crls(crls.iter().cloned())
-                        .allow_unknown_revocation_status()
-                        .only_check_end_entity_revocation();
-                }
+                verifier_builder = crl_policy::apply_client_crl_policy(verifier_builder, crls);
 
                 let verifier = verifier_builder.build().map_err(|e| {
                     anyhow::anyhow!("Failed to build mesh client certificate verifier: {}", e)
@@ -2062,8 +2063,9 @@ pub fn backend_client_config_builder(
 /// Build a `WebPkiServerVerifier` with optional CRL checking.
 ///
 /// When CRLs are provided, the verifier rejects certificates that appear in any CRL.
-/// Uses `allow_unknown_revocation_status()` so certificates not covered by any CRL
-/// (e.g., from public CAs without matching CRLs) are still accepted.
+/// Applies the shared [`crl_policy`]: full-chain revocation, enforced CRL
+/// validity windows, and retained tolerance for certificates not covered by any
+/// configured CRL (e.g. public-CA chains with no matching CRL).
 pub fn build_server_verifier_with_crls(
     root_store: rustls::RootCertStore,
     crls: &[CertificateRevocationListDer<'static>],
@@ -2071,15 +2073,9 @@ pub fn build_server_verifier_with_crls(
     // Use the build-selected provider explicitly so this works even when no
     // global CryptoProvider is installed (e.g., in unit/integration tests).
     let provider = Arc::new(crate::fips::base_crypto_provider());
-    let mut builder =
+    let builder =
         rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(root_store), provider);
-    if !crls.is_empty() {
-        builder = builder
-            .with_crls(crls.iter().cloned())
-            .allow_unknown_revocation_status()
-            .only_check_end_entity_revocation();
-    }
-    builder
+    crl_policy::apply_server_crl_policy(builder, crls)
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build server certificate verifier: {}", e))
 }
@@ -2131,9 +2127,9 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 /// Build a client certificate verifier from a CA bundle file.
 /// Used by the HTTP/3 listener to carry forward mTLS from the main TLS config.
 ///
-/// When `crls` is non-empty, CRL revocation checking is enabled with the same
-/// policy used by H1/H2 frontend mTLS and DTLS:
-/// `allow_unknown_revocation_status` + `only_check_end_entity_revocation`.
+/// When `crls` is non-empty, CRL revocation checking is enabled with the shared
+/// policy in [`crl_policy`], the same one used by H1/H2 frontend mTLS, the mesh
+/// operator-CA path, backend server verification, SPIFFE, and DTLS.
 // Verifier-only projection. Production callers need the paired trust identity
 // and use `build_client_cert_verifier_candidate`, so the bin target sees this
 // only from `tests/`.
@@ -2182,11 +2178,8 @@ pub fn build_client_cert_verifier_candidate(
 
     let mut verifier_builder =
         rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
+    verifier_builder = crl_policy::apply_client_crl_policy(verifier_builder, crls);
     if !crls.is_empty() {
-        verifier_builder = verifier_builder
-            .with_crls(crls.iter().cloned())
-            .allow_unknown_revocation_status()
-            .only_check_end_entity_revocation();
         info!(
             "HTTP/3 client certificate CRL checking enabled ({} CRL(s))",
             crls.len()

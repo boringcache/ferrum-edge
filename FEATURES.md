@@ -291,7 +291,7 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
 - Finite bearer authorization leases for ConfigSync, local/cross-cluster native MeshSubscribe, and SotW/delta ADS — streams close at verified JWT expiry, accepted-key removal, or `FERRUM_CP_GRPC_MAX_STREAM_LIFETIME_SECONDS` without heartbeat renewal; fixed-cardinality termination metrics distinguish the cause
 - Opt-in Via header (RFC 9110 §7.6.3) on request and response paths (`FERRUM_ADD_VIA_HEADER`)
 - Opt-in Forwarded header (RFC 7239) alongside X-Forwarded-* (`FERRUM_ADD_FORWARDED_HEADER`); when enabled Ferrum owns the outbound value and discards client-supplied `Forwarded` on every backend transport
-- Certificate Revocation List (CRL) checking across all TLS/DTLS surfaces (`FERRUM_TLS_CRL_FILE_PATH`)
+- Certificate Revocation List (CRL) checking across all TLS/DTLS surfaces (`FERRUM_TLS_CRL_FILE_PATH`) — full-chain revocation including issuing intermediates, enforced CRL validity windows at admission and at handshake time, and retained tolerance for chains no configured CRL covers
 
 ## DNS Caching
 

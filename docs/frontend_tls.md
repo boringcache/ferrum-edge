@@ -461,6 +461,87 @@ curl --cert client.crt --key client.key https://localhost:8443/api/v1
 curl https://localhost:8443/api/v1
 ```
 
+## CRL Policy
+
+`FERRUM_TLS_CRL_FILE_PATH` / `_SOURCE` supplies one PEM file that may hold many
+`-----BEGIN X509 CRL-----` blocks. One policy governs every verifier that
+consumes them — frontend and admin mTLS (HTTP/1.1, HTTP/2, HTTP/3, and TCP+TLS),
+frontend DTLS, the mesh operator-CA and SPIFFE peer verifiers, rustls backend
+server verification on the proxy data path, active HTTPS and gRPC health-check
+probes, and the rustls LDAP / TCP / UDP / WebSocket logging sinks. Across those
+surfaces there is no per-surface CRL setting and no way for one of them to run a
+weaker posture than another. The surfaces the CRL source does not reach at all
+are listed at the end of this section.
+
+### What the verifier enforces
+
+- **Full-chain revocation.** Every certificate in the chain rustls builds is
+  checked, excluding the trust anchor itself. Revoking an issuing intermediate
+  in a CRL signed by its own issuer stops the certificates that intermediate
+  signed; it is not necessary to remove the intermediate's root from the trust
+  bundle to make the revocation take effect.
+- **Unknown revocation status is accepted.** A chain that no configured CRL is
+  authoritative for still verifies. This is deliberate: a configured CRL list is
+  the operator's list of issuers to police, not a completeness claim about every
+  trusted anchor, and refusing uncovered chains would break every public-CA path
+  the moment one private CRL is configured. If you need a chain policed, supply
+  a CRL from its issuer.
+- **CRL validity windows are enforced at handshake time.** A CRL whose
+  `nextUpdate` has passed is an error, not a fallback to "no revocation data".
+  A CRL that expires while the gateway is running therefore stops authorizing
+  **new** handshakes on every surface it is installed on, without a reload and
+  without a restart. Keep the CRL refreshed ahead of its own `nextUpdate`.
+
+### What admission enforces
+
+Every path that loads CRLs — startup, `ferrum-edge validate`, config load, each
+live reload, `POST /admin/tls/validate`, and managed CRL create/update — applies
+the same temporal check before any candidate is published:
+
+| Candidate | Result |
+|-----------|--------|
+| `thisUpdate` in the future | refused, "is not yet valid" |
+| `thisUpdate` exactly now | admitted |
+| `nextUpdate` absent | refused, "omits the required nextUpdate field" |
+| `nextUpdate` in the future | admitted |
+| `nextUpdate` exactly now, or in the past | refused, "has expired" |
+| Not a parseable X.509 CRL | refused |
+
+The boundaries are chosen to match rustls exactly (`now >= nextUpdate` is
+expired), so a CRL that admission accepts is always one the handshake path can
+still use. A missing `nextUpdate` is refused rather than treated as "never
+expires": RFC 5280 §5.1.2.5 requires conforming issuers to emit it, and a record
+that declares no expiry cannot have one enforced.
+
+Admission is **atomic** over the whole source. If any record in a multi-CRL file
+is malformed or outside its validity window, the entire candidate is refused;
+Ferrum never publishes the usable subset, because doing so would silently drop
+revocations the operator declared. At startup that is a hard failure. On a live
+reload the refusal keeps the complete previous generation — verifier, generation
+counter, semantic material, and every established session — in service, and is
+counted as a rejected candidate so the refusal is observable rather than silent.
+
+Refusal diagnostics carry the record index and the already-redacted source
+display id only. CRL contents, issuer names, revoked serials, validity
+timestamps, and secret source URIs are never logged.
+
+### Surfaces CRLs do not reach
+
+CRLs are not applied to DP-to-CP gRPC or to reqwest-based plugin egress; those
+stacks do not expose a compatible CRL configuration. `kafka_logging` uses
+librdkafka/OpenSSL and maps the CRL source to `ssl.crl.location` instead.
+Skip-verify health probes (`backend_tls_verify_server_cert: false` or
+`FERRUM_TLS_NO_VERIFY`) skip CRL enforcement, matching the data-path skip-verify
+contract. TCP and UDP probes perform no TLS handshake and are unaffected.
+
+Verified **HTTPS and gRPC health-check probes** share this policy. They snapshot
+the same admitted `SharedCrlList` generation backend data-path pools use when
+each probe task is spawned. Backend TLS live reload stores a new generation
+first, then restarts probes so replacement tasks load that exact snapshot. A
+refused candidate keeps the previous generation, verifiers, and probe tasks in
+service. See [backend_mtls.md](backend_mtls.md) for the backend-side reload
+contract.
+
 ## Certificate Reload Behavior
 
 Frontend proxy, Admin API, and frontend DTLS cert/key/client-CA/OCSP/CRL sources can opt in to live reload with `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`. Sources supplied as paths or `file://` URIs are polled by material byte fingerprint using `FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS`. Provider URI sources (`vault://`, `aws://`, `azure://`, `gcp://`) are fetched through the matching secret-provider backend and polled with `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` unless the URI includes `?poll=` (for example, `vault://secret/data/edge#cert?poll=60s`). Kubernetes Secret URI sources (`k8s://namespace/secret#key`) also register a Kubernetes watch on the named Secret and queue an immediate reload when cert-manager or another controller updates it; polling remains the fallback and debounce. A `pkcs11://` frontend/admin key source is tracked by stable selector fingerprint so adjacent cert, client-CA, OCSP, and CRL rotations still reload; changing the HSM key behind the same URI requires a config/source change or restart. Each rebuild re-proves that the token key pairs with the rotated leaf certificate, so a rotation onto a mismatched pair fails the rebuild and the previous known-good `ServerConfig` stays published. Inline PEM remains static until config reload. Provider URI sources require the matching secret-provider Cargo feature and use the same credentials/configuration as the existing `_VAULT`, `_AWS`, `_AZURE`, and `_GCP` env-var suffixes.
@@ -477,7 +558,7 @@ Frontend proxy, Admin API, and frontend DTLS cert/key/client-CA/OCSP/CRL sources
 | **Loaded but static** | Inline frontend/admin/DTLS/backend/database/CP-gRPC/DP-gRPC sources |
 | **Gateway SVID rotation** | `FERRUM_GATEWAY_SVID_*_PATH` / `_SOURCE`: file-backed sources are re-read once per second, provider URIs are re-fetched on `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` or the source's `?poll=`, and inline PEM stays static until config reload |
 
-All TLS sources are validated at startup and config load time when their owning runtime is built. Certificate and CA bundles are atomic: Ferrum rejects the complete candidate if any declared `CERTIFICATE` record is malformed or any CA record cannot be admitted as a trust root; it never installs a usable subset. If any configured certificate, key, CA bundle, OCSP response, or CRL source is missing, unreadable, expired, not-yet-valid, mismatched, or contains invalid PEM data where PEM is expected, the gateway refuses to start or rejects the config reload. OCSP response sources must resolve to non-empty DER bytes. There is no silent fallback to unauthenticated or unencrypted connections. Client cert and key sources must always be configured as a pair.
+All TLS sources are validated at startup and config load time when their owning runtime is built. Certificate and CA bundles are atomic: Ferrum rejects the complete candidate if any declared `CERTIFICATE` record is malformed or any CA record cannot be admitted as a trust root; it never installs a usable subset. CRL sources are atomic on the same terms and are additionally checked against their own declared validity window — see [CRL Policy](#crl-policy). If any configured certificate, key, CA bundle, OCSP response, or CRL source is missing, unreadable, expired, not-yet-valid, mismatched, or contains invalid PEM data where PEM is expected, the gateway refuses to start or rejects the config reload. OCSP response sources must resolve to non-empty DER bytes. There is no silent fallback to unauthenticated or unencrypted connections. Client cert and key sources must always be configured as a pair.
 
 Certificate/key PEM parsing is capped at 4 MiB per source and certificate
 bundles at 4096 records. A configured client-CA is still fully admitted when a
@@ -694,28 +775,26 @@ A refused candidate keeps the previous verifier, the previous generation, the
 previous semantic material, and every live session, and is counted as a rejected
 candidate so the refusal is observable rather than silent.
 
-##### Revoking an intermediate CA does not stop its leaves
+##### Revoking an intermediate CA stops the leaves it issued
 
-Ferrum's client-certificate verifier is built with rustls's
-`only_check_end_entity_revocation()`, so CRL checking applies to the **leaf**
-certificate a client presents and not to the intermediates above it. The
-semantic identity above, however, summarizes *every* revoked serial in every
-CRL, because a CRL entry is an issuer key plus a serial number and carries
-nothing that distinguishes an end-entity serial from a CA serial.
+Revocation is checked on **every non-trust-anchor certificate in the built
+chain**, not only on the leaf a client presents. Revoking an intermediate CA in
+a CRL its issuer signed therefore retires the scope's established
+client-certificate sessions *and* refuses their reconnect: the retirement and
+the enforcement agree.
 
-The consequence is visible and easy to misread. Adding a CRL entry that revokes
-an **intermediate CA** advances the generation, retires every
-client-certificate-authenticated session in the scope, and produces a reconnect
-storm — and then every one of those clients reconnects **successfully**, because
-the verifier never checks revocation above the leaf. The retirement is real; the
-revocation is not enforced.
+The semantic identity above is still a superset of what the verifier rejects. It
+summarizes *every* revoked serial in every CRL, because a CRL entry is an issuer
+key plus a serial number and carries nothing that distinguishes an end-entity
+serial from a CA serial. An entry naming a serial that no presented chain
+contains therefore still retires sessions. That direction is the fail-closed
+one: it can only end sessions that would have survived, never keep alive a
+session that should have ended.
 
-Retiring on the broader set is the fail-closed direction: it can only end
-sessions that would have survived, never keep alive a session that should have
-ended. To actually revoke an intermediate, remove that intermediate (or its
-issuing root) from the client-CA bundle. That is a trust-anchor change, it is
-enforced on every subsequent handshake, and it shows up in the table above as
-"CA **removed** from the bundle".
+Removing the intermediate (or its issuing root) from the client-CA bundle
+remains available and is still the broader instrument — it invalidates every
+chain terminating at that anchor, including branches a CRL does not name. It
+shows up in the table above as "CA **removed** from the bundle".
 
 #### Retirement scope
 

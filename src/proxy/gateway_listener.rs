@@ -1436,6 +1436,11 @@ impl GatewayListenerManager {
                             shutdown_rx,
                             None,
                             Some(mesh_direction),
+                            // Dedicated Gateway/ingress binds listen on an
+                            // operator-chosen address, not on a capture
+                            // wildcard fed by REDIRECT rules, so they keep the
+                            // host's default V6ONLY posture.
+                            false,
                             Some(started_tx),
                         )
                         .await

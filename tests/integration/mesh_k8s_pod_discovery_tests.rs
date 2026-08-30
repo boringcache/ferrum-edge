@@ -377,6 +377,110 @@ fn k8s_pod_discovery_resolves_node_waypoint_downward_api_spiffe_id() {
 }
 
 #[test]
+fn k8s_pod_discovery_attaches_node_waypoint_metadata_to_identity_only_sources() {
+    // Live NodeWaypoint same-node Service allow: src-a is a captured client
+    // with a ServiceAccount and no Service. Issue #4274's per-assertor grant
+    // is derived from Workload.node_waypoint bindings, so identity-only
+    // sources must carry the same per-node SVID as service-backed destinations.
+    let waypoint_spiffe = "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/node-a";
+    let source_spiffe = "spiffe://cluster.local/ns/default/sa/frontend";
+    let dest_spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+    let mut source = object(
+        "Pod",
+        "default",
+        "frontend-v1",
+        json!({
+            "serviceAccountName": "frontend",
+            "nodeName": "node-a",
+            "containers": [{"name": "curl"}]
+        }),
+    );
+    source.metadata.uid = "frontend-pod-uid".to_string();
+    source
+        .metadata
+        .labels
+        .insert("app".to_string(), "frontend".to_string());
+    source.status = json!({
+        "phase": "Running",
+        "podIP": "10.1.0.20",
+        "conditions": [{"type": "Ready", "status": "True"}]
+    });
+
+    let translation = translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            source,
+            node_waypoint_pod_with_spiffe("node-a", "192.0.2.10", true, 15008, waypoint_spiffe),
+        ],
+        options(),
+    )
+    .expect("K8s core translation succeeds");
+
+    let mesh = translation.config.mesh.as_ref().expect("mesh config");
+    let source_workload = mesh
+        .workloads
+        .iter()
+        .find(|workload| {
+            workload.namespace == "default"
+                && workload.service_account.as_deref() == Some("frontend")
+                && workload.addresses.is_empty()
+        })
+        .expect("identity-only frontend source");
+    assert_eq!(source_workload.spiffe_id.as_str(), source_spiffe);
+    let source_node_waypoint = source_workload
+        .node_waypoint
+        .as_ref()
+        .expect("identity-only source must carry NodeWaypoint metadata");
+    assert_eq!(source_node_waypoint.spiffe_id.as_str(), waypoint_spiffe);
+    assert_eq!(source_node_waypoint.node_name.as_deref(), Some("node-a"));
+
+    let dest_workload = mesh
+        .workloads
+        .iter()
+        .find(|workload| workload.namespace == "default" && workload.service_name == "reviews")
+        .expect("reviews workload");
+    assert_eq!(
+        dest_workload
+            .node_waypoint
+            .as_ref()
+            .map(|endpoint| endpoint.spiffe_id.as_str()),
+        Some(waypoint_spiffe)
+    );
+
+    // NodeWaypoint subscribes in its own mesh namespace; assertor inventory
+    // is derived before that narrowing so the destination still trusts the
+    // source identities this NodeWaypoint fronts.
+    let slice = MeshSlice::from_gateway_config(
+        &translation.config,
+        MeshSliceRequest {
+            node_id: waypoint_spiffe.to_string(),
+            namespace: "ferrum-system".to_string(),
+            workload_spiffe_id: Some(waypoint_spiffe.to_string()),
+            ..MeshSliceRequest::default()
+        },
+    );
+    assert!(
+        slice
+            .workloads
+            .iter()
+            .all(|workload| workload.namespace == "ferrum-system"),
+        "visible routing workloads remain the NodeWaypoint subscription namespace"
+    );
+    assert_eq!(slice.node_waypoint_assertors.len(), 1);
+    let assertor = &slice.node_waypoint_assertors[0];
+    assert_eq!(assertor.spiffe_id.as_str(), waypoint_spiffe);
+    let asserted: Vec<&str> = assertor.asserts.iter().map(|id| id.as_str()).collect();
+    assert_eq!(
+        asserted,
+        vec![source_spiffe, dest_spiffe],
+        "per-assertor inventory must include identity-only sources and service-backed destinations"
+    );
+}
+
+#[test]
 fn k8s_pod_discovery_does_not_recursively_expand_node_waypoint_spiffe_env() {
     let mut waypoint = node_waypoint_pod("node-a", "192.0.2.10", true, 15008);
     push_pod_env(
