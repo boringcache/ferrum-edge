@@ -7915,6 +7915,7 @@ async fn compaction_refuses_while_admitted_and_succeeds_after_drain() {
 }
 
 #[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn compaction_refuses_while_overflow_delivery_can_stage_back() {
     use ferrum_edge::_test_support::{
         api_chargeback_sink_compact_refuses_while_overflow_delivery_for_test,
