@@ -48,8 +48,8 @@ use super::utils::ai_usage_stream::{
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::rate_limit::{
     AiRateLimitOp, AiTokenRateAlgorithm, ENFORCEMENT_UNAVAILABLE_BODY,
-    ENFORCEMENT_UNAVAILABLE_STATUS, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
-    RateLimitOutcome, ReservationBackend, STANDALONE_RATE_LIMIT_CONFIG_ID,
+    ENFORCEMENT_UNAVAILABLE_STATUS, LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS,
+    RateLimitBackend, RateLimitOutcome, ReservationBackend, STANDALONE_RATE_LIMIT_CONFIG_ID,
     apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
     validate_window_seconds,
 };
@@ -379,6 +379,28 @@ impl AiRateLimiter {
         http_client: PluginHttpClient,
         config_id: &str,
     ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, None, config_id)
+    }
+
+    /// Construct with local enforcement state shared across compatible
+    /// plugin-cache generations for the stable `(namespace, plugin kind,
+    /// plugin-config id)` policy identity. See
+    /// [`super::utils::rate_limit::RateLimitBackend::from_plugin_config_with_policy_identity`].
+    pub fn new_with_policy_identity(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, Some(namespace), config_id)
+    }
+
+    fn from_parts(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: Option<&str>,
+        config_id: &str,
+    ) -> Result<Self, String> {
         let object = config
             .as_object()
             .ok_or_else(|| "ai_rate_limiter: config must be an object".to_string())?;
@@ -470,19 +492,41 @@ impl AiRateLimiter {
 
         // Scope the ENTIRE per-request reservation lifecycle to THIS limiter
         // instance via a process-unique id, not to a budget-config fingerprint.
-        // Each instance owns its own token window (a separate in-memory map for
-        // the local backend, or a distinct `redis_key_prefix` for the centralized
-        // backend), so its reserved estimate, reservation id, Redis window index,
-        // inferred backend, AI classification, unmetered action, release
-        // idempotency, and exposed telemetry must all be per instance too. A
-        // config-derived key would be shared by two limiters with identical
+        // Two instances routinely enforce on SEPARATE token windows: a different
+        // plugin-config policy identity, a semantically changed generation, and an
+        // identityless (config-validation / direct) construction each own their own
+        // in-memory map, and a distinct `redis_key_prefix` owns its own centralized
+        // window. This instance's reserved estimate, reservation id, Redis window
+        // index, inferred backend, AI classification, unmetered action, release
+        // idempotency, and exposed telemetry must therefore all be per instance
+        // too. A config-derived key would be shared by two limiters with identical
         // budget config that are nonetheless SEPARATE budgets (e.g. different
-        // `sync_mode`/`redis_key_prefix`, or just two local instances): the first
-        // to run would overwrite the second's reservation state and its release
-        // would suppress the sibling's, under-counting one window and
+        // `sync_mode`/`redis_key_prefix`, or two distinct plugin-config policies):
+        // the first to run would overwrite the second's reservation state and its
+        // release would suppress the sibling's, under-counting one window and
         // over-counting the other — contradicting the documented per-instance
-        // accounting contract (GHSA-wh4p-pmxm-3784).
+        // accounting contract (GHSA-wh4p-pmxm-3784). Per-instance scoping is still
+        // required where two COMPATIBLE plugin-cache generations for one policy
+        // identity DO share a token window (issue #4268): reservation ids are then
+        // drawn from that single shared window so they cannot collide, and a
+        // retired generation must reconcile only the reservations it took.
         let instance_id = INSTANCE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        // Effective enforcement semantics, not raw syntax: the algorithm
+        // parameters after defaulting (`window_seconds` omitted is 60), the
+        // parsed limit dimension and count mode, the trimmed/lower-cased
+        // provider (omitted is `auto`), and the parsed unmetered-response
+        // action (omitted is `charge_estimate`) — all of which decide which
+        // tokens are charged. `expose_headers` is response presentation only
+        // and never resets a live budget; the shared Redis posture is added by
+        // the backend.
+        let mut semantics = LocalStateSemantics::new();
+        semantics.u64("token_limit", token_limit);
+        semantics.u64("window_seconds", window_seconds);
+        semantics.text("count_mode", &count_mode);
+        semantics.text("limit_by", &limit_by);
+        semantics.text("provider", &provider);
+        semantics.text("on_unmetered_response", on_unmetered_response.as_str());
 
         Ok(Self {
             token_limit,
@@ -496,17 +540,29 @@ impl AiRateLimiter {
             instance_id,
             keys: InstanceKeys::new(instance_id),
             stream_usage_handoff_key: allocate_response_stream_handoff_id(),
-            limiter: RateLimitBackend::from_plugin_config_with_config_id(
+            limiter: RateLimitBackend::from_plugin_config_with_policy_identity(
                 "ai_rate_limiter",
+                namespace,
                 config_id,
                 config,
                 &http_client,
                 AiTokenRateAlgorithm::new(token_limit, window_seconds),
+                &semantics,
             )?,
             request_counter: AtomicU64::new(0),
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
         })
+    }
+
+    /// Whether this instance enforces on the same live local state as `other`.
+    ///
+    /// A compatible reload generation for one policy identity must share; an
+    /// unrelated policy, tenant, plugin kind, or semantically changed policy
+    /// must not. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn shares_local_state_with(&self, other: &Self) -> bool {
+        self.limiter.shares_local_state_with(&other.limiter)
     }
 
     /// Local/fallback DashMap shard count. Test-only; not a production API.
