@@ -613,9 +613,10 @@ fn mongo_timeout_overrides_preserve_uri_unless_env_explicit() {
 
 #[test]
 fn replace_api_spec_metadata_shortcut_checks_matched_count() {
-    // Issue #2989: the hash-unchanged metadata-only shortcut must verify the
+    // Issue #2989 / #4285: the hash-unchanged metadata-only shortcut must verify the
     // `replace_one` (no upsert) matched a document before reporting success, so
-    // a spec raced away by a concurrent DELETE surfaces an error, not a 200.
+    // a spec raced away by a concurrent DELETE (or a dangling api_spec_id without
+    // an api_specs document) surfaces an error, not a 200.
     let replace = mongo_method("replace_api_spec_bundle(");
     let shortcut = replace
         .find("Only update metadata fields on the spec doc")

@@ -1326,6 +1326,25 @@ fn sidecar_udp_capture_active(config: &InjectorConfig) -> bool {
         && config.capture_mode == CaptureMode::Iptables
 }
 
+/// Whether this pod's rendered capture plan actually installs `ip6tables`
+/// REDIRECT rules, so the sidecar must plan an IPv6-capable TCP capture
+/// listener (issue #4271).
+///
+/// Gated on `CaptureMode::Iptables` for the same reason
+/// [`sidecar_udp_capture_active`] is: the netfilter rules come from the iptables
+/// init container, which `build_sidecar_patch_for_namespace` only adds in that
+/// mode, so no other mode can produce the IPv6 REDIRECTs this flag describes.
+///
+/// A `capture_config` error resolves to `false` here rather than being
+/// propagated: the same call inside [`init_container`] fails the whole
+/// admission, so the sidecar env is never rendered from a config this rejects.
+fn sidecar_capture_ipv6_active(config: &InjectorConfig, pod: &Value) -> bool {
+    config.capture_mode == CaptureMode::Iptables
+        && capture_config(config, pod)
+            .map(|capture| !IptablesPlan::for_config(&capture).v6_commands.is_empty())
+            .unwrap_or(false)
+}
+
 fn sidecar_env(config: &InjectorConfig, pod: &Value, namespace: &str) -> Vec<Value> {
     let mut env = vec![
         json!({"name": "FERRUM_MODE", "value": "mesh"}),
@@ -1351,6 +1370,16 @@ fn sidecar_env(config: &InjectorConfig, pod: &Value, namespace: &str) -> Vec<Val
             "name": "FERRUM_MESH_TPROXY_MARK",
             "value": config.tproxy_mark.to_string()
         }));
+    }
+    // Tell the sidecar which address families its capture listeners must serve
+    // (issue #4271). The init container emits `ip6tables` REDIRECT rules
+    // whenever the pod's resolved capture scope carries an IPv6 CIDR; without
+    // this signal the runtime would bind an IPv4-only listener and every
+    // captured IPv6 connection would be refused with `ECONNREFUSED` while the
+    // pod reports ready. Derived from the SAME rendered plan the init container
+    // runs, so producer and consumer cannot disagree.
+    if sidecar_capture_ipv6_active(config, pod) {
+        env.push(json!({"name": "FERRUM_MESH_CAPTURE_IPV6_ENABLED", "value": "true"}));
     }
     env.extend(
         config
