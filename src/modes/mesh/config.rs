@@ -4631,11 +4631,14 @@ pub struct MeshConfig {
     ///   bound services' namespaces), not per-binding.
     ///
     /// `Sidecar` / `Ambient` ALSO set
-    /// [`Self::inbound_relay_admits_accepted_local_address`], because the pod
-    /// IP the peer actually reached is a transport fact no inventory is needed
-    /// for. `EastWestGateway` (SNI passthrough) and `EgressGateway` (external
-    /// ServiceEntry destinations, admitted by their own allowlists) leave both
-    /// unset.
+    /// [`Self::inbound_relay_admits_accepted_local_address`], because a
+    /// non-loopback accepted local address is a transport fact no inventory is
+    /// needed for. Only `Sidecar` sets
+    /// [`Self::inbound_relay_admits_loopback_namespace`]: it shares the
+    /// application pod's network namespace. `Ambient` is node-shared and runs
+    /// outside that pod, so the same names would reach the host. `EastWestGateway`
+    /// (SNI passthrough) and `EgressGateway` (external ServiceEntry destinations,
+    /// admitted by their own allowlists) leave every relay privilege unset.
     ///
     /// **Fail closed by construction.** Assigned UNCONDITIONALLY on every mesh
     /// apply, so an empty vector admits no non-local destination and a withdrawn
@@ -4645,18 +4648,34 @@ pub struct MeshConfig {
     /// relay into, bypassing that workload's own inbound policy.
     #[serde(skip)]
     pub inbound_relay_destinations: Vec<MeshInboundRelayDestination>,
-    /// Runtime-only marker for the inbound CONNECT terminators that serve their
-    /// own workload identity (`Sidecar` / `Ambient`), set on every mesh apply
-    /// (issue #4150).
+    /// Runtime-only marker for inbound CONNECT terminators that may treat the
+    /// accepted connection's own local address as a destination (`Sidecar` /
+    /// `Ambient`), set on every mesh apply (issue #4150).
     ///
-    /// When true, the accepted connection's own local address is an admissible
-    /// relay destination: the peer provably reached the pod it named, on this
-    /// socket, so the destination IS this terminator. The port is still bounded
-    /// by the workload record(s) the slice declares FOR THAT ADDRESS, never by
-    /// some other workload's ports. False for every topology that runs outside
-    /// the destination pod's own network namespace.
+    /// When true, a **non-loopback** accepted local address is an admissible
+    /// relay destination: the peer provably reached that address on this
+    /// socket. The port is still bounded by the workload record(s) the slice
+    /// declares FOR THAT ADDRESS, never by some other workload's ports. This
+    /// is independent of [`Self::inbound_relay_admits_loopback_namespace`].
+    /// False for waypoint and gateway topologies: their accepted local address
+    /// is the waypoint/node/gateway itself, not a workload they terminate for.
     #[serde(skip)]
     pub inbound_relay_admits_accepted_local_address: bool,
+    /// Runtime-only Sidecar own-network-namespace loopback shortcut, set on
+    /// every mesh apply. Default false: fail closed until topology assignment.
+    ///
+    /// When true, `127.0.0.1`, `::1`, IPv4-mapped IPv6 loopback
+    /// (`::ffff:127.0.0.1`), `localhost`, and names in `.localhost` are
+    /// admissible on a port this pod's own workload record declares. Sidecar
+    /// shares the application pod's network namespace, so those names reach the
+    /// co-located workload. False for `Ambient`, `NodeWaypoint`,
+    /// `ServiceWaypoint`, and both gateway topologies: they run outside the
+    /// destination pod's network namespace, so the same names would reach the
+    /// host/terminator namespace instead. Inventory entries cannot override
+    /// this refusal, including a declared hostname that later resolves to
+    /// loopback.
+    #[serde(skip)]
+    pub inbound_relay_admits_loopback_namespace: bool,
 }
 
 /// One destination the authenticated inbound CONNECT terminator may relay to,
@@ -4684,7 +4703,8 @@ pub struct MeshInboundRelayDestination {
 /// the terminator's OWN inventory: a name is compared verbatim and is NEVER
 /// resolved here, so nothing is admitted that this proxy's inventory does not
 /// already name. Resolution stays where it belongs — after admission, on the
-/// dial path.
+/// dial path — where [`MeshConfig::screen_inbound_relay_resolved_ips`] drops
+/// loopback answers unless this terminator admits that namespace.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MeshInboundRelayHost {
     /// Canonicalized IP literal (IPv4-mapped IPv6 folded to IPv4), so the two
@@ -4833,6 +4853,45 @@ pub enum SidecarIngressConnectRelay {
     },
 }
 
+/// Whether a concrete resolved address is in the loopback namespace the
+/// ordinary inbound HBONE relay must not dial unless the terminator shares
+/// the destination pod's network namespace.
+///
+/// Canonicalization covers `127.0.0.0/8`, `::1`, and IPv4-mapped IPv6
+/// loopback (`::ffff:127.0.0.1`). Rust treats the mapped form as IPv6, so a
+/// raw `IpAddr::is_loopback()` is false; folding first matches the later
+/// dial of `127.0.0.1`. Ordinary mapped non-loopback (`::ffff:10.1.2.3`)
+/// stays non-loopback.
+pub fn inbound_relay_resolved_ip_is_loopback_namespace(ip: std::net::IpAddr) -> bool {
+    ip.to_canonical().is_loopback()
+}
+
+/// Whether `host` is in the reserved DNS `localhost` namespace or is a loopback
+/// IP literal, including IPv4-mapped IPv6 loopback (`::ffff:127.0.0.1`).
+/// Case-insensitive; a trailing root dot is ignored. Allocation-free and never
+/// resolves DNS.
+///
+/// Mapped addresses are classified after `IpAddr::to_canonical()`: Rust treats
+/// `::ffff:127.0.0.1` as IPv6, so a raw `IpAddr::is_loopback()` is false, but
+/// the later relay arms canonicalize it to `127.0.0.1`. Folding first keeps
+/// that form in the loopback-namespace arm and out of accepted-local-address
+/// and inventory matching. Ordinary mapped non-loopback (`::ffff:10.1.2.3`)
+/// stays non-loopback so canonical equivalence is preserved there.
+fn inbound_relay_host_is_loopback_namespace(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    const LOCALHOST_SUFFIX: &str = ".localhost";
+    if host.eq_ignore_ascii_case("localhost")
+        || (host.len() > LOCALHOST_SUFFIX.len()
+            && host
+                .get(host.len() - LOCALHOST_SUFFIX.len()..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(LOCALHOST_SUFFIX)))
+    {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(inbound_relay_resolved_ip_is_loopback_namespace)
+}
+
 impl MeshConfig {
     /// Whether an authenticated inbound CONNECT to `host:port` may be
     /// transparently relayed by THIS terminator (issue #4150), and why not when
@@ -4846,21 +4905,23 @@ impl MeshConfig {
     ///
     /// Admissible sources, in order:
     ///
-    /// 1. **The accepted connection's own local address** (`Sidecar` /
-    ///    `Ambient`, gated on
+    /// 1. **The accepted connection's own non-loopback local address**
+    ///    (`Sidecar` / `Ambient`, gated on
     ///    [`Self::inbound_relay_admits_accepted_local_address`]). The peer
-    ///    provably reached this pod at the address it named — a transport fact
-    ///    the peer cannot choose. The port is still bounded by the workload
-    ///    record(s) the slice declares FOR THAT ADDRESS.
-    /// 2. **Loopback** (`127.0.0.1` / `::1` / `localhost`) as an
-    ///    own-namespace shortcut, admissible only for those same own-pod
-    ///    terminators and only on a port this pod's own workload record
-    ///    declares. A `NodeWaypoint` / `ServiceWaypoint` does not get that
-    ///    shortcut — they run outside the destination pods' network
-    ///    namespaces — but they MAY still relay to loopback when that
-    ///    address is itself in [`Self::inbound_relay_destinations`] (the
-    ///    functional waypoint suite declares `127.0.0.1` as the workload
-    ///    address).
+    ///    provably reached this terminator at the address it named — a
+    ///    transport fact the peer cannot choose. The port is still bounded by
+    ///    the workload record(s) the slice declares FOR THAT ADDRESS.
+    /// 2. **Loopback** (`127.0.0.1` / `::1` / IPv4-mapped IPv6 loopback /
+    ///    the DNS `localhost` namespace) as an own-network-namespace shortcut,
+    ///    gated on [`Self::inbound_relay_admits_loopback_namespace`]
+    ///    (`Sidecar` only) and only on a port this pod's own workload record
+    ///    declares. `Ambient` is node-shared and runs outside the destination
+    ///    pod's network namespace, so the same names would reach the
+    ///    Ambient/host namespace rather than that pod — even when the accepted
+    ///    socket's local address is a non-loopback pod IP, and even when
+    ///    loopback appears in [`Self::inbound_relay_destinations`].
+    ///    `NodeWaypoint` / `ServiceWaypoint` / the gateway topologies are
+    ///    refused for the same namespace reason.
     /// 3. **[`Self::inbound_relay_destinations`]** — the deliberate, narrow
     ///    multi-destination allowance for the topologies that are MEANT to
     ///    terminate for a workload other than the pod the proxy runs in
@@ -4869,7 +4930,10 @@ impl MeshConfig {
     ///    An entry is matched by IP when the authority is an IP literal and by
     ///    verbatim (case-insensitive) name when it is not; a name is never
     ///    resolved here, so this cannot reach anything the inventory does not
-    ///    itself declare.
+    ///    itself declare. Loopback/DNS-localhost authorities never fall through
+    ///    to this inventory. A non-reserved declared hostname may still resolve
+    ///    to loopback later; [`Self::screen_inbound_relay_resolved_ips`] enforces
+    ///    the same namespace boundary on concrete DNS answers before dial.
     ///
     /// Everything else fails closed, including a slice-declared workload owned
     /// by a different node. Hot path: no allocation, no lock, and no scan of
@@ -4884,9 +4948,9 @@ impl MeshConfig {
         if host.is_empty() || port == 0 {
             return Err(InboundRelayDenial::UnresolvableHost);
         }
-        // Only an own-pod terminator may treat its socket's local address as a
-        // relay destination; on every other topology the local address is the
-        // waypoint/node itself, not a workload it terminates for.
+        // Sidecar and Ambient may treat a non-loopback accepted local address
+        // as a relay destination; on waypoint/gateway topologies the local
+        // address is the terminator itself, not a workload it terminates for.
         let own_address = terminator_local_ip
             .filter(|_| self.inbound_relay_admits_accepted_local_address)
             .map(|ip| ip.to_canonical());
@@ -4908,23 +4972,23 @@ impl MeshConfig {
             return Err(InboundRelayDenial::UnresolvableHost);
         }
 
-        if candidate.eq_ignore_ascii_case("localhost") || parsed.is_some_and(|ip| ip.is_loopback())
-        {
-            if let Some(own_address) = own_address {
+        if inbound_relay_host_is_loopback_namespace(candidate) {
+            // Sidecar alone shares the application pod's network namespace.
+            // Ambient, waypoints, and gateways dial from a different netns, so
+            // loopback — including IPv4-mapped `::ffff:127.0.0.1`, which
+            // canonicalizes to `127.0.0.1` — would hit the terminator/host.
+            // Never fall through to inventory, even when the accepted local
+            // address is a non-loopback pod IP.
+            if self.inbound_relay_admits_loopback_namespace
+                && let Some(own_address) = own_address
+            {
                 return if self.workload_declares_address_port(own_address, port) {
                     Ok(())
                 } else {
                     Err(InboundRelayDenial::PortNotDeclared)
                 };
             }
-            if parsed.is_none() {
-                // `localhost` is a resolver alias, never a declared workload
-                // address, so a terminator without the own-namespace shortcut
-                // has nothing to match it against.
-                return Err(InboundRelayDenial::AddressNotTerminated);
-            }
-            // Fall through: a waypoint/node may still terminate for
-            // 127.0.0.1 / ::1 when that address is in its inventory.
+            return Err(InboundRelayDenial::AddressNotTerminated);
         }
 
         // Canonicalize so `::ffff:10.1.2.3` and `10.1.2.3`, and the several
@@ -4943,6 +5007,63 @@ impl MeshConfig {
         }
 
         self.inbound_relay_inventory_decision(candidate, address, port)
+    }
+
+    /// Screen DNS answers for the ordinary inbound HBONE relay before any
+    /// TCP or UDP socket opens.
+    ///
+    /// The authority-level guard matches declared names without resolving
+    /// them. A `WorkloadEntry` hostname (or a rebinding DNS answer) can
+    /// still resolve to loopback after admission. When
+    /// [`Self::inbound_relay_admits_loopback_namespace`] is false, every
+    /// loopback answer is dropped using
+    /// [`inbound_relay_resolved_ip_is_loopback_namespace`]. Mixed answers
+    /// keep only the non-loopback addresses, in the iterator's order. An
+    /// empty remainder fails closed as [`InboundRelayDenial::AddressNotTerminated`].
+    ///
+    /// Sidecar (the flag true) returns `Ok(None)` without walking the
+    /// answers: the terminator shares the pod namespace, so a resolved
+    /// loopback on a declared application port is legitimate. Callers must
+    /// still skip this screen for Sidecar `ingress[]` remaps and for the
+    /// separately authorized EgressGateway external-UDP path.
+    ///
+    /// `Ok(None)` means dial the original answer set. `Ok(Some(ips))` means
+    /// dial only `ips`. Sidecar (flag true) and an all-safe answer set allocate
+    /// nothing; a `Vec` is built only when mixed answers must be filtered.
+    pub fn screen_inbound_relay_resolved_ips<I>(
+        &self,
+        ips: I,
+    ) -> Result<Option<Vec<std::net::IpAddr>>, InboundRelayDenial>
+    where
+        I: IntoIterator<Item = std::net::IpAddr>,
+        I::IntoIter: Clone,
+    {
+        if self.inbound_relay_admits_loopback_namespace {
+            return Ok(None);
+        }
+        let ips = ips.into_iter();
+        let mut any_safe = false;
+        let mut any_loopback = false;
+        for ip in ips.clone() {
+            if inbound_relay_resolved_ip_is_loopback_namespace(ip) {
+                any_loopback = true;
+            } else {
+                any_safe = true;
+            }
+            if any_safe && any_loopback {
+                break;
+            }
+        }
+        if !any_safe {
+            return Err(InboundRelayDenial::AddressNotTerminated);
+        }
+        if !any_loopback {
+            return Ok(None);
+        }
+        Ok(Some(
+            ips.filter(|ip| !inbound_relay_resolved_ip_is_loopback_namespace(*ip))
+                .collect(),
+        ))
     }
 
     /// Match `host` (already bracket-stripped; `address` is its canonical IP
@@ -5250,6 +5371,7 @@ impl Default for MeshConfig {
             external_udp_egress_routes: Vec::new(),
             inbound_relay_destinations: Vec::new(),
             inbound_relay_admits_accepted_local_address: false,
+            inbound_relay_admits_loopback_namespace: false,
         }
     }
 }
