@@ -37,8 +37,8 @@ Retry logic applies to the following proxy protocols:
 | HTTP/3 (QUIC) | Yes | Full retry support with body replay |
 | gRPC / gRPCs | Yes | Connection failure retries with body replay and upstream target rotation |
 | WebSocket / WSS | Yes | Connection failure retries on initial backend connection with upstream target rotation |
-| TCP / TCP+TLS | No | Stream-based protocol, no request/response retry semantics |
-| UDP / DTLS | No | Datagram-based protocol, application-level retry responsibility |
+| TCP / TCP+TLS | Yes (connect-phase only) | Target rotation on connection-setup failures when `retry_on_connect_failure` is enabled and `upstream_id` is set; no mid-stream byte replay. See [Load Balancing — Retry Logic](load_balancing.md#retry-logic). |
+| UDP / DTLS | No | Datagram-based protocol, no connect-phase retry or target rotation |
 
 HTTP-family protocols (HTTP/1.1, HTTP/2, HTTP/3) share the same retry loop in the proxy core and support both connection failure and HTTP status code retries.
 
@@ -51,6 +51,8 @@ A client `grpc-timeout` is anchored once at request receipt into an absolute mon
 WebSocket retries handle connection-level failures during the initial backend connection attempt (before the upgrade response — 101 Switching Protocols for HTTP/1.1, 200 OK for HTTP/2 Extended CONNECT). Once the WebSocket connection is established, retries no longer apply — the bidirectional stream is managed by the application layer.
 
 Ambient HBONE WebSocket establishment shares one `backend_connect_timeout_ms` budget from before byte-tunnel acquisition through the inner HTTP/1.1 101 response. A timeout of an unknown tunnel phase, and a timeout of the inner upgrade wait (the RFC 6455 request is written before awaiting 101), classify as reached-wire protocol failures (`HbonePoolError::ConnectStream`) and are not retried under `retry_on_connect_failure`.
+
+TCP and TCP+TLS stream proxies retry only during connection setup. When a `retry` block has `retry_on_connect_failure: true` (the default) and the proxy uses an `upstream_id`, connect-phase failures — DNS resolution errors, circuit-breaker-open targets, `maxConnections` rejections, and backend TCP or TLS handshake failures — can rotate to a different upstream target via the endpoint-lane exclude contract (`select_next_target_*_excluding_endpoint_lane_from`). `max_retries` caps how many additional connect attempts run after the first; backoff between attempts honors the configured `backoff` strategy. Once the backend connection is established and the bidirectional relay begins, no further retries are possible because application bytes may already have been exchanged. HTTP status-code retries and `retryable_methods` do not apply to stream proxies. Proxies without an `upstream_id` do not rotate on TCP connect failure — there is no alternate target to select. See [Load Balancing — Retry Logic](load_balancing.md#retry-logic) for the shared rotation semantics.
 
 ## Configuration
 
