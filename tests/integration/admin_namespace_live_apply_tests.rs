@@ -5,7 +5,10 @@
 //! resource rows into or out of the served namespace. Those mutations must not
 //! answer 2xx before the poll loop accepts a covering `config_changes`
 //! generation, and must fail closed with #3926's redacted reason taxonomy when
-//! it cannot. The mutations that write no change record at all — a
+//! it cannot. Tests that park a mutation on poll acceptance poll for the
+//! covering watermark to be written before asserting the response is still
+//! withheld, so the commit precondition is observed rather than assumed from a
+//! fixed sleep. The mutations that write no change record at all — a
 //! registry-only `POST`, a description-only `PUT`, an unconfirmed `DELETE` —
 //! must never wait, because `latest_change_sequence` is a namespace-wide `MAX`
 //! and waiting on it would block them behind an unrelated concurrent writer.
@@ -29,9 +32,6 @@ use tempfile::TempDir;
 
 const JWT_SECRET: &str = "test-secret-key-for-namespace-live-apply";
 const JWT_ISSUER: &str = "test-ferrum-edge";
-/// Long enough that a genuinely blocked request is unambiguous, short enough
-/// that the suite stays fast. Never used as the success path's only signal.
-const SETTLE: Duration = Duration::from_millis(300);
 
 /// A live-apply budget chosen so it can never fire in these tests.
 ///
@@ -42,8 +42,9 @@ const SETTLE: Duration = Duration::from_millis(300);
 /// and it sets its own 200ms budget explicitly.
 ///
 /// It used to be 30s, which a heavily loaded runner can beat: the task can be
-/// starved between the `SETTLE` sleep and the call that drives the outcome, and
-/// the request then answers `reload_timeout` instead of the expected reason.
+/// starved between observing the parked mutation and the call that drives the
+/// outcome, and the request then answers `reload_timeout` instead of the expected
+/// reason.
 /// Observed on PR #4121 (`Integration Tests (admin-platform)`), where the job
 /// recorded 30.42s for `rename_into_served_namespace_fails_closed_on_rejection`
 /// and got `reload_timeout` where `config_rejected` was required — on a PR that
@@ -262,15 +263,13 @@ async fn rename_into_served_namespace_waits_for_poll_acceptance() {
         "/namespaces/tenant-a",
         Some(json!({"name": "served"})),
     );
-    tokio::time::sleep(SETTLE).await;
+    // The rename committed even though the response is withheld: the covering
+    // watermark is readable and the resources already moved.
+    let covering = covering_watermark(&fx.store, "served").await;
     assert!(
         !handle.is_finished(),
         "a rename into the served namespace must not answer before the poll loop accepts it"
     );
-
-    // The rename committed even though the response is withheld: the covering
-    // watermark is readable and the resources already moved.
-    let covering = watermark(&fx.store, "served").await;
     assert!(covering >= 1, "rename must write upsert tombstones");
 
     fx.apply.record_accepted(covering);
@@ -290,10 +289,8 @@ async fn rename_into_served_namespace_fails_closed_on_rejection() {
         "/namespaces/tenant-a",
         Some(json!({"name": "served"})),
     );
-    tokio::time::sleep(SETTLE).await;
+    let covering = covering_watermark(&fx.store, "served").await;
     assert!(!handle.is_finished(), "rename must still be waiting");
-
-    let covering = watermark(&fx.store, "served").await;
     fx.apply.record_rejected(covering);
 
     let (status, body) = handle.await.expect("rename task");
@@ -333,8 +330,6 @@ async fn waiting_rename_releases_the_registry_admission_lease() {
         "/namespaces/tenant-a",
         Some(json!({"name": "served"})),
     );
-    tokio::time::sleep(SETTLE).await;
-    assert!(!rename.is_finished(), "rename must be parked on the wait");
 
     // Every registry mutation takes the SAME global admission lease first. A
     // create that completes proves the waiting rename is not holding it — the
@@ -352,7 +347,8 @@ async fn waiting_rename_releases_the_registry_admission_lease() {
     .expect("a concurrent create must not block behind the parked rename");
     assert_eq!(status, 201, "{body}");
 
-    let covering = watermark(&fx.store, "served").await;
+    let covering = covering_watermark(&fx.store, "served").await;
+    assert!(!rename.is_finished(), "rename must be parked on the wait");
     fx.apply.record_accepted(covering);
     let (status, body) = rename.await.expect("rename task");
     assert_eq!(status, 200, "{body}");
@@ -455,13 +451,11 @@ async fn confirmed_cascade_delete_of_the_served_namespace_waits() {
         "/namespaces/served?confirm=true",
         None,
     );
-    tokio::time::sleep(SETTLE).await;
+    let covering = covering_watermark(&store, "served").await;
     assert!(
         !handle.is_finished(),
         "a confirmed cascade of the served namespace must wait for poll acceptance"
     );
-
-    let covering = watermark(&store, "served").await;
     apply.record_accepted(covering);
     let (status, body) = handle.await.expect("delete task");
     assert_eq!(status, 204, "{body}");
@@ -534,4 +528,38 @@ async fn seed_config_change(store: &DatabaseStore, namespace: &str) {
 async fn watermark(store: &DatabaseStore, namespace: &str) -> u64 {
     let sequence = store.latest_change_sequence(namespace).await;
     sequence.expect("covering watermark")
+}
+
+/// Waits until the parked mutation has durably written a covering change
+/// record, then returns that watermark.
+///
+/// `!handle.is_finished()` alone cannot distinguish "committed and parked on
+/// poll acceptance" from "has not committed yet" — a loaded runner can leave
+/// the request short of the commit for longer than any fixed sleep. Polling
+/// for the watermark makes that precondition observable instead of assumed.
+///
+/// The deadline is generous enough that it can never fire on a merely-slow
+/// runner (same reasoning as [`NEVER_FIRES`]): a genuinely wedged coordinator
+/// that never commits must still fail, and fail legibly. Sixty seconds is far
+/// outside any plausible commit stall while still bounding a wedged writer.
+async fn covering_watermark(store: &DatabaseStore, namespace: &str) -> u64 {
+    const POLL: Duration = Duration::from_millis(10);
+    const DEADLINE: Duration = Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        let sequence = store
+            .latest_change_sequence(namespace)
+            .await
+            .expect("latest_change_sequence");
+        if sequence >= 1 {
+            return sequence;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "namespace {namespace}: covering config_changes record was never written \
+                 within {DEADLINE:?}"
+            );
+        }
+        tokio::time::sleep(POLL).await;
+    }
 }
