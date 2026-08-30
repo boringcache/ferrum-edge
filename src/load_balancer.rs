@@ -845,9 +845,10 @@ pub struct HealthContext<'a> {
     pub proxy_passive: Option<Arc<ProxyHealthState>>,
     /// Maximum percentage of targets (0-100) that may be ejected simultaneously
     /// via passive health checks. When the ejection count would exceed
-    /// `ceil(total * pct / 100)`, the earliest passive ejections are re-admitted
-    /// to keep the effective ejection count within
-    /// the cap. `None` = no cap (default behavior).
+    /// Envoy's integer percentage gate, the earliest passive ejections are
+    /// re-admitted to keep the effective ejection count within the cap. This
+    /// includes allowing zero ejections for small pools. `None` = no cap
+    /// (default behavior).
     pub max_ejection_percent: Option<u8>,
 }
 
@@ -863,12 +864,16 @@ fn passive_ejections_to_readmit(
         return 0;
     }
 
-    // ceil(n * pct / 100) — at least 0, at most n.
+    // Envoy admits a prospective ejection when
+    // `(currently_ejected + 1) * 100 / host_count <= max_ejection_percent`.
+    // The largest retained count satisfying that integer gate is
+    // `floor((n * (pct + 1) - 1) / 100)`; unlike `floor(n * pct / 100)`, this
+    // also preserves boundary cases such as one of three hosts at 33%.
     let max_ejected = ((total_targets as u64)
-        .saturating_mul(max_pct as u64)
-        .saturating_add(99))
-        / 100;
-    let max_ejected = (max_ejected as usize).min(total_targets);
+        .saturating_mul(u64::from(max_pct).saturating_add(1))
+        .saturating_sub(1)
+        / 100) as usize;
+    let max_ejected = max_ejected.min(total_targets);
     if passive_ejected.len() <= max_ejected {
         return 0;
     }

@@ -65,9 +65,9 @@ The test runs in 10 batches. Each batch:
    - 3,000 proxies (unique listen paths `/svc/0` through `/svc/29999`), sent in chunks of 100
    - 6,000 plugin configs (key_auth + access_control per proxy), sent in chunks of 100
    - All proxies route to the same echo backend
-2. Waits for the DB poller to load the new config
-3. Verifies a sample proxy is routable with its consumer's key
-4. Runs a **30-second load test** with 50 concurrent workers hitting all accumulated proxies round-robin, each request authenticated with the correct API key
+2. Waits for the highest deferred-apply cursor to be accepted by the poller
+3. Proves end-to-end data-plane convergence across the oldest proxy and the first, middle, and last proxies in the new batch
+4. Runs a **complete 30-second load test** with 50 concurrent workers hitting all accumulated proxies round-robin, each request authenticated with the correct API key. A route-miss 404 ends and discards the partial window, re-runs the bounded convergence gate, and restarts the full window once; a second interrupted window fails as convergence instability rather than being reported as a routing-throughput regression.
 
 After all 10 batches, a summary table is printed comparing RPS and latency percentiles across each scale point (3k, 6k, 9k, ... 30k).
 
@@ -161,6 +161,6 @@ Batch API creation speed: ~3,200-3,900 resources/s (vs ~5-116/s with individual 
 
 - **RPS % of baseline**: How current throughput compares to the first batch (3k proxies). Ideally stays above 70%.
 - **Latency growth**: Small increases in avg/p50 are expected. Large jumps in p99/max may indicate lock contention or cache rebuild overhead.
-- **Failed requests**: A small number of failures during config reloads is acceptable. The test asserts success rate stays above 50% (a very conservative floor).
+- **Failed requests**: Route-miss 404s are convergence signals, not throughput samples: the harness discards one interrupted window and restarts only after convergence is proved again. A second interruption fails loudly as convergence instability. Other request failures remain in the completed window, whose success rate must stay above 50%.
 - **Creation speed (resources/s)**: With the batch API, expect 3,000-5,500+ resources/s on SQLite, potentially higher on PostgreSQL. Compare against the baseline of ~5-100/s with individual API calls.
 - **Throughput degradation > 70%**: The test prints a warning. This would indicate a scaling issue in the router, plugin cache, or consumer index.

@@ -876,30 +876,23 @@ fn authorization_policy_status(
                     .and_then(Value::as_array)
                     .map(|v| v.len())
                     .unwrap_or(0);
-                let target_refs = object
-                    .spec
-                    .get("targetRefs")
-                    .and_then(Value::as_array)
-                    .map(|refs| {
-                        refs.iter()
-                            .filter_map(|entry| {
-                                let kind = entry.get("kind")?.as_str()?;
-                                let name = entry.get("name")?.as_str()?;
-                                let group =
-                                    entry.get("group").and_then(Value::as_str).unwrap_or("");
-                                Some(json!({
-                                    "group": group,
-                                    "kind": kind,
-                                    "name": name,
-                                    "namespace": entry
-                                        .get("namespace")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or(&object.metadata.namespace),
-                                }))
-                            })
-                            .collect::<Vec<_>>()
+                let target_refs = declared_target_ref_entries(&object.spec)
+                    .into_iter()
+                    .filter_map(|entry| {
+                        let kind = entry.get("kind")?.as_str()?;
+                        let name = entry.get("name")?.as_str()?;
+                        let group = entry.get("group").and_then(Value::as_str).unwrap_or("");
+                        Some(json!({
+                            "group": group,
+                            "kind": kind,
+                            "name": name,
+                            "namespace": entry
+                                .get("namespace")
+                                .and_then(Value::as_str)
+                                .unwrap_or(&object.metadata.namespace),
+                        }))
                     })
-                    .unwrap_or_default();
+                    .collect::<Vec<_>>();
                 let message = if target_refs.is_empty() {
                     format!("Ferrum accepted this AuthorizationPolicy ({rule_count} rule(s))")
                 } else {
@@ -1052,6 +1045,7 @@ fn destination_rule_status(
                 deferred.push(DEFERRED_SUBSET_PORT_LEVEL_SETTINGS);
             }
             deferred.extend(deferred_locality_lb_fields(&object.spec));
+            deferred.extend(deferred_outlier_detection_fields(&object.spec));
             let message = if deferred.is_empty() {
                 format!("Ferrum accepted this DestinationRule (host: {host})")
             } else {
@@ -1195,6 +1189,69 @@ fn has_failover_priority(locality: &Value) -> bool {
         .get("failoverPriority")
         .and_then(Value::as_array)
         .is_some_and(|entries| !entries.is_empty())
+}
+
+/// `outlierDetection` fields the translator parses past but never applies
+/// (issue #4292), across top-level, `portLevelSettings`, and subset policies.
+///
+/// Kept in sync with `DEFERRED_OUTLIER_DETECTION_FIELDS` in
+/// `src/config_sources/k8s/istio.rs`. Labels name the FIELD only, never the
+/// operator's configured value.
+fn deferred_outlier_detection_fields(spec: &Value) -> Vec<&'static str> {
+    let has_field = |field: &str| {
+        outlier_detection_blocks(spec)
+            .into_iter()
+            .any(|block| block.get(field).is_some())
+    };
+    let mut deferred = Vec::new();
+    if has_field("consecutiveGatewayErrors") {
+        deferred.push(
+            "trafficPolicy.outlierDetection.consecutiveGatewayErrors (not applied: gateway-error \
+             ejection is not tracked separately from consecutive5xxErrors)",
+        );
+    }
+    if has_field("consecutiveLocalOriginFailures") {
+        deferred.push(
+            "trafficPolicy.outlierDetection.consecutiveLocalOriginFailures (not applied: \
+             local-origin failures are not counted in a separate bucket)",
+        );
+    }
+    if has_field("minHealthPercent") {
+        deferred.push(
+            "trafficPolicy.outlierDetection.minHealthPercent (not applied: ejection is bounded by \
+             maxEjectionPercent only)",
+        );
+    }
+    deferred
+}
+
+/// Every `outlierDetection` block in a DestinationRule spec: top-level,
+/// per-port, per-subset, and per-subset-per-port.
+fn outlier_detection_blocks(spec: &Value) -> Vec<&Value> {
+    fn push_policy<'a>(policy: Option<&'a Value>, policies: &mut Vec<&'a Value>) {
+        let Some(policy) = policy else {
+            return;
+        };
+        policies.push(policy);
+        if let Some(ports) = policy.get("portLevelSettings").and_then(Value::as_array) {
+            policies.extend(ports.iter());
+        }
+    }
+
+    let mut policies: Vec<&Value> = Vec::new();
+    push_policy(spec.get("trafficPolicy"), &mut policies);
+    for subset in spec
+        .get("subsets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        push_policy(subset.get("trafficPolicy"), &mut policies);
+    }
+    policies
+        .into_iter()
+        .filter_map(|policy| policy.get("outlierDetection"))
+        .collect()
 }
 
 /// Collect the deferred `connectionPool.http.*` field labels.
@@ -1386,6 +1443,32 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
              (not projected; use the cors plugin)",
         );
     }
+    // `http[].headers.{request,response}.{set,add,remove}` IS translated onto
+    // the emitted `mesh_route_dispatch` rules and consumed by the auto-attached
+    // request/response transformer instances (issue #4304), so it is not
+    // deferred. Per-DESTINATION `http[].route[].headers` is translated only for
+    // a single-destination route: a weighted split materializes one upstream
+    // with weighted targets, so there is no per-destination rule to carry the
+    // transform and applying it would hit every share of the split.
+    if http_routes.is_some_and(|routes| {
+        routes.iter().any(|route| {
+            route
+                .get("route")
+                .and_then(Value::as_array)
+                .is_some_and(|destinations| {
+                    destinations.len() > 1
+                        && destinations
+                            .iter()
+                            .any(|destination| destination.get("headers").is_some())
+                })
+        })
+    }) {
+        deferred.push(
+            "http[].route[].headers on a weighted multi-destination route \
+             (not projected; per-destination transforms cannot be bound to one \
+             share of a weighted split — move them to http[].headers)",
+        );
+    }
     deferred
 }
 
@@ -1544,19 +1627,35 @@ fn request_authentication_status(
         .and_then(Value::as_array)
         .map(|v| v.len())
         .unwrap_or(0);
+    // COUNT only (issue #4305). A rejected targetRef(s) attachment must be
+    // visible without republishing the referenced resource identities into a
+    // cluster-readable status block.
+    let declared_target_refs = declared_target_ref_count(&object.spec);
 
     match result {
         Ok(_translation) => {
-            let message = format!(
-                "Ferrum accepted this RequestAuthentication (scope: {scope}; {jwt_rule_count} JWT rule(s); \
-                 permissive by default — a request with no JWT passes, an invalid JWT is rejected, \
-                 require a JWT via AuthorizationPolicy)"
-            );
+            let deferred = request_authentication_deferred_fields(&object.spec);
+            let message = if deferred.is_empty() {
+                format!(
+                    "Ferrum accepted this RequestAuthentication (scope: {scope}; {jwt_rule_count} JWT rule(s); \
+                     permissive by default — a request with no JWT passes, an invalid JWT is rejected, \
+                     require a JWT via AuthorizationPolicy)"
+                )
+            } else {
+                format!(
+                    "Ferrum accepted this RequestAuthentication (scope: {scope}; {jwt_rule_count} JWT rule(s); \
+                     permissive by default — a request with no JWT passes, an invalid JWT is rejected, \
+                     require a JWT via AuthorizationPolicy); deferred fields: {}",
+                    deferred.join(", ")
+                )
+            };
             let detail = json!({
                 "translation": {
                     "scope": scope,
                     "jwt_rules": jwt_rule_count,
                     "enforcement": "permissive",
+                    "deferred_fields": deferred,
+                    "target_refs_declared": declared_target_refs,
                 }
             });
             accepted_status(object, true, "Accepted", &message, Some(detail))
@@ -1567,12 +1666,50 @@ fn request_authentication_status(
                 "translation": {
                     "scope": scope,
                     "jwt_rules": jwt_rule_count,
+                    "target_refs_declared": declared_target_refs,
                     "error": format!("{error}"),
                 }
             });
             accepted_status(object, false, "Invalid", &message, Some(detail))
         }
     }
+}
+
+/// `RequestAuthentication.jwtRules[]` fields Ferrum recognizes but does not
+/// enforce (issue #4277).
+///
+/// `outputClaimToHeaders` is NOT here — it is translated onto
+/// `MeshJwtRule.output_claim_to_headers` and enforced by the injected
+/// `jwks_auth` plugin (declared headers are stripped from every inbound
+/// request and re-asserted only from a validated claim).
+///
+/// Labels name the FIELD only. A value is never echoed: a `fromCookies` entry
+/// names the cookie a token rides in, and repeating it into a cluster-readable
+/// status object would publish a credential location beside the issuer.
+fn request_authentication_deferred_fields(spec: &Value) -> Vec<&'static str> {
+    let mut deferred: Vec<&'static str> = Vec::new();
+    let rules = spec.get("jwtRules").and_then(Value::as_array);
+    let any_rule_has = |field: &str| {
+        rules.is_some_and(|rules| {
+            rules.iter().any(|rule| {
+                rule.get(field)
+                    .is_some_and(|value| value.as_array().is_none_or(|list| !list.is_empty()))
+            })
+        })
+    };
+    if any_rule_has("outputPayloadToHeader") {
+        deferred.push(
+            "jwtRules[].outputPayloadToHeader (not applied: the base64 token payload is not \
+             published to a backend header; use outputClaimToHeaders)",
+        );
+    }
+    if any_rule_has("fromCookies") {
+        deferred.push(
+            "jwtRules[].fromCookies (not applied: cookie-borne token extraction is unsupported; \
+             use fromHeaders or fromParams)",
+        );
+    }
+    deferred
 }
 
 /// Status for `WorkloadEntry`. Reports the derived SPIFFE service-account
@@ -2068,6 +2205,9 @@ fn telemetry_status(
         .and_then(Value::as_array)
         .is_some_and(|v| !v.is_empty());
 
+    // COUNT only — see `request_authentication_status` (issue #4305).
+    let declared_target_refs = declared_target_ref_count(&object.spec);
+
     let mut sections: Vec<&'static str> = Vec::new();
     if has_tracing {
         sections.push("tracing");
@@ -2093,6 +2233,7 @@ fn telemetry_status(
             let detail = json!({
                 "translation": {
                     "sections": sections,
+                    "target_refs_declared": declared_target_refs,
                 }
             });
             accepted_status(object, true, "Accepted", &message, Some(detail))
@@ -2102,6 +2243,7 @@ fn telemetry_status(
             let detail = json!({
                 "translation": {
                     "sections": sections,
+                    "target_refs_declared": declared_target_refs,
                     "error": format!("{error}"),
                 }
             });
@@ -2192,6 +2334,29 @@ fn proxy_config_status(
             accepted_status(object, false, "Invalid", &message, Some(detail))
         }
     }
+}
+
+/// Declared `spec.targetRef` / `spec.targetRefs` entries, with no interpretation.
+fn declared_target_ref_entries(spec: &Value) -> Vec<&Value> {
+    let mut entries = Vec::new();
+    if let Some(entry) = spec.get("targetRef") {
+        entries.push(entry);
+    }
+    if let Some(target_refs) = spec.get("targetRefs").and_then(Value::as_array) {
+        entries.extend(target_refs);
+    }
+    entries
+}
+
+/// Number of declared `spec.targetRef` / `spec.targetRefs` entries, with NO
+/// resource identities.
+///
+/// `RequestAuthentication` / `Telemetry` reject either target-reference form (issue
+/// #4305) rather than widening to namespace/mesh scope; the count is what makes
+/// the refusal legible in `kubectl describe` without republishing the target
+/// group/kind/name/namespace into a cluster-readable object.
+fn declared_target_ref_count(spec: &Value) -> usize {
+    declared_target_ref_entries(spec).len()
 }
 
 /// Resolve the Istio policy scope label for selector-driven CRDs

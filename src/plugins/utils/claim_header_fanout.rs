@@ -1,12 +1,19 @@
 use std::collections::HashMap;
 
-use http::header::HeaderName;
+use http::header::{HeaderName, HeaderValue};
 use serde_json::{Map, Value};
 
 use crate::plugins::RequestContext;
 
 use super::auth_attempt::AuthenticationAttempt;
 use super::claim_resolver::{parse_claim_path_value, resolve_claim_path};
+
+/// Keep direct plugin configuration on the same bounded surface as Istio
+/// `outputClaimToHeaders` translation.
+pub const MAX_OUTPUT_CLAIM_HEADERS: usize = 16;
+pub const MAX_OUTPUT_CLAIM_HEADER_NAME_LEN: usize = 128;
+pub const MAX_OUTPUT_CLAIM_PATH_LEN: usize = 256;
+pub const MAX_OUTPUT_CLAIM_VALUE_LEN: usize = 8 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ClaimHeaderMapping {
@@ -108,6 +115,152 @@ pub fn parse_claim_headers(
         });
     }
     Ok(mappings)
+}
+
+/// Parse the ARRAY form of a claim → header mapping list.
+///
+/// Istio `RequestAuthentication.jwtRules[].outputClaimToHeaders` is an ordered
+/// LIST of `{header, claim}` pairs, not a claim-keyed map: the same claim may
+/// legitimately be published to two different headers. An object shape
+/// (`parse_claim_headers`) cannot express that, so the mesh projection carries
+/// the list shape and this parser resolves it into the same
+/// [`ClaimHeaderMapping`] the object form produces.
+///
+/// Two entries naming the SAME destination header are rejected rather than
+/// resolved by declaration order: both would derive the same metadata key, so
+/// whichever claim happened to resolve last would decide the gateway-asserted
+/// value. A configuration whose meaning depends on that is refused at load.
+pub fn parse_claim_header_list(
+    config: &Map<String, Value>,
+    field: &str,
+    plugin: &str,
+    metadata_prefix: &str,
+) -> Result<Vec<ClaimHeaderMapping>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(Vec::new());
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| format!("{plugin}: '{field}' must be an array, got: {value}"))?;
+    if entries.len() > MAX_OUTPUT_CLAIM_HEADERS {
+        return Err(format!(
+            "{plugin}: '{field}' supports at most {MAX_OUTPUT_CLAIM_HEADERS} entries"
+        ));
+    }
+    let mut mappings: Vec<ClaimHeaderMapping> = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let object = entry
+            .as_object()
+            .ok_or_else(|| format!("{plugin}: '{field}[{index}]' must be an object"))?;
+        for key in object.keys() {
+            if key != "claim" && key != "header" {
+                return Err(format!(
+                    "{plugin}: '{field}[{index}]' does not support field '{key}'"
+                ));
+            }
+        }
+        let claim_value = object
+            .get("claim")
+            .ok_or_else(|| format!("{plugin}: '{field}[{index}].claim' is required"))?;
+        let claim_path =
+            parse_claim_path_value(&format!("{field}[{index}].claim"), claim_value, plugin)?;
+        if claim_path.len() > MAX_OUTPUT_CLAIM_PATH_LEN
+            || claim_path
+                .chars()
+                .any(|character| character.is_control() || character.is_whitespace())
+        {
+            return Err(format!(
+                "{plugin}: '{field}[{index}].claim' must be at most \
+                 {MAX_OUTPUT_CLAIM_PATH_LEN} bytes and contain no whitespace or control characters"
+            ));
+        }
+        let raw_header = object
+            .get("header")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{plugin}: '{field}[{index}].header' must be a string"))?;
+        let header_name = normalize_allowed_header(raw_header, plugin, field)?;
+        if header_name.len() > MAX_OUTPUT_CLAIM_HEADER_NAME_LEN {
+            return Err(format!(
+                "{plugin}: '{field}[{index}].header' must be at most \
+                 {MAX_OUTPUT_CLAIM_HEADER_NAME_LEN} bytes"
+            ));
+        }
+        if is_output_claim_reserved_header(&header_name) {
+            return Err(format!(
+                "{plugin}: '{field}' cannot target framing, provenance, credential-bearing, \
+                 or gateway-reserved header '{header_name}'"
+            ));
+        }
+        if mappings
+            .iter()
+            .any(|mapping| mapping.destination_header == header_name)
+        {
+            return Err(format!(
+                "{plugin}: '{field}' declares header '{header_name}' more than once; \
+                 a destination may be asserted from exactly one claim"
+            ));
+        }
+        mappings.push(ClaimHeaderMapping {
+            metadata_key: format!("{metadata_prefix}{header_name}"),
+            claim_path,
+            destination_header: header_name,
+        });
+    }
+    Ok(mappings)
+}
+
+/// Stage the values for an `outputClaimToHeaders`-style mapping list.
+///
+/// Differs from [`emit_claim_headers_to_attempt`] only in the value
+/// conversion: Istio `ClaimToHeader` publishes nonblank string, integer, and
+/// boolean claims only. Arrays, objects, null, floating-point / non-integer
+/// numbers, blank strings, and header-illegal values leave the destination
+/// absent. The destination was already stripped of any client-supplied value by
+/// [`apply_claim_headers_from_context`].
+pub fn emit_output_claim_headers_to_attempt(
+    attempt: &mut AuthenticationAttempt,
+    claims: &Value,
+    mappings: &[ClaimHeaderMapping],
+    _separator: &str,
+) {
+    for mapping in mappings {
+        let Some(value) = output_claim_value_for_header(claims, &mapping.claim_path) else {
+            continue;
+        };
+        attempt.stage_claim_header(mapping.metadata_key.clone(), value);
+    }
+}
+
+/// Render one claim as an output-header value, or `None` when it cannot be
+/// represented under Istio `ClaimToHeader` semantics. Never logs or returns
+/// the claim value on refusal.
+fn output_claim_value_for_header(claims: &Value, claim_path: &str) -> Option<String> {
+    let rendered = render_istio_output_claim(resolve_claim_path(claims, claim_path)?)?;
+    if rendered.trim().is_empty() {
+        return None;
+    }
+    // One validated token may fan a claim out to every configured destination.
+    // Bound each published value before staging clones it up to 16 times.
+    if rendered.len() > MAX_OUTPUT_CLAIM_VALUE_LEN {
+        return None;
+    }
+    // The same complete `HeaderValue` gate the outbound adapters apply, so a
+    // claim carrying CR/LF or other control bytes can never be spliced into
+    // the backend-bound request.
+    HeaderValue::from_str(&rendered).ok()?;
+    Some(rendered)
+}
+
+fn render_istio_output_claim(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => (!value.trim().is_empty()).then(|| value.clone()),
+        Value::Number(number) => number
+            .as_i64()
+            .map(|value| value.to_string())
+            .or_else(|| number.as_u64().map(|value| value.to_string())),
+        Value::Bool(flag) => Some(flag.to_string()),
+        Value::Null | Value::Array(_) | Value::Object(_) => None,
+    }
 }
 
 pub fn emit_claim_headers_to_attempt(
@@ -288,6 +441,32 @@ pub fn is_reserved_header(name: &str) -> bool {
             | "proxy-authorization"
             | "authorization"
     )
+}
+
+/// Headers that a validated JWT claim must never be allowed to synthesize.
+///
+/// This is intentionally stricter than the legacy `claim_headers` predicate:
+/// `outputClaimToHeaders` is a new Istio-facing surface, so direct plugin
+/// configuration and mesh translation can share one fail-closed contract
+/// without changing established `claim_headers` configurations.
+pub fn is_output_claim_reserved_header(name: &str) -> bool {
+    let lowercase = name.to_ascii_lowercase();
+    is_reserved_header(&lowercase)
+        || matches!(
+            lowercase.as_str(),
+            "baggage"
+                | "content-length"
+                | "cookie"
+                | "expect"
+                | "forwarded"
+                | "proxy-authenticate"
+                | "proxy-connection"
+                | "trailer"
+                | "via"
+                | "x-real-ip"
+        )
+        || lowercase.starts_with("x-ferrum-")
+        || lowercase.starts_with("x-forwarded-")
 }
 
 #[cfg(test)]
