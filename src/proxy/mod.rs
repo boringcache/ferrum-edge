@@ -7064,9 +7064,17 @@ fn push_tls_material_source(
 /// call on rotation — the H3 pool's TLS config cache is co-located on
 /// `connection_pool.backend_h3_tls_configs`, so it is drained transitively,
 /// and the HBONE and mesh mTLS pools build their SPIFFE client config per
-/// connect (no cache to drain). All pools get a `force_drain_svid_generation()` call when
-/// the operator-configured drain window elapses, because each pool keeps its
-/// own `DashMap` of live connections.
+/// connect (no cache to drain). That same unconditional call also reclaims
+/// generation-keyed H2/gRPC `rr_counters`. A post-sweep late insert of a
+/// captured retired generation is removed on the cold-insert miss path
+/// (and TLS configs refuse to cache a retired numeric generation) so a
+/// default `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS=0` cannot leak one
+/// counter or TLS-config entry per rotation. HBONE and mesh-mTLS have no
+/// generation-keyed rr counters — they key by SVID fingerprint and keep
+/// connection drain gated on the operator drain window. All pools get a
+/// `force_drain_svid_generation()` call when the operator-configured drain
+/// window elapses, because each pool keeps its own `DashMap` of live
+/// connections.
 #[derive(Clone)]
 struct BackendPoolFamily {
     connection_pool: Arc<ConnectionPool>,
@@ -7334,6 +7342,13 @@ fn spawn_backend_svid_rotation_task(
             // after the first.
             let retiring = outgoing_generation_span(old_generation, next_generation);
             for outgoing in retiring.clone() {
+                // Unconditional: TLS-config cache AND H2/gRPC `rr_counters`
+                // for the retired generation. Live connections are not
+                // withdrawn here. `retain` alone does not close a cold
+                // insert that captured `outgoing` before this fetch_max
+                // and completes after the sweep; that race is closed by
+                // cache-level retirement (TLS) and post-insert exact-key
+                // removal on the `rr_counters` miss path.
                 consumer.pools.drain_tls_config_cache(outgoing);
             }
             consumer.restart_health_checks();

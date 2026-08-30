@@ -368,6 +368,11 @@ fn test_proxy_overrides_apply_all_h2_bounds_defensively() {
     assert!(!config.http2_adaptive_window);
     assert_eq!(config.http2_max_frame_size, MIN_HTTP2_MAX_FRAME_SIZE);
     assert_eq!(config.http2_max_concurrent_streams, Some(1));
+    assert_eq!(
+        global.effective_http2_max_concurrent_streams(&proxy),
+        config.http2_max_concurrent_streams,
+        "the allocation-free helper must match for_proxy"
+    );
 }
 
 #[test]
@@ -379,6 +384,39 @@ fn test_proxy_overrides_clamp_h2_max_frame_high_boundary() {
     let config = global.for_proxy(&proxy);
 
     assert_eq!(config.http2_max_frame_size, MAX_HTTP2_MAX_FRAME_SIZE);
+}
+
+#[test]
+fn test_effective_http2_max_concurrent_streams_matches_for_proxy() {
+    let mut global = PoolConfig::default();
+    let inherit = create_test_proxy();
+    assert!(inherit.pool_http2_max_concurrent_streams.is_none());
+
+    let mut explicit_global = create_test_proxy();
+    explicit_global.pool_http2_max_concurrent_streams = global.http2_max_concurrent_streams;
+
+    assert_eq!(
+        global.effective_http2_max_concurrent_streams(&inherit),
+        Some(1000)
+    );
+    assert_eq!(
+        global.effective_http2_max_concurrent_streams(&inherit),
+        global.for_proxy(&inherit).http2_max_concurrent_streams
+    );
+    assert_eq!(
+        global.effective_http2_max_concurrent_streams(&inherit),
+        global.effective_http2_max_concurrent_streams(&explicit_global)
+    );
+
+    global.http2_max_concurrent_streams = None;
+    assert_eq!(
+        global.effective_http2_max_concurrent_streams(&inherit),
+        None
+    );
+    assert_eq!(
+        global.effective_http2_max_concurrent_streams(&inherit),
+        global.for_proxy(&inherit).http2_max_concurrent_streams
+    );
 }
 
 #[test]
