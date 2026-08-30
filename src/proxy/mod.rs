@@ -49,11 +49,11 @@ pub(crate) mod frontend_admission;
 pub mod gateway_listener;
 pub mod gateway_listener_status;
 pub mod grpc_proxy;
+mod h1_framing_guard;
 /// Shared h2c (cleartext, prior-knowledge HTTP/2) peer-preface observation.
 /// Hyper's client handshake proves only the client half, so both h2c transports
 /// — the pooled gRPC path and the Unix-socket path — establish through here.
 pub(crate) mod h2c_preface;
-mod h1_framing_guard;
 pub mod hbone_pool;
 mod hbone_proxy;
 pub mod headers;
@@ -28868,8 +28868,7 @@ async fn handle_proxy_request_on_frontend_port(
         connection_metadata.http1_framing_result,
         h1_framing_guard::H1FramingResult::ObserverFailed
     ) {
-        let error_body =
-            r#"{"error":"HTTP/1 request framing could not be verified; connection will be closed"}"#;
+        let error_body = r#"{"error":"HTTP/1 request framing could not be verified; connection will be closed"}"#;
         warn!(
             framing_observer_state = "unknown_or_overflowed",
             "Rejected HTTP/1 request because wire framing could not be verified; closing connection"
@@ -45634,8 +45633,7 @@ fn check_protocol_headers_with_wire_framing(
     // HTTP/2 and HTTP/3 don't use Transfer-Encoding (framing is at the protocol layer).
     if is_http1
         && (http1_te_cl_conflict_on_wire
-            || headers.contains_key("transfer-encoding")
-                && headers.contains_key("content-length"))
+            || headers.contains_key("transfer-encoding") && headers.contains_key("content-length"))
     {
         return Some(
             r#"{"error":"Request contains both Content-Length and Transfer-Encoding headers"}"#,

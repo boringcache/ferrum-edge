@@ -100,10 +100,7 @@ impl H1FramingSignals {
         }
 
         let slot = sequence % SIGNAL_CAPACITY;
-        let Some(word) = self
-            .conflicts
-            .get((slot / u64::BITS as u64) as usize)
-        else {
+        let Some(word) = self.conflicts.get((slot / u64::BITS as u64) as usize) else {
             self.mark_unknown();
             return false;
         };
@@ -133,10 +130,7 @@ impl H1FramingSignals {
         }
 
         let slot = sequence % SIGNAL_CAPACITY;
-        let Some(word) = self
-            .conflicts
-            .get((slot / u64::BITS as u64) as usize)
-        else {
+        let Some(word) = self.conflicts.get((slot / u64::BITS as u64) as usize) else {
             self.mark_unknown();
             return H1FramingResult::ObserverFailed;
         };
@@ -465,9 +459,7 @@ impl ContentLengthScanner {
 
     fn observe(&mut self, byte: u8) {
         self.phase = match (self.phase, byte) {
-            (ContentLengthPhase::LeadingOws, b' ' | b'\t') => {
-                ContentLengthPhase::LeadingOws
-            }
+            (ContentLengthPhase::LeadingOws, b' ' | b'\t') => ContentLengthPhase::LeadingOws,
             (ContentLengthPhase::LeadingOws | ContentLengthPhase::Digits, b'0'..=b'9') => {
                 match self
                     .value
