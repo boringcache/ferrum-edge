@@ -9420,14 +9420,25 @@ impl DatabaseStore {
         self.lock_mtls_dns_admission_tx(&mut tx, &spec.namespace)
             .await?;
 
-        let existing_spec: Option<crate::config::types::ApiSpec> =
-            sqlx::query(&self.q("SELECT * FROM api_specs WHERE namespace = ? AND id = ?"))
-                .bind(&spec.namespace)
-                .bind(&spec.id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .map(|row| row_to_api_spec(&row))
-                .transpose()?;
+        // Existence read inside the transaction is the not-found authority —
+        // not the UPDATE's rows_affected. MySQL without CLIENT_FOUND_ROWS
+        // (sqlx's default) counts *changed* rows, so an update writing
+        // identical values would falsely report 0 for an existing row.
+        // FOR UPDATE locks the row against a concurrent delete until commit.
+        // SQLite has no FOR UPDATE, but this transaction already holds the
+        // database writer lock (taken by lock_mtls_dns_admission_tx).
+        let existing_spec_sql = if self.db_type == "sqlite" {
+            self.q("SELECT * FROM api_specs WHERE namespace = ? AND id = ?")
+        } else {
+            self.q("SELECT * FROM api_specs WHERE namespace = ? AND id = ? FOR UPDATE")
+        };
+        let existing_spec: Option<crate::config::types::ApiSpec> = sqlx::query(&existing_spec_sql)
+            .bind(&spec.namespace)
+            .bind(&spec.id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|row| row_to_api_spec(&row))
+            .transpose()?;
         let previous_declared_assoc_ids = existing_spec
             .as_ref()
             .map(crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec)
@@ -9449,6 +9460,20 @@ impl DatabaseStore {
             && current_resource_hash.as_deref() == Some(desired_resource_hash.as_str())
         {
             // Bundle is unchanged — only update the api_specs metadata row.
+            // The live resource hash never reads `api_specs`, so dangling
+            // `api_spec_id` tags can match while the spec row is absent. The
+            // SELECT above is the existence authority (and holds FOR UPDATE
+            // on PostgreSQL/MySQL until commit). Do not treat rows_affected as
+            // matched-row existence: a MySQL no-op UPDATE of an existing row
+            // can return 0 changed rows.
+            if existing_spec.is_none() {
+                anyhow::bail!(
+                    "API spec row not found for id '{}' in namespace '{}' during \
+                     metadata-only replace",
+                    spec.id,
+                    spec.namespace
+                );
+            }
             let tags_json = serialize_api_spec_string_list(&spec.id, "tags", &spec.tags)?;
             let server_urls_json =
                 serialize_api_spec_string_list(&spec.id, "server_urls", &spec.server_urls)?;

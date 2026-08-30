@@ -2038,11 +2038,16 @@ When `FERRUM_TLS_CRL_FILE_PATH` is configured, Ferrum applies that CRL set
 symmetrically to mesh SPIFFE peer verification: inbound mTLS/HBONE handshakes
 reject revoked client SVIDs, and outbound/backend mesh dials reject revoked
 server SVIDs. A peer listed in an applicable configured CRL is rejected
-fail-closed even when its SVID is otherwise trusted and unexpired. If the
+fail-closed even when its SVID is otherwise trusted and unexpired. Revocation is
+checked on **every non-trust-anchor certificate in the built chain**, so
+revoking an intermediate SVID-issuing CA also stops the SVIDs it signed. If the
 bundle has no CRL from the peer certificate's issuing CA, its revocation status
 is undeterminable and Ferrum accepts it, matching the shared inbound mesh CRL
 model. With no CRLs configured, revocation checking is skipped and handshake
-behavior is unchanged.
+behavior is unchanged. A configured CRL that has reached its own `nextUpdate` is
+an error rather than a fallback to "no revocation data", so mesh handshakes it
+would police stop succeeding until the CRL is refreshed; see
+[frontend_tls.md → CRL Policy](frontend_tls.md#crl-policy).
 
 The CRL set follows the same lifecycle as Ferrum's other rustls backend pools.
 When backend TLS live reload is enabled, `reload_backend_tls_material` reloads
@@ -3669,6 +3674,17 @@ Port-list annotations merge with their Ferrum aliases; exclude lists also merge 
 **Mid-life annotation updates:** the node-agent watches Kubernetes Pod `Modified` events (kube-rs `Event::Apply` conflates added + modified) and re-reads `includeOutboundPorts` on every event. A diff against the policy stashed at enrollment time gates the BPF map write so unrelated Modified events (status updates, image-pull progress, condition flips) are skipped without syscalls -- the policy structurally compared is the post-merge, sorted, deduplicated `IncludePortsPolicy`, so reordering ports in the annotation is also a no-op. When the parsed policy differs the node-agent writes the new entry, or removes it when the annotation is stripped entirely. Failures to re-apply (annotation parse error or BPF map write error) keep the previous policy in place rather than silently widening capture; the failure is counted in `ferrum_node_agent_pod_annotation_updates_failed_total` and the successful re-apply count is exposed as `ferrum_node_agent_pod_annotation_updates_applied_total`. Cgroup-id-unavailable retries (Pod object reached the watcher before kubelet finished creating the cgroup) are intentionally not counted as failures because they are routinely observed during early pod startup and are retried on the next Apply event. Opt-in/opt-out label or annotation flips (`ferrum.io/inject` true⇄false, `ferrum.io/mesh` enabled⇄disabled) trigger enrollment or un-enrollment on the next Apply event. **Long-lived flow caveat:** the BPF programs hook `connect(2)`, so a policy change applies only to *new* outbound connections; established TCP flows continue using the redirect chosen at their original connect call and are unaffected until they close and reconnect.
 
 **IPv6 CIDRs:** `includeOutboundIPRanges` / `excludeOutboundIPRanges` accept IPv6 CIDR literals (e.g. `fd00::/8`) and `IptablesPlan::for_config` partitions rules by address family. Any IPv6 CIDR in either the include or exclude list activates the IPv6 address family: outbound IPv6 rules are rendered for the configured include/exclude lists, and inbound IPv6 capture emits the same default redirect/exclusion shape as IPv4. If explicit include ports are set, port REDIRECT rules are emitted for IPv6 too once that family is active; without an IPv6 CIDR, include-port rules only render in the IPv4 plan. IPv4 rules are emitted through `iptables`; IPv6 rules are emitted through `ip6tables`. `FERRUM_MESH_IP6TABLES_ENABLED=auto` probes for `ip6tables` and skips only the IPv6 rule block when the binary is absent, so legacy IPv4-only nodes do not crash-loop. Set it to `true` to require `ip6tables` whenever IPv6 rules are present; this is all-or-nothing, so a missing `ip6tables` binary fails before any IPv4 rules are applied. Set it to `false` for permanent IPv4-only capture. The injector init-container script and node-agent iptables fallback both render from the same `IptablesPlan`, so their IPv6 wrapping semantics stay aligned.
+
+**Dual-stack capture listeners (issue [#4271](https://github.com/ferrum-edge/ferrum-edge/issues/4271)).** The `iptables` and `ip6tables` REDIRECT rules point at the SAME ports (`15006` inbound, `15001` outbound), so a listener set that serves only one address family black-holes the other with `ECONNREFUSED` while the pod reports ready. The Sidecar listener plan therefore derives its addresses from whether IPv6 capture rules exist (`FERRUM_MESH_CAPTURE_IPV6_ENABLED`, derived from `FERRUM_MESH_IP6TABLES_ENABLED` plus the include/exclude CIDR families when unset, and set explicitly by the injector whenever the rendered init-container plan contains `ip6tables` commands). An explicit `false` is rejected if those local rule inputs still require IPv6, because a listener-only override must not leave live `ip6tables` REDIRECTs without a consumer:
+
+- IPv6 capture inactive: exactly the configured address, unchanged.
+- A **wildcard** capture address (`0.0.0.0` / `::`, the inbound default): ONE listener on the dual-stack `[::]` wildcard with `IPV6_V6ONLY` explicitly disabled, so a single socket claims the native-v6 and the v4-mapped halves. `REDIRECT` in `PREROUTING` rewrites the destination to the receiving interface's own address, which is why inbound capture must be a wildcard bind; two sockets are not an option because a dual-stack `[::]` bind already owns the v4 wildcard on that port. The bind downgrades to `0.0.0.0` **only** when IPv6 is genuinely unavailable on the host (`EAFNOSUPPORT` / `EADDRNOTAVAIL` / `EPROTONOSUPPORT`), never on `EADDRINUSE` — falling back on a real conflict would report the listener started while IPv6 capture is black-holed.
+- A **loopback** capture address (`127.0.0.1`, the outbound default): TWO listeners, `127.0.0.1` and `[::1]`. `REDIRECT` in `OUTPUT` sends locally generated traffic to `127.0.0.1` for IPv4 and `::1` for IPv6, and unlike the wildcard a dual-stack socket bound to `[::1]` does not receive IPv4 loopback traffic. This keeps outbound capture loopback-only rather than widening it to a network-reachable wildcard.
+- Any other specific literal is a **startup error** naming the offending variable, because there is no defensible way to guess the workload's address in the other family.
+
+A dual-stack accept reports an IPv4 connection's local address as the IPv4-mapped `::ffff:a.b.c.d`. `original_dst_from_raw_fd` folds that back to IPv4 before choosing the conntrack socket option, so it issues `SOL_IP`/`SO_ORIGINAL_DST` (not `SOL_IPV6`/`IP6T_SO_ORIGINAL_DST`, which answers `ENOENT` for an IPv4 flow) and recovers the real pre-NAT IPv4 destination. Native IPv6 keeps the `IP6T_SO_ORIGINAL_DST` path. Losing that value is not cosmetic: original destination drives multi-port service disambiguation and pre-handshake `PeerAuthentication.portLevelMtls` selection.
+
+**Loopback / pod-self RETURN (issue [#4276](https://github.com/ferrum-edge/ferrum-edge/issues/4276)).** `nat FERRUM_MESH_OUTBOUND` leads with `-m addrtype --dst-type LOCAL -j RETURN`, emitted for both `iptables` and `ip6tables` and ahead of every REDIRECT in the chain. Setup deletes any prior copy and inserts the rule at position 1, so this ordering remains true when a surviving chain is reconciled rather than only when it is created fresh. `nat OUTPUT` is traversed by locally generated packets, so without it the shipped catch-all `-p tcp -d 0.0.0.0/0 -j REDIRECT --to-ports 15001` hairpins every intra-pod `127.0.0.1` connection — the universal multi-container pattern (`app` dialing a local `postgres`/`redis`) — into the mesh outbound proxy, where it matches no mesh route and is denied outright under `outboundTrafficPolicy: REGISTRY_ONLY`. In the pod netns the `LOCAL` address type covers both loopback and the pod's own IP in one family-agnostic rule; this is the same discriminator the UDP sibling chain uses (`-m addrtype ! --dst-type LOCAL` for its complementary egress scope) and it is gated on pod-netns rendering for the same reason, since pod IPs are FORWARDED rather than `LOCAL` in the host namespace.
 
 ### SPIFFE ID Derivation
 
@@ -5783,6 +5799,7 @@ Set `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables` only when running a custom node-a
 | `FERRUM_MESH_CAPTURE_EXCLUDE_PORTS` | `15001,15006,15008,15020` | Destination TCP ports excluded from outbound capture |
 | `FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS` | (empty) | Destination TCP and UDP ports excluded from inbound capture (mirrors Istio `excludeInboundPorts`; pod annotation `traffic.sidecar.istio.io/excludeInboundPorts` is additive) |
 | `FERRUM_MESH_IP6TABLES_ENABLED` | `auto` | IPv6 iptables fan-out: `auto` probes and skips IPv6 rules when `ip6tables` is unavailable, `true` requires it when IPv6 CIDRs are configured and fails all capture setup before IPv4 rules if unavailable, `false` emits IPv4-only capture rules |
+| `FERRUM_MESH_CAPTURE_IPV6_ENABLED` | derived | Whether the Sidecar TCP capture listeners must serve IPv6 captured traffic. Derived from `FERRUM_MESH_IP6TABLES_ENABLED` plus the include/exclude CIDR families when unset; set to `true` by the injector whenever the rendered init-container plan emits `ip6tables` rules |
 
 ## VirtualService Translation
 
@@ -6320,6 +6337,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_CAPTURE_MODE` | `explicit` | Traffic capture mode: `explicit`, `iptables`, `ebpf` |
 | `FERRUM_MESH_PROXY_UID` | `1337` | Proxy user ID in injected sidecars |
 | `FERRUM_MESH_IP6TABLES_ENABLED` | `auto` | IPv6 iptables fan-out: `auto`, `true` (required/all-or-nothing), or `false` |
+| `FERRUM_MESH_CAPTURE_IPV6_ENABLED` | derived | Whether the Sidecar TCP capture listeners must serve IPv6 captured traffic. Derived from `FERRUM_MESH_IP6TABLES_ENABLED` plus the include/exclude CIDR families when unset; set to `true` by the injector whenever the rendered init-container plan emits `ip6tables` rules |
 
 ### Kubernetes Controller
 
