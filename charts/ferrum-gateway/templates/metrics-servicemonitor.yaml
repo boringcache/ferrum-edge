@@ -6,23 +6,25 @@
 {{- $adminTlsSet := include "ferrum-gateway.serverTlsConfigured" (dict "root" . "surface" $adminTls "certSource" "FERRUM_ADMIN_TLS_CERT_SOURCE" "keySource" "FERRUM_ADMIN_TLS_KEY_SOURCE") -}}
 {{- $hasAdminHttp := and (hasKey $ports "adminHttp") (ne ($ports.adminHttp | toString) "0") -}}
 {{- $hasAdminHttps := and (hasKey $ports "adminHttps") (ne ($ports.adminHttps | toString) "0") $adminTlsSet -}}
+{{- $bearer := $metrics.bearerToken | default dict -}}
+{{- $bearerSecret := $bearer.existingSecret | default dict -}}
+{{- $hasBearerSecret := not (empty $bearerSecret.name) -}}
 {{- if not (or $hasAdminHttp $hasAdminHttps) -}}
 {{- fail "metrics.serviceMonitor.enabled=true but no admin scrape port is available: enable a plaintext admin listener (ports.adminHttp>0) or admin HTTPS (ports.adminHttps>0 with tls.admin or complete FERRUM_ADMIN_TLS_{CERT,KEY}_SOURCE pair)." -}}
 {{- end -}}
 {{- $smTls := $sm.tlsConfig | default dict -}}
-{{/* An HTTPS scrape carries the metrics bearer token, so it must not go to an
-     unverified endpoint by default: without verification any pod that can win
-     the Service IP presents a cert Prometheus accepts and harvests the token.
-     Require the operator to state a trust configuration explicitly — supply
-     `ca`/`caFile`+`serverName`, or opt into `insecureSkipVerify: true`
-     deliberately. Plaintext admin scrapes are unaffected. */}}
-{{- if and (not $hasAdminHttp) $hasAdminHttps -}}
+{{/* A bearer credential must only be sent to a verified HTTPS endpoint. */}}
+{{- if and $hasBearerSecret (not $hasAdminHttps) -}}
+{{- fail "metrics.serviceMonitor bearer authorization requires admin HTTPS (ports.adminHttps>0 with tls.admin or a complete FERRUM_ADMIN_TLS_{CERT,KEY}_SOURCE pair); the chart will not send the metrics bearer token over plaintext HTTP." -}}
+{{- end -}}
+{{- if and (or $hasBearerSecret (not $hasAdminHttp)) $hasAdminHttps -}}
 {{- if not $smTls -}}
-{{- fail "metrics.serviceMonitor scrapes admin over HTTPS but metrics.serviceMonitor.tlsConfig is empty. Set metrics.serviceMonitor.tlsConfig (for example ca.secret + serverName) so the scrape verifies the admin certificate, or set metrics.serviceMonitor.tlsConfig.insecureSkipVerify=true to accept an unverified endpoint deliberately. The scrape carries the metrics bearer token, so it is not verified by default." -}}
+{{- fail "metrics.serviceMonitor scrapes admin over HTTPS but metrics.serviceMonitor.tlsConfig is empty. Set metrics.serviceMonitor.tlsConfig (for example ca.secret + serverName) so the scrape verifies the admin certificate." -}}
 {{- end -}}
 {{- end -}}
-{{- $bearer := $metrics.bearerToken | default dict -}}
-{{- $bearerSecret := $bearer.existingSecret | default dict -}}
+{{- if and $hasBearerSecret ($smTls.insecureSkipVerify | default false) -}}
+{{- fail "metrics.serviceMonitor.tlsConfig.insecureSkipVerify cannot be true when bearer authorization is configured; the bearer token requires certificate verification." -}}
+{{- end -}}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
@@ -51,13 +53,13 @@ spec:
     - path: /metrics
       interval: {{ $sm.interval | default "30s" | quote }}
       scrapeTimeout: {{ $sm.scrapeTimeout | default "10s" | quote }}
-      {{- if $hasAdminHttp }}
-      port: admin-http
-      {{- else }}
+      {{- if or $hasBearerSecret (not $hasAdminHttp) }}
       port: admin-https
       scheme: https
       tlsConfig:
         {{- toYaml $smTls | nindent 8 }}
+      {{- else }}
+      port: admin-http
       {{- end }}
       {{- if $bearerSecret.name }}
       authorization:

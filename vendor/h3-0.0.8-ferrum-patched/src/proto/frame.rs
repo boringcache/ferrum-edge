@@ -22,6 +22,20 @@ pub enum FrameError {
     UnknownFrame(u64),     // Unknown frames that should be ignored
     InvalidFrameValue,
     Incomplete(usize),
+    /// A frame declared a payload length that must not be buffered.
+    ///
+    /// Raised as soon as the frame type and length varint are decoded, before
+    /// any payload byte is stored, for a non-`DATA` frame whose DECLARED
+    /// length exceeds the receive-side ceiling, and for any frame whose
+    /// declared length this platform cannot address.
+    ExceedsMaxBufferedLen {
+        /// The frame type varint as received.
+        ty: u64,
+        /// The declared payload length as received.
+        len: u64,
+        /// The ceiling that was applied.
+        max: u64,
+    },
     Settings(SettingsError),
     InvalidStreamId(InvalidStreamId),
     InvalidPushId(InvalidPushId),
@@ -37,6 +51,11 @@ impl fmt::Display for FrameError {
             FrameError::UnknownFrame(c) => write!(f, "frame 0x{:x} ignored", c),
             FrameError::InvalidFrameValue => write!(f, "frame value is invalid"),
             FrameError::Incomplete(x) => write!(f, "internal error: frame incomplete {}", x),
+            FrameError::ExceedsMaxBufferedLen { ty, len, max } => write!(
+                f,
+                "frame 0x{:x} declared a payload of {} bytes, above the receive limit of {}",
+                ty, len, max
+            ),
             FrameError::Settings(x) => write!(f, "invalid settings: {}", x),
             FrameError::InvalidStreamId(x) => write!(f, "{}", x),
             FrameError::InvalidPushId(x) => write!(f, "{}", x),
@@ -79,7 +98,33 @@ impl Frame<PayloadLen> {
     pub const MAX_ENCODED_SIZE: usize = VarInt::MAX_SIZE * 7;
 
     /// Decodes a Frame from the stream according to <https://www.rfc-editor.org/rfc/rfc9114#section-7.1>
+    ///
+    /// Equivalent to [`Frame::decode_bounded`] with no receive-side ceiling on
+    /// the declared payload length of a buffered non-`DATA` frame, which is
+    /// stock upstream behaviour.
     pub fn decode<T: Buf>(buf: &mut T) -> Result<Self, FrameError> {
+        Self::decode_bounded(buf, u64::MAX)
+    }
+
+    /// Decodes a Frame, refusing a non-`DATA` frame whose DECLARED payload
+    /// length exceeds `max_buffered_frame_len`.
+    ///
+    /// Every frame type other than `DATA` (and the length-less WebTransport
+    /// bidirectional stream header) has to be accumulated whole before it can
+    /// be interpreted, including the unknown-frame skip arm below. So the
+    /// declared length is refused here — after the type and length varints are
+    /// decoded and before a single payload byte is stored or a caller can park
+    /// on an accumulation target. `DATA` payloads are handed to the caller as
+    /// a streaming length and are deliberately NOT bounded by this ceiling.
+    ///
+    /// The comparison is made on the raw `u64` QUIC varint before any `usize`
+    /// conversion, so a declared length that would truncate on a 32-bit target
+    /// cannot present itself as a short frame. A length this platform cannot
+    /// address is refused the same way, whatever the configured ceiling.
+    pub fn decode_bounded<T: Buf>(
+        buf: &mut T,
+        max_buffered_frame_len: u64,
+    ) -> Result<Self, FrameError> {
         let remaining = buf.remaining();
         let ty = FrameType::decode(buf).map_err(|_| FrameError::Incomplete(remaining + 1))?;
 
@@ -97,21 +142,43 @@ impl Frame<PayloadLen> {
             .get_var()
             .map_err(|_| FrameError::Incomplete(remaining + 1))?;
 
+        // Widest declared length this platform can even represent as a byte
+        // count. On every supported target `usize` is 64 bits or narrower, so
+        // this is a real bound on 32-bit and a no-op on 64-bit.
+        let addressable_max = usize::MAX as u64;
+
         if ty == FrameType::DATA {
+            if len > addressable_max {
+                return Err(FrameError::ExceedsMaxBufferedLen {
+                    ty: ty.0,
+                    len,
+                    max: addressable_max,
+                });
+            }
             return Ok(Frame::Data((len as usize).into()));
         }
 
-        if buf.remaining() < len as usize {
-            return Err(FrameError::Incomplete(2 + len as usize));
+        let max = max_buffered_frame_len.min(addressable_max);
+        if len > max {
+            return Err(FrameError::ExceedsMaxBufferedLen { ty: ty.0, len, max });
+        }
+        // `len <= max <= usize::MAX`, so this conversion cannot truncate.
+        let len = len as usize;
+
+        if buf.remaining() < len {
+            // `+ 2` is the smallest possible type/length header. Saturating
+            // keeps the accumulation target from wrapping to a tiny value for
+            // a length near the platform maximum.
+            return Err(FrameError::Incomplete(len.saturating_add(2)));
         }
 
-        let mut payload = buf.take(len as usize);
+        let mut payload = buf.take(len);
 
         #[cfg(feature = "tracing")]
         trace!("frame ty: {:?}", ty);
 
         let frame = match ty {
-            FrameType::HEADERS => Ok(Frame::Headers(payload.copy_to_bytes(len as usize))),
+            FrameType::HEADERS => Ok(Frame::Headers(payload.copy_to_bytes(len))),
             FrameType::SETTINGS => Ok(Frame::Settings(Settings::decode(&mut payload)?)),
             FrameType::CANCEL_PUSH => Ok(Frame::CancelPush(payload.get_var()?.try_into()?)),
             FrameType::PUSH_PROMISE => Ok(Frame::PushPromise(PushPromise::decode(&mut payload)?)),
@@ -127,7 +194,7 @@ impl Frame<PayloadLen> {
             | FrameType::H2_CONTINUATION => Err(FrameError::UnsupportedFrame(ty.0)),
             FrameType::WEBTRANSPORT_BI_STREAM | FrameType::DATA => unreachable!(),
             _ => {
-                buf.advance(len as usize);
+                buf.advance(len);
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
                 //# Endpoints MUST
                 //# NOT consider these frames to have any meaning upon receipt.

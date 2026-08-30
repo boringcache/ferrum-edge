@@ -155,7 +155,10 @@ still a live Endpoint. The chart closes that window from both sides:
    **before** SIGTERM, so the gateway keeps serving normally for the whole
    window while endpoint removal propagates. `SleepAction` needs no shell, so
    it works on the distroless image; it requires Kubernetes **1.29+** (GA in
-   1.30). Set it to `0` on older clusters to omit the hook.
+   1.30). Set it to `0` on older clusters to omit the hook. With
+   `shutdownPreStopSeconds > 0`, `helm template` / `helm install` **fail** on
+   clusters older than 1.29 with a remediation message instead of silently
+   dropping the unsupported `sleep` field.
 2. `shutdownPreDrainSeconds` (default `0`, `FERRUM_SHUTDOWN_PREDRAIN_SECONDS`)
    keeps every listener — proxy **and** admin — accepting for a window *after*
    SIGTERM while readiness already reports `ready:false` / 503 and `/live` still
@@ -408,6 +411,12 @@ Pair a non-loopback admin bind with a `NetworkPolicy` restricting who can reach
 the admin port. `metrics.bearerToken.value` wires the pod env for development;
 `metrics.bearerToken.existingSecret` is required for ServiceMonitor Bearer
 authorization when `metrics.allowedCidrs` is empty.
+
+When the ServiceMonitor uses Bearer authorization, the chart always scrapes the
+admin HTTPS port and requires a verifying `metrics.serviceMonitor.tlsConfig`
+(for example, `ca.secret` and `serverName`). It refuses plaintext transport and
+`insecureSkipVerify: true` so the observability credential is never sent to an
+unauthenticated endpoint.
 
 `/metrics` also requires a globally scoped `prometheus_metrics` plugin instance or
 the scrape succeeds with an empty exposition. Add it to your gateway config

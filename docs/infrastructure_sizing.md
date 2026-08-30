@@ -103,7 +103,7 @@ At this scale, use the [Control Plane / Data Plane](cp_dp_mode.md) deployment mo
 Ferrum Edge supports two response body modes configured per proxy: **streaming** (default) and **buffered**. The mode significantly affects memory usage.
 
 - **Streaming mode** (default): Response bodies flow through the gateway without being fully buffered in memory. Only the current chunk (up to 128 KB coalescing target) is held at any time. Small responses with known `Content-Length ≤ 64 KiB` (configurable via `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES`) are eagerly buffered into a single allocation since that's cheaper than the async coalescing adapter. SSE responses always stream regardless of size.
-- **Buffered mode**: The entire response body is collected in memory before forwarding to the client. Required when plugins need to inspect or modify the full response body. When `max_response_body_size_bytes > 0` and Content-Length is absent, a `SizeLimitedStreamingResponse` adapter enforces the limit frame-by-frame without full-body buffering.
+- **Buffered mode**: The entire response body is collected in memory before forwarding to the client. Required when plugins need to inspect or modify the full response body. When `max_response_body_size_bytes > 0` and the backend did not declare a canonical Content-Length, a `SizeLimitedStreamingResponse` adapter enforces the limit frame-by-frame without full-body buffering.
 
 Plugins that declare `requires_response_body_buffering()` signal a config-time upper bound; the per-request `should_buffer_response_body(&RequestContext)` method lets plugins skip buffering when the request context makes it irrelevant (e.g., `compression` skips when `Accept-Encoding` is absent, AI plugins skip non-POST/non-JSON requests).
 

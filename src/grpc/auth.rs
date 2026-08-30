@@ -1,8 +1,9 @@
 //! Shared authentication helpers for Ferrum control-plane gRPC surfaces.
 //!
 //! `ConfigSync` and xDS ADS are separate services, but both enforce the same
-//! CP/DP security boundary: HS256 JWT in `authorization` metadata, standard
-//! time claims required, and issuer pinned to `FERRUM_CP_DP_GRPC_JWT_ISSUER`.
+//! CP/DP security boundary: HS256 JWT in `authorization` metadata, required
+//! `exp`/`iat` plus a present `nbf` when the token carries one, and issuer
+//! pinned to `FERRUM_CP_DP_GRPC_JWT_ISSUER`.
 //!
 //! # Audience binding (issue #2475)
 //!
@@ -998,6 +999,10 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
 
     let mut validation = Validation::new(header.alg);
     validation.validate_exp = true;
+    // `nbf` is optional (not listed in `required_grpc_claims`) but a present
+    // not-before must be enforced. The same `GRPC_JWT_LEEWAY_SECONDS` skew
+    // already applied to `exp` covers `nbf` as well.
+    validation.validate_nbf = true;
     validation.leeway = GRPC_JWT_LEEWAY_SECONDS;
     validation.required_spec_claims = required_grpc_claims();
     validation.set_issuer(&[expected_issuer]);
@@ -1142,6 +1147,8 @@ fn extract_subject_claim(claims: &Value) -> Result<String, Status> {
 }
 
 fn required_grpc_claims() -> HashSet<String> {
+    // `nbf` is optional per RFC 7519 §4.1.5 and is therefore omitted here.
+    // `validate_nbf = true` still rejects a present future `nbf`.
     ["exp", "iat", "sub", "iss"]
         .into_iter()
         .map(str::to_string)

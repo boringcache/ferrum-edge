@@ -213,6 +213,18 @@ pub struct MeshListener {
     pub direction: MeshTrafficDirection,
     pub kind: MeshListenerKind,
     pub addr: SocketAddr,
+    /// Bind this listener's `AF_INET6` wildcard with `IPV6_V6ONLY` explicitly
+    /// disabled, so ONE socket accepts both native IPv6 and v4-mapped IPv4
+    /// connections, and downgrade to the IPv4 wildcard when IPv6 is genuinely
+    /// unavailable on this host (issue #4271).
+    ///
+    /// Only ever `true` for a wildcard TCP capture listener: those must serve
+    /// whichever address families the installed `iptables` / `ip6tables`
+    /// REDIRECT rules divert at them, and a family with rules but no listener is
+    /// an `ECONNREFUSED` black hole. Always `false` for a specific-address
+    /// (loopback) bind, where each family gets its own listener instead — a
+    /// dual-stack socket only receives v4-mapped traffic on the WILDCARD.
+    pub dual_stack: bool,
 }
 
 /// Mesh data-plane topology. Sidecar and ambient share the same runtime path;
@@ -1037,18 +1049,25 @@ impl MeshRuntimeConfig {
     pub fn listener_plan(&self) -> Vec<MeshListener> {
         match self.topology {
             MeshTopology::Sidecar => {
-                let mut listeners = vec![
-                    MeshListener {
-                        direction: MeshTrafficDirection::Outbound,
-                        kind: MeshListenerKind::PlaintextCapture,
-                        addr: self.outbound_listen_addr,
-                    },
-                    MeshListener {
-                        direction: MeshTrafficDirection::Inbound,
-                        kind: MeshListenerKind::MtlsTermination,
-                        addr: self.inbound_listen_addr,
-                    },
-                ];
+                // Sidecar TCP capture is fed by netfilter REDIRECT rules that
+                // are emitted PER ADDRESS FAMILY (`iptables` and `ip6tables`),
+                // so the listener set must cover every family those rules
+                // divert (issue #4271). See
+                // [`Self::sidecar_capture_listeners`].
+                let ipv6_capture = self.sidecar_capture_ipv6_enabled();
+                let mut listeners = Vec::new();
+                listeners.extend(self.sidecar_capture_listeners(
+                    self.outbound_listen_addr,
+                    MeshTrafficDirection::Outbound,
+                    MeshListenerKind::PlaintextCapture,
+                    ipv6_capture,
+                ));
+                listeners.extend(self.sidecar_capture_listeners(
+                    self.inbound_listen_addr,
+                    MeshTrafficDirection::Inbound,
+                    MeshListenerKind::MtlsTermination,
+                    ipv6_capture,
+                ));
                 // Sidecar relays captured UDP over a mesh-mTLS datagram tunnel
                 // (#1808), so the helper emits the `PlaintextUdpCapture` listener
                 // here when the capture flag is set (gated to Ambient | Sidecar).
@@ -1061,11 +1080,13 @@ impl MeshRuntimeConfig {
                         direction: MeshTrafficDirection::Outbound,
                         kind: MeshListenerKind::PlaintextCapture,
                         addr: self.outbound_listen_addr,
+                        dual_stack: false,
                     },
                     MeshListener {
                         direction: MeshTrafficDirection::Inbound,
                         kind: MeshListenerKind::HboneTermination,
                         addr: self.hbone_listen_addr,
+                        dual_stack: false,
                     },
                 ];
                 listeners.extend(self.udp_capture_listener());
@@ -1076,6 +1097,7 @@ impl MeshRuntimeConfig {
                     direction: MeshTrafficDirection::Inbound,
                     kind: MeshListenerKind::HboneTermination,
                     addr: self.hbone_listen_addr,
+                    dual_stack: false,
                 }];
                 listeners.extend(self.transparent_inbound_capture_listener());
                 listeners
@@ -1085,8 +1107,98 @@ impl MeshRuntimeConfig {
                 direction: MeshTrafficDirection::Inbound,
                 kind: MeshListenerKind::MtlsTermination,
                 addr: self.egress_listen_addr,
+                dual_stack: false,
             }],
         }
+    }
+
+    /// Whether this Sidecar must serve IPv6 CAPTURED TCP, i.e. whether
+    /// `ip6tables` REDIRECT rules are installed in this pod's network namespace
+    /// (issue #4271).
+    ///
+    /// INFALLIBLE, because read-only predicates and tests reach `listener_plan()`
+    /// too: a malformed setting warns and resolves to "IPv4 only", which is the
+    /// pre-existing behavior rather than a new failure mode. The SERVING path
+    /// validates the same env with `?` before anything binds — see
+    /// [`MeshRuntimeConfig::validate_capture_listener_families`] — so an operator
+    /// error aborts mesh startup with a field-specific message instead of
+    /// silently planning half the capture surface.
+    fn sidecar_capture_ipv6_enabled(&self) -> bool {
+        match crate::capture::capture_ipv6_enabled_from_env() {
+            Ok(enabled) => enabled,
+            Err(e) => {
+                warn!(
+                    "Planning mesh TCP capture listeners for IPv4 only: invalid IPv6 capture \
+                     settings: {e}"
+                );
+                false
+            }
+        }
+    }
+
+    /// The listener descriptors that make one configured Sidecar TCP capture
+    /// address serve every address family whose REDIRECT rules exist.
+    ///
+    /// Infallible for the same reason as [`Self::sidecar_capture_ipv6_enabled`]:
+    /// an unserviceable configuration warns here and keeps the configured
+    /// address alone, while the serving path refuses to start.
+    fn sidecar_capture_listeners(
+        &self,
+        configured: SocketAddr,
+        direction: MeshTrafficDirection,
+        kind: MeshListenerKind,
+        ipv6_capture: bool,
+    ) -> Vec<MeshListener> {
+        match sidecar_capture_listener_addrs(configured, ipv6_capture) {
+            Ok(addrs) => addrs
+                .into_iter()
+                .map(|(addr, dual_stack)| MeshListener {
+                    direction,
+                    kind,
+                    addr,
+                    dual_stack,
+                })
+                .collect(),
+            Err(e) => {
+                warn!(
+                    configured = %configured,
+                    ?direction,
+                    "Mesh TCP capture listener plan falls back to the configured address alone: {e}"
+                );
+                vec![MeshListener {
+                    direction,
+                    kind,
+                    addr: configured,
+                    dual_stack: false,
+                }]
+            }
+        }
+    }
+
+    /// Fail-closed validation of the Sidecar TCP capture listen addresses
+    /// against the installed capture rule families (issue #4271), for the
+    /// SERVING path only.
+    ///
+    /// `listener_plan()` cannot fail, so on its own a capture address that
+    /// cannot serve the IPv6 rules — a specific, non-wildcard, non-loopback
+    /// IPv4 literal — would warn-and-plan the IPv4 listener alone while
+    /// `ip6tables` keeps redirecting IPv6 connections at a port with no IPv6
+    /// listener. Those connections are refused (`ECONNREFUSED`) while the proxy
+    /// reports ready: a silent capture black hole. Validating here turns it into
+    /// a startup error naming the offending variable.
+    ///
+    /// Scoped to `Sidecar`: it is the only topology whose TCP capture is driven
+    /// by the injector's per-family netfilter REDIRECT rules.
+    pub fn validate_capture_listener_families(&self) -> Result<(), String> {
+        if self.topology != MeshTopology::Sidecar {
+            return Ok(());
+        }
+        let ipv6_capture = crate::capture::capture_ipv6_enabled_from_env()?;
+        sidecar_capture_listener_addrs(self.outbound_listen_addr, ipv6_capture)
+            .map_err(|e| format!("FERRUM_MESH_OUTBOUND_LISTEN_ADDR: {e}"))?;
+        sidecar_capture_listener_addrs(self.inbound_listen_addr, ipv6_capture)
+            .map_err(|e| format!("FERRUM_MESH_INBOUND_LISTEN_ADDR: {e}"))?;
+        Ok(())
     }
 
     /// The optional NodeWaypoint transparent inbound capture listener
@@ -1132,6 +1244,10 @@ impl MeshRuntimeConfig {
             direction: MeshTrafficDirection::Inbound,
             kind: MeshListenerKind::TransparentInboundCapture,
             addr,
+            // The tc ingress redirect delivers the workload's real
+            // `podIP:appPort` on the configured wildcard family; the UDP-style
+            // dual-stack posture is not applicable here.
+            dual_stack: false,
         })
     }
 
@@ -1319,6 +1435,10 @@ impl MeshRuntimeConfig {
             direction: MeshTrafficDirection::Outbound,
             kind: MeshListenerKind::PlaintextUdpCapture,
             addr,
+            // The UDP capture socket disables V6ONLY (and falls back to the v4
+            // wildcard) inside `bind_mesh_udp_capture_socket`, which owns the
+            // transparent-bind sequence; this TCP-listener flag does not apply.
+            dual_stack: false,
         })
     }
 
@@ -12675,25 +12795,78 @@ fn node_waypoint_authz_cluster_domains(primary_cluster_domain: &str) -> Vec<Stri
     domains
 }
 
-fn node_waypoint_assertor_spiffe_ids(mesh_slice: &MeshSlice) -> Vec<String> {
+/// Project the CP-derived NodeWaypoint assertor inventory into plugin config.
+///
+/// Each entry becomes an OBJECT carrying the assertor SVID plus the exact
+/// identities that assertor fronts, so a legitimately cross-namespace
+/// source-node waypoint keeps working while a NodeWaypoint that fronts nothing
+/// (or that the CP never authorized for a workload) authorizes nothing (issue
+/// #4274). Emitting the bare SPIFFE strings would fall back to the
+/// same-namespace default and break cross-node NodeWaypoint traffic.
+fn node_waypoint_assertor_entries(mesh_slice: &MeshSlice) -> Vec<serde_json::Value> {
     mesh_slice
         .node_waypoint_assertors
         .iter()
-        .map(|spiffe_id| spiffe_id.as_str().to_string())
+        .map(|assertor| {
+            serde_json::json!({
+                "assertor": assertor.spiffe_id.as_str(),
+                "asserts": assertor
+                    .asserts
+                    .iter()
+                    .map(|id| id.as_str())
+                    .collect::<Vec<_>>(),
+            })
+        })
         .collect()
 }
 
 fn mesh_managed_trusted_hbone_assertors(
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
-) -> Option<Vec<String>> {
+) -> Option<Vec<serde_json::Value>> {
     if !runtime.trusted_hbone_assertors.is_empty() {
-        return Some(runtime.trusted_hbone_assertors.clone());
+        // Operator-declared entries keep the plugin's own parsing contract:
+        // a bare service account or exact SVID grants same-namespace only, and
+        // a wider grant must be spelled out per entry.
+        return Some(
+            runtime
+                .trusted_hbone_assertors
+                .iter()
+                .map(|raw| serde_json::Value::String(raw.clone()))
+                .collect(),
+        );
     }
     if runtime.node_waypoint_secured_transport_required() {
-        return Some(node_waypoint_assertor_spiffe_ids(mesh_slice));
+        return Some(node_waypoint_assertor_entries(mesh_slice));
     }
     None
+}
+
+/// Extract only the baggage-trust fields from a `mesh_authz` plugin config so
+/// the injected telemetry gate list mirrors authorization without carrying
+/// the rest of the authz config (slice, policies, route upstreams).
+fn mesh_authz_baggage_gate_config(config: &serde_json::Value) -> serde_json::Value {
+    let mut gate = serde_json::Map::new();
+    for key in ["trusted_hbone_assertors", "trust_domain_aliases"] {
+        if let Some(value) = config.get(key) {
+            gate.insert(key.to_string(), value.clone());
+        }
+    }
+    serde_json::Value::Object(gate)
+}
+
+fn mirror_mesh_authz_baggage_gate_fields(target: &mut serde_json::Value, gate: &serde_json::Value) {
+    let Some(gate) = gate.as_object() else {
+        return;
+    };
+    let Some(target) = target.as_object_mut() else {
+        return;
+    };
+    for key in ["trusted_hbone_assertors", "trust_domain_aliases"] {
+        if let Some(value) = gate.get(key) {
+            target.insert(key.to_string(), value.clone());
+        }
+    }
 }
 
 fn inject_mesh_global_plugins(
@@ -12713,19 +12886,6 @@ fn inject_mesh_global_plugins(
         .iter()
         .map(|td| td.as_str().to_string())
         .collect();
-    let operator_mesh_authz_config = config
-        .plugin_configs
-        .iter()
-        .find(|plugin| {
-            plugin.scope == PluginScope::Global
-                && plugin.plugin_name == "mesh_authz"
-                && plugin.id != MESH_AUTHZ_PLUGIN_ID
-        })
-        .map(|plugin| plugin.config.clone());
-    let operator_mesh_authz_present = operator_mesh_authz_config.is_some();
-    let operator_mesh_authz_trusted_assertors = operator_mesh_authz_config
-        .as_ref()
-        .and_then(|cfg| cfg.get("trusted_hbone_assertors").cloned());
     let mesh_managed_trusted_assertors = mesh_managed_trusted_hbone_assertors(runtime, mesh_slice);
     let mut mesh_authz_config = serde_json::json!({
         "mesh_slice": mesh_slice,
@@ -12782,12 +12942,7 @@ fn inject_mesh_global_plugins(
     // so production NodeWaypoint does not fall back to the bare service-account
     // defaults or to namespace-scoped destination workload metadata.
     if let Some(assertors) = mesh_managed_trusted_assertors.as_ref() {
-        mesh_authz_config["trusted_hbone_assertors"] = serde_json::Value::Array(
-            assertors
-                .iter()
-                .map(|raw| serde_json::Value::String(raw.clone()))
-                .collect(),
-        );
+        mesh_authz_config["trusted_hbone_assertors"] = serde_json::Value::Array(assertors.clone());
     }
     // Transparent inbound capture admits unauthenticated direct plaintext, so
     // the mesh-managed, slice-fed `__mesh_authz` instance must be present even
@@ -12870,24 +13025,45 @@ fn inject_mesh_global_plugins(
         "labels": mesh_slice.labels.clone(),
         "trust_domain_aliases": trust_domain_aliases,
     });
-    // Mirror the EFFECTIVE mesh_authz assertor gate so telemetry source-identity
-    // attribution honors HBONE baggage only from the same trusted assertors.
-    // If an operator-managed global mesh_authz overrides the mesh-managed
-    // instance, copy its `trusted_hbone_assertors` field verbatim (including
-    // `[]`); if it omits the field, workload_metrics also omits it so both
-    // plugins fall back to their shared defaults. Without an override, thread
-    // the runtime/env list exactly as the mesh-managed mesh_authz config does.
-    if let Some(value) = operator_mesh_authz_trusted_assertors {
-        workload_metrics_config["trusted_hbone_assertors"] = value;
-    } else if !operator_mesh_authz_present
-        && let Some(assertors) = mesh_managed_trusted_assertors.as_ref()
-    {
-        workload_metrics_config["trusted_hbone_assertors"] = serde_json::Value::Array(
-            assertors
-                .iter()
-                .map(|raw| serde_json::Value::String(raw.clone()))
-                .collect(),
-        );
+    // Mirror EVERY enabled global mesh_authz baggage gate PluginCache will
+    // execute (issue #4274). Capture-on force-injects reserved `__mesh_authz`
+    // beside an operator global; multiple enabled operator globals are also
+    // conjunctive. Disabled rows must not constrain or select this set. A
+    // trigger makes request applicability unknowable, so requiring that gate
+    // is the fail-closed direction. Direct/user-created workload_metrics
+    // without this internal field keep their own single-gate config.
+    let effective_authz_gates: Vec<serde_json::Value> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| {
+            plugin.enabled
+                && plugin.scope == PluginScope::Global
+                && plugin.plugin_name == "mesh_authz"
+        })
+        .map(|plugin| mesh_authz_baggage_gate_config(&plugin.config))
+        .collect();
+    if !effective_authz_gates.is_empty() {
+        if let [single_gate] = effective_authz_gates.as_slice() {
+            mirror_mesh_authz_baggage_gate_fields(&mut workload_metrics_config, single_gate);
+        }
+        let gates_key =
+            crate::plugins::mesh::workload_metrics::EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY;
+        workload_metrics_config[gates_key] = serde_json::Value::Array(effective_authz_gates);
+    } else {
+        // No enabled global mesh_authz. Do not copy a disabled operator
+        // config. Thread the mesh-managed list only when no operator global
+        // mesh_authz row exists, matching the historical no-override path.
+        let operator_mesh_authz_present = config.plugin_configs.iter().any(|plugin| {
+            plugin.scope == PluginScope::Global
+                && plugin.plugin_name == "mesh_authz"
+                && plugin.id != MESH_AUTHZ_PLUGIN_ID
+        });
+        if !operator_mesh_authz_present
+            && let Some(assertors) = mesh_managed_trusted_assertors.as_ref()
+        {
+            workload_metrics_config["trusted_hbone_assertors"] =
+                serde_json::Value::Array(assertors.clone());
+        }
     }
     // Apply ProxyConfig sampling as a baseline. The more granular Telemetry
     // resource below may override on the `sampling_percentage` key.
@@ -13959,6 +14135,15 @@ fn prepare_mesh_runtime_before_owner(
     runtime
         .validate_node_waypoint_udp_listener_settings()
         .map_err(|e| anyhow::anyhow!("Invalid NodeWaypoint UDP/DTLS listener settings: {e}"))?;
+
+    // Same contract for the Sidecar TCP capture listen addresses (issue #4271).
+    // `listener_plan()` is infallible, so an address that cannot serve the
+    // installed `ip6tables` REDIRECT rules would otherwise warn-and-plan the
+    // IPv4 listener alone and leave every captured IPv6 connection refused while
+    // the proxy reports ready.
+    runtime
+        .validate_capture_listener_families()
+        .map_err(|e| anyhow::anyhow!("Invalid mesh TCP capture listener settings: {e}"))?;
 
     if peek_mesh_startup_fault_inject() == MeshStartupFaultInject::BeforeOwner {
         let _ = take_mesh_startup_fault_inject();
@@ -15373,12 +15558,19 @@ async fn arm_mesh_runtime_startup(
             );
         }
 
-        let label = format!("{:?} {:?} mesh listener", listener.direction, listener.kind);
+        // The address is part of the label because one direction/kind can now plan
+        // TWO listeners (the `127.0.0.1` + `[::1]` loopback capture pair), and
+        // the startup-signal and post-start-failure reports must name which one.
+        let label = format!(
+            "{:?} {:?} mesh listener on {}",
+            listener.direction, listener.kind, listener.addr
+        );
         let state = proxy_state.clone();
         let shutdown = shutdown_tx.subscribe();
         let addr = listener.addr;
         let direction = listener.direction;
         let kind = listener.kind;
+        let dual_stack = listener.dual_stack;
         let listener_startup_ready = startup_ready.clone();
         let listener_serving_degraded = serving_degraded.clone();
         let listener_failures = serving_listener_failures.clone();
@@ -15401,6 +15593,7 @@ async fn arm_mesh_runtime_startup(
                     shutdown,
                     Some(direction),
                     allows_plaintext,
+                    dual_stack,
                     Some(started_tx),
                 )
                 .await
@@ -15446,6 +15639,7 @@ async fn arm_mesh_runtime_startup(
                     shutdown,
                     tls_config,
                     Some(direction),
+                    dual_stack,
                     Some(started_tx),
                 )
                 .await
@@ -19982,6 +20176,79 @@ pub mod initial_config_wait_test_seams {
     }
 }
 
+/// Resolve one configured Sidecar TCP capture address into the complete set of
+/// `(bind address, dual-stack)` listeners needed to serve the installed capture
+/// rules (issue #4271).
+///
+/// Sidecar capture is netfilter `REDIRECT`, and the injector emits the redirect
+/// rules PER ADDRESS FAMILY: `iptables` for IPv4 and `ip6tables` for IPv6, both
+/// pointing at the SAME port. A family with rules but no listener on that port
+/// is refused with `ECONNREFUSED` — a silent capture black hole — so the plan is
+/// derived from `ipv6_capture` (whether `ip6tables` rules exist) rather than
+/// from the configured address's family alone.
+///
+/// * `ipv6_capture == false` keeps exactly the configured address. This is the
+///   default posture and is byte-for-byte the historical plan.
+/// * A **wildcard** address becomes ONE dual-stack `[::]` listener. `REDIRECT`
+///   in `PREROUTING` rewrites the destination to the receiving interface's own
+///   address, so inbound capture must listen on a wildcard; a single
+///   `IPV6_V6ONLY`-disabled socket claims both the native-v6 and the v4-mapped
+///   half, and the bind downgrades to `0.0.0.0` when IPv6 is unavailable. Two
+///   sockets are not an option here — a dual-stack `[::]` bind already owns the
+///   v4 wildcard, so a sibling `0.0.0.0` bind on the same port is `EADDRINUSE`.
+/// * A **loopback** address becomes TWO listeners, `127.0.0.1` and `[::1]`.
+///   `REDIRECT` in `OUTPUT` sends locally generated traffic to `127.0.0.1` for
+///   IPv4 and `::1` for IPv6, and — unlike the wildcard — a dual-stack socket
+///   bound to `[::1]` does NOT receive IPv4 loopback traffic. This keeps the
+///   outbound capture listener loopback-only instead of widening it to a
+///   network-reachable wildcard.
+/// * Any other **specific** literal is an ERROR: there is no defensible way to
+///   guess the workload's address in the other family, and quietly serving one
+///   family would be the black hole this function exists to prevent. The
+///   operator either widens the address or disables IPv6 capture.
+///
+/// Port `0` (ephemeral, used by in-process tests and to disable a listener)
+/// keeps the configured address alone: two ephemeral binds would land on two
+/// unrelated ports, which no redirect rule can name.
+fn sidecar_capture_listener_addrs(
+    configured: SocketAddr,
+    ipv6_capture: bool,
+) -> Result<Vec<(SocketAddr, bool)>, String> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    if !ipv6_capture || configured.port() == 0 {
+        return Ok(vec![(configured, false)]);
+    }
+    let port = configured.port();
+    let ip = configured.ip();
+    if ip.is_unspecified() {
+        return Ok(vec![(
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+            true,
+        )]);
+    }
+    if ip.is_loopback() {
+        return Ok(vec![
+            (
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+                false,
+            ),
+            (
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
+                false,
+            ),
+        ]);
+    }
+    Err(format!(
+        "IPv6 mesh capture is active (ip6tables REDIRECT rules point at port {port}), but the \
+         configured capture address {configured} is a specific {} literal, so captured IPv6 \
+         connections would be refused with ECONNREFUSED. Use a wildcard (0.0.0.0 / ::) or a \
+         loopback address, or disable the IPv6 rule producer with \
+         FERRUM_MESH_IP6TABLES_ENABLED=false (or remove the IPv6 CIDRs)",
+        if ip.is_ipv4() { "IPv4" } else { "IPv6" }
+    ))
+}
+
 fn parse_socket_addr(key: &str, raw: &str) -> Result<SocketAddr, String> {
     raw.parse::<SocketAddr>()
         .map_err(|e| format!("{key} must be a socket address (got '{raw}'): {e}"))
@@ -20757,6 +21024,13 @@ mod tests {
             "FERRUM_MESH_ALLOW_NO_CA",
             "FERRUM_MESH_CAPTURE_UDP_ENABLED",
             "FERRUM_MESH_CAPTURE_UDP_PORT",
+            // Decide the TCP capture listener families (issue #4271). Leaving any
+            // of these set after an IPv6-capture test would make an unrelated
+            // plan assertion observe the dual-stack / loopback-pair shape.
+            "FERRUM_MESH_CAPTURE_IPV6_ENABLED",
+            "FERRUM_MESH_IP6TABLES_ENABLED",
+            "FERRUM_MESH_CAPTURE_INCLUDE_CIDRS",
+            "FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS",
             "FERRUM_MESH_WAYPOINT_NAME",
             // Shared with the node-agent: when set, NodeWaypoint plans a second
             // transparent capture listener. Leaving it set after a redirect-on
@@ -29272,8 +29546,18 @@ mod tests {
             namespace: "default".to_string(),
             workloads: vec![reviews, ratings, duplicate],
             node_waypoint_assertors: vec![
-                SpiffeId::new(waypoint_a).unwrap(),
-                SpiffeId::new(waypoint_b).unwrap(),
+                crate::modes::mesh::config::NodeWaypointAssertor {
+                    spiffe_id: SpiffeId::new(waypoint_a).unwrap(),
+                    asserts: vec![
+                        SpiffeId::new("spiffe://cluster.local/ns/ratings/sa/ratings").unwrap(),
+                    ],
+                },
+                crate::modes::mesh::config::NodeWaypointAssertor {
+                    spiffe_id: SpiffeId::new(waypoint_b).unwrap(),
+                    asserts: vec![
+                        SpiffeId::new("spiffe://cluster.local/ns/reviews/sa/reviews").unwrap(),
+                    ],
+                },
             ],
             ..MeshSlice::default()
         };
@@ -29281,7 +29565,16 @@ mod tests {
 
         inject_mesh_global_plugins(&mut config, &runtime, &mesh_slice);
 
-        let expected = serde_json::json!([waypoint_a, waypoint_b]);
+        let expected = serde_json::json!([
+            {
+                "assertor": waypoint_a,
+                "asserts": ["spiffe://cluster.local/ns/ratings/sa/ratings"],
+            },
+            {
+                "assertor": waypoint_b,
+                "asserts": ["spiffe://cluster.local/ns/reviews/sa/reviews"],
+            },
+        ]);
         let authz = config
             .plugin_configs
             .iter()
@@ -29325,8 +29618,16 @@ mod tests {
             namespace: "default".to_string(),
             workloads: vec![reviews],
             node_waypoint_assertors: vec![
-                SpiffeId::new(destination_waypoint).unwrap(),
-                SpiffeId::new(source_waypoint).unwrap(),
+                crate::modes::mesh::config::NodeWaypointAssertor {
+                    spiffe_id: SpiffeId::new(destination_waypoint).unwrap(),
+                    asserts: vec![SpiffeId::new(destination_workload_spiffe).unwrap()],
+                },
+                crate::modes::mesh::config::NodeWaypointAssertor {
+                    spiffe_id: SpiffeId::new(source_waypoint).unwrap(),
+                    asserts: vec![
+                        SpiffeId::new("spiffe://cluster.local/ns/other/sa/client").unwrap(),
+                    ],
+                },
             ],
             services: vec![http_mesh_service(
                 "reviews",
@@ -29339,7 +29640,16 @@ mod tests {
 
         inject_mesh_global_plugins(&mut config, &runtime, &mesh_slice);
 
-        let expected = serde_json::json!([destination_waypoint, source_waypoint]);
+        let expected = serde_json::json!([
+            {
+                "assertor": destination_waypoint,
+                "asserts": [destination_workload_spiffe],
+            },
+            {
+                "assertor": source_waypoint,
+                "asserts": ["spiffe://cluster.local/ns/other/sa/client"],
+            },
+        ]);
         let authz = config
             .plugin_configs
             .iter()
@@ -29423,6 +29733,50 @@ mod tests {
             authz.config.get("trusted_hbone_assertors").is_none(),
             "explicit no-CA/no-identity development NodeWaypoint keeps mesh_authz defaults"
         );
+    }
+
+    /// Issue #4274 topology derivation: every mesh-managed topology OTHER than
+    /// identity-backed NodeWaypoint threads NO assertor list, so both plugins
+    /// fall back to the shared fail-closed defaults (bare `ztunnel`/`waypoint`
+    /// with a SAME-NAMESPACE grant). What must never happen is a topology
+    /// quietly emitting a namespace-blind list.
+    #[test]
+    fn inject_mesh_global_plugins_non_node_waypoint_topologies_keep_default_assertors() {
+        for topology in [
+            MeshTopology::Sidecar,
+            MeshTopology::Ambient,
+            MeshTopology::ServiceWaypoint,
+            MeshTopology::EastWestGateway,
+            MeshTopology::EgressGateway,
+        ] {
+            let mut runtime = test_mesh_runtime_config();
+            runtime.topology = topology;
+            let mut config = GatewayConfig::default();
+
+            inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
+
+            let authz = config
+                .plugin_configs
+                .iter()
+                .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
+                .expect("mesh_authz plugin injected");
+            assert!(
+                authz.config.get("trusted_hbone_assertors").is_none(),
+                "{topology:?} must not thread an assertor list of its own"
+            );
+            let workload_metrics = config
+                .plugin_configs
+                .iter()
+                .find(|plugin| plugin.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
+                .expect("workload_metrics plugin injected");
+            assert!(
+                workload_metrics
+                    .config
+                    .get("trusted_hbone_assertors")
+                    .is_none(),
+                "{topology:?} telemetry must mirror the authz allow-list exactly"
+            );
+        }
     }
 
     #[test]
@@ -29977,6 +30331,177 @@ mod tests {
                 .get("trusted_hbone_assertors")
                 .is_none(),
             "when operator mesh_authz omits trusted_hbone_assertors, workload_metrics must omit it too so both use shared defaults"
+        );
+    }
+
+    fn injected_workload_metrics_config(config: &GatewayConfig) -> &serde_json::Value {
+        &config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
+            .expect("workload_metrics plugin injected")
+            .config
+    }
+
+    fn injected_effective_authz_gates(config: &GatewayConfig) -> &[serde_json::Value] {
+        injected_workload_metrics_config(config)
+            .get(crate::plugins::mesh::workload_metrics::EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY)
+            .and_then(|value| value.as_array())
+            .map(Vec::as_slice)
+            .expect("injected workload_metrics must carry the effective authz gate list")
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_injects_single_enabled_authz_gate_into_workload_metrics() {
+        let mut config = GatewayConfig::default();
+        inject_mesh_global_plugins(
+            &mut config,
+            &test_mesh_runtime_config(),
+            &MeshSlice::default(),
+        );
+        let gates = injected_effective_authz_gates(&config);
+        assert_eq!(
+            gates.len(),
+            1,
+            "managed __mesh_authz is the only enabled gate"
+        );
+        assert!(
+            gates[0].get("trusted_hbone_assertors").is_none(),
+            "sidecar managed authz omits the allow-list so both plugins use shared defaults"
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_capture_on_metrics_gates_are_managed_and_enabled_operator() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "node_waypoint"),
+                ("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES", "eth0"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                assert!(runtime.transparent_inbound_capture_requested());
+
+                let mut config = GatewayConfig {
+                    plugin_configs: vec![global_mesh_authz_plugin(
+                        "operator-mesh-authz",
+                        serde_json::json!({ "trusted_hbone_assertors": [] }),
+                    )],
+                    ..GatewayConfig::default()
+                };
+                inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
+                let gates = injected_effective_authz_gates(&config);
+                assert_eq!(
+                    gates.len(),
+                    2,
+                    "capture-on must conjunct the managed gate with the enabled operator gate"
+                );
+                assert!(
+                    gates.iter().any(|gate| {
+                        gate.get("trusted_hbone_assertors") == Some(&serde_json::json!([]))
+                    }),
+                    "operator empty allow-list must be one of the effective gates"
+                );
+                assert!(
+                    injected_workload_metrics_config(&config)
+                        .get("trusted_hbone_assertors")
+                        .is_none(),
+                    "multiple gates must not pick a single winner for the top-level allow-list"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_disabled_operator_is_absent_from_metrics_gates() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "node_waypoint"),
+                ("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES", "eth0"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                let mut disabled = global_mesh_authz_plugin(
+                    "operator-mesh-authz-disabled",
+                    serde_json::json!({ "trusted_hbone_assertors": [] }),
+                );
+                disabled.enabled = false;
+                let mut config = GatewayConfig {
+                    plugin_configs: vec![disabled],
+                    ..GatewayConfig::default()
+                };
+                inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
+                let gates = injected_effective_authz_gates(&config);
+                assert_eq!(
+                    gates.len(),
+                    1,
+                    "disabled operator must not constrain or select the telemetry gate"
+                );
+                assert_ne!(
+                    gates[0].get("trusted_hbone_assertors"),
+                    Some(&serde_json::json!([])),
+                    "disabled operator empty list must not become the telemetry allow-list"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_multiple_operator_authz_gates_are_conjunctive() {
+        let mut config = GatewayConfig {
+            plugin_configs: vec![
+                global_mesh_authz_plugin(
+                    "operator-mesh-authz-a",
+                    serde_json::json!({
+                        "trusted_hbone_assertors": ["waypoint"],
+                    }),
+                ),
+                global_mesh_authz_plugin(
+                    "operator-mesh-authz-b",
+                    serde_json::json!({
+                        "trusted_hbone_assertors": [],
+                    }),
+                ),
+            ],
+            ..GatewayConfig::default()
+        };
+        inject_mesh_global_plugins(
+            &mut config,
+            &test_mesh_runtime_config(),
+            &MeshSlice::default(),
+        );
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != MESH_AUTHZ_PLUGIN_ID),
+            "operator globals suppress managed injection outside capture"
+        );
+        let gates = injected_effective_authz_gates(&config);
+        assert_eq!(gates.len(), 2);
+        assert_eq!(
+            gates[0].get("trusted_hbone_assertors"),
+            Some(&serde_json::json!(["waypoint"]))
+        );
+        assert_eq!(
+            gates[1].get("trusted_hbone_assertors"),
+            Some(&serde_json::json!([]))
         );
     }
 

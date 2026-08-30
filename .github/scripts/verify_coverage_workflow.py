@@ -268,6 +268,31 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         "coverage-shard must not hardcode a static six-shard include matrix",
         failures,
     )
+    require(
+        re.search(r"(?m)^    timeout-minutes: 120$", shard_body) is not None,
+        "coverage-shard must keep the 120-minute lib-unit wall-clock budget",
+        failures,
+    )
+    require(
+        'CARGO_BUILD_JOBS: "2"' in shard_body,
+        "coverage-shard must cap CARGO_BUILD_JOBS at 2 for the lib-unit compile",
+        failures,
+    )
+    require(
+        'CARGO_BUILD_JOBS: "3"' not in shard_body,
+        "coverage-shard must not restore CARGO_BUILD_JOBS=3 after the #4368 OOM recurrence",
+        failures,
+    )
+    require(
+        re.search(r"(?m)^    timeout-minutes: 75$", shard_body) is None,
+        "coverage-shard must not restore the 75-minute deadline that canceled a progressing suite",
+        failures,
+    )
+    require(
+        "--lib" in shard_body and "--test unit_tests" in shard_body,
+        "coverage-shard must keep the combined lib + unit_tests coverage invocation",
+        failures,
+    )
 
     merge_body = extract_job_body(text, "coverage-merge")
     require(
@@ -382,6 +407,16 @@ def validate_docs(failures: list[str]) -> None:
         "docs/ci_cd.md must describe coverage shard planning",
         failures,
     )
+    require(
+        "CARGO_BUILD_JOBS=2" in ci_cd_doc and "timeout-minutes: 120" in ci_cd_doc,
+        "docs/ci_cd.md must record the coverage-shard jobs=2 / 120-minute contract",
+        failures,
+    )
+    require(
+        "#4368" in ci_cd_doc and "33219849557" in ci_cd_doc and "33223661366" in ci_cd_doc,
+        "docs/ci_cd.md must record the #4368 recurrence evidence",
+        failures,
+    )
 
 
 def validate_repository_contract(failures: list[str]) -> None:
@@ -424,11 +459,15 @@ jobs:
           python3 .github/scripts/coverage_plan.py --github-output "$GITHUB_OUTPUT"
   coverage-shard:
     if: needs.coverage-plan.outputs.mode != 'skip'
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
     strategy:
       matrix:
         include: ${{ fromJSON(needs.coverage-plan.outputs.shard-matrix) }}
     steps:
       - run: echo "${{ matrix.shard }}"
+      - run: cargo llvm-cov --no-report --lib --test unit_tests
   coverage-merge:
     name: Merge Coverage
     if: always()
@@ -509,6 +548,21 @@ jobs:
             "PLUGIN_GATE: ${{ needs.coverage-plan.outputs.plugin_gate }}",
             "PLUGIN_GATE: false",
             "dropped plugin gate",
+        ),
+        (
+            "timeout-minutes: 120",
+            "timeout-minutes: 75",
+            "restored 75-minute shard deadline",
+        ),
+        (
+            'CARGO_BUILD_JOBS: "2"',
+            'CARGO_BUILD_JOBS: "3"',
+            "restored CARGO_BUILD_JOBS=3",
+        ),
+        (
+            "cargo llvm-cov --no-report --lib --test unit_tests",
+            "cargo llvm-cov --no-report --lib",
+            "narrowed lib-unit coverage set",
         ),
     ]
     for old, new, label in mutations:

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use reqwest::ClientBuilder;
 #[cfg(feature = "pkcs11")]
@@ -61,9 +61,32 @@ pub enum TlsError {
 /// [`append_backend_svid_generation_key_field`] before calling
 /// [`get_or_try_build`]. Drain operations rely on this contract to scope
 /// invalidation to the rotated generation only.
+///
+/// Numeric-generation retirement is a pair of atomics, not a per-rotation
+/// marker map: an inclusive high-water mark plus a `any` flag so generation
+/// `0` stays cacheable until something is actually retired. `svidg=static`
+/// keys ignore the mark. A late [`get_or_try_build`] whose generation is
+/// already at or below the mark still returns the in-flight `Arc` but does
+/// not re-insert it.
 #[derive(Clone, Default)]
 pub struct BackendTlsConfigCache {
     configs: Arc<DashMap<String, Arc<ClientConfig>>>,
+    retirement: Arc<NumericSvidRetirement>,
+}
+
+/// Monotonic numeric SVID-generation retirement for [`BackendTlsConfigCache`].
+///
+/// Two atomics are required to encode "nothing retired yet" together with
+/// every inclusive high-water mark in `0..=u64::MAX` without a rollover
+/// sentinel. `any == false` means generation `0` is still live. After the
+/// first drain, a numeric generation is retired for *insert* iff
+/// `generation <= inclusive` (`fetch_max`, so retiring `N` also refuses
+/// late inserts of every older numeric generation, including ones a clamped
+/// rotation span did not `retain`).
+#[derive(Default)]
+struct NumericSvidRetirement {
+    inclusive: AtomicU64,
+    any: AtomicBool,
 }
 
 impl BackendTlsConfigCache {
@@ -74,19 +97,28 @@ impl BackendTlsConfigCache {
 
     /// Build a cache sized to the pool's shard count.
     ///
-    /// The SVID generation is intentionally NOT held on the cache: cache keys
-    /// are pre-tagged by callers via `append_backend_svid_generation_key_field`,
-    /// and a stale `|svidg=N` entry is evicted by `drain_svid_generation(N)`
-    /// when the rotation consumer task observes a revision bump. The cache
-    /// itself stays generation-agnostic — see the `BackendTlsConfigCache`
-    /// rustdoc for the full contract.
+    /// Cache keys are pre-tagged by callers via
+    /// `append_backend_svid_generation_key_field`. `drain_svid_generation(N)`
+    /// both `retain`s `|svidg=N` entries and advances the cache-level
+    /// retirement high-water mark so a build that raced the drain cannot
+    /// re-insert `N`. See [`BackendTlsConfigCache`].
     pub fn with_shards(shards: usize) -> Self {
         Self {
             configs: Arc::new(DashMap::with_shard_amount(shards)),
+            retirement: Arc::new(NumericSvidRetirement::default()),
         }
     }
 
     pub fn drain_svid_generation(&self, generation: u64) {
+        // High-water first, then the `any` flag, then retain. A vacant
+        // insert that takes the shard lock after `any` is published must
+        // observe `inclusive >= generation` (AcqRel `fetch_max` happens
+        // before Release `any`) and skip the insert. An insert that
+        // committed before `any` is removed by the subsequent retain.
+        self.retirement
+            .inclusive
+            .fetch_max(generation, Ordering::AcqRel);
+        self.retirement.any.store(true, Ordering::Release);
         let matcher = SvidGenerationMatcher::new(generation);
         self.configs.retain(|key, _| !matcher.matches(key));
     }
@@ -123,6 +155,12 @@ impl BackendTlsConfigCache {
     /// already appended the SVID generation marker to `key` — see the
     /// rustdoc on [`BackendTlsConfigCache`]. A `debug_assert` catches drift
     /// in tests; release builds skip the check.
+    ///
+    /// The `build` closure runs outside the map so handshake work is not
+    /// serialized on a DashMap shard. After it returns, a vacant insert is
+    /// refused when `key`'s numeric `|svidg=` is already retired; the `Arc`
+    /// is still returned for the in-flight connection attempt. Hit lookups
+    /// and `svidg=static` inserts do not load the retirement atomics.
     pub fn get_or_try_build<E, F>(&self, key: String, build: F) -> Result<Arc<ClientConfig>, E>
     where
         F: FnOnce() -> Result<ClientConfig, E>,
@@ -136,15 +174,46 @@ impl BackendTlsConfigCache {
         }
 
         let config = Arc::new(build()?);
+        let numeric_generation = numeric_svid_generation_from_key(&key);
 
         match self.configs.entry(key) {
             dashmap::mapref::entry::Entry::Occupied(entry) => Ok(entry.get().clone()),
             dashmap::mapref::entry::Entry::Vacant(entry) => {
+                if let Some(generation) = numeric_generation
+                    && self.retirement.is_numeric_generation_retired(generation)
+                {
+                    return Ok(config);
+                }
                 entry.insert(config.clone());
                 Ok(config)
             }
         }
     }
+}
+
+impl NumericSvidRetirement {
+    fn is_numeric_generation_retired(&self, generation: u64) -> bool {
+        if !self.any.load(Ordering::Acquire) {
+            // Generation 0 is live until the first drain publishes `any`.
+            return false;
+        }
+        generation <= self.inclusive.load(Ordering::Acquire)
+    }
+}
+
+/// Numeric `|svidg=` from a pool or TLS-config key, ignoring a `#shard` suffix.
+/// `svidg=static` and unparseable tokens yield `None` (not subject to the
+/// numeric high-water mark).
+fn numeric_svid_generation_from_key(key: &str) -> Option<u64> {
+    let rest = key.rsplit_once("|svidg=")?.1;
+    let token = rest
+        .split_once('#')
+        .map(|(generation, _)| generation)
+        .unwrap_or(rest);
+    if token == "static" {
+        return None;
+    }
+    token.parse().ok()
 }
 
 /// Pre-built matcher for SVID generation pool-key drain checks.
@@ -263,12 +332,18 @@ pub fn append_optional_pool_key_component(buf: &mut String, component: Option<&s
 
 /// Append the effective optional H2 max-concurrent-streams pool-key segment.
 ///
-/// Direct-H2 / native-gRPC builders bake `Proxy.pool_http2_max_concurrent_streams`
-/// into the connection (`max_concurrent_streams` + `initial_max_send_streams`),
-/// so the value must partition those pools. `None` writes the literal sentinel
-/// `none` (delimiter-safe digits-or-sentinel encoding, matching the HBONE /
-/// mesh-mTLS `write_pool_config_key` convention) so a DestinationRule update
-/// that removes the cap cannot reuse a connection built under the old limit.
+/// Direct-H2 / native-gRPC builders bake
+/// `PoolConfig::for_proxy(...).http2_max_concurrent_streams` into the
+/// connection (`max_concurrent_streams` + `initial_max_send_streams`), so the
+/// **effective** cap must partition those pools. Callers must pass that
+/// resolved value, not the raw `Proxy.pool_http2_max_concurrent_streams`
+/// `Option`: inheriting the global and setting the same number explicitly
+/// share a key, and a present override is clamped with `.max(1)`. `None`
+/// writes the literal sentinel `none` (delimiter-safe digits-or-sentinel
+/// encoding, matching the HBONE / mesh-mTLS `write_pool_config_key`
+/// convention) when the effective cap is unlimited, so a DestinationRule
+/// update that removes a finite cap cannot reuse a connection built under
+/// the old limit.
 pub fn append_http2_max_concurrent_streams_pool_key(buf: &mut String, max_streams: Option<u32>) {
     match max_streams {
         Some(value) => {

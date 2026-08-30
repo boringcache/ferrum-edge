@@ -18,6 +18,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 - [CONNECT-UDP over HTTP/3 (RFC 9298)](#connect-udp-over-http3-rfc-9298)
 - [QUIC connection migration](#quic-connection-migration)
 - [Header size limits](#header-size-limits)
+  - [Declared frame-length bound and SETTINGS alignment (issue #4261)](#declared-frame-length-bound-and-settings-alignment-issue-4261)
 - [Flow-control window tuning](#flow-control-window-tuning)
 - [Environment variables](#environment-variables)
 
@@ -95,7 +96,7 @@ When the matched proxy has `backend_scheme: https`, the concrete backend target 
 
 The same native QUIC fast path now also serves **`Grpc`** flavor via `dispatch_grpc_native_h3()`, and it is **fully bidirectional**. The response body streams back through the shared QUIC coalescer, and the terminal `grpc-status` / `grpc-message` trailer is forwarded after response-direction hop-by-hop stripping and response-header-policy reconciliation of its application metadata (the reserved status fields always survive — see [Native gRPC terminal metadata](#native-grpc-terminal-metadata)). This is the **only** path that can reach an H3-only gRPC backend, because the gRPC pool (`GrpcConnectionPool`) speaks only HTTP/2 (h2 TLS / h2c). It is gated to the streamable case (no retry / body-plugin buffering, no reqwest-forcing plugin); unary, server-streaming, client-streaming, and bidirectional RPCs are all supported. Retry / body-buffering gRPC still falls through to the H2 gRPC bridge. Every downstream DATA/coalescer write is deadline-biased: expiry before the first client-visible DATA completes with `grpc-status: 4`, including simultaneous readiness, while expiry after any visible DATA resets because a length-prefixed message may be partial. CB / passive-health key off the HTTP transport status (gRPC failures ride on HTTP 200); the adaptive-concurrency sample maps a non-OK backend `grpc-status` to a 5xx, matching the H2 streaming gRPC bridge.
 
-### Committed streaming responses always reset on a non-clean exit (issue #4112)
+### Committed streaming responses always reset on a non-clean exit (issue #4112 / #4363)
 
 `quinn::SendStream::drop` implicitly `finish()`es a send half that was neither
 finished nor reset. Once a streaming response's HEADERS have committed, any way
@@ -112,22 +113,49 @@ The inline native-H3 streaming relay in `handle_h3_request` therefore holds its
 committed send half in `stream_util::CommittedH3ResponseStream`. The predicate
 is inverted relative to `stream_util::committed_response_requires_reset` (the
 conditional post-relay re-assertion the cross-protocol relays apply): the
-terminal is a **reset unless the relay proved a `finish()` returned `Ok`**, so a
-branch that stops writing without latching an error class is still fail closed,
-and `Drop` covers a task that never reaches the post-relay settle at all. Same
-shape as `ConnectUdpSendHalf` (issue #4072). The relay calls
+terminal is a **reset unless the relay proved a `finish()` returned `Ok` and
+the stream was not already forced to reset**, so a branch that stops writing
+without latching an error class is still fail closed, and `Drop` covers a task
+that never reaches the post-relay settle at all. Same shape as
+`ConnectUdpSendHalf` (issue #4072). The relay calls
 `settle_committed_terminal()` immediately after its loop so the reset reaches
 the wire before the response-termination hooks and transaction logging await;
 `Drop` is only the backstop.
+
+`abort_committed()` latches `force_reset` and applies `stop_stream` immediately.
+That latch is authorization-first: a later `finish()` that returns `Ok` cannot
+disarm it. Settle skips the reset only for a proven clean authorized FIN
+(`clean_finish && !force_reset`); otherwise it always retries `stop_stream`.
+A previous `reset_applied` flag set *before* a no-op abort skipped the Drop
+retry, and `quinn::SendStream::drop` then FINned — which is how a stalled
+client observed `recv_data() == Ok(None)` after the credential had already been
+counted as expired (issue #4363). `h3-quinn`'s `reset` ignores Quinn errors and
+does not clear a cancelled `send_data`'s `writing` buffer, so the first abort
+while a write is parked can be a no-op; Drop retries after that future is gone.
+`stop_stream` is idempotent, matching `ConnectUdpSendHalf`.
+
+Native **plain** relays (`handle_h3_request`, `stream_h3_open_response_to_client`,
+`proxy_to_backend_h3_streaming`) use a **biased** `select!` with the
+authorization arm first, so a simultaneously-ready backend EOS cannot proceed
+to `finish()`. `h3-quinn`'s `poll_finish` calls Quinn `finish()` synchronously
+and does not park on a stalled client, so reaching that call after expiry would
+present a clean FIN. Backend EOS (`recv_data` `Ok(None)` or a graceful-close
+treated as complete) also consults the **captured** authorization Instant
+before any client FIN; a spent plan aborts rather than finishing. The post-body
+trailer read in `finish_h3_response_with_backend_trailers` races the same
+captured plan through `await_deadline_first`, so an operator
+`backend_read_timeout_ms` longer than the credential cannot outlive it. A
+response that genuinely completes before expiry still FINs cleanly.
 
 The sibling relays `stream_h3_open_response_to_client` and
 `proxy_to_backend_h3_streaming` receive their send half as a `&mut` from the H3
 request handler, so they cannot move it into the owning guard. They hold it in
 `stream_util::BorrowedCommittedH3ResponseStream` instead (issue #4125) — the
-same inverted predicate, the same `Drop` backstop, the same explicit settle
-after the relay loop, differing only in that the guard borrows rather than owns.
-Every reset site in the committed region reborrows through the guard
-(`&mut *h3_stream`), so a write can no longer reach the send half around it.
+same inverted predicate, the same `force_reset` latch, the same `Drop`
+backstop, the same explicit settle after the relay loop, differing only in that
+the guard borrows rather than owns. Every reset site in the committed region
+goes through `abort_committed()` so a write can no longer reach the send half
+around the guard and a no-op abort cannot skip Drop's retry.
 
 In both borrowing relays the disarm is a SINGLE site, and the invariant that
 makes that safe is stronger than the native relay's: inside the committed region
@@ -137,7 +165,8 @@ its `h3_stream.finish()` produced `H3AuthorizedWrite::Written`, and that one
 match arm is also the relay's only `body_completed = true`. One disarm per
 relay, coinciding with one clean-completion latch, is therefore the complete
 set — locked by
-`committed_borrowed_h3_streaming_responses_reset_unless_a_finish_landed` in
+`committed_borrowed_h3_streaming_responses_reset_unless_a_finish_landed` and
+`native_plain_h3_streaming_relays_are_authorization_first_at_backend_eos` in
 `tests/unit/gateway_core/http3_server_dispatch_tests.rs`.
 
 As with the native relay, the behaviour change beyond the drop hazard is that
@@ -1308,9 +1337,86 @@ The H3 listener enforces its own per-header and total-header size limits:
 
 These are enforced separately from hyper's built-in validation because the H3 listener parses headers via the `h3` crate, not via hyper. The `Host` value used for routing is extracted from an already-validated header, so separate host-length validation is unnecessary.
 
+### Declared frame-length bound and SETTINGS alignment (issue #4261)
+
+Header size limits are also the HTTP/3 *receive-side* bound on what one QUIC
+stream can make the frame decoder buffer, on both untrusted frontend clients and
+untrusted H3 backend peers.
+
+Every HTTP/3 frame other than `DATA` — HEADERS, SETTINGS, GOAWAY, PUSH_PROMISE,
+and every unknown type, which RFC 9114 §7.2.8 says to ignore but which still has
+to be buffered before it can be skipped — has to be accumulated whole before it
+can be interpreted. The frame decoder learns the payload length from a QUIC
+varint in the frame header, so an unbounded declared length is an unbounded
+buffer.
+
+QUIC flow control does **not** bound that. `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW`
+and `FERRUM_HTTP3_RECEIVE_WINDOW` cap the bytes *in flight*; the decoder
+consumes from the stream on every poll, which re-grants credit. `max_idle_timeout`
+does not help either — a peer streaming payload for a frame it over-declared is
+active, not idle.
+
+The gateway therefore derives two values from `FERRUM_MAX_HEADER_SIZE_BYTES`,
+the same policy the HTTP/1.1 and HTTP/2 frontends derive their parser limits
+from. It installs both at `h3::server::builder()` for untrusted frontend
+clients. Every production pooled H3 backend connection installs the declared
+frame ceiling through `h3::client::builder()` as well; `h3::client::new` keeps
+the unbounded upstream default and is not used on those constructors. A
+malicious or compromised H3 backend can declare an enormous HEADERS, unknown,
+CONTROL, or PUSH frame the same way a frontend client can; QUIC flow control
+does not bound accumulation on either side. Backend clients deliberately do
+not set `max_field_section_size`: `FERRUM_MAX_HEADER_SIZE_BYTES` is documented
+as a request-header policy, not an H3-only backend response-header limit.
+
+| Value | Source | Effect |
+|---|---|---|
+| Frontend `SETTINGS_MAX_FIELD_SECTION_SIZE` | `FERRUM_MAX_HEADER_SIZE_BYTES`, floored at 16 KiB, clamped into the QUIC varint range | Advertised to the client, and enforced by frontend QPACK decoding. Before this the listener advertised `VarInt::MAX` (2^62-1) while enforcing the configured limit only after a complete decode. |
+| Buffered non-`DATA` frame ceiling | 2x the frontend field-section size | On frontend and pooled backend connections, a frame whose **declared** payload length exceeds it is refused before a single payload byte is buffered. |
+
+**Failure posture.** The refusal happens as soon as the frame's type and length
+varints are decoded — before the payload is stored and before the decoder arms
+an accumulation target — and is a *connection* error of type
+`H3_EXCESSIVE_LOAD` (`0x0107`, RFC 9114 §8.1). An over-declared length is a
+resource-exhaustion attempt, not a malformed frame, so `H3_FRAME_ERROR` would
+misreport it. The declared length is compared against the raw `u64` varint
+before any `usize` conversion, so a `2^32 + n` declaration cannot truncate into
+a short frame on a 32-bit target and slip under the ceiling; a length the
+platform cannot address is refused the same way whatever the ceiling is.
+
+Both the request streams and the peer's unidirectional control and push streams
+decode under the same ceiling.
+
+**The `DATA` exception.** `DATA` frame lengths are *never* bounded by this
+ceiling. Their payload is streamed to the proxy path rather than accumulated by
+the decoder, and request bodies legitimately exceed any header-sized limit.
+Request bodies stay bounded by Ferrum's existing body-size policy
+(`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` and the per-proxy equivalents).
+
+**Why 2x, and what still returns 431.** The ceiling sits above the advertised
+policy on purpose. A QPACK-encoded field section is smaller than the RFC 9114
+field-section accounting of the same headers (which adds 32 bytes per field), so
+a request that merely overshoots `FERRUM_MAX_HEADER_SIZE_BYTES` still decodes
+and is answered with a graceful `431 Request Header Fields Too Large` rather
+than a connection abort. Only a declaration far beyond the policy — the attack
+shape — reaches the connection-level refusal. The listener's own post-decode
+total-header check remains in place as defence in depth. On the backend client,
+the same 2x declared-frame ceiling bounds encoded response HEADERS and the
+peer's unidirectional control and push frames without adding a decoded response
+header policy that H1/H2 backends do not share.
+
+**Configuration admission.** Both derived values travel the wire as QUIC
+varints. `EnvConfig::validate` refuses a `FERRUM_MAX_HEADER_SIZE_BYTES` whose
+derived ceiling would not fit in one, rather than silently clamping the policy
+into a bound the operator never configured (which would also make the H3
+frontend disagree with H1 and H2 about the same setting).
+
+This bound lives in the vendored `h3` crate; see
+[`docs/upstream-h3-patches/005-max-buffered-frame-len/`](upstream-h3-patches/005-max-buffered-frame-len/README.md)
+for the upstream retirement plan.
+
 ## Flow-control window tuning
 
-The default QUIC flow-control windows are conservative because the H3 listener serves untrusted clients: 256 KiB per stream, 2 MiB receive budget per connection, and 2 MiB send budget per connection. The connection-level receive window is the aggregate governor, so active per-stream receive windows cannot exceed the connection receive budget in total. Memory budget per QUIC connection scales with `FERRUM_HTTP3_RECEIVE_WINDOW + FERRUM_HTTP3_SEND_WINDOW`; raise these values only after benchmarking a workload that benefits from larger windows. Explicit env values continue to override these defaults. Note: the H3 *backend* pool (gateway-to-upstream) uses larger windows internally (8 MiB stream / 32 MiB connection / 8 MiB send) — these are not exposed as env vars because the backend pool talks to trusted upstreams.
+The default QUIC flow-control windows are conservative because the H3 listener serves untrusted clients: 256 KiB per stream, 2 MiB receive budget per connection, and 2 MiB send budget per connection. The connection-level receive window is the aggregate governor, so active per-stream receive windows cannot exceed the connection receive budget in total. Memory budget per QUIC connection scales with `FERRUM_HTTP3_RECEIVE_WINDOW + FERRUM_HTTP3_SEND_WINDOW`; raise these values only after benchmarking a workload that benefits from larger windows. Explicit env values continue to override these defaults. Note: the H3 *backend* pool (gateway-to-upstream) uses larger windows internally (8 MiB stream / 32 MiB connection / 8 MiB send) — these are not exposed as env vars. Larger windows do **not** replace the declared-frame-length bound: pooled backend connections still install `max_buffered_frame_len` from `FERRUM_MAX_HEADER_SIZE_BYTES`, because an H3 backend is a hostile network boundary.
 
 The frontend HTTP/2 listener applies the same conservative-by-default philosophy via `FERRUM_FRONTEND_H2_INITIAL_STREAM_WINDOW_SIZE` (256 KiB), `FERRUM_FRONTEND_H2_INITIAL_CONNECTION_WINDOW_SIZE` (2 MiB), and `FERRUM_FRONTEND_H2_MAX_FRAME_SIZE` (16 KiB). These are independent of the backend pool `FERRUM_POOL_HTTP2_*` env vars. For benchmarking or trusted-network deployments, raise the frontend H2 values to match the backend pool defaults (8 MiB stream / 32 MiB connection / 1 MiB frame).
 

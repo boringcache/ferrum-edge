@@ -2067,7 +2067,7 @@ struct RecoveredSliceCarriers {
     config_revision: Option<crate::modes::mesh::revision::MeshConfigRevision>,
     workloads: Vec<crate::modes::mesh::config::Workload>,
     ambient_udp_source_workloads: Vec<crate::modes::mesh::config::Workload>,
-    node_waypoint_assertors: Vec<crate::identity::spiffe::SpiffeId>,
+    node_waypoint_assertors: Vec<crate::modes::mesh::config::NodeWaypointAssertor>,
     node_waypoint_capture_destinations: Vec<crate::modes::mesh::config::Workload>,
     node_waypoint_capture_peer_authentications: Vec<crate::modes::mesh::config::PeerAuthentication>,
     mesh_policies: Vec<crate::modes::mesh::config::MeshPolicy>,
@@ -5728,10 +5728,14 @@ mod tests {
             })],
             workloads: vec![workload.clone()],
             ambient_udp_source_workloads: vec![workload.clone()],
-            node_waypoint_assertors: vec![
-                SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint")
+            node_waypoint_assertors: vec![crate::modes::mesh::config::NodeWaypointAssertor {
+                spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint")
                     .expect("node waypoint spiffe id"),
-            ],
+                asserts: vec![
+                    SpiffeId::new("spiffe://cluster.local/ns/default/sa/app")
+                        .expect("fronted workload spiffe id"),
+                ],
+            }],
             services: vec![service.clone()],
             // Inbound-only un-narrowed views must round-trip via their dedicated
             // ECDS carriers independent of the egress-narrowed `services` /
