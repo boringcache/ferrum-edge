@@ -39,6 +39,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail-closed pair `forward_sensitive_query=true` plus an exact decoded-name
   `forward_sensitive_query_allowlist`. Mirror logs still omit the entire query.
 
+### Fixed
+
+- **Linux GNU release ABI floor is now GLIBC_2.34** (issue #4301). Generic
+  `ferrum-edge-linux-{x86_64,aarch64}` and `ferrum-cni-linux-{x86_64,aarch64}`
+  artifacts previously linked against whatever glibc `ubuntu-latest` shipped
+  (observed GLIBC_2.39), so they failed on Ubuntu 22.04, RHEL 9, and Debian 12.
+  The x86_64 GNU cell of the release and `latest` producer jobs no longer
+  compiles on the runner: it builds both binaries in a digest-pinned
+  AlmaLinux 8.10 sysroot under an isolated `CARGO_TARGET_DIR`
+  (`target/linux-gnu-sysroot`) so native runner caches cannot contaminate the
+  pinned link, and the same job then stages, checksums, ABI-scans, and
+  oldest-baseline-smokes those exact bytes before uploading them. The GitHub
+  Release, its `.sha256` sidecars, the `latest` prerelease, the x86_64 layer
+  of the default multi-arch container images, and the signing/attestation
+  jobs therefore all consume the x86_64 bytes that were verified; a floor
+  violation means that artifact is never uploaded. ARM64 GNU artifacts still
+  come from the isolated Cross build, already target an older glibc, and are
+  re-checked as published on an ARM64 runner. The `docker` job needs
+  `[test, build-binaries, build-arm64-cross, main-publish-gate]` and does not
+  wait on that ARM64 ABI job, so the arm64 image layer is pushed before
+  verification; `linux-gnu-abi-latest-gate` / `linux-gnu-abi-release-gate`
+  delete only the GitHub Release (or `latest` prerelease), never the
+  `:latest` / `:vX.Y.Z` image tags. Full-mode pull requests run the same
+  sysroot builder as a pre-merge regression signal. Artifact names,
+  checksums, signatures, and container publish behavior are unchanged.
+  Remaining dynamic libraries are `libgcc_s.so.1` and, if not static-linked,
+  `libz.so.1`.
+
 ### Changed
 
 - **BREAKING — `FERRUM_TLS_OFFLOAD_THREADS` nonzero values fail startup**

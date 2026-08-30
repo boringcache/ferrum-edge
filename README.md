@@ -51,7 +51,7 @@ On Kubernetes, map each mode to its chart or external contract in
 ## Prerequisites
 
 - **Rust** toolchain — latest stable (the repo pins `channel = "stable"` via `rust-toolchain.toml`; rustup will auto-install on first `cargo` invocation). CI runs clippy with `-D warnings` against the current stable, so local toolchains MUST be at parity.
-- **protoc** (Protocol Buffers compiler) for gRPC code generation
+- **protoc** (Protocol Buffers compiler) for gRPC code generation — install `protobuf-compiler` or set `PROTOC` to the executable path
 - **Database** (optional): PostgreSQL, MySQL, SQLite, or MongoDB (for database and CP modes)
 
 ## Installation
@@ -86,6 +86,8 @@ chmod +x ferrum-edge-linux-x86_64
 sudo install -m 0755 ferrum-edge-linux-x86_64 /usr/local/bin/ferrum-edge
 ferrum-edge version
 ```
+
+Published Linux GNU artifacts (`ferrum-edge-linux-x86_64`, `ferrum-cni-linux-x86_64`, and the ARM64 pair) are dynamically linked against glibc. The declared runtime floor is **GLIBC_2.34** (RHEL 9 / Rocky Linux 9 / AlmaLinux 9, which also covers Ubuntu 22.04 and Debian 12). The x86_64 GNU binaries are built in a digest-pinned **AlmaLinux 8.10** sysroot (glibc 2.28) by the same job that checksums and uploads them, and that job ABI-scans and smoke-tests the exact staged bytes before publishing them, so the released artifact is the artifact that was verified. ARM64 GNU artifacts come from the isolated Cross build, already target an older glibc, and are re-checked as published. Beyond glibc, the remaining dynamic libraries are `libgcc_s.so.1` and, when the Kafka stack does not static-link zlib, `libz.so.1`. Any GNU artifact whose GLIBC version-need records exceed 2.34, whose `DT_NEEDED` set is outside that allowlist, whose `e_machine` does not match the advertised `*-x86_64` / `*-aarch64` architecture, or that embeds a `DT_RPATH` / `DT_RUNPATH`, fails the release.
 
 ### Docker
 
