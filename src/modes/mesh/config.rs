@@ -6420,6 +6420,15 @@ fn validate_mesh_config_internal(
                 se.name
             ));
         }
+        // Export visibility is security-relevant (issue #2465): an
+        // unsupported or self-conflicting list must reject the config rather
+        // than be interpreted, so a typo can never widen a namespace-local
+        // entry into a mesh-wide one.
+        validate_mesh_export_to(
+            &format!("ServiceEntry '{}'", se.name),
+            &se.export_to,
+            &mut errors,
+        );
     }
 
     // Telemetry

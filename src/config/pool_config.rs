@@ -353,6 +353,25 @@ impl PoolConfig {
         proxy.pool_enable_http2.unwrap_or(self.enable_http2)
     }
 
+    /// Effective HTTP/2 max concurrent streams after proxy overrides, without
+    /// cloning `PoolConfig`.
+    ///
+    /// Matches [`Self::apply_proxy_overrides`]: a present per-proxy value is
+    /// clamped with `.max(1)`; otherwise the global (possibly `None` =
+    /// unlimited) is inherited. Direct-H2 and native-gRPC pool keys encode
+    /// this resolved value so identical constructed-connection behavior shares
+    /// one key (inherit-global == explicit-global, `Some(0)` == `Some(1)`).
+    #[inline]
+    pub fn effective_http2_max_concurrent_streams(
+        &self,
+        proxy: &crate::config::types::Proxy,
+    ) -> Option<u32> {
+        match proxy.pool_http2_max_concurrent_streams {
+            Some(val) => Some(val.max(1)),
+            None => self.http2_max_concurrent_streams,
+        }
+    }
+
     /// Append the reqwest client-level settings that `ConnectionPool::create_client`
     /// bakes into the shared `reqwest::Client`.
     ///

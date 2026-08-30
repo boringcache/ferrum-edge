@@ -22,6 +22,7 @@ use futures_util::{Stream, StreamExt};
 use k8s_openapi::api::core::v1::{Container, Node, Pod, PodSpec, PodStatus, Probe};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ListParams;
+use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher::{self as kube_watcher, Event};
 use kube::{Client, api::Api};
 use tracing::{debug, error, info, warn};
@@ -1750,7 +1751,12 @@ async fn run_with_backend(
     let pods: Api<Pod> = Api::all(client.clone());
     let watcher_config =
         kube_watcher::Config::default().fields(&format!("spec.nodeName={}", config.node_name));
-    let pod_stream = Box::pin(kube_watcher::watcher(pods, watcher_config));
+    // `watcher()` yields errors to the consumer without pausing. Chain the
+    // kube runtime's default backoff at construction (same contract as
+    // `k8s_controller::watcher`) so a persistently failing node-scoped Pods
+    // watch cannot tight-loop list/watch on every DaemonSet replica. Do not
+    // add a second sleep in the select error arm.
+    let pod_stream = Box::pin(kube_watcher::watcher(pods, watcher_config).default_backoff());
     run_with_pod_stream(
         &mut owner,
         config,

@@ -4752,16 +4752,29 @@ fn committed_native_h3_streaming_responses_reset_unless_a_finish_landed() {
         .expect("the fail-closed terminal must be applicable before the relay's awaits");
     let settle_body = settle.split("\n    }").next().expect("bounded settle body");
     assert!(
-        settle_body.contains("if self.clean_finish || self.reset_applied {"),
-        "the terminal must be skipped only for a proven clean FIN, and stay idempotent"
+        settle_body.contains("if self.clean_finish && !self.force_reset {"),
+        "the terminal must be skipped only for a proven clean authorized FIN"
+    );
+    assert!(
+        !settle_body.contains("reset_applied"),
+        "a no-op abort must not latch a skip that Drop would honor; Drop retries stop_stream"
     );
     assert!(
         settle_body.contains("abort_response_stream(&mut self.stream)"),
         "the fail-closed terminal must RESET the send half"
     );
     assert!(
-        stream_util.contains("pub(crate) fn record_clean_finish(&mut self) {"),
-        "only an actual clean FIN may disarm the reset"
+        stream_util.contains("pub(crate) fn abort_committed(&mut self) {"),
+        "non-clean exits must latch force_reset so a later finish Ok cannot disarm"
+    );
+    let record = stream_util
+        .split("pub(crate) fn record_clean_finish(&mut self) {")
+        .nth(1)
+        .expect("only an actual clean FIN may disarm the reset");
+    let record_body = record.split("\n    }").next().expect("bounded record body");
+    assert!(
+        record_body.contains("if self.force_reset {"),
+        "record_clean_finish must ignore a finish Ok after abort_committed (authorization-first)"
     );
 
     let server = include_str!("../../../src/http3/server.rs");
@@ -4792,6 +4805,14 @@ fn committed_native_h3_streaming_responses_reset_unless_a_finish_landed() {
         relay.matches("body_completed = true;").count(),
         disarms,
         "every clean-completion latch in the guarded relay must disarm the reset with it"
+    );
+    assert!(
+        !relay.contains("abort_response_stream(&mut *stream)"),
+        "guarded native-H3 resets must go through abort_committed so force_reset latches"
+    );
+    assert!(
+        relay.contains("stream.abort_committed();"),
+        "every non-clean exit in the native relay must latch force_reset"
     );
 }
 
@@ -4858,12 +4879,12 @@ fn committed_borrowed_h3_streaming_responses_reset_unless_a_finish_landed() {
     );
     for body in &settle_bodies {
         assert!(
-            body.contains("if self.clean_finish || self.reset_applied {"),
-            "the terminal must be skipped only for a proven clean FIN, and stay idempotent"
+            body.contains("if self.clean_finish && !self.force_reset {"),
+            "the terminal must be skipped only for a proven clean authorized FIN"
         );
         assert!(
-            body.contains("self.reset_applied = true;"),
-            "a settled committed-response terminal must record that it fired"
+            !body.contains("reset_applied"),
+            "a no-op abort must not latch a skip that Drop would honor; Drop retries stop_stream"
         );
         assert!(
             body.contains("abort_response_stream("),
@@ -4927,6 +4948,14 @@ fn committed_borrowed_h3_streaming_responses_reset_unless_a_finish_landed() {
         assert!(
             !guarded.contains("abort_response_stream(h3_stream)"),
             "guarded relay resets must reborrow through the committed-response guard"
+        );
+        assert!(
+            !guarded.contains("abort_response_stream(&mut *h3_stream)"),
+            "guarded relay resets must go through abort_committed so force_reset latches"
+        );
+        assert!(
+            guarded.contains("h3_stream.abort_committed();"),
+            "every non-clean exit in a borrowing relay must latch force_reset"
         );
     }
 }
@@ -5330,4 +5359,96 @@ fn h3_vendored_frame_ceiling_behavioural_regressions_are_present() {
              vendor/h3-0.0.8-ferrum-patched/Cargo.toml --lib frame`"
         );
     }
+}
+/// Issue #4363. Native PLAIN H3 streaming relays must fail closed on an
+/// authorization / backend-EOS race: biased auth-first `select!`, a captured-plan
+/// check before `finish()`, and the trailer read under the same plan.
+///
+/// Unbiased `select!` listed `recv_data` first. When backend EOS and the
+/// captured deadline were both ready, `Ok(None)` won, `h3-quinn`'s synchronous
+/// `poll_finish` FINned, and a stalled client observed `recv_data() == Ok(None)`
+/// after the credential had already been counted as expired.
+#[test]
+fn native_plain_h3_streaming_relays_are_authorization_first_at_backend_eos() {
+    let server = include_str!("../../../src/http3/server.rs");
+    let stream_util = include_str!("../../../src/http3/stream_util.rs");
+
+    assert!(
+        stream_util.contains("pub(crate) fn captured_authorization_elapsed("),
+        "backend EOS must consult the captured Instant, not re-derive a plan"
+    );
+
+    let trailer_helper = server
+        .split("async fn finish_h3_response_with_backend_trailers<S>(")
+        .nth(1)
+        .expect("trailer/FIN helper")
+        .split("/// Start the HTTP/3 listener")
+        .next()
+        .expect("bounded trailer helper");
+    assert!(
+        trailer_helper.contains("await_deadline_first("),
+        "recv_trailers must race the captured authorization plan, not only backend_read_timeout_ms"
+    );
+    assert!(
+        trailer_helper.contains("auth_deadline.map(|plan| plan.at)"),
+        "the trailer-read bound must be the captured Instant"
+    );
+
+    let owning = server
+        .split("CommittedH3ResponseStream::new(stream)")
+        .nth(1)
+        .expect("owning native relay")
+        .split("stream.settle_committed_terminal();")
+        .next()
+        .expect("bounded owning relay");
+    assert_plain_relay_authorization_first(owning, "h3_resp.recv_stream.recv_data()");
+
+    let borrowed: Vec<&str> = server
+        .split("BorrowedCommittedH3ResponseStream::new(h3_stream)")
+        .skip(1)
+        .map(|relay| {
+            relay
+                .split("h3_stream.settle_committed_terminal();")
+                .next()
+                .expect("bounded borrowing relay")
+        })
+        .collect();
+    assert_eq!(
+        borrowed.len(),
+        2,
+        "exactly the two borrowing H3 streaming relays may guard a committed send half"
+    );
+    assert_plain_relay_authorization_first(borrowed[0], "recv_stream.recv_data()");
+    assert_plain_relay_authorization_first(borrowed[1], "h3_resp.recv_stream.recv_data()");
+}
+
+fn assert_plain_relay_authorization_first(relay: &str, recv_data: &str) {
+    let select = relay
+        .split("tokio::select! {")
+        .nth(1)
+        .expect("plain streaming select");
+    let auth = select
+        .find("_ = &mut auth_deadline_sleep")
+        .expect("authorization arm");
+    let data = select
+        .find(recv_data)
+        .unwrap_or_else(|| panic!("backend DATA arm `{recv_data}`"));
+    assert!(
+        select[..auth].contains("biased;"),
+        "plain native-H3 select must be biased so authorization wins an exact tie"
+    );
+    assert!(
+        auth < data,
+        "simultaneously-ready backend EOS must lose to the captured authorization deadline"
+    );
+    let eos = relay
+        .find("captured_authorization_elapsed(auth_deadline_plan)")
+        .expect("backend EOS must consult the captured plan before finish");
+    let finish = relay
+        .find("finish_h3_response_with_backend_trailers(")
+        .expect("trailer/FIN helper call");
+    assert!(
+        eos < finish,
+        "a spent captured plan must abort before finish_h3_response_with_backend_trailers"
+    );
 }

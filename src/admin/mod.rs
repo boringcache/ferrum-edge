@@ -2207,6 +2207,29 @@ fn extract_namespace(headers: &hyper::HeaderMap) -> Result<String, Response<Full
     Ok(ns.to_string())
 }
 
+/// Canonical audit bucket for fleet-global mutations, invalid
+/// `X-Ferrum-Namespace` values, and `ns`-claim denials. `GET /audit` still
+/// filters on this field, so a caller must not be able to choose it via an
+/// unvalidated header on routes the claim gate never checks.
+fn canonical_global_audit_namespace() -> &'static str {
+    crate::config::types::DEFAULT_NAMESPACE
+}
+
+/// Namespace stored on an admin audit row (and on the per-request audit slot).
+///
+/// `X-Ferrum-Namespace` may label an event only for routes selected by that
+/// header ([`is_namespace_scoped_route`]), and only after the existing
+/// `ns`-claim gate has authorized it. Fleet-global surfaces (TLS/ACME
+/// management, mesh config-revision reset, observability, `/cluster`, the
+/// `/namespaces` registry path) always use [`canonical_global_audit_namespace`].
+fn audit_namespace_for_request<'a>(segments: &[&str], request_namespace: &'a str) -> &'a str {
+    if is_namespace_scoped_route(segments) {
+        request_namespace
+    } else {
+        canonical_global_audit_namespace()
+    }
+}
+
 /// Whether an admin route operates on namespace-scoped resources selected via
 /// `X-Ferrum-Namespace`. Used by the opt-in per-namespace `ns`-claim gate
 /// (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`); global admin surfaces (TLS
@@ -2344,13 +2367,17 @@ pub async fn handle_admin_request(
     state: AdminState,
     client_ip: std::net::IpAddr,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let request_path = req.uri().path();
+    let request_segments: Vec<&str> = request_path.trim_start_matches('/').split('/').collect();
+    let header_namespace = req
+        .headers()
+        .get("x-ferrum-namespace")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or(crate::config::types::DEFAULT_NAMESPACE);
     let slot = audit::new_request_slot(
         req.method().as_str(),
-        req.uri().path(),
-        req.headers()
-            .get("x-ferrum-namespace")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or(crate::config::types::DEFAULT_NAMESPACE),
+        request_path,
+        audit_namespace_for_request(request_segments.as_slice(), header_namespace),
     );
     let result = audit::scope_request(
         Arc::clone(&slot),
@@ -3201,8 +3228,8 @@ async fn handle_admin_request_inner(
                     &auth,
                     "backup",
                     "gateway_config",
-                    crate::config::types::DEFAULT_NAMESPACE,
-                    crate::config::types::DEFAULT_NAMESPACE,
+                    canonical_global_audit_namespace(),
+                    canonical_global_audit_namespace(),
                     audit::backup_namespace_validation_failure_diff(resources),
                 )
                 .with_request_context(&audit_request_ctx)
@@ -3240,12 +3267,14 @@ async fn handle_admin_request_inner(
         // for an export that was never a reachable route.
         if method == Method::GET && matches!(segments_peek.as_slice(), ["backup"]) {
             let resources = backup_resources_query_audit_value(query.as_deref());
+            // The header was just denied: do not file the security record under
+            // the unvalidated tenant the caller asked for.
             let event = audit::AuditEvent::new(
                 &auth,
                 "backup",
                 "gateway_config",
-                namespace.as_str(),
-                namespace.as_str(),
+                canonical_global_audit_namespace(),
+                canonical_global_audit_namespace(),
                 audit::backup_failure_diff(audit::failure_category::NAMESPACE_DENIED, resources),
             )
             .with_request_context(&audit_request_ctx)
@@ -4233,14 +4262,8 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            handle_mesh_config_revision_reset(
-                &state,
-                &auth,
-                query.as_deref(),
-                &namespace,
-                &audit_request_ctx,
-            )
-            .await
+            handle_mesh_config_revision_reset(&state, &auth, query.as_deref(), &audit_request_ctx)
+                .await
         }
 
         // F7.2: remote-cluster discovery introspection. Read-only operator
@@ -4351,7 +4374,7 @@ async fn handle_admin_request_inner(
                 action,
                 resource_type,
                 resource_id,
-                &namespace,
+                audit_namespace_for_request(segments.as_slice(), &namespace),
                 json!({"path": path}),
             );
             if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
@@ -4569,12 +4592,12 @@ async fn handle_mesh_runtime_overlay_get(
 /// The revision the gate hands back is already sanitized — the `authority` is
 /// control-plane-supplied, so `MeshRevisionGate::reset` strips control
 /// characters and truncates before the value can reach this audit log line or
-/// the JSON body. Do not swap this for a raw accessor.
+/// the JSON body. Do not swap this for a raw accessor. The audit row is always
+/// stored under [`canonical_global_audit_namespace`], not `X-Ferrum-Namespace`.
 async fn handle_mesh_config_revision_reset(
     state: &AdminState,
     auth: &AuditActor,
     query: Option<&str>,
-    namespace: &str,
     request_ctx: &audit::AuditRequestContext,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let Some(mesh_runtime) = state.mesh_runtime_state.as_ref() else {
@@ -4620,7 +4643,7 @@ async fn handle_mesh_config_revision_reset(
         "reset",
         "mesh_config_revision",
         resource_id,
-        namespace,
+        canonical_global_audit_namespace(),
         diff,
     )
     .with_request_context(request_ctx)
@@ -11485,8 +11508,10 @@ mod tests {
             vec!["backend-capabilities"],
             vec!["metrics", "runtime"],
             vec!["admin", "tls", "inventory"],
+            vec!["admin", "tls", "ca-bundles"],
             vec!["admin", "metrics"],
             vec!["mesh", "service-graph"],
+            vec!["mesh", "config-revision", "reset"],
             vec!["health"],
             vec!["overload"],
         ] {
@@ -11495,7 +11520,26 @@ mod tests {
                 "/{} should NOT be namespace-scoped",
                 segs.join("/")
             );
+            assert_eq!(
+                audit_namespace_for_request(&segs, "tenant-b"),
+                canonical_global_audit_namespace(),
+                "/{} must not inherit an unvalidated request namespace on audit rows",
+                segs.join("/")
+            );
         }
+
+        assert_eq!(
+            audit_namespace_for_request(&["proxies"], "tenant-a"),
+            "tenant-a"
+        );
+        assert_eq!(
+            audit_namespace_for_request(&["backup"], "tenant-a"),
+            "tenant-a"
+        );
+        assert_eq!(
+            canonical_global_audit_namespace(),
+            crate::config::types::DEFAULT_NAMESPACE
+        );
     }
 
     #[test]
