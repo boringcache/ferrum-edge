@@ -39,7 +39,7 @@ use uuid::Uuid;
 
 use crate::common::scheduled_scaling::{
     BatchApplyCursor, CONFIG_CONVERGENCE_MAX_WAIT_SECS, LIVE_APPLY_CURSOR_MAX_WAIT_SECS,
-    SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, post_admin_batch,
+    MEASUREMENT_WINDOW_MAX_ATTEMPTS, SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS, post_admin_batch,
     scheduled_scaling_admin_jwt_max_ttl_value, wait_for_batch_apply_cursor,
     wait_for_config_convergence,
 };
@@ -505,6 +505,7 @@ struct PerfResult {
     total_requests: u64,
     successful_requests: u64,
     failed_requests: u64,
+    not_found_requests: u64,
     duration_secs: f64,
     rps: f64,
     avg_latency_us: f64,
@@ -527,6 +528,8 @@ async fn run_perf_test(
     let total_requests = Arc::new(AtomicU64::new(0));
     let successful_requests = Arc::new(AtomicU64::new(0));
     let failed_requests = Arc::new(AtomicU64::new(0));
+    let not_found_requests = Arc::new(AtomicU64::new(0));
+    let convergence_interruption = Arc::new(tokio::sync::Notify::new());
 
     // Shared latency collection — each worker has its own vec, merged later
     let latencies: Arc<tokio::sync::Mutex<Vec<u64>>> =
@@ -541,6 +544,8 @@ async fn run_perf_test(
         let total_requests = total_requests.clone();
         let successful_requests = successful_requests.clone();
         let failed_requests = failed_requests.clone();
+        let not_found_requests = not_found_requests.clone();
+        let convergence_interruption = convergence_interruption.clone();
         let latencies = latencies.clone();
         let entries = entries.clone();
         let base_url = proxy_base_url.to_string();
@@ -573,6 +578,12 @@ async fn run_perf_test(
                     Ok(r) if r.status().is_success() => {
                         successful_requests.fetch_add(1, Ordering::Relaxed);
                     }
+                    Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                        failed_requests.fetch_add(1, Ordering::Relaxed);
+                        not_found_requests.fetch_add(1, Ordering::Relaxed);
+                        stop.store(true, Ordering::Relaxed);
+                        convergence_interruption.notify_one();
+                    }
                     _ => {
                         failed_requests.fetch_add(1, Ordering::Relaxed);
                     }
@@ -591,8 +602,13 @@ async fn run_perf_test(
         }));
     }
 
-    // Let it run for the specified duration
-    tokio::time::sleep(Duration::from_secs(duration_secs)).await;
+    // A route-miss 404 is the observable data-plane signal that convergence
+    // changed after the pre-window gate. End this attempt immediately so its
+    // partial traffic can be discarded rather than reported as throughput.
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(duration_secs)) => {}
+        _ = convergence_interruption.notified() => {}
+    }
     stop.store(true, Ordering::Relaxed);
 
     // Wait for all workers to finish
@@ -604,6 +620,7 @@ async fn run_perf_test(
     let total = total_requests.load(Ordering::Relaxed);
     let success = successful_requests.load(Ordering::Relaxed);
     let fail = failed_requests.load(Ordering::Relaxed);
+    let not_found = not_found_requests.load(Ordering::Relaxed);
 
     let mut lats = latencies.lock().await;
     lats.sort_unstable();
@@ -625,6 +642,7 @@ async fn run_perf_test(
         total_requests: total,
         successful_requests: success,
         failed_requests: fail,
+        not_found_requests: not_found,
         duration_secs: elapsed,
         rps: total as f64 / elapsed,
         avg_latency_us: avg,
@@ -703,6 +721,43 @@ fn convergence_sample_indices(batch_start: usize, total: usize) -> Vec<usize> {
     indices.sort_unstable();
     indices.dedup();
     indices
+}
+
+async fn wait_for_scale_config_convergence(
+    client: &reqwest::Client,
+    proxy_base_url: &str,
+    entries: &[(String, String)],
+    sample_indices: &[usize],
+) -> Result<(), String> {
+    let sample_labels: Vec<String> = sample_indices
+        .iter()
+        .map(|&index| entries[index].0.clone())
+        .collect();
+    println!(
+        "  Waiting for config convergence on {} sample proxies (bound {}s)...",
+        sample_labels.len(),
+        CONFIG_CONVERGENCE_MAX_WAIT_SECS
+    );
+    let convergence = wait_for_config_convergence("the scale harness", &sample_labels, |i| {
+        let index = sample_indices[i];
+        let (ref path, ref key) = entries[index];
+        let url = format!("{proxy_base_url}{path}");
+        let key = key.clone();
+        let client = client.clone();
+        async move {
+            match client.get(&url).header("X-API-Key", key).send().await {
+                Ok(response) => Ok(response.status().as_u16()),
+                Err(error) => Err(error.to_string()),
+            }
+        }
+    })
+    .await?;
+    println!(
+        "  Config converged after {:.1}s ({} polls)",
+        convergence.waited.as_secs_f64(),
+        convergence.polls
+    );
+    Ok(())
 }
 
 /// Core test runner shared between SQLite and PostgreSQL variants.
@@ -796,28 +851,12 @@ async fn run_scale_perf_test(harness: &ScalePerfHarness) {
         // proxy — plus the oldest proxy, so a reload that drops already-published
         // config is caught too.
         let sample_indices = convergence_sample_indices(batch_start, all_entries.len());
-        let sample_labels: Vec<String> = sample_indices
-            .iter()
-            .map(|&index| all_entries[index].0.clone())
-            .collect();
-        println!(
-            "  Waiting for config convergence on {} sample proxies (bound {}s)...",
-            sample_labels.len(),
-            CONFIG_CONVERGENCE_MAX_WAIT_SECS
-        );
-        let convergence = wait_for_config_convergence("the scale harness", &sample_labels, |i| {
-            let index = sample_indices[i];
-            let (ref path, ref key) = all_entries[index];
-            let url = format!("{}{}", harness.proxy_base_url, path);
-            let key = key.clone();
-            let client = client.clone();
-            async move {
-                match client.get(&url).header("X-API-Key", key).send().await {
-                    Ok(response) => Ok(response.status().as_u16()),
-                    Err(error) => Err(error.to_string()),
-                }
-            }
-        })
+        wait_for_scale_config_convergence(
+            &client,
+            &harness.proxy_base_url,
+            &all_entries,
+            &sample_indices,
+        )
         .await
         .unwrap_or_else(|error| {
             panic!(
@@ -826,28 +865,65 @@ async fn run_scale_perf_test(harness: &ScalePerfHarness) {
                 error
             )
         });
-        println!(
-            "  Config converged after {:.1}s ({} polls)",
-            convergence.waited.as_secs_f64(),
-            convergence.polls
-        );
 
-        // Run perf test against all proxies accumulated so far
-        println!(
-            "\n  Running {}-second perf test against {} proxies (concurrency={})...",
-            PERF_TEST_DURATION_SECS,
-            all_entries.len(),
-            CONCURRENCY
-        );
+        // Run one complete window against the converged generation. A 404 is
+        // the observable route-miss signal that the data plane changed after
+        // the gate; discard that partial window, prove convergence again, and
+        // allow one bounded restart. Other failures stay in the completed
+        // window and remain subject to the success-rate assertion below.
+        let mut measurement_attempt = 0u32;
+        let result = loop {
+            measurement_attempt += 1;
+            println!(
+                "\n  Running {}-second perf test against {} proxies (concurrency={}, window {}/{})...",
+                PERF_TEST_DURATION_SECS,
+                all_entries.len(),
+                CONCURRENCY,
+                measurement_attempt,
+                MEASUREMENT_WINDOW_MAX_ATTEMPTS
+            );
+            let candidate = run_perf_test(
+                &harness.proxy_base_url,
+                &all_entries,
+                PERF_TEST_DURATION_SECS,
+                CONCURRENCY,
+            )
+            .await
+            .expect("Perf test failed");
+            if candidate.not_found_requests == 0 {
+                break candidate;
+            }
 
-        let result = run_perf_test(
-            &harness.proxy_base_url,
-            &all_entries,
-            PERF_TEST_DURATION_SECS,
-            CONCURRENCY,
-        )
-        .await
-        .expect("Perf test failed");
+            println!(
+                "  CONVERGENCE EVENT: observed {} route-miss 404 response(s) after {:.1}s; \
+                 discarding interrupted measurement window {}/{}",
+                candidate.not_found_requests,
+                candidate.duration_secs,
+                measurement_attempt,
+                MEASUREMENT_WINDOW_MAX_ATTEMPTS
+            );
+            assert!(
+                measurement_attempt < MEASUREMENT_WINDOW_MAX_ATTEMPTS,
+                "Configuration convergence instability interrupted all {} bounded measurement \
+                 windows at {} proxies; no routing-throughput result was recorded",
+                MEASUREMENT_WINDOW_MAX_ATTEMPTS,
+                all_entries.len()
+            );
+            wait_for_scale_config_convergence(
+                &client,
+                &harness.proxy_base_url,
+                &all_entries,
+                &sample_indices,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "Scale harness could not restart the measurement at {} proxies: {}",
+                    all_entries.len(),
+                    error
+                )
+            });
+        };
 
         print_perf_result(&result);
 
