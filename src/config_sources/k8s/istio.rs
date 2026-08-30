@@ -6,9 +6,9 @@ use crate::identity::spiffe::SpiffeId;
 use crate::modes::mesh::access_log_filter::parse_access_log_filter_expression;
 use crate::modes::mesh::config::{
     AppProtocol, ConditionMatch, JwtHeader, MeshAccessLoggingConfig, MeshConsistentHash,
-    MeshCorsOriginMatch, MeshCorsPolicy, MeshDestinationRule, MeshEndpoint, MeshJwtRule,
-    MeshLoadBalancer, MeshLocalityDistribute, MeshLocalityFailover, MeshLocalityLbSetting,
-    MeshMetricsConfig, MeshOutlierDetection, MeshPolicy, MeshProxyConfig,
+    MeshCorsOriginMatch, MeshCorsPolicy, MeshDestinationRule, MeshEndpoint, MeshJwtClaimHeader,
+    MeshJwtRule, MeshLoadBalancer, MeshLocalityDistribute, MeshLocalityFailover,
+    MeshLocalityLbSetting, MeshMetricsConfig, MeshOutlierDetection, MeshPolicy, MeshProxyConfig,
     MeshRequestAuthentication, MeshRule, MeshSidecar, MeshSidecarEgress, MeshSidecarIngress,
     MeshSimpleLb, MeshSubset, MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig,
     MeshTrafficPolicy, MeshTrafficPolicyTls, MeshVirtualServiceCorsPolicy, MetricTagOverride,
@@ -26,10 +26,10 @@ use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, K8sTranslationOptions,
     MeshRouteDispatchDestination, MeshRouteDispatchPolicy, RouteBackend, RouteProxySpec,
     SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
-    mesh_route_dispatch_can_emit_rule, mesh_route_dispatch_has_unsupported_predicate,
-    mesh_route_dispatch_plugin_from_rules, mesh_route_dispatch_rules_for_proxy,
-    optional_port_field, optional_target_weight_field, parse_istio_duration_ms, port_from_u64,
-    proxy_for_route, request_termination_plugin_for_proxy,
+    is_vs_authority_header, mesh_route_dispatch_can_emit_rule,
+    mesh_route_dispatch_has_unsupported_predicate, mesh_route_dispatch_plugin_from_rules,
+    mesh_route_dispatch_rules_for_proxy, optional_port_field, optional_target_weight_field,
+    parse_istio_duration_ms, port_from_u64, proxy_for_route, request_termination_plugin_for_proxy,
     resolve_workload_entry_service_attachment, resource_id,
     route_backends_require_node_waypoint_authz, route_local_fault_delay_for_rule,
     route_local_fault_value_for_rule, route_request_transformer_plugin_for_proxy,
@@ -153,7 +153,7 @@ fn authorization_policy(
     }
 
     let has_selector = object.spec.get("selector").is_some();
-    let has_target_refs = object.spec.get("targetRefs").is_some();
+    let has_target_refs = has_istio_target_refs(&object.spec);
     if has_selector && has_target_refs {
         return Err(invalid_resource(
             object,
@@ -162,7 +162,8 @@ fn authorization_policy(
     }
 
     let scope = if has_target_refs {
-        let attachments = resolve_authorization_policy_target_refs(acc, object)?;
+        let attachments =
+            resolve_authorization_policy_target_refs(acc, object, "AuthorizationPolicy")?;
         PolicyScope::TargetRefs { attachments }
     } else {
         istio_policy_scope(&acc.options, object, object.spec.get("selector"))
@@ -372,42 +373,56 @@ const ISTIO_NETWORKING_GROUP: &str = "networking.istio.io";
 fn resolve_authorization_policy_target_refs(
     acc: &K8sAccumulator,
     object: &K8sObject,
+    kind: &str,
 ) -> Result<Vec<PolicyTargetAttachment>, K8sTranslateError> {
-    let raw = object
-        .spec
-        .get("targetRefs")
-        .ok_or_else(|| invalid_resource(object, "AuthorizationPolicy targetRefs is required"))?;
-    let entries = raw.as_array().ok_or_else(|| {
-        invalid_resource(object, "AuthorizationPolicy targetRefs must be an array")
-    })?;
+    let mut entries: Vec<(String, &Value)> = Vec::new();
+    if let Some(entry) = object.spec.get("targetRef") {
+        entries.push(("targetRef".to_string(), entry));
+    }
+    if let Some(raw) = object.spec.get("targetRefs") {
+        let target_refs = raw.as_array().ok_or_else(|| {
+            invalid_resource(object, format!("{kind} targetRefs must be an array"))
+        })?;
+        entries.extend(
+            target_refs
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (format!("targetRefs[{index}]"), entry)),
+        );
+    }
     if entries.is_empty() {
         return Err(invalid_resource(
             object,
-            "AuthorizationPolicy targetRefs must not be empty",
+            format!("{kind} targetRef or targetRefs is required and must not be empty"),
         ));
     }
     if entries.len() > AUTHZ_TARGET_REF_MAX {
         return Err(invalid_resource(
             object,
             format!(
-                "AuthorizationPolicy targetRefs supports at most {AUTHZ_TARGET_REF_MAX} entries"
+                "{kind} targetRef and targetRefs support at most {AUTHZ_TARGET_REF_MAX} entries"
             ),
         ));
     }
 
     let mut attachments = Vec::with_capacity(entries.len());
-    for (index, entry) in entries.iter().enumerate() {
+    for (path, entry) in entries {
         attachments.push(resolve_one_authorization_policy_target_ref(
-            acc, object, index, entry,
+            acc, object, kind, &path, entry,
         )?);
     }
     Ok(attachments)
 }
 
+fn has_istio_target_refs(spec: &Value) -> bool {
+    spec.get("targetRef").is_some() || spec.get("targetRefs").is_some()
+}
+
 fn resolve_one_authorization_policy_target_ref(
     acc: &K8sAccumulator,
     object: &K8sObject,
-    index: usize,
+    kind_label: &str,
+    path: &str,
     entry: &Value,
 ) -> Result<PolicyTargetAttachment, K8sTranslateError> {
     use crate::modes::mesh::config::{
@@ -415,38 +430,35 @@ fn resolve_one_authorization_policy_target_ref(
         MAX_POLICY_TARGET_REF_NAME_LEN, MAX_POLICY_TARGET_REF_NAMESPACE_LEN,
     };
 
-    let path = format!("targetRefs[{index}]");
-    let kind = string_field(entry, "kind").ok_or_else(|| {
-        invalid_resource(
+    if !entry.is_object() {
+        return Err(invalid_resource(
             object,
-            format!("AuthorizationPolicy {path}.kind is required"),
-        )
-    })?;
+            format!("{kind_label} {path} must be an object"),
+        ));
+    }
+    let kind = string_field(entry, "kind")
+        .ok_or_else(|| invalid_resource(object, format!("{kind_label} {path}.kind is required")))?;
     if kind.len() > MAX_POLICY_TARGET_REF_KIND_LEN {
         return Err(invalid_resource(
             object,
             format!(
-                "AuthorizationPolicy {path}.kind must be at most {MAX_POLICY_TARGET_REF_KIND_LEN} characters"
+                "{kind_label} {path}.kind must be at most {MAX_POLICY_TARGET_REF_KIND_LEN} characters"
             ),
         ));
     }
-    let name = string_field(entry, "name").ok_or_else(|| {
-        invalid_resource(
-            object,
-            format!("AuthorizationPolicy {path}.name is required"),
-        )
-    })?;
+    let name = string_field(entry, "name")
+        .ok_or_else(|| invalid_resource(object, format!("{kind_label} {path}.name is required")))?;
     if name.trim().is_empty() {
         return Err(invalid_resource(
             object,
-            format!("AuthorizationPolicy {path}.name must be non-empty"),
+            format!("{kind_label} {path}.name must be non-empty"),
         ));
     }
     if name.len() > MAX_POLICY_TARGET_REF_NAME_LEN {
         return Err(invalid_resource(
             object,
             format!(
-                "AuthorizationPolicy {path}.name must be at most {MAX_POLICY_TARGET_REF_NAME_LEN} characters"
+                "{kind_label} {path}.name must be at most {MAX_POLICY_TARGET_REF_NAME_LEN} characters"
             ),
         ));
     }
@@ -455,7 +467,7 @@ fn resolve_one_authorization_policy_target_ref(
         return Err(invalid_resource(
             object,
             format!(
-                "AuthorizationPolicy {path}.group must be at most {MAX_POLICY_TARGET_REF_GROUP_LEN} characters"
+                "{kind_label} {path}.group must be at most {MAX_POLICY_TARGET_REF_GROUP_LEN} characters"
             ),
         ));
     }
@@ -466,7 +478,7 @@ fn resolve_one_authorization_policy_target_ref(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "AuthorizationPolicy {path}.namespace must be at most {MAX_POLICY_TARGET_REF_NAMESPACE_LEN} characters"
+                        "{kind_label} {path}.namespace must be at most {MAX_POLICY_TARGET_REF_NAMESPACE_LEN} characters"
                     ),
                 ));
             }
@@ -475,7 +487,7 @@ fn resolve_one_authorization_policy_target_ref(
         Some(_) => {
             return Err(invalid_resource(
                 object,
-                format!("AuthorizationPolicy {path}.namespace must be non-empty when set"),
+                format!("{kind_label} {path}.namespace must be non-empty when set"),
             ));
         }
         None => object.metadata.namespace.clone(),
@@ -485,7 +497,8 @@ fn resolve_one_authorization_policy_target_ref(
         ("", "Service") => {
             ensure_authz_target_ref_same_namespace(
                 object,
-                &path,
+                kind_label,
+                path,
                 &target_namespace,
                 "Service",
                 name,
@@ -494,7 +507,7 @@ fn resolve_one_authorization_policy_target_ref(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "AuthorizationPolicy {path} Service '{target_namespace}/{name}' was not found; \
+                        "{kind_label} {path} Service '{target_namespace}/{name}' was not found; \
                          targeted policies fail closed when the target is missing"
                     ),
                 ));
@@ -507,7 +520,8 @@ fn resolve_one_authorization_policy_target_ref(
         (GATEWAY_API_GROUP, "Gateway") => {
             ensure_authz_target_ref_same_namespace(
                 object,
-                &path,
+                kind_label,
+                path,
                 &target_namespace,
                 "Gateway",
                 name,
@@ -516,7 +530,7 @@ fn resolve_one_authorization_policy_target_ref(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "AuthorizationPolicy {path} Gateway '{target_namespace}/{name}' was not found \
+                        "{kind_label} {path} Gateway '{target_namespace}/{name}' was not found \
                          or is not a waypoint Gateway (istio-waypoint/ferrum-waypoint); \
                          targeted policies fail closed when the target is missing"
                     ),
@@ -532,7 +546,7 @@ fn resolve_one_authorization_policy_target_ref(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "AuthorizationPolicy {path} GatewayClass attachments must live in the Istio \
+                        "{kind_label} {path} GatewayClass attachments must live in the Istio \
                          root namespace ('{}')",
                         acc.options.istio_root_namespace
                     ),
@@ -542,7 +556,7 @@ fn resolve_one_authorization_policy_target_ref(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "AuthorizationPolicy {path} GatewayClass must not set namespace \
+                        "{kind_label} {path} GatewayClass must not set namespace \
                          (GatewayClass is cluster-scoped)"
                     ),
                 ));
@@ -557,7 +571,7 @@ fn resolve_one_authorization_policy_target_ref(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "AuthorizationPolicy {path} GatewayClass '{name}' is unsupported; \
+                        "{kind_label} {path} GatewayClass '{name}' is unsupported; \
                          Ferrum accepts istio-waypoint/ferrum-waypoint class attachments"
                     ),
                 ));
@@ -570,7 +584,7 @@ fn resolve_one_authorization_policy_target_ref(
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "AuthorizationPolicy {path} GatewayClass '{name}' was not found; \
+                        "{kind_label} {path} GatewayClass '{name}' was not found; \
                          targeted policies fail closed when the target is missing"
                     ),
                 ));
@@ -589,7 +603,7 @@ fn resolve_one_authorization_policy_target_ref(
         (ISTIO_NETWORKING_GROUP, "ServiceEntry") => Err(invalid_resource(
             object,
             format!(
-                "AuthorizationPolicy {path} ServiceEntry attachments are not supported yet; \
+                "{kind_label} {path} ServiceEntry attachments are not supported yet; \
                  Ferrum has no ServiceEntry-to-waypoint association model, so such a policy \
                  could not be enforced on ServiceEntry traffic. Use a Service, Gateway, or \
                  GatewayClass targetRef, or a workload selector"
@@ -598,7 +612,7 @@ fn resolve_one_authorization_policy_target_ref(
         (group, kind) => Err(invalid_resource(
             object,
             format!(
-                "AuthorizationPolicy {path} group '{group}' kind '{kind}' is unsupported; \
+                "{kind_label} {path} group '{group}' kind '{kind}' is unsupported; \
                  supported attachments are Service (core) and Gateway/GatewayClass \
                  (gateway.networking.k8s.io)"
             ),
@@ -631,6 +645,7 @@ fn normalize_target_ref_group(group: &str) -> String {
 /// would report `Accepted` for a policy that never reaches its destination.
 fn ensure_authz_target_ref_same_namespace(
     object: &K8sObject,
+    kind: &str,
     path: &str,
     target_namespace: &str,
     to_kind: &str,
@@ -642,8 +657,8 @@ fn ensure_authz_target_ref_same_namespace(
     Err(invalid_resource(
         object,
         format!(
-            "AuthorizationPolicy {path} references {to_kind} '{target_namespace}/{to_name}' in \
-             another namespace; Istio AuthorizationPolicy targetRefs to {to_kind} are \
+            "{kind} {path} references {to_kind} '{target_namespace}/{to_name}' in \
+             another namespace; Istio {kind} targetRefs to {to_kind} are \
              same-namespace only (policy namespace '{}')",
             object.metadata.namespace
         ),
@@ -1318,6 +1333,7 @@ fn request_authentication(
     acc: &K8sAccumulator,
     object: &K8sObject,
 ) -> Result<MeshRequestAuthentication, K8sTranslateError> {
+    reject_unenforceable_target_refs(acc, object, "RequestAuthentication")?;
     let scope = istio_policy_scope(&acc.options, object, object.spec.get("selector"));
 
     let jwt_rules: Vec<MeshJwtRule> = object
@@ -1369,6 +1385,25 @@ fn translate_jwt_rule(object: &K8sObject, rule: &Value) -> Result<MeshJwtRule, K
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
+    let output_claim_to_headers = jwt_output_claim_to_headers(object, rule)?;
+
+    // Recognized-but-unenforced JWT-rule fields. Warn by FIELD NAME only —
+    // a `fromCookies` entry names the cookie a token rides in, so echoing the
+    // value would log a credential location. The same pair is surfaced in the
+    // resource's `deferred_fields` status block
+    // (`request_authentication_deferred_fields`); keep the two in sync.
+    for field in ["outputPayloadToHeader", "fromCookies"] {
+        if rule.get(field).is_some() {
+            tracing::warn!(
+                namespace = %object.metadata.namespace,
+                resource = %object.metadata.name,
+                field = field,
+                "RequestAuthentication jwtRules[] field is recognized but not enforced; \
+                 surfaced in status deferred_fields",
+            );
+        }
+    }
+
     Ok(MeshJwtRule {
         issuer,
         audiences,
@@ -1377,7 +1412,78 @@ fn translate_jwt_rule(object: &K8sObject, rule: &Value) -> Result<MeshJwtRule, K
         from_headers,
         from_params,
         forward_original_token,
+        output_claim_to_headers,
     })
+}
+
+/// Translate `jwtRules[].outputClaimToHeaders` (issue #4277).
+///
+/// Istio SETS and OVERWRITES these headers from the validated token, which is
+/// exactly what makes them trustworthy to a backend. Ferrum's projection is
+/// gateway-owned in the same sense: `jwks_auth` strips every declared header
+/// from the inbound request before validation and re-asserts it only from a
+/// validated claim. Because that ownership is the security property, an entry
+/// Ferrum cannot represent is REJECTED (`FerrumAccepted=False` / `Invalid`)
+/// rather than dropped — a dropped entry would leave the header unowned and
+/// client-forgeable on a workload migrated from Istio.
+fn jwt_output_claim_to_headers(
+    object: &K8sObject,
+    rule: &Value,
+) -> Result<Vec<MeshJwtClaimHeader>, K8sTranslateError> {
+    let Some(raw) = rule.get("outputClaimToHeaders") else {
+        return Ok(Vec::new());
+    };
+    let entries = raw.as_array().ok_or_else(|| {
+        invalid_resource(
+            object,
+            "RequestAuthentication jwtRules[].outputClaimToHeaders must be an array of objects",
+        )
+    })?;
+    if entries.len() > crate::modes::mesh::config::MAX_MESH_JWT_OUTPUT_CLAIM_HEADERS {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "RequestAuthentication jwtRules[].outputClaimToHeaders supports at most {} entries",
+                crate::modes::mesh::config::MAX_MESH_JWT_OUTPUT_CLAIM_HEADERS
+            ),
+        ));
+    }
+    let mut out: Vec<MeshJwtClaimHeader> = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let path = format!("RequestAuthentication jwtRules[].outputClaimToHeaders[{index}]");
+        let object_entry = entry
+            .as_object()
+            .ok_or_else(|| invalid_resource(object, format!("{path} must be an object")))?;
+        for key in object_entry.keys() {
+            if key != "header" && key != "claim" {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "{path} does not support field '{}'",
+                        crate::modes::mesh::config::sanitize_mesh_ext_authz_diagnostic(key)
+                    ),
+                ));
+            }
+        }
+        let header = string_field(entry, "header")
+            .ok_or_else(|| invalid_resource(object, format!("{path}.header is required")))?;
+        let claim = string_field(entry, "claim")
+            .ok_or_else(|| invalid_resource(object, format!("{path}.claim is required")))?;
+        let (header, claim) =
+            crate::modes::mesh::config::validate_mesh_jwt_claim_header(header, claim)
+                .map_err(|error| invalid_resource(object, format!("{path}: {error}")))?;
+        if out.iter().any(|existing| existing.header == header) {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "{path} declares header '{header}' more than once; a destination may be \
+                     asserted from exactly one claim"
+                ),
+            ));
+        }
+        out.push(MeshJwtClaimHeader { header, claim });
+    }
+    Ok(out)
 }
 
 fn jwt_from_headers(object: &K8sObject, rule: &Value) -> Result<Vec<JwtHeader>, K8sTranslateError> {
@@ -1423,6 +1529,59 @@ fn jwt_from_headers(object: &K8sObject, rule: &Value) -> Result<Vec<JwtHeader>, 
             })
         })
         .collect()
+}
+
+/// Refuse a `targetRef` / `targetRefs`-carrying resource whose attachments Ferrum cannot
+/// enforce (issue #4305).
+///
+/// `istio_policy_scope` has three outcomes and reads `selector` only, so a
+/// resource carrying ONLY either target-reference form looks selector-less and WIDENS to
+/// namespace scope — or, in the Istio root namespace, to the whole mesh. For a
+/// `RequestAuthentication` that installs a JWT provider on workloads that were
+/// never in scope; for a `Telemetry` that can disable access logging mesh-wide.
+/// Both are fail-open, so both are refused.
+///
+/// The attachments are still resolved through the SHARED AuthorizationPolicy
+/// machinery first, so an operator sees the precise structural diagnostic
+/// (unknown kind, cross-namespace Service, missing target, selector conflict)
+/// before the "not enforceable here" refusal. Only `AuthorizationPolicy` /
+/// `MeshPolicy` implement end-to-end `targetRefs` attachment today — see
+/// `reject_unsupported_target_refs_scope` at the native/file/xDS boundary and
+/// `scope_applies_to_workload`, which fails `PolicyScope::TargetRefs` closed for
+/// non-waypoint slices. Translating one here would produce an accepted,
+/// permanently inert policy instead of a visible rejection.
+fn reject_unenforceable_target_refs(
+    acc: &K8sAccumulator,
+    object: &K8sObject,
+    kind: &str,
+) -> Result<(), K8sTranslateError> {
+    if !has_istio_target_refs(&object.spec) {
+        return Ok(());
+    }
+    if object.spec.get("selector").is_some() {
+        return Err(invalid_resource(
+            object,
+            format!("{kind} must set at most one of selector or targetRefs"),
+        ));
+    }
+    // Surface structural/ownership problems with the exact same diagnostics an
+    // AuthorizationPolicy would produce.
+    resolve_authorization_policy_target_refs(acc, object, kind)?;
+    let field = if object.spec.get("targetRef").is_some() && object.spec.get("targetRefs").is_none()
+    {
+        "targetRef"
+    } else {
+        "targetRefs"
+    };
+    Err(invalid_resource(
+        object,
+        format!(
+            "{kind} {field} is not supported; Ferrum implements targetRefs attachment for \
+             AuthorizationPolicy only, and admitting this resource would widen it to \
+             namespace-wide (or mesh-wide in the Istio root namespace) scope. Use a workload \
+             selector to scope it explicitly"
+        ),
+    ))
 }
 
 fn istio_policy_scope(
@@ -2559,37 +2718,102 @@ fn translate_client_tls_settings(
     })
 }
 
+/// `outlierDetection` fields Ferrum parses past but does not enforce
+/// (issue #4292). Kept in sync with `deferred_outlier_detection_fields` in
+/// `src/k8s_controller/istio_status.rs`.
+pub(crate) const DEFERRED_OUTLIER_DETECTION_FIELDS: &[&str] = &[
+    "consecutiveGatewayErrors",
+    "consecutiveLocalOriginFailures",
+    "minHealthPercent",
+];
+
 fn translate_outlier_detection(
     object: &K8sObject,
     value: &Value,
 ) -> Result<MeshOutlierDetection, K8sTranslateError> {
-    let consecutive_errors = value
+    let consecutive_errors = match value
         .get("consecutive5xxErrors")
         .or_else(|| value.get("consecutiveErrors"))
-        .and_then(Value::as_u64)
-        .and_then(|v| u32::try_from(v).ok());
+    {
+        Some(raw) => Some(
+            raw.as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        "outlierDetection.consecutive5xxErrors must be a non-negative integer",
+                    )
+                })?,
+        ),
+        None => None,
+    };
 
-    let interval_seconds = string_field(value, "interval")
-        .and_then(parse_istio_duration_secs)
-        .filter(|seconds| *seconds > 0);
-
-    let base_ejection_seconds =
-        string_field(value, "baseEjectionTime").and_then(parse_istio_duration_secs);
-
-    let max_ejection_percent = value
-        .get("maxEjectionPercent")
-        .and_then(Value::as_u64)
-        .map(|v| {
-            if v <= 100 {
-                Ok(v as u8)
-            } else {
-                Err(invalid_resource(
+    let interval_seconds = match value.get("interval") {
+        Some(raw) => {
+            let raw = raw.as_str().ok_or_else(|| {
+                invalid_resource(
                     object,
-                    format!("outlierDetection.maxEjectionPercent must be 0-100 (got {v})"),
-                ))
-            }
-        })
-        .transpose()?;
+                    "outlierDetection.interval must be a positive duration string",
+                )
+            })?;
+            let seconds = parse_istio_duration_secs(raw)
+                .filter(|seconds| *seconds > 0)
+                .ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        "outlierDetection.interval must be a positive duration string",
+                    )
+                })?;
+            Some(seconds)
+        }
+        None => None,
+    };
+
+    let base_ejection_seconds = match value.get("baseEjectionTime") {
+        Some(raw) => {
+            let raw = raw.as_str().ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    "outlierDetection.baseEjectionTime must be a duration string",
+                )
+            })?;
+            Some(parse_istio_duration_secs(raw).ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    "outlierDetection.baseEjectionTime must be a duration string",
+                )
+            })?)
+        }
+        None => None,
+    };
+
+    let max_ejection_percent = match value.get("maxEjectionPercent") {
+        Some(raw) => {
+            let percent = raw.as_u64().filter(|value| *value <= 100).ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    "outlierDetection.maxEjectionPercent must be an integer from 0 through 100",
+                )
+            })?;
+            Some(percent as u8)
+        }
+        None => None,
+    };
+
+    // Recognized-but-unenforced fields. Warn by FIELD NAME only (a threshold
+    // value is operator configuration, not a secret, but the status projection
+    // is value-redacted and these two surfaces must agree).
+    for field in DEFERRED_OUTLIER_DETECTION_FIELDS {
+        if value.get(field).is_some() {
+            tracing::warn!(
+                namespace = %object.metadata.namespace,
+                resource = %object.metadata.name,
+                field = field,
+                "DestinationRule outlierDetection field is parsed but not applied; surfaced in \
+                 status deferred_fields",
+            );
+        }
+    }
 
     Ok(MeshOutlierDetection {
         consecutive_errors,
@@ -3006,6 +3230,224 @@ fn uri_match_for_literal_listen_path(listen_path: &Option<String>) -> Option<Val
     Some(serde_json::json!({ "prefix": listen_path }))
 }
 
+/// Header names Ferrum refuses as a VirtualService `headers.*.set` / `.add`
+/// target: framing and hop-by-hop fields are owned by the transports, and a
+/// route transform that rewrote one would corrupt message framing rather than
+/// carry operator intent. `remove` is unrestricted — stripping a header is
+/// exactly the operation this issue exists to make reliable
+/// (`headers.request.remove: [x-internal-auth]`).
+const VS_UNWRITABLE_HEADERS: &[&str] = &[
+    "connection",
+    "content-length",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Fail closed on a VirtualService header transform Ferrum cannot represent
+/// (issue #4304).
+///
+/// The transforms are carried on the emitted `mesh_route_dispatch` rules and
+/// parsed by `parse_route_header_transforms` when the plugin is constructed. A
+/// malformed name or value would fail THERE, at plugin construction, after the
+/// resource already reported `FerrumAccepted=True` — and a failed dispatch
+/// plugin takes the whole route's transform set down with it, including a
+/// security-relevant `remove`. Rejecting at translation makes the loss visible
+/// on the resource instead.
+///
+/// Diagnostics name the header and the field, never the operator-supplied
+/// VALUE: a `headers.request.set` value can carry a credential.
+fn validate_vs_header_transforms(
+    object: &K8sObject,
+    http: &Value,
+    index: usize,
+) -> Result<(), K8sTranslateError> {
+    validate_vs_header_block(
+        object,
+        http.get("headers"),
+        &format!("http[{index}].headers"),
+    )?;
+    for (destination_index, destination) in http
+        .get("route")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        validate_vs_header_block(
+            object,
+            destination.get("headers"),
+            &format!("http[{index}].route[{destination_index}].headers"),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_vs_header_block(
+    object: &K8sObject,
+    headers: Option<&Value>,
+    path: &str,
+) -> Result<(), K8sTranslateError> {
+    let Some(headers) = headers else {
+        return Ok(());
+    };
+    let headers = headers.as_object().ok_or_else(|| {
+        invalid_resource(object, format!("VirtualService {path} must be an object"))
+    })?;
+    for key in headers.keys() {
+        if key != "request" && key != "response" {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService {path} does not support field '{}'",
+                    crate::modes::mesh::config::sanitize_mesh_ext_authz_diagnostic(key)
+                ),
+            ));
+        }
+    }
+    for direction in ["request", "response"] {
+        let Some(block) = headers.get(direction) else {
+            continue;
+        };
+        let block = block.as_object().ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!("VirtualService {path}.{direction} must be an object"),
+            )
+        })?;
+        for key in block.keys() {
+            if key != "set" && key != "add" && key != "remove" {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "VirtualService {path}.{direction} does not support field '{}'",
+                        crate::modes::mesh::config::sanitize_mesh_ext_authz_diagnostic(key)
+                    ),
+                ));
+            }
+        }
+        let mut has_request_authority_set = false;
+        for operation in ["set", "add"] {
+            let Some(entries) = block.get(operation) else {
+                continue;
+            };
+            let entries = entries.as_object().ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    format!("VirtualService {path}.{direction}.{operation} must be an object"),
+                )
+            })?;
+            for (name, value) in entries {
+                let field = format!("{path}.{direction}.{operation}");
+                let authority_header = is_vs_authority_header(name);
+                let normalized = if authority_header {
+                    "host".to_string()
+                } else {
+                    validate_vs_header_name(object, &field, name)?
+                };
+                if authority_header && (direction != "request" || operation != "set") {
+                    return Err(invalid_resource(
+                        object,
+                        format!(
+                            "VirtualService {field} cannot write framing or hop-by-hop header \
+                             '{normalized}'"
+                        ),
+                    ));
+                }
+                if authority_header && has_request_authority_set {
+                    return Err(invalid_resource(
+                        object,
+                        format!(
+                            "VirtualService {field} must declare at most one Host/:authority set"
+                        ),
+                    ));
+                }
+                has_request_authority_set |= authority_header;
+                if VS_UNWRITABLE_HEADERS.contains(&normalized.as_str())
+                    || (direction == "response"
+                        && crate::proxy::headers::is_protocol_managed_plugin_response_destination(
+                            &normalized,
+                        ))
+                {
+                    return Err(invalid_resource(
+                        object,
+                        format!(
+                            "VirtualService {field} cannot write framing or hop-by-hop header \
+                             '{normalized}'"
+                        ),
+                    ));
+                }
+                let value = value.as_str().ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        format!("VirtualService {field}['{normalized}'] must be a string"),
+                    )
+                })?;
+                if http::header::HeaderValue::from_str(value).is_err() {
+                    return Err(invalid_resource(
+                        object,
+                        format!(
+                            "VirtualService {field}['{normalized}'] is not a valid HTTP header \
+                             value"
+                        ),
+                    ));
+                }
+                if authority_header && (value.is_empty() || value.chars().any(char::is_whitespace))
+                {
+                    return Err(invalid_resource(
+                        object,
+                        format!(
+                            "VirtualService {field}['{normalized}'] must be a non-empty authority \
+                             without whitespace"
+                        ),
+                    ));
+                }
+            }
+        }
+        let Some(remove) = block.get("remove") else {
+            continue;
+        };
+        let remove = remove.as_array().ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!("VirtualService {path}.{direction}.remove must be an array of strings"),
+            )
+        })?;
+        for entry in remove {
+            let field = format!("{path}.{direction}.remove");
+            let name = entry.as_str().ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    format!("VirtualService {field}[] entries must be strings"),
+                )
+            })?;
+            validate_vs_header_name(object, &field, name)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_vs_header_name(
+    object: &K8sObject,
+    field: &str,
+    name: &str,
+) -> Result<String, K8sTranslateError> {
+    http::header::HeaderName::from_bytes(name.as_bytes())
+        .map(|header| header.as_str().to_string())
+        .map_err(|_| {
+            invalid_resource(
+                object,
+                format!(
+                    "VirtualService {field} header name '{}' is not a valid HTTP header name",
+                    crate::modes::mesh::config::sanitize_mesh_ext_authz_diagnostic(name)
+                ),
+            )
+        })
+}
+
 fn route_has_uncollapsible_local_policy(route_plugins: &[PluginConfig]) -> bool {
     !route_plugins.is_empty()
 }
@@ -3040,12 +3482,11 @@ fn materialize_route_candidate(
     // per-rule transforms onto `RequestContext` at match time; without a
     // consumer plugin on the proxy, those overrides would never apply.
     //
-    // Operator-configured proxy-scoped plugins win because we only emit
-    // when none exists in `route_plugins`. Operators who configure a global
-    // request_transformer on the gateway should be aware that a VS-driven
-    // proxy will use the auto-emitted instance (proxy-scope replaces same-
-    // named global) — keep route-level transforms out of the VS when that
-    // is undesired.
+    // Operator-configured proxy-scoped plugins win because we only emit when
+    // none exists in `route_plugins`. The exact translator-owned empty
+    // consumer is additive to any same-name global transformer: global static
+    // rules remain active and the selected VirtualService route transform is
+    // applied once in the authoritative route-header final phase.
     let dispatch_rules_have_request_transform =
         dispatch_rules_carry_transform(&dispatch_rules, "request_transform");
     let dispatch_rules_have_response_transform =
@@ -4445,6 +4886,10 @@ fn virtual_service_routes(
     }
 
     for (index, http) in http_routes.iter().copied().enumerate() {
+        // Validate header transforms BEFORE the no-candidate `continue`: an
+        // unrepresentable transform must reject the resource wherever it
+        // appears, not only on routes that materialize (issue #4304).
+        validate_vs_header_transforms(object, http, index)?;
         let route_candidates = route_candidate_paths(http);
         if route_candidates.is_empty() {
             continue;
@@ -5162,20 +5607,30 @@ fn route_timeout_ms(http: &Value) -> Option<u64> {
 /// Project an Istio `VirtualService.http[].rewrite` block into the per-rule
 /// `RouteRewriteConfig` JSON shape consumed by `mesh_route_dispatch`.
 ///
-/// Maps `rewrite.uri` -> `uri` and `rewrite.authority` -> `authority`. The
+/// Maps `rewrite.uri` -> `uri` and `rewrite.authority` -> `authority`. An Istio
+/// `headers.request.set` entry for `Host` / `:authority` uses the same typed
+/// authority projection when no explicit `rewrite.authority` is present; it is
+/// removed from the generic transformer rule list. The
 /// `match_prefix` field is filled per emitted rule by
 /// `mesh_route_dispatch_rules_for_proxy` from each match entry's URI prefix —
 /// it is NOT derived here. Returns `None` when neither field is present so a
 /// `rewrite: {}` block does not emit an inert action.
 fn route_rewrite_value(http: &Value) -> Option<Value> {
-    let rewrite = http.get("rewrite")?.as_object()?;
+    let rewrite = http.get("rewrite").and_then(Value::as_object);
     let mut out = serde_json::Map::new();
-    if let Some(uri) = rewrite.get("uri").and_then(Value::as_str)
+    if let Some(uri) = rewrite
+        .and_then(|value| value.get("uri"))
+        .and_then(Value::as_str)
         && !uri.is_empty()
     {
         out.insert("uri".to_string(), Value::String(uri.to_string()));
     }
-    if let Some(authority) = rewrite.get("authority").and_then(Value::as_str)
+    let authority = rewrite
+        .and_then(|value| value.get("authority"))
+        .and_then(Value::as_str)
+        .filter(|authority| !authority.is_empty())
+        .or_else(|| route_request_header_authority(http));
+    if let Some(authority) = authority
         && !authority.is_empty()
     {
         out.insert(
@@ -5187,6 +5642,26 @@ fn route_rewrite_value(http: &Value) -> Option<Value> {
         return None;
     }
     Some(Value::Object(out))
+}
+
+fn route_request_header_authority(http: &Value) -> Option<&str> {
+    fn from_headers(headers: Option<&Value>) -> Option<&str> {
+        headers?
+            .get("request")?
+            .get("set")?
+            .as_object()?
+            .iter()
+            .find(|(name, _)| is_vs_authority_header(name))
+            .and_then(|(_, value)| value.as_str())
+    }
+
+    from_headers(http.get("headers")).or_else(|| {
+        let destinations = http.get("route")?.as_array()?;
+        if destinations.len() != 1 {
+            return None;
+        }
+        from_headers(destinations[0].get("headers"))
+    })
 }
 
 /// Project an Istio `VirtualService.http[].redirect` block into the per-rule
@@ -6442,6 +6917,7 @@ fn telemetry(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
 ) -> Result<MeshTelemetryResource, K8sTranslateError> {
+    reject_unenforceable_target_refs(acc, object, "Telemetry")?;
     let scope = istio_policy_scope(&acc.options, object, object.spec.get("selector"));
 
     let tracing = object
@@ -12109,8 +12585,9 @@ extensionProviders:
         .expect_err("invalid max ejection percent must fail");
 
         assert!(
-            err.to_string()
-                .contains("outlierDetection.maxEjectionPercent must be 0-100")
+            err.to_string().contains(
+                "outlierDetection.maxEjectionPercent must be an integer from 0 through 100"
+            )
         );
     }
 
@@ -17848,8 +18325,8 @@ extensionProviders:
     }
 
     #[test]
-    fn destination_rule_outlier_interval_ignores_zero_and_rounds_subsecond() {
-        let zero_interval = translate_k8s_objects(
+    fn destination_rule_outlier_interval_rejects_zero_and_rounds_subsecond() {
+        let zero_error = translate_k8s_objects(
             &[object(
                 "DestinationRule",
                 serde_json::json!({
@@ -17863,15 +18340,11 @@ extensionProviders:
             )],
             options(),
         )
-        .expect("translation succeeds");
-        let mesh = zero_interval.config.mesh.expect("mesh config");
-        assert_eq!(
-            mesh.destination_rules[0]
-                .traffic_policy
-                .as_ref()
-                .and_then(|policy| policy.outlier_detection.as_ref())
-                .and_then(|outlier| outlier.interval_seconds),
-            None
+        .expect_err("zero outlier interval must fail closed");
+        assert!(
+            zero_error
+                .to_string()
+                .contains("outlierDetection.interval must be a positive duration string")
         );
 
         let subsecond_interval = translate_k8s_objects(

@@ -42,6 +42,19 @@ fn is_passive_unhealthy(checker: &HealthChecker, proxy_id: &str, host_port: &str
         .is_some_and(|ps| ps.unhealthy.contains_key(host_port))
 }
 
+fn consecutive_ejection_generation(
+    checker: &HealthChecker,
+    proxy_id: &str,
+    host_port: &str,
+) -> Option<u64> {
+    checker
+        .passive_health
+        .get(&rk(proxy_id))?
+        .unhealthy
+        .get(host_port)
+        .and_then(|ejection| ejection.consecutive_generation)
+}
+
 /// Count total passive unhealthy entries across all proxies.
 fn passive_unhealthy_count(checker: &HealthChecker) -> usize {
     checker
@@ -91,6 +104,8 @@ fn test_passive_health_marks_unhealthy() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     for _ in 0..3 {
@@ -120,6 +135,8 @@ fn test_passive_health_recovers() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     for _ in 0..2 {
@@ -159,6 +176,8 @@ fn test_success_does_not_mark_unhealthy() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     for _ in 0..100 {
@@ -188,6 +207,8 @@ fn test_connection_error_counts_as_failure_regardless_of_status_codes() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     for _ in 0..2 {
@@ -220,6 +241,8 @@ fn test_connection_error_recovery_on_success() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     for _ in 0..2 {
@@ -260,6 +283,8 @@ fn test_remove_stale_passive_targets_for_proxy_cleans_unhealthy() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     for _ in 0..2 {
@@ -308,6 +333,8 @@ fn test_remove_stale_passive_targets_for_proxy_empty_list_clears_all() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     for _ in 0..2 {
@@ -340,6 +367,8 @@ fn test_remove_stale_targets_no_op_when_all_present() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     for _ in 0..2 {
@@ -385,6 +414,8 @@ fn test_passive_health_isolated_across_proxies_sharing_upstream() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     // Proxy-A sends large payloads → backend returns 500s
@@ -443,6 +474,8 @@ fn test_active_and_passive_health_are_independent() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     for _ in 0..2 {
@@ -510,6 +543,8 @@ fn test_prune_removed_proxies() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     // Insert passive health state for 3 proxies by reporting responses
@@ -587,6 +622,8 @@ fn test_passive_window_only_counts_recent_failures() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     // Record 2 failures (under threshold)
@@ -644,6 +681,8 @@ fn test_passive_window_failures_within_window_accumulate() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     // All 3 failures within the 60s window
@@ -694,6 +733,8 @@ fn test_passive_failure_ring_matches_threshold_sequences() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     report_failures(&checker, TEST_PROXY, &target, &config, 1);
@@ -726,6 +767,8 @@ fn test_passive_failure_ring_stays_capped_past_max() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     report_failures(
@@ -767,6 +810,8 @@ fn test_passive_failure_ring_is_isolated_per_proxy() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     report_failures(
@@ -806,6 +851,8 @@ fn test_passive_failure_ring_clears_on_success_recovery() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     report_failures(&checker, TEST_PROXY, &target, &config, 5);
@@ -842,6 +889,8 @@ fn test_remove_stale_passive_targets_drops_failure_ring() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     report_failures(&checker, TEST_PROXY, &target, &config, 4);
@@ -870,6 +919,8 @@ fn test_passive_failure_ring_clears_on_timer_recovery() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     report_failures(&checker, TEST_PROXY, &target, &config, 4);
@@ -899,6 +950,8 @@ fn test_passive_health_threshold_1_immediate_unhealthy() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     checker.report_response(
@@ -930,6 +983,8 @@ fn test_connection_error_ignores_status_code_list() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     // Status code 200 with connection_error=true should still count as failure
@@ -963,6 +1018,8 @@ fn test_passive_health_per_target_isolation() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     // Fail target_a only
@@ -1006,6 +1063,8 @@ fn test_recovery_clears_failures_then_re_threshold() {
         max_ejection_percent: None,
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
     };
 
     // Mark unhealthy
@@ -2180,4 +2239,683 @@ async fn restart_upstream_probes_does_not_cancel_other_upstreams() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(checker.active_task_count(), 3);
     assert!(checker.has_running_active_probes(DEFAULT_NAMESPACE, "up-b"));
+}
+
+// ── Istio consecutive-error semantics (issue #4292) ────────────────────────
+
+fn consecutive_policy(threshold: u32) -> PassiveHealthCheck {
+    PassiveHealthCheck {
+        unhealthy_status_codes: vec![500, 502, 503, 504],
+        unhealthy_threshold: threshold,
+        // Deliberately wide: under consecutive semantics the window must not
+        // participate in the decision at all.
+        unhealthy_window_seconds: 600,
+        healthy_after_seconds: 30,
+        max_ejection_percent: None,
+        gateway_error_codes: None,
+        split_external_local_origin_errors: None,
+        consecutive_error_mode: true,
+        consecutive_5xx_ejection_disabled: false,
+    }
+}
+
+/// The test the windowed model could not express: a target alternating
+/// success/failure must NEVER reach the threshold under Istio
+/// `consecutive5xxErrors` semantics, even though the sliding window would have
+/// counted far more than `unhealthy_threshold` failures.
+#[test]
+fn alternating_failures_never_eject_under_consecutive_semantics() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = consecutive_policy(5);
+
+    for _ in 0..50 {
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            200,
+            false,
+            Some(&config),
+        );
+    }
+
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "a success between failures resets the streak, so no ejection may occur"
+    );
+}
+
+/// A true consecutive streak still ejects at exactly the threshold.
+#[test]
+fn true_consecutive_failures_eject_at_the_threshold() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = consecutive_policy(5);
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 4);
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "must not eject below the consecutive threshold"
+    );
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 1);
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "the fifth consecutive failure must eject"
+    );
+}
+
+/// The same alternating pattern DOES eject under Ferrum's native windowed
+/// model — the two semantics stay distinct, and the default is unchanged.
+#[test]
+fn windowed_mode_still_ejects_on_alternating_failures() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_threshold: 5,
+        unhealthy_window_seconds: 600,
+        ..PassiveHealthCheck::default()
+    };
+    assert!(!config.consecutive_error_mode, "windowed is the default");
+
+    // Interleaved, ending on a failure: a trailing success would re-admit the
+    // target through on-success recovery and hide the windowed decision.
+    for index in 0..5 {
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
+        if index < 4 {
+            checker.report_response(
+                DEFAULT_NAMESPACE,
+                TEST_PROXY,
+                "test-upstream",
+                &target,
+                200,
+                false,
+                Some(&config),
+            );
+        }
+    }
+
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "windowed semantics count every in-window failure regardless of streaks"
+    );
+}
+
+/// Istio `consecutive5xxErrors: 0` disables the consecutive-5xx detector.
+/// Matching HTTP 5xx and locally originated connection failures (the Envoy
+/// 5xx bucket when split mode is off) must not eject. Native windowed
+/// policies never set this sentinel.
+#[test]
+fn disabled_consecutive_5xx_detector_never_ejects_on_status_errors() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        consecutive_error_mode: true,
+        consecutive_5xx_ejection_disabled: true,
+        unhealthy_threshold: 1,
+        ..consecutive_policy(1)
+    };
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 100);
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "consecutive5xxErrors: 0 must not eject on HTTP 5xx"
+    );
+}
+
+#[test]
+fn disabled_consecutive_5xx_detector_never_ejects_on_connection_errors() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        consecutive_error_mode: true,
+        consecutive_5xx_ejection_disabled: true,
+        unhealthy_threshold: 1,
+        ..consecutive_policy(1)
+    };
+
+    for _ in 0..100 {
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            0,
+            true,
+            Some(&config),
+        );
+    }
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "consecutive5xxErrors: 0 must not eject on locally originated connection errors"
+    );
+    assert_eq!(
+        checker.consecutive_failures_for_test(DEFAULT_NAMESPACE, TEST_PROXY, "backend1:8080"),
+        0,
+        "a disabled 5xx detector must not increment the consecutive streak"
+    );
+}
+
+#[test]
+fn native_windowed_connection_errors_still_eject_when_5xx_detector_is_enabled() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_threshold: 2,
+        ..PassiveHealthCheck::default()
+    };
+    assert!(!config.consecutive_error_mode);
+    assert!(!config.consecutive_5xx_ejection_disabled);
+
+    checker.report_response(
+        DEFAULT_NAMESPACE,
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        0,
+        true,
+        Some(&config),
+    );
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "native windowed policy must not eject below threshold"
+    );
+    checker.report_response(
+        DEFAULT_NAMESPACE,
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        0,
+        true,
+        Some(&config),
+    );
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "native windowed policy still counts connection errors when the Istio disable sentinel is unset"
+    );
+}
+
+/// Top-level `consecutive5xxErrors: 0` sets the disable sentinel without
+/// flipping `consecutive_error_mode`. Connection errors must still be ignored.
+#[test]
+fn disabled_5xx_detector_without_consecutive_mode_still_ignores_connection_errors() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        consecutive_5xx_ejection_disabled: true,
+        unhealthy_threshold: 1,
+        ..PassiveHealthCheck::default()
+    };
+    assert!(!config.consecutive_error_mode);
+
+    for _ in 0..50 {
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            0,
+            true,
+            Some(&config),
+        );
+    }
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "explicit 0 must disable the 5xx bucket even when consecutive_error_mode is unset"
+    );
+}
+
+/// Explicit nonzero consecutive thresholds still eject under consecutive mode.
+#[test]
+fn explicit_nonzero_consecutive_threshold_still_wins_over_disable_sentinel() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = consecutive_policy(7);
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 6);
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "must not eject below the explicit consecutive threshold"
+    );
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 1);
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "the seventh consecutive failure must eject"
+    );
+}
+
+/// Deterministic consecutive-mode stale-insert proof: a threshold failure
+/// increments the streak, a later success resets it and observes no ejection,
+/// then the older failure would have inserted from its cached count. The
+/// live epoch/streak must win so the endpoint is not left ejected.
+#[test]
+fn consecutive_mode_success_wins_over_stale_threshold_insert() {
+    let checker = Arc::new(HealthChecker::new());
+    let target = make_target("backend1", 8080);
+    let config = consecutive_policy(5);
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 4);
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "must not eject below the consecutive threshold"
+    );
+
+    let checker_for_success = Arc::clone(&checker);
+    let target_for_success = target.clone();
+    let config_for_success = config.clone();
+    let mut success_observed_ejection = false;
+    let mut hook = || {
+        checker_for_success.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target_for_success,
+            200,
+            false,
+            Some(&config_for_success),
+        );
+        success_observed_ejection =
+            is_passive_unhealthy(&checker_for_success, TEST_PROXY, "backend1:8080");
+    };
+    checker.report_response_with_after_consecutive_failure_count_hook_for_test(
+        DEFAULT_NAMESPACE,
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+        &mut hook,
+    );
+
+    assert!(
+        !success_observed_ejection,
+        "the later success must observe no ejection (insert has not happened yet)"
+    );
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "a stale threshold insert must not leave the endpoint ejected after the later success"
+    );
+    assert_eq!(
+        checker.consecutive_failures_for_test(DEFAULT_NAMESPACE, TEST_PROXY, "backend1:8080"),
+        0,
+        "the later success must own the live streak"
+    );
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 5);
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "a fresh consecutive streak after the interleaved success must still eject"
+    );
+}
+
+/// F1 publishes at generation G, then a later success plus a complete
+/// post-success streak publish generation G+1 before F1's stale retract.
+/// Retract must use the owned generation token and leave G+1 in place.
+#[test]
+fn consecutive_mode_stale_cleanup_cannot_retract_fresh_post_success_ejection() {
+    let checker = Arc::new(HealthChecker::new());
+    let target = make_target("backend1", 8080);
+    let config = consecutive_policy(5);
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 4);
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "must not eject below the consecutive threshold"
+    );
+
+    let checker_for_hook = Arc::clone(&checker);
+    let target_for_hook = target.clone();
+    let config_for_hook = config.clone();
+    let mut hook_saw_new_generation = false;
+    let mut hook = || {
+        assert!(
+            is_passive_unhealthy(&checker_for_hook, TEST_PROXY, "backend1:8080"),
+            "F1 must have published before the interleaving hook"
+        );
+        assert_eq!(
+            consecutive_ejection_generation(&checker_for_hook, TEST_PROXY, "backend1:8080"),
+            Some(0),
+            "F1 owns generation 0"
+        );
+
+        checker_for_hook.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target_for_hook,
+            200,
+            false,
+            Some(&config_for_hook),
+        );
+        report_failures(
+            &checker_for_hook,
+            TEST_PROXY,
+            &target_for_hook,
+            &config_for_hook,
+            5,
+        );
+        assert!(
+            is_passive_unhealthy(&checker_for_hook, TEST_PROXY, "backend1:8080"),
+            "the fresh post-success streak must publish a newer ejection"
+        );
+        assert_eq!(
+            consecutive_ejection_generation(&checker_for_hook, TEST_PROXY, "backend1:8080"),
+            Some(1),
+            "the newer ejection must carry generation 1"
+        );
+        hook_saw_new_generation = true;
+    };
+    checker.report_response_with_after_consecutive_ejection_insert_hook_for_test(
+        DEFAULT_NAMESPACE,
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+        &mut hook,
+    );
+
+    assert!(
+        hook_saw_new_generation,
+        "the insert hook must run so the race is deterministic"
+    );
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "stale F1 cleanup must not retract a fresh post-success ejection"
+    );
+    assert_eq!(
+        consecutive_ejection_generation(&checker, TEST_PROXY, "backend1:8080"),
+        Some(1),
+        "the live ejection must still be the post-success generation"
+    );
+}
+
+/// Threshold 1: a failure CAS-increments, then a success retires that
+/// generation before publication. Linearizable order is failure-then-success:
+/// no ejection, packed streak 0. The two-atomic sequence could leave streak 1
+/// while suppressing the failure as stale.
+#[test]
+fn consecutive_mode_overlapping_success_does_not_leave_orphan_streak_at_threshold_one() {
+    let checker = Arc::new(HealthChecker::new());
+    let target = make_target("backend1", 8080);
+    let config = consecutive_policy(1);
+
+    let checker_for_hook = Arc::clone(&checker);
+    let target_for_hook = target.clone();
+    let config_for_hook = config.clone();
+    let mut hook = || {
+        checker_for_hook.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target_for_hook,
+            200,
+            false,
+            Some(&config_for_hook),
+        );
+    };
+    checker.report_response_with_after_consecutive_failure_count_hook_for_test(
+        DEFAULT_NAMESPACE,
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+        &mut hook,
+    );
+
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "success linearized after the overlapping failure must not leave an ejection"
+    );
+    assert_eq!(
+        checker.consecutive_failures_for_test(DEFAULT_NAMESPACE, TEST_PROXY, "backend1:8080"),
+        0,
+        "packed CAS must not leave streak 1 after the success retired that generation"
+    );
+}
+
+/// Success retires generation G, then a fresh threshold streak publishes G+1
+/// before success `remove_if`. Cleanup must not delete the newer token.
+#[test]
+fn consecutive_mode_success_cleanup_cannot_retract_fresh_post_success_ejection() {
+    let checker = Arc::new(HealthChecker::new());
+    let target = make_target("backend1", 8080);
+    let config = consecutive_policy(1);
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 1);
+    assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+    assert_eq!(
+        consecutive_ejection_generation(&checker, TEST_PROXY, "backend1:8080"),
+        Some(0)
+    );
+
+    let checker_for_hook = Arc::clone(&checker);
+    let target_for_hook = target.clone();
+    let config_for_hook = config.clone();
+    let mut hook = || {
+        report_failures(
+            &checker_for_hook,
+            TEST_PROXY,
+            &target_for_hook,
+            &config_for_hook,
+            1,
+        );
+        assert_eq!(
+            consecutive_ejection_generation(&checker_for_hook, TEST_PROXY, "backend1:8080"),
+            Some(1),
+            "the post-success failure must publish generation 1 before success cleanup"
+        );
+    };
+    checker.report_response_with_after_consecutive_success_reset_hook_for_test(
+        DEFAULT_NAMESPACE,
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        200,
+        false,
+        Some(&config),
+        &mut hook,
+    );
+
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "success cleanup must not retract a newer generation"
+    );
+    assert_eq!(
+        consecutive_ejection_generation(&checker, TEST_PROXY, "backend1:8080"),
+        Some(1)
+    );
+}
+
+/// Timer snapshots a due generation-0 ejection, then a success plus a fresh
+/// streak publish generation 1 with the same backdated deadline. Deadline
+/// equality alone would delete the newer record; the generation token must
+/// keep it.
+#[test]
+fn consecutive_mode_timer_recovery_cannot_retract_fresh_post_success_ejection() {
+    let checker = Arc::new(HealthChecker::new());
+    let target = make_target("backend1", 8080);
+    let config = consecutive_policy(5);
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 5);
+    assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+    {
+        let ps = checker.passive_health.get(&rk(TEST_PROXY)).unwrap();
+        ps.unhealthy.get_mut("backend1:8080").unwrap().recover_at_ms = 1;
+    }
+    assert_eq!(
+        consecutive_ejection_generation(&checker, TEST_PROXY, "backend1:8080"),
+        Some(0)
+    );
+
+    let checker_for_hook = Arc::clone(&checker);
+    let target_for_hook = target.clone();
+    let config_for_hook = config.clone();
+    let mut hook = || {
+        checker_for_hook.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target_for_hook,
+            200,
+            false,
+            Some(&config_for_hook),
+        );
+        report_failures(
+            &checker_for_hook,
+            TEST_PROXY,
+            &target_for_hook,
+            &config_for_hook,
+            5,
+        );
+        {
+            let ps = checker_for_hook
+                .passive_health
+                .get(&rk(TEST_PROXY))
+                .unwrap();
+            ps.unhealthy.get_mut("backend1:8080").unwrap().recover_at_ms = 1;
+        }
+        assert_eq!(
+            consecutive_ejection_generation(&checker_for_hook, TEST_PROXY, "backend1:8080"),
+            Some(1)
+        );
+    };
+    checker.recover_due_passive_ejections_with_after_scan_hook_for_test(&mut hook);
+
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "timer recovery must not retract a newer generation with the same deadline"
+    );
+    assert_eq!(
+        consecutive_ejection_generation(&checker, TEST_PROXY, "backend1:8080"),
+        Some(1)
+    );
+}
+
+/// Timer used to `remove_if` generation G, drop the DashMap lock, then retire
+/// packed G. In that gap a concurrent failure could increment still-live G,
+/// see a vacant map, republish G, and then the timer would advance packed
+/// state to G+1 — stranding a stale G ejection.
+///
+/// The coupled retire-under-entry-lock closes that gap. This hook runs after
+/// removal (lock released) and is the exact observation of the old
+/// remove-before-retire window: the map is vacant, but packed G must already
+/// be retired. A threshold failure in the hook therefore publishes G+1, never
+/// a leftover G.
+#[test]
+fn consecutive_mode_timer_cannot_strand_republished_generation_after_remove() {
+    let checker = Arc::new(HealthChecker::new());
+    let target = make_target("backend1", 8080);
+    let config = consecutive_policy(1);
+
+    report_failures(&checker, TEST_PROXY, &target, &config, 1);
+    assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+    {
+        let ps = checker.passive_health.get(&rk(TEST_PROXY)).unwrap();
+        ps.unhealthy.get_mut("backend1:8080").unwrap().recover_at_ms = 1;
+    }
+    assert_eq!(
+        consecutive_ejection_generation(&checker, TEST_PROXY, "backend1:8080"),
+        Some(0)
+    );
+    assert_eq!(
+        checker.consecutive_packed_state_for_test(DEFAULT_NAMESPACE, TEST_PROXY, "backend1:8080",),
+        (0, 1),
+        "threshold-1 ejection owns packed generation 0"
+    );
+
+    let checker_for_hook = Arc::clone(&checker);
+    let target_for_hook = target.clone();
+    let config_for_hook = config.clone();
+    let mut hook_ran = false;
+    let mut hook = || {
+        assert_eq!(
+            checker_for_hook.consecutive_packed_state_for_test(
+                DEFAULT_NAMESPACE,
+                TEST_PROXY,
+                "backend1:8080",
+            ),
+            (1, 0),
+            "packed G must already be retired before the map lock is released"
+        );
+        assert!(
+            !is_passive_unhealthy(&checker_for_hook, TEST_PROXY, "backend1:8080"),
+            "generation 0 must already be gone from the map"
+        );
+
+        report_failures(
+            &checker_for_hook,
+            TEST_PROXY,
+            &target_for_hook,
+            &config_for_hook,
+            1,
+        );
+        assert_eq!(
+            consecutive_ejection_generation(&checker_for_hook, TEST_PROXY, "backend1:8080"),
+            Some(1),
+            "a post-retirement failure must publish the new generation"
+        );
+        assert_eq!(
+            checker_for_hook.consecutive_packed_state_for_test(
+                DEFAULT_NAMESPACE,
+                TEST_PROXY,
+                "backend1:8080",
+            ),
+            (1, 1),
+            "the post-retirement failure must increment packed generation 1"
+        );
+        hook_ran = true;
+    };
+    checker.recover_due_passive_ejections_with_after_consecutive_remove_hook_for_test(&mut hook);
+
+    assert!(
+        hook_ran,
+        "the remove hook must run so the race is deterministic"
+    );
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "the post-retirement publication must remain"
+    );
+    assert_eq!(
+        consecutive_ejection_generation(&checker, TEST_PROXY, "backend1:8080"),
+        Some(1),
+        "no stale generation-0 ejection may remain after packed retirement"
+    );
+    assert_eq!(
+        checker.consecutive_packed_state_for_test(DEFAULT_NAMESPACE, TEST_PROXY, "backend1:8080",),
+        (1, 1)
+    );
 }

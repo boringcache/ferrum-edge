@@ -5802,6 +5802,7 @@ mod tests {
                     from_headers: Vec::new(),
                     from_params: Vec::new(),
                     forward_original_token: false,
+                    output_claim_to_headers: Vec::new(),
                 }],
             }],
             service_entries: vec![ServiceEntry {

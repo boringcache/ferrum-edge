@@ -139,13 +139,36 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   Source and destination are bound inside `verify_trusted_local_action.py`; the
   candidate cannot supply a digest. Retire the pair after #3910 is the trusted
   base.
+- The published x86_64 GNU producers carry an admitted generation pair each
+  (`CI_JOB_GENERATION_TRANSITIONS`): `ci.yml`'s `build-binaries` and
+  `release.yml`'s `build-release-binaries` move their ONE x86_64 GNU matrix
+  cell from a native `ubuntu-latest` `cargo build` to the digest-pinned
+  AlmaLinux 8.10 sysroot builder, and gain an ABI/oldest-baseline gate over
+  the staged, checksummed `release-assets/` files they are about to upload
+  (issue #4301). One producer, one artifact identity: the scanned bytes ARE
+  the published bytes, so `create-release`, the `.sha256` sidecars, the
+  `latest` prerelease, and the container image inputs cannot describe a
+  binary that was never verified. The digest withholding is backed by an
+  absolute check, `linux_gnu_producer_contract_errors`, which binds as soon
+  as the repository references
+  `.github/scripts/build_linux_gnu_sysroot.sh` and rejects a producer that
+  native-compiles x86_64 GNU, scans a `target/x86_64-unknown-linux-gnu/...`
+  rebuild, gates after the upload, or shares the canonical artifact name with
+  a second uploader. Reverting either producer to its native text is refused
+  outright. The ARM64 Cross producer, its command/environment/image freeze,
+  and every publication `needs` graph are untouched; ARM64 is scanned as
+  published by `verify-linux-gnu-abi-aarch64` /
+  `verify-latest-linux-gnu-abi-aarch64` and joined by the existing retraction
+  gates, which is the only shape available while both its producer and its
+  consumers are frozen. Retire both pairs once they are on `main`. See
+  `docs/ci_cd.md` → "Admitted CI job SHA-256 generation transitions".
 - Cross-sensitive `ci.yml` jobs `ci-plan`, `test`, and `performance-regression`
   carry temporary SHA-256 generation pairs (`CI_JOB_GENERATION_TRANSITIONS`)
   for PRs #3913 and #3911, the three per-suite live gates (`ebpf-live`,
   `netns-capture-live`, `two-cluster-mesh-live`) carry pairs for PR #3915's
   planner-gate split (adopted digests pinned against #3915's latest-main merge
-  `d95ea4796`), and `build-binaries` carries a pair for PR #3916's macOS
-  compile-gate reduction. `setup-rust-ci/action.yml` carries a two-step
+  `d95ea4796`). PR #3916's `build-binaries` pair is retired; that job's pair is
+  now the issue #4301 one above. `setup-rust-ci/action.yml` carries a two-step
   trusted-base chain (`LOCAL_ACTION_GENERATION_TRANSITIONS`): #3889's landed
   `fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda` moving to
   the cache-budget generation

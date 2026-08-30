@@ -2,11 +2,13 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT, Proxy, Upstream, UpstreamTarget,
+    DEFAULT_NAMESPACE, GatewayConfig, LoadBalancerAlgorithm, MAX_TARGET_WEIGHT, Proxy, Upstream,
+    UpstreamTarget,
 };
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
+use ferrum_edge::health_check::HealthChecker;
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{
     MeshConfig, MeshCorsUnmatchedPreflights, MeshDestinationRule, MeshLoadBalancer,
@@ -327,6 +329,393 @@ fn destination_rule_port_level_outlier_detection_projects_to_dispatch_override()
     assert_eq!(dispatch_passive.unhealthy_window_seconds, 11);
     assert_eq!(dispatch_passive.healthy_after_seconds, 17);
     assert_eq!(dispatch_passive.max_ejection_percent, Some(50));
+}
+
+#[test]
+fn destination_rule_empty_outlier_detection_applies_istio_defaults_at_overlay_time() {
+    let mut config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    outlier_detection: Some(MeshOutlierDetection {
+                        consecutive_errors: None,
+                        interval_seconds: None,
+                        base_ejection_seconds: None,
+                        max_ejection_percent: None,
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let passive = prepared.upstreams[0]
+        .health_checks
+        .as_ref()
+        .and_then(|health| health.passive.as_ref())
+        .expect("top-level outlierDetection must project passive health");
+    assert!(passive.consecutive_error_mode);
+    assert_eq!(passive.unhealthy_threshold, 5);
+    assert_eq!(passive.max_ejection_percent, Some(10));
+}
+
+#[test]
+fn partial_port_outlier_overlay_inherits_explicit_top_level_fields() {
+    let mut port_level_settings = HashMap::new();
+    port_level_settings.insert(
+        8080,
+        MeshTrafficPolicy {
+            outlier_detection: Some(MeshOutlierDetection {
+                consecutive_errors: None,
+                interval_seconds: Some(5),
+                base_ejection_seconds: None,
+                max_ejection_percent: None,
+            }),
+            ..MeshTrafficPolicy::default()
+        },
+    );
+    let mut config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    outlier_detection: Some(MeshOutlierDetection {
+                        consecutive_errors: Some(20),
+                        interval_seconds: Some(10),
+                        base_ejection_seconds: Some(30),
+                        max_ejection_percent: Some(100),
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings,
+                subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let passive = prepared.upstreams[0]
+        .port_overrides
+        .get(&8080)
+        .and_then(|slot| slot.passive_health_check.as_ref())
+        .expect("port outlierDetection must project passive health");
+    assert_eq!(passive.unhealthy_threshold, 20);
+    assert_eq!(passive.unhealthy_window_seconds, 5);
+    assert_eq!(passive.healthy_after_seconds, 30);
+    assert_eq!(passive.max_ejection_percent, Some(100));
+}
+
+#[test]
+fn partial_subset_and_port_outlier_overlays_share_field_level_precedence() {
+    use ferrum_edge::modes::mesh::config::MeshSubset;
+
+    let mut selected_proxy = proxy();
+    selected_proxy.upstream_subset = Some("v1".to_string());
+    let mut selected_upstream = upstream();
+    selected_upstream.targets[0]
+        .tags
+        .insert("version".to_string(), "v1".to_string());
+    let mut port_level_settings = HashMap::new();
+    port_level_settings.insert(
+        8080,
+        MeshTrafficPolicy {
+            outlier_detection: Some(MeshOutlierDetection {
+                consecutive_errors: Some(7),
+                interval_seconds: None,
+                base_ejection_seconds: Some(45),
+                max_ejection_percent: None,
+            }),
+            ..MeshTrafficPolicy::default()
+        },
+    );
+    let mut config = GatewayConfig {
+        proxies: vec![selected_proxy],
+        upstreams: vec![selected_upstream],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    outlier_detection: Some(MeshOutlierDetection {
+                        consecutive_errors: Some(20),
+                        interval_seconds: Some(10),
+                        base_ejection_seconds: Some(30),
+                        max_ejection_percent: Some(100),
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings,
+                subsets: vec![MeshSubset {
+                    name: "v1".to_string(),
+                    labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        outlier_detection: Some(MeshOutlierDetection {
+                            consecutive_errors: None,
+                            interval_seconds: Some(15),
+                            base_ejection_seconds: None,
+                            max_ejection_percent: Some(80),
+                        }),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                }],
+                export_to: vec!["*".to_string()],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let subset_passive = prepared.upstreams[0]
+        .resolved_subset_tls
+        .get("v1")
+        .and_then(|resolved| resolved.passive_health_check.as_ref())
+        .expect("subset outlierDetection must project passive health");
+    assert_eq!(subset_passive.unhealthy_threshold, 20);
+    assert_eq!(subset_passive.unhealthy_window_seconds, 15);
+    assert_eq!(subset_passive.healthy_after_seconds, 30);
+    assert_eq!(subset_passive.max_ejection_percent, Some(80));
+
+    let port_passive = prepared.proxies[0]
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&8080))
+        .and_then(|override_slot| override_slot.passive_health_check.as_ref())
+        .expect("port outlierDetection must layer over selected subset passive health");
+    assert_eq!(port_passive.unhealthy_threshold, 7);
+    assert_eq!(port_passive.unhealthy_window_seconds, 15);
+    assert_eq!(port_passive.healthy_after_seconds, 45);
+    assert_eq!(port_passive.max_ejection_percent, Some(80));
+}
+
+#[test]
+fn port_level_positive_outlier_overlay_clears_top_level_disable_sentinel() {
+    let mut port_level_settings = HashMap::new();
+    port_level_settings.insert(
+        8080,
+        MeshTrafficPolicy {
+            outlier_detection: Some(MeshOutlierDetection {
+                consecutive_errors: Some(5),
+                interval_seconds: None,
+                base_ejection_seconds: None,
+                max_ejection_percent: None,
+            }),
+            ..MeshTrafficPolicy::default()
+        },
+    );
+    let mut config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    outlier_detection: Some(MeshOutlierDetection {
+                        consecutive_errors: Some(0),
+                        interval_seconds: None,
+                        base_ejection_seconds: None,
+                        max_ejection_percent: None,
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings,
+                subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let port_passive = prepared.upstreams[0]
+        .port_overrides
+        .get(&8080)
+        .and_then(|override_slot| override_slot.passive_health_check.as_ref())
+        .expect("port-level outlier projected");
+    assert!(
+        !port_passive.consecutive_5xx_ejection_disabled,
+        "per-port consecutive5xxErrors must clear a top-level disable sentinel"
+    );
+    assert!(port_passive.consecutive_error_mode);
+    assert_eq!(port_passive.unhealthy_threshold, 5);
+
+    let checker = HealthChecker::new();
+    let target = UpstreamTarget {
+        host: "reviews.default.svc.cluster.local".to_string(),
+        port: 8080,
+        service_port_policy_key: None,
+        weight: 1,
+        tags: HashMap::new(),
+        locality: None,
+        path: None,
+    };
+    for _ in 0..4 {
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            "reviews-p",
+            "reviews-u",
+            &target,
+            500,
+            false,
+            Some(port_passive),
+        );
+    }
+    assert!(
+        !checker
+            .passive_health
+            .get(&ferrum_edge::config::db_backend::namespaced_runtime_key(
+                "ferrum",
+                "reviews-p"
+            ))
+            .is_some_and(|ps| ps
+                .unhealthy
+                .contains_key("reviews.default.svc.cluster.local:8080")),
+        "must not eject below the per-port consecutive threshold"
+    );
+    checker.report_response(
+        DEFAULT_NAMESPACE,
+        "reviews-p",
+        "reviews-u",
+        &target,
+        500,
+        false,
+        Some(port_passive),
+    );
+    assert!(
+        checker
+            .passive_health
+            .get(&ferrum_edge::config::db_backend::namespaced_runtime_key(
+                "ferrum",
+                "reviews-p"
+            ))
+            .is_some_and(|ps| ps
+                .unhealthy
+                .contains_key("reviews.default.svc.cluster.local:8080")),
+        "the fifth consecutive failure must eject once the disable sentinel is cleared"
+    );
+}
+
+#[test]
+fn port_level_zero_outlier_overlay_disables_top_level_positive_threshold() {
+    let mut port_level_settings = HashMap::new();
+    port_level_settings.insert(
+        8080,
+        MeshTrafficPolicy {
+            outlier_detection: Some(MeshOutlierDetection {
+                consecutive_errors: Some(0),
+                interval_seconds: None,
+                base_ejection_seconds: None,
+                max_ejection_percent: None,
+            }),
+            ..MeshTrafficPolicy::default()
+        },
+    );
+    let mut config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    outlier_detection: Some(MeshOutlierDetection {
+                        consecutive_errors: Some(5),
+                        interval_seconds: None,
+                        base_ejection_seconds: None,
+                        max_ejection_percent: None,
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings,
+                subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let port_passive = prepared.upstreams[0]
+        .port_overrides
+        .get(&8080)
+        .and_then(|override_slot| override_slot.passive_health_check.as_ref())
+        .expect("port-level outlier projected");
+    assert!(
+        port_passive.consecutive_5xx_ejection_disabled,
+        "per-port consecutive5xxErrors: 0 must disable a top-level positive threshold"
+    );
+
+    let checker = HealthChecker::new();
+    let target = UpstreamTarget {
+        host: "reviews.default.svc.cluster.local".to_string(),
+        port: 8080,
+        service_port_policy_key: None,
+        weight: 1,
+        tags: HashMap::new(),
+        locality: None,
+        path: None,
+    };
+    for _ in 0..20 {
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            "reviews-p",
+            "reviews-u",
+            &target,
+            500,
+            false,
+            Some(port_passive),
+        );
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            "reviews-p",
+            "reviews-u",
+            &target,
+            0,
+            true,
+            Some(port_passive),
+        );
+    }
+    assert!(
+        !checker
+            .passive_health
+            .get(&ferrum_edge::config::db_backend::namespaced_runtime_key(
+                "ferrum",
+                "reviews-p"
+            ))
+            .is_some_and(|ps| ps
+                .unhealthy
+                .contains_key("reviews.default.svc.cluster.local:8080")),
+        "port-level consecutive5xxErrors: 0 must not eject on HTTP 5xx or connection errors"
+    );
 }
 
 #[test]

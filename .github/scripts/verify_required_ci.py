@@ -45,6 +45,12 @@ from verify_install_docs_contract import (
 from verify_install_docs_contract import (
     check_repository as check_install_docs_contract,
 )
+from verify_linux_gnu_abi import (
+    run_self_test as linux_gnu_abi_self_test,
+)
+from verify_linux_gnu_abi import (
+    check_repository as check_linux_gnu_abi_contract,
+)
 from verify_publication_gate import (
     ContractError as PublicationContractError,
     by_mode as publication_entries_by_mode,
@@ -2310,6 +2316,8 @@ def main() -> int:
     planner_errors.extend(error.format() for error in check_repository())
     planner_errors.extend(install_docs_contract_self_test())
     planner_errors.extend(check_install_docs_contract())
+    planner_errors.extend(linux_gnu_abi_self_test())
+    planner_errors.extend(check_linux_gnu_abi_contract())
     release_yml = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
     planner_errors.extend(validate_release_workflow(release_yml))
     planner_errors.extend(release_attestation_self_test(release_yml))

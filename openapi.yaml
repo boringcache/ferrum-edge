@@ -13058,6 +13058,29 @@ components:
           description: |
             Reserved for DestinationRule parity. Validated and persisted, but
             not yet applied by passive health at runtime.
+        consecutive_error_mode:
+          type: boolean
+          default: false
+          description: |
+            Evaluate `unhealthy_threshold` against the target's consecutive
+            failure streak instead of the sliding-window failure count. False
+            (default) keeps Ferrum's windowed passive health; true is Istio
+            `outlierDetection.consecutive5xxErrors` semantics, where a single
+            success resets the streak and `unhealthy_window_seconds` is not
+            consulted. Set automatically for translated Istio DestinationRules;
+            direct native configuration may opt in explicitly.
+        consecutive_5xx_ejection_disabled:
+          type: boolean
+          default: false
+          description: |
+            When true, the Istio consecutive-5xx detector is disabled
+            (`consecutive5xxErrors: 0`). Matching `unhealthy_status_codes` and
+            locally originated connection failures are ignored — Envoy's
+            default `splitExternalLocalOriginErrors=false` puts those
+            connection failures in the same 5xx bucket, and Ferrum's split
+            mode is deferred and unused. Set automatically for translated
+            Istio DestinationRules that explicitly disable the 5xx detector.
+            Direct native configuration may opt into the same sentinel.
 
     # ── Service Discovery ──────────────────────────────────────────
     ServiceDiscoveryConfig:
@@ -19448,6 +19471,36 @@ components:
               claim_headers_separator:
                 type: string
                 description: Separator for array claim header values
+              output_claim_headers:
+                type: array
+                maxItems: 16
+                items:
+                  type: object
+                  required: [header, claim]
+                  additionalProperties: false
+                  properties:
+                    header:
+                      type: string
+                      maxLength: 128
+                      description: Backend-visible request header the claim is published to
+                    claim:
+                      type: string
+                      maxLength: 256
+                      description: Dot-path claim to publish
+                description: >-
+                  Istio RequestAuthentication jwtRules[].outputClaimToHeaders
+                  projection. An ordered list rather than a map, because one claim
+                  may be published to several headers. Destinations are
+                  gateway-owned exactly like claim_headers: each is removed from
+                  the client request (case-insensitively) before validation and set
+                  only from a validated claim, so an unauthenticated or invalid
+                  request can never forge one. Duplicate destination headers,
+                  reserved/credential-bearing destinations, and invalid header names
+                  are rejected at config load. Only nonblank string, integer, and
+                  boolean claims are published (Istio ClaimToHeader does not support
+                  arrays, objects, null, or floating-point numbers); anything else
+                  or a header-illegal value leaves the destination absent. A rendered
+                  claim value over 8192 bytes is omitted before fan-out.
               require_mtls_binding:
                 type: boolean
                 default: false
@@ -20490,9 +20543,9 @@ components:
         construction time from the slice-embedded workload identity, except in
         node-waypoint topology where the filter runs per-request against the
         pod-scoped cache attached to `RequestContext`. `TargetRefs`
-        (AuthorizationPolicy `spec.targetRefs`) is waypoint-only and is
-        additionally re-checked per request against the exact destination
-        Service and waypoint Gateway/GatewayClass identity — construction-time
+        (AuthorizationPolicy `spec.targetRef` / `spec.targetRefs`) is
+        waypoint-only and is additionally re-checked per request against the
+        exact destination Service and waypoint Gateway/GatewayClass identity — construction-time
         retention is OR over the attachment list and never widens a targeted
         policy onto another destination. See `docs/mesh.md`.
       properties:

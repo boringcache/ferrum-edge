@@ -212,8 +212,32 @@ jobs:
           }
           $nasmBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
 
+      # Every target except x86_64 GNU is compiled natively on its runner.
+      # The x86_64 GNU cell is deliberately excluded: `ubuntu-latest` is a
+      # moving image whose glibc defines the published runtime floor, which is
+      # exactly the defect issue #4301 fixes.
       - name: Build release binary
+        if: matrix.target != 'x86_64-unknown-linux-gnu'
         run: cargo build --features cloud-secrets --release --target ${{ matrix.target }}
+
+      # Canonical x86_64 GNU producer. The digest-pinned AlmaLinux 8.10
+      # sysroot links against glibc 2.28, below the declared GLIBC_2.34 floor,
+      # and writes into an isolated CARGO_TARGET_DIR before copying the two
+      # regular files to `target/x86_64-unknown-linux-gnu/release/`. The
+      # `Copy binary` step below therefore publishes these exact bytes as
+      # `release-binaries-x86_64-unknown-linux-gnu`; there is no second build.
+      - name: Build x86_64 GNU release binaries in the pinned sysroot
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          LINUX_GNU_TARGET: x86_64-unknown-linux-gnu
+          LINUX_GNU_FEATURES: cloud-secrets
+          LINUX_GNU_PROFILE: release
+        run: |
+          set -euo pipefail
+          python3 -I .github/scripts/verify_linux_gnu_abi.py --self-test
+          python3 -I .github/scripts/verify_linux_gnu_abi.py --check-contract
+          python3 -I .github/scripts/smoke_linux_gnu_baseline.py --self-test
+          bash .github/scripts/build_linux_gnu_sysroot.sh
 
       - name: Create release assets directory
         shell: bash
@@ -240,6 +264,34 @@ jobs:
             fi
             cat "$asset.sha256"
           done
+
+      # Fail closed on the exact bytes that are about to be uploaded. The
+      # checksum re-verification proves the scanned and smoked files are the
+      # same bytes the `.sha256` sidecars and the GitHub Release advertise, so
+      # publication cannot describe a binary that was never scanned. Both
+      # steps run before `Upload artifacts`, so a floor violation means the
+      # canonical artifact never exists and every downstream consumer
+      # (`create-release`, `docker`, `docker-manifest`) fails closed with it.
+      - name: Re-verify the staged x86_64 GNU asset checksums
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        working-directory: release-assets
+        run: |
+          set -euo pipefail
+          sha256sum -c ferrum-edge-linux-x86_64.sha256
+          sha256sum -c ferrum-cni-linux-x86_64.sha256
+
+      - name: Verify published x86_64 GNU ABI floor and oldest baselines
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I .github/scripts/verify_linux_gnu_abi.py \
+            release-assets/ferrum-edge-linux-x86_64 \
+            release-assets/ferrum-cni-linux-x86_64
+          bash .github/scripts/smoke_linux_gnu_baseline.sh \
+            --edge release-assets/ferrum-edge-linux-x86_64 \
+            --cni release-assets/ferrum-cni-linux-x86_64
 
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -325,6 +377,50 @@ jobs:
         with:
           name: release-binaries-aarch64-unknown-linux-gnu
           path: release-assets/
+
+  verify-linux-gnu-abi-aarch64:
+    name: Verify Linux GNU ABI (aarch64)
+    # x86_64 GNU is scanned and smoked inside its producer job
+    # (`build-release-binaries`) on the exact bytes it uploads, so it is NOT
+    # rebuilt here. ARM64 is produced by the trusted-policy-frozen Cross job,
+    # whose text no pull request may change, so its actual uploaded artifact
+    # is downloaded, checksum-verified, and scanned here instead.
+    needs: build-release-arm64-cross
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Download ARM64 GNU artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-binaries-aarch64-unknown-linux-gnu
+          path: gnu-artifacts
+
+      - name: Verify the published ARM64 artifact checksums
+        working-directory: gnu-artifacts
+        run: |
+          set -euo pipefail
+          sha256sum -c ferrum-edge-linux-aarch64.sha256
+          sha256sum -c ferrum-cni-linux-aarch64.sha256
+          chmod +x ferrum-edge-linux-aarch64 ferrum-cni-linux-aarch64
+
+      - name: Verify the ABI floor and oldest baselines
+        run: |
+          set -euo pipefail
+          python3 -I .github/scripts/verify_linux_gnu_abi.py --self-test
+          python3 -I .github/scripts/verify_linux_gnu_abi.py --check-contract
+          python3 -I .github/scripts/smoke_linux_gnu_baseline.py --self-test
+          python3 -I .github/scripts/verify_linux_gnu_abi.py \
+            gnu-artifacts/ferrum-edge-linux-aarch64 \
+            gnu-artifacts/ferrum-cni-linux-aarch64
+          bash .github/scripts/smoke_linux_gnu_baseline.sh \
+            --edge gnu-artifacts/ferrum-edge-linux-aarch64 \
+            --cni gnu-artifacts/ferrum-cni-linux-aarch64
 
   create-release:
     name: Create GitHub Release
@@ -1371,3 +1467,50 @@ jobs:
           fi
 
           echo "GitHub Release ${TAG_NAME} remains published after successful image attestation verification"
+
+  linux-gnu-abi-release-gate:
+    name: Gate release on Linux GNU ABI
+    # ARM64 ONLY. The x86_64 GNU floor is enforced inside the producer job
+    # before its artifact exists, so no post-publication step is involved in
+    # it. ARM64 is built by the trusted-policy-frozen Cross job and consumed
+    # by frozen `create-release`/`docker` needs, neither of which a pull
+    # request may edit, so its actual-artifact scan can only join after
+    # publication. This gate therefore fails the release workflow and deletes
+    # a GitHub Release whose ARM64 artifacts were not proven.
+    needs: [create-release, verify-linux-gnu-abi-aarch64]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Require GNU ABI success and retract unverified releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+          CREATE_RESULT: ${{ needs.create-release.result }}
+          ABI_RESULT: ${{ needs.verify-linux-gnu-abi-aarch64.result }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "Invalid release tag format: $TAG_NAME" >&2
+            exit 1
+          fi
+
+          if [ "$ABI_RESULT" != "success" ]; then
+            if [ "$CREATE_RESULT" = "success" ]; then
+              if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                gh release delete "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag=false
+                echo "Deleted GitHub Release ${TAG_NAME} because the Linux GNU ABI gate did not succeed"
+              fi
+            fi
+            echo "::error::release publication is blocked until verify-linux-gnu-abi-aarch64 succeeds (result=${ABI_RESULT})"
+            exit 1
+          fi
+
+          if [ "$CREATE_RESULT" != "success" ]; then
+            echo "::error::create-release did not succeed (result=${CREATE_RESULT})"
+            exit 1
+          fi
+
+          echo "GitHub Release ${TAG_NAME} remains published after successful Linux GNU ABI verification"

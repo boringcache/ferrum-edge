@@ -288,6 +288,7 @@ fn request_authentication_plugin_only_injected_when_jwt_rules_present() {
                     from_headers: Vec::new(),
                     from_params: Vec::new(),
                     forward_original_token: false,
+                    output_claim_to_headers: Vec::new(),
                 }],
             });
         let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
