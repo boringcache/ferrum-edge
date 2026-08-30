@@ -2211,6 +2211,9 @@ jobs:
             --namespace ferrum \
             --set observability.enabled=true \
             --set observability.alerts.enabled=true \
+            --set observability.metrics.allowedCidrs=10.0.0.0/8 \
+            --set observability.metrics.serviceMonitor.enabled=false \
+            --set observability.metrics.podMonitor.enabled=false \
             > "$RUNNER_TEMP/ferrum-helm-results/prometheus-rule-rendered.yaml"
           python3 -I .github/scripts/extract_rendered_prometheus_rules.py \
             "$RUNNER_TEMP/ferrum-helm-results/prometheus-rule-rendered.yaml" \
@@ -3040,7 +3043,300 @@ jobs:
             --set nodeAgent.proxyMode=node_waypoint \
             --set-string nodeAgent.admin.port=19090 \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-waypoint.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set injector.enabled=true \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            --set injector.probes.startup.override.exec.command[0]=/bin/startup-inj \
+            --set ca.enabled=true \
+            --set ca.probes.startup.override.exec.command[0]=/bin/startup-ca \
+            --set eastWest.enabled=true \
+            --set eastWest.probes.startup.override.exec.command[0]=/bin/startup-ew \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set ambient.probes.startup.override.exec.command[0]=/bin/startup-amb \
+            --set controlPlane.probes.startup.override.exec.command[0]=/bin/startup-cp \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-startup-overrides.yaml"
           python3 -I .github/scripts/verify_mesh_workload_probes.py \
+            --results-dir "$RUNNER_TEMP/ferrum-helm-results"
+          # Mesh production-readiness (#4266/#4267/#4288): helm stays in this
+          # trusted workflow shell; assertions live in
+          # verify_mesh_production_readiness.py so the ARM64 build-policy gate
+          # does not freeze PodSpec/monitor-shape edits here.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.terminationGracePeriodSeconds=35 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-low-grace.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-low-grace.err"; then
+            echo "::error title=Under-budget mesh grace accepted::controlPlane.terminationGracePeriodSeconds must cover preStop + full shutdown budget"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --kube-version 1.28.0 \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-kube-1.28.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-kube-1.28.err"; then
+            echo "::error title=SleepAction accepted on Kubernetes 1.28::preStop.sleep requires 1.29+ or shutdownPreStopSeconds=0"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.shutdownDrainSeconds=0 \
+            --set controlPlane.shutdownPreStopSeconds=0 \
+            --set controlPlane.terminationGracePeriodSeconds=25 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-zero-drain.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.resources.requests.cpu= \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-empty-resources.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-empty-resources.err"; then
+            echo "::error title=Empty mesh resources accepted::serving requests.cpu/memory must be non-empty"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set observability.enabled=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-no-cred.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-no-cred.err"; then
+            echo "::error title=Observability without scrape credential accepted::alerts/monitors must fail closed without bearer or allowedCidrs"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set observability.enabled=true \
+            --set observability.metrics.bearerToken.value=lab-only-not-a-secret \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-inline-bearer.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs-inline-bearer.err"; then
+            echo "::error title=Inline metrics bearer accepted for ServiceMonitor::monitors without allowedCidrs need existingSecret.name"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ca.enabled=true \
+            --set eastWest.enabled=true \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set injector.enabled=true \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            --set observability.enabled=true \
+            --set-string 'observability.metrics.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            --set controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            --set ca.admin.bindAddress=0.0.0.0 \
+            --set-string 'ca.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            --set eastWest.admin.bindAddress=0.0.0.0 \
+            --set ambient.admin.bindAddress=0.0.0.0 \
+            --set nodeAgent.admin.bindAddress=0.0.0.0 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-obs.yaml"
+          # Strict admin/metrics IP+CIDR validation ported from ferrum-gateway.
+          # Each of these renders cleanly under a permissive approximation and
+          # then CrashLoops (or has the admin accept loop silently drop the
+          # in-pod exec probes), so every one must fail at render.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=10.0.0.0/8\,10.0.0.300/24' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-bad-cidr.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-bad-cidr.err"; then
+            echo "::error title=Malformed admin CIDR accepted::CidrSet::parse_strict rejects 10.0.0.300/24 at startup"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=0.0.0.0/0' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-catchall-cidr.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-catchall-cidr.err"; then
+            echo "::error title=Catch-all admin allowlist accepted::a full-family allowlist is not plaintext protection for cp/ca"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=localhost \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-hostname-bind.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-hostname-bind.err"; then
+            echo "::error title=Hostname admin bind accepted::FERRUM_ADMIN_BIND_ADDRESS must be an IP literal"
+            exit 1
+          fi
+          # IPv6 wildcard bind with an IPv4-only loopback allowlist: the computed
+          # exec probes dial ::1 and the admin TCP allowlist drops them.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=:: \
+            --set-string 'controlPlane.admin.allowedCidrs=10.0.0.0/8\,127.0.0.1/32' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-probe-family.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-probe-family.err"; then
+            echo "::error title=Probe-source family mismatch accepted::an IPv6 wildcard bind probes from ::1, not 127.0.0.1"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set observability.enabled=true \
+            --set-string 'observability.metrics.allowedCidrs=10.0.0.300/24' \
+            --set observability.metrics.serviceMonitor.enabled=false \
+            --set observability.metrics.podMonitor.enabled=false \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-bad-metrics-cidr.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-bad-metrics-cidr.err"; then
+            echo "::error title=Malformed metrics CIDR accepted::FERRUM_METRICS_ALLOWED_CIDRS is parsed strictly too"
+            exit 1
+          fi
+          # An enabled computed probe with no usable handler must fail rather
+          # than render a PodSpec that silently omits drain-aware readiness.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set eastWest.enabled=true \
+            --set eastWest.admin.httpPort=0 \
+            --set-string 'eastWest.probes.liveness.override.tcpSocket.port=tls-passthru' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-missing-ready-handler.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-missing-ready-handler.err"; then
+            echo "::error title=Handler-less readiness accepted::renderProbes would silently omit east-west readiness"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set-string 'ambient.securityContext.capabilities.drop[0]=NET_BIND_SERVICE' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-drop.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-drop.err"; then
+            echo "::error title=Narrowed ambient capability drop accepted::ambient must keep drop ALL"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --skip-schema-validation \
+            --set-json 'ambient.securityContext.capabilities.drop=[]' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-drop-empty.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-drop-empty.err"; then
+            echo "::error title=Empty ambient capability drop accepted::drop [] must not become [ALL]"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --skip-schema-validation \
+            --set-string 'ambient.securityContext.capabilities.add[0]=*' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-add-malformed.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-add-malformed.err"; then
+            echo "::error title=Malformed ambient capability add accepted::capability names must match the Linux grammar"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set-string 'ambient.securityContext.capabilities.add[0]=ALL' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-add-all.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-add-all.err"; then
+            echo "::error title=Ambient capabilities.add ALL accepted::add ALL re-grants every capability after drop ALL"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --skip-schema-validation \
+            --set-string 'ambient.securityContext.capabilities.add[0]=CAP_ALL' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-add-cap-all.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-add-cap-all.err"; then
+            echo "::error title=Ambient capabilities.add CAP_ALL accepted::CAP_ALL normalizes to ALL and must fail closed even with --skip-schema-validation"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set-string 'ambient.securityContext.runAsUser=1000' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-unknown-sc.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-unknown-sc.err"; then
+            echo "::error title=Unsupported ambient securityContext key accepted::the template never reads it; the schema must reject it"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=::ffff:0.0.0.0/96' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-catchall.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-catchall.err"; then
+            echo "::error title=Mapped IPv6 /96 catch-all accepted::a mapped /96 canonicalizes to IPv4 /0"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=::ffff:127.0.0.1' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-bare.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=0.0.0.0 \
+            --set-string 'controlPlane.admin.allowedCidrs=::ffff:127.0.0.1/128' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-cidr-host.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=::ffff:127.0.0.2 \
+            --set-string 'controlPlane.admin.allowedCidrs=::ffff:127.0.0.2' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-loopback-probe.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-loopback-probe.err"; then
+            echo "::error title=Mapped loopback probe source not canonicalized::::ffff:127.0.0.2 must probe from 127.0.0.1"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=::ffff:127.0.0.2 \
+            --set-string 'controlPlane.admin.allowedCidrs=127.0.0.1/32' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-loopback-probe-ok.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set ambient.admin.httpPort=0 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-admin-port0.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-admin-port0.err"; then
+            echo "::error title=Ambient admin-port-zero probes omitted::enabled computed probes must fail closed"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set ambient.admin.httpPort=0 \
+            --set ambient.probes.startup.enabled=false \
+            --set ambient.probes.liveness.enabled=false \
+            --set ambient.probes.readiness.enabled=false \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-ambient-admin-port0-disabled.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.env.FERRUM_ALLOW_INSECURE_ADMIN_HTTP=not-a-bool \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-bad-admin-bool.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-bad-admin-bool.err"; then
+            echo "::error title=Invalid admin insecure-http boolean accepted::EnvConfig rejects non-boolean FERRUM_ALLOW_INSECURE_ADMIN_HTTP at startup"
+            exit 1
+          fi
+          # Valid narrow IPv6 allowlist covering the IPv6 probe source, plus the
+          # <1.29 pre-drain remediation on a cp-mode workload and an ambient
+          # capabilities.add merge, must all render.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set-string 'ambient.securityContext.capabilities.add[0]=SYS_RESOURCE' \
+            --set-string controlPlane.admin.bindAddress=:: \
+            --set-string 'controlPlane.admin.allowedCidrs=fd00::/8\,::1/128' \
+            --set controlPlane.shutdownPreStopSeconds=0 \
+            --set controlPlane.shutdownPreDrainSeconds=30 \
+            --set controlPlane.terminationGracePeriodSeconds=115 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-narrow-ipv6.yaml"
+          # A <workload>.env-supplied admin key must still reach the container.
+          # ferrum-mesh.adminEnv is the sole renderer of the four admin keys and
+          # the workload env loops filter them, so a resolver that skipped an
+          # env-supplied value would drop it from the PodSpec entirely.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.env.FERRUM_ADMIN_HTTP_PORT=19000 \
+            --set-string controlPlane.env.FERRUM_ADMIN_BIND_ADDRESS=0.0.0.0 \
+            --set-string controlPlane.env.FERRUM_ADMIN_ALLOWED_CIDRS=127.0.0.0/8 \
+            --set-string controlPlane.env.FERRUM_ALLOW_INSECURE_ADMIN_HTTP=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-admin-env-override.yaml"
+          python3 -I .github/scripts/verify_mesh_production_readiness.py \
             --results-dir "$RUNNER_TEMP/ferrum-helm-results"
 
       - name: Core gateway chart static validation

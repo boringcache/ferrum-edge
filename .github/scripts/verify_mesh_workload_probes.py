@@ -586,6 +586,46 @@ def validate_node_waypoint_ambient(results_dir: Path, expectations: dict) -> Non
     print("mesh probe NodeWaypoint ambient ok")
 
 
+def validate_startup_overrides(results_dir: Path, expectations: dict) -> None:
+    captures = expectations["captures"]
+    rendered = require_capture(results_dir, captures["startup_overrides"]).read_text(
+        encoding="utf-8"
+    )
+    expected = (
+        ("ferrum-mesh-control-plane", "Deployment", "/bin/startup-cp"),
+        ("ferrum-mesh-ca", "Deployment", "/bin/startup-ca"),
+        ("ferrum-mesh-east-west", "Deployment", "/bin/startup-ew"),
+        ("ferrum-mesh-ambient", "DaemonSet", "/bin/startup-amb"),
+        ("ferrum-mesh-injector", "Deployment", "/bin/startup-inj"),
+    )
+    for name, kind, needle in expected:
+        resource = resource_document(rendered, name, kind)
+        startup = require_probe(resource, name, "startupProbe")
+        liveness = require_probe(resource, name, "livenessProbe")
+        if needle not in startup:
+            fail(
+                "Startup override missing",
+                f"{name} startupProbe must use {needle}",
+            )
+        if needle in liveness:
+            fail(
+                "Startup override leaked into liveness",
+                f"{name} livenessProbe must keep the computed/fallback handler",
+            )
+        if name == "ferrum-mesh-injector":
+            if "tcpSocket:" not in liveness:
+                fail(
+                    "Injector liveness lost TCP default",
+                    "injector must keep tcpSocket on webhook when only startup is overridden",
+                )
+        elif "--live" not in liveness:
+            fail(
+                "Liveness lost computed handler after startup override",
+                f"{name} livenessProbe must remain health --live",
+            )
+    print("mesh probe startup overrides ok")
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -623,6 +663,7 @@ def main(argv: list[str]) -> int:
     validate_node_agent_https_mtls_probe_policy(results_dir, expectations)
     validate_node_agent_https_collision_policy(results_dir, expectations)
     validate_node_waypoint_ambient(results_dir, expectations)
+    validate_startup_overrides(results_dir, expectations)
     return 0
 
 

@@ -3519,7 +3519,9 @@ pub struct EnvConfig {
     /// Default: 0 (no pre-drain window; behavior identical to before). On
     /// Kubernetes prefer the chart's `preStop` sleep, which delays SIGTERM
     /// itself; this knob is for load balancers and clusters that cannot use
-    /// `lifecycle.preStop.sleep`. Only serving modes honor it.
+    /// `lifecycle.preStop.sleep`. Honored by the listener-serving modes
+    /// (`database`, `file`, `cp`, `dp`, `mesh`); see
+    /// [`EnvConfig::effective_shutdown_predrain_seconds`].
     pub shutdown_predrain_seconds: u64,
 
     // ── Admin status metrics ─────────────────────────────────────────────
@@ -5695,6 +5697,40 @@ impl EnvConfig {
     /// Returns the resolved list of CP gRPC URLs for DP failover, priority-ordered.
     pub fn resolved_dp_cp_grpc_urls(&self) -> Vec<String> {
         self.dp_cp_grpc_urls.clone()
+    }
+
+    /// Seconds the shutdown signal handler holds the accept loops open after
+    /// SIGTERM/SIGINT, after the process-wide draining verdict is published.
+    ///
+    /// The window is honored by every mode that runs BOTH a listener an
+    /// orchestrator steers traffic at AND the admin readiness surface that
+    /// publishes `ready:false`:
+    ///
+    /// * `database` / `file` / `dp` / `mesh` — proxy + admin listeners.
+    /// * `cp` — admin HTTP/HTTPS plus the CP gRPC (and optional xDS) listeners.
+    ///   `mode=cp` is what the mesh chart's `controlPlane` and `ca` workloads
+    ///   run, and both sit behind a ClusterIP Service whose endpoint set is
+    ///   withdrawn by the readiness probe. `/health` derives `ready` from the
+    ///   process-wide latch (`overload::shutdown_drain_announced`), which is
+    ///   published before this window opens, and every CP listener is closed by
+    ///   the same `shutdown_tx` broadcast this window delays — so the only
+    ///   effect is that the CP keeps serving admin/gRPC while it is already
+    ///   advertising not-ready. The bounded listener drain and the audit /
+    ///   background / observability finalizers all run afterwards, unchanged.
+    ///
+    /// `injector`, `node_agent`, and `migrate` return 0: the injector is an
+    /// admission webhook rather than a Ferrum serving listener, the node agent
+    /// has no proxy listeners, and `migrate` exits on its own. Holding a
+    /// non-serving mode open would only burn grace-period budget.
+    pub fn effective_shutdown_predrain_seconds(&self) -> u64 {
+        match self.mode {
+            OperatingMode::Database
+            | OperatingMode::File
+            | OperatingMode::ControlPlane
+            | OperatingMode::DataPlane
+            | OperatingMode::Mesh => self.shutdown_predrain_seconds,
+            OperatingMode::Injector | OperatingMode::NodeAgent | OperatingMode::Migrate => 0,
+        }
     }
 
     /// Collect all ports reserved by the gateway's own listeners.

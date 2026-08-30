@@ -798,3 +798,111 @@ fn k8s_pod_discovery_keeps_istio_root_pods_out_of_pod_sources() {
             .all(|workload| workload.namespace == "prod")
     );
 }
+
+#[test]
+fn k8s_pod_discovery_rejects_noncanonical_node_waypoint_pod_shapes() {
+    let mut string_host_network = node_waypoint_pod_with_spiffe(
+        "node-a",
+        "192.0.2.10",
+        true,
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint",
+    );
+    string_host_network.spec["hostNetwork"] = json!("true");
+
+    let mut snake_case_node_name = node_waypoint_pod_with_spiffe(
+        "node-a",
+        "192.0.2.10",
+        true,
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint",
+    );
+    let node_name = snake_case_node_name
+        .spec
+        .as_object_mut()
+        .expect("pod spec object")
+        .remove("nodeName")
+        .expect("canonical nodeName");
+    snake_case_node_name
+        .spec
+        .as_object_mut()
+        .expect("pod spec object")
+        .insert("node_name".to_string(), node_name);
+
+    for (shape, waypoint) in [
+        ("string hostNetwork", string_host_network),
+        ("snake-case node_name", snake_case_node_name),
+    ] {
+        let translation = translate_k8s_objects(
+            &[
+                node("node-a", "node-uid-a"),
+                service(),
+                ready_pod(),
+                endpoint_slice(),
+                waypoint,
+            ],
+            options(),
+        )
+        .expect("K8s core translation succeeds");
+        let workload = translation
+            .config
+            .mesh
+            .as_ref()
+            .expect("mesh config")
+            .workloads
+            .iter()
+            .find(|workload| workload.namespace == "default" && workload.service_name == "reviews")
+            .expect("reviews workload");
+        assert!(
+            workload.node_waypoint.is_none(),
+            "{shape} must not classify a pod as a trusted NodeWaypoint"
+        );
+    }
+}
+
+#[test]
+fn k8s_pod_discovery_rejects_noncanonical_downward_api_field_path() {
+    let mut waypoint = node_waypoint_pod("node-a", "192.0.2.10", true, 15008);
+    waypoint.spec["containers"][0]["env"]
+        .as_array_mut()
+        .expect("env array")
+        .push(json!({
+            "name": "FERRUM_K8S_NODE_NAME",
+            "value": "",
+            "valueFrom": {
+                "fieldRef": {
+                    "field_path": "spec.node_name"
+                }
+            }
+        }));
+    push_pod_env(
+        &mut waypoint,
+        "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+        "spiffe://cluster.local/ns/ferrum-system/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)",
+    );
+
+    let translation = translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            waypoint,
+        ],
+        options(),
+    )
+    .expect("K8s core translation succeeds");
+    let workload = translation
+        .config
+        .mesh
+        .as_ref()
+        .expect("mesh config")
+        .workloads
+        .iter()
+        .find(|workload| workload.namespace == "default" && workload.service_name == "reviews")
+        .expect("reviews workload");
+    assert!(
+        workload.node_waypoint.is_none(),
+        "noncanonical field_path/spec.node_name must not resolve trusted NodeWaypoint identity"
+    );
+}

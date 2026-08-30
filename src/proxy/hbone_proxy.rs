@@ -30,6 +30,7 @@ use crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK;
 use crate::load_balancer::LoadBalancerCache;
 use crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID;
 use crate::modes::mesh::MESH_INGRESS_HBONE_RELAY_PROXY_ID;
+use crate::modes::mesh::config::MeshConfig;
 use crate::plugins::{Direction, DisconnectCause, Plugin, RequestContext, TransactionSummary};
 use crate::request_epoch::RequestEpoch;
 use crate::retry;
@@ -69,6 +70,25 @@ pub(super) const MESH_RELAY_DENIAL_DESTINATION_METADATA_KEY: &str = "mesh.relay.
 /// the address this proxy terminates for. Present only when the accept path
 /// resolved one; its ABSENCE is itself the diagnosis for an own-pod topology.
 pub(super) const MESH_RELAY_TERMINATOR_IP_METADATA_KEY: &str = "mesh.relay.terminator_ip";
+
+/// Settle the selected-target breaker after `connect_backend` returns.
+///
+/// A gateway-side DNS-screen 403 (`DispatchPolicyRejected`) is health-neutral:
+/// every HALF_OPEN probe `check_circuit_breaker` admitted must be settled, but
+/// this refusal is not evidence about the backend. Real connection failures
+/// still record a failure. Callers must invoke this at most once per connect
+/// attempt.
+pub(crate) fn settle_hbone_backend_connect_circuit_breaker_outcome(
+    cb: &crate::circuit_breaker::CircuitBreaker,
+    status: StatusCode,
+    is_half_open_probe: bool,
+) {
+    if status == StatusCode::FORBIDDEN {
+        cb.record_neutral(is_half_open_probe);
+    } else {
+        cb.record_failure(status.as_u16(), true, is_half_open_probe);
+    }
+}
 
 pub(super) fn tag_request_metadata(ctx: &mut RequestContext) {
     ctx.metadata
@@ -309,6 +329,7 @@ async fn connect_backend(
     state: &ProxyState,
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
+    mesh: Option<&MeshConfig>,
 ) -> Result<HboneBackendConnection, HboneConnectError> {
     let (host, port) = effective_hbone_backend_target(proxy, upstream_target);
     let target_url = format!("tcp://{host}:{port}");
@@ -339,6 +360,21 @@ async fn connect_backend(
             target_url: Some(target_url.clone()),
             resolved_ip: None,
         })?;
+    let candidates =
+        match screen_ordinary_inbound_hbone_relay_dns_candidates(proxy, mesh, candidates) {
+            Ok(candidates) => candidates,
+            Err(denial) => {
+                return Err(HboneConnectError {
+                    status: StatusCode::FORBIDDEN,
+                    body: br#"{"error":"HBONE relay destination not allowed"}"#,
+                    phase: "hbone_relay_destination_denied",
+                    class: retry::ErrorClass::DispatchPolicyRejected,
+                    message: denial.as_str().to_string(),
+                    target_url: Some(target_url),
+                    resolved_ip: None,
+                });
+            }
+        };
     let socket_mark = (proxy.id == MESH_INBOUND_HBONE_RELAY_PROXY_ID
         && node_waypoint_inbound_relay_mark_enabled())
     .then_some(NODE_WAYPOINT_INBOUND_AUTH_MARK);
@@ -460,6 +496,36 @@ fn inbound_hbone_relay_effective_destination_decision(
 ) -> Result<(), crate::modes::mesh::config::InboundRelayDenial> {
     let (app_host, app_port) = effective_hbone_backend_target(proxy, upstream_target);
     inbound_hbone_relay_destination_decision(app_host, app_port, mesh, terminator_local_ip)
+}
+
+/// Drop loopback DNS answers for the ordinary transparent inbound relay when
+/// the current [`RequestEpoch`] mesh snapshot does not grant the Sidecar
+/// own-namespace privilege.
+///
+/// Authority matching admits a declared hostname without resolving it. The
+/// production backend egress policy also permits loopback, so this screen is
+/// the boundary that keeps Ambient / waypoint / gateway terminators from
+/// dialing `127.0.0.0/8`, `::1`, or mapped IPv4 loopback after DNS. Mixed
+/// answers keep only non-loopback candidates. Sidecar ordinary relay, Sidecar
+/// `ingress[]` remaps (`MESH_INGRESS_HBONE_RELAY_PROXY_ID`), unrelated HBONE
+/// backends, and the EgressGateway external-UDP path (caller skips this) are
+/// not screened here.
+fn screen_ordinary_inbound_hbone_relay_dns_candidates(
+    proxy: &Proxy,
+    mesh: Option<&MeshConfig>,
+    candidates: crate::dns::ResolvedAddresses,
+) -> Result<crate::dns::ResolvedAddresses, crate::modes::mesh::config::InboundRelayDenial> {
+    if proxy.id != MESH_INBOUND_HBONE_RELAY_PROXY_ID {
+        return Ok(candidates);
+    }
+    let Some(mesh) = mesh else {
+        return Err(crate::modes::mesh::config::InboundRelayDenial::NoSlice);
+    };
+    match mesh.screen_inbound_relay_resolved_ips(candidates.iter()) {
+        Ok(None) => Ok(candidates),
+        Ok(Some(retained)) => Ok(crate::dns::ResolvedAddresses::from_dial_order(retained)),
+        Err(denial) => Err(denial),
+    }
 }
 
 /// Post-plugin re-check for a Sidecar `ingress[]` CONNECT remap (issue #3260).
@@ -813,18 +879,58 @@ pub(super) async fn handle_hbone_request(
     };
 
     let backend_start = Instant::now();
-    let backend = match connect_backend(state, proxy, upstream_target.as_deref()).await {
+    let backend = match connect_backend(
+        state,
+        proxy,
+        upstream_target.as_deref(),
+        epoch.config.mesh.as_deref(),
+    )
+    .await
+    {
         Ok(backend) => backend,
         Err(err) => {
-            error!(
-                proxy_id = %proxy.id,
-                backend_target = ?err.target_url,
-                backend_resolved_ip = ?err.resolved_ip,
-                error_kind = retry::error_class_log_kind(err.class),
-                error_class = %err.class,
-                error = %err.message,
-                "HBONE backend connection failed"
-            );
+            if err.status == StatusCode::FORBIDDEN {
+                warn!(
+                    proxy_id = %proxy.id,
+                    backend_target = ?err.target_url,
+                    denial = %err.message,
+                    "Rejected inbound CONNECT whose resolved destination is not one this proxy \
+                     terminates for"
+                );
+                ctx.metadata.insert(
+                    "mesh_authz.deny_policy".to_string(),
+                    "hbone_relay_destination_denied".to_string(),
+                );
+                ctx.metadata.insert(
+                    MESH_RELAY_DENIAL_REASON_METADATA_KEY.to_string(),
+                    err.message.clone(),
+                );
+                if let Some(target) = err.target_url.as_deref() {
+                    ctx.metadata.insert(
+                        MESH_RELAY_DENIAL_DESTINATION_METADATA_KEY.to_string(),
+                        target.strip_prefix("tcp://").unwrap_or(target).to_string(),
+                    );
+                }
+                if let Some(terminator_ip) = ctx.mesh_inbound_terminator_ip {
+                    ctx.metadata.insert(
+                        MESH_RELAY_TERMINATOR_IP_METADATA_KEY.to_string(),
+                        terminator_ip.to_string(),
+                    );
+                }
+                crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
+                    crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::RelayDestinationDenied,
+                );
+            } else {
+                error!(
+                    proxy_id = %proxy.id,
+                    backend_target = ?err.target_url,
+                    backend_resolved_ip = ?err.resolved_ip,
+                    error_kind = retry::error_class_log_kind(err.class),
+                    error_class = %err.class,
+                    error = %err.message,
+                    "HBONE backend connection failed"
+                );
+            }
             if let Some(cb_config) = &proxy.circuit_breaker {
                 let cb = state.circuit_breaker_cache.get_or_create(
                     &proxy.namespace,
@@ -832,7 +938,11 @@ pub(super) async fn handle_hbone_request(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(err.status.as_u16(), true, cb_is_half_open_probe);
+                settle_hbone_backend_connect_circuit_breaker_outcome(
+                    &cb,
+                    err.status,
+                    cb_is_half_open_probe,
+                );
             }
             ctx.metadata
                 .insert("error_class".to_string(), err.class.to_string());
@@ -1380,6 +1490,70 @@ pub(super) async fn handle_hbone_udp_request(
             return build_response_from_normalized_reject(reject);
         }
     };
+    // Ordinary local UDP relay: re-apply the loopback-namespace boundary to
+    // concrete DNS answers. Skip the separately authorized EgressGateway
+    // external-UDP path — that destination is not a terminator-owned local
+    // relay even if a hostname happens to resolve to loopback.
+    let dest_candidates = if external_egress_allowed {
+        dest_candidates
+    } else {
+        match screen_ordinary_inbound_hbone_relay_dns_candidates(
+            proxy,
+            mesh_config,
+            dest_candidates,
+        ) {
+            Ok(candidates) => candidates,
+            Err(denial) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    app_host,
+                    app_port,
+                    denial = denial.as_str(),
+                    terminator_local_ip = ?ctx.mesh_inbound_terminator_ip,
+                    "Rejected datagram-over-HBONE CONNECT whose resolved destination is not one \
+                     this proxy terminates for"
+                );
+                ctx.metadata.insert(
+                    "mesh_authz.deny_policy".to_string(),
+                    "hbone_udp_relay_destination_denied".to_string(),
+                );
+                ctx.metadata.insert(
+                    MESH_RELAY_DENIAL_REASON_METADATA_KEY.to_string(),
+                    denial.as_str().to_string(),
+                );
+                ctx.metadata.insert(
+                    MESH_RELAY_DENIAL_DESTINATION_METADATA_KEY.to_string(),
+                    format!("{app_host}:{app_port}"),
+                );
+                if let Some(terminator_ip) = ctx.mesh_inbound_terminator_ip {
+                    ctx.metadata.insert(
+                        MESH_RELAY_TERMINATOR_IP_METADATA_KEY.to_string(),
+                        terminator_ip.to_string(),
+                    );
+                }
+                let reject = finalize_reject_response_with_after_proxy_hooks(
+                    plugins,
+                    ctx,
+                    StatusCode::FORBIDDEN,
+                    Bytes::from_static(br#"{"error":"HBONE UDP relay destination not allowed"}"#),
+                    HashMap::new(),
+                    false,
+                )
+                .await;
+                log_rejected_request(
+                    plugins,
+                    ctx,
+                    reject.http_status.as_u16(),
+                    start_time,
+                    "hbone_udp_relay_destination_denied",
+                    plugin_execution_ns,
+                )
+                .await;
+                record_request(state, reject.http_status.as_u16());
+                return build_response_from_normalized_reject(reject);
+            }
+        }
+    };
 
     let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
     let (socket, dest_addr) = match crate::dns::connect_candidates(
@@ -1554,9 +1728,10 @@ pub(super) async fn handle_hbone_udp_request(
         })
 }
 
-/// Resolve the CONNECT authority `host:port` to a concrete `SocketAddr` for the
-/// local UDP dial (DNS via the shared cache; the relay destination is normally a
-/// loopback / pod IP already). Returns a reject tuple on failure.
+/// Resolve the CONNECT authority `host` to concrete IPs for the local UDP
+/// dial (DNS via the shared cache). Loopback-namespace screening for the
+/// ordinary inbound relay happens at the call site after this returns, so a
+/// declared hostname cannot be dialed until resolved candidates are checked.
 async fn resolve_local_udp_dest(
     state: &ProxyState,
     proxy: &Proxy,
@@ -1964,12 +2139,13 @@ mod tests {
         assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
-    /// Slice shaped like an own-pod terminator (`Sidecar` / `Ambient`): the
-    /// pod's own workload record, and the marker the apply path sets for those
-    /// topologies so the accepted local address counts as a destination.
+    /// Slice shaped like a Sidecar terminator: the pod's own workload record,
+    /// plus the apply-path markers so the accepted local address and the
+    /// own-network-namespace loopback shortcut both count as destinations.
     fn mesh_with_workload_port(port: u16) -> MeshConfig {
         let mut mesh = MeshConfig {
             inbound_relay_admits_accepted_local_address: true,
+            inbound_relay_admits_loopback_namespace: true,
             ..MeshConfig::default()
         };
         mesh.workloads.push(Workload {

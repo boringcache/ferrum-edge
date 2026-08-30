@@ -1764,11 +1764,14 @@ fn prepare_normalized_gateway_config_for_mesh(
         // Assigned UNCONDITIONALLY on every apply, so a topology change, a
         // withdrawn NodeWaypoint enrollment, or a service unbound from this
         // waypoint immediately stops being an admissible relay destination
-        // instead of leaving a stale admission behind. Both fields default to
-        // "terminates for nothing", so an unrecognized or gateway topology
-        // refuses every transparent relay rather than falling back to the
-        // slice-wide workload view — which is what made this terminator an
-        // open relay into other nodes' pods.
+        // instead of leaving a stale admission behind. The admission fields
+        // collectively default to "terminates for nothing", so an unrecognized
+        // or gateway topology refuses every transparent relay rather than
+        // falling back to the slice-wide workload view — which is what made
+        // this terminator an open relay into other nodes' pods. Sidecar's
+        // loopback-namespace shortcut is a separate privilege from
+        // accepted-local-address admission and is never inferred from inventory
+        // or identity.
         //
         // Resolved once, ahead of the match: the owned-workload view below is
         // built from it, and the own-ADDRESS port bound is authoritative only
@@ -1996,6 +1999,8 @@ fn prepare_normalized_gateway_config_for_mesh(
         };
         mesh.inbound_relay_destinations = inbound_relay_destinations;
         mesh.inbound_relay_admits_accepted_local_address = admits_accepted_local_address;
+        mesh.inbound_relay_admits_loopback_namespace =
+            matches!(runtime.topology, MeshTopology::Sidecar);
         mesh.inbound_relay_own_address_ports = own_address_ports;
         mesh.inbound_relay_node_local_registry = node_local_registry;
     }
@@ -41222,13 +41227,18 @@ mod tests {
 
         // Own-identity terminators with NO configured workload identity: no
         // inventory at all, so the accepted local address is the only
-        // admission. A slice-declared workload reached WITHOUT that proof is
-        // refused — the open-relay fix.
+        // non-loopback admission. A slice-declared workload reached WITHOUT
+        // that proof is refused — the open-relay fix. Loopback is Sidecar-only.
         for topology in [MeshTopology::Sidecar, MeshTopology::Ambient] {
             let mesh = prepared(topology);
             assert!(
                 mesh.inbound_relay_admits_accepted_local_address,
-                "{topology:?} terminates for its own workload"
+                "{topology:?} may admit its accepted non-loopback local address"
+            );
+            assert_eq!(
+                mesh.inbound_relay_admits_loopback_namespace,
+                topology == MeshTopology::Sidecar,
+                "{topology:?} loopback-namespace privilege must be Sidecar-only"
             );
             assert!(
                 mesh.inbound_relay_destinations.is_empty(),
@@ -41239,16 +41249,39 @@ mod tests {
                 decide(&mesh, "10.244.1.7", None),
                 Err(InboundRelayDenial::AddressNotTerminated)
             );
+            let loopback = decide(&mesh, "127.0.0.1", Some(pod_ip));
+            let localhost = decide(&mesh, "localhost", Some(pod_ip));
+            if topology == MeshTopology::Sidecar {
+                assert_eq!(loopback, Ok(()));
+                assert_eq!(localhost, Ok(()));
+                assert_eq!(decide(&mesh, "app.localhost", Some(pod_ip)), Ok(()));
+                assert_eq!(
+                    decide(&mesh, "127.0.0.1", None),
+                    Err(InboundRelayDenial::AddressNotTerminated)
+                );
+            } else {
+                assert_eq!(loopback, Err(InboundRelayDenial::AddressNotTerminated));
+                assert_eq!(localhost, Err(InboundRelayDenial::AddressNotTerminated));
+                assert_eq!(
+                    decide(&mesh, "app.localhost", Some(pod_ip)),
+                    Err(InboundRelayDenial::AddressNotTerminated)
+                );
+            }
         }
 
         // NodeWaypoint: the CP-authorized enrolled pods, never the
         // subscription-namespace workload view, and never its own address.
         let mesh = prepared(MeshTopology::NodeWaypoint);
         assert!(!mesh.inbound_relay_admits_accepted_local_address);
+        assert!(!mesh.inbound_relay_admits_loopback_namespace);
         assert_eq!(hosts(&mesh), vec![MeshInboundRelayHost::Ip(enrolled_ip)]);
         assert_eq!(decide(&mesh, "10.244.2.9", Some(pod_ip)), Ok(()));
         assert_eq!(
             decide(&mesh, "10.244.1.7", Some(pod_ip)),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
+        assert_eq!(
+            decide(&mesh, "127.0.0.1", Some(pod_ip)),
             Err(InboundRelayDenial::AddressNotTerminated)
         );
 
@@ -41256,6 +41289,7 @@ mod tests {
         // those (issue #4251).
         let mesh = prepared(MeshTopology::ServiceWaypoint);
         assert!(!mesh.inbound_relay_admits_accepted_local_address);
+        assert!(!mesh.inbound_relay_admits_loopback_namespace);
         assert_eq!(hosts(&mesh), vec![MeshInboundRelayHost::Ip(pod_ip)]);
         assert_eq!(decide(&mesh, "10.244.1.7", None), Ok(()));
         assert_eq!(
@@ -41268,14 +41302,23 @@ mod tests {
             "a workload merely VISIBLE in a bound service's namespace, backing \
              no bound service, is not a destination this waypoint terminates for"
         );
+        assert_eq!(
+            decide(&mesh, "127.0.0.1", None),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
 
         // Gateway topologies terminate no in-mesh workload at all.
         for topology in [MeshTopology::EastWestGateway, MeshTopology::EgressGateway] {
             let mesh = prepared(topology);
             assert!(!mesh.inbound_relay_admits_accepted_local_address);
+            assert!(!mesh.inbound_relay_admits_loopback_namespace);
             assert!(mesh.inbound_relay_destinations.is_empty());
             assert_eq!(
                 decide(&mesh, "10.244.1.7", Some(pod_ip)),
+                Err(InboundRelayDenial::AddressNotTerminated)
+            );
+            assert_eq!(
+                decide(&mesh, "127.0.0.1", Some(pod_ip)),
                 Err(InboundRelayDenial::AddressNotTerminated)
             );
         }
@@ -41301,7 +41344,13 @@ mod tests {
         const OWN_NAME: &str = "reviews.default.svc.cluster.local";
 
         let mut own = workload("reviews", "reviews");
-        own.addresses = vec!["10.244.5.5".to_string(), OWN_NAME.to_string()];
+        own.addresses = vec![
+            "10.244.5.5".to_string(),
+            OWN_NAME.to_string(),
+            "127.0.0.1".to_string(),
+            "localhost".to_string(),
+            "app.localhost".to_string(),
+        ];
         own.cluster = Some("cluster-a".to_string());
         let mut other = workload("ratings", "ratings");
         other.addresses = vec!["10.244.6.6".to_string()];
@@ -41367,8 +41416,16 @@ mod tests {
             hosts,
             vec![
                 MeshInboundRelayHost::Ip("10.244.5.5".parse().expect("own pod IP")),
+                MeshInboundRelayHost::Ip("127.0.0.1".parse().expect("loopback IP")),
+                MeshInboundRelayHost::Name("app.localhost".to_string()),
+                MeshInboundRelayHost::Name("localhost".to_string()),
                 MeshInboundRelayHost::Name(OWN_NAME.to_string()),
             ]
+        );
+        assert!(mesh.inbound_relay_admits_accepted_local_address);
+        assert!(
+            !mesh.inbound_relay_admits_loopback_namespace,
+            "Ambient must not inherit Sidecar's own-network-namespace loopback privilege"
         );
 
         assert_eq!(decide("10.244.5.5", 8080), Ok(()));
@@ -41416,11 +41473,9 @@ mod tests {
             decide("10.244.0.1", 8080),
             Err(InboundRelayDenial::PortNotDeclared)
         );
-
         // Issue #4249, own-ADDRESS arm: reached at the address the co-located
         // pod also declares, the port bound comes from the records THIS
-        // terminator owns. `co_located`'s 9443 is not unioned in, and neither
-        // is it reachable through the own-namespace loopback shortcut.
+        // terminator owns. `co_located`'s 9443 is not unioned in.
         let own_ip = "10.244.5.5".parse::<std::net::IpAddr>().expect("own IP");
         let decide_own = |host: &str, port: u16| {
             mesh.inbound_relay_destination_decision(host, port, Some(own_ip))
@@ -41431,12 +41486,27 @@ mod tests {
             Err(InboundRelayDenial::PortNotDeclared),
             "a co-located pod's port must not widen the own-address bound"
         );
-        assert_eq!(decide_own("127.0.0.1", 8080), Ok(()));
-        assert_eq!(
-            decide_own("localhost", 9443),
-            Err(InboundRelayDenial::PortNotDeclared),
-            "the own-namespace loopback shortcut is bounded by the same owned records"
-        );
+        // Inventory-listed loopback / DNS localhost still reach the Ambient
+        // (host) namespace, so they stay refused. An accepted non-loopback
+        // pod IP does not grant that shortcut either.
+        for host in [
+            "127.0.0.1",
+            "::1",
+            "localhost",
+            "localhost.",
+            "app.localhost",
+        ] {
+            assert_eq!(
+                mesh.inbound_relay_destination_decision(host, 8080, Some(own_ip)),
+                Err(InboundRelayDenial::AddressNotTerminated),
+                "Ambient must refuse loopback-namespace authority {host}"
+            );
+            assert_eq!(
+                decide(host, 8080),
+                Err(InboundRelayDenial::AddressNotTerminated),
+                "Ambient must refuse inventory-listed loopback-namespace authority {host}"
+            );
+        }
     }
 
     /// The `sidecar_ingress_declared` marker is SIDECAR-topology only, exactly
