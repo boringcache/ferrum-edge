@@ -3379,6 +3379,16 @@ paths:
                           mesh_proxy_configs: { type: integer, minimum: 0 }
                           extension_configs: { type: integer, minimum: 0 }
                           ext_authz_providers: { type: integer, minimum: 0 }
+                          workloads_with_node_waypoint:
+                            type: integer
+                            minimum: 0
+                            description: |
+                              Count of workloads whose trusted destination
+                              `node_waypoint` metadata is present. Optional;
+                              omitted when zero so older clients and pre-slice
+                              zeros keep their previous JSON shape. NodeWaypoint
+                              Service routing requires this to be non-zero for
+                              destination workloads.
                       fingerprint:
                         type: string
                         pattern: "^sha256-[0-9a-f]{64}$"

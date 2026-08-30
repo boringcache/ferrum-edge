@@ -701,8 +701,9 @@ async fn wait_until_udp_port_free(port: u16) -> bool {
     .unwrap_or(false)
 }
 
-/// `wait_until_started` looks up individual proxy runtime keys and does not
-/// observe a shared `__nwudp_{port}` listener. Wait on the exact shared key.
+/// Wait on an exact shared listener key when a test also needs to inspect the
+/// retained generation rather than only exercise the production readiness
+/// gate.
 async fn wait_until_shared_nw_udp_listener_started(
     manager: &StreamListenerManager,
     key: &str,
@@ -2988,13 +2989,12 @@ async fn node_waypoint_udp_retract_a_keeps_shared_listener_and_b_route() {
         "retracting A must not unbind B: {failures:?}"
     );
     assert!(
-        wait_until_shared_nw_udp_listener_started(
-            &runtime.manager,
-            &shared_key,
-            Duration::from_secs(5),
-        )
-        .await,
-        "surviving shared listener must stay started"
+        runtime
+            .manager
+            .wait_until_started(Duration::from_secs(5))
+            .await
+            .is_ok(),
+        "a retained one-member shared listener must satisfy startup readiness"
     );
 
     let owners_after = runtime
@@ -3144,19 +3144,10 @@ async fn node_waypoint_udp_shared_rebind_clears_every_member_failure() {
         failures.is_empty(),
         "shared listener must rebind: {failures:?}"
     );
-    // `wait_until_started` looks up per-proxy runtime keys and cannot observe
-    // a shared `__nwudp_{port}` handle (the documented limitation the shared
-    // helper exists for); the sibling shared-group tests all wait on the exact
-    // shared key.
-    assert!(
-        wait_until_shared_nw_udp_listener_started(
-            &manager,
-            &format!("__nwudp_{port}"),
-            Duration::from_secs(5),
-        )
-        .await,
-        "rebound shared listener must start"
-    );
+    manager
+        .wait_until_started(Duration::from_secs(5))
+        .await
+        .expect("a rebound shared NodeWaypoint UDP listener must satisfy startup readiness");
     assert!(
         manager.stream_bind_failures().is_empty(),
         "successful shared rebind must clear every member's durable failure"
