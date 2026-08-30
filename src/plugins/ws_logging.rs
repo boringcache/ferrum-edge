@@ -498,12 +498,7 @@ impl WsLogging {
         let Some(config_obj) = config.as_object() else {
             return Err("ws_logging: config must be a JSON object".to_string());
         };
-        reject_unknown_keys(
-            config_obj,
-            "config",
-            WS_LOGGING_CONFIG_KEYS,
-            "ws_logging: ",
-        )?;
+        reject_unknown_keys(config_obj, "config", WS_LOGGING_CONFIG_KEYS, "ws_logging: ")?;
 
         let endpoint_url = config
             .get("endpoint_url")
