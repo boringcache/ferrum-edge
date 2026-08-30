@@ -972,6 +972,33 @@ fn plan_at(at: tokio::time::Instant, termination: StreamAuthTermination) -> Stre
     StreamAuthDeadline { at, termination }
 }
 
+/// Issue #4363. Backend EOS consults the captured Instant: an already-elapsed
+/// plan is spent, a future plan is not, and `None` never expires.
+#[tokio::test(start_paused = true)]
+async fn captured_authorization_elapsed_uses_the_captured_instant() {
+    assert_eq!(
+        ferrum_edge::_test_support::captured_authorization_elapsed_for_test(None),
+        None
+    );
+    let future = plan_at(
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        StreamAuthTermination::CredentialExpired,
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::captured_authorization_elapsed_for_test(Some(future)),
+        None
+    );
+    let past = plan_at(
+        tokio::time::Instant::now(),
+        StreamAuthTermination::CredentialExpired,
+    );
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert_eq!(
+        ferrum_edge::_test_support::captured_authorization_elapsed_for_test(Some(past)),
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+}
+
 // ── TCP connect-retry backoff is authorization-bounded (issue #3816) ────────
 //
 // `retry_delay` grows with the attempt number, so a chain of failing

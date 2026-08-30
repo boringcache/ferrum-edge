@@ -228,9 +228,51 @@ does not infer controller ownership from the class name spelling; disable
 independent `ferrum-mesh` release in the same cluster must set a unique
 `gatewayClass.name`; Helm ownership of the cluster-scoped object is
 intentional, and a later release must not force-import or skip-create to share
-another release's class. Do not put the reserved DB/JWT variables under
-`controlPlane.env`; use the first-class chart values so the rendered Deployment
-has a clear secret contract:
+another release's class.
+
+### Gateway API CRDs (required)
+
+Ferrum does **not** ship upstream Gateway API CRDs in the Helm chart. The chart
+`crds/` directory contains only Ferrum-owned CRDs (for example
+`UDPResponseAmplificationPolicy`). Upstream Gateway API definitions are large,
+versioned independently, and must not live in Helm `crds/` — that directory is
+not upgraded on `helm upgrade` and cannot be removed on uninstall.
+
+When `controlPlane.enabled=true` and `controlPlane.rbac.gatewayApi=true` (the
+default), the chart renders a cluster-scoped `GatewayClass` and a `ClusterRole`
+that watches `HTTPRoute`, `GRPCRoute`, `TCPRoute`, `TLSRoute`, `UDPRoute`,
+`ListenerSet`, and `XBackendTrafficPolicy` (`gateway.networking.x-k8s.io`).
+Those kinds require the **experimental** Gateway API channel at the pin Ferrum
+CI and conformance labs use — **`v1.5.1`** (`GATEWAY_API_VERSION` in
+`.github/workflows/ci.yml` and `scripts/gateway_api_conformance_lab_setup.sh`).
+
+Install the experimental bundle **once per cluster** before `helm install`:
+
+```bash
+kubectl apply --server-side=true \
+  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/experimental-install.yaml
+```
+
+Do **not** install `standard-install.yaml` for Ferrum mesh control planes. The
+standard channel at v1.5.1 does not include `TCPRoute`, `UDPRoute`, or
+`XBackendTrafficPolicy`, yet Ferrum's control-plane RBAC and reconciler expect
+them. Upstream rejects mixing channels — applying `standard-install.yaml` and
+then adding a standalone experimental L4 CRD fails with
+`multiple gateway API CRDs channels detected` (see
+`scripts/gateway_api_conformance_lab_setup.sh`).
+
+**Opt out of Gateway API entirely.** Set `controlPlane.rbac.gatewayApi=false`
+so the chart does not render the `GatewayClass` or Gateway API RBAC. For an
+Istio-only control plane that should not watch Gateway API resources at all,
+also set `controlPlane.env.FERRUM_K8S_WATCH_GATEWAY_API_CRDS: "false"`. You do
+not need to install the Gateway API CRD bundle in that posture.
+
+**Keep Gateway API watching but manage `GatewayClass` yourself.** Leave
+`controlPlane.rbac.gatewayApi=true`, install the experimental CRD bundle above,
+and set `gatewayClass.create=false`.
+
+Do not put the reserved DB/JWT variables under `controlPlane.env`; use the
+first-class chart values so the rendered Deployment has a clear secret contract:
 
 ```yaml
 controlPlane:
@@ -255,6 +297,9 @@ Development installs can use SQLite with operator-generated random JWT
 secrets:
 
 ```bash
+kubectl apply --server-side=true \
+  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/experimental-install.yaml
+
 kubectl create namespace ferrum --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n ferrum create secret generic ferrum-mesh-dev-credentials \
   --from-literal=admin-jwt-secret="$(openssl rand -hex 32)" \
@@ -268,6 +313,9 @@ Production-style installs should use existing Secrets for both JWT material and
 the database URL:
 
 ```bash
+kubectl apply --server-side=true \
+  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/experimental-install.yaml
+
 kubectl create namespace ferrum --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n ferrum create secret generic ferrum-mesh-production-db \
   --from-literal=url='postgres://ferrum:<percent-encoded-password>@postgres.ferrum.svc:5432/ferrum'
@@ -344,7 +392,7 @@ dependency-aware readiness.
 | `controlPlane`, `ca` | `ferrum-edge health --live` against the admin listener | `ferrum-edge health` (503 while starting/unavailable; ready-but-degraded stays HTTP 200 with JSON `status: "degraded"`) |
 | `ambient`, `nodeAgent` | same admin `--live` exec when admin is enabled and port ≠ `0` | same admin `/health` exec; omitted when admin is disabled or port is `0` (NodeWaypoint still requires a non-zero ambient admin port) |
 | `injector` | `tcpSocket` on the `webhook` port | `tcpSocket` on the `webhook` port |
-| `eastWest` | `tcpSocket` on the `tls-passthru` port | `tcpSocket` on the `tls-passthru` port |
+| `eastWest` | `ferrum-edge health --live` against the east-west admin listener | `ferrum-edge health` (drain-aware `/health`; `tcpSocket` on `tls-passthru` is not used because it stays ready after SIGTERM) |
 
 Liveness and startup share the process-only handler so an alive-but-degraded
 workload is not restart-looped. Readiness uses dependency-aware `/health`:
@@ -353,6 +401,46 @@ remains HTTP 200 / Ready with degradation observable in the JSON body (the
 built-in `ferrum-edge health` command evaluates HTTP status). Per-probe
 `override` maps replace only that probe's handler; a shared `probes.override`
 is rejected by `values.schema.json`.
+
+Serving mesh workloads (`controlPlane`, `ca`, `eastWest`, `ambient`) also render
+the gateway chart's graceful-shutdown contract: `FERRUM_SHUTDOWN_DRAIN_SECONDS`,
+optional `FERRUM_SHUTDOWN_PREDRAIN_SECONDS`, native `preStop.sleep`, and
+`terminationGracePeriodSeconds` sized for the full additive budget in
+[graceful_shutdown.md](graceful_shutdown.md). `controlPlane` and `ca` run `cp`
+mode, which honors the pre-drain window on its admin and CP-gRPC accept loops,
+so the `<1.29` remediation (`shutdownPreStopSeconds: 0` plus a raised
+`shutdownPreDrainSeconds`) is a real contract there and not just a rendered env.
+The injector webhook, node-agent, and one-shot CNI uninstall hooks do not
+receive any of it. Restricted-compatible `securityContext` / non-empty
+`resources` apply to control plane, CA, and east-west; ambient keeps
+host-network datapath capabilities after dropping ALL, and its
+`securityContext` is a constrained explicit surface
+(`allowPrivilegeEscalation`, `readOnlyRootFilesystem`, `capabilities.drop`,
+`capabilities.add`) so an unsupported key is rejected rather than ignored.
+`allowPrivilegeEscalation` defaults to `false` on the steady-state proxy
+(Restricted); it is not a UDP-preflight-only field.
+
+Each workload's `admin.bindAddress` must be an IP literal and its
+`admin.allowedCidrs` (and `observability.metrics.allowedCidrs`) is validated
+entry-for-entry against the runtime's strict CIDR parser. For `controlPlane` and
+`ca` a full-family allowlist (`0.0.0.0/0`, `::/0`, an IPv4-mapped `/96`, or a
+covering union) is not accepted as plaintext-admin protection, and while the
+computed exec probes are enabled the allowlist must cover the exact probe source
+(`127.0.0.1` for an IPv4/wildcard bind, `::1` for an IPv6 wildcard bind). An
+enabled computed probe with no usable handler — for example `admin.httpPort: 0`
+with readiness still enabled — fails render instead of silently omitting the
+probe.
+
+### Mesh metrics scrape
+
+`charts/ferrum-mesh` `observability.enabled` (default `false`) does not change
+admin bind addresses. When enabled it renders `FERRUM_METRICS_ALLOWED_CIDRS` /
+`FERRUM_METRICS_BEARER_TOKEN`, dedicated metrics Services for Deployments (the
+main control-plane Service stays gRPC-only; east-west stays `tls-passthru`), a
+Prometheus Operator `ServiceMonitor`, and `PodMonitor`s for the host-network
+ambient and node-agent DaemonSets. Alerts and monitors fail render without a
+scrape credential. `FerrumMeshControlPlaneConfigStale` does not use `absent()`
+for optional mesh emitters.
 
 Example: disable control-plane probes, or replace injector readiness with HTTPS:
 

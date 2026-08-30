@@ -952,6 +952,14 @@ Validation: fail render on missing/unsafe configuration.
      too. Both default the pod's grace period upward rather than silently
      truncating the shutdown. */}}
 {{- $preStop := int (.Values.shutdownPreStopSeconds | default 0) -}}
+{{- if and (gt $preStop 0) (semverCompare "<1.29.0-0" .Capabilities.KubeVersion.Version) -}}
+{{- $probes := .Values.probes | default dict -}}
+{{- $readiness := $probes.readiness | default dict -}}
+{{- $failureThreshold := int ($readiness.failureThreshold | default 3) -}}
+{{- $periodSeconds := int ($readiness.periodSeconds | default 10) -}}
+{{- $preDrainBudget := mul $failureThreshold $periodSeconds -}}
+{{- fail (printf "shutdownPreStopSeconds=%d renders lifecycle.preStop.sleep (SleepAction), which requires Kubernetes 1.29+ (GA in 1.30); cluster version is %s. On older clusters set shutdownPreStopSeconds: 0 and raise shutdownPreDrainSeconds to probes.readiness.failureThreshold x periodSeconds (%d x %d = %ds) instead." $preStop .Capabilities.KubeVersion.Version $failureThreshold $periodSeconds $preDrainBudget) -}}
+{{- end -}}
 {{- $preDrain := int (.Values.shutdownPreDrainSeconds | default 0) -}}
 {{- $minGrace := add $preStop (add $preDrain $shutdownBudget) -}}
 {{- $grace := .Values.terminationGracePeriodSeconds -}}

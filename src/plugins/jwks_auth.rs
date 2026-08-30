@@ -22,7 +22,8 @@ use super::utils::auth_flow::{
 use super::utils::cert_hash::sha256_base64url_no_pad;
 use super::utils::claim_header_fanout::{
     ClaimHeaderDestinations, ClaimHeaderMapping, apply_claim_headers_from_context,
-    emit_claim_headers_to_attempt, parse_claim_headers, parse_separator,
+    emit_claim_headers_to_attempt, emit_output_claim_headers_to_attempt, parse_claim_header_list,
+    parse_claim_headers, parse_separator,
 };
 use super::utils::claim_resolver::{
     extract_claim_string, extract_claim_string_exact, parse_claim_path_value,
@@ -160,6 +161,8 @@ struct JwksProvider {
     /// Expected `iss` claim value. Used to match incoming tokens to this provider.
     issuer: Option<String>,
     /// Accepted `aud` claim values. jsonwebtoken treats this as OR matching.
+    /// When non-empty, `aud` must be present; `set_audience` alone does not
+    /// require presence.
     audiences: Vec<String>,
     /// Configured token extraction locations.
     token_locations: Vec<TokenLocation>,
@@ -183,6 +186,13 @@ struct JwksProvider {
     claim_headers: Vec<ClaimHeaderMapping>,
     /// Per-provider array separator for claim header fan-out.
     claim_headers_separator: Option<String>,
+    /// Istio `RequestAuthentication.jwtRules[].outputClaimToHeaders` projection
+    /// (issue #4277). Independent of `claim_headers`: these destinations are
+    /// ALWAYS staged for this provider (they never merely override the
+    /// plugin-level map), and they share the same gateway-owned destination
+    /// set, so every declared header is stripped from the inbound request
+    /// before validation and re-asserted only from a validated claim.
+    output_claim_headers: Vec<ClaimHeaderMapping>,
     /// Require RFC 8705 mTLS sender-constrained access tokens.
     require_mtls_binding: bool,
     /// Require RFC 9449 DPoP proof JWTs.
@@ -270,6 +280,7 @@ const PROVIDER_FIELDS: &[&str] = &[
     "consumer_header_claim",
     "claim_headers",
     "claim_headers_separator",
+    "output_claim_headers",
     "require_mtls_binding",
     "require_dpop",
     "dpop_clock_skew_secs",
@@ -549,6 +560,29 @@ impl JwksAuth {
             )?;
             let provider_claim_headers_separator =
                 optional_provider_string(prov_obj, "claim_headers_separator", idx)?;
+            let provider_output_claim_headers = parse_claim_header_list(
+                prov_obj,
+                "output_claim_headers",
+                "jwks_auth",
+                CLAIM_HEADER_METADATA_PREFIX,
+            )?;
+            let effective_claim_headers = if provider_claim_headers.is_empty() {
+                claim_headers.as_slice()
+            } else {
+                provider_claim_headers.as_slice()
+            };
+            if let Some(duplicate) = provider_output_claim_headers.iter().find(|output| {
+                effective_claim_headers
+                    .iter()
+                    .any(|mapping| mapping.destination_header == output.destination_header)
+            }) {
+                return Err(format!(
+                    "jwks_auth: provider[{idx}] maps header '{}' through both \
+                     'claim_headers' and 'output_claim_headers'; a destination may be asserted \
+                     from exactly one claim mapping family",
+                    duplicate.destination_header
+                ));
+            }
             let require_mtls_binding =
                 optional_provider_bool(prov_obj, "require_mtls_binding", idx)?.unwrap_or(false);
             let require_dpop =
@@ -725,6 +759,7 @@ impl JwksAuth {
                 require_exp: provider_require_exp,
                 claim_headers: provider_claim_headers,
                 claim_headers_separator: provider_claim_headers_separator,
+                output_claim_headers: provider_output_claim_headers,
                 require_mtls_binding,
                 require_dpop,
                 dpop_clock_skew: Duration::from_secs(dpop_clock_skew_secs),
@@ -794,12 +829,18 @@ impl JwksAuth {
             }
         }
 
+        // Both mapping families contribute to the owned destination set: an
+        // `output_claim_headers` destination must be stripped from every
+        // inbound request, including the requests that never authenticate.
         let claim_header_destinations = ClaimHeaderDestinations::from_mapping_groups(
-            std::iter::once(claim_headers.as_slice()).chain(
-                providers
-                    .iter()
-                    .map(|provider| provider.claim_headers.as_slice()),
-            ),
+            std::iter::once(claim_headers.as_slice()).chain(providers.iter().flat_map(
+                |provider| {
+                    [
+                        provider.claim_headers.as_slice(),
+                        provider.output_claim_headers.as_slice(),
+                    ]
+                },
+            )),
         );
 
         Ok(Self {
@@ -1181,6 +1222,32 @@ impl JwksAuth {
         emit_claim_headers_to_attempt(attempt, claims, mappings, separator);
     }
 
+    /// Stage this provider's Istio `outputClaimToHeaders` destinations from the
+    /// VALIDATED claim set (issue #4277). Always additive to
+    /// [`Self::stage_claim_headers`]: the two families are separate contracts,
+    /// and an operator-configured `claim_headers` map must not silence a
+    /// mesh-translated output header (or the reverse).
+    fn stage_output_claim_headers(
+        &self,
+        attempt: &mut AuthenticationAttempt,
+        claims: &Value,
+        provider: &JwksProvider,
+    ) {
+        if provider.output_claim_headers.is_empty() {
+            return;
+        }
+        let separator = provider
+            .claim_headers_separator
+            .as_deref()
+            .unwrap_or(&self.claim_headers_separator);
+        emit_output_claim_headers_to_attempt(
+            attempt,
+            claims,
+            &provider.output_claim_headers,
+            separator,
+        );
+    }
+
     async fn authenticate_request(
         &self,
         ctx: &mut RequestContext,
@@ -1252,6 +1319,7 @@ impl JwksAuth {
                     stage_mesh_request_principal_metadata(&claims, &mut attempt);
                 }
                 self.stage_claim_headers(&mut attempt, &claims, provider);
+                self.stage_output_claim_headers(&mut attempt, &claims, provider);
                 if !provider.forward_original_token {
                     stage_original_token_stripping(&mut attempt, provider);
                 }
@@ -1562,10 +1630,9 @@ impl super::Plugin for JwksAuth {
     fn modifies_request_headers(&self) -> bool {
         self.strip_authorization_on_success
             || !self.claim_headers.is_empty()
-            || self
-                .providers
-                .iter()
-                .any(|provider| !provider.claim_headers.is_empty())
+            || self.providers.iter().any(|provider| {
+                !provider.claim_headers.is_empty() || !provider.output_claim_headers.is_empty()
+            })
     }
 
     async fn before_proxy(
@@ -1847,8 +1914,13 @@ async fn try_validate_with_provider(provider: &JwksProvider, token: &str) -> Opt
             issuer: provider.issuer.as_deref(),
             audiences: &provider.audiences,
             require_exp: provider.require_exp,
+            // JWT `exp`/`nbf` use this surface's existing 0-second leeway.
+            // DPoP `dpop_clock_skew` is a separate proof-validation contract.
             leeway_secs: 0,
-            validate_nbf: false,
+            // `nbf` stays optional (not a required claim). When present it
+            // must be enforced so a pre-minted credential cannot authenticate
+            // before its not-before instant.
+            validate_nbf: true,
         },
     )
     .await

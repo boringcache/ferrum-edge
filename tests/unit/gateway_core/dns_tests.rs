@@ -44,6 +44,7 @@ async fn test_dns_resolve_ip_address_directly() {
     let result = cache.resolve("127.0.0.1", None, None).await;
     assert!(result.is_ok());
     assert_eq!(result.unwrap().to_string(), "127.0.0.1");
+    assert_eq!(cache.cache_len(), 0, "IP literals must not be cached");
 }
 
 #[tokio::test]
@@ -53,6 +54,7 @@ async fn test_dns_resolve_ipv6_directly() {
     let result = cache.resolve("::1", None, None).await;
     assert!(result.is_ok());
     assert_eq!(result.unwrap().to_string(), "::1");
+    assert_eq!(cache.cache_len(), 0, "IPv6 literals must not be cached");
 }
 
 #[tokio::test]
@@ -340,10 +342,16 @@ async fn test_dns_warmup_populates_cache() {
     ];
     cache.warmup(hostnames).await;
 
-    // After warmup, cache should contain entries for resolved hostnames
+    // After warmup, only the real hostname is cached — IP literals are skipped.
+    assert_eq!(
+        cache.cache_len(),
+        1,
+        "Warmup should populate the hostname and skip the IP literal"
+    );
+    assert!(cache.is_cached("localhost"));
     assert!(
-        cache.cache_len() >= 1,
-        "Warmup should populate at least one cache entry"
+        !cache.is_cached("127.0.0.1"),
+        "IP literals must not occupy a success-cache row"
     );
 }
 
@@ -1099,22 +1107,19 @@ async fn test_evict_expired_removes_stale_entries() {
     };
     let cache = DnsCache::new(config);
 
-    // Populate cache with an IP override (direct IP bypass, creates cache entry)
-    let _ = cache.resolve("10.0.0.1", None, None).await;
-    let _ = cache.resolve("10.0.0.2", None, None).await;
-    assert!(cache.cache_len() >= 2);
+    // Populate cache with a real hostname (IP literals are not cached).
+    let _ = cache.resolve("localhost", None, None).await;
+    assert_eq!(cache.cache_len(), 1);
 
     // Wait for entries to expire past stale deadline
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-    let before = cache.cache_len();
     cache.evict_expired();
 
-    assert!(
-        cache.cache_len() < before,
-        "evict_expired should reduce cache size from {} but got {}",
-        before,
-        cache.cache_len()
+    assert_eq!(
+        cache.cache_len(),
+        0,
+        "evict_expired should drop the expired localhost row"
     );
 }
 
@@ -1136,17 +1141,17 @@ async fn test_max_cache_size_eviction() {
     };
     let cache = DnsCache::new(config);
 
-    // Fill cache with IP addresses (these are direct IP parses, not DNS lookups)
+    // IP literals must not occupy cache rows or count toward capacity.
     for i in 0..10 {
         let ip = format!("10.0.0.{}", i);
         let _ = cache.resolve(&ip, None, None).await;
     }
 
-    // After eviction, cache should be at or below max_cache_size
     cache.evict_expired();
-    assert!(
-        cache.cache_len() <= 5,
-        "Cache should be bounded by max_cache_size, got {}",
+    assert_eq!(
+        cache.cache_len(),
+        0,
+        "IP literals must not create success-cache rows, got {}",
         cache.cache_len()
     );
 }
@@ -1169,6 +1174,96 @@ async fn test_srv_resolution_nonexistent_service() {
     );
 }
 
+#[test]
+fn resolve_srv_discards_rfc2782_root_target_and_port_zero() {
+    use ferrum_edge::_test_support::try_srv_answer_for_test;
+
+    assert!(
+        try_srv_answer_for_test(".", 8080, 1, 10).is_none(),
+        "RFC 2782 root target '.' must be discarded"
+    );
+    assert!(
+        try_srv_answer_for_test("", 8080, 1, 10).is_none(),
+        "empty name after stripping the root label is the same unavailability signal"
+    );
+    assert!(
+        try_srv_answer_for_test("primary.example.com.", 0, 1, 10).is_none(),
+        "port 0 is the RFC 2782 unavailability / non-dialable signal"
+    );
+    assert!(
+        try_srv_answer_for_test("..", 8080, 1, 10).is_none(),
+        "dotted-only names are the DNS root after stripping trailing labels"
+    );
+    assert!(
+        try_srv_answer_for_test("...", 443, 1, 0).is_none(),
+        "dotted-only names at priority 0 must still be discarded"
+    );
+
+    let answer = try_srv_answer_for_test("primary.example.com.", 8080, 7, 10)
+        .expect("dialable SRV RR must be admitted");
+    assert_eq!(answer.host, "primary.example.com");
+    assert_eq!(answer.port, 8080);
+    assert_eq!(answer.weight, 7);
+    assert_eq!(answer.priority, 10);
+
+    let mixed = try_srv_answer_for_test("Primary.Example.COM.", 65535, 65535, 0)
+        .expect("mixed-case dialable SRV RR must be admitted");
+    assert_eq!(mixed.host, "primary.example.com");
+    assert_eq!(mixed.port, 65535);
+    assert_eq!(mixed.weight, 65535);
+    assert_eq!(mixed.priority, 0);
+}
+
+/// The ADDRESS-ONLY SRV mode (`FERRUM_DNS_ORDER` containing `SRV`) and
+/// the DNS-SD service-availability path (`resolve_srv`) read the same RR type
+/// with deliberately different rules (issue #4291). This pins the distinction
+/// so neither silently inherits the other's contradictory behavior.
+#[test]
+fn address_only_srv_mode_ignores_port_but_honors_root_target_and_priority() {
+    const DNS_SOURCE: &str = include_str!("../../../src/dns/mod.rs");
+
+    let arm_start = DNS_SOURCE
+        .find("CachedRecordType::Srv =>")
+        .expect("the address-only SRV resolver arm must exist");
+    let arm_end = arm_start
+        + DNS_SOURCE[arm_start..]
+            .find("CachedRecordType::Cname")
+            .expect("the SRV arm must be followed by the CNAME arm");
+    let arm = &DNS_SOURCE[arm_start..arm_end];
+
+    assert!(
+        !arm.contains("srv.port"),
+        "address-only SRV resolution must never read the RR's port: it dials the proxy's \
+         own configured backend port, so a port-0 RR still carries a usable address"
+    );
+    assert!(
+        !arm.contains("admit_registry_port"),
+        "registry-port admission belongs to the DNS-SD service-availability path only"
+    );
+    assert!(
+        arm.contains("is_rfc2782_root_target"),
+        "the RFC 2782 root target IS an availability signal and must be honored here too"
+    );
+    assert!(
+        arm.contains("srv.priority"),
+        "answers must be walked in ascending RFC 2782 priority so the lowest reachable \
+         tier wins and the chosen address is independent of answer order"
+    );
+
+    // `resolve_srv` — the service-availability path — does the opposite for port.
+    assert!(
+        ferrum_edge::_test_support::try_srv_answer_for_test("primary.example.com.", 0, 1, 10)
+            .is_none(),
+        "DNS-SD admission must still reject port 0"
+    );
+
+    const DNS_DOC: &str = include_str!("../../../docs/dns_resolver.md");
+    assert!(
+        DNS_DOC.contains("Address-only SRV mode"),
+        "the two modes' differing port/priority semantics must stay documented"
+    );
+}
+
 // ============================================================================
 // Per-proxy TTL override tests
 // ============================================================================
@@ -1183,18 +1278,21 @@ async fn test_per_proxy_ttl_override_does_not_affect_resolution() {
     };
     let cache = DnsCache::new(config);
 
-    // Resolve with a per-proxy TTL override of 1s
+    // Resolve with a per-proxy TTL override of 1s. Literals are not cached, so
+    // the override cannot change the returned address.
     let result = cache.resolve("127.0.0.1", None, Some(1)).await;
     assert!(result.is_ok());
 
-    // Wait for the per-proxy TTL to expire (but global 300s TTL would still hold)
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
-    // Entry should still resolve (still cached; per-proxy TTL affects the
-    // internal expires_at but the entry is served stale-while-revalidate)
     let result2 = cache.resolve("127.0.0.1", None, Some(1)).await;
     assert!(result2.is_ok());
     assert_eq!(result.unwrap(), result2.unwrap());
+    assert_eq!(
+        cache.cache_len(),
+        0,
+        "IP literals must not occupy a success-cache row"
+    );
 }
 
 // ============================================================================
@@ -1244,19 +1342,10 @@ async fn test_dns_stale_refresh_still_works_with_semaphore() {
 async fn test_dns_concurrent_refresh_limit_prevents_unbounded_tasks() {
     // Verify that the semaphore limits concurrent background refresh tasks.
     //
-    // This test uses IP-literal entries which resolve instantly in do_resolve()
-    // (parsed before hitting the resolver). Because refresh completes so quickly,
-    // this test cannot directly *observe* the semaphore blocking concurrent tasks.
-    // It instead verifies the end-to-end contract: all stale entries are still
-    // served, the cache is not corrupted, and no panics occur under load.
-    //
-    // A stronger behavioral test would require injecting a mock/slow resolver
-    // into DnsCache (the resolver is private and constructed internally), which
-    // is not currently supported. The semaphore bound is verified structurally:
-    //   - DnsCache::new() creates Semaphore::new(max_concurrent_refreshes.max(1))
-    //   - resolve()/resolve_all() call try_acquire_owned() before spawning
-    //   - On Err (all permits taken), the refresh is skipped and the dedup entry
-    //     is removed so a future request can retry
+    // IP literals are not cached (issue #4293), so this test confirms they
+    // still resolve under load without occupying rows or spawning refresh
+    // tasks. The semaphore bound for real hostnames is covered by the
+    // localhost stale-refresh tests below.
     let cache = DnsCache::new(DnsConfig {
         min_ttl_seconds: 1,
         stale_ttl_seconds: 60,
@@ -1264,35 +1353,28 @@ async fn test_dns_concurrent_refresh_limit_prevents_unbounded_tasks() {
         ..DnsConfig::default()
     });
 
-    // Populate cache with several IP-based entries (these resolve instantly)
+    // IP literals resolve without occupying cache rows, so they cannot
+    // spawn stale-refresh tasks or overflow the semaphore.
     for i in 1..=10 {
         let ip = format!("10.0.0.{}", i);
         let _ = cache.resolve(&ip, None, Some(1)).await;
     }
-    assert!(cache.cache_len() >= 10);
+    assert_eq!(
+        cache.cache_len(),
+        0,
+        "IP literals must not occupy success-cache rows"
+    );
 
-    // Wait for TTL to expire (entries become stale)
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-    // Hit all 10 stale entries — only max_concurrent_refreshes tasks should run
-    // concurrently, the rest should be skipped (and still serve stale data)
     for i in 1..=10 {
         let ip = format!("10.0.0.{}", i);
         let result = cache.resolve(&ip, None, Some(1)).await;
         assert!(
             result.is_ok(),
-            "Stale entries should still be served even when concurrency limit is hit"
+            "IP literals must still resolve after repeated lookups"
         );
     }
 
-    // Give refreshes time to complete
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    // All entries should still be in the cache
-    assert!(
-        cache.cache_len() >= 10,
-        "Cache entries should persist after refresh"
-    );
+    assert_eq!(cache.cache_len(), 0);
 }
 
 #[tokio::test]
@@ -1313,15 +1395,15 @@ async fn test_dns_concurrent_stale_refresh_with_real_dns_hostnames() {
     let result1 = cache.resolve("localhost", None, Some(1)).await.unwrap();
     assert_eq!(cache.cache_len(), 1);
 
-    // Also populate with an IP (different entry, instant resolution)
+    // An IP literal still resolves but must not occupy a second cache row.
     let ip_result = cache.resolve("127.0.0.1", None, Some(1)).await.unwrap();
-    assert_eq!(cache.cache_len(), 2);
+    assert_eq!(cache.cache_len(), 1);
 
     // Wait for TTL to expire
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    // Hit both stale entries concurrently — with semaphore=1, at most one
-    // refresh task runs. The other is skipped and stale data is served.
+    // Hit the stale hostname and the literal concurrently. The literal is not
+    // cached, so it cannot consume a refresh permit.
     let cache_a = cache.clone();
     let cache_b = cache.clone();
     let (r1, r2) = tokio::join!(
@@ -1329,13 +1411,13 @@ async fn test_dns_concurrent_stale_refresh_with_real_dns_hostnames() {
         cache_b.resolve("127.0.0.1", None, Some(1)),
     );
     assert_eq!(r1.unwrap(), result1, "Stale localhost should be served");
-    assert_eq!(r2.unwrap(), ip_result, "Stale IP should be served");
+    assert_eq!(r2.unwrap(), ip_result, "IP literal should still resolve");
 
-    // Give the single permitted refresh time to complete
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // Both entries should still exist in cache
-    assert_eq!(cache.cache_len(), 2);
+    assert_eq!(cache.cache_len(), 1);
+    assert!(cache.is_cached("localhost"));
+    assert!(!cache.is_cached("127.0.0.1"));
 }
 
 #[tokio::test]
@@ -1394,7 +1476,7 @@ async fn test_dns_resolve_all_respects_refresh_semaphore() {
 
 #[tokio::test]
 async fn test_shared_hostname_ttl_isolation_both_insertion_orders() {
-    // Public-API coverage: two consumers sharing 127.0.0.1 at 1s/600s must
+    // Public-API coverage: two consumers sharing localhost at 1s/600s must
     // each honor their own freshness window regardless of who resolved first.
     for (first, second) in [(1u64, 600u64), (600u64, 1u64)] {
         let cache = DnsCache::new(DnsConfig {
@@ -1405,11 +1487,11 @@ async fn test_shared_hostname_ttl_isolation_both_insertion_orders() {
         });
 
         cache
-            .resolve("127.0.0.1", None, Some(first))
+            .resolve("localhost", None, Some(first))
             .await
             .expect("first consumer");
         cache
-            .resolve("127.0.0.1", None, Some(second))
+            .resolve("localhost", None, Some(second))
             .await
             .expect("second consumer");
         assert_eq!(cache.cache_len(), 1, "shared hostname stays one cache row");
@@ -1417,13 +1499,13 @@ async fn test_shared_hostname_ttl_isolation_both_insertion_orders() {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         let long = cache
-            .resolve("127.0.0.1", None, Some(600))
+            .resolve("localhost", None, Some(600))
             .await
             .expect("long-TTL consumer");
         assert!(long.is_ipv4() || long.is_ipv6());
 
         let short = cache
-            .resolve("127.0.0.1", None, Some(1))
+            .resolve("localhost", None, Some(1))
             .await
             .expect("short-TTL consumer");
         assert_eq!(long, short);
@@ -1435,12 +1517,12 @@ async fn test_shared_hostname_ttl_isolation_both_insertion_orders() {
 async fn test_warmup_reordering_shared_hostname_ttl_isolation() {
     for order in [
         vec![
-            ("127.0.0.1".to_string(), None, Some(1u64)),
-            ("127.0.0.1".to_string(), None, Some(600u64)),
+            ("localhost".to_string(), None, Some(1u64)),
+            ("localhost".to_string(), None, Some(600u64)),
         ],
         vec![
-            ("127.0.0.1".to_string(), None, Some(600u64)),
-            ("127.0.0.1".to_string(), None, Some(1u64)),
+            ("localhost".to_string(), None, Some(600u64)),
+            ("localhost".to_string(), None, Some(1u64)),
         ],
     ] {
         let cache = DnsCache::new(DnsConfig {
@@ -1454,11 +1536,11 @@ async fn test_warmup_reordering_shared_hostname_ttl_isolation() {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         assert!(
-            cache.resolve("127.0.0.1", None, Some(600)).await.is_ok(),
+            cache.resolve("localhost", None, Some(600)).await.is_ok(),
             "600s consumer stays fresh after either warmup order"
         );
         assert!(
-            cache.resolve("127.0.0.1", None, Some(1)).await.is_ok(),
+            cache.resolve("localhost", None, Some(1)).await.is_ok(),
             "1s consumer re-resolves after either warmup order"
         );
     }
@@ -1474,22 +1556,22 @@ async fn test_per_proxy_vs_global_ttl_precedence_on_shared_hostname() {
     });
 
     cache
-        .resolve("127.0.0.1", None, Some(1))
+        .resolve("localhost", None, Some(1))
         .await
         .expect("per-proxy consumer");
     cache
-        .resolve("127.0.0.1", None, None)
+        .resolve("localhost", None, None)
         .await
         .expect("global-policy consumer");
 
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     assert!(
-        cache.resolve("127.0.0.1", None, None).await.is_ok(),
+        cache.resolve("localhost", None, None).await.is_ok(),
         "global 3600s policy must still be fresh"
     );
     assert!(
-        cache.resolve("127.0.0.1", None, Some(1)).await.is_ok(),
+        cache.resolve("localhost", None, Some(1)).await.is_ok(),
         "per-proxy 1s policy must re-resolve after expiry"
     );
 }
@@ -1693,5 +1775,173 @@ async fn fresh_all_candidates_resolution_without_an_override_is_unchanged() {
     assert_eq!(
         resolved,
         vec!["127.0.0.1".parse::<std::net::IpAddr>().expect("literal")]
+    );
+}
+
+// ============================================================================
+// IP literals must not invert DNS cache eviction (issue #4293)
+// ============================================================================
+
+#[tokio::test]
+async fn ip_literals_are_not_cached_and_cannot_displace_short_ttl_hostname() {
+    let cache = DnsCache::new(DnsConfig {
+        max_cache_size: 4,
+        min_ttl_seconds: 1,
+        stale_ttl_seconds: 3600,
+        ..DnsConfig::default()
+    });
+
+    cache
+        .resolve("localhost", None, Some(30))
+        .await
+        .expect("short-TTL hostname");
+    assert_eq!(cache.cache_len(), 1);
+    assert!(cache.is_cached("localhost"));
+
+    for i in 0..8u8 {
+        let ip = format!("10.0.0.{i}");
+        let addr = cache
+            .resolve(&ip, None, None)
+            .await
+            .unwrap_or_else(|err| panic!("literal {ip} must resolve: {err}"));
+        assert_eq!(addr.to_string(), ip);
+        let v6 = format!("2001:db8::{i:x}");
+        cache
+            .resolve(&v6, None, None)
+            .await
+            .unwrap_or_else(|err| panic!("IPv6 literal {v6} must resolve: {err}"));
+    }
+
+    assert_eq!(
+        cache.cache_len(),
+        1,
+        "literals must not occupy success-cache rows under capacity pressure"
+    );
+    cache.evict_expired();
+    assert_eq!(cache.cache_len(), 1);
+    assert!(
+        cache.is_cached("localhost"),
+        "short-TTL hostname must survive capacity pressure from IP literals"
+    );
+    assert!(!cache.is_cached("10.0.0.1"));
+    assert!(!cache.is_cached("2001:db8::1"));
+}
+
+#[tokio::test]
+async fn literal_warmup_publication_churn_does_not_evict_short_ttl_hostname() {
+    let cache = DnsCache::new(DnsConfig {
+        max_cache_size: 4,
+        min_ttl_seconds: 1,
+        stale_ttl_seconds: 3600,
+        ..DnsConfig::default()
+    });
+
+    cache
+        .resolve("localhost", None, Some(30))
+        .await
+        .expect("short-TTL hostname");
+
+    for generation in 0..3u8 {
+        let mut hosts = vec![("localhost".to_string(), None, Some(30u64))];
+        for i in 0..8u8 {
+            hosts.push((format!("10.{generation}.0.{i}"), None, None));
+        }
+        cache.warmup(hosts).await;
+        assert_eq!(
+            cache.cache_len(),
+            1,
+            "generation {generation}: literals must not occupy cache rows"
+        );
+        assert!(
+            cache.is_cached("localhost"),
+            "generation {generation}: short-TTL hostname must survive publication churn"
+        );
+    }
+
+    cache.evict_expired();
+    assert_eq!(cache.cache_len(), 1);
+    assert!(cache.is_cached("localhost"));
+    assert!(!cache.is_cached("10.0.0.1"));
+    assert!(!cache.is_cached("10.2.0.7"));
+}
+
+#[tokio::test]
+async fn dns_warmup_skips_ip_literals_without_policy_bypass() {
+    let cache = DnsCache::new(public_dns_config(HashMap::new()));
+    cache
+        .warmup(vec![
+            ("169.254.169.254".to_string(), None, None),
+            ("10.0.0.1".to_string(), None, None),
+            ("::1".to_string(), None, None),
+        ])
+        .await;
+    assert_eq!(cache.cache_len(), 0);
+
+    // Skipping warmup is not a policy bypass: request-time resolve still screens.
+    let metadata = cache
+        .resolve("169.254.169.254", None, None)
+        .await
+        .expect_err("metadata literal must be denied")
+        .to_string();
+    assert!(
+        metadata.contains("denied by backend egress policy"),
+        "unexpected error: {metadata}"
+    );
+    assert!(cache.resolve("10.0.0.1", None, None).await.is_err());
+    assert!(cache.resolve("::1", None, None).await.is_err());
+    assert_eq!(cache.cache_len(), 0);
+}
+
+#[tokio::test]
+async fn per_proxy_override_still_wins_for_literal_hostname() {
+    let cache = DnsCache::new(default_dns_config(HashMap::new()));
+    let result = cache
+        .resolve("10.0.0.1", Some("10.0.0.9"), None)
+        .await
+        .expect("override");
+    assert_eq!(result.to_string(), "10.0.0.9");
+    assert_eq!(cache.cache_len(), 0);
+}
+
+#[tokio::test]
+async fn global_override_still_wins_for_literal_hostname() {
+    let mut overrides = HashMap::new();
+    overrides.insert("10.0.0.1".to_string(), "10.0.0.9".to_string());
+    let cache = DnsCache::new(default_dns_config(overrides));
+    let result = cache
+        .resolve("10.0.0.1", None, None)
+        .await
+        .expect("global override");
+    assert_eq!(result.to_string(), "10.0.0.9");
+    assert_eq!(cache.cache_len(), 0);
+}
+
+#[tokio::test]
+async fn public_policy_denies_literal_without_caching() {
+    let cache = DnsCache::new(public_dns_config(HashMap::new()));
+    let err = cache
+        .resolve("169.254.169.254", None, None)
+        .await
+        .expect_err("metadata literal must be denied")
+        .to_string();
+    assert!(
+        err.contains("denied by backend egress policy"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(cache.cache_len(), 0);
+    assert!(!cache.is_cached("169.254.169.254"));
+}
+
+// ============================================================================
+// Proactive background refresh hardening (issue #4270)
+// ============================================================================
+
+#[test]
+fn proactive_refresh_and_eviction_intervals_use_missed_tick_delay() {
+    let source = include_str!("../../../src/dns/mod.rs");
+    let delay_hits = source.matches("MissedTickBehavior::Delay").count();
+    assert!(
+        delay_hits >= 3,
+        "proactive refresh, independent eviction, and failed-retry must Delay missed ticks, found {delay_hits}"
     );
 }

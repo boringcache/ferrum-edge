@@ -155,7 +155,10 @@ still a live Endpoint. The chart closes that window from both sides:
    **before** SIGTERM, so the gateway keeps serving normally for the whole
    window while endpoint removal propagates. `SleepAction` needs no shell, so
    it works on the distroless image; it requires Kubernetes **1.29+** (GA in
-   1.30). Set it to `0` on older clusters to omit the hook.
+   1.30). Set it to `0` on older clusters to omit the hook. With
+   `shutdownPreStopSeconds > 0`, `helm template` / `helm install` **fail** on
+   clusters older than 1.29 with a remediation message instead of silently
+   dropping the unsupported `sleep` field.
 2. `shutdownPreDrainSeconds` (default `0`, `FERRUM_SHUTDOWN_PREDRAIN_SECONDS`)
    keeps every listener — proxy **and** admin — accepting for a window *after*
    SIGTERM while readiness already reports `ready:false` / 503 and `/live` still
@@ -344,6 +347,22 @@ CI Unit Tests plus a live UDP data-path integration suite, including the finite
 response-amplification default and Ferrum `UDPResponseAmplificationPolicy` —
 see [`docs/gateway_api_conformance.md`](../../docs/gateway_api_conformance.md).
 
+Gateway API CRDs are a **cluster prerequisite** for any install that attaches
+routes to a `Gateway` (including paired `ferrum-mesh` control-plane +
+`ferrum-gateway` data-plane labs). This chart does not install them. Apply the
+experimental v1.5.1 bundle before the control plane creates `Gateway` /
+`GatewayClass` objects:
+
+```bash
+kubectl apply --server-side=true \
+  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/experimental-install.yaml
+```
+
+Ferrum requires the experimental channel because L4 routes and
+`XBackendTrafficPolicy` are not in `standard-install.yaml` at this pin, and
+upstream rejects mixing channels. See
+[`docs/kubernetes_deployment.md`](../../docs/kubernetes_deployment.md#gateway-api-crds-required).
+
 Gateway API `GRPCRoute` attaches to HTTP/HTTPS listeners and is release-gated by
 the upstream `GATEWAY-GRPC` profile (same doc).
 
@@ -384,7 +403,14 @@ scraper must present a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`
 or originate from `FERRUM_METRICS_ALLOWED_CIDRS`. The chart's optional `metrics`
 subtree (`metrics.enabled`, default `false`) wires those env vars and can render
 a Prometheus Operator `ServiceMonitor` plus a `PrometheusRule` with core gateway
-alerts. Enabling metrics does **not** change `admin.bindAddress`; you must
+alerts. Data-path alerts (overload shedding, upstream health, circuit breakers,
+frontend TLS handshake failures) work without the optional `prometheus_metrics`
+plugin; traffic alerts (5xx rate, P99 latency) require it. Database poll
+freshness alerts render only in `database` and `cp` modes. The frontend TLS
+handshake alert renders only when `metrics.alerts.frontendTlsHandshakeErrorsPerSecond`
+is set above `0`: `reason="error"` counts every rustls accept failure, including
+mid-handshake client disconnects and scanners, so a `0` threshold would fire
+permanently on an internet-facing listener. Enabling metrics does **not** change `admin.bindAddress`; you must
 explicitly expose admin for cluster scraping:
 
 ```yaml
@@ -409,9 +435,20 @@ the admin port. `metrics.bearerToken.value` wires the pod env for development;
 `metrics.bearerToken.existingSecret` is required for ServiceMonitor Bearer
 authorization when `metrics.allowedCidrs` is empty.
 
-`/metrics` also requires a globally scoped `prometheus_metrics` plugin instance or
-the scrape succeeds with an empty exposition. Add it to your gateway config
-(`file.inlineConfig`, database `plugin_configs`, or CP-pushed config):
+When the ServiceMonitor uses Bearer authorization, the chart always scrapes the
+admin HTTPS port and requires a verifying `metrics.serviceMonitor.tlsConfig`
+(for example, `ca.secret` and `serverName`). It refuses plaintext transport and
+`insecureSkipVerify: true` so the observability credential is never sent to an
+unauthenticated endpoint.
+
+Authenticated `/metrics` always includes core data-path families (overload shedding,
+upstream health, circuit breakers, frontend TLS handshake failures, TLS inventory,
+and other runtime families) without the plugin. The optional globally scoped
+`prometheus_metrics` plugin adds traffic/request families such as
+`ferrum_requests_total` and `ferrum_request_duration_ms_bucket`, which the
+5xx-rate and P99-latency alerts require. Add it to your gateway config when you
+need those traffic metrics or alerts (`file.inlineConfig`, database
+`plugin_configs`, or CP-pushed config):
 
 ```yaml
 plugin_configs:

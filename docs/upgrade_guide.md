@@ -2,6 +2,121 @@
 
 This document describes how to safely upgrade Ferrum Edge between versions with zero data loss and a clear rollback path. The approach varies by operating mode, but the core principle is the same: **validate the new version against a copy of your data before cutting over production traffic.**
 
+## Breaking Changes Since 0.9.0
+
+Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
+
+### HTTP/1.1 requests without a Host header are rejected with 400 (issue [#4390](https://github.com/ferrum-edge/ferrum-edge/issues/4390))
+
+RFC 9112 §3.2.2 requires a 400 when an HTTP/1.1 request lacks a Host field. Ferrum previously only rejected multiple Host fields, so a Host-less origin-form request skipped exact/wildcard host tiers and could fall through to a catch-all (empty `hosts`) route. `check_protocol_headers()` now rejects HTTP/1.1 when both the Host field and the URI authority are absent. HTTP/1.0 still does not require Host. Absolute-form request-targets that already carry an authority are accepted without a Host field. An empty Host value (`Host:` with no tokens) is treated as present-but-invalid and also returns 400 on HTTP/1.1. HTTP/2 and HTTP/3 are unchanged.
+
+**Operator action:** any HTTP/1.1 client that omitted Host (non-conformant scanners, some raw sockets, misconfigured health probes) will start seeing `400` `{"error":"HTTP/1.1 request is missing a Host header"}` instead of being routed. Send a Host field, or use HTTP/1.0 / absolute-form if that is the intended protocol.
+
+### Route header transforms now compose with global transformers (issue [#4304](https://github.com/ferrum-edge/ferrum-edge/issues/4304))
+
+Auto-emitted `istio-vs-req-xform-*` / `istio-vs-resp-xform-*` consumers no
+longer shadow global `request_transformer` / `response_transformer` instances.
+Global static rules now run first, followed by the matched route rules. This
+changes existing Gateway API `HTTPRoute` deployments using
+`RequestHeaderModifier` or `ResponseHeaderModifier`; newly supported Istio
+VirtualService header transforms follow the same composition contract.
+
+**Operator action:** audit HTTPRoute-backed proxies that relied on the former
+accidental suppression, then scope or remove global static transformer rules
+that should not compose with those routes.
+
+### `hmac_auth` v2 nonce / client rollout and DPoP replay protection (issues [#3834](https://github.com/ferrum-edge/ferrum-edge/issues/3834) / [#3837](https://github.com/ferrum-edge/ferrum-edge/issues/3837))
+
+**Silent HMAC outage.** `hmac_auth` now defaults to **`ferrum-hmac-v2`**. Version 2 requires a client-generated `nonce` in the `Authorization: hmac …` parameters and binds it into the signing base:
+
+```text
+ferrum-hmac-v2\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST}\n{NONCE}
+```
+
+The profile version is the first field and the nonce is the last, so a v1 signature can never verify as v2. Every unmodified HMAC client starts getting `401` at cutover. The nonce must be base64url-unpadded or hex, carry at least 128 bits of entropy (22 base64url or 32 hex characters), and be at most 86 characters. A verbatim transport retry **is** a replay and is rejected with `401`; a client that needs safe retries sends a fresh nonce with a recomputed signature.
+
+`hmac_auth` also requires an explicit **`replay_scope`** (`process` or `shared`) whenever the v2 profile is active. There is no default: a gateway cannot observe its own replica count. A missing `replay_scope` is refused at admission. `clock_skew_seconds` is bounded at **300**. The configuration root is a closed key set (`clock_skew_seconds`, `signing_profile`, `allow_unsafe_replayable_v1`, `replay_scope`, `replay_max_entries`, plus the shared Redis fields); a misspelled key is refused. `require_digest` stays removed; digests remain mandatory.
+
+**Operator action (HMAC):** roll clients to send and sign a v2 nonce **before** cutover; add `"replay_scope": "process"` (single process) or `"replay_scope": "shared"` with `sync_mode: "redis"` and a `redis_url` (multi-replica, including a rolling deploy) to every `hmac_auth` config; lower any `clock_skew_seconds` above 300.
+
+To defer the client change, select the legacy freshness-only profile with **both** `signing_profile: "ferrum-hmac-v1"` and `allow_unsafe_replayable_v1: true`. Plugin admission in `src/plugins/hmac_auth.rs` and [hmac_auth in plugins.md](plugins.md#hmac_auth) require that pair; `signing_profile` alone is refused. That profile accepts neither `replay_scope` nor a Redis backend, has no single-use guarantee (a captured valid request replays verbatim for the whole freshness window), **rejects** a `nonce` parameter rather than ignoring it, and increments `legacy_unsafe_profile_accepted`. Do not use it on non-idempotent routes.
+
+**DPoP / `jwks_auth` as shipped.** Both admission controls claim each proof exactly once through one shared, fail-closed replay authority:
+
+- Every `jwks_auth` provider with `require_dpop: true` needs an explicit `providers[].dpop_replay_scope` (`process` or `shared`) and a nonblank exact `issuer` (the replay realm). `dpop_replay_scope` is rejected when `require_dpop` is false.
+- `dpop_jti_ttl_secs` and `dpop_jti_cache_max_entries` were **removed**. Retention is a fixed 601-second horizon; capacity is `providers[].dpop_replay_max_entries`. Configs that still carry the removed keys are rejected with the replacement named.
+- Equivalent DPoP providers that share a replay domain must declare the same `dpop_replay_scope` and the same process-scope cap. A mixed process/shared pair is refused even when Redis is configured. Providers that share one exact issuer share one realm and must agree on `require_dpop` (a non-DPoP sibling is a bearer-only bypass).
+- Any deployment running more than one gateway replica behind a load balancer — including a rolling deployment — must declare `shared` scope and provision Redis via `sync_mode: "redis"`. `process` scope in a multi-replica deployment means one replay per replica. There is no fallback between scopes: a shared-backend timeout, partition, authentication failure, capacity failure, proven-unsupported topology, or proven-unsafe Redis eviction policy (`allkeys-*` / `volatile-*`) refuses the protected request. Replay Redis clients accept a connection only when `INFO MEMORY` proves `maxmemory == 0` or `maxmemory_policy == noeviction`.
+- Authenticated `/health` and `/status` fail readiness (`status: "unavailable"`) while a live policy's shared backend is unavailable, and publish a bounded `replay_authority` aggregate; recovery restores readiness with no restart. See [admin_api.md](admin_api.md).
+
+**Operator action (DPoP):** add `dpop_replay_scope` to every `require_dpop` provider, declare a nonblank exact `issuer` on those providers, and drop `dpop_jti_ttl_secs` / `dpop_jti_cache_max_entries`.
+
+### WAF custom `match_kind: literal` is now case-sensitive (issue [#3937](https://github.com/ferrum-edge/ferrum-edge/issues/3937))
+
+`literal` was compiled with `(?i)` exactly like `contains`, so a rule spelled `pattern: EVIL-LITERAL` also blocked `evil-literal`, and there was no way to express a case-sensitive literal match. `literal` is now a case-sensitive Unicode substring; `contains` keeps the folded substring semantics and `equals` keeps the folded anchored match. A pre-existing `literal` rule that relied on the accidental folding **silently stops matching** other spellings — there is no config-load error.
+
+**Operator action:** audit every custom `match_kind: literal` rule; change it to `contains` to keep the old folded substring behavior, or to `regex` with an explicit `(?i)` prefix for partial folding. Metacharacters stay escaped under both `literal` and `contains`. See the `match_kind` table in [waf.md](waf.md).
+
+### Untrusted `X-Forwarded-For` is no longer forwarded to backends (issue [#4034](https://github.com/ferrum-edge/ferrum-edge/issues/4034))
+
+With the default empty `FERRUM_TRUSTED_PROXIES`, Ferrum already ignored a client-supplied XFF chain for its own `client_ip` resolution, but the outbound request still carried that spoofable chain with the socket peer appended (`spoofed, peer`). Backends that trust the leftmost hop therefore saw an attacker-injected address. Outbound XFF now matches [client_ip_resolution.md](client_ip_resolution.md): an untrusted peer (including every peer when the trust list is empty) produces `peer` only; a trusted peer still has its inbound chain honored and appended to. The same drop applies to `X-Real-IP` on untrusted peers (Ferrum never regenerates that header). RFC 7239 `Forwarded` is unchanged: when `FERRUM_ADD_FORWARDED_HEADER=true` it is still regenerated from the resolved client IP; when false, pass-through remains the operator contract from issue #2952.
+
+This changes what every backend observes, with no error surface.
+
+**Operator action:** if a backend depended on seeing client-supplied XFF hops in front of an untrusted Ferrum, add the connecting peer to `FERRUM_TRUSTED_PROXIES` so Ferrum will honor and append that chain; otherwise configure the backend to trust only the rightmost hop (Ferrum's socket peer).
+
+### Seven plugin constructors reject unknown config keys (issues [#4405](https://github.com/ferrum-edge/ferrum-edge/issues/4405) / [#4409](https://github.com/ferrum-edge/ferrum-edge/issues/4409))
+
+A typo in a plugin's `config` object was previously admitted and silently ignored, so a misspelled key became a no-op that still passed `validate` with exit 0. Unknown keys are now rejected, matching `PluginConfig`'s `deny_unknown_fields` and the behavior `jwt_auth`, `cors`, `ai_federation`, and `ai_stream_router` already had.
+
+`request_size_limiting`, `ws_message_size_limiting`, `a2a_gateway`, `ws_logging`, and `mcp_gateway` fail closed at construction, so file-mode `validate` exits 1. `http_logging` and `prometheus_metrics` keep their `OptionalFailOpen` policy: construction returns an error naming the unknown key, and `validate` / reload warn and omit that instance rather than failing the gateway — the same shape `stdout_logging` already had.
+
+`mcp_gateway` additionally rejects `command`, `args`, and `stdio` at the root and inside `servers.*` with an HTTP-only diagnostic. The gateway speaks HTTP to MCP upstreams and never spawned a stdio child, so a Claude-Desktop-style `command` field was previously accepted and ignored. Diagnostics include a spelling suggestion when the typo is close to a valid key. See [plugins.md](plugins.md).
+
+**Operator action:** run `ferrum-edge validate` before upgrading and fix any key it now names — typos such as `max_bytez`, `max_frame_bytez`, `endpont_url`, or `render_cache_ttl_secnds`. Replace any `servers.*.command` with an `upstream_url` using `http://` or `https://`.
+
+### `POST /batch` rejects unknown top-level envelope keys (issue [#4042](https://github.com/ferrum-edge/ferrum-edge/issues/4042))
+
+`POST /batch` is create-only (`consumers`, `upstreams`, `proxies`, `plugin_configs`). Sending `updates`, `deletes`, or `dry_run` previously returned `201` and created only the resource arrays while silently ignoring the other keys. Unknown envelope keys now return `400`. `GET /backup` metadata (`version`, `ferrum_version`, `exported_at`, `source`, `counts`) and the backup-only `api_specs` / `gateway_trust_bundles` sections remain accepted and ignored so a backup file is still a valid additive import. See [admin_api.md](admin_api.md) and [admin_backup_restore.md](admin_backup_restore.md).
+
+**Operator action:** stop sending unimplemented mutation verbs on `/batch`; use per-resource PUT/DELETE or `POST /restore` for replacement.
+
+### File/DP `POST /restore` returns `503` instead of `403` (issue [#4027](https://github.com/ferrum-edge/ferrum-edge/issues/4027))
+
+Restore requires a database. File and data-plane mode now answer `{"error":"No database"}` with `503`, matching [admin_backup_restore.md](admin_backup_restore.md). Other file-mode writes still return `403` `{"error":"Admin API is in read-only mode"}`. Database mode with `FERRUM_ADMIN_READ_ONLY=true` still returns that `403` for restore.
+
+**Operator action:** match file/DP restore unavailability on `503` / `No database`, not on the generic read-only `403`.
+
+### `DELETE /consumers/{id}` returns 409 while `access_control.allowed_consumers` still names the username (issue [#4045](https://github.com/ferrum-edge/ferrum-edge/issues/4045))
+
+The previous 204 left live plugin configs authorizing an identity that no longer exists. Ferrum now scans `access_control` plugin configs in the same namespace and refuses the delete with `{"error":"Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"}`. Plugin configs are not rewritten. A consumer named only in `disallowed_consumers` can still be deleted. See [admin_api.md](admin_api.md).
+
+**Operator action:** remove or edit the username in those plugin configs, then retry.
+
+### DP last-known-good configuration has a bounded age (issue [#3726](https://github.com/ferrum-edge/ferrum-edge/issues/3726))
+
+In `dp` mode, a data plane that has applied one CP snapshot keeps serving it while every control plane is unreachable. That window is now bounded by `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` (default **`3600`**). Age is measured on a **monotonic clock** from the last snapshot or delta that was validated and successfully applied; wall-clock or NTP steps cannot extend or shorten the window. Heartbeats, reconnect attempts, CP transport success, fenced or rejected snapshots, rejected deltas, and snapshots that fail to apply do **not** reset the age — only an applied snapshot does. The configured maximum is the boundary itself; nothing is added to it.
+
+Staleness additionally requires the DP to have actually lost its authoritative CP source: an intentional primary-retry or TLS-rotation reconnect, and a successful failover to an alternate CP, leave the DP `reconnecting` and never latch, while a failed connect/subscribe attempt latches the moment the applied snapshot reaches the bound. At the bound, `/health` reports `ready: false` with `status: "unavailable"`. Under the default `FERRUM_DP_CONFIG_STALE_ACTION=fail_closed`, new HTTP/1.1, HTTP/2, HTTP/3, TCP, UDP-session, and DTLS-session admissions are refused while already-accepted connections, established sessions, and in-flight requests drain normally. `readiness_only` is the named compatibility mode that degrades readiness only and keeps admitting traffic.
+
+`FERRUM_DP_CONFIG_MAX_STALE_SECONDS=0` restores the previous unbounded behavior as an explicit, deliberately unsafe production opt-in and logs a startup warning. Recovery requires a snapshot that passes every normal validation and freshness check **and applies successfully** — reconnecting alone does not restore readiness or admission. Authenticated `/health` adds a fixed-cardinality `dp_config` diagnostic (`cp_disconnected`, `snapshot_stale`, `snapshot_rejected`, `snapshot_apply_failed`, and related counters). See [cp_dp_mode.md](cp_dp_mode.md#bounded-last-known-good-configuration-age).
+
+**Operator action:** set `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` and `FERRUM_DP_CONFIG_STALE_ACTION` before cutover so orchestrators and load balancers honor degraded readiness at the bound; do not rely on `0` except as a deliberate unsafe opt-in. After a CP outage, restore an authoritative CP and confirm an applied snapshot before steering new traffic back.
+
+### `a2a_gateway` `endpoint.grpc_services` default and declared Agent Card wire layouts (issue [#3297](https://github.com/ferrum-edge/ferrum-edge/issues/3297))
+
+`endpoint.grpc_services` now defaults to the canonical A2A **0.3** service `a2a.v1.A2AService` (package `a2a.v1`, from `a2aproject/A2A` at tag `v0.3.0`) and A2A **1.0**'s `lf.a2a.v1.A2AService`. Every configured entry carries a declared Agent Card wire layout. The default 0.3 identity matches the card layout that default `endpoint.protocol_versions` (`0.3.0`) actually describes; retaining the 1.0 identity preserves method-policy enforcement for deployments that relied on the former default, while its schema prevents the 0.3 decoder from interpreting its renumbered card.
+
+Entries may be plain service-name strings — a published A2A name resolves to the layout the specification gives it (`a2a.v1.A2AService` → `a2a-0.3`, `lf.a2a.v1.A2AService` → `a2a-1.0`) and any custom name resolves to `none` — or the explicit `{service, card_schema}` object form a custom deployment uses to declare which published layout its own service serves. Declaring a `card_schema` that contradicts a published A2A service name is rejected at admission. Detection, method policy, and `a2a.*` metadata are unchanged for every schema, but Agent Card protobuf rewriting is implemented only for `a2a-0.3` and fails closed with `agent_card_grpc_schema_unsupported` (`a2a-1.0`) or `agent_card_grpc_schema_undeclared` (`none`) before a byte of the reply is decoded — a 1.0 card is never interpreted with 0.3 field numbers.
+
+**Operator action:** for deployments fronting A2A 1.0 or a custom gRPC service whose cards must pass through untouched, set `discovery.rewrite_agent_card_urls: false`, or declare an explicit `{service, card_schema}` pair that truthfully matches the service you publish (for example `card_schema: a2a-0.3` only when the backend actually serves the 0.3 card layout). Do not pair a published A2A service name with a contradicting `card_schema`. See [plugins.md](plugins.md#a2a_gateway).
+
+### `FERRUM_TLS_OFFLOAD_THREADS` nonzero values fail startup (issue [#4294](https://github.com/ferrum-edge/ferrum-edge/issues/4294))
+
+TLS handshake offload is not implemented. A nonzero `FERRUM_TLS_OFFLOAD_THREADS` was parsed, documented in five places, and then silently ignored, so operators who set it believed handshakes were being offloaded when nothing had changed. `EnvConfig::validate()` now rejects any value other than `0` before mode dispatch, which turns a previously accepted configuration into a refused start.
+
+**Operator action:** leave `FERRUM_TLS_OFFLOAD_THREADS` unset, or set it to `0`. There is no configuration that enables offload; removing the variable is equivalent to the behaviour every prior release actually had.
+
 ## Database Mode (`FERRUM_MODE=database`)
 
 This is the most involved upgrade because schema migrations may alter your database. The strategy is: clone the database, migrate the clone, validate with the new binary, then cut over.
@@ -789,7 +904,7 @@ FERRUM_MODE=file \
 
 ### Pre-Upgrade Checklist
 
-- [ ] Read the release notes for breaking changes, deprecated fields, and new required fields
+- [ ] Read [Breaking Changes Since 0.9.0](#breaking-changes-since-090) and the release notes for breaking changes, deprecated fields, and new required fields
 - [ ] Back up your database (database/CP modes) or config file (file mode)
 - [ ] Back up your `ferrum.conf` if you use one — new versions may add env vars with different defaults
 - [ ] Use `GET /backup` to capture a logical config snapshot (database/CP modes)

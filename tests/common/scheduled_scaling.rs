@@ -379,6 +379,15 @@ pub const CONFIG_CONVERGENCE_MAX_WAIT_SECS: u64 = 5 * 60;
 /// Interval between convergence probes.
 pub const CONFIG_CONVERGENCE_POLL_INTERVAL_SECS: u64 = 2;
 
+/// Maximum number of complete throughput windows allowed after convergence.
+///
+/// A route-miss 404 during the first window means the data plane changed after
+/// the pre-window probes. That window is discarded and convergence is proved
+/// again before one clean restart. A second interrupted window is persistent
+/// convergence instability, so the gate fails instead of retrying indefinitely
+/// or folding those 404s into a routing-throughput result.
+pub const MEASUREMENT_WINDOW_MAX_ATTEMPTS: u32 = 2;
+
 /// How long a bounded convergence wait actually took.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConvergenceOutcome {

@@ -38,7 +38,11 @@ info:
     observability, cluster state, backend capabilities, TLS management, and mesh
     topology reflect the current node or control-plane state and are not
     namespace-filtered unless their operation explicitly declares the namespace
-    header. Discover all known resource namespaces via `GET /namespaces`
+    header. Audit events for those fleet-global mutations (TLS/ACME management
+    and `POST /mesh/config-revision/reset`) are stored under the canonical
+    default namespace (`ferrum`), not `X-Ferrum-Namespace`. Invalid namespace
+    headers and `ns`-claim denials use the same canonical audit bucket.
+    Discover all known resource namespaces via `GET /namespaces`
     (a paginated list of name strings). `POST /namespaces` registers an empty
     tenant before any resource exists; `PUT /namespaces/{name}` can rename a
     tenant (moving every resource row) and `DELETE /namespaces/{name}` removes
@@ -1089,7 +1093,9 @@ paths:
       description: |
         Managed TLS record IDs are globally unique across material kinds. Create
         with `allow_overwrite=true` rejects a cross-kind ID collision with
-        `409 Conflict`.
+        `409 Conflict`. This surface is not selected by `X-Ferrum-Namespace`;
+        when ordinary mutation auditing is enabled, the event is stored under
+        the canonical default namespace (`ferrum`).
       tags: [TLS]
       requestBody:
         required: true
@@ -3373,6 +3379,16 @@ paths:
                           mesh_proxy_configs: { type: integer, minimum: 0 }
                           extension_configs: { type: integer, minimum: 0 }
                           ext_authz_providers: { type: integer, minimum: 0 }
+                          workloads_with_node_waypoint:
+                            type: integer
+                            minimum: 0
+                            description: |
+                              Count of workloads whose trusted destination
+                              `node_waypoint` metadata is present. Optional;
+                              omitted when zero so older clients and pre-slice
+                              zeros keep their previous JSON shape. NodeWaypoint
+                              Service routing requires this to be non-zero for
+                              destination workloads.
                       fingerprint:
                         type: string
                         pattern: "^sha256-[0-9a-f]{64}$"
@@ -3821,7 +3837,9 @@ paths:
 
         Requires the `operator` role. Returns `404 Not Found` outside mesh mode.
         Requires `?confirm=true` because clearing the freshness gate is a
-        privileged operation that lowers a fail-closed guard.
+        privileged operation that lowers a fail-closed guard. The matching
+        audit event is stored under the canonical default namespace (`ferrum`),
+        not `X-Ferrum-Namespace`, because this route is fleet-global.
       tags: [Mesh Config Drift]
       security:
         - bearerAuth: []
@@ -4079,7 +4097,15 @@ paths:
         plus unconditional security-sensitive backup export and authenticated
         backup-attempt records. Requires an admin-role JWT. Each event
         includes actor, action, resource identity, timestamp, and a JSON diff.
-        Events may also include `namespace_at_event` (the namespace in effect
+        The list is filtered by the request `X-Ferrum-Namespace` (the
+        authorization-scoping field). Namespace-scoped mutations are labeled
+        with that header only after the `ns`-claim gate has authorized it when
+        `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` is on. Fleet-global mutations
+        (TLS/ACME management, `POST /mesh/config-revision/reset`), invalid
+        namespace headers, and `ns`-claim denials are stored under the
+        canonical default namespace (`ferrum`) so a caller cannot file a
+        privileged record under another tenant. Events may also include
+        `namespace_at_event` (the namespace in effect
         when the event was written; never rewritten on tenant rename),
         `source_address` (canonical socket peer), a bounded `request_id`, and a
         fixed-cardinality `outcome`. Consumer
@@ -4250,6 +4276,9 @@ paths:
           description: |
             All resources created successfully. In database mode the committed
             generation is already live on this process.
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -4518,6 +4547,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Configuration restored successfully
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -4627,12 +4659,21 @@ paths:
             intentionally retained uncertain operation instead returns the
             stable retryable namespace-admission error. Database mode with
             `FERRUM_ADMIN_READ_ONLY=true` still returns `403`.
+
+            In database mode this status is also returned after restore has
+            committed when the in-process poll-loop reload cannot make that
+            generation live (`applied: false` and a closed `reason`). That
+            committed-but-not-live family may carry `X-Ferrum-Config-Cursor`
+            so the caller can keep gating on `GET /config/apply-status`. The
+            pre-commit abort family never attaches the cursor.
           headers:
             Retry-After:
               description: Present as `1` for namespace-admission contention.
               schema:
                 type: integer
                 minimum: 1
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -4721,6 +4762,9 @@ paths:
           description: |
             Proxy created. In database mode a covering `config_changes`
             generation is already live on this process.
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -4797,6 +4841,9 @@ paths:
           description: |
             Proxy updated. In database mode a covering `config_changes`
             generation is already live on this process.
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -4866,6 +4913,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Proxy deleted
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
         "400":
           description: Deletion would leave an invalid plugin-composition graph, or an API-spec-owned proxy has foreign/missing ownership metadata or another restore-snapshot shape that atomic compensation cannot reproduce safely, or `cleanup_orphaned_upstream` was duplicated or supplied with a value other than the exact strings `true` or `false`
           content:
@@ -4955,6 +5005,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "201":
           description: Consumer created
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5029,6 +5082,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Consumer updated
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5069,6 +5125,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Consumer deleted
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -5139,6 +5198,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Credentials updated — returns full consumer object
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5193,6 +5255,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Credential appended — returns full consumer object
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5247,6 +5312,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Credential removed
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -5298,6 +5366,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Credential entry removed — returns full consumer object
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5480,6 +5551,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "201":
           description: Plugin configuration created
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5542,6 +5616,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Plugin configuration updated
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5572,6 +5649,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Plugin configuration deleted
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
         "400":
           description: Deletion would expose an invalid plugin-composition graph, including unsupported TCP connection-throttle attachments
           content:
@@ -5645,6 +5725,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "201":
           description: Created upstream
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5705,6 +5788,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Updated upstream
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5743,6 +5829,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Upstream deleted
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -5835,6 +5924,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "201":
           description: Created gateway trust bundle
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5918,6 +6010,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Updated gateway trust bundle
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -5957,6 +6052,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Gateway trust bundle deleted
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -6106,7 +6204,7 @@ paths:
         "501":
           $ref: "#/components/responses/NamespaceRegistryAtomicityUnsupported"
         "503":
-          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionPreCommitUnavailable"
 
   /namespaces/{name}:
     parameters:
@@ -6227,6 +6325,9 @@ paths:
       responses:
         "200":
           description: Updated namespace
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -6310,6 +6411,9 @@ paths:
       responses:
         "204":
           description: Namespace deleted
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -6620,6 +6724,8 @@ paths:
               schema:
                 type: string
               description: URL of the newly created spec (`/api-specs/{id}`)
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -6849,6 +6955,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "200":
           description: Spec replaced; spec-owned resources recreated
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
           content:
             application/json:
               schema:
@@ -6965,6 +7074,9 @@ paths:
           $ref: "#/components/responses/AcceptedDeferred"
         "204":
           description: Spec and spec-owned resources deleted
+          headers:
+            X-Ferrum-Config-Cursor:
+              $ref: "#/components/headers/X-Ferrum-Config-Cursor"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -7194,11 +7306,16 @@ components:
         generation is live on this process. `async` is the explicit
         bulk-provisioning opt-in: the mutation commits durably, the covering
         cursor is still captured fail-closed under the write pins, and the
-        response is `202 Accepted` with an `X-Ferrum-Config-Cursor` header
-        instead of waiting — one blocking `GET /config/apply-status` on the
-        last cursor then proves every prior deferred write live with a single
-        reload. Request-level validation (`400`) still happens synchronously;
-        only graph-level poll rejections are deferred to the status endpoint.
+        response is `202 Accepted` instead of waiting — one blocking
+        `GET /config/apply-status` on the last cursor then proves every prior
+        deferred write live with a single reload. Request-level validation
+        (`400`) still happens synchronously; only graph-level poll rejections
+        are deferred to the status endpoint.
+
+        When this process serves the written namespace, a covering cursor is
+        attached as the optional `X-Ferrum-Config-Cursor` header on
+        synchronous 2xx, deferred `202`, and the committed-but-not-live `503`
+        — not on pre-commit validation, admission, or storage failures.
 
         Exactly one occurrence of the exact string `sync` or `async` is
         accepted; any other value or a duplicate returns `400`, because this
@@ -7257,14 +7374,18 @@ components:
     X-Ferrum-Config-Cursor:
       description: |
         Covering live-apply cursor of a config-database mutation, as
-        `{topology_epoch}:{sequence}` (issue #4139). Present on database-mode
-        mutation responses when this process serves the written namespace —
+        `{topology_epoch}:{sequence}` (issue #4139). Optional: present on
+        database-mode mutation responses when this process serves the written
+        namespace and a covering cursor was captured after durable commit —
         on synchronous 2xx (the proven-live generation), on deferred `202`
         (the cursor to prove later), and on the committed-but-not-live `503`
         (so the caller can keep gating on `GET /config/apply-status` instead
-        of guessing whether the durable commit converged). Cursors are
-        monotone per topology epoch, so a bulk client only needs to keep the
-        last one it saw.
+        of guessing whether the durable commit converged). Absent on
+        pre-commit validation, admission, and storage failures, on writes to
+        a namespace this process does not serve, and in CP/file/DP modes.
+        HeaderValue formatting can also omit it. Cursors are monotone per
+        topology epoch, so a bulk client only needs to keep the last one it
+        saw.
       required: false
       schema:
         type: string
@@ -7362,6 +7483,35 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    NamespaceAdmissionPreCommitUnavailable:
+      description: >-
+        Nothing was applied. The admin write gate may have refused the
+        mutation because the database was unavailable, failover writes were
+        disabled, or fail-closed audit preparation failed. Otherwise the
+        namespace may be fenced by another mutation (including an
+        intentionally retained uncertain operation), the namespace-registry
+        admission lease was not held at the commit boundary, or the database
+        aborted the transaction as a serialization failure or deadlock
+        victim. The response has no `applied` field and never carries
+        `X-Ferrum-Config-Cursor`. Admission/transaction aborts carry
+        `rollback: not_needed` and a fixed redacted message; uniqueness and
+        name conflicts are `409` instead.
+      headers:
+        Retry-After:
+          required: false
+          description: >-
+            Minimum delay in seconds before retrying; present for
+            namespace-admission contention.
+          schema:
+            type: integer
+            minimum: 1
+            example: 1
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: Namespace mutation is temporarily unavailable; retry later
     NamespaceAdmissionUnavailable:
       description: >-
         Two distinct fail-closed families share this response, and the body
@@ -7394,7 +7544,10 @@ components:
         The row is durable; `Retry-After` is not used for this case. Namespace
         registry mutations that change the served runtime snapshot (rename of
         or into the served namespace, and a confirmed cascade delete of the
-        served namespace) use this same contract.
+        served namespace) use this same contract. This family may carry
+        `X-Ferrum-Config-Cursor` (optional; see that header) so the caller can
+        keep gating on `GET /config/apply-status`. The nothing-applied family
+        never attaches the cursor.
       headers:
         Retry-After:
           required: false
@@ -7405,6 +7558,8 @@ components:
             type: integer
             minimum: 1
             example: 1
+        X-Ferrum-Config-Cursor:
+          $ref: "#/components/headers/X-Ferrum-Config-Cursor"
       content:
         application/json:
           schema:
@@ -8137,7 +8292,20 @@ components:
           type: string
         ocsp_der_base64:
           type: string
-          description: Base64-encoded DER OCSP response bytes. The decoded response must be non-empty.
+          description: >
+            Base64-encoded DER OCSP response bytes. The decoded response must be
+            at most 65536 bytes and must parse as a successful OCSP response
+            carrying an `id-pkix-ocsp-basic` `BasicOCSPResponse` with at least
+            one `SingleResponse`. This admin boundary cannot bind the response
+            to a certificate, so certificate-bound validation (CertID match,
+            responder authorization, signature, `thisUpdate`/`nextUpdate`, and
+            `good` status) is mandatory before the response is stapled: a
+            structurally valid record that belongs to another certificate is
+            rejected when the frontend TLS config that references it is built.
+            With `FERRUM_FIPS_MODE=enforce` this boundary also refuses a
+            responder signature algorithm of `sha1WithRSAEncryption` or Ed25519,
+            and a carried responder certificate whose public key is outside the
+            approved set.
         allow_overwrite:
           type: boolean
           default: false
@@ -12251,9 +12419,11 @@ components:
             type: string
           description: |
             Operator-defined key-value tags. Keys beginning with `mesh.` are
-            reserved for Ferrum's trusted mesh projection and are rejected on
-            upstream create/update, API-spec import, restore, and file-config
-            admission; ordinary operator tag keys remain supported.
+            reserved for Ferrum's trusted mesh projection, and keys beginning
+            with `ferrum.srv.` are reserved for DNS-SD's internal RFC 2782 SRV
+            priority-tier metadata. Both namespaces are rejected on upstream
+            create/update, API-spec import, restore, and file-config admission;
+            ordinary operator tag keys remain supported.
         locality:
           type: [string, "null"]
           maxLength: 255
@@ -12281,7 +12451,10 @@ components:
             type: string
           description: |
             Exact label selector. A target matches when its `tags` contain all
-            key/value pairs listed here.
+            key/value pairs listed here. Keys in the reserved `ferrum.srv.`
+            namespace (DNS-SD RFC 2782 priority-tier metadata) are internal
+            load-balancer state, not an addressable selector, and are rejected
+            on operator-provided config loads.
         traffic_policy:
           oneOf:
             - $ref: "#/components/schemas/SubsetTrafficPolicy"
@@ -12885,6 +13058,29 @@ components:
           description: |
             Reserved for DestinationRule parity. Validated and persisted, but
             not yet applied by passive health at runtime.
+        consecutive_error_mode:
+          type: boolean
+          default: false
+          description: |
+            Evaluate `unhealthy_threshold` against the target's consecutive
+            failure streak instead of the sliding-window failure count. False
+            (default) keeps Ferrum's windowed passive health; true is Istio
+            `outlierDetection.consecutive5xxErrors` semantics, where a single
+            success resets the streak and `unhealthy_window_seconds` is not
+            consulted. Set automatically for translated Istio DestinationRules;
+            direct native configuration may opt in explicitly.
+        consecutive_5xx_ejection_disabled:
+          type: boolean
+          default: false
+          description: |
+            When true, the Istio consecutive-5xx detector is disabled
+            (`consecutive5xxErrors: 0`). Matching `unhealthy_status_codes` and
+            locally originated connection failures are ignored — Envoy's
+            default `splitExternalLocalOriginErrors=false` puts those
+            connection failures in the same 5xx bucket, and Ferrum's split
+            mode is deferred and unused. Set automatically for translated
+            Istio DestinationRules that explicitly disable the 5xx detector.
+            Direct native configuration may opt into the same sentinel.
 
     # ── Service Discovery ──────────────────────────────────────────
     ServiceDiscoveryConfig:
@@ -12897,7 +13093,22 @@ components:
           description: Service discovery provider type
         dns_sd:
           type: [object, "null"]
-          description: DNS-SD (SRV record) configuration. Required when provider is `dns_sd`.
+          description: |
+            DNS-SD (SRV record) configuration. Required when provider is `dns_sd`.
+            The poller queries `service_name` off the request path. It discards
+            the RFC 2782 root target `.` and port `0`, admits surviving ports
+            with the same `1..=65535` rule as Kubernetes and Consul, and
+            publishes every remaining priority tier (the eight numerically
+            smallest), tagging each target with its RFC 2782 priority.
+            Traffic is then served only from the lowest-numbered tier that still
+            has a healthy target; the next tier becomes eligible only when every
+            lower tier is fully unhealthy, and loses eligibility again as soon as
+            a lower tier recovers. Tiers are never mixed. Same-tier SRV weights
+            are preserved (weight `0` uses `default_weight`) and the configured
+            load-balancing algorithm runs inside the selected tier. Statically
+            configured targets carry no tier and stay eligible in every tier. A
+            poisoned tier never becomes a tier; if nothing admissible remains,
+            the snapshot is empty.
           required: [service_name]
           properties:
             service_name:
@@ -19170,6 +19381,8 @@ components:
                 type: string
                 description: >-
                   Expected JWT iss claim — routes tokens to this provider.
+                  When set, the token MUST carry iss and it must match exactly;
+                  the issuer check alone rejects only a mismatching claim.
                   Required and must be nonblank when require_dpop is true: the
                   DPoP replay realm is this exact issuer, so key-set or JWKS
                   source rotation cannot reopen a proof. Issuers are compared
@@ -19181,12 +19394,17 @@ components:
                   issuer is refused as a bearer-only bypass.
               audience:
                 type: string
-                description: Expected JWT aud claim
+                description: Expected JWT aud claim; presence is required when set (same contract as audiences)
               audiences:
                 type: array
                 items:
                   type: string
-                description: Accepted JWT aud claims; OR matched
+                description: >-
+                  Accepted JWT aud claims; OR matched. When non-empty the token
+                  MUST carry aud and at least one value must match. When empty,
+                  tokens without aud are accepted and a token that carries aud is
+                  rejected because no acceptable audience is configured (RFC 7519
+                  4.1.3).
               from_headers:
                 type: array
                 items:
@@ -19212,7 +19430,11 @@ components:
                 description: Whether to forward the token-bearing header or query parameter upstream
               require_exp:
                 type: boolean
-                description: Per-provider override for requiring an exp claim
+                description: >-
+                  Per-provider override for requiring an exp claim. Expiry is
+                  always validated when present. A present nbf is always
+                  validated too (it is not required). JWT exp/nbf use zero
+                  clock leeway; DPoP skew is a separate proof contract.
               required_scopes:
                 type: array
                 items:
@@ -19249,6 +19471,36 @@ components:
               claim_headers_separator:
                 type: string
                 description: Separator for array claim header values
+              output_claim_headers:
+                type: array
+                maxItems: 16
+                items:
+                  type: object
+                  required: [header, claim]
+                  additionalProperties: false
+                  properties:
+                    header:
+                      type: string
+                      maxLength: 128
+                      description: Backend-visible request header the claim is published to
+                    claim:
+                      type: string
+                      maxLength: 256
+                      description: Dot-path claim to publish
+                description: >-
+                  Istio RequestAuthentication jwtRules[].outputClaimToHeaders
+                  projection. An ordered list rather than a map, because one claim
+                  may be published to several headers. Destinations are
+                  gateway-owned exactly like claim_headers: each is removed from
+                  the client request (case-insensitively) before validation and set
+                  only from a validated claim, so an unauthenticated or invalid
+                  request can never forge one. Duplicate destination headers,
+                  reserved/credential-bearing destinations, and invalid header names
+                  are rejected at config load. Only nonblank string, integer, and
+                  boolean claims are published (Istio ClaimToHeader does not support
+                  arrays, objects, null, or floating-point numbers); anything else
+                  or a header-illegal value leaves the destination absent. A rendered
+                  claim value over 8192 bytes is omitted before fan-out.
               require_mtls_binding:
                 type: boolean
                 default: false
@@ -20291,9 +20543,9 @@ components:
         construction time from the slice-embedded workload identity, except in
         node-waypoint topology where the filter runs per-request against the
         pod-scoped cache attached to `RequestContext`. `TargetRefs`
-        (AuthorizationPolicy `spec.targetRefs`) is waypoint-only and is
-        additionally re-checked per request against the exact destination
-        Service and waypoint Gateway/GatewayClass identity — construction-time
+        (AuthorizationPolicy `spec.targetRef` / `spec.targetRefs`) is
+        waypoint-only and is additionally re-checked per request against the
+        exact destination Service and waypoint Gateway/GatewayClass identity — construction-time
         retention is OR over the attachment list and never widens a targeted
         policy onto another destination. See `docs/mesh.md`.
       properties:
@@ -25258,9 +25510,21 @@ components:
         backend_read_timeout_ms, else 60000ms, capped at 300000ms). Label-safe
         process-wide ferrum_request_mirror_*_total lifecycle counters are exported
         on authenticated /metrics (no URLs, header names, or plugin IDs). The mirror
-        request-target preserves the raw query (after the same auth credential
-        strips as primary) including repeated pairs, order, flags, empty values,
-        +, percent escapes, and non-ASCII encoded bytes.
+        request-target snapshots the same canonical backend-visible query primary
+        dispatch uses (after auth credential strips), then drops deny-by-default
+        sensitive query pairs from the mirror URL only. Query names are classified
+        with bounded staged percent-decode (every layer through a hard cap of 4;
+        residual valid %XX, malformed, or control-bearing names fail closed).
+        Built-in token/sig/signature matching is delimiter-bounded (oauth_token,
+        x-amz-signature, x-goog-signature denied; continuation_token and signal
+        retained). Delimiter variants of api_key are denied, and raw semicolon-
+        bearing segments fail closed because backend query parsers disagree on
+        whether they contain additional pairs. Retained pairs keep raw encoding,
+        order, flags, empty values, +, percent escapes, and non-ASCII encoded
+        bytes. The primary backend
+        request-target is never rewritten. Forwarding a denied query name requires
+        forward_sensitive_query=true plus a non-empty exact decoded-name
+        forward_sensitive_query_allowlist.
       required:
         - mirror_host
       properties:
@@ -25401,6 +25665,44 @@ components:
             origin unless it is on the exact-name forward_sensitive_header_allowlist.
             Covers HTTP headers and native gRPC metadata (gRPC metadata is carried
             as HTTP/2 headers). Default empty.
+        forward_sensitive_query:
+          type: boolean
+          default: false
+          description: >-
+            Dangerous opt-in. When true, selected origin-bound credential query
+            parameter names may cross to the distinct mirror origin, but only
+            exact percent-decoded names listed in
+            forward_sensitive_query_allowlist. Construction is fail-closed: both
+            fields are required together and the allowlist must be non-empty.
+            Does not change the primary backend request-target.
+        forward_sensitive_query_allowlist:
+          type: array
+          maxItems: 64
+          items:
+            type: string
+            maxLength: 256
+          description: >-
+            Lowercased exact allowlist of denied sensitive query parameter names
+            to forward when forward_sensitive_query is true. Each entry is matched
+            against the fully percent-decoded (bounded staged decode)
+            ASCII-lowercased name (at most 256 bytes) that the deny-by-default
+            policy actually strips (a built-in credential or a
+            sensitive_query_patterns match); non-sensitive names are rejected
+            at construction. At most 64 entries. Default (with
+            forward_sensitive_query false) strips every sensitive query pair.
+        sensitive_query_patterns:
+          type: array
+          maxItems: 64
+          items:
+            type: string
+            maxLength: 128
+          description: >-
+            Additional lowercased substrings matched against each staged
+            percent-decoded query parameter name (case-insensitive; each at most
+            128 bytes, at most 64 entries) that extend the built-in deny-by-default
+            query credential set. A name whose decoded lowercased form contains any
+            pattern is stripped from the mirror request-target unless it is on the
+            exact-name forward_sensitive_query_allowlist. Default empty.
         max_response_body_bytes:
           type: integer
           format: uint64

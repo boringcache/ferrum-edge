@@ -1763,18 +1763,20 @@ fn prepare_normalized_gateway_config_for_mesh(
         // Assigned UNCONDITIONALLY on every apply, so a topology change, a
         // withdrawn NodeWaypoint enrollment, or a service unbound from this
         // waypoint immediately stops being an admissible relay destination
-        // instead of leaving a stale admission behind. Both fields default to
-        // "terminates for nothing", so an unrecognized or gateway topology
-        // refuses every transparent relay rather than falling back to the
-        // slice-wide workload view — which is what made this terminator an
-        // open relay into other nodes' pods.
-        let (inbound_relay_destinations, admits_accepted_local_address) = match runtime.topology {
-            // Own-IDENTITY terminators. Two admission sources, both narrow:
+        // instead of leaving a stale admission behind. Every relay privilege
+        // defaults to "terminates for nothing", so an unrecognized or gateway
+        // topology refuses every transparent relay rather than falling back to
+        // the slice-wide workload view — which is what made this terminator an
+        // open relay into other nodes' pods. Sidecar's loopback-namespace
+        // shortcut is a separate privilege from accepted-local-address
+        // admission and is never inferred from inventory or identity.
+        let inbound_relay_destinations = match runtime.topology {
+            // Own-IDENTITY terminators. Two non-loopback admission sources:
             //
-            // 1. The accepted connection's own local address — the pod IP the
-            //    peer actually reached on this socket. A transport fact, so it
-            //    needs no inventory and works even when the slice resolved no
-            //    local identity.
+            // 1. The accepted connection's own non-loopback local address —
+            //    the address the peer actually reached on this socket. A
+            //    transport fact, so it needs no inventory and works even when
+            //    the slice resolved no local identity.
             // 2. The slice workload record(s) carrying THIS proxy's configured
             //    workload identity (`FERRUM_MESH_WORKLOAD_SPIFFE_ID`). Ambient
             //    is ztunnel-style: it runs OUTSIDE the workload pods' network
@@ -1798,7 +1800,7 @@ fn prepare_normalized_gateway_config_for_mesh(
                     .as_deref()
                     .map(str::trim)
                     .filter(|identity| !identity.is_empty());
-                let destinations = match own_identity {
+                match own_identity {
                     Some(identity) => {
                         crate::modes::mesh::config::inbound_relay_destinations_from_workloads(
                             mesh_slice.workloads.iter().filter(|workload| {
@@ -1821,20 +1823,18 @@ fn prepare_normalized_gateway_config_for_mesh(
                         )
                     }
                     None => Vec::new(),
-                };
-                (destinations, true)
+                }
             }
             // Deliberate multi-destination allowance #1: a NodeWaypoint IS the
             // inbound terminator for every pod enrolled on its node, so those
             // pods' addresses are legitimately not its own. The inventory is the
             // CP-authorized enrolled set (scope + bearer `ns` claim), never the
             // subscription-namespace `workloads` view.
-            MeshTopology::NodeWaypoint => (
+            MeshTopology::NodeWaypoint => {
                 crate::modes::mesh::config::inbound_relay_destinations_from_workloads(
                     &mesh_slice.node_waypoint_capture_destinations,
-                ),
-                false,
-            ),
+                )
+            }
             // Deliberate multi-destination allowance #2: a GAMMA ServiceWaypoint
             // IS the L7 terminator for the services bound to it. NOTE the slice
             // filter is NAMESPACE-level, not service-level:
@@ -1844,21 +1844,25 @@ fn prepare_normalized_gateway_config_for_mesh(
             // the ones backing the bound services. That still refuses every
             // workload outside those namespaces, but do not read it as a
             // per-binding narrowing.
-            MeshTopology::ServiceWaypoint => (
+            MeshTopology::ServiceWaypoint => {
                 crate::modes::mesh::config::inbound_relay_destinations_from_workloads(
                     &mesh_slice.workloads,
-                ),
-                false,
-            ),
+                )
+            }
             // EastWestGateway is SNI passthrough and terminates no HBONE at all.
             // EgressGateway relays to EXTERNAL ServiceEntry destinations through
             // its own admission lists (`egress_udp_destinations` for datagrams,
             // materialized routes for byte streams), never to an in-mesh
             // workload address, so it owns no transparent-relay destination.
-            MeshTopology::EastWestGateway | MeshTopology::EgressGateway => (Vec::new(), false),
+            MeshTopology::EastWestGateway | MeshTopology::EgressGateway => Vec::new(),
         };
         mesh.inbound_relay_destinations = inbound_relay_destinations;
-        mesh.inbound_relay_admits_accepted_local_address = admits_accepted_local_address;
+        mesh.inbound_relay_admits_accepted_local_address = matches!(
+            runtime.topology,
+            MeshTopology::Sidecar | MeshTopology::Ambient
+        );
+        mesh.inbound_relay_admits_loopback_namespace =
+            matches!(runtime.topology, MeshTopology::Sidecar);
     }
     materialize_fault_runtime_overlay(&mut config, &mesh_slice.runtime_overlay);
     materialize_transformer_runtime_overlay(&mut config, &mesh_slice.runtime_overlay);
@@ -4624,6 +4628,11 @@ where
             // masquerade as remote and be excluded by strict locality LB.
             let mut tags = workload.selector.labels.clone();
             crate::modes::mesh::multicluster::strip_reserved_mesh_tags(&mut tags);
+            // Same reasoning for the reserved `ferrum.srv.*` namespace (issue
+            // #4291): it carries the internal RFC 2782 SRV priority-tier
+            // contract, and a copied workload label must not be able to place a
+            // mesh endpoint into a DNS-SD tier.
+            crate::service_discovery::strip_reserved_srv_tags(&mut tags);
             crate::config::types::merge_derived_topology_labels(
                 &mut tags,
                 workload.locality.as_deref(),
@@ -10036,6 +10045,14 @@ fn apply_destination_rules(
             if let Some(ref policy) = dr.traffic_policy {
                 apply_traffic_policy_to_upstream(upstream, policy, runtime)?;
             }
+            // Capture this DR's settled top-level passive tier before an
+            // owner-gated port policy is also projected onto the upstream for
+            // selection-time fallback. Per-port slots and subsets must inherit
+            // the top-level tier itself, not that later owner-only projection.
+            let top_level_passive = upstream
+                .health_checks
+                .as_ref()
+                .and_then(|health| health.passive.clone());
 
             let upstream_policy_ports: std::collections::HashSet<u16> = upstream
                 .targets
@@ -10190,24 +10207,18 @@ fn apply_destination_rules(
 
                 let is_owner_entry =
                     outbound_upstream_owner_port.get(&upstream_owner_key) == Some(port);
-                // Seed a FRESH fanned slot's passive health from the upstream
-                // level — which carries this DR's top-level outlierDetection,
-                // applied above — so a PARTIAL per-port outlier override
-                // layers over the top-level window/recovery fields instead of
-                // over defaults (`passive_health_for_target` prefers a
-                // per-port slot outright). Owner-gated entries only, and only
-                // when the entry actually carries outlierDetection; a slot an
-                // earlier rule already populated keeps its accumulated
-                // layering.
-                let upstream_passive_seed =
-                    if is_owner_entry && port_policy.outlier_detection.is_some() {
-                        upstream
-                            .health_checks
-                            .as_ref()
-                            .and_then(|h| h.passive.clone())
-                    } else {
-                        None
-                    };
+                // Seed every FRESH fanned slot's passive health from the
+                // upstream level, which already carries this DR's top-level
+                // outlierDetection. Ordinary upstreams need the same seed as
+                // owner-gated synthetic upstreams: `passive_health_for_target`
+                // prefers a per-port slot outright, so starting a partial port
+                // block from engine defaults would discard explicit top-level
+                // fields. Selected-subset projection later reapplies the raw
+                // port field mask over that subset's inherited policy.
+                let upstream_passive_seed = port_policy
+                    .outlier_detection
+                    .as_ref()
+                    .and_then(|_| top_level_passive.clone());
                 for store_port in store_ports {
                     let override_slot = upstream.port_overrides.entry(store_port).or_default();
                     if override_slot.passive_health_check.is_none()
@@ -10282,11 +10293,13 @@ fn apply_destination_rules(
                         name: subset.name.clone(),
                         labels: subset.labels.clone(),
                         traffic_policy: subset.traffic_policy.as_ref().map(|sp| {
-                            // Resolve the subset's outlierDetection into a
-                            // PassiveHealthCheck (ejection thresholds) up front,
-                            // the same projection the upstream-level path uses.
+                            // Resolve the subset's outlierDetection over this
+                            // DR's already-applied top-level passive policy.
+                            // A partial subset therefore inherits every omitted
+                            // represented field instead of synthesizing a fresh
+                            // per-block default.
                             let passive_health_check = sp.outlier_detection.as_ref().map(|od| {
-                                let mut passive = PassiveHealthCheck::default();
+                                let mut passive = top_level_passive.clone().unwrap_or_default();
                                 apply_outlier_detection_to_passive(&mut passive, od);
                                 passive
                             });
@@ -10610,21 +10623,18 @@ fn apply_traffic_policy_to_port_override(
         slot.hash_on = mesh_hash_on_to_ferrum(&policy.load_balancer);
     }
     if let Some(ref od) = policy.outlier_detection {
-        // A PARTIAL per-port `outlierDetection` (e.g. only `consecutiveErrors`)
-        // is overlaid field-by-field by `apply_outlier_detection_to_passive`, so
-        // the *base* it layers onto matters. The caller in `apply_destination_rules`
-        // seeds `slot.passive_health_check` from the UPSTREAM-level passive (which
-        // already carries this DR's TOP-LEVEL `outlierDetection`) before calling
-        // here for the owner-gated port, so a partial override correctly layers
-        // over the DR's top-level window/recovery fields rather than over engine
-        // defaults. The `unwrap_or_default()` base is therefore only reached when
-        // there is genuinely no top-level outlier to inherit (no seed) — the
-        // intended fallback, not a regression. NOTE: this is a per-field merge,
-        // not Istio's portLevelSettings "complete replacement"; that divergence
-        // is uniform across the per-port DR knobs and documented in `docs/mesh.md`.
+        // The caller seeds every fresh slot from upstream-level passive health.
+        // Retain the raw field mask as well: cold-path proxy projection reapplies
+        // it over the selected subset, preserving the documented field-level
+        // port > subset > top-level precedence for all represented fields.
         let mut passive = slot.passive_health_check.clone().unwrap_or_default();
         apply_outlier_detection_to_passive(&mut passive, od);
         slot.passive_health_check = Some(passive);
+        if let Some(accumulated) = slot.outlier_detection_overlay.as_mut() {
+            merge_outlier_detection_overlay(accumulated, od);
+        } else {
+            slot.outlier_detection_overlay = Some(od.clone());
+        }
     }
     // Per-port localityLbSetting projection. A later matching DR entry with no
     // localityLbSetting clears an earlier value, mirroring the upstream-level
@@ -11244,9 +11254,49 @@ fn mesh_hash_on_to_ferrum(lb: &Option<MeshLoadBalancer>) -> Option<String> {
     }
 }
 
-fn apply_outlier_detection_to_passive(passive: &mut PassiveHealthCheck, od: &MeshOutlierDetection) {
-    if let Some(consecutive) = od.consecutive_errors {
-        passive.unhealthy_threshold = consecutive;
+/// Overlay a translated Istio `outlierDetection` onto a passive health policy.
+///
+/// `consecutive5xxErrors` is a CONSECUTIVE-failure threshold in Istio, not a
+/// windowed count (issue #4292), so the overlay switches the policy into
+/// consecutive mode for explicit positive values. When no lower-precedence
+/// tier supplied the field, an omitted threshold/cap receives Istio's 5/10%
+/// defaults here; a partial higher-precedence block therefore inherits an
+/// explicit lower-tier value instead of replacing it with a synthesized
+/// per-block default. Explicit `0` disables the consecutive-5xx detector
+/// (HTTP 5xx and locally originated connection failures; split mode is
+/// deferred) via `consecutive_5xx_ejection_disabled`. Ferrum's native windowed
+/// semantics are untouched for policies this overlay never runs on. `interval`
+/// still lands on `unhealthy_window_seconds`: it is inert while consecutive
+/// mode is on (Istio's `interval` is an analysis sweep period), but keeping it
+/// recorded leaves the operator's declared value visible in the admin view and
+/// correct if a policy is later evaluated windowed.
+pub(crate) fn apply_outlier_detection_to_passive(
+    passive: &mut PassiveHealthCheck,
+    od: &MeshOutlierDetection,
+) {
+    match od.consecutive_errors {
+        Some(0) => {
+            // Istio `consecutive5xxErrors: 0` disables the 5xx detector,
+            // including locally originated connection failures that Envoy
+            // counts in that bucket when split mode is off (the default;
+            // Ferrum's split mode is deferred). It must not map to
+            // threshold 0 (which would eject on the first failure). The
+            // sentinel is normally Istio-translated, while direct native
+            // configuration may opt in explicitly.
+            passive.consecutive_5xx_ejection_disabled = true;
+        }
+        Some(consecutive) => {
+            // A higher-precedence overlay with an explicit positive threshold
+            // must clear a stale disable sentinel left by an earlier `Some(0)`.
+            passive.consecutive_5xx_ejection_disabled = false;
+            passive.unhealthy_threshold = consecutive;
+            passive.consecutive_error_mode = true;
+        }
+        None if !passive.consecutive_error_mode && !passive.consecutive_5xx_ejection_disabled => {
+            passive.unhealthy_threshold = 5;
+            passive.consecutive_error_mode = true;
+        }
+        None => {}
     }
     if let Some(interval) = od.interval_seconds {
         passive.unhealthy_window_seconds = interval;
@@ -11254,8 +11304,30 @@ fn apply_outlier_detection_to_passive(passive: &mut PassiveHealthCheck, od: &Mes
     if let Some(ejection) = od.base_ejection_seconds {
         passive.healthy_after_seconds = ejection;
     }
-    if let Some(max_pct) = od.max_ejection_percent {
-        passive.max_ejection_percent = Some(max_pct);
+    match od.max_ejection_percent {
+        Some(max_pct) => passive.max_ejection_percent = Some(max_pct),
+        None if passive.max_ejection_percent.is_none() => {
+            passive.max_ejection_percent = Some(10);
+        }
+        None => {}
+    }
+}
+
+fn merge_outlier_detection_overlay(
+    accumulated: &mut MeshOutlierDetection,
+    overlay: &MeshOutlierDetection,
+) {
+    if overlay.consecutive_errors.is_some() {
+        accumulated.consecutive_errors = overlay.consecutive_errors;
+    }
+    if overlay.interval_seconds.is_some() {
+        accumulated.interval_seconds = overlay.interval_seconds;
+    }
+    if overlay.base_ejection_seconds.is_some() {
+        accumulated.base_ejection_seconds = overlay.base_ejection_seconds;
+    }
+    if overlay.max_ejection_percent.is_some() {
+        accumulated.max_ejection_percent = overlay.max_ejection_percent;
     }
 }
 
@@ -12135,6 +12207,7 @@ fn build_egress_upstream_targets(
                 // mesh provenance/transport marker the data plane owns.
                 let mut tags = ep.labels.clone();
                 crate::modes::mesh::multicluster::strip_reserved_mesh_tags(&mut tags);
+                crate::service_discovery::strip_reserved_srv_tags(&mut tags);
                 crate::config::types::merge_derived_topology_labels(
                     &mut tags,
                     None,
@@ -13218,6 +13291,23 @@ fn build_jwks_provider_config(rule: &MeshJwtRule) -> Option<serde_json::Value> {
 
     if !rule.from_params.is_empty() {
         provider["from_params"] = serde_json::json!(rule.from_params);
+    }
+
+    // Istio `outputClaimToHeaders` (issue #4277). The array shape is preserved
+    // (not collapsed into a claim-keyed map) because Istio allows one claim to
+    // be published to several headers. `jwks_auth` owns every destination:
+    // each is stripped from the inbound request before validation and set only
+    // from a validated claim.
+    if !rule.output_claim_to_headers.is_empty() {
+        provider["output_claim_headers"] = serde_json::json!(
+            rule.output_claim_to_headers
+                .iter()
+                .map(|entry| serde_json::json!({
+                    "header": entry.header,
+                    "claim": entry.claim,
+                }))
+                .collect::<Vec<_>>()
+        );
     }
 
     Some(provider)
@@ -15009,6 +15099,19 @@ async fn arm_mesh_runtime_startup(
                 env_config.frontend_tls_live_reload_enabled,
             )
             .await;
+    }
+
+    // The first mesh slice was converted and accepted before `ProxyState` /
+    // `StreamListenerManager` existed, so the live apply loop correctly treats
+    // it as already applied and never enters the dynamic owner-scoped DTLS
+    // publication path. Seed that exact accepted generation before the first
+    // listener reconcile. A missing or invalid required DTLS identity is fatal
+    // here: no listener may count as started until its owner-scoped material is
+    // valid and the socket is actually serving.
+    if runtime.topology == MeshTopology::NodeWaypoint
+        && let Some(slice) = initial_applied_mesh_slice.as_deref()
+    {
+        publish_initial_node_waypoint_dtls_generation(&proxy_state, runtime, slice).await?;
     }
 
     // Spawn the SPIFFE trust-bundle federation poller reconciler before the
@@ -18370,6 +18473,47 @@ pub fn build_node_waypoint_dtls_owner_configs(
         }
     }
     Ok(configs)
+}
+
+/// Publish the owner-scoped DTLS generation for the already-accepted initial
+/// NodeWaypoint slice before stream listeners reconcile.
+///
+/// The background apply loop receives that slice as its last-applied baseline,
+/// so it intentionally skips the no-op generation. Startup must perform the
+/// corresponding DTLS publication itself or a generated listener has routing
+/// but no owner-scoped certificate/verifier generation and remains deferred.
+/// Any required candidate that cannot be built aborts startup fail-closed;
+/// unlike a later update, there is no prior serving generation to retain.
+pub async fn publish_initial_node_waypoint_dtls_generation(
+    proxy_state: &ProxyState,
+    runtime: &MeshRuntimeConfig,
+    slice: &MeshSlice,
+) -> Result<(), anyhow::Error> {
+    if runtime.topology != MeshTopology::NodeWaypoint {
+        return Ok(());
+    }
+    let config = proxy_state.config.load_full();
+    let configs = match build_node_waypoint_dtls_owner_configs(
+        proxy_state,
+        runtime,
+        slice,
+        config.as_ref(),
+    ) {
+        Ok(configs) => configs,
+        Err(reason) => {
+            proxy_state
+                .stream_listener_manager
+                .record_mesh_node_waypoint_dtls_candidate_failure();
+            return Err(anyhow::anyhow!(
+                "initial NodeWaypoint DTLS generation is not servable: {reason}"
+            ));
+        }
+    };
+    proxy_state
+        .stream_listener_manager
+        .publish_mesh_node_waypoint_dtls_generation(configs)
+        .await;
+    Ok(())
 }
 
 /// Effective `PeerAuthentication` mode for one generated NodeWaypoint DTLS
@@ -28154,6 +28298,12 @@ mod tests {
             .expect("v1 subset passive health resolved from outlierDetection");
         assert_eq!(passive.unhealthy_threshold, 5);
         assert_eq!(passive.unhealthy_window_seconds, 20);
+        // Istio `consecutive5xxErrors` is a consecutive streak, not a windowed
+        // count (issue #4292): the overlay must switch the policy's mode.
+        assert!(
+            passive.consecutive_error_mode,
+            "a translated consecutive5xxErrors must not be evaluated as a sliding-window count"
+        );
     }
 
     #[test]
@@ -33733,6 +33883,7 @@ mod tests {
                 from_headers: Vec::new(),
                 from_params: Vec::new(),
                 forward_original_token: false,
+                output_claim_to_headers: Vec::new(),
             }],
         }
     }
@@ -34054,6 +34205,7 @@ mod tests {
                         from_headers: Vec::new(),
                         from_params: Vec::new(),
                         forward_original_token: false,
+                        output_claim_to_headers: Vec::new(),
                     }],
                 }],
                 ..MeshConfig::default()
@@ -34110,6 +34262,7 @@ mod tests {
                         ],
                         from_params: vec!["access_token".to_string()],
                         forward_original_token: false,
+                        output_claim_to_headers: Vec::new(),
                     }],
                 }],
                 ..MeshConfig::default()
@@ -34163,6 +34316,7 @@ mod tests {
                         from_headers: Vec::new(),
                         from_params: Vec::new(),
                         forward_original_token: false,
+                        output_claim_to_headers: Vec::new(),
                     }],
                 }],
                 ..MeshConfig::default()
@@ -40870,13 +41024,18 @@ mod tests {
 
         // Own-identity terminators with NO configured workload identity: no
         // inventory at all, so the accepted local address is the only
-        // admission. A slice-declared workload reached WITHOUT that proof is
-        // refused — the open-relay fix.
+        // non-loopback admission. A slice-declared workload reached WITHOUT
+        // that proof is refused — the open-relay fix. Loopback is Sidecar-only.
         for topology in [MeshTopology::Sidecar, MeshTopology::Ambient] {
             let mesh = prepared(topology);
             assert!(
                 mesh.inbound_relay_admits_accepted_local_address,
-                "{topology:?} terminates for its own workload"
+                "{topology:?} may admit its accepted non-loopback local address"
+            );
+            assert_eq!(
+                mesh.inbound_relay_admits_loopback_namespace,
+                topology == MeshTopology::Sidecar,
+                "{topology:?} loopback-namespace privilege must be Sidecar-only"
             );
             assert!(
                 mesh.inbound_relay_destinations.is_empty(),
@@ -40887,26 +41046,54 @@ mod tests {
                 decide(&mesh, "10.244.1.7", None),
                 Err(InboundRelayDenial::AddressNotTerminated)
             );
+            let loopback = decide(&mesh, "127.0.0.1", Some(pod_ip));
+            let localhost = decide(&mesh, "localhost", Some(pod_ip));
+            if topology == MeshTopology::Sidecar {
+                assert_eq!(loopback, Ok(()));
+                assert_eq!(localhost, Ok(()));
+                assert_eq!(decide(&mesh, "app.localhost", Some(pod_ip)), Ok(()));
+                assert_eq!(
+                    decide(&mesh, "127.0.0.1", None),
+                    Err(InboundRelayDenial::AddressNotTerminated)
+                );
+            } else {
+                assert_eq!(loopback, Err(InboundRelayDenial::AddressNotTerminated));
+                assert_eq!(localhost, Err(InboundRelayDenial::AddressNotTerminated));
+                assert_eq!(
+                    decide(&mesh, "app.localhost", Some(pod_ip)),
+                    Err(InboundRelayDenial::AddressNotTerminated)
+                );
+            }
         }
 
         // NodeWaypoint: the CP-authorized enrolled pods, never the
         // subscription-namespace workload view, and never its own address.
         let mesh = prepared(MeshTopology::NodeWaypoint);
         assert!(!mesh.inbound_relay_admits_accepted_local_address);
+        assert!(!mesh.inbound_relay_admits_loopback_namespace);
         assert_eq!(hosts(&mesh), vec![MeshInboundRelayHost::Ip(enrolled_ip)]);
         assert_eq!(decide(&mesh, "10.244.2.9", Some(pod_ip)), Ok(()));
         assert_eq!(
             decide(&mesh, "10.244.1.7", Some(pod_ip)),
             Err(InboundRelayDenial::AddressNotTerminated)
         );
+        assert_eq!(
+            decide(&mesh, "127.0.0.1", Some(pod_ip)),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
 
         // ServiceWaypoint: the already waypoint-narrowed backing workloads.
         let mesh = prepared(MeshTopology::ServiceWaypoint);
         assert!(!mesh.inbound_relay_admits_accepted_local_address);
+        assert!(!mesh.inbound_relay_admits_loopback_namespace);
         assert_eq!(hosts(&mesh), vec![MeshInboundRelayHost::Ip(pod_ip)]);
         assert_eq!(decide(&mesh, "10.244.1.7", None), Ok(()));
         assert_eq!(
             decide(&mesh, "10.244.2.9", None),
+            Err(InboundRelayDenial::AddressNotTerminated)
+        );
+        assert_eq!(
+            decide(&mesh, "127.0.0.1", None),
             Err(InboundRelayDenial::AddressNotTerminated)
         );
 
@@ -40914,9 +41101,14 @@ mod tests {
         for topology in [MeshTopology::EastWestGateway, MeshTopology::EgressGateway] {
             let mesh = prepared(topology);
             assert!(!mesh.inbound_relay_admits_accepted_local_address);
+            assert!(!mesh.inbound_relay_admits_loopback_namespace);
             assert!(mesh.inbound_relay_destinations.is_empty());
             assert_eq!(
                 decide(&mesh, "10.244.1.7", Some(pod_ip)),
+                Err(InboundRelayDenial::AddressNotTerminated)
+            );
+            assert_eq!(
+                decide(&mesh, "127.0.0.1", Some(pod_ip)),
                 Err(InboundRelayDenial::AddressNotTerminated)
             );
         }
@@ -40942,7 +41134,13 @@ mod tests {
         const OWN_NAME: &str = "reviews.default.svc.cluster.local";
 
         let mut own = workload("reviews", "reviews");
-        own.addresses = vec!["10.244.5.5".to_string(), OWN_NAME.to_string()];
+        own.addresses = vec![
+            "10.244.5.5".to_string(),
+            OWN_NAME.to_string(),
+            "127.0.0.1".to_string(),
+            "localhost".to_string(),
+            "app.localhost".to_string(),
+        ];
         let mut other = workload("ratings", "ratings");
         other.addresses = vec!["10.244.6.6".to_string()];
         let slice = MeshSlice {
@@ -40977,8 +41175,16 @@ mod tests {
             hosts,
             vec![
                 MeshInboundRelayHost::Ip("10.244.5.5".parse().expect("own pod IP")),
+                MeshInboundRelayHost::Ip("127.0.0.1".parse().expect("loopback IP")),
+                MeshInboundRelayHost::Name("app.localhost".to_string()),
+                MeshInboundRelayHost::Name("localhost".to_string()),
                 MeshInboundRelayHost::Name(OWN_NAME.to_string()),
             ]
+        );
+        assert!(mesh.inbound_relay_admits_accepted_local_address);
+        assert!(
+            !mesh.inbound_relay_admits_loopback_namespace,
+            "Ambient must not inherit Sidecar's own-network-namespace loopback privilege"
         );
 
         assert_eq!(decide("10.244.5.5", 8080), Ok(()));
@@ -41012,6 +41218,38 @@ mod tests {
             decide("10.244.0.1", 8080),
             Err(InboundRelayDenial::PortNotDeclared)
         );
+        // Inventory-listed loopback / DNS localhost still reach the Ambient
+        // (host) namespace, so they stay refused. An accepted non-loopback
+        // pod IP does not grant that shortcut either.
+        let pod_ip = "10.244.5.5"
+            .parse::<std::net::IpAddr>()
+            .expect("own pod IP");
+        assert_eq!(
+            mesh.inbound_relay_destination_decision("10.244.5.5", 8080, Some(pod_ip)),
+            Ok(())
+        );
+        assert_eq!(
+            mesh.inbound_relay_destination_decision("10.244.5.5", 9999, Some(pod_ip)),
+            Err(InboundRelayDenial::PortNotDeclared)
+        );
+        for host in [
+            "127.0.0.1",
+            "::1",
+            "localhost",
+            "localhost.",
+            "app.localhost",
+        ] {
+            assert_eq!(
+                mesh.inbound_relay_destination_decision(host, 8080, Some(pod_ip)),
+                Err(InboundRelayDenial::AddressNotTerminated),
+                "Ambient must refuse loopback-namespace authority {host}"
+            );
+            assert_eq!(
+                decide(host, 8080),
+                Err(InboundRelayDenial::AddressNotTerminated),
+                "Ambient must refuse inventory-listed loopback-namespace authority {host}"
+            );
+        }
     }
 
     /// The `sidecar_ingress_declared` marker is SIDECAR-topology only, exactly

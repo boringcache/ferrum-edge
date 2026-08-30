@@ -7,7 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`request_mirror` denies cross-origin query credentials by default**
+  (issue #4295). Sensitive query pairs (`access_token`, `api_key`,
+  delimiter-bounded `token`/`sig`/`signature` including `oauth_token` and
+  `x-amz-signature` / `x-goog-signature`, nested percent-encoded names, and
+  operator `sensitive_query_patterns`) are dropped from the mirror
+  request-target only. Classification checks every decode layer through a
+  hard cap of 4 and fails closed on residual `%XX`. The primary backend
+  request-target is unchanged. Literal semicolon-bearing segments also fail
+  closed because mirror frameworks disagree on whether `;` separates query
+  pairs; delimiter variants of the `api_key` family are denied as well.
+  Forwarding a denied name requires the
+  fail-closed pair `forward_sensitive_query=true` plus an exact decoded-name
+  `forward_sensitive_query_allowlist`. Mirror logs still omit the entire query.
+
 ### Changed
+
+- **BREAKING — `FERRUM_TLS_OFFLOAD_THREADS` nonzero values fail startup**
+  (issue #4294). TLS handshake offload is not implemented; a nonzero setting
+  was previously parsed and then silently ignored. `EnvConfig::validate()`
+  now rejects any value other than `0` before mode dispatch. **Operator
+  action**: leave the variable unset or set it to `0`.
+
+- **BREAKING — seven plugin constructors reject unknown config keys**
+  (issues #4405, #4409). `request_size_limiting`, `ws_message_size_limiting`,
+  `a2a_gateway`, `ws_logging`, and `mcp_gateway` fail closed at construction
+  (file-mode `validate` exit 1). `http_logging` and `prometheus_metrics`
+  remain `OptionalFailOpen`: construction still returns `Err` naming the
+  unknown key, and `validate`/reload warn and omit the instance instead of
+  failing the gateway. `mcp_gateway` also rejects `command` / `args` /
+  `stdio` (root or `servers.*`) with an HTTP-only diagnostic; stdio spawn is
+  not implemented. **Operator action**: rename typos (`max_bytez`,
+  `max_frame_bytez`, `endpont_url`, `render_cache_ttl_secnds`, …) and replace
+  Claude-Desktop `command` with `servers.*.upstream_url` `http://`/`https://`.
+
+- **BREAKING — HTTP/1.1 requests without a Host header are rejected with 400**
+  (issue #4390). RFC 9112 §3.2.2 requires a server to answer 400 when an
+  HTTP/1.1 request lacks a Host field. Ferrum previously only rejected
+  *multiple* Host fields, so a Host-less origin-form request skipped
+  exact/wildcard host tiers and fell through to a catch-all (empty `hosts`)
+  route. `check_protocol_headers()` now rejects HTTP/1.1 when both the Host
+  field and the URI authority are absent. HTTP/1.0 still does not require
+  Host. Absolute-form request-targets (`GET http://host/path HTTP/1.1`) that
+  already carry an authority are accepted without a Host field. An empty
+  Host value (`Host:` with no tokens) is treated as present-but-invalid and
+  also returns 400 on HTTP/1.1. HTTP/2 and HTTP/3 are unchanged
+  (`check_host_authority_consistency()` still governs `:authority`).
+  **Operator action**: any HTTP/1.1 client that omitted Host (non-conformant
+  scanners, some raw sockets, misconfigured health probes) will start seeing
+  `400` `{"error":"HTTP/1.1 request is missing a Host header"}` instead of
+  being routed. Send a Host field, or use HTTP/1.0 / absolute-form if that
+  is the intended protocol.
+
+- The recommended level-1 WAF enforcement posture now blocks SQL injection in
+  admitted request bodies as well as decoded query values, prototype-pollution
+  tokens in decoded query keys and values, and matching payloads carried in
+  declared UTF-16LE/UTF-16BE bodies (issues #4401, #4402, #4403). SQLi body
+  mirrors use the existing query patterns unchanged. UTF-16 transcoding runs
+  only after the existing body content-type, multipart, and binary inspection
+  gates admit the body; those gates are unchanged. **Operator action**: review
+  WAF monitor logs for the new body/query matches before using
+  `default_rule_action: enforce` if application payloads legitimately contain
+  these attack-shaped tokens.
+
+- **BREAKING — translator-owned route header consumers now compose with global
+  transformers** (issue #4304). The auto-emitted `istio-vs-req-xform-*` /
+  `istio-vs-resp-xform-*` instances consume matched
+  `mesh_route_dispatch` header rules without shadowing a same-name global
+  `request_transformer` / `response_transformer`. Before this change, a
+  Gateway API `HTTPRoute` with `RequestHeaderModifier` or
+  `ResponseHeaderModifier` accidentally suppressed the global transformer's
+  static rules on that proxy; those global rules now run first and the matched
+  route rules run last. Istio VirtualService header transforms use the same
+  composition contract. **Operator action**: audit HTTPRoute-backed proxies
+  that relied on the accidental suppression and scope or remove global static
+  rules that should not apply there.
 
 - **BREAKING — `POST /batch` rejects unknown top-level envelope keys**
   (issue #4042). The request is create-only (`consumers`, `upstreams`,
@@ -207,6 +283,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   half-configured identity validate clean.
 
 ### Fixed
+
+- Gateway API `TLSRoute` is watched at `v1` as well as `v1alpha2` (issue #4383).
+  Gateway API v1.5.1 `standard-install.yaml` serves TLSRoute at `v1` only
+  (`v1alpha2`/`v1alpha3` remain on the CRD with `served: false`), so a
+  standard-channel cluster previously skipped the reflector and never
+  programmed passthrough listeners or route status. Experimental-install still
+  serves `v1alpha2`; both versions are dual-watched and de-duplicated the same
+  way as HTTPRoute `v1`/`v1beta1`.
+
+- **DNS background refresh no longer stalls cache eviction** (issue #4270). The
+  proactive refresh task scanned every near-expiry hostname sequentially with
+  no cap, timeout, or delayed tick behavior, and it owned the only production
+  `evict_expired()` call. A degraded resolver with a large cache could leave
+  `FERRUM_DNS_CACHE_MAX_SIZE` unenforced for hours and then burst catch-up
+  sweeps. Refresh now selects soonest-expiry success rows up to
+  `FERRUM_DNS_MAX_CONCURRENT_REFRESHES`, resolves them concurrently through
+  the shared stale-while-revalidate semaphore and dedup map, bounds each
+  SWR and proactive lookup at 15 seconds, observes shutdown with RAII
+  permit/dedup cleanup, and publishes generation-safely
+  (stale-while-revalidate and proactive refresh share one success-generation
+  check) so a stale in-flight result cannot overwrite a newer row or resurrect
+  an evicted hostname. Capacity eviction runs on its own 5s delayed cadence.
+  **Operator action**: none; the existing concurrency env var now also caps
+  proactive refresh per cycle.
 
 - **Security — client-asserted `X-Real-IP` no longer reaches mirror or
   load-test targets** (issue #4164). The primary backend builders drop an

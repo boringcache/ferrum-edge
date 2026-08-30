@@ -1189,6 +1189,65 @@ pub mod _test_support {
         crate::service_discovery::consul::parse_consul_index_header(headers)
     }
 
+    /// Admit one RFC 2782 SRV RR the way [`crate::dns::DnsCache::resolve_srv`]
+    /// does (issue #4291): drop the root target and port 0.
+    pub fn try_srv_answer_for_test(
+        target: &str,
+        port: u16,
+        weight: u16,
+        priority: u16,
+    ) -> Option<crate::dns::SrvAnswer> {
+        crate::dns::try_srv_answer(target, port, weight, priority)
+    }
+
+    /// Map SRV answers into DNS-SD upstream targets (issue #4291).
+    ///
+    /// `records` are `(host, port, weight, priority)` — the same field order
+    /// `DnsCache::resolve_srv` used before it returned [`crate::dns::SrvAnswer`].
+    pub fn dns_sd_targets_from_srv_records_for_test(
+        records: Vec<(String, u16, u16, u16)>,
+        default_weight: u32,
+    ) -> Vec<crate::config::types::UpstreamTarget> {
+        let answers =
+            records
+                .into_iter()
+                .map(|(host, port, weight, priority)| crate::dns::SrvAnswer {
+                    host,
+                    port,
+                    weight,
+                    priority,
+                });
+        crate::service_discovery::dns_sd::targets_from_srv_records(answers, default_weight)
+    }
+
+    /// Reserved tag key carrying a discovered target's RFC 2782 SRV priority
+    /// (issue #4291). The DNS-SD discoverer is its only writer and the load
+    /// balancer's candidate filter its only reader.
+    pub fn srv_priority_tag_for_test() -> &'static str {
+        crate::service_discovery::SRV_PRIORITY_TAG
+    }
+
+    /// Reserved tag-key namespace owning [`srv_priority_tag_for_test`].
+    pub fn reserved_srv_tag_prefix_for_test() -> &'static str {
+        crate::service_discovery::RESERVED_SRV_TAG_PREFIX
+    }
+
+    /// Largest number of distinct RFC 2782 priority tiers DNS-SD publishes and
+    /// the load balancer honors (issue #4291).
+    pub fn max_srv_priority_tiers_for_test() -> usize {
+        crate::service_discovery::MAX_SRV_PRIORITY_TIERS
+    }
+
+    /// Canonical-decimal parse for the reserved SRV priority tag value.
+    pub fn parse_srv_priority_tag_for_test(value: &str) -> Option<u16> {
+        crate::service_discovery::parse_srv_priority_tag(value)
+    }
+
+    /// Drop every reserved `ferrum.srv.*` key from a copied label map.
+    pub fn strip_reserved_srv_tags_for_test(tags: &mut std::collections::HashMap<String, String>) {
+        crate::service_discovery::strip_reserved_srv_tags(tags);
+    }
+
     /// Mutable discovery-loop state used by the production apply pipeline.
     #[derive(Debug, Default)]
     pub struct DiscoveryLoopStateForTest {
@@ -4950,6 +5009,275 @@ pub mod _test_support {
         parse_cluster_enabled, parse_memory_policy_fields,
     };
 
+    // ── plugins/utils/rate_limit (stable local-state lifecycle, issue #4268) ──
+
+    /// Number of live local-state generations retained for one rate-limit
+    /// policy identity, or `None` for a plugin that owns no local limiter.
+    ///
+    /// Dead generations are pruned first, so this doubles as the reclaimability
+    /// probe: once every instance for an identity is dropped the count is zero.
+    pub fn shared_local_rate_limit_generations_for_test(
+        plugin_name: &str,
+        namespace: &str,
+        config_id: &str,
+    ) -> Option<usize> {
+        use crate::plugins::utils::rate_limit::{
+            AiTokenRateAlgorithm, DynamicHttpRateLimitAlgorithm, UdpRateLimitAlgorithm,
+            WsFrameRateAlgorithm, shared_local_limiter_generations_for_test,
+        };
+        let count =
+            match plugin_name {
+                "rate_limiting" | "graphql" | "grpc_method_router" => {
+                    shared_local_limiter_generations_for_test::<DynamicHttpRateLimitAlgorithm>(
+                        namespace,
+                        plugin_name,
+                        config_id,
+                    )
+                }
+                "ai_rate_limiter" => shared_local_limiter_generations_for_test::<
+                    AiTokenRateAlgorithm,
+                >(namespace, plugin_name, config_id),
+                "ws_rate_limiting" => shared_local_limiter_generations_for_test::<
+                    WsFrameRateAlgorithm,
+                >(namespace, plugin_name, config_id),
+                "udp_rate_limiting" => shared_local_limiter_generations_for_test::<
+                    UdpRateLimitAlgorithm,
+                >(namespace, plugin_name, config_id),
+                _ => return None,
+            };
+        Some(count)
+    }
+
+    /// Build two `rate_limiting` instances on the given policy identities and
+    /// report whether they enforce on the same live local state.
+    pub fn rate_limiting_shares_local_state_for_test(
+        left: (&str, &str, &serde_json::Value),
+        right: (&str, &str, &serde_json::Value),
+    ) -> Result<bool, String> {
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::rate_limiting::RateLimiting;
+
+        let first = RateLimiting::new_with_policy_identity(
+            left.2,
+            PluginHttpClient::default(),
+            left.0,
+            left.1,
+        )?;
+        let second = RateLimiting::new_with_policy_identity(
+            right.2,
+            PluginHttpClient::default(),
+            right.0,
+            right.1,
+        )?;
+        Ok(first.shares_local_state_with(&second))
+    }
+
+    /// Whether one Redis-backed policy identity shares local fallback state
+    /// when constructed through HTTP clients carrying different namespaces.
+    pub fn rate_limiting_shares_across_client_namespaces_for_test(
+        config: &serde_json::Value,
+        policy_namespace: &str,
+        config_id: &str,
+        first_client_namespace: &str,
+        second_client_namespace: &str,
+    ) -> Result<bool, String> {
+        use crate::config::PoolConfig;
+        use crate::dns::{DnsCache, DnsConfig};
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::rate_limiting::RateLimiting;
+
+        let client = |namespace: &str| {
+            PluginHttpClient::new(
+                &PoolConfig::default(),
+                DnsCache::new(DnsConfig::default()),
+                1000,
+                0,
+                100,
+                false,
+                None,
+                std::sync::Arc::new(Vec::new()),
+                namespace,
+                crate::config::BackendEgressPolicy::unrestricted(),
+                std::sync::Arc::new(Vec::new()),
+                0,
+            )
+        };
+        let first = RateLimiting::new_with_policy_identity(
+            config,
+            client(first_client_namespace),
+            policy_namespace,
+            config_id,
+        )?;
+        let second = RateLimiting::new_with_policy_identity(
+            config,
+            client(second_client_namespace),
+            policy_namespace,
+            config_id,
+        )?;
+        Ok(first.shares_local_state_with(&second))
+    }
+
+    /// Whether two identityless standalone `rate_limiting` instances share
+    /// local state. They must not: production
+    /// [`crate::plugin_cache::PluginCache`] paths always attach a validated
+    /// stable identity, and identityless instances cannot share or mutate a live
+    /// production policy's counters.
+    pub fn standalone_rate_limiting_shares_state_for_test(
+        config: &serde_json::Value,
+    ) -> Result<bool, String> {
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::rate_limiting::RateLimiting;
+
+        let first = RateLimiting::new(config, PluginHttpClient::default())?;
+        let second = RateLimiting::new(config, PluginHttpClient::default())?;
+        Ok(first.shares_local_state_with(&second))
+    }
+
+    /// [`rate_limiting_shares_local_state_for_test`] for `graphql`.
+    pub fn graphql_shares_local_state_for_test(
+        left: (&str, &str, &serde_json::Value),
+        right: (&str, &str, &serde_json::Value),
+    ) -> Result<bool, String> {
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::graphql::GraphqlPlugin;
+
+        let first = GraphqlPlugin::new_with_policy_identity(
+            left.2,
+            PluginHttpClient::default(),
+            left.0,
+            left.1,
+        )?;
+        let second = GraphqlPlugin::new_with_policy_identity(
+            right.2,
+            PluginHttpClient::default(),
+            right.0,
+            right.1,
+        )?;
+        Ok(first.shares_local_state_with(&second))
+    }
+
+    /// [`rate_limiting_shares_local_state_for_test`] for `grpc_method_router`.
+    pub fn grpc_method_router_shares_local_state_for_test(
+        left: (&str, &str, &serde_json::Value),
+        right: (&str, &str, &serde_json::Value),
+    ) -> Result<bool, String> {
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::grpc_method_router::GrpcMethodRouter;
+
+        let first = GrpcMethodRouter::new_with_policy_identity(
+            left.2,
+            PluginHttpClient::default(),
+            left.0,
+            left.1,
+        )?;
+        let second = GrpcMethodRouter::new_with_policy_identity(
+            right.2,
+            PluginHttpClient::default(),
+            right.0,
+            right.1,
+        )?;
+        Ok(first.shares_local_state_with(&second))
+    }
+
+    /// [`rate_limiting_shares_local_state_for_test`] for `ai_rate_limiter`.
+    pub fn ai_rate_limiter_shares_local_state_for_test(
+        left: (&str, &str, &serde_json::Value),
+        right: (&str, &str, &serde_json::Value),
+    ) -> Result<bool, String> {
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::ai_rate_limiter::AiRateLimiter;
+
+        let first = AiRateLimiter::new_with_policy_identity(
+            left.2,
+            PluginHttpClient::default(),
+            left.0,
+            left.1,
+        )?;
+        let second = AiRateLimiter::new_with_policy_identity(
+            right.2,
+            PluginHttpClient::default(),
+            right.0,
+            right.1,
+        )?;
+        Ok(first.shares_local_state_with(&second))
+    }
+
+    /// [`rate_limiting_shares_local_state_for_test`] for `udp_rate_limiting`.
+    pub fn udp_rate_limiting_shares_local_state_for_test(
+        left: (&str, &str, &serde_json::Value),
+        right: (&str, &str, &serde_json::Value),
+    ) -> Result<bool, String> {
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::udp_rate_limiting::UdpRateLimiting;
+
+        let first = UdpRateLimiting::new_with_policy_identity(
+            left.2,
+            PluginHttpClient::default(),
+            left.0,
+            left.1,
+        )?;
+        let second = UdpRateLimiting::new_with_policy_identity(
+            right.2,
+            PluginHttpClient::default(),
+            right.0,
+            right.1,
+        )?;
+        Ok(first.shares_local_state_with(&second))
+    }
+
+    /// Build a `ws_rate_limiting` instance bound to a stable policy identity.
+    pub fn ws_rate_limiting_with_policy_identity_for_test(
+        config: &serde_json::Value,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<crate::plugins::ws_rate_limiting::WsRateLimiting, String> {
+        use crate::plugins::PluginHttpClient;
+
+        crate::plugins::ws_rate_limiting::WsRateLimiting::new_with_policy_identity(
+            config,
+            PluginHttpClient::default(),
+            namespace,
+            config_id,
+        )
+    }
+
+    /// Charge one frame at `now` and report whether the local bucket admitted it.
+    pub fn ws_rate_limiting_charge_frame_for_test(
+        plugin: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+        connection_id: u64,
+        now: std::time::Instant,
+    ) -> bool {
+        plugin.charge_frame_locally_at_for_test(connection_id, now)
+    }
+
+    /// Whether `connection_id` still has retained local frame state.
+    pub fn ws_rate_limiting_contains_connection_for_test(
+        plugin: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+        connection_id: u64,
+    ) -> bool {
+        plugin.contains_connection_for_test(connection_id)
+    }
+
+    /// Whether two `ws_rate_limiting` instances enforce on the same live state.
+    pub fn ws_rate_limiting_shares_local_state_for_test(
+        left: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+        right: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+    ) -> bool {
+        left.shares_local_state_with(right)
+    }
+
+    /// Run the production full-reload plugin-cache path: build a candidate
+    /// generation against the currently published one, then publish it
+    /// atomically. Mirrors `ProxyState::update_config`.
+    pub fn plugin_cache_full_reload_for_test(
+        cache: &crate::plugin_cache::PluginCache,
+        config: &crate::config::types::GatewayConfig,
+    ) -> Result<(), String> {
+        let inner = cache.build_inner_with_existing_client(config)?;
+        cache.store_inner(inner);
+        Ok(())
+    }
+
     // ── plugins/utils/rate_limit (Redis failure policy) ──────────────────────
     pub use crate::plugins::utils::rate_limit::{
         ENFORCEMENT_UNAVAILABLE_BODY, ENFORCEMENT_UNAVAILABLE_MESSAGE,
@@ -5068,6 +5396,44 @@ pub mod _test_support {
         MongoReconnectTopology, MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,
     };
 
+    // External test crates only: mirror production `config_changes` shapes without
+    // widening `ferrum_edge::config::mongo_store` public API.
+    /// Canonical `config_changes.operation` values for external unit tests.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MongoConfigChangeOp {
+        Upsert,
+        Delete,
+    }
+
+    /// Typed `config_changes` row decoded by incremental polling.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct MongoConfigChangeRecord {
+        pub sequence: u64,
+        pub resource_type: String,
+        pub resource_id: String,
+        pub operation: MongoConfigChangeOp,
+    }
+
+    /// Decode one `config_changes` document using the production decoder.
+    pub fn decode_mongo_config_change_record(
+        doc: &mongodb::bson::Document,
+    ) -> Result<MongoConfigChangeRecord, anyhow::Error> {
+        let change = crate::config::mongo_store::decode_mongo_config_change_record(doc)?;
+        Ok(MongoConfigChangeRecord {
+            sequence: change.sequence,
+            resource_type: change.resource_type,
+            resource_id: change.resource_id,
+            operation: match change.operation {
+                crate::config::mongo_store::MongoConfigChangeOp::Upsert => {
+                    MongoConfigChangeOp::Upsert
+                }
+                crate::config::mongo_store::MongoConfigChangeOp::Delete => {
+                    MongoConfigChangeOp::Delete
+                }
+            },
+        })
+    }
+
     /// Lazy Mongo store (no live MongoDB) for topology publication tests.
     pub fn mongo_store_new_unconnected_for_test(
         failover_urls: Vec<String>,
@@ -5122,6 +5488,15 @@ pub mod _test_support {
     /// clear the fault when the test finishes.
     pub fn set_atomic_batch_fault_for_test(namespace: &str, fault: Option<AtomicBatchFault>) {
         crate::config::batch_atomicity::set_atomic_batch_fault(namespace, fault);
+    }
+
+    /// Install (or clear, with `None`) a deterministic `POST /batch`
+    /// reference-check failure for one namespace. The injected detail is
+    /// treated as a raw persistence error so tests can prove it is redacted
+    /// to the shared 503 `db_error_response` body. Always clear the fault when
+    /// the test finishes.
+    pub fn set_batch_reference_check_fault_for_test(namespace: &str, detail: Option<&str>) {
+        crate::admin::set_batch_reference_check_fault(namespace, detail);
     }
 
     pub use crate::config::namespace_registry::NamespaceRegistryPhase;
@@ -6770,6 +7145,15 @@ pub mod _test_support {
                 .await,
             Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded)
         )
+    }
+
+    /// Whether a captured authorization plan has already elapsed — the exact
+    /// Instant check native plain-H3 relays use at backend EOS before `finish()`
+    /// (issue #4363).
+    pub fn captured_authorization_elapsed_for_test(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        crate::http3::stream_util::captured_authorization_elapsed(plan)
     }
 
     /// Outcome of racing one native-H3 gRPC upload-pump await against shutdown
@@ -11952,6 +12336,39 @@ pub mod _test_support {
         crate::proxy::canonical_header_content_length_from_map(headers)
     }
 
+    /// Whether a streaming response must wrap the size-limited adapter, using
+    /// the trusted backend-observed length captured before `after_proxy`.
+    pub fn streaming_response_requires_size_limit_for_test(
+        max_response_body_size_bytes: usize,
+        trusted_backend_content_length: Option<u64>,
+    ) -> bool {
+        crate::proxy::streaming_response_requires_size_limit(
+            max_response_body_size_bytes,
+            trusted_backend_content_length,
+        )
+    }
+
+    /// Direct-H2 large-response passthrough predicate. Callers must pass the
+    /// trusted backend-observed length, never a post-hook header.
+    pub fn should_bypass_h2_coalesce_for_large_response_for_test(
+        trusted_backend_content_length: Option<u64>,
+        max_response_body_size_bytes: usize,
+    ) -> bool {
+        crate::proxy::should_bypass_h2_coalesce_for_large_response(
+            trusted_backend_content_length,
+            max_response_body_size_bytes,
+        )
+    }
+
+    /// Post-hook declared length used only for HEAD advertisement and H3
+    /// client-facing completeness — not size-limit enforcement.
+    pub fn preserved_response_content_length_for_test(
+        headers: &std::collections::HashMap<String, String>,
+        status: u16,
+    ) -> Option<u64> {
+        crate::proxy::headers::preserved_response_content_length(headers, status)
+    }
+
     /// Request-side declared-length reject predicate used by every dispatch path.
     pub fn declared_request_content_length_over_limit_for_test(
         headers: &std::collections::HashMap<String, String>,
@@ -12992,6 +13409,21 @@ pub mod _test_support {
     /// Return the bounded exponential delay after `previous_failures`.
     pub fn spec_expose_failure_backoff_seconds_for_test(previous_failures: u32) -> u64 {
         crate::plugins::spec_expose::spec_expose_failure_backoff_seconds(previous_failures)
+    }
+
+    /// Production HBONE CONNECT circuit-breaker settlement after
+    /// `connect_backend`. External tests use this so a DNS-screen 403 cannot
+    /// drift from the served HALF_OPEN accounting.
+    pub fn settle_hbone_backend_connect_circuit_breaker_outcome_for_test(
+        cb: &crate::circuit_breaker::CircuitBreaker,
+        status: hyper::StatusCode,
+        is_half_open_probe: bool,
+    ) {
+        crate::proxy::settle_hbone_backend_connect_circuit_breaker_outcome(
+            cb,
+            status,
+            is_half_open_probe,
+        )
     }
 
     /// Build an email channel with deterministic `*_env` resolution for unit

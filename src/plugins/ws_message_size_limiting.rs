@@ -24,6 +24,11 @@ use tracing::warn;
 
 use super::utils::size_limit::required_positive_usize;
 use super::{Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketSizeLimits};
+use crate::util::unknown_keys::reject_unknown_keys;
+
+/// Authoritative closed set of top-level `ws_message_size_limiting` configuration keys.
+const WS_MESSAGE_SIZE_LIMITING_CONFIG_KEYS: &[&str] =
+    &["close_reason", "max_frame_bytes", "max_message_bytes"];
 
 pub struct WsMessageSizeLimiting {
     max_frame_bytes: usize,
@@ -35,9 +40,15 @@ impl WsMessageSizeLimiting {
     const MAX_CLOSE_REASON_BYTES: usize = 123;
 
     pub fn new(config: &Value) -> Result<Self, String> {
-        if !config.is_object() {
+        let Some(config_obj) = config.as_object() else {
             return Err("ws_message_size_limiting: config must be an object".to_string());
-        }
+        };
+        reject_unknown_keys(
+            config_obj,
+            "config",
+            WS_MESSAGE_SIZE_LIMITING_CONFIG_KEYS,
+            "ws_message_size_limiting: ",
+        )?;
 
         let max_frame_bytes =
             required_positive_usize(config, "max_frame_bytes", "ws_message_size_limiting")?;
