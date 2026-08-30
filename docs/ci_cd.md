@@ -926,9 +926,14 @@ PostgreSQL load-stress test run weekly and on manual dispatch in the
 `Scheduled Scaling Regression` workflow. Its matrix jobs have independent
 failure signals and a five-hour timeout for the large provisioning and load
 phases (raised from three hours by issue #4136, after read-your-write live
-apply made every batch pay a synchronous convergence cost). A red matrix, or a latest main scaling-regression run that is not a
-completed success within eight days (the daily
-`Scheduled Scaling Gate Freshness` workflow), upserts a `severity:high`
+apply made every batch pay a synchronous convergence cost). The 30k harness
+does not count route-miss 404s from an in-flight config publication as routing
+failures: it discards that partial 30-second window, proves end-to-end
+convergence again, and permits one full-window restart. A second interrupted
+window fails explicitly as convergence instability; non-404 failures and RPS
+remain routing measurements. A red matrix, or a latest main
+scaling-regression run that is not a completed success within eight days (the
+daily `Scheduled Scaling Gate Freshness` workflow), upserts a `severity:high`
 issue so the streak cannot stay silent. Weekly and daily publisher jobs
 share `concurrency.group: scaling-gate-publisher` with `queue: max` and
 `cancel-in-progress: false` so a newer publisher does not replace queued

@@ -15,7 +15,8 @@ use scheduled_scaling::{
     ADMIN_BATCH_REQUEST_TIMEOUT_SECS, APPLY_STATUS_WAIT_MS, BATCH_ROLLBACK_NOT_NEEDED,
     BatchApplyCursor, BatchProvisionDecision, CONFIG_CONVERGENCE_MAX_WAIT_SECS,
     CONFIG_CONVERGENCE_POLL_INTERVAL_SECS, NAMESPACE_FENCE_DEFAULT_RETRY_AFTER_SECS,
-    NAMESPACE_FENCE_MAX_ATTEMPTS, NAMESPACE_FENCE_MAX_BACKOFF_SECS,
+    MEASUREMENT_WINDOW_MAX_ATTEMPTS, NAMESPACE_FENCE_MAX_ATTEMPTS,
+    NAMESPACE_FENCE_MAX_BACKOFF_SECS,
     NAMESPACE_FENCE_MAX_RETRY_AFTER_SECS, NAMESPACE_FENCE_MAX_TOTAL_RETRY_SECS,
     NAMESPACE_FENCE_RETRY_MESSAGE, SCHEDULED_SCALING_ADMIN_JWT_TTL_SECS,
     classify_admin_batch_response, documented_batch_rollback_not_needed_body,
@@ -372,6 +373,18 @@ fn both_harnesses_gate_measurement_on_bounded_convergence_not_a_fixed_sleep() {
             "{name} harness must not fall back to a fixed sleep after a failed sample probe"
         );
     }
+
+    assert_eq!(MEASUREMENT_WINDOW_MAX_ATTEMPTS, 2);
+    assert!(SCALE.contains("convergence_interruption.notified()"));
+    assert!(
+        SCALE.contains("r.status() == reqwest::StatusCode::NOT_FOUND")
+    );
+    assert!(
+        SCALE.contains("discarding interrupted measurement window")
+    );
+    assert!(
+        SCALE.contains("Configuration convergence instability interrupted all")
+    );
 }
 
 #[test]
