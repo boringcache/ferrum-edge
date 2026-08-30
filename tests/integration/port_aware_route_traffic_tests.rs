@@ -454,10 +454,24 @@ async fn gateway_listener_ports_follow_config_reload_add_and_withdraw() {
         .await
         .expect("file::serve starts");
 
-        assert_eq!(
-            handles.gateway_listeners.active_ports().await,
-            vec![listener_a_port]
-        );
+        let active_ports = handles.gateway_listeners.active_ports().await;
+        if !active_ports.contains(&listener_a_port) {
+            eprintln!(
+                "reload add/withdraw attempt {attempt}/{GATEWAY_LISTENER_STARTUP_ATTEMPTS} \
+                 lost declared-port reservation race on port {listener_a_port}"
+            );
+            let _ = shutdown_tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_secs(5), handles.join()).await;
+            if attempt == GATEWAY_LISTENER_STARTUP_ATTEMPTS {
+                assert_eq!(
+                    active_ports,
+                    vec![listener_a_port],
+                    "declared listener port must be bound by the gateway after all retries"
+                );
+            }
+            continue;
+        }
+        assert_eq!(active_ports, vec![listener_a_port]);
         assert_eq!(http_get(listener_a_port, "/api/x").await.0, 200);
         if undeclared_port_stolen_externally(&handles, listener_b_port).await {
             eprintln!(
