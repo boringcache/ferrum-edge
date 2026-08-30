@@ -62904,6 +62904,11 @@ mod tests {
                 },
             ],
             inbound_relay_admits_accepted_local_address: true,
+            // What the apply path projects for an own-pod terminator: the
+            // per-address port bound of the record it owns (issue #4249).
+            inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
+                relay_guard_workload("app", &["10.1.2.3", "127.0.0.1"], &[8080]),
+            ]),
             ..MeshConfig::default()
         };
         let ambient_decide = |host: &str, port: u16| {

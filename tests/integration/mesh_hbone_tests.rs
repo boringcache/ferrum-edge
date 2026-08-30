@@ -1699,6 +1699,11 @@ fn ambient_terminator_mesh() -> MeshConfig {
             },
         ],
         inbound_relay_admits_accepted_local_address: true,
+        // What the apply path projects for an own-pod terminator: the
+        // per-address port bound of the record it owns (issue #4249).
+        inbound_relay_own_address_ports: own_address_port_bounds_from_workloads(&[
+            relay_guard_workload("app", &["10.244.1.7", "127.0.0.1"], &[8080]),
+        ]),
         ..MeshConfig::default()
     }
 }
@@ -3570,7 +3575,8 @@ fn inbound_relay_ambient_own_address_fails_closed_on_two_pods_sharing_an_address
     );
     assert_eq!(
         mesh.inbound_relay_destination_decision("localhost", 8080, own_ip),
-        Err(InboundRelayDenial::PortNotDeclared)
+        Err(InboundRelayDenial::PortNotDeclared),
+        "the ambiguous own-address port bound precedes the Ambient loopback capability denial"
     );
 
     // The registry-bounded general inventory is unchanged and still admits the
