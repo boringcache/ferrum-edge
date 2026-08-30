@@ -208,7 +208,8 @@ need them, or because they are blocked upstream / architecturally:
   targets so they cannot become plaintext backends, and destination-side
   `mesh_authz` trusts HBONE baggage only from exact NodeWaypoint SPIFFE IDs in
   the CP-derived `node_waypoint_assertors` inventory, which is built from
-  scope-authorized workloads before namespace/service slice narrowing.
+  destination-visible, CP-scope-authorized, and bearer-`ns`-authorized
+  workloads before namespace/service slice narrowing.
   Explicit no-CA/no-identity development runs retain the temporary plaintext
   fallback and built-in assertor defaults. The pod-veth tc guard now drops
   unmanaged direct Pod-IP attempts to enrolled destination pods unless the

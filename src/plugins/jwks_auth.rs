@@ -160,6 +160,8 @@ struct JwksProvider {
     /// Expected `iss` claim value. Used to match incoming tokens to this provider.
     issuer: Option<String>,
     /// Accepted `aud` claim values. jsonwebtoken treats this as OR matching.
+    /// When non-empty, `aud` must be present; `set_audience` alone does not
+    /// require presence.
     audiences: Vec<String>,
     /// Configured token extraction locations.
     token_locations: Vec<TokenLocation>,
@@ -1847,8 +1849,13 @@ async fn try_validate_with_provider(provider: &JwksProvider, token: &str) -> Opt
             issuer: provider.issuer.as_deref(),
             audiences: &provider.audiences,
             require_exp: provider.require_exp,
+            // JWT `exp`/`nbf` use this surface's existing 0-second leeway.
+            // DPoP `dpop_clock_skew` is a separate proof-validation contract.
             leeway_secs: 0,
-            validate_nbf: false,
+            // `nbf` stays optional (not a required claim). When present it
+            // must be enforced so a pre-minted credential cannot authenticate
+            // before its not-before instant.
+            validate_nbf: true,
         },
     )
     .await

@@ -2194,13 +2194,13 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | `providers[].jwks_uri` | String | Direct URL to the IdP's JWKS endpoint. HTTPS is required except for literal loopback or `localhost`; URL userinfo is rejected |
 | `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`). HTTPS is required except for literal loopback or `localhost`, and URL userinfo is rejected. SSRF hardening: the discovered `jwks_uri` must use the **same origin** as the discovery URL (scheme, host, and effective port). For IdPs that serve JWKS from a different origin than discovery (e.g. Google `accounts.google.com` → `www.googleapis.com`, and some Azure AD / Okta / Auth0 setups), set `providers[].jwks_uri` directly instead of `discovery_url`. |
 | `providers[].jwks` | String/Object (optional) | Inline JWKS JSON; useful for mesh-provided or static key sets |
-| `providers[].issuer` | String (optional; **required** with `require_dpop`) | Expected JWT `iss` claim — routes tokens to this provider. When `require_dpop` is true this must be a nonblank exact issuer: it is the DPoP replay realm, so key-set or JWKS-source rotation cannot reopen a proof. Issuers are compared exactly (not URL-canonicalized). Providers in one policy that share this exact issuer share one replay realm and must agree on `require_dpop` (and, when DPoP is required, on replay scope and process capacity). A non-DPoP sibling for the same issuer is refused as a bearer-only bypass |
-| `providers[].audience` | String (optional) | Expected JWT `aud` claim |
-| `providers[].audiences` | String[] (optional) | Accepted JWT `aud` values; OR-matched |
+| `providers[].issuer` | String (optional; **required** with `require_dpop`) | Expected JWT `iss` claim — routes tokens to this provider. When set, the token MUST carry `iss` and it must match exactly (`set_issuer` alone rejects only a mismatching claim). When `require_dpop` is true this must be a nonblank exact issuer: it is the DPoP replay realm, so key-set or JWKS-source rotation cannot reopen a proof. Issuers are compared exactly (not URL-canonicalized). Providers in one policy that share this exact issuer share one replay realm and must agree on `require_dpop` (and, when DPoP is required, on replay scope and process capacity). A non-DPoP sibling for the same issuer is refused as a bearer-only bypass |
+| `providers[].audience` | String (optional) | Expected JWT `aud` claim; presence is required when set (same contract as `audiences`) |
+| `providers[].audiences` | String[] (optional) | Accepted JWT `aud` values; OR-matched. When non-empty, the token MUST carry `aud` and at least one value must match. When empty, tokens without `aud` are accepted; a token that carries `aud` is rejected because no acceptable audience is configured (RFC 7519 §4.1.3) |
 | `providers[].from_headers` | Array (optional) | Header token locations, each `{ "name": "...", "prefix": "..." }`; empty prefix is treated as no prefix |
 | `providers[].from_params` | String[] (optional) | Query parameter token locations |
 | `providers[].forward_original_token` | Boolean (optional) | Forward the token-bearing header/query param to the backend (default `true`) |
-| `providers[].require_exp` | Boolean (optional) | Require an `exp` claim for this provider; expiry is always validated when present |
+| `providers[].require_exp` | Boolean (optional) | Require an `exp` claim for this provider; expiry is always validated when present. A present `nbf` is always validated (it is not required). JWT `exp`/`nbf` use zero clock leeway; DPoP skew is a separate proof contract |
 | `providers[].required_scopes` | String[] (optional) | Scopes that must all be present in the token |
 | `providers[].required_roles` | String[] (optional) | Roles where any one must be present in the token |
 | `providers[].scope_claim` | String (optional) | Per-provider override for scope claim path |
@@ -3785,7 +3785,7 @@ Handles Cross-Origin Resource Sharing at the gateway level.
 | `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Preflight-only allowed methods; not evaluated on actual requests |
 | `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Preflight-only allowed request headers; not evaluated on actual requests |
 | `exposed_headers` | String[] | `[]` | Response headers exposed to browser JavaScript |
-| `allow_credentials` | bool | `false` | Send `Access-Control-Allow-Credentials: true` |
+| `allow_credentials` | bool | `false` | Send `Access-Control-Allow-Credentials: true`. Exact `*` drops credentials; opaque exact `null` and an effectively universal prefix or regex are refused. |
 | `max_age` | u64 | `86400` | Preflight cache duration in seconds |
 | `preflight_continue` | bool | `false` | Pass allowed preflights to the backend while replacing its CORS fields with the complete gateway-authoritative policy. |
 | `unmatched_preflights` | `forward` \| `ignore` | — | Istio projection marker preserving unmatched and omitted-field semantics; mutually exclusive with `preflight_continue`. |
@@ -7377,6 +7377,8 @@ See [Proxy Alerts](proxy_alerts.md) for rule types, channel configuration, templ
 ### `workload_metrics`
 
 Adds Istio/GAMMA workload identity labels to request, stream, and log metadata, and can emit mesh telemetry spans when mesh Telemetry providers are configured. Mesh mode auto-injects this plugin when workload metrics are needed, but standalone use is supported for non-mesh gateway deployments that want the same identity labels.
+
+HBONE `source.principal` attribution uses the same trusted-assertor relation as `mesh_authz`. Direct / user-created instances honor that relation from this plugin's own `trusted_hbone_assertors` / `trust_domain_aliases` config. Mesh injection additionally stamps an internal `_effective_mesh_authz_baggage_gates` list that is an exact, fail-closed conjunction of every enabled global `mesh_authz` baggage gate PluginCache will execute (including a force-injected reserved `__mesh_authz` under transparent inbound capture). Disabled operator rows are omitted; each gate keeps its own absent/null/default, explicit `[]`, and alias contract; a sibling cannot silently widen another gate. Malformed or over-bound internal lists fail construction. See [Trusted HBONE Assertors](mesh.md#trusted-hbone-assertors).
 
 See [Mesh Observability](mesh.md#observability) for metric names, service graph aggregation, and tracing behavior.
 

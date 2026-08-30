@@ -99,11 +99,12 @@ fn start_gateway(
     http_port: u16,
     admin_port: u16,
     drain_seconds: u64,
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> std::process::Child {
     let binary_path = gateway_binary_path();
 
-    std::process::Command::new(binary_path)
-        .env("FERRUM_MODE", "file")
+    let mut cmd = std::process::Command::new(binary_path);
+    cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_PROXY_HTTPS_PORT", "0")
@@ -113,23 +114,24 @@ fn start_gateway(
         .env("FERRUM_LOG_LEVEL", "error")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("Failed to start gateway binary")
+        .stderr(std::process::Stdio::null());
+    identity.apply_to_command(&mut cmd);
+    cmd.spawn().expect("Failed to start gateway binary")
 }
 
-async fn wait_for_gateway(admin_port: u16) -> bool {
-    let client = reqwest::Client::new();
-    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
-    for _ in 0..60 {
-        if let Ok(resp) = client.get(&health_url).send().await
-            && resp.status().is_success()
-        {
-            return true;
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
-    false
+async fn wait_for_owned_gateway(
+    child: &mut std::process::Child,
+    admin_port: u16,
+    identity: &crate::common::SpawnedGatewayIdentity,
+) -> bool {
+    crate::common::wait_for_owned_gateway_identity(
+        child,
+        admin_port,
+        identity,
+        Duration::from_secs(15),
+    )
+    .await
+    .is_ok()
 }
 
 async fn ephemeral_port() -> u16 {
@@ -149,9 +151,16 @@ async fn start_gateway_with_retry(
         let proxy_port = ephemeral_port().await;
         let admin_port = ephemeral_port().await;
 
-        let mut child = start_gateway(config_path, proxy_port, admin_port, drain_seconds);
+        let identity = crate::common::SpawnedGatewayIdentity::mint("graceful-shutdown");
+        let mut child = start_gateway(
+            config_path,
+            proxy_port,
+            admin_port,
+            drain_seconds,
+            &identity,
+        );
 
-        if wait_for_gateway(admin_port).await {
+        if wait_for_owned_gateway(&mut child, admin_port, &identity).await {
             return (child, proxy_port, admin_port);
         }
 
@@ -765,14 +774,16 @@ where
         let admin_port = ephemeral_port().await;
         let config_path = write_config(&dir, stream_port);
 
+        let identity = crate::common::SpawnedGatewayIdentity::mint("graceful-shutdown-stream");
         let mut child = start_gateway(
             config_path.to_str().unwrap(),
             proxy_port,
             admin_port,
             drain_seconds,
+            &identity,
         );
 
-        if wait_for_gateway(admin_port).await {
+        if wait_for_owned_gateway(&mut child, admin_port, &identity).await {
             return Some((child, proxy_port, admin_port, dir));
         }
 
