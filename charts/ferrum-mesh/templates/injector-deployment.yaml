@@ -4,6 +4,9 @@
 {{- if not $liveHandler }}{{- $liveHandler = $tcpHandler -}}{{- end -}}
 {{- $readyHandler := .Values.injector.probes.readiness.override | default dict -}}
 {{- if not $readyHandler }}{{- $readyHandler = $tcpHandler -}}{{- end -}}
+{{- $startupHandler := .Values.injector.probes.startup.override | default dict -}}
+{{- if not $startupHandler }}{{- $startupHandler = $liveHandler -}}{{- end -}}
+{{- include "ferrum-mesh.validateComputedProbeHandlers" (dict "component" "injector" "probes" .Values.injector.probes "startupHandler" $startupHandler "liveHandler" $liveHandler "readyHandler" $readyHandler) -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -61,7 +64,7 @@ spec:
             - name: {{ $name }}
               value: {{ $value | quote }}
             {{- end }}
-          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.injector.probes "liveHandler" $liveHandler "readyHandler" $readyHandler) }}
+          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.injector.probes "startupHandler" $startupHandler "liveHandler" $liveHandler "readyHandler" $readyHandler) }}
           volumeMounts:
             - name: injector-tls
               mountPath: /etc/ferrum/injector/tls

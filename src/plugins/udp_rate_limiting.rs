@@ -9,9 +9,10 @@ use std::time::Instant;
 use tracing::warn;
 
 use super::utils::rate_limit::{
-    RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend, STANDALONE_RATE_LIMIT_CONFIG_ID,
-    UdpRateLimitAlgorithm, UdpRateLimitOp, apply_rate_limit_cleanup, debug_assert_closed_root_keys,
-    debug_assert_rate_limit_redis_keys, validate_window_seconds,
+    LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
+    STANDALONE_RATE_LIMIT_CONFIG_ID, UdpRateLimitAlgorithm, UdpRateLimitOp,
+    apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
+    validate_window_seconds,
 };
 use super::{
     Plugin, PluginHttpClient, ProxyProtocol, UDP_ONLY_PROTOCOLS, UdpDatagramContext,
@@ -92,6 +93,33 @@ impl UdpRateLimiting {
         http_client: PluginHttpClient,
         config_id: &str,
     ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, None, config_id)
+    }
+
+    /// Construct with local enforcement state shared across compatible
+    /// plugin-cache generations for the stable `(namespace, plugin kind,
+    /// plugin-config id)` policy identity.
+    ///
+    /// An inherited limiter keeps the algorithm — and therefore the window
+    /// epoch — it was created with, so an inherited counter is never
+    /// re-indexed onto a replacement generation's fresh epoch. A change to the
+    /// effective per-window datagram/byte budgets or the window length isolates
+    /// onto fresh state instead.
+    pub fn new_with_policy_identity(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, Some(namespace), config_id)
+    }
+
+    fn from_parts(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: Option<&str>,
+        config_id: &str,
+    ) -> Result<Self, String> {
         let object = config
             .as_object()
             .ok_or_else(|| "udp_rate_limiting: config must be an object".to_string())?;
@@ -130,6 +158,17 @@ impl UdpRateLimiting {
         };
         let datagrams_per_window = per_window_limit(datagrams_per_second, window_seconds)?;
         let bytes_per_window = per_window_limit(bytes_per_second, window_seconds)?;
+        // Effective enforcement semantics, not raw syntax: the per-window
+        // budgets the algorithm actually enforces and the window length after
+        // defaulting (`window_seconds` omitted is 1), so an omitted window and
+        // an explicit `1` describe the same budget. An unset axis is encoded
+        // distinctly from any set value — unlimited is not a bound. The shared
+        // Redis posture is added by the backend.
+        let mut semantics = LocalStateSemantics::new();
+        semantics.optional_u64("datagrams_per_window", datagrams_per_window);
+        semantics.optional_u64("bytes_per_window", bytes_per_window);
+        semantics.u64("window_seconds", window_seconds);
+
         let epoch_base = Instant::now();
 
         Ok(Self {
@@ -137,8 +176,9 @@ impl UdpRateLimiting {
             epoch_base,
             last_eviction_secs: AtomicU64::new(0),
             rejection_warn: AtomicLogRateLimiter::new(),
-            limiter: RateLimitBackend::from_plugin_config_with_config_id(
+            limiter: RateLimitBackend::from_plugin_config_with_policy_identity(
                 "udp_rate_limiting",
+                namespace,
                 config_id,
                 config,
                 &http_client,
@@ -148,8 +188,19 @@ impl UdpRateLimiting {
                     window_seconds,
                     epoch_base,
                 ),
+                &semantics,
             )?,
         })
+    }
+
+    /// Whether this instance enforces on the same live local state as `other`.
+    ///
+    /// A compatible reload generation for one policy identity must share; an
+    /// unrelated policy, tenant, plugin kind, or semantically changed policy
+    /// must not. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn shares_local_state_with(&self, other: &Self) -> bool {
+        self.limiter.shares_local_state_with(&other.limiter)
     }
 
     /// Local/fallback DashMap shard count. Test-only; not a production API.

@@ -12,9 +12,10 @@ use tracing::warn;
 use uuid::Uuid;
 
 use super::utils::rate_limit::{
-    RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend, STANDALONE_RATE_LIMIT_CONFIG_ID,
-    WsFrameRateAlgorithm, WsRateLimitOp, apply_rate_limit_cleanup, debug_assert_closed_root_keys,
-    debug_assert_rate_limit_redis_keys, validate_ws_frame_rate_params,
+    LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
+    STANDALONE_RATE_LIMIT_CONFIG_ID, WsFrameRateAlgorithm, WsRateLimitOp, apply_rate_limit_cleanup,
+    debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
+    validate_ws_frame_rate_params,
 };
 use super::{Plugin, PluginHttpClient, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection};
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -80,6 +81,32 @@ impl WsRateLimiting {
         http_client: PluginHttpClient,
         config_id: &str,
     ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, None, config_id)
+    }
+
+    /// Construct with local enforcement state shared across compatible
+    /// plugin-cache generations for the stable `(namespace, plugin kind,
+    /// plugin-config id)` policy identity.
+    ///
+    /// Local keys are the proxy's process-wide monotonic WebSocket connection
+    /// ids (`ProxyState::ws_connection_counter`), which outlive a config reload,
+    /// so a live connection keeps its consumed frame budget instead of being
+    /// handed a full bucket by an unrelated plugin-config change.
+    pub fn new_with_policy_identity(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, Some(namespace), config_id)
+    }
+
+    fn from_parts(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: Option<&str>,
+        config_id: &str,
+    ) -> Result<Self, String> {
         let object = config
             .as_object()
             .ok_or_else(|| "ws_rate_limiting: config must be an object".to_string())?;
@@ -120,20 +147,42 @@ impl WsRateLimiting {
             ));
         }
 
+        // Effective enforcement semantics, not raw syntax: the token bucket's
+        // sustained rate and burst capacity after defaulting (`frames_per_second`
+        // omitted is 100, `burst_size` omitted is the sustained rate), so an
+        // explicit default and an omission describe the same bucket.
+        // `close_reason` is client-visible presentation only and never resets a
+        // live budget; the shared Redis posture is added by the backend.
+        let mut semantics = LocalStateSemantics::new();
+        semantics.u64("frames_per_second", frames_per_second);
+        semantics.u64("burst_size", burst_size);
+
         Ok(Self {
             close_reason,
             frame_counter: AtomicU64::new(0),
             redis_instance_id: Uuid::new_v4().simple().to_string(),
-            limiter: RateLimitBackend::from_plugin_config_with_config_id(
+            limiter: RateLimitBackend::from_plugin_config_with_policy_identity(
                 "ws_rate_limiting",
+                namespace,
                 config_id,
                 config,
                 &http_client,
                 WsFrameRateAlgorithm::new(frames_per_second as f64, burst_size as f64),
+                &semantics,
             )?,
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
         })
+    }
+
+    /// Whether this instance enforces on the same live local state as `other`.
+    ///
+    /// A compatible reload generation for one policy identity must share; an
+    /// unrelated policy, tenant, plugin kind, or semantically changed policy
+    /// must not. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn shares_local_state_with(&self, other: &Self) -> bool {
+        self.limiter.shares_local_state_with(&other.limiter)
     }
 
     /// Local/fallback DashMap shard count. Test-only; not a production API.
@@ -149,6 +198,20 @@ impl WsRateLimiting {
         &self,
     ) -> Option<super::utils::rate_limit::RedisFailurePolicy> {
         self.limiter.redis_failure_policy()
+    }
+
+    /// Charge one frame against the local token bucket at `now` and report
+    /// whether it was admitted. Deterministic (no wall-clock sleep) mirror of
+    /// the frame budget for stable-state coverage. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn charge_frame_locally_at_for_test(
+        &self,
+        connection_id: u64,
+        now: Instant,
+    ) -> bool {
+        self.limiter
+            .check_local_at(connection_id, &WsRateLimitOp::ONE, now)
+            .allowed
     }
 
     /// Controllable-time seed for external cleanup tests. Not a production API.
