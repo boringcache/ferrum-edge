@@ -188,6 +188,76 @@ fn dns_name_without_trailing_root(name: impl std::fmt::Display) -> String {
     name
 }
 
+/// RFC 2782 root target: a Target of "." means the service is decidedly not
+/// available at this domain. After stripping the trailing root label the DNS
+/// root is the empty name, so `"."`, `""`, and dotted-only names are all
+/// treated as that unavailability signal.
+pub(crate) fn is_rfc2782_root_target(host: &str) -> bool {
+    host.trim_end_matches('.').is_empty()
+}
+
+/// Strip trailing root labels, reject the RFC 2782 `.` target, and ASCII-
+/// lowercase so the host matches `UpstreamTarget` admission (`validate_host_entry`
+/// requires lowercase; mixed-case DNS names must not be dropped as invalid).
+pub(crate) fn normalize_srv_target_host(target: impl std::fmt::Display) -> Option<String> {
+    let host = dns_name_without_trailing_root(target);
+    if is_rfc2782_root_target(&host) {
+        return None;
+    }
+    if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Some(host.to_ascii_lowercase())
+    } else {
+        Some(host)
+    }
+}
+
+/// One RFC 2782 SRV answer as returned by [`DnsCache::resolve_srv`].
+///
+/// `resolve_srv` drops the root target (`.`) and port 0 before returning.
+/// DNS-SD still re-runs `admit_registry_port`, then publishes EVERY remaining
+/// priority tier with `priority` stamped into the reserved
+/// `ferrum.srv.priority` tag. Choosing which tier serves traffic is a runtime,
+/// health-aware decision made by the load balancer's shared candidate filter,
+/// so a fully-unhealthy primary tier can actually fail over to the DR tier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SrvAnswer {
+    /// SRV target hostname with the trailing root label stripped and ASCII-lowercased.
+    pub host: String,
+    /// Dial port. `resolve_srv` never returns `0`.
+    pub port: u16,
+    /// RFC 2782 weight. DNS-SD remaps `0` to `default_weight` on publish.
+    pub weight: u16,
+    /// RFC 2782 priority. Lower values are preferred; DNS-SD publishes every
+    /// retained tier up to `MAX_SRV_PRIORITY_TIERS`, and the load balancer
+    /// selects the lowest healthy tier.
+    pub priority: u16,
+}
+
+/// Admit one SRV RR into a dialable [`SrvAnswer`].
+///
+/// Discards the RFC 2782 root target and port 0, strips trailing root labels,
+/// and ASCII-lowercases the host. SRV ports are already `u16`, so the only
+/// `admit_registry_port` rejection that can occur here is `0`; DNS-SD still
+/// routes the surviving port through that helper for contract parity with
+/// Kubernetes and Consul.
+pub(crate) fn try_srv_answer(
+    target: impl std::fmt::Display,
+    port: u16,
+    weight: u16,
+    priority: u16,
+) -> Option<SrvAnswer> {
+    let host = normalize_srv_target_host(target)?;
+    if port == 0 {
+        return None;
+    }
+    Some(SrvAnswer {
+        host,
+        port,
+        weight,
+        priority,
+    })
+}
+
 /// Sentinel for [`DnsCacheEntry::shortest_per_proxy_ttl_secs`]: no per-proxy
 /// override has been observed for this hostname yet.
 const NO_PER_PROXY_TTL: u64 = u64::MAX;
@@ -1607,12 +1677,38 @@ impl DnsCache {
                     match self.resolver.srv_lookup(hostname).await {
                         Ok(srv_lookup) => {
                             let srv_ttl = extract_ttl(srv_lookup.valid_until());
-                            // SRV records point to target hostnames -- resolve them to IPs
-                            for record in srv_lookup.answers() {
+                            // ADDRESS-ONLY SRV mode. This resolver path answers
+                            // "what IPs back this hostname"; the caller dials
+                            // the proxy's own configured backend port, so the
+                            // RR's `port` is never used. It therefore
+                            // deliberately does NOT apply the DNS-SD
+                            // registry-port admission that `resolve_srv` (the
+                            // service-availability path) applies: a port-0 RR
+                            // still carries a perfectly usable target address
+                            // here, and dropping it would blackhole a resolvable
+                            // host for a field this mode ignores. See
+                            // `docs/dns_resolver.md` → "Address-only SRV mode".
+                            //
+                            // The RFC 2782 signals that ARE about availability
+                            // still apply: the root target `.` means "decidedly
+                            // not available" and is skipped, and answers are
+                            // walked in ascending `priority` so the lowest
+                            // reachable tier wins instead of whatever order the
+                            // resolver happened to return. Sorting also makes
+                            // the chosen address independent of answer order.
+                            let mut ordered: Vec<_> = srv_lookup.answers().iter().collect();
+                            ordered.sort_by_key(|record| match &record.data {
+                                RData::SRV(srv) => srv.priority,
+                                _ => u16::MAX,
+                            });
+                            for record in ordered {
                                 let RData::SRV(ref srv) = record.data else {
                                     continue;
                                 };
                                 let target = dns_name_without_trailing_root(&srv.target);
+                                if is_rfc2782_root_target(&target) {
+                                    continue;
+                                }
                                 if let Ok(ip_lookup) = self.resolver.lookup_ip(&target).await {
                                     let addrs: Vec<IpAddr> = ip_lookup.iter().collect();
                                     if !addrs.is_empty() {
@@ -1671,15 +1767,24 @@ impl DnsCache {
             .unwrap_or(false)
     }
 
-    /// Resolve a DNS SRV record to a list of (hostname, port, weight) tuples.
+    /// Resolve a DNS SRV record to dialable [`SrvAnswer`] values.
     ///
     /// Used by DNS-SD service discovery. Does not use the cache — callers
     /// manage their own polling intervals. Reuses the configured resolver
     /// so custom nameservers from `FERRUM_DNS_RESOLVER_ADDRESS` are respected.
-    pub async fn resolve_srv(
-        &self,
-        service_name: &str,
-    ) -> Result<Vec<(String, u16, u16)>, anyhow::Error> {
+    ///
+    /// Each answer carries RFC 2782 `priority`. The root target (`.`) and port
+    /// 0 are discarded here: they are the RFC 2782 "service decidedly not
+    /// available" signal and are not dialable. Surviving records keep their
+    /// original weights. Tier FORMATION happens in DNS-SD after this filter, so
+    /// a poisoned tier never becomes a tier (see
+    /// `service_discovery::dns_sd::targets_from_srv_records`); tier SELECTION
+    /// happens per request in the load balancer's candidate filter.
+    ///
+    /// Distinct from the address-only SRV mode in `resolve_with_type`, which
+    /// answers "what IPs back this hostname", never dials the RR's port, and
+    /// therefore deliberately does not reject port 0.
+    pub async fn resolve_srv(&self, service_name: &str) -> Result<Vec<SrvAnswer>, anyhow::Error> {
         let srv_lookup = self
             .resolver
             .srv_lookup(service_name)
@@ -1687,15 +1792,26 @@ impl DnsCache {
             .map_err(|e| anyhow::anyhow!("SRV lookup failed for {}: {}", service_name, e))?;
 
         let mut results = Vec::new();
+        let mut dropped = 0usize;
         for record in srv_lookup.answers() {
             let RData::SRV(ref srv) = record.data else {
                 continue;
             };
-            results.push((
-                dns_name_without_trailing_root(&srv.target),
-                srv.port,
-                srv.weight,
-            ));
+            let Some(answer) = try_srv_answer(&srv.target, srv.port, srv.weight, srv.priority)
+            else {
+                dropped += 1;
+                continue;
+            };
+            results.push(answer);
+        }
+
+        if dropped > 0 {
+            debug!(
+                service = %service_name,
+                dropped,
+                admitted = results.len(),
+                "SRV lookup discarded RFC 2782 unavailability records"
+            );
         }
 
         Ok(results)

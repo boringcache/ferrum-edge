@@ -6107,3 +6107,400 @@ async fn discovered_snapshot_starts_active_probes_for_sd_only_upstream() {
     );
     assert!(health_checker.has_running_active_probes("ferrum", "sd-hc"));
 }
+
+// ── RFC 2782 DNS-SD ingest: admission, tiers, dedup (issue #4291) ──
+//
+// Ingest publishes EVERY admissible priority tier, each target stamped with the
+// reserved `ferrum.srv.priority` tag. Choosing which tier serves traffic is a
+// runtime, health-aware decision made by the load balancer's candidate filter —
+// see `load_balancer_srv_priority_tests.rs`. Discarding the DR tiers here (the
+// original fix for #4291) stopped primary/DR mixing but left nothing to fail
+// over to once every primary went unhealthy.
+
+/// `(host, port, weight, priority)` — same field order as `resolve_srv`.
+fn dns_sd_from_srv(records: &[(&str, u16, u16, u16)], default_weight: u32) -> Vec<UpstreamTarget> {
+    ferrum_edge::_test_support::dns_sd_targets_from_srv_records_for_test(
+        records
+            .iter()
+            .map(|(host, port, weight, priority)| (host.to_string(), *port, *weight, *priority))
+            .collect(),
+        default_weight,
+    )
+}
+
+/// `(host, port, weight, priority-tag)` for every published target.
+fn dns_sd_rows(targets: &[UpstreamTarget]) -> Vec<(String, u16, u32, Option<String>)> {
+    let tag = ferrum_edge::_test_support::srv_priority_tag_for_test();
+    targets
+        .iter()
+        .map(|t| (t.host.clone(), t.port, t.weight, t.tags.get(tag).cloned()))
+        .collect()
+}
+
+fn row(host: &str, port: u16, weight: u32, priority: &str) -> (String, u16, u32, Option<String>) {
+    (host.to_string(), port, weight, Some(priority.to_string()))
+}
+
+#[test]
+fn dns_sd_publishes_every_admissible_tier_tagged_with_its_priority() {
+    // Issue #4291 verification fixture: port 0 at the live tier is dropped, and
+    // the disaster-recovery tier IS published — tagged priority 20 so the
+    // balancer can reach it only when priority 10 is entirely unhealthy.
+    let targets = dns_sd_from_srv(
+        &[
+            ("primary", 8080, 1, 10),
+            ("dr", 8080, 1, 20),
+            ("alt", 0, 1, 10),
+        ],
+        1,
+    );
+    assert_eq!(
+        dns_sd_rows(&targets),
+        vec![row("primary", 8080, 1, "10"), row("dr", 8080, 1, "20")],
+        "every dialable tier must be retained, each stamped with its RFC 2782 priority"
+    );
+}
+
+#[test]
+fn dns_sd_output_is_ordered_by_ascending_priority_regardless_of_answer_order() {
+    let forward = dns_sd_from_srv(
+        &[
+            ("primary", 8080, 4, 10),
+            ("mid", 8080, 5, 20),
+            ("far", 8080, 6, 30),
+        ],
+        1,
+    );
+    let shuffled = dns_sd_from_srv(
+        &[
+            ("far", 8080, 6, 30),
+            ("primary", 8080, 4, 10),
+            ("mid", 8080, 5, 20),
+        ],
+        1,
+    );
+    assert_eq!(
+        dns_sd_rows(&forward),
+        vec![
+            row("primary", 8080, 4, "10"),
+            row("mid", 8080, 5, "20"),
+            row("far", 8080, 6, "30"),
+        ]
+    );
+    assert_eq!(
+        dns_sd_rows(&forward),
+        dns_sd_rows(&shuffled),
+        "published targets must be a function of the answer SET, not the resolver's ordering"
+    );
+}
+
+#[test]
+fn dns_sd_same_tier_preserves_srv_weights() {
+    let targets = dns_sd_from_srv(
+        &[
+            ("a.example", 8080, 10, 10),
+            ("b.example", 8080, 20, 10),
+            ("dr.example", 8080, 50, 20),
+        ],
+        99,
+    );
+    assert_eq!(
+        dns_sd_rows(&targets),
+        vec![
+            row("a.example", 8080, 10, "10"),
+            row("b.example", 8080, 20, "10"),
+            row("dr.example", 8080, 50, "20"),
+        ],
+        "SRV weights are per-record and survive tiering"
+    );
+}
+
+#[test]
+fn dns_sd_zero_srv_weight_uses_default_weight() {
+    let targets = dns_sd_from_srv(&[("primary", 8080, 0, 10)], 7);
+    assert_eq!(dns_sd_rows(&targets), vec![row("primary", 8080, 7, "10")]);
+}
+
+#[test]
+fn dns_sd_zero_weight_among_nonzero_peers_uses_default_weight() {
+    let targets = dns_sd_from_srv(
+        &[("a.example", 8080, 10, 10), ("b.example", 8080, 0, 10)],
+        3,
+    );
+    assert_eq!(
+        dns_sd_rows(&targets),
+        vec![
+            row("a.example", 8080, 10, "10"),
+            row("b.example", 8080, 3, "10"),
+        ]
+    );
+}
+
+#[test]
+fn dns_sd_port_zero_is_not_published() {
+    let targets = dns_sd_from_srv(&[("alt", 0, 1, 10), ("primary", 8080, 1, 10)], 1);
+    assert_eq!(dns_sd_rows(&targets), vec![row("primary", 8080, 1, "10")]);
+}
+
+#[test]
+fn dns_sd_root_target_is_discarded_explicitly() {
+    let targets = dns_sd_from_srv(
+        &[
+            (".", 8080, 1, 10),
+            ("", 8080, 1, 10),
+            ("primary", 8080, 5, 10),
+        ],
+        1,
+    );
+    assert_eq!(
+        dns_sd_rows(&targets),
+        vec![row("primary", 8080, 5, "10")],
+        "RFC 2782 '.' must not rely on later empty-host validation"
+    );
+}
+
+#[test]
+fn dns_sd_dotted_only_names_are_root_targets() {
+    let targets = dns_sd_from_srv(
+        &[
+            ("..", 8080, 1, 10),
+            ("...", 8080, 1, 10),
+            ("primary", 8080, 1, 10),
+        ],
+        1,
+    );
+    assert_eq!(dns_sd_rows(&targets), vec![row("primary", 8080, 1, "10")]);
+}
+
+#[test]
+fn dns_sd_all_invalid_records_fail_closed() {
+    let targets = dns_sd_from_srv(&[(".", 0, 1, 0), ("alt", 0, 1, 10), ("", 8080, 1, 20)], 1);
+    assert!(
+        targets.is_empty(),
+        "when every SRV RR is undialable the snapshot must be empty, not a synthetic target"
+    );
+}
+
+#[test]
+fn dns_sd_empty_answers_fail_closed() {
+    let targets = dns_sd_from_srv(&[], 1);
+    assert!(
+        targets.is_empty(),
+        "an empty SRV answer set must publish no synthetic target"
+    );
+}
+
+#[test]
+fn dns_sd_poisoned_tier_does_not_become_a_tier() {
+    // Filter-then-tier: a priority-10 tier whose every RR is undialable never
+    // enters the published set at all, so priority 20 is the BEST tier rather
+    // than a fallback the balancer must first discover to be empty.
+    let targets = dns_sd_from_srv(
+        &[
+            ("primary", 0, 1, 10),
+            (".", 8080, 1, 10),
+            ("dr", 8080, 3, 20),
+        ],
+        1,
+    );
+    assert_eq!(
+        dns_sd_rows(&targets),
+        vec![row("dr", 8080, 3, "20")],
+        "undialable RRs are not reachable, so they must not occupy a tier"
+    );
+}
+
+#[test]
+fn dns_sd_poisoned_intermediate_tier_falls_through() {
+    let targets = dns_sd_from_srv(
+        &[(".", 8080, 1, 10), ("mid", 0, 1, 20), ("far", 9090, 8, 30)],
+        1,
+    );
+    assert_eq!(
+        dns_sd_rows(&targets),
+        vec![row("far", 9090, 8, "30")],
+        "each fully-undialable tier is skipped at ingest"
+    );
+}
+
+#[test]
+fn dns_sd_priority_zero_is_the_best_tier() {
+    let targets = dns_sd_from_srv(
+        &[
+            ("standby", 8080, 1, 10),
+            ("primary", 8080, 2, 0),
+            ("dr", 8080, 3, 20),
+        ],
+        1,
+    );
+    assert_eq!(
+        dns_sd_rows(&targets),
+        vec![
+            row("primary", 8080, 2, "0"),
+            row("standby", 8080, 1, "10"),
+            row("dr", 8080, 3, "20"),
+        ],
+        "RFC 2782 priority 0 is legal and sorts first; it must not read as 'unset'"
+    );
+}
+
+#[test]
+fn dns_sd_duplicate_dial_identity_keeps_the_lowest_priority() {
+    // A zone that lists one endpoint in two tiers must not double its share of
+    // the tier it actually serves, and must not be pinned to the DR tier by
+    // record order.
+    let dr_first = dns_sd_from_srv(
+        &[
+            ("primary.example", 8080, 1, 20),
+            ("primary.example", 8080, 1, 10),
+        ],
+        1,
+    );
+    let live_first = dns_sd_from_srv(
+        &[
+            ("primary.example", 8080, 1, 10),
+            ("primary.example", 8080, 1, 20),
+        ],
+        1,
+    );
+    assert_eq!(
+        dns_sd_rows(&dr_first),
+        vec![row("primary.example", 8080, 1, "10")]
+    );
+    assert_eq!(dns_sd_rows(&dr_first), dns_sd_rows(&live_first));
+}
+
+#[test]
+fn dns_sd_same_host_two_ports_are_distinct_dial_identities() {
+    let targets = dns_sd_from_srv(
+        &[
+            ("primary.example", 8080, 1, 10),
+            ("primary.example", 8443, 1, 10),
+        ],
+        1,
+    );
+    assert_eq!(
+        dns_sd_rows(&targets),
+        vec![
+            row("primary.example", 8080, 1, "10"),
+            row("primary.example", 8443, 1, "10"),
+        ]
+    );
+}
+
+#[test]
+fn dns_sd_max_port_and_weight_are_admitted() {
+    let targets = dns_sd_from_srv(&[("primary.example", 65535, 65535, 10)], 1);
+    assert_eq!(
+        dns_sd_rows(&targets),
+        vec![row("primary.example", 65535, 65535, "10")]
+    );
+}
+
+#[test]
+fn dns_sd_mixed_case_host_is_lowercased_for_admission() {
+    let targets = dns_sd_from_srv(&[("Primary.Example.COM.", 8080, 1, 10)], 1);
+    assert_eq!(
+        dns_sd_rows(&targets),
+        vec![row("primary.example.com", 8080, 1, "10")],
+        "mixed-case DNS names must be lowercased so validate_host_entry cannot drop them"
+    );
+}
+
+#[test]
+fn dns_sd_retained_tier_count_is_bounded() {
+    let max = ferrum_edge::_test_support::max_srv_priority_tiers_for_test();
+    let records: Vec<(String, u16, u16, u16)> = (0..(max as u16 + 5))
+        .map(|i| (format!("tier{i}.example"), 8080u16, 1u16, i * 10))
+        .collect();
+    let targets = ferrum_edge::_test_support::dns_sd_targets_from_srv_records_for_test(records, 1);
+    assert_eq!(
+        targets.len(),
+        max,
+        "only the numerically-smallest MAX_SRV_PRIORITY_TIERS tiers are published"
+    );
+    let tag = ferrum_edge::_test_support::srv_priority_tag_for_test();
+    let kept: Vec<&str> = targets
+        .iter()
+        .map(|t| t.tags.get(tag).map(String::as_str).unwrap_or(""))
+        .collect();
+    assert_eq!(kept.first().copied(), Some("0"), "tier 0 must survive");
+    assert!(
+        !kept.contains(&(((max as u16) * 10).to_string().as_str())),
+        "the first tier beyond the bound must be dropped, not the best tier"
+    );
+}
+
+#[test]
+fn dns_sd_combined_resolve_then_publish_matches_issue_fixture() {
+    use ferrum_edge::_test_support::try_srv_answer_for_test;
+
+    let answers = [
+        ("primary", 8080, 1u16, 10u16),
+        ("dr", 8080, 1, 20),
+        ("alt", 0, 1, 10),
+        (".", 8080, 1, 10),
+        ("Primary.Example.COM.", 8080, 5, 10),
+    ]
+    .into_iter()
+    .filter_map(|(host, port, weight, priority)| {
+        try_srv_answer_for_test(host, port, weight, priority)
+    })
+    .map(|answer| (answer.host, answer.port, answer.weight, answer.priority))
+    .collect();
+
+    let targets = ferrum_edge::_test_support::dns_sd_targets_from_srv_records_for_test(answers, 1);
+    assert_eq!(
+        dns_sd_rows(&targets),
+        vec![
+            row("primary", 8080, 1, "10"),
+            row("primary.example.com", 8080, 5, "10"),
+            row("dr", 8080, 1, "20"),
+        ],
+        "resolve_srv admission keeps every dialable host, tiered by RFC 2782 priority"
+    );
+}
+
+#[test]
+fn srv_priority_tag_value_parse_is_canonical_decimal_only() {
+    use ferrum_edge::_test_support::parse_srv_priority_tag_for_test as parse;
+
+    assert_eq!(parse("0"), Some(0));
+    assert_eq!(parse("10"), Some(10));
+    assert_eq!(parse("65535"), Some(65535));
+    for spoof in [
+        "", " 10", "10 ", "+10", "-1", "010", "00", "0x10", "1_0", "65536", "1e1",
+    ] {
+        assert!(
+            parse(spoof).is_none(),
+            "non-canonical priority tag value {spoof:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn reserved_srv_tag_namespace_is_stripped_from_copied_labels() {
+    use std::collections::HashMap;
+
+    let prefix = ferrum_edge::_test_support::reserved_srv_tag_prefix_for_test();
+    let tag = ferrum_edge::_test_support::srv_priority_tag_for_test();
+    let mut tags: HashMap<String, String> = HashMap::new();
+    tags.insert(tag.to_string(), "0".to_string());
+    tags.insert(format!("{prefix}future"), "x".to_string());
+    tags.insert("app".to_string(), "checkout".to_string());
+    tags.insert("srv.priority".to_string(), "0".to_string());
+
+    ferrum_edge::_test_support::strip_reserved_srv_tags_for_test(&mut tags);
+
+    assert_eq!(tags.get("app").map(String::as_str), Some("checkout"));
+    assert!(
+        !tags.contains_key(tag),
+        "a copied label cannot forge the priority tag"
+    );
+    assert!(!tags.contains_key(&format!("{prefix}future")));
+    assert_eq!(
+        tags.get("srv.priority").map(String::as_str),
+        Some("0"),
+        "only the reserved ferrum.srv.* namespace is stripped"
+    );
+}
