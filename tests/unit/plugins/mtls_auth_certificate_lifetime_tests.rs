@@ -275,13 +275,12 @@ fn the_per_request_validity_check_uses_the_inclusive_unix_predicate() {
     );
 }
 
-#[tokio::test]
-async fn one_second_past_not_after_is_outside_the_window() {
-    let cert = cert_with_validity("client.example.com", -600, -1);
-    let index = ConsumerIndex::new(&[mtls_consumer("alice", "client.example.com")]);
-    let mut ctx = ctx_with_cert(cert);
-
-    assert_fixed_401(default_plugin().authenticate(&mut ctx, &index).await);
+#[test]
+fn one_second_past_not_after_is_outside_the_window() {
+    assert_eq!(
+        mtls_client_cert_is_valid_at_unix_for_test(100, 200, 201),
+        Some(false)
+    );
 }
 
 #[tokio::test]
