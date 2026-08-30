@@ -443,6 +443,11 @@ pub struct MeshRule {
     /// A request matches when its `request_principal` (set by `jwks_auth`
     /// from the validated JWT's `iss/sub`) matches any pattern in this list.
     /// An empty list means "any request principal" (no filter).
+    ///
+    /// The field is HTTP-only (it exists only where a validated JWT was
+    /// parsed). On an L4 session it is unevaluable, so a non-empty list
+    /// follows Istio's non-HTTP-port model — see
+    /// [`crate::modes::mesh::policy`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub request_principals: Vec<String>,
     /// Istio `from[].source.notRequestPrincipals` — conjunctive negative
@@ -450,7 +455,10 @@ pub struct MeshRule {
     /// the request's `request_principal`, the rule fails. When no request
     /// principal is present, the negative match succeeds; this is Istio's
     /// canonical way to match anonymous requests with
-    /// `notRequestPrincipals: ["*"]`.
+    /// `notRequestPrincipals: ["*"]`. That absent-principal rule applies only
+    /// where a JWT could have been observed: on an L4 session the field is
+    /// unevaluable and follows Istio's non-HTTP-port model instead — see
+    /// [`crate::modes::mesh::policy`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_request_principals: Vec<String>,
     /// Conjunctive source-negative / IP-block matchers for this rule's

@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
 
 use ferrum_edge::config_sources::k8s::{
-    K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    K8sMetadata, K8sObject, K8sTranslation, K8sTranslationOptions, NodeWaypointInventory,
+    translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
+use ferrum_edge::modes::mesh::config::NodeWaypointEndpoint;
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use serde_json::{Value, json};
 
@@ -158,6 +160,31 @@ fn node_waypoint_pod_with_spiffe(
 ) -> K8sObject {
     let mut pod = node_waypoint_pod(node_name, ip, ready, hbone_port);
     push_pod_env(&mut pod, "FERRUM_MESH_WORKLOAD_SPIFFE_ID", spiffe_id);
+    pod
+}
+
+fn named_node_waypoint_pod(
+    name: &str,
+    node_name: &str,
+    ip: &str,
+    ready: bool,
+    hbone_port: u16,
+    spiffe_id: &str,
+) -> K8sObject {
+    let mut pod = node_waypoint_pod_with_spiffe(node_name, ip, ready, hbone_port, spiffe_id);
+    pod.metadata.name = name.to_string();
+    pod
+}
+
+fn terminating_node_waypoint_pod(
+    name: &str,
+    node_name: &str,
+    ip: &str,
+    hbone_port: u16,
+    spiffe_id: &str,
+) -> K8sObject {
+    let mut pod = named_node_waypoint_pod(name, node_name, ip, true, hbone_port, spiffe_id);
+    pod.metadata.deletion_timestamp = Some("2026-08-29T00:00:00Z".to_string());
     pod
 }
 
@@ -691,6 +718,345 @@ fn k8s_pod_discovery_does_not_attach_unready_or_different_node_waypoint() {
             .expect("reviews workload");
         assert!(workload.node_waypoint.is_none());
     }
+}
+
+fn reviews_workload_node_waypoint(translation: &K8sTranslation) -> Option<&NodeWaypointEndpoint> {
+    translation
+        .config
+        .mesh
+        .as_ref()?
+        .workloads
+        .iter()
+        .find(|workload| workload.namespace == "default" && workload.service_name == "reviews")?
+        .node_waypoint
+        .as_ref()
+}
+
+#[test]
+fn k8s_pod_discovery_retains_last_ready_node_waypoint_for_same_node_unready_replacement() {
+    let inventory = NodeWaypointInventory::new();
+    let options = options().with_node_waypoint_inventory(inventory);
+
+    let ready_a = named_node_waypoint_pod(
+        "ferrum-node-waypoint-node-a",
+        "node-a",
+        "192.0.2.10",
+        true,
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a",
+    );
+    let translation = translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            ready_a,
+        ],
+        options.clone(),
+    )
+    .expect("K8s core translation succeeds");
+    assert_eq!(
+        reviews_workload_node_waypoint(&translation)
+            .expect("ready waypoint publishes destination metadata")
+            .address,
+        "192.0.2.10"
+    );
+
+    let unready_replacement = named_node_waypoint_pod(
+        "ferrum-node-waypoint-node-a-replacement",
+        "node-a",
+        "192.0.2.99",
+        false,
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a-next",
+    );
+    let translation = translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            unready_replacement,
+        ],
+        options,
+    )
+    .expect("K8s core translation succeeds");
+    let retained = reviews_workload_node_waypoint(&translation)
+        .expect("same-node unready replacement must keep last Ready endpoint");
+    assert_eq!(
+        retained.address, "192.0.2.10",
+        "sticky inventory is last Ready, not the current unready pod address"
+    );
+    assert_eq!(
+        retained.spiffe_id.as_str(),
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a",
+        "fail-closed identity pin must keep the last Ready SVID"
+    );
+}
+
+#[test]
+fn k8s_pod_discovery_retains_last_ready_node_waypoint_for_same_node_terminating_replacement() {
+    let inventory = NodeWaypointInventory::new();
+    let options = options().with_node_waypoint_inventory(inventory);
+
+    let ready_a = named_node_waypoint_pod(
+        "ferrum-node-waypoint-node-a",
+        "node-a",
+        "192.0.2.10",
+        true,
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a",
+    );
+    translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            ready_a,
+        ],
+        options.clone(),
+    )
+    .expect("K8s core translation succeeds");
+
+    let terminating_replacement = terminating_node_waypoint_pod(
+        "ferrum-node-waypoint-node-a-old",
+        "node-a",
+        "192.0.2.99",
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a-old",
+    );
+    let translation = translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            terminating_replacement,
+        ],
+        options,
+    )
+    .expect("K8s core translation succeeds");
+    let retained = reviews_workload_node_waypoint(&translation)
+        .expect("same-node terminating replacement must keep last Ready endpoint");
+    assert_eq!(retained.address, "192.0.2.10");
+    assert_eq!(
+        retained.spiffe_id.as_str(),
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a"
+    );
+}
+
+#[test]
+fn k8s_pod_discovery_does_not_retain_withdrawn_node_because_another_node_has_trusted_pod() {
+    let inventory = NodeWaypointInventory::new();
+    let options = options().with_node_waypoint_inventory(inventory);
+
+    let ready_a = named_node_waypoint_pod(
+        "ferrum-node-waypoint-node-a",
+        "node-a",
+        "192.0.2.10",
+        true,
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a",
+    );
+    translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            ready_a,
+        ],
+        options.clone(),
+    )
+    .expect("K8s core translation succeeds");
+
+    let ready_b = named_node_waypoint_pod(
+        "ferrum-node-waypoint-node-b",
+        "node-b",
+        "192.0.2.11",
+        true,
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-b",
+    );
+    let translation = translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            node("node-b", "node-uid-b"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            ready_b,
+        ],
+        options,
+    )
+    .expect("K8s core translation succeeds");
+    assert!(
+        reviews_workload_node_waypoint(&translation).is_none(),
+        "another node's trusted pod must not retain a withdrawn node's endpoint"
+    );
+}
+
+#[test]
+fn k8s_pod_discovery_clears_sticky_node_waypoint_when_no_trusted_proxy_remains() {
+    let inventory = NodeWaypointInventory::new();
+    let options = options().with_node_waypoint_inventory(inventory);
+    let ready_a = named_node_waypoint_pod(
+        "ferrum-node-waypoint-node-a",
+        "node-a",
+        "192.0.2.10",
+        true,
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a",
+    );
+    translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            ready_a,
+        ],
+        options.clone(),
+    )
+    .expect("K8s core translation succeeds");
+
+    let translation = translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+        ],
+        options,
+    )
+    .expect("K8s core translation succeeds");
+    assert!(
+        reviews_workload_node_waypoint(&translation).is_none(),
+        "withdrawing every trusted waypoint pod must clear destination metadata"
+    );
+}
+
+#[test]
+fn k8s_pod_discovery_clears_sticky_node_waypoint_for_ready_proxy_without_svid() {
+    let inventory = NodeWaypointInventory::new();
+    let options = options().with_node_waypoint_inventory(inventory);
+    let ready_a = named_node_waypoint_pod(
+        "ferrum-node-waypoint-node-a",
+        "node-a",
+        "192.0.2.10",
+        true,
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a",
+    );
+    translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            ready_a,
+        ],
+        options.clone(),
+    )
+    .expect("K8s core translation succeeds");
+
+    let ready_without_svid = node_waypoint_pod("node-a", "192.0.2.20", true, 15008);
+    let translation = translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            ready_without_svid,
+        ],
+        options,
+    )
+    .expect("K8s core translation succeeds");
+    assert!(
+        reviews_workload_node_waypoint(&translation).is_none(),
+        "a Ready proxy without valid SVID material must withdraw stale destination metadata"
+    );
+}
+
+#[test]
+fn k8s_pod_discovery_replaces_retained_node_waypoint_when_same_node_becomes_ready() {
+    let inventory = NodeWaypointInventory::new();
+    let options = options().with_node_waypoint_inventory(inventory);
+
+    let ready_a = named_node_waypoint_pod(
+        "ferrum-node-waypoint-node-a",
+        "node-a",
+        "192.0.2.10",
+        true,
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a",
+    );
+    translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            ready_a,
+        ],
+        options.clone(),
+    )
+    .expect("K8s core translation succeeds");
+
+    let unready_replacement = named_node_waypoint_pod(
+        "ferrum-node-waypoint-node-a-replacement",
+        "node-a",
+        "192.0.2.99",
+        false,
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a-next",
+    );
+    let translation = translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            unready_replacement,
+        ],
+        options.clone(),
+    )
+    .expect("K8s core translation succeeds");
+    assert_eq!(
+        reviews_workload_node_waypoint(&translation)
+            .expect("unready replacement retains last Ready")
+            .address,
+        "192.0.2.10"
+    );
+
+    let newly_ready = named_node_waypoint_pod(
+        "ferrum-node-waypoint-node-a-replacement",
+        "node-a",
+        "192.0.2.20",
+        true,
+        15008,
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a-next",
+    );
+    let translation = translate_k8s_objects(
+        &[
+            node("node-a", "node-uid-a"),
+            service(),
+            ready_pod(),
+            endpoint_slice(),
+            newly_ready,
+        ],
+        options,
+    )
+    .expect("K8s core translation succeeds");
+    let replaced = reviews_workload_node_waypoint(&translation)
+        .expect("newly Ready same-node endpoint must replace the retained one");
+    assert_eq!(replaced.address, "192.0.2.20");
+    assert_eq!(
+        replaced.spiffe_id.as_str(),
+        "spiffe://cluster.local/ns/ferrum-system/sa/node-waypoint-a-next"
+    );
 }
 
 #[test]

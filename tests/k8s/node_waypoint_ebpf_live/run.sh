@@ -2772,6 +2772,10 @@ expected = {
     "services": 2,
     "mesh_policies": 1,
     "peer_authentications": 1,
+    # Destination Service workloads must carry node_waypoint metadata before
+    # Service routes can materialize. Identity-only src workloads do not.
+    # A count-only wait can pass on a metadata-stripped snapshot and then 404.
+    "workloads_with_node_waypoint": 2,
 }
 errors = []
 if not slice_view.get("last_received_at"):
@@ -3205,6 +3209,56 @@ expect_blocked_from_namespace() {
     return 1
   fi
   rm -f "$err"
+}
+
+expect_policy_denied() {
+  local from="$1"
+  local label="$2"
+  local url="$3"
+  local family="${4:-}"
+  local max_attempts="${5:-8}"
+  local output="" code="" body="" status=1 err
+  err="$(mktemp)"
+  for attempt in $(seq 1 "$max_attempts"); do
+    set +e
+    output="$(curl_for_family_from "$family" "$from" "$url" 2>"$err")"
+    status=$?
+    set -e
+    code="${output##*$'\n'}"
+    body="${output%$'\n'*}"
+    body="${body//$'\r'/}"
+    while [[ "$body" == *$'\n' ]]; do
+      body="${body%$'\n'}"
+    done
+    if [[ "$status" -eq 0 && "$code" == "403" ]]; then
+      rm -f "$err"
+      return
+    fi
+    if [[ "$status" -eq 0 && "$code" == "200" ]]; then
+      echo "expected policy deny for $label from $from to $url, got HTTP 200 body '${body:-<empty>}'" >&2
+      cat "$err" >&2 || true
+      rm -f "$err"
+      collect_traffic_failure_diagnostics
+      return 1
+    fi
+    if [[ "$status" -eq 0 ]]; then
+      if [[ "$code" == "404" ]] && [[ "$body" == '{"error":"Not Found"}' ]]; then
+        sleep 1
+        continue
+      fi
+      echo "expected HTTP 403 policy deny for $label from $from to $url, got HTTP ${code} body '${body:-<empty>}'" >&2
+      cat "$err" >&2 || true
+      rm -f "$err"
+      collect_traffic_failure_diagnostics
+      return 1
+    fi
+    sleep 1
+  done
+  echo "expected HTTP 403 policy deny for $label from $from to $url, got HTTP ${code:-curl-exit-$status} body '${body:-<empty>}'" >&2
+  cat "$err" >&2 || true
+  rm -f "$err"
+  collect_traffic_failure_diagnostics
+  return 1
 }
 
 hbone_probe_error_is_transport_rejection() {
@@ -3786,7 +3840,7 @@ run_spire_restart_recovery_check() {
       allow_ok=$?
     fi
 
-    if expect_blocked src-b \
+    if expect_policy_denied src-b \
       "post-restart AuthorizationPolicy DENY" \
       "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" \
       4 >"$out_dir/deny-src-b.log" 2>&1; then
