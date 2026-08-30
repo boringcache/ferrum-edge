@@ -9,11 +9,7 @@ use hyper::header::HeaderValue;
 /// include a Host header (or pass an absolute-form URI to
 /// `check_protocol_headers` directly).
 fn check_protocol(headers: &hyper::HeaderMap, version: hyper::Version) -> Option<&'static str> {
-    check_protocol_headers(
-        headers,
-        version,
-        &hyper::Uri::from_static("/"),
-    )
+    check_protocol_headers(headers, version, &hyper::Uri::from_static("/"))
 }
 
 // ============================================================================
