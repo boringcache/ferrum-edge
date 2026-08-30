@@ -1156,7 +1156,7 @@ fn fixture_servers_bind_through_the_mesh_port_aware_helper() {
         "start_tcp_echo_on",
         "start_counting_tcp_echo_on",
         "start_counting_udp_echo_on",
-        "start_loopback_udp_echo",
+        "start_udp_echo_on",
     ] {
         let body = mesh_test_fn_body(name);
         let through_helper =
@@ -1181,9 +1181,20 @@ fn fixture_servers_bind_through_the_mesh_port_aware_helper() {
 fn third_workload_refusal_exercises_synthesis_time_guard() {
     let drive = mesh_test_fn_body("drive_inbound_relay_third_workload_refusal");
     assert!(
+        drive.contains("fixture_non_loopback_local_v4("),
+        "B's own destination must be a non-loopback local IPv4; Ambient \
+         refuses the loopback namespace, so a 127.0.0.1 control CONNECT \
+         cannot prove the terminator still relays"
+    );
+    assert!(
         drive.contains("discover_bindable_non_loopback_local_ip("),
         "C must be a discovered non-loopback interface address so PR #4315's \
          loopback-namespace guard cannot stand in for the ownership check"
+    );
+    assert!(
+        drive.contains("SocketAddr::new(b_ip, b_local_port)"),
+        "the control CONNECT must name B's non-loopback own destination, \
+         not 127.0.0.1 — Ambient refuses that namespace"
     );
     assert!(
         drive.contains("SocketAddr::new(c_ip, c_port)"),
@@ -1230,6 +1241,16 @@ fn third_workload_refusal_exercises_synthesis_time_guard() {
     assert!(
         !slice.contains("mesh_route_dispatch"),
         "the functional slice must stay production-shaped MeshConfig content"
+    );
+    assert!(
+        !slice.contains("127.0.0.1"),
+        "Ambient refuses the loopback namespace; B's own identity must not be \
+         hardcoded to 127.0.0.1"
+    );
+    assert!(
+        slice.contains("b_ip.to_string()"),
+        "B's own identity must declare the non-loopback address the control \
+         CONNECT names"
     );
 
     let assert_header = "\nfn assert_third_workload_connect_refused(";
@@ -10149,11 +10170,12 @@ async fn functional_mesh_udp_dest_untrusted_peer_fails_closed() {
 //
 // Each case carries an IN-FIXTURE POSITIVE CONTROL: before the C-named
 // CONNECT, the same peer SVID and the same CONNECT flavor name B's OWN
-// declared loopback destination and must be relayed (200 + byte-exact echo).
-// A 404 is only evidence of an ownership refusal once the same terminator has
-// been shown to relay something. Without the control, a fixture whose slice
-// never applied, whose SVID did not chain, or whose topology was wrong would
-// 404 for C and pass as a security proof.
+// declared non-loopback destination and must be relayed (200 + byte-exact echo).
+// Ambient refuses the loopback namespace (#4315), so the control cannot name
+// `127.0.0.1`. A 404 is only evidence of an ownership refusal once the same
+// terminator has been shown to relay something. Without the control, a
+// fixture whose slice never applied, whose SVID did not chain, or whose
+// topology was wrong would 404 for C and pass as a security proof.
 
 /// After a CONNECT result, wait this long for C's backend task to report a
 /// TCP accept or UDP datagram that was already queued while that task had not
@@ -10350,11 +10372,11 @@ async fn observe_third_workload_backend_hits(
     }
 }
 
-/// Loopback UDP echo bound through the mesh-port-aware helper (issue #2132).
+/// UDP echo bound through the mesh-port-aware helper (issue #2132).
 /// This is B's OWN declared destination for the datagram control, so it must
 /// echo: `drive_one_udp_connect` only reports 200 after a framed round trip.
-async fn start_loopback_udp_echo() -> (u16, tokio::task::JoinHandle<()>) {
-    let socket = bind_fixture_udp_socket(loopback_ephemeral())
+async fn start_udp_echo_on(addr: SocketAddr) -> (u16, tokio::task::JoinHandle<()>) {
+    let socket = bind_fixture_udp_socket(addr)
         .await
         .expect("bind third-workload control UDP echo");
     let port = socket
@@ -10372,18 +10394,21 @@ async fn start_loopback_udp_echo() -> (u16, tokio::task::JoinHandle<()>) {
     (port, task)
 }
 
-/// Stand up B's OWN declared destination on loopback for the in-fixture
-/// positive control. Both CONNECT helpers require a byte-exact round trip
-/// before they report 200, so this echoes rather than counting.
+/// Stand up B's OWN declared destination for the in-fixture positive control.
+/// Ambient refuses the loopback namespace, so `ip` is a non-loopback local
+/// bind. Both CONNECT helpers require a byte-exact round trip before they
+/// report 200, so this echoes rather than counting.
 async fn start_own_dest_echo_for(
     flavor: ThirdWorkloadConnectFlavor,
+    ip: IpAddr,
 ) -> (u16, tokio::task::JoinHandle<()>) {
+    let addr = SocketAddr::new(ip, 0);
     match flavor {
         ThirdWorkloadConnectFlavor::ByteStream => {
-            let (port, _accepted, task) = start_tcp_echo_on(loopback_ephemeral()).await;
+            let (port, _accepted, task) = start_tcp_echo_on(addr).await;
             (port, task)
         }
-        ThirdWorkloadConnectFlavor::Datagram => start_loopback_udp_echo().await,
+        ThirdWorkloadConnectFlavor::Datagram => start_udp_echo_on(addr).await,
     }
 }
 
@@ -10392,13 +10417,14 @@ async fn abort_third_workload_backend(task: tokio::task::JoinHandle<()>) {
     let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
 }
 
-/// Slice consumed by terminator B: B's own-identity record at 127.0.0.1 plus
-/// workload C — a different SPIFFE, a discovered non-loopback address. No
-/// operator plugins: this is the production MeshSubscribe shape.
+/// Slice consumed by terminator B: B's own-identity record at a non-loopback
+/// local address plus workload C — a different SPIFFE, a discovered non-loopback
+/// address. No operator plugins: this is the production MeshSubscribe shape.
 fn third_workload_refusal_slice(
     node_id: &str,
     b_spiffe: &str,
     c_spiffe: &str,
+    b_ip: IpAddr,
     b_local_port: u16,
     c_ip: IpAddr,
     c_port: u16,
@@ -10424,7 +10450,7 @@ fn third_workload_refusal_slice(
                 },
                 service_name: "svc-b".to_string(),
                 service_namespace: None,
-                addresses: vec!["127.0.0.1".to_string()],
+                addresses: vec![b_ip.to_string()],
                 ports: vec![WorkloadPort {
                     port: b_local_port,
                     protocol,
@@ -10544,6 +10570,10 @@ async fn drive_inbound_relay_third_workload_refusal(
         ThirdWorkloadConnectFlavor::ByteStream => b"own-dest-control",
         ThirdWorkloadConnectFlavor::Datagram => b"ping",
     };
+    // Ambient refuses the loopback namespace (#4315). B's own dest and C must
+    // both be non-loopback so a control 200 and a C 404 are attributable to
+    // ownership, not to loopback-namespace denial.
+    let b_ip = IpAddr::V4(fixture_non_loopback_local_v4());
     let c_ip = discover_bindable_non_loopback_local_ip().await?;
 
     let mut last_failure = String::new();
@@ -10557,15 +10587,15 @@ async fn drive_inbound_relay_third_workload_refusal(
             ThirdWorkloadConnectFlavor::Datagram => start_counting_udp_echo_on(c_ip).await,
         };
         let c_port = c_addr.port();
-        // B's own-identity record must declare a port, otherwise the loopback
-        // arm treats the own address as unconstrained. It is a LIVE echo so the
+        // B's own-identity record must declare a port, otherwise an empty port
+        // list leaves the owned address unconstrained. It is a LIVE echo so the
         // positive control below can prove this terminator still relays for the
         // destination it owns.
-        let (b_local_port, control_echo) = start_own_dest_echo_for(flavor).await;
-        if b_local_port == c_port {
+        let (b_local_port, control_echo) = start_own_dest_echo_for(flavor, b_ip).await;
+        if b_ip == c_ip && b_local_port == c_port {
             // Keep the two ports distinct so an unconstrained own-address arm
-            // could not admit C's port on loopback. Both are ephemeral, so this
-            // is a re-roll, not a failure.
+            // could not admit C's port on B's owned address. Both are
+            // ephemeral, so this is a re-roll, not a failure.
             abort_third_workload_backend(echo).await;
             abort_third_workload_backend(control_echo).await;
             last_failure = format!("attempt {attempt}: B and C drew the same port {c_port}");
@@ -10576,6 +10606,7 @@ async fn drive_inbound_relay_third_workload_refusal(
             &node_b,
             b_spiffe,
             c_spiffe,
+            b_ip,
             b_local_port,
             c_ip,
             c_port,
@@ -10629,7 +10660,7 @@ async fn drive_inbound_relay_third_workload_refusal(
         // synthesis still builds a relay on this child. Without it, a fixture
         // that refuses EVERY destination (slice never applied, SVID mismatch,
         // wrong topology) would 404 for C and pass as a security proof.
-        let control_authority = format!("127.0.0.1:{b_local_port}");
+        let control_authority = SocketAddr::new(b_ip, b_local_port).to_string();
         let control = match flavor {
             ThirdWorkloadConnectFlavor::ByteStream => {
                 drive_one_waypoint_byte_connect(
@@ -10684,7 +10715,11 @@ async fn drive_inbound_relay_third_workload_refusal(
         }
 
         // CONNECT names C, a dest B does not terminate for. Synthesis 404s
-        // before either HBONE handler runs.
+        // before either HBONE handler runs. When this host has only one
+        // non-loopback IPv4, B and C share that address and inventory refuses
+        // C as PortNotDeclared (C's port lives only on C's SPIFFE); distinct
+        // addresses refuse as AddressNotTerminated. Both are synthesis 404,
+        // and C is not loopback so the 404 is not the #4315 namespace refusal.
         let authority = SocketAddr::new(c_ip, c_port).to_string();
         let connect = match flavor {
             ThirdWorkloadConnectFlavor::ByteStream => drive_one_waypoint_byte_connect(
