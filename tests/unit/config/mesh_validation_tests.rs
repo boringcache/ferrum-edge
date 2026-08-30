@@ -2790,8 +2790,9 @@ mod virtual_service_cors {
         credentialed.cors.allow_credentials = Some(true);
         let errors = validate(vec![credentialed]);
         assert!(
-            errors.iter().any(|error| error
-                .contains("allow_credentials must not be true with an exact `*` origin")),
+            errors.iter().any(|error| error.contains(
+                "allow_credentials must not be true with exact `*`, opaque exact `null`, or an effectively universal prefix/regex matcher"
+            )),
             "{errors:?}"
         );
 
@@ -2799,6 +2800,47 @@ mod virtual_service_cors {
         uncredentialed.cors.allow_credentials = Some(false);
         let errors = validate(vec![uncredentialed]);
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn credentialed_opaque_and_universal_matchers_are_rejected_without_weakening() {
+        for origin in [
+            MeshCorsOriginMatch::Exact("null".into()),
+            MeshCorsOriginMatch::Prefix("https://".into()),
+            MeshCorsOriginMatch::Prefix("h".into()),
+            MeshCorsOriginMatch::Prefix("chrome-extension://".into()),
+            MeshCorsOriginMatch::Regex(".*".into()),
+            MeshCorsOriginMatch::Regex("https://.*".into()),
+            MeshCorsOriginMatch::Regex("null".into()),
+        ] {
+            let mut credentialed = policy(vec![origin.clone()]);
+            credentialed.cors.allow_credentials = Some(true);
+            let errors = validate(vec![credentialed]);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("opaque exact `null`")),
+                "credentialed {origin:?} must be refused: {errors:?}"
+            );
+
+            let mut uncredentialed = policy(vec![origin]);
+            uncredentialed.cors.allow_credentials = Some(false);
+            let errors = validate(vec![uncredentialed]);
+            assert!(
+                errors.is_empty(),
+                "uncredentialed universal matcher must still construct: {errors:?}"
+            );
+        }
+
+        let mut narrow = policy(vec![MeshCorsOriginMatch::Prefix(
+            "https://app.example.com".into(),
+        )]);
+        narrow.cors.allow_credentials = Some(true);
+        let errors = validate(vec![narrow]);
+        assert!(
+            errors.is_empty(),
+            "credentialed host-constraining prefix must remain representable: {errors:?}"
+        );
     }
 
     /// A padded literal is preserved verbatim under literal-exact semantics
@@ -3053,7 +3095,7 @@ mod virtual_service_cors {
             allowed_origins: vec![
                 MeshCorsOriginMatch::Exact("https://a.example".into()),
                 MeshCorsOriginMatch::Prefix("https://app.".into()),
-                MeshCorsOriginMatch::Regex("https://.*".into()),
+                MeshCorsOriginMatch::Regex("https://.*\\.example\\.com".into()),
             ],
             allowed_methods: vec!["GET".into()],
             allowed_headers: vec!["x-a".into()],
@@ -3070,7 +3112,7 @@ mod virtual_service_cors {
             serde_json::json!([
                 {"exact": "https://a.example"},
                 {"prefix": "https://app."},
-                {"regex": "https://.*"}
+                {"regex": "https://.*\\.example\\.com"}
             ])
         );
         assert_eq!(config["allowed_methods"], serde_json::json!(["GET"]));

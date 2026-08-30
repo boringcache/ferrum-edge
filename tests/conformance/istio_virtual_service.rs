@@ -91,7 +91,8 @@ fn cors_plugin_for(translation_input: &[K8sObject]) -> Option<PluginConfig> {
 /// surface Istio operators set on a route. Malformed/unknown origin matchers,
 /// un-compilable or over-complex regexes, over-budget matcher lists/values, and
 /// credentialed exact `*` combinations are left unprojected (deferred), not
-/// silently approximated.
+/// silently approximated. Credentialed opaque exact `null` and effectively
+/// universal prefix/regex matchers are deferred the same way (issue #4269).
 #[test]
 fn vs_cors_policy_translated() {
     register_feature!(
@@ -99,7 +100,7 @@ fn vs_cors_policy_translated() {
         feature = "http[].corsPolicy",
         status = Status::Supported,
         maturity = Maturity::Ga,
-        notes = "Translated to a proxy-scoped `cors` plugin (allowOrigins[] exact/prefix/regex StringMatch / legacy allowOrigin, allowMethods/allowHeaders/exposeHeaders/maxAge/allowCredentials/unmatchedPreflights). Exact origins project onto the plugin's LITERAL {exact} matcher, so wildcard-shaped and noncanonical exacts keep their source semantics instead of being widened or deferred; omitted unmatchedPreflights preserves Istio FORWARD; uncredentialed exact `*` preserves allow-all, while credentialed exact `*` stays deferred instead of losing credentials.",
+        notes = "Translated to a proxy-scoped `cors` plugin (allowOrigins[] exact/prefix/regex StringMatch / legacy allowOrigin, allowMethods/allowHeaders/exposeHeaders/maxAge/allowCredentials/unmatchedPreflights). Exact origins project onto the plugin's LITERAL {exact} matcher, so wildcard-shaped and noncanonical exacts keep their source semantics instead of being widened or deferred; omitted unmatchedPreflights preserves Istio FORWARD; uncredentialed exact `*` preserves allow-all, while credentialed exact `*`, opaque exact `null`, and effectively universal prefix/regex stay deferred instead of losing credentials or reflecting arbitrary origins.",
     );
     let cors = cors_plugin_for(&[virtual_service(json!({
         "hosts": ["api.example.com"],
@@ -332,6 +333,58 @@ fn vs_cors_policy_uncompilable_regex_origin_not_projected() {
             "an unrepresentable origin matcher must not emit a cors plugin: {origins}"
         );
     }
+}
+
+/// Credentialed opaque `null` and effectively universal prefix/regex origin
+/// matchers cannot be projected: they would reflect an arbitrary origin with
+/// credentials. Exact `*` keeps the documented deferral; these matchers are
+/// refused the same way rather than silently dropping credentials (issue
+/// #4269).
+#[test]
+fn vs_cors_policy_credentialed_universal_matcher_not_projected() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "http[].corsPolicy credentialed opaque/universal origin",
+        status = Status::Deferred,
+        notes = "allowCredentials plus opaque exact null or an effectively universal prefix/regex is fail-closed: left unprojected (deferred) rather than reflecting arbitrary origins with credentials or silently dropping credentials.",
+    );
+    for origins in [
+        json!([{"exact": "null"}]),
+        json!([{"prefix": "https://"}]),
+        json!([{"prefix": "h"}]),
+        json!([{"prefix": "chrome-extension://"}]),
+        json!([{"regex": ".*"}]),
+        json!([{"regex": "https://.*"}]),
+        json!([{"regex": "null"}]),
+    ] {
+        assert!(
+            cors_plugin_for(&[virtual_service(json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "route": [{"destination": {"host": "echo.default.svc.cluster.local", "port": {"number": 8080}}}],
+                    "corsPolicy": {
+                        "allowOrigins": origins,
+                        "allowCredentials": true
+                    }
+                }]
+            }))])
+            .is_none(),
+            "credentialed universal matcher must not emit a cors plugin: {origins}"
+        );
+    }
+
+    let projected = cors_plugin_for(&[virtual_service(json!({
+        "hosts": ["api.example.com"],
+        "http": [{
+            "route": [{"destination": {"host": "echo.default.svc.cluster.local", "port": {"number": 8080}}}],
+            "corsPolicy": {
+                "allowOrigins": [{"prefix": "https://app.example.com"}],
+                "allowCredentials": true
+            }
+        }]
+    }))])
+    .expect("credentialed host-constraining prefix must still project");
+    assert_eq!(projected.config["allow_credentials"], json!(true));
 }
 
 /// A `corsPolicy` `allowOrigins[]` entry that is not a single-key
