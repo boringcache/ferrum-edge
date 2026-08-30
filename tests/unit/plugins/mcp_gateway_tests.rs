@@ -931,6 +931,41 @@ fn invalid_config_shapes_are_rejected() {
 }
 
 #[test]
+fn valid_transparent_config_still_constructs() {
+    let config = transparent_config("http://127.0.0.1:9/mcp");
+    assert!(
+        create_plugin("mcp_gateway", &config).is_ok(),
+        "valid HTTP mcp_gateway config must still construct"
+    );
+}
+
+#[test]
+fn unknown_root_key_is_rejected() {
+    let mut config = transparent_config("http://127.0.0.1:9/mcp");
+    config["not_a_real_mcp_key"] = json!(true);
+    let error = create_plugin("mcp_gateway", &config)
+        .err()
+        .expect("unknown root key must fail closed");
+    assert!(error.contains("unknown configuration key"), "{error}");
+    assert!(error.contains("not_a_real_mcp_key"), "{error}");
+}
+
+#[test]
+fn servers_command_is_rejected_as_http_only() {
+    let mut config = transparent_config("http://127.0.0.1:9/mcp");
+    config["servers"]["github"]["command"] = json!("/path/to/mcp_stdio_server.py");
+    let error = create_plugin("mcp_gateway", &config)
+        .err()
+        .expect("stdio command must fail closed");
+    assert!(error.contains("HTTP-only"), "{error}");
+    assert!(error.contains("command"), "{error}");
+    assert!(
+        !error.contains("unknown configuration key"),
+        "stdio spawn keys must not be a generic unknown-key error: {error}"
+    );
+}
+
+#[test]
 fn validate_tool_results_config_is_accepted() {
     let mut config = aggregate_config("http://127.0.0.1:9/mcp");
     config["validation"] = json!({ "validate_tool_results": true });
