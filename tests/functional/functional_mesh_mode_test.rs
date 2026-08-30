@@ -527,6 +527,37 @@ fn ambient_dest_hbone_listen_override(port: u16) -> (&'static str, String) {
     ("FERRUM_MESH_HBONE_LISTEN_ADDR", format!("0.0.0.0:{port}"))
 }
 
+/// Kubernetes UUID leaf for host-netns Ambient dest fixtures that enroll the
+/// advertised workload address in the node-agent registry (issue #4249).
+/// Registry `spiffe_id=` requires a UUID; an alphanumeric leaf retracts the
+/// enrolled-destination index and the dest relay then refuses the CONNECT.
+const AMBIENT_DEST_RELAY_POD_UID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+/// Publish a node-agent registry leaf so an Ambient dest terminator whose HBONE
+/// listener is reached at `127.0.0.1` still admits a CONNECT `:authority`
+/// naming the advertised non-loopback workload address (issue #4249).
+///
+/// Ambient with a configured registry directory treats the enrolled-pod index
+/// as AUTHORITATIVE for the inventory arm. [`spawn_mesh_gateway`] always points
+/// `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR` at an empty `node-waypoint-pods/`
+/// dir, so without this leaf `destination_is_node_local_enrolled` refuses every
+/// inventory destination (`AddressNotTerminated`) even though the slice
+/// declares the dest as local. Same-cluster fixtures avoid this by dialing the
+/// workload IP on a `0.0.0.0` HBONE bind (own-address arm); cross-cluster and
+/// UDP-dest fixtures dial `127.0.0.1` and therefore need enrollment. Write the
+/// leaf before spawning the dest gateway so the startup `reconcile_once` sees
+/// it.
+fn publish_ambient_dest_relay_enrollment(temp: &TempDir, ipv4: &str, spiffe_id: &str) {
+    let registry_dir = temp.path().join("node-waypoint-pods");
+    std::fs::create_dir_all(&registry_dir).expect("create ambient dest pod registry");
+    let pod_uid = AMBIENT_DEST_RELAY_POD_UID;
+    std::fs::write(
+        registry_dir.join(pod_uid),
+        format!("/sys/fs/cgroup/kubepods/{pod_uid}\nspiffe_id={spiffe_id}\nipv4={ipv4}\n"),
+    )
+    .expect("publish ambient dest pod registry enrollment");
+}
+
 /// Bind an ephemeral listener for a fixture-owned server (a control plane, an
 /// echo backend, …) on a port no mesh gateway subprocess has been given.
 ///
@@ -7426,6 +7457,7 @@ fn cross_cluster_ambient_dest_slice(
     c_spiffe: &str,
     backend_port: u16,
     workload_address: &str,
+    pod_uid: &str,
     b_local_ca_pem: &str,
     a_ca_pem: &str,
 ) -> MeshSlice {
@@ -7458,7 +7490,7 @@ fn cross_cluster_ambient_dest_slice(
             weight: None,
             locality: None,
             service_account: Some("svc-c".to_string()),
-            pod_uid: None,
+            pod_uid: Some(pod_uid.to_string()),
             node_waypoint: None,
             remote_provenance: false,
         }],
@@ -7724,6 +7756,7 @@ async fn drive_ambient_cross_cluster_egress(
             c_spiffe,
             backend_port,
             &workload_address,
+            AMBIENT_DEST_RELAY_POD_UID,
             &b_ca_pem,
             &a_ca_for_c_federation,
         ))
@@ -7744,6 +7777,12 @@ async fn drive_ambient_cross_cluster_egress(
             &b_ca_for_a_federation,
         ))
         .await;
+
+        // Issue #4249: C's HBONE is reached at 127.0.0.1, so the CONNECT
+        // authority (non-loopback workload IP) takes the inventory arm, which
+        // the empty spawn-helper registry would refuse. Enroll the dest before
+        // C starts so the startup reconcile sees it.
+        publish_ambient_dest_relay_enrollment(&temp_c, &workload_address, c_spiffe);
 
         // Gateway C (dest, Ambient): HBONE relay → echo backend.
         let mut child_c = spawn_mesh_gateway(
@@ -8165,6 +8204,7 @@ async fn try_start_ambient_cross_cluster_fixture(
         c_spiffe,
         backend_port,
         workload_address,
+        AMBIENT_DEST_RELAY_POD_UID,
         &b_ca_pem,
         &a_ca_for_c_federation,
     ))
@@ -8185,6 +8225,12 @@ async fn try_start_ambient_cross_cluster_fixture(
         &b_ca_for_a_federation,
     ))
     .await;
+
+    // Issue #4249: C's HBONE is reached at 127.0.0.1, so the CONNECT
+    // authority (non-loopback workload IP) takes the inventory arm, which
+    // the empty spawn-helper registry would refuse. Enroll the dest before
+    // C starts so the startup reconcile sees it.
+    publish_ambient_dest_relay_enrollment(&temp_c, workload_address, c_spiffe);
 
     // Gateway C (dest, Ambient): HBONE relay → the app backend.
     let mut child_c = spawn_mesh_gateway(
@@ -9601,6 +9647,7 @@ fn udp_dest_slice(
     b_spiffe: &str,
     udp_port: u16,
     workload_address: &str,
+    pod_uid: &str,
 ) -> MeshSlice {
     let b_id = SpiffeId::new(b_spiffe).expect("b SPIFFE id");
     let trust_domain = TrustDomain::new("cluster.local").expect("trust domain");
@@ -9629,7 +9676,7 @@ fn udp_dest_slice(
             weight: None,
             locality: None,
             service_account: Some("svc-b".to_string()),
-            pod_uid: None,
+            pod_uid: Some(pod_uid.to_string()),
             node_waypoint: None,
             remote_provenance: false,
         }],
@@ -9849,10 +9896,17 @@ async fn drive_udp_dest_connect(
             b_spiffe,
             udp_port,
             &workload_address,
+            AMBIENT_DEST_RELAY_POD_UID,
         ))
         .await;
         let ports_b = reserve_mesh_ports().await;
         let hbone_port = ports_b.hbone;
+
+        // Issue #4249: the client dials B's HBONE at 127.0.0.1, so the CONNECT
+        // authority (non-loopback workload IP) takes the inventory arm, which
+        // the empty spawn-helper registry would refuse. Enroll the dest before
+        // B starts so the startup reconcile sees it.
+        publish_ambient_dest_relay_enrollment(&temp_b, &workload_address, b_spiffe);
 
         let mut child_b = spawn_mesh_gateway(
             &temp_b,
