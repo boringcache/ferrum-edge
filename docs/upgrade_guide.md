@@ -46,6 +46,16 @@ This changes what every backend observes, with no error surface.
 
 **Operator action:** if a backend depended on seeing client-supplied XFF hops in front of an untrusted Ferrum, add the connecting peer to `FERRUM_TRUSTED_PROXIES` so Ferrum will honor and append that chain; otherwise configure the backend to trust only the rightmost hop (Ferrum's socket peer).
 
+### Seven plugin constructors reject unknown config keys (issues [#4405](https://github.com/ferrum-edge/ferrum-edge/issues/4405) / [#4409](https://github.com/ferrum-edge/ferrum-edge/issues/4409))
+
+A typo in a plugin's `config` object was previously admitted and silently ignored, so a misspelled key became a no-op that still passed `validate` with exit 0. Unknown keys are now rejected, matching `PluginConfig`'s `deny_unknown_fields` and the behavior `jwt_auth`, `cors`, `ai_federation`, and `ai_stream_router` already had.
+
+`request_size_limiting`, `ws_message_size_limiting`, `a2a_gateway`, `ws_logging`, and `mcp_gateway` fail closed at construction, so file-mode `validate` exits 1. `http_logging` and `prometheus_metrics` keep their `OptionalFailOpen` policy: construction returns an error naming the unknown key, and `validate` / reload warn and omit that instance rather than failing the gateway — the same shape `stdout_logging` already had.
+
+`mcp_gateway` additionally rejects `command`, `args`, and `stdio` at the root and inside `servers.*` with an HTTP-only diagnostic. The gateway speaks HTTP to MCP upstreams and never spawned a stdio child, so a Claude-Desktop-style `command` field was previously accepted and ignored. Diagnostics include a spelling suggestion when the typo is close to a valid key. See [plugins.md](plugins.md).
+
+**Operator action:** run `ferrum-edge validate` before upgrading and fix any key it now names — typos such as `max_bytez`, `max_frame_bytez`, `endpont_url`, or `render_cache_ttl_secnds`. Replace any `servers.*.command` with an `upstream_url` using `http://` or `https://`.
+
 ### `POST /batch` rejects unknown top-level envelope keys (issue [#4042](https://github.com/ferrum-edge/ferrum-edge/issues/4042))
 
 `POST /batch` is create-only (`consumers`, `upstreams`, `proxies`, `plugin_configs`). Sending `updates`, `deletes`, or `dry_run` previously returned `201` and created only the resource arrays while silently ignoring the other keys. Unknown envelope keys now return `400`. `GET /backup` metadata (`version`, `ferrum_version`, `exported_at`, `source`, `counts`) and the backup-only `api_specs` / `gateway_trust_bundles` sections remain accepted and ignored so a backup file is still a valid additive import. See [admin_api.md](admin_api.md) and [admin_backup_restore.md](admin_backup_restore.md).
