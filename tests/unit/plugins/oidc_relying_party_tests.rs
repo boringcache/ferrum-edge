@@ -2441,6 +2441,7 @@ async fn previous_encryption_secret_accepts_pending_flow_during_rotation() {
 /// aggregate as soon as its generation commits — the same guarantee a directly
 /// configured `jwks_uri` gets at publication — and must leave it again when the
 /// generation retires.
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn oidc_discovered_jwks_store_joins_active_trust_health_after_commit() {
     use ferrum_edge::plugins::utils::jwks_cache::{
@@ -2520,6 +2521,7 @@ async fn oidc_discovered_jwks_store_joins_active_trust_health_after_commit() {
 
 /// A staged `oidc_relying_party` generation that is never committed must not
 /// reach readiness or metrics even after its discovery task publishes.
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn oidc_staged_discovery_store_is_not_exposed_before_commit() {
     use ferrum_edge::plugins::utils::jwks_cache::{clear_jwks_cache, trust_health_snapshot};

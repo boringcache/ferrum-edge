@@ -31,6 +31,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now rejects any value other than `0` before mode dispatch. **Operator
   action**: leave the variable unset or set it to `0`.
 
+- **BREAKING — seven plugin constructors reject unknown config keys**
+  (issues #4405, #4409). `request_size_limiting`, `ws_message_size_limiting`,
+  `a2a_gateway`, `ws_logging`, and `mcp_gateway` fail closed at construction
+  (file-mode `validate` exit 1). `http_logging` and `prometheus_metrics`
+  remain `OptionalFailOpen`: construction still returns `Err` naming the
+  unknown key, and `validate`/reload warn and omit the instance instead of
+  failing the gateway. `mcp_gateway` also rejects `command` / `args` /
+  `stdio` (root or `servers.*`) with an HTTP-only diagnostic; stdio spawn is
+  not implemented. **Operator action**: rename typos (`max_bytez`,
+  `max_frame_bytez`, `endpont_url`, `render_cache_ttl_secnds`, …) and replace
+  Claude-Desktop `command` with `servers.*.upstream_url` `http://`/`https://`.
+
 - **BREAKING — HTTP/1.1 requests without a Host header are rejected with 400**
   (issue #4390). RFC 9112 §3.2.2 requires a server to answer 400 when an
   HTTP/1.1 request lacks a Host field. Ferrum previously only rejected
