@@ -406,9 +406,12 @@ where
                 .poll_accept_recv(cx)
                 .map_err(|e| self.handle_connection_error(e))?
             {
-                Poll::Ready(stream) => self
-                    .pending_recv_streams
-                    .push(Some(AcceptRecvStream::new(stream))),
+                // The same receive-side ceiling covers unidirectional
+                // streams: SETTINGS/GOAWAY on the peer control stream are
+                // decoded by a FrameStream too (issue #4261).
+                Poll::Ready(stream) => self.pending_recv_streams.push(Some(
+                    AcceptRecvStream::new(stream, self.config.max_buffered_frame_len),
+                )),
                 Poll::Pending => break,
             }
         }

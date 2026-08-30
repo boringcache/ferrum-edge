@@ -10,9 +10,9 @@
 //! mode-aware plugin file-dependency phase and by runtime construction, then
 //! cached in the committed plugin generation so first flush and reconnect do
 //! not rediscover static source errors. The gateway's CRL list
-//! (`FERRUM_TLS_CRL_FILE_PATH`) is applied to the DTLS server verifier with
-//! `allow_unknown_revocation_status() + only_check_end_entity_revocation()`,
-//! matching the proxy backend / DTLS / frontend mTLS surfaces.
+//! (`FERRUM_TLS_CRL_FILE_PATH`) is applied to the DTLS server verifier under
+//! the shared `tls::crl_policy`, matching the proxy backend / DTLS / frontend
+//! mTLS surfaces.
 //!
 //! Each batch is serialized as a JSON array and sent as a single UDP datagram.
 //! DTLS success means local engine + connected-socket acceptance, not remote

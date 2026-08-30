@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::types::{GatewayConfig, K8sMeshOverlay};
 use crate::config_sources::k8s::{
-    K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
+    K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions, NodeWaypointInventory,
     translate_k8s_objects_collecting_skips,
 };
 use crate::grpc::cp_server::{CpGrpcServer, CpScope, DpNodeRegistry, NamespaceBroadcasts};
@@ -26,6 +26,7 @@ use crate::k8s_controller::status::{
     GatewayApiStatusContext, GatewayApiStatusWriter, StatusTranslationReuse,
     gateway_api_data_plane_service_ready, plan_gateway_api_status_updates_budgeted,
 };
+use crate::k8s_controller::status_budget::STATUS_BATCH_BACKSTOP;
 use crate::k8s_controller::status_plan::{DEFAULT_STATUS_PLAN_WORK_BUDGET, StatusPlanBudget};
 use crate::k8s_controller::watcher::namespaces_with_istio_root;
 use crate::modes::mesh::config::MeshConfig;
@@ -33,7 +34,15 @@ use crate::modes::mesh::revision::{MeshConfigRevision, MeshRevisionOrder};
 
 const INITIAL_STORE_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP: usize = DEFAULT_STATUS_PLAN_WORK_BUDGET;
-const STATUS_PATCH_BATCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Defensive outer bound on a status patch batch.
+///
+/// Before issue #4239 this was the ONLY bound: it was 60 seconds, it matched the
+/// Gateway API conformance suite's own parent-status wait exactly, and dropping
+/// the whole batch on expiry destroyed the evidence of which write had stalled.
+/// Both writers now bound every request and every object against their own
+/// batch budget, so reaching this backstop means a patch path escaped its
+/// budget — it is counted and warned about rather than treated as routine.
+const STATUS_PATCH_BATCH_TIMEOUT: Duration = STATUS_BATCH_BACKSTOP;
 
 /// Last reconciler-accepted Kubernetes translation, held independently of the
 /// DB-authored `GatewayConfig` snapshot. CP full reloads re-merge this overlay
@@ -317,6 +326,8 @@ async fn run_reconcile_loop(
         return;
     }
 
+    let node_waypoint_inventory = NodeWaypointInventory::new();
+
     // Initial reconciliation — block until first success.
     do_reconcile(
         Arc::clone(&store_set),
@@ -349,6 +360,7 @@ async fn run_reconcile_loop(
             istio_status_writer: istio_status_writer.clone(),
             metrics: Arc::clone(&metrics),
             revision: Arc::clone(&revision),
+            node_waypoint_inventory: node_waypoint_inventory.clone(),
         },
     )
     .await;
@@ -399,6 +411,7 @@ async fn run_reconcile_loop(
                         istio_status_writer: istio_status_writer.clone(),
                         metrics: Arc::clone(&metrics),
                         revision: Arc::clone(&revision),
+                        node_waypoint_inventory: node_waypoint_inventory.clone(),
                     },
                 ).await;
             }
@@ -443,6 +456,7 @@ async fn run_reconcile_loop(
                         istio_status_writer: istio_status_writer.clone(),
                         metrics: Arc::clone(&metrics),
                         revision: Arc::clone(&revision),
+                        node_waypoint_inventory: node_waypoint_inventory.clone(),
                     },
                 ).await;
             }
@@ -637,6 +651,9 @@ struct ReconcileContext {
     /// Kubernetes `resourceVersion` convergence evidence and the authoritative
     /// mesh config revision derived from it (issue #3611).
     revision: Arc<K8sConfigRevisionTracker>,
+    /// Last Ready NodeWaypoint endpoint per node, shared across reconciles.
+    /// Applied only with same-node trusted replacement evidence.
+    node_waypoint_inventory: NodeWaypointInventory,
 }
 
 fn namespaces_for_broadcast(
@@ -1110,7 +1127,8 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         .with_pod_source_namespaces(ctx.watch_namespaces.clone())
         .with_pod_discovery_enabled(ctx.pod_discovery_enabled)
         .with_mesh_sidecar_ingress_enforced(ctx.mesh_sidecar_ingress_enforced)
-        .with_mesh_overlay_authority(ctx.mesh_overlay_authority);
+        .with_mesh_overlay_authority(ctx.mesh_overlay_authority)
+        .with_node_waypoint_inventory(ctx.node_waypoint_inventory.clone());
     let Some((translation, translation_errors)) =
         translate_with_skip_retries(&objects, options.clone(), &ctx.metrics)
     else {
@@ -1278,7 +1296,14 @@ async fn run_status_patchers(request: StatusPatchersRequest<'_>) {
         .await;
     }
     if let Some(writer) = istio_writer {
-        patch_istio_statuses(writer, snapshot, options.clone(), translation_reuse).await;
+        patch_istio_statuses(
+            writer,
+            snapshot,
+            options.clone(),
+            translation_reuse,
+            metrics,
+        )
+        .await;
     }
 }
 
@@ -1343,11 +1368,14 @@ async fn patch_gateway_api_statuses(
             );
         }
         Err(_) => {
+            metrics
+                .status_batch_timeouts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             warn!(
                 updates = updates_len,
                 timeout_secs = STATUS_PATCH_BATCH_TIMEOUT.as_secs(),
                 cursor,
-                "Gateway API status patch batch timed out; leaving status-plan cursor unchanged so this window retries on a later reconcile"
+                "Gateway API status patch batch exceeded its defensive backstop; leaving status-plan cursor unchanged so this window retries on a later reconcile"
             );
         }
     }
@@ -1383,6 +1411,7 @@ async fn patch_istio_statuses(
     objects: Arc<[K8sObject]>,
     options: K8sTranslationOptions,
     translation_reuse: Option<&StatusTranslationReuse>,
+    metrics: &ControllerMetrics,
 ) {
     let updates = plan_istio_status_updates_budgeted(
         &objects,
@@ -1406,10 +1435,13 @@ async fn patch_istio_statuses(
             );
         }
         Err(_) => {
+            metrics
+                .status_batch_timeouts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             warn!(
                 updates = updates_len,
                 timeout_secs = STATUS_PATCH_BATCH_TIMEOUT.as_secs(),
-                "Istio status patch batch timed out; unfinished updates will retry on a later reconcile"
+                "Istio status patch batch exceeded its defensive backstop; unfinished updates will retry on a later reconcile"
             );
         }
     }

@@ -19,13 +19,11 @@
 use chrono::Utc;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy, default_namespace};
-use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
-use uuid::Uuid;
 
 // ============================================================================
 // Helpers
@@ -68,21 +66,8 @@ fn start_static_backend(
     })
 }
 
-fn auth_header(jwt_secret: &str, jwt_issuer: &str) -> String {
-    let now = Utc::now();
-    let claims = json!({
-        "iss": jwt_issuer,
-        "sub": "test-admin",
-        "role": "admin",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
-        "jti": Uuid::new_v4().to_string()
-    });
-    let header = Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = EncodingKey::from_secret(jwt_secret.as_bytes());
-    let token = encode(&header, &claims, &key).expect("Failed to encode admin JWT");
-    format!("Bearer {}", token)
+fn mint_failover_identity(label: &str) -> crate::common::SpawnedGatewayIdentity {
+    crate::common::SpawnedGatewayIdentity::mint(label)
 }
 
 fn binary_path() -> &'static str {
@@ -101,18 +86,19 @@ fn ensure_built() -> Result<(), Box<dyn std::error::Error>> {
     crate::common::ensure_gateway_built().map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
-async fn wait_for_health(admin_port: u16) -> bool {
-    let url = format!("http://127.0.0.1:{}/health", admin_port);
-    let deadline = SystemTime::now() + Duration::from_secs(30);
-    loop {
-        if SystemTime::now() >= deadline {
-            return false;
-        }
-        match reqwest::get(&url).await {
-            Ok(r) if r.status().is_success() => return true,
-            _ => tokio::time::sleep(Duration::from_millis(500)).await,
-        }
-    }
+async fn wait_for_owned_health(
+    child: &mut Child,
+    admin_port: u16,
+    identity: &crate::common::SpawnedGatewayIdentity,
+) -> bool {
+    crate::common::wait_for_owned_gateway_identity(
+        child,
+        admin_port,
+        identity,
+        Duration::from_secs(30),
+    )
+    .await
+    .is_ok()
 }
 
 /// Kill the child process and reap its zombie before any retry re-binds ports.
@@ -224,16 +210,13 @@ async fn test_db_failover_urls_startup() {
         let bogus_primary = "sqlite:/nonexistent/primary-should-not-exist/bogus.db?mode=ro";
         let failover_url = format!("sqlite:{}?mode=rwc", failover_db_path.to_string_lossy());
 
-        let jwt_secret = "failover-urls-test-jwt-secret-12345".to_string();
-        let jwt_issuer = "ferrum-edge-failover-test".to_string();
+        let identity = mint_failover_identity("db-failover-urls");
 
-        let child = Command::new(binary_path())
-            .env("FERRUM_MODE", "database")
+        let mut cmd = Command::new(binary_path());
+        cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", bogus_primary)
             .env("FERRUM_DB_FAILOVER_URLS", &failover_url)
-            .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
             .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
             .env("FERRUM_DB_POLL_INTERVAL", "2")
@@ -241,11 +224,11 @@ async fn test_db_failover_urls_startup() {
             .env("FERRUM_LOG_LEVEL", "info")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn gateway");
+            .stderr(Stdio::null());
+        identity.apply_to_command(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn gateway");
 
-        if !wait_for_health(admin_port).await {
+        if !wait_for_owned_health(&mut child, admin_port, &identity).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
             kill_child(child);
@@ -257,7 +240,7 @@ async fn test_db_failover_urls_startup() {
 
         // Gateway is up backed by the failover DB. Reads succeed; writes fail closed.
         let client = reqwest::Client::new();
-        let auth = auth_header(&jwt_secret, &jwt_issuer);
+        let auth = identity.auth_header();
 
         let health = client
             .get(format!("http://127.0.0.1:{}/health", admin_port))
@@ -386,19 +369,16 @@ async fn test_db_config_backup_bootstrap() {
         // the database mode entry point falls through to load_config_backup().
         let bogus_primary = "sqlite:/nonexistent/bootstrap/bogus.db?mode=ro";
 
-        let jwt_secret = "backup-bootstrap-test-jwt-secret-12345".to_string();
-        let jwt_issuer = "ferrum-edge-backup-test".to_string();
+        let identity = mint_failover_identity("db-failover-backup");
 
-        let child = Command::new(binary_path())
-            .env("FERRUM_MODE", "database")
+        let mut cmd = Command::new(binary_path());
+        cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", bogus_primary)
             .env(
                 "FERRUM_DB_CONFIG_BACKUP_PATH",
                 backup_path.to_string_lossy().to_string(),
             )
-            .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
             .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
             .env("FERRUM_DB_POLL_INTERVAL", "2")
@@ -406,14 +386,14 @@ async fn test_db_config_backup_bootstrap() {
             .env("FERRUM_LOG_LEVEL", "info")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn gateway");
+            .stderr(Stdio::null());
+        identity.apply_to_command(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn gateway");
 
         // Note: connecting to the primary DB fails with a short pool timeout,
         // but the backup loader still needs to read and parse the JSON file.
         // Budget plenty of time to avoid timing-out on a slow CI runner.
-        if !wait_for_health(admin_port).await {
+        if !wait_for_owned_health(&mut child, admin_port, &identity).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
             kill_child(child);
@@ -450,7 +430,7 @@ async fn test_db_config_backup_bootstrap() {
         // are disabled because the primary isn't reachable yet.
         let health = client
             .get(format!("http://127.0.0.1:{}/health", admin_port))
-            .header("Authorization", auth_header(&jwt_secret, &jwt_issuer))
+            .header("Authorization", identity.auth_header())
             .send()
             .await
             .expect("health");
@@ -529,19 +509,16 @@ async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
         std::fs::write(&backup_path, backup_json.to_string()).expect("write backup");
 
         let bogus_primary = "sqlite:/nonexistent/bootstrap/bogus-invalid-backup.db?mode=ro";
-        let jwt_secret = "backup-bootstrap-reject-test-jwt-secret".to_string();
-        let jwt_issuer = "ferrum-edge-backup-reject-test".to_string();
+        let identity = mint_failover_identity("db-failover-backup-reject");
 
-        let mut child = Command::new(binary_path())
-            .env("FERRUM_MODE", "database")
+        let mut cmd = Command::new(binary_path());
+        cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", bogus_primary)
             .env(
                 "FERRUM_DB_CONFIG_BACKUP_PATH",
                 backup_path.to_string_lossy().to_string(),
             )
-            .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
             // Both listeners are irrelevant to this pre-serving rejection
             // path. Disabling them avoids introducing a bind/drop/rebind race
             // into a test whose sole success condition is a non-zero exit.
@@ -552,9 +529,9 @@ async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
             .env("FERRUM_LOG_LEVEL", "info")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn gateway");
+            .stderr(Stdio::piped());
+        identity.apply_to_command(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn gateway");
 
         // An invalid backup should fail closed with a non-zero status once the
         // unreachable primary pool times out and the backup rejection path
@@ -691,11 +668,10 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
         let bogus_primary = "sqlite:/nonexistent/recovery-test/bogus.db?mode=ro";
         let failover_url = format!("sqlite:{}?mode=rwc", failover_db_path.to_string_lossy());
 
-        let jwt_secret = "recovery-test-jwt-secret-ferrum-edge-12345".to_string();
-        let jwt_issuer = "ferrum-edge-recovery-test".to_string();
+        let identity = mint_failover_identity("db-failover-recovery");
 
-        let child = Command::new(binary_path())
-            .env("FERRUM_MODE", "database")
+        let mut cmd = Command::new(binary_path());
+        cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", bogus_primary)
             .env("FERRUM_DB_FAILOVER_URLS", &failover_url)
@@ -703,8 +679,6 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
                 "FERRUM_DB_CONFIG_BACKUP_PATH",
                 backup_path.to_string_lossy().to_string(),
             )
-            .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
             .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
             .env("FERRUM_DB_POLL_INTERVAL", "1")
@@ -712,11 +686,11 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
             .env("FERRUM_LOG_LEVEL", "info")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn gateway");
+            .stderr(Stdio::null());
+        identity.apply_to_command(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn gateway");
 
-        if !wait_for_health(admin_port).await {
+        if !wait_for_owned_health(&mut child, admin_port, &identity).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
             kill_child(child);
@@ -737,7 +711,7 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let mut recovered = false;
         let mut last_health = serde_json::Value::Null;
-        let health_auth = auth_header(&jwt_secret, &jwt_issuer);
+        let health_auth = identity.auth_header();
         while std::time::Instant::now() < deadline {
             if let Ok(resp) = client
                 .get(&health_url)
@@ -783,7 +757,7 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
 
         // Reads stay available; mutations stay gated. A GET proves the failover
         // schema/migrations path without accepting a write that failback would erase.
-        let auth = auth_header(&jwt_secret, &jwt_issuer);
+        let auth = identity.auth_header();
         let list = client
             .get(format!("http://127.0.0.1:{}/proxies", admin_port))
             .header("Authorization", &auth)
@@ -874,16 +848,13 @@ async fn test_db_read_replica_startup() {
         let primary_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
         let replica_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
 
-        let jwt_secret = "replica-startup-test-jwt-secret-12345".to_string();
-        let jwt_issuer = "ferrum-edge-replica-test".to_string();
+        let identity = mint_failover_identity("db-failover-replica");
 
-        let child = Command::new(binary_path())
-            .env("FERRUM_MODE", "database")
+        let mut cmd = Command::new(binary_path());
+        cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", &primary_url)
             .env("FERRUM_DB_READ_REPLICA_URL", &replica_url)
-            .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
             .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
             .env("FERRUM_DB_POLL_INTERVAL", "2")
@@ -891,11 +862,11 @@ async fn test_db_read_replica_startup() {
             .env("FERRUM_LOG_LEVEL", "info")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn gateway");
+            .stderr(Stdio::null());
+        identity.apply_to_command(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn gateway");
 
-        if !wait_for_health(admin_port).await {
+        if !wait_for_owned_health(&mut child, admin_port, &identity).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
             kill_child(child);
@@ -912,7 +883,7 @@ async fn test_db_read_replica_startup() {
         assert!(db_path.exists(), "gateway.db should exist after startup");
 
         let client = reqwest::Client::new();
-        let auth = auth_header(&jwt_secret, &jwt_issuer);
+        let auth = identity.auth_header();
 
         // Writes always go to primary — exercise that codepath.
         let create = client
@@ -1024,16 +995,13 @@ async fn test_db_authoritative_startup_uses_primary_when_replica_is_stale() {
             .expect("insert primary proxy");
         drop(store);
 
-        let jwt_secret = "authoritative-primary-test-jwt-secret-12345".to_string();
-        let jwt_issuer = "ferrum-edge-authoritative-primary-test".to_string();
+        let identity = mint_failover_identity("db-failover-authoritative");
 
-        let child = Command::new(binary_path())
-            .env("FERRUM_MODE", "database")
+        let mut cmd = Command::new(binary_path());
+        cmd.env("FERRUM_MODE", "database")
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", &primary_url)
             .env("FERRUM_DB_READ_REPLICA_URL", &replica_url)
-            .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
             .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
             .env("FERRUM_DB_POLL_INTERVAL", "1")
@@ -1041,11 +1009,11 @@ async fn test_db_authoritative_startup_uses_primary_when_replica_is_stale() {
             .env("FERRUM_LOG_LEVEL", "info")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn gateway");
+            .stderr(Stdio::null());
+        identity.apply_to_command(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn gateway");
 
-        if !wait_for_health(admin_port).await {
+        if !wait_for_owned_health(&mut child, admin_port, &identity).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
             kill_child(child);
@@ -1069,7 +1037,7 @@ async fn test_db_authoritative_startup_uses_primary_when_replica_is_stale() {
         let body = resp.text().await.unwrap_or_default();
         assert_eq!(body, "primary-authoritative-ok");
 
-        let auth = auth_header(&jwt_secret, &jwt_issuer);
+        let auth = identity.auth_header();
         let list = client
             .get(format!("http://127.0.0.1:{}/proxies", admin_port))
             .header("Authorization", &auth)

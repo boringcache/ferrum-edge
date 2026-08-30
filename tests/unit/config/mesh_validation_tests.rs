@@ -1087,6 +1087,78 @@ fn service_entry_endpoints_only_with_static_resolution() {
     );
 }
 
+fn minimal_valid_service_entry() -> ServiceEntry {
+    ServiceEntry {
+        name: "se".into(),
+        namespace: "default".into(),
+        hosts: vec!["api.example.com".into()],
+        endpoints: Vec::new(),
+        resolution: Resolution::Dns,
+        location: ServiceEntryLocation::MeshExternal,
+        ports: Vec::new(),
+        export_to: Vec::new(),
+        workload_selector: None,
+    }
+}
+
+/// Native/file/xDS ServiceEntry slices must share the same fail-closed
+/// `exportTo` boundary DestinationRules get (issue #4308).
+#[test]
+fn service_entry_rejects_unsupported_export_to_values() {
+    for (label, export_to) in [
+        ("tilde", vec!["~".to_string()]),
+        ("uppercase namespace", vec!["Prod".to_string()]),
+        (
+            "wildcard plus namespace",
+            vec!["*".to_string(), "team-a".to_string()],
+        ),
+        (
+            "over-long list",
+            (0..65).map(|i| format!("ns-{i}")).collect(),
+        ),
+    ] {
+        let mut se = minimal_valid_service_entry();
+        se.export_to = export_to;
+        let errors = validate_mesh_config(&[], &[], &[], &[], &[se], &[], None);
+        assert!(
+            errors.iter().any(|e| e.contains("exportTo")),
+            "{label}: expected an exportTo validation error, got {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn service_entry_export_to_rejection_does_not_echo_the_hostile_value() {
+    let hostile = "Q".repeat(200);
+    let mut se = minimal_valid_service_entry();
+    se.export_to = vec![hostile.clone()];
+    let errors = validate_mesh_config(&[], &[], &[], &[], &[se], &[], None);
+    assert!(errors.iter().any(|e| e.contains("exportTo")), "{errors:?}");
+    assert!(
+        !errors.iter().any(|e| e.contains(&hostile)),
+        "the diagnostic must name the field and index, never echo the raw \
+         operator-supplied value; got {errors:?}"
+    );
+}
+
+#[test]
+fn service_entry_accepts_supported_export_to_values() {
+    for export_to in [
+        vec![],
+        vec![".".to_string()],
+        vec!["*".to_string()],
+        vec!["team-a".to_string()],
+    ] {
+        let mut se = minimal_valid_service_entry();
+        se.export_to = export_to.clone();
+        let errors = validate_mesh_config(&[], &[], &[], &[], &[se], &[], None);
+        assert!(
+            !errors.iter().any(|e| e.contains("exportTo")),
+            "{export_to:?} must validate, got {errors:?}"
+        );
+    }
+}
+
 #[test]
 fn trust_bundle_set_must_have_authorities() {
     let tbs = TrustBundleSet {
@@ -2789,8 +2861,9 @@ mod virtual_service_cors {
         credentialed.cors.allow_credentials = Some(true);
         let errors = validate(vec![credentialed]);
         assert!(
-            errors.iter().any(|error| error
-                .contains("allow_credentials must not be true with an exact `*` origin")),
+            errors.iter().any(|error| error.contains(
+                "allow_credentials must not be true with exact `*`, opaque exact `null`, or an effectively universal prefix/regex matcher"
+            )),
             "{errors:?}"
         );
 
@@ -2798,6 +2871,47 @@ mod virtual_service_cors {
         uncredentialed.cors.allow_credentials = Some(false);
         let errors = validate(vec![uncredentialed]);
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn credentialed_opaque_and_universal_matchers_are_rejected_without_weakening() {
+        for origin in [
+            MeshCorsOriginMatch::Exact("null".into()),
+            MeshCorsOriginMatch::Prefix("https://".into()),
+            MeshCorsOriginMatch::Prefix("h".into()),
+            MeshCorsOriginMatch::Prefix("chrome-extension://".into()),
+            MeshCorsOriginMatch::Regex(".*".into()),
+            MeshCorsOriginMatch::Regex("https://.*".into()),
+            MeshCorsOriginMatch::Regex("null".into()),
+        ] {
+            let mut credentialed = policy(vec![origin.clone()]);
+            credentialed.cors.allow_credentials = Some(true);
+            let errors = validate(vec![credentialed]);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("opaque exact `null`")),
+                "credentialed {origin:?} must be refused: {errors:?}"
+            );
+
+            let mut uncredentialed = policy(vec![origin]);
+            uncredentialed.cors.allow_credentials = Some(false);
+            let errors = validate(vec![uncredentialed]);
+            assert!(
+                errors.is_empty(),
+                "uncredentialed universal matcher must still construct: {errors:?}"
+            );
+        }
+
+        let mut narrow = policy(vec![MeshCorsOriginMatch::Prefix(
+            "https://app.example.com".into(),
+        )]);
+        narrow.cors.allow_credentials = Some(true);
+        let errors = validate(vec![narrow]);
+        assert!(
+            errors.is_empty(),
+            "credentialed host-constraining prefix must remain representable: {errors:?}"
+        );
     }
 
     /// A padded literal is preserved verbatim under literal-exact semantics
@@ -3052,7 +3166,7 @@ mod virtual_service_cors {
             allowed_origins: vec![
                 MeshCorsOriginMatch::Exact("https://a.example".into()),
                 MeshCorsOriginMatch::Prefix("https://app.".into()),
-                MeshCorsOriginMatch::Regex("https://.*".into()),
+                MeshCorsOriginMatch::Regex("https://.*\\.example\\.com".into()),
             ],
             allowed_methods: vec!["GET".into()],
             allowed_headers: vec!["x-a".into()],
@@ -3069,7 +3183,7 @@ mod virtual_service_cors {
             serde_json::json!([
                 {"exact": "https://a.example"},
                 {"prefix": "https://app."},
-                {"regex": "https://.*"}
+                {"regex": "https://.*\\.example\\.com"}
             ])
         );
         assert_eq!(config["allowed_methods"], serde_json::json!(["GET"]));

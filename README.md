@@ -445,7 +445,7 @@ concurrent, 10s, 64-byte payload; run date not recorded in this summary):
 
 **Adaptive buffer sizing** (enabled by default) dynamically tunes TCP/WebSocket tunnel copy buffers and UDP batch limits per proxy based on observed traffic patterns. Small-message proxies get smaller buffers (saves memory), bulk transfer proxies get larger buffers (reduces syscalls). See `FERRUM_ADAPTIVE_BUFFER_*` env vars for tuning.
 
-**Linux socket tuning**: (`TCP_FASTOPEN`, `IP_BIND_ADDRESS_NO_PORT`), TLS handshake offload to dedicated runtimes, thread-local Date header caching, lazy timeout initialization, frequency-aware router cache eviction (Count-Min Sketch), RED-style adaptive load shedding, and a cacheability predictor for the response cache plugin. See [FEATURES.md](FEATURES.md) for details.
+**Linux socket tuning**: (`TCP_FASTOPEN`, `IP_BIND_ADDRESS_NO_PORT`), thread-local Date header caching, lazy timeout initialization, frequency-aware router cache eviction (Count-Min Sketch), RED-style adaptive load shedding, and a cacheability predictor for the response cache plugin. See [FEATURES.md](FEATURES.md) for details.
 
 For current suite methodology and dated result tables, see
 [`tests/performance/`](tests/performance/) and
@@ -551,4 +551,4 @@ Copyright (c) 2026 Ferrum Edge
 
 Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
 
-**TL;DR**: Free to use as long as you're not reselling our technology. Hobbyists, students, researchers, nonprofits — go wild. Companies evaluating Ferrum for a proof-of-concept or demo? Also totally fine, kick the tires. But if you're dropping this into your production network stack, we kindly ask that you grab a [commercial license](LICENSE-COMMERCIAL.md) and help fund our caffeine supply. Open source doesn't run on exposure — it runs on coffee, and coffee costs money.
+**TL;DR**: Permitted noncommercial use is defined by [LICENSE](LICENSE) (PolyForm Noncommercial 1.0.0). For-profit infrastructure use and evaluation with anticipated commercial application require a [commercial license](LICENSE-COMMERCIAL.md). See [LICENSE](LICENSE) and [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md) for the controlling terms and use-case table.

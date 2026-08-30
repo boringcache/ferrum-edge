@@ -2207,6 +2207,29 @@ fn extract_namespace(headers: &hyper::HeaderMap) -> Result<String, Response<Full
     Ok(ns.to_string())
 }
 
+/// Canonical audit bucket for fleet-global mutations, invalid
+/// `X-Ferrum-Namespace` values, and `ns`-claim denials. `GET /audit` still
+/// filters on this field, so a caller must not be able to choose it via an
+/// unvalidated header on routes the claim gate never checks.
+fn canonical_global_audit_namespace() -> &'static str {
+    crate::config::types::DEFAULT_NAMESPACE
+}
+
+/// Namespace stored on an admin audit row (and on the per-request audit slot).
+///
+/// `X-Ferrum-Namespace` may label an event only for routes selected by that
+/// header ([`is_namespace_scoped_route`]), and only after the existing
+/// `ns`-claim gate has authorized it. Fleet-global surfaces (TLS/ACME
+/// management, mesh config-revision reset, observability, `/cluster`, the
+/// `/namespaces` registry path) always use [`canonical_global_audit_namespace`].
+fn audit_namespace_for_request<'a>(segments: &[&str], request_namespace: &'a str) -> &'a str {
+    if is_namespace_scoped_route(segments) {
+        request_namespace
+    } else {
+        canonical_global_audit_namespace()
+    }
+}
+
 /// Whether an admin route operates on namespace-scoped resources selected via
 /// `X-Ferrum-Namespace`. Used by the opt-in per-namespace `ns`-claim gate
 /// (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`); global admin surfaces (TLS
@@ -2344,13 +2367,17 @@ pub async fn handle_admin_request(
     state: AdminState,
     client_ip: std::net::IpAddr,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let request_path = req.uri().path();
+    let request_segments: Vec<&str> = request_path.trim_start_matches('/').split('/').collect();
+    let header_namespace = req
+        .headers()
+        .get("x-ferrum-namespace")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or(crate::config::types::DEFAULT_NAMESPACE);
     let slot = audit::new_request_slot(
         req.method().as_str(),
-        req.uri().path(),
-        req.headers()
-            .get("x-ferrum-namespace")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or(crate::config::types::DEFAULT_NAMESPACE),
+        request_path,
+        audit_namespace_for_request(request_segments.as_slice(), header_namespace),
     );
     let result = audit::scope_request(
         Arc::clone(&slot),
@@ -3201,8 +3228,8 @@ async fn handle_admin_request_inner(
                     &auth,
                     "backup",
                     "gateway_config",
-                    crate::config::types::DEFAULT_NAMESPACE,
-                    crate::config::types::DEFAULT_NAMESPACE,
+                    canonical_global_audit_namespace(),
+                    canonical_global_audit_namespace(),
                     audit::backup_namespace_validation_failure_diff(resources),
                 )
                 .with_request_context(&audit_request_ctx)
@@ -3240,12 +3267,14 @@ async fn handle_admin_request_inner(
         // for an export that was never a reachable route.
         if method == Method::GET && matches!(segments_peek.as_slice(), ["backup"]) {
             let resources = backup_resources_query_audit_value(query.as_deref());
+            // The header was just denied: do not file the security record under
+            // the unvalidated tenant the caller asked for.
             let event = audit::AuditEvent::new(
                 &auth,
                 "backup",
                 "gateway_config",
-                namespace.as_str(),
-                namespace.as_str(),
+                canonical_global_audit_namespace(),
+                canonical_global_audit_namespace(),
                 audit::backup_failure_diff(audit::failure_category::NAMESPACE_DENIED, resources),
             )
             .with_request_context(&audit_request_ctx)
@@ -4233,14 +4262,8 @@ async fn handle_admin_request_inner(
             if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
                 return Ok(resp);
             }
-            handle_mesh_config_revision_reset(
-                &state,
-                &auth,
-                query.as_deref(),
-                &namespace,
-                &audit_request_ctx,
-            )
-            .await
+            handle_mesh_config_revision_reset(&state, &auth, query.as_deref(), &audit_request_ctx)
+                .await
         }
 
         // F7.2: remote-cluster discovery introspection. Read-only operator
@@ -4351,7 +4374,7 @@ async fn handle_admin_request_inner(
                 action,
                 resource_type,
                 resource_id,
-                &namespace,
+                audit_namespace_for_request(segments.as_slice(), &namespace),
                 json!({"path": path}),
             );
             if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
@@ -4569,12 +4592,12 @@ async fn handle_mesh_runtime_overlay_get(
 /// The revision the gate hands back is already sanitized — the `authority` is
 /// control-plane-supplied, so `MeshRevisionGate::reset` strips control
 /// characters and truncates before the value can reach this audit log line or
-/// the JSON body. Do not swap this for a raw accessor.
+/// the JSON body. Do not swap this for a raw accessor. The audit row is always
+/// stored under [`canonical_global_audit_namespace`], not `X-Ferrum-Namespace`.
 async fn handle_mesh_config_revision_reset(
     state: &AdminState,
     auth: &AuditActor,
     query: Option<&str>,
-    namespace: &str,
     request_ctx: &audit::AuditRequestContext,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let Some(mesh_runtime) = state.mesh_runtime_state.as_ref() else {
@@ -4620,7 +4643,7 @@ async fn handle_mesh_config_revision_reset(
         "reset",
         "mesh_config_revision",
         resource_id,
-        namespace,
+        canonical_global_audit_namespace(),
         diff,
     )
     .with_request_context(request_ctx)
@@ -7373,6 +7396,55 @@ pub(crate) fn plugin_validation_http_client(state: &AdminState) -> plugins::Plug
         })
 }
 
+/// Collect plugin-name and plugin-definition admission errors for an
+/// operator-provided set of `PluginConfig` rows.
+///
+/// Shared by `POST /batch` and `POST /restore` so the two cannot drift. The
+/// checks are deliberately unconditional: an `enabled: false` row with an
+/// unknown plugin name, an invalid trigger, or a denied config-graph policy
+/// would otherwise be persisted and then be impossible to enable, because
+/// every other write path validates it. This is the admission contract only —
+/// the runtime pipeline keeps its intentional disabled-plugin construction
+/// short circuit, so full schema validation still applies to enabled rows.
+pub(crate) fn collect_plugin_config_admission_errors(
+    state: &AdminState,
+    plugin_configs: &[PluginConfig],
+    validation_errors: &mut Vec<String>,
+) {
+    let known_plugins = plugins::available_plugins();
+    // Built once: on a control plane (no `ProxyState`) this constructs a fresh
+    // validation client, and restore admits payloads with far more plugin rows
+    // than a batch write.
+    let http_client = plugin_validation_http_client(state);
+    for plugin_config in plugin_configs {
+        if !known_plugins.contains(&plugin_config.plugin_name.as_str()) {
+            validation_errors.push(format!(
+                "PluginConfig '{}': unknown plugin name '{}'",
+                plugin_config.id, plugin_config.plugin_name
+            ));
+        }
+        if crate::plugins::transaction_log_schema::participates_in_config_graph(plugin_config) {
+            if let Err(err) = crate::plugins::validate_plugin_config_policy_only(
+                &plugin_config.plugin_name,
+                &plugin_config.config,
+                &state.backend_allow_ips,
+            ) {
+                validation_errors.push(format!(
+                    "PluginConfig '{}': invalid config: {}",
+                    plugin_config.id, err
+                ));
+            }
+        } else if let Err(err) =
+            validate_plugin_config_definition(plugin_config, http_client.clone())
+        {
+            validation_errors.push(format!(
+                "PluginConfig '{}': invalid config: {}",
+                plugin_config.id, err
+            ));
+        }
+    }
+}
+
 pub(crate) fn validate_plugin_config_definition(
     pc: &PluginConfig,
     http_client: plugins::PluginHttpClient,
@@ -7698,7 +7770,6 @@ async fn handle_batch_create(
 
     let now = Utc::now();
     let validation_ctx = crud::ValidationCtx::from_state(state);
-    let known_plugins = crate::plugins::available_plugins();
     let mut validation_errors: Vec<String> = Vec::new();
 
     if let Err(error) = prepare_batch_items(
@@ -7754,33 +7825,7 @@ async fn handle_batch_create(
         ));
     }
 
-    for plugin_config in &batch.plugin_configs {
-        if !known_plugins.contains(&plugin_config.plugin_name.as_str()) {
-            validation_errors.push(format!(
-                "PluginConfig '{}': unknown plugin name '{}'",
-                plugin_config.id, plugin_config.plugin_name
-            ));
-        }
-        if crate::plugins::transaction_log_schema::participates_in_config_graph(plugin_config) {
-            if let Err(err) = crate::plugins::validate_plugin_config_policy_only(
-                &plugin_config.plugin_name,
-                &plugin_config.config,
-                &state.backend_allow_ips,
-            ) {
-                validation_errors.push(format!(
-                    "PluginConfig '{}': invalid config: {}",
-                    plugin_config.id, err
-                ));
-            }
-        } else if let Err(err) =
-            validate_plugin_config_definition(plugin_config, plugin_validation_http_client(state))
-        {
-            validation_errors.push(format!(
-                "PluginConfig '{}': invalid config: {}",
-                plugin_config.id, err
-            ));
-        }
-    }
+    collect_plugin_config_admission_errors(state, &batch.plugin_configs, &mut validation_errors);
 
     if batch
         .plugin_configs
@@ -8984,6 +9029,13 @@ async fn validate_restore_candidate_on_blocking_pool(
             .validate_unique_resource_ids(ValidationAction::Collect)
             .validate_unique_consumer_identities(ValidationAction::Collect)
             .validate_unique_consumer_credentials(ValidationAction::Collect)
+            // Name uniqueness is enforced by `POST /batch`, file mode, and a
+            // real unique index on `(namespace, name)` in every backend. It
+            // must be refused here too, before the destructive clear, or a
+            // duplicate-name payload wipes the namespace and only then fails
+            // during persistence (issue #4265).
+            .validate_unique_upstream_names(ValidationAction::Collect)
+            .validate_unique_proxy_names(ValidationAction::Collect)
             .validate_hosts(ValidationAction::Collect)
             .validate_regex_listen_paths(ValidationAction::Collect)
             .validate_listen_path_encodings(ValidationAction::Collect)
@@ -9213,6 +9265,22 @@ async fn handle_restore(
             }
         }
     }
+    // Restore replaces the whole namespace, so the candidate is authoritative:
+    // no DB overlay is needed to decide mTLS transport compatibility. Without
+    // this check restore is the only way to persist an enabled `mtls_auth`
+    // instance on a stream proxy that terminates no TLS, which then rejects
+    // every connection with a 401 (issue #4282).
+    if let Err(errors) = candidate.validate_mtls_auth_compatibility() {
+        validation_errors.extend(errors);
+    }
+    // Match `POST /batch` and single-resource admission: plugin names and
+    // definitions are validated even for `enabled: false` rows, which the
+    // pipeline's `PluginConfigs` step deliberately skips (issue #4283).
+    collect_plugin_config_admission_errors(
+        state,
+        &candidate.plugin_configs,
+        &mut validation_errors,
+    );
     match crud::validate_plugin_graph_restore_candidate(state, &candidate) {
         Ok(()) => {}
         Err(
@@ -11440,8 +11508,10 @@ mod tests {
             vec!["backend-capabilities"],
             vec!["metrics", "runtime"],
             vec!["admin", "tls", "inventory"],
+            vec!["admin", "tls", "ca-bundles"],
             vec!["admin", "metrics"],
             vec!["mesh", "service-graph"],
+            vec!["mesh", "config-revision", "reset"],
             vec!["health"],
             vec!["overload"],
         ] {
@@ -11450,7 +11520,26 @@ mod tests {
                 "/{} should NOT be namespace-scoped",
                 segs.join("/")
             );
+            assert_eq!(
+                audit_namespace_for_request(&segs, "tenant-b"),
+                canonical_global_audit_namespace(),
+                "/{} must not inherit an unvalidated request namespace on audit rows",
+                segs.join("/")
+            );
         }
+
+        assert_eq!(
+            audit_namespace_for_request(&["proxies"], "tenant-a"),
+            "tenant-a"
+        );
+        assert_eq!(
+            audit_namespace_for_request(&["backup"], "tenant-a"),
+            "tenant-a"
+        );
+        assert_eq!(
+            canonical_global_audit_namespace(),
+            crate::config::types::DEFAULT_NAMESPACE
+        );
     }
 
     #[test]

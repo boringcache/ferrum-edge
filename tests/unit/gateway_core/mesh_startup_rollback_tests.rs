@@ -6,15 +6,35 @@
 //! the original cause.
 
 use ferrum_edge::_test_support::{
-    mesh_startup_failure_before_owner_probe_for_test,
+    MeshStartupRollbackProbe, mesh_startup_failure_before_owner_probe_for_test,
     mesh_startup_failure_before_startup_result_gate_probe_for_test,
     mesh_startup_failure_inside_startup_result_gate_probe_for_test,
     mesh_startup_failure_listener_join_bounded_probe_for_test,
 };
 
-#[tokio::test(flavor = "current_thread")]
-async fn failure_before_owner_drains_spawned_tasks() {
-    let probe = mesh_startup_failure_before_owner_probe_for_test().await;
+use crate::unit::env_lock::ENV_LOCK;
+
+/// The production startup path reads the UDP placement variables directly.
+/// Run each async probe to completion while owning the same process-wide lock
+/// as every environment-mutating unit test. A synchronous wrapper is
+/// deliberate: it avoids carrying a `MutexGuard` across an `.await` in test
+/// source while still excluding transient sibling-test environment state.
+fn run_env_locked_startup_probe(
+    probe: impl std::future::Future<Output = MeshStartupRollbackProbe>,
+) -> MeshStartupRollbackProbe {
+    let _env_lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("startup rollback probe runtime")
+        .block_on(probe)
+}
+
+#[test]
+fn failure_before_owner_drains_spawned_tasks() {
+    let probe = run_env_locked_startup_probe(mesh_startup_failure_before_owner_probe_for_test());
 
     assert!(
         !probe.ok,
@@ -37,9 +57,11 @@ async fn failure_before_owner_drains_spawned_tasks() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn failure_before_startup_result_gate_drains_spawned_tasks() {
-    let probe = mesh_startup_failure_before_startup_result_gate_probe_for_test().await;
+#[test]
+fn failure_before_startup_result_gate_drains_spawned_tasks() {
+    let probe = run_env_locked_startup_probe(
+        mesh_startup_failure_before_startup_result_gate_probe_for_test(),
+    );
 
     assert!(
         !probe.ok,
@@ -62,9 +84,11 @@ async fn failure_before_startup_result_gate_drains_spawned_tasks() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn failure_inside_startup_result_gate_drains_spawned_tasks() {
-    let probe = mesh_startup_failure_inside_startup_result_gate_probe_for_test().await;
+#[test]
+fn failure_inside_startup_result_gate_drains_spawned_tasks() {
+    let probe = run_env_locked_startup_probe(
+        mesh_startup_failure_inside_startup_result_gate_probe_for_test(),
+    );
 
     assert!(
         !probe.ok,

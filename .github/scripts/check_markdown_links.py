@@ -347,12 +347,32 @@ def run_self_test(root: Path = REPO_ROOT) -> None:
         external = temp_root / "external"
         repo.mkdir()
         external.mkdir()
-        first_party = repo / "README.md"
+        first_party = (repo / "README.md").resolve()
         first_party.write_text("# First party\n", encoding="utf-8")
         (external / "outside.md").write_text("# Outside\n", encoding="utf-8")
         (repo / "external-link").symlink_to(external, target_is_directory=True)
         discovered = first_party_markdown_files(repo)
     assert discovered == [first_party], discovered
+
+    # Discovery canonicalizes the repository root; a root reached through a
+    # symlink alias (for example macOS `/var` → `/private/var`) must return
+    # the same resolved first-party markdown set.
+    with tempfile.TemporaryDirectory(prefix="md-link-canonical-") as tmp:
+        temp_root = Path(tmp)
+        canonical_repo = temp_root / "repo"
+        canonical_repo.mkdir()
+        only_md = (canonical_repo / "notes.md").resolve()
+        only_md.write_text("# Notes\n", encoding="utf-8")
+        via_canonical = first_party_markdown_files(canonical_repo)
+        assert via_canonical == [only_md], via_canonical
+        alias = temp_root / "alias"
+        try:
+            alias.symlink_to(canonical_repo, target_is_directory=True)
+        except OSError:
+            pass
+        else:
+            via_alias = first_party_markdown_files(alias)
+            assert via_alias == via_canonical, (via_alias, via_canonical)
     print("markdown link-check self-test passed")
 
 

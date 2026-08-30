@@ -11,6 +11,7 @@ pub mod reconciler;
 pub mod resource_store;
 pub mod revision;
 pub mod status;
+pub mod status_budget;
 pub mod status_plan;
 pub mod watcher;
 

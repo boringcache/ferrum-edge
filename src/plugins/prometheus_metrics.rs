@@ -795,7 +795,8 @@ pub struct MetricsRegistry {
     /// disconnect.
     pub stream_disconnect_counter: DashMap<StreamDisconnectKey, TimestampedCounter>,
     /// Mesh DNS upstream transaction-ID exhaustion events. This is process-wide
-    /// because the transparent mesh DNS proxy uses one shared upstream socket.
+    /// because the transparent mesh DNS proxy shares one 16-bit upstream ID
+    /// space across in-flight forwarded queries.
     pub mesh_dns_upstream_id_exhaustions: AtomicU64,
     /// HBONE tunnel relay failures keyed by (proxy_id, direction, error_class).
     /// Incremented when the background CONNECT relay observes a copy failure
@@ -3000,6 +3001,26 @@ impl MetricsRegistry {
             output,
             "ferrum_k8s_controller_istio_status_unsupported_total",
             snapshot.istio_status_unsupported,
+            "",
+        );
+        output.push_str(
+            "# HELP ferrum_k8s_controller_status_batch_timeouts_total Kubernetes status patch batches abandoned by the reconciler's defensive outer timeout after the batch failed to bound itself.\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_status_batch_timeouts_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_status_batch_timeouts_total",
+            snapshot.status_batch_timeouts,
+            "",
+        );
+        output.push_str(
+            "# HELP ferrum_k8s_controller_status_request_timeouts_total Kubernetes status reads and writes abandoned because they exceeded their wall-clock budget on the serialized reconcile loop.\n",
+        );
+        output.push_str("# TYPE ferrum_k8s_controller_status_request_timeouts_total counter\n");
+        render_process_counter(
+            output,
+            "ferrum_k8s_controller_status_request_timeouts_total",
+            snapshot.status_request_timeouts,
             "",
         );
     }

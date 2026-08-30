@@ -39,7 +39,7 @@ use serde_json::json;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// Default MongoDB connection for local development / CI.
@@ -62,6 +62,7 @@ struct MongoTestHarness {
     admin_base_url: String,
     jwt_secret: String,
     jwt_issuer: String,
+    observability_token: String,
     mongo_app_name: String,
     admin_port: u16,
     proxy_port: u16,
@@ -69,8 +70,7 @@ struct MongoTestHarness {
 
 impl MongoTestHarness {
     async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let jwt_secret = "mongo-test-secret-key-1234567890ab".to_string();
-        let jwt_issuer = "ferrum-edge-mongo-test".to_string();
+        let identity = crate::common::SpawnedGatewayIdentity::mint("mongodb");
 
         let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let admin_port = admin_listener.local_addr()?.port();
@@ -84,12 +84,21 @@ impl MongoTestHarness {
             gateway_process: None,
             proxy_base_url: format!("http://127.0.0.1:{}", proxy_port),
             admin_base_url: format!("http://127.0.0.1:{}", admin_port),
-            jwt_secret,
-            jwt_issuer,
+            jwt_secret: identity.jwt_secret,
+            jwt_issuer: identity.jwt_issuer,
+            observability_token: identity.observability_token,
             mongo_app_name: format!("ferrum-functional-{}", Uuid::new_v4()),
             admin_port,
             proxy_port,
         })
+    }
+
+    fn mint_spawn_identity(&mut self) -> crate::common::SpawnedGatewayIdentity {
+        let identity = crate::common::SpawnedGatewayIdentity::mint("mongodb");
+        self.jwt_secret = identity.jwt_secret.clone();
+        self.jwt_issuer = identity.jwt_issuer.clone();
+        self.observability_token = identity.observability_token.clone();
+        identity
     }
 
     /// Start the gateway with plaintext MongoDB connection.
@@ -149,13 +158,12 @@ impl MongoTestHarness {
         replica_set: Option<&str>,
         extra_env: &[(&str, &str)],
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let identity = self.mint_spawn_identity();
         let binary_path = find_binary()?;
 
         let mut command = Command::new(binary_path);
         command
             .env("FERRUM_MODE", "database")
-            .env("FERRUM_ADMIN_JWT_SECRET", &self.jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &self.jwt_issuer)
             .env("FERRUM_DB_TYPE", "mongodb")
             .env("FERRUM_DB_URL", mongo_url)
             .env("FERRUM_MONGO_DATABASE", DEFAULT_MONGO_DATABASE)
@@ -173,6 +181,7 @@ impl MongoTestHarness {
             command.env(key, value);
         }
         configure_coverage_gateway_command(&mut command);
+        identity.apply_to_command(&mut command);
         let child = command.spawn()?;
 
         self.gateway_process = Some(child);
@@ -323,14 +332,13 @@ impl MongoTestHarness {
         cert_dir: &str,
         insecure: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let identity = self.mint_spawn_identity();
         let binary_path = find_binary()?;
         let ca_cert_path = format!("{}/ca.crt", cert_dir);
         let tls_mode = if insecure { "require" } else { "verify-full" };
         let mut command = Command::new(binary_path);
         command
             .env("FERRUM_MODE", "database")
-            .env("FERRUM_ADMIN_JWT_SECRET", &self.jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &self.jwt_issuer)
             .env("FERRUM_DB_TYPE", "mongodb")
             .env("FERRUM_DB_URL", mongo_url)
             .env("FERRUM_MONGO_DATABASE", DEFAULT_MONGO_DATABASE)
@@ -345,6 +353,7 @@ impl MongoTestHarness {
         }
 
         configure_coverage_gateway_command(&mut command);
+        identity.apply_to_command(&mut command);
         let child = command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -399,6 +408,7 @@ impl MongoTestHarness {
         mongo_url: &str,
         cert_dir: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let identity = self.mint_spawn_identity();
         let binary_path = find_binary()?;
         let ca_cert_path = format!("{}/ca.crt", cert_dir);
         let client_cert_path = format!("{}/client.crt", cert_dir);
@@ -407,8 +417,6 @@ impl MongoTestHarness {
         let mut command = Command::new(binary_path);
         command
             .env("FERRUM_MODE", "database")
-            .env("FERRUM_ADMIN_JWT_SECRET", &self.jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &self.jwt_issuer)
             .env("FERRUM_DB_TYPE", "mongodb")
             .env("FERRUM_DB_URL", mongo_url)
             .env("FERRUM_MONGO_DATABASE", DEFAULT_MONGO_DATABASE)
@@ -424,6 +432,7 @@ impl MongoTestHarness {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         configure_coverage_gateway_command(&mut command);
+        identity.apply_to_command(&mut command);
         let child = command.spawn()?;
 
         self.gateway_process = Some(child);
@@ -453,31 +462,26 @@ impl MongoTestHarness {
         Ok(())
     }
 
-    async fn wait_for_health(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let health_url = format!("{}/health", self.admin_base_url);
-        let deadline = SystemTime::now() + Duration::from_secs(30);
-        // Finite per-request timeout so a dead/hung admin socket cannot wedge
-        // the SystemTime loop (a loop deadline does not bound `.send()`).
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .connect_timeout(Duration::from_secs(1))
-            .build()?;
-
-        loop {
-            if SystemTime::now() >= deadline {
-                return Err("Gateway (mongodb) did not start within 30 seconds".into());
-            }
-
-            match client.get(&health_url).send().await {
-                Ok(response) if response.status().is_success() => {
-                    println!("  Gateway (mongodb) is ready!");
-                    return Ok(());
-                }
-                _ => {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-            }
-        }
+    async fn wait_for_health(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let identity = crate::common::SpawnedGatewayIdentity {
+            jwt_secret: self.jwt_secret.clone(),
+            jwt_issuer: self.jwt_issuer.clone(),
+            observability_token: self.observability_token.clone(),
+        };
+        let child = self
+            .gateway_process
+            .as_mut()
+            .ok_or("gateway process missing")?;
+        crate::common::wait_for_owned_gateway_identity(
+            child,
+            self.admin_port,
+            &identity,
+            Duration::from_secs(30),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        println!("  Gateway (mongodb) is ready!");
+        Ok(())
     }
 
     fn generate_token(&self) -> Result<String, Box<dyn std::error::Error>> {

@@ -1301,7 +1301,7 @@ mod tests {
         assert_eq!(
             mesh.node_waypoint_assertors
                 .iter()
-                .map(SpiffeId::as_str)
+                .map(|assertor| assertor.spiffe_id.as_str())
                 .collect::<Vec<_>>(),
             vec![waypoint_alpha, waypoint_beta]
         );
@@ -1337,7 +1337,7 @@ mod tests {
                 .expect("mesh should remain")
                 .node_waypoint_assertors
                 .iter()
-                .map(SpiffeId::as_str)
+                .map(|assertor| assertor.spiffe_id.as_str())
                 .collect::<Vec<_>>(),
             vec![waypoint_alpha, waypoint_beta],
             "incremental refiltering must not shrink carried source assertors"
@@ -1346,7 +1346,7 @@ mod tests {
             next_slice
                 .node_waypoint_assertors
                 .iter()
-                .map(SpiffeId::as_str)
+                .map(|assertor| assertor.spiffe_id.as_str())
                 .collect::<Vec<_>>(),
             vec![waypoint_alpha, waypoint_beta]
         );

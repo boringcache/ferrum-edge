@@ -1139,23 +1139,14 @@ fn analyze_selection_set<'a>(
         }
 
         if is_graphql_name_start(c) {
+            // Selection-set bodies only: identifiers here are field names (or
+            // aliases), including names that spell document/value keywords.
+            // Top-level `query`/`mutation`/`subscription`/`fragment` are
+            // consumed by `parse_document`; inline-fragment `on` is consumed
+            // by the `...` branch above; argument literals live inside
+            // `skip_parens`. The whole-document fallback scanner in
+            // `analyze_query` keeps a distinct keyword skip.
             let (ident, after_ident) = read_name(bytes, i);
-
-            // Skip keywords/literals that are not fields.
-            if matches!(
-                ident,
-                "query"
-                    | "mutation"
-                    | "subscription"
-                    | "fragment"
-                    | "on"
-                    | "true"
-                    | "false"
-                    | "null"
-            ) {
-                i = after_ident;
-                continue;
-            }
 
             // Look past whitespace for an alias `:`.
             let j = skip_ws_only(bytes, after_ident);
@@ -1364,7 +1355,10 @@ fn analyze_query(query: &str) -> (u32, u32, u32, bool) {
             }
             let ident = &query[start..i];
 
-            // Skip GraphQL keywords that aren't fields
+            // Whole-document fallback only: this scanner does not split
+            // operations from selection sets, so top-level keywords and the
+            // inline-fragment `on` Type condition would otherwise be counted
+            // as fields. `analyze_selection_set` must not share this skip.
             if matches!(
                 ident,
                 "query"

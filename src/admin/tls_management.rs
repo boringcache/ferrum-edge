@@ -1626,6 +1626,16 @@ fn validate_ca_bundle(
     Ok(certs.len())
 }
 
+/// Validate a managed-CRL candidate.
+///
+/// Shares [`crate::tls::crl_policy::validate_crl_windows`] with the file/config
+/// admission path, so `POST /admin/tls/validate` and managed CRL create/update
+/// apply exactly the temporal rule the handshake path enforces (issue #4297).
+/// The first unusable record refuses the whole candidate: a partially usable
+/// multi-CRL body is never stored as its usable subset. There is no
+/// `allow_expired` escape for CRLs — an expired revocation list is not a stale
+/// credential an operator can knowingly stage, it is a list that has stopped
+/// describing the revocations it claims to.
 fn validate_crl_bundle(crl_pem: &str) -> Result<usize, String> {
     let crls = rustls_pemfile::crls(&mut Cursor::new(crl_pem.as_bytes()))
         .collect::<Result<Vec<_>, _>>()
@@ -1633,6 +1643,8 @@ fn validate_crl_bundle(crl_pem: &str) -> Result<usize, String> {
     if crls.is_empty() {
         return Err("crl_pem: no PEM CRLs found".to_string());
     }
+    crate::tls::crl_policy::validate_crl_windows(&crls, "inline-pem:<redacted>")
+        .map_err(|error| format!("crl_pem: {error}"))?;
     Ok(crls.len())
 }
 

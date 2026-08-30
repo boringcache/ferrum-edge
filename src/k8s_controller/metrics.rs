@@ -34,6 +34,19 @@ pub struct ControllerMetrics {
     /// exists → parent status appears). kube-rs does not expose a watch-event
     /// timestamp, so this is not a reflector-observation clock.
     pub last_route_status_publish_latency_ms: AtomicU64,
+    /// Kubernetes status read/write operations abandoned because they exceeded
+    /// their wall-clock budget (issue #4239).
+    ///
+    /// A status patch batch is awaited inline on the serialized reconcile loop,
+    /// so an unbounded stalled request stops every other object's status from
+    /// being published. Each expiry here is one object left for the next
+    /// reconcile, not a lost write; a sustained rise means the API server's
+    /// status path is degrading before it costs a whole reconcile round.
+    pub status_request_timeouts: AtomicU64,
+    /// Status patch batches abandoned by the reconciler's defensive outer
+    /// timeout. The batch bounds itself, so this should stay at zero; any
+    /// increase means a patch path escaped its own budget.
+    pub status_batch_timeouts: AtomicU64,
     /// Istio status JSON Merge Patch 409s observed while applying Ferrum-owned
     /// conditions. Unlabeled: object identity and API error strings stay out.
     pub istio_status_conflicts: AtomicU64,
@@ -77,6 +90,8 @@ impl ControllerMetrics {
             watch_idle_relists: AtomicU64::new(0),
             route_status_publications: AtomicU64::new(0),
             last_route_status_publish_latency_ms: AtomicU64::new(0),
+            status_request_timeouts: AtomicU64::new(0),
+            status_batch_timeouts: AtomicU64::new(0),
             istio_status_conflicts: AtomicU64::new(0),
             istio_status_retries: AtomicU64::new(0),
             istio_status_retry_exhausted: AtomicU64::new(0),
@@ -98,6 +113,8 @@ impl ControllerMetrics {
             last_route_status_publish_latency_ms: self
                 .last_route_status_publish_latency_ms
                 .load(Ordering::Relaxed),
+            status_request_timeouts: self.status_request_timeouts.load(Ordering::Relaxed),
+            status_batch_timeouts: self.status_batch_timeouts.load(Ordering::Relaxed),
             istio_status_conflicts: self.istio_status_conflicts.load(Ordering::Relaxed),
             istio_status_retries: self.istio_status_retries.load(Ordering::Relaxed),
             istio_status_retry_exhausted: self.istio_status_retry_exhausted.load(Ordering::Relaxed),
@@ -118,6 +135,8 @@ pub struct MetricsSnapshot {
     pub watch_idle_relists: u64,
     pub route_status_publications: u64,
     pub last_route_status_publish_latency_ms: u64,
+    pub status_request_timeouts: u64,
+    pub status_batch_timeouts: u64,
     pub istio_status_conflicts: u64,
     pub istio_status_retries: u64,
     pub istio_status_retry_exhausted: u64,

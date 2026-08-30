@@ -224,16 +224,21 @@ async fn run_connectivity_recovery(db: DbType, container: &str, label: &str) {
     );
 
     drop(_guard);
-    // Wait for docker unpause + pool reconnect.
+    // Wait for docker unpause + pool reconnect. Each attempt must mint a
+    // fresh proxy id and listen_path: create can commit (MySQL especially)
+    // while a later settlement or admission-lease step still returns 5xx.
+    // Retrying the same identity then 409s for the rest of the deadline even
+    // though connectivity has already returned.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let recovery_id = format!("{proxy_id}-recovered");
     loop {
+        let recovery_id = format!("recovery-{}", Uuid::new_v4().simple());
+        let recovery_path = format!("/recovery-{}", Uuid::new_v4().simple());
         let recovered = client
             .post(gateway.admin_url("/proxies"))
             .header("Authorization", &auth)
             .json(&json!({
                 "id": recovery_id,
-                "listen_path": format!("{listen_path}-recovered"),
+                "listen_path": recovery_path,
                 "backend_scheme": "http",
                 "backend_host": "127.0.0.1",
                 "backend_port": 9,

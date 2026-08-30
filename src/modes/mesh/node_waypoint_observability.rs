@@ -63,6 +63,7 @@ static HBONE_OUTBOUND_DIAL_FAILURE: AtomicU64 = AtomicU64::new(0);
 
 static ASSERTED_IDENTITY_ACCEPTED: AtomicU64 = AtomicU64::new(0);
 static ASSERTED_IDENTITY_REJECTED_UNTRUSTED_ASSERTOR: AtomicU64 = AtomicU64::new(0);
+static ASSERTED_IDENTITY_REJECTED_ASSERTION_OUT_OF_SCOPE: AtomicU64 = AtomicU64::new(0);
 static ASSERTED_IDENTITY_REJECTED_TRUST_DOMAIN_MISMATCH: AtomicU64 = AtomicU64::new(0);
 static ASSERTED_IDENTITY_REJECTED_UNAUTHENTICATED: AtomicU64 = AtomicU64::new(0);
 static ASSERTED_IDENTITY_REJECTED_MALFORMED: AtomicU64 = AtomicU64::new(0);
@@ -98,6 +99,9 @@ impl NodeWaypointHboneHandshakePhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeWaypointAssertedIdentityRejectReason {
     UntrustedAssertor,
+    /// The peer is an admitted assertor but is not authorized to assert the
+    /// identity it claimed (issue #4274).
+    AssertionOutOfScope,
     TrustDomainMismatch,
     UnauthenticatedHbone,
     Malformed,
@@ -108,6 +112,7 @@ impl NodeWaypointAssertedIdentityRejectReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::UntrustedAssertor => "untrusted_assertor",
+            Self::AssertionOutOfScope => "assertion_out_of_scope",
             Self::TrustDomainMismatch => "trust_domain_mismatch",
             Self::UnauthenticatedHbone => "unauthenticated_hbone",
             Self::Malformed => "malformed",
@@ -118,6 +123,7 @@ impl NodeWaypointAssertedIdentityRejectReason {
     fn counter(self) -> &'static AtomicU64 {
         match self {
             Self::UntrustedAssertor => &ASSERTED_IDENTITY_REJECTED_UNTRUSTED_ASSERTOR,
+            Self::AssertionOutOfScope => &ASSERTED_IDENTITY_REJECTED_ASSERTION_OUT_OF_SCOPE,
             Self::TrustDomainMismatch => &ASSERTED_IDENTITY_REJECTED_TRUST_DOMAIN_MISMATCH,
             Self::UnauthenticatedHbone => &ASSERTED_IDENTITY_REJECTED_UNAUTHENTICATED,
             Self::Malformed => &ASSERTED_IDENTITY_REJECTED_MALFORMED,
@@ -182,6 +188,9 @@ pub struct NodeWaypointHboneHandshakeSnapshot {
 pub struct NodeWaypointAssertedIdentitySnapshot {
     pub accepted: u64,
     pub rejected_untrusted_assertor: u64,
+    /// Assertions refused because the admitted assertor's grant does not cover
+    /// the claimed identity (issue #4274).
+    pub rejected_assertion_out_of_scope: u64,
     pub rejected_trust_domain_mismatch: u64,
     pub rejected_unauthenticated_hbone: u64,
     pub rejected_malformed: u64,
@@ -288,6 +297,8 @@ pub fn snapshot() -> NodeWaypointObservabilitySnapshot {
             accepted: ASSERTED_IDENTITY_ACCEPTED.load(Ordering::Relaxed),
             rejected_untrusted_assertor: ASSERTED_IDENTITY_REJECTED_UNTRUSTED_ASSERTOR
                 .load(Ordering::Relaxed),
+            rejected_assertion_out_of_scope: ASSERTED_IDENTITY_REJECTED_ASSERTION_OUT_OF_SCOPE
+                .load(Ordering::Relaxed),
             rejected_trust_domain_mismatch: ASSERTED_IDENTITY_REJECTED_TRUST_DOMAIN_MISMATCH
                 .load(Ordering::Relaxed),
             rejected_unauthenticated_hbone: ASSERTED_IDENTITY_REJECTED_UNAUTHENTICATED
@@ -386,11 +397,13 @@ reasons are compile-time-bounded; SPIFFE IDs never appear as labels.\n",
     // Emit every ADR-bounded reject reason (including reserved Malformed /
     // StaleOrUnknown) so scrapes keep a stable zero baseline. Those two
     // variants are constructed here for label export; mesh_authz currently
-    // only produces UntrustedAssertor / TrustDomainMismatch /
-    // UnauthenticatedHbone, and collapses malformed principal parse / slice
+    // only produces UntrustedAssertor / AssertionOutOfScope /
+    // TrustDomainMismatch / UnauthenticatedHbone, and collapses malformed
+    // principal parse / slice
     // unknowns into existing fail-closed paths until dedicated producers land.
     for reason in [
         NodeWaypointAssertedIdentityRejectReason::UntrustedAssertor,
+        NodeWaypointAssertedIdentityRejectReason::AssertionOutOfScope,
         NodeWaypointAssertedIdentityRejectReason::TrustDomainMismatch,
         NodeWaypointAssertedIdentityRejectReason::UnauthenticatedHbone,
         NodeWaypointAssertedIdentityRejectReason::Malformed,
@@ -399,6 +412,9 @@ reasons are compile-time-bounded; SPIFFE IDs never appear as labels.\n",
         let value = match reason {
             NodeWaypointAssertedIdentityRejectReason::UntrustedAssertor => {
                 snap.asserted_identity.rejected_untrusted_assertor
+            }
+            NodeWaypointAssertedIdentityRejectReason::AssertionOutOfScope => {
+                snap.asserted_identity.rejected_assertion_out_of_scope
             }
             NodeWaypointAssertedIdentityRejectReason::TrustDomainMismatch => {
                 snap.asserted_identity.rejected_trust_domain_mismatch

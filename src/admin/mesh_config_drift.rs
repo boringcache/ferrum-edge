@@ -35,9 +35,11 @@ use crate::modes::mesh::revision::MeshRevisionDiagnostics;
 use crate::modes::mesh::runtime::XdsConvergenceSnapshot;
 use crate::modes::mesh::slice::MeshSlice;
 
-/// Per-resource-kind counts shipped on the `slice.resources` block. Each
-/// field corresponds to a `Vec` on [`MeshSlice`] so operators can spot the
+/// Per-resource-kind counts shipped on the `slice.resources` block. Most
+/// fields correspond to a `Vec` on [`MeshSlice`] so operators can spot the
 /// kind that drifted (e.g. "we lost all our DestinationRules").
+/// `workloads_with_node_waypoint` counts destination metadata on those
+/// workloads instead of a separate slice vector.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshResourceCounts {
     pub workloads: usize,
@@ -56,11 +58,20 @@ pub struct MeshResourceCounts {
     /// policies remain is exactly the drift that turns every delegated
     /// decision into a fail-closed denial, so it gets its own count.
     pub ext_authz_providers: usize,
+    /// Workloads whose trusted destination `node_waypoint` metadata is present.
+    /// Optional so older clients still deserialize; omitted from JSON when zero
+    /// so pre-slice zeros keep their previous shape.
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub workloads_with_node_waypoint: usize,
+}
+
+fn usize_is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 impl MeshResourceCounts {
-    /// Build a counts block from a slice, naming each field after the slice
-    /// `Vec` it shadows so a translation drift (slice field rename / split)
+    /// Build a counts block from a slice, naming most fields after the slice
+    /// `Vec` they shadow so a translation drift (slice field rename / split)
     /// is caught at compile time.
     pub fn from_slice(slice: &MeshSlice) -> Self {
         Self {
@@ -76,6 +87,11 @@ impl MeshResourceCounts {
             mesh_proxy_configs: slice.proxy_configs.len(),
             extension_configs: slice.extension_configs.len(),
             ext_authz_providers: slice.ext_authz_providers.len(),
+            workloads_with_node_waypoint: slice
+                .workloads
+                .iter()
+                .filter(|workload| workload.node_waypoint.is_some())
+                .count(),
         }
     }
 }

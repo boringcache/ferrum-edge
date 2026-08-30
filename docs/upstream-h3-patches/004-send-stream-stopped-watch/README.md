@@ -9,7 +9,7 @@
 | Target version | 0.0.8 |
 | State | **Applied via vendored crate at `vendor/h3-0.0.8-ferrum-patched`** |
 | Upstream issue | _Deliberate fork — unfiled upstream (see hand-off below + [policy](../../dependency-policy.md#deliberate-fork-policy-and-sla))_ |
-| Upstream PR | _Deliberate fork — unfiled; target branch `feat/send-stream-stopped-watch` on `jeremyjpj0916/h3`_ |
+| Upstream PR | _Deliberate fork — unfiled upstream; no published fork ref yet (see hand-off below + [policy](../../dependency-policy.md#deliberate-fork-policy-and-sla))_ |
 | Tracks | Ferrum Edge H3 destination-permit release on per-stream cancel (#3775) |
 
 ## Why this directory exists

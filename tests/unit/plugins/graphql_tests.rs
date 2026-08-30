@@ -1287,6 +1287,171 @@ async fn test_inline_fragment_does_not_add_depth() {
 }
 
 #[tokio::test]
+async fn test_keyword_spelled_nested_fields_count_toward_complexity() {
+    // Selection-set identifiers that spell GraphQL keywords are legal field
+    // names. `{ on { on { on { x } } } }` is four fields; the old keyword skip
+    // measured complexity 1 (`x` only).
+    let config = json!({ "max_complexity": 100 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "{ on { on { on { x } } } }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    let complexity: u32 = ctx
+        .metadata
+        .get("graphql_complexity")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        complexity >= 4,
+        "keyword-named nested fields must count toward complexity, got {complexity}"
+    );
+}
+
+#[tokio::test]
+async fn test_keyword_named_fields_enforce_max_complexity() {
+    let config = json!({ "max_complexity": 3 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "{ on { on { on { x } } } }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+    assert_eq!(ctx.metadata.get("graphql_complexity").unwrap(), "4");
+}
+
+#[tokio::test]
+async fn test_aliased_keyword_named_fields_count_aliases_and_complexity() {
+    // `{ a1: on a2: on a3: on }` is three aliases and three fields.
+    let config = json!({ "max_complexity": 100, "max_aliases": 100 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "{ a1: on a2: on a3: on }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert_eq!(ctx.metadata.get("graphql_complexity").unwrap(), "3");
+}
+
+#[tokio::test]
+async fn test_aliased_keyword_named_fields_enforce_max_aliases() {
+    let config = json!({ "max_aliases": 2 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "{ a1: on a2: on a3: on }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(
+                body.contains("Query uses 3 aliases, maximum allowed is 2"),
+                "expected alias-budget rejection, got {body}"
+            );
+        }
+        other => panic!("Expected Reject(400), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_every_document_keyword_spelling_is_a_legal_field_name() {
+    // Every identifier the selection-set analyzer used to skip is a legal
+    // field name inside `{ ... }`.
+    let spellings = [
+        "query",
+        "mutation",
+        "subscription",
+        "fragment",
+        "on",
+        "true",
+        "false",
+        "null",
+    ];
+    let config = json!({ "max_complexity": 100 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    for name in spellings {
+        let query = format!("{{ {name} {{ x }} }}");
+        let mut ctx = create_graphql_context(&query, None);
+        let mut headers = make_graphql_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_continue(result);
+        assert_eq!(
+            ctx.metadata.get("graphql_complexity").unwrap(),
+            "2",
+            "{name} as a nested field must count as complexity 2"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_inline_fragment_on_is_not_counted_as_a_field() {
+    // `{ ... on Foo { x } }` must count only `x`. Counting the type-condition
+    // keyword would inflate complexity after the selection-set keyword skip
+    // is removed.
+    let config = json!({ "max_complexity": 100 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = "{ ... on Foo { x } }";
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata.get("graphql_complexity").unwrap(),
+        "1",
+        "inline-fragment `on` must not be double-counted as a field"
+    );
+    assert_eq!(ctx.metadata.get("graphql_depth").unwrap(), "1");
+}
+
+#[tokio::test]
+async fn test_argument_literals_and_directives_are_not_fields() {
+    // true/false/null in arguments, `@on` directives, and keyword spellings
+    // inside strings/comments must not contribute complexity.
+    let config = json!({ "max_complexity": 100 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let query = r#"{ x(flag: true, n: null, b: false) @on(if: true) # on query
+y(msg: "on true null") }"#;
+    let mut ctx = create_graphql_context(query, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata.get("graphql_complexity").unwrap(),
+        "2",
+        "argument literals, directives, strings, and comments must not count as fields"
+    );
+}
+
+#[tokio::test]
+async fn test_top_level_operation_keywords_still_parse() {
+    let config = json!({ "max_complexity": 100 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    for (query, op_type) in [
+        ("query { user { id } }", "query"),
+        ("mutation { createUser { id } }", "mutation"),
+        ("subscription { messageAdded { content } }", "subscription"),
+    ] {
+        let mut ctx = create_graphql_context(query, None);
+        let mut headers = make_graphql_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_continue(result);
+        assert_eq!(ctx.metadata.get("graphql_operation_type").unwrap(), op_type);
+        assert_eq!(ctx.metadata.get("graphql_complexity").unwrap(), "2");
+    }
+}
+
+#[tokio::test]
 async fn test_introspection_inside_fragment_is_detected() {
     // __schema hidden behind a fragment spread must still trip introspection
     // control once fragments are expanded into the selected operation.

@@ -7,13 +7,15 @@
 //! the kind of latency we are trying to keep CNI plugins cheap to avoid.
 //!
 //! Failure model: any connection / IO / decode error surfaces as
-//! [`CniError::IpcFailed`] which the CNI binary reports back to kubelet
-//! as CNI error code 11. That is the deliberate fail-closed ADD posture
-//! (issue #3609): while a chained conflist is installed, an unreachable
-//! node-agent leaves new pods in `ContainerCreating` rather than starting
-//! them outside the mesh. The kube-rs watcher still reconciles pods that
-//! already have a sandbox; it cannot create one. Do not turn IPC failure
-//! into an unauthenticated pass-through.
+//! [`CniError::IpcFailed`]. The `ferrum-cni` binary maps that to CNI error
+//! code 11 for ADD and CHECK (fail closed), but treats DEL transport failure
+//! as an idempotent empty success so kubelet can finish pod teardown (issue
+//! #4309). ADD's fail-closed posture (issue #3609) is deliberate: while a
+//! chained conflist is installed, an unreachable node-agent leaves new pods
+//! in `ContainerCreating` rather than starting them outside the mesh. The
+//! kube-rs watcher still reconciles pods that already have a sandbox; it
+//! cannot create one. Do not turn ADD IPC failure into an unauthenticated
+//! pass-through.
 
 use std::io::{Read, Write};
 use std::time::Duration;

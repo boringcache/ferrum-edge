@@ -3204,12 +3204,18 @@ mod tests {
         left.mesh
             .as_mut()
             .expect("mesh should exist")
-            .node_waypoint_assertors = vec![waypoint_a];
+            .node_waypoint_assertors = vec![crate::modes::mesh::config::NodeWaypointAssertor {
+            spiffe_id: waypoint_a,
+            asserts: Vec::new(),
+        }];
         right
             .mesh
             .as_mut()
             .expect("mesh should exist")
-            .node_waypoint_assertors = vec![waypoint_b];
+            .node_waypoint_assertors = vec![crate::modes::mesh::config::NodeWaypointAssertor {
+            spiffe_id: waypoint_b,
+            asserts: Vec::new(),
+        }];
 
         assert_eq!(
             serde_json::to_vec(&left).expect("serialized config"),

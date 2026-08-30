@@ -2157,6 +2157,26 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_k8s_controller_status_batch_timeouts_total",
+    "type": "counter",
+    "help": "Kubernetes status patch batches abandoned by the reconciler's defensive outer timeout after the batch failed to bound itself.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_k8s_controller_status_request_timeouts_total",
+    "type": "counter",
+    "help": "Kubernetes status reads and writes abandoned because they exceeded their wall-clock budget on the serialized reconcile loop.",
+    "labels": [],
+    "subsystem": "k8s_controller",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_k8s_controller_watch_idle_relists_total",
     "type": "counter",
     "help": "Watch-scope reflector rebuilds triggered because a scope delivered no event for the configured idle window, or because a replacement generation never finished its initial list.",

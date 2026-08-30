@@ -88,6 +88,31 @@ impl Builder {
         self
     }
 
+    /// Set the receive-side ceiling, in bytes, on the DECLARED payload length
+    /// of a non-`DATA` frame.
+    ///
+    /// Non-`DATA` frames — HEADERS, SETTINGS, GOAWAY, PUSH_PROMISE, and every
+    /// unknown type, which has to be buffered before it can be skipped — are
+    /// accumulated whole before they can be interpreted. Without a ceiling a
+    /// peer can declare a 2^62-1 payload and stream bytes until the process
+    /// runs out of memory; QUIC flow control bounds only the bytes in flight,
+    /// because every read re-grants credit.
+    ///
+    /// A frame declaring more than `value` is refused as a connection error of
+    /// type `H3_EXCESSIVE_LOAD` as soon as its type and length varints are
+    /// decoded, before any payload byte is buffered.
+    ///
+    /// `DATA` frames are streamed to the application and are deliberately NOT
+    /// bounded by this value; bound request bodies with an application-level
+    /// policy instead.
+    ///
+    /// Defaults to `FrameDecoder::UNBOUNDED_FRAME_LEN` (`u64::MAX`), which is
+    /// stock upstream behaviour: no receive-side bound.
+    pub fn max_buffered_frame_len(&mut self, value: u64) -> &mut Self {
+        self.config.max_buffered_frame_len = value;
+        self
+    }
+
     /// Just like in HTTP/2, HTTP/3 also uses the concept of "grease"
     /// to prevent potential interoperability issues in the future.
     /// In HTTP/3, the concept of grease is used to ensure that the protocol can evolve
@@ -131,6 +156,7 @@ impl Builder {
             open,
             conn_state,
             max_field_section_size: self.config.settings.max_field_section_size,
+            max_buffered_frame_len: self.config.max_buffered_frame_len,
             sender_count: Arc::new(AtomicUsize::new(1)),
             send_grease_frame: self.config.send_grease,
             _buf: PhantomData,

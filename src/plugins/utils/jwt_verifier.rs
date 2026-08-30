@@ -74,16 +74,30 @@ fn build_validation(algorithm: Algorithm, params: &JwtVerifyParams<'_>) -> Valid
     validation.validate_exp = true;
     validation.leeway = params.leeway_secs;
     validation.validate_nbf = params.validate_nbf;
+    // Build `required_spec_claims` additively. `jsonwebtoken`'s
+    // `set_issuer`/`set_audience` reject only a *mismatching* claim — a
+    // token that simply OMITS `iss`/`aud` is still accepted. When a caller
+    // configures an issuer or audiences they intend those claims to be
+    // mandatory, so insert them into `required_spec_claims` (the only
+    // mechanism that enforces presence).
+    let mut required: HashSet<String> = HashSet::new();
     if params.require_exp {
-        validation.required_spec_claims = HashSet::from(["exp".to_string()]);
-    } else {
-        validation.required_spec_claims.clear();
+        required.insert("exp".to_string());
     }
     if let Some(issuer) = params.issuer {
         validation.set_issuer(&[issuer]);
+        required.insert("iss".to_string());
     }
     if !params.audiences.is_empty() {
         validation.set_audience(params.audiences);
+        required.insert("aud".to_string());
     }
+    validation.required_spec_claims = required;
+    // When no audiences are configured, `validation.aud` stays `None` and
+    // jsonwebtoken's default `validate_aud = true` is kept. Tokens without
+    // `aud` still pass; a token that carries `aud` is rejected because no
+    // acceptable audience is configured (RFC 7519 §4.1.3). Do not set
+    // `validate_aud = false` — that would let a token minted for another
+    // service authenticate whenever the JWKS kid matches.
     validation
 }
