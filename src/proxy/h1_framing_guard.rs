@@ -16,8 +16,8 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -26,14 +26,29 @@ const H2_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const OBSERVED_READ_CAP: usize = 8 * 1024;
 const SIGNAL_WORDS: usize = 16;
 const SIGNAL_CAPACITY: u64 = (SIGNAL_WORDS * u64::BITS as usize) as u64;
+// Mirrored from hyper 1.9.0 `src/proto/h1/decode.rs`:
+// `CHUNKED_EXTENSIONS_LIMIT` (line 20) and `TRAILER_LIMIT` (line 25).
+// The safety invariant is one-directional: hyper must error at or before the
+// guard disables observation. Hyper's server connection currently leaves
+// `h1_max_header_size` unset, so `TRAILER_LIMIT` is independent of the head
+// limit (`decode.rs:181` falls back to `TRAILER_LIMIT`). If a hyper 1.x bump
+// populates that from `max_buf_size` (the TODO at `decode.rs:24`), hyper's
+// trailer budget becomes 32 KiB while this guard would still disable at 16 KiB
+// and fail-close the *next* keep-alive request. Re-check both constants on
+// every hyper bump. Do not pin hyper solely to freeze these private limits —
+// 1.x security updates must keep flowing.
 const CHUNK_EXTENSION_LIMIT: usize = 16 * 1024;
-// Hyper's fixed `proto::h1::decode::TRAILER_LIMIT`; its server connection
-// leaves `h1_max_header_size` unset, so this is independent of the head limit.
 const HYPER_TRAILER_LIMIT: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum H1FramingResult {
+    /// No HTTP/1 observation ran for this request (H2/H3, the public test
+    /// entry, or a handler that never installed the guard). Enforcement must
+    /// treat this like [`Self::Clear`]: it is not a rejection. [`Self::Clear`]
+    /// is reserved for a completed observation that saw no CL+TE conflict.
     #[default]
+    NotObserved,
+    /// The observer published a request-head decision and saw no CL+TE conflict.
     Clear,
     Conflict,
     ObserverFailed,
@@ -41,18 +56,27 @@ pub(super) enum H1FramingResult {
 
 /// Connection-local queue of wire-level CL+TE decisions.
 ///
-/// Leading empty lines produce no entries, matching httparse. The shortest
-/// request head Hyper can dispatch is `A / HTTP/1.1\n\n` (14 bytes). Hyper
-/// returns after parsing the first head instead of issuing another read, and a
-/// boundary-crossing read exposes at most 8 KiB after the body, so one prior
-/// partial head plus `8192 / 14` complete heads can lead the consumer: at most
-/// 586 entries. The 1,024-entry ring therefore cannot wrap while the observer
-/// remains congruent. Capacity exhaustion, an observer/parser divergence, and
-/// a consumer underflow are nevertheless sticky fail-closed states.
+/// Leading empty lines produce no entries, matching httparse. The bound that
+/// matters is the observer's own minimum complete head, `X\n\n` (3 bytes):
+/// `observe_line_byte` sets `line_has_data`, the first `\n` clears
+/// `request_line`, and the second `\n` takes the `!line_has_data &&
+/// !request_line` branch and publishes. Hyper returns after parsing the first
+/// head instead of issuing another read, and a boundary-crossing read exposes
+/// at most 8 KiB after the body, so one prior partial head plus `8192 / 3`
+/// complete heads can lead the consumer: at most 2,731 entries. That exceeds
+/// the 1,024-entry ring, so wrap is possible while the observer remains
+/// congruent. The capacity check in [`Self::push`] is therefore load-bearing,
+/// not belt-and-braces; overflow is a sticky fail-closed `ObserverFailed`.
+/// Capacity exhaustion, an observer/parser divergence, and a consumer
+/// underflow are sticky fail-closed states.
+///
+/// The 16-word conflict ring is heap-allocated only when the scanner first
+/// classifies the connection as HTTP/1, so an h2c preface match never pays
+/// for it. TLS connections that negotiated ALPN `h2` skip this type entirely.
 pub(super) struct H1FramingSignals {
     produced: AtomicU64,
     consumed: AtomicU64,
-    conflicts: [AtomicU64; SIGNAL_WORDS],
+    conflicts: OnceLock<Box<[AtomicU64; SIGNAL_WORDS]>>,
     overflowed: AtomicBool,
     unknown: AtomicBool,
     observation_disabled: AtomicBool,
@@ -63,11 +87,16 @@ impl H1FramingSignals {
         Self {
             produced: AtomicU64::new(0),
             consumed: AtomicU64::new(0),
-            conflicts: std::array::from_fn(|_| AtomicU64::new(0)),
+            conflicts: OnceLock::new(),
             overflowed: AtomicBool::new(false),
             unknown: AtomicBool::new(false),
             observation_disabled: AtomicBool::new(false),
         }
+    }
+
+    fn conflict_ring(&self) -> &[AtomicU64; SIGNAL_WORDS] {
+        self.conflicts
+            .get_or_init(|| Box::new(std::array::from_fn(|_| AtomicU64::new(0))))
     }
 
     fn mark_unknown(&self) {
@@ -100,7 +129,10 @@ impl H1FramingSignals {
         }
 
         let slot = sequence % SIGNAL_CAPACITY;
-        let Some(word) = self.conflicts.get((slot / u64::BITS as u64) as usize) else {
+        let Some(word) = self
+            .conflict_ring()
+            .get((slot / u64::BITS as u64) as usize)
+        else {
             self.mark_unknown();
             return false;
         };
@@ -130,7 +162,11 @@ impl H1FramingSignals {
         }
 
         let slot = sequence % SIGNAL_CAPACITY;
-        let Some(word) = self.conflicts.get((slot / u64::BITS as u64) as usize) else {
+        let Some(ring) = self.conflicts.get() else {
+            self.mark_unknown();
+            return H1FramingResult::ObserverFailed;
+        };
+        let Some(word) = ring.get((slot / u64::BITS as u64) as usize) else {
             self.mark_unknown();
             return H1FramingResult::ObserverFailed;
         };
@@ -238,6 +274,87 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for H1FramingGuardIo<T> {
 
     fn is_write_vectored(&self) -> bool {
         self.inner.is_write_vectored()
+    }
+}
+
+/// HTTP/1 observation wrapper, or the raw stream when ALPN already proved HTTP/2.
+///
+/// TLS connections that negotiated `h2` never install [`H1FramingGuardIo`], so
+/// they do not allocate [`H1FramingSignals`]. `Observed` is boxed so a
+/// passthrough HTTP/2 connection does not carry the scanner in the enum layout.
+/// Plaintext still wraps because protocol detection happens on the first read
+/// (h2c preface vs HTTP/1).
+pub(super) enum MaybeH1FramingGuardIo<T> {
+    Observed(Box<H1FramingGuardIo<T>>),
+    Passthrough(T),
+}
+
+impl<T> MaybeH1FramingGuardIo<T> {
+    pub(super) fn observed(inner: T, max_head_bytes: usize) -> (Self, Arc<H1FramingSignals>) {
+        let (guard, signals) = H1FramingGuardIo::new(inner, max_head_bytes);
+        (Self::Observed(Box::new(guard)), signals)
+    }
+
+    pub(super) fn passthrough(inner: T) -> Self {
+        Self::Passthrough(inner)
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for MaybeH1FramingGuardIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Observed(inner) => Pin::new(inner.as_mut()).poll_read(cx, buf),
+            Self::Passthrough(inner) => Pin::new(inner).poll_read(cx, buf),
+        }
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for MaybeH1FramingGuardIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Observed(inner) => Pin::new(inner.as_mut()).poll_write(cx, buf),
+            Self::Passthrough(inner) => Pin::new(inner).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Observed(inner) => Pin::new(inner.as_mut()).poll_flush(cx),
+            Self::Passthrough(inner) => Pin::new(inner).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Observed(inner) => Pin::new(inner.as_mut()).poll_shutdown(cx),
+            Self::Passthrough(inner) => Pin::new(inner).poll_shutdown(cx),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Observed(inner) => Pin::new(inner.as_mut()).poll_write_vectored(cx, bufs),
+            Self::Passthrough(inner) => Pin::new(inner).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Observed(inner) => inner.is_write_vectored(),
+            Self::Passthrough(inner) => inner.is_write_vectored(),
+        }
     }
 }
 
@@ -717,6 +834,11 @@ impl ChunkedScanner {
             let next = match self.state {
                 ChunkState::SizeStart => match hex_value(byte) {
                     Some(value) => {
+                        // Hyper's `ChunkedState::SizeStart` (decode.rs:355-377)
+                        // accumulates `size = size * 16 + value`. Equivalent to
+                        // this assignment because hyper's `chunk_len` is
+                        // provably 0 at SizeStart (reset on each new chunk). If
+                        // that ever changes, this must accumulate too.
                         self.chunk_size = u64::from(value);
                         Some(ChunkState::Size)
                     }
