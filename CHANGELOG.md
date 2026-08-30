@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`request_mirror` denies cross-origin query credentials by default**
+  (issue #4295). Sensitive query pairs (`access_token`, `api_key`,
+  delimiter-bounded `token`/`sig`/`signature` including `oauth_token` and
+  `x-amz-signature` / `x-goog-signature`, nested percent-encoded names, and
+  operator `sensitive_query_patterns`) are dropped from the mirror
+  request-target only. Classification checks every decode layer through a
+  hard cap of 4 and fails closed on residual `%XX`. The primary backend
+  request-target is unchanged. Literal semicolon-bearing segments also fail
+  closed because mirror frameworks disagree on whether `;` separates query
+  pairs; delimiter variants of the `api_key` family are denied as well.
+  Forwarding a denied name requires the
+  fail-closed pair `forward_sensitive_query=true` plus an exact decoded-name
+  `forward_sensitive_query_allowlist`. Mirror logs still omit the entire query.
+
 ### Changed
+
+- **BREAKING — `FERRUM_TLS_OFFLOAD_THREADS` nonzero values fail startup**
+  (issue #4294). TLS handshake offload is not implemented; a nonzero setting
+  was previously parsed and then silently ignored. `EnvConfig::validate()`
+  now rejects any value other than `0` before mode dispatch. **Operator
+  action**: leave the variable unset or set it to `0`.
 
 - **BREAKING — seven plugin constructors reject unknown config keys**
   (issues #4405, #4409). `request_size_limiting`, `ws_message_size_limiting`,

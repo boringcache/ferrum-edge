@@ -435,8 +435,8 @@ fn rule_matches(
         return false;
     }
     matches_principals(&rule.from, request)
-        && matches_request_principals(&rule.request_principals, request)
-        && matches_not_request_principals(&rule.not_request_principals, request)
+        && matches_request_principals(&rule.request_principals, request, &rule.action)
+        && matches_not_request_principals(&rule.not_request_principals, request, &rule.action)
         && matches_source_negation(&rule.source_negation, request)
         && matches_requests(&rule.to, request, &rule.action, normalized_host)
         && matches_conditions(&rule.when, request, &rule.action, policy_namespace)
@@ -522,11 +522,28 @@ fn matches_source_negation(neg: &SourceNegationMatch, request: &MeshAuthzRequest
 
 /// Istio `requestPrincipals` matching: JWT-derived `iss/sub` identity.
 ///
-/// An empty list means "any" (no filter). A non-empty list requires a
-/// matching `request_principal`; `None` (no JWT) fails the match.
-fn matches_request_principals(patterns: &[String], request: &MeshAuthzRequest) -> bool {
+/// An empty list means "any" (no filter), so the emptiness check stays ahead of
+/// the protocol gate: an unset field is a no-op on every protocol.
+///
+/// `requestPrincipals` is an HTTP-only attribute — it exists only where a
+/// validated JWT was parsed off a request. On an L4 connection it is
+/// unevaluable, not merely absent, so it resolves through
+/// [`deny_missing_http_attribute_matches`] exactly like the `to.operation`
+/// HTTP fields and the `when: request.auth.*` conditions: `DENY`/`CUSTOM`
+/// ignore it and still match, `ALLOW`/`AUDIT` can never match on it.
+///
+/// On the HTTP path a non-empty list requires a matching `request_principal`;
+/// `None` (no JWT) fails the match.
+fn matches_request_principals(
+    patterns: &[String],
+    request: &MeshAuthzRequest,
+    action: &PolicyAction,
+) -> bool {
     if patterns.is_empty() {
         return true;
+    }
+    if request.protocol != MeshAuthzProtocol::Http {
+        return deny_missing_http_attribute_matches(action);
     }
     request.request_principal.as_ref().is_some_and(|principal| {
         patterns
@@ -538,14 +555,32 @@ fn matches_request_principals(patterns: &[String], request: &MeshAuthzRequest) -
 /// Istio `notRequestPrincipals` matching: conjunctive negative match over the
 /// JWT-derived `iss/sub` identity.
 ///
-/// An empty list means "no negative filter". A non-empty list fails the match
-/// when the request principal matches any pattern. When no request principal
-/// is present the negative matcher succeeds, matching Istio's semantics and
-/// enabling the canonical `DENY` `notRequestPrincipals: ["*"]` policy for
-/// anonymous requests.
-fn matches_not_request_principals(patterns: &[String], request: &MeshAuthzRequest) -> bool {
+/// An empty list means "no negative filter", checked before the protocol gate
+/// so an unset field stays a no-op everywhere.
+///
+/// Like its positive sibling this is an HTTP-only attribute, so on an L4
+/// connection it resolves through [`deny_missing_http_attribute_matches`]
+/// rather than through the "no principal present" branch below. That branch is
+/// correct only where a JWT *could* have been observed: on a raw TCP/UDP/TLS
+/// session it would turn `notRequestPrincipals` into an unconditional match
+/// and let a `from:`-only `ALLOW` grant an L4 session Istio compiles to a
+/// never-matching rule.
+///
+/// On the HTTP path a non-empty list fails the match when the request
+/// principal matches any pattern. When no request principal is present the
+/// negative matcher succeeds, matching Istio's semantics and enabling the
+/// canonical `DENY` `notRequestPrincipals: ["*"]` policy for anonymous
+/// requests.
+fn matches_not_request_principals(
+    patterns: &[String],
+    request: &MeshAuthzRequest,
+    action: &PolicyAction,
+) -> bool {
     if patterns.is_empty() {
         return true;
+    }
+    if request.protocol != MeshAuthzProtocol::Http {
+        return deny_missing_http_attribute_matches(action);
     }
     let Some(principal) = request.request_principal.as_ref() else {
         return true;
@@ -3425,6 +3460,17 @@ mod tests {
 
     // ── requestPrincipals matching ──────────────────────────────────────
 
+    /// An anonymous HTTP-family request. The request-principal matchers are
+    /// HTTP-only, so a test that means "no JWT was presented" must say so on
+    /// the HTTP path — `MeshAuthzProtocol::default()` is `L4`, where the
+    /// field is unevaluable rather than absent.
+    fn anonymous_http_authz_request() -> MeshAuthzRequest {
+        MeshAuthzRequest {
+            protocol: MeshAuthzProtocol::Http,
+            ..MeshAuthzRequest::default()
+        }
+    }
+
     #[test]
     fn request_principals_exact_match_allows() {
         let slice = MeshSlice {
@@ -3442,6 +3488,7 @@ mod tests {
         };
         let request = MeshAuthzRequest {
             request_principal: Some("https://accounts.google.com/user-42".to_string()),
+            protocol: MeshAuthzProtocol::Http,
             ..MeshAuthzRequest::default()
         };
 
@@ -3468,6 +3515,7 @@ mod tests {
         };
         let request = MeshAuthzRequest {
             request_principal: Some("https://accounts.google.com/any-subject".to_string()),
+            protocol: MeshAuthzProtocol::Http,
             ..MeshAuthzRequest::default()
         };
 
@@ -3492,7 +3540,7 @@ mod tests {
             }],
             ..MeshSlice::default()
         };
-        let request = MeshAuthzRequest::default();
+        let request = anonymous_http_authz_request();
 
         assert_eq!(
             evaluate_mesh_authorization(&slice, &request),
@@ -3519,6 +3567,7 @@ mod tests {
         };
         let request = MeshAuthzRequest {
             request_principal: Some("https://evil.com/attacker".to_string()),
+            protocol: MeshAuthzProtocol::Http,
             ..MeshAuthzRequest::default()
         };
 
@@ -3547,6 +3596,7 @@ mod tests {
         };
         let request = MeshAuthzRequest {
             request_principal: Some("https://auth.example.com/admin-root".to_string()),
+            protocol: MeshAuthzProtocol::Http,
             ..MeshAuthzRequest::default()
         };
 
@@ -3575,6 +3625,7 @@ mod tests {
         };
         let request = MeshAuthzRequest {
             request_principal: Some("https://auth.example.com/user-123".to_string()),
+            protocol: MeshAuthzProtocol::Http,
             ..MeshAuthzRequest::default()
         };
 
@@ -4398,6 +4449,7 @@ mod tests {
         // Matching request principal → blocked.
         let admin = MeshAuthzRequest {
             request_principal: Some("https://issuer/admin".to_string()),
+            protocol: MeshAuthzProtocol::Http,
             ..MeshAuthzRequest::default()
         };
         assert_eq!(
@@ -4409,6 +4461,7 @@ mod tests {
         // Different request principal → admitted.
         let user = MeshAuthzRequest {
             request_principal: Some("https://issuer/user".to_string()),
+            protocol: MeshAuthzProtocol::Http,
             ..MeshAuthzRequest::default()
         };
         assert_eq!(
@@ -4417,7 +4470,7 @@ mod tests {
         );
         // No JWT at all → negative request-principal match succeeds.
         assert_eq!(
-            evaluate_mesh_authorization(&slice, &MeshAuthzRequest::default()),
+            evaluate_mesh_authorization(&slice, &anonymous_http_authz_request()),
             MeshAuthzDecision::Allow
         );
     }
@@ -4439,7 +4492,7 @@ mod tests {
         };
 
         assert_eq!(
-            evaluate_mesh_authorization(&slice, &MeshAuthzRequest::default()),
+            evaluate_mesh_authorization(&slice, &anonymous_http_authz_request()),
             MeshAuthzDecision::Deny {
                 policy: "deny-anonymous".to_string()
             }
@@ -4447,6 +4500,7 @@ mod tests {
 
         let authenticated = MeshAuthzRequest {
             request_principal: Some("https://issuer/user".to_string()),
+            protocol: MeshAuthzProtocol::Http,
             ..MeshAuthzRequest::default()
         };
         assert_eq!(

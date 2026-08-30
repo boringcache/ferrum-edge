@@ -262,8 +262,11 @@ The finalized-egress phase always follows `load_testing`'s `before_proxy` hook,
 so the reserved `X-Loadtesting-Key` is stripped on both matching and
 non-matching paths before the mirror can copy headers. As defense in depth,
 `request_mirror` also excludes both load-testing control headers regardless of
-priority configuration. `request_mirror` is also the security-sensitive path
-exception: when backend-path policy is active and `mirror_path` is unset, it
+priority configuration. Cross-origin query credentials are deny-by-default on
+the mirror request-target (owned snapshot of the finalized backend-visible
+query); the primary backend target is unchanged. `request_mirror` is also the
+security-sensitive path exception: when backend-path policy is active and
+`mirror_path` is unset, it
 mirrors the exact effective path that passed final authorization. An explicit
 operator-configured `mirror_path` still wins.
 Each configured mirror instance appends its own bounded result receiver; result

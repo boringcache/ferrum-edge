@@ -55,6 +55,9 @@ pub mod grpc_proxy;
 pub(crate) mod h2c_preface;
 pub mod hbone_pool;
 mod hbone_proxy;
+#[allow(unused_imports)]
+// Used by external tests; unused in the separately compiled bin target.
+pub(crate) use hbone_proxy::settle_hbone_backend_connect_circuit_breaker_outcome;
 pub mod headers;
 pub mod host_udp_capture;
 /// Privileged live-kernel gate for Ambient host-network UDP capture (#3705).
@@ -62765,15 +62768,16 @@ mod tests {
         assert_eq!(no_slice("localhost"), Err(InboundRelayDenial::NoSlice));
         assert_eq!(no_slice("10.1.2.3"), Err(InboundRelayDenial::NoSlice));
 
-        // An own-pod terminator (Sidecar / Ambient): this pod plus a SIBLING pod
-        // the slice also declares. Only the first is a destination we terminate
-        // for.
+        // Sidecar: this pod plus a SIBLING pod the slice also declares. Only
+        // the first is a destination we terminate for. Loopback is the
+        // Sidecar own-network-namespace shortcut.
         let mesh = MeshConfig {
             workloads: vec![
                 relay_guard_workload("app", &["10.1.2.3", "fd00:10:244:1::4"], &[8080]),
                 relay_guard_workload("peer", &["10.9.9.9"], &[8080]),
             ],
             inbound_relay_admits_accepted_local_address: true,
+            inbound_relay_admits_loopback_namespace: true,
             ..MeshConfig::default()
         };
         let decide = |host: &str, port: u16, local: Option<std::net::IpAddr>| {
@@ -62784,6 +62788,9 @@ mod tests {
         assert_eq!(decide("127.0.0.1", 8080, Some(own_ip)), Ok(()));
         assert_eq!(decide("::1", 8080, Some(own_ip)), Ok(()));
         assert_eq!(decide("localhost", 8080, Some(own_ip)), Ok(()));
+        assert_eq!(decide("localhost.", 8080, Some(own_ip)), Ok(()));
+        assert_eq!(decide("LocalHost", 8080, Some(own_ip)), Ok(()));
+        assert_eq!(decide("app.localhost", 8080, Some(own_ip)), Ok(()));
         // ...but undeclared loopback ports remain refused.
         assert_eq!(
             decide("127.0.0.1", 9999, Some(own_ip)),
@@ -62849,6 +62856,65 @@ mod tests {
             decide("127.0.0.1", 8080, None),
             Err(InboundRelayDenial::AddressNotTerminated)
         );
+
+        // Ambient admits the accepted non-loopback local address but must not
+        // inherit Sidecar's loopback-namespace shortcut, even when inventory
+        // lists those names.
+        let ambient = MeshConfig {
+            workloads: vec![relay_guard_workload(
+                "app",
+                &["10.1.2.3", "127.0.0.1"],
+                &[8080],
+            )],
+            inbound_relay_destinations: vec![
+                crate::modes::mesh::config::MeshInboundRelayDestination {
+                    host: crate::modes::mesh::config::MeshInboundRelayHost::Ip(own_ip),
+                    ports: vec![8080],
+                },
+                crate::modes::mesh::config::MeshInboundRelayDestination {
+                    host: crate::modes::mesh::config::MeshInboundRelayHost::Ip(
+                        "127.0.0.1".parse().expect("loopback"),
+                    ),
+                    ports: vec![8080],
+                },
+                crate::modes::mesh::config::MeshInboundRelayDestination {
+                    host: crate::modes::mesh::config::MeshInboundRelayHost::Name(
+                        "localhost".to_string(),
+                    ),
+                    ports: vec![8080],
+                },
+                crate::modes::mesh::config::MeshInboundRelayDestination {
+                    host: crate::modes::mesh::config::MeshInboundRelayHost::Name(
+                        "app.localhost".to_string(),
+                    ),
+                    ports: vec![8080],
+                },
+            ],
+            inbound_relay_admits_accepted_local_address: true,
+            ..MeshConfig::default()
+        };
+        let ambient_decide = |host: &str, port: u16| {
+            inbound_hbone_relay_destination_decision(host, port, Some(&ambient), Some(own_ip))
+        };
+        assert_eq!(ambient_decide("10.1.2.3", 8080), Ok(()));
+        assert_eq!(
+            ambient_decide("10.1.2.3", 9999),
+            Err(InboundRelayDenial::PortNotDeclared)
+        );
+        for host in [
+            "127.0.0.1",
+            "::1",
+            "localhost",
+            "localhost.",
+            "LocalHost",
+            "app.localhost",
+        ] {
+            assert_eq!(
+                ambient_decide(host, 8080),
+                Err(InboundRelayDenial::AddressNotTerminated),
+                "Ambient must refuse loopback-namespace authority {host}"
+            );
+        }
     }
 
     /// Issue #4150: the two topologies that legitimately terminate for OTHER
@@ -62857,7 +62923,8 @@ mod tests {
     #[test]
     fn inbound_hbone_relay_guard_admits_the_waypoint_termination_inventory_only() {
         use crate::modes::mesh::config::{
-            InboundRelayDenial, MeshConfig, inbound_relay_destinations_from_workloads,
+            InboundRelayDenial, MeshConfig, MeshInboundRelayDestination, MeshInboundRelayHost,
+            inbound_relay_destinations_from_workloads,
         };
 
         let waypoint_ip: std::net::IpAddr = "10.4.4.4".parse().expect("waypoint IP");
@@ -62899,9 +62966,8 @@ mod tests {
             Err(InboundRelayDenial::AddressNotTerminated)
         );
 
-        // Loopback listed IN the inventory is a real termination target —
-        // the functional waypoint suite declares `127.0.0.1` as the
-        // workload address. The own-namespace shortcut stays off.
+        // Inventory data cannot make the waypoint/host network namespace's
+        // loopback address into a workload termination target.
         let loopback_mesh = MeshConfig {
             inbound_relay_destinations: inbound_relay_destinations_from_workloads(&[
                 relay_guard_workload("loopback-app", &["127.0.0.1"], &[8080]),
@@ -62915,7 +62981,7 @@ mod tests {
                 Some(&loopback_mesh),
                 Some(waypoint_ip),
             ),
-            Ok(())
+            Err(InboundRelayDenial::AddressNotTerminated)
         );
         assert_eq!(
             inbound_hbone_relay_destination_decision(
@@ -62926,6 +62992,35 @@ mod tests {
             ),
             Err(InboundRelayDenial::AddressNotTerminated)
         );
+
+        // DNS localhost namespace spellings must not bypass the loopback refusal
+        // via inventory Name entries that the backend dial would resolve to
+        // loopback.
+        let localhost_namespace_mesh = MeshConfig {
+            inbound_relay_destinations: vec![
+                MeshInboundRelayDestination {
+                    host: MeshInboundRelayHost::Name("localhost.".to_string()),
+                    ports: vec![8080],
+                },
+                MeshInboundRelayDestination {
+                    host: MeshInboundRelayHost::Name("app.localhost".to_string()),
+                    ports: vec![8080],
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        for host in ["localhost.", "LocalHost", "app.localhost", "APP.Localhost"] {
+            assert_eq!(
+                inbound_hbone_relay_destination_decision(
+                    host,
+                    8080,
+                    Some(&localhost_namespace_mesh),
+                    Some(waypoint_ip),
+                ),
+                Err(InboundRelayDenial::AddressNotTerminated),
+                "waypoint must refuse loopback-namespace authority {host} even when inventory-listed"
+            );
+        }
     }
 
     #[test]

@@ -62,7 +62,13 @@ The control plane may derive this from Kubernetes Pods, Nodes, and DaemonSet
 endpoints, but the data plane consumes the explicit slice fields. The
 Kubernetes core translator now derives the endpoint for service-backed
 workloads from a trusted ready host-network NodeWaypoint proxy Pod on the same
-node. The proxy Pod must live in `FERRUM_K8S_CONTROLLER_NAMESPACE`, carry
+node. Last Ready endpoints are retained across a rolling restart only when that
+same node still has a trusted not-Ready or terminating NodeWaypoint proxy pod,
+so destination metadata is not stripped solely because one node's proxy is
+briefly not Ready. Another node's trusted pod cannot retain a withdrawn node.
+Removing a node's trusted waypoint object, or removing every trusted waypoint
+pod, clears that node's inventory and withdraws its metadata. The proxy Pod
+must live in `FERRUM_K8S_CONTROLLER_NAMESPACE`, carry
 `app.kubernetes.io/name=ferrum-mesh-ambient`, use service account
 `ferrum-mesh`, and advertise `FERRUM_MESH_TOPOLOGY=node_waypoint`; scoped
 workload watches include that namespace for Pod discovery. Helm sets this to
@@ -100,8 +106,10 @@ secured HBONE target whose outer dial host is the destination NodeWaypoint
 endpoint, whose pinned peer identity is the NodeWaypoint SPIFFE ID, and whose
 inner CONNECT authority remains the selected workload app address and port.
 Kubernetes pod discovery now populates `node_waypoint` for service-backed
-workloads when their node has a trusted ready NodeWaypoint proxy Pod;
-identity-backed source NodeWaypoint runtimes now make missing destination
+workloads when their node has a trusted ready NodeWaypoint proxy Pod, and
+retains the last Ready endpoint only while that same node still has a trusted
+not-Ready or terminating waypoint pod. Identity-backed source NodeWaypoint
+runtimes now make missing destination
 metadata fail closed by skipping those targets during materialization. For
 identity-backed NodeWaypoint, the mesh-managed destination `mesh_authz` and
 `workload_metrics` plugins derive their `trusted_hbone_assertors` list from the

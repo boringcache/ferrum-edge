@@ -13074,6 +13074,21 @@ pub mod _test_support {
         crate::plugins::spec_expose::spec_expose_failure_backoff_seconds(previous_failures)
     }
 
+    /// Production HBONE CONNECT circuit-breaker settlement after
+    /// `connect_backend`. External tests use this so a DNS-screen 403 cannot
+    /// drift from the served HALF_OPEN accounting.
+    pub fn settle_hbone_backend_connect_circuit_breaker_outcome_for_test(
+        cb: &crate::circuit_breaker::CircuitBreaker,
+        status: hyper::StatusCode,
+        is_half_open_probe: bool,
+    ) {
+        crate::proxy::settle_hbone_backend_connect_circuit_breaker_outcome(
+            cb,
+            status,
+            is_half_open_probe,
+        )
+    }
+
     /// Build an email channel with deterministic `*_env` resolution for unit
     /// tests. Production uses [`crate::notifications::channels::EmailChannel::new`]
     /// and real `std::env::var`.
