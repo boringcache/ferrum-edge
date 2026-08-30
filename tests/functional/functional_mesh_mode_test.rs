@@ -542,11 +542,13 @@ const AMBIENT_DEST_RELAY_POD_UID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 /// `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR` at an empty `node-waypoint-pods/`
 /// dir, so without this leaf `destination_is_node_local_enrolled` refuses every
 /// inventory destination (`AddressNotTerminated`) even though the slice
-/// declares the dest as local. Same-cluster fixtures avoid this by dialing the
-/// workload IP on a `0.0.0.0` HBONE bind (own-address arm); cross-cluster and
-/// UDP-dest fixtures dial `127.0.0.1` and therefore need enrollment. Write the
-/// leaf before spawning the dest gateway so the startup `reconcile_once` sees
-/// it.
+/// declares the dest as local. Same-cluster and host-netns UDP-dest fixtures
+/// avoid this by dialing the workload IP on a `0.0.0.0` HBONE bind (own-address
+/// arm); cross-cluster fixtures dial `127.0.0.1` and therefore need enrollment.
+/// Write the leaf before spawning the dest gateway so the startup
+/// `reconcile_once` sees it. UDP dest must not enroll: a matching `ipv4=` makes
+/// `open_hbone_udp_relay_socket` enter the enrolled pod netns, which a
+/// host-netns echo fixture does not have.
 fn publish_ambient_dest_relay_enrollment(temp: &TempDir, ipv4: &str, spiffe_id: &str) {
     let registry_dir = temp.path().join("node-waypoint-pods");
     std::fs::create_dir_all(&registry_dir).expect("create ambient dest pod registry");
@@ -9779,18 +9781,18 @@ async fn read_one_framed_reply(
 /// Open mTLS H2 to B, send a `udp` CONNECT + one framed `ping`, return
 /// (status, optional framed reply).
 async fn drive_one_udp_connect(
+    hbone_ip: Ipv4Addr,
     hbone_port: u16,
     authority: &str,
     client_svid: &GeneratedGatewaySvid,
 ) -> Result<(u16, Option<Vec<u8>>), String> {
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", hbone_port))
+    let tcp = tokio::net::TcpStream::connect((hbone_ip, hbone_port))
         .await
         .map_err(|e| format!("connect B: {e}"))?;
     let _ = tcp.set_nodelay(true);
     let connector = tokio_rustls::TlsConnector::from(udp_dest_client_config(client_svid));
-    let server_name = rustls::pki_types::ServerName::IpAddress(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)).into(),
-    );
+    let server_name =
+        rustls::pki_types::ServerName::IpAddress(std::net::IpAddr::V4(hbone_ip).into());
     // Bound the handshakes: if the HBONE port is bound but the TLS server wedges
     // (or a regression binds a non-TLS listener), an unbounded handshake await
     // would hang the ignored test forever before reaching the later timeouts.
@@ -9902,12 +9904,12 @@ async fn drive_udp_dest_connect(
         let ports_b = reserve_mesh_ports().await;
         let hbone_port = ports_b.hbone;
 
-        // Issue #4249: the client dials B's HBONE at 127.0.0.1, so the CONNECT
-        // authority (non-loopback workload IP) takes the inventory arm, which
-        // the empty spawn-helper registry would refuse. Enroll the dest before
-        // B starts so the startup reconcile sees it.
-        publish_ambient_dest_relay_enrollment(&temp_b, &workload_address, b_spiffe);
-
+        // Same-cluster Ambient dest shape (issue #4249): bind HBONE on 0.0.0.0
+        // and dial the advertised workload IP so the CONNECT takes the
+        // own-address arm. Do not enroll that IP — enrollment is what the
+        // inventory arm needs when HBONE is reached at 127.0.0.1, but
+        // `open_hbone_udp_relay_socket` then enters the enrolled pod netns,
+        // and this host-netns echo has none (502).
         let mut child_b = spawn_mesh_gateway(
             &temp_b,
             MeshGatewaySpawnOptions {
@@ -9927,6 +9929,7 @@ async fn drive_udp_dest_connect(
                         "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
                         svids.b.trust_bundle_path.clone(),
                     ),
+                    ambient_dest_hbone_listen_override(hbone_port),
                 ],
             },
         );
@@ -9951,7 +9954,8 @@ async fn drive_udp_dest_connect(
         };
         let authority = format!("{workload_address}:{dial_port}");
 
-        let outcome = drive_one_udp_connect(hbone_port, &authority, &client_svid).await;
+        let outcome =
+            drive_one_udp_connect(workload_ip, hbone_port, &authority, &client_svid).await;
 
         let logs = captured_output(&temp_b);
         kill_child(&mut child_b);
