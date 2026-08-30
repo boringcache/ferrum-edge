@@ -90,6 +90,7 @@ use futures_util::future::join_all;
 use kube::Client;
 use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
 use serde_json::{Value, json};
+use tokio::time::Instant as TokioInstant;
 use tracing::warn;
 
 use crate::config_sources::k8s::{
@@ -101,6 +102,9 @@ use crate::config_sources::k8s::{
 };
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::status::StatusTranslationReuse;
+use crate::k8s_controller::status_budget::{
+    STATUS_BATCH_BUDGET, STATUS_UPDATE_BUDGET, StatusOperation, await_status_operation,
+};
 use crate::k8s_controller::status_plan::{
     StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
 };
@@ -169,6 +173,11 @@ impl IstioStatusWriter {
     /// callers can metric / alert on the failure rate without losing the
     /// rest of the batch.
     pub async fn patch_updates(&self, updates: Vec<IstioStatusUpdate>) -> Result<(), kube::Error> {
+        // One deadline for the whole batch (issue #4239): this is awaited inline
+        // on the serialized reconcile loop, so an unbounded per-object write
+        // would stop every other object's status from being published for as
+        // long as the API server keeps the request open.
+        let deadline = TokioInstant::now() + STATUS_BATCH_BUDGET;
         // Take `updates` by value and consume via `into_iter` so the per-
         // update closure / async block owns its `update` rather than
         // capturing `&IstioStatusUpdate`. Otherwise the spawned reconciler
@@ -194,7 +203,19 @@ impl IstioStatusWriter {
             let namespace = update.namespace.clone();
             let metrics = metrics.clone();
             Some(async move {
-                let result = patch_istio_status_with_retry(&api, &update, metrics.as_deref()).await;
+                let result = await_status_operation(
+                    StatusOperation {
+                        phase: "update",
+                        kind: &update.kind,
+                        namespace: &update.namespace,
+                        name: &update.name,
+                    },
+                    deadline,
+                    STATUS_UPDATE_BUDGET,
+                    metrics.as_deref(),
+                    patch_istio_status_with_retry(&api, &update, metrics.as_deref()),
+                )
+                .await;
                 (kind, namespace, name, result)
             })
         });

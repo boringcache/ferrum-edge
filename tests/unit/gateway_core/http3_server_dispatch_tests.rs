@@ -4930,3 +4930,404 @@ fn committed_borrowed_h3_streaming_responses_reset_unless_a_finish_landed() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #4261 — HTTP/3 declared-frame-length accumulation bound
+// ---------------------------------------------------------------------------
+
+/// The advertised `SETTINGS_MAX_FIELD_SECTION_SIZE` follows the operator's
+/// configured header policy, floored so the peer's own control-stream frames
+/// still fit, and never exceeds the QUIC varint range it has to be encoded in.
+#[test]
+fn h3_advertised_field_section_size_tracks_configured_header_policy() {
+    use ferrum_edge::http3::config::{
+        H3_MIN_FIELD_SECTION_SIZE, QUIC_VARINT_MAX_U64, h3_max_field_section_size,
+    };
+
+    // Default `FERRUM_MAX_HEADER_SIZE_BYTES` is carried through verbatim, not
+    // advertised as VarInt::MAX (the pre-#4261 behaviour).
+    assert_eq!(h3_max_field_section_size(32_768), 32_768);
+    assert_ne!(h3_max_field_section_size(32_768), QUIC_VARINT_MAX_U64);
+
+    // A very small configured limit is floored: Ferrum's own 431 check still
+    // enforces the configured value exactly.
+    assert_eq!(
+        h3_max_field_section_size(64),
+        H3_MIN_FIELD_SECTION_SIZE as u64
+    );
+
+    // Clamping only ever narrows.
+    assert!(h3_max_field_section_size(usize::MAX) <= QUIC_VARINT_MAX_U64);
+}
+
+/// The receive-side buffered-frame ceiling sits above the advertised policy so
+/// a field section that merely overshoots still reaches the graceful 431, and
+/// stays inside the QUIC varint range.
+#[test]
+fn h3_buffered_frame_ceiling_leaves_the_graceful_431_reachable() {
+    use ferrum_edge::http3::config::{
+        QUIC_VARINT_MAX_U64, h3_max_buffered_frame_len, h3_max_field_section_size,
+    };
+
+    for configured in [64usize, 16_384, 32_768, 1_048_576] {
+        let advertised = h3_max_field_section_size(configured);
+        let ceiling = h3_max_buffered_frame_len(configured);
+        assert!(
+            ceiling > advertised,
+            "the buffered-frame ceiling must exceed the advertised field-section \
+             policy so an overshooting request is answered 431 rather than aborted \
+             (configured={configured})"
+        );
+        assert!(ceiling <= QUIC_VARINT_MAX_U64);
+    }
+
+    // Saturation must not wrap into a small (or unrepresentable) ceiling.
+    assert!(h3_max_buffered_frame_len(usize::MAX) <= QUIC_VARINT_MAX_U64);
+    assert!(h3_max_buffered_frame_len(usize::MAX) > 0);
+}
+
+/// A header policy whose derived H3 limits could not be represented as QUIC
+/// varints is a configuration error, not something silently clamped into a
+/// bound the operator never asked for.
+#[test]
+fn h3_field_section_limits_refuse_an_unrepresentable_header_policy() {
+    use ferrum_edge::http3::config::{QUIC_VARINT_MAX_U64, validate_h3_field_section_limits};
+
+    assert!(validate_h3_field_section_limits(32_768).is_ok());
+    assert!(validate_h3_field_section_limits(0).is_ok());
+
+    let err = validate_h3_field_section_limits(usize::MAX)
+        .expect_err("an unrepresentable header policy must fail configuration admission");
+    assert!(
+        err.contains("FERRUM_MAX_HEADER_SIZE_BYTES"),
+        "the refusal must name the offending variable: {err}"
+    );
+
+    // The stated boundary is exact.
+    let largest_ok = (QUIC_VARINT_MAX_U64 / 2) as usize;
+    assert!(validate_h3_field_section_limits(largest_ok).is_ok());
+    assert!(validate_h3_field_section_limits(largest_ok + 1).is_err());
+}
+
+/// Configuration admission actually runs the H3 varint check, so an
+/// unrepresentable header policy cannot reach a serving listener.
+#[test]
+fn env_config_validation_screens_h3_field_section_limits() {
+    let src = include_str!("../../../src/config/env_config.rs");
+    assert!(
+        src.contains("crate::http3::config::validate_h3_field_section_limits("),
+        "EnvConfig::validate must refuse a header policy the H3 frontend cannot \
+         advertise (issue #4261)"
+    );
+}
+
+/// The H3 listener builder derives BOTH the advertised field-section size and
+/// the receive-side buffered-frame ceiling from the same configured header
+/// policy the H1 and H2 frontends use, and keeps the post-decode 431 as
+/// defence in depth.
+#[test]
+fn h3_listener_builder_binds_frame_bounds_to_the_header_policy() {
+    let src = include_str!("../../../src/http3/server.rs");
+    let builder = src
+        .split("let mut h3_conn = h3::server::builder()")
+        .nth(1)
+        .expect("H3 frontend builder must remain present")
+        .split(".await?;")
+        .next()
+        .expect("bounded H3 frontend builder");
+
+    assert!(
+        builder.contains(".max_field_section_size(h3_max_field_section_size)"),
+        "the H3 listener must advertise the enforced policy, not VarInt::MAX: {builder}"
+    );
+    assert!(
+        builder.contains(".max_buffered_frame_len(h3_max_buffered_frame_len)"),
+        "the H3 listener must bound the buffered non-DATA frame payload: {builder}"
+    );
+
+    assert!(
+        src.contains(
+            "crate::http3::config::h3_max_field_section_size(state.max_header_size_bytes)"
+        ) && src.contains(
+            "crate::http3::config::h3_max_buffered_frame_len(state.max_header_size_bytes)"
+        ),
+        "both H3 receive bounds must come from FERRUM_MAX_HEADER_SIZE_BYTES"
+    );
+    assert!(
+        src.contains("if total_header_size > state.max_header_size_bytes {"),
+        "the post-decode 431 check must survive as defence in depth"
+    );
+}
+
+/// Production pooled H3 backend constructors opt into the declared-frame
+/// ceiling, so a hostile or compromised upstream cannot accumulate an
+/// over-declared HEADERS, CONTROL, PUSH, or unknown frame.
+///
+/// `FERRUM_MAX_HEADER_SIZE_BYTES` is documented as a request-header policy, so
+/// the backend client must not also turn it into an H3-only decoded response
+/// header limit. `h3::client::new` is the unbounded frame-decoder default.
+#[test]
+fn h3_backend_client_builder_binds_frame_ceiling_without_response_policy_drift() {
+    let src = include_str!("../../../src/http3/client.rs");
+    let pool_impl = src
+        .split("impl Http3ConnectionPool {")
+        .nth(1)
+        .expect("Http3ConnectionPool impl must remain present")
+        .split("\npub struct Http3Client {")
+        .next()
+        .expect("pool impl must end before the standalone Http3Client");
+
+    assert!(
+        !pool_impl.contains("h3::client::new("),
+        "no production pooled H3 backend constructor may use unbounded \
+         h3::client::new: {pool_impl}"
+    );
+    assert_eq!(
+        pool_impl.matches("h3::client::builder()").count(),
+        2,
+        "both production H3 backend constructors must use the bounded client \
+         builder"
+    );
+
+    for fn_name in ["create_connection", "create_connection_to_target"] {
+        let body = src
+            .split(&format!("async fn {fn_name}("))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{fn_name} must remain present"))
+            .split("\n    async fn ")
+            .next()
+            .unwrap_or_else(|| panic!("{fn_name} body must remain present"));
+        let collapsed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(
+            collapsed.contains("crate::http3::config::h3_max_buffered_frame_len(")
+                && collapsed.contains("self.env_config.max_header_size_bytes"),
+            "{fn_name} must bound the buffered non-DATA frame payload from \
+             FERRUM_MAX_HEADER_SIZE_BYTES: {body}"
+        );
+        assert!(
+            collapsed.contains("h3::client::builder()")
+                && collapsed.contains(".max_buffered_frame_len(h3_max_buffered_frame_len)"),
+            "{fn_name} must opt into the bounded client builder: {body}"
+        );
+        assert!(
+            !collapsed.contains(".max_field_section_size("),
+            "{fn_name} must not repurpose the request-header policy as an \
+             H3-only backend response-header limit: {body}"
+        );
+        assert!(
+            !collapsed.contains("h3::client::new("),
+            "{fn_name} must not regress to unbounded h3::client::new: {body}"
+        );
+    }
+}
+
+/// The vendored refusal must fire on the DECLARED length, before any payload
+/// byte is buffered and before an accumulation target is armed.
+///
+/// This is the load-bearing half of the fix: stock h3 0.0.8 returns
+/// `Incomplete(declared_len)` and `FrameStream` then pulls QUIC chunks into an
+/// unbounded `BufList` until that target is met. QUIC flow control caps bytes
+/// in flight, not cumulative accumulation, because every read re-grants credit.
+#[test]
+fn h3_vendored_frame_decoder_refuses_oversized_declared_non_data_length() {
+    let proto = include_str!("../../../vendor/h3-0.0.8-ferrum-patched/src/proto/frame.rs");
+    let decode = proto
+        .split("pub fn decode_bounded<T: Buf>(")
+        .nth(1)
+        .expect("vendored bounded frame decoder must remain present")
+        .split("\nimpl<B> Encode for Frame<B>")
+        .next()
+        .expect("bounded vendored frame decoder");
+
+    // The ceiling is compared against the raw u64 varint. A `usize` conversion
+    // first would let a 2^32+n declaration truncate to a short frame on a
+    // 32-bit target and slip under the cap.
+    let cap_check = decode
+        .find("if len > max {")
+        .expect("the declared length must be compared against the ceiling");
+    let take = decode
+        .find("buf.take(len)")
+        .expect("the payload take must remain present");
+    assert!(
+        cap_check < take,
+        "the declared length must be refused before any payload byte is taken"
+    );
+    let usize_cast = decode
+        .find("let len = len as usize;")
+        .expect("the checked usize narrowing must remain present");
+    assert!(
+        cap_check < usize_cast,
+        "the u64 comparison must precede the usize conversion so truncation \
+         cannot bypass the ceiling"
+    );
+    assert!(
+        decode.contains("let addressable_max = usize::MAX as u64;")
+            && decode.contains("let max = max_buffered_frame_len.min(addressable_max);"),
+        "a declared length this platform cannot address must fail closed too: {decode}"
+    );
+    assert!(
+        decode.contains("FrameError::Incomplete(len.saturating_add(2))"),
+        "the accumulation target must use checked arithmetic"
+    );
+
+    // DATA frames stream to the caller and must NOT be capped by the header
+    // ceiling: request bodies legitimately exceed it.
+    let data_arm = decode
+        .split("if ty == FrameType::DATA {")
+        .nth(1)
+        .expect("the DATA arm must remain present")
+        .split("let max = max_buffered_frame_len")
+        .next()
+        .expect("bounded DATA arm");
+    assert!(
+        !data_arm.contains("max_buffered_frame_len"),
+        "DATA payload length must not be bounded by the buffered-frame ceiling: {data_arm}"
+    );
+
+    let frame = include_str!("../../../vendor/h3-0.0.8-ferrum-patched/src/frame.rs");
+    let decoder = frame
+        .split("pub struct FrameDecoder {")
+        .nth(1)
+        .expect("vendored FrameDecoder must remain present")
+        .split("\n#[derive(Debug)]")
+        .next()
+        .expect("bounded vendored FrameDecoder");
+    assert!(
+        decoder.contains("max_buffered_frame_len: u64,"),
+        "the decoder must carry the receive-side ceiling: {decoder}"
+    );
+    assert!(
+        decoder.contains("Frame::decode_bounded(&mut cur, self.max_buffered_frame_len)"),
+        "the decoder must decode under its ceiling, not with the unbounded entry point"
+    );
+    // The refusal arm must not fall through to `self.expected = Some(min)`.
+    let refusal = decoder
+        .split("Err(frame::FrameError::ExceedsMaxBufferedLen { ty, len, max }) => {")
+        .nth(1)
+        .expect("the decoder must map the over-ceiling refusal")
+        .split("\n                }")
+        .next()
+        .expect("bounded refusal arm");
+    assert!(
+        refusal.contains("FrameProtocolError::ExceedsMaxBufferedFrameLen")
+            && !refusal.contains("self.expected"),
+        "the refusal must surface a protocol error without arming accumulation: {refusal}"
+    );
+}
+
+/// The refusal is a connection error of type `H3_EXCESSIVE_LOAD`, and it is
+/// wired through every decoder the server owns: request streams AND the peer's
+/// unidirectional control/push streams.
+#[test]
+fn h3_vendored_frame_ceiling_maps_to_excessive_load_on_every_decoder() {
+    let internal =
+        include_str!("../../../vendor/h3-0.0.8-ferrum-patched/src/error/internal_error.rs");
+    let mapping = internal
+        .split("FrameProtocolError::ExceedsMaxBufferedFrameLen { ty, len, max } =>")
+        .nth(1)
+        .expect("the over-ceiling refusal must map to a connection error")
+        .split("\n            FrameProtocolError::InvalidFrameValue")
+        .next()
+        .expect("bounded mapping");
+    assert!(
+        mapping.contains("code: Code::H3_EXCESSIVE_LOAD"),
+        "an over-ceiling declared length is resource exhaustion, not a malformed \
+         frame: {mapping}"
+    );
+
+    let builder = include_str!("../../../vendor/h3-0.0.8-ferrum-patched/src/server/builder.rs");
+    assert!(
+        builder.contains("pub fn max_buffered_frame_len(&mut self, value: u64) -> &mut Self {")
+            && builder.contains("self.config.max_buffered_frame_len = value;"),
+        "server::builder() must expose the receive-side ceiling setter"
+    );
+
+    let client_builder =
+        include_str!("../../../vendor/h3-0.0.8-ferrum-patched/src/client/builder.rs");
+    assert!(
+        client_builder
+            .contains("pub fn max_buffered_frame_len(&mut self, value: u64) -> &mut Self {")
+            && client_builder.contains("self.config.max_buffered_frame_len = value;"),
+        "client::builder() must expose the receive-side ceiling setter so pooled \
+         backend connections can fail closed too"
+    );
+
+    let config = include_str!("../../../vendor/h3-0.0.8-ferrum-patched/src/config.rs");
+    assert!(
+        config.contains("pub(crate) max_buffered_frame_len: u64,")
+            && config.contains(
+                "max_buffered_frame_len: crate::frame::FrameDecoder::UNBOUNDED_FRAME_LEN,"
+            ),
+        "the ceiling must live on Config and default to stock upstream behaviour"
+    );
+
+    // Request streams.
+    let server_conn =
+        include_str!("../../../vendor/h3-0.0.8-ferrum-patched/src/server/connection.rs");
+    let accept = server_conn
+        .split("pub async fn accept(&mut self)")
+        .nth(1)
+        .expect("server accept() must remain present")
+        .split("\n    fn create_resolver_internal(")
+        .next()
+        .expect("bounded server accept()");
+    assert!(
+        accept.contains("FrameStream::with_max_buffered_frame_len(")
+            && accept.contains("self.inner.config.max_buffered_frame_len,")
+            && !accept.contains("FrameStream::new("),
+        "accepted request streams must decode under the connection's ceiling: {accept}"
+    );
+
+    // Unidirectional control / push streams.
+    let conn = include_str!("../../../vendor/h3-0.0.8-ferrum-patched/src/connection.rs");
+    assert!(
+        conn.contains("AcceptRecvStream::new(stream, self.config.max_buffered_frame_len)"),
+        "unidirectional streams must inherit the connection's ceiling"
+    );
+    let stream = include_str!("../../../vendor/h3-0.0.8-ferrum-patched/src/stream.rs");
+    let into_stream = stream
+        .split("pub fn into_stream(self) -> AcceptedRecvStream<S, B> {")
+        .nth(1)
+        .expect("uni-stream resolution must remain present")
+        .split("\n    }")
+        .next()
+        .expect("bounded uni-stream resolution");
+    assert_eq!(
+        into_stream
+            .matches("FrameStream::with_max_buffered_frame_len(")
+            .count(),
+        2,
+        "both frame-decoded uni-stream types (CONTROL, PUSH) must carry the \
+         ceiling: {into_stream}"
+    );
+    assert!(
+        !into_stream.contains("FrameStream::new("),
+        "no frame-decoded uni-stream may fall back to the unbounded decoder"
+    );
+}
+
+/// The vendored behavioural regressions that must survive retirement of the
+/// vendor patch. Named here so removing them is a visible change to a
+/// repository-owned contract, not a silent vendor-directory deletion.
+#[test]
+fn h3_vendored_frame_ceiling_behavioural_regressions_are_present() {
+    let frame = include_str!("../../../vendor/h3-0.0.8-ferrum-patched/src/frame.rs");
+    for name in [
+        "fn oversized_declared_headers_frame_is_refused_without_buffering()",
+        "fn oversized_declared_settings_frame_is_refused_without_buffering()",
+        "fn oversized_declared_unknown_frame_is_refused_rather_than_buffered_to_skip()",
+        "fn headers_frame_at_the_max_buffered_frame_len_is_accepted()",
+        "fn headers_frame_one_byte_over_the_max_buffered_frame_len_is_refused()",
+        "fn data_frame_length_is_not_bounded_by_max_buffered_frame_len()",
+        "fn default_frame_decoder_keeps_unbounded_upstream_behaviour()",
+        "fn frame_stream_refuses_oversized_declared_frame_before_accumulating()",
+    ] {
+        assert!(
+            frame.contains(name),
+            "vendored behavioural regression {name} must survive (issue #4261); \
+             CI runs it via `cargo test --manifest-path \
+             vendor/h3-0.0.8-ferrum-patched/Cargo.toml --lib frame`"
+        );
+    }
+}

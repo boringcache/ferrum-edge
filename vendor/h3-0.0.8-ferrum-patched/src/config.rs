@@ -17,6 +17,23 @@ pub struct Config {
 
     /// HTTP/3 Settings
     pub settings: Settings,
+
+    /// Receive-side ceiling, in bytes, on the DECLARED payload length of a
+    /// non-`DATA` frame on any stream of this connection.
+    ///
+    /// Non-`DATA` frames (HEADERS, SETTINGS, GOAWAY, PUSH_PROMISE, and every
+    /// unknown type, which must be skipped) are accumulated whole before they
+    /// can be interpreted, so an unbounded declared length is an unbounded
+    /// buffer. QUIC flow control does not bound it: reading re-grants credit.
+    /// A frame declaring more than this is refused as a connection error of
+    /// type `H3_EXCESSIVE_LOAD` before a single payload byte is stored.
+    ///
+    /// `DATA` frames are streamed to the caller and are deliberately NOT
+    /// bounded by this value.
+    ///
+    /// Defaults to [`crate::frame::FrameDecoder::UNBOUNDED_FRAME_LEN`], which
+    /// is stock upstream behaviour.
+    pub(crate) max_buffered_frame_len: u64,
 }
 
 /// HTTP/3 Settings
@@ -78,6 +95,8 @@ impl TryFrom<Config> for frame::Settings {
             send_grease,
             #[cfg(test)]
                 send_settings: _,
+            // Local receive policy, not a wire setting.
+            max_buffered_frame_len: _,
             settings:
                 Settings {
                     max_field_section_size,
@@ -174,6 +193,7 @@ impl Default for Config {
             #[cfg(test)]
             send_settings: true,
             settings: Default::default(),
+            max_buffered_frame_len: crate::frame::FrameDecoder::UNBOUNDED_FRAME_LEN,
         }
     }
 }
