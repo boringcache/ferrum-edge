@@ -1174,6 +1174,96 @@ async fn test_srv_resolution_nonexistent_service() {
     );
 }
 
+#[test]
+fn resolve_srv_discards_rfc2782_root_target_and_port_zero() {
+    use ferrum_edge::_test_support::try_srv_answer_for_test;
+
+    assert!(
+        try_srv_answer_for_test(".", 8080, 1, 10).is_none(),
+        "RFC 2782 root target '.' must be discarded"
+    );
+    assert!(
+        try_srv_answer_for_test("", 8080, 1, 10).is_none(),
+        "empty name after stripping the root label is the same unavailability signal"
+    );
+    assert!(
+        try_srv_answer_for_test("primary.example.com.", 0, 1, 10).is_none(),
+        "port 0 is the RFC 2782 unavailability / non-dialable signal"
+    );
+    assert!(
+        try_srv_answer_for_test("..", 8080, 1, 10).is_none(),
+        "dotted-only names are the DNS root after stripping trailing labels"
+    );
+    assert!(
+        try_srv_answer_for_test("...", 443, 1, 0).is_none(),
+        "dotted-only names at priority 0 must still be discarded"
+    );
+
+    let answer = try_srv_answer_for_test("primary.example.com.", 8080, 7, 10)
+        .expect("dialable SRV RR must be admitted");
+    assert_eq!(answer.host, "primary.example.com");
+    assert_eq!(answer.port, 8080);
+    assert_eq!(answer.weight, 7);
+    assert_eq!(answer.priority, 10);
+
+    let mixed = try_srv_answer_for_test("Primary.Example.COM.", 65535, 65535, 0)
+        .expect("mixed-case dialable SRV RR must be admitted");
+    assert_eq!(mixed.host, "primary.example.com");
+    assert_eq!(mixed.port, 65535);
+    assert_eq!(mixed.weight, 65535);
+    assert_eq!(mixed.priority, 0);
+}
+
+/// The ADDRESS-ONLY SRV mode (`FERRUM_DNS_ORDER` containing `SRV`) and
+/// the DNS-SD service-availability path (`resolve_srv`) read the same RR type
+/// with deliberately different rules (issue #4291). This pins the distinction
+/// so neither silently inherits the other's contradictory behavior.
+#[test]
+fn address_only_srv_mode_ignores_port_but_honors_root_target_and_priority() {
+    const DNS_SOURCE: &str = include_str!("../../../src/dns/mod.rs");
+
+    let arm_start = DNS_SOURCE
+        .find("CachedRecordType::Srv =>")
+        .expect("the address-only SRV resolver arm must exist");
+    let arm_end = arm_start
+        + DNS_SOURCE[arm_start..]
+            .find("CachedRecordType::Cname")
+            .expect("the SRV arm must be followed by the CNAME arm");
+    let arm = &DNS_SOURCE[arm_start..arm_end];
+
+    assert!(
+        !arm.contains("srv.port"),
+        "address-only SRV resolution must never read the RR's port: it dials the proxy's \
+         own configured backend port, so a port-0 RR still carries a usable address"
+    );
+    assert!(
+        !arm.contains("admit_registry_port"),
+        "registry-port admission belongs to the DNS-SD service-availability path only"
+    );
+    assert!(
+        arm.contains("is_rfc2782_root_target"),
+        "the RFC 2782 root target IS an availability signal and must be honored here too"
+    );
+    assert!(
+        arm.contains("srv.priority"),
+        "answers must be walked in ascending RFC 2782 priority so the lowest reachable \
+         tier wins and the chosen address is independent of answer order"
+    );
+
+    // `resolve_srv` — the service-availability path — does the opposite for port.
+    assert!(
+        ferrum_edge::_test_support::try_srv_answer_for_test("primary.example.com.", 0, 1, 10)
+            .is_none(),
+        "DNS-SD admission must still reject port 0"
+    );
+
+    const DNS_DOC: &str = include_str!("../../../docs/dns_resolver.md");
+    assert!(
+        DNS_DOC.contains("Address-only SRV mode"),
+        "the two modes' differing port/priority semantics must stay documented"
+    );
+}
+
 // ============================================================================
 // Per-proxy TTL override tests
 // ============================================================================

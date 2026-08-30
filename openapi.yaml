@@ -12406,9 +12406,11 @@ components:
             type: string
           description: |
             Operator-defined key-value tags. Keys beginning with `mesh.` are
-            reserved for Ferrum's trusted mesh projection and are rejected on
-            upstream create/update, API-spec import, restore, and file-config
-            admission; ordinary operator tag keys remain supported.
+            reserved for Ferrum's trusted mesh projection, and keys beginning
+            with `ferrum.srv.` are reserved for DNS-SD's internal RFC 2782 SRV
+            priority-tier metadata. Both namespaces are rejected on upstream
+            create/update, API-spec import, restore, and file-config admission;
+            ordinary operator tag keys remain supported.
         locality:
           type: [string, "null"]
           maxLength: 255
@@ -12436,7 +12438,10 @@ components:
             type: string
           description: |
             Exact label selector. A target matches when its `tags` contain all
-            key/value pairs listed here.
+            key/value pairs listed here. Keys in the reserved `ferrum.srv.`
+            namespace (DNS-SD RFC 2782 priority-tier metadata) are internal
+            load-balancer state, not an addressable selector, and are rejected
+            on operator-provided config loads.
         traffic_policy:
           oneOf:
             - $ref: "#/components/schemas/SubsetTrafficPolicy"
@@ -13052,7 +13057,22 @@ components:
           description: Service discovery provider type
         dns_sd:
           type: [object, "null"]
-          description: DNS-SD (SRV record) configuration. Required when provider is `dns_sd`.
+          description: |
+            DNS-SD (SRV record) configuration. Required when provider is `dns_sd`.
+            The poller queries `service_name` off the request path. It discards
+            the RFC 2782 root target `.` and port `0`, admits surviving ports
+            with the same `1..=65535` rule as Kubernetes and Consul, and
+            publishes every remaining priority tier (the eight numerically
+            smallest), tagging each target with its RFC 2782 priority.
+            Traffic is then served only from the lowest-numbered tier that still
+            has a healthy target; the next tier becomes eligible only when every
+            lower tier is fully unhealthy, and loses eligibility again as soon as
+            a lower tier recovers. Tiers are never mixed. Same-tier SRV weights
+            are preserved (weight `0` uses `default_weight`) and the configured
+            load-balancing algorithm runs inside the selected tier. Statically
+            configured targets carry no tier and stay eligible in every tier. A
+            poisoned tier never becomes a tier; if nothing admissible remains,
+            the snapshot is empty.
           required: [service_name]
           properties:
             service_name:

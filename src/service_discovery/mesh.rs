@@ -876,6 +876,7 @@ fn mesh_target_tags_core(
     // primary outbound / service-discovery path without silently broadening.
     let mut failover_labels = workload.selector.labels.clone();
     crate::modes::mesh::multicluster::strip_reserved_mesh_tags(&mut failover_labels);
+    crate::service_discovery::strip_reserved_srv_tags(&mut failover_labels);
     crate::config::types::merge_derived_topology_labels(
         &mut failover_labels,
         workload.locality.as_deref(),
