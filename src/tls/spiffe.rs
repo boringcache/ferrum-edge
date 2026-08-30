@@ -127,7 +127,7 @@ pub fn build_spiffe_inbound_config(
 ///
 /// `crls` is threaded into the per-trust-domain peer-chain verifiers so inbound
 /// mesh peers are subject to end-entity revocation checks, matching the
-/// operator-CA path. An empty `crls` skips `.with_crls(...)`, preserving the
+/// operator-CA path. An empty `crls` leaves revocation checking off, preserving the
 /// pre-CRL behavior exactly.
 pub fn build_spiffe_client_cert_verifier(
     bundle_slot: SharedBundleSlot,
@@ -727,15 +727,11 @@ fn build_peer_chain_verifier(
         Arc::new(roots),
         Arc::new(crate::fips::base_crypto_provider()),
     );
-    // Mirror the operator-CA mesh path: when CRLs are configured, enforce
-    // end-entity revocation for inbound and outbound mesh peers. Empty CRLs
-    // skip this so behavior is unchanged for deployments without a CRL file.
-    if !crls.is_empty() {
-        builder = builder
-            .with_crls(crls.iter().cloned())
-            .allow_unknown_revocation_status()
-            .only_check_end_entity_revocation();
-    }
+    // Mirror every other Ferrum surface: when CRLs are configured, the shared
+    // policy enforces full-chain revocation and CRL validity windows for
+    // inbound and outbound mesh peers. Empty CRLs leave revocation checking off
+    // so behavior is unchanged for deployments without a CRL file.
+    builder = crate::tls::crl_policy::apply_client_crl_policy(builder, crls);
     builder
         .build()
         .map_err(|e| format!("webpki verifier build failed: {e}"))
@@ -801,8 +797,8 @@ fn verify_peer_against_bundle(
     })?;
 
     // The uncached path is test-only direct validation; it intentionally does
-    // not apply CRLs (empty slice => `.with_crls(...)` skipped), preserving its
-    // existing behavior. Inbound CRL enforcement flows through the cached
+    // not apply CRLs (an empty slice leaves revocation checking off), preserving
+    // its existing behavior. Inbound CRL enforcement flows through the cached
     // verifier path above.
     let verifier = build_peer_chain_verifier(bundle, &[])?;
     verify_peer_chain(verifier.as_ref(), end_entity, intermediates)?;

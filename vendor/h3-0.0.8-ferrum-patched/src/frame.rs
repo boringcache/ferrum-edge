@@ -30,9 +30,20 @@ pub struct FrameStream<S, B> {
 
 impl<S, B> FrameStream<S, B> {
     pub fn new(stream: BufRecvStream<S, B>) -> Self {
+        Self::with_max_buffered_frame_len(stream, FrameDecoder::UNBOUNDED_FRAME_LEN)
+    }
+
+    /// Build a [`FrameStream`] whose decoder refuses any non-`DATA` frame that
+    /// declares more than `max_buffered_frame_len` payload bytes.
+    ///
+    /// [`FrameDecoder::UNBOUNDED_FRAME_LEN`] reproduces [`FrameStream::new`].
+    pub fn with_max_buffered_frame_len(
+        stream: BufRecvStream<S, B>,
+        max_buffered_frame_len: u64,
+    ) -> Self {
         Self {
             stream,
-            decoder: FrameDecoder::default(),
+            decoder: FrameDecoder::with_max_buffered_frame_len(max_buffered_frame_len),
             remaining_data: 0,
         }
     }
@@ -224,10 +235,11 @@ where
 {
     pub(crate) fn split(self) -> (FrameStream<S::SendStream, B>, FrameStream<S::RecvStream, B>) {
         let (send, recv) = self.stream.split();
+        let max_buffered_frame_len = self.decoder.max_buffered_frame_len;
         (
             FrameStream {
                 stream: send,
-                decoder: FrameDecoder::default(),
+                decoder: FrameDecoder::with_max_buffered_frame_len(max_buffered_frame_len),
                 remaining_data: 0,
             },
             FrameStream {
@@ -239,12 +251,39 @@ where
     }
 }
 
-#[derive(Default)]
 pub struct FrameDecoder {
     expected: Option<usize>,
+    /// Receive-side ceiling on the DECLARED payload length of a non-`DATA`
+    /// frame, which this decoder has to accumulate whole before it can be
+    /// interpreted. Without it a peer can declare a 2^62-1 length and stream
+    /// bytes into `BufList` forever: QUIC flow control caps bytes IN FLIGHT,
+    /// and every poll here consumes from the stream and re-grants credit.
+    ///
+    /// Defaults to [`FrameDecoder::UNBOUNDED_FRAME_LEN`], which is stock
+    /// upstream behaviour, so the bound only applies to callers that opt in.
+    max_buffered_frame_len: u64,
+}
+
+impl Default for FrameDecoder {
+    fn default() -> Self {
+        Self::with_max_buffered_frame_len(Self::UNBOUNDED_FRAME_LEN)
+    }
 }
 
 impl FrameDecoder {
+    /// The ceiling value that applies no receive-side bound beyond what the
+    /// platform can address.
+    pub const UNBOUNDED_FRAME_LEN: u64 = u64::MAX;
+
+    /// Build a decoder that refuses any non-`DATA` frame declaring more than
+    /// `max_buffered_frame_len` payload bytes.
+    pub fn with_max_buffered_frame_len(max_buffered_frame_len: u64) -> Self {
+        Self {
+            expected: None,
+            max_buffered_frame_len,
+        }
+    }
+
     fn decode<B: Buf>(
         &mut self,
         src: &mut BufList<B>,
@@ -264,7 +303,7 @@ impl FrameDecoder {
 
             let (pos, decoded) = {
                 let mut cur = src.cursor();
-                let decoded = Frame::decode(&mut cur);
+                let decoded = Frame::decode_bounded(&mut cur, self.max_buffered_frame_len);
                 (cur.position(), decoded)
             };
 
@@ -316,6 +355,14 @@ impl FrameDecoder {
                 Err(frame::FrameError::Malformed) => {
                     return Err(FrameStreamError::Proto(FrameProtocolError::Malformed));
                 }
+                // Refused on the DECLARED length: `src` is left untouched and
+                // `self.expected` is never set, so not one payload byte of the
+                // offending frame is retained.
+                Err(frame::FrameError::ExceedsMaxBufferedLen { ty, len, max }) => {
+                    return Err(FrameStreamError::Proto(
+                        FrameProtocolError::ExceedsMaxBufferedFrameLen { ty, len, max },
+                    ));
+                }
             }
         }
     }
@@ -338,6 +385,16 @@ pub enum FrameProtocolError {
     Settings(SettingsError),
     InvalidStreamId(InvalidStreamId),
     InvalidPushId(InvalidPushId),
+    /// A non-`DATA` frame declared more payload than the receive-side ceiling
+    /// permits this decoder to buffer, or more than the platform can address.
+    ExceedsMaxBufferedFrameLen {
+        /// The frame type varint as received.
+        ty: u64,
+        /// The declared payload length as received.
+        len: u64,
+        /// The ceiling that was applied.
+        max: u64,
+    },
 }
 
 #[cfg(test)]
@@ -423,6 +480,162 @@ mod tests {
         assert_matches!(decoder.decode(&mut buf), Ok(None));
     }
 
+    // ---------------------------------------------------------------
+    // Receive-side buffered non-DATA frame ceiling (Ferrum patch 005)
+    // ---------------------------------------------------------------
+
+    /// Largest length a QUIC variable-length integer can carry.
+    const QUIC_VARINT_MAX: u64 = (1 << 62) - 1;
+
+    const FRAME_TYPE_DATA: u64 = 0x00;
+    const FRAME_TYPE_HEADERS: u64 = 0x01;
+    const FRAME_TYPE_SETTINGS: u64 = 0x04;
+    /// A reserved "grease" type: unknown to h3, so the decoder's skip arm.
+    const FRAME_TYPE_UNKNOWN: u64 = 0x21;
+
+    /// Encode only a frame header: the type varint followed by a DECLARED
+    /// payload length. No payload byte follows, which is exactly the attacker
+    /// shape — declare an enormous frame, then stream bytes forever.
+    fn declared_frame_header(ty: u64, len: u64) -> BytesMut {
+        use crate::proto::varint::BufMutExt;
+
+        let mut buf = BytesMut::with_capacity(32);
+        buf.write_var(ty);
+        buf.write_var(len);
+        buf
+    }
+
+    /// A HEADERS frame whose DECLARED length is above the ceiling must be
+    /// refused the moment its length varint is decoded: no payload byte is
+    /// buffered, the source buffer is left untouched, and no accumulation
+    /// target is armed.
+    #[test]
+    fn oversized_declared_headers_frame_is_refused_without_buffering() {
+        let header = declared_frame_header(FRAME_TYPE_HEADERS, QUIC_VARINT_MAX);
+        let header_len = header.len();
+        let mut buf = BufList::from(header);
+
+        let mut decoder = FrameDecoder::with_max_buffered_frame_len(16 * 1024);
+
+        assert_matches!(
+            decoder.decode(&mut buf),
+            Err(FrameStreamError::Proto(
+                FrameProtocolError::ExceedsMaxBufferedFrameLen {
+                    ty: FRAME_TYPE_HEADERS,
+                    len: QUIC_VARINT_MAX,
+                    max: 16_384,
+                }
+            ))
+        );
+        // Nothing was consumed and, crucially, nothing was retained: the
+        // decoder did not arm `expected`, so `FrameStream` will not keep
+        // pulling QUIC chunks into its `BufList` waiting for the payload.
+        assert_eq!(buf.remaining(), header_len);
+        assert_eq!(decoder.expected, None);
+    }
+
+    /// Same refusal on the peer control stream, where SETTINGS and GOAWAY are
+    /// decoded by an identically bounded `FrameDecoder`.
+    #[test]
+    fn oversized_declared_settings_frame_is_refused_without_buffering() {
+        let mut buf = BufList::from(declared_frame_header(FRAME_TYPE_SETTINGS, 1 << 40));
+
+        let mut decoder = FrameDecoder::with_max_buffered_frame_len(4096);
+
+        assert_matches!(
+            decoder.decode(&mut buf),
+            Err(FrameStreamError::Proto(
+                FrameProtocolError::ExceedsMaxBufferedFrameLen { .. }
+            ))
+        );
+        assert_eq!(decoder.expected, None);
+    }
+
+    /// The unknown-frame skip arm is reached only AFTER the whole payload is
+    /// buffered, so an oversized unknown frame must be refused too rather than
+    /// accumulated merely to be discarded.
+    #[test]
+    fn oversized_declared_unknown_frame_is_refused_rather_than_buffered_to_skip() {
+        let mut buf = BufList::from(declared_frame_header(FRAME_TYPE_UNKNOWN, QUIC_VARINT_MAX));
+
+        let mut decoder = FrameDecoder::with_max_buffered_frame_len(64 * 1024);
+
+        assert_matches!(
+            decoder.decode(&mut buf),
+            Err(FrameStreamError::Proto(
+                FrameProtocolError::ExceedsMaxBufferedFrameLen {
+                    ty: FRAME_TYPE_UNKNOWN,
+                    ..
+                }
+            ))
+        );
+        assert_eq!(decoder.expected, None);
+    }
+
+    /// A declared length exactly AT the ceiling is legal and still decodes.
+    #[test]
+    fn headers_frame_at_the_max_buffered_frame_len_is_accepted() {
+        const CAP: usize = 1024;
+
+        let mut buf = BytesMut::with_capacity(CAP + 16);
+        Frame::headers(vec![0x2a_u8; CAP]).encode_with_payload(&mut buf);
+        let mut buf = BufList::from(buf);
+
+        let mut decoder = FrameDecoder::with_max_buffered_frame_len(CAP as u64);
+
+        assert_matches!(
+            decoder.decode(&mut buf),
+            Ok(Some(Frame::Headers(payload))) if payload.len() == CAP
+        );
+    }
+
+    /// One byte over the ceiling is refused, so the bound is exact.
+    #[test]
+    fn headers_frame_one_byte_over_the_max_buffered_frame_len_is_refused() {
+        const CAP: usize = 1024;
+
+        let mut buf = BytesMut::with_capacity(CAP + 16);
+        Frame::headers(vec![0x2a_u8; CAP + 1]).encode_with_payload(&mut buf);
+        let mut buf = BufList::from(buf);
+
+        let mut decoder = FrameDecoder::with_max_buffered_frame_len(CAP as u64);
+
+        assert_matches!(
+            decoder.decode(&mut buf),
+            Err(FrameStreamError::Proto(
+                FrameProtocolError::ExceedsMaxBufferedFrameLen { .. }
+            ))
+        );
+    }
+
+    /// DATA payloads are streamed to the caller, never accumulated by the
+    /// decoder, so a request body far larger than the header ceiling must keep
+    /// flowing. Bounding it here would break every large upload.
+    #[test]
+    fn data_frame_length_is_not_bounded_by_max_buffered_frame_len() {
+        let declared: u64 = 64 * 1024 * 1024;
+        let mut buf = BufList::from(declared_frame_header(FRAME_TYPE_DATA, declared));
+
+        let mut decoder = FrameDecoder::with_max_buffered_frame_len(16 * 1024);
+
+        assert_matches!(
+            decoder.decode(&mut buf),
+            Ok(Some(Frame::Data(PayloadLen(len)))) if len as u64 == declared
+        );
+    }
+
+    /// The bound is opt-in: a default decoder reproduces stock upstream
+    /// behaviour, parking on the declared length instead of erroring.
+    #[test]
+    fn default_frame_decoder_keeps_unbounded_upstream_behaviour() {
+        let mut buf = BufList::from(declared_frame_header(FRAME_TYPE_HEADERS, 1 << 40));
+
+        let mut decoder = FrameDecoder::default();
+
+        assert_matches!(decoder.decode(&mut buf), Ok(None));
+        assert!(decoder.expected.is_some());
+    }
+
     // FrameStream
 
     macro_rules! assert_poll_matches {
@@ -438,6 +651,27 @@ mod tests {
                 $match if $cond
             );
         }
+    }
+
+    /// End-to-end through `FrameStream`: the refusal surfaces on `poll_next`
+    /// and the payload bytes the peer streamed afterwards are never merged
+    /// into an accumulation buffer.
+    #[tokio::test]
+    async fn frame_stream_refuses_oversized_declared_frame_before_accumulating() {
+        let mut recv = FakeRecv::default();
+        recv.chunk(declared_frame_header(FRAME_TYPE_HEADERS, QUIC_VARINT_MAX).freeze());
+        // The attacker keeps writing payload for the frame it declared.
+        recv.chunk(Bytes::from(vec![0x5a_u8; 4096]));
+
+        let mut stream: FrameStream<_, ()> =
+            FrameStream::with_max_buffered_frame_len(BufRecvStream::new(recv), 16 * 1024);
+
+        assert_poll_matches!(
+            |cx| stream.poll_next(cx),
+            Err(FrameStreamError::Proto(
+                FrameProtocolError::ExceedsMaxBufferedFrameLen { .. }
+            ))
+        );
     }
 
     #[tokio::test]

@@ -34,6 +34,10 @@ fn reason_enums_expose_stable_label_strings() {
         "untrusted_assertor"
     );
     assert_eq!(
+        NodeWaypointAssertedIdentityRejectReason::AssertionOutOfScope.as_str(),
+        "assertion_out_of_scope"
+    );
+    assert_eq!(
         NodeWaypointDestinationPolicyRejectReason::AuthzDeny.as_str(),
         "authz_deny"
     );
@@ -164,6 +168,12 @@ fn enabled_producers_increment_and_render_bounded_labels() {
     assert!(output.contains("# TYPE ferrum_mesh_node_waypoint_asserted_identity_total counter"));
     assert!(output.contains(
         "ferrum_mesh_node_waypoint_asserted_identity_total{result=\"rejected\",reason=\"untrusted_assertor\"}"
+    ));
+    // Issue #4274: the out-of-scope refusal is a distinct, bounded reason so an
+    // operator can tell "peer is not an assertor" from "assertor may not assert
+    // THAT identity". It must keep a stable zero baseline in the exposition.
+    assert!(output.contains(
+        "ferrum_mesh_node_waypoint_asserted_identity_total{result=\"rejected\",reason=\"assertion_out_of_scope\"}"
     ));
     assert!(
         output.contains(

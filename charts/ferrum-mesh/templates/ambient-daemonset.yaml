@@ -208,15 +208,10 @@
 {{- $ambientSetnsCapture := or $nodeWaypointRegistryEnabled (and $ambientUdpLifecycle (or (not $ambientUdpHostNetns) $ambientUdpMigrationNeedsSetns)) -}}
 {{- $nodeAgentProxyMode := replace "-" "_" (lower (toString .Values.nodeAgent.proxyMode)) -}}
 {{- $nodeAgentCaptureMode := lower (toString .Values.nodeAgent.captureMode) -}}
-{{- $ambientAdminPort := "9000" -}}
-{{- if hasKey $ambientEnv "FERRUM_ADMIN_HTTP_PORT" -}}
-{{- $ambientAdminPort = toString (index $ambientEnv "FERRUM_ADMIN_HTTP_PORT") -}}
-{{- end -}}
-{{- $ambientAdminBindAddress := "0.0.0.0" -}}
-{{- if hasKey $ambientEnv "FERRUM_ADMIN_BIND_ADDRESS" -}}
-{{- $ambientAdminBindAddress = toString (index $ambientEnv "FERRUM_ADMIN_BIND_ADDRESS") -}}
-{{- end -}}
-{{- $ambientAdminProbeHost := include "ferrum-mesh.adminProbeHost" $ambientAdminBindAddress -}}
+{{- $ambientAdminResolved := include "ferrum-mesh.resolveComponentAdmin" (dict "component" "ambient" "env" $ambientEnv "admin" (.Values.ambient.admin | default dict)) | fromYaml -}}
+{{- $ambientAdminPort := toString $ambientAdminResolved.port -}}
+{{- $ambientAdminBindAddress := toString $ambientAdminResolved.bind -}}
+{{- $ambientAdminProbeHost := $ambientAdminResolved.probeHost -}}
 {{- $nodeAgentAdminPort := toString .Values.nodeAgent.admin.port -}}
 {{- /* Preserve integer httpsPort=0; Sprig `default` would treat 0 as empty. */ -}}
 {{- $nodeAgentAdminHttpsPort := toString .Values.nodeAgent.admin.httpsPort -}}
@@ -356,6 +351,14 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       serviceAccountName: ferrum-mesh
+      terminationGracePeriodSeconds: {{ .Values.ambient.terminationGracePeriodSeconds }}
+      {{- with .Values.ambient.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.ambient.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- /* Disable kubelet's automatic pod token projection so the privileged
              preflight init container is not given a bearer token by default.
              The short-lived kube-api-access volume below is the replacement:
@@ -472,28 +475,84 @@ spec:
           image: {{ $ambientImage | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["run"]
+          {{- /* Ambient's container SecurityContext is assembled field by field, not
+                 `toYaml`-ed wholesale: `runAsUser`/`runAsGroup` are decided by the
+                 capture mode and the capability set is a datapath requirement. The
+                 schema therefore admits only the keys read here
+                 (`allowPrivilegeEscalation`, `readOnlyRootFilesystem`,
+                 `capabilities.drop`, `capabilities.add`) so a supported-looking key
+                 cannot be silently ignored. `allowPrivilegeEscalation` defaults to
+                 false (Restricted); an explicit true follows the chart's override
+                 convention. `capabilities.add` MERGES on top of the required set;
+                 it can never remove one. Normalized ALL (including CAP_ALL) is
+                 rejected in add so drop ALL is not undone. Required names are
+                 rendered unquoted so they match the established live/CI capability
+                 greps. */ -}}
+          {{- $ambientSc := .Values.ambient.securityContext | default dict -}}
+          {{- $ambientScCaps := $ambientSc.capabilities | default dict -}}
+          {{- /* Do not use Sprig `default` on drop: an explicit empty list is
+                 empty and would silently become [ALL]. Omit the key to take the
+                 chart default; `drop: []` fails because this contract requires ALL. */ -}}
+          {{- $ambientScDrop := list "ALL" -}}
+          {{- if hasKey $ambientScCaps "drop" -}}
+          {{- $ambientScDrop = $ambientScCaps.drop | default list -}}
+          {{- if eq (len $ambientScDrop) 0 -}}
+          {{- fail "ambient.securityContext.capabilities.drop is an empty list; this chart requires [\"ALL\"] so the rendered add list is the complete privilege surface. Omitting the key uses the default [ALL]; an explicit empty list is not silently rewritten." -}}
+          {{- end -}}
+          {{- end -}}
+          {{- /* Indexed only after the length check, so an empty list never
+                 evaluates `index ... 0`. */ -}}
+          {{- $ambientDropOk := false -}}
+          {{- $ambientDropNormalized := list -}}
+          {{- range $cap := $ambientScDrop -}}
+          {{- $ambientDropNormalized = append $ambientDropNormalized (include "ferrum-mesh.normalizedLinuxCapability" $cap | trim) -}}
+          {{- end -}}
+          {{- if eq (len $ambientDropNormalized) 1 -}}
+          {{- $ambientDropOk = eq (index $ambientDropNormalized 0) "ALL" -}}
+          {{- end -}}
+          {{- if not $ambientDropOk -}}
+          {{- fail (printf "ambient.securityContext.capabilities.drop must stay [\"ALL\"] (got %v): the rendered add list is the ambient datapath's complete privilege surface, and narrowing the drop would silently retain the container runtime's default capabilities" $ambientScDrop) -}}
+          {{- end -}}
+          {{- $ambientRequiredCaps := list -}}
+          {{- if $nodeWaypointRegistryEnabled -}}
+          {{- $ambientRequiredCaps = concat $ambientRequiredCaps (list "BPF" "PERFMON") -}}
+          {{- end -}}
+          {{- $ambientRequiredCaps = concat $ambientRequiredCaps (list "NET_ADMIN" "NET_RAW") -}}
+          {{- if $ambientSetnsCapture -}}
+          {{- /* setns(CLONE_NEWNET) + ptrace_may_access on /proc/pid/ns/net;
+                 shared by the NodeWaypoint TCP path and the per-pod-netns
+                 Ambient UDP producer. The host-network UDP placement enters
+                 no other namespace and so is deliberately excluded — the
+                 rendered container retains its baseline NET_ADMIN/NET_RAW
+                 pair. BPF/PERFMON stay NodeWaypoint-only (no eBPF here). */ -}}
+          {{- $ambientRequiredCaps = concat $ambientRequiredCaps (list "SYS_ADMIN" "SYS_PTRACE") -}}
+          {{- end -}}
+          {{- $ambientExtraCaps := list -}}
+          {{- range $cap := $ambientScCaps.add | default list -}}
+          {{- $normalized := include "ferrum-mesh.normalizedLinuxCapability" $cap | trim -}}
+          {{- if eq $normalized "ALL" -}}
+          {{- fail "ambient.securityContext.capabilities.add must not include ALL (including the CAP_ALL spelling): that re-grants the complete Linux capability set after drop ALL. Add only named extra capabilities." -}}
+          {{- end -}}
+          {{- if not (has $normalized $ambientRequiredCaps) -}}
+          {{- $ambientExtraCaps = append $ambientExtraCaps $normalized -}}
+          {{- end -}}
+          {{- /* Closes with `}}`, not `-}}`: every action above trims both sides,
+                 so a trailing trim here would splice `securityContext:` onto the
+                 preceding `args: ["run"]` line. */ -}}
+          {{- end }}
           securityContext:
+            allowPrivilegeEscalation: {{ $ambientSc.allowPrivilegeEscalation | default false }}
+            readOnlyRootFilesystem: {{ if hasKey $ambientSc "readOnlyRootFilesystem" }}{{ $ambientSc.readOnlyRootFilesystem }}{{ else }}true{{ end }}
             {{- if $ambientInNetnsCapture }}
             runAsUser: 0
             runAsGroup: 0
             {{- end }}
             capabilities:
+              drop:
+                - {{ index $ambientDropNormalized 0 }}
               add:
-                {{- if $nodeWaypointRegistryEnabled }}
-                - BPF
-                - PERFMON
-                {{- end }}
-                - NET_ADMIN
-                - NET_RAW
-                {{- if $ambientSetnsCapture }}
-                {{- /* setns(CLONE_NEWNET) + ptrace_may_access on /proc/pid/ns/net;
-                       shared by the NodeWaypoint TCP path and the per-pod-netns
-                       Ambient UDP producer. The host-network UDP placement enters
-                       no other namespace and so is deliberately excluded — the
-                       rendered container retains its baseline NET_ADMIN/NET_RAW
-                       pair. BPF/PERFMON stay NodeWaypoint-only (no eBPF here). */}}
-                - SYS_ADMIN
-                - SYS_PTRACE
+                {{- range $cap := concat $ambientRequiredCaps (uniq $ambientExtraCaps) }}
+                - {{ $cap }}
                 {{- end }}
           ports:
             - name: outbound
@@ -502,7 +561,15 @@ spec:
               containerPort: {{ .Values.ambient.inboundPort }}
             - name: hbone
               containerPort: {{ .Values.ambient.hbonePort }}
+            {{- if ne $ambientAdminPort "0" }}
+            - name: admin-http
+              containerPort: {{ $ambientAdminPort }}
+              protocol: TCP
+            {{- end }}
           env:
+            {{- include "ferrum-mesh.adminEnv" (dict "env" $ambientEnv "resolved" $ambientAdminResolved) | nindent 12 }}
+            {{- include "ferrum-mesh.shutdownEnv" .Values.ambient | nindent 12 }}
+            {{- include "ferrum-mesh.metricsEnv" . | nindent 12 }}
             - name: FERRUM_MESH_CAPTURE_MODE
               value: {{ .Values.ambient.captureMode | quote }}
             {{- if and $ambientInNetnsCapture (not (hasKey $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR")) }}
@@ -579,9 +646,16 @@ spec:
             - name: FERRUM_MESH_PRODUCTION_MODE
               value: {{ $ambientSpireProductionMode | quote }}
             {{- end }}
+            {{- /* The four admin keys are rendered once, above, by
+                   `ferrum-mesh.adminEnv` from the resolved (and bracket-
+                   normalized) admin target, which already honors an explicit
+                   `ambient.env` entry. Re-emitting them here would duplicate the
+                   variable in this container's env list. */ -}}
             {{- range $name, $value := $ambientEnv }}
+            {{- if not (has $name (list "FERRUM_ADMIN_HTTP_PORT" "FERRUM_ADMIN_BIND_ADDRESS" "FERRUM_ALLOW_INSECURE_ADMIN_HTTP" "FERRUM_ADMIN_ALLOWED_CIDRS")) }}
             - name: {{ $name }}
               value: {{ $value | quote }}
+            {{- end }}
             {{- end }}
           volumeMounts:
             {{- /* Always mount the projected in-cluster credentials. Pod-level
@@ -611,10 +685,14 @@ spec:
             {{- with .Values.ambient.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+            - name: tmp
+              mountPath: /tmp
           {{- /* Admin-backed probes when the listener is enabled. NodeWaypoint
                  still requires a non-zero admin port (validated above). Ordinary
                  ambient also probes admin when available so rollouts wait for
-                 /health. Liveness uses --live so a degraded mesh stays alive. */ -}}
+                 /health. Liveness uses --live so a degraded mesh stays alive.
+                 An enabled computed probe with no handler fails closed (admin
+                 HTTP port 0) instead of omitting the probe. */ -}}
           {{- $ambientHandlers := dict "live" (dict) "ready" (dict) -}}
           {{- if ne $ambientAdminPort "0" -}}
           {{- $ambientHandlers = include "ferrum-mesh.adminHealthHandlers" (dict "port" $ambientAdminPort "probeHost" $ambientAdminProbeHost) | fromYaml -}}
@@ -623,7 +701,15 @@ spec:
           {{- if not $ambientLiveHandler }}{{- $ambientLiveHandler = $ambientHandlers.live | default dict -}}{{- end -}}
           {{- $ambientReadyHandler := .Values.ambient.probes.readiness.override | default dict -}}
           {{- if not $ambientReadyHandler }}{{- $ambientReadyHandler = $ambientHandlers.ready | default dict -}}{{- end -}}
-          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.ambient.probes "liveHandler" $ambientLiveHandler "readyHandler" $ambientReadyHandler) }}
+          {{- $ambientStartupHandler := .Values.ambient.probes.startup.override | default dict -}}
+          {{- if not $ambientStartupHandler }}{{- $ambientStartupHandler = $ambientLiveHandler -}}{{- end -}}
+          {{- include "ferrum-mesh.validateComputedProbeHandlers" (dict "component" "ambient" "probes" .Values.ambient.probes "startupHandler" $ambientStartupHandler "liveHandler" $ambientLiveHandler "readyHandler" $ambientReadyHandler) -}}
+          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.ambient.probes "startupHandler" $ambientStartupHandler "liveHandler" $ambientLiveHandler "readyHandler" $ambientReadyHandler) }}
+          {{- include "ferrum-mesh.preStopLifecycle" .Values.ambient | nindent 10 }}
+          {{- with .Values.ambient.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
       volumes:
         {{- /* Always rendered, including when no cgroup/SPIRE/preflight
                hostPath volumes exist. automountServiceAccountToken is false, so
@@ -683,4 +769,6 @@ spec:
         {{- with .Values.ambient.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+        - name: tmp
+          emptyDir: {}
 {{- end }}

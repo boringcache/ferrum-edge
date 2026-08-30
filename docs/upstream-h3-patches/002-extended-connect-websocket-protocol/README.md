@@ -9,7 +9,7 @@
 | Target version | 0.0.8 (forward-ports cleanly to master at the time of writing) |
 | State | **Applied via vendored crate at `vendor/h3-0.0.8-ferrum-patched`** |
 | Upstream issue | _Deliberate fork — unfiled upstream (see hand-off below + [policy](../../dependency-policy.md#deliberate-fork-policy-and-sla))_ |
-| Upstream PR | _Deliberate fork — unfiled; target branch `feat/extended-connect-websocket-protocol` on `jeremyjpj0916/h3`_ |
+| Upstream PR | _Deliberate fork — unfiled upstream; no published fork ref yet (see hand-off below + [policy](../../dependency-policy.md#deliberate-fork-policy-and-sla))_ |
 | Tracks | Ferrum Edge RFC 9220 (WebSocket-over-HTTP/3 Extended CONNECT) support |
 
 ## Why this directory exists

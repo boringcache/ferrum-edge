@@ -33,7 +33,7 @@ use std::convert::Infallible;
 use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -59,6 +59,7 @@ struct ScalePerfHarness {
     admin_base_url: String,
     jwt_secret: String,
     jwt_issuer: String,
+    observability_token: String,
     proxy_port: u16,
     backend_port: u16,
     db_label: String,
@@ -170,8 +171,10 @@ impl ScalePerfHarness {
         db_label: &str,
         mongo_database: Option<&str>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let jwt_secret = "scale-test-secret-key-1234567890ab".to_string();
-        let jwt_issuer = "ferrum-edge-scale-test".to_string();
+        let identity = crate::common::SpawnedGatewayIdentity::mint("scale-perf");
+        let jwt_secret = identity.jwt_secret.clone();
+        let jwt_issuer = identity.jwt_issuer.clone();
+        let observability_token = identity.observability_token.clone();
 
         let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let admin_port = admin_listener.local_addr()?.port();
@@ -223,8 +226,6 @@ impl ScalePerfHarness {
         let mut command = Command::new(binary_path);
         command
             .env("FERRUM_MODE", "database")
-            .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
             .env(
                 "FERRUM_ADMIN_JWT_MAX_TTL",
                 scheduled_scaling_admin_jwt_max_ttl_value(),
@@ -258,6 +259,7 @@ impl ScalePerfHarness {
                 command.env("FERRUM_MONGO_REPLICA_SET", replica_set);
             }
         }
+        identity.apply_to_command(&mut command);
         let child = command.spawn()?;
 
         let proxy_base_url = format!("http://127.0.0.1:{}", proxy_port);
@@ -270,6 +272,7 @@ impl ScalePerfHarness {
             admin_base_url,
             jwt_secret,
             jwt_issuer,
+            observability_token,
             proxy_port,
             backend_port,
             db_label: db_label.to_string(),
@@ -287,18 +290,31 @@ impl ScalePerfHarness {
         }
     }
 
-    async fn wait_for_health(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let health_url = format!("{}/health", self.admin_base_url);
-        let deadline = SystemTime::now() + Duration::from_secs(30);
-        loop {
-            if SystemTime::now() >= deadline {
-                return Err("Gateway did not start within 30 seconds".into());
-            }
-            match reqwest::get(&health_url).await {
-                Ok(r) if r.status().is_success() => return Ok(()),
-                _ => tokio::time::sleep(Duration::from_millis(500)).await,
-            }
-        }
+    async fn wait_for_health(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let admin_port: u16 = self
+            .admin_base_url
+            .rsplit(':')
+            .next()
+            .ok_or("admin_base_url missing port")?
+            .parse()?;
+        let identity = crate::common::SpawnedGatewayIdentity {
+            jwt_secret: self.jwt_secret.clone(),
+            jwt_issuer: self.jwt_issuer.clone(),
+            observability_token: self.observability_token.clone(),
+        };
+        let child = self
+            .gateway_process
+            .as_mut()
+            .ok_or("gateway process missing")?;
+        crate::common::wait_for_owned_gateway_identity(
+            child,
+            admin_port,
+            &identity,
+            Duration::from_secs(30),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     fn generate_token(&self) -> Result<String, Box<dyn std::error::Error>> {

@@ -63,8 +63,9 @@ use crate::FERRUM_VERSION;
 use crate::config::gateway_trust::GatewayTrustPublication;
 use crate::config::types::{GatewayConfig, default_namespace};
 use crate::modes::mesh::config::{
-    MeshConfig, MeshSidecar, MeshSidecarEgress, PeerAuthentication, PolicyScope,
-    SidecarHostPattern, Workload, WorkloadSelector, service_entry_exported_to_namespace,
+    MeshConfig, MeshSidecar, MeshSidecarEgress, NodeWaypointAssertor, PeerAuthentication,
+    PolicyScope, SidecarHostPattern, Workload, WorkloadSelector,
+    service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::slice::{
     MeshSliceRequest, node_waypoint_assertors_from_workloads,
@@ -1007,13 +1008,30 @@ impl CpGrpcServer {
         // a stream-local config is refiltered after an incremental delta,
         // though, it may already contain source assertors that are no longer
         // visible in `mesh.workloads`; preserve them rather than shrinking the
-        // allow-list to the destination-visible workload slice.
+        // allow-list to the destination-visible workload slice. Re-apply the
+        // CP-scope and bearer `ns` bounds to that carried inventory so a
+        // narrower claim cannot inherit identities the current request is not
+        // authorized to see. Destination-visibility is NOT re-applied here:
+        // that is the gate recomputing from the already-narrowed workload
+        // view would weaken. An assertor whose asserted identities are all
+        // filtered out is dropped as inert: an object with `asserts: []`
+        // authorizes nothing (`NodeWaypointAssertor` and
+        // `parse_trusted_hbone_assertors`), so retaining or dropping it is
+        // equivalent for authorization. Drop the empty entry so the stream
+        // does not carry a dead assertor key.
         if mesh.node_waypoint_assertors.is_empty() {
             mesh.node_waypoint_assertors = Self::node_waypoint_assertors_for_request(
                 mesh,
                 namespace,
                 allow_cross_namespace_mesh_visibility,
                 scope,
+                bearer_namespaces,
+            );
+        } else {
+            mesh.node_waypoint_assertors = Self::retain_authorized_node_waypoint_assertors(
+                std::mem::take(&mut mesh.node_waypoint_assertors),
+                scope,
+                bearer_namespaces,
             );
         }
 
@@ -1454,13 +1472,77 @@ impl CpGrpcServer {
         namespace: &str,
         allow_cross_namespace_mesh_visibility: bool,
         scope: Option<&CpScope>,
-    ) -> Vec<crate::identity::spiffe::SpiffeId> {
+        bearer_namespaces: Option<&HashSet<String>>,
+    ) -> Vec<NodeWaypointAssertor> {
         node_waypoint_assertors_from_workloads(mesh.workloads.iter().filter(|workload| {
-            if !allow_cross_namespace_mesh_visibility && workload.namespace != namespace {
-                return false;
-            }
-            Self::namespace_allowed_by_scope(&workload.namespace, scope)
+            Self::node_waypoint_assertor_contributing_namespace_allowed(
+                &workload.namespace,
+                namespace,
+                allow_cross_namespace_mesh_visibility,
+                scope,
+                bearer_namespaces,
+            )
         }))
+    }
+
+    /// Every gate that admits a contributing workload into the NodeWaypoint
+    /// assertor inventory: destination/cross-namespace visibility, CP scope,
+    /// and the explicit bearer `ns` claim. All three must allow the namespace.
+    fn node_waypoint_assertor_contributing_namespace_allowed(
+        workload_namespace: &str,
+        request_namespace: &str,
+        allow_cross_namespace_mesh_visibility: bool,
+        scope: Option<&CpScope>,
+        bearer_namespaces: Option<&HashSet<String>>,
+    ) -> bool {
+        if !allow_cross_namespace_mesh_visibility && workload_namespace != request_namespace {
+            return false;
+        }
+        Self::namespace_allowed_by_scope(workload_namespace, scope)
+            && bearer_namespaces.is_none_or(|allowed| allowed.contains(workload_namespace))
+    }
+
+    /// Re-apply CP-scope and bearer bounds to a carried assertor inventory
+    /// without consulting the (already destination-narrowed) workload view.
+    fn retain_authorized_node_waypoint_assertors(
+        assertors: Vec<NodeWaypointAssertor>,
+        scope: Option<&CpScope>,
+        bearer_namespaces: Option<&HashSet<String>>,
+    ) -> Vec<NodeWaypointAssertor> {
+        assertors
+            .into_iter()
+            .filter_map(|mut assertor| {
+                assertor.asserts.retain(|identity| {
+                    Self::node_waypoint_asserted_identity_allowed(
+                        identity,
+                        scope,
+                        bearer_namespaces,
+                    )
+                });
+                if assertor.asserts.is_empty() {
+                    None
+                } else {
+                    Some(assertor)
+                }
+            })
+            .collect()
+    }
+
+    fn node_waypoint_asserted_identity_allowed(
+        identity: &crate::identity::SpiffeId,
+        scope: Option<&CpScope>,
+        bearer_namespaces: Option<&HashSet<String>>,
+    ) -> bool {
+        let Some(namespace) = identity.namespace() else {
+            // A namespace-less identity cannot be proven against a Single or
+            // Set CP scope, or against an explicit bearer `ns` claim. Keep it
+            // only when neither a namespace-bounding scope nor a bearer bound
+            // applies (All / no-scope, with no bearer).
+            return bearer_namespaces.is_none()
+                && !matches!(scope, Some(CpScope::Single(_) | CpScope::Set(_)));
+        };
+        Self::namespace_allowed_by_scope(namespace, scope)
+            && bearer_namespaces.is_none_or(|allowed| allowed.contains(namespace))
     }
 
     fn policy_scope_can_apply_to_namespace(
@@ -3440,7 +3522,7 @@ mod tests {
         assert_eq!(
             mesh.node_waypoint_assertors
                 .iter()
-                .map(SpiffeId::as_str)
+                .map(|assertor| assertor.spiffe_id.as_str())
                 .collect::<Vec<_>>(),
             vec![waypoint_alpha, waypoint_beta],
             "CP should derive assertors from scope-authorized workloads before request-visible workload narrowing"
@@ -3451,7 +3533,7 @@ mod tests {
             slice
                 .node_waypoint_assertors
                 .iter()
-                .map(SpiffeId::as_str)
+                .map(|assertor| assertor.spiffe_id.as_str())
                 .collect::<Vec<_>>(),
             vec![waypoint_alpha, waypoint_beta],
             "the narrowed slice must carry source-node assertors that are no longer visible as workloads"
@@ -3469,10 +3551,375 @@ mod tests {
             beta_only_mesh
                 .node_waypoint_assertors
                 .iter()
-                .map(SpiffeId::as_str)
+                .map(|assertor| assertor.spiffe_id.as_str())
                 .collect::<Vec<_>>(),
             vec![waypoint_beta],
             "explicit CP namespace scopes must bound the assertor inventory"
+        );
+    }
+
+    /// Issue #4274: a bearer `ns` claim that is a strict subset of the CP
+    /// scope must bound the NodeWaypoint assertor inventory the same way it
+    /// bounds capture destinations. Otherwise a beta-only token on an
+    /// {alpha,beta} CP receives alpha identities (and alpha-only assertors)
+    /// and can honor HBONE baggage for a tenant it is not authorized to see.
+    #[test]
+    fn mesh_request_filter_bounds_node_waypoint_assertors_to_bearer_namespaces() {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{NodeWaypointEndpoint, Workload};
+        use crate::modes::mesh::slice::MeshSlice;
+
+        let waypoint_alpha = "spiffe://test.local/ns/ferrum-system/sa/node-waypoint-alpha";
+        let waypoint_beta = "spiffe://test.local/ns/ferrum-system/sa/node-waypoint-beta";
+        let waypoint_mixed = "spiffe://test.local/ns/ferrum-system/sa/node-waypoint-mixed";
+        let workload =
+            |namespace: &str, service_name: &str, waypoint_spiffe: &str, address: &str| Workload {
+                spiffe_id: SpiffeId::new(format!(
+                    "spiffe://test.local/ns/{namespace}/sa/{service_name}"
+                ))
+                .expect("fixture SPIFFE ID should be valid"),
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), service_name.to_string())]),
+                    namespace: Some(namespace.to_string()),
+                },
+                service_name: service_name.to_string(),
+                service_namespace: None,
+                addresses: vec![address.to_string()],
+                ports: Vec::new(),
+                trust_domain: TrustDomain::new("test.local")
+                    .expect("fixture trust domain should be valid"),
+                namespace: namespace.to_string(),
+                network: None,
+                cluster: None,
+                weight: None,
+                locality: None,
+                service_account: Some(service_name.to_string()),
+                pod_uid: None,
+                node_waypoint: Some(NodeWaypointEndpoint {
+                    address: address.to_string(),
+                    hbone_port: 15008,
+                    spiffe_id: SpiffeId::new(waypoint_spiffe)
+                        .expect("fixture waypoint SPIFFE ID should be valid"),
+                    node_name: None,
+                    node_uid: None,
+                    network: None,
+                    cluster: None,
+                }),
+                remote_provenance: false,
+            };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                workloads: vec![
+                    workload("alpha", "client", waypoint_alpha, "10.2.0.11"),
+                    workload("beta", "reviews", waypoint_beta, "10.2.0.12"),
+                    workload("alpha", "ledger", waypoint_mixed, "10.2.0.13"),
+                    workload("beta", "catalog", waypoint_mixed, "10.2.0.14"),
+                ],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let request = MeshSliceRequest {
+            namespace: "beta".to_string(),
+            ..MeshSliceRequest::default()
+        };
+        let scope = CpScope::Set(HashSet::from(["alpha".to_string(), "beta".to_string()]));
+
+        let full = CpGrpcServer::filter_config_to_mesh_request_for_scope(&config, &request, &scope);
+        let full_mesh = full.mesh.as_ref().expect("mesh should remain");
+        let full_ids: Vec<&str> = full_mesh
+            .node_waypoint_assertors
+            .iter()
+            .map(|assertor| assertor.spiffe_id.as_str())
+            .collect();
+        assert_eq!(
+            full_ids,
+            vec![waypoint_alpha, waypoint_beta, waypoint_mixed],
+            "full-scope / no-bearer must still serialize every scope-authorized assertor"
+        );
+        let mixed_full = full_mesh
+            .node_waypoint_assertors
+            .iter()
+            .find(|assertor| assertor.spiffe_id.as_str() == waypoint_mixed)
+            .expect("mixed assertor present without bearer bound");
+        let mixed_full_asserts: Vec<&str> =
+            mixed_full.asserts.iter().map(|id| id.as_str()).collect();
+        assert_eq!(
+            mixed_full_asserts,
+            vec![
+                "spiffe://test.local/ns/alpha/sa/ledger",
+                "spiffe://test.local/ns/beta/sa/catalog",
+            ]
+        );
+
+        let bearer = CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
+            &config,
+            &request,
+            &scope,
+            Some(&HashSet::from(["beta".to_string()])),
+        );
+        let bearer_mesh = bearer.mesh.as_ref().expect("mesh should remain");
+        let bearer_ids: Vec<&str> = bearer_mesh
+            .node_waypoint_assertors
+            .iter()
+            .map(|assertor| assertor.spiffe_id.as_str())
+            .collect();
+        assert_eq!(
+            bearer_ids,
+            vec![waypoint_beta, waypoint_mixed],
+            "an alpha-only assertor must not be serialized to a beta-restricted bearer"
+        );
+        assert!(
+            bearer_mesh
+                .node_waypoint_assertors
+                .iter()
+                .all(|assertor| assertor.spiffe_id.as_str() != waypoint_alpha),
+            "alpha-only NodeWaypoint must not survive as an empty/widening entry"
+        );
+        let serialized_identities: Vec<&str> = bearer_mesh
+            .node_waypoint_assertors
+            .iter()
+            .flat_map(|assertor| assertor.asserts.iter().map(|id| id.as_str()))
+            .collect();
+        assert!(
+            serialized_identities
+                .iter()
+                .all(|id| id.contains("/ns/beta/")),
+            "no alpha identity may be serialized under a beta-only bearer: {serialized_identities:?}"
+        );
+        assert!(
+            serialized_identities.contains(&"spiffe://test.local/ns/beta/sa/reviews"),
+            "beta identity fronted by the beta-only waypoint must remain"
+        );
+        assert!(
+            serialized_identities.contains(&"spiffe://test.local/ns/beta/sa/catalog"),
+            "beta identity on a mixed waypoint must remain after alpha identities are stripped"
+        );
+        let mixed_bearer = bearer_mesh
+            .node_waypoint_assertors
+            .iter()
+            .find(|assertor| assertor.spiffe_id.as_str() == waypoint_mixed)
+            .expect("mixed assertor remains with its beta identities");
+        assert_eq!(
+            mixed_bearer
+                .asserts
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["spiffe://test.local/ns/beta/sa/catalog"]
+        );
+
+        let slice = MeshSlice::from_gateway_config(&bearer, request.clone());
+        assert_eq!(
+            slice
+                .node_waypoint_assertors
+                .iter()
+                .map(|assertor| assertor.spiffe_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![waypoint_beta, waypoint_mixed],
+            "the narrowed slice must carry the bearer-bound inventory, not re-widen from remaining workloads"
+        );
+
+        // Stream-local refilter: inventory is already present, so derivation
+        // from destination-narrowed workloads is skipped. The carried field
+        // must still drop identities the current bearer is not allowed to see.
+        let mut already_filtered = bearer.clone();
+        already_filtered
+            .mesh
+            .as_mut()
+            .expect("mesh should remain")
+            .node_waypoint_assertors = full_mesh.node_waypoint_assertors.clone();
+        let refiltered = CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
+            &already_filtered,
+            &request,
+            &scope,
+            Some(&HashSet::from(["beta".to_string()])),
+        );
+        let refiltered_ids: Vec<&str> = refiltered
+            .mesh
+            .as_ref()
+            .expect("mesh should remain")
+            .node_waypoint_assertors
+            .iter()
+            .map(|assertor| assertor.spiffe_id.as_str())
+            .collect();
+        assert_eq!(
+            refiltered_ids,
+            vec![waypoint_beta, waypoint_mixed],
+            "refiltering a carried full-scope inventory must still apply the bearer bound"
+        );
+    }
+
+    /// A namespace-less asserted identity cannot be proven inside a Single or
+    /// Set CP scope, or against an explicit bearer `ns` bound. It may remain
+    /// only for All / no-scope with no bearer.
+    #[test]
+    fn node_waypoint_asserted_identity_allowed_fails_closed_for_namespaceless() {
+        use crate::identity::spiffe::SpiffeId;
+
+        let namespaceless = SpiffeId::new("spiffe://test.local/sa/client")
+            .expect("fixture SPIFFE ID should be valid");
+        let namespaced = SpiffeId::new("spiffe://test.local/ns/alpha/sa/client")
+            .expect("fixture SPIFFE ID should be valid");
+        let single = CpScope::Single("alpha".to_string());
+        let set = CpScope::Set(HashSet::from(["alpha".to_string(), "beta".to_string()]));
+        let bearer = HashSet::from(["alpha".to_string()]);
+
+        assert!(
+            !CpGrpcServer::node_waypoint_asserted_identity_allowed(
+                &namespaceless,
+                Some(&single),
+                None,
+            ),
+            "Single is a namespace-bounding scope; a namespace-less identity cannot be proven inside it"
+        );
+        assert!(
+            !CpGrpcServer::node_waypoint_asserted_identity_allowed(
+                &namespaceless,
+                Some(&set),
+                None,
+            ),
+            "Set is a namespace-bounding scope; a namespace-less identity cannot be proven inside it"
+        );
+        assert!(
+            CpGrpcServer::node_waypoint_asserted_identity_allowed(
+                &namespaceless,
+                Some(&CpScope::All),
+                None,
+            ),
+            "All with no bearer bound has no namespace boundary to prove against"
+        );
+        assert!(
+            CpGrpcServer::node_waypoint_asserted_identity_allowed(&namespaceless, None, None),
+            "no-scope with no bearer bound has no namespace boundary to prove against"
+        );
+        assert!(
+            !CpGrpcServer::node_waypoint_asserted_identity_allowed(
+                &namespaceless,
+                Some(&CpScope::All),
+                Some(&bearer),
+            ),
+            "an explicit bearer bound still requires a namespace that can be proven"
+        );
+        assert!(
+            !CpGrpcServer::node_waypoint_asserted_identity_allowed(
+                &namespaceless,
+                None,
+                Some(&bearer),
+            ),
+            "an explicit bearer bound still requires a namespace that can be proven"
+        );
+        assert!(
+            !CpGrpcServer::node_waypoint_asserted_identity_allowed(
+                &namespaceless,
+                Some(&single),
+                Some(&bearer),
+            ),
+            "Single plus a bearer bound must still fail closed for a namespace-less identity"
+        );
+        assert!(
+            CpGrpcServer::node_waypoint_asserted_identity_allowed(&namespaced, Some(&single), None,),
+            "a namespaced identity remains subject to the ordinary scope/bearer check"
+        );
+        assert!(
+            CpGrpcServer::node_waypoint_asserted_identity_allowed(&namespaced, Some(&set), None),
+            "a namespaced identity in a Set member remains allowed"
+        );
+        assert!(
+            !CpGrpcServer::node_waypoint_asserted_identity_allowed(
+                &namespaced,
+                Some(&CpScope::Set(HashSet::from(["beta".to_string()]))),
+                None,
+            ),
+            "a namespaced identity outside the Set is still rejected"
+        );
+    }
+
+    /// Stream-local refilter must apply the same fail-closed rule: a carried
+    /// namespace-less asserted identity is dropped under Single/Set (and under
+    /// All when a bearer bound is present), and kept only for All/no-scope
+    /// with no bearer.
+    #[test]
+    fn stream_local_refilter_fails_closed_for_namespaceless_asserted_identity() {
+        use crate::identity::spiffe::SpiffeId;
+
+        let waypoint = "spiffe://test.local/ns/ferrum-system/sa/node-waypoint";
+        let namespaced = "spiffe://test.local/ns/alpha/sa/client";
+        let namespaceless = "spiffe://test.local/sa/cluster-local";
+        let carried = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                node_waypoint_assertors: vec![NodeWaypointAssertor {
+                    spiffe_id: SpiffeId::new(waypoint)
+                        .expect("fixture waypoint SPIFFE ID should be valid"),
+                    asserts: vec![
+                        SpiffeId::new(namespaced)
+                            .expect("fixture namespaced SPIFFE ID should be valid"),
+                        SpiffeId::new(namespaceless)
+                            .expect("fixture namespaceless SPIFFE ID should be valid"),
+                    ],
+                }],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let request = MeshSliceRequest {
+            namespace: "alpha".to_string(),
+            ..MeshSliceRequest::default()
+        };
+        let asserted = |config: &GatewayConfig| -> Vec<String> {
+            config
+                .mesh
+                .as_ref()
+                .expect("mesh should remain")
+                .node_waypoint_assertors
+                .iter()
+                .flat_map(|assertor| assertor.asserts.iter().map(|id| id.as_str().to_string()))
+                .collect()
+        };
+
+        let single = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &carried,
+            &request,
+            &CpScope::Single("alpha".to_string()),
+        );
+        assert_eq!(
+            asserted(&single),
+            vec![namespaced],
+            "stream-local refilter under Single must drop a namespace-less asserted identity"
+        );
+
+        let set = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &carried,
+            &request,
+            &CpScope::Set(HashSet::from(["alpha".to_string(), "beta".to_string()])),
+        );
+        assert_eq!(
+            asserted(&set),
+            vec![namespaced],
+            "stream-local refilter under Set must drop a namespace-less asserted identity"
+        );
+
+        let all = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &carried,
+            &request,
+            &CpScope::All,
+        );
+        assert_eq!(
+            asserted(&all),
+            vec![namespaced, namespaceless],
+            "stream-local refilter under All with no bearer may retain a namespace-less asserted identity"
+        );
+
+        let all_bearer = CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
+            &carried,
+            &request,
+            &CpScope::All,
+            Some(&HashSet::from(["alpha".to_string()])),
+        );
+        assert_eq!(
+            asserted(&all_bearer),
+            vec![namespaced],
+            "stream-local refilter under All with a bearer bound must drop a namespace-less asserted identity"
         );
     }
 

@@ -13,9 +13,9 @@
 //! `connect_timeout_ms` covers DNS, TCP connect, and TLS handshake;
 //! `write_timeout_ms` bounds each batch write/flush. Unknown config keys are
 //! rejected fail-closed. Revoked log-sink certificates are rejected via
-//! `WebPkiServerVerifier`'s
-//! `allow_unknown_revocation_status() + only_check_end_entity_revocation()`
-//! policy, matching the proxy backend / DTLS / frontend mTLS surfaces.
+//! `WebPkiServerVerifier` under the shared `tls::crl_policy` (full-chain
+//! revocation, enforced CRL validity windows, retained unknown-status
+//! tolerance), matching the proxy backend / DTLS / frontend mTLS surfaces.
 //!
 //! Supports both HTTP and stream (TCP/UDP) transaction summaries, matching the
 //! http_logging plugin's behavior.
@@ -430,9 +430,8 @@ fn build_tls_connector(
 
         // Apply gateway CRL list (`FERRUM_TLS_CRL_FILE_PATH`) so that revoked
         // log-sink certificates are rejected, matching the proxy backend / DTLS
-        // / frontend mTLS surfaces. The verifier uses
-        // `allow_unknown_revocation_status() + only_check_end_entity_revocation()`
-        // (set inside `build_server_verifier_with_crls`).
+        // / frontend mTLS surfaces. The shared `tls::crl_policy` (applied inside
+        // `build_server_verifier_with_crls`) decides the posture.
         let verifier = crate::tls::build_server_verifier_with_crls(root_store, tls_crls)
             .map_err(|error| format!("TCP logging: failed to build TLS verifier: {error}"))?;
         rustls::ClientConfig::builder()

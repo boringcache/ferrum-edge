@@ -162,6 +162,9 @@ async fn start_live_reload_listener_with_retry(
                 // swap must reject plaintext via the policy slot even though
                 // the listener itself allows the plaintext peek path.
                 true,
+                // Loopback-bound test listener; the dual-stack capture posture
+                // is exercised by the mesh listener-plan tests.
+                false,
                 Some(started_tx),
             )
             .await

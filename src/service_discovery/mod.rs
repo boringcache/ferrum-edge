@@ -1961,8 +1961,15 @@ pub(crate) async fn apply_discovered_snapshot(
 
         let merged = merge_targets(static_targets, &discovered);
 
+        // Kubernetes and Consul targets are typically pod IP literals. Warming
+        // them would persist 1-day success rows that displace short-TTL FQDNs
+        // under capacity eviction (issue #4293). `DnsCache::warmup` also
+        // skips literals; filtering here avoids cloning every pod IP into the
+        // warmup set. Admission already applied egress policy, and request-time
+        // resolve still screens literals, so this is not a policy bypass.
         let hostnames: Vec<(String, Option<String>, Option<u64>)> = discovered
             .iter()
+            .filter(|t| t.host.parse::<IpAddr>().is_err())
             .map(|t| (t.host.clone(), None, None))
             .collect();
 

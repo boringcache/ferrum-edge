@@ -55,6 +55,9 @@ pub mod grpc_proxy;
 pub(crate) mod h2c_preface;
 pub mod hbone_pool;
 mod hbone_proxy;
+#[allow(unused_imports)]
+// Used by external tests; unused in the separately compiled bin target.
+pub(crate) use hbone_proxy::settle_hbone_backend_connect_circuit_breaker_outcome;
 pub mod headers;
 pub mod host_udp_capture;
 /// Privileged live-kernel gate for Ambient host-network UDP capture (#3705).
@@ -209,7 +212,8 @@ use crate::util::http_headers::{
 use self::backend_capabilities::{
     BackendCapabilityProbeTarget, BackendCapabilityRecord, BackendCapabilityRefreshOutcome,
     BackendCapabilityRegistry, BackendCapabilitySnapshot, CapabilityCommitOutcome, ProtocolSupport,
-    RefreshCoalescer, SharedBackendCapabilityRegistry, SharedRefreshCoalescer,
+    RefreshCoalescer, RefreshRole, RefreshRunnerGuard, SharedBackendCapabilityRegistry,
+    SharedRefreshCoalescer,
 };
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{
@@ -2005,12 +2009,29 @@ pub(crate) fn refine_stream_response_for_content_type(
     })
 }
 
+/// Whether a streaming response must wrap the size-limited adapter.
+///
+/// `trusted_backend_content_length` is the canonical length observed on the
+/// **backend** response, captured before `after_proxy`. A hook-authored
+/// `Content-Length` must never suppress this adapter: inserting a length onto
+/// an originally unknown-length stream would otherwise skip frame-by-frame
+/// enforcement of `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`.
+#[inline]
+pub(crate) fn streaming_response_requires_size_limit(
+    max_response_body_size_bytes: usize,
+    trusted_backend_content_length: Option<u64>,
+) -> bool {
+    max_response_body_size_bytes > 0 && trusted_backend_content_length.is_none()
+}
+
 /// Fix 5: decide whether a plain-HTTPS direct-H2 response body should skip
 /// the `CoalescingH2Body` adapter and stream through hyper's `Incoming`
 /// directly.
 ///
 /// Bypass is safe when:
-///   * `content-length` is known (we can size-check up-front), AND
+///   * the **backend-observed** canonical `Content-Length` is known (we can
+///     size-check up-front; a post-`after_proxy` header must never supply
+///     this value), AND
 ///   * it is ≥ 512 KiB (backend is already emitting large H2 frames —
 ///     `http2_max_frame_size` is 1 MiB in our build — so coalescing just
 ///     adds a `BytesMut::extend_from_slice` copy that the large-frame
@@ -7047,9 +7068,17 @@ fn push_tls_material_source(
 /// call on rotation — the H3 pool's TLS config cache is co-located on
 /// `connection_pool.backend_h3_tls_configs`, so it is drained transitively,
 /// and the HBONE and mesh mTLS pools build their SPIFFE client config per
-/// connect (no cache to drain). All pools get a `force_drain_svid_generation()` call when
-/// the operator-configured drain window elapses, because each pool keeps its
-/// own `DashMap` of live connections.
+/// connect (no cache to drain). That same unconditional call also reclaims
+/// generation-keyed H2/gRPC `rr_counters`. A post-sweep late insert of a
+/// captured retired generation is removed on the cold-insert miss path
+/// (and TLS configs refuse to cache a retired numeric generation) so a
+/// default `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS=0` cannot leak one
+/// counter or TLS-config entry per rotation. HBONE and mesh-mTLS have no
+/// generation-keyed rr counters — they key by SVID fingerprint and keep
+/// connection drain gated on the operator drain window. All pools get a
+/// `force_drain_svid_generation()` call when the operator-configured drain
+/// window elapses, because each pool keeps its own `DashMap` of live
+/// connections.
 #[derive(Clone)]
 struct BackendPoolFamily {
     connection_pool: Arc<ConnectionPool>,
@@ -7317,6 +7346,13 @@ fn spawn_backend_svid_rotation_task(
             // after the first.
             let retiring = outgoing_generation_span(old_generation, next_generation);
             for outgoing in retiring.clone() {
+                // Unconditional: TLS-config cache AND H2/gRPC `rr_counters`
+                // for the retired generation. Live connections are not
+                // withdrawn here. `retain` alone does not close a cold
+                // insert that captured `outgoing` before this fetch_max
+                // and completes after the sweep; that race is closed by
+                // cache-level retirement (TLS) and post-insert exact-key
+                // removal on the `rr_counters` miss path.
                 consumer.pools.drain_tls_config_cache(outgoing);
             }
             consumer.restart_health_checks();
@@ -8500,6 +8536,10 @@ impl ProxyState {
     fn reload_backend_tls_material(&self) -> Result<(), anyhow::Error> {
         let active_crls = crate::tls::load_crls(self.env_config.tls_crl_file_path.as_deref())?;
         let validated = self.validate_backend_tls_material(active_crls.as_ref().as_slice())?;
+        // Publish the admitted CRL generation before restarting health probes
+        // so replacement tasks snapshot this exact generation. A refused
+        // candidate never reaches this store, so previous verifiers,
+        // generation, and probe tasks stay in service.
         self.shared_crls.store(active_crls);
         let pools = self.backend_pool_family();
         pools.clear_tls_config_caches();
@@ -9128,8 +9168,11 @@ impl ProxyState {
         // Initialize health checker with the gateway's pool settings so active
         // probes share connection tuning (keep-alive, idle timeout, HTTP/2) with
         // regular proxy traffic.
-        let mut health_checker =
-            HealthChecker::with_pool_config(&global_pool_config, dns_cache.clone());
+        let mut health_checker = HealthChecker::with_pool_config_and_shared_crls(
+            &global_pool_config,
+            dns_cache.clone(),
+            shared_crls.clone(),
+        );
         health_checker.set_global_tls_config(
             env_config_arc.tls_ca_bundle_path.clone(),
             env_config_arc.backend_tls_client_cert_path.clone(),
@@ -10713,36 +10756,59 @@ impl ProxyState {
     /// still picked up without spawning N duplicate tasks or orphaning the
     /// queued request.
     pub(crate) fn spawn_backend_capability_refresh(&self) {
-        if !self.backend_capabilities_refresh.request() {
-            debug!("Backend capability refresh coalesced into in-flight task");
-            return;
+        match self.backend_capabilities_refresh.request() {
+            RefreshRole::Joined => {
+                debug!("Backend capability refresh coalesced into in-flight task");
+            }
+            RefreshRole::Runner(guard) => self.spawn_capability_refresh_runner(guard),
         }
+    }
+
+    fn spawn_capability_refresh_runner(&self, guard: RefreshRunnerGuard) {
         let state = self.clone();
+        // Detached from the caller future: aborting an admin/DP waiter
+        // cannot cancel the probe. Guard Drop is last-resort only, when
+        // this task itself is cancelled (runtime teardown).
         tokio::spawn(async move {
-            state.run_backend_capability_refresh_loop().await;
+            state.run_backend_capability_refresh_loop(guard).await;
         });
     }
 
     /// Synchronously refresh backend capabilities through the shared
     /// [`RefreshCoalescer`], preserving the admin endpoint's post-refresh
     /// snapshot contract while collapsing concurrent callers onto one pass.
+    ///
+    /// The exclusive drain loop always runs in a detached Tokio task so
+    /// dropping this caller (HTTP disconnect, DP task abort) cannot cancel
+    /// the runner. A caller that won the role spawns that task and then
+    /// joins through [`RefreshCoalescer::wait_until_idle`], returning
+    /// [`BackendCapabilityRefreshOutcome::Ran`]. A coalesced caller waits
+    /// the same way and returns
+    /// [`BackendCapabilityRefreshOutcome::Joined`]. `Ran` versus `Joined`
+    /// stays tied to who acquired the role, not to who happened to still
+    /// be awaiting when the probe finished.
     pub async fn refresh_backend_capabilities_coalesced(&self) -> BackendCapabilityRefreshOutcome {
-        if self.backend_capabilities_refresh.request() {
-            self.run_backend_capability_refresh_loop().await;
-            BackendCapabilityRefreshOutcome::Ran
-        } else {
-            self.backend_capabilities_refresh.wait_until_idle().await;
-            BackendCapabilityRefreshOutcome::Joined
+        match self.backend_capabilities_refresh.request() {
+            RefreshRole::Runner(guard) => {
+                self.spawn_capability_refresh_runner(guard);
+                self.backend_capabilities_refresh.wait_until_idle().await;
+                BackendCapabilityRefreshOutcome::Ran
+            }
+            RefreshRole::Joined => {
+                self.backend_capabilities_refresh.wait_until_idle().await;
+                BackendCapabilityRefreshOutcome::Joined
+            }
         }
     }
 
-    async fn run_backend_capability_refresh_loop(&self) {
+    async fn run_backend_capability_refresh_loop(&self, mut guard: RefreshRunnerGuard) {
         loop {
             while self.backend_capabilities_refresh.take_pending() {
                 self.refresh_backend_capabilities().await;
             }
             if self.backend_capabilities_refresh.try_finish() {
                 self.backend_capabilities_refresh.signal_idle();
+                guard.disarm();
                 break;
             }
         }
@@ -19523,6 +19589,26 @@ pub async fn start_proxy_listener_with_bound_listener_and_mesh_direction(
     Ok(())
 }
 
+/// Opt-in socket options for one bound proxy/capture listener.
+///
+/// Both flags default OFF, so every ordinary listener keeps the historical
+/// posture; each is granted to the narrow caller that needs it and never to a
+/// whole class of listeners through a process-wide switch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProxyListenerBind {
+    /// `IP_TRANSPARENT` / `IPV6_TRANSPARENT`. Lets the socket bind and source
+    /// addresses this host does not own, so it is granted ONLY to the
+    /// NodeWaypoint transparent inbound capture listener (issue #3287).
+    pub transparent: bool,
+    /// Bind an `AF_INET6` wildcard with `IPV6_V6ONLY` explicitly DISABLED, so a
+    /// single socket accepts both native IPv6 and v4-mapped IPv4 connections,
+    /// and downgrade to the IPv4 wildcard when (and only when) IPv6 is
+    /// unavailable on this host. Granted to the mesh TCP capture listeners
+    /// (issue #4271), which must serve whichever families the installed
+    /// `iptables` / `ip6tables` REDIRECT rules divert at them.
+    pub dual_stack: bool,
+}
+
 /// Bind one exclusive TCP listen socket and duplicate it for intra-process
 /// accept workers (issue #3924).
 ///
@@ -19538,10 +19624,42 @@ pub(crate) fn bind_exclusive_proxy_accept_listeners(
     backlog: i32,
     tcp_fastopen_queue_len: Option<u16>,
     accept_threads: usize,
-    transparent: bool,
+    bind: ProxyListenerBind,
 ) -> Result<Vec<TcpListener>, anyhow::Error> {
     let accept_threads = accept_threads.max(1);
-    let first = create_proxy_socket(addr, backlog, tcp_fastopen_queue_len, transparent)?;
+    let first = match create_proxy_socket(addr, backlog, tcp_fastopen_queue_len, bind) {
+        Ok(listener) => listener,
+        // Dual-stack downgrade, and ONLY on a genuine IPv6-unavailability error
+        // (issue #4271). A mesh TCP capture listener PREFERS the `[::]` wildcard
+        // so one socket claims both the v4-mapped and the native-v6 captured
+        // connections; on a host without IPv6 that bind cannot succeed, and the
+        // `ip6tables` rules that would have fed it cannot exist either, so the
+        // v4 wildcard is the complete surface. Any other failure —
+        // `EADDRINUSE` above all — is returned: falling back on it would report
+        // the listener started on IPv4 while IPv6 capture is black-holed behind
+        // a healthy readiness signal.
+        Err(err)
+            if bind.dual_stack
+                && addr.ip().is_ipv6()
+                && addr.ip().is_unspecified()
+                && err
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(crate::socket_opts::is_ipv6_unavailable_io_error) =>
+        {
+            let fallback = SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                addr.port(),
+            );
+            warn!(
+                requested = %addr,
+                fallback = %fallback,
+                "Dual-stack capture listener bind failed because IPv6 is unavailable on this \
+                 host ({err}); falling back to the IPv4 wildcard (IPv6 capture is unavailable here)"
+            );
+            create_proxy_socket(fallback, backlog, tcp_fastopen_queue_len, bind)?
+        }
+        Err(err) => return Err(err),
+    };
     if accept_threads == 1 {
         return Ok(vec![first]);
     }
@@ -19615,8 +19733,12 @@ pub(crate) fn create_proxy_socket(
     addr: SocketAddr,
     backlog: i32,
     tcp_fastopen_queue_len: Option<u16>,
-    transparent: bool,
+    bind: ProxyListenerBind,
 ) -> Result<TcpListener, anyhow::Error> {
+    let ProxyListenerBind {
+        transparent,
+        dual_stack,
+    } = bind;
     let socket = socket2::Socket::new(
         if addr.is_ipv6() {
             socket2::Domain::IPV6
@@ -19638,6 +19760,22 @@ pub(crate) fn create_proxy_socket(
     // sockets therefore require SO_EXCLUSIVEADDRUSE before bind.
     #[cfg(windows)]
     set_windows_exclusive_addr_use(&socket)?;
+
+    // Dual-stack capture listener (issue #4271): disable `IPV6_V6ONLY` so ONE
+    // `AF_INET6` wildcard socket accepts both native IPv6 and IPv4 (reported as
+    // v4-mapped `::ffff:a.b.c.d`) connections. Set EXPLICITLY rather than
+    // inherited from `net.ipv6.bindv6only`: mesh capture correctness must not
+    // depend on a host sysctl, because a `bindv6only=1` node would leave the
+    // IPv4 half of the capture rules pointing at a port with no listener. Only
+    // callers that opt in are affected; every other listener keeps the host
+    // default. Set before `bind`, which is where the option takes effect.
+    if dual_stack && addr.is_ipv6() {
+        socket.set_only_v6(false).map_err(|err| {
+            anyhow::Error::new(err).context(format!(
+                "failed to disable IPV6_V6ONLY on the dual-stack capture listener {addr}"
+            ))
+        })?;
+    }
 
     // IP_TRANSPARENT / IPV6_TRANSPARENT for the NodeWaypoint transparent
     // inbound CAPTURE listener (issue #3287). That listener is the only caller
@@ -19684,8 +19822,13 @@ pub(crate) fn create_proxy_socket(
     }
 
     socket.set_nonblocking(true)?;
+    // `anyhow::Error::new` (not `anyhow!`) so the underlying `io::Error` stays
+    // downcastable: the dual-stack capture bind classifies it to decide whether
+    // an IPv6 failure is a safe downgrade to the v4 wildcard or a real conflict.
     socket.bind(&addr.into()).map_err(|err| {
-        anyhow::anyhow!("failed to bind exclusive TCP proxy listener on {addr}: {err}")
+        anyhow::Error::new(err).context(format!(
+            "failed to bind exclusive TCP proxy listener on {addr}"
+        ))
     })?;
 
     // TCP_FASTOPEN: enable TFO on the server socket after bind, before listen.
@@ -19778,6 +19921,7 @@ pub async fn start_proxy_listener_with_tls_and_signal(
             record_mesh_mtls_metric: false,
         },
         None,
+        false,
         started_tx,
     )
     .await
@@ -19789,12 +19933,18 @@ pub async fn start_proxy_listener_with_tls_and_signal(
 /// stamps `mesh_direction` onto every accepted connection so mesh-aware
 /// plugins can gate CLIENT vs SERVER span emission. Used by mesh outbound
 /// capture, which terminates plaintext on a known port.
+///
+/// `dual_stack` is set by the mesh listener plan for a capture listener bound on
+/// the IPv6 wildcard, so one socket serves both the `iptables` and `ip6tables`
+/// REDIRECT rules (issue #4271).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_mesh_plaintext_listener_with_signal(
     addr: SocketAddr,
     state: ProxyState,
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    dual_stack: bool,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
     start_proxy_listener_with_tls_source_and_signal(
@@ -19806,6 +19956,7 @@ pub(crate) async fn start_mesh_plaintext_listener_with_signal(
             record_mesh_mtls_metric: false,
         },
         mesh_direction,
+        dual_stack,
         started_tx,
     )
     .await
@@ -19886,6 +20037,7 @@ pub async fn start_proxy_listener_with_dynamic_tls_and_signal(
             record_mesh_mtls_metric: false,
         },
         None,
+        false,
         started_tx,
     )
     .await
@@ -19902,12 +20054,14 @@ pub async fn start_proxy_listener_with_dynamic_tls_and_signal(
 ///
 /// Each accept performs one `ArcSwap::load()` plus one inner `Arc` clone,
 /// keeping the atomic read off the proxy request path. See `ListenerTlsSource`.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_proxy_listener_with_mesh_inbound_tls_and_signal(
     addr: SocketAddr,
     state: ProxyState,
     shutdown: tokio::sync::watch::Receiver<bool>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     allows_plaintext: bool,
+    dual_stack: bool,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
     start_proxy_listener_with_tls_source_and_signal(
@@ -19916,6 +20070,7 @@ pub async fn start_proxy_listener_with_mesh_inbound_tls_and_signal(
         shutdown,
         ListenerTlsSource::MeshInbound { allows_plaintext },
         mesh_direction,
+        dual_stack,
         started_tx,
     )
     .await
@@ -20402,12 +20557,14 @@ fn resolve_node_waypoint_accept_identity(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_proxy_listener_with_tls_source_and_signal(
     addr: SocketAddr,
     state: ProxyState,
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_source: ListenerTlsSource,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    dual_stack: bool,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
     let backlog = state.env_config.tcp_listen_backlog as i32;
@@ -20443,9 +20600,17 @@ async fn start_proxy_listener_with_tls_source_and_signal(
     // exactly one listener — the NodeWaypoint inbound capture socket, which
     // opts in explicitly in `proxy::node_waypoint_ingress_capture` — and never
     // to a whole class of listeners on the strength of a process-wide env var.
-    let mut listeners =
-        bind_exclusive_proxy_accept_listeners(addr, backlog, tfo_queue, accept_threads, false)
-            .map_err(|err| err.context("Proxy listener bind failed"))?;
+    let mut listeners = bind_exclusive_proxy_accept_listeners(
+        addr,
+        backlog,
+        tfo_queue,
+        accept_threads,
+        ProxyListenerBind {
+            transparent: false,
+            dual_stack,
+        },
+    )
+    .map_err(|err| err.context("Proxy listener bind failed"))?;
     let first_listener = listeners.pop().ok_or_else(|| {
         anyhow::anyhow!("exclusive proxy listener set unexpectedly empty after bind")
     })?;
@@ -34652,6 +34817,10 @@ async fn handle_proxy_request_inner(
                         grpc_streaming_trailer_governor.take(),
                     )
                 } else if effective_max_response_body_size_bytes > 0 {
+                    // Native gRPC never frames with Content-Length, and a
+                    // hook-authored length must not suppress the cap: always
+                    // wrap the size-limited adapter when the operator ceiling
+                    // is enabled.
                     crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
                         effective_max_response_body_size_bytes,
@@ -37074,17 +37243,19 @@ async fn handle_proxy_request_inner(
     let pristine_streaming_grpc_web_trailers_only_terminal_metadata =
         (grpc_request_is_web_translated && streaming_h2_body_ended)
             .then(|| grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&response_headers));
-    let streaming_h3_header_content_length = match &response_body {
-        ResponseBody::StreamingH3(_) => response_headers
-            .get("content-length")
-            .and_then(|v| v.parse::<u64>().ok()),
-        _ => None,
-    };
+    // Canonical backend-observed Content-Length, captured before any
+    // `after_proxy` mutation. Size-limit adapter selection and the large-H2
+    // passthrough must use this value so a hook-authored Content-Length cannot
+    // suppress `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`. One HashMap scan, no
+    // extra allocation — the same parser dispatch uses for the pre-commit
+    // reject (`GHSA-xrfj-852f-645j`).
+    let trusted_backend_content_length =
+        canonical_header_content_length_from_map(&response_headers);
     // H3 does not expose an `is_end_stream()` signal at response-header time.
     // Treat declared zero-length responses as already ended for the defer gate;
     // HEAD/204/304 are still covered by `streaming_dispatch_should_defer`.
     let streaming_h3_body_ended = matches!(&response_body, ResponseBody::StreamingH3(_))
-        && streaming_h3_header_content_length == Some(0);
+        && trusted_backend_content_length == Some(0);
     let pristine_streaming_grpc_web_terminal_names = (grpc_request_is_web_translated
         && (streaming_h2_body_ended || streaming_h3_body_ended))
         .then(|| {
@@ -37873,15 +38044,14 @@ async fn handle_proxy_request_inner(
             | ResponseBody::StreamingH3(_)
     );
     // Native H3 needs the backend's declared length to distinguish a complete
-    // body followed by a graceful QUIC close from truncation. Preserve it
-    // before an attached inspector strips the client-visible Content-Length.
+    // body followed by a graceful QUIC close from truncation. Use the
+    // pre-`after_proxy` capture: a hook-authored Content-Length must not
+    // describe the backend stream. An attached inspector still strips the
+    // client-visible field below so completeness of the *transformed* body
+    // does not judge against this length.
     let streaming_h3_backend_content_length =
         matches!(&response_body, ResponseBody::StreamingH3(_))
-            .then(|| {
-                response_headers
-                    .get("content-length")
-                    .and_then(|value| value.parse::<u64>().ok())
-            })
+            .then_some(trusted_backend_content_length)
             .flatten();
     // Resolve the inspector before cloning the context into the deferred
     // logger. The resolver stamps a private stream id only when an inspector
@@ -38127,12 +38297,14 @@ async fn handle_proxy_request_inner(
     // flag remains. Keep the three buffered writers (this one, native H3, and
     // the H3 bridge) in agreement.
     //
-    // Streaming bodies capture their declared length for internal accounting
-    // FIRST: ordinary Streaming framing removes `Content-Length` from the wire
-    // map (a hook-authored value cannot be verified against bytes not yet
-    // written), while the H3 graceful-close classifier and the direct-H2
-    // large-response coalescer bypass still need the length the boundary would
-    // have accepted.
+    // Streaming bodies capture their post-hook declared length for wire /
+    // completeness accounting FIRST: ordinary Streaming framing removes
+    // `Content-Length` from the wire map (a hook-authored value cannot be
+    // verified against bytes not yet written). Only HEAD advertisement and the
+    // H3 graceful-close classifier of the *client-facing* representation still
+    // need the length the boundary would have accepted. Size-limit adapter
+    // selection and the large-H2 passthrough use `trusted_backend_content_length`
+    // captured before `after_proxy`.
     let declared_streaming_content_length =
         headers_mod::preserved_response_content_length(&response_headers, response_status);
     // What the WIRE may advertise, as opposed to what the gateway keeps for its
@@ -38363,11 +38535,17 @@ async fn handle_proxy_request_inner(
                 }
                 inspected
             } else {
-                // `cl` drives the gateway's own construction choices only;
-                // `advertised_cl` is what the body may report as an exact size
-                // hint, and hence what hyper may turn back into a wire
-                // `Content-Length`.
-                let cl = declared_streaming_content_length;
+                // `cl` is the trusted backend-observed length (size-limit
+                // adapter selection). `advertised_cl` is what the body may
+                // report as an exact size hint, and hence what hyper may turn
+                // back into a wire `Content-Length` — HEAD only.
+                let cl = if grpc_web_streaming_adapter.is_some() {
+                    // gRPC-Web reframes the body, so the backend length does
+                    // not describe the client-visible bytes.
+                    None
+                } else {
+                    trusted_backend_content_length
+                };
                 let advertised_cl = advertised_streaming_content_length;
                 // Build the base body from the shared protocol-agnostic builders
                 // first, THEN optionally wrap it in latency tracking via
@@ -38387,9 +38565,14 @@ async fn handle_proxy_request_inner(
                         advertised_cl,
                         proxy.backend_read_timeout_ms,
                     )
-                } else if effective_max_response_body_size_bytes > 0 && cl.is_none() {
-                    // No Content-Length — enforce size limit while streaming instead
-                    // of buffering the entire body into memory.
+                } else if streaming_response_requires_size_limit(
+                    effective_max_response_body_size_bytes,
+                    cl,
+                ) {
+                    // No backend-observed Content-Length — enforce size limit
+                    // while streaming instead of buffering the entire body
+                    // into memory. A hook-authored Content-Length cannot take
+                    // this branch off.
                     crate::proxy::body::size_limited_streaming_body(
                         response,
                         effective_max_response_body_size_bytes,
@@ -38482,11 +38665,17 @@ async fn handle_proxy_request_inner(
                 .extensions_mut()
                 .remove::<crate::proxy::body::PooledBackendLeaseSlot>()
                 .and_then(|slot| slot.take());
-            // `cl` is the gateway's internal size decision input (the
-            // large-response coalescer bypass); `advertised_cl` is the only one
-            // the body may expose as an exact size hint, which hyper would
-            // otherwise re-emit as a wire `Content-Length`.
-            let cl = declared_streaming_content_length;
+            // `cl` is the trusted backend-observed length (size-limit adapter
+            // selection and the large-response coalescer bypass). `advertised_cl`
+            // is the only one the body may expose as an exact size hint, which
+            // hyper would otherwise re-emit as a wire `Content-Length`.
+            let cl = if grpc_web_streaming_adapter.is_some() {
+                // gRPC-Web reframes the body, so the backend length does not
+                // describe the client-visible bytes.
+                None
+            } else {
+                trusted_backend_content_length
+            };
             let advertised_cl = advertised_streaming_content_length;
             // Plain-HTTPS direct-H2 large-response fast path.
             //
@@ -38501,10 +38690,14 @@ async fn handle_proxy_request_inner(
             // That copy was the remaining gap for 5 MB HTTP/2 throughput
             // (81 RPS vs direct 232 RPS).
             //
-            // Decision made ONCE per response using `content-length` — we
-            // only bypass when the size is known AND large. Unknown CL
-            // keeps the coalescer (we cannot be sure frames are already
-            // 1 MiB when the backend is chunked).
+            // Decision made ONCE per response using the backend-observed
+            // canonical `content-length` — we only bypass when that size is
+            // known AND large. A hook-authored Content-Length must never
+            // select this passthrough: unknown-length backends keep the
+            // coalescer (and the size-limited adapter) even if a plugin
+            // later inserts a length. Unknown CL keeps the coalescer (we
+            // cannot be sure frames are already 1 MiB when the backend is
+            // chunked).
             //
             // gRPC still uses the coalescing path (see gRPC streaming
             // response at ~line 5905) because gRPC's +35 % large-payload
@@ -38546,10 +38739,15 @@ async fn handle_proxy_request_inner(
                     None,
                     streaming_trailer_governor.take(),
                 )
-            } else if effective_max_response_body_size_bytes > 0 && cl.is_none() {
-                // No Content-Length — enforce response-size limits while
-                // streaming H2 bodies, including HBONE tunnel responses,
-                // without buffering the whole backend response into memory.
+            } else if streaming_response_requires_size_limit(
+                effective_max_response_body_size_bytes,
+                cl,
+            ) {
+                // No backend-observed Content-Length — enforce response-size
+                // limits while streaming H2 bodies, including HBONE tunnel
+                // responses, without buffering the whole backend response
+                // into memory. A hook-authored Content-Length cannot take
+                // this branch off.
                 crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
                     effective_max_response_body_size_bytes,
@@ -38701,10 +38899,13 @@ async fn handle_proxy_request_inner(
         ResponseBody::StreamingH3(h3_resp) => {
             // The length describing the CLIENT-facing representation (as
             // opposed to `backend_content_length`, the backend's own
-            // pre-transform declaration). Captured before the final wire
+            // pre-`after_proxy` declaration). Captured before the final wire
             // boundary removed the field: it is no longer advertised to the
             // client, but the graceful-close success gate must still distinguish
-            // a complete body from a truncated one.
+            // a complete body from a truncated one. A hook-authored length is
+            // accepted here only as that completeness claim — never as a
+            // size-limit enforcement input (H3 always wraps the size-limited
+            // adapter when the cap is enabled).
             let client_content_length = declared_streaming_content_length;
             let success_on_drop_after_bytes =
                 h3_success_on_drop_after_response_bytes(inbound_version, client_content_length);
@@ -44145,9 +44346,11 @@ async fn proxy_to_backend(
                     );
                 }
 
-                // No Content-Length — stream with coalescing. The response size
-                // limit is still enforced via the `SizeLimitedStreamingResponse`
-                // adapter applied at the response body builder stage.
+                // No backend-observed Content-Length — stream with coalescing.
+                // The response size limit is still enforced via the
+                // `SizeLimitedStreamingResponse` adapter applied at the
+                // response body builder stage from that trusted length, not
+                // from a post-`after_proxy` header.
                 if stream_response {
                     return backend_dispatch_response(
                         retry::BackendResponse {
@@ -62589,15 +62792,16 @@ mod tests {
         assert_eq!(no_slice("localhost"), Err(InboundRelayDenial::NoSlice));
         assert_eq!(no_slice("10.1.2.3"), Err(InboundRelayDenial::NoSlice));
 
-        // An own-pod terminator (Sidecar / Ambient): this pod plus a SIBLING pod
-        // the slice also declares. Only the first is a destination we terminate
-        // for.
+        // Sidecar: this pod plus a SIBLING pod the slice also declares. Only
+        // the first is a destination we terminate for. Loopback is the
+        // Sidecar own-network-namespace shortcut.
         let mesh = MeshConfig {
             workloads: vec![
                 relay_guard_workload("app", &["10.1.2.3", "fd00:10:244:1::4"], &[8080]),
                 relay_guard_workload("peer", &["10.9.9.9"], &[8080]),
             ],
             inbound_relay_admits_accepted_local_address: true,
+            inbound_relay_admits_loopback_namespace: true,
             ..MeshConfig::default()
         };
         let decide = |host: &str, port: u16, local: Option<std::net::IpAddr>| {
@@ -62608,6 +62812,9 @@ mod tests {
         assert_eq!(decide("127.0.0.1", 8080, Some(own_ip)), Ok(()));
         assert_eq!(decide("::1", 8080, Some(own_ip)), Ok(()));
         assert_eq!(decide("localhost", 8080, Some(own_ip)), Ok(()));
+        assert_eq!(decide("localhost.", 8080, Some(own_ip)), Ok(()));
+        assert_eq!(decide("LocalHost", 8080, Some(own_ip)), Ok(()));
+        assert_eq!(decide("app.localhost", 8080, Some(own_ip)), Ok(()));
         // ...but undeclared loopback ports remain refused.
         assert_eq!(
             decide("127.0.0.1", 9999, Some(own_ip)),
@@ -62673,6 +62880,65 @@ mod tests {
             decide("127.0.0.1", 8080, None),
             Err(InboundRelayDenial::AddressNotTerminated)
         );
+
+        // Ambient admits the accepted non-loopback local address but must not
+        // inherit Sidecar's loopback-namespace shortcut, even when inventory
+        // lists those names.
+        let ambient = MeshConfig {
+            workloads: vec![relay_guard_workload(
+                "app",
+                &["10.1.2.3", "127.0.0.1"],
+                &[8080],
+            )],
+            inbound_relay_destinations: vec![
+                crate::modes::mesh::config::MeshInboundRelayDestination {
+                    host: crate::modes::mesh::config::MeshInboundRelayHost::Ip(own_ip),
+                    ports: vec![8080],
+                },
+                crate::modes::mesh::config::MeshInboundRelayDestination {
+                    host: crate::modes::mesh::config::MeshInboundRelayHost::Ip(
+                        "127.0.0.1".parse().expect("loopback"),
+                    ),
+                    ports: vec![8080],
+                },
+                crate::modes::mesh::config::MeshInboundRelayDestination {
+                    host: crate::modes::mesh::config::MeshInboundRelayHost::Name(
+                        "localhost".to_string(),
+                    ),
+                    ports: vec![8080],
+                },
+                crate::modes::mesh::config::MeshInboundRelayDestination {
+                    host: crate::modes::mesh::config::MeshInboundRelayHost::Name(
+                        "app.localhost".to_string(),
+                    ),
+                    ports: vec![8080],
+                },
+            ],
+            inbound_relay_admits_accepted_local_address: true,
+            ..MeshConfig::default()
+        };
+        let ambient_decide = |host: &str, port: u16| {
+            inbound_hbone_relay_destination_decision(host, port, Some(&ambient), Some(own_ip))
+        };
+        assert_eq!(ambient_decide("10.1.2.3", 8080), Ok(()));
+        assert_eq!(
+            ambient_decide("10.1.2.3", 9999),
+            Err(InboundRelayDenial::PortNotDeclared)
+        );
+        for host in [
+            "127.0.0.1",
+            "::1",
+            "localhost",
+            "localhost.",
+            "LocalHost",
+            "app.localhost",
+        ] {
+            assert_eq!(
+                ambient_decide(host, 8080),
+                Err(InboundRelayDenial::AddressNotTerminated),
+                "Ambient must refuse loopback-namespace authority {host}"
+            );
+        }
     }
 
     /// Issue #4150: the two topologies that legitimately terminate for OTHER
@@ -62681,7 +62947,8 @@ mod tests {
     #[test]
     fn inbound_hbone_relay_guard_admits_the_waypoint_termination_inventory_only() {
         use crate::modes::mesh::config::{
-            InboundRelayDenial, MeshConfig, inbound_relay_destinations_from_workloads,
+            InboundRelayDenial, MeshConfig, MeshInboundRelayDestination, MeshInboundRelayHost,
+            inbound_relay_destinations_from_workloads,
         };
 
         let waypoint_ip: std::net::IpAddr = "10.4.4.4".parse().expect("waypoint IP");
@@ -62723,9 +62990,8 @@ mod tests {
             Err(InboundRelayDenial::AddressNotTerminated)
         );
 
-        // Loopback listed IN the inventory is a real termination target —
-        // the functional waypoint suite declares `127.0.0.1` as the
-        // workload address. The own-namespace shortcut stays off.
+        // Inventory data cannot make the waypoint/host network namespace's
+        // loopback address into a workload termination target.
         let loopback_mesh = MeshConfig {
             inbound_relay_destinations: inbound_relay_destinations_from_workloads(&[
                 relay_guard_workload("loopback-app", &["127.0.0.1"], &[8080]),
@@ -62739,7 +63005,7 @@ mod tests {
                 Some(&loopback_mesh),
                 Some(waypoint_ip),
             ),
-            Ok(())
+            Err(InboundRelayDenial::AddressNotTerminated)
         );
         assert_eq!(
             inbound_hbone_relay_destination_decision(
@@ -62750,6 +63016,35 @@ mod tests {
             ),
             Err(InboundRelayDenial::AddressNotTerminated)
         );
+
+        // DNS localhost namespace spellings must not bypass the loopback refusal
+        // via inventory Name entries that the backend dial would resolve to
+        // loopback.
+        let localhost_namespace_mesh = MeshConfig {
+            inbound_relay_destinations: vec![
+                MeshInboundRelayDestination {
+                    host: MeshInboundRelayHost::Name("localhost.".to_string()),
+                    ports: vec![8080],
+                },
+                MeshInboundRelayDestination {
+                    host: MeshInboundRelayHost::Name("app.localhost".to_string()),
+                    ports: vec![8080],
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        for host in ["localhost.", "LocalHost", "app.localhost", "APP.Localhost"] {
+            assert_eq!(
+                inbound_hbone_relay_destination_decision(
+                    host,
+                    8080,
+                    Some(&localhost_namespace_mesh),
+                    Some(waypoint_ip),
+                ),
+                Err(InboundRelayDenial::AddressNotTerminated),
+                "waypoint must refuse loopback-namespace authority {host} even when inventory-listed"
+            );
+        }
     }
 
     #[test]

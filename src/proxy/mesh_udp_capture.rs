@@ -196,19 +196,16 @@ pub struct CaptureSessionKey {
 }
 
 /// Whether `e` indicates IPv6 is unavailable on this host (so the dual-stack
-/// `[::]` capture bind may safely fall back to the v4 wildcard). True ONLY for
-/// "address family not supported" / "cannot assign requested address" /
-/// "protocol not supported" — NOT for a real conflict like `EADDRINUSE`, which
-/// must surface so IPv6 UDP is never silently left black-holed behind a v4-only
-/// listener while `ip6tables` still diverts it to this port.
+/// `[::]` capture bind may safely fall back to the v4 wildcard). The
+/// classification itself lives in
+/// [`crate::socket_opts::is_ipv6_unavailable_io_error`] so the UDP capture bind
+/// and the mesh TCP capture bind (issue #4271) can never disagree about which
+/// bind failures are a safe downgrade; this wrapper only unwraps the `anyhow`
+/// context this module carries.
 #[cfg(target_os = "linux")]
 fn is_ipv6_unavailable_error(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<std::io::Error>().is_some_and(|io_err| {
-        matches!(
-            io_err.raw_os_error(),
-            Some(libc::EAFNOSUPPORT) | Some(libc::EADDRNOTAVAIL) | Some(libc::EPROTONOSUPPORT)
-        ) || io_err.kind() == std::io::ErrorKind::AddrNotAvailable
-    })
+    e.downcast_ref::<std::io::Error>()
+        .is_some_and(crate::socket_opts::is_ipv6_unavailable_io_error)
 }
 
 /// Canonicalize an IPv4-mapped-IPv6 `SocketAddr` (`::ffff:a.b.c.d`) to its plain

@@ -943,6 +943,13 @@ fn max_in_flight_is_documented_across_source_guide_and_example() {
             && section.contains("forward_sensitive_header_allowlist"),
         "credential forwarding opt-in must be documented fail-closed"
     );
+    assert!(
+        source.contains("`forward_sensitive_query`")
+            && section.contains("`forward_sensitive_query`")
+            && section.contains("forward_sensitive_query_allowlist")
+            && section.contains("`sensitive_query_patterns`"),
+        "query credential forwarding opt-in must be documented fail-closed"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2674,6 +2681,13 @@ async fn test_ordinary_http_mirror_still_uses_http1() {
 }
 
 async fn capture_mirror_request_line(ctx: &mut RequestContext) -> String {
+    capture_mirror_request_line_with_config(ctx, json!({})).await
+}
+
+async fn capture_mirror_request_line_with_config(
+    ctx: &mut RequestContext,
+    extra: serde_json::Value,
+) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -2707,16 +2721,19 @@ async fn capture_mirror_request_line(ctx: &mut RequestContext) -> String {
         }
     });
 
-    let plugin = RequestMirror::new(
-        &json!({
-            "mirror_host": addr.ip().to_string(),
-            "mirror_port": addr.port(),
-            "mirror_request_body": false,
-            "percentage": 100.0
-        }),
-        PluginHttpClient::default(),
-    )
-    .unwrap();
+    let mut config = json!({
+        "mirror_host": addr.ip().to_string(),
+        "mirror_port": addr.port(),
+        "mirror_request_body": false,
+        "percentage": 100.0
+    });
+    if let Some(extra_obj) = extra.as_object() {
+        let dest = config.as_object_mut().expect("plugin config object");
+        for (key, value) in extra_obj {
+            dest.insert(key.clone(), value.clone());
+        }
+    }
+    let plugin = RequestMirror::new(&config, PluginHttpClient::default()).unwrap();
     let mut headers = HashMap::new();
     let result = plugin.finalized_egress(ctx, &mut headers).await;
     plugin_utils::assert_continue(result);
@@ -2844,6 +2861,446 @@ async fn test_mirror_does_not_serialize_stale_map_without_outbound_or_raw() {
     assert!(
         request_line.contains("injected=value"),
         "synthetic map-only contexts still use the map fallback: {request_line}"
+    );
+}
+
+#[test]
+fn forward_sensitive_query_opt_in_is_fail_closed() {
+    let missing_allowlist = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "forward_sensitive_query": true
+        }),
+        PluginHttpClient::default(),
+    );
+    assert!(
+        missing_allowlist
+            .err()
+            .unwrap()
+            .contains("forward_sensitive_query_allowlist"),
+        "true without allowlist must fail closed"
+    );
+
+    let allowlist_without_flag = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "forward_sensitive_query_allowlist": ["access_token"]
+        }),
+        PluginHttpClient::default(),
+    );
+    assert!(
+        allowlist_without_flag
+            .err()
+            .unwrap()
+            .contains("forward_sensitive_query=true"),
+        "allowlist without opt-in flag must fail closed"
+    );
+
+    let non_sensitive = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["page"]
+        }),
+        PluginHttpClient::default(),
+    );
+    assert!(
+        non_sensitive
+            .err()
+            .unwrap()
+            .contains("not a recognized sensitive query name"),
+        "non-sensitive allowlist names must be rejected"
+    );
+
+    let invalid_name = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["bad name"]
+        }),
+        PluginHttpClient::default(),
+    );
+    assert!(
+        invalid_name
+            .err()
+            .unwrap()
+            .contains("is not a valid query parameter name"),
+        "hostile allowlist names must be rejected"
+    );
+
+    let malformed = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "sensitive_query_patterns": "not-an-array"
+        }),
+        PluginHttpClient::default(),
+    );
+    assert!(
+        malformed
+            .err()
+            .unwrap()
+            .contains("sensitive_query_patterns"),
+        "malformed pattern config must fail closed"
+    );
+
+    assert!(
+        RequestMirror::new(
+            &json!({
+                "mirror_host": "mirror.local",
+                "sensitive_query_patterns": ["x-vendor-"],
+                "forward_sensitive_query": true,
+                "forward_sensitive_query_allowlist": ["x-vendor-token"]
+            }),
+            PluginHttpClient::default(),
+        )
+        .is_ok(),
+        "a query name denied only by a configured pattern must be allowlistable"
+    );
+    assert!(
+        RequestMirror::new(
+            &json!({
+                "mirror_host": "mirror.local",
+                "forward_sensitive_query": true,
+                "forward_sensitive_query_allowlist": ["x-amz-signature", "oauth_token"]
+            }),
+            PluginHttpClient::default(),
+        )
+        .is_ok(),
+        "delimiter-bounded built-in credential names must be allowlistable"
+    );
+}
+
+#[test]
+fn sensitive_query_config_bounds_reject_unbounded_lists_and_items() {
+    let patterns_overflow = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "sensitive_query_patterns": (0..65).map(|i| format!("pat{i}")).collect::<Vec<_>>()
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        patterns_overflow.contains("sensitive_query_patterns")
+            && patterns_overflow.contains("at most 64"),
+        "expected pattern count bound, got {patterns_overflow}"
+    );
+
+    let pattern_len = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "sensitive_query_patterns": ["x".repeat(129)]
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        pattern_len.contains("maximum length of 128"),
+        "expected pattern length bound, got {pattern_len}"
+    );
+
+    let allow_count = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "sensitive_query_patterns": (0..64).map(|i| format!("vendorkey{i}")).collect::<Vec<_>>(),
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": (0..65)
+                .map(|i| format!("x-vendorkey{i}"))
+                .collect::<Vec<_>>()
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        allow_count.contains("forward_sensitive_query_allowlist")
+            && allow_count.contains("at most 64"),
+        "expected allowlist count bound, got {allow_count}"
+    );
+}
+
+#[tokio::test]
+async fn sensitive_query_pairs_stripped_by_default_primary_unchanged() {
+    let mut ctx = make_ctx_with_proxy();
+    const RAW: &str = "x=1&access_token=live-secret&x=2";
+    ctx.set_raw_query_string(RAW.to_string());
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        request_line.contains("x=1&x=2"),
+        "non-sensitive raw pairs and order must be retained: {request_line}"
+    );
+    assert!(
+        !request_line.contains("access_token") && !request_line.contains("live-secret"),
+        "default mirror must omit the sensitive pair: {request_line}"
+    );
+    assert_eq!(
+        ctx.raw_query_string(),
+        Some(RAW),
+        "primary/raw query snapshot must stay byte-for-byte unchanged"
+    );
+}
+
+#[tokio::test]
+async fn sensitive_query_retain_all_keeps_empty_segments_byte_for_byte() {
+    let mut ctx = make_ctx_with_proxy();
+    const RAW: &str = "keep=1&&flag&x=";
+    ctx.set_raw_query_string(RAW.to_string());
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        request_line.contains(&format!("?{RAW} ")),
+        "retain-all must borrow original empty segments and trailing flags: {request_line}"
+    );
+    assert_eq!(
+        ctx.raw_query_string(),
+        Some(RAW),
+        "primary/raw query snapshot must stay byte-for-byte unchanged"
+    );
+}
+
+#[tokio::test]
+async fn sensitive_query_allowlist_forwards_only_listed_decoded_names() {
+    let mut ctx = make_ctx_with_proxy();
+    ctx.set_raw_query_string("access_token=allow-me&api_key=nope&x=1".to_string());
+
+    let request_line = capture_mirror_request_line_with_config(
+        &mut ctx,
+        json!({
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["access_token"]
+        }),
+    )
+    .await;
+    assert!(
+        request_line.contains("access_token=allow-me&x=1"),
+        "allowlisted decoded name must forward with original encoding: {request_line}"
+    );
+    assert!(
+        !request_line.contains("api_key") && !request_line.contains("nope"),
+        "non-allowlisted credential must stay stripped: {request_line}"
+    );
+}
+
+#[tokio::test]
+async fn sensitive_query_strips_encoded_case_repeated_empty_and_all_sensitive_shapes() {
+    let mut ctx = make_ctx_with_proxy();
+    ctx.set_raw_query_string(
+        "keep=ok&ACCESS_TOKEN=A&%61ccess_token=B&access_token=&sig=C&sig=D&signal=1&x=".to_string(),
+    );
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        request_line.contains("keep=ok&signal=1&x="),
+        "non-sensitive pairs including empty values must keep raw encoding: {request_line}"
+    );
+    for forbidden in [
+        "ACCESS_TOKEN",
+        "%61ccess_token",
+        "access_token",
+        "sig=",
+        "=A",
+        "=B",
+        "=C",
+        "=D",
+    ] {
+        assert!(
+            !request_line.contains(forbidden),
+            "must omit sensitive encoding/case/repeat/empty shape `{forbidden}`: {request_line}"
+        );
+    }
+    assert!(
+        request_line.contains("/api/users?keep=ok"),
+        "path must stay intact and not inherit query delimiters: {request_line}"
+    );
+
+    let mut all_sensitive = make_ctx_with_proxy();
+    all_sensitive.set_raw_query_string("access_token=one&api_key=two&sig=three".to_string());
+    let all_line = capture_mirror_request_line(&mut all_sensitive).await;
+    assert!(
+        !all_line.contains('?') && !all_line.contains('&') && all_line.contains("/api/users "),
+        "all-sensitive query must yield a valid target with no leftover delimiters: {all_line}"
+    );
+}
+
+#[tokio::test]
+async fn sensitive_query_map_fallback_strips_without_form_encoder_rewrite() {
+    let mut ctx = make_ctx_with_proxy();
+    ctx.query_params.insert("q".to_string(), "a b".to_string());
+    ctx.query_params
+        .insert("access_token".to_string(), "map-secret".to_string());
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        request_line.contains("q=a%20b"),
+        "map fallback must RFC-encode remaining pairs, not form-encode: {request_line}"
+    );
+    assert!(
+        !request_line.contains("access_token") && !request_line.contains("map-secret"),
+        "map fallback must still strip sensitive names: {request_line}"
+    );
+    assert!(
+        ctx.query_params.contains_key("access_token"),
+        "primary query_params must remain unchanged"
+    );
+}
+
+#[tokio::test]
+async fn sensitive_query_hostile_encoding_prefixed_credentials_and_benign_names() {
+    let mut ctx = make_ctx_with_proxy();
+    const RAW: &str = concat!(
+        "keep=1&%61ccess_token=s1&%2561ccess_token=s2&",
+        "oauth_token=s3&x-amz-signature=s4&x-goog-signature=s5&",
+        "continuation_token=ok&signal=1&foo%GG=bad&tok%00en=nul"
+    );
+    ctx.set_raw_query_string(RAW.to_string());
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        request_line.contains("keep=1&continuation_token=ok&signal=1"),
+        "benign continuation_token/signal and order must be retained: {request_line}"
+    );
+    for forbidden in [
+        "%61ccess_token",
+        "%2561ccess_token",
+        "oauth_token",
+        "x-amz-signature",
+        "x-goog-signature",
+        "foo%GG",
+        "tok%00en",
+        "=s1",
+        "=s2",
+        "=s3",
+        "=s4",
+        "=s5",
+        "=bad",
+        "=nul",
+    ] {
+        assert!(
+            !request_line.contains(forbidden),
+            "must omit hostile/prefixed credential `{forbidden}`: {request_line}"
+        );
+    }
+    assert_eq!(
+        ctx.raw_query_string(),
+        Some(RAW),
+        "primary/raw query snapshot must stay byte-for-byte unchanged"
+    );
+
+    let mut residual = make_ctx_with_proxy();
+    const RESIDUAL: &str = "keep=2&%2525252561ccess_token=hidden";
+    residual.set_raw_query_string(RESIDUAL.to_string());
+    let residual_line = capture_mirror_request_line(&mut residual).await;
+    assert!(
+        residual_line.contains("keep=2")
+            && !residual_line.contains("%2525252561")
+            && !residual_line.contains("hidden"),
+        "decode-depth residual %XX must fail closed: {residual_line}"
+    );
+    assert_eq!(residual.raw_query_string(), Some(RESIDUAL));
+
+    let mut allow = make_ctx_with_proxy();
+    allow.set_raw_query_string("%2561ccess_token=allow-me&x=1".to_string());
+    let allow_line = capture_mirror_request_line_with_config(
+        &mut allow,
+        json!({
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["access_token"]
+        }),
+    )
+    .await;
+    assert!(
+        allow_line.contains("%2561ccess_token=allow-me&x=1"),
+        "allowlist must match the decoded name and keep the raw encoded pair: {allow_line}"
+    );
+
+    let mut all_sensitive = make_ctx_with_proxy();
+    all_sensitive
+        .set_raw_query_string("oauth_token=a&x-amz-signature=b&x-goog-signature=c".to_string());
+    let all_line = capture_mirror_request_line(&mut all_sensitive).await;
+    assert!(
+        !all_line.contains('?') && !all_line.contains('&') && all_line.contains("/api/users "),
+        "all-sensitive prefixed credentials must drop leftover delimiters: {all_line}"
+    );
+}
+
+#[tokio::test]
+async fn sensitive_query_parser_differentials_fail_closed() {
+    let mut ctx = make_ctx_with_proxy();
+    const RAW: &str = concat!(
+        "keep=1&carrier=ok;access_token=semicolon-secret&",
+        "api+key=plus-secret&api%20key=space-secret&api.key=dot-secret&signal=1"
+    );
+    ctx.set_raw_query_string(RAW.to_string());
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        request_line.contains("keep=1&signal=1"),
+        "unambiguous benign pairs must retain their order: {request_line}"
+    );
+    for forbidden in [
+        "carrier=",
+        "access_token",
+        "api+key",
+        "api%20key",
+        "api.key",
+        "semicolon-secret",
+        "plus-secret",
+        "space-secret",
+        "dot-secret",
+    ] {
+        assert!(
+            !request_line.contains(forbidden),
+            "parser-differential credential shape must be omitted: {forbidden}: {request_line}"
+        );
+    }
+    assert_eq!(
+        ctx.raw_query_string(),
+        Some(RAW),
+        "primary raw query must remain byte-for-byte unchanged"
+    );
+}
+
+#[tokio::test]
+async fn sensitive_query_unicode_control_names_fail_closed() {
+    let mut direct = make_ctx_with_proxy();
+    const DIRECT_RAW: &str = "keep=1&%C2%85=secret&signal=1";
+    direct.set_raw_query_string(DIRECT_RAW.to_string());
+
+    let direct_line = capture_mirror_request_line(&mut direct).await;
+    assert!(
+        direct_line.contains("keep=1&signal=1"),
+        "benign pairs must be retained: {direct_line}"
+    );
+    assert!(
+        !direct_line.contains("%C2%85") && !direct_line.contains("secret"),
+        "direct percent-encoded Unicode control name must be omitted: {direct_line}"
+    );
+    assert_eq!(
+        direct.raw_query_string(),
+        Some(DIRECT_RAW),
+        "primary raw query must stay byte-for-byte unchanged"
+    );
+
+    let mut nested = make_ctx_with_proxy();
+    const NESTED_RAW: &str = "keep=2&%25C2%2585=hidden";
+    nested.set_raw_query_string(NESTED_RAW.to_string());
+
+    let nested_line = capture_mirror_request_line(&mut nested).await;
+    assert!(
+        nested_line.contains("keep=2"),
+        "benign pair must be retained: {nested_line}"
+    );
+    assert!(
+        !nested_line.contains("%25C2%2585") && !nested_line.contains("hidden"),
+        "nested percent-encoded Unicode control name must be omitted: {nested_line}"
+    );
+    assert_eq!(
+        nested.raw_query_string(),
+        Some(NESTED_RAW),
+        "primary raw query must stay byte-for-byte unchanged"
     );
 }
 

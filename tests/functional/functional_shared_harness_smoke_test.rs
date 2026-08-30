@@ -199,13 +199,14 @@ async fn test_harness_file_mode_yaml_config() {
     assert_eq!(body["echo"], "/hi");
 }
 
-// ─── Process identity (issue #3428) ────────────────────────────────────────
+// ─── Process identity (issue #3428 / #4253) ───────────────────────────────
 //
 // `ephemeral_port()` releases the listener before the child binds, so under
 // parallel functional execution another gateway can claim either port. These
 // tests are the contract for the ownership probe that closes that hole: a
-// foreign listener — even one that answers `/health` as ready — must never be
-// mistaken for the spawned child.
+// foreign listener — even one that answers `/health` as ready, including via
+// an allowed-CIDR observability grant — must never be mistaken for the spawned
+// child. JWT `GET /proxies` is the credential-specific proof.
 
 /// How a fake `/health` responder decides which tier to answer with.
 #[derive(Clone)]

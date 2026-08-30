@@ -154,7 +154,51 @@ pub fn socket_cookie(_stream: &tokio::net::TcpStream) -> std::io::Result<u64> {
     ))
 }
 
+// ── dual-stack bind classification ──────────────────────────────────────────
+
+/// Whether `e` reports that IPv6 is unavailable on this host, so a caller that
+/// PREFERS a dual-stack `[::]` bind may safely fall back to the IPv4 wildcard.
+///
+/// True ONLY for "address family not supported" / "cannot assign requested
+/// address" / "protocol not supported". A real conflict such as `EADDRINUSE`
+/// must NOT be classified here: falling back on it would report a capture
+/// listener "started" on IPv4 while `ip6tables` still redirects IPv6 to that
+/// port with nothing listening for it — a silent black hole behind a healthy
+/// readiness signal. This is the single definition shared by the mesh TCP
+/// capture listener bind and the mesh UDP capture socket bind.
+pub fn is_ipv6_unavailable_io_error(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::AddrNotAvailable || ipv6_unavailable_errno(e)
+}
+
+/// The platform-specific half of [`is_ipv6_unavailable_io_error`], split out so
+/// the public predicate has one unconditional body.
+#[cfg(unix)]
+fn ipv6_unavailable_errno(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EAFNOSUPPORT) | Some(libc::EADDRNOTAVAIL) | Some(libc::EPROTONOSUPPORT)
+    )
+}
+
+#[cfg(not(unix))]
+fn ipv6_unavailable_errno(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Unsupported
+}
+
 // ── SO_ORIGINAL_DST ─────────────────────────────────────────────────────────
+
+/// The local address `original_dst_from_raw_fd` uses to choose the conntrack
+/// socket-option family for an accepted connection.
+///
+/// An IPv4-mapped IPv6 local address (`::ffff:a.b.c.d`) — what a dual-stack
+/// listener reports for an IPv4 connection — describes an IPv4 flow and folds to
+/// its plain IPv4 form, selecting `SOL_IP`/`SO_ORIGINAL_DST`. Native IPv6 and
+/// native IPv4 addresses are returned unchanged. Exposed (and platform
+/// independent) so the family choice is unit-testable without a live
+/// netfilter-redirected socket; the Linux lookup calls exactly this.
+pub fn original_dst_lookup_addr(local_addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    crate::util::client_identity::canonical_socket_addr(local_addr)
+}
 
 /// Read the pre-NAT original destination of an iptables-`REDIRECT`ed TCP
 /// connection (Linux netfilter `SO_ORIGINAL_DST` / `IP6T_SO_ORIGINAL_DST`).
@@ -174,6 +218,10 @@ pub fn socket_cookie(_stream: &tokio::net::TcpStream) -> std::io::Result<u64> {
 /// iptables model). eBPF `connect4`-rewritten capture (NodeWaypoint) never
 /// creates a conntrack entry; its original destination lives in the eBPF
 /// orig-dst records instead.
+///
+/// The conntrack lookup family comes from [`original_dst_lookup_addr`], so a
+/// dual-stack capture listener's IPv4-mapped accept (`::ffff:a.b.c.d`) uses the
+/// IPv4 socket option and recovers the pre-NAT IPv4 destination (issue #4271).
 #[cfg(target_os = "linux")]
 pub fn original_dst(stream: &tokio::net::TcpStream) -> Option<std::net::SocketAddr> {
     use std::os::fd::AsRawFd;
@@ -195,7 +243,24 @@ pub fn original_dst_from_raw_fd(
     const SO_ORIGINAL_DST: libc::c_int = 80;
     const IP6T_SO_ORIGINAL_DST: libc::c_int = 80;
 
-    let orig: std::net::SocketAddr = if local_addr.is_ipv4() {
+    // Pick the conntrack socket-option family from the CANONICAL local address,
+    // never from the raw `SocketAddr` variant (issue #4271).
+    //
+    // The mesh TCP capture listeners bind the dual-stack IPv6 wildcard so a
+    // single socket claims both families, and a dual-stack accept reports an
+    // IPv4 connection's local address as the IPv4-MAPPED form `::ffff:a.b.c.d`
+    // — an `AF_INET6` `SocketAddr` describing an IPv4 flow. Branching on the
+    // raw variant would then issue `getsockopt(SOL_IPV6, IP6T_SO_ORIGINAL_DST)`
+    // against an IPv4 conntrack entry, which answers `ENOENT`, and every
+    // captured IPv4 connection would silently report "no original destination"
+    // — losing multi-port service disambiguation and pre-handshake
+    // `PeerAuthentication.portLevelMtls` selection. Folding the mapped form back
+    // to IPv4 first selects `SOL_IP`/`SO_ORIGINAL_DST` and recovers the real
+    // pre-NAT IPv4 destination. A NATIVE IPv6 local address is untouched and
+    // keeps the `IP6T_SO_ORIGINAL_DST` path.
+    let canonical_local = original_dst_lookup_addr(local_addr);
+
+    let orig: std::net::SocketAddr = if canonical_local.is_ipv4() {
         let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
         let ret = unsafe {
@@ -208,6 +273,12 @@ pub fn original_dst_from_raw_fd(
             )
         };
         if ret != 0 {
+            // Diagnostic only: `ENOENT` here is the ordinary "this flow was not
+            // REDIRECTed" answer, which callers must keep treating as "no
+            // captured original destination". Log the errno so a genuine
+            // lookup failure (a wrong-family probe, a missing conntrack module)
+            // is distinguishable in the field instead of vanishing into `None`.
+            log_original_dst_lookup_failure("SOL_IP/SO_ORIGINAL_DST", local_addr);
             return None;
         }
         std::net::SocketAddr::new(
@@ -227,6 +298,7 @@ pub fn original_dst_from_raw_fd(
             )
         };
         if ret != 0 {
+            log_original_dst_lookup_failure("SOL_IPV6/IP6T_SO_ORIGINAL_DST", local_addr);
             return None;
         }
         std::net::SocketAddr::new(
@@ -237,11 +309,31 @@ pub fn original_dst_from_raw_fd(
 
     // A destination equal to the accepted socket's own local address means the
     // flow was not redirected (or conntrack echoed the post-NAT tuple back) —
-    // there is no original destination to act on.
-    if orig == local_addr {
+    // there is no original destination to act on. Compare against the CANONICAL
+    // local address: on a dual-stack accept the recovered v4 destination is an
+    // `AF_INET` address while the raw local address is v4-mapped `AF_INET6`, so
+    // comparing the raw forms would never match and this defensive check would
+    // be dead for exactly the family the dual-stack listener serves.
+    if orig == canonical_local {
         return None;
     }
     Some(orig)
+}
+
+/// Structured, secret-free diagnostic for a failed `SO_ORIGINAL_DST` lookup.
+///
+/// Kept out of [`original_dst_from_raw_fd`] so the success path stays a straight
+/// line, and deliberately at `debug` level: the overwhelmingly common cause is
+/// an un-redirected connection (`ENOENT`), which is normal on every direct dial.
+#[cfg(target_os = "linux")]
+fn log_original_dst_lookup_failure(option: &str, local_addr: std::net::SocketAddr) {
+    debug!(
+        sockopt = option,
+        local_addr = %local_addr,
+        error = %std::io::Error::last_os_error(),
+        "SO_ORIGINAL_DST lookup failed; treating the connection as having no captured \
+         original destination"
+    );
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -4168,7 +4260,7 @@ mod original_dst_live_tests {
     //! fail there instead of passing as skips. Local ad-hoc runs still self-skip
     //! without root / `unshare` / `iptables`.
 
-    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
     use std::os::fd::AsRawFd;
     use std::process::{Child, Command};
     use std::time::Duration;
@@ -4230,7 +4322,7 @@ mod original_dst_live_tests {
 
     #[test]
     #[ignore = "requires root + iptables to create a REDIRECT rule in a fresh netns"]
-    fn redirected_connection_reports_pre_nat_destination() {
+    fn redirected_ipv4_connection_on_dual_stack_listener_reports_pre_nat_destination() {
         if !is_root() {
             skip_or_fail("not root; cannot create network namespaces");
             return;
@@ -4265,34 +4357,61 @@ mod original_dst_live_tests {
 
         // Everything runs on one throwaway thread inside the child's netns
         // (`setns` mutates only the calling thread, which exits right after).
-        let orig = std::thread::spawn(move || -> Result<Option<SocketAddr>, String> {
-            let ns = std::fs::File::open(format!("/proc/{pid}/ns/net"))
-                .map_err(|e| format!("open netns handle: {e}"))?;
-            // Safety: `ns` is an open netns handle owned for the call.
-            if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
-                return Err(format!("setns failed: {}", std::io::Error::last_os_error()));
-            }
-            let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, CAPTURE_PORT)))
-                .map_err(|e| format!("bind capture listener: {e}"))?;
-            // Dial the "service port"; netfilter REDIRECTs it onto the
-            // capture listener — exactly the sidecar capture shape.
-            let _client = TcpStream::connect_timeout(
-                &SocketAddr::from((Ipv4Addr::LOCALHOST, DIAL_PORT)),
-                Duration::from_secs(2),
-            )
-            .map_err(|e| format!("redirected connect: {e}"))?;
-            let (accepted, _) = listener.accept().map_err(|e| format!("accept: {e}"))?;
-            let local = accepted
-                .local_addr()
-                .map_err(|e| format!("local_addr: {e}"))?;
-            Ok(crate::socket_opts::original_dst_from_raw_fd(
-                accepted.as_raw_fd(),
-                local,
-            ))
-        })
+        let (local, orig) = std::thread::spawn(
+            move || -> Result<(SocketAddr, Option<SocketAddr>), String> {
+                let ns = std::fs::File::open(format!("/proc/{pid}/ns/net"))
+                    .map_err(|e| format!("open netns handle: {e}"))?;
+                // Safety: `ns` is an open netns handle owned for the call.
+                if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                    return Err(format!("setns failed: {}", std::io::Error::last_os_error()));
+                }
+                // Match the production issue-#4271 capture shape exactly: one
+                // AF_INET6 wildcard with V6ONLY disabled accepts both native IPv6
+                // and IPv4-mapped traffic. A plain IPv4 listener would not exercise
+                // the family-selection bug this regression test exists to catch.
+                let socket = socket2::Socket::new(
+                    socket2::Domain::IPV6,
+                    socket2::Type::STREAM,
+                    Some(socket2::Protocol::TCP),
+                )
+                .map_err(|e| format!("create dual-stack capture socket: {e}"))?;
+                socket
+                    .set_only_v6(false)
+                    .map_err(|e| format!("disable IPV6_V6ONLY: {e}"))?;
+                socket
+                    .bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, CAPTURE_PORT)).into())
+                    .map_err(|e| format!("bind dual-stack capture listener: {e}"))?;
+                socket
+                    .listen(128)
+                    .map_err(|e| format!("listen on dual-stack capture socket: {e}"))?;
+                let listener: TcpListener = socket.into();
+                // Dial the "service port"; netfilter REDIRECTs it onto the
+                // dual-stack capture listener as an IPv4-mapped accept.
+                let _client = TcpStream::connect_timeout(
+                    &SocketAddr::from((Ipv4Addr::LOCALHOST, DIAL_PORT)),
+                    Duration::from_secs(2),
+                )
+                .map_err(|e| format!("redirected connect: {e}"))?;
+                let (accepted, _) = listener.accept().map_err(|e| format!("accept: {e}"))?;
+                let local = accepted
+                    .local_addr()
+                    .map_err(|e| format!("local_addr: {e}"))?;
+                let orig =
+                    crate::socket_opts::original_dst_from_raw_fd(accepted.as_raw_fd(), local);
+                Ok((local, orig))
+            },
+        )
         .join()
         .expect("netns scenario thread must not panic")
         .expect("live SO_ORIGINAL_DST scenario must complete");
+
+        assert!(
+            matches!(
+                local.ip(),
+                IpAddr::V6(v6) if v6.to_ipv4_mapped() == Some(Ipv4Addr::LOCALHOST)
+            ),
+            "the AF_INET6 dual-stack listener must expose the IPv4 flow as a mapped local address; got {local}"
+        );
 
         assert_eq!(
             orig,

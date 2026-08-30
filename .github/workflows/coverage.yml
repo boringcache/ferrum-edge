@@ -135,18 +135,27 @@ jobs:
     if: needs.coverage-plan.outputs.mode != 'skip'
     runs-on: ubuntu-latest
     # A cold/partial-cache lib + unit_tests llvm-cov invocation can exceed the
-    # old 45-minute budget even though warm shards normally finish sooner. Keep
-    # the combined invocation so runner loss cannot discard the shared compile.
-    timeout-minutes: 75
+    # old 45- and 75-minute budgets even though warm shards normally finish
+    # sooner. Keep the combined invocation so runner loss cannot discard the
+    # shared compile. Issue #4368: PR #4347 run 33223661366 attempt 1 job
+    # 99027333486 was still progressing through passing unit tests when the
+    # 75-minute deadline canceled it. Cap cargo's jobserver below the #4099
+    # value of 3 so peak memory fits the runner, and keep enough wall-clock
+    # for the slower compile plus the remaining suite.
+    timeout-minutes: 120
     env:
-      # Issue #4099: cold-cache instrumented compiles have killed hosted
+      # Issue #4099 / #4368: cold-cache instrumented compiles have killed hosted
       # runners ("shutdown signal" + exit 143) during the cargo compile
       # phase, before any test runs — the same memory-ceiling signature as
-      # fips-test-build (#4018). Cap cargo's jobserver so peak memory fits
-      # the runner, and shrink debuginfo per codegen thread. llvm-cov's
-      # instrumentation flags (`--no-report`, `--lib`, `--test`, nextest)
-      # are untouched.
-      CARGO_BUILD_JOBS: "3"
+      # fips-test-build (#4018). PR #4336 run 33219849557 job 99020110238
+      # reproduced that stall at CARGO_BUILD_JOBS=3 (silent after
+      # Compiling testcontainers v0.27.3, then exit 143). Cap cargo's
+      # jobserver at 2 so peak memory fits the runner, and shrink debuginfo
+      # per codegen thread. llvm-cov's instrumentation flags (`--no-report`,
+      # `--lib`, `--test`, nextest) are untouched. The cap is job-level
+      # because GitHub cannot set per-matrix-row env without splitting the
+      # shard job; integration shards finish well under the new deadline.
+      CARGO_BUILD_JOBS: "2"
       # `line-tables-only` keeps file:line for backtraces and drops only
       # variable-level DWARF. Line/region attribution comes from
       # `-C instrument-coverage` mapping sections, not from DWARF locals, so

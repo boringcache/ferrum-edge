@@ -207,6 +207,7 @@ fn start_gateway_with_extra_env(
     tls_cert_path: Option<&str>,
     tls_key_path: Option<&str>,
     extra_env: &[(&str, &str)],
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let mut cmd = std::process::Command::new(gateway_binary_path());
     cmd.env("FERRUM_MODE", "file")
@@ -229,24 +230,27 @@ fn start_gateway_with_extra_env(
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
+    identity.apply_to_command(&mut cmd);
 
     Ok(cmd.spawn()?)
 }
 
-/// Wait for the gateway health endpoint to respond.
-/// Returns true if healthy, false if timed out.
-async fn wait_for_health(admin_port: u16) -> bool {
-    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
-    let deadline = std::time::SystemTime::now() + Duration::from_secs(30);
-    loop {
-        if std::time::SystemTime::now() >= deadline {
-            return false;
-        }
-        match reqwest::get(&health_url).await {
-            Ok(r) if r.status().is_success() => return true,
-            _ => sleep(Duration::from_millis(500)).await,
-        }
-    }
+/// Wait until `child` owns `admin_port`. Unauthenticated `/health` and
+/// CIDR-granted health detail are not identity: a parallel test can steal
+/// the bind-drop port and answer 200 after this child has already exited.
+async fn wait_for_owned_gateway(
+    child: &mut std::process::Child,
+    admin_port: u16,
+    identity: &crate::common::SpawnedGatewayIdentity,
+) -> bool {
+    crate::common::wait_for_owned_gateway_identity(
+        child,
+        admin_port,
+        identity,
+        Duration::from_secs(30),
+    )
+    .await
+    .is_ok()
 }
 
 async fn tagged_round_trip(
@@ -330,6 +334,8 @@ where
         let config_content = make_config(proxy_listen_port);
         std::fs::write(&config_path, &config_content).unwrap();
 
+        let identity = crate::common::SpawnedGatewayIdentity::mint("tcp-proxy");
+
         let mut child = match start_gateway_with_extra_env(
             config_path.to_str().unwrap(),
             http_port,
@@ -337,6 +343,7 @@ where
             tls_cert_path,
             tls_key_path,
             extra_env,
+            &identity,
         ) {
             Ok(c) => c,
             Err(e) => {
@@ -351,7 +358,7 @@ where
             }
         };
 
-        if wait_for_health(admin_port).await {
+        if wait_for_owned_gateway(&mut child, admin_port, &identity).await {
             return (child, proxy_listen_port, admin_port, dir);
         }
 

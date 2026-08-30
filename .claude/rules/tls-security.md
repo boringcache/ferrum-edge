@@ -85,8 +85,18 @@ paths:
   Frontend H1/H2/H3, admin HTTPS, and DTLS consumers reload the CRL only when
   `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`; a refused candidate retains
   the complete last accepted verifier, generation, and live sessions.
-- CRL applies to frontend mTLS for H1/H2/H3/DTLS, all rustls backend paths, and rustls logging sinks.
-- CRL does not apply to DP-to-CP gRPC or reqwest-based plugin paths because those stacks do not expose compatible CRL config.
+- CRL applies to frontend mTLS for H1/H2/H3/DTLS, rustls backend data
+  paths, rustls health-check probes, and rustls logging sinks.
+- CRL does not apply to DP-to-CP gRPC or reqwest-based plugin paths because
+  those stacks do not expose compatible CRL config. Skip-verify health
+  probes also skip CRL enforcement, matching the data-path skip-verify
+  contract.
+- Backend TLS live reload stores the newly admitted `SharedCrlList`
+  generation and then restarts active health probes so replacement tasks
+  snapshot that generation. A refused candidate retains the previous
+  verifier, generation, and probe tasks.
+- One shared policy governs every CRL-enabled verifier: `tls::crl_policy::apply_client_crl_policy` / `apply_server_crl_policy`. A CRL list may only be attached to a rustls verifier inside `src/tls/crl_policy.rs`; `tests/unit/tls/crl_policy_tests.rs` pins that statically. The policy is full-chain revocation (rustls's default depth — never narrow it back to the end entity), retained `allow_unknown_revocation_status()`, and `enforce_revocation_expiration()`.
+- CRL admission is temporal and atomic: `tls::crl_policy::validate_crl_windows` refuses a future `thisUpdate`, a missing `nextUpdate`, and `now >= nextUpdate` (webpki's own boundary), and one unusable record refuses the whole candidate. `tls::load_crls` (startup/config/live reload) and `admin::tls_management::validate_crl_bundle` (`/admin/tls/validate` + managed create/update) are the only admission points and must share it. Diagnostics carry the record index and redacted source id only.
 - CRL reload requires restart for backend TLS and rustls logging sinks;
   frontend client-certificate verification follows the opt-in live-reload and
   established-session retirement contract above.

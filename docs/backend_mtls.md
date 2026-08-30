@@ -187,7 +187,9 @@ when verification is disabled.
 > The proxy backend path (HTTP/1.1, H2, HTTP/3, gRPC, WebSocket, TCP/TLS) builds its trust store in-house from `webpki-roots`'s `TLS_SERVER_ROOTS` and hands the resulting `rustls::ClientConfig` to reqwest via `use_preconfigured_tls(...)`. That means the "no custom CA" fallback always uses bundled webpki on every platform — Linux, macOS, and Windows — regardless of OS keychain contents. Only the `FERRUM_TLS_CA_BUNDLE_PATH` / `_SOURCE` or per-proxy CA paths can change which roots the gateway trusts for backend traffic.
 
 > **Trust roots — internal helper clients.**
-> A few internal-helper reqwest clients (active health-check probes, plugin outbound HTTP via `PluginHttpClient`, the `spec_expose` plugin) do not preconfigure TLS the way the proxy backend path does. As of reqwest 0.13 those clients use `rustls-platform-verifier`, which resolves trust roots from the **OS keychain on macOS/Windows** and from the host CA bundle on Linux (`rustls-native-certs`, typically `/etc/ssl/certs` via `ca-certificates`). Linux does **not** fall through to bundled webpki when that host bundle is missing or empty: verifier construction fails instead. `PluginHttpClient` then constructs a fail-closed client — native/built-in roots disabled, empty trust store, certificate verification still enabled — so the gateway stays up and plugin HTTPS calls fail at handshake rather than aborting the process. If even that bounded empty-trust construction fails, the shared client stays inert and outbound plugin HTTP fails closed without hanging, panicking, or restoring ambient proxy, redirects, or an unapproved crypto provider. Ambient proxy environment and redirect following stay disabled on that fallback. When the gateway DNS resolver is present, every fallback retains it so hostname resolution cannot bypass `FERRUM_BACKEND_ALLOW_IPS`; the HTTP/2 companion likewise retains prior-knowledge mode instead of downgrading h2c. Operators running the gateway locally on macOS/Windows will see helper-client TLS verified against their OS keychain unless a `FERRUM_TLS_CA_BUNDLE_PATH` / `_SOURCE` or per-plugin CA is configured (in which case the custom CA replaces the trust store wholesale, per the exclusivity rule above). Production images should still ship CA certificates so ordinary plugin HTTPS can authenticate public peers.
+> A few internal-helper reqwest clients (plugin outbound HTTP via `PluginHttpClient`, the `spec_expose` plugin, and skip-verify health-check probes) do not preconfigure TLS the way the proxy backend path does. As of reqwest 0.13 those clients use `rustls-platform-verifier`, which resolves trust roots from the **OS keychain on macOS/Windows** and from the host CA bundle on Linux (`rustls-native-certs`, typically `/etc/ssl/certs` via `ca-certificates`). Linux does **not** fall through to bundled webpki when that host bundle is missing or empty: verifier construction fails instead. `PluginHttpClient` then constructs a fail-closed client — native/built-in roots disabled, empty trust store, certificate verification still enabled — so the gateway stays up and plugin HTTPS calls fail at handshake rather than aborting the process. If even that bounded empty-trust construction fails, the shared client stays inert and outbound plugin HTTP fails closed without hanging, panicking, or restoring ambient proxy, redirects, or an unapproved crypto provider. Ambient proxy environment and redirect following stay disabled on that fallback. When the gateway DNS resolver is present, every fallback retains it so hostname resolution cannot bypass `FERRUM_BACKEND_ALLOW_IPS`; the HTTP/2 companion likewise retains prior-knowledge mode instead of downgrading h2c. Operators running the gateway locally on macOS/Windows will see helper-client TLS verified against their OS keychain unless a `FERRUM_TLS_CA_BUNDLE_PATH` / `_SOURCE` or per-plugin CA is configured (in which case the custom CA replaces the trust store wholesale, per the exclusivity rule above). Production images should still ship CA certificates so ordinary plugin HTTPS can authenticate public peers.
+>
+> Verified HTTPS and gRPC health-check probes are not in that helper-client group: they preconfigure rustls with the same server verifier and shared CRL snapshot as proxy backend traffic.
 
 Backends using certificates from public CAs work out of the box with no CA configuration. Backends using internal or self-signed certificates require either a proxy-specific or global CA bundle.
 
@@ -354,6 +356,38 @@ cargo test test_backend_mtls_global_config -- --nocapture
 2. **Key Storage**: Consider using hardware security modules (HSMs) for production environments. Backend mTLS client keys can use `pkcs11://` RSA signer URIs when Ferrum is built with the `pkcs11` feature; see [pkcs11_tls.md](pkcs11_tls.md).
 3. **Certificate Rotation**: Keep `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` so backend cert/key/CA/CRL source changes are validated, backend CRLs are refreshed, HTTP-family backend pools are cleared, and active health checks restart with the rotated material.
 4. **Monitoring**: Monitor certificate expiration and renewal.
+
+### Backend CRL Policy
+
+`FERRUM_TLS_CRL_FILE_PATH` / `_SOURCE` is the same gateway-wide CRL source the
+frontend uses, and backend server verification applies the same shared policy.
+The full contract, including the admission table and boundary semantics, is in
+[frontend_tls.md → CRL Policy](frontend_tls.md#crl-policy). What matters
+outbound:
+
+- **Every certificate in the backend chain is checked, not just the leaf.** A
+  backend server whose issuing intermediate has been revoked by its own issuer
+  is refused, even when the leaf itself is not listed.
+- **A chain no configured CRL covers is still accepted.** Configuring a private
+  CRL does not turn every public-CA backend into a failure.
+- **An expired CRL is an error, not a fallback.** Once a loaded CRL passes its
+  `nextUpdate`, new backend connections that would be policed by it fail. In-flight
+  requests on already-established connections are unaffected; the refusal applies
+  to new handshakes. Refresh the CRL ahead of its own `nextUpdate`.
+- **A candidate CRL outside its validity window is refused whole.** Startup
+  fails; a live reload keeps the previously accepted CRL slot, backend pools, and
+  health checks exactly as they were, and logs a redacted warning.
+- **Active HTTPS and gRPC health-check probes share this policy.** Probe tasks
+  snapshot the same admitted `SharedCrlList` generation backend data-path
+  pools use. Backend TLS live reload stores the new generation first, then
+  restarts probes so replacement tasks load that exact snapshot. A refused
+  candidate retains the previous verifier, generation, and probe tasks.
+  Skip-verify probes skip CRL enforcement, matching the data-path skip-verify
+  contract. TCP and UDP probes perform no TLS handshake.
+- The same policy covers the rustls logging sinks (`tcp_logging` TLS,
+  `ws_logging` wss, `udp_logging` DTLS) and `ldap_auth` over `ldaps://` /
+  StartTLS. `kafka_logging` maps the source to librdkafka's `ssl.crl.location`
+  instead, and reqwest-based plugin egress does not apply CRLs at all.
 
 ### Operational Contract for Backend TLS Sources
 

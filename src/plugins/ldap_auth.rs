@@ -1392,9 +1392,10 @@ fn build_ldap_tls_config(
         // the gateway's parsed CRL list so revoked LDAP server certificates are
         // rejected, matching the proxy backend / DTLS / frontend mTLS / rustls
         // logging-sink surfaces (finding #84). When no CRL is configured this is
-        // equivalent to the default root-store verifier. `build_server_verifier_with_crls`
-        // uses `allow_unknown_revocation_status() + only_check_end_entity_revocation()`
-        // so certs from CAs without a matching CRL are still accepted.
+        // equivalent to the default root-store verifier. The shared
+        // `tls::crl_policy` applied inside `build_server_verifier_with_crls`
+        // retains unknown-status tolerance, so certs from CAs without a matching
+        // CRL are still accepted.
         let root_store = custom_root_store.unwrap_or_else(|| {
             rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
         });
