@@ -7581,6 +7581,9 @@ fn batch_ref_faults() -> std::sync::MutexGuard<'static, BatchRefFaultMap> {
 /// Install (or clear, with `None`) a deterministic reference-check failure
 /// for `namespace`. Keyed per namespace so tests sharing a process cannot
 /// perturb each other. Always clear the fault when the test finishes.
+///
+/// Reached through `_test_support`; the binary target has no consumer.
+#[allow(dead_code)]
 pub(crate) fn set_batch_reference_check_fault(namespace: &str, detail: Option<&str>) {
     let mut faults = batch_ref_faults();
     match detail {
