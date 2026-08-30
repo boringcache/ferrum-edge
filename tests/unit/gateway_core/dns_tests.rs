@@ -1209,7 +1209,7 @@ fn resolve_srv_discards_rfc2782_root_target_and_port_zero() {
     assert_eq!(mixed.priority, 0);
 }
 
-/// The ADDRESS-ONLY SRV mode (`FERRUM_DNS_RECORD_TYPES` containing `srv`) and
+/// The ADDRESS-ONLY SRV mode (`FERRUM_DNS_ORDER` containing `SRV`) and
 /// the DNS-SD service-availability path (`resolve_srv`) read the same RR type
 /// with deliberately different rules (issue #4291). This pins the distinction
 /// so neither silently inherits the other's contradictory behavior.

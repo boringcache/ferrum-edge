@@ -149,7 +149,7 @@ That last rule sets the direction of the failure mode. A bad tag can only turn t
 
 ## Address-only SRV mode
 
-`FERRUM_DNS_RECORD_TYPES` may include `srv`, which is a different feature from DNS-SD discovery. There, an SRV lookup answers "what IP addresses back this hostname"; the caller dials the proxy's own configured backend port. That mode therefore:
+`FERRUM_DNS_ORDER` may include `SRV`, which is a different feature from DNS-SD discovery. There, an SRV lookup answers "what IP addresses back this hostname"; the caller dials the proxy's own configured backend port. That mode therefore:
 
 - **ignores the RR's `port` entirely, including port `0`** — it does not apply the `admit_registry_port` rejection `resolve_srv` uses, because a port-0 RR still carries a perfectly usable target address and dropping it would blackhole a resolvable host over a field this mode never reads;
 - **honors the `.` root target**, which is a genuine availability signal rather than a port question, and skips it;
