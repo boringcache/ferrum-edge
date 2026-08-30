@@ -4,10 +4,10 @@ When the gateway receives SIGTERM or SIGINT, it performs a graceful shutdown tha
 
 ## Shutdown Sequence
 
-Serving modes (database, file, dp, mesh) run these phases **sequentially**, each with its own bounded budget. The worst-case total is the sum of every phase below, not just `FERRUM_SHUTDOWN_DRAIN_SECONDS`.
+Serving modes (database, file, cp, dp, mesh) run these phases **sequentially**, each with its own bounded budget. The worst-case total is the sum of every phase below, not just `FERRUM_SHUTDOWN_DRAIN_SECONDS`.
 
 1. **Signal received** — the process publishes its draining verdict *before* anything else: `/health` and `/status` immediately report `{"status": "draining", "ready": false}` with HTTP 503, while `/live` deliberately keeps returning 200 so a Kubernetes livenessProbe cannot SIGKILL the pod mid-drain
-2. **Pre-drain window (optional)** — for `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` (default `0`) every listener, proxy **and** admin, keeps accepting normally while readiness already reports not-ready. This is the window in which a load balancer or orchestrator can withdraw the replica from its endpoint set before a single new connection is refused. At the default `0` the shutdown broadcast fires immediately, exactly as before
+2. **Pre-drain window (optional)** — for `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` (default `0`) every listener keeps accepting normally while readiness already reports not-ready. In `database`/`file`/`dp`/`mesh` that is the proxy **and** admin listeners; in `cp` (the mesh chart's `controlPlane` and `ca` workloads) it is the admin HTTP/HTTPS plus CP gRPC / xDS listeners, all of which close on the same broadcast this window delays. This is the window in which a load balancer or orchestrator can withdraw the replica from its endpoint set before a single new connection is refused. At the default `0` the shutdown broadcast fires immediately, exactly as before
 3. **Shutdown broadcast** — SIGTERM/SIGINT is broadcast to all components
 4. **Accept loops exit** — no new connections are accepted on any listener (HTTP, HTTPS, H3, TCP, UDP)
 5. **Drain phase begins** — the per-instance `draining` flag is set, causing:
@@ -34,7 +34,8 @@ FERRUM_SHUTDOWN_DRAIN_SECONDS=30
 
 # Seconds every listener (proxy AND admin) keeps accepting after the signal,
 # while readiness already reports ready:false / 503 (default: 0 = disabled).
-# Serving modes only (database, file, dp, mesh).
+# Listener-serving modes only (database, file, cp, dp, mesh); injector,
+# node_agent, and migrate ignore it.
 FERRUM_SHUTDOWN_PREDRAIN_SECONDS=0
 
 # Shared observability shutdown budget in milliseconds (default: 2000)
@@ -74,7 +75,7 @@ terminationGracePeriodSeconds >= preStop + preDrain + drain
   + 5   # finalizer slack
 ```
 
-With the default 30s drain the post-SIGTERM budget is **78s**, and the chart's default 30s `preStop` brings the minimum to **108s**. The Ferrum gateway Helm chart defaults to **110s** and validates this at render time:
+With the default 30s drain the post-SIGTERM budget is **78s**, and the chart's default 30s `preStop` brings the minimum to **108s**. The Ferrum gateway and mesh Helm charts default to **110s** and validate this at render time:
 
 ```yaml
 spec:
@@ -104,7 +105,7 @@ The readiness probe is drain-aware: `ferrum-edge health` exits non-zero as soon 
 
 On clusters older than 1.29 there is no `SleepAction`. Use `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` instead: it holds the accept loops (proxy and admin) open *after* SIGTERM while readiness already reports not-ready, so kubelet's `failureThreshold x periodSeconds` removal path completes before any connection is refused. Set it to at least `failureThreshold x periodSeconds` and add it to the grace period.
 
-The Ferrum gateway Helm chart wires all of this from `shutdownPreStopSeconds`, `shutdownPreDrainSeconds`, `shutdownDrainSeconds`, and `probes.readiness.failureThreshold`, and fails `helm template` when the grace period cannot cover the sum.
+The Ferrum gateway and mesh Helm charts wire all of this from per-workload `shutdownPreStopSeconds`, `shutdownPreDrainSeconds`, `shutdownDrainSeconds`, and `probes.readiness.failureThreshold`, and fail `helm template` when the grace period cannot cover the sum. On Kubernetes older than 1.29, `ferrum-mesh` refuses a non-zero SleepAction `preStop` (except the unversioned `helm template` 1.20.0 sentinel) and tells operators to set `shutdownPreStopSeconds=0` and raise `shutdownPreDrainSeconds`.
 
 ### Load Balancer Integration
 

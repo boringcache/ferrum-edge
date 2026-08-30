@@ -22,7 +22,8 @@
     "admin_port_noncollision": "mesh-probes-admin-port-noncollision.yaml",
     "node_agent_https_no_ambient_collision": "mesh-probes-node-agent-https-no-ambient-collision.yaml",
     "node_agent_https_collision_err": "mesh-probes-node-agent-https-collision.err",
-    "node_waypoint": "mesh-probes-node-waypoint.yaml"
+    "node_waypoint": "mesh-probes-node-waypoint.yaml",
+    "startup_overrides": "mesh-probes-startup-overrides.yaml"
   },
   "workloads": [
     {
@@ -44,8 +45,7 @@
     {
       "name": "ferrum-mesh-east-west",
       "kind": "Deployment",
-      "handler": "tcp",
-      "tcp_port": "tls-passthru"
+      "handler": "admin_health"
     },
     {
       "name": "ferrum-mesh-ambient",

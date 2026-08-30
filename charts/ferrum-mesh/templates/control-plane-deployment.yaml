@@ -1,14 +1,22 @@
 {{- if .Values.controlPlane.enabled }}
 {{- $cpEnv := .Values.controlPlane.env | default dict -}}
-{{- $adminTarget := include "ferrum-mesh.adminProbeTargetFromEnv" $cpEnv | fromYaml -}}
+{{- $admin := include "ferrum-mesh.resolveComponentAdmin" (dict "component" "controlPlane" "env" $cpEnv "admin" (.Values.controlPlane.admin | default dict)) | fromYaml -}}
 {{- $handlers := dict "live" (dict) "ready" (dict) -}}
-{{- if ne (toString $adminTarget.port) "0" -}}
-{{- $handlers = include "ferrum-mesh.adminHealthHandlers" $adminTarget | fromYaml -}}
+{{- if ne (toString $admin.port) "0" -}}
+{{- $handlers = include "ferrum-mesh.adminHealthHandlers" $admin | fromYaml -}}
 {{- end -}}
 {{- $liveHandler := .Values.controlPlane.probes.liveness.override | default dict -}}
 {{- if not $liveHandler }}{{- $liveHandler = $handlers.live | default dict -}}{{- end -}}
 {{- $readyHandler := .Values.controlPlane.probes.readiness.override | default dict -}}
 {{- if not $readyHandler }}{{- $readyHandler = $handlers.ready | default dict -}}{{- end -}}
+{{- $startupHandler := .Values.controlPlane.probes.startup.override | default dict -}}
+{{- if not $startupHandler }}{{- $startupHandler = $liveHandler -}}{{- end -}}
+{{- /* An admin HTTP port of 0 leaves the computed handlers empty; `renderProbes`
+       would then silently omit the enabled probe, so a controlPlane rollout would keep
+       serving from the Service endpoint set through shutdown. Fail per probe.
+       Startup is classified independently so liveness.override cannot replace an
+       explicit startup.override (or hide a missing computed startup handler). */ -}}
+{{- include "ferrum-mesh.validateComputedProbeHandlers" (dict "component" "controlPlane" "probes" .Values.controlPlane.probes "startupHandler" $startupHandler "liveHandler" $liveHandler "readyHandler" $readyHandler) -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -30,40 +38,69 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       serviceAccountName: ferrum-mesh
+      terminationGracePeriodSeconds: {{ .Values.controlPlane.terminationGracePeriodSeconds }}
+      {{- with .Values.controlPlane.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
 {{- include "ferrum-mesh.renderTopologySpreadConstraints" (dict
   "Release" .Release
   "replicas" .Values.controlPlane.replicas
   "selectorName" "ferrum-mesh-control-plane"
   "constraints" .Values.controlPlane.topologySpreadConstraints) }}
+      {{- with .Values.controlPlane.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: ferrum-edge
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["run"]
+          {{- with .Values.controlPlane.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - name: grpc
               containerPort: {{ .Values.controlPlane.grpcPort }}
+            {{- if ne (toString $admin.port) "0" }}
+            - name: admin-http
+              containerPort: {{ $admin.port }}
+              protocol: TCP
+            {{- end }}
           env:
             {{- include "ferrum-mesh.renderControlPlaneRequiredEnv" . | nindent 12 }}
             {{- if not (hasKey .Values.controlPlane.env "FERRUM_K8S_CONTROLLER_NAMESPACE") }}
             - name: FERRUM_K8S_CONTROLLER_NAMESPACE
               value: {{ .Release.Namespace | quote }}
             {{- end }}
+            {{- include "ferrum-mesh.adminEnv" (dict "env" $cpEnv "resolved" $admin) | nindent 12 }}
+            {{- include "ferrum-mesh.shutdownEnv" .Values.controlPlane | nindent 12 }}
+            {{- include "ferrum-mesh.metricsEnv" . | nindent 12 }}
             {{- range $name, $value := .Values.controlPlane.env }}
-            {{- if not (has $name (list "FERRUM_DB_TYPE" "FERRUM_DB_URL" "FERRUM_ADMIN_JWT_SECRET" "FERRUM_CP_DP_GRPC_JWT_SECRET")) }}
+            {{- if not (has $name (list "FERRUM_DB_TYPE" "FERRUM_DB_URL" "FERRUM_ADMIN_JWT_SECRET" "FERRUM_CP_DP_GRPC_JWT_SECRET" "FERRUM_ADMIN_HTTP_PORT" "FERRUM_ADMIN_BIND_ADDRESS" "FERRUM_ALLOW_INSECURE_ADMIN_HTTP" "FERRUM_ADMIN_ALLOWED_CIDRS")) }}
             - name: {{ $name }}
               value: {{ $value | quote }}
             {{- end }}
             {{- end }}
-          {{- with .Values.controlPlane.extraVolumeMounts }}
           volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.controlPlane.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.controlPlane.probes "startupHandler" $startupHandler "liveHandler" $liveHandler "readyHandler" $readyHandler) }}
+          {{- include "ferrum-mesh.preStopLifecycle" .Values.controlPlane | nindent 10 }}
+          {{- with .Values.controlPlane.resources }}
+          resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.controlPlane.probes "liveHandler" $liveHandler "readyHandler" $readyHandler) }}
-      {{- with .Values.controlPlane.extraVolumes }}
       volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- with .Values.controlPlane.extraVolumes }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service

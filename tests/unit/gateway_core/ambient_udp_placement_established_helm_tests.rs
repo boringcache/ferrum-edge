@@ -338,19 +338,24 @@ fn the_steady_state_proxy_container_carries_no_preflight_surface() {
         "ambient-udp-preflight",
         "host-proc",
         "initContainers",
-        "allowPrivilegeEscalation",
     ] {
         assert!(
             !proxy.contains(forbidden),
             "the steady-state proxy container must not carry {forbidden}"
         );
     }
+    assert!(
+        proxy.contains(
+            "allowPrivilegeEscalation: {{ $ambientSc.allowPrivilegeEscalation | default false }}"
+        ),
+        "the steady-state proxy must emit Restricted allowPrivilegeEscalation, defaulting to false"
+    );
 
     // SYS_ADMIN/SYS_PTRACE still exist for the setns capture modes whose RUNNING
     // producer enters pod netns; they must never be reachable through the
     // preflight gate.
     let setns_gate = proxy
-        .find("{{- if $ambientSetnsCapture }}")
+        .find("{{- if $ambientSetnsCapture")
         .expect("steady-state setns capability gate");
     for privilege in ["SYS_ADMIN", "SYS_PTRACE"] {
         assert_eq!(
@@ -364,6 +369,89 @@ fn the_steady_state_proxy_container_carries_no_preflight_surface() {
             "{privilege} must sit inside the setns-capture gate, not the preflight one"
         );
     }
+
+    // Datapath capability names must stay unquoted (`- BPF`, not `- "BPF"`):
+    // NodeWaypoint eBPF live and Helm Chart greps match the unquoted form on
+    // both the proxy and the node-agent.
+    assert!(
+        proxy.contains("- {{ $cap }}")
+            && !proxy.contains("$cap | quote")
+            && !proxy.contains("ambientDropNormalized 0 | quote"),
+        "steady-state capability names must render unquoted so topology greps keep matching"
+    );
+    let bpf_gate = proxy
+        .find("{{- if $nodeWaypointRegistryEnabled -}}")
+        .expect("NodeWaypoint BPF/PERFMON gate");
+    for cap in ["BPF", "PERFMON"] {
+        assert_eq!(
+            proxy.matches(&format!("\"{cap}\"")).count(),
+            1,
+            "{cap} must appear once as a required NodeWaypoint capability token"
+        );
+        let at = proxy.find(&format!("\"{cap}\"")).expect("cap position");
+        assert!(
+            bpf_gate < at && at < setns_gate,
+            "{cap} must sit inside the NodeWaypoint registry gate"
+        );
+    }
+}
+
+#[test]
+fn ambient_proxy_security_context_defaults_allow_privilege_escalation_false() {
+    let ambient = read("templates/ambient-daemonset.yaml");
+    let values = read("values.yaml");
+    let schema = read("values.schema.json");
+
+    assert!(
+        !ambient.contains(
+            "ambient.securityContext.allowPrivilegeEscalation is not a steady-state proxy field"
+        ),
+        "allowPrivilegeEscalation is a Restricted proxy field, not a preflight-only key"
+    );
+    assert!(
+        ambient.contains(
+            "allowPrivilegeEscalation: {{ $ambientSc.allowPrivilegeEscalation | default false }}"
+        ),
+        "the proxy must render allowPrivilegeEscalation with a false default"
+    );
+
+    let ambient_sc = schema
+        .split("\"ambientSecurityContext\"")
+        .nth(1)
+        .expect("ambientSecurityContext schema");
+    let ambient_sc = ambient_sc
+        .split("\"workloadResources\"")
+        .next()
+        .unwrap_or(ambient_sc);
+    assert!(
+        ambient_sc.contains("allowPrivilegeEscalation")
+            && ambient_sc.contains("readOnlyRootFilesystem")
+            && ambient_sc.contains("capabilities"),
+        "ambient.securityContext must admit allowPrivilegeEscalation, readOnlyRootFilesystem, and capabilities"
+    );
+
+    let marker = "Unlike the Deployment workloads this is NOT rendered verbatim";
+    assert!(
+        values.contains(marker),
+        "values must document that ambient.securityContext is assembled field by field"
+    );
+    let sc_at = values
+        .find(marker)
+        .expect("ambient securityContext comment");
+    let sc_window = &values[sc_at..sc_at.saturating_add(1600).min(values.len())];
+    assert!(
+        sc_window.contains("allowPrivilegeEscalation: false"),
+        "ambient values must default allowPrivilegeEscalation to false for Restricted"
+    );
+    assert!(
+        !sc_window.contains("Privilege-escalation is NOT a proxy key")
+            && !sc_window.contains("not a steady-state proxy field"),
+        "values must not claim privilege-escalation belongs only to the preflight init container"
+    );
+    assert!(
+        sc_window.contains("readOnlyRootFilesystem: true") && sc_window.contains("- ALL"),
+        "ambient values must keep read-only root and drop ALL"
+    );
 }
 
 #[test]
