@@ -362,7 +362,8 @@ pub struct Http3ListenerOptions {
     /// Loaded CRLs for client certificate revocation checking. When non-empty
     /// and `client_ca_bundle_path` is set, the H3 mTLS verifier checks revocation
     /// with the same policy as H1/H2/DTLS frontend mTLS:
-    /// `allow_unknown_revocation_status` + `only_check_end_entity_revocation`.
+    /// the shared `tls::crl_policy` (full-chain revocation, enforced CRL
+    /// validity windows, retained unknown-status tolerance).
     pub client_crls: CrlList,
     pub started_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// Optional opt-in frontend TLS live-reload inputs. When `Some`, the H3
@@ -1689,8 +1690,38 @@ async fn handle_h3_connection(
     // refuse.
     let extended_connect_enabled = state.env_config.http3_websocket_enabled
         || crate::http3::connect_udp::connect_udp_profile_available(&state.env_config);
+    // Issue #4261: bound what one QUIC stream can make the H3 decoder buffer,
+    // and advertise the policy Ferrum actually enforces.
+    //
+    // A non-DATA frame (HEADERS, SETTINGS, GOAWAY, PUSH_PROMISE, and every
+    // unknown type, which has to be buffered before it can be skipped) is
+    // accumulated whole before it can be interpreted. QUIC flow control bounds
+    // only the bytes in flight — every read re-grants credit — so without a
+    // ceiling a peer can declare a 2^62-1 payload on one unauthenticated
+    // stream and stream bytes until the process is OOM-killed.
+    //
+    // Both values come from the same `FERRUM_MAX_HEADER_SIZE_BYTES` policy the
+    // H1 and H2 frontends derive their parser limits from, so the advertised
+    // SETTINGS_MAX_FIELD_SECTION_SIZE matches what is enforced instead of
+    // claiming VarInt::MAX. The ceiling carries headroom above the advertised
+    // value so a field section that merely overshoots the limit still reaches
+    // the graceful 431 below rather than a connection abort; that 431 check
+    // remains in place as defence in depth. DATA frames are deliberately NOT
+    // bounded by the ceiling — request bodies keep streaming under Ferrum's
+    // existing body-size policy.
+    //
+    // Both are plain integer reads of an already-validated configuration
+    // (`EnvConfig::validate` refuses a header limit that could not be
+    // represented as a QUIC varint), computed once per QUIC connection: no
+    // allocation and no lock on the per-request path.
+    let h3_max_field_section_size =
+        crate::http3::config::h3_max_field_section_size(state.max_header_size_bytes);
+    let h3_max_buffered_frame_len =
+        crate::http3::config::h3_max_buffered_frame_len(state.max_header_size_bytes);
     let mut h3_conn = h3::server::builder()
         .enable_extended_connect(extended_connect_enabled)
+        .max_field_section_size(h3_max_field_section_size)
+        .max_buffered_frame_len(h3_max_buffered_frame_len)
         .build(h3_quinn::Connection::new(connection))
         .await?;
 
@@ -1842,6 +1873,20 @@ async fn handle_h3_connection(
                             {
                                 error!("HTTP/3 request error: {}", e);
                             }
+                        }
+                        // Issue #4261: now that the listener advertises a real
+                        // SETTINGS_MAX_FIELD_SECTION_SIZE, an over-limit field
+                        // section is refused by h3 itself with a 431 before
+                        // Ferrum's own header checks run. That is an expected
+                        // client-policy rejection, not a gateway fault, so it
+                        // must not let an unauthenticated peer drive
+                        // error-level logging one stream at a time.
+                        Err(h3::error::StreamError::HeaderTooBig { actual_size, .. }) => {
+                            debug!(
+                                "HTTP/3 request field section of {} bytes exceeds the advertised \
+                                 SETTINGS_MAX_FIELD_SECTION_SIZE of {}; answered 431",
+                                actual_size, h3_max_field_section_size
+                            );
                         }
                         Err(e) => {
                             error!("HTTP/3 request resolution error: {}", e);

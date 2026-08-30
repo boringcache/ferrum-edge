@@ -6636,6 +6636,7 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
         asserted_identity: NodeWaypointAssertedIdentitySnapshot {
             accepted: 1,
             rejected_untrusted_assertor: 2,
+            rejected_assertion_out_of_scope: 3,
             rejected_trust_domain_mismatch: 0,
             rejected_unauthenticated_hbone: 0,
             rejected_malformed: 0,

@@ -219,7 +219,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://localhost:9000/admin/tls/validate
 ```
 
-`cert_pem` and `key_pem` must be submitted together. `ca_bundle_pem` and `crl_pem` can be validated independently. Private key bytes are never logged or persisted by this endpoint.
+`cert_pem` and `key_pem` must be submitted together. `ca_bundle_pem` and `crl_pem` can be validated independently. `crl_pem` is checked against each record's own validity window — a future `thisUpdate`, a missing `nextUpdate`, or a `nextUpdate` that has been reached is rejected, and one unusable record rejects the whole bundle rather than reporting the usable subset. `allow_expired` covers certificates only and never relaxes CRL validity; managed CRL create/update (`POST /admin/tls/crls`, `PUT /admin/tls/crls/{id}`) applies the identical check. See [frontend_tls.md → CRL Policy](frontend_tls.md#crl-policy). Private key bytes are never logged or persisted by this endpoint.
 
 ## ACME-Issued Certificates
 
