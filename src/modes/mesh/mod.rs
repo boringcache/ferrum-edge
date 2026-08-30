@@ -212,6 +212,18 @@ pub struct MeshListener {
     pub direction: MeshTrafficDirection,
     pub kind: MeshListenerKind,
     pub addr: SocketAddr,
+    /// Bind this listener's `AF_INET6` wildcard with `IPV6_V6ONLY` explicitly
+    /// disabled, so ONE socket accepts both native IPv6 and v4-mapped IPv4
+    /// connections, and downgrade to the IPv4 wildcard when IPv6 is genuinely
+    /// unavailable on this host (issue #4271).
+    ///
+    /// Only ever `true` for a wildcard TCP capture listener: those must serve
+    /// whichever address families the installed `iptables` / `ip6tables`
+    /// REDIRECT rules divert at them, and a family with rules but no listener is
+    /// an `ECONNREFUSED` black hole. Always `false` for a specific-address
+    /// (loopback) bind, where each family gets its own listener instead — a
+    /// dual-stack socket only receives v4-mapped traffic on the WILDCARD.
+    pub dual_stack: bool,
 }
 
 /// Mesh data-plane topology. Sidecar and ambient share the same runtime path;
@@ -1036,18 +1048,25 @@ impl MeshRuntimeConfig {
     pub fn listener_plan(&self) -> Vec<MeshListener> {
         match self.topology {
             MeshTopology::Sidecar => {
-                let mut listeners = vec![
-                    MeshListener {
-                        direction: MeshTrafficDirection::Outbound,
-                        kind: MeshListenerKind::PlaintextCapture,
-                        addr: self.outbound_listen_addr,
-                    },
-                    MeshListener {
-                        direction: MeshTrafficDirection::Inbound,
-                        kind: MeshListenerKind::MtlsTermination,
-                        addr: self.inbound_listen_addr,
-                    },
-                ];
+                // Sidecar TCP capture is fed by netfilter REDIRECT rules that
+                // are emitted PER ADDRESS FAMILY (`iptables` and `ip6tables`),
+                // so the listener set must cover every family those rules
+                // divert (issue #4271). See
+                // [`Self::sidecar_capture_listeners`].
+                let ipv6_capture = self.sidecar_capture_ipv6_enabled();
+                let mut listeners = Vec::new();
+                listeners.extend(self.sidecar_capture_listeners(
+                    self.outbound_listen_addr,
+                    MeshTrafficDirection::Outbound,
+                    MeshListenerKind::PlaintextCapture,
+                    ipv6_capture,
+                ));
+                listeners.extend(self.sidecar_capture_listeners(
+                    self.inbound_listen_addr,
+                    MeshTrafficDirection::Inbound,
+                    MeshListenerKind::MtlsTermination,
+                    ipv6_capture,
+                ));
                 // Sidecar relays captured UDP over a mesh-mTLS datagram tunnel
                 // (#1808), so the helper emits the `PlaintextUdpCapture` listener
                 // here when the capture flag is set (gated to Ambient | Sidecar).
@@ -1060,11 +1079,13 @@ impl MeshRuntimeConfig {
                         direction: MeshTrafficDirection::Outbound,
                         kind: MeshListenerKind::PlaintextCapture,
                         addr: self.outbound_listen_addr,
+                        dual_stack: false,
                     },
                     MeshListener {
                         direction: MeshTrafficDirection::Inbound,
                         kind: MeshListenerKind::HboneTermination,
                         addr: self.hbone_listen_addr,
+                        dual_stack: false,
                     },
                 ];
                 listeners.extend(self.udp_capture_listener());
@@ -1075,6 +1096,7 @@ impl MeshRuntimeConfig {
                     direction: MeshTrafficDirection::Inbound,
                     kind: MeshListenerKind::HboneTermination,
                     addr: self.hbone_listen_addr,
+                    dual_stack: false,
                 }];
                 listeners.extend(self.transparent_inbound_capture_listener());
                 listeners
@@ -1084,8 +1106,98 @@ impl MeshRuntimeConfig {
                 direction: MeshTrafficDirection::Inbound,
                 kind: MeshListenerKind::MtlsTermination,
                 addr: self.egress_listen_addr,
+                dual_stack: false,
             }],
         }
+    }
+
+    /// Whether this Sidecar must serve IPv6 CAPTURED TCP, i.e. whether
+    /// `ip6tables` REDIRECT rules are installed in this pod's network namespace
+    /// (issue #4271).
+    ///
+    /// INFALLIBLE, because read-only predicates and tests reach `listener_plan()`
+    /// too: a malformed setting warns and resolves to "IPv4 only", which is the
+    /// pre-existing behavior rather than a new failure mode. The SERVING path
+    /// validates the same env with `?` before anything binds — see
+    /// [`MeshRuntimeConfig::validate_capture_listener_families`] — so an operator
+    /// error aborts mesh startup with a field-specific message instead of
+    /// silently planning half the capture surface.
+    fn sidecar_capture_ipv6_enabled(&self) -> bool {
+        match crate::capture::capture_ipv6_enabled_from_env() {
+            Ok(enabled) => enabled,
+            Err(e) => {
+                warn!(
+                    "Planning mesh TCP capture listeners for IPv4 only: invalid IPv6 capture \
+                     settings: {e}"
+                );
+                false
+            }
+        }
+    }
+
+    /// The listener descriptors that make one configured Sidecar TCP capture
+    /// address serve every address family whose REDIRECT rules exist.
+    ///
+    /// Infallible for the same reason as [`Self::sidecar_capture_ipv6_enabled`]:
+    /// an unserviceable configuration warns here and keeps the configured
+    /// address alone, while the serving path refuses to start.
+    fn sidecar_capture_listeners(
+        &self,
+        configured: SocketAddr,
+        direction: MeshTrafficDirection,
+        kind: MeshListenerKind,
+        ipv6_capture: bool,
+    ) -> Vec<MeshListener> {
+        match sidecar_capture_listener_addrs(configured, ipv6_capture) {
+            Ok(addrs) => addrs
+                .into_iter()
+                .map(|(addr, dual_stack)| MeshListener {
+                    direction,
+                    kind,
+                    addr,
+                    dual_stack,
+                })
+                .collect(),
+            Err(e) => {
+                warn!(
+                    configured = %configured,
+                    ?direction,
+                    "Mesh TCP capture listener plan falls back to the configured address alone: {e}"
+                );
+                vec![MeshListener {
+                    direction,
+                    kind,
+                    addr: configured,
+                    dual_stack: false,
+                }]
+            }
+        }
+    }
+
+    /// Fail-closed validation of the Sidecar TCP capture listen addresses
+    /// against the installed capture rule families (issue #4271), for the
+    /// SERVING path only.
+    ///
+    /// `listener_plan()` cannot fail, so on its own a capture address that
+    /// cannot serve the IPv6 rules — a specific, non-wildcard, non-loopback
+    /// IPv4 literal — would warn-and-plan the IPv4 listener alone while
+    /// `ip6tables` keeps redirecting IPv6 connections at a port with no IPv6
+    /// listener. Those connections are refused (`ECONNREFUSED`) while the proxy
+    /// reports ready: a silent capture black hole. Validating here turns it into
+    /// a startup error naming the offending variable.
+    ///
+    /// Scoped to `Sidecar`: it is the only topology whose TCP capture is driven
+    /// by the injector's per-family netfilter REDIRECT rules.
+    pub fn validate_capture_listener_families(&self) -> Result<(), String> {
+        if self.topology != MeshTopology::Sidecar {
+            return Ok(());
+        }
+        let ipv6_capture = crate::capture::capture_ipv6_enabled_from_env()?;
+        sidecar_capture_listener_addrs(self.outbound_listen_addr, ipv6_capture)
+            .map_err(|e| format!("FERRUM_MESH_OUTBOUND_LISTEN_ADDR: {e}"))?;
+        sidecar_capture_listener_addrs(self.inbound_listen_addr, ipv6_capture)
+            .map_err(|e| format!("FERRUM_MESH_INBOUND_LISTEN_ADDR: {e}"))?;
+        Ok(())
     }
 
     /// The optional NodeWaypoint transparent inbound capture listener
@@ -1131,6 +1243,10 @@ impl MeshRuntimeConfig {
             direction: MeshTrafficDirection::Inbound,
             kind: MeshListenerKind::TransparentInboundCapture,
             addr,
+            // The tc ingress redirect delivers the workload's real
+            // `podIP:appPort` on the configured wildcard family; the UDP-style
+            // dual-stack posture is not applicable here.
+            dual_stack: false,
         })
     }
 
@@ -1318,6 +1434,10 @@ impl MeshRuntimeConfig {
             direction: MeshTrafficDirection::Outbound,
             kind: MeshListenerKind::PlaintextUdpCapture,
             addr,
+            // The UDP capture socket disables V6ONLY (and falls back to the v4
+            // wildcard) inside `bind_mesh_udp_capture_socket`, which owns the
+            // transparent-bind sequence; this TCP-listener flag does not apply.
+            dual_stack: false,
         })
     }
 
@@ -13655,6 +13775,15 @@ fn prepare_mesh_runtime_before_owner(
         .validate_node_waypoint_udp_listener_settings()
         .map_err(|e| anyhow::anyhow!("Invalid NodeWaypoint UDP/DTLS listener settings: {e}"))?;
 
+    // Same contract for the Sidecar TCP capture listen addresses (issue #4271).
+    // `listener_plan()` is infallible, so an address that cannot serve the
+    // installed `ip6tables` REDIRECT rules would otherwise warn-and-plan the
+    // IPv4 listener alone and leave every captured IPv6 connection refused while
+    // the proxy reports ready.
+    runtime
+        .validate_capture_listener_families()
+        .map_err(|e| anyhow::anyhow!("Invalid mesh TCP capture listener settings: {e}"))?;
+
     if peek_mesh_startup_fault_inject() == MeshStartupFaultInject::BeforeOwner {
         let _ = take_mesh_startup_fault_inject();
         return Err(anyhow::anyhow!(
@@ -15041,12 +15170,19 @@ async fn arm_mesh_runtime_startup(
             );
         }
 
-        let label = format!("{:?} {:?} mesh listener", listener.direction, listener.kind);
+        // The address is part of the label because one direction/kind can now plan
+        // TWO listeners (the `127.0.0.1` + `[::1]` loopback capture pair), and
+        // the startup-signal and post-start-failure reports must name which one.
+        let label = format!(
+            "{:?} {:?} mesh listener on {}",
+            listener.direction, listener.kind, listener.addr
+        );
         let state = proxy_state.clone();
         let shutdown = shutdown_tx.subscribe();
         let addr = listener.addr;
         let direction = listener.direction;
         let kind = listener.kind;
+        let dual_stack = listener.dual_stack;
         let listener_startup_ready = startup_ready.clone();
         let listener_serving_degraded = serving_degraded.clone();
         let listener_failures = serving_listener_failures.clone();
@@ -15069,6 +15205,7 @@ async fn arm_mesh_runtime_startup(
                     shutdown,
                     Some(direction),
                     allows_plaintext,
+                    dual_stack,
                     Some(started_tx),
                 )
                 .await
@@ -15114,6 +15251,7 @@ async fn arm_mesh_runtime_startup(
                     shutdown,
                     tls_config,
                     Some(direction),
+                    dual_stack,
                     Some(started_tx),
                 )
                 .await
@@ -19650,6 +19788,79 @@ pub mod initial_config_wait_test_seams {
     }
 }
 
+/// Resolve one configured Sidecar TCP capture address into the complete set of
+/// `(bind address, dual-stack)` listeners needed to serve the installed capture
+/// rules (issue #4271).
+///
+/// Sidecar capture is netfilter `REDIRECT`, and the injector emits the redirect
+/// rules PER ADDRESS FAMILY: `iptables` for IPv4 and `ip6tables` for IPv6, both
+/// pointing at the SAME port. A family with rules but no listener on that port
+/// is refused with `ECONNREFUSED` — a silent capture black hole — so the plan is
+/// derived from `ipv6_capture` (whether `ip6tables` rules exist) rather than
+/// from the configured address's family alone.
+///
+/// * `ipv6_capture == false` keeps exactly the configured address. This is the
+///   default posture and is byte-for-byte the historical plan.
+/// * A **wildcard** address becomes ONE dual-stack `[::]` listener. `REDIRECT`
+///   in `PREROUTING` rewrites the destination to the receiving interface's own
+///   address, so inbound capture must listen on a wildcard; a single
+///   `IPV6_V6ONLY`-disabled socket claims both the native-v6 and the v4-mapped
+///   half, and the bind downgrades to `0.0.0.0` when IPv6 is unavailable. Two
+///   sockets are not an option here — a dual-stack `[::]` bind already owns the
+///   v4 wildcard, so a sibling `0.0.0.0` bind on the same port is `EADDRINUSE`.
+/// * A **loopback** address becomes TWO listeners, `127.0.0.1` and `[::1]`.
+///   `REDIRECT` in `OUTPUT` sends locally generated traffic to `127.0.0.1` for
+///   IPv4 and `::1` for IPv6, and — unlike the wildcard — a dual-stack socket
+///   bound to `[::1]` does NOT receive IPv4 loopback traffic. This keeps the
+///   outbound capture listener loopback-only instead of widening it to a
+///   network-reachable wildcard.
+/// * Any other **specific** literal is an ERROR: there is no defensible way to
+///   guess the workload's address in the other family, and quietly serving one
+///   family would be the black hole this function exists to prevent. The
+///   operator either widens the address or disables IPv6 capture.
+///
+/// Port `0` (ephemeral, used by in-process tests and to disable a listener)
+/// keeps the configured address alone: two ephemeral binds would land on two
+/// unrelated ports, which no redirect rule can name.
+fn sidecar_capture_listener_addrs(
+    configured: SocketAddr,
+    ipv6_capture: bool,
+) -> Result<Vec<(SocketAddr, bool)>, String> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    if !ipv6_capture || configured.port() == 0 {
+        return Ok(vec![(configured, false)]);
+    }
+    let port = configured.port();
+    let ip = configured.ip();
+    if ip.is_unspecified() {
+        return Ok(vec![(
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+            true,
+        )]);
+    }
+    if ip.is_loopback() {
+        return Ok(vec![
+            (
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+                false,
+            ),
+            (
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
+                false,
+            ),
+        ]);
+    }
+    Err(format!(
+        "IPv6 mesh capture is active (ip6tables REDIRECT rules point at port {port}), but the \
+         configured capture address {configured} is a specific {} literal, so captured IPv6 \
+         connections would be refused with ECONNREFUSED. Use a wildcard (0.0.0.0 / ::) or a \
+         loopback address, or disable the IPv6 rule producer with \
+         FERRUM_MESH_IP6TABLES_ENABLED=false (or remove the IPv6 CIDRs)",
+        if ip.is_ipv4() { "IPv4" } else { "IPv6" }
+    ))
+}
+
 fn parse_socket_addr(key: &str, raw: &str) -> Result<SocketAddr, String> {
     raw.parse::<SocketAddr>()
         .map_err(|e| format!("{key} must be a socket address (got '{raw}'): {e}"))
@@ -20425,6 +20636,13 @@ mod tests {
             "FERRUM_MESH_ALLOW_NO_CA",
             "FERRUM_MESH_CAPTURE_UDP_ENABLED",
             "FERRUM_MESH_CAPTURE_UDP_PORT",
+            // Decide the TCP capture listener families (issue #4271). Leaving any
+            // of these set after an IPv6-capture test would make an unrelated
+            // plan assertion observe the dual-stack / loopback-pair shape.
+            "FERRUM_MESH_CAPTURE_IPV6_ENABLED",
+            "FERRUM_MESH_IP6TABLES_ENABLED",
+            "FERRUM_MESH_CAPTURE_INCLUDE_CIDRS",
+            "FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS",
             "FERRUM_MESH_WAYPOINT_NAME",
             // Shared with the node-agent: when set, NodeWaypoint plans a second
             // transparent capture listener. Leaving it set after a redirect-on
