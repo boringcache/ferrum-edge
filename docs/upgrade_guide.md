@@ -6,6 +6,12 @@ This document describes how to safely upgrade Ferrum Edge between versions with 
 
 Every current `[Unreleased]` `BREAKING` changelog entry is listed here exactly once, with its issue number and the operator action that entry already states. Several of these fail **silently** at cutover (HMAC clients get `401`, WAF `literal` rules stop matching folded spellings, backends stop seeing client-supplied XFF hops) rather than refusing config load. Read this section before the per-mode procedures below.
 
+### HTTP/2 and HTTP/3 requests without `:authority` or Host are rejected with 400 (issue [#4416](https://github.com/ferrum-edge/ferrum-edge/issues/4416))
+
+RFC 9113 §8.3.1 and RFC 9114 §4.3.1 require either `:authority` or Host. Ferrum previously treated the both-absent case as agreement and admitted the request, so routing skipped exact/wildcard host tiers and could fall through to a catch-all (empty `hosts`) route. `check_host_authority_consistency()` now rejects that shape with 400. `:authority`-only (typical H2/H3 clients, including RFC 8441 / RFC 9220 Extended CONNECT) and Host-only remain valid. HTTP/1.1 is unchanged and still owned by `check_protocol_headers()` (issue #4390).
+
+**Operator action:** any HTTP/2 or HTTP/3 client that omitted both `:authority` and Host will start seeing `400` `{"error":"Request is missing both :authority and Host"}` instead of being routed. Send `:authority` or Host.
+
 ### HTTP/1.1 requests without a Host header are rejected with 400 (issue [#4390](https://github.com/ferrum-edge/ferrum-edge/issues/4390))
 
 RFC 9112 §3.2.2 requires a 400 when an HTTP/1.1 request lacks a Host field. Ferrum previously only rejected multiple Host fields, so a Host-less origin-form request skipped exact/wildcard host tiers and could fall through to a catch-all (empty `hosts`) route. `check_protocol_headers()` now rejects HTTP/1.1 when both the Host field and the URI authority are absent. HTTP/1.0 still does not require Host. Absolute-form request-targets that already carry an authority are accepted without a Host field. An empty Host value (`Host:` with no tokens) is treated as present-but-invalid and also returns 400 on HTTP/1.1. HTTP/2 and HTTP/3 are unchanged.
