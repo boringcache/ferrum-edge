@@ -331,9 +331,17 @@ async fn waiting_rename_releases_the_registry_admission_lease() {
         Some(json!({"name": "served"})),
     );
 
+    // Establish the precondition before probing: the rename has committed (its
+    // covering record is readable) and is therefore parked on poll acceptance.
+    // Probing first would race the rename's own lease acquisition and could
+    // succeed for the wrong reason.
+    let covering = covering_watermark(&fx.store, "served").await;
+    assert!(!rename.is_finished(), "rename must be parked on the wait");
+
     // Every registry mutation takes the SAME global admission lease first. A
     // create that completes proves the waiting rename is not holding it — the
-    // pins are dropped before the poll-acceptance wait, not across it.
+    // pins are dropped before the poll-acceptance wait, not across it. Were the
+    // lease held across the wait, this probe would block until the timeout.
     let (status, body) = tokio::time::timeout(
         Duration::from_secs(10),
         send(
@@ -347,8 +355,6 @@ async fn waiting_rename_releases_the_registry_admission_lease() {
     .expect("a concurrent create must not block behind the parked rename");
     assert_eq!(status, 201, "{body}");
 
-    let covering = covering_watermark(&fx.store, "served").await;
-    assert!(!rename.is_finished(), "rename must be parked on the wait");
     fx.apply.record_accepted(covering);
     let (status, body) = rename.await.expect("rename task");
     assert_eq!(status, 200, "{body}");
@@ -522,12 +528,6 @@ async fn seed_config_change(store: &DatabaseStore, namespace: &str) {
     .execute(&store.pool())
     .await
     .expect("seed config change");
-}
-
-/// Namespace-wide covering `config_changes` watermark.
-async fn watermark(store: &DatabaseStore, namespace: &str) -> u64 {
-    let sequence = store.latest_change_sequence(namespace).await;
-    sequence.expect("covering watermark")
 }
 
 /// Waits until the parked mutation has durably written a covering change
