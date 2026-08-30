@@ -197,8 +197,21 @@ wait_for_gateway() {
 # default (~1024 soft / 65536 hard on most distros) regardless of host tuning.
 DOCKER_NOFILE_ULIMIT="--ulimit nofile=1048576:1048576"
 
+prepare_ferrum_config() {
+    local src_config="$1"
+    local ca_path="$2"
+    local runtime_config="$SCRIPT_DIR/ferrum_runtime_$(basename "$src_config")"
+
+    sed -e "s|CA_PATH|${ca_path}|g" \
+        "$src_config" > "$runtime_config"
+
+    echo "$runtime_config"
+}
+
 start_ferrum() {
-    local config_file="$SCRIPT_DIR/configs/http1_tls_e2e_perf.yaml"
+    local config_src="$SCRIPT_DIR/configs/http1_tls_e2e_perf.yaml"
+    local config_file
+    config_file=$(prepare_ferrum_config "$config_src" "/etc/ferrum/tls/ca.pem")
     echo "[ferrum] starting..."
 
     GATEWAY_CID=$(docker run -d --rm --network host $DOCKER_NOFILE_ULIMIT \

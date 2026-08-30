@@ -245,9 +245,22 @@ start_backend() {
 }
 
 # ── Ferrum (docker, distroless image from repo Dockerfile) ──────────────────
+prepare_ferrum_config() {
+    local src_config="$1"
+    local ca_path="$2"
+    local runtime_config="$SCRIPT_DIR/ferrum_runtime_$(basename "$src_config")"
+
+    sed -e "s|CA_PATH|${ca_path}|g" \
+        "$src_config" > "$runtime_config"
+
+    echo "$runtime_config"
+}
+
 start_ferrum() {
-    local config_file="$SCRIPT_DIR/configs/$(ferrum_config_name)"
-    echo "[ferrum] starting ($FERRUM_IMAGE) with $(basename "$config_file")..."
+    local config_src="$SCRIPT_DIR/configs/$(ferrum_config_name)"
+    local config_file
+    config_file=$(prepare_ferrum_config "$config_src" "/etc/ferrum/tls/ca.pem")
+    echo "[ferrum] starting ($FERRUM_IMAGE) with $(basename "$config_src")..."
 
     # FERRUM_POOL_ENABLE_HTTP2 defaults to true (see CLAUDE.md), no need to set.
     local extra_env=()

@@ -42,6 +42,20 @@ SCENARIOS_PATH = (
 RUNBOOK_PATH = REPO_ROOT / "docs" / "protocol_perf_regression.md"
 CI_CD_PATH = REPO_ROOT / "docs" / "ci_cd.md"
 CI_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+MULTI_PROTOCOL_DIR = REPO_ROOT / "tests" / "performance" / "multi_protocol"
+RUN_PROTOCOL_TEST_PATH = MULTI_PROTOCOL_DIR / "run_protocol_test.sh"
+NATIVE_FERRUM_CONFIGS = (
+    "http1_perf.yaml",
+    "http1_tls_perf.yaml",
+    "http2_perf.yaml",
+    "http3_perf.yaml",
+    "ws_perf.yaml",
+    "grpc_perf.yaml",
+    "tcp_perf.yaml",
+    "tcp_tls_perf.yaml",
+    "udp_perf.yaml",
+    "udp_dtls_perf.yaml",
+)
 SETUP_RUST_CI_PATH = (
     REPO_ROOT / ".github" / "actions" / "setup-rust-ci" / "action.yml"
 )
@@ -626,6 +640,37 @@ def validate_pr_ci_contract(text: str, failures: list[str]) -> None:
         )
 
 
+def validate_native_ferrum_config_paths(failures: list[str]) -> None:
+    """Native harness must not point Ferrum YAML at Docker-only cert mount paths."""
+
+    if not RUN_PROTOCOL_TEST_PATH.is_file():
+        require(
+            False,
+            f"missing native protocol harness: {RUN_PROTOCOL_TEST_PATH}",
+            failures,
+        )
+        return
+
+    harness = RUN_PROTOCOL_TEST_PATH.read_text(encoding="utf-8")
+    require(
+        "prepare_ferrum_config" in harness and "CA_PATH" in harness,
+        "run_protocol_test.sh must template Ferrum YAML CA_PATH before gateway start",
+        failures,
+    )
+
+    configs_dir = MULTI_PROTOCOL_DIR / "configs"
+    for name in NATIVE_FERRUM_CONFIGS:
+        path = configs_dir / name
+        require(path.is_file(), f"missing native Ferrum config: {path}", failures)
+        text = path.read_text(encoding="utf-8")
+        require(
+            "/etc/ferrum/tls" not in text,
+            f"{path.relative_to(REPO_ROOT)} must not hardcode Docker-only "
+            "/etc/ferrum/tls paths; use CA_PATH and rewrite in the harness",
+            failures,
+        )
+
+
 def validate_repository_contract(failures: list[str]) -> None:
     require(WORKFLOW_PATH.is_file(), f"missing workflow: {WORKFLOW_PATH}", failures)
     require(BUDGETS_PATH.is_file(), f"missing budgets file: {BUDGETS_PATH}", failures)
@@ -763,6 +808,8 @@ def validate_repository_contract(failures: list[str]) -> None:
             "runbook must document PR CI mesh workspace rust-cache coverage",
             failures,
         )
+
+    validate_native_ferrum_config_paths(failures)
 
 
 def self_test() -> int:

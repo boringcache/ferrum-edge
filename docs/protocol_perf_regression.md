@@ -115,6 +115,17 @@ python3 -m py_compile tests/performance/multi_protocol/run_protocol_regression_s
 Full-mode PR CI runs the same static set in `Performance Regression Check`
 immediately after checkout.
 
+## Native harness cert paths
+
+The scheduled workflow runs `run_protocol_test.sh` **natively** (not in Docker).
+Backend TLS configs use a `CA_PATH` placeholder in committed YAML; the harness
+substitutes `tests/performance/multi_protocol/certs/ca.pem` at gateway start.
+Docker comparison benches (`run_gateway_protocol_bench.sh`,
+`run_connection_saturation_bench.sh`) rewrite the same placeholder to
+`/etc/ferrum/tls/ca.pem` before mounting configs into containers. Committed
+native perf YAML must not hardcode `/etc/ferrum/tls` paths — the workflow
+verifier enforces this contract.
+
 ## Mesh in-process vs E2E suites
 
 `tests/performance/mesh/` is the **in-process** Criterion crate (`authz_match`,

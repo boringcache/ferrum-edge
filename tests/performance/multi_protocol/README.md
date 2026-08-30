@@ -93,6 +93,12 @@ Options:
 
 Gateway configs are in `configs/`. Each protocol has its own YAML file that configures the appropriate `backend_scheme` and ports.
 
+Configs that terminate or verify TLS to a backend use a `CA_PATH` placeholder for
+`backend_tls_server_ca_cert_path`. `run_protocol_test.sh` rewrites it to
+`certs/ca.pem` before starting the native gateway (same pattern as Envoy's
+`prepare_envoy_config`). Docker benchmark scripts substitute
+`/etc/ferrum/tls/ca.pem` at container mount time.
+
 Key environment variables set by the test runner:
 
 | Variable | Value | Purpose |
