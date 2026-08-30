@@ -4098,7 +4098,7 @@ fn api_resource_for_update(update: &GatewayApiStatusUpdate) -> Option<ApiResourc
         ("HTTPRoute", "v1" | "v1beta1") => "httproutes",
         ("GRPCRoute", "v1") => "grpcroutes",
         ("TCPRoute", "v1alpha2") => "tcproutes",
-        ("TLSRoute", "v1alpha2") => "tlsroutes",
+        ("TLSRoute", "v1" | "v1alpha2") => "tlsroutes",
         ("UDPRoute", "v1alpha2") => "udproutes",
         // Both channels Ferrum watches. An object served under any other
         // version is skipped rather than patched through a guessed plural.
@@ -4256,6 +4256,92 @@ mod tests {
             assert_eq!(resource.kind, kind);
             assert_eq!(resource.plural, plural);
         }
+    }
+
+    #[test]
+    fn status_writer_supports_tlsroute_v1_and_v1alpha2() {
+        for version in ["v1", "v1alpha2"] {
+            let update = GatewayApiStatusUpdate {
+                api_version: format!("gateway.networking.k8s.io/{version}"),
+                kind: "TLSRoute".to_string(),
+                namespace: "default".to_string(),
+                name: "db".to_string(),
+                status: json!({}),
+                patch_gateway_addresses: false,
+                patch_gateway_listeners: false,
+            };
+
+            let resource = api_resource_for_update(&update)
+                .expect("TLSRoute status resource should be supported");
+
+            assert_eq!(resource.group, "gateway.networking.k8s.io");
+            assert_eq!(resource.version, version);
+            assert_eq!(
+                resource.api_version,
+                format!("gateway.networking.k8s.io/{version}")
+            );
+            assert_eq!(resource.kind, "TLSRoute");
+            assert_eq!(resource.plural, "tlsroutes");
+        }
+    }
+
+    #[test]
+    fn status_writer_skips_unwatched_tlsroute_version() {
+        let update = GatewayApiStatusUpdate {
+            api_version: "gateway.networking.k8s.io/v1alpha3".to_string(),
+            kind: "TLSRoute".to_string(),
+            namespace: "default".to_string(),
+            name: "db".to_string(),
+            status: json!({}),
+            patch_gateway_addresses: false,
+            patch_gateway_listeners: false,
+        };
+
+        assert!(
+            api_resource_for_update(&update).is_none(),
+            "an unwatched TLSRoute version must be skipped, not patched"
+        );
+    }
+
+    #[test]
+    fn tlsroute_status_write_follows_snapshot_api_version() {
+        let gateway_class = ferrum_gateway_class();
+        let gateway = object(
+            "Gateway",
+            "edge",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tls",
+                    "port": 15443,
+                    "protocol": "TLS",
+                    "tls": {"mode": "Passthrough"},
+                    "allowedRoutes": {"kinds": [{"kind": "TLSRoute"}]}
+                }]
+            }),
+        );
+        let mut route = object(
+            "TLSRoute",
+            "db",
+            json!({
+                "parentRefs": [{"name": "edge", "sectionName": "tls"}],
+                "hostnames": ["db.example.com"],
+                "rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]
+            }),
+        );
+        route.api_version = "gateway.networking.k8s.io/v1".to_string();
+
+        let updates = plan_status_updates(&[gateway_class, gateway, route], options());
+        let tls_updates: Vec<_> = updates
+            .iter()
+            .filter(|update| update.kind == "TLSRoute")
+            .collect();
+        assert_eq!(tls_updates.len(), 1);
+        assert_eq!(tls_updates[0].api_version, "gateway.networking.k8s.io/v1");
+        let resource = api_resource_for_update(tls_updates[0])
+            .expect("v1 TLSRoute status write must map to a GVK");
+        assert_eq!(resource.version, "v1");
+        assert_eq!(resource.plural, "tlsroutes");
     }
 
     fn route_with_created_at(name: &str, created_at: &str) -> K8sObject {

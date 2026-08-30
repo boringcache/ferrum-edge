@@ -208,6 +208,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Gateway API `TLSRoute` is watched at `v1` as well as `v1alpha2` (issue #4383).
+  Gateway API v1.5.1 `standard-install.yaml` serves TLSRoute at `v1` only
+  (`v1alpha2`/`v1alpha3` remain on the CRD with `served: false`), so a
+  standard-channel cluster previously skipped the reflector and never
+  programmed passthrough listeners or route status. Experimental-install still
+  serves `v1alpha2`; both versions are dual-watched and de-duplicated the same
+  way as HTTPRoute `v1`/`v1beta1`.
+
 - **Security — client-asserted `X-Real-IP` no longer reaches mirror or
   load-test targets** (issue #4164). The primary backend builders drop an
   untrusted peer's `X-Real-IP`, but the shared secondary-request boundary took

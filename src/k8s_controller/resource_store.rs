@@ -396,6 +396,37 @@ mod tests {
         assert_eq!(objects[0].metadata.name, "edge");
     }
 
+    #[test]
+    fn snapshot_all_deduplicates_tlsroute_v1_and_v1alpha2() {
+        let mut set = ResourceStoreSet::new();
+        assert!(set.add_store(populated_test_store(
+            "gateway.networking.k8s.io/v1",
+            "TLSRoute",
+            "db",
+            "default",
+        )));
+        assert!(set.add_store(populated_test_store(
+            "gateway.networking.k8s.io/v1alpha2",
+            "TLSRoute",
+            "db",
+            "default",
+        )));
+
+        assert!(set.has_store("gateway.networking.k8s.io/v1", "TLSRoute"));
+        assert!(set.has_store(
+            "gateway.networking.k8s.io/v1alpha2",
+            "TLSRoute",
+        ));
+
+        let objects = set.snapshot_all();
+
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].api_version, "gateway.networking.k8s.io/v1");
+        assert_eq!(objects[0].kind, "TLSRoute");
+        assert_eq!(objects[0].metadata.namespace, "default");
+        assert_eq!(objects[0].metadata.name, "db");
+    }
+
     /// ProxyConfig rides the same scoped-store + remove-on-stream-end path as
     /// every other Istio CRD: a live store keeps last-known-good objects in
     /// `snapshot_all` until the watcher explicitly deregisters the scope

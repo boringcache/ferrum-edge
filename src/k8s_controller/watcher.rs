@@ -184,6 +184,17 @@ pub const GATEWAY_API_CRDS: &[CrdSpec] = &[
         plural: "grpcroutes",
         namespaced: true,
     },
+    // TLSRoute graduated to v1 on Gateway API v1.5.1 standard-install
+    // (v1alpha2/v1alpha3 remain on that CRD with served:false). Experimental
+    // still serves v1alpha2. Discovery skips an unserved version; snapshot_all
+    // de-duplicates dual served versions the same way as HTTPRoute v1/v1beta1.
+    CrdSpec {
+        group: "gateway.networking.k8s.io",
+        version: "v1",
+        kind: "TLSRoute",
+        plural: "tlsroutes",
+        namespaced: true,
+    },
     CrdSpec {
         group: "gateway.networking.k8s.io",
         version: "v1alpha2",
@@ -1737,6 +1748,55 @@ mod tests {
                 resource.kind
             );
         }
+    }
+
+    fn tlsroute_versions_registered_for_served(served: &[&str]) -> Vec<&'static str> {
+        GATEWAY_API_CRDS
+            .iter()
+            .filter(|resource| {
+                resource.kind == "TLSRoute" && served.contains(&resource.version)
+            })
+            .map(|resource| resource.version)
+            .collect()
+    }
+
+    #[test]
+    fn gateway_api_watches_tlsroute_v1_and_v1alpha2() {
+        assert!(GATEWAY_API_CRDS.iter().any(|resource| {
+            resource.kind == "TLSRoute"
+                && resource.version == "v1"
+                && resource.plural == "tlsroutes"
+                && resource.namespaced
+        }));
+        assert!(GATEWAY_API_CRDS.iter().any(|resource| {
+            resource.kind == "TLSRoute"
+                && resource.version == "v1alpha2"
+                && resource.plural == "tlsroutes"
+                && resource.namespaced
+        }));
+        assert!(
+            !GATEWAY_API_CRDS
+                .iter()
+                .any(|resource| resource.kind == "TLSRoute" && resource.version == "v1alpha3"),
+            "v1alpha3 is served on experimental-install but is not a Ferrum watch pin"
+        );
+    }
+
+    #[test]
+    fn standard_channel_tlsroute_starts_v1_reflector() {
+        // Pinned Gateway API v1.5.1 standard-install serves TLSRoute v1 only.
+        let registered = tlsroute_versions_registered_for_served(&["v1"]);
+        assert_eq!(registered, vec!["v1"]);
+    }
+
+    #[test]
+    fn experimental_channel_tlsroute_registers_served_watch_pins_only() {
+        // experimental-install serves v1 + v1alpha2 + v1alpha3. Ferrum watches
+        // v1 (storage) and v1alpha2 (compat); an unlisted served version is
+        // skipped without error, matching find_crd_resource for a missing spec.
+        let registered = tlsroute_versions_registered_for_served(&["v1", "v1alpha2", "v1alpha3"]);
+        assert_eq!(registered, vec!["v1", "v1alpha2"]);
+        assert!(tlsroute_versions_registered_for_served(&["v1alpha3"]).is_empty());
     }
 
     #[test]
