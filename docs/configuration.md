@@ -1319,6 +1319,10 @@ upstreams:
         poll_interval_seconds: 30
 ```
 
+DNS-SD queries SRV records for `service_name` on the poll interval (not on the request path) and implements health-aware RFC 2782 priority selection. The root target `.` and port `0` are discarded; remaining hosts are ASCII-lowercased and remaining ports go through the same `1..=65535` admission Kubernetes and Consul use. Every remaining priority tier (up to the eight numerically smallest) is published, and the load balancer sends traffic only to the lowest-numbered tier that still has a **healthy** target. So a zone advertising `10 → primary` / `20 → dr-site` serves entirely from `primary` while any primary is healthy, fails the whole service over to `dr-site` when every priority-10 target is unhealthy, and returns to `primary` the moment one recovers. Tiers are never mixed. Same-tier SRV weights are preserved (weight `0` uses `default_weight`) and the configured load-balancing algorithm runs normally inside the selected tier.
+
+Statically configured `targets` on the same upstream carry no SRV tier and stay eligible in every tier — they are additional capacity the operator declared explicitly, not a DNS tier to be demoted. A static target also continues to take precedence over a discovered target on the same `host:port`. A poisoned tier (every RR at that priority is `.` or port 0) never becomes a tier at all; if nothing admissible remains at any priority, the snapshot is empty. If every target in every tier is unhealthy, the existing degraded fallback applies unchanged.
+
 **Kubernetes**:
 ```yaml
 upstreams:

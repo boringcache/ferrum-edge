@@ -1191,6 +1191,71 @@ fn test_upstream_mesh_target_tags_rejected_in_operator_config() {
 }
 
 #[test]
+fn test_upstream_reserved_srv_priority_tags_rejected_in_operator_config() {
+    // Issue #4291: `ferrum.srv.*` is the internal DNS-SD RFC 2782 priority
+    // contract between the discoverer and the load balancer's candidate
+    // filter. A static target must not be able to claim a DNS tier.
+    let prefix = ferrum_edge::_test_support::reserved_srv_tag_prefix_for_test();
+    let tag = ferrum_edge::_test_support::srv_priority_tag_for_test();
+
+    let mut upstream = make_upstream("test");
+    upstream.targets[0].tags = HashMap::from([
+        ("environment".to_string(), "production".to_string()),
+        ("srv.priority".to_string(), "0".to_string()),
+        (tag.to_string(), "0".to_string()),
+        (format!("{prefix}future"), "x".to_string()),
+    ]);
+
+    let errors = upstream
+        .validate_operator_provided_fields()
+        .expect_err("operator-provided targets must not forge reserved ferrum.srv.* tags");
+    assert_eq!(
+        errors.len(),
+        1,
+        "ordinary target tags (including the unreserved `srv.priority`) must remain allowed: \
+         {errors:?}"
+    );
+    assert!(
+        errors[0].contains("targets[0].tags") && errors[0].contains(prefix),
+        "expected a reserved ferrum.srv.* rejection, got: {errors:?}"
+    );
+    assert!(
+        !errors[0].contains("future"),
+        "the rejection must not echo the forged key's value space: {errors:?}"
+    );
+
+    // Discovery materialization legitimately stamps the tag, so the runtime
+    // path must keep accepting it.
+    assert!(
+        upstream.validate_fields().is_ok(),
+        "validate_fields must not reject a discovery-stamped SRV priority tag"
+    );
+}
+
+#[test]
+fn test_upstream_subset_labels_cannot_select_reserved_srv_namespace() {
+    let tag = ferrum_edge::_test_support::srv_priority_tag_for_test();
+    let prefix = ferrum_edge::_test_support::reserved_srv_tag_prefix_for_test();
+
+    let mut upstream = make_upstream("test");
+    upstream.subsets = Some(vec![ferrum_edge::config::types::SubsetDefinition {
+        name: "tier-10".to_string(),
+        labels: HashMap::from([(tag.to_string(), "10".to_string())]),
+        traffic_policy: None,
+    }]);
+
+    let errors = upstream
+        .validate_operator_provided_fields()
+        .expect_err("a subset must not be able to select on internal SRV tier state");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("subsets[0].labels") && e.contains(prefix)),
+        "expected a reserved ferrum.srv.* subset-selector rejection, got: {errors:?}"
+    );
+}
+
+#[test]
 fn test_upstream_locality_lb_strict_rejected_by_admin_api() {
     let mut upstream = make_upstream("test");
     upstream.locality_lb_strict = true;
