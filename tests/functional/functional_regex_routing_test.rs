@@ -78,58 +78,63 @@ fn start_gateway_in_file_mode(
     config_path: &str,
     http_port: u16,
     admin_port: u16,
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> std::process::Child {
     let binary_path = gateway_binary_path();
 
-    std::process::Command::new(binary_path)
-        .env("FERRUM_MODE", "file")
+    let mut cmd = std::process::Command::new(binary_path);
+    cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_LOG_LEVEL", "warn")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("Failed to start gateway binary")
+        .stderr(std::process::Stdio::null());
+    identity.apply_to_command(&mut cmd);
+    cmd.spawn().expect("Failed to start gateway binary")
 }
 
-/// Readiness requires admin `/health` *and* a reachable proxy listener while
-/// the same child is still alive. Admin can become healthy before the proxy
-/// accept loop binds; returning on health alone races the first proxy request
-/// into `ECONNREFUSED`.
+/// Readiness requires this child to own admin `/health` *and* a reachable
+/// proxy listener. Unauthenticated `/health` is not identity (issue #4253);
+/// CIDR-granted health detail is not either. JWT `GET /proxies` plus
+/// `Child::try_wait` prove the responder is ours. The proxy TCP accept is
+/// still required because a loaded runner can surface the proxy socket after
+/// `ready`.
 async fn wait_for_gateway(
     admin_port: u16,
     proxy_port: u16,
     child: &mut std::process::Child,
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> bool {
-    let client = reqwest::Client::new();
-    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
+    if crate::common::wait_for_owned_gateway_identity(
+        child,
+        admin_port,
+        identity,
+        Duration::from_secs(15),
+    )
+    .await
+    .is_err()
+    {
+        return false;
+    }
 
-    for _ in 0..60 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
         if child.try_wait().ok().flatten().is_some() {
             return false;
         }
-
-        let admin_ready = match client.get(&health_url).send().await {
-            Ok(resp) => resp.status().is_success(),
-            Err(_) => false,
-        };
-        let proxy_ready = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+        if tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
             .await
-            .is_ok();
-
-        if admin_ready && proxy_ready {
-            // Re-check liveness: a child can exit after the probes succeed if a
-            // later bind failed, leaving the probed ports owned by nobody.
-            if child.try_wait().ok().flatten().is_some() {
-                return false;
-            }
-            return true;
+            .is_ok()
+        {
+            return child.try_wait().ok().flatten().is_none();
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
         }
         sleep(Duration::from_millis(250)).await;
     }
-    false
 }
 
 async fn ephemeral_port() -> u16 {
@@ -147,9 +152,10 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
         let proxy_port = ephemeral_port().await;
         let admin_port = ephemeral_port().await;
 
-        let mut child = start_gateway_in_file_mode(config_path, proxy_port, admin_port);
+        let identity = crate::common::SpawnedGatewayIdentity::mint("regex-routing");
+        let mut child = start_gateway_in_file_mode(config_path, proxy_port, admin_port, &identity);
 
-        if wait_for_gateway(admin_port, proxy_port, &mut child).await {
+        if wait_for_gateway(admin_port, proxy_port, &mut child, &identity).await {
             return (child, proxy_port, admin_port);
         }
 
