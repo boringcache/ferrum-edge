@@ -2538,10 +2538,10 @@ impl DnsCache {
         generation: &SuccessRefreshGeneration,
     ) {
         let cache_key = dns_hostname_key(hostname);
-        if let Some(mut entry) = self.cache.get_mut(cache_key.as_ref()) {
-            if Self::matches_success_refresh_generation(&entry, generation) {
-                entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
-            }
+        if let Some(mut entry) = self.cache.get_mut(cache_key.as_ref())
+            && Self::matches_success_refresh_generation(&entry, generation)
+        {
+            entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
         }
     }
 
