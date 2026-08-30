@@ -1070,6 +1070,83 @@ pub fn udp_capture_settings_from_env() -> Result<UdpCaptureSettings, String> {
     })
 }
 
+/// Whether the mesh data plane must serve IPv6 CAPTURED traffic on this
+/// workload — i.e. whether `ip6tables` capture rules are (or will be) installed
+/// in this network namespace (issue #4271).
+///
+/// This is the runtime half of a producer/consumer pair. The rule PRODUCER is
+/// the injector's init container, which emits `ip6tables` REDIRECTs when
+/// `FERRUM_MESH_IP6TABLES_ENABLED` is not `disabled` AND at least one
+/// include/exclude CIDR is IPv6 — exactly [`IptablesPlan::for_config`]'s v6
+/// gate. The CONSUMER is the sidecar's TCP capture listener plan, which must
+/// bind a socket able to accept the family those rules divert, or the captured
+/// IPv6 connections land on a port with no listener and are black-holed with
+/// `ECONNREFUSED`.
+///
+/// Resolution order:
+///
+/// 1. `FERRUM_MESH_CAPTURE_IPV6_ENABLED`, the explicit operator/injector signal.
+///    The injector sets it to `true` on the sidecar container whenever the init
+///    container's rendered plan actually contains `ip6tables` commands. An
+///    explicit `false` is rejected when the local rule inputs independently
+///    require IPv6; accepting that contradiction would recreate the silent
+///    listener/rule-family black hole this signal exists to prevent.
+/// 2. Otherwise the same derivation applied to whatever capture scope env this
+///    process can see, so a hand-rolled (non-injector) sidecar that carries the
+///    capture CIDRs still plans the right listeners.
+///
+/// Errors are the ordinary malformed-env errors of the underlying parsers; the
+/// serving path turns them into a startup failure rather than guessing.
+pub fn capture_ipv6_enabled_from_env() -> Result<bool, String> {
+    if let Some(raw) = resolve_ferrum_var("FERRUM_MESH_CAPTURE_IPV6_ENABLED")
+        && !raw.trim().is_empty()
+    {
+        let explicit = parse_bool_env(Some(raw.as_str()), "FERRUM_MESH_CAPTURE_IPV6_ENABLED")?;
+        if explicit {
+            return Ok(true);
+        }
+        if capture_ipv6_derived_from_env()? {
+            return Err(
+                "FERRUM_MESH_CAPTURE_IPV6_ENABLED=false contradicts the configured IPv6 capture \
+                 rule inputs: FERRUM_MESH_IP6TABLES_ENABLED is not false and an include/exclude \
+                 CIDR is IPv6. Disable the IPv6 rule producer with \
+                 FERRUM_MESH_IP6TABLES_ENABLED=false (or remove the IPv6 CIDRs) instead of \
+                 leaving ip6tables REDIRECTs without a listener"
+                    .to_string(),
+            );
+        }
+        return Ok(false);
+    }
+    capture_ipv6_derived_from_env()
+}
+
+fn capture_ipv6_derived_from_env() -> Result<bool, String> {
+    let ip6tables_mode = Ip6TablesMode::parse(
+        &resolve_ferrum_var("FERRUM_MESH_IP6TABLES_ENABLED").unwrap_or_else(|| "auto".to_string()),
+    )?;
+    if ip6tables_mode == Ip6TablesMode::Disabled {
+        return Ok(false);
+    }
+    let include_cidrs = parse_cidr_env(
+        &resolve_ferrum_var("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS").unwrap_or_default(),
+    );
+    if !include_cidrs.is_empty() {
+        validate_cidr_list(&include_cidrs)
+            .map_err(|e| format!("FERRUM_MESH_CAPTURE_INCLUDE_CIDRS: {e}"))?;
+    }
+    let exclude_cidrs = parse_cidr_env(
+        &resolve_ferrum_var("FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS").unwrap_or_default(),
+    );
+    if !exclude_cidrs.is_empty() {
+        validate_cidr_list(&exclude_cidrs)
+            .map_err(|e| format!("FERRUM_MESH_CAPTURE_EXCLUDE_CIDRS: {e}"))?;
+    }
+    Ok(include_cidrs
+        .iter()
+        .chain(exclude_cidrs.iter())
+        .any(|cidr| cidr_family(cidr) == Some(CidrFamily::V6)))
+}
+
 /// Validate a host-side interface name before it is interpolated into an
 /// `iptables -i <iface>` argument inside a `sh -c` script.
 ///
@@ -1598,8 +1675,10 @@ impl IptablesPlan {
         // init phase fails, instead of starting the workload with a partial
         // capture ruleset that would let egress silently bypass the mesh proxy
         // (and therefore `mesh_authz`). The idempotent command shapes are
-        // `set -e`-safe — `-N ... || true` and `-C ... || -A ...` only abort on
-        // a real `-A` append failure, never on the expected `-C`/`-N` misses.
+        // `set -e`-safe: `-N ... || true` and `-C ... || -A ...` tolerate the
+        // expected existence probes, while the ordered safety rule uses
+        // `-D ... || true; -I ... 1` and therefore still aborts on a real insert
+        // failure.
         format!(
             "set -e\n{}",
             iptables_script(
@@ -2028,6 +2107,38 @@ fn commands_for_family(
     let mut commands = Vec::new();
     commands.push(idempotent_new_chain(binary, "nat", "FERRUM_MESH_INBOUND"));
     commands.push(idempotent_new_chain(binary, "nat", "FERRUM_MESH_OUTBOUND"));
+
+    // Loopback / pod-self RETURN, emitted FIRST so it precedes every REDIRECT in
+    // this chain (issue #4276). `nat OUTPUT` is traversed by locally generated
+    // packets, including the universal multi-container-pod pattern where the app
+    // dials a sidecar over `127.0.0.1` (`postgres`, `redis`, an app-local admin
+    // port). With the shipped defaults the include rule is a catch-all
+    // `-p tcp -d 0.0.0.0/0 -j REDIRECT --to-ports <outbound>`, so without this
+    // RETURN that intra-pod connection is DNAT'd into the mesh outbound proxy,
+    // recovers `SO_ORIGINAL_DST = 127.0.0.1:<app port>`, matches no mesh route,
+    // and is handed to the HTTP path (or denied outright under
+    // `outboundTrafficPolicy: REGISTRY_ONLY`). Istio's `ISTIO_OUTPUT` carries
+    // `-d 127.0.0.1/32 -j RETURN` for exactly this.
+    //
+    // `-m addrtype --dst-type LOCAL` is the SAME discriminator the UDP sibling
+    // chain already uses (`udp_tproxy_commands_for_family`'s complementary
+    // `! --dst-type LOCAL` egress scope), and in the POD netns it covers both
+    // loopback and the pod's own IP in one family-agnostic rule — so the
+    // `ip6tables` fan-out gets the identical protection without a second literal.
+    //
+    // Gated on `host_netns` for the same reason the UDP path is: in the HOST
+    // namespace pod IPs are FORWARDED rather than `LOCAL`, so the discriminator
+    // does not describe "this workload's own address" there. The TCP chains are
+    // only ever rendered by the injector's pod-netns init container today, and
+    // this keeps that invariant explicit rather than assumed.
+    if !config.host_netns {
+        commands.push(idempotent_insert_first(
+            binary,
+            "nat",
+            "FERRUM_MESH_OUTBOUND",
+            "-m addrtype --dst-type LOCAL -j RETURN",
+        ));
+    }
 
     for cidr in &exclude_cidrs {
         commands.push(idempotent_append(
@@ -3550,6 +3661,17 @@ fn idempotent_new_chain(binary: &str, table: &str, chain: &str) -> String {
 fn idempotent_append(binary: &str, table: &str, chain: &str, rule: &str) -> String {
     format!(
         "{binary} -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -C {chain} {rule} 2>/dev/null || {binary} -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -A {chain} {rule}"
+    )
+}
+
+/// Install one rule at position 1 even when the chain survived an earlier
+/// generation. A simple `-C || -I` is not sufficient: if the rule already
+/// exists below a REDIRECT, `-C` succeeds and leaves the safety rule dead. The
+/// exact delete plus insert is idempotent and makes the documented "leads with"
+/// contract true across guarded retries as well as a fresh chain.
+fn idempotent_insert_first(binary: &str, table: &str, chain: &str, rule: &str) -> String {
+    format!(
+        "{binary} -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -D {chain} {rule} 2>/dev/null || true; {binary} -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -I {chain} 1 {rule}"
     )
 }
 
