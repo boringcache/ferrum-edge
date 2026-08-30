@@ -1509,8 +1509,9 @@ impl Plugin for Waf {
             Ok(value) => value,
             Err(result) => return result,
         };
+        let content_type = headers.get("content-type").map(String::as_str);
         let mut outcome = self
-            .run_body_scan_with_budget(|| self.run_request_body_scan(ctx, body))
+            .run_body_scan_with_budget(|| self.run_request_body_scan(ctx, body, content_type))
             .await;
         outcome.truncated = truncated;
         self.finish_scan(ctx, outcome)
