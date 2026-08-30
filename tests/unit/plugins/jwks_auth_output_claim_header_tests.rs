@@ -192,7 +192,7 @@ async fn unusable_claims_leave_the_destination_absent() {
     let plugin = plugin_with(json!([{"header": "x-claim-value", "claim": "value"}]))
         .expect("valid jwks_auth config");
 
-    for claims in [
+    let mut unusable_claims = vec![
         json!({"sub": "alice"}),
         json!({"sub": "alice", "value": null}),
         json!({"sub": "alice", "value": ""}),
@@ -203,7 +203,12 @@ async fn unusable_claims_leave_the_destination_absent() {
         // A header-illegal value must be dropped, never spliced into the
         // backend request.
         json!({"sub": "alice", "value": "bad\r\nx-injected: 1"}),
-    ] {
+    ];
+    unusable_claims.push(json!({
+        "sub": "alice",
+        "value": "x".repeat(8 * 1024 + 1),
+    }));
+    for claims in unusable_claims {
         let token = create_rs256_token(&claims, PRIVATE_KEY);
         let headers = run(&plugin, Some(&token), &[("x-claim-value", "attacker")]).await;
         assert_eq!(

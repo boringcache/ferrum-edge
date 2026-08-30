@@ -1490,8 +1490,8 @@ pub struct PassiveHealthCheck {
     /// locally originated `connection_error` values are ignored (Envoy's
     /// default `splitExternalLocalOriginErrors=false` puts those connection
     /// failures in the same 5xx bucket; Ferrum's split mode is deferred and
-    /// unused). Set only by translated DestinationRules; native windowed
-    /// policies never enable this.
+    /// unused). Normally set by translated DestinationRules; direct native
+    /// configuration may opt into the same sentinel explicitly.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub consecutive_5xx_ejection_disabled: bool,
 }

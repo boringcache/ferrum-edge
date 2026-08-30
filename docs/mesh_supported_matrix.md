@@ -465,9 +465,9 @@ need them, or because they are blocked upstream / architecturally:
   deferred), and
   a translated block that omits `maxEjectionPercent` inherits Istio's own 10%
   default rather than Ferrum's uncapped native default.
-- **`RequestAuthentication` / `Telemetry` `targetRefs`** — rejected
+- **`RequestAuthentication` / `Telemetry` `targetRef` / `targetRefs`** — rejected
   (`FerrumAccepted=False` / `Invalid`) rather than translated (issue #4305).
-  Only `AuthorizationPolicy` implements end-to-end `targetRefs` attachment;
+  Only `AuthorizationPolicy` implements end-to-end attachment for either form;
   admitting one on these kinds would read as "no selector" and WIDEN the
   resource to namespace scope — or to the whole mesh in the Istio root
   namespace. Scope these with a workload selector. Structural diagnostics
@@ -482,8 +482,9 @@ need them, or because they are blocked upstream / architecturally:
 - **VS `http[].route[].headers` on a weighted multi-destination route** —
   listed in `deferred_fields` (issue #4304). A weighted split materializes one
   upstream with weighted targets, so there is no per-destination rule to bind
-  the transform to. Single-destination routes DO apply it, after the route-level
-  `http[].headers` block.
+  the transform to. Single-destination routes DO apply it before the route-level
+  `http[].headers` block, matching Envoy's weighted-cluster then route mutation
+  order; a route-level `set` wins when both blocks write the same header.
 - **LB `MAGLEV`** — niche; `loadBalancer.simple = MAGLEV` is a hard reject at
   translation.
 - **Active-active multi-cluster endpoint discovery at scale** — minority need;

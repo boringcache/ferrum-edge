@@ -876,30 +876,23 @@ fn authorization_policy_status(
                     .and_then(Value::as_array)
                     .map(|v| v.len())
                     .unwrap_or(0);
-                let target_refs = object
-                    .spec
-                    .get("targetRefs")
-                    .and_then(Value::as_array)
-                    .map(|refs| {
-                        refs.iter()
-                            .filter_map(|entry| {
-                                let kind = entry.get("kind")?.as_str()?;
-                                let name = entry.get("name")?.as_str()?;
-                                let group =
-                                    entry.get("group").and_then(Value::as_str).unwrap_or("");
-                                Some(json!({
-                                    "group": group,
-                                    "kind": kind,
-                                    "name": name,
-                                    "namespace": entry
-                                        .get("namespace")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or(&object.metadata.namespace),
-                                }))
-                            })
-                            .collect::<Vec<_>>()
+                let target_refs = declared_target_ref_entries(&object.spec)
+                    .into_iter()
+                    .filter_map(|entry| {
+                        let kind = entry.get("kind")?.as_str()?;
+                        let name = entry.get("name")?.as_str()?;
+                        let group = entry.get("group").and_then(Value::as_str).unwrap_or("");
+                        Some(json!({
+                            "group": group,
+                            "kind": kind,
+                            "name": name,
+                            "namespace": entry
+                                .get("namespace")
+                                .and_then(Value::as_str)
+                                .unwrap_or(&object.metadata.namespace),
+                        }))
                     })
-                    .unwrap_or_default();
+                    .collect::<Vec<_>>();
                 let message = if target_refs.is_empty() {
                     format!("Ferrum accepted this AuthorizationPolicy ({rule_count} rule(s))")
                 } else {
@@ -1634,7 +1627,7 @@ fn request_authentication_status(
         .and_then(Value::as_array)
         .map(|v| v.len())
         .unwrap_or(0);
-    // COUNT only (issue #4305). A rejected targetRefs attachment must be
+    // COUNT only (issue #4305). A rejected targetRef(s) attachment must be
     // visible without republishing the referenced resource identities into a
     // cluster-readable status block.
     let declared_target_refs = declared_target_ref_count(&object.spec);
@@ -2343,23 +2336,33 @@ fn proxy_config_status(
     }
 }
 
-/// Resolve the Istio policy scope label for selector-driven CRDs
-/// (`RequestAuthentication`, etc.) the same way the translator's
-/// `istio_policy_scope` does: a non-empty selector means `WorkloadSelector`,
-/// the root namespace means `MeshWide`, otherwise `Namespace`.
-/// Number of declared `spec.targetRefs` entries, with NO resource identities.
+/// Declared `spec.targetRef` / `spec.targetRefs` entries, with no interpretation.
+fn declared_target_ref_entries(spec: &Value) -> Vec<&Value> {
+    let mut entries = Vec::new();
+    if let Some(entry) = spec.get("targetRef") {
+        entries.push(entry);
+    }
+    if let Some(target_refs) = spec.get("targetRefs").and_then(Value::as_array) {
+        entries.extend(target_refs);
+    }
+    entries
+}
+
+/// Number of declared `spec.targetRef` / `spec.targetRefs` entries, with NO
+/// resource identities.
 ///
-/// `RequestAuthentication` / `Telemetry` reject `targetRefs` outright (issue
+/// `RequestAuthentication` / `Telemetry` reject either target-reference form (issue
 /// #4305) rather than widening to namespace/mesh scope; the count is what makes
 /// the refusal legible in `kubectl describe` without republishing the target
 /// group/kind/name/namespace into a cluster-readable object.
 fn declared_target_ref_count(spec: &Value) -> usize {
-    spec.get("targetRefs")
-        .and_then(Value::as_array)
-        .map(|entries| entries.len())
-        .unwrap_or(0)
+    declared_target_ref_entries(spec).len()
 }
 
+/// Resolve the Istio policy scope label for selector-driven CRDs
+/// (`RequestAuthentication`, etc.) the same way the translator's
+/// `istio_policy_scope` does: a non-empty selector means `WorkloadSelector`,
+/// the root namespace means `MeshWide`, otherwise `Namespace`.
 fn istio_policy_scope_label(object: &K8sObject, istio_root_namespace: &str) -> &'static str {
     if workload_selector_from_istio(object.spec.get("selector"), None).is_some() {
         "WorkloadSelector"

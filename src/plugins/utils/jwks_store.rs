@@ -640,16 +640,14 @@ impl JwksKeyStore {
     /// The task runs until the returned [`tokio::task::JoinHandle`] is aborted
     /// or the process exits. Populated stores keep the configured refresh cadence
     /// based on fetch start time; every failed refresh (including an empty 200)
-    /// retries on a short capped backoff without advancing key trust. The first
-    /// pass yields once so the shared-cache insertion can release its shard
-    /// guard, then fetches without registering a zero-deadline timer.
+    /// retries on a short capped backoff without advancing key trust.
     pub fn start_background_refresh(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
         self.start_background_refresh_task(interval, false)
     }
 
     /// Replace a background task after publishing a changed refresh policy.
     ///
-    /// The first iteration forces a fetch (rather than `fetch_keys_if_empty`)
+    /// Unlike ordinary startup, the first iteration contacts the endpoint
     /// before waiting on the timer wheel. A retained snapshot may be fresh
     /// under the new policy but close enough to its stricter deadline that
     /// waiting a full interval would leave it expired before the next
@@ -679,19 +677,14 @@ impl JwksKeyStore {
             let mut next_refresh_at = Instant::now();
             let mut first_refresh = true;
             loop {
-                // Every first pass must avoid the timer wheel: a
-                // `sleep_until(Instant::now())` timer is not guaranteed to fire
-                // promptly under a frozen clock or a saturated hosted matrix.
-                // Yield exactly once instead. Besides giving the worker a fair
-                // scheduling turn, this lets the shared cache release the
-                // DashMap shard guard held while the task was spawned before a
-                // refresh completion republishes trust health and re-enters the
-                // cache. Policy reconfiguration still forces `fetch_keys`
-                // below; ordinary startup coalesces with eager warmup through
-                // `fetch_keys_if_empty`.
-                if first_refresh {
-                    tokio::task::yield_now().await;
-                } else {
+                // Policy reconfiguration must hit the endpoint immediately.
+                // Do not register a zero-delay timer for that first pass —
+                // under a frozen/paused clock the timer may never become ready
+                // until time is advanced, which would miss the stricter
+                // max-stale window the reconfiguration exists to honor.
+                // `unconstrained` keeps that first fetch from being fairness-
+                // delayed behind unrelated tasks under the full/coverage matrix.
+                if !(first_refresh && force_first_refresh) {
                     tokio::time::sleep_until(next_refresh_at).await;
                 }
                 let fetch_started_at = Instant::now();

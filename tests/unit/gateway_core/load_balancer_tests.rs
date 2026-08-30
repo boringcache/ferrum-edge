@@ -2292,6 +2292,118 @@ fn ejection_cap_zero_percent_readmits_all() {
 }
 
 #[test]
+fn ejection_cap_rounds_down_like_envoy_for_small_pools() {
+    use ferrum_edge::config::types::PassiveHealthCheck;
+    use ferrum_edge::health_check::HealthChecker;
+
+    let targets = make_targets(3);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+    );
+    let checker = HealthChecker::new();
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 1,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+        max_ejection_percent: None,
+        gateway_error_codes: None,
+        split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
+    };
+    checker.report_response(
+        "ferrum",
+        "test-proxy",
+        TEST_UPSTREAM,
+        &targets[0],
+        500,
+        false,
+        Some(&config),
+    );
+
+    let active = DashMap::new();
+    let proxy_passive = checker
+        .passive_health
+        .get("ferrum|test-proxy")
+        .map(|entry| entry.clone());
+    let ctx = HealthContext {
+        active_unhealthy: &active,
+        proxy_passive,
+        max_ejection_percent: Some(10),
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..100 {
+        seen.insert(lb.select("", Some(&ctx)).unwrap().target.host.clone());
+    }
+    assert_eq!(
+        seen.len(),
+        3,
+        "Envoy's integer 10% gate permits zero ejections in a three-target pool"
+    );
+}
+
+#[test]
+fn ejection_cap_matches_envoy_integer_boundary() {
+    use ferrum_edge::config::types::PassiveHealthCheck;
+    use ferrum_edge::health_check::HealthChecker;
+
+    let targets = make_targets(3);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+    );
+    let checker = HealthChecker::new();
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 1,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+        max_ejection_percent: None,
+        gateway_error_codes: None,
+        split_external_local_origin_errors: None,
+        consecutive_error_mode: false,
+        consecutive_5xx_ejection_disabled: false,
+    };
+    checker.report_response(
+        "ferrum",
+        "test-proxy",
+        TEST_UPSTREAM,
+        &targets[0],
+        500,
+        false,
+        Some(&config),
+    );
+
+    let active = DashMap::new();
+    let proxy_passive = checker
+        .passive_health
+        .get("ferrum|test-proxy")
+        .map(|entry| entry.clone());
+    let ctx = HealthContext {
+        active_unhealthy: &active,
+        proxy_passive,
+        max_ejection_percent: Some(33),
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..100 {
+        seen.insert(lb.select("", Some(&ctx)).unwrap().target.host.clone());
+    }
+    assert_eq!(
+        seen.len(),
+        2,
+        "Envoy's integer gate permits one of three ejections at 33%"
+    );
+}
+
+#[test]
 fn ejection_cap_does_not_affect_active_health_ejections() {
     use ferrum_edge::config::types::PassiveHealthCheck;
     use ferrum_edge::health_check::HealthChecker;
@@ -2370,11 +2482,10 @@ fn ejection_cap_does_not_affect_active_health_ejections() {
 /// computation used the whole upstream. Here the in-subset orig-dst target is
 /// passively ejected; the assertion is that out-of-pool ejections do NOT change
 /// whether it is dialed. With a 1-target subset and a 25% cap, the in-pool
-/// target stays ejected (`ceil(1*25/100)=1`, one ejection within cap → 0
-/// readmit) regardless of how many out-of-pool targets are ejected. Under the
-/// old whole-upstream cap (`ceil(4*25/100)=1`), ejecting the 3 out-of-pool
-/// targets too (4 > 1) would readmit the earliest — the matched in-pool target
-/// — flipping the result to a dial.
+/// target is re-admitted (`floor(1*25/100)=0`, so the pool permits no ejections)
+/// regardless of how many out-of-pool targets are ejected. Under a whole-upstream
+/// cap (`floor(4*25/100)=1`), ejecting only the in-pool target would instead keep
+/// it ejected, so out-of-pool pool size would change the decision.
 #[test]
 fn passthrough_ejection_cap_scoped_to_candidate_pool_not_whole_upstream() {
     use ferrum_edge::config::types::{PassiveHealthCheck, SubsetDefinition};
@@ -2487,8 +2598,8 @@ fn passthrough_ejection_cap_scoped_to_candidate_pool_not_whole_upstream() {
             .is_some()
     };
 
-    // Only the in-pool target ejected (earliest ts): with the pool-scoped cap it
-    // stays ejected → not dialed.
+    // Only the in-pool target ejected (earliest ts): the one-target pool permits
+    // zero ejections at 25%, so it is re-admitted and dialed.
     let only_in_pool = dial_decision(&[(&targets[0], 100)]);
     // Additionally eject all 3 out-of-pool targets (later ts). Pool-scoped, the
     // v1 pool is unchanged (still just the ejected in-pool target) → identical.
@@ -2500,8 +2611,8 @@ fn passthrough_ejection_cap_scoped_to_candidate_pool_not_whole_upstream() {
     ]);
 
     assert!(
-        !only_in_pool,
-        "in-pool orig-dst ejected within the subset cap must not be dialed"
+        only_in_pool,
+        "a 25% cap permits zero ejections in a one-target subset, so the target is re-admitted"
     );
     assert_eq!(
         only_in_pool, plus_out_of_pool,

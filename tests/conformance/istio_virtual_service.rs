@@ -1421,8 +1421,41 @@ fn vs_malformed_header_transform_fails_closed() {
     }
 }
 
-/// A single-destination `http[].route[].headers` block is applied after the
-/// route-level block, so the more specific `set` wins.
+#[test]
+fn vs_request_host_set_projects_to_typed_authority_rewrite() {
+    for request_headers in [
+        json!({"set": {"Host": "internal.svc", "x-route": "base"}}),
+        json!({"set": {":authority": "internal.svc", "x-route": "base"}}),
+    ] {
+        let plugins = plugins_for(&[virtual_service(json!({
+            "hosts": ["api.example.com"],
+            "http": [{
+                "headers": {"request": request_headers},
+                "route": [{"destination": {
+                    "host": "echo.default.svc.cluster.local",
+                    "port": {"number": 8080}
+                }}]
+            }]
+        }))]);
+        let dispatch = plugins
+            .iter()
+            .find(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+            .expect("authority set must emit a mesh_route_dispatch plugin");
+        let rule = &dispatch.config["rules"][0];
+        assert_eq!(rule["rewrite"]["authority"].as_str(), Some("internal.svc"));
+        assert_eq!(
+            rule["request_transform"],
+            json!([
+                {"operation": "update", "target": "header", "key": "x-route", "value": "base"},
+            ]),
+            "Host/:authority must use the typed rewrite, not the generic transformer"
+        );
+    }
+}
+
+/// A single-destination `http[].route[].headers` block is applied before the
+/// route-level block, matching Envoy's weighted-cluster → route ordering so
+/// the route-level `set` wins.
 #[test]
 fn vs_single_destination_route_headers_are_applied() {
     let plugins = plugins_for(&[virtual_service(json!({
@@ -1447,9 +1480,9 @@ fn vs_single_destination_route_headers_are_applied() {
     assert_eq!(
         dispatch.config["rules"][0]["request_transform"],
         json!([
-            {"operation": "update", "target": "header", "key": "x-route", "value": "base"},
             {"operation": "update", "target": "header", "key": "x-route", "value": "destination"},
+            {"operation": "update", "target": "header", "key": "x-route", "value": "base"},
         ]),
-        "the per-destination block is appended after the route-level block"
+        "the route-level block must run after the per-destination block"
     );
 }

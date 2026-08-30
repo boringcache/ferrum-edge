@@ -208,7 +208,7 @@ fn recognized_but_unenforced_jwt_rule_fields_still_translate() {
 // ── #4305 targetRefs must not widen ───────────────────────────────────────
 
 #[test]
-fn request_authentication_with_target_refs_is_not_widened_to_namespace() {
+fn request_authentication_with_singular_target_ref_is_not_widened_to_namespace() {
     let error = translate_in(
         "default",
         &[
@@ -232,11 +232,11 @@ fn request_authentication_with_target_refs_is_not_widened_to_namespace() {
             request_authentication(
                 "default",
                 json!({
-                    "targetRefs": [{
+                    "targetRef": {
                         "group": "gateway.networking.k8s.io",
                         "kind": "Gateway",
                         "name": "waypoint"
-                    }],
+                    },
                     "jwtRules": [{
                         "issuer": "https://issuer.example.com",
                         "jwksUri": "https://issuer.example.com/jwks"
@@ -245,15 +245,15 @@ fn request_authentication_with_target_refs_is_not_widened_to_namespace() {
             ),
         ],
     )
-    .expect_err("a targetRefs-only RequestAuthentication must not be silently widened");
+    .expect_err("a targetRef-only RequestAuthentication must not be silently widened");
     assert!(
-        error.contains("targetRefs is not supported"),
-        "expected a fail-closed targetRefs diagnostic, got: {error}"
+        error.contains("targetRef is not supported"),
+        "expected a fail-closed targetRef diagnostic, got: {error}"
     );
 }
 
 #[test]
-fn telemetry_with_target_refs_is_not_widened_to_mesh_wide() {
+fn telemetry_with_singular_target_ref_is_not_widened_to_mesh_wide() {
     let error = translate_in(
         ROOT_NS,
         &[
@@ -277,20 +277,20 @@ fn telemetry_with_target_refs_is_not_widened_to_mesh_wide() {
             telemetry(
                 ROOT_NS,
                 json!({
-                    "targetRefs": [{
+                    "targetRef": {
                         "group": "gateway.networking.k8s.io",
                         "kind": "Gateway",
                         "name": "ingress"
-                    }],
+                    },
                     "accessLogging": [{"disabled": true}]
                 }),
             ),
         ],
     )
-    .expect_err("a root-namespace targetRefs Telemetry must not become MeshWide");
+    .expect_err("a root-namespace targetRef Telemetry must not become MeshWide");
     assert!(
-        error.contains("targetRefs is not supported"),
-        "expected a fail-closed targetRefs diagnostic, got: {error}"
+        error.contains("targetRef is not supported"),
+        "expected a fail-closed targetRef diagnostic, got: {error}"
     );
 }
 
@@ -381,7 +381,7 @@ fn destination_rule(outlier: Value) -> K8sObject {
 }
 
 #[test]
-fn translated_outlier_detection_without_a_cap_inherits_istios_ten_percent() {
+fn translated_outlier_detection_preserves_an_omitted_cap_for_overlay_time() {
     let mesh = translate_in(
         "default",
         &[destination_rule(json!({
@@ -399,8 +399,8 @@ fn translated_outlier_detection_without_a_cap_inherits_istios_ten_percent() {
     assert_eq!(outlier.consecutive_errors, Some(5));
     assert_eq!(
         outlier.max_ejection_percent,
-        Some(10),
-        "a stock Istio DestinationRule must not eject the whole upstream"
+        None,
+        "translation must not synthesize a per-block default that overwrites a lower tier"
     );
 }
 
@@ -426,6 +426,33 @@ fn an_explicit_max_ejection_percent_still_wins() {
 }
 
 #[test]
+fn malformed_outlier_detection_values_fail_closed() {
+    for (outlier, field) in [
+        (json!({"consecutive5xxErrors": "5"}), "consecutive5xxErrors"),
+        (json!({"consecutive5xxErrors": -1}), "consecutive5xxErrors"),
+        (json!({"consecutive5xxErrors": 5.5}), "consecutive5xxErrors"),
+        (
+            json!({"consecutive5xxErrors": u64::from(u32::MAX) + 1}),
+            "consecutive5xxErrors",
+        ),
+        (json!({"interval": 10}), "interval"),
+        (json!({"interval": "later"}), "interval"),
+        (json!({"interval": "0s"}), "interval"),
+        (json!({"baseEjectionTime": 30}), "baseEjectionTime"),
+        (json!({"baseEjectionTime": "later"}), "baseEjectionTime"),
+        (json!({"maxEjectionPercent": "10"}), "maxEjectionPercent"),
+        (json!({"maxEjectionPercent": 101}), "maxEjectionPercent"),
+    ] {
+        let error = translate_in("default", &[destination_rule(outlier)])
+            .expect_err("an unrepresentable outlierDetection value must fail closed");
+        assert!(
+            error.contains(field),
+            "expected a field-shaped {field} diagnostic, got: {error}"
+        );
+    }
+}
+
+#[test]
 fn unenforced_outlier_fields_do_not_reject_the_resource() {
     // They are reported through `deferred_fields` (status-planning tests).
     let mesh = translate_in(
@@ -448,7 +475,7 @@ fn unenforced_outlier_fields_do_not_reject_the_resource() {
 }
 
 #[test]
-fn translated_outlier_detection_without_consecutive_fields_inherits_istios_five() {
+fn translated_outlier_detection_preserves_an_omitted_threshold_for_overlay_time() {
     let mesh = translate_in(
         "default",
         &[destination_rule(json!({
@@ -464,14 +491,14 @@ fn translated_outlier_detection_without_consecutive_fields_inherits_istios_five(
         .expect("outlierDetection translated");
     assert_eq!(
         outlier.consecutive_errors,
-        Some(5),
-        "omitted consecutive5xxErrors must inherit Istio's default of 5"
+        None,
+        "translation must preserve omission so a lower tier can supply the threshold"
     );
-    assert_eq!(outlier.max_ejection_percent, Some(10));
+    assert_eq!(outlier.max_ejection_percent, None);
 }
 
 #[test]
-fn translated_outlier_detection_empty_block_inherits_istios_five() {
+fn translated_outlier_detection_empty_block_preserves_omitted_fields() {
     let mesh = translate_in("default", &[destination_rule(json!({}))])
         .expect("empty outlierDetection translates");
 
@@ -481,7 +508,7 @@ fn translated_outlier_detection_empty_block_inherits_istios_five() {
             .as_ref()
             .and_then(|policy| policy.outlier_detection.as_ref())
             .and_then(|outlier| outlier.consecutive_errors),
-        Some(5)
+        None
     );
 }
 
@@ -507,7 +534,7 @@ fn explicit_zero_consecutive5xx_errors_is_preserved_as_disabled() {
 }
 
 #[test]
-fn legacy_consecutive_errors_alias_still_wins_over_default() {
+fn legacy_consecutive_errors_alias_is_preserved_for_overlay() {
     let mesh = translate_in(
         "default",
         &[destination_rule(json!({

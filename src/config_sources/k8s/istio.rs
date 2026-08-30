@@ -26,6 +26,7 @@ use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, K8sTranslationOptions,
     MeshRouteDispatchDestination, MeshRouteDispatchPolicy, RouteBackend, RouteProxySpec,
     SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
+    is_vs_authority_header,
     mesh_route_dispatch_can_emit_rule, mesh_route_dispatch_has_unsupported_predicate,
     mesh_route_dispatch_plugin_from_rules, mesh_route_dispatch_rules_for_proxy,
     optional_port_field, optional_target_weight_field, parse_istio_duration_ms, port_from_u64,
@@ -153,7 +154,7 @@ fn authorization_policy(
     }
 
     let has_selector = object.spec.get("selector").is_some();
-    let has_target_refs = object.spec.get("targetRefs").is_some();
+    let has_target_refs = has_istio_target_refs(&object.spec);
     if has_selector && has_target_refs {
         return Err(invalid_resource(
             object,
@@ -375,40 +376,54 @@ fn resolve_authorization_policy_target_refs(
     object: &K8sObject,
     kind: &str,
 ) -> Result<Vec<PolicyTargetAttachment>, K8sTranslateError> {
-    let raw = object
-        .spec
-        .get("targetRefs")
-        .ok_or_else(|| invalid_resource(object, format!("{kind} targetRefs is required")))?;
-    let entries = raw
-        .as_array()
-        .ok_or_else(|| invalid_resource(object, format!("{kind} targetRefs must be an array")))?;
+    let mut entries: Vec<(String, &Value)> = Vec::new();
+    if let Some(entry) = object.spec.get("targetRef") {
+        entries.push(("targetRef".to_string(), entry));
+    }
+    if let Some(raw) = object.spec.get("targetRefs") {
+        let target_refs = raw.as_array().ok_or_else(|| {
+            invalid_resource(object, format!("{kind} targetRefs must be an array"))
+        })?;
+        entries.extend(
+            target_refs
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (format!("targetRefs[{index}]"), entry)),
+        );
+    }
     if entries.is_empty() {
         return Err(invalid_resource(
             object,
-            format!("{kind} targetRefs must not be empty"),
+            format!("{kind} targetRef or targetRefs is required and must not be empty"),
         ));
     }
     if entries.len() > AUTHZ_TARGET_REF_MAX {
         return Err(invalid_resource(
             object,
-            format!("{kind} targetRefs supports at most {AUTHZ_TARGET_REF_MAX} entries"),
+            format!(
+                "{kind} targetRef and targetRefs support at most {AUTHZ_TARGET_REF_MAX} entries"
+            ),
         ));
     }
 
     let mut attachments = Vec::with_capacity(entries.len());
-    for (index, entry) in entries.iter().enumerate() {
+    for (path, entry) in entries {
         attachments.push(resolve_one_authorization_policy_target_ref(
-            acc, object, kind, index, entry,
+            acc, object, kind, &path, entry,
         )?);
     }
     Ok(attachments)
+}
+
+fn has_istio_target_refs(spec: &Value) -> bool {
+    spec.get("targetRef").is_some() || spec.get("targetRefs").is_some()
 }
 
 fn resolve_one_authorization_policy_target_ref(
     acc: &K8sAccumulator,
     object: &K8sObject,
     kind_label: &str,
-    index: usize,
+    path: &str,
     entry: &Value,
 ) -> Result<PolicyTargetAttachment, K8sTranslateError> {
     use crate::modes::mesh::config::{
@@ -416,7 +431,12 @@ fn resolve_one_authorization_policy_target_ref(
         MAX_POLICY_TARGET_REF_NAME_LEN, MAX_POLICY_TARGET_REF_NAMESPACE_LEN,
     };
 
-    let path = format!("targetRefs[{index}]");
+    if !entry.is_object() {
+        return Err(invalid_resource(
+            object,
+            format!("{kind_label} {path} must be an object"),
+        ));
+    }
     let kind = string_field(entry, "kind")
         .ok_or_else(|| invalid_resource(object, format!("{kind_label} {path}.kind is required")))?;
     if kind.len() > MAX_POLICY_TARGET_REF_KIND_LEN {
@@ -1512,11 +1532,11 @@ fn jwt_from_headers(object: &K8sObject, rule: &Value) -> Result<Vec<JwtHeader>, 
         .collect()
 }
 
-/// Refuse a `targetRefs`-carrying resource whose targetRefs Ferrum cannot
+/// Refuse a `targetRef` / `targetRefs`-carrying resource whose attachments Ferrum cannot
 /// enforce (issue #4305).
 ///
 /// `istio_policy_scope` has three outcomes and reads `selector` only, so a
-/// resource carrying ONLY `targetRefs` looks selector-less and WIDENS to
+/// resource carrying ONLY either target-reference form looks selector-less and WIDENS to
 /// namespace scope — or, in the Istio root namespace, to the whole mesh. For a
 /// `RequestAuthentication` that installs a JWT provider on workloads that were
 /// never in scope; for a `Telemetry` that can disable access logging mesh-wide.
@@ -1536,7 +1556,7 @@ fn reject_unenforceable_target_refs(
     object: &K8sObject,
     kind: &str,
 ) -> Result<(), K8sTranslateError> {
-    if object.spec.get("targetRefs").is_none() {
+    if !has_istio_target_refs(&object.spec) {
         return Ok(());
     }
     if object.spec.get("selector").is_some() {
@@ -1548,10 +1568,17 @@ fn reject_unenforceable_target_refs(
     // Surface structural/ownership problems with the exact same diagnostics an
     // AuthorizationPolicy would produce.
     resolve_authorization_policy_target_refs(acc, object, kind)?;
+    let field = if object.spec.get("targetRef").is_some()
+        && object.spec.get("targetRefs").is_none()
+    {
+        "targetRef"
+    } else {
+        "targetRefs"
+    };
     Err(invalid_resource(
         object,
         format!(
-            "{kind} targetRefs is not supported; Ferrum implements targetRefs attachment for \
+            "{kind} {field} is not supported; Ferrum implements targetRefs attachment for \
              AuthorizationPolicy only, and admitting this resource would widen it to \
              namespace-wide (or mesh-wide in the Istio root namespace) scope. Use a workload \
              selector to scope it explicitly"
@@ -2693,24 +2720,6 @@ fn translate_client_tls_settings(
     })
 }
 
-/// Istio/Envoy default `outlierDetection.maxEjectionPercent` (issue #4292).
-///
-/// Istio defaults the cap to 10%; Ferrum's native `max_ejection_percent`
-/// defaults to `None` (uncapped). Applying the Istio default to a TRANSLATED
-/// DestinationRule that omits the field is what keeps a stock Istio config
-/// from ejecting an entire upstream into all-unhealthy fallback here when it
-/// would eject at most one in ten backends there. Native/file/xDS policies keep
-/// Ferrum's own uncapped default.
-pub(crate) const ISTIO_DEFAULT_MAX_EJECTION_PERCENT: u8 = 10;
-
-/// Istio/Envoy default `outlierDetection.consecutive5xxErrors` (issue #4292).
-///
-/// Istio defaults the consecutive 5xx streak threshold to 5; Ferrum's native
-/// passive health defaults to 3 failures in a sliding window. Applied only when
-/// a translated DestinationRule omits both `consecutive5xxErrors` and the
-/// legacy `consecutiveErrors` alias.
-pub(crate) const ISTIO_DEFAULT_CONSECUTIVE_5XX_ERRORS: u32 = 5;
-
 /// `outlierDetection` fields Ferrum parses past but does not enforce
 /// (issue #4292). Kept in sync with `deferred_outlier_detection_fields` in
 /// `src/k8s_controller/istio_status.rs`.
@@ -2728,31 +2737,73 @@ fn translate_outlier_detection(
         .get("consecutive5xxErrors")
         .or_else(|| value.get("consecutiveErrors"))
     {
-        Some(raw) => raw.as_u64().and_then(|v| u32::try_from(v).ok()),
-        None => Some(ISTIO_DEFAULT_CONSECUTIVE_5XX_ERRORS),
+        Some(raw) => Some(
+            raw.as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        "outlierDetection.consecutive5xxErrors must be a non-negative integer",
+                    )
+                })?,
+        ),
+        None => None,
     };
 
-    let interval_seconds = string_field(value, "interval")
-        .and_then(parse_istio_duration_secs)
-        .filter(|seconds| *seconds > 0);
-
-    let base_ejection_seconds =
-        string_field(value, "baseEjectionTime").and_then(parse_istio_duration_secs);
-
-    let max_ejection_percent = value
-        .get("maxEjectionPercent")
-        .and_then(Value::as_u64)
-        .map(|v| {
-            if v <= 100 {
-                Ok(v as u8)
-            } else {
-                Err(invalid_resource(
+    let interval_seconds = match value.get("interval") {
+        Some(raw) => {
+            let raw = raw.as_str().ok_or_else(|| {
+                invalid_resource(
                     object,
-                    format!("outlierDetection.maxEjectionPercent must be 0-100 (got {v})"),
-                ))
-            }
-        })
-        .transpose()?;
+                    "outlierDetection.interval must be a positive duration string",
+                )
+            })?;
+            let seconds = parse_istio_duration_secs(raw)
+                .filter(|seconds| *seconds > 0)
+                .ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        "outlierDetection.interval must be a positive duration string",
+                    )
+                })?;
+            Some(seconds)
+        }
+        None => None,
+    };
+
+    let base_ejection_seconds = match value.get("baseEjectionTime") {
+        Some(raw) => {
+            let raw = raw.as_str().ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    "outlierDetection.baseEjectionTime must be a duration string",
+                )
+            })?;
+            Some(parse_istio_duration_secs(raw).ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    "outlierDetection.baseEjectionTime must be a duration string",
+                )
+            })?)
+        }
+        None => None,
+    };
+
+    let max_ejection_percent = match value.get("maxEjectionPercent") {
+        Some(raw) => {
+            let percent = raw
+                .as_u64()
+                .filter(|value| *value <= 100)
+                .ok_or_else(|| {
+                    invalid_resource(
+                        object,
+                        "outlierDetection.maxEjectionPercent must be an integer from 0 through 100",
+                    )
+                })?;
+            Some(percent as u8)
+        }
+        None => None,
+    };
 
     // Recognized-but-unenforced fields. Warn by FIELD NAME only (a threshold
     // value is operator configuration, not a secret, but the status projection
@@ -2773,8 +2824,7 @@ fn translate_outlier_detection(
         consecutive_errors,
         interval_seconds,
         base_ejection_seconds,
-        // Istio's own default, applied only to translated policies.
-        max_ejection_percent: max_ejection_percent.or(Some(ISTIO_DEFAULT_MAX_EJECTION_PERCENT)),
+        max_ejection_percent,
     })
 }
 
@@ -3194,7 +3244,6 @@ fn uri_match_for_literal_listen_path(listen_path: &Option<String>) -> Option<Val
 const VS_UNWRITABLE_HEADERS: &[&str] = &[
     "connection",
     "content-length",
-    "host",
     "keep-alive",
     "proxy-connection",
     "te",
@@ -3285,6 +3334,7 @@ fn validate_vs_header_block(
                 ));
             }
         }
+        let mut has_request_authority_set = false;
         for operation in ["set", "add"] {
             let Some(entries) = block.get(operation) else {
                 continue;
@@ -3297,7 +3347,30 @@ fn validate_vs_header_block(
             })?;
             for (name, value) in entries {
                 let field = format!("{path}.{direction}.{operation}");
-                let normalized = validate_vs_header_name(object, &field, name)?;
+                let authority_header = is_vs_authority_header(name);
+                let normalized = if authority_header {
+                    "host".to_string()
+                } else {
+                    validate_vs_header_name(object, &field, name)?
+                };
+                if authority_header && (direction != "request" || operation != "set") {
+                    return Err(invalid_resource(
+                        object,
+                        format!(
+                            "VirtualService {field} cannot write framing or hop-by-hop header \
+                             '{normalized}'"
+                        ),
+                    ));
+                }
+                if authority_header && has_request_authority_set {
+                    return Err(invalid_resource(
+                        object,
+                        format!(
+                            "VirtualService {field} must declare at most one Host/:authority set"
+                        ),
+                    ));
+                }
+                has_request_authority_set |= authority_header;
                 if VS_UNWRITABLE_HEADERS.contains(&normalized.as_str())
                     || (direction == "response"
                         && crate::proxy::headers::is_protocol_managed_plugin_response_destination(
@@ -3324,6 +3397,17 @@ fn validate_vs_header_block(
                         format!(
                             "VirtualService {field}['{normalized}'] is not a valid HTTP header \
                              value"
+                        ),
+                    ));
+                }
+                if authority_header
+                    && (value.is_empty() || value.chars().any(char::is_whitespace))
+                {
+                    return Err(invalid_resource(
+                        object,
+                        format!(
+                            "VirtualService {field}['{normalized}'] must be a non-empty authority \
+                             without whitespace"
                         ),
                     ));
                 }
@@ -5529,20 +5613,30 @@ fn route_timeout_ms(http: &Value) -> Option<u64> {
 /// Project an Istio `VirtualService.http[].rewrite` block into the per-rule
 /// `RouteRewriteConfig` JSON shape consumed by `mesh_route_dispatch`.
 ///
-/// Maps `rewrite.uri` -> `uri` and `rewrite.authority` -> `authority`. The
+/// Maps `rewrite.uri` -> `uri` and `rewrite.authority` -> `authority`. An Istio
+/// `headers.request.set` entry for `Host` / `:authority` uses the same typed
+/// authority projection when no explicit `rewrite.authority` is present; it is
+/// removed from the generic transformer rule list. The
 /// `match_prefix` field is filled per emitted rule by
 /// `mesh_route_dispatch_rules_for_proxy` from each match entry's URI prefix —
 /// it is NOT derived here. Returns `None` when neither field is present so a
 /// `rewrite: {}` block does not emit an inert action.
 fn route_rewrite_value(http: &Value) -> Option<Value> {
-    let rewrite = http.get("rewrite")?.as_object()?;
+    let rewrite = http.get("rewrite").and_then(Value::as_object);
     let mut out = serde_json::Map::new();
-    if let Some(uri) = rewrite.get("uri").and_then(Value::as_str)
+    if let Some(uri) = rewrite
+        .and_then(|value| value.get("uri"))
+        .and_then(Value::as_str)
         && !uri.is_empty()
     {
         out.insert("uri".to_string(), Value::String(uri.to_string()));
     }
-    if let Some(authority) = rewrite.get("authority").and_then(Value::as_str)
+    let authority = rewrite
+        .and_then(|value| value.get("authority"))
+        .and_then(Value::as_str)
+        .filter(|authority| !authority.is_empty())
+        .or_else(|| route_request_header_authority(http));
+    if let Some(authority) = authority
         && !authority.is_empty()
     {
         out.insert(
@@ -5554,6 +5648,26 @@ fn route_rewrite_value(http: &Value) -> Option<Value> {
         return None;
     }
     Some(Value::Object(out))
+}
+
+fn route_request_header_authority(http: &Value) -> Option<&str> {
+    fn from_headers(headers: Option<&Value>) -> Option<&str> {
+        headers?
+            .get("request")?
+            .get("set")?
+            .as_object()?
+            .iter()
+            .find(|(name, _)| is_vs_authority_header(name))
+            .and_then(|(_, value)| value.as_str())
+    }
+
+    from_headers(http.get("headers")).or_else(|| {
+        let destinations = http.get("route")?.as_array()?;
+        if destinations.len() != 1 {
+            return None;
+        }
+        from_headers(destinations[0].get("headers"))
+    })
 }
 
 /// Project an Istio `VirtualService.http[].redirect` block into the per-rule
@@ -12477,8 +12591,9 @@ extensionProviders:
         .expect_err("invalid max ejection percent must fail");
 
         assert!(
-            err.to_string()
-                .contains("outlierDetection.maxEjectionPercent must be 0-100")
+            err.to_string().contains(
+                "outlierDetection.maxEjectionPercent must be an integer from 0 through 100"
+            )
         );
     }
 
@@ -18207,8 +18322,8 @@ extensionProviders:
     }
 
     #[test]
-    fn destination_rule_outlier_interval_ignores_zero_and_rounds_subsecond() {
-        let zero_interval = translate_k8s_objects(
+    fn destination_rule_outlier_interval_rejects_zero_and_rounds_subsecond() {
+        let zero_error = translate_k8s_objects(
             &[object(
                 "DestinationRule",
                 serde_json::json!({
@@ -18222,15 +18337,11 @@ extensionProviders:
             )],
             options(),
         )
-        .expect("translation succeeds");
-        let mesh = zero_interval.config.mesh.expect("mesh config");
-        assert_eq!(
-            mesh.destination_rules[0]
-                .traffic_policy
-                .as_ref()
-                .and_then(|policy| policy.outlier_detection.as_ref())
-                .and_then(|outlier| outlier.interval_seconds),
-            None
+        .expect_err("zero outlier interval must fail closed");
+        assert!(
+            zero_error.to_string().contains(
+                "outlierDetection.interval must be a positive duration string"
+            )
         );
 
         let subsecond_interval = translate_k8s_objects(

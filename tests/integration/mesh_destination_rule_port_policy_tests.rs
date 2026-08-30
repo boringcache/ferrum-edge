@@ -332,6 +332,100 @@ fn destination_rule_port_level_outlier_detection_projects_to_dispatch_override()
 }
 
 #[test]
+fn destination_rule_empty_outlier_detection_applies_istio_defaults_at_overlay_time() {
+    let mut config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    outlier_detection: Some(MeshOutlierDetection {
+                        consecutive_errors: None,
+                        interval_seconds: None,
+                        base_ejection_seconds: None,
+                        max_ejection_percent: None,
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let passive = prepared.upstreams[0]
+        .health_checks
+        .as_ref()
+        .and_then(|health| health.passive.as_ref())
+        .expect("top-level outlierDetection must project passive health");
+    assert!(passive.consecutive_error_mode);
+    assert_eq!(passive.unhealthy_threshold, 5);
+    assert_eq!(passive.max_ejection_percent, Some(10));
+}
+
+#[test]
+fn partial_port_outlier_overlay_inherits_explicit_top_level_fields() {
+    let mut port_level_settings = HashMap::new();
+    port_level_settings.insert(
+        8080,
+        MeshTrafficPolicy {
+            outlier_detection: Some(MeshOutlierDetection {
+                consecutive_errors: None,
+                interval_seconds: Some(5),
+                base_ejection_seconds: None,
+                max_ejection_percent: None,
+            }),
+            ..MeshTrafficPolicy::default()
+        },
+    );
+    let mut config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    outlier_detection: Some(MeshOutlierDetection {
+                        consecutive_errors: Some(20),
+                        interval_seconds: Some(10),
+                        base_ejection_seconds: Some(30),
+                        max_ejection_percent: Some(100),
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings,
+                subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let passive = prepared.upstreams[0]
+        .port_overrides
+        .get(&8080)
+        .and_then(|slot| slot.passive_health_check.as_ref())
+        .expect("port outlierDetection must project passive health");
+    assert_eq!(passive.unhealthy_threshold, 20);
+    assert_eq!(passive.unhealthy_window_seconds, 5);
+    assert_eq!(passive.healthy_after_seconds, 30);
+    assert_eq!(passive.max_ejection_percent, Some(100));
+}
+
+#[test]
 fn port_level_positive_outlier_overlay_clears_top_level_disable_sentinel() {
     let mut port_level_settings = HashMap::new();
     port_level_settings.insert(

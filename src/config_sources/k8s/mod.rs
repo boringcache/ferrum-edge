@@ -3375,15 +3375,15 @@ fn uri_match_for_listen_path(listen_path: &str) -> Option<Value> {
 /// shape the `request_transformer` / `response_transformer` plugins accept).
 /// `direction` is `"request"` or `"response"`.
 pub(crate) fn vs_route_header_transform_rules(http: &Value, direction: &str) -> Vec<Value> {
-    let mut rules = header_block_transform_rules(http.get("headers"), direction);
+    let mut rules = Vec::new();
     // Per-destination `http[].route[].headers` (issue #4304). Istio applies it
     // to the selected destination, which Ferrum's per-route dispatch rule can
     // reproduce EXACTLY when the route has a single destination. A weighted
     // split materializes one upstream with weighted targets, so there is no
     // per-destination rule to hang the transform on — that shape is reported as
     // a deferred field (`virtual_service_deferred_fields`) instead of being
-    // applied to the wrong share of traffic. Destination rules are appended
-    // after the route-level block so the more specific `set` wins.
+    // applied to the wrong share of traffic. Envoy applies weighted-cluster
+    // mutations BEFORE enclosing route mutations, so route-level `set` wins.
     if let Some(destinations) = http.get("route").and_then(Value::as_array)
         && destinations.len() == 1
     {
@@ -3392,6 +3392,7 @@ pub(crate) fn vs_route_header_transform_rules(http: &Value, direction: &str) -> 
             direction,
         ));
     }
+    rules.extend(header_block_transform_rules(http.get("headers"), direction));
     rules
 }
 
@@ -3406,6 +3407,25 @@ fn header_block_transform_rules(headers: Option<&Value>, direction: &str) -> Vec
         return Vec::new();
     };
     let set = headers.get("set").and_then(Value::as_object);
+    // `Host` / `:authority` request `set` is projected onto the dispatch
+    // rule's typed authority rewrite instead of the generic transformer. It
+    // must never also appear here as an ordinary header mutation.
+    let request_set_without_authority = if direction == "request" {
+        set.map(|entries| {
+            entries
+                .iter()
+                .filter(|(name, _)| !is_vs_authority_header(name))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect::<serde_json::Map<_, _>>()
+        })
+    } else {
+        None
+    };
+    let set = if direction == "request" {
+        request_set_without_authority.as_ref()
+    } else {
+        set
+    };
     let add = headers.get("add").and_then(Value::as_object);
 
     // Warn (don't silently drop) when set/add contain non-string values.
@@ -3420,7 +3440,7 @@ fn header_block_transform_rules(headers: Option<&Value>, direction: &str) -> Vec
                 tracing::warn!(
                     direction = direction,
                     header = %key,
-                    value_kind = ?value,
+                    value_kind = json_value_kind(value),
                     "VirtualService headers.{}.set entry has non-string value; entry will be dropped",
                     direction,
                 );
@@ -3433,7 +3453,7 @@ fn header_block_transform_rules(headers: Option<&Value>, direction: &str) -> Vec
                 tracing::warn!(
                     direction = direction,
                     header = %key,
-                    value_kind = ?value,
+                    value_kind = json_value_kind(value),
                     "VirtualService headers.{}.add entry has non-string value; entry will be dropped",
                     direction,
                 );
@@ -3449,7 +3469,7 @@ fn header_block_transform_rules(headers: Option<&Value>, direction: &str) -> Vec
                 None => {
                     tracing::warn!(
                         direction = direction,
-                        value_kind = ?entry,
+                        value_kind = json_value_kind(entry),
                         "VirtualService headers.{}.remove entry is not a string; entry will be dropped",
                         direction,
                     );
@@ -3463,6 +3483,21 @@ fn header_block_transform_rules(headers: Option<&Value>, direction: &str) -> Vec
         add,
         remove.as_deref(),
     )
+}
+
+pub(crate) fn is_vs_authority_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case(":authority")
+}
+
+fn json_value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 pub(crate) fn mesh_route_dispatch_plugin_from_rules(

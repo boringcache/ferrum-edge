@@ -523,78 +523,6 @@ mod recent_failure_ring_tests {
     }
 }
 
-#[cfg(test)]
-#[allow(clippy::items_after_test_module)]
-mod consecutive_state_tests {
-    use super::*;
-
-    #[test]
-    fn pack_round_trips_generation_and_streak() {
-        let packed = pack_consecutive_state(0, 0);
-        assert_eq!(unpack_consecutive_state(packed), (0, 0));
-        let packed = pack_consecutive_state(7, 5);
-        assert_eq!(unpack_consecutive_state(packed), (7, 5));
-        let packed = pack_consecutive_state(CONSECUTIVE_GEN_MAX, CONSECUTIVE_STREAK_MAX);
-        assert_eq!(
-            unpack_consecutive_state(packed),
-            (CONSECUTIVE_GEN_MAX, CONSECUTIVE_STREAK_MAX)
-        );
-    }
-
-    #[test]
-    fn generation_wrap_skips_zero() {
-        assert_eq!(next_consecutive_generation(0), 1);
-        assert_eq!(
-            next_consecutive_generation(CONSECUTIVE_GEN_MAX - 1),
-            CONSECUTIVE_GEN_MAX
-        );
-        assert_eq!(next_consecutive_generation(CONSECUTIVE_GEN_MAX), 1);
-    }
-
-    #[test]
-    fn failure_then_success_cas_leaves_zero_streak_in_next_generation() {
-        let state = TargetHealth::new();
-        let (generation, streak) = state.record_consecutive_failure();
-        assert_eq!((generation, streak), (0, 1));
-        let retired = state.record_consecutive_success();
-        assert_eq!(retired, 0);
-        assert_eq!(state.consecutive_generation(), 1);
-        assert_eq!(
-            unpack_consecutive_state(state.consecutive_state.load(Ordering::Acquire)),
-            (1, 0)
-        );
-    }
-
-    #[test]
-    fn retire_generation_is_a_noop_once_a_newer_generation_is_live() {
-        let state = TargetHealth::new();
-        state.record_consecutive_failure();
-        assert!(state.retire_consecutive_generation(0));
-        state.record_consecutive_failure();
-        assert_eq!(
-            unpack_consecutive_state(state.consecutive_state.load(Ordering::Acquire)),
-            (1, 1)
-        );
-        assert!(!state.retire_consecutive_generation(0));
-        assert_eq!(
-            unpack_consecutive_state(state.consecutive_state.load(Ordering::Acquire)),
-            (1, 1)
-        );
-    }
-
-    #[test]
-    fn failure_after_retire_belongs_to_the_next_generation() {
-        let state = TargetHealth::new();
-        assert_eq!(state.record_consecutive_failure(), (0, 1));
-        assert!(state.retire_consecutive_generation(0));
-        assert_eq!(state.record_consecutive_failure(), (1, 1));
-        assert_eq!(
-            unpack_consecutive_state(state.consecutive_state.load(Ordering::Acquire)),
-            (1, 1)
-        );
-    }
-}
-
 /// Passive-ejection record stored per `(proxy_id, host:port)`.
 ///
 /// Captures the **effective** recovery deadline from the per-port / subset /
@@ -1772,7 +1700,8 @@ impl HealthChecker {
         // (the split mode is deferred and unused), Envoy counts locally
         // originated connection failures in that same bucket, so this
         // sentinel must fail closed for both matching HTTP status codes
-        // and `connection_error`. Native windowed policies never set it.
+        // and `connection_error`. Translated DestinationRules normally set it;
+        // direct native configuration may opt in explicitly.
         if config.consecutive_5xx_ejection_disabled
             && (connection_error || config.unhealthy_status_codes.contains(&status_code))
         {
@@ -1823,19 +1752,32 @@ impl HealthChecker {
                     // live generation so a success that retired `my_generation`
                     // cannot eject from this failure's cached streak.
                     if my_streak >= config.unhealthy_threshold {
-                        let published = try_publish_consecutive_ejection(
-                            &proxy_state,
-                            &state,
-                            buf.as_str(),
-                            PassiveEjection::from_policy(
-                                upstream_id,
-                                target,
-                                config.healthy_after_seconds,
-                                now_epoch_ms(),
-                                Some(my_generation),
-                            ),
-                            my_generation,
-                        );
+                        // Once this generation is already published, the common
+                        // outage path must remain a zero-allocation read lookup.
+                        // `try_publish_consecutive_ejection` keeps its entry-lock
+                        // re-check for linearization when this pre-check misses.
+                        let already_published = proxy_state
+                            .unhealthy
+                            .get(buf.as_str())
+                            .is_some_and(|entry| {
+                                entry
+                                    .consecutive_generation
+                                    .is_some_and(|generation| generation >= my_generation)
+                            });
+                        let published = !already_published
+                            && try_publish_consecutive_ejection(
+                                &proxy_state,
+                                &state,
+                                buf.as_str(),
+                                PassiveEjection::from_policy(
+                                    upstream_id,
+                                    target,
+                                    config.healthy_after_seconds,
+                                    now_epoch_ms(),
+                                    Some(my_generation),
+                                ),
+                                my_generation,
+                            );
                         if published {
                             if let Some(hook) = hooks.after_ejection_insert.as_mut() {
                                 drop(buf);

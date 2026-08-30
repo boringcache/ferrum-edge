@@ -354,6 +354,43 @@ fn rejected_resource_still_emits_update_with_false_status() {
     assert!(detail["translation"]["error"].is_string());
 }
 
+#[test]
+fn authorization_policy_singular_target_ref_is_reported_as_an_attachment() {
+    let service = object(
+        "v1",
+        "Service",
+        "reviews",
+        json!({
+            "selector": {"app": "reviews"},
+            "ports": [{"port": 9080, "name": "http"}]
+        }),
+    );
+    let policy = object(
+        "security.istio.io/v1",
+        "AuthorizationPolicy",
+        "targeted",
+        json!({
+            "targetRef": {"group": "", "kind": "Service", "name": "reviews"},
+            "action": "DENY",
+            "rules": [{}]
+        }),
+    );
+
+    let updates = plan_istio_status_updates(&[service, policy], options());
+    let update = update_for(&updates, "AuthorizationPolicy", "targeted");
+    let condition = find_condition(
+        update.status["conditions"].as_array().unwrap(),
+        "FerrumAccepted",
+    );
+    assert_eq!(condition["status"].as_str(), Some("True"));
+    let detail = update.ferrum_detail.as_ref().expect("detail block");
+    let target_refs = detail["translation"]["target_refs"]
+        .as_array()
+        .expect("target attachment projection");
+    assert_eq!(target_refs.len(), 1);
+    assert_eq!(target_refs[0]["name"].as_str(), Some("reviews"));
+}
+
 /// Deterministic output: calling the planner twice on the same input
 /// yields the same set of updates with the same condition messages.
 /// `lastTransitionTime` is wall-clock and may differ — checked
@@ -1395,18 +1432,18 @@ fn virtual_service_reports_weighted_destination_headers_as_deferred() {
     );
 }
 
-/// A `targetRefs`-carrying `RequestAuthentication` / `Telemetry` is rejected
+/// A singular `targetRef`-carrying `RequestAuthentication` / `Telemetry` is rejected
 /// rather than widened, and the status reports the attachment COUNT without
 /// republishing the referenced resource identities.
 #[test]
-fn target_refs_on_request_authentication_and_telemetry_report_invalid() {
+fn singular_target_ref_on_request_authentication_and_telemetry_reports_invalid() {
     for obj in [
         object(
             "security.istio.io/v1",
             "RequestAuthentication",
             "ra-targeted",
             json!({
-                "targetRefs": [{"kind": "Service", "name": "reviews"}],
+                "targetRef": {"kind": "Service", "name": "reviews"},
                 "jwtRules": [{
                     "issuer": "https://issuer.example.com",
                     "jwksUri": "https://issuer.example.com/jwks"
@@ -1418,7 +1455,7 @@ fn target_refs_on_request_authentication_and_telemetry_report_invalid() {
             "Telemetry",
             "tel-targeted",
             json!({
-                "targetRefs": [{"kind": "Service", "name": "reviews"}],
+                "targetRef": {"kind": "Service", "name": "reviews"},
                 "accessLogging": [{"disabled": true}]
             }),
         ),
@@ -1434,7 +1471,7 @@ fn target_refs_on_request_authentication_and_telemetry_report_invalid() {
         assert_eq!(
             condition["status"].as_str(),
             Some("False"),
-            "{kind}/{name} must not be accepted with an unenforceable targetRefs"
+            "{kind}/{name} must not be accepted with an unenforceable targetRef"
         );
         assert_eq!(condition["reason"].as_str(), Some("Invalid"));
         let detail = update

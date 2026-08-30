@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — translator-owned route header consumers now compose with global
+  transformers.** The auto-emitted `istio-vs-req-xform-*` /
+  `istio-vs-resp-xform-*` instances consume matched
+  `mesh_route_dispatch` header rules without shadowing a same-name global
+  `request_transformer` / `response_transformer`. Before this change, a
+  Gateway API `HTTPRoute` with `RequestHeaderModifier` or
+  `ResponseHeaderModifier` accidentally suppressed the global transformer's
+  static rules on that proxy; those global rules now run first and the matched
+  route rules run last. Istio VirtualService header transforms use the same
+  composition contract. **Operator action**: audit HTTPRoute-backed proxies
+  that relied on the accidental suppression and scope or remove global static
+  rules that should not apply there.
+
 - **BREAKING — `POST /batch` rejects unknown top-level envelope keys**
   (issue #4042). The request is create-only (`consumers`, `upstreams`,
   `proxies`, `plugin_configs`). Sending `updates`, `deletes`, or `dry_run`

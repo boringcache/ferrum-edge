@@ -11248,8 +11248,11 @@ fn mesh_hash_on_to_ferrum(lb: &Option<MeshLoadBalancer>) -> Option<String> {
 ///
 /// `consecutive5xxErrors` is a CONSECUTIVE-failure threshold in Istio, not a
 /// windowed count (issue #4292), so the overlay switches the policy into
-/// consecutive mode for explicit positive values. Omitted fields are defaulted
-/// to 5 at translate time; explicit `0` disables the consecutive-5xx detector
+/// consecutive mode for explicit positive values. When no lower-precedence
+/// tier supplied the field, an omitted threshold/cap receives Istio's 5/10%
+/// defaults here; a partial higher-precedence block therefore inherits an
+/// explicit lower-tier value instead of replacing it with a synthesized
+/// per-block default. Explicit `0` disables the consecutive-5xx detector
 /// (HTTP 5xx and locally originated connection failures; split mode is
 /// deferred) via `consecutive_5xx_ejection_disabled`. Ferrum's native windowed
 /// semantics are untouched for policies this overlay never runs on. `interval`
@@ -11265,7 +11268,8 @@ fn apply_outlier_detection_to_passive(passive: &mut PassiveHealthCheck, od: &Mes
             // counts in that bucket when split mode is off (the default;
             // Ferrum's split mode is deferred). It must not map to
             // threshold 0 (which would eject on the first failure). The
-            // sentinel is Istio-translated only.
+            // sentinel is normally Istio-translated, while direct native
+            // configuration may opt in explicitly.
             passive.consecutive_5xx_ejection_disabled = true;
         }
         Some(consecutive) => {
@@ -11273,6 +11277,10 @@ fn apply_outlier_detection_to_passive(passive: &mut PassiveHealthCheck, od: &Mes
             // must clear a stale disable sentinel left by an earlier `Some(0)`.
             passive.consecutive_5xx_ejection_disabled = false;
             passive.unhealthy_threshold = consecutive;
+            passive.consecutive_error_mode = true;
+        }
+        None if !passive.consecutive_error_mode && !passive.consecutive_5xx_ejection_disabled => {
+            passive.unhealthy_threshold = 5;
             passive.consecutive_error_mode = true;
         }
         None => {}
@@ -11283,8 +11291,12 @@ fn apply_outlier_detection_to_passive(passive: &mut PassiveHealthCheck, od: &Mes
     if let Some(ejection) = od.base_ejection_seconds {
         passive.healthy_after_seconds = ejection;
     }
-    if let Some(max_pct) = od.max_ejection_percent {
-        passive.max_ejection_percent = Some(max_pct);
+    match od.max_ejection_percent {
+        Some(max_pct) => passive.max_ejection_percent = Some(max_pct),
+        None if passive.max_ejection_percent.is_none() => {
+            passive.max_ejection_percent = Some(10);
+        }
+        None => {}
     }
 }
 

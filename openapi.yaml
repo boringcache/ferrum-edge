@@ -12894,7 +12894,8 @@ components:
             (default) keeps Ferrum's windowed passive health; true is Istio
             `outlierDetection.consecutive5xxErrors` semantics, where a single
             success resets the streak and `unhealthy_window_seconds` is not
-            consulted. Set automatically for translated Istio DestinationRules.
+            consulted. Set automatically for translated Istio DestinationRules;
+            direct native configuration may opt in explicitly.
         consecutive_5xx_ejection_disabled:
           type: boolean
           default: false
@@ -12906,7 +12907,7 @@ components:
             connection failures in the same 5xx bucket, and Ferrum's split
             mode is deferred and unused. Set automatically for translated
             Istio DestinationRules that explicitly disable the 5xx detector.
-            Native windowed policies never enable this sentinel.
+            Direct native configuration may opt into the same sentinel.
 
     # ── Service Discovery ──────────────────────────────────────────
     ServiceDiscoveryConfig:
@@ -19299,7 +19300,8 @@ components:
                   are rejected at config load. Only nonblank string, integer, and
                   boolean claims are published (Istio ClaimToHeader does not support
                   arrays, objects, null, or floating-point numbers); anything else
-                  or a header-illegal value leaves the destination absent.
+                  or a header-illegal value leaves the destination absent. A rendered
+                  claim value over 8192 bytes is omitted before fan-out.
               require_mtls_binding:
                 type: boolean
                 default: false
@@ -20342,9 +20344,9 @@ components:
         construction time from the slice-embedded workload identity, except in
         node-waypoint topology where the filter runs per-request against the
         pod-scoped cache attached to `RequestContext`. `TargetRefs`
-        (AuthorizationPolicy `spec.targetRefs`) is waypoint-only and is
-        additionally re-checked per request against the exact destination
-        Service and waypoint Gateway/GatewayClass identity — construction-time
+        (AuthorizationPolicy `spec.targetRef` / `spec.targetRefs`) is
+        waypoint-only and is additionally re-checked per request against the
+        exact destination Service and waypoint Gateway/GatewayClass identity — construction-time
         retention is OR over the attachment list and never widens a targeted
         policy onto another destination. See `docs/mesh.md`.
       properties:

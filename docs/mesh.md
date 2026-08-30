@@ -1457,10 +1457,10 @@ Visibility and the lookup hierarchy compose in that order: `exportTo` is absolut
 | `host` | Supported | Required, lowercased at admission, empty/dot-only rejected |
 | `trafficPolicy.connectionPool.tcp.connectTimeout` | Supported | Applied to `Proxy.backend_connect_timeout_ms` for every proxy referencing the matching upstream |
 | `trafficPolicy.connectionPool.tcp.idleTimeout` | Supported (stream-family / mesh L4 relays) | Bidirectional TCP idle bound, mapped to `tcp_idle_timeout_seconds` (`0` disables). Lands on `Upstream.port_overrides[port].tcp_idle_timeout_seconds` via the same top-level fan-out + per-port overlay as `connectTimeout` / `maxConnections` / `tcpKeepalive`, then `Proxy.dispatch_port_overrides`. Synthesized mesh L4 relays (inbound TCP, HBONE CONNECT, outbound TCP/UDP, east-west passthrough, stream egress) default `backend_read_timeout_ms` / `backend_write_timeout_ms` to `0` (disabled) so a silent backend or one-way sink is not torn down at 30s; the relay is bounded by this idle timeout, or `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` when the per-proxy field is unset. Distinct from HTTP `connectionPool.http.idleTimeout` (pool idle; 0 is rejected). Sub-second durations other than `0s` are rejected; values above `MAX_TCP_IDLE_TIMEOUT` (24h) are rejected. |
-| `trafficPolicy.outlierDetection.consecutive5xxErrors` / `consecutiveErrors` | Supported | → `PassiveHealthCheck.unhealthy_threshold` **and** `PassiveHealthCheck.consecutive_error_mode = true`. The threshold is an Istio-style CONSECUTIVE failure streak: a single success resets it, so a backend erroring at a low rate under high load is never ejected (issue #4292). **Omitting both fields inherits Istio's own default of 5** (Ferrum's native default is 3 in a sliding window). Explicit `0` disables the consecutive-5xx detector via `consecutive_5xx_ejection_disabled` rather than ejecting immediately — both matching HTTP 5xx and locally originated connection failures (Envoy's default `splitExternalLocalOriginErrors=false` bucket; Ferrum's split mode is deferred). Ferrum's native windowed passive health is unchanged for policies that are not translated from a DestinationRule. |
-| `trafficPolicy.outlierDetection.interval` | Supported | → `PassiveHealthCheck.unhealthy_window_seconds` (zero filtered out, sub-second rounded up). Recorded but **inert** while consecutive mode is on — Istio's `interval` is an analysis sweep period, not a failure window. |
-| `trafficPolicy.outlierDetection.baseEjectionTime` | Supported | → `PassiveHealthCheck.healthy_after_seconds` |
-| `trafficPolicy.outlierDetection.maxEjectionPercent` | Supported | → `PassiveHealthCheck.max_ejection_percent`; values >100 rejected. **Omitting it inherits Istio's own 10% default** (Ferrum's native default is uncapped), so a stock DestinationRule cannot eject a whole upstream into degraded mode. |
+| `trafficPolicy.outlierDetection.consecutive5xxErrors` / `consecutiveErrors` | Supported | → `PassiveHealthCheck.unhealthy_threshold` **and** `PassiveHealthCheck.consecutive_error_mode = true`. The threshold is an Istio-style CONSECUTIVE failure streak: a single success resets it, so a backend erroring at a low rate under high load is never ejected (issue #4292). **Omitting both fields inherits Istio's own default of 5 only when no lower-precedence outlier tier supplied a threshold** (Ferrum's native default is 3 in a sliding window). Explicit `0` disables the consecutive-5xx detector via `consecutive_5xx_ejection_disabled` rather than ejecting immediately — both matching HTTP 5xx and locally originated connection failures (Envoy's default `splitExternalLocalOriginErrors=false` bucket; Ferrum's split mode is deferred). A success observed through all-unhealthy fallback immediately clears a Ferrum ejection; Envoy otherwise retains it for `baseEjectionTime`. Malformed, negative, fractional, or out-of-range thresholds reject translation. Ferrum's native windowed passive health is unchanged for policies that are not translated from a DestinationRule. |
+| `trafficPolicy.outlierDetection.interval` | Supported | → `PassiveHealthCheck.unhealthy_window_seconds` (positive duration required; sub-second rounded up). Recorded but **inert** while consecutive mode is on — Istio's `interval` is an analysis sweep period, not a failure window. A malformed/non-string/zero value rejects translation. |
+| `trafficPolicy.outlierDetection.baseEjectionTime` | Supported | → `PassiveHealthCheck.healthy_after_seconds`; malformed or non-string durations reject translation. |
+| `trafficPolicy.outlierDetection.maxEjectionPercent` | Supported | → `PassiveHealthCheck.max_ejection_percent`; only integer values `0..=100` are accepted. **Omitting it inherits Istio's own 10% default only when no lower-precedence outlier tier supplied a cap** (Ferrum's native default is uncapped). The cap uses Envoy's integer prospective-ejection gate, `(currently_ejected + 1) × 100 / targets <= percent`; a 10% cap therefore permits zero ejections in pools smaller than ten, while one of three is admitted at the exact 33% integer boundary. |
 | `trafficPolicy.outlierDetection.consecutiveGatewayErrors` / `consecutiveLocalOriginFailures` / `minHealthPercent` | Deferred | Parsed past with a translate-time warning and surfaced in `status.ferrum.translation.deferred_fields` (field names only). Ferrum keeps one failure bucket (`unhealthy_status_codes` + connection errors) and bounds ejection with `maxEjectionPercent` alone. |
 | `trafficPolicy.loadBalancer.simple = ROUND_ROBIN` | Supported | → `LoadBalancerAlgorithm::RoundRobin` |
 | `trafficPolicy.loadBalancer.simple = LEAST_REQUEST` / `LEAST_CONN` | Supported | → `LoadBalancerAlgorithm::LeastConnections` |
@@ -1473,6 +1473,13 @@ Visibility and the lookup hierarchy compose in that order: `exportTo` is absolut
 | `subsets[].trafficPolicy.tls` | Supported | → `SubsetTrafficPolicy.tls` (nests `MeshTrafficPolicyTls`). Cold-path `resolve_subset_traffic_policy` layers the subset's TLS overlay (mode / SNI / CA / mTLS material / SAN allow-list / `insecureSkipVerify`) onto the upstream-level TLS and stores the result on `Upstream.resolved_subset_tls[subset_name]`. `GatewayConfig::resolve_upstream_tls` then projects that overlay onto `Proxy.resolved_tls` for proxies whose `upstream_subset` selects this subset — so v1 and v2 subsets with different CAs land on different `Proxy.resolved_tls` values and partition the backend pool. `upstream_subset` also enters HTTP / H2 / gRPC / H3 pool keys as a defense-in-depth backstop on top of TLS partitioning. Subsets without `trafficPolicy.tls` fall back to upstream-level TLS, identical to today's behavior. |
 | `subsets[].trafficPolicy.connectionPool.tcp.connectTimeout` | Supported | Overrides `backend_connect_timeout_ms` for proxies bound to the subset (precedence over the DR top-level connectTimeout). |
 | `subsets[].trafficPolicy.connectionPool.tcp.idleTimeout` | Supported (config.proxies) | Overrides `tcp_idle_timeout_seconds` for proxies bound to the subset (precedence over the DR top-level idleTimeout). Synthesized L4 relays are not in `config.proxies` and honor the top-level / per-port overlay via `dispatch_port_overrides` instead. `0` disables. |
+
+`outlierDetection` precedence is field-level, consistently across threshold,
+interval, base ejection time, and maximum ejection percentage: explicit
+per-port values override the selected subset, which overrides top-level; an
+omitted higher-tier field inherits the explicit lower-tier value. Istio's 5
+and 10% defaults are applied only when no tier supplied the corresponding
+field, never synthesized independently into each partial block.
 | `subsets[].trafficPolicy.connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests,idleTimeout,http2MaxRequests,maxConcurrentStreams}` | Supported | Preserved in `SubsetTrafficPolicy`, resolved into `ResolvedSubsetTrafficPolicy`, and overlaid onto the selected proxy's immutable inherited-policy snapshot (`dispatch_port_override_fallback`) for each selected target. Precedence is field-level `portLevelSettings` > selected subset > top-level; sibling subsets and unmatched destinations never inherit the selected subset. **Semantics differ from Istio on purpose:** Istio applies subset > DR `portLevelSettings` and replaces the whole `connectionPool` wholesale when a subset sets any connection-pool field; Ferrum keeps the inverted tier order and field-level merge (same convention as port-level overrides). Example: top-level/port `UPGRADE` plus subset `DO_NOT_UPGRADE` → Istio forces H1 on that port for the subset; Ferrum still negotiates h2. A subset that sets only `maxRetries` also inherits top-level `DO_NOT_UPGRADE` / `idleTimeout` / `http2MaxRequests` here, where Istio's wholesale replacement would clear them. Transport, retry-cap, H1-admission, idle-timeout, destination active-request budget, and H2-stream-cap semantics match the corresponding top-level rows below (including the reqwest-H2 builder residual for `maxConcurrentStreams`). The `http2MaxRequests` admission lane carries the selected subset name, so sibling subsets keep independent budgets. Every HTTP-family shared-client/pool key already carries `upstream_subset`, so same-endpoint sibling subsets cannot first-materialize each other. Invalid values reject the DestinationRule without echoing the value. |
 | `subsets[].trafficPolicy.portLevelSettings` | Deferred | Detected at translate time with a value-redacted warning and listed in `status.ferrum.translation.deferred_fields`. Not parsed or applied — Istio's highest-precedence tier. Express per-port policy at top-level `trafficPolicy.portLevelSettings` or use subset `connectionPool` fields. |
 | `subsets[].trafficPolicy.outlierDetection` | Supported | Ejection thresholds (consecutive errors / interval / base-ejection) AND the `maxEjectionPercent` cap applied per-subset (`minHealthPercent` is NOT implemented — it is a deferred field), overriding upstream-level passive health for subset-bound proxies (`passive_health_for_target` for thresholds, `LoadBalancerCache::max_ejection_percent_resolved_from` for the cap, sharing one per-port > per-subset > upstream tier precedence). The cap is sized against the subset candidate pool (denominator = subset target count). The per-port cap tier applies only when a single dispatch port is resolvable pre-selection; for subset dispatch on a multi-port upstream the subset cap governs (the cap is resolved before a target's port is known). |
@@ -1568,15 +1575,19 @@ Every `MeshPolicy` carries a `PolicyScope`:
 | `MeshWide` | Always |
 | `Namespace { namespace }` | `proxy_namespace == policy_namespace` |
 | `WorkloadSelector { selector }` | Selector namespace matches (or is unset) AND all selector labels are present on the proxy with matching values (subset match) |
-| `TargetRefs { attachments }` | Istio `AuthorizationPolicy.spec.targetRefs` attachment scope — see the dedicated section below. |
+| `TargetRefs { attachments }` | Istio `AuthorizationPolicy.spec.targetRef` / `spec.targetRefs` attachment scope — see the dedicated section below. |
 
 An empty `WorkloadSelector` (`labels: {}`, `namespace: None`) intentionally matches any workload.
 
 The canonical matching helper `policy_scope_applies_to_workload()` is shared between the slice builder and the plugin filter so scope semantics stay byte-identical across both surfaces.
 
-### AuthorizationPolicy `targetRefs` (issue #3226)
+### AuthorizationPolicy `targetRef` / `targetRefs` (issue #3226)
 
-`PolicyScope::TargetRefs { attachments }` models Istio `AuthorizationPolicy.spec.targetRefs`. The supported set is deliberately narrower than the [Istio reference](https://istio.io/latest/docs/reference/config/security/authorization-policy/):
+`PolicyScope::TargetRefs { attachments }` models Istio's singular
+`AuthorizationPolicy.spec.targetRef` and plural `spec.targetRefs` forms. Both
+flow through the same resolver and exact-match runtime scope. The supported set
+is deliberately narrower than the
+[Istio reference](https://istio.io/latest/docs/reference/config/security/authorization-policy/):
 
 | Attachment | Namespace rule | Status |
 |---|---|---|
@@ -2255,7 +2266,9 @@ from the inbound request — case-insensitively, including duplicates —
 one, and sets it only from the validated token's claim. Istio `ClaimToHeader`
 supports only nonblank string, integer, and boolean claims; array, object, null,
 floating-point / non-integer, blank, missing, or header-illegal values leave the
-destination **absent** rather than restoring the client value. Duplicate
+destination **absent** rather than restoring the client value. Rendered values
+over 8192 bytes are also omitted before the value can fan out to as many as 16
+destinations. Duplicate
 destination headers, reserved or credential-bearing destinations
 (`authorization`, `host`, hop-by-hop/framing fields, `x-ferrum-*`,
 `x-forwarded-*`), malformed header names, and malformed claim paths are rejected
@@ -2268,9 +2281,9 @@ recognized but not enforced. Both are surfaced in
 entry names the cookie a token rides in, so the value is never republished into
 a cluster-readable status object.
 
-**`targetRefs`**: rejected (`FerrumAccepted=False` / `Invalid`). Only
-`AuthorizationPolicy` implements end-to-end `targetRefs` attachment; a
-`RequestAuthentication` carrying only `targetRefs` would read as "no selector"
+**`targetRef` / `targetRefs`**: rejected (`FerrumAccepted=False` / `Invalid`).
+Only `AuthorizationPolicy` implements end-to-end attachment; a
+`RequestAuthentication` carrying only either form would read as "no selector"
 and widen to the whole namespace — or the whole mesh in the Istio root
 namespace — installing its JWT provider on workloads that were never in scope.
 Scope it with a workload selector instead. The same refusal applies to
@@ -3346,7 +3359,7 @@ Istio `DestinationRule` resources are translated into Ferrum upstream and proxy 
 
 - **`connectionPool.tcp.connectTimeout`**: mapped to the proxy's `backend_connect_timeout_ms`.
 - **`connectionPool.tcp.idleTimeout`**: mapped to `tcp_idle_timeout_seconds` (bidirectional TCP idle; `0` disables). Distinct from HTTP `connectionPool.http.idleTimeout`. Synthesized mesh L4 relays default per-direction `backend_read_timeout_ms` / `backend_write_timeout_ms` to `0` (disabled) so long-lived TCP is bounded by this idle timeout or `FERRUM_TCP_IDLE_TIMEOUT_SECONDS`.
-- **`outlierDetection`**: translated to Ferrum passive health checks (`unhealthy_threshold` / `unhealthy_window_seconds` / `healthy_after_seconds` / `max_ejection_percent`), with `consecutive_error_mode` set so `consecutive5xxErrors` is a consecutive streak rather than a windowed count, with Istio's default threshold of 5 applied when both `consecutive5xxErrors` and the legacy `consecutiveErrors` alias are omitted, explicit `0` disabling the consecutive-5xx detector (HTTP 5xx and locally originated connection failures; split mode is deferred) via `consecutive_5xx_ejection_disabled`, and with Istio's 10% `maxEjectionPercent` default applied when the resource omits it (issue #4292). `consecutiveGatewayErrors`, `consecutiveLocalOriginFailures`, and `minHealthPercent` are deferred fields. Automatic recovery after `baseEjectionTime` is scoped to the ejecting proxy and the **effective** per-port / subset / upstream policy that caused the ejection (deadline stored on the entry; independent cooldowns when two proxies share an endpoint; SD-discovered targets recover the same way as static ones). See [Passive Health Checks](load_balancing.md#passive-health-checks).
+- **`outlierDetection`**: translated to Ferrum passive health checks (`unhealthy_threshold` / `unhealthy_window_seconds` / `healthy_after_seconds` / `max_ejection_percent`), with `consecutive_error_mode` set so `consecutive5xxErrors` is a consecutive streak rather than a windowed count. Ferrum applies Istio's default threshold of 5 and cap of 10% only when no top-level / selected-subset / per-port tier supplied the corresponding field; all four represented fields otherwise merge consistently at field-level precedence per-port > selected subset > top-level. Explicit `0` disables the consecutive-5xx detector (HTTP 5xx and locally originated connection failures; split mode is deferred) via `consecutive_5xx_ejection_disabled`. Malformed represented values reject translation. The cap uses Envoy's integer prospective-ejection arithmetic, so small pools may permit zero ejections. `consecutiveGatewayErrors`, `consecutiveLocalOriginFailures`, and `minHealthPercent` are deferred fields. Automatic recovery after `baseEjectionTime` is scoped to the ejecting proxy and the **effective** per-port / subset / upstream policy that caused the ejection (deadline stored on the entry; independent cooldowns when two proxies share an endpoint; SD-discovered targets recover the same way as static ones). A success observed through all-unhealthy fallback also immediately clears a Ferrum ejection, unlike Envoy's fixed ejection-duration behavior. See [Passive Health Checks](load_balancing.md#passive-health-checks).
 
 ### Load Balancer
 
@@ -3601,9 +3614,9 @@ The injector webhook failure alert uses the Kubernetes API server metric `apiser
 
 **Scope precedence**: `WorkloadSelector` > `Namespace` > `MeshWide`
 
-**`targetRefs` is rejected** (`FerrumAccepted=False` / `Invalid`, issue #4305).
-Only `AuthorizationPolicy` implements end-to-end `targetRefs` attachment. A
-`Telemetry` carrying only `targetRefs` reads as "no selector" and would widen to
+**`targetRef` / `targetRefs` is rejected** (`FerrumAccepted=False` / `Invalid`,
+issue #4305). Only `AuthorizationPolicy` implements end-to-end attachment. A
+`Telemetry` carrying only either form reads as "no selector" and would widen to
 the whole namespace — or, in the Istio root namespace, to `MeshWide` — so a
 resource meant to disable access logging for one gateway would disable it mesh
 wide. Scope it with a workload selector instead.
@@ -6009,15 +6022,19 @@ route `remove` or `set`.
   backend dispatch — this is the security-relevant case, and it is why a
   malformed sibling entry is not silently dropped.
 - Per-destination `http[].route[].headers` is applied for a route with exactly
-  ONE destination, after the route-level block (so the more specific `set`
-  wins). On a weighted multi-destination route it is reported in
+  ONE destination before the route-level block, matching Envoy's weighted-
+  cluster → route ordering so the route-level `set` wins. On a weighted
+  multi-destination route it is reported in
   `status.ferrum.translation.deferred_fields` instead: the split materializes
   one upstream with weighted targets, so no per-destination rule exists to bind
   the transform to and applying it would hit every share.
+- Request `set` on `Host` or `:authority` is projected onto the typed route
+  authority rewrite so it works across HTTP versions; it is not sent through
+  the generic header transformer. `add` remains invalid for authority.
 - Malformed header names, non-string or header-illegal values (CR/LF and other
   control bytes), unknown fields under `headers` / `headers.{direction}`, and
-  `set`/`add` targeting a framing or hop-by-hop header (`host`,
-  `content-length`, `connection`, `keep-alive`, `proxy-connection`, `te`,
+  `set`/`add` targeting a framing or hop-by-hop header (`content-length`,
+  `connection`, `keep-alive`, `proxy-connection`, `te`,
   `trailer`, `transfer-encoding`, `upgrade`) are rejected at translation with
   `FerrumAccepted=False` / `Invalid`. Diagnostics name the header and field,
   never the value. `remove` may name any header.

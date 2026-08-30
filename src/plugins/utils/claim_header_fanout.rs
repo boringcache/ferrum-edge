@@ -13,6 +13,7 @@ use super::claim_resolver::{parse_claim_path_value, resolve_claim_path};
 pub const MAX_OUTPUT_CLAIM_HEADERS: usize = 16;
 pub const MAX_OUTPUT_CLAIM_HEADER_NAME_LEN: usize = 128;
 pub const MAX_OUTPUT_CLAIM_PATH_LEN: usize = 256;
+pub const MAX_OUTPUT_CLAIM_VALUE_LEN: usize = 8 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ClaimHeaderMapping {
@@ -236,6 +237,11 @@ pub fn emit_output_claim_headers_to_attempt(
 fn output_claim_value_for_header(claims: &Value, claim_path: &str) -> Option<String> {
     let rendered = render_istio_output_claim(resolve_claim_path(claims, claim_path)?)?;
     if rendered.trim().is_empty() {
+        return None;
+    }
+    // One validated token may fan a claim out to every configured destination.
+    // Bound each published value before staging clones it up to 16 times.
+    if rendered.len() > MAX_OUTPUT_CLAIM_VALUE_LEN {
         return None;
     }
     // The same complete `HeaderValue` gate the outbound adapters apply, so a
