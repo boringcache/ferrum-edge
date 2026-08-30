@@ -1,0 +1,89 @@
+{{- $obs := .Values.observability | default dict -}}
+{{- $metrics := $obs.metrics | default dict -}}
+{{- $sm := $metrics.serviceMonitor | default dict -}}
+{{- if and $obs.enabled (ne ($sm.enabled | toString) "false") }}
+{{- $bearer := $metrics.bearerToken | default dict -}}
+{{- $bearerSecret := $bearer.existingSecret | default dict -}}
+{{- $workloads := list -}}
+{{- if .Values.controlPlane.enabled -}}
+{{- $workloads = append $workloads (dict "name" "ferrum-mesh-control-plane" "component" "controlPlane" "env" (.Values.controlPlane.env | default dict) "admin" (.Values.controlPlane.admin | default dict)) -}}
+{{- end -}}
+{{- if .Values.ca.enabled -}}
+{{- $workloads = append $workloads (dict "name" "ferrum-mesh-ca" "component" "ca" "env" (.Values.ca.env | default dict) "admin" (.Values.ca.admin | default dict)) -}}
+{{- end -}}
+{{- if .Values.eastWest.enabled -}}
+{{- $workloads = append $workloads (dict "name" "ferrum-mesh-east-west" "component" "eastWest" "env" (.Values.eastWest.env | default dict) "admin" (.Values.eastWest.admin | default dict)) -}}
+{{- end -}}
+{{- $state := dict "count" 0 -}}
+{{- range $workloads }}
+{{- $resolved := include "ferrum-mesh.resolveComponentAdmin" (dict "component" .component "env" .env "admin" .admin) | fromYaml -}}
+{{- if and (ne (toString $resolved.port) "0") (not (include "ferrum-mesh.isLoopbackBind" $resolved.bind)) }}
+{{- if gt (int $state.count) 0 }}
+---
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ printf "%s-metrics" .name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .name }}
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    app.kubernetes.io/component: mesh-metrics
+spec:
+  selector:
+    app.kubernetes.io/name: {{ .name }}
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+  ports:
+    - name: admin-http
+      port: {{ $resolved.port }}
+      targetPort: admin-http
+      protocol: TCP
+{{- $_ := set $state "count" (add (int $state.count) 1) }}
+{{- end }}
+{{- end }}
+{{- if gt (int $state.count) 0 }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ferrum-mesh-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-observability
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: mesh-metrics
+    {{- with $sm.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $sm.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  jobLabel: app.kubernetes.io/name
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: mesh-metrics
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  endpoints:
+    - path: /metrics
+      port: admin-http
+      interval: {{ $sm.interval | default "30s" | quote }}
+      scrapeTimeout: {{ $sm.scrapeTimeout | default "10s" | quote }}
+      {{- if $bearerSecret.name }}
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ $bearerSecret.name | quote }}
+          key: {{ default "metrics-bearer-token" $bearerSecret.key | quote }}
+      {{- end }}
+      {{- with $sm.tlsConfig }}
+      tlsConfig:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- end }}

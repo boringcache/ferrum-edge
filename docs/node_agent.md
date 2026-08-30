@@ -1141,6 +1141,12 @@ The CNI plugin and the kube-rs watcher feed the same enrollment path, and the wa
 >
 > A node-agent that crash-loops *after* it was once ready is **not** rolled back automatically — see "Recovering a node" for the manual path.
 
+### CNI ADD/DEL/CHECK IPC transport semantics
+
+- **ADD — fail closed.** A missing socket, connect refusal, RPC timeout, or other IPC transport failure returns CNI error code 11 and kubelet leaves the pod in `ContainerCreating`. This is the deliberate capture-race posture: passing ADD through unenrolled would silently start a pod outside the mesh.
+- **DEL — idempotent success on transport failure.** When the node-agent socket is missing, connect is refused, or the RPC times out, `ferrum-cni` exits `0` with empty stdout (the CNI empty-success response) and logs a redacted, actionable diagnostic to stderr. kubelet must not retry DEL indefinitely while a crash-looping node-agent blocks pod teardown and `kubectl drain`. Returning success is safe: leftover eBPF programs and per-pod map entries are reclaimed by the CNI 1.1.0 GC verb and the node-agent `InitDone` stale sweep. Node-agent **rejection** of DEL (for example pod not currently enrolled) was already lenient and remains so.
+- **CHECK — fail closed on transport failure.** Per the CNI spec, a plugin that cannot determine whether the container is attached must return an error. Socket-missing/connect-refused/timeout therefore map to CNI error code 11. Node-agent **rejection** (pod not enrolled) still fails CHECK so kubelet can observe the mismatch.
+
 STATUS reports whether that node-agent + Kubernetes API dependency is ready for ADD. GC is complementary: it recovers Ferrum capture/enrollment state after missed DEL calls, node crashes, or sandbox metadata loss without relying on watcher timing alone.
 
 ### CNI 1.1 STATUS semantics
@@ -1327,7 +1333,7 @@ replacement.
 ### Fallback semantics
 
 - **Default disabled.** `nodeAgent.cni.enabled=false` (chart) / `FERRUM_NODE_AGENT_CNI_ENABLED=false` (env) keeps the kube-rs watcher as the sole enrollment path. Existing operators upgrade with zero behavior change.
-- **Enabled but UDS unreachable.** If the listener fails to bind (permission error on the parent dir or another live generation holds the ownership lock), the node-agent logs `error!` and continues running with the watcher path active. Stale socket files from crashed owners are recovered only after the new process acquires that lock. The CNI binary on the host then fails **every** kubelet ADD on that node with `IpcFailed`, so new pods stick in `ContainerCreating` — the watcher path still reconciles pods that already have a sandbox, but it cannot create one. If this happens during initial pod startup the rollback watcher removes the chain once its readiness budget expires; if it happens after the node-agent was once ready, recovery is manual ("Recovering a node").
+- **Enabled but UDS unreachable.** If the listener fails to bind (permission error on the parent dir or another live generation holds the ownership lock), the node-agent logs `error!` and continues running with the watcher path active. Stale socket files from crashed owners are recovered only after the new process acquires that lock. The CNI binary on the host then fails **every** kubelet ADD on that node with `IpcFailed`, so new pods stick in `ContainerCreating` — the watcher path still reconciles pods that already have a sandbox, but it cannot create one. kubelet DEL still completes (empty success) so terminating pods are not stranded; stale Ferrum state is reclaimed by GC and node-agent sweeps once the daemon returns. If this happens during initial pod startup the rollback watcher removes the chain once its readiness budget expires; if it happens after the node-agent was once ready, recovery is manual ("Recovering a node").
 - **CNI plugin installed but node-agent not running.** Same effect as above, and the watcher path is irrelevant because the node-agent process is absent. If the pod never became ready in the first place, the rollback watcher unchains the node automatically.
 - **CNI plugin enabled, node-agent running, watcher disabled.** Not a supported configuration. The watcher is the source of truth for enrollment; the CNI hook only acknowledges sandbox-setup events to close the race window.
 

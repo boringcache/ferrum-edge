@@ -145,7 +145,7 @@ The backend echoes each request body back with the same `Content-Type` header an
 **Environment**: macOS Darwin 25.4.0, Apple Silicon
 **Duration**: 10s per test, 100 concurrent connections
 **Gateway**: Ferrum Edge (release build, optimizations enabled) vs Envoy 1.37.1 (`brew install envoy`)
-**Optimizations**: `CoalescingBody` (128 KB chunk batching for streaming responses), small response buffering (≤ 64 KiB bodies collected into single allocation via `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES`), frequency-aware router cache eviction (Count-Min Sketch), thread-local Date header caching, lazy timeout wrapper, `TCP_FASTOPEN` + `IP_BIND_ADDRESS_NO_PORT` socket opts, RED adaptive load shedding, TLS handshake offload, cacheability predictor, disabled per-request validation checks for perf tests
+**Optimizations**: `CoalescingBody` (128 KB chunk batching for streaming responses), small response buffering (≤ 64 KiB bodies collected into single allocation via `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES`), frequency-aware router cache eviction (Count-Min Sketch), thread-local Date header caching, lazy timeout wrapper, `TCP_FASTOPEN` + `IP_BIND_ADDRESS_NO_PORT` socket opts, RED adaptive load shedding, cacheability predictor, disabled per-request validation checks for perf tests
 
 ### Tier 1: application/json (HTTP/1.1)
 
@@ -376,7 +376,6 @@ The P99 advantage is most pronounced on HTTP/1.1 across all content types, where
 - **Lazy timeout wrapper** — `lazy_timeout::lazy_timeout()` defers tokio timer allocation until inner future returns `Pending`, eliminating timer overhead on fast-path operations
 - **TCP_FASTOPEN + IP_BIND_ADDRESS_NO_PORT** — Linux socket optimizations saving 1 RTT on repeat connections and preventing ephemeral port exhaustion
 - **RED adaptive load shedding** — Linear probability ramp between pressure and critical thresholds for smoother degradation
-- **TLS handshake offload** — Optional dedicated single-threaded runtimes for CPU-intensive TLS handshakes
 - **Cacheability predictor** — LRU of known-uncacheable keys to skip cache lookups for historically uncacheable assets
 - **Runtime tuning** — disabled body size limits, header timeouts, connection caps, and per-request validation checks for perf tests
 

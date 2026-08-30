@@ -1,14 +1,22 @@
 {{- if .Values.ca.enabled }}
 {{- $caEnv := .Values.ca.env | default dict -}}
-{{- $adminTarget := include "ferrum-mesh.adminProbeTargetFromEnv" $caEnv | fromYaml -}}
+{{- $admin := include "ferrum-mesh.resolveComponentAdmin" (dict "component" "ca" "env" $caEnv "admin" (.Values.ca.admin | default dict)) | fromYaml -}}
 {{- $handlers := dict "live" (dict) "ready" (dict) -}}
-{{- if ne (toString $adminTarget.port) "0" -}}
-{{- $handlers = include "ferrum-mesh.adminHealthHandlers" $adminTarget | fromYaml -}}
+{{- if ne (toString $admin.port) "0" -}}
+{{- $handlers = include "ferrum-mesh.adminHealthHandlers" $admin | fromYaml -}}
 {{- end -}}
 {{- $liveHandler := .Values.ca.probes.liveness.override | default dict -}}
 {{- if not $liveHandler }}{{- $liveHandler = $handlers.live | default dict -}}{{- end -}}
 {{- $readyHandler := .Values.ca.probes.readiness.override | default dict -}}
 {{- if not $readyHandler }}{{- $readyHandler = $handlers.ready | default dict -}}{{- end -}}
+{{- $startupHandler := .Values.ca.probes.startup.override | default dict -}}
+{{- if not $startupHandler }}{{- $startupHandler = $liveHandler -}}{{- end -}}
+{{- /* An admin HTTP port of 0 leaves the computed handlers empty; `renderProbes`
+       would then silently omit the enabled probe, so a ca rollout would keep
+       serving from the Service endpoint set through shutdown. Fail per probe.
+       Startup is classified independently so liveness.override cannot replace an
+       explicit startup.override (or hide a missing computed startup handler). */ -}}
+{{- include "ferrum-mesh.validateComputedProbeHandlers" (dict "component" "ca" "probes" .Values.ca.probes "startupHandler" $startupHandler "liveHandler" $liveHandler "readyHandler" $readyHandler) -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -30,20 +38,52 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       serviceAccountName: ferrum-mesh
+      terminationGracePeriodSeconds: {{ .Values.ca.terminationGracePeriodSeconds }}
+      {{- with .Values.ca.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.ca.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: ferrum-edge
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["run"]
+          {{- with .Values.ca.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if ne (toString $admin.port) "0" }}
+          ports:
+            - name: admin-http
+              containerPort: {{ $admin.port }}
+              protocol: TCP
+          {{- end }}
           env:
             {{- include "ferrum-mesh.renderControlPlaneRequiredEnv" . | nindent 12 }}
             - name: FERRUM_MODE
               value: cp
+            {{- include "ferrum-mesh.adminEnv" (dict "env" $caEnv "resolved" $admin) | nindent 12 }}
+            {{- include "ferrum-mesh.shutdownEnv" .Values.ca | nindent 12 }}
+            {{- include "ferrum-mesh.metricsEnv" . | nindent 12 }}
             {{- range $name, $value := .Values.ca.env }}
-            {{- if not (has $name (list "FERRUM_DB_TYPE" "FERRUM_DB_URL" "FERRUM_ADMIN_JWT_SECRET" "FERRUM_CP_DP_GRPC_JWT_SECRET")) }}
+            {{- if not (has $name (list "FERRUM_DB_TYPE" "FERRUM_DB_URL" "FERRUM_ADMIN_JWT_SECRET" "FERRUM_CP_DP_GRPC_JWT_SECRET" "FERRUM_ADMIN_HTTP_PORT" "FERRUM_ADMIN_BIND_ADDRESS" "FERRUM_ALLOW_INSECURE_ADMIN_HTTP" "FERRUM_ADMIN_ALLOWED_CIDRS" "FERRUM_MODE")) }}
             - name: {{ $name }}
               value: {{ $value | quote }}
             {{- end }}
             {{- end }}
-          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.ca.probes "liveHandler" $liveHandler "readyHandler" $readyHandler) }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.ca.probes "startupHandler" $startupHandler "liveHandler" $liveHandler "readyHandler" $readyHandler) }}
+          {{- include "ferrum-mesh.preStopLifecycle" .Values.ca | nindent 10 }}
+          {{- with .Values.ca.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
 {{- end }}
