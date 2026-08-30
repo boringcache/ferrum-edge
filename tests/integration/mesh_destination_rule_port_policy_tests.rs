@@ -426,6 +426,89 @@ fn partial_port_outlier_overlay_inherits_explicit_top_level_fields() {
 }
 
 #[test]
+fn partial_subset_and_port_outlier_overlays_share_field_level_precedence() {
+    use ferrum_edge::modes::mesh::config::MeshSubset;
+
+    let mut selected_proxy = proxy();
+    selected_proxy.upstream_subset = Some("v1".to_string());
+    let mut selected_upstream = upstream();
+    selected_upstream.targets[0].tags.insert("version".to_string(), "v1".to_string());
+    let mut port_level_settings = HashMap::new();
+    port_level_settings.insert(
+        8080,
+        MeshTrafficPolicy {
+            outlier_detection: Some(MeshOutlierDetection {
+                consecutive_errors: Some(7),
+                interval_seconds: None,
+                base_ejection_seconds: Some(45),
+                max_ejection_percent: None,
+            }),
+            ..MeshTrafficPolicy::default()
+        },
+    );
+    let mut config = GatewayConfig {
+        proxies: vec![selected_proxy],
+        upstreams: vec![selected_upstream],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    outlier_detection: Some(MeshOutlierDetection {
+                        consecutive_errors: Some(20),
+                        interval_seconds: Some(10),
+                        base_ejection_seconds: Some(30),
+                        max_ejection_percent: Some(100),
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings,
+                subsets: vec![MeshSubset {
+                    name: "v1".to_string(),
+                    labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        outlier_detection: Some(MeshOutlierDetection {
+                            consecutive_errors: None,
+                            interval_seconds: Some(15),
+                            base_ejection_seconds: None,
+                            max_ejection_percent: Some(80),
+                        }),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                }],
+                export_to: vec!["*".to_string()],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+    let subset_passive = prepared.upstreams[0]
+        .resolved_subset_tls
+        .get("v1")
+        .and_then(|resolved| resolved.passive_health_check.as_ref())
+        .expect("subset outlierDetection must project passive health");
+    assert_eq!(subset_passive.unhealthy_threshold, 20);
+    assert_eq!(subset_passive.unhealthy_window_seconds, 15);
+    assert_eq!(subset_passive.healthy_after_seconds, 30);
+    assert_eq!(subset_passive.max_ejection_percent, Some(80));
+
+    let port_passive = prepared.proxies[0]
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&8080))
+        .and_then(|override_slot| override_slot.passive_health_check.as_ref())
+        .expect("port outlierDetection must layer over selected subset passive health");
+    assert_eq!(port_passive.unhealthy_threshold, 7);
+    assert_eq!(port_passive.unhealthy_window_seconds, 15);
+    assert_eq!(port_passive.healthy_after_seconds, 45);
+    assert_eq!(port_passive.max_ejection_percent, Some(80));
+}
+
+#[test]
 fn port_level_positive_outlier_overlay_clears_top_level_disable_sentinel() {
     let mut port_level_settings = HashMap::new();
     port_level_settings.insert(

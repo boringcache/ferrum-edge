@@ -624,6 +624,12 @@ pub struct UpstreamPortOverride {
     /// `outlierDetection`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passive_health_check: Option<PassiveHealthCheck>,
+    /// Raw per-port `outlierDetection` field overlay retained for cold-path
+    /// projection onto a selected subset's inherited passive-health policy.
+    /// The fully resolved `passive_health_check` above remains the serialized
+    /// top-level-plus-port view; this field is mesh-derived state only.
+    #[serde(skip)]
+    pub outlier_detection_overlay: Option<crate::modes::mesh::config::MeshOutlierDetection>,
     /// Per-port locality LB override mapped from DestinationRule
     /// `portLevelSettings[].loadBalancer.localityLbSetting`. When present,
     /// HTTP-family / gRPC / WebSocket / HBONE dispatch consults this before
@@ -1026,6 +1032,48 @@ pub(crate) fn dispatch_port_override_fallback_for_selected_subset(
             .overlay_subset_connection_pool_http(subset_policy);
     }
     inherited
+}
+
+/// Resolve an upstream's per-port overlays for one selected subset.
+///
+/// Passive health needs this subset-specific materialization because its four
+/// represented Istio fields are stored as one `PassiveHealthCheck`. The raw
+/// per-port field mask is therefore applied over the selected subset's fully
+/// resolved passive policy (or the upstream policy when no subset applies),
+/// preserving field-level port > subset > top-level precedence without any
+/// request-path merging. Other per-port fields are projected unchanged.
+pub(crate) fn dispatch_port_overrides_for_selected_subset(
+    upstream: &Upstream,
+    selected_subset: Option<&str>,
+) -> Option<HashMap<u16, ResolvedPortOverride>> {
+    if upstream.port_overrides.is_empty() {
+        return None;
+    }
+
+    let inherited_passive = selected_subset
+        .and_then(|subset| upstream.resolved_subset_tls.get(subset))
+        .and_then(|resolved| resolved.passive_health_check.as_ref())
+        .or_else(|| {
+            upstream
+                .health_checks
+                .as_ref()
+                .and_then(|health| health.passive.as_ref())
+        });
+    let resolved: HashMap<u16, ResolvedPortOverride> = upstream
+        .port_overrides
+        .iter()
+        .filter_map(|(port, override_config)| {
+            let mut resolved = ResolvedPortOverride::from_upstream_override(override_config)
+                .unwrap_or_default();
+            if let Some(outlier) = override_config.outlier_detection_overlay.as_ref() {
+                let mut passive = inherited_passive.cloned().unwrap_or_default();
+                crate::modes::mesh::apply_outlier_detection_to_passive(&mut passive, outlier);
+                resolved.passive_health_check = Some(passive);
+            }
+            (!resolved.is_empty()).then_some((*port, resolved))
+        })
+        .collect();
+    (!resolved.is_empty()).then_some(resolved)
 }
 
 /// A named subset of upstream targets identified by label selectors.
@@ -4229,29 +4277,12 @@ impl GatewayConfig {
     /// Same pattern as `resolve_upstream_tls` — derived projection cached on
     /// the proxy so the request path never re-derives it.
     pub fn resolve_dispatch_port_overrides(&mut self) {
-        let by_upstream: HashMap<(&str, &str), HashMap<u16, ResolvedPortOverride>> = self
-            .upstreams
-            .iter()
-            .filter(|u| !u.port_overrides.is_empty())
-            .map(|u| {
-                let ports: HashMap<u16, ResolvedPortOverride> = u
-                    .port_overrides
-                    .iter()
-                    .filter_map(|(port, ovr)| {
-                        ResolvedPortOverride::from_upstream_override(ovr)
-                            .map(|resolved| (*port, resolved))
-                    })
-                    .collect();
-                ((u.namespace.as_str(), u.id.as_str()), ports)
-            })
-            .filter(|(_, m)| !m.is_empty())
-            .collect();
-
         // Inherited top-level `connectionPool.http` fallback. All six applied
         // HTTP fields supported at subset scope are overlaid per proxy via the
         // shared selected-subset helper so admission and runtime stay aligned.
-        // The per-port map stays separate and is consulted first at dispatch,
-        // preserving port > subset > top-level.
+        // The per-port map is likewise materialized for the selected subset so
+        // partial outlierDetection blocks preserve field-level
+        // port > subset > top-level precedence without hot-path merging.
         let upstream_by_key: HashMap<(&str, &str), &Upstream> = self
             .upstreams
             .iter()
@@ -4263,7 +4294,14 @@ impl GatewayConfig {
                 .upstream_id
                 .as_deref()
                 .map(|uid| (proxy.namespace.as_str(), uid));
-            proxy.dispatch_port_overrides = key.and_then(|key| by_upstream.get(&key)).cloned();
+            proxy.dispatch_port_overrides = key.and_then(|key| {
+                upstream_by_key.get(&key).and_then(|upstream| {
+                    dispatch_port_overrides_for_selected_subset(
+                        upstream,
+                        proxy.upstream_subset.as_deref(),
+                    )
+                })
+            });
             proxy.dispatch_port_override_fallback = key.and_then(|key| {
                 upstream_by_key.get(&key).and_then(|upstream| {
                     dispatch_port_override_fallback_for_selected_subset(
