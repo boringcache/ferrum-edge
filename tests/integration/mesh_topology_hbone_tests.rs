@@ -301,6 +301,23 @@ fn request_authentication_plugin_only_injected_when_jwt_rules_present() {
             plugin_ids.contains(MESH_REQUEST_AUTH_PLUGIN_ID),
             "JWT rule present → request_auth plugin must be injected, got {plugin_ids:?}"
         );
+        let jwks = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID)
+            .expect("jwks_auth plugin injected");
+        assert_eq!(
+            jwks.config["providers"][0]["issuer"].as_str(),
+            Some("https://issuer.example.com")
+        );
+        assert_eq!(
+            jwks.config["providers"][0]["audiences"],
+            serde_json::json!(["api"])
+        );
+        assert_eq!(
+            jwks.config["emit_mesh_request_principal_metadata"],
+            serde_json::json!(true)
+        );
     }
 }
 

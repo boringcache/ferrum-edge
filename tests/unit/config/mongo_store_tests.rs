@@ -9,18 +9,19 @@
 //! detection without requiring a live DocumentDB backend.
 
 use ferrum_edge::_test_support::{
-    MongoReconnectTopology, MongoReconnectTransitionTestHooks,
-    mongo_migration_lease_acquire_filter_classic, mongo_migration_lease_acquire_update_classic,
-    mongo_migration_lease_duration_millis, mongo_migration_lease_renew_update_classic,
-    mongo_mtls_dns_admission_drop_must_retain, mongo_mtls_dns_admission_lock_filter,
-    mongo_mtls_dns_admission_lock_update, mongo_pipeline_update_unsupported,
-    mongo_store_acquire_connection_generation_pin_for_test, mongo_store_new_unconnected_for_test,
-    mongo_store_published_database_name_for_test,
+    MongoConfigChangeOp, MongoReconnectTopology, MongoReconnectTransitionTestHooks,
+    decode_mongo_config_change_record, mongo_migration_lease_acquire_filter_classic,
+    mongo_migration_lease_acquire_update_classic, mongo_migration_lease_duration_millis,
+    mongo_migration_lease_renew_update_classic, mongo_mtls_dns_admission_drop_must_retain,
+    mongo_mtls_dns_admission_lock_filter, mongo_mtls_dns_admission_lock_update,
+    mongo_pipeline_update_unsupported, mongo_store_acquire_connection_generation_pin_for_test,
+    mongo_store_new_unconnected_for_test, mongo_store_published_database_name_for_test,
     mongo_store_set_reconnect_transition_hooks_for_test,
     mongo_store_try_publish_reconnected_bundle_for_test, mtls_dns_policy_requires_consumer_load,
 };
 use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
+use mongodb::bson::{Bson, Document, doc};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -613,9 +614,10 @@ fn mongo_timeout_overrides_preserve_uri_unless_env_explicit() {
 
 #[test]
 fn replace_api_spec_metadata_shortcut_checks_matched_count() {
-    // Issue #2989: the hash-unchanged metadata-only shortcut must verify the
+    // Issue #2989 / #4285: the hash-unchanged metadata-only shortcut must verify the
     // `replace_one` (no upsert) matched a document before reporting success, so
-    // a spec raced away by a concurrent DELETE surfaces an error, not a 200.
+    // a spec raced away by a concurrent DELETE (or a dangling api_spec_id without
+    // an api_specs document) surfaces an error, not a 200.
     let replace = mongo_method("replace_api_spec_bundle(");
     let shortcut = replace
         .find("Only update metadata fields on the spec doc")
@@ -2288,4 +2290,190 @@ fn mongo_namespace_registry_backfill_is_one_time_and_crash_retryable() {
         lease_at < backfill_at && backfill_at < release_at,
         "the first compatibility run must stay serialized by the migration lease:\n{migrations}"
     );
+}
+
+fn well_formed_change_doc(sequence: i64, resource_id: &str, operation: &str) -> Document {
+    doc! {
+        "sequence": sequence,
+        "namespace": "ferrum",
+        "resource_type": "proxy",
+        "resource_id": resource_id,
+        "operation": operation,
+        "created_at": "2026-08-28T00:00:00Z",
+    }
+}
+
+fn incremental_cursor_after(after_sequence: u64, docs: &[Document]) -> Result<u64, anyhow::Error> {
+    let mut sequence_cursor = after_sequence;
+    for doc in docs {
+        let change = decode_mongo_config_change_record(doc)?;
+        sequence_cursor = sequence_cursor.max(change.sequence);
+    }
+    Ok(sequence_cursor)
+}
+
+fn assert_decode_error_is_opaque(error: &anyhow::Error, forbidden: &[&str]) {
+    let message = error.to_string();
+    for needle in forbidden {
+        assert!(
+            !message.contains(needle),
+            "decode error must not leak record content {needle:?}: {message}"
+        );
+    }
+}
+
+#[test]
+fn incremental_poll_decodes_canonical_upsert_and_delete() {
+    let upsert = decode_mongo_config_change_record(&well_formed_change_doc(3, "proxy-a", "upsert"))
+        .expect("canonical upsert must decode");
+    assert_eq!(upsert.sequence, 3);
+    assert_eq!(upsert.resource_type, "proxy");
+    assert_eq!(upsert.resource_id, "proxy-a");
+    assert_eq!(upsert.operation, MongoConfigChangeOp::Upsert);
+
+    let delete = decode_mongo_config_change_record(&well_formed_change_doc(4, "proxy-a", "delete"))
+        .expect("canonical delete must decode");
+    assert_eq!(delete.operation, MongoConfigChangeOp::Delete);
+}
+
+#[test]
+fn incremental_poll_accepts_int32_sequence() {
+    let mut doc = well_formed_change_doc(1, "proxy-a", "upsert");
+    doc.insert("sequence", Bson::Int32(9));
+    let change = decode_mongo_config_change_record(&doc).expect("Int32 sequence must decode");
+    assert_eq!(change.sequence, 9);
+}
+
+#[test]
+fn incremental_poll_rejects_wrong_bson_types() {
+    for field in ["resource_type", "resource_id", "operation"] {
+        let mut doc = well_formed_change_doc(1, "secret-resource-id", "upsert");
+        doc.insert(field, Bson::Int32(7));
+        let error = decode_mongo_config_change_record(&doc)
+            .expect_err("wrong BSON type must abort the poll");
+        let message = error.to_string();
+        assert!(
+            message.contains("non-string field") && message.contains(field),
+            "wrong-type error must name the field, got: {message}"
+        );
+        assert_decode_error_is_opaque(&error, &["secret-resource-id", "7"]);
+    }
+}
+
+#[test]
+fn incremental_poll_rejects_missing_fields() {
+    for field in ["sequence", "resource_type", "resource_id", "operation"] {
+        let mut doc = well_formed_change_doc(1, "secret-resource-id", "upsert");
+        doc.remove(field);
+        let error =
+            decode_mongo_config_change_record(&doc).expect_err("missing field must abort the poll");
+        let message = error.to_string();
+        if field == "sequence" {
+            assert!(
+                message.contains("invalid sequence"),
+                "missing sequence must fail closed, got: {message}"
+            );
+        } else {
+            assert!(
+                message.contains("missing field") && message.contains(field),
+                "missing-field error must name the field, got: {message}"
+            );
+        }
+        assert_decode_error_is_opaque(&error, &["secret-resource-id"]);
+    }
+}
+
+#[test]
+fn incremental_poll_rejects_invalid_operations() {
+    for operation in ["", "update", "patch", "UPSERT", "Delete"] {
+        let doc = well_formed_change_doc(1, "secret-resource-id", operation);
+        let error = decode_mongo_config_change_record(&doc)
+            .expect_err("non-canonical operation must abort the poll");
+        assert!(
+            error.to_string().contains("unsupported operation"),
+            "invalid operation must not default to upsert, got: {error}"
+        );
+        assert_decode_error_is_opaque(&error, &["secret-resource-id"]);
+    }
+}
+
+#[test]
+fn incremental_poll_rejects_empty_resource_identity() {
+    for (field, value) in [("resource_id", ""), ("resource_type", "")] {
+        let mut doc = well_formed_change_doc(1, "proxy-a", "upsert");
+        doc.insert(field, value);
+        let error = decode_mongo_config_change_record(&doc)
+            .expect_err("empty identity fields must abort the poll");
+        assert!(
+            error.to_string().contains("empty"),
+            "empty {field} must fail closed, got: {error}"
+        );
+    }
+}
+
+#[test]
+fn malformed_change_does_not_advance_cursor_past_later_well_formed_record() {
+    let malformed = {
+        let mut doc = well_formed_change_doc(5, "secret-resource-id", "upsert");
+        doc.insert("resource_id", Bson::Int32(42));
+        doc
+    };
+    let later = well_formed_change_doc(6, "later-proxy", "upsert");
+    let error = incremental_cursor_after(0, &[malformed, later])
+        .expect_err("typed decode failure must abort before the cursor can skip the record");
+    assert!(error.to_string().contains("non-string field 'resource_id'"));
+    assert_decode_error_is_opaque(&error, &["secret-resource-id", "later-proxy", "42"]);
+}
+
+#[test]
+fn well_formed_batch_advances_cursor_to_max_sequence() {
+    let cursor = incremental_cursor_after(
+        1,
+        &[
+            well_formed_change_doc(2, "proxy-a", "upsert"),
+            well_formed_change_doc(4, "proxy-b", "delete"),
+        ],
+    )
+    .expect("canonical batch must decode");
+    assert_eq!(cursor, 4);
+}
+
+#[test]
+fn load_incremental_config_decodes_before_advancing_cursor() {
+    let body = mongo_method("load_incremental_config");
+    let decode_at = body
+        .find("decode_mongo_config_change_record")
+        .expect("incremental poll must use the fail-closed decoder");
+    let cursor_at = body
+        .find("sequence_cursor = sequence_cursor.max(")
+        .expect("incremental poll must advance the cursor after a record is accepted");
+    let question_at = body[decode_at..]
+        .find('?')
+        .map(|offset| decode_at + offset)
+        .expect("typed decode failure must abort the poll with ?");
+    assert!(
+        decode_at < question_at && question_at < cursor_at,
+        "cursor must advance only after a successful typed decode:\n{body}"
+    );
+    assert!(
+        !body.contains("get_str(\"resource_type\")")
+            && !body.contains("get_str(\"resource_id\")")
+            && !body.contains("get_str(\"operation\")")
+            && !body.contains("unwrap_or_default()"),
+        "incremental poll must not default wrong-typed BSON fields:\n{body}"
+    );
+    assert!(
+        body.contains("split_mongo_change_ops"),
+        "incremental poll must split only canonical upsert/delete operations:\n{body}"
+    );
+}
+
+#[test]
+fn unknown_resource_type_still_decodes_so_the_cursor_can_advance() {
+    let mut doc = well_formed_change_doc(8, "spec-1", "upsert");
+    doc.insert("resource_type", "api_spec");
+    let change = decode_mongo_config_change_record(&doc)
+        .expect("unknown resource_type is ignored after a successful typed decode");
+    assert_eq!(change.sequence, 8);
+    assert_eq!(change.resource_type, "api_spec");
 }

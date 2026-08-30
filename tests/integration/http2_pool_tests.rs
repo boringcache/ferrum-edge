@@ -28,7 +28,7 @@ use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsage
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1402,4 +1402,229 @@ async fn test_grpc_h2c_pool_without_cap_is_unbounded_and_untracked() {
         0,
         "an uncapped destination must never allocate a counter slot"
     );
+}
+
+/// Issue #4280: H2/gRPC `rr_counters` are keyed by the full base pool key,
+/// which ends in `|svidg=`. `retain_live_from_config` keeps every generation
+/// for a still-live host:port, and `force_drain_svid_generation` is scheduled
+/// only when `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS > 0` (default 0).
+/// The rotation consumer's unconditional `drain_tls_config_cache` path must
+/// reclaim retired-generation counters without withdrawing live connections.
+#[tokio::test]
+async fn rr_counters_reclaim_retired_svid_generations_at_zero_drain() {
+    rr_counters_reclaim_retired_generations_for_h2();
+    rr_counters_reclaim_retired_generations_for_grpc();
+}
+
+fn rr_counters_reclaim_retired_generations_for_h2() {
+    let pool = Http2ConnectionPool::default();
+    let proxy = create_test_proxy();
+    let global = PoolConfig::default();
+    let live_generation = 10u64;
+    let retired = 1..live_generation;
+
+    let live_key =
+        Http2ConnectionPool::pool_key_with_global(&proxy, Some(live_generation), &global);
+    let static_key = Http2ConnectionPool::pool_key_with_global(&proxy, None, &global);
+    pool.insert_rr_counter_for_tests(live_key.clone());
+    pool.insert_rr_counter_for_tests(static_key.clone());
+    for generation in retired.clone() {
+        pool.insert_rr_counter_for_tests(Http2ConnectionPool::pool_key_with_global(
+            &proxy,
+            Some(generation),
+            &global,
+        ));
+    }
+
+    let before = pool.rr_counter_len();
+    assert_eq!(before, 2 + retired.clone().count());
+    assert_eq!(pool.pool_size(), 0);
+
+    // Drive the same public method the rotation consumer calls
+    // unconditionally (including at drain_seconds = 0). Do not call
+    // `force_drain_svid_generation`, which would also invalidate senders.
+    for generation in retired.clone() {
+        pool.drain_backend_tls_config_cache_svid_generation(generation);
+    }
+
+    assert_eq!(
+        pool.rr_counter_len(),
+        2,
+        "retired SVID generations must not retain rr_counters after unconditional TLS-cache drain"
+    );
+    assert!(
+        pool.contains_rr_counter(&live_key),
+        "the live generation counter must remain: {live_key}"
+    );
+    assert!(
+        pool.contains_rr_counter(&static_key),
+        "operator-static svidg=static counters must remain"
+    );
+    for generation in retired {
+        let retired_key =
+            Http2ConnectionPool::pool_key_with_global(&proxy, Some(generation), &global);
+        assert!(
+            !pool.contains_rr_counter(&retired_key),
+            "generation {generation} counter must be reclaimed: {retired_key}"
+        );
+    }
+    assert_eq!(
+        pool.pool_size(),
+        0,
+        "rr-counter reclaim must not withdraw (or invent) pooled connections"
+    );
+}
+
+fn rr_counters_reclaim_retired_generations_for_grpc() {
+    let pool = GrpcConnectionPool::default();
+    let proxy = create_test_proxy();
+    let global = PoolConfig::default();
+    let live_generation = 8u64;
+    let retired = 1..live_generation;
+
+    let live_key = GrpcConnectionPool::pool_key_with_global(&proxy, Some(live_generation), &global);
+    let static_key = GrpcConnectionPool::pool_key_with_global(&proxy, None, &global);
+    pool.insert_rr_counter_for_tests(live_key.clone());
+    pool.insert_rr_counter_for_tests(static_key.clone());
+    for generation in retired.clone() {
+        pool.insert_rr_counter_for_tests(GrpcConnectionPool::pool_key_with_global(
+            &proxy,
+            Some(generation),
+            &global,
+        ));
+    }
+
+    assert_eq!(pool.rr_counter_len(), 2 + retired.clone().count());
+
+    for generation in retired.clone() {
+        pool.drain_backend_tls_config_cache_svid_generation(generation);
+    }
+
+    assert_eq!(pool.rr_counter_len(), 2);
+    assert!(pool.contains_rr_counter(&live_key));
+    assert!(pool.contains_rr_counter(&static_key));
+    for generation in retired {
+        let retired_key =
+            GrpcConnectionPool::pool_key_with_global(&proxy, Some(generation), &global);
+        assert!(
+            !pool.contains_rr_counter(&retired_key),
+            "gRPC generation {generation} counter must be reclaimed: {retired_key}"
+        );
+    }
+    assert_eq!(pool.pool_size(), 0);
+}
+
+/// Issue #4280 race: a request can capture generation N, rotation can
+/// `fetch_max` and `retain`, then the paused request can still take the
+/// `None => entry(...)` branch. Post-insert exact-key removal on that cold
+/// path (and the insert-before-retire `retain`) keep the map bounded.
+#[tokio::test]
+async fn rr_counters_close_late_insert_after_svid_retire() {
+    rr_counters_insert_before_and_after_retire_for_h2();
+    rr_counters_insert_before_and_after_retire_for_grpc();
+}
+
+fn rr_counters_insert_before_and_after_retire_for_h2() {
+    let live = Arc::new(AtomicU64::new(3));
+    let pool = Http2ConnectionPool::new_with_svid_generation(
+        PoolConfig::default(),
+        ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
+        None,
+        Arc::new(Vec::new()),
+        Arc::clone(&live),
+    );
+    let proxy = create_test_proxy();
+    let global = PoolConfig::default();
+    let captured = 3u64;
+    let key = Http2ConnectionPool::pool_key_with_global(&proxy, Some(captured), &global);
+    let static_key = Http2ConnectionPool::pool_key_with_global(&proxy, None, &global);
+
+    let inserted = pool.get_or_seed_rr_counter_for_tests(&key, Some(captured));
+    assert!(pool.contains_rr_counter(&key));
+    pool.drain_backend_tls_config_cache_svid_generation(captured);
+    assert!(
+        !pool.contains_rr_counter(&key),
+        "insert-before-retire must be reclaimed by the unconditional drain"
+    );
+    let inserted_before = inserted.load(Ordering::Relaxed);
+    let _ = inserted.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(
+        inserted.load(Ordering::Relaxed),
+        inserted_before.wrapping_add(1),
+        "the detached in-flight counter Arc must remain usable after map retirement"
+    );
+
+    live.store(4, Ordering::Release);
+    pool.drain_backend_tls_config_cache_svid_generation(captured);
+    let late = pool.get_or_seed_rr_counter_for_tests(&key, Some(captured));
+    assert!(
+        !pool.contains_rr_counter(&key),
+        "retire-before-insert must drop the exact captured key"
+    );
+    let late_before = late.load(Ordering::Relaxed);
+    let _ = late.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(
+        late.load(Ordering::Relaxed),
+        late_before.wrapping_add(1),
+        "the late retired-generation counter Arc must remain usable without being cached"
+    );
+
+    let current = Http2ConnectionPool::pool_key_with_global(&proxy, Some(4), &global);
+    let _ = pool.get_or_seed_rr_counter_for_tests(&current, Some(4));
+    let _ = pool.get_or_seed_rr_counter_for_tests(&static_key, None);
+    assert!(pool.contains_rr_counter(&current));
+    assert!(pool.contains_rr_counter(&static_key));
+    assert_eq!(pool.pool_size(), 0);
+}
+
+fn rr_counters_insert_before_and_after_retire_for_grpc() {
+    let live = Arc::new(AtomicU64::new(3));
+    let pool = GrpcConnectionPool::new_with_svid_generation(
+        PoolConfig::default(),
+        ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
+        None,
+        Arc::new(Vec::new()),
+        Arc::clone(&live),
+    );
+    let proxy = create_test_proxy();
+    let global = PoolConfig::default();
+    let captured = 3u64;
+    let key = GrpcConnectionPool::pool_key_with_global(&proxy, Some(captured), &global);
+    let static_key = GrpcConnectionPool::pool_key_with_global(&proxy, None, &global);
+
+    let inserted = pool.get_or_seed_rr_counter_for_tests(&key, Some(captured));
+    assert!(pool.contains_rr_counter(&key));
+    pool.drain_backend_tls_config_cache_svid_generation(captured);
+    assert!(!pool.contains_rr_counter(&key));
+    let inserted_before = inserted.load(Ordering::Relaxed);
+    let _ = inserted.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(
+        inserted.load(Ordering::Relaxed),
+        inserted_before.wrapping_add(1),
+        "the detached gRPC counter Arc must remain usable after map retirement"
+    );
+
+    live.store(4, Ordering::Release);
+    pool.drain_backend_tls_config_cache_svid_generation(captured);
+    let late = pool.get_or_seed_rr_counter_for_tests(&key, Some(captured));
+    assert!(
+        !pool.contains_rr_counter(&key),
+        "gRPC retire-before-insert must drop the exact captured key"
+    );
+    let late_before = late.load(Ordering::Relaxed);
+    let _ = late.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(
+        late.load(Ordering::Relaxed),
+        late_before.wrapping_add(1),
+        "the late retired-generation gRPC counter Arc must remain usable without being cached"
+    );
+
+    let current = GrpcConnectionPool::pool_key_with_global(&proxy, Some(4), &global);
+    let _ = pool.get_or_seed_rr_counter_for_tests(&current, Some(4));
+    let _ = pool.get_or_seed_rr_counter_for_tests(&static_key, None);
+    assert!(pool.contains_rr_counter(&current));
+    assert!(pool.contains_rr_counter(&static_key));
+    assert_eq!(pool.pool_size(), 0);
 }

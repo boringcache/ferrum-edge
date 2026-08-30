@@ -460,7 +460,7 @@ pub mod _test_support {
             backlog,
             None,
             accept_threads,
-            false,
+            crate::proxy::ProxyListenerBind::default(),
         )
     }
 
@@ -5068,6 +5068,44 @@ pub mod _test_support {
         MongoReconnectTopology, MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,
     };
 
+    // External test crates only: mirror production `config_changes` shapes without
+    // widening `ferrum_edge::config::mongo_store` public API.
+    /// Canonical `config_changes.operation` values for external unit tests.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MongoConfigChangeOp {
+        Upsert,
+        Delete,
+    }
+
+    /// Typed `config_changes` row decoded by incremental polling.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct MongoConfigChangeRecord {
+        pub sequence: u64,
+        pub resource_type: String,
+        pub resource_id: String,
+        pub operation: MongoConfigChangeOp,
+    }
+
+    /// Decode one `config_changes` document using the production decoder.
+    pub fn decode_mongo_config_change_record(
+        doc: &mongodb::bson::Document,
+    ) -> Result<MongoConfigChangeRecord, anyhow::Error> {
+        let change = crate::config::mongo_store::decode_mongo_config_change_record(doc)?;
+        Ok(MongoConfigChangeRecord {
+            sequence: change.sequence,
+            resource_type: change.resource_type,
+            resource_id: change.resource_id,
+            operation: match change.operation {
+                crate::config::mongo_store::MongoConfigChangeOp::Upsert => {
+                    MongoConfigChangeOp::Upsert
+                }
+                crate::config::mongo_store::MongoConfigChangeOp::Delete => {
+                    MongoConfigChangeOp::Delete
+                }
+            },
+        })
+    }
+
     /// Lazy Mongo store (no live MongoDB) for topology publication tests.
     pub fn mongo_store_new_unconnected_for_test(
         failover_urls: Vec<String>,
@@ -6772,6 +6810,15 @@ pub mod _test_support {
         )
     }
 
+    /// Whether a captured authorization plan has already elapsed — the exact
+    /// Instant check native plain-H3 relays use at backend EOS before `finish()`
+    /// (issue #4363).
+    pub fn captured_authorization_elapsed_for_test(
+        plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
+    ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
+        crate::http3::stream_util::captured_authorization_elapsed(plan)
+    }
+
     /// Outcome of racing one native-H3 gRPC upload-pump await against shutdown
     /// and the admitted authorization plan.
     #[derive(Debug, PartialEq, Eq)]
@@ -7758,6 +7805,25 @@ pub mod _test_support {
             now_unix,
             now_mono,
         )
+    }
+
+    /// Production inclusive mTLS leaf-validity predicate at an explicit Unix
+    /// instant (issue #4359). `None` is the fail-closed inverted-interval case.
+    /// Does not sample the wall clock and carries no certificate material.
+    pub fn mtls_client_cert_is_valid_at_unix_for_test(
+        not_before_unix: i64,
+        not_after_unix: i64,
+        now_unix: i64,
+    ) -> Option<bool> {
+        crate::plugins::mtls_auth::cert_is_valid_at_unix(not_before_unix, not_after_unix, now_unix)
+    }
+
+    /// Parse a client-certificate DER into the Unix `notBefore`/`notAfter`
+    /// bounds retained beside a cached mTLS identity. Used to prove the
+    /// inclusive predicate against the timestamps the authentication path
+    /// actually stores, without consulting live wall-clock time.
+    pub fn mtls_cert_validity_unix_bounds_from_der_for_test(der: &[u8]) -> Option<(i64, i64)> {
+        crate::plugins::mtls_auth::cert_validity_unix_bounds_from_der(der)
     }
 
     /// Set a request's credential deadline directly so external tests can drive
@@ -11931,6 +11997,39 @@ pub mod _test_support {
         headers: &std::collections::HashMap<String, String>,
     ) -> Option<u64> {
         crate::proxy::canonical_header_content_length_from_map(headers)
+    }
+
+    /// Whether a streaming response must wrap the size-limited adapter, using
+    /// the trusted backend-observed length captured before `after_proxy`.
+    pub fn streaming_response_requires_size_limit_for_test(
+        max_response_body_size_bytes: usize,
+        trusted_backend_content_length: Option<u64>,
+    ) -> bool {
+        crate::proxy::streaming_response_requires_size_limit(
+            max_response_body_size_bytes,
+            trusted_backend_content_length,
+        )
+    }
+
+    /// Direct-H2 large-response passthrough predicate. Callers must pass the
+    /// trusted backend-observed length, never a post-hook header.
+    pub fn should_bypass_h2_coalesce_for_large_response_for_test(
+        trusted_backend_content_length: Option<u64>,
+        max_response_body_size_bytes: usize,
+    ) -> bool {
+        crate::proxy::should_bypass_h2_coalesce_for_large_response(
+            trusted_backend_content_length,
+            max_response_body_size_bytes,
+        )
+    }
+
+    /// Post-hook declared length used only for HEAD advertisement and H3
+    /// client-facing completeness — not size-limit enforcement.
+    pub fn preserved_response_content_length_for_test(
+        headers: &std::collections::HashMap<String, String>,
+        status: u16,
+    ) -> Option<u64> {
+        crate::proxy::headers::preserved_response_content_length(headers, status)
     }
 
     /// Request-side declared-length reject predicate used by every dispatch path.

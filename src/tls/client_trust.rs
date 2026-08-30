@@ -494,27 +494,22 @@ impl ClientTrustMaterial {
     /// an additive CA rotation (new CA appended, overlapping with the old) and a
     /// routine CRL re-issue from churning live sessions.
     ///
-    /// # Known limitation: retirement is broader than enforcement for CRLs
+    /// # Retirement is a superset of enforcement, and stays that way
     ///
-    /// `revocations` hashes **every** entry in every configured CRL, but the
-    /// verifier those CRLs are installed on is built with
-    /// `.only_check_end_entity_revocation()` (`tls::build_client_cert_verifier`).
-    /// Publishing a CRL that revokes an **intermediate CA** therefore reports
-    /// `CrlChanged`, retires every client-certificate session in the scope, and
-    /// then admits the very same peers again on reconnect, because the verifier
-    /// never checks revocation above the leaf. An operator watching the
-    /// reconnect storm can read that as "the revocation took effect" when it did
-    /// not.
+    /// `revocations` hashes **every** entry in every configured CRL. It cannot
+    /// do otherwise: a CRL entry is an issuer key plus a serial number and
+    /// carries nothing that distinguishes an end-entity serial from a CA serial,
+    /// so `from_parts` cannot narrow the set without the revoked certificates
+    /// themselves.
     ///
-    /// This is deliberate, and it is not fixable here: a CRL entry is an issuer
-    /// key plus a serial number and carries nothing that distinguishes an
-    /// end-entity serial from a CA serial, so `from_parts` cannot narrow the set
-    /// without the revoked certificates themselves. Retiring on the superset is
-    /// also the fail-closed direction — it can only end sessions that would have
-    /// survived, never keep one alive that should have ended. The enforcement
-    /// gap belongs to the verifier posture (pre-#3857 behaviour), not to this
-    /// diff. To actually revoke an intermediate, remove it (or its issuing root)
-    /// from the client-CA bundle, which is an anchor change and IS enforced.
+    /// Since issue #4298 the verifier those CRLs are installed on checks every
+    /// non-trust-anchor certificate in the built chain (`tls::crl_policy`), so
+    /// publishing a CRL that revokes an **intermediate CA** now both retires the
+    /// scope's sessions and refuses the reconnect — the retirement and the
+    /// enforcement finally agree. The set is still a superset, because an entry
+    /// naming a serial no chain presents retires sessions nothing would have
+    /// rejected. That direction is the fail-closed one: it can only end sessions
+    /// that would have survived, never keep one alive that should have ended.
     /// Documented for operators in `docs/frontend_tls.md`.
     pub fn withdrawal_relative_to(
         &self,

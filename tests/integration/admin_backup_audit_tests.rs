@@ -664,11 +664,12 @@ async fn namespace_claim_denial_audits_get_backup_only() {
 
     let (base, _shutdown) = start_admin(state).await;
     let scoped = token_with_ns("ns-scoped-admin", "other-ns");
+    let spoofed_ns = "unused-name";
 
     let post = reqwest::Client::new()
         .post(format!("{base}/backup"))
         .bearer_auth(&scoped)
-        .header("X-Ferrum-Namespace", "ferrum")
+        .header("X-Ferrum-Namespace", spoofed_ns)
         .send()
         .await
         .expect("POST backup");
@@ -686,7 +687,7 @@ async fn namespace_claim_denial_audits_get_backup_only() {
         &scoped,
         Some("ns-denied-1"),
         None,
-        Some("ferrum"),
+        Some(spoofed_ns),
     )
     .await;
     assert_eq!(status, 403);
@@ -697,6 +698,16 @@ async fn namespace_claim_denial_audits_get_backup_only() {
     assert_eq!(events[0].outcome, audit::outcome::DENIED.as_str());
     assert_eq!(events[0].request_id, "ns-denied-1");
     assert_eq!(events[0].diff["failure_category"], "namespace_denied");
+    assert_eq!(
+        events[0].namespace,
+        ferrum_edge::config::types::DEFAULT_NAMESPACE
+    );
+    assert_ne!(events[0].namespace, spoofed_ns);
+    let rendered = serde_json::to_string(&events[0]).unwrap();
+    assert!(
+        !rendered.contains(spoofed_ns),
+        "denied request namespace leaked into backup audit: {rendered}"
+    );
 }
 
 #[tokio::test]

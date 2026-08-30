@@ -963,11 +963,14 @@ async fn h3_auth_lifetime_stalled_downstream_cannot_outlive_the_credential() {
 
 /// A backend script that keeps producing LARGE response DATA frames.
 ///
-/// Each chunk is far bigger than the stalled client's per-stream receive window
-/// below, so the gateway's very first downstream `send_data` parks in QUIC flow
-/// control and the relay never returns to its own `select!` timer. That is
-/// exactly the shape the write seam has to bound.
+/// A tiny priming chunk is committed first so expiry cannot race onto a
+/// HEADERS-only path: the client reads that frame, then stops. Each bulk chunk
+/// is far bigger than the stalled client's per-stream receive window, so the
+/// gateway's next downstream `send_data` parks in QUIC flow control and the
+/// relay never returns to its own `select!` timer. That is exactly the shape
+/// the write seam has to bound.
 fn h3_bulk_sse_stream(count: usize, chunk_len: usize) -> Vec<H3Step> {
+    let primed = Bytes::from_static(b"primed-native-sse-data");
     let chunk = Bytes::from(vec![b'x'; chunk_len]);
     let mut steps = vec![
         H3Step::AcceptStream,
@@ -976,12 +979,17 @@ fn h3_bulk_sse_stream(count: usize, chunk_len: usize) -> Vec<H3Step> {
             ("content-type", "text/event-stream".to_string()),
             ("cache-control", "no-cache".to_string()),
         ]),
+        H3Step::RespondData(primed),
+        // Let the gateway flush the priming frame separately before the first
+        // bulk frame parks on the client's tiny receive window.
+        H3Step::StallFor(Duration::from_millis(100)),
     ];
     for _ in 0..count {
         steps.push(H3Step::RespondData(chunk.clone()));
     }
     // Keep the connection alive far past the credential lifetime so only the
-    // authorization bound can end the exchange.
+    // authorization bound can end the exchange. StallFor does not itself FIN;
+    // end-of-script finish is delayed until this stall completes.
     steps.push(H3Step::StallFor(Duration::from_secs(45)));
     steps
 }
@@ -990,10 +998,12 @@ fn h3_bulk_sse_stream(count: usize, chunk_len: usize) -> Vec<H3Step> {
 // 7. Regression: a NON-READING client on a PLAIN HTTP/SSE response must not be
 //    able to hold an admitted native-H3 stream past the credential deadline.
 //
-//    This is the plain-relay counterpart of test 6. `select!` alone does not
-//    cover it: a client that stops reading parks the relay inside
-//    `RequestStream::send_data`, so the authorization arm is never polled and
-//    only a deadline raced around the WRITE itself can terminate the stream.
+//    A tiny first DATA frame is committed before the bulk stall so expiry
+//    cannot race onto a HEADERS-only path: the client reads that frame, then
+//    stops. After that, `select!` alone does not cover it: a client that
+//    stops reading parks the relay inside `RequestStream::send_data`, so the
+//    authorization arm is never polled and only a deadline raced around the
+//    WRITE itself can terminate the stream.
 //    Unlike gRPC there is no `grpc-timeout` at all on this path, so the
 //    authorization bound is the only bound in existence.
 //
@@ -1062,6 +1072,20 @@ async fn h3_auth_lifetime_stalled_plain_sse_response_cannot_outlive_the_credenti
             .and_then(|value| value.to_str().ok()),
         Some("text/event-stream"),
         "the relay under test must be the streaming SSE one"
+    );
+
+    // Prove the post-DATA precondition before deliberately stalling. Reading
+    // this small priming frame restores only its own flow-control credit; the
+    // following 64 KiB frame still cannot complete in a 4 KiB stream window.
+    let first = stream
+        .recv_data()
+        .await
+        .expect("priming response DATA must arrive before credential expiry")
+        .expect("priming response must not end before DATA");
+    assert_eq!(
+        first,
+        Bytes::from_static(b"primed-native-sse-data"),
+        "priming response payload must match"
     );
 
     // From here the client NEVER reads a DATA frame. The gateway's downstream
