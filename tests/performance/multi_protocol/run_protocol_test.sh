@@ -70,6 +70,7 @@ cleanup() {
         lsof -ti:"$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
     done
     rm -rf "$SCRIPT_DIR/certs" 2>/dev/null || true
+    rm -f "$SCRIPT_DIR"/ferrum_runtime_*.yaml 2>/dev/null || true
     [ -n "$RESULTS_DIR" ] && rm -rf "$RESULTS_DIR" 2>/dev/null || true
     echo -e "${GREEN}Cleanup complete${NC}"
 }
@@ -147,6 +148,18 @@ start_backend() {
     exit 1
 }
 
+# Substitute CA_PATH in Ferrum YAML configs (same placeholder pattern as Envoy).
+prepare_ferrum_config() {
+    local src_config="$1"
+    local ca_path="$2"
+    local runtime_config="$SCRIPT_DIR/ferrum_runtime_$(basename "$src_config")"
+
+    sed -e "s|CA_PATH|${ca_path}|g" \
+        "$src_config" > "$runtime_config"
+
+    echo "$runtime_config"
+}
+
 # Start gateway with config
 start_gateway() {
     local config_file="$1"
@@ -160,11 +173,14 @@ start_gateway() {
         sleep 1
     done
 
+    local runtime_config
+    runtime_config=$(prepare_ferrum_config "$config_file" "$cert_dir/ca.pem")
+
     cd "$PROJECT_ROOT"
     local env_cmd=(
         env
         FERRUM_MODE=file
-        "FERRUM_FILE_CONFIG_PATH=$config_file"
+        "FERRUM_FILE_CONFIG_PATH=$runtime_config"
         "FERRUM_PROXY_HTTP_PORT=$GATEWAY_HTTP_PORT"
         "FERRUM_PROXY_HTTPS_PORT=$GATEWAY_HTTPS_PORT"
         # Minimize non-proxy overhead
