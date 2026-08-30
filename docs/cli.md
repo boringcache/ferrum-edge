@@ -56,6 +56,7 @@ ferrum-edge run [OPTIONS]
 | `--settings <PATH>` | `-s` | Path to `ferrum.conf` (operational settings) |
 | `--spec <PATH>` | `-c` | Path to resources YAML/JSON (proxies, consumers, upstreams, plugins) |
 | `--mode <MODE>` | `-m` | Operating mode: `database`, `file`, `cp`, `dp`, `mesh`, `injector`, `node_agent`, `migrate` |
+| `--fips-mode <MODE>` | | FIPS deployment mode: `off` (default) or `enforce`. Must be supplied via this flag or the environment — a value set only in `ferrum.conf` arrives after the crypto provider is installed and is refused. See [FIPS mode](fips.md) |
 | `--verbose` | `-v` | Increase log verbosity (repeatable: `-v`=info, `-vv`=debug, `-vvv`=trace) |
 
 ### Examples
@@ -104,6 +105,7 @@ ferrum-edge validate [OPTIONS]
 | `--settings <PATH>` | `-s` | Path to `ferrum.conf` (operational settings) |
 | `--spec <PATH>` | `-c` | Path to resources YAML/JSON, or a localized `{version?, mesh}` mesh slice when `-m mesh` selects file-protocol validation |
 | `--mode <MODE>` | `-m` | Operating mode: `database`, `file`, `cp`, `dp`, `mesh`, `injector`, `node_agent`, `migrate` |
+| `--fips-mode <MODE>` | | FIPS deployment mode: `off` (default) or `enforce`. Must be supplied via this flag or the environment — a value set only in `ferrum.conf` arrives after the crypto provider is installed and is refused. See [FIPS mode](fips.md) |
 | `--verbose` | `-v` | Increase log verbosity (repeatable: `-v`=info, `-vv`=debug, `-vvv`=trace) |
 
 ### What is validated
@@ -373,8 +375,8 @@ ferrum-edge ambient-udp-preflight [OPTIONS]
 
 When using CLI subcommands, the configuration resolution order is (highest precedence first):
 
-1. **CLI flag** (`--settings`, `--spec`, `--mode`, `--verbose` on `run` and `validate`; `--settings` / `--verbose` on `ambient-udp-preflight`)
-2. **Environment variable** (`FERRUM_CONF_PATH`, `FERRUM_FILE_CONFIG_PATH`, `FERRUM_MODE`, `FERRUM_LOG_LEVEL`)
+1. **CLI flag** (`--settings`, `--spec`, `--mode`, `--fips-mode`, `--verbose` on `run` and `validate`; `--settings` / `--verbose` on `ambient-udp-preflight`)
+2. **Environment variable** (`FERRUM_CONF_PATH`, `FERRUM_FILE_CONFIG_PATH`, `FERRUM_MODE`, `FERRUM_FIPS_MODE`, `FERRUM_LOG_LEVEL`)
 3. **Conf file value** (`ferrum.conf`)
 4. **Smart path defaults** (see below)
 5. **Hardcoded defaults**

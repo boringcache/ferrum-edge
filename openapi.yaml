@@ -8121,6 +8121,12 @@ components:
           type: string
         crl_pem:
           type: string
+          description: >
+            PEM bundle of one or more X509 CRLs. Every record must parse and be
+            inside its own validity window: a future thisUpdate, a missing
+            nextUpdate, or a nextUpdate that has been reached is rejected, and a
+            single unusable record rejects the whole bundle rather than storing
+            the usable subset. allow_expired does not apply to CRLs.
         allow_overwrite:
           type: boolean
           default: false
@@ -8337,11 +8343,17 @@ components:
           description: PEM CA bundle to parse and expiry-check.
         crl_pem:
           type: string
-          description: PEM CRL bundle to parse.
+          description: >
+            PEM CRL bundle to parse and validity-window check. A future
+            thisUpdate, a missing nextUpdate, or a nextUpdate that has been
+            reached is rejected, and one unusable record rejects the whole
+            bundle.
         allow_expired:
           type: boolean
           default: false
-          description: Skip notBefore/notAfter checks for submitted certificates.
+          description: >
+            Skip notBefore/notAfter checks for submitted certificates. Does not
+            apply to crl_pem: an expired revocation list is always rejected.
         cert_expiry_warning_days:
           type: integer
           format: int64
@@ -13444,6 +13456,7 @@ components:
       required:
         - accepted
         - rejected_untrusted_assertor
+        - rejected_assertion_out_of_scope
         - rejected_trust_domain_mismatch
         - rejected_unauthenticated_hbone
         - rejected_malformed
@@ -13455,6 +13468,12 @@ components:
         rejected_untrusted_assertor:
           type: integer
           format: uint64
+        rejected_assertion_out_of_scope:
+          type: integer
+          format: uint64
+          description: |
+            Baggage assertions refused because the admitted assertor's grant
+            does not cover the claimed workload identity (issue #4274).
         rejected_trust_domain_mismatch:
           type: integer
           format: uint64
@@ -19161,6 +19180,8 @@ components:
                 type: string
                 description: >-
                   Expected JWT iss claim — routes tokens to this provider.
+                  When set, the token MUST carry iss and it must match exactly;
+                  the issuer check alone rejects only a mismatching claim.
                   Required and must be nonblank when require_dpop is true: the
                   DPoP replay realm is this exact issuer, so key-set or JWKS
                   source rotation cannot reopen a proof. Issuers are compared
@@ -19172,12 +19193,17 @@ components:
                   issuer is refused as a bearer-only bypass.
               audience:
                 type: string
-                description: Expected JWT aud claim
+                description: Expected JWT aud claim; presence is required when set (same contract as audiences)
               audiences:
                 type: array
                 items:
                   type: string
-                description: Accepted JWT aud claims; OR matched
+                description: >-
+                  Accepted JWT aud claims; OR matched. When non-empty the token
+                  MUST carry aud and at least one value must match. When empty,
+                  tokens without aud are accepted and a token that carries aud is
+                  rejected because no acceptable audience is configured (RFC 7519
+                  4.1.3).
               from_headers:
                 type: array
                 items:
@@ -19203,7 +19229,11 @@ components:
                 description: Whether to forward the token-bearing header or query parameter upstream
               require_exp:
                 type: boolean
-                description: Per-provider override for requiring an exp claim
+                description: >-
+                  Per-provider override for requiring an exp claim. Expiry is
+                  always validated when present. A present nbf is always
+                  validated too (it is not required). JWT exp/nbf use zero
+                  clock leeway; DPoP skew is a separate proof contract.
               required_scopes:
                 type: array
                 items:
@@ -20405,7 +20435,37 @@ components:
         trusted_hbone_assertors:
           type: array
           items:
-            type: string
+            oneOf:
+              - type: string
+              - type: object
+                required: [assertor]
+                properties:
+                  assertor:
+                    type: string
+                    description: |
+                      Bare service-account name or full `spiffe://` SPIFFE ID
+                      identifying the peer this entry admits.
+                  asserts:
+                    type: array
+                    items:
+                      type: string
+                    description: |
+                      Exact SPIFFE IDs this assertor may assert and nothing
+                      else — the inventory of workloads it actually fronts. An
+                      empty array authorizes nothing. Mutually exclusive with
+                      `scope`.
+                  scope:
+                    type: string
+                    enum: [same_namespace, mesh_wide]
+                    description: |
+                      Explicit grant contract. `same_namespace` (the default
+                      for every entry) permits only identities in the
+                      assertor's own Kubernetes namespace; `mesh_wide` requires
+                      `assertor` to be a full, exactly matched `spiffe://` ID,
+                      permits any identity that clears the trust-domain gate,
+                      and logs a warning at construction. Mutually exclusive
+                      with `asserts`.
+                additionalProperties: false
           default: ["ztunnel", "waypoint"]
           description: |
             Allow-list of identity-asserting infrastructure components whose
@@ -20415,6 +20475,14 @@ components:
             `["ztunnel", "waypoint"]`. Explicit empty array disables all
             baggage rewriting.
 
+            Matching a peer is necessary but NOT sufficient (issue #4274):
+            every entry also carries a grant that decides WHICH identities that
+            peer may assert. String entries and objects without `asserts` /
+            `scope` grant `same_namespace` only, so a peer in
+            `ns/attacker/sa/waypoint` can no longer assert
+            `ns/prod/sa/payments`. Baggage refused by the grant is dropped, the
+            peer-cert identity is used instead, and the request is stamped
+            `mesh_authz.ignored_baggage.assertion_out_of_scope=true`.
     MeshOutboundRegistryConfig:
       type: object
       description: |
@@ -21068,7 +21136,25 @@ components:
         trusted_hbone_assertors:
           type: array
           items:
-            type: string
+            oneOf:
+              - type: string
+              - type: object
+                required: [assertor]
+                properties:
+                  assertor:
+                    type: string
+                  asserts:
+                    type: array
+                    items:
+                      type: string
+                  scope:
+                    type: string
+                    enum: [same_namespace, mesh_wide]
+                    description: |
+                      `mesh_wide` requires `assertor` to be a full, exactly
+                      matched `spiffe://` ID; bare service-account matchers are
+                      rejected.
+                additionalProperties: false
           default: ["ztunnel", "waypoint"]
           description: |
             Allow-list of identity-asserting infrastructure components whose
@@ -21077,6 +21163,12 @@ components:
             peer whose SPIFFE path ends with `/sa/<name>`; full SPIFFE IDs
             match exactly. Default is `["ztunnel", "waypoint"]`. Explicit
             empty array disables baggage-derived source attribution.
+
+            Identical schema and identical semantics to the `mesh_authz` field
+            of the same name — the two plugins share ONE relation, so telemetry
+            attribution can never grant what authorization refused (issue
+            #4274). Refused baggage is stamped
+            `mesh.ignored_baggage=assertion_out_of_scope`.
         sampling_percentage:
           type: number
           format: double
@@ -22005,7 +22097,11 @@ components:
                     maxLength: 512
                     description: >-
                       Literal byte-prefix of the request Origin header
-                      (case-sensitive), e.g. "https://app.".
+                      (case-sensitive), e.g. "https://app.". A prefix that does
+                      not constrain the host (missing `://` or empty authority,
+                      such as "https://" or "h") is effectively universal: it
+                      is admitted without credentials but cannot be combined
+                      with allow_credentials.
                   regex:
                     type: string
                     minLength: 1
@@ -22016,7 +22112,10 @@ components:
                       per request) under explicit bounds — 512 pattern bytes, a
                       64 KiB compiled-program limit, a 64 KiB lazy-DFA limit,
                       and an AST nesting limit of 24. An invalid or over-budget
-                      pattern is rejected with a field-specific error.
+                      pattern is rejected with a field-specific error. A regex
+                      that admits the opaque `null` origin or every origin of a
+                      scheme (for example `.*` or `https://.*`) cannot be
+                      combined with allow_credentials.
           description: >-
             Required permitted-origin policy, bounded at 64 entries. Each entry
             is either a string — NATIVE syntax: `"*"` for intentional allow-all,
@@ -22064,7 +22163,14 @@ components:
         allow_credentials:
           type: boolean
           default: false
-          description: "Send Access-Control-Allow-Credentials: true"
+          description: >-
+            Send Access-Control-Allow-Credentials: true. Incompatible with
+            wildcard origins (native `"*"` / `{exact: "*"}` logs a warning and
+            disables credentials), opaque exact `null`, and an effectively
+            universal prefix or regex (refused at config load rather than
+            silently weakened). A
+            prefix must constrain the host (`://` plus at least one host
+            character); a regex must not match `null` or every origin of a scheme.
         max_age:
           type: integer
           format: uint64

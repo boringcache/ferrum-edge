@@ -162,6 +162,37 @@ fn mint_with_exp(
     .expect("test JWT must encode")
 }
 
+fn mint_with_nbf(
+    secret: &str,
+    kid: Option<&str>,
+    node_id: &str,
+    ns: Option<serde_json::Value>,
+    nbf: Option<i64>,
+) -> String {
+    let now = Utc::now().timestamp();
+    let mut claims = json!({
+        "sub": node_id,
+        "iat": now,
+        "exp": now + 600,
+        "iss": TEST_ISSUER,
+        "role": "data_plane",
+    });
+    if let Some(ns) = ns {
+        claims["ns"] = ns;
+    }
+    if let Some(nbf) = nbf {
+        claims["nbf"] = json!(nbf);
+    }
+    let mut header = Header::new(Algorithm::HS256);
+    header.kid = kid.map(str::to_string);
+    encode(
+        &header,
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .expect("test JWT must encode")
+}
+
 // ── Config fixtures ──────────────────────────────────────────────────────
 
 fn tenant_marked_config() -> GatewayConfig {
@@ -481,6 +512,80 @@ fn captured_old_verifier_snapshot_cannot_bind_after_remove_then_readd() {
         Err(status) => status,
     };
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
+}
+
+/// A present future `nbf` must fail at token validation (`Unauthenticated`)
+/// before namespace resolution can run. A token that would otherwise be
+/// `PermissionDenied` for a cross-tenant `ns` claim therefore still returns
+/// `Unauthenticated` when `nbf` is in the future. An absent `nbf` remains
+/// allowed.
+#[test]
+fn grpc_jwt_rejects_future_nbf_before_namespace_resolution() {
+    let verifier = CpDpVerifierStore::from_arc(two_tenant_bundle());
+    let snapshot = verifier.load();
+    let now = Utc::now().timestamp();
+
+    let future_nbf_valid_ns = mint_with_nbf(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "nbf-node",
+        Some(json!(TENANT_A)),
+        Some(now + 3600),
+    );
+    let future_valid_status = snapshot
+        .verify_and_bind_grpc_identity(
+            authorize(tonic::Request::new(()), &future_nbf_valid_ns).metadata(),
+            TEST_ISSUER,
+            None,
+            &verifier,
+        )
+        .expect_err("future nbf must be unauthenticated");
+    assert_eq!(future_valid_status.code(), tonic::Code::Unauthenticated);
+    assert_eq!(
+        future_valid_status.message(),
+        "Invalid token: authentication failed"
+    );
+
+    // Cross-tenant `ns` would be PermissionDenied if verification reached
+    // namespace resolution. Future `nbf` must fail first.
+    let future_nbf_cross_ns = mint_with_nbf(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "nbf-node",
+        Some(json!(TENANT_B)),
+        Some(now + 3600),
+    );
+    let future_cross_status = snapshot
+        .verify_and_bind_grpc_identity(
+            authorize(tonic::Request::new(()), &future_nbf_cross_ns).metadata(),
+            TEST_ISSUER,
+            None,
+            &verifier,
+        )
+        .expect_err("future nbf must fail before namespace resolution");
+    assert_eq!(future_cross_status.code(), tonic::Code::Unauthenticated);
+    assert_eq!(
+        future_cross_status.message(),
+        "Invalid token: authentication failed"
+    );
+
+    let absent_nbf = mint_with_nbf(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "nbf-node",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let identity = snapshot
+        .verify_and_bind_grpc_identity(
+            authorize(tonic::Request::new(()), &absent_nbf).metadata(),
+            TEST_ISSUER,
+            None,
+            &verifier,
+        )
+        .expect("absent nbf must remain allowed");
+    assert_eq!(identity.subject, "nbf-node");
+    assert!(identity.allowed_namespaces.allows(TENANT_A));
 }
 
 #[tokio::test(start_paused = true)]
