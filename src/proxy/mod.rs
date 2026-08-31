@@ -45711,9 +45711,20 @@ pub(crate) fn apply_outbound_h2_preserve_to_uri(
     {
         return;
     }
-    if let Some(authority) = outbound_h2_authority(uri) {
-        let _ = align_outbound_h2_uri_authority(uri, authority);
+    let Some(authority) = outbound_h2_authority(uri) else {
+        return;
+    };
+    if uri
+        .authority()
+        .is_some_and(|existing| existing.as_str() == authority)
+    {
+        return;
     }
+    // `authority` borrows `uri`; the rewrite needs `&mut uri`. Own the string
+    // only on this rare branch (an explicit default port), so the common path
+    // stays a borrow.
+    let authority = authority.to_owned();
+    let _ = align_outbound_h2_uri_authority(uri, &authority);
 }
 
 /// Set `Host` from the URI's outbound authority. Never rewrites the URI.
@@ -45780,11 +45791,17 @@ pub(crate) fn apply_outbound_h2_host(
     let needs_align = uri
         .authority()
         .is_none_or(|existing| existing.as_str() != authority);
-    if needs_align && !align_outbound_h2_uri_authority(uri, authority) {
-        // URI rewrite failed; omitting Host lets Hyper emit `:authority`
-        // alone rather than a disagreeing pair.
-        headers.remove(hyper::header::HOST);
-        return;
+    if needs_align {
+        // `authority` borrows `uri`; the rewrite needs `&mut uri`. Own the
+        // string only here, so the common non-default-port path is still a
+        // borrow plus the `HeaderValue` insert that already existed.
+        let authority = authority.to_owned();
+        if !align_outbound_h2_uri_authority(uri, &authority) {
+            // URI rewrite failed; omitting Host lets Hyper emit `:authority`
+            // alone rather than a disagreeing pair.
+            headers.remove(hyper::header::HOST);
+            return;
+        }
     }
     sync_outbound_h2_host_to_authority(headers, uri);
 }
